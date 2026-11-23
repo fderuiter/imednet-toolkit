@@ -9,14 +9,17 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pydantic import Field
 
+from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import ImednetBaseModel
+from imednet.spi.utils import JobProgressCallback
 from imednet.spi.validation import DataDictionary, extract_variable_constraints
 
 from .generator import GeneratedRecordSet
+from .inspector import StudySnapshot
 from .models import (
     TERMINAL_UAT_STATES,
     InvalidUATStateTransitionError,
@@ -31,12 +34,6 @@ from .models import (
     validate_uat_transition,
 )
 from .submission import SubmissionResult
-
-if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
-    from imednet.spi.utils import JobProgressCallback
-
-    from .inspector import StudySnapshot
 
 
 class UATRunPhase(str, Enum):

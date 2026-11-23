@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from functools import cached_property
-from typing import TYPE_CHECKING
+
+from imednet.spi.facade import ImednetFacade
 
 from .data_extraction import DataExtractionWorkflow
 from .duckdb_centralizer import DuckDBIngestionWorkflow
@@ -13,9 +14,6 @@ from .record_update import RecordUpdateWorkflow
 from .register_subjects import RegisterSubjectsWorkflow
 from .subject_data import SubjectDataWorkflow
 from .uat import StudySchemaInspector, UATWorkflow
-
-if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
 
 
 class Workflows:

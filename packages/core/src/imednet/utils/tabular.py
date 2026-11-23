@@ -10,13 +10,11 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+import imednet.validation as _validation
 from imednet.errors import ValidationError
 from imednet.utils.typing import JsonDict, RecordsInput
-
-if TYPE_CHECKING:
-    from imednet.validation.cache import ValidationSchemaProtocol
 
 MASKED_SENTINEL: str = "***MASKED***"
 
@@ -201,7 +199,7 @@ def _coerce_int_identifier(value: Any, *, row_index: int, column_name: str) -> i
 
 
 def _resolve_expected_var_type(
-    schema: ValidationSchemaProtocol | None,
+    schema: _validation.ValidationSchemaProtocol | None,
     form_key: str | None,
     form_id: int | None,
     var_name: str,
@@ -300,7 +298,7 @@ def normalize_tabular_row(
     *,
     row_index: int = 0,
     from_csv_str: bool = False,
-    schema: ValidationSchemaProtocol | None = None,
+    schema: _validation.ValidationSchemaProtocol | None = None,
 ) -> JsonDict | None:
     """Normalize a single DataFrame or CSV row into a REST create-records payload dict.
 
@@ -418,7 +416,7 @@ def csv_to_records(
     path: str | os.PathLike[str],
     *,
     encoding: str = "utf-8-sig",
-    schema: ValidationSchemaProtocol | None = None,
+    schema: _validation.ValidationSchemaProtocol | None = None,
 ) -> list[JsonDict]:
     """Load a CSV file into REST create-records payload dicts using the standard library.
 
@@ -451,7 +449,7 @@ def _is_dataframe_instance(obj: object) -> bool:
 def dataframe_rows_to_records(
     df: Any,
     *,
-    schema: ValidationSchemaProtocol | None = None,
+    schema: _validation.ValidationSchemaProtocol | None = None,
 ) -> list[JsonDict]:
     """Convert a ``pandas.DataFrame`` into REST create-records payload dicts."""
     if getattr(df, "empty", False):
@@ -474,7 +472,7 @@ def dataframe_rows_to_records(
 def normalize_records_input(
     records_data: RecordsInput,
     *,
-    schema: ValidationSchemaProtocol | None = None,
+    schema: _validation.ValidationSchemaProtocol | None = None,
 ) -> list[JsonDict]:
     """Normalize ``DataFrame``, CSV path, or ``list[JsonDict]`` into record payload dicts."""
     if isinstance(records_data, (str, os.PathLike)):

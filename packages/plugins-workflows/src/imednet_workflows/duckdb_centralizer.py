@@ -9,15 +9,13 @@ import re
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 from uuid import uuid4
 
+from imednet.spi.facade import ImednetFacade
+from imednet.spi.models import RecordRevision
+
 from .data_extraction import DataExtractionWorkflow
-
-if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
-    from imednet.spi.models import RecordRevision
-
 
 _SAFE_STUDY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
 _BRONZE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (

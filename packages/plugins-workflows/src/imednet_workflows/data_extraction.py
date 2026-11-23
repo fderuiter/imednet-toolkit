@@ -1,14 +1,12 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import Record, RecordRevision
 from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import normalize_utc_timestamp_bound
-
-if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
 
 
 class DataExtractionWorkflow:
@@ -18,7 +16,7 @@ class DataExtractionWorkflow:
         sdk: An instance of the ImednetSDK.
     """
 
-    def __init__(self, sdk: "ImednetFacade"):
+    def __init__(self, sdk: ImednetFacade):
         """Initialize the data extraction workflow.
 
         Args:

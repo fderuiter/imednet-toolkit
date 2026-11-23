@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+from imednet.spi.facade import ImednetFacade, TriageStoreProtocol
 from imednet.spi.models import (
     Query,
     QueryStatus,
@@ -18,9 +19,6 @@ from imednet.spi.models import (
 from imednet.spi.utils import normalize_iso_date, parse_iso_datetime
 
 from .triage_store import TriageStore
-
-if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade, TriageStoreProtocol
 
 
 class QueryStateCounts(dict[str, int]):

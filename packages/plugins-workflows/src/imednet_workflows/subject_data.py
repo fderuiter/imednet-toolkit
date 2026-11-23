@@ -1,14 +1,12 @@
 """Provides a workflow to retrieve comprehensive data for a specific subject."""
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pydantic import BaseModel, Field
 
+from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import Query, Record, Subject, Visit
 from imednet.spi.sink_base import is_record_deleted
-
-if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
 
 
 class SubjectComprehensiveData(BaseModel):
@@ -31,7 +29,7 @@ class SubjectDataWorkflow:
         sdk: An instance of the ImednetFacade.
     """
 
-    def __init__(self, sdk: "ImednetFacade"):
+    def __init__(self, sdk: ImednetFacade):
         """Initialize the subject data workflow.
 
         Args:

@@ -6,8 +6,9 @@ import json
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+import imednet.validation as _validation
 from imednet.models.records import RegisterSubjectRequest
 from imednet.models.sites import (
     ELIGIBLE_SITE_ENROLLMENT_STATUSES,
@@ -22,9 +23,6 @@ from imednet.utils.tabular import (
     ensure_no_masked_sentinel,
 )
 from imednet.utils.typing import JsonDict
-
-if TYPE_CHECKING:
-    from imednet.validation.cache import ValidationSchemaProtocol
 
 
 def extract_candidate_subject_key(
@@ -80,7 +78,7 @@ def normalize_subject_registration_inputs(
     *,
     default_form_key: str | None = None,
     default_site_name: str | None = None,
-    schema: ValidationSchemaProtocol | None = None,
+    schema: _validation.ValidationSchemaProtocol | None = None,
 ) -> list[tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]]:
     """Normalize registration requests from models, dicts, DataFrame, or CSV/JSON file path."""
     raw_items: Sequence[RegisterSubjectRequest | dict[str, Any]]

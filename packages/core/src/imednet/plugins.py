@@ -51,27 +51,11 @@ from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, overload, runti
 
 from typing_extensions import deprecated
 
-if TYPE_CHECKING:
-    import pandas as pd
-
-    from .datadict import DataDictionary
-    from .integrations.sink_base import ExportSink
-    from .models.forms import Form
-    from .models.intervals import Interval
-    from .models.jobs import Job
-    from .models.queries import Query
-    from .models.record_revisions import RecordRevision
-    from .models.records import Record, RegisterSubjectRequest
-    from .models.sites import Site
-    from .models.subjects import Subject
-    from .models.triage import TriageItem, TriageStatus
-    from .models.variables import Variable
-    from .models.visits import Visit
-    from .spi.facade import AsyncImednetFacade, ImednetFacade
-    from .utils.batch_coordinator import BatchSubmissionSummary
-    from .utils.job_poller import JobProgressHandler
-    from .utils.typing import RecordsInput
-    from .validation.cache import ValidationSchemaProtocol
+from . import models as _models
+from . import spi as _spi
+from . import validation as _validation
+from .utils import typing as _typing
+from .utils.typing import RecordsInput
 
 if not TYPE_CHECKING:
     from typing import _ProtocolMeta
@@ -128,7 +112,7 @@ class DataExtractionWorkflowProtocol(Protocol):
         *,
         include_deleted: bool = False,
         **other_filters: Any,
-    ) -> list[Record]:
+    ) -> list[_models.Record]:
         """Extract study records matching combined subject, visit, and record filters."""
         ...
 
@@ -139,7 +123,7 @@ class DataExtractionWorkflowProtocol(Protocol):
         end_date: str | None = None,
         user_filter: dict[str, Any] | None = None,
         **filters: Any,
-    ) -> list[RecordRevision]:
+    ) -> list[_models.RecordRevision]:
         """Extract record revisions bounded by optional UTC dates and filters."""
         ...
 
@@ -166,15 +150,17 @@ class DuckDBIngestionWorkflowProtocol(Protocol):
 class TriageStoreProtocol(Protocol):
     """Structural contract for triage stores used by ``sdk.workflows.query_management``."""
 
-    def upsert_item(self, item: TriageItem) -> None:
+    def upsert_item(self, item: _models.TriageItem) -> None:
         """Insert or update a triage item while preserving annotations and history."""
         ...
 
-    def get_triage_item(self, item_id: str) -> TriageItem | None:
+    def get_triage_item(self, item_id: str) -> _models.TriageItem | None:
         """Fetch a single triage item by ID."""
         ...
 
-    def get_queue(self, study_key: str, status: TriageStatus | None = None) -> list[TriageItem]:
+    def get_queue(
+        self, study_key: str, status: _models.TriageStatus | None = None
+    ) -> list[_models.TriageItem]:
         """Fetch the triage queue for a study, optionally filtered by status."""
         ...
 
@@ -188,7 +174,7 @@ class QueryManagementWorkflowProtocol(Protocol):
         additional_filter: dict[str, Any] | None = None,
         include_answered: bool = False,
         **kwargs: Any,
-    ) -> list[Query]:
+    ) -> list[_models.Query]:
         """Retrieve open queries for a study, optionally including answered queries."""
         ...
 
@@ -197,7 +183,7 @@ class QueryManagementWorkflowProtocol(Protocol):
         study_key: str,
         additional_filter: dict[str, Any] | None = None,
         **kwargs: Any,
-    ) -> list[Query]:
+    ) -> list[_models.Query]:
         """Retrieve all unresolved (OPEN and ANSWERED) queries for a study."""
         ...
 
@@ -207,7 +193,7 @@ class QueryManagementWorkflowProtocol(Protocol):
         subject_key: str,
         additional_filter: dict[str, Any] | None = None,
         **kwargs: Any,
-    ) -> list[Query]:
+    ) -> list[_models.Query]:
         """Retrieve queries associated with a specific subject."""
         ...
 
@@ -217,7 +203,7 @@ class QueryManagementWorkflowProtocol(Protocol):
         site_key: str,
         additional_filter: dict[str, Any] | None = None,
         **kwargs: Any,
-    ) -> list[Query]:
+    ) -> list[_models.Query]:
         """Retrieve queries associated with a specific site."""
         ...
 
@@ -234,7 +220,7 @@ class QueryManagementWorkflowProtocol(Protocol):
         unresolved_only: bool = False,
         default_severity: str = "medium",
         **kwargs: Any,
-    ) -> list[TriageItem]:
+    ) -> list[_models.TriageItem]:
         """Synchronize clinical queries for a study into a local triage queue."""
         ...
 
@@ -254,7 +240,7 @@ class RecordMapperProtocol(Protocol):
         domain: str | None = None,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
-    ) -> pd.DataFrame:
+    ) -> _typing.DataFrame:
         """Return mapped study records as a pandas DataFrame."""
         ...
 
@@ -270,7 +256,7 @@ class RecordMapperProtocol(Protocol):
         domain: str | None = None,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
-    ) -> Iterator[pd.DataFrame]:
+    ) -> Iterator[_typing.DataFrame]:
         """Yield mapped study record DataFrames in bounded chunks."""
         ...
 
@@ -284,7 +270,7 @@ class RecordMapperProtocol(Protocol):
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
-        records: Iterable[Record] | None = None,
+        records: Iterable[_models.Record] | None = None,
     ) -> list[dict[str, Any]]:
         """Generate a nested JSON hierarchy for study records."""
         ...
@@ -298,7 +284,7 @@ class RecordMapperProtocol(Protocol):
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
         seq_counters: dict[str, int] | None = None,
-    ) -> pd.DataFrame:
+    ) -> _typing.DataFrame:
         """Transform records into a normalized SDTM domain DataFrame."""
         ...
 
@@ -312,7 +298,7 @@ class RecordMapperProtocol(Protocol):
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
-    ) -> pd.DataFrame:
+    ) -> _typing.DataFrame:
         """Return study records mapped to a CDISC SDTM domain DataFrame."""
         ...
 
@@ -326,7 +312,7 @@ class RecordMapperProtocol(Protocol):
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
-    ) -> Iterator[pd.DataFrame]:
+    ) -> Iterator[_typing.DataFrame]:
         """Yield chunked DataFrames mapped to a CDISC SDTM domain."""
         ...
 
@@ -343,11 +329,11 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         poll_interval: int = 5,
         *,
         chunk_size: int | None = None,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> BatchSubmissionSummary:
+    ) -> _spi.utils.BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and return a batch summary."""
         ...
 
@@ -359,11 +345,11 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> Job:
+    ) -> _models.Job:
         """Submit records for creation or update and return the resulting Job."""
         ...
 
@@ -379,8 +365,8 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
-        schema: ValidationSchemaProtocol | None = None,
-    ) -> Job:
+        schema: _validation.ValidationSchemaProtocol | None = None,
+    ) -> _models.Job:
         """Register a new subject by submitting a single enrollment record."""
         ...
 
@@ -398,8 +384,8 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
-        schema: ValidationSchemaProtocol | None = None,
-    ) -> Job:
+        schema: _validation.ValidationSchemaProtocol | None = None,
+    ) -> _models.Job:
         """Update an existing scheduled record for a subject."""
         ...
 
@@ -415,8 +401,8 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
-        schema: ValidationSchemaProtocol | None = None,
-    ) -> Job:
+        schema: _validation.ValidationSchemaProtocol | None = None,
+    ) -> _models.Job:
         """Create a new unscheduled record for an existing subject."""
         ...
 
@@ -433,11 +419,11 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         poll_interval: int = 5,
         *,
         chunk_size: int | None = None,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> BatchSubmissionSummary:
+    ) -> _spi.utils.BatchSubmissionSummary:
         """Asynchronously validate once, submit chunks, and return a batch summary."""
         ...
 
@@ -449,11 +435,11 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> Job:
+    ) -> _models.Job:
         """Asynchronously submit records for creation or update and return the Job."""
         ...
 
@@ -469,8 +455,8 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
-        schema: ValidationSchemaProtocol | None = None,
-    ) -> Job:
+        schema: _validation.ValidationSchemaProtocol | None = None,
+    ) -> _models.Job:
         """Asynchronously register a new subject via the Records API."""
         ...
 
@@ -488,8 +474,8 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
-        schema: ValidationSchemaProtocol | None = None,
-    ) -> Job:
+        schema: _validation.ValidationSchemaProtocol | None = None,
+    ) -> _models.Job:
         """Asynchronously update an existing scheduled record for a subject."""
         ...
 
@@ -505,8 +491,8 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
-        schema: ValidationSchemaProtocol | None = None,
-    ) -> Job:
+        schema: _validation.ValidationSchemaProtocol | None = None,
+    ) -> _models.Job:
         """Asynchronously create a new unscheduled record for an existing subject."""
         ...
 
@@ -557,7 +543,7 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
     def register_subjects_batch(
         self,
         study_key: str,
-        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        subjects: Sequence[_models.RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
         email_notify: str | None = None,
         wait_for_completion: bool = False,
         timeout: int = 300,
@@ -567,18 +553,18 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> BatchSubmissionSummary:
+    ) -> _spi.utils.BatchSubmissionSummary:
         """Validate sites and submit subject registrations in bounded chunks."""
         ...
 
     def register_subjects(
         self,
         study_key: str,
-        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        subjects: Sequence[_models.RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
         email_notify: str | None = None,
         wait_for_completion: bool = False,
         timeout: int = 300,
@@ -587,18 +573,18 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> Job:
+    ) -> _models.Job:
         """Register one or more subjects in a study."""
         ...
 
     async def async_register_subjects_batch(
         self,
         study_key: str,
-        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        subjects: Sequence[_models.RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
         email_notify: str | None = None,
         wait_for_completion: bool = False,
         timeout: int = 300,
@@ -608,18 +594,18 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> BatchSubmissionSummary:
+    ) -> _spi.utils.BatchSubmissionSummary:
         """Asynchronously register subjects in bounded chunks."""
         ...
 
     async def async_register_subjects(
         self,
         study_key: str,
-        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        subjects: Sequence[_models.RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
         email_notify: str | None = None,
         wait_for_completion: bool = False,
         timeout: int = 300,
@@ -628,11 +614,11 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> Job:
+    ) -> _models.Job:
         """Asynchronously register one or more subjects in a study."""
         ...
 
@@ -646,7 +632,7 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
     async def async_register_subjects_batch(
         self,
         study_key: str,
-        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        subjects: Sequence[_models.RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
         email_notify: str | None = None,
         wait_for_completion: bool = False,
         timeout: int = 300,
@@ -656,18 +642,18 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> BatchSubmissionSummary:
+    ) -> _spi.utils.BatchSubmissionSummary:
         """Asynchronously validate sites and submit subject registrations in bounded chunks."""
         ...
 
     async def async_register_subjects(
         self,
         study_key: str,
-        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        subjects: Sequence[_models.RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
         email_notify: str | None = None,
         wait_for_completion: bool = False,
         timeout: int = 300,
@@ -676,11 +662,11 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
-        schema: ValidationSchemaProtocol | None = None,
-        on_progress: JobProgressHandler | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
+        on_progress: _spi.utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> Job:
+    ) -> _models.Job:
         """Asynchronously register one or more subjects in a study."""
         ...
 
@@ -705,22 +691,22 @@ class SubjectComprehensiveDataProtocol(Protocol):
     """Structural contract for aggregated subject data returned by ``subject_data``."""
 
     @property
-    def subject_details(self) -> Subject | None:
+    def subject_details(self) -> _models.Subject | None:
         """Core details of the subject."""
         ...
 
     @property
-    def visits(self) -> list[Visit]:
+    def visits(self) -> list[_models.Visit]:
         """Visits associated with the subject."""
         ...
 
     @property
-    def records(self) -> list[Record]:
+    def records(self) -> list[_models.Record]:
         """Records associated with the subject."""
         ...
 
     @property
-    def queries(self) -> list[Query]:
+    def queries(self) -> list[_models.Query]:
         """Queries associated with the subject."""
         ...
 
@@ -753,53 +739,53 @@ class StudySnapshotProtocol(Protocol):
         ...
 
     @property
-    def forms(self) -> list[Form]:
+    def forms(self) -> list[_models.Form]:
         """Study form definitions."""
         ...
 
     @property
-    def variables(self) -> list[Variable]:
+    def variables(self) -> list[_models.Variable]:
         """Study variable definitions."""
         ...
 
     @property
-    def intervals(self) -> list[Interval]:
+    def intervals(self) -> list[_models.Interval]:
         """Study interval definitions."""
         ...
 
     @property
-    def sites(self) -> list[Site]:
+    def sites(self) -> list[_models.Site]:
         """Study site definitions."""
         ...
 
     @property
-    def forms_by_key(self) -> dict[str, Form]:
+    def forms_by_key(self) -> dict[str, _models.Form]:
         """Lookup dictionary mapping form keys to Form models."""
         ...
 
     @property
-    def variables_by_form(self) -> dict[str, list[Variable]]:
+    def variables_by_form(self) -> dict[str, list[_models.Variable]]:
         """Lookup dictionary mapping form keys to Variable lists."""
         ...
 
     @property
-    def intervals_by_name(self) -> dict[str, Interval]:
+    def intervals_by_name(self) -> dict[str, _models.Interval]:
         """Lookup dictionary mapping interval names to Interval models."""
         ...
 
-    def enrollment_forms(self) -> list[Form]:
+    def enrollment_forms(self) -> list[_models.Form]:
         """Return forms configured for subject enrollment/registration."""
         ...
 
-    def scheduled_forms(self) -> list[Form]:
+    def scheduled_forms(self) -> list[_models.Form]:
         """Return scheduled non-enrollment forms."""
         ...
 
-    def unscheduled_forms(self) -> list[Form]:
+    def unscheduled_forms(self) -> list[_models.Form]:
         """Return unscheduled forms."""
         ...
 
-    def active_sites(self) -> list[Site]:
+    def active_sites(self) -> list[_models.Site]:
         """Return actively enrolling sites."""
         ...
 
@@ -957,7 +943,7 @@ class UATWorkflowProtocol(Protocol):
         site_name: str | None = None,
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
-        data_dictionary: DataDictionary | None = None,
+        data_dictionary: _spi.validation.DataDictionary | None = None,
     ) -> UATRunResultProtocol:
         """Execute the end-to-end UAT pipeline and return its run result."""
         ...
@@ -975,7 +961,7 @@ class UATWorkflowProtocol(Protocol):
         spec: Any,
         snapshot: Any,
         *,
-        data_dictionary: DataDictionary | None = None,
+        data_dictionary: _spi.validation.DataDictionary | None = None,
     ) -> list[Any]:
         """Generate synthetic record sets from a UAT specification and snapshot."""
         ...
@@ -1202,7 +1188,7 @@ class MongoDbSinkConfigFactoryProtocol(Protocol):
 class MongoDbExportSinkFactoryProtocol(Protocol):
     """Callable factory contract for ``sdk.sinks.MongoDbExportSink``."""
 
-    def __call__(self, config: Any) -> ExportSink:
+    def __call__(self, config: Any) -> _spi.sink_base.ExportSink:
         """Instantiate a MongoDB export sink."""
         ...
 
@@ -1230,7 +1216,7 @@ class BoundExportToMongoDbProtocol(Protocol):
     )
     def __call__(
         self,
-        sdk: ImednetFacade,
+        sdk: _spi.facade.ImednetFacade,
         study_key: str,
         uri: str = "",
         database: str = "",
@@ -1308,7 +1294,7 @@ class Neo4jSinkConfigFactoryProtocol(Protocol):
 class Neo4jExportSinkFactoryProtocol(Protocol):
     """Callable factory contract for ``sdk.sinks.Neo4jExportSink``."""
 
-    def __call__(self, config: Any) -> ExportSink:
+    def __call__(self, config: Any) -> _spi.sink_base.ExportSink:
         """Instantiate a Neo4j export sink."""
         ...
 
@@ -1335,7 +1321,7 @@ class BoundExportToNeo4jProtocol(Protocol):
     )
     def __call__(
         self,
-        sdk: ImednetFacade,
+        sdk: _spi.facade.ImednetFacade,
         study_key: str,
         uri: str = "",
         auth: tuple[str, str] = ("", ""),
@@ -1427,7 +1413,7 @@ class SnowflakeSinkConfigFactoryProtocol(Protocol):
 class SnowflakeExportSinkFactoryProtocol(Protocol):
     """Callable factory contract for ``sdk.sinks.SnowflakeExportSink``."""
 
-    def __call__(self, config: Any) -> ExportSink:
+    def __call__(self, config: Any) -> _spi.sink_base.ExportSink:
         """Instantiate a Snowflake export sink."""
         ...
 
@@ -1451,7 +1437,7 @@ class BoundExportToSnowflakeProtocol(Protocol):
     )
     def __call__(
         self,
-        sdk: ImednetFacade,
+        sdk: _spi.facade.ImednetFacade,
         study_key: str,
         *,
         config: Any,
@@ -1606,7 +1592,7 @@ class PluginProtocol(Protocol):
         assert isinstance(create_workflows, PluginProtocol)
     """
 
-    def __call__(self, sdk_instance: ImednetFacade, /) -> WorkflowsNamespaceProtocol:
+    def __call__(self, sdk_instance: _spi.facade.ImednetFacade, /) -> WorkflowsNamespaceProtocol:
         """Initialize the workflows plugin with an SDK instance."""
         ...
 
@@ -1616,7 +1602,7 @@ class SinksPluginProtocol(Protocol):
     """Protocol for the sinks plugin factory."""
 
     def __call__(
-        self, sdk_instance: ImednetFacade | AsyncImednetFacade, /
+        self, sdk_instance: _spi.facade.ImednetFacade | _spi.facade.AsyncImednetFacade, /
     ) -> SinksNamespaceProtocol | AsyncSinksNamespaceProtocol:
         """Initialize the sinks plugin with an SDK instance."""
         ...

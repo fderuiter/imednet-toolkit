@@ -13,6 +13,8 @@ import math
 import numbers
 import os
 import re
+import sys
+import types
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -4511,3 +4513,28 @@ _UNPATCHED_EXPORTS: dict[str, Callable[..., Any]] = {
     "export_to_sql": export_to_sql,
     "export_to_sql_by_form": export_to_sql_by_form,
 }
+
+
+class _CallableExportModule(types.ModuleType):
+    """Module subclass allowing ``imednet.integrations.export`` to be called directly."""
+
+    def __call__(
+        self,
+        target: str,
+        sdk: ImednetSDK,
+        study_key: str,
+        *,
+        config: SinkConfig | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Dispatch a unified export call via ``imednet.integrations.dispatcher.export``."""
+        import importlib
+
+        if "imednet.integrations" not in sys.modules:
+            importlib.import_module("imednet.integrations")
+        from .dispatcher import export as _dispatch_export
+
+        return _dispatch_export(target, sdk, study_key, config=config, **kwargs)
+
+
+sys.modules[__name__].__class__ = _CallableExportModule

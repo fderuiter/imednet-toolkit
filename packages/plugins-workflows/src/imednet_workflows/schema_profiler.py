@@ -6,18 +6,16 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pydantic import BaseModel, Field
 
+from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import Record, Variable
 from imednet.spi.utils import is_boolean_token
 from imednet.spi.validation import SchemaCache
 
 from .cached_loader import CachedRecordsLoader
-
-if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
 
 _SCHEMA_TYPE_MAP = {
     "bool": "boolean",

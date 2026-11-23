@@ -1,10 +1,11 @@
 """Workflow for retrieving and aggregating study structural metadata."""
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 # Import potential exceptions
 from imednet.spi.errors import ImednetError
+from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 # Import the models we need
 from imednet.spi.models import (
@@ -15,10 +16,6 @@ from imednet.spi.models import (
     StudyStructure,
     Variable,
 )
-
-# Use TYPE_CHECKING to avoid circular import at runtime
-if TYPE_CHECKING:
-    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 
 def _build_study_structure(

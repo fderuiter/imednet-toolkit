@@ -1,8 +1,9 @@
 """Utilities for submitting and updating records in iMedNet studies."""
 
-from typing import TYPE_CHECKING, Any, Literal, Union, cast
+from typing import Any, Literal, cast
 
 from imednet.spi.errors import ValidationError
+from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.spi.models import Job
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
@@ -25,10 +26,7 @@ from imednet.spi.validation import (
     ValidationSchemaProtocol,
 )
 
-if TYPE_CHECKING:
-    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
-
-FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
+FacadeLike = ImednetFacade | AsyncImednetFacade
 
 
 def _extract_record_form_ref(record: dict[str, Any]) -> tuple[str | None, Any]:

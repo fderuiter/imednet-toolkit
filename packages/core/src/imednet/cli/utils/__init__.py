@@ -102,32 +102,35 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str) -> Any:
-    """Lazily load interactive grid symbols so standard CLI startup avoids importing curses."""
-    if name == "grid":
-        import importlib
-        import sys
+if not TYPE_CHECKING:
 
-        mod = sys.modules.get(f"{__name__}.grid")
-        if mod is None:
-            mod = importlib.import_module(".grid", __name__)
-        globals().pop("grid", None)
-        return mod
-    if name in ("InteractiveDataGrid", "is_interactive_terminal", "run_interactive_grid"):
-        try:
+    def __getattr__(name: str) -> Any:
+        """Lazily load interactive grid symbols so standard CLI startup avoids importing curses."""
+        if name == "grid":
             import importlib
+            import sys
 
-            grid_mod = importlib.import_module(".grid", __name__)
+            mod = sys.modules.get(f"{__name__}.grid")
+            if mod is None:
+                mod = importlib.import_module(".grid", __name__)
             globals().pop("grid", None)
-            return getattr(grid_mod, name)
-        except (ImportError, AttributeError):
-            if name == "is_interactive_terminal":
-                return lambda: False
-            if name == "run_interactive_grid":
-                return lambda *args, **kwargs: False
-            raise
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+            return mod
+        if name in ("InteractiveDataGrid", "is_interactive_terminal", "run_interactive_grid"):
+            try:
+                import importlib
+
+                grid_mod = importlib.import_module(".grid", __name__)
+                globals().pop("grid", None)
+                return getattr(grid_mod, name)
+            except (ImportError, AttributeError):
+                if name == "is_interactive_terminal":
+                    return lambda: False
+                if name == "run_interactive_grid":
+                    return lambda *args, **kwargs: False
+                raise
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
+    """Return module attributes including lazy interactive grid exports."""
     return sorted(list(globals().keys()) + __all__)

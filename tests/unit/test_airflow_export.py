@@ -68,18 +68,23 @@ def test_airflow_export_forwards_arguments(func_name: str) -> None:
 
 @pytest.mark.parametrize("func_name", EXPORT_FUNCTIONS)
 def test_spi_export_delegation_with_dispatcher_binding(func_name: str) -> None:
-    """Resolve real SPI bindings independently of package attribute import order."""
+    """Resolve real SPI bindings on fresh import without reload workarounds."""
     script = '''
-import importlib
+from types import SimpleNamespace
 from unittest.mock import patch
 import imednet.integrations as integrations
-
-# A cached submodule import must not decide whether `export` is callable or a module.
-importlib.reload(integrations)
-assert callable(integrations.export)
 import imednet.spi as spi
-importlib.reload(spi)
+
+assert callable(integrations.export)
+assert callable(spi.export)
 assert spi.export is integrations.export
+
+sdk_stub = SimpleNamespace()
+with patch("imednet.integrations.export.export_to_csv", return_value=7) as csv_dest:
+    dispatched = spi.export("csv", sdk_stub, "synthetic-study", path="synthetic-output")
+    assert dispatched == 7
+    csv_dest.assert_called_once_with(sdk_stub, "synthetic-study", path="synthetic-output")
+
 from apache_airflow_providers_imednet import export
 with patch("imednet.integrations.export." + FUNC, return_value=None) as destination:
     getattr(export, FUNC)("synthetic-study", path="synthetic-output")

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import Any, TypedDict, cast
 
 from pydantic import Field
 
+from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.spi.models import (
     Form,
     ImednetBaseModel,
@@ -16,9 +17,6 @@ from imednet.spi.models import (
     Variable,
     is_site_enrollment_eligible,
 )
-
-if TYPE_CHECKING:
-    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 
 class FormVariableMap(TypedDict):

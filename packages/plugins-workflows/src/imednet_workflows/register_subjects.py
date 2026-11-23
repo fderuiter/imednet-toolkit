@@ -9,8 +9,9 @@ import asyncio
 import functools
 import inspect
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Union, cast
+from typing import Any, cast
 
+from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.spi.models import Job, RegisterSubjectRequest
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
@@ -30,10 +31,7 @@ from imednet.spi.utils import (
 )
 from imednet.spi.validation import ValidationSchemaProtocol
 
-if TYPE_CHECKING:
-    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
-
-FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
+FacadeLike = ImednetFacade | AsyncImednetFacade
 SubjectInputs = Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput
 
 

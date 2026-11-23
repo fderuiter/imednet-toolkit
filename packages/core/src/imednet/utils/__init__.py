@@ -1,10 +1,10 @@
-"""Utils init module."""
-
-from typing import Any
-
+# pylint: disable=duplicate-code
 """Re-exports utility functions for easier access."""
 
+from __future__ import annotations
+
 from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
 from .dates import (
     format_iso_datetime,
@@ -26,6 +26,62 @@ from .filters import (
 )
 from .json_logging import configure_json_logging
 from .typing import FilterValue, ItemId, JsonDict, RecordsInput
+
+if TYPE_CHECKING:
+    from .arrow import to_arrow_table
+    from .batch_coordinator import (
+        DEFAULT_BATCH_CHUNK_SIZE,
+        AsyncBatchCoordinator,
+        BatchCoordinator,
+        BatchSubmissionSummary,
+        chunk_records,
+        poll_facade_many_async,
+        poll_facade_many_sync,
+        poll_facade_single_async,
+        poll_facade_single_sync,
+    )
+    from .enrollment import (
+        ELIGIBLE_SITE_ENROLLMENT_STATUSES,
+        extract_candidate_subject_key,
+        filter_existing_subject_registrations,
+        is_site_enrollment_eligible,
+        normalize_subject_registration_inputs,
+        validate_subject_registration_sites,
+    )
+    from .evaluator import RestrictedAstEvaluator, evaluate_expression, parse_expression
+    from .pandas import (
+        check_pandas,
+        csv_to_records,
+        dataframe_to_records,
+        export_records_csv,
+        forms_to_dataframe,
+        import_records_csv,
+        intervals_to_dataframe,
+        queries_to_dataframe,
+        records_to_dataframe,
+        sites_to_dataframe,
+        subjects_to_dataframe,
+        users_to_dataframe,
+        variables_to_dataframe,
+        visits_to_dataframe,
+    )
+    from .security import sanitize_csv_formula, validate_partition_key
+    from .serialization import flatten
+    from .tabular import (
+        MASKED_SENTINEL,
+        ensure_no_masked_sentinel,
+        normalize_records_input,
+        normalize_tabular_row,
+    )
+    from .url import build_safe_path, sanitize_base_url, validate_path_segment
+    from .validators import (
+        parse_bool,
+        parse_datetime,
+        parse_dict_or_default,
+        parse_int_or_default,
+        parse_list_or_default,
+        parse_str_or_default,
+    )
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "flatten": ("imednet.utils.serialization", "flatten"),
@@ -92,16 +148,18 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
 }
 
 
-def __getattr__(name: str) -> Any:
-    """Lazy load utility functions from their respective modules."""
-    try:
-        module_path, obj_name = _LAZY_ATTRS[name]
-    except KeyError:
-        raise AttributeError(name) from None
-    mod = import_module(module_path)  # nosem
-    obj = getattr(mod, obj_name)
-    globals()[name] = obj
-    return obj
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> Any:
+        """Lazy load utility functions from their respective modules."""
+        try:
+            module_path, obj_name = _LAZY_ATTRS[name]
+        except KeyError:
+            raise AttributeError(name) from None
+        mod = import_module(module_path)  # nosem
+        obj = getattr(mod, obj_name)
+        globals()[name] = obj
+        return obj
 
 
 def __dir__() -> list[str]:

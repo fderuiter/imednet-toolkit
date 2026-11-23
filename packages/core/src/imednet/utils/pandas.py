@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import Any
+
+import imednet as _imednet
+import imednet.validation as _validation
 
 try:
     import pandas as pd
@@ -31,10 +34,6 @@ from .security import (
 )
 from .tabular import MASKED_SENTINEL, csv_to_records, dataframe_rows_to_records
 from .typing import JsonDict
-
-if TYPE_CHECKING:  # pragma: no cover - only for type checking
-    from ..sdk import ImednetSDK
-    from ..validation.cache import ValidationSchemaProtocol
 
 
 def check_pandas(feature_name: str | None = None) -> None:
@@ -213,7 +212,7 @@ def records_to_dataframe(
 def dataframe_to_records(
     df: pd.DataFrame,
     *,
-    schema: ValidationSchemaProtocol | None = None,
+    schema: _validation.ValidationSchemaProtocol | None = None,
 ) -> list[JsonDict]:
     """Convert a ``pandas.DataFrame`` into REST create-records payload dicts.
 
@@ -229,12 +228,12 @@ def dataframe_to_records(
 
 
 def import_records_csv(
-    sdk: ImednetSDK,
+    sdk: _imednet.ImednetSDK,
     study_key: str,
     file_path: str | os.PathLike[str],
     *,
     email_notify: bool | str | None = None,
-    schema: ValidationSchemaProtocol | None = None,
+    schema: _validation.ValidationSchemaProtocol | None = None,
     chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
     skip_validation: bool = False,
     wait_for_completion: bool = False,
@@ -267,7 +266,7 @@ def import_records_csv(
 
 
 def export_records_csv(
-    sdk: ImednetSDK,
+    sdk: _imednet.ImednetSDK,
     study_key: str,
     file_path: str,
     *,

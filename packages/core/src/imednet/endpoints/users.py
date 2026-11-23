@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.core.endpoint.structs import ParamState
 from imednet.core.protocols import ParamProcessor
 from imednet.models.users import User
-
-if TYPE_CHECKING:
-    import pandas as pd
+from imednet.utils import typing as _typing
 
 
 class UsersParamProcessor(ParamProcessor):
@@ -135,7 +133,7 @@ class UsersEndpoint(UsersOperationDef, EdcSyncListEndpoint[User]):  # type: igno
         self,
         study_key: str | None = None,
         **filters: Any,
-    ) -> pd.DataFrame:
+    ) -> _typing.DataFrame:
         """Export queried users directly to a pandas DataFrame.
 
         Args:
@@ -162,7 +160,7 @@ class AsyncUsersEndpoint(UsersOperationDef, EdcAsyncListEndpoint[User]):  # type
         self,
         study_key: str | None = None,
         **filters: Any,
-    ) -> pd.DataFrame:
+    ) -> _typing.DataFrame:
         """Export queried users asynchronously directly to a pandas DataFrame.
 
         Args:

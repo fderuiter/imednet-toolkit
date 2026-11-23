@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 from imednet.core.context import get_study_context
 from imednet.core.endpoint.base import (
@@ -14,9 +14,7 @@ from imednet.core.endpoint.base import (
     SyncListGetEndpoint,
 )
 from imednet.models.base import ImednetBaseModel
-
-if TYPE_CHECKING:
-    import pandas as pd
+from imednet.utils import typing as _typing
 
 T = TypeVar("T", bound=ImednetBaseModel)
 
@@ -82,7 +80,7 @@ class EdcSyncListEndpoint(_EdcEndpointBase, SyncListEndpoint[T]):
         self,
         study_key: str | None = None,
         **filters: Any,
-    ) -> pd.DataFrame:
+    ) -> _typing.DataFrame:
         """Export queried resources directly to a pandas DataFrame.
 
         Args:
@@ -112,7 +110,7 @@ class EdcAsyncListEndpoint(_EdcEndpointBase, AsyncListEndpoint[T]):
         self,
         study_key: str | None = None,
         **filters: Any,
-    ) -> pd.DataFrame:
+    ) -> _typing.DataFrame:
         """Export queried resources asynchronously directly to a pandas DataFrame.
 
         Args:

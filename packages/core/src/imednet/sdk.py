@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from importlib.metadata import EntryPoint, entry_points
 from typing import TYPE_CHECKING, Any, Never, Self, cast
 
+from . import core as _core
+from . import endpoints as _endpoints
 from .auth.credentials import CredentialSource
 from .auth.strategy import AuthStrategy
 from .config import Config, load_config, merge_config_overrides
@@ -37,23 +39,6 @@ from .plugins import (
     SyncWorkflowsNamespaceProtocol,
 )
 from .sdk_convenience import AsyncSDKConvenienceMixin, SyncSDKConvenienceMixin
-
-if TYPE_CHECKING:
-    from .core.async_client import AsyncClient
-    from .core.client import Client
-    from .endpoints.codings import AsyncCodingsEndpoint, CodingsEndpoint
-    from .endpoints.forms import AsyncFormsEndpoint, FormsEndpoint
-    from .endpoints.intervals import AsyncIntervalsEndpoint, IntervalsEndpoint
-    from .endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
-    from .endpoints.queries import AsyncQueriesEndpoint, QueriesEndpoint
-    from .endpoints.record_revisions import AsyncRecordRevisionsEndpoint, RecordRevisionsEndpoint
-    from .endpoints.records import AsyncRecordsEndpoint, RecordsEndpoint
-    from .endpoints.sites import AsyncSitesEndpoint, SitesEndpoint
-    from .endpoints.studies import AsyncStudiesEndpoint, StudiesEndpoint
-    from .endpoints.subjects import AsyncSubjectsEndpoint, SubjectsEndpoint
-    from .endpoints.users import AsyncUsersEndpoint, UsersEndpoint
-    from .endpoints.variables import AsyncVariablesEndpoint, VariablesEndpoint
-    from .endpoints.visits import AsyncVisitsEndpoint, VisitsEndpoint
 
 
 class WorkflowPluginProtocol(PluginProtocol):
@@ -358,19 +343,19 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
     Provides access to all iMednet API endpoints and maintains configuration.
     """
 
-    codings: CodingsEndpoint
-    forms: FormsEndpoint
-    intervals: IntervalsEndpoint
-    jobs: JobsEndpoint
-    queries: QueriesEndpoint
-    record_revisions: RecordRevisionsEndpoint
-    records: RecordsEndpoint
-    sites: SitesEndpoint
-    studies: StudiesEndpoint
-    subjects: SubjectsEndpoint
-    users: UsersEndpoint
-    variables: VariablesEndpoint
-    visits: VisitsEndpoint
+    codings: _endpoints.CodingsEndpoint
+    forms: _endpoints.FormsEndpoint
+    intervals: _endpoints.IntervalsEndpoint
+    jobs: _endpoints.JobsEndpoint
+    queries: _endpoints.QueriesEndpoint
+    record_revisions: _endpoints.RecordRevisionsEndpoint
+    records: _endpoints.RecordsEndpoint
+    sites: _endpoints.SitesEndpoint
+    studies: _endpoints.StudiesEndpoint
+    subjects: _endpoints.SubjectsEndpoint
+    users: _endpoints.UsersEndpoint
+    variables: _endpoints.VariablesEndpoint
+    visits: _endpoints.VisitsEndpoint
     workflows: SyncWorkflowsNamespaceProtocol
     sinks: SinksNamespaceProtocol | None
     config: Config
@@ -383,7 +368,7 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
         timeout: float | None = None,
         strict_mode: bool | None = None,
         retry_config: RetryConfig | None = None,
-        client: Client | None = None,
+        client: _core.Client | None = None,
         retries: int | None = None,
         backoff_factor: float | None = None,
         retry_policy: RetryPolicy | None = None,
@@ -544,19 +529,19 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
     synchronous ``close()`` on this class will raise a :exc:`TypeError`.
     """
 
-    codings: AsyncCodingsEndpoint
-    forms: AsyncFormsEndpoint
-    intervals: AsyncIntervalsEndpoint
-    jobs: AsyncJobsEndpoint
-    queries: AsyncQueriesEndpoint
-    record_revisions: AsyncRecordRevisionsEndpoint
-    records: AsyncRecordsEndpoint
-    sites: AsyncSitesEndpoint
-    studies: AsyncStudiesEndpoint
-    subjects: AsyncSubjectsEndpoint
-    users: AsyncUsersEndpoint
-    variables: AsyncVariablesEndpoint
-    visits: AsyncVisitsEndpoint
+    codings: _endpoints.AsyncCodingsEndpoint
+    forms: _endpoints.AsyncFormsEndpoint
+    intervals: _endpoints.AsyncIntervalsEndpoint
+    jobs: _endpoints.AsyncJobsEndpoint
+    queries: _endpoints.AsyncQueriesEndpoint
+    record_revisions: _endpoints.AsyncRecordRevisionsEndpoint
+    records: _endpoints.AsyncRecordsEndpoint
+    sites: _endpoints.AsyncSitesEndpoint
+    studies: _endpoints.AsyncStudiesEndpoint
+    subjects: _endpoints.AsyncSubjectsEndpoint
+    users: _endpoints.AsyncUsersEndpoint
+    variables: _endpoints.AsyncVariablesEndpoint
+    visits: _endpoints.AsyncVisitsEndpoint
     workflows: AsyncWorkflowsNamespaceProtocol
     sinks: AsyncSinksNamespaceProtocol | None
 
@@ -568,7 +553,7 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
         timeout: float | None = None,
         strict_mode: bool | None = None,
         retry_config: RetryConfig | None = None,
-        async_client: AsyncClient | None = None,
+        async_client: _core.AsyncClient | None = None,
         retries: int | None = None,
         backoff_factor: float | None = None,
         retry_policy: RetryPolicy | None = None,

@@ -13,7 +13,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import (
-    TYPE_CHECKING,
     Any,
     Generic,
     Literal,
@@ -31,13 +30,10 @@ from imednet.errors import UnknownVariableTypeError, ValidationError
 from imednet.utils.security import global_sensitivity_registry
 from imednet.utils.tabular import MASKED_SENTINEL, _contains_masked_sentinel
 
+from .. import endpoints as _endpoints
+from .. import spi as _spi
 from ..models.variables import Variable
 from ._base import _extract_form_ref, _ValidatorMixin
-
-if TYPE_CHECKING:
-    from ..endpoints.forms import AsyncFormsEndpoint, FormsEndpoint
-    from ..endpoints.variables import AsyncVariablesEndpoint, VariablesEndpoint
-    from ..spi.facade import AsyncImednetFacade, ImednetFacade
 
 logger = logging.getLogger(__name__)
 
@@ -205,8 +201,8 @@ class BaseSchemaCache(Generic[_TClient]):
 
     async def _refresh_async(
         self,
-        forms: AsyncFormsEndpoint,
-        variables: AsyncVariablesEndpoint,
+        forms: _endpoints.AsyncFormsEndpoint,
+        variables: _endpoints.AsyncVariablesEndpoint,
         study_key: str | None = None,
     ) -> None:
         """Refresh the cache asynchronously by fetching all variables for a study.
@@ -222,8 +218,8 @@ class BaseSchemaCache(Generic[_TClient]):
 
     def _refresh_sync(
         self,
-        forms: FormsEndpoint,
-        variables: VariablesEndpoint,
+        forms: _endpoints.FormsEndpoint,
+        variables: _endpoints.VariablesEndpoint,
         study_key: str | None = None,
     ) -> None:
         """Refresh the cache synchronously by fetching all variables for a study.
@@ -239,8 +235,8 @@ class BaseSchemaCache(Generic[_TClient]):
 
     def refresh(
         self,
-        forms: FormsEndpoint | AsyncFormsEndpoint,
-        variables: VariablesEndpoint | AsyncVariablesEndpoint,
+        forms: _endpoints.FormsEndpoint | _endpoints.AsyncFormsEndpoint,
+        variables: _endpoints.VariablesEndpoint | _endpoints.AsyncVariablesEndpoint,
         study_key: str | None = None,
     ) -> Any:
         """Refresh the cache, using the appropriate sync or async implementation.
@@ -255,13 +251,13 @@ class BaseSchemaCache(Generic[_TClient]):
         """
         if self._is_async:
             return self._refresh_async(
-                cast("AsyncFormsEndpoint", forms),
-                cast("AsyncVariablesEndpoint", variables),
+                cast("_endpoints.AsyncFormsEndpoint", forms),
+                cast("_endpoints.AsyncVariablesEndpoint", variables),
                 study_key,
             )
         return self._refresh_sync(
-            cast("FormsEndpoint", forms),
-            cast("VariablesEndpoint", variables),
+            cast("_endpoints.FormsEndpoint", forms),
+            cast("_endpoints.VariablesEndpoint", variables),
             study_key,
         )
 
@@ -414,7 +410,7 @@ class BaseSchemaCache(Generic[_TClient]):
         return {(k[1] if isinstance(k, tuple) else k): v for k, v in self._form_variables.items()}
 
 
-class SchemaCache(BaseSchemaCache["ImednetFacade"]):
+class SchemaCache(BaseSchemaCache["_spi.facade.ImednetFacade"]):
     """Synchronous implementation of the schema cache."""
 
     def __init__(self) -> None:
@@ -422,7 +418,7 @@ class SchemaCache(BaseSchemaCache["ImednetFacade"]):
         super().__init__(is_async=False)
 
 
-class AsyncSchemaCache(BaseSchemaCache["AsyncImednetFacade"]):
+class AsyncSchemaCache(BaseSchemaCache["_spi.facade.AsyncImednetFacade"]):
     """Asynchronous implementation of the schema cache."""
 
     def __init__(self) -> None:
@@ -1438,10 +1434,10 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
         return None, False
 
 
-class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
+class SchemaValidator(BaseSchemaValidator["_spi.facade.ImednetFacade"]):
     """Validate record payloads using variable metadata from the API (Synchronous)."""
 
-    def __init__(self, sdk: ImednetFacade) -> None:
+    def __init__(self, sdk: _spi.facade.ImednetFacade) -> None:
         """Initialize the synchronous schema validator."""
         self._sdk = sdk
         self.schema = SchemaCache()
@@ -1539,10 +1535,10 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
         )
 
 
-class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
+class AsyncSchemaValidator(BaseSchemaValidator["_spi.facade.AsyncImednetFacade"]):
     """Validate record payloads using variable metadata from the API (Asynchronous)."""
 
-    def __init__(self, sdk: AsyncImednetFacade) -> None:
+    def __init__(self, sdk: _spi.facade.AsyncImednetFacade) -> None:
         """Initialize the asynchronous schema validator."""
         self._sdk = sdk
         self.schema = AsyncSchemaCache()

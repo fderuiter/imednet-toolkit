@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
@@ -11,6 +11,7 @@ from imednet.core.endpoint.strategies import MappingParamProcessor
 from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
 from imednet.models.jobs import Job
 from imednet.models.records import Record
+from imednet.utils import typing as _typing
 from imednet.utils.batch_coordinator import (
     DEFAULT_BATCH_CHUNK_SIZE,
     AsyncBatchCoordinator,
@@ -21,9 +22,6 @@ from imednet.utils.job_poller import JobProgressHandler
 from imednet.utils.tabular import normalize_records_input
 from imednet.utils.typing import RecordsInput
 from imednet.validation.cache import ValidationSchemaProtocol
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 
 class RecordsOperationDef:
@@ -176,7 +174,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         flatten: bool = False,
         mask_phi: bool = True,
         **filters: Any,
-    ) -> pd.DataFrame:
+    ) -> _typing.DataFrame:
         """Export queried records directly to a pandas DataFrame.
 
         Args:
@@ -278,7 +276,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         flatten: bool = False,
         mask_phi: bool = True,
         **filters: Any,
-    ) -> pd.DataFrame:
+    ) -> _typing.DataFrame:
         """Export queried records asynchronously directly to a pandas DataFrame.
 
         Args:

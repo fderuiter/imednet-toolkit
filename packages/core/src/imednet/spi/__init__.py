@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import imednet.integrations.export as export_helpers
-    from imednet.integrations import export
+    from imednet.integrations.dispatcher import export as export
 
     from . import (
         cli,

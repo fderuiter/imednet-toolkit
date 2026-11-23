@@ -19,6 +19,10 @@ from typing import (
     overload,
 )
 
+from imednet import endpoints as _endpoints
+from imednet import models as _models
+from imednet import validation as _validation
+from imednet.spi import utils as _spi_utils
 from imednet.utils.typing import FilterValue, RecordsInput
 
 DEFAULT_BATCH_CHUNK_SIZE = 100
@@ -65,27 +69,6 @@ def _async_trace_method(
         return await func(*args, **kwargs)
 
     return wrapper
-
-
-if TYPE_CHECKING:
-    from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
-    from imednet.endpoints.records import AsyncRecordsEndpoint, RecordsEndpoint
-    from imednet.models.codings import Coding
-    from imednet.models.forms import Form
-    from imednet.models.intervals import Interval
-    from imednet.models.jobs import Job, JobStatus
-    from imednet.models.queries import Query
-    from imednet.models.record_revisions import RecordRevision
-    from imednet.models.records import Record
-    from imednet.models.sites import Site
-    from imednet.models.studies import Study
-    from imednet.models.subjects import Subject
-    from imednet.models.users import User
-    from imednet.models.variables import Variable
-    from imednet.models.visits import Visit
-    from imednet.utils.batch_coordinator import BatchSubmissionSummary
-    from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
-    from imednet.validation.cache import ValidationSchemaProtocol
 
 
 T = TypeVar("T")
@@ -354,33 +337,49 @@ class SyncSDKConvenienceMixin:
     """Synchronous SDK convenience methods."""
 
     if TYPE_CHECKING:
-        records: RecordsEndpoint
-        jobs: JobsEndpoint
+        records: _endpoints.RecordsEndpoint
+        jobs: _endpoints.JobsEndpoint
         _client: Any
 
-    get_codings: _ListOperation[Coding, list[Coding]] = _ListOperation("codings", "get_codings")
-    get_forms: _ListOperation[Form, list[Form]] = _ListOperation("forms", "get_forms")
-    get_intervals: _ListOperation[Interval, list[Interval]] = _ListOperation(
+    get_codings: _ListOperation[_models.Coding, list[_models.Coding]] = _ListOperation(
+        "codings", "get_codings"
+    )
+    get_forms: _ListOperation[_models.Form, list[_models.Form]] = _ListOperation(
+        "forms", "get_forms"
+    )
+    get_intervals: _ListOperation[_models.Interval, list[_models.Interval]] = _ListOperation(
         "intervals", "get_intervals"
     )
-    get_queries: _ListOperation[Query, list[Query]] = _ListOperation("queries", "get_queries")
-    get_record_revisions: _ListOperation[RecordRevision, list[RecordRevision]] = _ListOperation(
-        "record_revisions", "get_record_revisions"
+    get_queries: _ListOperation[_models.Query, list[_models.Query]] = _ListOperation(
+        "queries", "get_queries"
     )
-    get_records: _ListOperation[Record, list[Record]] = _ListOperation("records", "get_records")
-    get_sites: _ListOperation[Site, list[Site]] = _ListOperation("sites", "get_sites")
-    get_studies: _ListOperation[Study, list[Study]] = _ListOperation("studies", "get_studies")
-    get_subjects: _ListOperation[Subject, list[Subject]] = _ListOperation(
+    get_record_revisions: _ListOperation[_models.RecordRevision, list[_models.RecordRevision]] = (
+        _ListOperation("record_revisions", "get_record_revisions")
+    )
+    get_records: _ListOperation[_models.Record, list[_models.Record]] = _ListOperation(
+        "records", "get_records"
+    )
+    get_sites: _ListOperation[_models.Site, list[_models.Site]] = _ListOperation(
+        "sites", "get_sites"
+    )
+    get_studies: _ListOperation[_models.Study, list[_models.Study]] = _ListOperation(
+        "studies", "get_studies"
+    )
+    get_subjects: _ListOperation[_models.Subject, list[_models.Subject]] = _ListOperation(
         "subjects", "get_subjects"
     )
-    get_users: _ListOperation[User, list[User]] = _ListOperation("users", "get_users")
-    get_variables: _ListOperation[Variable, list[Variable]] = _ListOperation(
+    get_users: _ListOperation[_models.User, list[_models.User]] = _ListOperation(
+        "users", "get_users"
+    )
+    get_variables: _ListOperation[_models.Variable, list[_models.Variable]] = _ListOperation(
         "variables", "get_variables"
     )
-    get_visits: _ListOperation[Visit, list[Visit]] = _ListOperation("visits", "get_visits")
+    get_visits: _ListOperation[_models.Visit, list[_models.Visit]] = _ListOperation(
+        "visits", "get_visits"
+    )
 
     @_trace_method
-    def get_job(self, study_key: str, batch_id: str) -> JobStatus:
+    def get_job(self, study_key: str, batch_id: str) -> _models.JobStatus:
         """Get job status."""
         return self.jobs.get(study_key, batch_id)
 
@@ -391,9 +390,9 @@ class SyncSDKConvenienceMixin:
         records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
-        schema: ValidationSchemaProtocol | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
         skip_validation: bool = False,
-    ) -> Job:
+    ) -> _models.Job:
         """Create records in the specified study."""
         from imednet.utils.tabular import normalize_records_input
 
@@ -420,16 +419,16 @@ class SyncSDKConvenienceMixin:
         records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
-        schema: ValidationSchemaProtocol | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
         wait_for_completion: bool = False,
         timeout: float = 300.0,
         interval: float = 5.0,
-        on_progress: JobProgressHandler | None = None,
+        on_progress: _spi_utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> BatchSubmissionSummary:
+    ) -> _spi_utils.BatchSubmissionSummary:
         """Validate once and submit records in bounded chunks (default 100 per POST)."""
         from imednet.utils.batch_coordinator import BatchCoordinator
         from imednet.utils.tabular import normalize_records_input
@@ -470,8 +469,8 @@ class SyncSDKConvenienceMixin:
         *,
         interval: float = 5,
         timeout: float = 300,
-        on_progress: JobProgressHandler | None = None,
-    ) -> JobStatus:
+        on_progress: _spi_utils.JobProgressHandler | None = None,
+    ) -> _models.JobStatus:
         """Poll a job until it reaches a terminal state."""
         return self.jobs.poll(
             study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
@@ -485,9 +484,9 @@ class SyncSDKConvenienceMixin:
         *,
         interval: float = 5.0,
         timeout: float = 300.0,
-        on_progress: JobProgressHandler | None = None,
+        on_progress: _spi_utils.JobProgressHandler | None = None,
         fail_fast: bool = False,
-    ) -> JobPollSummary:
+    ) -> _spi_utils.JobPollSummary:
         """Poll multiple jobs concurrently and fetch terminal resultUrl payloads."""
         return self.jobs.poll_many(
             study_key,
@@ -503,49 +502,49 @@ class AsyncSDKConvenienceMixin:
     """Asynchronous SDK convenience methods."""
 
     if TYPE_CHECKING:
-        records: AsyncRecordsEndpoint
-        jobs: AsyncJobsEndpoint
+        records: _endpoints.AsyncRecordsEndpoint
+        jobs: _endpoints.AsyncJobsEndpoint
         _async_client: Any
 
-    async_get_codings: _ListOperation[Coding, Coroutine[Any, Any, list[Coding]]] = _ListOperation(
-        "codings", "async_get_codings", is_async=True
+    async_get_codings: _ListOperation[_models.Coding, Coroutine[Any, Any, list[_models.Coding]]] = (
+        _ListOperation("codings", "async_get_codings", is_async=True)
     )
-    async_get_forms: _ListOperation[Form, Coroutine[Any, Any, list[Form]]] = _ListOperation(
-        "forms", "async_get_forms", is_async=True
+    async_get_forms: _ListOperation[_models.Form, Coroutine[Any, Any, list[_models.Form]]] = (
+        _ListOperation("forms", "async_get_forms", is_async=True)
     )
-    async_get_intervals: _ListOperation[Interval, Coroutine[Any, Any, list[Interval]]] = (
-        _ListOperation("intervals", "async_get_intervals", is_async=True)
-    )
-    async_get_queries: _ListOperation[Query, Coroutine[Any, Any, list[Query]]] = _ListOperation(
-        "queries", "async_get_queries", is_async=True
+    async_get_intervals: _ListOperation[
+        _models.Interval, Coroutine[Any, Any, list[_models.Interval]]
+    ] = _ListOperation("intervals", "async_get_intervals", is_async=True)
+    async_get_queries: _ListOperation[_models.Query, Coroutine[Any, Any, list[_models.Query]]] = (
+        _ListOperation("queries", "async_get_queries", is_async=True)
     )
     async_get_record_revisions: _ListOperation[
-        RecordRevision, Coroutine[Any, Any, list[RecordRevision]]
+        _models.RecordRevision, Coroutine[Any, Any, list[_models.RecordRevision]]
     ] = _ListOperation("record_revisions", "async_get_record_revisions", is_async=True)
-    async_get_records: _ListOperation[Record, Coroutine[Any, Any, list[Record]]] = _ListOperation(
-        "records", "async_get_records", is_async=True
+    async_get_records: _ListOperation[_models.Record, Coroutine[Any, Any, list[_models.Record]]] = (
+        _ListOperation("records", "async_get_records", is_async=True)
     )
-    async_get_sites: _ListOperation[Site, Coroutine[Any, Any, list[Site]]] = _ListOperation(
-        "sites", "async_get_sites", is_async=True
+    async_get_sites: _ListOperation[_models.Site, Coroutine[Any, Any, list[_models.Site]]] = (
+        _ListOperation("sites", "async_get_sites", is_async=True)
     )
-    async_get_studies: _ListOperation[Study, Coroutine[Any, Any, list[Study]]] = _ListOperation(
-        "studies", "async_get_studies", is_async=True
+    async_get_studies: _ListOperation[_models.Study, Coroutine[Any, Any, list[_models.Study]]] = (
+        _ListOperation("studies", "async_get_studies", is_async=True)
     )
-    async_get_subjects: _ListOperation[Subject, Coroutine[Any, Any, list[Subject]]] = (
-        _ListOperation("subjects", "async_get_subjects", is_async=True)
+    async_get_subjects: _ListOperation[
+        _models.Subject, Coroutine[Any, Any, list[_models.Subject]]
+    ] = _ListOperation("subjects", "async_get_subjects", is_async=True)
+    async_get_users: _ListOperation[_models.User, Coroutine[Any, Any, list[_models.User]]] = (
+        _ListOperation("users", "async_get_users", is_async=True)
     )
-    async_get_users: _ListOperation[User, Coroutine[Any, Any, list[User]]] = _ListOperation(
-        "users", "async_get_users", is_async=True
-    )
-    async_get_variables: _ListOperation[Variable, Coroutine[Any, Any, list[Variable]]] = (
-        _ListOperation("variables", "async_get_variables", is_async=True)
-    )
-    async_get_visits: _ListOperation[Visit, Coroutine[Any, Any, list[Visit]]] = _ListOperation(
-        "visits", "async_get_visits", is_async=True
+    async_get_variables: _ListOperation[
+        _models.Variable, Coroutine[Any, Any, list[_models.Variable]]
+    ] = _ListOperation("variables", "async_get_variables", is_async=True)
+    async_get_visits: _ListOperation[_models.Visit, Coroutine[Any, Any, list[_models.Visit]]] = (
+        _ListOperation("visits", "async_get_visits", is_async=True)
     )
 
     @_async_trace_method
-    async def async_get_job(self, study_key: str, batch_id: str) -> JobStatus:
+    async def async_get_job(self, study_key: str, batch_id: str) -> _models.JobStatus:
         """Asynchronously get job status."""
         return await self.jobs.get(study_key, batch_id)
 
@@ -556,9 +555,9 @@ class AsyncSDKConvenienceMixin:
         records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
-        schema: ValidationSchemaProtocol | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
         skip_validation: bool = False,
-    ) -> Job:
+    ) -> _models.Job:
         """Asynchronously create records in the specified study."""
         from imednet.utils.tabular import normalize_records_input
 
@@ -585,16 +584,16 @@ class AsyncSDKConvenienceMixin:
         records_data: RecordsInput,
         email_notify: bool | str | None = None,
         *,
-        schema: ValidationSchemaProtocol | None = None,
+        schema: _validation.ValidationSchemaProtocol | None = None,
         chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         skip_validation: bool = False,
         wait_for_completion: bool = False,
         timeout: float = 300.0,
         interval: float = 5.0,
-        on_progress: JobProgressHandler | None = None,
+        on_progress: _spi_utils.JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
-    ) -> BatchSubmissionSummary:
+    ) -> _spi_utils.BatchSubmissionSummary:
         """Asynchronously validate once and submit records in bounded chunks."""
         from imednet.utils.batch_coordinator import AsyncBatchCoordinator
         from imednet.utils.tabular import normalize_records_input
@@ -635,8 +634,8 @@ class AsyncSDKConvenienceMixin:
         *,
         interval: float = 5,
         timeout: float = 300,
-        on_progress: JobProgressHandler | None = None,
-    ) -> JobStatus:
+        on_progress: _spi_utils.JobProgressHandler | None = None,
+    ) -> _models.JobStatus:
         """Asynchronously poll a job until it reaches a terminal state."""
         return await self.jobs.poll(
             study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
@@ -650,9 +649,9 @@ class AsyncSDKConvenienceMixin:
         *,
         interval: float = 5.0,
         timeout: float = 300.0,
-        on_progress: JobProgressHandler | None = None,
+        on_progress: _spi_utils.JobProgressHandler | None = None,
         fail_fast: bool = False,
-    ) -> JobPollSummary:
+    ) -> _spi_utils.JobPollSummary:
         """Asynchronously poll multiple jobs concurrently and fetch resultUrl payloads."""
         return await self.jobs.poll_many(
             study_key,

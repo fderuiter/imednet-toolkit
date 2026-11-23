@@ -12,7 +12,7 @@ import inspect
 import logging
 import types
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 try:
     import pandas as pd
@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
+from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import (
     _SDTM_RECORDS_SORT,
     _UNSET_PIPELINE,
@@ -51,9 +52,6 @@ from imednet.spi.utils import (
 
 from .cached_loader import CachedRecordsLoader
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE, ChunkedRecordPipeline, iter_chunks
-
-if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
 
 # Setup basic logging
 logger = logging.getLogger(__name__)

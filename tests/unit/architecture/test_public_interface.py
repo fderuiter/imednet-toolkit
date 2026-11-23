@@ -7,6 +7,10 @@ the stable public namespace.
 from __future__ import annotations
 
 import importlib
+import inspect
+import subprocess
+import sys
+from pathlib import Path
 from typing import get_type_hints
 
 import pytest
@@ -89,12 +93,9 @@ def _is_any(tp: object) -> bool:
 
     return tp is Any
 
-    if hasattr(method, "func"):
-        return get_type_hints(method.func)  # type: ignore[arg-type]
-    return get_type_hints(method)  # type: ignore[arg-type]
-
 
 def _get_type_hints_safe(method: object) -> dict[str, object]:
+    """Return resolved type hints for *method*, unwrapping partial/bound wrappers."""
     if hasattr(method, "func"):
         return get_type_hints(method.func)  # type: ignore[arg-type]
     return get_type_hints(method)  # type: ignore[arg-type]
@@ -224,3 +225,237 @@ def test_sdk_convenience_mixin_uses_filter_value() -> None:
             assert not _is_any(tp), (
                 f"SDKConvenienceMixin.{method_name}: **filters must not be typed as Any"
             )
+
+
+# ---------------------------------------------------------------------------
+# Lazy barrel __all__ resolution, callable export, get_type_hints, and mypy
+# ---------------------------------------------------------------------------
+
+RUNTIME_ALL_MODULES = [
+    *PUBLIC_MODULES_WITH_ALL,
+    "imednet.spi",
+    "imednet.spi.cli",
+    "imednet.cli.utils",
+    "imednet_workflows",
+]
+
+RUNTIME_HINT_MODULES = [
+    "imednet",
+    "imednet.utils",
+    "imednet.validation",
+    "imednet.endpoints",
+    "imednet.spi.facade",
+    "imednet.plugins",
+    "imednet_workflows",
+]
+
+
+@pytest.mark.parametrize("module_name", RUNTIME_ALL_MODULES)
+def test_all_public_symbols_resolve_at_runtime(module_name: str) -> None:
+    """Every symbol listed in __all__ must resolve via getattr at runtime."""
+    mod = importlib.import_module(module_name)
+    missing: list[str] = []
+    for symbol in mod.__all__:
+        try:
+            getattr(mod, symbol)
+        except AttributeError:
+            missing.append(symbol)
+    assert not missing, f"{module_name} failed to resolve __all__ attributes: {missing}"
+
+
+def test_testing_module_resolves_all_helpers_lazily() -> None:
+    """All 17 helpers in imednet.testing.__all__ must resolve via PEP 562 __getattr__."""
+    mod = pytest.importorskip("imednet.testing")
+    assert len(mod.__all__) == 17
+    for symbol in mod.__all__:
+        resolved = getattr(mod, symbol)
+        assert resolved is not None, f"imednet.testing.{symbol} resolved to None"
+
+
+def test_callable_export_fresh_import_and_submodule_compat() -> None:
+    """imednet.integrations.export and imednet.spi.export must be identical callables on fresh import."""
+    fresh_script = """
+from types import SimpleNamespace
+from unittest.mock import patch
+import imednet.integrations as integrations
+import imednet.spi as spi
+
+assert callable(integrations.export)
+assert callable(spi.export)
+assert spi.export is integrations.export
+assert hasattr(integrations.export, "export_to_csv")
+assert hasattr(integrations.export, "TabularSinkConfig")
+
+sdk_stub = SimpleNamespace()
+with patch("imednet.integrations.export.export_to_csv", return_value=42) as mock_csv:
+    assert spi.export("csv", sdk_stub, "STUDY-1", path="out.csv") == 42
+    mock_csv.assert_called_once_with(sdk_stub, "STUDY-1", path="out.csv")
+"""
+    submodule_first_script = """
+import imednet.integrations.export as export_mod
+import imednet.integrations as integrations
+import imednet.spi as spi
+
+assert callable(export_mod)
+assert integrations.export is export_mod
+assert spi.export is export_mod
+"""
+    for script in (fresh_script, submodule_first_script):
+        res = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+
+
+@pytest.mark.parametrize("module_name", RUNTIME_HINT_MODULES)
+def test_runtime_get_type_hints_resolves_public_surfaces(module_name: str) -> None:
+    """typing.get_type_hints() must succeed without NameError across public classes and functions."""
+    mod = importlib.import_module(module_name)
+    export_names = getattr(mod, "__all__", [n for n in dir(mod) if not n.startswith("_")])
+    failures: list[str] = []
+
+    for name in export_names:
+        obj = getattr(mod, name)
+        if inspect.isclass(obj):
+            try:
+                get_type_hints(obj)
+            except Exception as exc:  # pragma: no cover - failure reporting
+                failures.append(f"{module_name}.{name}: {exc!r}")
+            for member_name, member in inspect.getmembers(obj):
+                if member_name.startswith("_") and member_name not in ("__init__", "__call__"):
+                    continue
+                target_fn = None
+                if isinstance(member, property) and member.fget is not None:
+                    target_fn = member.fget
+                elif inspect.isfunction(member) or inspect.ismethod(member):
+                    target_fn = member
+                if target_fn is None:
+                    continue
+                fn_mod = getattr(target_fn, "__module__", "") or ""
+                if not fn_mod.startswith("imednet"):
+                    continue
+                try:
+                    get_type_hints(target_fn)
+                except Exception as exc:  # pragma: no cover - failure reporting
+                    failures.append(f"{module_name}.{name}.{member_name}: {exc!r}")
+        elif inspect.isfunction(obj):
+            try:
+                get_type_hints(obj)
+            except Exception as exc:  # pragma: no cover - failure reporting
+                failures.append(f"{module_name}.{name}: {exc!r}")
+
+    assert not failures, "get_type_hints() failures:\n" + "\n".join(failures)
+
+
+def test_records_to_dataframe_get_type_hints_without_pandas() -> None:
+    """to_dataframe type hints must fall back to Any when pandas is absent."""
+    script = """
+import sys
+import typing
+
+sys.modules["pandas"] = None
+from imednet.endpoints import AsyncRecordsEndpoint, RecordsEndpoint
+from imednet.endpoints.users import AsyncUsersEndpoint, UsersEndpoint
+
+assert typing.get_type_hints(RecordsEndpoint.to_dataframe)["return"] is typing.Any
+assert typing.get_type_hints(UsersEndpoint.to_dataframe)["return"] is typing.Any
+assert "return" in typing.get_type_hints(AsyncRecordsEndpoint.to_dataframe)
+assert "return" in typing.get_type_hints(AsyncUsersEndpoint.to_dataframe)
+"""
+    res = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+
+
+def test_cold_start_import_and_sdk_instantiation_budgets() -> None:
+    """Importing imednet and instantiating ImednetSDK must not eagerly load models or heavy deps."""
+    script = """
+import sys
+import imednet
+
+for heavy in ("pandas", "numpy", "pyarrow", "cryptography"):
+    assert heavy not in sys.modules, f"{heavy} loaded eagerly on import imednet"
+assert not any(m.startswith("imednet.models.") for m in sys.modules), (
+    "imednet.models.* loaded eagerly on import imednet"
+)
+
+sdk = imednet.ImednetSDK(api_key="test-key-1234567890", security_key="test-sec-1234567890")
+assert not any(m.startswith("imednet.models.") for m in sys.modules), (
+    "imednet.models.* loaded eagerly on ImednetSDK instantiation"
+)
+eager_endpoints = [
+    m for m in sys.modules
+    if m.startswith("imednet.endpoints.") and m != "imednet.endpoints.registry"
+]
+assert not eager_endpoints, f"Concrete endpoints loaded eagerly: {eager_endpoints}"
+"""
+    res = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+
+
+def test_lazy_barrels_mypy_strict_concrete_types_and_attr_defined(tmp_path: Path) -> None:
+    """mypy --strict must infer concrete types on lazy barrels and flag unknown attributes."""
+    mypy_api = pytest.importorskip("mypy.api")
+    repo_root = Path(__file__).resolve().parents[3]
+    config_file = repo_root / "pyproject.toml"
+
+    probe = tmp_path / "strict_barrel_probe.py"
+    probe.write_text(
+        """from typing import Any
+import imednet.cli.utils as cli_utils
+import imednet.integrations as integrations
+import imednet.spi as spi
+import imednet.spi.cli as spi_cli
+import imednet.testing as testing
+import imednet.utils as utils
+import imednet.validation as validation
+
+reveal_type(utils.BatchCoordinator)
+reveal_type(utils.parse_iso_datetime)
+reveal_type(testing.fake_record)
+reveal_type(testing.canonical_type)
+reveal_type(validation.SchemaValidator)
+reveal_type(spi_cli.is_interactive_terminal)
+reveal_type(cli_utils.InteractiveDataGrid)
+reveal_type(integrations.export)
+reveal_type(spi.export)
+
+_bad_utils: Any = utils.nonexistent_helper_xyz
+_bad_spi_cli: Any = spi_cli.nonexistent_helper_xyz
+_bad_cli_utils: Any = cli_utils.nonexistent_helper_xyz
+_bad_testing: Any = testing.nonexistent_helper_xyz
+_bad_validation: Any = validation.nonexistent_helper_xyz
+""",
+        encoding="utf-8",
+    )
+
+    stdout, stderr, _ = mypy_api.run(["--config-file", str(config_file), "--strict", str(probe)])
+    assert stderr == ""
+    revealed_lines = [line for line in stdout.splitlines() if "Revealed type is" in line]
+    assert len(revealed_lines) == 9, f"Unexpected reveal_type output:\n{stdout}"
+    for line in revealed_lines:
+        assert 'Revealed type is "Any"' not in line, f"Lazy export degraded to Any: {line}"
+        assert 'Revealed type is "types.ModuleType"' not in line, (
+            f"Callable export degraded to ModuleType: {line}"
+        )
+
+    for line_no in (20, 21, 22, 23, 24):
+        expected_err = (
+            f':{line_no}: error: Module has no attribute "nonexistent_helper_xyz"  [attr-defined]'
+        )
+        assert expected_err in stdout, f"Expected {expected_err!r}, got:\n{stdout}"

@@ -93,13 +93,15 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str) -> Any:
-    """Lazily resolve interactive terminal helpers from ``imednet.cli.utils``."""
-    if name == "is_interactive_terminal":
-        from imednet.cli.utils import is_interactive_terminal
+if not TYPE_CHECKING:
 
-        return is_interactive_terminal
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    def __getattr__(name: str) -> Any:
+        """Lazily resolve interactive terminal helpers from ``imednet.cli.utils``."""
+        if name == "is_interactive_terminal":
+            from imednet.cli.utils import is_interactive_terminal
+
+            return is_interactive_terminal
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
