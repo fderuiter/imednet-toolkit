@@ -1304,6 +1304,9 @@
     // -------------------------------------------------------------------------
     function initAccessibleCodeBlocks() {
         checkCodeBlocks();
+        if (globalThis.__imednetCodeOverflowBound) {
+            return;
+        }
         window.addEventListener("resize", scheduleCheckCodeBlocks);
         window.addEventListener("load", scheduleCheckCodeBlocks);
 

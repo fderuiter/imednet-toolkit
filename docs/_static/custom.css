@@ -48,15 +48,110 @@ article p {
     object-fit: contain;
 }
 
-/* Code blocks margins & padding */
+/* Code blocks margins, padding & accessible sphinx-copybutton chrome */
 div.highlight {
     margin: 1.25rem 0;
     border-radius: 6px;
+    position: relative;
 }
 
 div.highlight pre:focus-visible,
 pre:focus-visible {
     outline: 2px solid var(--color-brand-primary);
+}
+
+div.highlight button.copybtn,
+button.copybtn {
+    opacity: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    top: 0.4rem;
+    right: 0.4rem;
+    width: 1.85rem;
+    height: 1.85rem;
+    padding: 0.15rem;
+    border-radius: 0.375rem;
+    cursor: pointer;
+    background-color: var(--color-background-primary, #ffffff);
+    color: var(--color-foreground-primary, #1f2328);
+    border: 1px solid var(--color-foreground-muted, #57606a);
+    transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+div.highlight button.copybtn svg,
+button.copybtn svg {
+    stroke: currentColor;
+    fill: none;
+    width: 1.2rem;
+    height: 1.2rem;
+    padding: 0;
+}
+
+div.highlight button.copybtn:hover,
+button.copybtn:hover {
+    background-color: var(--color-background-secondary, #f4f6f8);
+    color: var(--color-brand-primary, #005fb8);
+    border-color: var(--color-brand-primary, #005fb8);
+}
+
+div.highlight button.copybtn:active,
+button.copybtn:active {
+    background-color: var(--color-background-secondary, #eaeef2);
+}
+
+div.highlight button.copybtn:focus-visible,
+button.copybtn:focus-visible {
+    opacity: 1;
+    outline: 2px solid var(--color-brand-primary, #005fb8);
+    outline-offset: 2px;
+}
+
+div.highlight button.copybtn.success,
+button.copybtn.success {
+    background-color: var(--color-background-primary, #ffffff);
+    color: var(--color-status-success, #065f46);
+    border-color: var(--color-status-success, #065f46);
+}
+
+.o-tooltip--left::after {
+    background-color: var(--color-foreground-primary, #1f2328);
+    color: var(--color-background-primary, #ffffff);
+    border: 1px solid var(--color-background-border, #4a5056);
+    padding: 0.2rem 0.45rem;
+    border-radius: 4px;
+    font-weight: 500;
+}
+
+.o-tooltip--left:focus-visible::after {
+    display: block;
+    opacity: 1;
+    visibility: visible;
+    transform: translateX(-100%) translateY(0);
+}
+
+/* Hide static <pre> copy button when interactive Pyodide editor is active */
+.thebelab-cell button.copybtn,
+div.highlight.thebelab-cell button.copybtn {
+    display: none !important;
+}
+
+/* Furo footer icon links */
+.bottom-of-page .right-details .icons a {
+    color: var(--color-foreground-secondary);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+}
+
+.bottom-of-page .right-details .icons a:hover {
+    color: var(--color-brand-primary);
+}
+
+.bottom-of-page .right-details .icons a:focus-visible {
+    outline: 2px solid var(--color-brand-primary);
+    outline-offset: 2px;
 }
 
 /* Admonition margins */
@@ -331,10 +426,18 @@ body[data-theme="dark"] .role-card:hover {
     cursor: wait;
 }
 
+.thebelab-copy-button:hover,
+.thebelab-button.thebelab-copy-button:hover:not(:disabled),
 .thebelab-clear-button:hover,
 .thebelab-button.thebelab-clear-button:hover:not(:disabled) {
     background-color: var(--color-background-secondary, #f6f8fa);
     color: var(--color-foreground-primary, #24292f);
+}
+
+.thebelab-copy-button.copied,
+.thebelab-button.thebelab-copy-button.copied {
+    color: var(--color-status-success, #065f46);
+    border-color: var(--color-status-success, #065f46);
 }
 
 .thebelab-cell-status {
@@ -1453,6 +1556,8 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
         border: 1px solid currentColor;
     }
 
+    div.highlight button.copybtn,
+    button.copybtn,
     .thebe-launch-button,
     .thebelab-button,
     .explorer-run-btn,
@@ -1460,6 +1565,30 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     .explorer-copy-btn,
     .role-card-launch-btn {
         border: 2px solid currentColor;
+    }
+
+    div.highlight button.copybtn,
+    button.copybtn {
+        background-color: var(--color-background-primary);
+        color: var(--color-foreground-primary);
+    }
+
+    div.highlight button.copybtn:hover,
+    button.copybtn:hover {
+        background-color: var(--color-background-secondary);
+        color: var(--color-brand-primary);
+        border-color: var(--color-brand-primary);
+    }
+
+    div.highlight button.copybtn.success,
+    button.copybtn.success {
+        background-color: var(--color-background-primary);
+        color: var(--color-status-success);
+        border-color: var(--color-status-success);
+    }
+
+    .bottom-of-page .right-details .icons a {
+        color: var(--color-foreground-primary);
     }
 }
 
@@ -1501,6 +1630,8 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
    ========================================================================= */
 
 @media (forced-colors: active) {
+    div.highlight button.copybtn,
+    button.copybtn,
     .thebe-launch-button,
     .thebelab-button,
     .thebelab-button.thebe-launch-button,
@@ -1519,6 +1650,17 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
         transition: none !important;
     }
 
+    div.highlight button.copybtn svg,
+    button.copybtn svg {
+        stroke: currentColor !important;
+    }
+
+    div.highlight button.copybtn:hover:not(:disabled),
+    button.copybtn:hover:not(:disabled),
+    div.highlight button.copybtn.success,
+    button.copybtn.success,
+    .thebelab-copy-button.copied,
+    .thebelab-button.thebelab-copy-button.copied,
     .thebe-launch-button:hover:not(:disabled),
     .thebelab-button:hover:not(:disabled),
     .thebelab-button.thebelab-run-button:hover:not(:disabled),
@@ -1564,6 +1706,9 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
         border: 1px solid CanvasText !important;
     }
 
+    div.highlight button.copybtn:focus-visible,
+    button.copybtn:focus-visible,
+    .bottom-of-page .right-details .icons a:focus-visible,
     .thebe-editor:focus-visible,
     .thebe-launch-button:focus-visible,
     .thebelab-button:focus-visible,

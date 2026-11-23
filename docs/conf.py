@@ -9,6 +9,7 @@ import importlib.metadata
 import importlib.util
 import inspect
 import json
+import lzma
 import os
 import re
 import sys
@@ -109,6 +110,7 @@ from imednet import __version__ as imednet_version
 
 project = "imednet"
 author = "Frederick de Ruiter"
+copyright = "2026, Frederick de Ruiter"
 release = imednet_version
 version = imednet_version
 
@@ -124,8 +126,14 @@ extensions = [
     "sphinx.ext.doctest",
     "myst_parser",
     "sphinx.ext.githubpages",
+    "sphinx_copybutton",
     "pyodide_cells",
 ]
+
+# sphinx-copybutton prompt-stripping rules for Python REPL and shell blocks
+copybutton_prompt_text = r">>> |\.\.\. |\$ "
+copybutton_prompt_is_regexp = True
+copybutton_line_continuation_character = "\\"
 
 # Configure Mermaid 10.2.0 with hex-only themeVariables (khroma-compatible)
 # and Furo --color-* custom properties in themeCSS so light/dark/high-contrast
@@ -1266,12 +1274,84 @@ def _rewrite_not_found_assets(not_found_path: Path, base_path: str) -> None:
     not_found_path.write_text(content, encoding="utf-8")
 
 
+def _should_suppress_edit_button(pagename: str) -> bool:
+    """Return True when Furo edit/source buttons should be suppressed for pagename."""
+    normalized = pagename.strip("/")
+    return normalized.startswith("reference/api/") or normalized in {"adr/index", "404"}
+
+
+def _doctree_has_mermaid(doctree: Any) -> bool:
+    """Return True when doctree contains at least one sphinxcontrib.mermaid node."""
+    if doctree is None or not hasattr(doctree, "findall"):
+        return False
+    try:
+        from sphinxcontrib.mermaid import mermaid as mermaid_node_cls
+    except ImportError:
+        return False
+    return any(doctree.findall(mermaid_node_cls))
+
+
+def _is_mermaid_script_entry(js_entry: Any) -> bool:
+    """Return True if a Sphinx script_files entry is a Mermaid script or initializer."""
+    filename = getattr(js_entry, "filename", None)
+    if filename is None and isinstance(js_entry, str):
+        filename = js_entry
+    filename_str = str(filename or "").lower()
+    if "mermaid" in filename_str:
+        return True
+    attrs = getattr(js_entry, "attributes", None) or {}
+    body_str = str(attrs.get("body", ""))
+    return "mermaid.initialize" in body_str
+
+
+def _configure_page_chrome_and_assets(
+    app: Any,
+    pagename: str,
+    _templatename: str,
+    context: dict[str, Any],
+    doctree: Any,
+) -> None:
+    """Scope per-page JS assets and suppress edit-this-page on generated/404 pages."""
+    if _should_suppress_edit_button(pagename):
+        context["theme_top_of_page_buttons"] = []
+
+    script_files = context.get("script_files")
+    if isinstance(script_files, list):
+        script_files[:] = [js for js in script_files if not _is_mermaid_script_entry(js)]
+
+    if pagename == "index" and hasattr(app, "add_js_file"):
+        existing_names = [getattr(js, "filename", str(js)) for js in (script_files or [])]
+        if "_static/showcase.js" not in existing_names and "showcase.js" not in existing_names:
+            app.add_js_file("showcase.js")
+
+    if _doctree_has_mermaid(doctree) and hasattr(app, "add_js_file"):
+        app.add_js_file("mermaid.min.js", priority=500)
+        app.add_js_file(None, body=mermaid_init_js, priority=501)
+
+
+def _unpack_local_mermaid_bundle(outdir: Path) -> None:
+    """Unpack the pinned Mermaid JS bundle into outdir/_static/mermaid.min.js."""
+    candidates = [
+        Path(_REPO_ROOT) / "tests" / "fixtures" / "mermaid-10.2.0.min.js.xz",
+        Path.cwd() / "tests" / "fixtures" / "mermaid-10.2.0.min.js.xz",
+    ]
+    fixture_path = next((cand for cand in candidates if cand.is_file()), None)
+    if fixture_path is None:
+        return
+    static_out = outdir / "_static"
+    static_out.mkdir(parents=True, exist_ok=True)
+    target = static_out / "mermaid.min.js"
+    target.write_bytes(lzma.decompress(fixture_path.read_bytes()))
+
+
 def _on_build_finished(app: Any, exception: Exception | None) -> None:
-    """Finalize HTML build by rewriting 404.html asset paths and emitting sitemap.xml and robots.txt."""
+    """Finalize HTML build by unpacking local Mermaid, rewriting 404.html, and emitting SEO files."""
     if exception is not None or getattr(app.builder, "format", "") != "html":
         return
 
     outdir = Path(app.outdir)
+    _unpack_local_mermaid_bundle(outdir)
+
     base_url = (getattr(app.config, "html_baseurl", "") or html_baseurl).rstrip("/") + "/"
     base_path = urllib.parse.urlsplit(base_url).path or "/"
 
@@ -1313,6 +1393,7 @@ def setup(app: Any) -> None:  # pragma: no cover
     app.connect("html-collect-pages", _sanitize_viewcode_modules, priority=100)
 
     app.connect("html-page-context", _inject_seo_metadata)
+    app.connect("html-page-context", _configure_page_chrome_and_assets, priority=900)
     app.connect("build-finished", _on_build_finished)
 
 
@@ -1341,6 +1422,7 @@ napoleon_include_init_with_doc = True
 # Templates and static paths
 templates_path: list[str] = []
 exclude_patterns: list[str] = [
+    "_includes/**",
     "tutorials/examples/dummy.py",
     "agents/**",
     "superpowers/**",
@@ -1348,7 +1430,7 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["showcase.js", "thebe_pyodide.js"]
+html_js_files: list[str] = ["code_overflow.js"]
 
 doctest_global_setup = """
 import builtins
@@ -1427,6 +1509,27 @@ html_theme_options: dict[str, Any] = {
     "source_repository": "https://github.com/fderuiter/imednet-toolkit",
     "source_branch": "main",
     "source_directory": "docs/",
+    "footer_icons": [
+        {
+            "name": "GitHub",
+            "url": "https://github.com/fderuiter/imednet-toolkit",
+            "html": (
+                '<svg stroke="currentColor" fill="currentColor" stroke-width="0" '
+                'viewBox="0 0 16 16" aria-hidden="true">'
+                '<path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 '
+                "5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-"
+                "2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 "
+                "1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-"
+                "3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 "
+                "2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 "
+                "2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-"
+                "3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38"
+                'A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path>'
+                "</svg>"
+            ),
+            "class": "",
+        },
+    ],
     "light_css_variables": {
         "color-brand-primary": "#005fb8",
         "color-brand-primary-hover": "#004c94",

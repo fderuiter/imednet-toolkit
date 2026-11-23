@@ -821,10 +821,13 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
     assert _compute_content_root("tutorials/quick_start") == "../"
     assert _compute_content_root("tutorials/examples/quick_start") == "../../"
 
-    # Verify page context hook injects #imednet-pyodide-config and backports content_root
+    # Verify page context hook backports content_root and gates Pyodide assets on PyodideButtonNode
+    from docutils import nodes as docutils_nodes
+
     class _DummyApp:
         def __init__(self) -> None:
             self.directives: list[str] = []
+            self.js_files: list[str] = []
             self.config = type("Cfg", (), {"pyodide_config": pyodide_cfg})()
 
         def add_config_value(self, *_args: object, **_kwargs: object) -> None:
@@ -836,6 +839,9 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
         def add_directive(self, name: str, *_args: object, **_kwargs: object) -> None:
             self.directives.append(name)
 
+        def add_js_file(self, filename: str, **_kwargs: object) -> None:
+            self.js_files.append(filename)
+
         def connect(self, *_args: object, **_kwargs: object) -> None:
             pass
 
@@ -845,10 +851,33 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
     assert "pyodide-button" in dummy_app.directives
     assert "thebe-button" in dummy_app.directives
 
-    ctx: dict[str, str] = {"metatags": ""}
-    _inject_pyodide_page_context(dummy_app, "tutorials/quick_start", "page.html", ctx, None)
-    assert ctx["content_root"] == "../"
-    assert '<script id="imednet-pyodide-config" type="application/json">' in ctx["metatags"]
+    # Non-Pyodide pages (doctree=None or doctree without PyodideButtonNode) omit Pyodide assets
+    ctx_none: dict[str, object] = {"metatags": "", "script_files": []}
+    _inject_pyodide_page_context(dummy_app, "tutorials/quick_start", "page.html", ctx_none, None)
+    assert ctx_none["content_root"] == "../"
+    assert '<script id="imednet-pyodide-config"' not in str(ctx_none["metatags"])
+    assert dummy_app.js_files == []
+
+    plain_doc = docutils_nodes.Element()
+    plain_doc += docutils_nodes.paragraph(text="No Pyodide button")
+    ctx_plain: dict[str, object] = {"metatags": "", "script_files": []}
+    _inject_pyodide_page_context(dummy_app, "index", "page.html", ctx_plain, plain_doc)
+    assert ctx_plain["content_root"] == "./"
+    assert '<script id="imednet-pyodide-config"' not in str(ctx_plain["metatags"])
+    assert dummy_app.js_files == []
+
+    # Pages with PyodideButtonNode receive both #imednet-pyodide-config and thebe_pyodide.js
+    pyodide_doc = docutils_nodes.Element()
+    pyodide_doc += PyodideButtonNode()
+    ctx_active: dict[str, object] = {"metatags": "", "script_files": []}
+    _inject_pyodide_page_context(
+        dummy_app, "tutorials/quick_start", "page.html", ctx_active, pyodide_doc
+    )
+    assert ctx_active["content_root"] == "../"
+    assert '<script id="imednet-pyodide-config" type="application/json">' in str(
+        ctx_active["metatags"]
+    )
+    assert dummy_app.js_files == ["thebe_pyodide.js"]
 
 
 @pytest.mark.unit
@@ -2376,6 +2405,446 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
 
                 idx_page.close()
                 context.close()
+            finally:
+                browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.unit
+def test_copybutton_footer_chrome_edit_suppression_and_asset_scoping_config() -> None:
+    """Verify static configuration for sphinx-copybutton, Furo chrome, SRI, and asset scoping."""
+    import base64
+    import tomllib
+
+    from docs import conf as docs_conf
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    docs_deps = pyproject["dependency-groups"]["docs"]
+    assert any(dep.startswith("sphinx-copybutton") for dep in docs_deps)
+
+    assert "sphinx_copybutton" in docs_conf.extensions
+    assert docs_conf.copybutton_prompt_is_regexp is True
+    prompt_re = re.compile(f"^({docs_conf.copybutton_prompt_text})")
+    assert prompt_re.match(">>> import imednet")
+    assert prompt_re.match("...     pass")
+    assert prompt_re.match("$ uv add imednet")
+
+    assert "2026" in docs_conf.copyright
+    assert "Frederick de Ruiter" in docs_conf.copyright
+
+    footer_icons = docs_conf.html_theme_options.get("footer_icons", [])
+    assert any(
+        icon.get("url") == "https://github.com/fderuiter/imednet-toolkit"
+        and icon.get("name") == "GitHub"
+        for icon in footer_icons
+    )
+
+    assert "_includes/**" in docs_conf.exclude_patterns
+    assert docs_conf.html_js_files == ["code_overflow.js"]
+    assert (REPO_ROOT / "docs" / "_static" / "code_overflow.js").is_file()
+
+    assert docs_conf._should_suppress_edit_button("reference/api/imednet.sdk") is True
+    assert docs_conf._should_suppress_edit_button("adr/index") is True
+    assert docs_conf._should_suppress_edit_button("404") is True
+    assert docs_conf._should_suppress_edit_button("index") is False
+    assert docs_conf._should_suppress_edit_button("tutorials/quick_start") is False
+
+    thebe_js = (REPO_ROOT / "docs" / "_static" / "thebe_pyodide.js").read_text(encoding="utf-8")
+    sri_match = re.search(r'PYODIDE_SRI_BASE64\s*=\s*"([^"]+)"', thebe_js)
+    assert sri_match is not None
+    raw_digest = base64.b64decode(sri_match.group(1), validate=True)
+    assert len(raw_digest) == 48, "SHA-384 digest must decode to 48 bytes"
+    assert 'integrity: "${PYODIDE_SRI_SHA384}"' in thebe_js
+    assert "script.integrity = PYODIDE_SRI_SHA384;" in thebe_js
+    assert 'script.crossOrigin = "anonymous";' in thebe_js
+    assert "thebelab-copy-button" in thebe_js
+    assert "hideStaticCopyButtons" in thebe_js
+
+
+@pytest.mark.unit
+def test_built_html_portal_scoping_chrome_copybutton_and_sri_in_chromium(tmp_path: Path) -> None:
+    """Verify asset scoping, Furo chrome, copybutton WCAG/forced-colors, Pyodide copy, and SRI."""
+    import functools
+    import os
+    import sys
+    import threading
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+    require_pw = os.environ.get("IMEDNET_REQUIRE_PLAYWRIGHT") == "1"
+    if require_pw:
+        from playwright.sync_api import sync_playwright
+    else:
+        sync_pw_mod = pytest.importorskip("playwright.sync_api")
+        sync_playwright = sync_pw_mod.sync_playwright
+
+    env_html_dir = os.environ.get("IMEDNET_BUILT_HTML_DIR")
+    default_html_dir = REPO_ROOT / "docs" / "_build" / "html"
+    if env_html_dir and Path(env_html_dir).is_dir():
+        html_dir = Path(env_html_dir).resolve()
+    elif (default_html_dir / "index.html").is_file():
+        html_dir = default_html_dir.resolve()
+    else:
+        html_dir = (tmp_path / "html").resolve()
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sphinx",
+                "-b",
+                "html",
+                "-W",
+                "--keep-going",
+                str(REPO_ROOT / "docs"),
+                str(html_dir),
+            ],
+            check=True,
+            cwd=str(REPO_ROOT),
+        )
+
+    all_html = sorted(p.relative_to(html_dir).as_posix() for p in html_dir.rglob("*.html"))
+    assert len(all_html) >= 290
+    assert not any("_includes" in rel for rel in all_html), (
+        "_includes partial was built as standalone HTML"
+    )
+    assert not (REPO_ROOT / "docs" / "_static" / "mermaid.min.js").exists(), (
+        "Unpacked mermaid.min.js must never be written into tracked docs/_static/"
+    )
+    assert (html_dir / "_static" / "mermaid.min.js").is_file(), (
+        "Local mermaid.min.js missing from HTML build output _static/"
+    )
+
+    showcase_pages: list[str] = []
+    pyodide_js_pages: list[str] = []
+    pyodide_cfg_pages: list[str] = []
+    mermaid_js_pages: list[str] = []
+    unpkg_pages: list[str] = []
+    suppressed_edit_leaks: list[str] = []
+    missing_copyright: list[str] = []
+    missing_github_icon: list[str] = []
+
+    for rel in all_html:
+        text = (html_dir / rel).read_text(encoding="utf-8")
+        if "showcase.js" in text:
+            showcase_pages.append(rel)
+        if "thebe_pyodide.js" in text:
+            pyodide_js_pages.append(rel)
+        if 'id="imednet-pyodide-config"' in text:
+            pyodide_cfg_pages.append(rel)
+        if "mermaid.min.js" in text:
+            mermaid_js_pages.append(rel)
+        if "unpkg.com" in text:
+            unpkg_pages.append(rel)
+        if (
+            rel.startswith("reference/api/") or rel in {"adr/index.html", "404.html"}
+        ) and "edit-this-page" in text:
+            suppressed_edit_leaks.append(rel)
+        if "2026, Frederick de Ruiter" not in text:
+            missing_copyright.append(rel)
+        if (
+            'href="https://github.com/fderuiter/imednet-toolkit"' not in text
+            or 'aria-label="GitHub"' not in text
+        ):
+            missing_github_icon.append(rel)
+
+    assert showcase_pages == ["index.html"]
+    assert pyodide_js_pages == ["tutorials/async_quick_start.html", "tutorials/quick_start.html"]
+    assert pyodide_cfg_pages == ["tutorials/async_quick_start.html", "tutorials/quick_start.html"]
+    assert len(mermaid_js_pages) == 8
+    assert unpkg_pages == []
+    assert suppressed_edit_leaks == []
+    assert missing_copyright == []
+    assert missing_github_icon == []
+
+    for authored in ("index.html", "tutorials/quick_start.html", "explanation/architecture.html"):
+        assert "edit-this-page" in (html_dir / authored).read_text(encoding="utf-8"), (
+            f"Hand-authored guide {authored} lost edit-this-page link"
+        )
+
+    class _QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        functools.partial(_QuietHandler, directory=str(html_dir)),
+    )
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    contrast_js = """
+    () => {
+        function parseRgb(str) {
+            const m = str && str.match(/rgba?\\(\\s*([0-9.]+)[,\\s]+([0-9.]+)[,\\s]+([0-9.]+)(?:[,/\\s]+([0-9.]+))?\\s*\\)/i);
+            if (!m) return null;
+            return { r: +m[1], g: +m[2], b: +m[3], a: m[4] === undefined ? 1 : +m[4] };
+        }
+        function blend(fg, bg) {
+            const a = fg.a + bg.a * (1 - fg.a);
+            if (a === 0) return { r: 255, g: 255, b: 255, a: 1 };
+            return {
+                r: (fg.r * fg.a + bg.r * bg.a * (1 - fg.a)) / a,
+                g: (fg.g * fg.a + bg.g * bg.a * (1 - fg.a)) / a,
+                b: (fg.b * fg.a + bg.b * bg.a * (1 - fg.a)) / a,
+                a
+            };
+        }
+        function effectiveBg(el) {
+            const layers = [];
+            let cur = el;
+            while (cur && cur.nodeType === 1) {
+                const parsed = parseRgb(getComputedStyle(cur).backgroundColor);
+                if (parsed && parsed.a > 0) {
+                    layers.push(parsed);
+                    if (parsed.a >= 1) break;
+                }
+                cur = cur.parentElement;
+            }
+            let base = { r: 255, g: 255, b: 255, a: 1 };
+            for (let i = layers.length - 1; i >= 0; i--) base = blend(layers[i], base);
+            return base;
+        }
+        function lum(c) {
+            const f = (v) => {
+                const s = v / 255;
+                return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+            };
+            return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+        }
+        function contrast(el) {
+            const bg = effectiveBg(el);
+            const rawFg = parseRgb(getComputedStyle(el).color);
+            const fg = rawFg && rawFg.a < 1 ? blend(rawFg, bg) : rawFg;
+            const l1 = lum(fg), l2 = lum(bg);
+            return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+        }
+        const highlights = Array.from(document.querySelectorAll('div.highlight'));
+        const missingBtn = highlights.filter((h) => !h.querySelector('button.copybtn')).length;
+        const copyBtn = document.querySelector('div.highlight button.copybtn');
+        const ghLink = document.querySelector('.bottom-of-page .right-details .icons a[aria-label="GitHub"]');
+        return {
+            highlightCount: highlights.length,
+            missingBtn,
+            copyTabIndex: copyBtn ? copyBtn.tabIndex : -1,
+            copyOpacity: copyBtn ? parseFloat(getComputedStyle(copyBtn).opacity) : 0,
+            copyContrast: copyBtn ? contrast(copyBtn) : 0,
+            ghContrast: ghLink ? contrast(ghLink) : 0,
+        };
+    }
+    """
+
+    try:
+        with sync_playwright() as p:
+            browser = _launch_chromium_for_accessibility(p)
+            try:
+                # 1. Offline local Mermaid rendering + light/dark contrast >= 4.5:1
+                ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+                ctx.route("https://**", lambda route: route.abort())
+                page = ctx.new_page()
+                page.goto(
+                    f"http://127.0.0.1:{port}/explanation/architecture.html", wait_until="load"
+                )
+                page.wait_for_selector(".mermaid svg", timeout=10000)
+
+                page.evaluate("document.body.dataset.theme = 'light'")
+                light_metrics = page.evaluate(contrast_js)
+                assert light_metrics["highlightCount"] >= 1
+                assert light_metrics["missingBtn"] == 0
+                assert light_metrics["copyTabIndex"] == 0
+                assert light_metrics["copyOpacity"] == 1.0
+                assert light_metrics["copyContrast"] >= 4.5
+                assert light_metrics["ghContrast"] >= 4.5
+
+                page.evaluate("document.body.dataset.theme = 'dark'")
+                dark_metrics = page.evaluate(contrast_js)
+                assert dark_metrics["copyContrast"] >= 4.5
+                assert dark_metrics["ghContrast"] >= 4.5
+                ctx.close()
+
+                # 2. High-contrast (prefers-contrast: more) >= 7.0:1 in light and dark
+                hc_ctx = browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    contrast="more",
+                )
+                hc_ctx.route("https://**", lambda route: route.abort())
+                hc_page = hc_ctx.new_page()
+                hc_page.goto(
+                    f"http://127.0.0.1:{port}/tutorials/quick_start.html", wait_until="load"
+                )
+                hc_page.wait_for_selector("div.highlight button.copybtn", timeout=5000)
+
+                for theme_mode in ("light", "dark"):
+                    hc_page.evaluate(f"document.body.dataset.theme = '{theme_mode}'")
+                    hc_metrics = hc_page.evaluate(contrast_js)
+                    assert hc_metrics["missingBtn"] == 0
+                    assert hc_metrics["copyContrast"] >= 7.0, (
+                        f"{theme_mode} high-contrast copybtn {hc_metrics['copyContrast']:.2f}:1 < 7:1"
+                    )
+                    assert hc_metrics["ghContrast"] >= 7.0, (
+                        f"{theme_mode} high-contrast GitHub icon {hc_metrics['ghContrast']:.2f}:1 < 7:1"
+                    )
+                hc_ctx.close()
+
+                # 3. Forced-colors mode (ButtonFace, ButtonText, Highlight, HighlightText, 2px solid Highlight)
+                fc_ctx = browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    forced_colors="active",
+                )
+                fc_ctx.route("https://**", lambda route: route.abort())
+                fc_page = fc_ctx.new_page()
+                fc_page.goto(
+                    f"http://127.0.0.1:{port}/tutorials/quick_start.html", wait_until="load"
+                )
+                fc_page.wait_for_selector("div.highlight button.copybtn", timeout=5000)
+                fc_probe = fc_page.evaluate(
+                    """() => {
+                        const probe = document.createElement('div');
+                        const readSys = (kw, cssProp, jsProp) => {
+                            probe.style.cssText = 'forced-color-adjust:none;';
+                            probe.style.setProperty(cssProp, kw, 'important');
+                            document.body.appendChild(probe);
+                            const v = getComputedStyle(probe)[jsProp];
+                            probe.remove();
+                            return v;
+                        };
+                        const sys = {
+                            ButtonFace: readSys('ButtonFace', 'background-color', 'backgroundColor'),
+                            ButtonText: readSys('ButtonText', 'color', 'color'),
+                            Highlight: readSys('Highlight', 'background-color', 'backgroundColor'),
+                            HighlightText: readSys('HighlightText', 'color', 'color'),
+                            HighlightOutline: readSys('Highlight', 'outline-color', 'outlineColor'),
+                        };
+                        const btn = document.querySelector('div.highlight button.copybtn');
+                        const restBg = getComputedStyle(btn).backgroundColor;
+                        const restFg = getComputedStyle(btn).color;
+                        btn.classList.add('success');
+                        const activeBg = getComputedStyle(btn).backgroundColor;
+                        const activeFg = getComputedStyle(btn).color;
+                        btn.classList.remove('success');
+                        return { sys, restBg, restFg, activeBg, activeFg };
+                    }"""
+                )
+                assert fc_probe["restBg"] == fc_probe["sys"]["ButtonFace"]
+                assert fc_probe["restFg"] == fc_probe["sys"]["ButtonText"]
+                assert fc_probe["activeBg"] == fc_probe["sys"]["Highlight"]
+                assert fc_probe["activeFg"] == fc_probe["sys"]["HighlightText"]
+
+                first_btn = fc_page.locator("div.highlight button.copybtn").first
+                first_btn.focus()
+                fc_page_focus = fc_page.evaluate(
+                    """() => {
+                        const btn = document.querySelector('div.highlight button.copybtn');
+                        const cs = getComputedStyle(btn);
+                        return { style: cs.outlineStyle, width: cs.outlineWidth, color: cs.outlineColor };
+                    }"""
+                )
+                assert fc_page_focus["style"] == "solid"
+                assert fc_page_focus["width"] == "2px"
+                assert fc_page_focus["color"] == fc_probe["sys"]["HighlightOutline"]
+                fc_ctx.close()
+
+                # 4. Interactive Pyodide cell copy button & SRI tamper rejection
+                pyo_ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+                pyo_ctx.route(
+                    "**/pyodide.js",
+                    lambda route: route.fulfill(
+                        status=200,
+                        headers={"Access-Control-Allow-Origin": "*"},
+                        content_type="application/javascript",
+                        body="self.__tamperedPyodideLoaded = true; self.loadPyodide = async () => ({});",
+                    ),
+                )
+                pyo_page = pyo_ctx.new_page()
+                pyo_page.goto(
+                    f"http://127.0.0.1:{port}/tutorials/quick_start.html", wait_until="load"
+                )
+                pyo_page.wait_for_selector("div.highlight button.copybtn", timeout=5000)
+
+                # Test prompt stripping via sphinx-copybutton formatCopyText on synthetic REPL/shell block
+                stripped_results = pyo_page.evaluate(
+                    """() => {
+                        let captured = [];
+                        const origExec = document.execCommand.bind(document);
+                        document.execCommand = (cmd) => {
+                            if (cmd === 'copy') {
+                                const sel = window.getSelection().toString();
+                                const active = document.activeElement;
+                                captured.push(active && active.tagName === 'TEXTAREA' ? active.value : sel);
+                                return true;
+                            }
+                            return origExec(cmd);
+                        };
+                        const replBlock = document.createElement('div');
+                        replBlock.className = 'highlight';
+                        replBlock.innerHTML = '<pre id="test-repl-pre">&gt;&gt;&gt; x = 1\\n... y = 2\\n3\\n</pre>' +
+                            '<button class="copybtn" data-clipboard-target="#test-repl-pre">Copy</button>';
+                        document.body.appendChild(replBlock);
+                        replBlock.querySelector('button.copybtn').click();
+
+                        const shBlock = document.createElement('div');
+                        shBlock.className = 'highlight';
+                        shBlock.innerHTML = '<pre id="test-sh-pre">$ uv add imednet\\nInstalled 1 package\\n</pre>' +
+                            '<button class="copybtn" data-clipboard-target="#test-sh-pre">Copy</button>';
+                        document.body.appendChild(shBlock);
+                        shBlock.querySelector('button.copybtn').click();
+                        replBlock.remove();
+                        shBlock.remove();
+                        return captured;
+                    }"""
+                )
+                assert stripped_results == ["x = 1\ny = 2", "uv add imednet"]
+
+                # Activate Pyodide cells: static copybtn hidden, live .thebelab-copy-button copies edited code,
+                # and tampered pyodide.js fails SRI verification!
+                pyo_page.evaluate(
+                    """() => {
+                        window.__copiedLiveText = null;
+                        Object.defineProperty(navigator, 'clipboard', {
+                            configurable: true,
+                            value: {
+                                writeText: (txt) => {
+                                    window.__copiedLiveText = txt;
+                                    return Promise.resolve();
+                                }
+                            }
+                        });
+                    }"""
+                )
+                pyo_page.locator(".pyodide-launch-button").first.click()
+                pyo_page.wait_for_selector(".thebelab-cell .thebelab-copy-button", timeout=5000)
+
+                cell_copy_state = pyo_page.evaluate(
+                    """() => {
+                        const cell = document.querySelector('.thebelab-cell');
+                        const staticBtns = Array.from(cell.querySelectorAll('button.copybtn'));
+                        const allHidden = staticBtns.length > 0 && staticBtns.every(
+                            (b) => getComputedStyle(b).display === 'none'
+                        );
+                        const editor = cell.querySelector('textarea.thebe-editor');
+                        editor.value = '# live edited snippet\\nprint(42)';
+                        cell.querySelector('.thebelab-copy-button').click();
+                        return { staticCount: staticBtns.length, allHidden };
+                    }"""
+                )
+                assert cell_copy_state["staticCount"] >= 1
+                assert cell_copy_state["allHidden"] is True
+                pyo_page.wait_for_function(
+                    "() => window.__copiedLiveText === '# live edited snippet\\nprint(42)'"
+                )
+                status_text = pyo_page.locator(
+                    ".thebelab-cell .thebelab-cell-status"
+                ).first.text_content()
+                assert status_text == "Code copied to clipboard."
+
+                # Confirm tampered CDN pyodide.js is rejected by SRI and runtime transitions to 'failed'
+                pyo_page.wait_for_function(
+                    "() => document.querySelector('.pyodide-launch-button .status')?.textContent === 'failed'",
+                    timeout=10000,
+                )
+                assert pyo_page.evaluate("Boolean(window.__tamperedPyodideLoaded)") is False
+                pyo_ctx.close()
             finally:
                 browser.close()
     finally:

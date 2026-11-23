@@ -5,7 +5,11 @@
 (function () {
   "use strict";
 
-  const PYODIDE_CDN_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js";
+  const PYODIDE_INDEX_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
+  const PYODIDE_CDN_URL = `${PYODIDE_INDEX_URL}pyodide.js`;
+  const PYODIDE_SRI_BASE64 =
+    "i3R37b3tF+HWudsUf1VSEOY2YxwSNMqY8DQa9Z0O3xh+NkJ9o+yjcGyIi5huj+nB";
+  const PYODIDE_SRI_SHA384 = `sha384-${PYODIDE_SRI_BASE64}`;
 
   const EXCLUDED_WHEEL_PREFIXES = [
     "apache_airflow_providers_imednet-",
@@ -182,10 +186,44 @@
     let execQueue = Promise.resolve();
     const installedWheels = new Set();
 
+    async function verifyAndLoadPyodideScript() {
+      const resp = await fetch("${PYODIDE_CDN_URL}", {
+        integrity: "${PYODIDE_SRI_SHA384}",
+        mode: "cors",
+        credentials: "omit",
+      });
+      if (!resp.ok) {
+        throw new Error("Failed to fetch Pyodide runtime: HTTP " + resp.status);
+      }
+      const buf = await resp.arrayBuffer();
+      if (typeof crypto !== "undefined" && crypto.subtle && crypto.subtle.digest) {
+        const hashBuf = await crypto.subtle.digest("SHA-384", buf);
+        const bytes = new Uint8Array(hashBuf);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const actualB64 = btoa(binary);
+        if (actualB64 !== "${PYODIDE_SRI_BASE64}") {
+          throw new Error(
+            "Subresource Integrity mismatch for pyodide.js: expected ${PYODIDE_SRI_SHA384}, got sha384-" +
+              actualB64
+          );
+        }
+      }
+      const scriptBlob = new Blob([buf], { type: "application/javascript" });
+      const scriptBlobUrl = URL.createObjectURL(scriptBlob);
+      try {
+        importScripts(scriptBlobUrl);
+      } finally {
+        URL.revokeObjectURL(scriptBlobUrl);
+      }
+    }
+
     async function initRuntime(config) {
       if (ready) return;
-      importScripts("${PYODIDE_CDN_URL}");
-      pyodide = await loadPyodide();
+      await verifyAndLoadPyodideScript();
+      pyodide = await loadPyodide({ indexURL: "${PYODIDE_INDEX_URL}" });
 
       const pyodidePackages = (config && config.pyodidePackages) || [
         "micropip",
@@ -441,9 +479,11 @@ finally:
     const config = getConfig();
     const script = document.createElement("script");
     script.src = PYODIDE_CDN_URL;
+    script.integrity = PYODIDE_SRI_SHA384;
+    script.crossOrigin = "anonymous";
     script.onload = async () => {
       try {
-        mainThreadPyodide = await window.loadPyodide();
+        mainThreadPyodide = await window.loadPyodide({ indexURL: PYODIDE_INDEX_URL });
         const pyodidePackages = config.pyodidePackages || [
           "micropip",
           "pydantic",
@@ -672,6 +712,34 @@ finally:
       });
   }
 
+  function fallbackExecCopy(text, done) {
+    try {
+      const helper = document.createElement("textarea");
+      helper.value = text;
+      helper.setAttribute("readonly", "");
+      helper.style.position = "fixed";
+      helper.style.left = "-9999px";
+      helper.style.top = "0";
+      document.body.appendChild(helper);
+      helper.select();
+      helper.setSelectionRange(0, helper.value.length);
+      const ok = Boolean(document.execCommand && document.execCommand("copy"));
+      helper.remove();
+      done(ok);
+    } catch (_err) {
+      done(false);
+    }
+  }
+
+  function hideStaticCopyButtons(container) {
+    container.querySelectorAll("button.copybtn").forEach((btn) => {
+      btn.hidden = true;
+      btn.style.display = "none";
+      btn.setAttribute("aria-hidden", "true");
+      btn.tabIndex = -1;
+    });
+  }
+
   function transformCodeCells() {
     const config = getConfig();
     const selector = config.selector || "div.highlight-python";
@@ -686,6 +754,7 @@ finally:
       if (!pre) return;
 
       const originalCode = pre.innerText.trim();
+      hideStaticCopyButtons(block);
 
       // Create editor
       const editorWrapper = document.createElement("div");
@@ -716,6 +785,13 @@ finally:
         ? "Execute cell (Shift+Enter)"
         : "Runtime initializing, please wait...";
 
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "thebelab-button thebelab-copy-button";
+      copyBtn.textContent = "Copy";
+      copyBtn.title = "Copy cell code";
+      copyBtn.setAttribute("aria-label", "Copy cell code");
+
       const clearBtn = document.createElement("button");
       clearBtn.type = "button";
       clearBtn.className = "thebelab-button thebelab-clear-button";
@@ -729,6 +805,7 @@ finally:
       cellStatus.setAttribute("aria-atomic", "true");
 
       controls.appendChild(runBtn);
+      controls.appendChild(copyBtn);
       controls.appendChild(clearBtn);
       controls.appendChild(cellStatus);
 
@@ -744,6 +821,37 @@ finally:
       block.appendChild(editorWrapper);
       block.appendChild(controls);
       block.appendChild(outputArea);
+
+      let copyResetTimer = null;
+      function showCopyFeedback(success) {
+        if (copyResetTimer) clearTimeout(copyResetTimer);
+        copyBtn.textContent = success ? "Copied!" : "Copy failed";
+        copyBtn.classList.toggle("copied", success);
+        cellStatus.textContent = success
+          ? "Code copied to clipboard."
+          : "Failed to copy code.";
+        copyResetTimer = setTimeout(() => {
+          copyBtn.textContent = "Copy";
+          copyBtn.classList.remove("copied");
+          copyResetTimer = null;
+        }, 1800);
+      }
+
+      copyBtn.addEventListener("click", () => {
+        const liveCode = textarea.value;
+        if (
+          typeof navigator !== "undefined" &&
+          navigator.clipboard &&
+          typeof navigator.clipboard.writeText === "function"
+        ) {
+          navigator.clipboard.writeText(liveCode).then(
+            () => showCopyFeedback(true),
+            () => fallbackExecCopy(liveCode, showCopyFeedback)
+          );
+        } else {
+          fallbackExecCopy(liveCode, showCopyFeedback);
+        }
+      });
 
       // Execution handler
       function runCurrentCell() {

@@ -62,16 +62,26 @@ def _compute_content_root(pagename: str) -> str:
     return "../" * depth
 
 
+def _has_pyodide_button(doctree: Any) -> bool:
+    """Return True if ``doctree`` contains at least one ``PyodideButtonNode``."""
+    if doctree is None or not hasattr(doctree, "findall"):
+        return False
+    return any(doctree.findall(PyodideButtonNode))
+
+
 def _inject_pyodide_page_context(
     app: Any,
     pagename: str,
     _templatename: str,
     context: dict[str, Any],
-    _doctree: Any,
+    doctree: Any,
 ) -> None:
-    """Ensure ``data-content_root`` and ``#imednet-pyodide-config`` JSON are present."""
+    """Ensure ``data-content_root`` and doctree-gated Pyodide assets are present."""
     if not context.get("content_root"):
         context["content_root"] = _compute_content_root(pagename)
+
+    if not _has_pyodide_button(doctree):
+        return
 
     raw_config = getattr(app.config, "pyodide_config", None)
     if not isinstance(raw_config, dict):
@@ -84,6 +94,14 @@ def _inject_pyodide_page_context(
     existing_metatags = context.get("metatags", "")
     if 'id="imednet-pyodide-config"' not in existing_metatags:
         context["metatags"] = existing_metatags + script_tag
+
+    existing_scripts = [getattr(js, "filename", str(js)) for js in context.get("script_files", [])]
+    if (
+        hasattr(app, "add_js_file")
+        and "_static/thebe_pyodide.js" not in existing_scripts
+        and "thebe_pyodide.js" not in existing_scripts
+    ):
+        app.add_js_file("thebe_pyodide.js")
 
 
 def setup(app: Any) -> dict[str, Any]:
