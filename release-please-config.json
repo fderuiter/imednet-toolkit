@@ -33,7 +33,8 @@
     "packages/plugins-tui": {
       "release-type": "python",
       "package-name": "imednet-tui",
-      "changelog-path": "CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "initial-version": "1.0.0"
     }
   }
 }
