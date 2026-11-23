@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import io
 import json
 import math
 import os
@@ -205,23 +206,40 @@ def _resolve_expected_var_type(
     form_key: str | None,
     form_id: int | None,
     var_name: str,
+    *,
+    study_key: str | None = None,
 ) -> str | None:
     """Look up normalized variable type from *schema* when available."""
     if schema is None:
         return None
     resolved_fk = form_key
     if not resolved_fk and form_id is not None:
-        resolved_fk = schema.form_key_from_id(form_id)
+        try:
+            resolved_fk = (
+                schema.form_key_from_id(form_id, study_key=study_key)  # type: ignore[call-arg]
+                if study_key is not None
+                else schema.form_key_from_id(form_id)
+            )
+        except TypeError:
+            resolved_fk = schema.form_key_from_id(form_id)
     if not resolved_fk:
         return None
-    variables = schema.variables_for_form(resolved_fk)
+    try:
+        variables = (
+            schema.variables_for_form(resolved_fk, study_key=study_key)  # type: ignore[call-arg]
+            if study_key is not None
+            else schema.variables_for_form(resolved_fk)
+        )
+    except TypeError:
+        variables = schema.variables_for_form(resolved_fk)
     if not variables or var_name not in variables:
         return None
     var_obj = variables[var_name]
     raw_type = getattr(var_obj, "variable_type", None) or getattr(var_obj, "variableType", None)
     if not isinstance(raw_type, str):
         return None
-    return re.sub(r"[\s_-]+", " ", raw_type.strip().lower())
+    normalized = re.sub(r"[\s_-]+", " ", raw_type.strip().lower())
+    return re.sub(r"\s*/\s*", "/", normalized)
 
 
 def _coerce_clinical_value(
@@ -414,6 +432,37 @@ def normalize_tabular_row(
     return envelope
 
 
+def _read_csv_stream_records(
+    stream: Any,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+) -> list[JsonDict]:
+    records: list[JsonDict] = []
+    reader = csv.DictReader(stream)
+    if not reader.fieldnames:
+        return []
+    for idx, raw_row in enumerate(reader):
+        normalized = normalize_tabular_row(
+            raw_row,
+            row_index=idx,
+            from_csv_str=True,
+            schema=schema,
+        )
+        if normalized is not None:
+            records.append(normalized)
+    return records
+
+
+def csv_text_to_records(
+    raw_csv: str,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+) -> list[JsonDict]:
+    """Parse CSV text into REST create-records payload dicts."""
+    cleaned = raw_csv.lstrip("\ufeff")
+    return _read_csv_stream_records(io.StringIO(cleaned), schema=schema)
+
+
 def csv_to_records(
     path: str | os.PathLike[str],
     *,
@@ -425,21 +474,8 @@ def csv_to_records(
     Works in ``packages/core`` even when ``pandas`` is not installed.
     """
     csv_path = Path(path)
-    records: list[JsonDict] = []
     with csv_path.open("r", encoding=encoding, newline="") as handle:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames:
-            return []
-        for idx, raw_row in enumerate(reader):
-            normalized = normalize_tabular_row(
-                raw_row,
-                row_index=idx,
-                from_csv_str=True,
-                schema=schema,
-            )
-            if normalized is not None:
-                records.append(normalized)
-    return records
+        return _read_csv_stream_records(handle, schema=schema)
 
 
 def _is_dataframe_instance(obj: object) -> bool:
@@ -498,6 +534,7 @@ def normalize_records_input(
 
 __all__ = [
     "MASKED_SENTINEL",
+    "csv_text_to_records",
     "csv_to_records",
     "dataframe_rows_to_records",
     "ensure_no_masked_sentinel",

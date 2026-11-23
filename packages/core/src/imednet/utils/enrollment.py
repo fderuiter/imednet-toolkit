@@ -126,6 +126,14 @@ def normalize_subject_registration_inputs(
             normalized_raw = model_subj
         elif isinstance(raw_subj, Mapping):
             raw_dict = dict(raw_subj)
+            if not (raw_dict.get("formKey") or raw_dict.get("form_key")):
+                raw_fid = raw_dict.get("formId")
+                if raw_fid is None:
+                    raw_fid = raw_dict.get("form_id")
+                if raw_fid is not None and schema is not None:
+                    resolved_fk = schema.form_key_from_id(int(raw_fid))
+                    if resolved_fk:
+                        raw_dict["formKey"] = resolved_fk
             if default_form_key and not (raw_dict.get("formKey") or raw_dict.get("form_key")):
                 raw_dict["formKey"] = default_form_key
             if default_site_name and not (raw_dict.get("siteName") or raw_dict.get("site_name")):
@@ -142,6 +150,21 @@ def normalize_subject_registration_inputs(
 
     ensure_no_masked_sentinel(dumped_for_check)
     return pairs
+
+
+def validate_local_subject_registration_sites(
+    normalized_pairs: Sequence[
+        tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]
+    ],
+) -> None:
+    """Validate local ``siteName`` presence without issuing remote site queries."""
+    errors = [
+        f"Index {idx}: siteName is required"
+        for idx, (_raw_subj, subj) in enumerate(normalized_pairs)
+        if not subj.site_name
+    ]
+    if errors:
+        raise ValueError("; ".join(errors))
 
 
 def validate_subject_registration_sites(
@@ -208,6 +231,13 @@ def filter_existing_subject_registrations(
     seen_in_batch: set[str] = set()
     for raw_subj, subj in normalized_pairs:
         dumped = subj.model_dump(by_alias=True)
+        if isinstance(raw_subj, Mapping):
+            raw_sk = raw_subj.get("subjectKey") or raw_subj.get("subject_key")
+            if isinstance(raw_sk, str) and raw_sk.strip():
+                dumped["subjectKey"] = raw_sk.strip()
+            raw_oid = raw_subj.get("subjectOid") or raw_subj.get("subject_oid")
+            if isinstance(raw_oid, str) and raw_oid.strip():
+                dumped["subjectOid"] = raw_oid.strip()
         if should_filter:
             cand_id = extract_candidate_subject_key(
                 raw_subj, payload=dumped, subject_key_field=subject_key_field
@@ -227,5 +257,6 @@ __all__ = [
     "filter_existing_subject_registrations",
     "is_site_enrollment_eligible",
     "normalize_subject_registration_inputs",
+    "validate_local_subject_registration_sites",
     "validate_subject_registration_sites",
 ]

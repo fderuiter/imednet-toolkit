@@ -860,12 +860,12 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Unsupported JSON value type: {type(value).__name__}")
 
 
-def emit_json(items: Sequence[Any], resource: str) -> None:
-    """Write one complete v1 response after successful retrieval and serialization."""
+def emit_json(items: Sequence[Any], resource: str, *, status: str = "complete") -> None:
+    """Write one complete v1 response after retrieval or execution and serialization."""
     envelope = {
         "schemaVersion": "1.0",
         "resource": resource,
-        "status": "complete",
+        "status": status,
         "count": len(items),
         "items": list(items),
     }

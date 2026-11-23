@@ -7,11 +7,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ...errors import ValidationError
 from ...sdk import ImednetSDK
+from ...utils.batch_coordinator import BatchSubmissionSummary
 from ...utils.enrollment import (
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
+    validate_local_subject_registration_sites,
     validate_subject_registration_sites,
 )
 from ..decorators import validate_cli_path_segment, with_sdk
@@ -22,15 +23,12 @@ from ..utils.args import (
 )
 from ..utils.write_helpers import (
     add_write_common_args,
-    coerce_batch_summary,
-    exit_cli_validation_error,
-    parse_email_notify,
-    parse_json_records_text,
-    parse_key_value_pairs,
-    render_write_summary,
+    assemble_cli_write_records,
+    execute_cli_write,
+    guard_stdin_dash_tty,
     resolve_cli_schema,
+    submit_cli_records_batch,
     validate_write_numeric_flags,
-    write_progress_context,
 )
 
 
@@ -38,31 +36,14 @@ def _load_cli_subject_inputs(
     args: argparse.Namespace,
     *,
     schema: Any = None,
-) -> Any:
+) -> list[dict[str, Any]]:
     """Resolve CLI subject registration inputs from ``--file``, ``--json``, or inline flags."""
-    if args.input_file and args.json_payload:
-        raise ValueError("Cannot combine --file and --json.")
-
-    inline_data = parse_key_value_pairs(args.data_pairs)
-    if args.input_file:
-        if args.input_file == "-":
-            return parse_json_records_text(sys.stdin.read(), source_label="stdin")
-        return Path(args.input_file)
-    if args.json_payload:
-        return parse_json_records_text(args.json_payload, source_label="--json")
-
-    if not args.form_key or not args.site_name:
-        raise ValueError(
-            "Provide --file, --json, or both --form-key and --site-name to register a subject."
-        )
-    single: dict[str, Any] = {
-        "formKey": args.form_key,
-        "siteName": args.site_name,
-        "data": inline_data,
-    }
-    if args.subject_key:
-        single["subjectKey"] = args.subject_key
-    return [single]
+    return assemble_cli_write_records(
+        args,
+        schema=schema,
+        study_key=getattr(args, "study_key", None),
+        is_subject_registration=True,
+    )
 
 
 def _subject_view_model(s: Any) -> dict[str, Any]:
@@ -108,7 +89,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "--file",
         dest="input_file",
         default=None,
-        help="Path to CSV or JSON file of subject registration requests ('-' for stdin JSON).",
+        help="Path to CSV or JSON file of subject registration requests ('-' for stdin JSON or CSV).",
     )
     register_parser.add_argument(
         "--json",
@@ -156,8 +137,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def register_subjects_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
-        no_interactive = getattr(args, "no_interactive", False)
-        try:
+        def _run() -> BatchSubmissionSummary:
             resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
             raw_inputs = _load_cli_subject_inputs(args, schema=resolved_schema)
             normalized_pairs = normalize_subject_registration_inputs(
@@ -166,54 +146,37 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 default_site_name=args.site_name,
                 schema=resolved_schema,
             )
-            sites = list(sdk.sites.list(args.study_key))
-            validate_subject_registration_sites(normalized_pairs, sites)
+            if args.dry_run:
+                validate_local_subject_registration_sites(normalized_pairs)
+                existing_subjects = None
+            else:
+                sites = list(sdk.sites.list(args.study_key))
+                validate_subject_registration_sites(normalized_pairs, sites)
+                existing_subjects = (
+                    list(sdk.subjects.list(args.study_key)) if args.skip_existing else None
+                )
 
-            existing_subjects = (
-                list(sdk.subjects.list(args.study_key)) if args.skip_existing else None
-            )
             subjects_data, skipped_count = filter_existing_subject_registrations(
                 normalized_pairs,
                 existing_subjects,
                 should_filter=args.skip_existing,
                 subject_key_field=args.subject_key_field,
             )
+            return submit_cli_records_batch(
+                sdk,
+                args,
+                subjects_data,
+                action_label="subject registration",
+                schema=resolved_schema,
+                skipped_count=skipped_count,
+            )
 
-            email_notify = parse_email_notify(args.email_notify)
-            with write_progress_context(
-                "subject registration",
-                args.study_key,
-                no_interactive=no_interactive,
-                output_format=args.output_format,
-            ) as on_progress:
-                raw_summary = sdk.records.create_batch(
-                    args.study_key,
-                    subjects_data,
-                    email_notify=email_notify,
-                    schema=resolved_schema,
-                    chunk_size=args.chunk_size,
-                    wait_for_completion=args.wait,
-                    timeout=args.timeout,
-                    interval=args.interval,
-                    on_progress=on_progress,
-                    dry_run=args.dry_run,
-                    collect_errors=True,
-                )
-        except (ValidationError, ValueError) as exc:
-            exit_cli_validation_error(exc)
-
-        summary = coerce_batch_summary(
-            raw_summary,
+        execute_cli_write(
+            _run,
             study_key=args.study_key,
-            total_records=len(subjects_data),
-            dry_run=args.dry_run,
-            skipped_count=skipped_count,
-        )
-        summary.skipped_count = skipped_count
-        render_write_summary(
-            summary,
             resource="subjects_register",
             output_format=args.output_format,
+            dry_run=args.dry_run,
         )
 
     def _dispatch_register_subjects(args: argparse.Namespace) -> None:
@@ -225,6 +188,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             timeout=args.timeout,
             interval=args.interval,
         )
+        guard_stdin_dash_tty(args.input_file)
         if args.input_file and args.input_file != "-" and not Path(args.input_file).exists():
             print_error(f"Error: Input file not found: '{args.input_file}'")
             sys.exit(1)

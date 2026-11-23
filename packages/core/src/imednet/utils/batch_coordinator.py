@@ -67,6 +67,7 @@ class BatchSubmissionSummary:
     poll_summary: JobPollSummary | None = None
     dry_run: bool = False
     validation_report: BatchValidationReport | None = None
+    has_error: bool = False
 
     @property
     def batch_ids(self) -> list[str]:
@@ -90,6 +91,8 @@ class BatchSubmissionSummary:
     @property
     def all_successful(self) -> bool:
         """Return True if validation and all submitted chunks succeeded without failed records."""
+        if self.has_error:
+            return False
         if self.validation_report is not None and not self.validation_report.is_valid:
             return False
         if self.poll_summary is not None:
@@ -237,6 +240,24 @@ async def _invoke_poll_many_async(
     return summary
 
 
+def _apply_poll_summary_to_jobs(
+    jobs: list[Job],
+    poll_summary: JobPollSummary | None,
+) -> None:
+    """Attach terminal JobStatus results (including JobFailedError statuses) onto ``jobs``."""
+    if poll_summary is None:
+        return
+    for idx, job in enumerate(jobs):
+        if not job.batch_id:
+            continue
+        if job.batch_id in poll_summary.results:
+            jobs[idx] = poll_summary.results[job.batch_id]
+        elif job.batch_id in poll_summary.failures:
+            failed_status = getattr(poll_summary.failures[job.batch_id], "status", None)
+            if isinstance(failed_status, Job):
+                jobs[idx] = failed_status
+
+
 def _finalize_polled_jobs(
     jobs: list[Job],
     poll_summary: JobPollSummary | None,
@@ -246,11 +267,141 @@ def _finalize_polled_jobs(
     """Attach terminal JobStatus results onto ``jobs`` and optionally raise on failures."""
     if poll_summary is None:
         return
-    for idx, job in enumerate(jobs):
-        if job.batch_id and job.batch_id in poll_summary.results:
-            jobs[idx] = poll_summary.results[job.batch_id]
+    _apply_poll_summary_to_jobs(jobs, poll_summary)
     if raise_on_poll_failure and not poll_summary.all_successful:
         _raise_from_poll_summary(poll_summary)
+
+
+def _attach_partial_batch_summary(
+    exc: BaseException,
+    *,
+    study_key: str,
+    jobs: list[Job],
+    chunk_sizes: list[int],
+    total_records: int,
+    skipped_count: int,
+    dry_run: bool,
+    validation_report: BatchValidationReport | None,
+    poll_summary: JobPollSummary | None = None,
+) -> None:
+    """Attach a partial :class:`BatchSubmissionSummary` onto ``exc.batch_summary``."""
+    if getattr(exc, "batch_summary", None) is not None:
+        return
+    resolved_report = validation_report or getattr(exc, "validation_report", None)
+    resolved_poll = poll_summary or getattr(exc, "poll_summary", None)
+    if isinstance(resolved_poll, JobPollSummary):
+        _apply_poll_summary_to_jobs(jobs, resolved_poll)
+    else:
+        resolved_poll = None
+    exc.batch_summary = BatchSubmissionSummary(  # type: ignore[attr-defined]
+        study_key=study_key,
+        jobs=list(jobs),
+        chunk_sizes=list(chunk_sizes),
+        total_records=total_records,
+        skipped_count=skipped_count,
+        poll_summary=resolved_poll,
+        dry_run=dry_run,
+        validation_report=resolved_report,
+        has_error=True,
+    )
+
+
+class _BatchSubmissionTracker:
+    """Mutable progress state for attaching partial :class:`BatchSubmissionSummary` on errors."""
+
+    def __init__(
+        self,
+        *,
+        study_key: str,
+        total_records: int,
+        skipped_count: int,
+        dry_run: bool,
+    ) -> None:
+        self.study_key = study_key
+        self.total_records = total_records
+        self.skipped_count = skipped_count
+        self.dry_run = dry_run
+        self.jobs: list[Job] = []
+        self.chunk_sizes: list[int] = []
+        self.validation_report: BatchValidationReport | None = None
+        self.poll_summary: JobPollSummary | None = None
+
+    def record_chunk(self, job: Job, size: int) -> None:
+        self.jobs.append(job)
+        self.chunk_sizes.append(size)
+
+    def early_summary(self, chunks: list[list[dict[str, Any]]]) -> BatchSubmissionSummary | None:
+        if self.dry_run:
+            return BatchSubmissionSummary(
+                study_key=self.study_key,
+                jobs=[],
+                chunk_sizes=[],
+                total_records=self.total_records,
+                skipped_count=self.skipped_count,
+                dry_run=True,
+                validation_report=self.validation_report,
+            )
+        if not chunks:
+            return BatchSubmissionSummary(
+                study_key=self.study_key,
+                jobs=[],
+                chunk_sizes=[],
+                total_records=0,
+                skipped_count=self.skipped_count,
+                validation_report=self.validation_report,
+            )
+        return None
+
+    def attach_error(self, exc: BaseException) -> None:
+        _attach_partial_batch_summary(
+            exc,
+            study_key=self.study_key,
+            jobs=self.jobs,
+            chunk_sizes=self.chunk_sizes,
+            total_records=self.total_records,
+            skipped_count=self.skipped_count,
+            dry_run=self.dry_run,
+            validation_report=self.validation_report,
+            poll_summary=self.poll_summary,
+        )
+
+    def build_summary(self) -> BatchSubmissionSummary:
+        return BatchSubmissionSummary(
+            study_key=self.study_key,
+            jobs=self.jobs,
+            chunk_sizes=self.chunk_sizes,
+            total_records=self.total_records,
+            skipped_count=self.skipped_count,
+            poll_summary=self.poll_summary,
+            validation_report=self.validation_report,
+        )
+
+
+def _build_single_poll_success_summary(
+    study_key: str, batch_id: str, status: JobStatus
+) -> JobPollSummary:
+    return JobPollSummary(
+        study_key=study_key,
+        results={batch_id: status},
+        failures={},
+        elapsed_total=0.0,
+    )
+
+
+def _build_single_poll_failure_summary(
+    study_key: str,
+    batch_id: str,
+    exc: Exception,
+) -> JobPollSummary:
+    """Create a :class:`JobPollSummary` for a single-batch polling failure."""
+    failed_status = getattr(exc, "status", None)
+    results = {batch_id: failed_status} if isinstance(failed_status, JobStatus) else {}
+    return JobPollSummary(
+        study_key=study_key,
+        results=results,
+        failures={batch_id: exc},
+        elapsed_total=0.0,
+    )
 
 
 def _extract_batch_ids(jobs: list[Job], *, require_batch_id: bool) -> list[str]:
@@ -386,90 +537,87 @@ class BatchCoordinator:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, submit in bounded chunks, and optionally poll to completion."""
-        report = self._run_sync_validation(
-            study_key,
-            records_data,
-            schema=schema,
-            validate_batch_fn=validate_batch_fn,
-            skip_validation=skip_validation,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-        )
-
-        if dry_run:
-            return BatchSubmissionSummary(
-                study_key=study_key,
-                jobs=[],
-                chunk_sizes=[],
-                total_records=len(records_data),
-                skipped_count=skipped_count,
-                dry_run=True,
-                validation_report=report,
-            )
-
-        chunks = chunk_records(records_data, self.chunk_size)
-        if not chunks:
-            return BatchSubmissionSummary(
-                study_key=study_key,
-                jobs=[],
-                chunk_sizes=[],
-                total_records=0,
-                skipped_count=skipped_count,
-                validation_report=report,
-            )
-
-        jobs: list[Job] = []
-        chunk_sizes: list[int] = []
-        for chunk in chunks:
-            ctx = prevalidated_records(schema, chunk) if schema is not None else nullcontext()
-            with ctx:
-                job = submit_chunk(chunk)
-            jobs.append(job)
-            chunk_sizes.append(len(chunk))
-
-        poll_summary: JobPollSummary | None = None
-        if wait_for_completion:
-            batch_ids = _extract_batch_ids(jobs, require_batch_id=require_batch_id)
-            if batch_ids:
-                if len(batch_ids) == 1 and poll_single is not None:
-                    single_status = _invoke_poll_single_sync(poll_single, batch_ids[0], on_progress)
-                    poll_summary = JobPollSummary(
-                        study_key=study_key,
-                        results={batch_ids[0]: single_status},
-                        failures={},
-                        elapsed_total=0.0,
-                    )
-                elif poll_many is not None:
-                    poll_summary = _invoke_poll_many_sync(poll_many, batch_ids, on_progress)
-                elif poll_single is not None:
-                    results: dict[str, JobStatus] = {}
-                    failures: dict[str, Exception] = {}
-                    for bid in batch_ids:
-                        try:
-                            results[bid] = _invoke_poll_single_sync(poll_single, bid, on_progress)
-                        except Exception as exc:
-                            failures[bid] = exc
-                            if raise_on_poll_failure:
-                                raise
-                    poll_summary = JobPollSummary(
-                        study_key=study_key,
-                        results=results,
-                        failures=failures,
-                        elapsed_total=0.0,
-                    )
-                _finalize_polled_jobs(
-                    jobs, poll_summary, raise_on_poll_failure=raise_on_poll_failure
-                )
-
-        return BatchSubmissionSummary(
+        tracker = _BatchSubmissionTracker(
             study_key=study_key,
-            jobs=jobs,
-            chunk_sizes=chunk_sizes,
             total_records=len(records_data),
             skipped_count=skipped_count,
-            poll_summary=poll_summary,
-            validation_report=report,
+            dry_run=dry_run,
         )
+        try:
+            tracker.validation_report = self._run_sync_validation(
+                study_key,
+                records_data,
+                schema=schema,
+                validate_batch_fn=validate_batch_fn,
+                skip_validation=skip_validation,
+                dry_run=dry_run,
+                collect_errors=collect_errors,
+            )
+        except ValidationError as exc:
+            tracker.attach_error(exc)
+            raise
+
+        chunks = [] if dry_run else chunk_records(records_data, self.chunk_size)
+        early = tracker.early_summary(chunks)
+        if early is not None:
+            return early
+
+        try:
+            for chunk in chunks:
+                ctx = prevalidated_records(schema, chunk) if schema is not None else nullcontext()
+                with ctx:
+                    tracker.record_chunk(submit_chunk(chunk), len(chunk))
+        except Exception as exc:
+            tracker.attach_error(exc)
+            raise
+
+        if wait_for_completion:
+            try:
+                batch_ids = _extract_batch_ids(tracker.jobs, require_batch_id=require_batch_id)
+                if batch_ids:
+                    if len(batch_ids) == 1 and poll_single is not None:
+                        try:
+                            single_status = _invoke_poll_single_sync(
+                                poll_single, batch_ids[0], on_progress
+                            )
+                        except Exception as poll_exc:
+                            tracker.poll_summary = _build_single_poll_failure_summary(
+                                study_key, batch_ids[0], poll_exc
+                            )
+                            raise
+                        tracker.poll_summary = _build_single_poll_success_summary(
+                            study_key, batch_ids[0], single_status
+                        )
+                    elif poll_many is not None:
+                        tracker.poll_summary = _invoke_poll_many_sync(
+                            poll_many, batch_ids, on_progress
+                        )
+                    elif poll_single is not None:
+                        results: dict[str, JobStatus] = {}
+                        failures: dict[str, Exception] = {}
+                        for bid in batch_ids:
+                            try:
+                                results[bid] = _invoke_poll_single_sync(
+                                    poll_single, bid, on_progress
+                                )
+                            except Exception as exc:
+                                failures[bid] = exc
+                        tracker.poll_summary = JobPollSummary(
+                            study_key=study_key,
+                            results=results,
+                            failures=failures,
+                            elapsed_total=0.0,
+                        )
+                    _finalize_polled_jobs(
+                        tracker.jobs,
+                        tracker.poll_summary,
+                        raise_on_poll_failure=raise_on_poll_failure,
+                    )
+            except Exception as exc:
+                tracker.attach_error(exc)
+                raise
+
+        return tracker.build_summary()
 
 
 class AsyncBatchCoordinator:
@@ -552,94 +700,87 @@ class AsyncBatchCoordinator:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit bounded chunks, and optionally poll."""
-        report = await self._run_async_validation(
-            study_key,
-            records_data,
-            schema=schema,
-            validate_batch_fn=validate_batch_fn,
-            skip_validation=skip_validation,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-        )
-
-        if dry_run:
-            return BatchSubmissionSummary(
-                study_key=study_key,
-                jobs=[],
-                chunk_sizes=[],
-                total_records=len(records_data),
-                skipped_count=skipped_count,
-                dry_run=True,
-                validation_report=report,
-            )
-
-        chunks = chunk_records(records_data, self.chunk_size)
-        if not chunks:
-            return BatchSubmissionSummary(
-                study_key=study_key,
-                jobs=[],
-                chunk_sizes=[],
-                total_records=0,
-                skipped_count=skipped_count,
-                validation_report=report,
-            )
-
-        jobs: list[Job] = []
-        chunk_sizes: list[int] = []
-        for chunk in chunks:
-            ctx = prevalidated_records(schema, chunk) if schema is not None else nullcontext()
-            with ctx:
-                job = await submit_chunk(chunk)
-            jobs.append(job)
-            chunk_sizes.append(len(chunk))
-
-        poll_summary: JobPollSummary | None = None
-        if wait_for_completion:
-            batch_ids = _extract_batch_ids(jobs, require_batch_id=require_batch_id)
-            if batch_ids:
-                if len(batch_ids) == 1 and poll_single is not None:
-                    single_status = await _invoke_poll_single_async(
-                        poll_single, batch_ids[0], on_progress
-                    )
-                    poll_summary = JobPollSummary(
-                        study_key=study_key,
-                        results={batch_ids[0]: single_status},
-                        failures={},
-                        elapsed_total=0.0,
-                    )
-                elif poll_many is not None:
-                    poll_summary = await _invoke_poll_many_async(poll_many, batch_ids, on_progress)
-                elif poll_single is not None:
-                    results: dict[str, JobStatus] = {}
-                    failures: dict[str, Exception] = {}
-                    for bid in batch_ids:
-                        try:
-                            results[bid] = await _invoke_poll_single_async(
-                                poll_single, bid, on_progress
-                            )
-                        except Exception as exc:
-                            failures[bid] = exc
-                            if raise_on_poll_failure:
-                                raise
-                    poll_summary = JobPollSummary(
-                        study_key=study_key,
-                        results=results,
-                        failures=failures,
-                        elapsed_total=0.0,
-                    )
-                _finalize_polled_jobs(
-                    jobs, poll_summary, raise_on_poll_failure=raise_on_poll_failure
-                )
-
-        return BatchSubmissionSummary(
+        tracker = _BatchSubmissionTracker(
             study_key=study_key,
-            jobs=jobs,
-            chunk_sizes=chunk_sizes,
             total_records=len(records_data),
             skipped_count=skipped_count,
-            poll_summary=poll_summary,
-            validation_report=report,
+            dry_run=dry_run,
         )
+        try:
+            tracker.validation_report = await self._run_async_validation(
+                study_key,
+                records_data,
+                schema=schema,
+                validate_batch_fn=validate_batch_fn,
+                skip_validation=skip_validation,
+                dry_run=dry_run,
+                collect_errors=collect_errors,
+            )
+        except ValidationError as exc:
+            tracker.attach_error(exc)
+            raise
+
+        chunks = [] if dry_run else chunk_records(records_data, self.chunk_size)
+        early = tracker.early_summary(chunks)
+        if early is not None:
+            return early
+
+        try:
+            for chunk in chunks:
+                ctx = prevalidated_records(schema, chunk) if schema is not None else nullcontext()
+                with ctx:
+                    tracker.record_chunk(await submit_chunk(chunk), len(chunk))
+        except Exception as exc:
+            tracker.attach_error(exc)
+            raise
+
+        if wait_for_completion:
+            try:
+                batch_ids = _extract_batch_ids(tracker.jobs, require_batch_id=require_batch_id)
+                if batch_ids:
+                    if len(batch_ids) == 1 and poll_single is not None:
+                        try:
+                            single_status = await _invoke_poll_single_async(
+                                poll_single, batch_ids[0], on_progress
+                            )
+                        except Exception as poll_exc:
+                            tracker.poll_summary = _build_single_poll_failure_summary(
+                                study_key, batch_ids[0], poll_exc
+                            )
+                            raise
+                        tracker.poll_summary = _build_single_poll_success_summary(
+                            study_key, batch_ids[0], single_status
+                        )
+                    elif poll_many is not None:
+                        tracker.poll_summary = await _invoke_poll_many_async(
+                            poll_many, batch_ids, on_progress
+                        )
+                    elif poll_single is not None:
+                        async_results: dict[str, JobStatus] = {}
+                        async_failures: dict[str, Exception] = {}
+                        for bid in batch_ids:
+                            try:
+                                async_results[bid] = await _invoke_poll_single_async(
+                                    poll_single, bid, on_progress
+                                )
+                            except Exception as exc:
+                                async_failures[bid] = exc
+                        tracker.poll_summary = JobPollSummary(
+                            study_key=study_key,
+                            results=async_results,
+                            failures=async_failures,
+                            elapsed_total=0.0,
+                        )
+                    _finalize_polled_jobs(
+                        tracker.jobs,
+                        tracker.poll_summary,
+                        raise_on_poll_failure=raise_on_poll_failure,
+                    )
+            except Exception as exc:
+                tracker.attach_error(exc)
+                raise
+
+        return tracker.build_summary()
 
 
 def poll_facade_single_sync(
@@ -722,7 +863,6 @@ def poll_facade_many_sync(
             )
         except Exception as exc:
             failures[bid] = exc
-            raise
     return JobPollSummary(
         study_key=study_key,
         results=results,
@@ -769,7 +909,6 @@ async def poll_facade_many_async(
             )
         except Exception as exc:
             failures[bid] = exc
-            raise
     return JobPollSummary(
         study_key=study_key,
         results=results,
