@@ -185,14 +185,24 @@ class BaseRecordRequest(ImednetBaseModel):
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Per the API documentation, registering a subject only requires ``formKey``
-    and ``siteName``.  The system assigns the subject identifier upon creation.
-    Do **not** include a ``subjectKey`` here — doing so causes the server to
-    treat the request as an update and reject it when the key is unknown.
+    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
+    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
+    ``None`` so server-assigned subject keys continue working by default.
     """
 
     site_name: str = Field(
         "", alias="siteName", description="Name of the site where the subject is enrolled"
+    )
+    site_id: int | None = Field(
+        default=None,
+        alias="siteId",
+        description="Numeric ID of the site where the subject is enrolled",
+    )
+    subject_key: str | None = Field(
+        default=None, alias="subjectKey", description="Optional client-assigned subject key"
+    )
+    subject_oid: str | None = Field(
+        default=None, alias="subjectOid", description="Optional subject OID"
     )
 
     def __init__(
@@ -203,7 +213,14 @@ class RegisterSubjectRequest(BaseRecordRequest):
         data: RecordData | dict[str, Any] = ...,
         site_name: str = "",
         siteName: str = "",
+        site_id: int | None = None,
+        siteId: int | None = None,
+        subject_key: str | None = None,
+        subjectKey: str | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
     ) -> None: ...
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]: ...
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):
     """Payload for updating an existing scheduled record."""

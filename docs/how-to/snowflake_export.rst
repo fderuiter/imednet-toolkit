@@ -24,12 +24,17 @@ The Snowflake export path uses a staged-loading and merge approach:
    *internal* stage via ``PUT file://... AUTO_COMPRESS = FALSE OVERWRITE = TRUE``.
 3. **Evolve & Merge** – The sink inspects ``INFORMATION_SCHEMA.COLUMNS`` and executes
    ``CREATE TABLE IF NOT EXISTS`` when the target table is missing or ``ALTER TABLE ... ADD COLUMN``
-   when unseen form variables appear. When ``idempotent=True`` (default), Snowflake
+   when unseen ``Form`` ``Variable`` columns appear. When ``idempotent=True`` (default), Snowflake
    bulk-loads the staged Parquet file into a temporary staging table via
    ``COPY INTO ... FILE_FORMAT = (TYPE = PARQUET) MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE FORCE = TRUE``,
-   deduplicates ``(study_key, record_id)`` by ``date_modified``, and executes
-   ``MERGE INTO`` keyed on ``(study_key, record_id)``. When ``idempotent=False``,
-   Snowflake loads directly into the target table via ``COPY INTO ... FORCE = TRUE``.
+   deduplicates candidate rows by modification timestamp (``date_modified`` / ``dateModified`` /
+   ``DATE_MODIFIED``), and executes ``MERGE INTO`` keyed on ``(study_key, record_id)`` by default
+   (``snake_case``), ``(studyKey, recordId)`` when ``naming_convention="camelCase"``,
+   ``(STUDYID, RECORD_ID)`` when ``naming_convention="sdtm"``, or
+   ``(STUDYID, DOMAIN, USUBJID, *SEQ)`` when ``as_sdtm=True`` (falling back to
+   ``(STUDYID, DOMAIN, USUBJID)`` for single-row-per-``Subject`` domains without ``*SEQ`` such as
+   ``DM``). When ``idempotent=False``, Snowflake loads directly into the target table via
+   ``COPY INTO ... FORCE = TRUE``.
 
 This is intentionally different from :func:`~imednet.integrations.export.export_to_sql`, which
 uses SQLAlchemy ``DataFrame.to_sql()`` and is appropriate for transactional SQL targets
@@ -66,7 +71,10 @@ batching, staging, and cleanup automatically:
    from imednet import ImednetSDK
    from imednet_sinks.warehouse import export_to_snowflake, SnowflakeSinkConfig
 
-   sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+   sdk = ImednetSDK(
+       api_key=os.environ["IMEDNET_API_KEY"],
+       security_key=os.environ["IMEDNET_SECURITY_KEY"],
+   )
 
    snowflake_cfg = SnowflakeSinkConfig(
        study_key="MY_STUDY",
@@ -96,7 +104,10 @@ per-batch control, custom ``batch_id`` keys, or integration with a workflow engi
    from imednet.spi.sink_base import iter_batches
    from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
-   sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+   sdk = ImednetSDK(
+       api_key=os.environ["IMEDNET_API_KEY"],
+       security_key=os.environ["IMEDNET_SECURITY_KEY"],
+   )
    records = list(sdk.records.list(study_key="MY_STUDY"))
 
    snowflake_cfg_advanced = SnowflakeSinkConfig(
@@ -158,9 +169,13 @@ When ``SnowflakeSinkConfig.idempotent`` is ``True`` (default), each batch upload
 ``PUT ... AUTO_COMPRESS = FALSE OVERWRITE = TRUE`` so refreshed Parquet files replace stale
 staged artifacts, ensures target table DDL via ``INFORMATION_SCHEMA.COLUMNS``, bulk-loads
 the batch into a session-scoped temporary staging table via ``COPY INTO ... FORCE = TRUE``,
-deduplicates ``(study_key, record_id)`` rows by ``date_modified``, and executes
-``MERGE INTO`` keyed on ``(study_key, record_id)``. Scheduled re-runs update modified
-records in place without inserting duplicate rows.
+deduplicates staged rows by modification timestamp (``date_modified`` / ``dateModified`` /
+``DATE_MODIFIED``), and executes ``MERGE INTO`` using schema-aware natural keys:
+``(study_key, record_id)`` for ``snake_case`` (default), ``(studyKey, recordId)`` for
+``naming_convention="camelCase"``, ``(STUDYID, RECORD_ID)`` for ``naming_convention="sdtm"``,
+and ``(STUDYID, DOMAIN, USUBJID, *SEQ)`` when ``as_sdtm=True`` (or ``(STUDYID, DOMAIN, USUBJID)``
+when a domain such as ``DM`` has no ``*SEQ`` column). Scheduled re-runs update modified
+``Record`` rows in place without inserting duplicates.
 
 By default (``hard_delete=False``), records with ``deleted=True`` update the ``DELETED``
 metadata column on matched target rows. Set ``hard_delete=True`` on

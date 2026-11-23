@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from imednet.datadict import (
     BusinessLogicRule,
     Choice,
+    DataDictionary,
+    Form,
     LogicTreeEvaluator,
     Variable,
     extract_variable_constraints,
+    get_schema,
     parse_logic_xml,
+    validate,
 )
+from imednet.datadict.logic import ExtractedCondition, _compile_safe_regex, validate_regex_pattern
+from imednet.errors import ValidationError
 from imednet.utils.evaluator import RestrictedAstEvaluator
+from imednet.validation.cache import calculate_readiness_score, validate_record_data
 
 
 def test_single_condition_blocking_form_rule_true_polarity() -> None:
@@ -1036,3 +1045,409 @@ def test_nested_and_or_not_explicit_group_combinations() -> None:
         evaluator.evaluate_rule(mixed_or_group, {"A": 0, "B": 2, "C": 0}, form_key="F1").triggered
         is False
     )
+
+
+def test_regex_redos_backtracking_guarded_in_validate_record_data() -> None:
+    """Nested quantifier regex rules skip safely without stalling validate_record_data."""
+    xml_rule = (
+        "<rule><conditions><condition>"
+        "<variable>CODE</variable><operator>regex</operator><value>^(a+)+$</value>"
+        "</condition></conditions>"
+        "<actions><action><type>error</type><message>Invalid code</message></action></actions></rule>"
+    )
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="DEMO",
+                variables=[Variable(variableName="CODE", variableType="Text")],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="R1",
+                        name="BacktrackRegexRule",
+                        type="Form",
+                        status="Active",
+                        form="DEMO",
+                        logic=parse_logic_xml(xml_rule),
+                    )
+                ],
+            )
+        ]
+    )
+    t0 = time.perf_counter()
+    validate_record_data(dd, "DEMO", {"CODE": ("a" * 28) + "!"})
+    assert (time.perf_counter() - t0) < 0.1
+
+    t1 = time.perf_counter()
+    score, reasons = calculate_readiness_score(dd, "DEMO", {"CODE": ("a" * 28) + "!"})
+    assert (time.perf_counter() - t1) < 0.1
+    assert score == pytest.approx(100.0)
+    assert reasons == []
+
+
+@pytest.mark.parametrize(
+    ("pattern", "matching_value", "non_matching_value"),
+    [
+        (r"^SUB-\d+$", "SUB-1042", "SUB-XYZ"),
+        (r"^ERR[0-9]+$", "ERR42", "OK42"),
+        (r"^[A-Z]{2,4}-\d{3,6}$", "SITE-1234", "S-12"),
+        (r"^(?:[A-Z]{2,4}-)?\d{3,6}$", "12345", "ABC-12"),
+        (r"^\d+(?:\.\d{1,2})?$", "98.6", "98.678"),
+        (r"^(YES|NO|UNK)$", "UNK", "MAYBE"),
+        (r"^(?:SITE|SUBJ)+$", "SITESUBJ", "VISIT"),
+        (r"^(JAN|JUN|JUL)+$", "JANJUL", "FEB"),
+        (r"(?i)^[a-zA-Z0-9_-]+$", "Subj_01-A", "Subj 01!"),
+        (r"^(?:éa|üa)+$", "éaüa", "öa"),
+        (r"^(?:\dx|\sx)+$", "1x x", "ax"),
+        (r"^(?:[à-ö]1|[ø-ÿ]2)+$", "é1ü2", "a1"),
+        (r"^(?>[A-Z]+)-\d+$", "SUB-01", "SUB-XX"),
+        (r"(?a)^(?:[^0-9]a|\da)+$", "xa1a", "xx"),
+    ],
+)
+def test_safe_clinical_regex_patterns_preserved(
+    pattern: str,
+    matching_value: str,
+    non_matching_value: str,
+) -> None:
+    """Safe flat clinical regex patterns compile via LRU cache and preserve matching behavior."""
+    _compile_safe_regex.cache_clear()
+    rule = BusinessLogicRule(
+        id="R-SAFE",
+        name="Safe Clinical Regex",
+        type="Form",
+        status="Active",
+        form="DEMO",
+        logic={
+            "conditions": {
+                "condition": {
+                    "variable": "CODE",
+                    "operator": "regex",
+                    "value": pattern,
+                }
+            },
+            "actions": {"action": {"type": "error", "message": "Matched code"}},
+        },
+    )
+    evaluator = LogicTreeEvaluator()
+
+    hit = evaluator.evaluate_rule(rule, {"CODE": matching_value}, form_key="DEMO")
+    assert hit.skipped is False
+    assert hit.triggered is True
+
+    miss = evaluator.evaluate_rule(rule, {"CODE": non_matching_value}, form_key="DEMO")
+    assert miss.skipped is False
+    assert miss.triggered is False
+    assert _compile_safe_regex.cache_info().hits >= 1
+
+
+@pytest.mark.parametrize(
+    "unsafe_pattern",
+    [
+        r"^(a+)+$",
+        r"^(a*)*$",
+        r"^(a?){25}a{25}$",
+        r"^(a{1,3})+$",
+        r"^(a++)+$",
+        r"^([a-z]+)-\1$",
+        r"^(?P<grp>\w+)-(?P=grp)$",
+        r"^(a)(?(1)b|c)$",
+        r"^(?=a)+b$",
+        r"^(?!x)*y$",
+        r"^(?:(?=a+)a)+$",
+        r"^(?=(a+)+)a+$",
+        r"^(a|aa)+$",
+        r"^(a|ab)+$",
+        r"^(a|a)+$",
+        r"^([a-z]x|\wx)+$",
+        r"^(.a|aa)+$",
+        r"^(\d|[0-9])+$",
+        r"^([a-m]|[j-z])+$",
+        r"(?i)^(ab|AB)+$",
+        r"(?i)^([à-ö]x|Éx)+$",
+        r"^(\Dx|\Wx)+$",
+        r"^(\Sx|ax)+$",
+        r"^([^0-9]x|ax)+$",
+        r"^(?:[^0-9]a|\da)+$",
+        r"^(?>(a+))+$",
+        r"^(CAT1|CAT12|DOG)+$",
+        r"^(\b)+$",
+        r"^a{1,5000}$",
+        r"^a{300}$",
+        "^" + ("a" * 600) + "$",
+        "[unclosed",
+    ],
+)
+def test_unsafe_and_invalid_regex_patterns_skipped_without_inversion(
+    unsafe_pattern: str,
+) -> None:
+    """Unsafe and malformed regex patterns skip with unsafe_regex under true, false, and not."""
+    evaluator = LogicTreeEvaluator()
+    adversarial_input = {"CODE": ("a" * 30) + "!"}
+
+    if unsafe_pattern != "[unclosed":
+        with pytest.raises(ValueError):
+            validate_regex_pattern(unsafe_pattern)
+
+    pos_rule = BusinessLogicRule(
+        id="R-POS",
+        name="Positive Unsafe Regex",
+        type="Form",
+        status="Active",
+        form="DEMO",
+        logic={
+            "conditions": {
+                "condition": {
+                    "variable": "CODE",
+                    "operator": "regex",
+                    "value": unsafe_pattern,
+                }
+            },
+            "actions": {"action": {"type": "error", "message": "Failed"}},
+        },
+    )
+    false_rule = BusinessLogicRule(
+        id="R-FALSE",
+        name="False Polarity Unsafe Regex",
+        type="Form",
+        status="Active",
+        form="DEMO",
+        logic={
+            "conditions": {
+                "condition": {
+                    "variable": "CODE",
+                    "operator": "regex",
+                    "value": unsafe_pattern,
+                    "false": True,
+                }
+            },
+            "actions": {"action": {"type": "error", "message": "Failed false"}},
+        },
+    )
+    not_rule = BusinessLogicRule(
+        id="R-NOT",
+        name="Not Wrapped Unsafe Regex",
+        type="Form",
+        status="Active",
+        form="DEMO",
+        logic={
+            "conditions": {
+                "not": {
+                    "condition": {
+                        "variable": "CODE",
+                        "operator": "regex",
+                        "value": unsafe_pattern,
+                    }
+                }
+            },
+            "actions": {"action": {"type": "error", "message": "Failed not"}},
+        },
+    )
+
+    t0 = time.perf_counter()
+    report = evaluator.evaluate_rules(
+        [pos_rule, false_rule, not_rule],
+        adversarial_input,
+        form_key="DEMO",
+    )
+    assert (time.perf_counter() - t0) < 0.1
+    assert report.has_errors is False
+    assert report.warnings == []
+    assert len(report.skipped) == 3
+    assert all(res.skip_reason == "unsafe_regex" for res in report.skipped)
+    assert all(res.triggered is False for res in report.skipped)
+
+
+def test_regex_compare_variable_and_input_length_caps() -> None:
+    """Dynamic compareVariable patterns and oversized actual inputs are guarded."""
+    evaluator = LogicTreeEvaluator()
+    compare_not_xml = (
+        "<rule><conditions><not><condition>"
+        "<variable>CODE</variable><operator>regex</operator>"
+        "<compareVariable>PATTERN_VAR</compareVariable>"
+        "</condition></not></conditions>"
+        "<actions><action><type>error</type><message>Mismatch</message></action></actions></rule>"
+    )
+    compare_rule = BusinessLogicRule(
+        id="R-CMP",
+        name="CompareVar Regex Rule",
+        type="Form",
+        status="Active",
+        form="DEMO",
+        logic=parse_logic_xml(compare_not_xml),
+    )
+
+    # Safe dynamic regex evaluates normally under <not>
+    ok_res = evaluator.evaluate_rule(
+        compare_rule,
+        {"CODE": "SUB-123", "PATTERN_VAR": r"^SUB-\d+$"},
+        form_key="DEMO",
+    )
+    assert ok_res.skipped is False
+    assert ok_res.triggered is False
+
+    mismatch_res = evaluator.evaluate_rule(
+        compare_rule,
+        {"CODE": "BAD-123", "PATTERN_VAR": r"^SUB-\d+$"},
+        form_key="DEMO",
+    )
+    assert mismatch_res.skipped is False
+    assert mismatch_res.triggered is True
+
+    # Unsafe dynamic regex in compareVariable skips with unsafe_regex instead of inverting <not>
+    t0 = time.perf_counter()
+    unsafe_cmp_res = evaluator.evaluate_rule(
+        compare_rule,
+        {"CODE": ("a" * 28) + "!", "PATTERN_VAR": r"^(a+)+$"},
+        form_key="DEMO",
+    )
+    assert (time.perf_counter() - t0) < 0.1
+    assert unsafe_cmp_res.skipped is True
+    assert unsafe_cmp_res.skip_reason == "unsafe_regex"
+    assert unsafe_cmp_res.triggered is False
+
+    # Oversized actual value fails closed quickly without running unbounded re.search
+    safe_false_rule = BusinessLogicRule(
+        id="R-LEN",
+        name="Safe Format Check",
+        type="Form",
+        status="Active",
+        form="DEMO",
+        logic=parse_logic_xml(
+            "<rule><conditions><condition>"
+            "<variable>CODE</variable><operator>regex</operator><value>^SUB-\\d+$</value><false/>"
+            "</condition></conditions>"
+            "<actions><action><type>error</type><message>Invalid format</message></action></actions></rule>"
+        ),
+    )
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="DEMO",
+                variables=[Variable(variableName="CODE", variableType="Text")],
+                businessLogic=[safe_false_rule],
+            )
+        ]
+    )
+    oversized_code = "SUB-" + ("1" * 5000)
+    t1 = time.perf_counter()
+    with pytest.raises(ValidationError, match="Invalid format"):
+        validate_record_data(dd, "DEMO", {"CODE": oversized_code})
+    assert (time.perf_counter() - t1) < 0.1
+
+    # Direct leaf and _compare_values defense-in-depth checks
+    direct_cond = ExtractedCondition(
+        variable="CODE",
+        operator="regex",
+        value=r"^(a+)+$",
+        expected_truth=False,
+    )
+    assert evaluator._eval_leaf(direct_cond, {"CODE": "aaa!"}, rule_type="Form") is False
+    direct_cmp_cond = ExtractedCondition(
+        variable="CODE",
+        operator="regex",
+        compare_variable="PAT",
+        expected_truth=False,
+    )
+    assert (
+        evaluator._eval_leaf(
+            direct_cmp_cond,
+            {"CODE": "aaa!", "PAT": r"^(a+)+$"},
+            rule_type="Form",
+        )
+        is False
+    )
+    assert evaluator._compare_values("a" * 5000, "regex", r"^a+$") is False
+    assert evaluator._compare_values(10**1100, "regex", r"^\d+$") is False
+    assert evaluator._compare_values("abc", "regex", r"^(a+)+$") is False
+
+
+def test_datadict_schema_validate_reports_unsafe_and_invalid_rule_regexes() -> None:
+    """datadict.schema.validate reports errors for invalid or unsafe BusinessLogicRule regexes."""
+    safe_dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="DEMO",
+                variables=[Variable(variableName="CODE", variableType="Text")],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="R-SAFE",
+                        name="SafeSubjectCode",
+                        type="Form",
+                        status="Active",
+                        form="DEMO",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>CODE</variable><operator>regex</operator><value>^SUB-\\d+$</value>"
+                            "</condition></conditions></rule>"
+                        ),
+                    )
+                ],
+            )
+        ]
+    )
+    assert validate(safe_dd) == []
+    assert validate(safe_dd, schema=get_schema()) == []
+
+    unsafe_dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="DEMO",
+                variables=[Variable(variableName="CODE", variableType="Text")],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="R1",
+                        name="BacktrackRegexRule",
+                        type="Form",
+                        status="Active",
+                        form="DEMO",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>CODE</variable><operator>regex</operator><value>^(a+)+$</value>"
+                            "</condition></conditions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        id="R2",
+                        name="MalformedRegexRule",
+                        type="Form",
+                        status="Active",
+                        form="DEMO",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>CODE</variable><operator>regex</operator><value>[unclosed</value>"
+                            "</condition></conditions></rule>"
+                        ),
+                    ),
+                ],
+            )
+        ],
+        unassignedBusinessLogic=[
+            BusinessLogicRule(
+                id="R3",
+                name="BackrefUnassignedRule",
+                type="Query",
+                status="Active",
+                logicRawXml=(
+                    "<rule><conditions><condition>"
+                    "<variable>DEMO.CODE</variable><visit>Screening</visit>"
+                    "<operator>matches</operator><value>^([a-z]+)-\\1$</value>"
+                    "</condition></conditions></rule>"
+                ),
+            )
+        ],
+    )
+
+    errors = validate(unsafe_dd)
+    assert len(errors) == 3
+    assert any(
+        "forms.0.businessLogic.0.logic" in err and "BacktrackRegexRule" in err for err in errors
+    )
+    assert any(
+        "forms.0.businessLogic.1.logic" in err and "MalformedRegexRule" in err for err in errors
+    )
+    assert any(
+        "unassignedBusinessLogic.0.logic" in err and "BackrefUnassignedRule" in err
+        for err in errors
+    )
+
+    schema_errors = validate(unsafe_dd, schema=get_schema())
+    assert len(schema_errors) == 3
