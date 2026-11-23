@@ -265,16 +265,20 @@ mapper ingress **by default** (``mask_phi=True``):
   ``terminologyLookups``, and ``mappings`` across flat, hierarchical, and sink
   paths. Store errors, missing plugins, or missing encryption keys fail closed
   so ``global_sensitivity_registry`` PHI redaction still applies.
-* **Pre-write quality-gate filtering**: Setting ``quality_gate_enabled=True``
-  (and optional ``min_schema_readiness_score``) on ``SnowflakeSinkConfig``,
-  ``MongoDbSinkConfig``, ``Neo4jSinkConfig``, or tabular exports runs
-  :func:`~imednet.spi.sink_base.apply_quality_gate` before batch writes to drop
-  low-readiness ``Record`` items consistently across warehouse, document, graph,
-  and tabular targets. On incremental runs, ``run_streaming_export`` and
-  multi-``Form`` tabular streaming cap ``max_ts`` at ``min_rejected_ts`` whenever
-  ``apply_quality_gate`` drops ``Record`` items (or leave ``max_ts`` uncommitted
-  when no exported timestamp is ``<= min_rejected_ts`` or a rejected ``Record``
-  has no timestamp) so dropped ``Record`` items are re-fetched after remediation.
+* **Pre-write quality-gate filtering**: Quality-gate filtering is opt-in
+  (``quality_gate_enabled=False`` by default across all CSV, Parquet, Excel,
+  JSON, DuckDB, SQL, warehouse, document, and graph exports). Setting
+  ``quality_gate_enabled=True`` (and optional ``min_schema_readiness_score``)
+  on ``SnowflakeSinkConfig``, ``MongoDbSinkConfig``, ``Neo4jSinkConfig``, or
+  tabular exports runs :func:`~imednet.spi.sink_base.apply_quality_gate` before
+  batch writes to drop empty drafts or invalid ``Record`` items while retaining
+  sparse ``Record`` payloads that omit optional ``Variable`` fields across
+  warehouse, document, graph, and tabular targets. On incremental runs,
+  ``run_streaming_export`` and multi-``Form`` tabular streaming cap ``max_ts``
+  at ``min_rejected_ts`` whenever ``apply_quality_gate`` drops ``Record`` items
+  (or leave ``max_ts`` uncommitted when no exported timestamp is
+  ``<= min_rejected_ts`` or a rejected ``Record`` has no timestamp) so dropped
+  ``Record`` items are re-fetched after remediation.
 * **Study-specific rules**: Study-level ``StudyConfiguration(phiFields=[...])``
   rules normalize camelCase, PascalCase, uppercase acronyms, and ``snake_case``
   field names automatically across both ``document`` and ``tabular`` mapper
