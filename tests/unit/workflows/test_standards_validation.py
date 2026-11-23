@@ -17,19 +17,21 @@ from imednet_workflows.standards_validation import (
 
 
 def test_categorical_normalizer_translates_lookup_values_and_yes_no_booleans() -> None:
-    """Test that categorical normalizer translates lookup values and yes no booleans."""
+    """Test that categorical normalizer translates lookup values and explicit true/false booleans."""
     normalizer = CategoricalNormalizer()
     result = normalizer.normalize_record(
         {
             "subjectKey": "S004",
             "AE_SEV": "2",
-            "aeSerious": "YES",
+            "aeSerious": "true",
+            "sex": "F",
         },
         terminology_lookups={"AE_SEV": {"1": "MILD", "2": "MODERATE", "3": "SEVERE"}},
     )
 
     assert result.normalized_record["AE_SEV"] == "MODERATE"
     assert result.normalized_record["aeSerious"] is True
+    assert result.normalized_record["sex"] == "F"
     assert result.warnings == []
 
 
@@ -79,7 +81,7 @@ def test_categorical_normalizer_precomputed_lookups_match_legacy_lookups() -> No
     record = {
         "subjectKey": "S005",
         "AE_SEV": " 2 ",
-        "aeSerious": "YES",
+        "aeSerious": "true",
         "aeStatus": "UNKNOWN",
     }
     raw_lookups = {
@@ -102,7 +104,7 @@ def test_categorical_normalizer_precomputed_lookups_match_legacy_lookups() -> No
 def test_categorical_normalizer_handles_none_and_empty_lookups() -> None:
     """Test that normalizer handles None and empty lookups gracefully."""
     normalizer = CategoricalNormalizer()
-    record = {"subjectKey": "S006", "aeSerious": "NO", "rawField": "ABC"}
+    record = {"subjectKey": "S006", "aeSerious": "false", "rawField": "ABC"}
 
     assert normalizer._normalize_lookups(None) == {}
     assert normalizer._normalize_lookups({}) == {}

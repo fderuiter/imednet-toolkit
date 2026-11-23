@@ -78,14 +78,17 @@ from imednet.sdk import ImednetSDK
 from imednet.spi.sink_base import (
     _redact_uri,
     _require_optional_dep,
+    resolve_max_buffered_records,
 )
 from imednet.spi.sinks import (
     CentralizedMapper,
     ExportSink,
     SinkConfig,
+    TransactionalSdtmSequencer,
     apply_quality_gate,
     build_sink_mapper,
     extract_record_id,
+    iter_staged_sdtm_records,
     normalize_sink_value,
     run_streaming_export,
 )
@@ -371,7 +374,7 @@ class Neo4jExportSink(ExportSink):
         self._uri = self.config.uri
         self._auth = self.config.auth
         self._study_key = self.config.study_key
-        self._seq_counters: dict[str, int] = {}
+        self._sdtm_sequencer = TransactionalSdtmSequencer()
         self._driver: Any = None
         self._connect()
 
@@ -399,14 +402,73 @@ class Neo4jExportSink(ExportSink):
         if not records:
             return 0
 
-        post_proc = _post_process_graph_sdtm if self.config.as_sdtm else _post_process_graph
+        database = getattr(self.config, "database", "neo4j")
+        if self.config.as_sdtm:
+            max_buf = resolve_max_buffered_records(
+                self.config.batch_size, self.config.max_buffered_records
+            )
+
+            def execute_sdtm_export() -> int:
+                """Stage SDTM sequences transactionally and commit only after Neo4j write succeeds."""
+                with self._sdtm_sequencer.stage():
+                    sdtm_mapper = build_sink_mapper(
+                        self.config,
+                        mode="document",
+                        post_processor=_post_process_graph_sdtm,
+                        seq_counters=self._sdtm_sequencer,
+                    )
+                    try:
+                        staged_records = list(
+                            iter_staged_sdtm_records(
+                                records,
+                                study_key=self._study_key,
+                                sdtm_domain=self.config.sdtm_domain,
+                                include_deleted=self.config.include_deleted,
+                                mask_phi=self.config.mask_phi,
+                                max_buffered_records=max_buf,
+                            )
+                        )
+                        sdtm_rows = [
+                            row
+                            for r in staged_records
+                            if (row := _record_to_row(r, self._study_key, mapper=sdtm_mapper))
+                        ]
+                    except ExportConfigurationError:
+                        raise
+                    except Exception:
+                        raise TypeError("Malformed Neo4j record batch payload.") from None
+                    if not sdtm_rows:
+                        return 0
+
+                    grouped_rows: dict[str | None, list[dict[str, Any]]] = {}
+                    for row in sdtm_rows:
+                        seq_prop = next(
+                            (
+                                k
+                                for k in row
+                                if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
+                            ),
+                            None,
+                        )
+                        grouped_rows.setdefault(seq_prop, []).append(row)
+
+                    with self._driver.session(database=database) as session:
+                        for seq_prop, group in grouped_rows.items():
+                            has_visit = any("VISITNUM" in r for r in group)
+                            merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
+                            stmt = merge_cypher if self.config.idempotent else create_cypher
+                            session.run(stmt, rows=group)
+                    logger.debug("Wrote batch %s (%d records)", batch_id, len(sdtm_rows))
+                    return len(sdtm_rows)
+
+            return self._execute_with_retry("export_graph", batch_id, execute_sdtm_export)
+
         mapper = build_sink_mapper(
             self.config,
             mode="document",
-            post_processor=post_proc,
-            seq_counters=self._seq_counters,
+            post_processor=_post_process_graph,
+            seq_counters=self._sdtm_sequencer,
         )
-        database = getattr(self.config, "database", "neo4j")
         mapped_rows: list[dict[str, Any]] | None = None
         cypher: str | None = None
 
@@ -425,19 +487,7 @@ class Neo4jExportSink(ExportSink):
             if not mapped_rows:
                 return 0
             if cypher is None:
-                if self.config.as_sdtm:
-                    sample_row = mapped_rows[0]
-                    seq_prop = next(
-                        (
-                            k
-                            for k in sample_row
-                            if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
-                        ),
-                        None,
-                    )
-                    has_visit = any("VISITNUM" in r for r in mapped_rows)
-                    merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
-                elif self.config.naming_convention == "camelCase":
+                if self.config.naming_convention == "camelCase":
                     merge_cypher, create_cypher = _build_convention_cypher(
                         "studyKey", "subjectKey", "recordId", "visitId"
                     )

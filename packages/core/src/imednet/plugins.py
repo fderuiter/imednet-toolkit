@@ -297,7 +297,7 @@ class RecordMapperProtocol(Protocol):
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
-        seq_counters: dict[str, int] | None = None,
+        seq_counters: Any | None = None,
     ) -> pd.DataFrame:
         """Transform records into a normalized SDTM domain DataFrame."""
         ...

@@ -44,11 +44,18 @@ from imednet.integrations.sink_base import (
     iter_batches,
     iter_filtered_sdk_records,
     normalize_watermark_datetime,
+    resolve_max_buffered_records,
     run_streaming_export,
 )
 from imednet.models.standards import (
+    _SDTM_RECORDS_SORT,
+    TransactionalSdtmSequencer,
+    _iter_sorted_sdtm_frames,
+    _SdtmNormalizer,
     format_variable_name,
     get_sdtm_domain_variables,
+    is_active_clinical_record,
+    iter_staged_sdtm_records,
     normalize_naming_convention,
     resolve_sdtm_domain,
     transform_records_to_sdtm,
@@ -628,6 +635,7 @@ class TabularCSVSink(ExportSink):
         self._is_incremental_sync = _is_incremental_config(config)
         self._staged_frames: list[pd.DataFrame] = []
         self._voided_ids: set[str] = set()
+        self._columns: list[str] | None = None
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -664,24 +672,47 @@ class TabularCSVSink(ExportSink):
             return loaded
 
         def execute_export() -> int:
+            batch_cols = [str(c) for c in df.columns]
+            sep = str(self._cfg.pandas_kwargs.get("sep", ","))
             if self._is_first_batch:
                 if self._cfg.idempotent or not Path(self.path).exists():
                     mode = "w"
                     header = True
+                    self._columns = list(batch_cols)
                 else:
                     mode = "a"
                     header = Path(self.path).stat().st_size == 0
+                    if header:
+                        self._columns = list(batch_cols)
+                    elif self._columns is None:
+                        with open(self.path, encoding="utf-8", newline="") as existing_f:
+                            existing_reader = csv.reader(existing_f, delimiter=sep)
+                            first_row = next(existing_reader, None)
+                            if first_row:
+                                self._columns = [str(c) for c in first_row]
             else:
                 mode = "a"
                 header = False
 
-            csv_str = df.to_csv(index=False, header=header, **self._cfg.pandas_kwargs)
-            checksum = hashlib.sha256(csv_str.encode('utf-8')).hexdigest()
+            aligned_df = df
+            if not header and self._columns is not None and batch_cols != self._columns:
+                new_cols = [c for c in batch_cols if c not in self._columns]
+                if new_cols and isinstance(self.path, str) and Path(self.path).exists():
+                    unified_cols = list(self._columns) + new_cols
+                    self._evolve_csv_schema(unified_cols, sep=sep)
+                    self._columns = unified_cols
+                if self._columns is not None and batch_cols != self._columns:
+                    aligned_df = df.copy()
+                    aligned_df.columns = pd.Index(batch_cols)
+                    aligned_df = aligned_df.reindex(columns=self._columns)
+
+            csv_str = aligned_df.to_csv(index=False, header=header, **self._cfg.pandas_kwargs)
+            checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
 
             with open(self.path, mode=mode, encoding="utf-8") as f:
                 f.write(csv_str)
 
-            rows_loaded = len(df)
+            rows_loaded = len(aligned_df)
             self._append_manifest(batch_id, rows_loaded, checksum)
             return rows_loaded
 
@@ -802,10 +833,33 @@ class TabularCSVSink(ExportSink):
             self._staged_frames.clear()
             self._voided_ids.clear()
 
+    def _evolve_csv_schema(self, unified_fields: list[str], *, sep: str = ",") -> None:
+        """Atomically widen an existing CSV file header and rows when new columns arrive."""
+
+        def _rewrite_with_wider_header(tmp_path: str) -> None:
+            with (
+                open(self.path, encoding="utf-8", newline="") as src_f,
+                open(tmp_path, mode="w", encoding="utf-8", newline="") as dst_f,
+            ):
+                reader = csv.DictReader(src_f, delimiter=sep)
+                writer = csv.DictWriter(
+                    dst_f,
+                    fieldnames=unified_fields,
+                    delimiter=sep,
+                    lineterminator="\n",
+                    restval="",
+                )
+                writer.writeheader()
+                for row in reader:
+                    writer.writerow({k: (row.get(k) or "") for k in unified_fields})
+
+        _atomic_replace_file(self.path, _rewrite_with_wider_header, suffix=".csv.tmp")
+
     def close(self) -> None:
         """Clear any staged state."""
         self._staged_frames.clear()
         self._voided_ids.clear()
+        self._columns = None
 
 
 _RECORD_META_CONTRACT_TYPES: tuple[tuple[str, str], ...] = (
@@ -1921,6 +1975,7 @@ class TabularDuckDBSink(ExportSink):
         self._untyped_null_cols: set[str] = set()
         self._is_first_batch = True
         self._is_incremental_sync = _is_incremental_config(config)
+        self._sdtm_sequencer = TransactionalSdtmSequencer()
         self._owns_conn = conn is None
         if conn is not None:
             self._conn: Any = conn
@@ -1960,57 +2015,183 @@ class TabularDuckDBSink(ExportSink):
         )
         return len(record_ids)
 
+    def _delete_sdtm_natural_keys(self, df: pd.DataFrame, quoted_alias: str) -> None:
+        """Delete matching SDTM natural keys from target DuckDB table prior to upsert insert."""
+        if not self._table_exists() or not {"STUDYID", "DOMAIN", "USUBJID"}.issubset(df.columns):
+            return
+        table_cols = {
+            row[1]
+            for row in self._conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+        }
+        if not {"STUDYID", "DOMAIN", "USUBJID"}.issubset(table_cols):
+            return
+        quoted_tbl = _quote_duckdb_identifier(self.table_name)
+        seq_cols = [
+            col
+            for col in df.columns
+            if col.endswith("SEQ")
+            and col not in ("STUDYID", "DOMAIN", "USUBJID")
+            and col in table_cols
+        ]
+        if not seq_cols or (df["DOMAIN"].astype(str).str.upper() == "DM").any():
+            dm_clause = (
+                f" AND UPPER(CAST({quoted_alias}.\"DOMAIN\" AS VARCHAR)) = 'DM'" if seq_cols else ""
+            )
+            self._conn.execute(
+                f"DELETE FROM {quoted_tbl} USING {quoted_alias} "
+                f'WHERE {quoted_tbl}."STUDYID" = {quoted_alias}."STUDYID" '
+                f'AND {quoted_tbl}."DOMAIN" = {quoted_alias}."DOMAIN" '
+                f'AND {quoted_tbl}."USUBJID" = {quoted_alias}."USUBJID"'
+                f"{dm_clause}"
+            )
+        for seq_col in seq_cols:
+            quoted_seq = _quote_duckdb_identifier(seq_col)
+            self._conn.execute(
+                f"DELETE FROM {quoted_tbl} USING {quoted_alias} "
+                f'WHERE {quoted_tbl}."STUDYID" = {quoted_alias}."STUDYID" '
+                f'AND {quoted_tbl}."DOMAIN" = {quoted_alias}."DOMAIN" '
+                f'AND {quoted_tbl}."USUBJID" = {quoted_alias}."USUBJID" '
+                f"AND {quoted_tbl}.{quoted_seq} IS NOT NULL "
+                f"AND {quoted_tbl}.{quoted_seq} = {quoted_alias}.{quoted_seq}"
+            )
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records into DuckDB."""
-        df = _prepare_tabular_batch_df(
-            records,
-            mask_phi=self._cfg.mask_phi,
-            sanitize=self._cfg.sanitize,
+        is_raw_sdtm_batch = (
+            self._cfg.as_sdtm
+            and not isinstance(records, pd.DataFrame)
+            and bool(records)
+            and not (
+                isinstance(records[0], Mapping)
+                and "STUDYID" in records[0]
+                and "USUBJID" in records[0]
+            )
         )
-        if len(df) == 0:
-            return 0
+        if not is_raw_sdtm_batch:
+            df_pre = _prepare_tabular_batch_df(
+                records,
+                mask_phi=self._cfg.mask_phi,
+                sanitize=self._cfg.sanitize,
+            )
+            if len(df_pre) == 0:
+                return 0
+        else:
+            df_pre = None
 
         def execute_export() -> int:
-            quoted_tbl = _quote_duckdb_identifier(self.table_name)
-            quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
-            replace_existing = (
-                self._is_first_batch and self._cfg.idempotent and not self._is_incremental_sync
-            )
-            creating_table = replace_existing or not self._table_exists()
-            if creating_table:
-                df_to_register = _apply_contract_to_all_null_df_columns(df, self._contract_types)
-                self._untyped_null_cols = _collect_untyped_all_null_columns(
-                    df, self._contract_types
-                )
-            else:
-                df_to_register = _evolve_duckdb_table_for_df(
-                    self._conn,
-                    self.table_name,
-                    df,
-                    self._contract_types,
-                    self._untyped_null_cols,
-                )
-            self._conn.register(_DUCKDB_DF_ALIAS, df_to_register)
-            try:
-                if replace_existing:
-                    self._conn.execute(
-                        f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
+            with self._sdtm_sequencer.stage():
+                if is_raw_sdtm_batch:
+                    raw_dom = self._cfg.sdtm_domain
+                    if not raw_dom:
+                        first_rec = records[0]
+                        raw_dom = (
+                            first_rec.get("DOMAIN")
+                            or first_rec.get("domain")
+                            or first_rec.get("form_key")
+                            or first_rec.get("formKey")
+                            if isinstance(first_rec, Mapping)
+                            else getattr(first_rec, "form_key", None)
+                        )
+                    target_dom = resolve_sdtm_domain(raw_dom, fallback="AE")
+                    df = transform_records_to_sdtm(
+                        records,
+                        domain=target_dom,
+                        study_key=self._cfg.study_key,
+                        include_deleted=self._cfg.include_deleted,
+                        mask_phi=self._cfg.mask_phi,
+                        seq_counters=self._sdtm_sequencer,
                     )
-                elif creating_table:
-                    self._conn.execute(f"CREATE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}")
+                    if self._cfg.sanitize and not df.empty:
+                        df = _sanitize_df(df)
                 else:
-                    if self._is_incremental_sync and self._cfg.idempotent:
-                        for candidate_col in ("recordId", "record_id", "RECORD_ID"):
-                            if candidate_col in df.columns:
-                                ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
-                                self._delete_record_ids(ids)
-                                break
-                    self._conn.execute(
-                        f"INSERT INTO {quoted_tbl} BY NAME SELECT * FROM {quoted_alias}"
+                    assert df_pre is not None
+                    df = df_pre
+
+                if len(df) == 0:
+                    return 0
+
+                if {"STUDYID", "DOMAIN", "USUBJID"}.issubset(
+                    df.columns
+                ) and "DMSEQ" not in df.columns:
+                    dm_mask = df["DOMAIN"].astype(str).str.upper() == "DM"
+                    if bool(dm_mask.any()) and int(dm_mask.sum()) > 1:
+                        dm_rows = df.loc[dm_mask]
+                        other_rows = df.loc[~dm_mask]
+                        consolidated_dm: list[dict[str, Any]] = []
+                        for _, grp_df in dm_rows.groupby(
+                            ["STUDYID", "DOMAIN", "USUBJID"], sort=False
+                        ):
+                            merged_dm: dict[str, Any] = {}
+                            for row_dict in grp_df.to_dict("records"):
+                                for col_k, col_v in row_dict.items():
+                                    if (
+                                        col_v is not None
+                                        and col_v != ""
+                                        and not (isinstance(col_v, float) and math.isnan(col_v))
+                                    ) or col_k not in merged_dm:
+                                        merged_dm[col_k] = col_v
+                            consolidated_dm.append(merged_dm)
+                        df = _concat_tabular_frames(
+                            [pd.DataFrame(consolidated_dm), other_rows]
+                            if not other_rows.empty
+                            else [pd.DataFrame(consolidated_dm)]
+                        )
+
+                quoted_tbl = _quote_duckdb_identifier(self.table_name)
+                quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
+                replace_existing = (
+                    self._is_first_batch and self._cfg.idempotent and not self._is_incremental_sync
+                )
+                creating_table = replace_existing or not self._table_exists()
+                if creating_table:
+                    df_to_register = _apply_contract_to_all_null_df_columns(
+                        df, self._contract_types
                     )
-            finally:
-                self._conn.unregister(_DUCKDB_DF_ALIAS)
-            return len(df)
+                    self._untyped_null_cols = _collect_untyped_all_null_columns(
+                        df, self._contract_types
+                    )
+                else:
+                    df_to_register = _evolve_duckdb_table_for_df(
+                        self._conn,
+                        self.table_name,
+                        df,
+                        self._contract_types,
+                        self._untyped_null_cols,
+                    )
+                self._conn.register(_DUCKDB_DF_ALIAS, df_to_register)
+                try:
+                    if replace_existing:
+                        self._conn.execute(
+                            f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
+                        )
+                    elif creating_table:
+                        self._conn.execute(
+                            f"CREATE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
+                        )
+                    else:
+                        if self._cfg.idempotent:
+                            has_record_id = False
+                            if self._is_incremental_sync:
+                                for candidate_col in ("recordId", "record_id", "RECORD_ID"):
+                                    if candidate_col in df.columns:
+                                        has_record_id = True
+                                        ids = [
+                                            rid
+                                            for rid in df[candidate_col].tolist()
+                                            if pd.notna(rid)
+                                        ]
+                                        self._delete_record_ids(ids)
+                                        break
+                            if not has_record_id and {"STUDYID", "DOMAIN", "USUBJID"}.issubset(
+                                df.columns
+                            ):
+                                self._delete_sdtm_natural_keys(df, quoted_alias)
+                        self._conn.execute(
+                            f"INSERT INTO {quoted_tbl} BY NAME SELECT * FROM {quoted_alias}"
+                        )
+                finally:
+                    self._conn.unregister(_DUCKDB_DF_ALIAS)
+                return len(df)
 
         loaded = self._execute_with_retry("export_duckdb", batch_id, execute_export)
         self._is_first_batch = False
@@ -2134,25 +2315,23 @@ class _TabularTransformSink(ExportSink):
         self._pipeline = pipeline
         self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
         self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
-        self._seq_counters: dict[str, int] = {}
+        self._sdtm_sequencer = TransactionalSdtmSequencer()
         self._meta_cols = {name for name, _ in _RECORD_META_CONTRACT_TYPES}
+
+    def _resolve_record_sdtm_domain(self, rec: Any) -> str:
+        if self._cfg.sdtm_domain:
+            return resolve_sdtm_domain(self._cfg.sdtm_domain, fallback="AE")
+        raw_domain = (
+            rec.get("DOMAIN") or rec.get("domain") or rec.get("form_key") or rec.get("formKey")
+            if isinstance(rec, Mapping)
+            else getattr(rec, "form_key", None)
+        )
+        return resolve_sdtm_domain(raw_domain, fallback="AE")
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         if self._cfg.as_sdtm:
             if not records:
                 return 0
-            raw_domain = self._cfg.sdtm_domain
-            if not raw_domain:
-                first_rec = records[0]
-                raw_domain = (
-                    first_rec.get("DOMAIN")
-                    or first_rec.get("domain")
-                    or first_rec.get("form_key")
-                    or first_rec.get("formKey")
-                    if isinstance(first_rec, Mapping)
-                    else getattr(first_rec, "form_key", None)
-                )
-            target_domain = resolve_sdtm_domain(raw_domain, fallback="AE")
             batch_records: Sequence[Any] = records
             if self._cfg.variable_whitelist is not None:
                 allowed = set(self._cfg.variable_whitelist)
@@ -2179,21 +2358,41 @@ class _TabularTransformSink(ExportSink):
                         projected.append(rec)
                 batch_records = projected
 
-            df = transform_records_to_sdtm(
-                batch_records,
-                domain=target_domain,
-                study_key=self._cfg.study_key,
-                include_deleted=self._cfg.include_deleted,
-                mask_phi=self._cfg.mask_phi,
-                seq_counters=self._seq_counters,
-                phi_keys=self._phi_keys,
-                pipeline=self._pipeline,
+            by_domain: dict[str, list[Any]] = {}
+            for rec in batch_records:
+                by_domain.setdefault(self._resolve_record_sdtm_domain(rec), []).append(rec)
+
+            max_buf = resolve_max_buffered_records(
+                self._cfg.batch_size, self._cfg.max_buffered_records
             )
-            if df.empty:
-                return 0
-            if self._sanitize:
-                df = _sanitize_df(df)
-            return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
+            with self._sdtm_sequencer.stage():
+                frames: list[pd.DataFrame] = []
+                for target_domain, dom_records in by_domain.items():
+                    normalizer = _SdtmNormalizer(
+                        domain=target_domain,
+                        study_key=self._cfg.study_key,
+                        include_deleted=self._cfg.include_deleted,
+                        mask_phi=self._cfg.mask_phi,
+                        pipeline=self._pipeline,
+                        phi_keys=self._phi_keys,
+                    )
+                    for frame in _iter_sorted_sdtm_frames(
+                        dom_records,
+                        normalizer,
+                        chunk_size=max(1, len(dom_records)),
+                        seq_counters=self._sdtm_sequencer,
+                        max_buffered_records=max_buf,
+                    ):
+                        if not frame.empty:
+                            frames.append(frame)
+                if not frames:
+                    return 0
+                df = frames[0] if len(frames) == 1 else _concat_tabular_frames(frames)
+                if df.empty:
+                    return 0
+                if self._sanitize:
+                    df = _sanitize_df(df)
+                return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
 
         rows, _ = self._mapper._parse_records(records, self._record_model)
         if self._pipeline is not None and not self._has_native_enrichment:
@@ -2273,6 +2472,8 @@ def _make_mapper_records_source(
                 from imednet.utils.dates import format_iso_datetime
 
                 iter_filters["dateModified"] = (">=", format_iso_datetime(watermark))
+            if config.as_sdtm:
+                iter_filters.setdefault("sort", _SDTM_RECORDS_SORT)
             return cast(
                 Iterable[Any],
                 mapper._iter_records(
@@ -2290,6 +2491,7 @@ def _make_mapper_records_source(
             record_filter=merged_filter,
             record_data_filter=config.record_data_filter,
             exclude_deleted_upstream=exclude_deleted_upstream,
+            sort=_SDTM_RECORDS_SORT if config.as_sdtm else None,
         )
 
     return _records_source
@@ -3648,6 +3850,15 @@ def _stream_records_across_forms(
                 ) or opts["modified_since"]
             else:
                 ctx.watermark = opts["modified_since"]
+            if opts["as_sdtm"] and ctx.sink is not None:
+                ctx_seq = getattr(ctx.sink, "_sdtm_sequencer", None)
+                if isinstance(ctx_seq, TransactionalSdtmSequencer):
+                    inner_s = getattr(ctx.sink, "_inner", None)
+                    if inner_s is not None:
+                        with contextlib.suppress(Exception):
+                            inner_s._sdtm_sequencer = ctx_seq
+                    if ctx.tx is not None and isinstance(ctx.tx.get("metadata"), Mapping):
+                        ctx_seq.hydrate_from_metadata(ctx.tx.get("metadata"))
 
         if all(ctx.watermark is not None for ctx in contexts):
             study_watermark: datetime | None = min(
@@ -3688,6 +3899,7 @@ def _stream_records_across_forms(
             record_filter=merged_filter,
             record_data_filter=opts["record_data_filter"],
             exclude_deleted_upstream=exclude_deleted_upstream,
+            sort=_SDTM_RECORDS_SORT if opts["as_sdtm"] else None,
         )
 
         check_standards = (
@@ -3756,12 +3968,15 @@ def _stream_records_across_forms(
                     elif study_watermark is None or study_watermark < ctx.watermark:
                         continue
 
-                if not opts["include_deleted"] and is_record_deleted(rec):
-                    if opts["idempotent"] and (use_checkpoint or ctx.watermark is not None):
-                        if rec_ts is not None:
-                            ctx.exported_timestamps.append(rec_ts)
-                        router.add_voided(ctx.form_key, rec)
-                    continue
+                if not opts["include_deleted"]:
+                    if is_record_deleted(rec):
+                        if opts["idempotent"] and (use_checkpoint or ctx.watermark is not None):
+                            if rec_ts is not None:
+                                ctx.exported_timestamps.append(rec_ts)
+                            router.add_voided(ctx.form_key, rec)
+                        continue
+                    if opts["as_sdtm"] and not is_active_clinical_record(rec):
+                        continue
 
                 ctx.pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
                 yield rec
@@ -3774,6 +3989,7 @@ def _stream_records_across_forms(
                 config,
                 variables=all_variables,
                 forms=[ctx.form for ctx in contexts],
+                _defer_standards_to_batch=not opts["quality_gate_enabled"],
             )
         else:
             gated_records = apply_quality_gate(
@@ -3783,13 +3999,31 @@ def _stream_records_across_forms(
                 config,
             )
 
-        for rec in gated_records:
+        def _accept_and_track(items: Iterable[Any]) -> Iterator[Any]:
+            for rec in items:
+                matched_ctx = _resolve_ctx(rec)
+                if matched_ctx is not None:
+                    _pop_form_accepted_candidate(matched_ctx, rec)
+                    rec_ts = extract_record_timestamp(rec)
+                    if rec_ts is not None:
+                        matched_ctx.exported_timestamps.append(rec_ts)
+                    yield rec
+
+        routed_records: Iterable[Any] = _accept_and_track(gated_records)
+        if opts["as_sdtm"]:
+            max_buf = resolve_max_buffered_records(opts["batch_size"], opts["max_buffered_records"])
+            routed_records = iter_staged_sdtm_records(
+                routed_records,
+                study_key=study_key,
+                sdtm_domain=opts["sdtm_domain"],
+                include_deleted=opts["include_deleted"],
+                mask_phi=opts["mask_phi"],
+                max_buffered_records=max_buf,
+            )
+
+        for rec in routed_records:
             matched_ctx = _resolve_ctx(rec)
             if matched_ctx is not None:
-                _pop_form_accepted_candidate(matched_ctx, rec)
-                rec_ts = extract_record_timestamp(rec)
-                if rec_ts is not None:
-                    matched_ctx.exported_timestamps.append(rec_ts)
                 router.add_active(matched_ctx.form_key, rec)
         router.flush_all()
 
@@ -3817,6 +4051,14 @@ def _stream_records_across_forms(
                 ctx.tx["records_processed"] = ctx.total_written + ctx.total_reconciled
                 if ctx.max_ts is not None:
                     ctx.tx["new_timestamp"] = ctx.max_ts
+                if opts["as_sdtm"] and ctx.sink is not None:
+                    ctx_seq = getattr(ctx.sink, "_sdtm_sequencer", None)
+                    if isinstance(ctx_seq, TransactionalSdtmSequencer):
+                        tx_meta = ctx.tx.get("metadata")
+                        if not isinstance(tx_meta, dict):
+                            tx_meta = {}
+                            ctx.tx["metadata"] = tx_meta
+                        ctx_seq.write_to_metadata(tx_meta)
 
 
 def _make_form_sink_config(

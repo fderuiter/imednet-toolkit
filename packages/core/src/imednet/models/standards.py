@@ -14,12 +14,15 @@ from imednet.models.sdtm import (
     _SDTM_RECORDS_SORT,
     _UNSET_PIPELINE,
     SDTM_DOMAIN_SPECS,
+    SDTM_SEQUENCER_METADATA_KEY,
     VALID_NAMING_CONVENTIONS,
+    TransactionalSdtmSequencer,
     _collapse_alnum_key,
     _extract_stream_usubjid_and_id,
     _format_sdtm_flag,
     _get_model_consumed_keys,
     _get_model_field_aliases,
+    _is_deleted_record,
     _iter_sorted_sdtm_frames,
     _normalize_key,
     _PreparedSdtmRow,
@@ -27,17 +30,15 @@ from imednet.models.sdtm import (
     format_iso8601_dtc,
     format_variable_name,
     get_sdtm_domain_variables,
+    is_active_clinical_record,
+    iter_staged_sdtm_records,
     normalize_naming_convention,
     resolve_sdtm_domain,
     transform_records_to_sdtm,
     transform_records_to_sdtm_rows,
 )
 from imednet.utils.dates import normalize_iso_date
-from imednet.utils.validators import (
-    is_boolean_token,
-    is_missing_value,
-    parse_bool,
-)
+from imednet.utils.validators import is_missing_value
 
 
 class ValidationViolation(BaseModel):
@@ -356,6 +357,107 @@ class DeviceSafetyProfile(StandardsProfile):
         return violations
 
 
+class BiologicSafetyProfile(StandardsProfile):
+    """Biologic safety profile enforcing AE coding, EX route/dose, DM sex, and VS unit rules."""
+
+    def __init__(self) -> None:
+        """Initialize the biologic safety profile."""
+        super().__init__(
+            profile_name="biologic",
+            required_fields={
+                "AE": ["subjectKey", "aeTerm", "aeSeverity", "aeDecod", "aeRelationship"],
+                "EX": ["subjectKey", "exTreatment", "exDose", "exRoute", "exStartDate"],
+                "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
+                "DM": ["subjectKey", "sex"],
+                "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+            },
+            recommended_fields={
+                "AE": ["aeActionTaken", "aeOutcome"],
+                "EX": ["exDoseUnit", "exEndDate"],
+                "DM": ["birthDate", "age", "race", "ethnicity"],
+                "VS": ["vsTestCd", "vsUnit"],
+            },
+            optional_fields={
+                "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
+            },
+            value_constraints={
+                "AE.aeSeverity": [
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5",
+                    "MILD",
+                    "MODERATE",
+                    "SEVERE",
+                    "LIFE THREATENING",
+                    "FATAL",
+                ],
+                "DM.sex": _STANDARD_SEX_VALUES,
+                "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
+            },
+        )
+
+
+class VaccineSafetyProfile(StandardsProfile):
+    """Vaccine safety profile enforcing reactogenicity AE, EX administration, DM sex, and VS unit rules."""
+
+    def __init__(self) -> None:
+        """Initialize the vaccine safety profile."""
+        super().__init__(
+            profile_name="vaccine",
+            required_fields={
+                "AE": [
+                    "subjectKey",
+                    "aeTerm",
+                    "aeSeverity",
+                    "aeDecod",
+                    "aeRelationship",
+                    "aeSerious",
+                ],
+                "EX": ["subjectKey", "exTreatment", "exDose", "exRoute", "exStartDate"],
+                "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
+                "DM": ["subjectKey", "sex"],
+                "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+            },
+            recommended_fields={
+                "AE": ["aeActionTaken", "aeOutcome"],
+                "EX": ["exDoseUnit", "exEndDate"],
+                "DM": ["birthDate", "age", "race", "ethnicity"],
+                "VS": ["vsTestCd", "vsUnit"],
+            },
+            optional_fields={
+                "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
+            },
+            value_constraints={
+                "AE.aeSeverity": [
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5",
+                    "MILD",
+                    "MODERATE",
+                    "SEVERE",
+                    "LIFE THREATENING",
+                    "FATAL",
+                ],
+                "DM.sex": _STANDARD_SEX_VALUES,
+                "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
+            },
+        )
+
+
 class StandardsProfileRegistry:
     """Registry for managing and retrieving standards profiles."""
 
@@ -379,6 +481,8 @@ class StandardsProfileRegistry:
 PROFILE_REGISTRY = StandardsProfileRegistry()
 PROFILE_REGISTRY.register(GeneralClinicalProfile())
 PROFILE_REGISTRY.register(DrugSafetyProfile())
+PROFILE_REGISTRY.register(BiologicSafetyProfile())
+PROFILE_REGISTRY.register(VaccineSafetyProfile())
 PROFILE_REGISTRY.register(DeviceSafetyProfile())
 
 
@@ -706,7 +810,7 @@ def is_valid_cdash_variable(target_field: str, domain: str) -> bool:
 
 
 def resolve_standards_profile(profile: str | StandardsProfile | None) -> StandardsProfile:
-    """Resolve a profile name ('drug', 'device', 'general') or StandardsProfile instance."""
+    """Resolve a profile name ('general', 'drug', 'biologic', 'vaccine', 'device') or instance."""
     if isinstance(profile, StandardsProfile):
         return profile
     if profile is None:
@@ -719,6 +823,10 @@ def resolve_standards_profile(profile: str | StandardsProfile | None) -> Standar
     aliases = {
         "drug_safety": "drug",
         "drugsafety": "drug",
+        "biologic_safety": "biologic",
+        "biologicsafety": "biologic",
+        "vaccine_safety": "vaccine",
+        "vaccinesafety": "vaccine",
         "device_safety": "device",
         "devicesafety": "device",
         "general_clinical": "general",
@@ -880,9 +988,11 @@ class CategoricalNormalizer:
             return normalize_iso_date(raw_value, date_order=self._date_order), None
 
         if isinstance(raw_value, str):
-            stripped_value = raw_value.strip()
-            if stripped_value and is_boolean_token(stripped_value):
-                return parse_bool(stripped_value), None
+            stripped_lower = raw_value.strip().lower()
+            if stripped_lower == "true":
+                return True, None
+            if stripped_lower == "false":
+                return False, None
 
         return raw_value, None
 
@@ -1068,10 +1178,12 @@ __all__ = [
     "NORMALIZATION_TERMINOLOGY",
     "PROFILE_REGISTRY",
     "SDTM_DOMAIN_SPECS",
+    "SDTM_SEQUENCER_METADATA_KEY",
     "UNIVERSAL_CDASH_IDENTIFIERS",
     "VALID_NAMING_CONVENTIONS",
     "_SDTM_RECORDS_SORT",
     "_UNSET_PIPELINE",
+    "BiologicSafetyProfile",
     "CategoricalNormalizer",
     "DeviceSafetyProfile",
     "DrugSafetyProfile",
@@ -1081,6 +1193,8 @@ __all__ = [
     "StandardsProfileRegistry",
     "StandardsReadinessReport",
     "StandardsReadinessValidator",
+    "TransactionalSdtmSequencer",
+    "VaccineSafetyProfile",
     "ValidationViolation",
     "_PreparedSdtmRow",
     "_SdtmNormalizer",
@@ -1089,12 +1203,15 @@ __all__ = [
     "_format_sdtm_flag",
     "_get_model_consumed_keys",
     "_get_model_field_aliases",
+    "_is_deleted_record",
     "_iter_sorted_sdtm_frames",
     "_normalize_key",
     "format_iso8601_dtc",
     "format_variable_name",
     "get_sdtm_domain_variables",
+    "is_active_clinical_record",
     "is_valid_cdash_variable",
+    "iter_staged_sdtm_records",
     "normalize_naming_convention",
     "resolve_sdtm_domain",
     "resolve_standards_profile",

@@ -1089,6 +1089,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         mask_phi: bool = True,
     ) -> None:
         from imednet.spi.models import (
+            is_active_clinical_record,
             resolve_sdtm_domain,
             validate_cdash_variable,
         )
@@ -1107,11 +1108,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             recs = [
                 rec
                 for rec in sdk.records.list(study_key=study_key)
-                if not bool(
-                    rec.get("deleted")
-                    if isinstance(rec, Mapping)
-                    else getattr(rec, "deleted", False)
-                )
+                if is_active_clinical_record(rec)
             ]
             return forms, variables, recs
 
@@ -1120,12 +1117,6 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         else:
             with fetching_status("standards readiness", study_key):
                 raw_forms, raw_variables, raw_records = _fetch_inputs()
-
-        sanitized_records = (
-            _sanitize_workflow_payload(raw_records, study_key=study_key, mask_phi=True)
-            if mask_phi
-            else raw_records
-        )
 
         form_id_to_key: dict[Any, str] = {}
         for f_obj in raw_forms:
@@ -1168,17 +1159,29 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     cdash_warnings.append(warning)
 
         report = evaluate_standards_readiness(
-            sanitized_records,
+            raw_records,
             study_key=study_key,
             standards_profile=standards_profile,
             sdtm_domain=sdtm_domain,
         )
         all_warnings = list(dict.fromkeys([*report.warnings, *cdash_warnings]))
+        emitted_warnings = (
+            [mask_clinical_phi(w) for w in all_warnings] if mask_phi else all_warnings
+        )
+        has_errors = any(getattr(v, "severity", "").upper() == "ERROR" for v in report.violations)
         threshold = 100.0 if min_standards_score is None else float(min_standards_score)
-        passed = report.is_ready if min_standards_score is None else report.score >= threshold
-        serialized_violations = [
-            v.model_dump() if hasattr(v, "model_dump") else str(v) for v in report.violations
-        ]
+        passed = (not has_errors) and (
+            report.is_ready if min_standards_score is None else report.score >= threshold
+        )
+        serialized_violations: list[Any] = []
+        for v in report.violations:
+            if hasattr(v, "model_dump"):
+                dumped = v.model_dump()
+                if mask_phi and isinstance(dumped.get("message"), str):
+                    dumped["message"] = mask_clinical_phi(dumped["message"])
+                serialized_violations.append(dumped)
+            else:
+                serialized_violations.append(mask_clinical_phi(str(v)) if mask_phi else str(v))
 
         payload = {
             "study_key": study_key,
@@ -1191,7 +1194,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "checked_fields": report.checked_fields,
             "successfully_validated_fields": report.successfully_validated_fields,
             "domain_scores": dict(report.domain_scores),
-            "warnings": all_warnings,
+            "warnings": emitted_warnings,
             "violations": serialized_violations,
         }
         if resolved_fmt == "json":
@@ -1213,21 +1216,22 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 _emit_line("Domain Scores:")
                 for dom_code, dom_score in sorted(report.domain_scores.items()):
                     _emit_line(f"  {dom_code}: {dom_score:.2f}")
-            if all_warnings:
-                _emit_line(f"Warnings ({len(all_warnings)}):")
-                for warn_msg in all_warnings:
+            if emitted_warnings:
+                _emit_line(f"Warnings ({len(emitted_warnings)}):")
+                for warn_msg in emitted_warnings:
                     _emit_line(f"  - {warn_msg}")
             if report.violations:
                 _emit_line(f"Violations ({len(report.violations)}):")
                 for violation in report.violations:
-                    v_msg = (
+                    raw_v_msg = (
                         f"[{violation.severity}] {violation.field}: {violation.message}"
                         if hasattr(violation, "message")
                         else str(violation)
                     )
+                    v_msg = mask_clinical_phi(raw_v_msg) if mask_phi else raw_v_msg
                     _emit_line(f"  - {v_msg}")
 
-        if min_standards_score is not None and report.score < min_standards_score:
+        if not passed:
             sys.exit(1)
 
     def _handle_validate_standards(args: argparse.Namespace) -> None:

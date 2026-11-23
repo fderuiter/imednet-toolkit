@@ -1,6 +1,6 @@
 """Supported core capabilities for external export sink implementations."""
 
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from typing import Any
 
 from imednet.integrations.enrichment import (
@@ -34,9 +34,14 @@ from imednet.integrations.sink_base import (
     validate_max_buffered_records,
 )
 from imednet.models.sdtm import (
+    _SDTM_RECORDS_SORT,
     SDTM_DOMAIN_SPECS,
+    SDTM_SEQUENCER_METADATA_KEY,
+    TransactionalSdtmSequencer,
     format_variable_name,
     get_sdtm_domain_variables,
+    is_active_clinical_record,
+    iter_staged_sdtm_records,
     normalize_naming_convention,
     resolve_sdtm_domain,
     transform_records_to_sdtm,
@@ -46,13 +51,16 @@ from imednet.models.sdtm import (
 __all__ = [
     "DEFAULT_MAX_BUFFERED_RECORDS",
     "SDTM_DOMAIN_SPECS",
+    "SDTM_SEQUENCER_METADATA_KEY",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
+    "_SDTM_RECORDS_SORT",
     "BoundedFormBufferRouter",
     "CentralizedMapper",
     "EnrichmentPipeline",
     "ExportSink",
     "SinkConfig",
     "StateProviderProtocol",
+    "TransactionalSdtmSequencer",
     "apply_quality_gate",
     "build_sink_mapper",
     "evaluate_standards_readiness",
@@ -62,9 +70,11 @@ __all__ = [
     "format_variable_name",
     "get_sdtm_domain_variables",
     "get_state_provider",
+    "is_active_clinical_record",
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
+    "iter_staged_sdtm_records",
     "normalize_naming_convention",
     "normalize_sink_value",
     "redact_batch_records",
@@ -86,11 +96,17 @@ def build_sink_mapper(
     *,
     mode: str = "document",
     post_processor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-    seq_counters: dict[str, int] | None = None,
+    seq_counters: MutableMapping[str, int] | TransactionalSdtmSequencer | None = None,
+    include_deleted: bool | None = None,
 ) -> CentralizedMapper:
     """Create a CentralizedMapper configured with SinkConfig PHI, SDTM, and naming rules."""
     extra = getattr(config, "extra", None)
     extra_dict = extra if isinstance(extra, dict) else {}
+    resolved_include_deleted = (
+        bool(getattr(config, "include_deleted", False))
+        if include_deleted is None
+        else bool(include_deleted)
+    )
     mapper = CentralizedMapper(
         mode=mode,
         post_processor=post_processor,
@@ -99,6 +115,7 @@ def build_sink_mapper(
         naming_convention=getattr(config, "naming_convention", None),
         as_sdtm=bool(getattr(config, "as_sdtm", False)),
         sdtm_domain=getattr(config, "sdtm_domain", None),
+        include_deleted=resolved_include_deleted,
         seq_counters=seq_counters,
     )
     custom_pipeline = extra_dict.get("enrichment_pipeline")

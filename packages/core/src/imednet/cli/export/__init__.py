@@ -142,7 +142,7 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--standards-profile",
         dest="standards_profile",
-        choices=["general", "drug", "device"],
+        choices=["general", "drug", "biologic", "vaccine", "device"],
         default=None,
         help="CDISC standards readiness profile used to validate study batches.",
     )

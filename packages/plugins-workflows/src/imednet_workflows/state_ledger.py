@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import contextlib
+import copy
 import json
 import os
 import re
@@ -466,6 +467,11 @@ class FileStateProvider(BaseStateProvider):
             prior_ts = (
                 _normalize_optional_utc(current_stream.last_timestamp) if current_stream else None
             )
+            prior_metadata: dict[str, Any] = (
+                copy.deepcopy(current_stream.metadata)
+                if current_stream and isinstance(current_stream.metadata, dict)
+                else {}
+            )
             effective_ts = (
                 prior_ts if prior_ts is not None else _normalize_optional_utc(fallback_timestamp)
             )
@@ -498,6 +504,7 @@ class FileStateProvider(BaseStateProvider):
                 last_timestamp=prior_ts,
                 records_processed=0,
                 last_run_status=StreamExecutionStatus.RUNNING,
+                metadata=copy.deepcopy(prior_metadata),
                 owner_pid=os.getpid(),
                 owner_host=socket.gethostname(),
                 lease_expires_at=now + timedelta(seconds=ttl),
@@ -508,14 +515,15 @@ class FileStateProvider(BaseStateProvider):
             "last_timestamp": effective_ts,
             "new_timestamp": None,
             "records_processed": 0,
-            "metadata": {},
+            "metadata": copy.deepcopy(prior_metadata),
+            "prior_metadata": copy.deepcopy(prior_metadata),
         }
         try:
             yield tx_data
         except BaseException as err:
             if isinstance(err, GeneratorExit):
                 raise
-            # Mark stream as failed and preserve previous committed high-water mark
+            # Mark stream as failed and restore previous committed high-water mark and metadata
             with self._lock():
                 state = self.read_state()
                 validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
@@ -525,7 +533,7 @@ class FileStateProvider(BaseStateProvider):
                     records_processed=tx_data.get("records_processed", 0),
                     last_run_status=StreamExecutionStatus.FAILED,
                     error_message=str(err),
-                    metadata=tx_data.get("metadata") or {},
+                    metadata=copy.deepcopy(prior_metadata),
                 )
                 self.write_state(state)
             raise
@@ -537,12 +545,18 @@ class FileStateProvider(BaseStateProvider):
                 commit_ts = (
                     _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
                 )
+                raw_commit_meta = tx_data.get("metadata")
+                commit_metadata = (
+                    copy.deepcopy(raw_commit_meta)
+                    if isinstance(raw_commit_meta, dict)
+                    else copy.deepcopy(prior_metadata)
+                )
                 study_entry = state.studies.setdefault(study_key, StudyState())
                 study_entry.streams[stream_name] = StreamState(
                     last_timestamp=commit_ts,
                     records_processed=tx_data.get("records_processed", 0),
                     last_run_status=StreamExecutionStatus.SUCCESS,
-                    metadata=tx_data.get("metadata") or {},
+                    metadata=commit_metadata,
                 )
                 self.write_state(state)
 
@@ -858,6 +872,10 @@ class AirflowStateProvider(BaseStateProvider):
         """Context manager for transactional state tracking backed by Airflow Variables."""
         raw_entry = self._read_variable(self._get_variable_key(study_key, stream_name))
         prior_ts = _normalize_optional_utc(self._parse_timestamp(raw_entry))
+        raw_prior_meta = raw_entry.get("metadata") if isinstance(raw_entry, dict) else None
+        prior_metadata: dict[str, Any] = (
+            copy.deepcopy(raw_prior_meta) if isinstance(raw_prior_meta, dict) else {}
+        )
         effective_ts = (
             prior_ts if prior_ts is not None else _normalize_optional_utc(fallback_timestamp)
         )
@@ -911,6 +929,7 @@ class AirflowStateProvider(BaseStateProvider):
             timestamp=prior_ts,
             records_processed=0,
             status=StreamExecutionStatus.RUNNING,
+            metadata=copy.deepcopy(prior_metadata),
             force=True,
             owner_pid=os.getpid(),
             owner_host=socket.gethostname(),
@@ -921,7 +940,8 @@ class AirflowStateProvider(BaseStateProvider):
             "last_timestamp": effective_ts,
             "new_timestamp": None,
             "records_processed": 0,
-            "metadata": {},
+            "metadata": copy.deepcopy(prior_metadata),
+            "prior_metadata": copy.deepcopy(prior_metadata),
         }
 
         try:
@@ -937,7 +957,7 @@ class AirflowStateProvider(BaseStateProvider):
                 records_processed=tx_data.get("records_processed", 0),
                 status=StreamExecutionStatus.FAILED,
                 error_message=str(err),
-                metadata=tx_data.get("metadata"),
+                metadata=copy.deepcopy(prior_metadata),
                 force=True,
             )
             raise
@@ -945,13 +965,19 @@ class AirflowStateProvider(BaseStateProvider):
             validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
             raw_new_ts = tx_data.get("new_timestamp")
             commit_ts = _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
+            raw_commit_meta = tx_data.get("metadata")
+            commit_metadata = (
+                copy.deepcopy(raw_commit_meta)
+                if isinstance(raw_commit_meta, dict)
+                else copy.deepcopy(prior_metadata)
+            )
             self.set_last_timestamp(
                 study_key=study_key,
                 stream_name=stream_name,
                 timestamp=commit_ts,
                 records_processed=tx_data.get("records_processed", 0),
                 status=StreamExecutionStatus.SUCCESS,
-                metadata=tx_data.get("metadata"),
+                metadata=commit_metadata,
                 force=True,
             )
 

@@ -86,14 +86,17 @@ from imednet.sdk import ImednetSDK
 from imednet.spi.sink_base import (
     _redact_uri,
     _require_optional_dep,
+    resolve_max_buffered_records,
 )
 from imednet.spi.sinks import (
     CentralizedMapper,
     ExportSink,
     SinkConfig,
+    TransactionalSdtmSequencer,
     apply_quality_gate,
     build_sink_mapper,
     extract_record_id,
+    iter_staged_sdtm_records,
     normalize_sink_value,
     require_optional_dep,
     run_streaming_export,
@@ -171,11 +174,13 @@ def _attach_sdtm_document_id(doc: dict[str, Any], record: Any, study_key: str) -
     """Attach a deterministic MongoDB ``_id`` to a flat SDTM domain document."""
     rid = extract_record_id(record)
     resolved_study = str(doc.get("STUDYID") or study_key)
-    if rid is not None:
+    domain = str(doc.get("DOMAIN") or "DM").upper()
+    usubjid = str(doc.get("USUBJID") or "")
+    if domain == "DM" and usubjid:
+        doc["_id"] = f"{resolved_study}/DM/{usubjid}"
+    elif rid is not None:
         doc["_id"] = _make_document_id(resolved_study, rid)
     else:
-        domain = str(doc.get("DOMAIN") or "DM")
-        usubjid = str(doc.get("USUBJID") or "")
         seq_val = next((doc[k] for k in doc if k.endswith("SEQ")), 1)
         doc["_id"] = f"{resolved_study}/{domain}/{usubjid}/{seq_val}"
     normalized: dict[str, Any] = normalize_sink_value(doc)
@@ -197,6 +202,8 @@ def _record_to_document(
             mask_phi=mask_phi,
         )
     mapped = mapper.map_record(record, study_key=study_key)
+    if not mapped:
+        return {}
     if getattr(mapper, "as_sdtm", False) and "_id" not in mapped:
         return _attach_sdtm_document_id(mapped, record, study_key)
     return mapped
@@ -227,7 +234,7 @@ class MongoDbExportSink(ExportSink):
         self._database = self.config.database
         self._collection_name = self.config.collection
         self._study_key = self.config.study_key
-        self._seq_counters: dict[str, int] = {}
+        self._sdtm_sequencer = TransactionalSdtmSequencer()
         self._client: Any = None
         self._collection: Any = None
         self._connect()
@@ -261,12 +268,68 @@ class MongoDbExportSink(ExportSink):
         if not records:
             return 0
 
-        post_proc = None if self.config.as_sdtm else _post_process_document
+        if self.config.as_sdtm:
+            max_buf = resolve_max_buffered_records(
+                self.config.batch_size, self.config.max_buffered_records
+            )
+
+            def execute_sdtm_export() -> int:
+                """Stage SDTM sequences transactionally and commit only after MongoDB write succeeds."""
+                with self._sdtm_sequencer.stage():
+                    sdtm_mapper = build_sink_mapper(
+                        self.config,
+                        mode="document",
+                        post_processor=None,
+                        seq_counters=self._sdtm_sequencer,
+                    )
+                    try:
+                        staged_records = list(
+                            iter_staged_sdtm_records(
+                                records,
+                                study_key=self._study_key,
+                                sdtm_domain=self.config.sdtm_domain,
+                                include_deleted=self.config.include_deleted,
+                                mask_phi=self.config.mask_phi,
+                                max_buffered_records=max_buf,
+                            )
+                        )
+                        sdtm_docs = [
+                            doc
+                            for r in staged_records
+                            if (doc := _record_to_document(r, self._study_key, mapper=sdtm_mapper))
+                        ]
+                    except ExportConfigurationError:
+                        raise
+                    except Exception:
+                        raise TypeError("Malformed MongoDB record batch payload.") from None
+                    if not sdtm_docs:
+                        return 0
+                    if self.config.idempotent:
+                        pymongo = _require_optional_dep("pymongo", "mongodb")
+                        ops = [
+                            pymongo.UpdateOne(
+                                {"_id": doc["_id"]},
+                                {"$set": doc},
+                                upsert=True,
+                            )
+                            for doc in sdtm_docs
+                        ]
+                        self._collection.bulk_write(ops, ordered=False)
+                        written = len(sdtm_docs)
+                    else:
+                        result = self._collection.insert_many(sdtm_docs, ordered=False)
+                        written = len(result.inserted_ids)
+
+                    logger.debug("Wrote batch %s (%d records)", batch_id, written)
+                    return written
+
+            return self._execute_with_retry("export_mongodb", batch_id, execute_sdtm_export)
+
         mapper = build_sink_mapper(
             self.config,
             mode="document",
-            post_processor=post_proc,
-            seq_counters=self._seq_counters,
+            post_processor=_post_process_document,
+            seq_counters=self._sdtm_sequencer,
         )
         mapped_docs: list[dict[str, Any]] | None = None
 

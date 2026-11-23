@@ -205,7 +205,8 @@ out explicitly with ``--no-mask-phi``.
 
 Exports also support native CDISC SDTM transformation (``--as-sdtm`` and
 ``--sdtm-domain``), batch-level CDISC standards readiness gating via
-``StandardsReadinessValidator`` (``--standards-profile`` and
+``StandardsReadinessValidator``
+(``--standards-profile general|drug|biologic|vaccine|device`` and
 ``--min-standards-score``), raw variable casing alignment
 (``--naming-convention snake_case|camelCase|sdtm``), and pre-write ``Record``
 schema readiness filtering (``--quality-gate`` and ``--min-readiness-score``):

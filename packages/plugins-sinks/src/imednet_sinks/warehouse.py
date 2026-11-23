@@ -91,15 +91,19 @@ from typing import Any
 
 from imednet.errors import ExportBatchError, ExportConfigurationError
 from imednet.sdk import ImednetSDK
-from imednet.spi.sink_base import _require_optional_dep
+from imednet.spi.models import resolve_sdtm_domain
+from imednet.spi.sink_base import _require_optional_dep, resolve_max_buffered_records
 from imednet.spi.sinks import (
     CentralizedMapper,
     ExportSink,
     SinkConfig,
+    TransactionalSdtmSequencer,
     apply_quality_gate,
     build_sink_mapper,
+    extract_record_form_ref,
     extract_record_id,
     format_variable_name,
+    iter_staged_sdtm_records,
     normalize_sink_value,
     run_streaming_export,
 )
@@ -928,6 +932,15 @@ def _records_to_arrow_table(
 
     if mapper is None:
         if mapper_as_sdtm:
+            staged_input = list(
+                iter_staged_sdtm_records(
+                    records,
+                    study_key=study_key,
+                    sdtm_domain=sdtm_domain,
+                    include_deleted=False,
+                    mask_phi=mask_phi,
+                )
+            )
             sdtm_proc = functools.partial(
                 _post_process_warehouse_sdtm,
                 mask_phi=mask_phi,
@@ -940,6 +953,9 @@ def _records_to_arrow_table(
                 as_sdtm=True,
                 sdtm_domain=sdtm_domain,
             )
+            raw_rows = [
+                row for r in staged_input if (row := mapper.map_record(r, study_key=study_key))
+            ]
         else:
             post_proc = (
                 _make_mapped_post_proc(False, mapper_convention)
@@ -952,9 +968,20 @@ def _records_to_arrow_table(
                 mask_phi=mask_phi,
                 naming_convention=None if is_default_conv else mapper_convention,
             )
-        raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+            raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
     elif mapper_as_sdtm:
-        mapped_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+        staged_input = list(
+            iter_staged_sdtm_records(
+                records,
+                study_key=study_key,
+                sdtm_domain=sdtm_domain or getattr(mapper, "sdtm_domain", None),
+                include_deleted=bool(getattr(mapper, "include_deleted", False)),
+                mask_phi=bool(getattr(mapper, "mask_phi", mask_phi)),
+            )
+        )
+        mapped_rows = [
+            row for r in staged_input if (row := mapper.map_record(r, study_key=study_key))
+        ]
         orig_post_proc = getattr(mapper, "post_processor", None)
         if getattr(orig_post_proc, "func", orig_post_proc) is _post_process_warehouse_sdtm:
             raw_rows = mapped_rows
@@ -1050,7 +1077,7 @@ class SnowflakeExportSink(ExportSink):
         """
         super().__init__(config)
         self._cfg: SnowflakeSinkConfig = config
-        self._seq_counters: dict[str, int] = {}
+        self._sdtm_sequencer = TransactionalSdtmSequencer()
         self._conn: Any = None
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
@@ -1189,35 +1216,20 @@ class SnowflakeExportSink(ExportSink):
                 if self.config.mask_phi
                 else _post_process_warehouse_unmasked
             )
-        mapper = build_sink_mapper(
-            cfg,
-            mode="tabular",
-            post_processor=post_proc,
-            seq_counters=self._seq_counters,
-        )
-
-        arrow_table = _records_to_arrow_table(
-            records,
-            mask_phi=self.config.mask_phi,
-            study_key=cfg.study_key,
-            mapper=mapper,
-            as_sdtm=cfg.as_sdtm,
-            sdtm_domain=cfg.sdtm_domain,
-            naming_convention=cfg.naming_convention,
-        )
-        merge_columns = _resolve_merge_columns(arrow_table)
-        local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
         pq = _require_optional_dep("pyarrow.parquet", "snowflake")
-        pq.write_table(arrow_table, str(local_path))
 
-        stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{safe_batch}.parquet"
-
-        def execute_export() -> int:
-            """Execute PUT, schema evolution DDL, and staged MERGE INTO (or COPY INTO) in Snowflake."""
+        def _load_arrow_batch(
+            batch_table: Any,
+            batch_merge_columns: list[str],
+            batch_local_path: Path,
+            batch_stage_path: str,
+            expected_rows: int,
+        ) -> int:
+            pq.write_table(batch_table, str(batch_local_path))
             cur = self._conn.cursor()
             try:
                 cur.execute(
-                    f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/' "
+                    f"PUT file://{batch_local_path} '@{cfg.stage}/{cfg.stage_prefix}/' "
                     f"AUTO_COMPRESS = FALSE OVERWRITE = TRUE"
                 )  # nosem
                 target_table = (
@@ -1225,7 +1237,7 @@ class SnowflakeExportSink(ExportSink):
                     f"{_quote_identifier(cfg.schema)}."
                     f"{_quote_identifier(cfg.table)}"
                 )
-                self._ensure_table_schema(cur, target_table, arrow_table, merge_columns)
+                self._ensure_table_schema(cur, target_table, batch_table, batch_merge_columns)
 
                 if self.config.idempotent:
                     staging_table = (
@@ -1238,17 +1250,17 @@ class SnowflakeExportSink(ExportSink):
                     )  # nosem
                     cur.execute(
                         f"COPY INTO {staging_table} "
-                        f"FROM '{stage_path}' "
+                        f"FROM '{batch_stage_path}' "
                         f"FILE_FORMAT = (TYPE = PARQUET) "
                         f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
                         f"FORCE = TRUE"
                     )  # nosem
                     merge_keys = _resolve_merge_keys(
-                        merge_columns,
+                        batch_merge_columns,
                         as_sdtm=cfg.as_sdtm,
                         naming_convention=cfg.naming_convention,
                     )
-                    non_key_cols = [col for col in merge_columns if col not in merge_keys]
+                    non_key_cols = [col for col in batch_merge_columns if col not in merge_keys]
                     if non_key_cols:
                         update_clause = ", ".join(
                             f"target.{_quote_identifier(col.upper())} = "
@@ -1258,19 +1270,21 @@ class SnowflakeExportSink(ExportSink):
                     else:
                         first_key = _quote_identifier(merge_keys[0].upper())
                         update_clause = f"target.{first_key} = source.{first_key}"
-                    insert_cols = ", ".join(_quote_identifier(col.upper()) for col in merge_columns)
+                    insert_cols = ", ".join(
+                        _quote_identifier(col.upper()) for col in batch_merge_columns
+                    )
                     insert_vals = ", ".join(
-                        f"source.{_quote_identifier(col.upper())}" for col in merge_columns
+                        f"source.{_quote_identifier(col.upper())}" for col in batch_merge_columns
                     )
                     deleted_col = next(
-                        (c for c in ("deleted", "DELETED") if c in merge_columns),
+                        (c for c in ("deleted", "DELETED") if c in batch_merge_columns),
                         None,
                     )
                     if not cfg.as_sdtm and cfg.naming_convention in (None, "snake_case"):
                         partition_expr = "study_key, record_id"
                         order_expr = (
                             "ORDER BY date_modified DESC NULLS LAST"
-                            if "date_modified" in merge_columns
+                            if "date_modified" in batch_merge_columns
                             else "ORDER BY record_id"
                         )
                         on_expr = (
@@ -1283,7 +1297,7 @@ class SnowflakeExportSink(ExportSink):
                             (
                                 c
                                 for c in ("date_modified", "dateModified", "DATE_MODIFIED")
-                                if c in merge_columns
+                                if c in batch_merge_columns
                             ),
                             None,
                         )
@@ -1323,24 +1337,117 @@ class SnowflakeExportSink(ExportSink):
                 else:
                     cur.execute(
                         f"COPY INTO {target_table} "
-                        f"FROM '{stage_path}' "
+                        f"FROM '{batch_stage_path}' "
                         f"FILE_FORMAT = (TYPE = PARQUET) "
                         f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
                         f"FORCE = TRUE"
                     )  # nosem
-                rows_loaded = len(records)
                 logger.debug(
                     "Loaded batch %s (%d rows) via stage %s",
                     batch_id,
-                    rows_loaded,
-                    stage_path,
+                    expected_rows,
+                    batch_stage_path,
                 )
-                self._append_manifest(batch_id, stage_path, rows_loaded)
-                return rows_loaded
+                self._append_manifest(batch_id, batch_stage_path, expected_rows)
+                return expected_rows
             finally:
                 cur.close()
 
-        return self._execute_with_retry("export_warehouse", batch_id, execute_export)
+        if not cfg.as_sdtm:
+            mapper = build_sink_mapper(
+                cfg,
+                mode="tabular",
+                post_processor=post_proc,
+                seq_counters=self._sdtm_sequencer,
+            )
+            arrow_table = _records_to_arrow_table(
+                records,
+                mask_phi=self.config.mask_phi,
+                study_key=cfg.study_key,
+                mapper=mapper,
+                as_sdtm=False,
+                sdtm_domain=cfg.sdtm_domain,
+                naming_convention=cfg.naming_convention,
+            )
+            merge_columns = _resolve_merge_columns(arrow_table)
+            local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
+            stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{safe_batch}.parquet"
+
+            def execute_raw_export() -> int:
+                return _load_arrow_batch(
+                    arrow_table, merge_columns, local_path, stage_path, len(records)
+                )
+
+            return self._execute_with_retry("export_warehouse", batch_id, execute_raw_export)
+
+        max_buf = resolve_max_buffered_records(cfg.batch_size, cfg.max_buffered_records)
+        staged_records = list(
+            iter_staged_sdtm_records(
+                records,
+                study_key=cfg.study_key,
+                sdtm_domain=cfg.sdtm_domain,
+                include_deleted=cfg.include_deleted,
+                mask_phi=self.config.mask_phi,
+                max_buffered_records=max_buf,
+            )
+        )
+        if not staged_records:
+            return 0
+        for rec in staged_records:
+            raw_rd = (
+                rec.get("record_data")
+                if isinstance(rec, Mapping)
+                else getattr(rec, "record_data", None)
+            )
+            if isinstance(raw_rd, Mapping):
+                _validate_nested_variable_keys(raw_rd)
+
+        domain_groups: dict[str, list[Any]] = {}
+        for rec in staged_records:
+            _, fk = extract_record_form_ref(rec)
+            raw_dom = (
+                cfg.sdtm_domain
+                or (rec.get("DOMAIN") or rec.get("domain") if isinstance(rec, Mapping) else None)
+                or fk
+            )
+            dom = resolve_sdtm_domain(raw_dom, fallback="SUPPQUAL")
+            domain_groups.setdefault(dom, []).append(rec)
+
+        def execute_sdtm_export() -> int:
+            """Stage SDTM sequences transactionally and commit only after Snowflake load succeeds."""
+            with self._sdtm_sequencer.stage():
+                sdtm_mapper = build_sink_mapper(
+                    cfg,
+                    mode="tabular",
+                    post_processor=post_proc,
+                    seq_counters=self._sdtm_sequencer,
+                )
+                total_loaded = 0
+                multi_domain = len(domain_groups) > 1
+                for dom, dom_records in domain_groups.items():
+                    dom_table = _records_to_arrow_table(
+                        dom_records,
+                        mask_phi=self.config.mask_phi,
+                        study_key=cfg.study_key,
+                        mapper=sdtm_mapper,
+                        as_sdtm=True,
+                        sdtm_domain=cfg.sdtm_domain or dom,
+                        naming_convention=cfg.naming_convention,
+                    )
+                    num_rows = getattr(dom_table, "num_rows", None)
+                    row_count = num_rows if isinstance(num_rows, int) else len(dom_records)
+                    if row_count == 0:
+                        continue
+                    dom_merge_cols = _resolve_merge_columns(dom_table)
+                    suffix = f"{safe_batch}_{dom}" if multi_domain else safe_batch
+                    dom_local_path = Path(self._staging_dir) / f"{suffix}.parquet"
+                    dom_stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{suffix}.parquet"
+                    total_loaded += _load_arrow_batch(
+                        dom_table, dom_merge_cols, dom_local_path, dom_stage_path, row_count
+                    )
+                return total_loaded
+
+        return self._execute_with_retry("export_warehouse", batch_id, execute_sdtm_export)
 
     def flush(self) -> None:
         """No-op: each batch is committed individually."""
@@ -1427,6 +1534,7 @@ def export_to_snowflake(
     stream_cfg = resolved_cfg
     if (
         resolved_cfg.idempotent
+        and not resolved_cfg.as_sdtm
         and not resolved_cfg.include_deleted
         and not resolved_cfg.incremental
         and resolved_cfg.modified_since is None

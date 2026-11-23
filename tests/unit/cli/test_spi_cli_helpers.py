@@ -453,20 +453,23 @@ def test_validate_standards_supports_simulation_and_study_key_flag(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Verify workflows validate-standards supports --study-key and --simulation offline."""
-    cli_mod.app(
-        [
-            "workflows",
-            "validate-standards",
-            "--study-key",
-            "STUDY",
-            "--simulation",
-            "--format",
-            "json",
-        ]
-    )
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.app(
+            [
+                "workflows",
+                "validate-standards",
+                "--study-key",
+                "STUDY",
+                "--simulation",
+                "--format",
+                "json",
+            ]
+        )
+    assert exc_info.value.code == 1
     out, err = capsys.readouterr()
     assert err == ""
     assert spi_cli.SIMULATION_MODE_ENV not in os.environ
     payload = json.loads(out)
     assert payload["study_key"] == "STUDY"
+    assert payload["passed"] is False
     assert "score" in payload

@@ -7,13 +7,14 @@ data using configured mappings, terminology lookups, and PHI masking rules.
 import functools
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from typing import Any
 
 from imednet.models.engine import ResourceRegistry
 from imednet.models.sdtm import (
+    TransactionalSdtmSequencer,
     format_variable_name,
     normalize_naming_convention,
     resolve_sdtm_domain,
@@ -249,7 +250,8 @@ class CentralizedMapper:
         naming_convention: str | None = None,
         as_sdtm: bool = False,
         sdtm_domain: str | None = None,
-        seq_counters: dict[str, int] | None = None,
+        include_deleted: bool = False,
+        seq_counters: MutableMapping[str, int] | TransactionalSdtmSequencer | None = None,
     ):
         """Initialize the mapper.
 
@@ -261,7 +263,8 @@ class CentralizedMapper:
             naming_convention: Optional key convention ('snake_case', 'camelCase', 'sdtm').
             as_sdtm: When True, transform records directly into CDISC SDTM domain rows.
             sdtm_domain: Optional SDTM domain code (e.g. 'AE', 'VS', 'DM').
-            seq_counters: Optional per-USUBJID sequence counter map shared across batches.
+            include_deleted: When False, exclude voided/deleted and incomplete draft records.
+            seq_counters: Optional TransactionalSdtmSequencer or sequence map shared across batches.
         """
         self.mode = mode
         self.post_processor = post_processor
@@ -273,7 +276,10 @@ class CentralizedMapper:
             else None
         )
         self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
-        self._seq_counters: dict[str, int] = seq_counters if seq_counters is not None else {}
+        self.include_deleted = bool(include_deleted)
+        self._seq_counters: MutableMapping[str, int] | TransactionalSdtmSequencer = (
+            seq_counters if seq_counters is not None else TransactionalSdtmSequencer()
+        )
         self._pipeline_cache: dict[str, Any] = {}
         self._sens_snapshot: frozenset[str] = frozenset()
         self._exempt_snapshot: frozenset[str] = frozenset()
@@ -381,21 +387,15 @@ class CentralizedMapper:
                 [record],
                 domain=target_domain,
                 study_key=sk,
-                include_deleted=True,
+                include_deleted=self.include_deleted,
                 mask_phi=self.mask_phi,
                 seq_counters=self._seq_counters,
                 phi_keys=pipeline_phi_keys or None,
                 pipeline=active_pipeline if has_active_rules else None,
             )
-            mapped_sdtm = (
-                sdtm_rows[0]
-                if sdtm_rows
-                else {
-                    "STUDYID": sk,
-                    "DOMAIN": target_domain,
-                    "USUBJID": "",
-                }
-            )
+            if not sdtm_rows:
+                return {}
+            mapped_sdtm = sdtm_rows[0]
             if self.post_processor:
                 mapped_sdtm = self.post_processor(mapped_sdtm)
             return mapped_sdtm

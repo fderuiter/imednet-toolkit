@@ -13,8 +13,14 @@ from imednet.models.standards import (
 
 
 def test_profile_registry_contains_general_drug_and_device_profiles() -> None:
-    """Test that profile registry contains general drug and device profiles."""
-    assert PROFILE_REGISTRY.list_profiles() == ["device", "drug", "general"]
+    """Test that profile registry contains general, drug, biologic, vaccine, and device profiles."""
+    assert PROFILE_REGISTRY.list_profiles() == [
+        "biologic",
+        "device",
+        "drug",
+        "general",
+        "vaccine",
+    ]
 
 
 def test_drug_profile_enforces_ae_decod_relationship_and_ctcae_grades() -> None:

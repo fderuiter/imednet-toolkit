@@ -98,10 +98,14 @@ from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
 from imednet.models.standards import (
+    _SDTM_RECORDS_SORT,
     SDTM_DOMAIN_SPECS,
     StandardsProfile,
     StandardsReadinessReport,
     StandardsReadinessValidator,
+    TransactionalSdtmSequencer,
+    is_active_clinical_record,
+    iter_staged_sdtm_records,
     normalize_naming_convention,
     resolve_sdtm_domain,
     resolve_standards_profile,
@@ -373,7 +377,8 @@ class SinkConfig:
             except KeyError as exc:
                 raise ValueError(
                     f"Unknown standards_profile '{self.standards_profile}'. "
-                    "Expected 'general', 'drug', 'device', or a StandardsProfile instance."
+                    "Expected 'general', 'drug', 'biologic', 'vaccine', 'device', "
+                    "or a StandardsProfile instance."
                 ) from exc
             if isinstance(self.standards_profile, str):
                 self.standards_profile = resolved_prof.profile_name
@@ -1117,7 +1122,12 @@ def evaluate_standards_readiness(
     cdash_warnings: list[str] = []
     seen_cdash: set[tuple[str, str]] = set()
 
+    include_deleted = (
+        bool(getattr(config, "include_deleted", False)) if config is not None else False
+    )
     for rec in records:
+        if not include_deleted and not is_active_clinical_record(rec):
+            continue
         domain, raw_data, canonical = _extract_record_for_standards(
             rec,
             configured_domain=cfg_domain,
@@ -1149,17 +1159,30 @@ def apply_quality_gate(
     *,
     variables: Iterable[Any] | None = None,
     forms: Iterable[Any] | None = None,
+    _defer_standards_to_batch: bool = False,
 ) -> Iterator[Any]:
     """Filter records based on schema readiness and optional CDASH/SDTM readiness rules."""
     cfg_profile = getattr(config, "standards_profile", None)
     cfg_min_std = getattr(config, "min_standards_score", None)
     cfg_domain = getattr(config, "sdtm_domain", None)
+    cfg_mask_phi = getattr(config, "mask_phi", True) is not False
+    cfg_include_deleted = getattr(config, "include_deleted", False) is True
+    extra = getattr(config, "extra", None)
+    lookups: dict[str, dict[str, str]] | None = None
+    if isinstance(extra, Mapping):
+        maybe_lookups = extra.get("terminology_lookups")
+        if isinstance(maybe_lookups, dict):
+            lookups = maybe_lookups
 
-    if not config.quality_gate_enabled and cfg_profile is None:
+    has_std_gate = (cfg_profile is not None or cfg_min_std is not None) and (
+        not _defer_standards_to_batch
+    )
+
+    if not config.quality_gate_enabled and not has_std_gate and cfg_profile is None:
         yield from records
         return
 
-    if not config.quality_gate_enabled:
+    if not config.quality_gate_enabled and not has_std_gate:
         seen_cdash: set[tuple[str, str]] = set()
         for record in records:
             domain, raw_data, _ = _extract_record_for_standards(
@@ -1171,8 +1194,57 @@ def apply_quality_gate(
                     seen_cdash.add(pair)
                     valid_cdash, cdash_msg = validate_cdash_variable(str(field_key), domain)
                     if not valid_cdash and cdash_msg:
-                        logger.warning("CDASH naming warning (%s): %s", domain, cdash_msg)
+                        logger.warning(
+                            "CDASH naming warning (%s): %s",
+                            domain,
+                            mask_clinical_phi(cdash_msg) if cfg_mask_phi else cdash_msg,
+                        )
             yield record
+        return
+
+    if not config.quality_gate_enabled and has_std_gate:
+        std_only_validator = StandardsReadinessValidator(resolve_standards_profile(cfg_profile))
+        std_only_threshold = float(cfg_min_std) if cfg_min_std is not None else 100.0
+        seen_std_cdash: set[tuple[str, str]] = set()
+        dropped_std = 0
+        for record in records:
+            if not cfg_include_deleted and not is_active_clinical_record(record):
+                dropped_std += 1
+                continue
+            dom, raw_data, canonical = _extract_record_for_standards(
+                record, configured_domain=cfg_domain
+            )
+            for field_key in raw_data:
+                pair = (dom, str(field_key))
+                if pair not in seen_std_cdash:
+                    seen_std_cdash.add(pair)
+                    valid_cdash, cdash_msg = validate_cdash_variable(str(field_key), dom)
+                    if not valid_cdash and cdash_msg:
+                        logger.warning(
+                            "CDASH naming warning (%s): %s",
+                            dom,
+                            mask_clinical_phi(cdash_msg) if cfg_mask_phi else cdash_msg,
+                        )
+            rec_report = std_only_validator.score_records(
+                records_by_domain={dom: [canonical]},
+                terminology_lookups=lookups,
+            )
+            has_errors = any(v.severity.upper() == "ERROR" for v in rec_report.violations)
+            if has_errors or rec_report.score < std_only_threshold:
+                raw_reasons = "; ".join(v.message for v in rec_report.violations)
+                logged_reasons = mask_clinical_phi(raw_reasons) if cfg_mask_phi else raw_reasons
+                logger.info(
+                    "Dropped record %s (Standards Score: %.1f, threshold: %.1f). Reasons: %s",
+                    extract_record_id(record) or "Unknown",
+                    rec_report.score,
+                    std_only_threshold,
+                    logged_reasons,
+                )
+                dropped_std += 1
+                continue
+            yield record
+        if dropped_std > 0:
+            logger.info("Quality gate dropped %d records in total.", dropped_std)
         return
 
     from imednet.core.context import reset_study_context, set_study_context
@@ -1216,7 +1288,7 @@ def apply_quality_gate(
 
     std_validator = (
         StandardsReadinessValidator(resolve_standards_profile(cfg_profile))
-        if cfg_profile is not None
+        if (cfg_profile is not None or cfg_min_std is not None)
         else None
     )
     seen_gate_cdash: set[tuple[str, str]] = set()
@@ -1224,6 +1296,13 @@ def apply_quality_gate(
     dropped_count = 0
 
     for record in records:
+        if (
+            not cfg_include_deleted
+            and (std_validator is not None or getattr(config, "as_sdtm", False))
+            and not is_active_clinical_record(record)
+        ):
+            dropped_count += 1
+            continue
         if hasattr(record, "model_dump"):
             rec_dict = record.model_dump()
         elif hasattr(record, "__dict__"):
@@ -1264,12 +1343,13 @@ def apply_quality_gate(
             reset_study_context(ctx_token)
 
         if score < config.min_schema_readiness_score:
+            joined_reasons = "; ".join(reasons)
             logger.info(
                 "Dropped record %s (Score: %.1f < %.1f). Reasons: %s",
                 rec_dict.get("record_id", "Unknown"),
                 score,
                 config.min_schema_readiness_score,
-                "; ".join(reasons),
+                mask_clinical_phi(joined_reasons) if cfg_mask_phi else joined_reasons,
             )
             dropped_count += 1
             continue
@@ -1284,21 +1364,32 @@ def apply_quality_gate(
                         str(field_key), domain_for_cdash
                     )
                     if not valid_cdash and cdash_msg:
-                        logger.warning("CDASH naming warning (%s): %s", domain_for_cdash, cdash_msg)
+                        logger.warning(
+                            "CDASH naming warning (%s): %s",
+                            domain_for_cdash,
+                            mask_clinical_phi(cdash_msg) if cfg_mask_phi else cdash_msg,
+                        )
 
-        if std_validator is not None and cfg_min_std is None:
+        if std_validator is not None:
             dom, _, canonical = _extract_record_for_standards(
                 record, configured_domain=cfg_domain or str(fk)
             )
-            rec_report = std_validator.score_records(records_by_domain={dom: [canonical]})
-            if rec_report.score < config.min_schema_readiness_score:
-                std_reasons = [v.message for v in rec_report.violations]
+            rec_report = std_validator.score_records(
+                records_by_domain={dom: [canonical]},
+                terminology_lookups=lookups,
+            )
+            std_threshold = (
+                float(cfg_min_std) if cfg_min_std is not None else config.min_schema_readiness_score
+            )
+            has_std_errors = any(v.severity.upper() == "ERROR" for v in rec_report.violations)
+            if has_std_errors or rec_report.score < std_threshold:
+                std_reasons = "; ".join(v.message for v in rec_report.violations)
                 logger.info(
-                    "Dropped record %s (Standards Score: %.1f < %.1f). Reasons: %s",
+                    "Dropped record %s (Standards Score: %.1f, threshold: %.1f). Reasons: %s",
                     rec_dict.get("record_id", "Unknown"),
                     rec_report.score,
-                    config.min_schema_readiness_score,
-                    "; ".join(std_reasons),
+                    std_threshold,
+                    mask_clinical_phi(std_reasons) if cfg_mask_phi else std_reasons,
                 )
                 dropped_count += 1
                 continue
@@ -1894,6 +1985,7 @@ def iter_filtered_sdk_records(
     record_filter: dict[str, Any] | str | Sequence[str] | None = None,
     record_data_filter: str | None = None,
     exclude_deleted_upstream: bool = True,
+    sort: str | None = None,
 ) -> Iterator[Any]:
     """Lazily yield records from ``sdk.records.list`` across one or more AND-safe branches."""
     validated_rdf = (
@@ -1914,11 +2006,29 @@ def iter_filtered_sdk_records(
     seen_ids: set[Any] = set()
 
     for branch, post_predicate in resolved:
-        page_iter = sdk.records.list(
-            study_key=study_key,
-            record_data_filter=validated_rdf,
-            **branch,
-        )
+        call_kwargs = dict(branch)
+        if sort is not None and "sort" not in call_kwargs:
+            try:
+                page_iter = sdk.records.list(
+                    study_key=study_key,
+                    record_data_filter=validated_rdf,
+                    sort=sort,
+                    **call_kwargs,
+                )
+            except TypeError as exc:
+                if "sort" not in str(exc):
+                    raise
+                page_iter = sdk.records.list(
+                    study_key=study_key,
+                    record_data_filter=validated_rdf,
+                    **call_kwargs,
+                )
+        else:
+            page_iter = sdk.records.list(
+                study_key=study_key,
+                record_data_filter=validated_rdf,
+                **call_kwargs,
+            )
         for record in page_iter:
             if post_predicate is not None and not post_predicate(record):
                 continue
@@ -1937,6 +2047,8 @@ def _extract_safe_config_options(config: Any) -> dict[str, Any]:
     incremental = getattr(config, "incremental", False) is True
     include_deleted = getattr(config, "include_deleted", False) is True
     idempotent = getattr(config, "idempotent", True) is not False
+    quality_gate_enabled = getattr(config, "quality_gate_enabled", False) is True
+    mask_phi = getattr(config, "mask_phi", True) is not False
 
     raw_batch_size = getattr(config, "batch_size", _DEFAULT_BATCH_SIZE)
     batch_size = (
@@ -2033,6 +2145,8 @@ def _extract_safe_config_options(config: Any) -> dict[str, Any]:
         "incremental": incremental,
         "include_deleted": include_deleted,
         "idempotent": idempotent,
+        "quality_gate_enabled": quality_gate_enabled,
+        "mask_phi": mask_phi,
         "batch_size": batch_size,
         "max_buffered_records": max_buffered_records,
         "modified_since": modified_since,
@@ -2059,7 +2173,7 @@ def _enforce_batch_standards_readiness(
     min_standards_score: float | None,
     sdtm_domain: str | None,
 ) -> None:
-    """Evaluate batch standards readiness, log masked warnings, and enforce min_standards_score."""
+    """Evaluate unmasked active batch standards readiness, mask logs, and reject ERRORs/low scores."""
     report = evaluate_standards_readiness(
         batch,
         study_key=study_key,
@@ -2068,19 +2182,30 @@ def _enforce_batch_standards_readiness(
         sdtm_domain=sdtm_domain,
     )
     profile_obj = resolve_standards_profile(standards_profile)
+    should_mask = getattr(config, "mask_phi", True) is not False
     for warning_msg in report.warnings:
         logger.warning(
             "Standards readiness warning in batch %s: %s",
             batch_id,
-            mask_clinical_phi(warning_msg) if config.mask_phi else warning_msg,
+            mask_clinical_phi(warning_msg) if should_mask else warning_msg,
         )
-    if min_standards_score is not None and report.score < min_standards_score:
-        error_fields = sorted({v.field for v in report.violations if v.severity.upper() == "ERROR"})
-        detail = f" (violating fields: {', '.join(error_fields)})" if error_fields else ""
+    error_fields = sorted({v.field for v in report.violations if v.severity.upper() == "ERROR"})
+    below_score = min_standards_score is not None and report.score < min_standards_score
+    if error_fields or below_score:
+        masked_fields = [
+            mask_clinical_phi(field_name) if should_mask else field_name
+            for field_name in error_fields
+        ]
+        detail = f" (violating fields: {', '.join(masked_fields)})" if masked_fields else ""
+        if below_score and min_standards_score is not None:
+            threshold_msg = (
+                f"score={report.score:.1f} < min_standards_score={min_standards_score:.1f}"
+            )
+        else:
+            threshold_msg = f"score={report.score:.1f}, error_violations={len(error_fields)}"
         raise ExportError(
             f"Standards readiness check failed for batch '{batch_id}' "
-            f"(profile='{profile_obj.profile_name}', score={report.score:.1f} < "
-            f"min_standards_score={min_standards_score:.1f}){detail}"
+            f"(profile='{profile_obj.profile_name}', {threshold_msg}){detail}"
         )
 
 
@@ -2145,6 +2270,22 @@ def run_streaming_export(
             sink_obj = sink()
         stack.enter_context(sink_obj)
 
+        sdtm_sequencer: TransactionalSdtmSequencer | None = None
+        if opts["as_sdtm"]:
+            existing_seq = getattr(sink_obj, "_sdtm_sequencer", None)
+            if isinstance(existing_seq, TransactionalSdtmSequencer):
+                sdtm_sequencer = existing_seq
+            else:
+                sdtm_sequencer = TransactionalSdtmSequencer()
+                with contextlib.suppress(Exception):
+                    sink_obj._sdtm_sequencer = sdtm_sequencer  # type: ignore[attr-defined]
+            inner_sink = getattr(sink_obj, "_inner", None)
+            if inner_sink is not None:
+                with contextlib.suppress(Exception):
+                    inner_sink._sdtm_sequencer = sdtm_sequencer
+            if tx is not None and isinstance(tx.get("metadata"), Mapping):
+                sdtm_sequencer.hydrate_from_metadata(tx.get("metadata"))
+
         reconcile_voided = (
             (not opts["include_deleted"])
             and opts["idempotent"]
@@ -2162,6 +2303,7 @@ def run_streaming_export(
                 record_filter=opts["record_filter"],
                 record_data_filter=opts["record_data_filter"],
                 exclude_deleted_upstream=exclude_deleted_upstream,
+                sort=_SDTM_RECORDS_SORT if opts["as_sdtm"] else None,
             )
 
         pending_voided: list[Any] = []
@@ -2174,19 +2316,22 @@ def run_streaming_export(
             for rec in raw_records:
                 rec_ts = extract_record_timestamp(rec)
 
-                if not opts["include_deleted"] and is_record_deleted(rec):
-                    if reconcile_voided:
-                        if rec_ts is not None:
-                            exported_timestamps.append(rec_ts)
-                        pending_voided.append(rec)
-                        if len(pending_voided) >= opts["batch_size"]:
-                            total_reconciled += sink_obj.reconcile_deleted(
-                                list(pending_voided),
-                                batch_id=f"{prefix}/voided/{voided_batch_idx}",
-                            )
-                            pending_voided.clear()
-                            voided_batch_idx += 1
-                    continue
+                if not opts["include_deleted"]:
+                    if is_record_deleted(rec):
+                        if reconcile_voided:
+                            if rec_ts is not None:
+                                exported_timestamps.append(rec_ts)
+                            pending_voided.append(rec)
+                            if len(pending_voided) >= opts["batch_size"]:
+                                total_reconciled += sink_obj.reconcile_deleted(
+                                    list(pending_voided),
+                                    batch_id=f"{prefix}/voided/{voided_batch_idx}",
+                                )
+                                pending_voided.clear()
+                                voided_batch_idx += 1
+                        continue
+                    if opts["as_sdtm"] and not is_active_clinical_record(rec):
+                        continue
 
                 pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
                 yield rec
@@ -2217,7 +2362,30 @@ def run_streaming_export(
                     exported_timestamps.append(rec_ts)
                 yield rec
 
-        filtered_records = _track_accepted(gate_fn(sdk, study_key, _observe_and_route(), config))
+        gated_iter: Iterable[Any]
+        if gate_fn is apply_quality_gate and not opts["quality_gate_enabled"]:
+            gated_iter = apply_quality_gate(
+                sdk,
+                study_key,
+                _observe_and_route(),
+                config,
+                _defer_standards_to_batch=True,
+            )
+        else:
+            gated_iter = gate_fn(sdk, study_key, _observe_and_route(), config)
+
+        filtered_records: Iterable[Any] = _track_accepted(gated_iter)
+        if opts["as_sdtm"]:
+            max_buf = resolve_max_buffered_records(opts["batch_size"], opts["max_buffered_records"])
+            filtered_records = iter_staged_sdtm_records(
+                filtered_records,
+                study_key=study_key,
+                sdtm_domain=opts["sdtm_domain"],
+                include_deleted=opts["include_deleted"],
+                mask_phi=opts["mask_phi"],
+                max_buffered_records=max_buf,
+            )
+
         check_standards = (
             opts["standards_profile"] is not None or opts["min_standards_score"] is not None
         )
@@ -2233,7 +2401,11 @@ def run_streaming_export(
                     min_standards_score=opts["min_standards_score"],
                     sdtm_domain=opts["sdtm_domain"],
                 )
-            total_written += sink_obj.write_batch(batch, batch_id=batch_id)
+            if sdtm_sequencer is not None:
+                with sdtm_sequencer.stage():
+                    total_written += sink_obj.write_batch(batch, batch_id=batch_id)
+            else:
+                total_written += sink_obj.write_batch(batch, batch_id=batch_id)
 
         if pending_voided:
             total_reconciled += sink_obj.reconcile_deleted(
@@ -2259,6 +2431,12 @@ def run_streaming_export(
             tx["records_processed"] = total_written + total_reconciled
             if max_ts is not None:
                 tx["new_timestamp"] = max_ts
+            if sdtm_sequencer is not None:
+                tx_meta = tx.get("metadata")
+                if not isinstance(tx_meta, dict):
+                    tx_meta = {}
+                    tx["metadata"] = tx_meta
+                sdtm_sequencer.write_to_metadata(tx_meta)
 
     return total_written
 

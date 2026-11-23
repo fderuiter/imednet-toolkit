@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import hashlib
+import hmac
 import math
 import re
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -30,18 +33,293 @@ _ISO_YEAR_MONTH_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
 _PARTIAL_UNKNOWN_YEAR_RE = re.compile(r"^(\d{4})-(?:UN|UNK|-)", re.IGNORECASE)
 _NON_ALNUM_RE = re.compile(r"[^a-zA-Z0-9]+")
 _UNSET_PIPELINE: Any = object()
+SDTM_SEQUENCER_METADATA_KEY = "sdtm_sequencer"
+_DEFAULT_SDTM_MAX_BUFFERED_RECORDS = 5_000
+
+_EXCLUDED_SDTM_STATUSES: frozenset[str] = frozenset(
+    {
+        "DELETED",
+        "RECORD INCOMPLETE",
+        "INCOMPLETE",
+        "PARTIAL",
+    }
+)
 
 
 def _is_deleted_record(rec: Any) -> bool:
-    """Return True if an EDC record or mapping is marked deleted/voided."""
+    """Return True if an EDC record or mapping is voided, deleted, or an incomplete draft."""
+    if not isinstance(rec, Mapping) and getattr(rec, "is_deleted", None) is True:
+        return True
+
     val = rec.get("deleted") if isinstance(rec, Mapping) else getattr(rec, "deleted", None)
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, (int, float)):
-        return bool(val)
-    if isinstance(val, str):
-        return val.strip().lower() in {"true", "1", "yes", "y"}
+    if isinstance(val, bool) and val:
+        return True
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and bool(val):
+        return True
+    if isinstance(val, str) and val.strip().lower() in {"true", "1", "yes", "y"}:
+        return True
+
+    if isinstance(rec, Mapping):
+        raw_status = (
+            rec.get("recordStatus")
+            if rec.get("recordStatus") is not None
+            else rec.get("record_status")
+        )
+    else:
+        raw_status = getattr(rec, "record_status", None)
+        if raw_status is None:
+            raw_status = getattr(rec, "recordStatus", None)
+
+    if raw_status is not None and hasattr(raw_status, "value"):
+        raw_status = raw_status.value
+    if isinstance(raw_status, str):
+        norm_status = " ".join(
+            raw_status.strip().upper().replace("_", " ").replace("-", " ").split()
+        )
+        if norm_status in _EXCLUDED_SDTM_STATUSES:
+            return True
     return False
+
+
+def is_active_clinical_record(rec: Any) -> bool:
+    """Return True when *rec* is an active clinical record eligible for SDTM/readiness scoring."""
+    return not _is_deleted_record(rec)
+
+
+def _canonical_sdtm_record_id(raw_id: Any) -> str | None:
+    """Normalize a non-empty record identifier to string, or None when absent."""
+    if raw_id is None or isinstance(raw_id, bool):
+        return None
+    s = str(raw_id).strip()
+    return s if s else None
+
+
+def _sdtm_digest_key(prefix: str, parts: Sequence[str], *, secret: bytes | None = None) -> str:
+    """Compute a deterministic SHA-256 (or HMAC-SHA256) hex digest so PHI never persists."""
+    payload = f"{prefix}|" + "|".join(f"{len(part)}:{part}" for part in parts)
+    encoded = payload.encode("utf-8")
+    if secret is not None:
+        return hmac.new(secret, encoded, hashlib.sha256).hexdigest()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class TransactionalSdtmSequencer:
+    """Transactional SDTM sequence tracker scoped to ``(STUDYID, DOMAIN, USUBJID)``.
+
+    Tracks ``(STUDYID, DOMAIN, USUBJID)`` high-water marks and ``(STUDYID, DOMAIN, record_id)``
+    bindings using SHA-256 (or HMAC-SHA256) digests so PHI never persists in ledger metadata.
+    Supports nested transactional staging via :meth:`begin`, :meth:`commit`, :meth:`rollback`,
+    and :meth:`stage`.
+    """
+
+    def __init__(
+        self,
+        *,
+        counters: Mapping[str, int] | None = None,
+        record_bindings: Mapping[str, int] | None = None,
+        secret: bytes | str | None = None,
+    ) -> None:
+        """Initialize the transactional SDTM sequencer with optional hydrated state."""
+        if isinstance(secret, str):
+            self._secret: bytes | None = secret.encode("utf-8")
+        else:
+            self._secret = secret
+        self._counters: dict[str, int] = {
+            str(k): int(v)
+            for k, v in (counters or {}).items()
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0
+        }
+        self._bindings: dict[str, int] = {
+            str(k): int(v)
+            for k, v in (record_bindings or {}).items()
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0
+        }
+        self._stage_stack: list[tuple[dict[str, int], dict[str, int]]] = []
+
+    @property
+    def has_staged_changes(self) -> bool:
+        """Return True when one or more uncommitted staging scopes are active."""
+        return bool(self._stage_stack)
+
+    @property
+    def committed_counters(self) -> dict[str, int]:
+        """Return a snapshot of committed ``(STUDYID, DOMAIN, USUBJID)`` digest counters."""
+        base = self._stage_stack[0][0] if self._stage_stack else self._counters
+        return dict(base)
+
+    @property
+    def committed_bindings(self) -> dict[str, int]:
+        """Return a snapshot of committed ``(STUDYID, DOMAIN, record_id)`` digest bindings."""
+        base = self._stage_stack[0][1] if self._stage_stack else self._bindings
+        return dict(base)
+
+    def counter_digest(self, study_id: str, domain: str, usubjid: str) -> str:
+        """Return the SHA-256/HMAC digest for ``(STUDYID, DOMAIN, USUBJID)``."""
+        return _sdtm_digest_key(
+            "seq",
+            (
+                str(study_id or "").strip(),
+                str(domain or "").strip().upper(),
+                str(usubjid or "").strip(),
+            ),
+            secret=self._secret,
+        )
+
+    def record_digest(self, study_id: str, domain: str, record_id: Any) -> str | None:
+        """Return the SHA-256/HMAC digest for ``(STUDYID, DOMAIN, record_id)``, or None."""
+        rec_clean = _canonical_sdtm_record_id(record_id)
+        if rec_clean is None:
+            return None
+        return _sdtm_digest_key(
+            "rec",
+            (
+                str(study_id or "").strip(),
+                str(domain or "").strip().upper(),
+                rec_clean,
+            ),
+            secret=self._secret,
+        )
+
+    def assign_seq(
+        self,
+        study_id: str,
+        domain: str,
+        usubjid: str,
+        record_id: Any = None,
+    ) -> int:
+        """Return prior bound ``<DOM>SEQ`` for *record_id* or allocate the next sequence."""
+        cnt_key = self.counter_digest(study_id, domain, usubjid)
+        rec_key = self.record_digest(study_id, domain, record_id)
+        if rec_key is not None and rec_key in self._bindings:
+            bound_seq = self._bindings[rec_key]
+            if bound_seq > self._counters.get(cnt_key, 0):
+                self._counters[cnt_key] = bound_seq
+            return bound_seq
+
+        next_seq = self._counters.get(cnt_key, 0) + 1
+        self._counters[cnt_key] = next_seq
+        if rec_key is not None:
+            self._bindings[rec_key] = next_seq
+        return next_seq
+
+    def begin(self) -> None:
+        """Open a nested transactional staging scope."""
+        self._stage_stack.append((dict(self._counters), dict(self._bindings)))
+
+    def commit(self) -> None:
+        """Commit the innermost staging scope."""
+        if self._stage_stack:
+            self._stage_stack.pop()
+
+    def rollback(self) -> None:
+        """Roll back uncommitted sequence increments in the innermost staging scope."""
+        if self._stage_stack:
+            saved_counters, saved_bindings = self._stage_stack.pop()
+            self._counters = saved_counters
+            self._bindings = saved_bindings
+
+    @contextlib.contextmanager
+    def stage(self) -> Iterator[TransactionalSdtmSequencer]:
+        """Context manager that commits sequence deltas on success and rolls back on failure."""
+        self.begin()
+        try:
+            yield self
+        except BaseException:
+            self.rollback()
+            raise
+        else:
+            self.commit()
+
+    def to_metadata(self) -> dict[str, Any]:
+        """Serialize committed digest watermarks and bindings for PHI-safe ledger persistence."""
+        return {
+            "version": 1,
+            "algorithm": "hmac-sha256" if self._secret is not None else "sha256",
+            "counters": self.committed_counters,
+            "record_bindings": self.committed_bindings,
+        }
+
+    def write_to_metadata(self, metadata: MutableMapping[str, Any]) -> None:
+        """Persist committed digest state into ``metadata[SDTM_SEQUENCER_METADATA_KEY]``."""
+        metadata[SDTM_SEQUENCER_METADATA_KEY] = self.to_metadata()
+
+    def hydrate_from_metadata(self, metadata: Mapping[str, Any] | None) -> None:
+        """Merge persisted digest watermarks and bindings into this sequencer."""
+        if not isinstance(metadata, Mapping):
+            return
+        payload = metadata.get(SDTM_SEQUENCER_METADATA_KEY, metadata)
+        if not isinstance(payload, Mapping):
+            return
+        raw_counters = payload.get("counters")
+        if isinstance(raw_counters, Mapping):
+            for k, v in raw_counters.items():
+                if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                    key_str = str(k)
+                    if v > self._counters.get(key_str, 0):
+                        self._counters[key_str] = v
+        raw_bindings = payload.get("record_bindings")
+        if isinstance(raw_bindings, Mapping):
+            for k, v in raw_bindings.items():
+                if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                    self._bindings.setdefault(str(k), v)
+
+    @classmethod
+    def from_metadata(
+        cls,
+        metadata: Mapping[str, Any] | None,
+        *,
+        secret: bytes | str | None = None,
+    ) -> TransactionalSdtmSequencer:
+        """Hydrate a new :class:`TransactionalSdtmSequencer` from ledger metadata."""
+        seq = cls(secret=secret)
+        seq.hydrate_from_metadata(metadata)
+        return seq
+
+
+def _assign_sdtm_sequence(
+    seq_counters: MutableMapping[str, int] | TransactionalSdtmSequencer,
+    *,
+    study_id: str,
+    domain: str,
+    usubjid: str,
+    record_id: Any = None,
+) -> int:
+    """Assign or reuse ``<DOM>SEQ`` using either ``TransactionalSdtmSequencer`` or a dict."""
+    if isinstance(seq_counters, TransactionalSdtmSequencer):
+        return seq_counters.assign_seq(study_id, domain, usubjid, record_id)
+
+    cnt_key = _sdtm_digest_key(
+        "seq",
+        (
+            str(study_id or "").strip(),
+            str(domain or "").strip().upper(),
+            str(usubjid or "").strip(),
+        ),
+    )
+    rec_clean = _canonical_sdtm_record_id(record_id)
+    rec_key = (
+        _sdtm_digest_key(
+            "rec",
+            (
+                str(study_id or "").strip(),
+                str(domain or "").strip().upper(),
+                rec_clean,
+            ),
+        )
+        if rec_clean is not None
+        else None
+    )
+    if rec_key is not None and rec_key in seq_counters:
+        bound_seq = int(seq_counters[rec_key])
+        if bound_seq > int(seq_counters.get(cnt_key, 0)):
+            seq_counters[cnt_key] = bound_seq
+        return bound_seq
+
+    next_seq = int(seq_counters.get(cnt_key, 0)) + 1
+    seq_counters[cnt_key] = next_seq
+    if rec_key is not None:
+        seq_counters[rec_key] = next_seq
+    return next_seq
 
 
 def _parse_dtc_string(val_str: str) -> tuple[str, int | None]:
@@ -911,6 +1189,8 @@ class _PreparedSdtmRow:
     usubjid: str
     sort_key: tuple[tuple[int, str], tuple[tuple[int, str], ...], tuple[int, int, str], int]
     row: dict[str, Any]
+    record_id: str | None = None
+    source_record: Any = None
 
 
 class _SdtmNormalizer:
@@ -1325,21 +1605,53 @@ class _SdtmNormalizer:
             _record_id_sort_key(raw_record_id),
             orig_idx,
         )
-        return _PreparedSdtmRow(usubjid=usubjid, sort_key=sort_key, row=row)
+        return _PreparedSdtmRow(
+            usubjid=usubjid,
+            sort_key=sort_key,
+            row=row,
+            record_id=_canonical_sdtm_record_id(raw_record_id),
+            source_record=rec,
+        )
+
+    @staticmethod
+    def _is_non_missing_sdtm_value(val: Any) -> bool:
+        if val is None or val == "":
+            return False
+        return not (isinstance(val, float) and math.isnan(val))
 
     def finalize_subject_group(
         self,
         group: list[_PreparedSdtmRow],
-        seq_counters: dict[str, int],
+        seq_counters: MutableMapping[str, int] | TransactionalSdtmSequencer,
     ) -> list[dict[str, Any]]:
-        """Sort a Subject's normalized rows and stamp sequential <DOM>SEQ values."""
+        """Sort a Subject's normalized rows, consolidate DM per USUBJID, or stamp <DOM>SEQ."""
         group.sort(key=lambda item: item.sort_key)
+        if not self.include_seq:
+            merged_by_usubjid: dict[str, dict[str, Any]] = {}
+            for item in group:
+                item.row.pop("DMSEQ", None)
+                item.row.pop("dmseq", None)
+                existing = merged_by_usubjid.get(item.usubjid)
+                if existing is None:
+                    merged_by_usubjid[item.usubjid] = dict(item.row)
+                else:
+                    for key, val in item.row.items():
+                        if key in ("STUDYID", "DOMAIN", "USUBJID"):
+                            continue
+                        if self._is_non_missing_sdtm_value(val) or key not in existing:
+                            existing[key] = val
+            return list(merged_by_usubjid.values())
+
         rows: list[dict[str, Any]] = []
         for item in group:
-            if self.include_seq:
-                next_seq = seq_counters.get(item.usubjid, 0) + 1
-                seq_counters[item.usubjid] = next_seq
-                item.row[self.seq_var] = next_seq
+            next_seq = _assign_sdtm_sequence(
+                seq_counters,
+                study_id=self.study_key,
+                domain=self.domain_clean,
+                usubjid=item.usubjid,
+                record_id=item.record_id,
+            )
+            item.row[self.seq_var] = next_seq
             rows.append(item.row)
         return rows
 
@@ -1358,10 +1670,13 @@ def _iter_sorted_sdtm_frames(
     normalizer: _SdtmNormalizer,
     *,
     chunk_size: int,
-    seq_counters: dict[str, int],
+    seq_counters: MutableMapping[str, int] | TransactionalSdtmSequencer,
     source_is_ordered: bool = False,
+    max_buffered_records: int = _DEFAULT_SDTM_MAX_BUFFERED_RECORDS,
 ) -> Iterator[pd.DataFrame]:
     """Yield bounded SDTM DataFrames grouped by USUBJID with continuous sequence counters."""
+    effective_cap = max(1, chunk_size, max_buffered_records)
+
     if isinstance(records, (list, tuple)):
         grouped: dict[str, list[_PreparedSdtmRow]] = {}
         for idx, rec in enumerate(records):
@@ -1388,6 +1703,22 @@ def _iter_sorted_sdtm_frames(
     rec_iter = iter(records)
     emit_buffer: list[dict[str, Any]] = []
 
+    def _flush_oldest_group() -> Iterator[pd.DataFrame]:
+        nonlocal staged_total_rows, yielded_any, emit_buffer
+        if not staged_groups:
+            return
+        target_subj = max(staged_groups, key=lambda s: len(staged_groups[s]))
+        flushed_group = staged_groups.pop(target_subj)
+        if target_subj in group_order:
+            group_order.remove(target_subj)
+        staged_total_rows -= len(flushed_group)
+        emit_buffer.extend(normalizer.finalize_subject_group(flushed_group, seq_counters))
+        while len(emit_buffer) >= chunk_size:
+            batch = emit_buffer[:chunk_size]
+            emit_buffer = emit_buffer[chunk_size:]
+            yielded_any = True
+            yield normalizer.rows_to_dataframe(batch)
+
     for rec in rec_iter:
         prepared = normalizer.prepare_record(rec, orig_idx)
         orig_idx += 1
@@ -1400,13 +1731,20 @@ def _iter_sorted_sdtm_frames(
                 and prepared.usubjid != last_usubjid
                 and (prepared.usubjid < last_usubjid or prepared.usubjid in staged_groups)
             ):
-                # Ungrouped input detected prior to emitting any chunk: drain and sort all subjects.
+                # Ungrouped input detected: stage within max_buffered_records ceiling.
                 staged_groups.setdefault(prepared.usubjid, []).append(prepared)
+                staged_total_rows += 1
+                while staged_total_rows >= effective_cap:
+                    yield from _flush_oldest_group()
                 for tail_rec in rec_iter:
                     tail_prepared = normalizer.prepare_record(tail_rec, orig_idx)
                     orig_idx += 1
-                    if tail_prepared is not None:
-                        staged_groups.setdefault(tail_prepared.usubjid, []).append(tail_prepared)
+                    if tail_prepared is None:
+                        continue
+                    staged_groups.setdefault(tail_prepared.usubjid, []).append(tail_prepared)
+                    staged_total_rows += 1
+                    while staged_total_rows >= effective_cap:
+                        yield from _flush_oldest_group()
                 for usubjid in sorted(staged_groups):
                     emit_buffer.extend(
                         normalizer.finalize_subject_group(staged_groups[usubjid], seq_counters)
@@ -1440,21 +1778,31 @@ def _iter_sorted_sdtm_frames(
                     emit_buffer = emit_buffer[chunk_size:]
                     yielded_any = True
                     yield normalizer.rows_to_dataframe(batch)
+            elif staged_total_rows >= effective_cap:
+                yield from _flush_oldest_group()
+                last_usubjid = group_order[-1] if group_order else None
             continue
 
         # Already streaming ordered Subject groups
-        assert last_usubjid is not None
-        if prepared.usubjid != last_usubjid:
-            finished_group = staged_groups.pop(last_usubjid)
-            emit_buffer.extend(normalizer.finalize_subject_group(finished_group, seq_counters))
+        if last_usubjid is not None and prepared.usubjid != last_usubjid:
+            if last_usubjid in staged_groups:
+                finished_group = staged_groups.pop(last_usubjid)
+                staged_total_rows -= len(finished_group)
+                emit_buffer.extend(normalizer.finalize_subject_group(finished_group, seq_counters))
             staged_groups[prepared.usubjid] = [prepared]
+            staged_total_rows += 1
             last_usubjid = prepared.usubjid
             while len(emit_buffer) >= chunk_size:
                 batch = emit_buffer[:chunk_size]
                 emit_buffer = emit_buffer[chunk_size:]
                 yield normalizer.rows_to_dataframe(batch)
         else:
-            staged_groups[last_usubjid].append(prepared)
+            last_usubjid = prepared.usubjid
+            staged_groups.setdefault(last_usubjid, []).append(prepared)
+            staged_total_rows += 1
+            if staged_total_rows >= effective_cap:
+                yield from _flush_oldest_group()
+                last_usubjid = next(iter(staged_groups), None)
 
     for rem_subj in sorted(staged_groups) if not yielded_any else list(staged_groups):
         emit_buffer.extend(normalizer.finalize_subject_group(staged_groups[rem_subj], seq_counters))
@@ -1464,6 +1812,169 @@ def _iter_sorted_sdtm_frames(
         yield normalizer.rows_to_dataframe(batch)
     if emit_buffer:
         yield normalizer.rows_to_dataframe(emit_buffer)
+
+
+def _consolidate_dm_source_records(group: list[_PreparedSdtmRow]) -> Any:
+    """Consolidate sorted DM source records for one USUBJID into a single Record or dict."""
+    if len(group) == 1:
+        return group[0].source_record
+
+    merged_data: dict[str, Any] = {}
+    latest_rec = group[-1].source_record
+    for item in group:
+        src = item.source_record
+        if isinstance(src, Mapping):
+            nested = src.get("record_data") or src.get("recordData")
+            if isinstance(nested, Mapping):
+                for k, v in nested.items():
+                    if k.upper() == "DMSEQ":
+                        continue
+                    if _SdtmNormalizer._is_non_missing_sdtm_value(v) or k not in merged_data:
+                        merged_data[k] = v
+            else:
+                for k, v in src.items():
+                    if k in ("record_id", "recordId", "DMSEQ", "dmseq"):
+                        continue
+                    if _SdtmNormalizer._is_non_missing_sdtm_value(v) or k not in merged_data:
+                        merged_data[k] = v
+        else:
+            rd = getattr(src, "record_data", None)
+            if isinstance(rd, Mapping):
+                for k, v in rd.items():
+                    if k.upper() == "DMSEQ":
+                        continue
+                    if _SdtmNormalizer._is_non_missing_sdtm_value(v) or k not in merged_data:
+                        merged_data[k] = v
+
+    model_copy = getattr(latest_rec, "model_copy", None)
+    if callable(model_copy) and hasattr(latest_rec, "record_data"):
+        return model_copy(update={"record_data": merged_data})
+    if isinstance(latest_rec, Mapping):
+        cloned = dict(latest_rec)
+        cloned.pop("DMSEQ", None)
+        cloned.pop("dmseq", None)
+        if "record_data" in cloned and isinstance(cloned["record_data"], Mapping):
+            cloned["record_data"] = merged_data
+        elif "recordData" in cloned and isinstance(cloned["recordData"], Mapping):
+            cloned["recordData"] = merged_data
+        else:
+            cloned.update(merged_data)
+        return cloned
+    return latest_rec
+
+
+def iter_staged_sdtm_records(
+    records: Iterable[Any],
+    *,
+    study_key: str | None = None,
+    sdtm_domain: str | None = None,
+    include_deleted: bool = False,
+    mask_phi: bool = True,
+    max_buffered_records: int = _DEFAULT_SDTM_MAX_BUFFERED_RECORDS,
+    source_is_ordered: bool = False,
+    phi_keys: Iterable[str] | None = None,
+    registry: SensitivityRegistry | None = None,
+    pipeline: Any = _UNSET_PIPELINE,
+) -> Iterator[Any]:
+    """Stage clinical records by ``(DOMAIN, USUBJID)`` in chronological ``--DTC`` order.
+
+    Honors ``max_buffered_records`` when draining ungrouped streams, drops deleted/draft
+    records when ``include_deleted=False``, and consolidates ``DM`` revisions per ``USUBJID``
+    prior to batch chunking so streaming sinks emit identical sequences to ``RecordMapper``.
+    """
+    effective_cap = max(1, max_buffered_records)
+    resolved_study_key = study_key or ""
+    resolved_pipeline = _resolve_sdtm_pipeline(resolved_study_key, pipeline, _UNSET_PIPELINE)
+    normalizers: dict[str, _SdtmNormalizer] = {}
+
+    def _get_normalizer(dom_code: str) -> _SdtmNormalizer:
+        norm = normalizers.get(dom_code)
+        if norm is None:
+            norm = _SdtmNormalizer(
+                domain=dom_code,
+                study_key=resolved_study_key,
+                include_deleted=include_deleted,
+                mask_phi=mask_phi,
+                pipeline=resolved_pipeline,
+                phi_keys=phi_keys,
+                registry=registry,
+            )
+            normalizers[dom_code] = norm
+        return norm
+
+    def _resolve_rec_domain(rec: Any) -> str:
+        if sdtm_domain:
+            return resolve_sdtm_domain(sdtm_domain, fallback="AE")
+        if isinstance(rec, Mapping):
+            raw_dom = (
+                rec.get("DOMAIN") or rec.get("domain") or rec.get("form_key") or rec.get("formKey")
+            )
+        else:
+            raw_dom = getattr(rec, "form_key", None) or getattr(rec, "formKey", None)
+        return resolve_sdtm_domain(raw_dom, fallback="AE")
+
+    def _emit_group(dom_code: str, group: list[_PreparedSdtmRow]) -> Iterator[Any]:
+        group.sort(key=lambda item: item.sort_key)
+        if dom_code == "DM":
+            yield _consolidate_dm_source_records(group)
+        else:
+            for item in group:
+                yield item.source_record
+
+    staged: dict[tuple[str, str], list[_PreparedSdtmRow]] = {}
+    subj_order: list[str] = []
+    last_usubjid: str | None = None
+    buffered_count = 0
+    ungrouped = not source_is_ordered
+
+    def _flush_subject(target_usubjid: str) -> Iterator[Any]:
+        nonlocal buffered_count
+        keys_for_subj = sorted(k for k in staged if k[1] == target_usubjid)
+        for key in keys_for_subj:
+            grp = staged.pop(key)
+            buffered_count -= len(grp)
+            yield from _emit_group(key[0], grp)
+        if target_usubjid in subj_order:
+            subj_order.remove(target_usubjid)
+
+    for idx, rec in enumerate(records):
+        dom_code = _resolve_rec_domain(rec)
+        norm = _get_normalizer(dom_code)
+        prepared = norm.prepare_record(rec, idx)
+        if prepared is None:
+            continue
+
+        usubjid = prepared.usubjid
+        if not ungrouped and last_usubjid is not None and usubjid != last_usubjid:
+            if usubjid < last_usubjid or usubjid in subj_order:
+                ungrouped = True
+            else:
+                yield from _flush_subject(last_usubjid)
+
+        if usubjid not in subj_order:
+            subj_order.append(usubjid)
+        staged.setdefault((dom_code, usubjid), []).append(prepared)
+        buffered_count += 1
+        last_usubjid = usubjid
+
+        while buffered_count >= effective_cap and staged:
+            # Prefer evicting completed subjects before splitting the active subject group.
+            candidate_subjs = [
+                s for s in subj_order if s != last_usubjid and any(k[1] == s for k in staged)
+            ]
+            if candidate_subjs:
+                evict_subj = candidate_subjs[0]
+            else:
+                counts_by_subj: dict[str, int] = {}
+                for (_, s_id), grp in staged.items():
+                    counts_by_subj[s_id] = counts_by_subj.get(s_id, 0) + len(grp)
+                evict_subj = max(counts_by_subj, key=lambda s: counts_by_subj[s])
+            yield from _flush_subject(evict_subj)
+            last_usubjid = subj_order[-1] if subj_order else None
+
+    remaining_subjects = sorted({s for (_, s) in staged}) if ungrouped else list(subj_order)
+    for rem_subj in remaining_subjects:
+        yield from _flush_subject(rem_subj)
 
 
 def _resolve_sdtm_pipeline(
@@ -1499,7 +2010,7 @@ def transform_records_to_sdtm_rows(
     *,
     include_deleted: bool = False,
     mask_phi: bool = True,
-    seq_counters: dict[str, int] | None = None,
+    seq_counters: MutableMapping[str, int] | TransactionalSdtmSequencer | None = None,
     phi_keys: Iterable[str] | None = None,
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
@@ -1510,9 +2021,9 @@ def transform_records_to_sdtm_rows(
     Applies ``SensitivityRegistry`` and custom ``phi_keys`` / ``EnrichmentPipeline``
     masking *before* constructing ``USUBJID`` or mapping SDTM domain variables,
     redacts masked ``BRTHDTC`` values to 4-digit ISO 8601 years or ``None``, sorts
-    records per subject by ``(--DTC, topic_vars, recordId)``, omits ``DMSEQ`` on
-    ``DM``, and maintains per-``USUBJID`` sequence counters across streaming batches
-    when ``seq_counters`` is supplied.
+    records per subject by ``(--DTC, topic_vars, recordId)``, consolidates ``DM``
+    to one row per ``USUBJID`` without ``DMSEQ``, and maintains per-``(STUDYID, DOMAIN, USUBJID)``
+    sequence counters across streaming batches when ``seq_counters`` is supplied.
     """
     resolved_pipeline = _resolve_sdtm_pipeline(study_key, pipeline, enrichment_pipeline)
     normalizer = _SdtmNormalizer(
@@ -1524,7 +2035,9 @@ def transform_records_to_sdtm_rows(
         phi_keys=phi_keys,
         registry=registry,
     )
-    counters = seq_counters if seq_counters is not None else {}
+    counters: MutableMapping[str, int] | TransactionalSdtmSequencer = (
+        seq_counters if seq_counters is not None else {}
+    )
 
     grouped: dict[str, list[_PreparedSdtmRow]] = {}
     for idx, rec in enumerate(records):
@@ -1545,7 +2058,7 @@ def transform_records_to_sdtm(
     *,
     include_deleted: bool = False,
     mask_phi: bool = True,
-    seq_counters: dict[str, int] | None = None,
+    seq_counters: MutableMapping[str, int] | TransactionalSdtmSequencer | None = None,
     phi_keys: Iterable[str] | None = None,
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
@@ -1555,9 +2068,9 @@ def transform_records_to_sdtm(
 
     Maps subject keys to USUBJID, study keys to STUDYID, sorts records per
     subject by canonical ``--DTC`` timestamp, domain topic variable, and record
-    identifier, sequences records per subject (omitting ``DMSEQ`` on ``DM``),
-    enforces PHI redaction and ``StudyConfiguration`` rules, and converts event
-    timestamps to standard ISO 8601 DTC string formats.
+    identifier, sequences records per ``(STUDYID, DOMAIN, USUBJID)`` (consolidating
+    ``DM`` without ``DMSEQ``), enforces PHI redaction and ``StudyConfiguration``
+    rules, and converts event timestamps to standard ISO 8601 DTC string formats.
     """
     if pd is None:
         raise ImportError(
@@ -1575,7 +2088,9 @@ def transform_records_to_sdtm(
         phi_keys=phi_keys,
         registry=registry,
     )
-    counters = seq_counters if seq_counters is not None else {}
+    counters: MutableMapping[str, int] | TransactionalSdtmSequencer = (
+        seq_counters if seq_counters is not None else {}
+    )
 
     grouped: dict[str, list[_PreparedSdtmRow]] = {}
     for idx, rec in enumerate(records):
@@ -1592,9 +2107,11 @@ def transform_records_to_sdtm(
 
 __all__ = [
     "SDTM_DOMAIN_SPECS",
+    "SDTM_SEQUENCER_METADATA_KEY",
     "VALID_NAMING_CONVENTIONS",
     "_SDTM_RECORDS_SORT",
     "_UNSET_PIPELINE",
+    "TransactionalSdtmSequencer",
     "_PreparedSdtmRow",
     "_SdtmNormalizer",
     "_collapse_alnum_key",
@@ -1602,11 +2119,14 @@ __all__ = [
     "_format_sdtm_flag",
     "_get_model_consumed_keys",
     "_get_model_field_aliases",
+    "_is_deleted_record",
     "_iter_sorted_sdtm_frames",
     "_normalize_key",
     "format_iso8601_dtc",
     "format_variable_name",
     "get_sdtm_domain_variables",
+    "is_active_clinical_record",
+    "iter_staged_sdtm_records",
     "normalize_naming_convention",
     "resolve_sdtm_domain",
     "transform_records_to_sdtm",
