@@ -97,14 +97,16 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
    imednet jobs wait STUDY BATCH --timeout 60 --format json
    imednet workflows extract-records STUDY --format json
    imednet workflows state show --study-key STUDY --format json
+   imednet workflows uat run STUDY --dry-run --simulation --format json
    imednet subject-data STUDY SUBJ-001 --format json
    IMEDNET_CLI_OUTPUT_FORMAT=json imednet studies list
 
 Supported core list resources are studies, queries, variables, record-revisions,
 sites, forms, records, subjects, intervals, visits, codings, and users, alongside
 ``workflows extract-records``, ``workflows state show`` (resource ``ledger_state``),
-and ``subject-data`` (plus write batch summaries for ``records create``, ``records update``,
-``records import``, and ``subjects register``). JSON reads emit one envelope
+``workflows uat run`` (resource ``uat_run``), and ``subject-data`` (plus write batch
+summaries for ``records create``, ``records update``, ``records import``, and
+``subjects register``). JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
 and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it), while
