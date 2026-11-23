@@ -32,17 +32,21 @@ dashboard for browsing studies, sites, subjects, and background jobs:
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
 ``Enter`` to select a Study or Site (re-selecting the active Site clears the Site filter;
-``Space`` is not bound on ``StudyList`` or ``SiteList``) or to register batch IDs in the
-Jobs tab input, ``Delete`` or ``Backspace`` on a highlighted row in the Jobs table to
-untrack that Job, ``Esc`` to move focus from the Jobs batch input to the Jobs table or
-clear an active Site filter, ``q`` to quit, ``d`` to toggle dark mode, ``h`` to toggle
-high-contrast mode, ``r`` to refresh active Study data, and ``a`` to load all pages when
-a panel is truncated. Switch between the ``Jobs`` (bounded to ``5`` concurrent status
-polls) and ``Logs`` tabs in the bottom pane to audit redacted SDK/TUI events; viewports narrower
-than ``100`` columns automatically reflow into the 2-column ``compact`` layout. Single-key shortcuts are suppressed
-automatically while typing batch IDs in the Jobs tab input. Pass ``--study`` / ``--study-key`` and
-repeatable ``--batch`` / ``--batch-id`` flags at launch to open a Study and monitor specific batch Jobs
-immediately, and pass ``--force`` only when intentionally bypassing TTY stream checks.
+``Space`` is not bound on ``StudyList`` or ``SiteList``) or to register validated batch IDs in the
+Jobs tab input, ``Enter`` or ``Space`` on the Jobs table to toggle the inline ``#job_detail_panel``
+(displaying sanitized ``resultUrl`` and per-``Record`` diagnostics), ``Delete`` or ``Backspace`` on
+a highlighted row in the Jobs table to untrack that Job, ``Esc`` to move focus from the Jobs batch
+input to the Jobs table, close an open ``#job_detail_panel``, or clear an active Site filter, ``q``
+to quit, ``d`` to toggle dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh active
+Study data, and ``a`` to load all pages when a panel is truncated. Switch between the ``Jobs``
+(bounded to ``5`` concurrent status polls) and ``Logs`` tabs in the bottom pane to audit redacted
+SDK/TUI events (``LogViewer`` masks ``Subject`` PHI fields to ``***MASKED***`` by default); viewports
+narrower than ``100`` columns automatically reflow into the 2-column ``compact`` layout. Single-key
+shortcuts are suppressed automatically while typing batch IDs in the Jobs tab input. Pass
+``--study`` / ``--study-key`` and repeatable ``--batch`` / ``--batch-id`` flags at launch to open a
+Study and monitor specific batch Jobs immediately (or pass ``--batch`` without ``--study`` to stage
+``QUEUED`` batches until a ``Study`` is selected), and pass ``--force`` only when intentionally
+bypassing TTY stream checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
 ``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
@@ -76,6 +80,8 @@ step-by-step wizard prompts for study keys, filters, and state ledger updates:
    imednet workflows state show --interactive
    imednet workflows state set --interactive
    imednet workflows state reset --interactive
+   imednet workflows uat build-spec STUDY --subject-count 2 --seed 42 -o uat_spec.json --simulation
+   imednet workflows uat run --spec uat_spec.json --schema study_dd.json --dry-run --format json
    imednet workflows uat run --interactive
    imednet workflows sync-worker STUDY --interval 900 --once
 
@@ -140,13 +146,14 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
    imednet jobs wait STUDY BATCH --timeout 60 --format json
    imednet workflows extract-records STUDY --format json
    imednet workflows state show --study-key STUDY --format json
+   imednet workflows uat run STUDY --dry-run --simulation --format json
    imednet subject-data STUDY SUBJ-001 --format json
    IMEDNET_CLI_OUTPUT_FORMAT=json imednet studies list
 
 Supported core list resources are studies, queries, variables, record-revisions,
 sites, forms, records, subjects, intervals, visits, codings, and users, alongside
 ``workflows extract-records``, ``workflows state show`` (resource ``ledger_state``),
-and ``subject-data`` (plus write batch summaries for ``records create``, ``records update``,
+``workflows uat run`` (resource ``uat_run``), and ``subject-data`` (plus write batch summaries for ``records create``, ``records update``,
 ``records import``, and ``subjects register``). JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
@@ -156,9 +163,12 @@ Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
 Usage failures exit 2, SDK-command interruption exits 130, and success/help exits 0.
 
-Legacy ``records list -o/--output json|csv`` still writes ``records.json`` or ``records.csv``
-and emits a ``stderr`` deprecation warning (prefer ``--format json`` for stdout or
-``imednet export`` for file exports); combining ``-o/--output`` with ``--format json`` is an error. Existing ``export``
+Legacy ``records list -o/--output`` accepts ``json``, ``csv``, or an explicit ``.json`` /
+``.csv`` destination path (preserving ``./records.json`` and ``./records.csv`` for
+``-o json`` and ``-o csv``), flattens ``recordData`` variables, masks ``Subject`` PHI to
+``***MASKED***`` by default (``--mask-phi``; opt out with ``--no-mask-phi``), and emits a
+``stderr`` deprecation warning (prefer ``--format json`` for stdout or ``imednet export``
+for file exports); combining ``-o/--output`` with ``--format json`` is an error. Existing ``export``
 commands (which also accept ``--no-interactive`` to suppress live spinners) and ``datadict`` JSON/schema/diff outputs
 (see :doc:`/how-to/data_dictionary`) retain their own contracts. This is not a global JSON wrapper for arbitrary third-party plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
@@ -307,20 +317,22 @@ Authorized compliance workflows operating inside a restricted enclave can opt
 out explicitly with ``--no-mask-phi``.
 
 All nine ``imednet export`` subcommands also share incremental checkpointing,
-watermark filtering, CDISC SDTM transformation, and quality-gate flags:
+watermark filtering, CDISC SDTM transformation, and opt-in quality-gate flags:
 
 * ``--since``: Export ``Record`` items modified on or after an ISO-8601 timestamp or date.
 * ``--incremental``, ``--stream-name``, and ``--ledger-path``: Read and commit
   transactional high-water mark checkpoints via ``imednet.state_providers`` (defaulting to
   ``IMEDNET_WORKFLOW_LEDGER_PATH`` or ``~/.imednet/pipeline_ledger.json`` for file ledgers).
 * ``--include-deleted``: Include voided (``deleted=True``) ``Record`` items in export batches.
-* ``--quality-gate``, ``--no-quality-gate``, and ``--min-readiness-score``: Explicitly enable
-  or disable pre-write ``Record`` schema readiness filtering and set the minimum ``0-100`` threshold.
+* ``--quality-gate``, ``--no-quality-gate``, and ``--min-readiness-score``: Opt-in pre-write
+  ``Record`` schema readiness filtering (disabled by default across all nine subcommands, including
+  SQLite per-``Form``, ``--single-table``, and ``--long-format`` SQL exports; enable explicitly with
+  ``--quality-gate`` and optional ``0-100`` ``--min-readiness-score``, or force off with ``--no-quality-gate``).
 * ``--as-sdtm``, ``--sdtm-domain`` (alias ``--domain``), ``--standards-profile``
   (``general``, ``drug``, or ``device``), ``--min-standards-score``, and
   ``--naming-convention snake_case|camelCase|sdtm``: Transform exports into CDISC SDTM
   domains, enforce batch-level ``StandardsReadinessValidator`` thresholds, or normalize raw
-  ``Variable`` column naming.
+  ``Variable`` column naming:
 
 .. code-block:: bash
 

@@ -112,8 +112,8 @@ def get_provider_info() -> dict[str, Any]:
                     "placeholders": {
                         "login": "iMednet API Key",
                         "password": "iMednet Security Key",  # pragma: allowlist secret
-                        "base_url": "https://edc.prod.imednetapi.com",
-                        "timeout": "30.0",
+                        "extra__imednet__base_url": "https://edc.prod.imednetapi.com",
+                        "extra__imednet__timeout": "30.0",
                     },
                 },
             }

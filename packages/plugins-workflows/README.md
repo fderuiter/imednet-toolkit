@@ -43,8 +43,10 @@ imednet workflows state set --study-key <STUDY_KEY> --stream records --timestamp
 imednet workflows state reset --study-key <STUDY_KEY> --stream records
 imednet workflows state reset --interactive
 
-# End-to-end synthetic UAT pipeline (batch or --interactive wizard)
+# End-to-end synthetic UAT specification builder and pipeline (batch, --spec, --dry-run, --format json, or --interactive wizard)
+imednet workflows uat build-spec <STUDY_KEY> --subject-count 2 --seed 42 -o uat_spec.json --simulation
 imednet workflows uat run <STUDY_KEY> --subject-count 2 --simulation
+imednet workflows uat run --spec uat_spec.json --schema study_dd.json --dry-run --format json
 imednet workflows uat run --interactive
 
 # CDISC CDASH and SDTM standards readiness audit (supports --profile, --domain, --min-score, --no-mask-phi, and --format json)
