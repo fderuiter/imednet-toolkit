@@ -3,7 +3,17 @@
     "packages/core": {
       "release-type": "python",
       "package-name": "imednet",
-      "changelog-path": "CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "/packages/core/src/imednet/__init__.py"
+        },
+        {
+          "type": "generic",
+          "path": "/docs/_static/thebe_pyodide.js"
+        }
+      ]
     },
     "packages/providers-airflow": {
       "release-type": "python",
@@ -23,7 +33,8 @@
     "packages/plugins-tui": {
       "release-type": "python",
       "package-name": "imednet-tui",
-      "changelog-path": "CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "initial-version": "1.0.0"
     }
   }
 }
