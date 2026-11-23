@@ -67,6 +67,7 @@ def test_generate_registration(basic_spec, mock_snapshot):
     assert len(res.payloads) == 1
     assert res.payloads[0]["formKey"] == "F_REG"
     assert res.payloads[0]["siteName"] == "Test Site"
+    assert res.payloads[0]["keywords"] == [{"keywordName": "UAT", "keywordKey": "UAT"}]
     assert "SUBJID" in res.payloads[0]["data"]
     assert len(res.payloads[0]["data"]["SUBJID"]) == 5
 
@@ -151,7 +152,16 @@ def test_boundary_strategy(mock_snapshot):
                         strategy=VariableTestStrategy.BOUNDARY,
                         min_value=10,
                         max_value=20,
-                    )
+                    ),
+                    UATVariableSpec(
+                        variable_name="FLT",
+                        variable_key="V2",
+                        variable_type="Float",
+                        form_key="F1",
+                        strategy=VariableTestStrategy.BOUNDARY,
+                        min_value=1.5,
+                        max_value=9.5,
+                    ),
                 ],
             )
         ],
@@ -159,8 +169,14 @@ def test_boundary_strategy(mock_snapshot):
     generator = SyntheticRecordGenerator()
     results = generator.generate(spec, mock_snapshot)
     assert len(results[0].payloads) == 2
-    assert results[0].payloads[0]["data"]["NUM"] == "10.0"
-    assert results[0].payloads[1]["data"]["NUM"] == "20.0"
+    assert results[0].payloads[0]["data"]["NUM"] == 10
+    assert isinstance(results[0].payloads[0]["data"]["NUM"], int)
+    assert results[0].payloads[1]["data"]["NUM"] == 20
+    assert isinstance(results[0].payloads[1]["data"]["NUM"], int)
+    assert results[0].payloads[0]["data"]["FLT"] == pytest.approx(1.5)
+    assert isinstance(results[0].payloads[0]["data"]["FLT"], float)
+    assert results[0].payloads[1]["data"]["FLT"] == pytest.approx(9.5)
+    assert isinstance(results[0].payloads[1]["data"]["FLT"], float)
 
 
 def test_coded_all_strategy(mock_snapshot):
@@ -299,11 +315,11 @@ def test_various_types(mock_snapshot):
     results = generator.generate(spec, mock_snapshot)
     data = results[0].payloads[0]["data"]
 
-    assert isinstance(data["N"], str)
-    assert "." in data["F"]
+    assert isinstance(data["N"], int) and not isinstance(data["N"], bool)
+    assert isinstance(data["F"], float)
     assert data["D"] == "2023-01-01"
     assert "T" in data["DT"]
-    assert data["B"] in ("Yes", "No")
+    assert isinstance(data["B"], bool)
     assert any(c in data["CB"] for c in ("X", "Y"))
     assert len(data["TA"]) > 0
 
@@ -517,7 +533,8 @@ def test_canonical_variable_types_and_datadictionary_enrichment(mock_snapshot):
     assert set(data["CHECK_V"].split("`")).issubset({"K1", "K2"})
     assert set(data["MULTI_V"].split("`")).issubset({"M1", "M2"})
     assert data["DTP_V"] == "2026-02-15"
-    assert 10 <= int(data["CALC_V"]) <= 20
+    assert isinstance(data["CALC_V"], int)
+    assert 10 <= data["CALC_V"] <= 20
     assert data["YESNO_V"] in {"Yes", "No"}
 
 
@@ -530,7 +547,7 @@ def test_generator_enriches_odm_range_checks_and_iso_temporal_bounds(
 
     from imednet.datadict import load_from_cdisc_odm
     from imednet.spi.validation import RangeCheckConstraint, VariableConstraints
-    from imednet.validation import validate_record_data
+    from imednet.validation import validate_record_data, validate_record_entry
 
     assert RangeCheckConstraint is not None
     assert VariableConstraints is not None
@@ -635,21 +652,16 @@ def test_generator_enriches_odm_range_checks_and_iso_temporal_bounds(
 
     generator = SyntheticRecordGenerator(seed=42, data_dictionary=dd)
 
-    def _typed_payload_data(raw: dict[str, object]) -> dict[str, object]:
-        typed = dict(raw)
-        if isinstance(typed.get("SYSBP"), str):
-            typed["SYSBP"] = int(typed["SYSBP"])
-        if isinstance(typed.get("TEMP"), str):
-            typed["TEMP"] = float(typed["TEMP"])
-        return typed
-
     # 1. SYNTHETIC payloads pass preflight with zero errors and zero Soft warnings
     synth_sets = generator.generate(_make_spec(VariableTestStrategy.SYNTHETIC), mock_snapshot)
     assert len(synth_sets[0].payloads) == 3
     with caplog.at_level(logging.WARNING):
         caplog.clear()
         for payload in synth_sets[0].payloads:
-            validate_record_data(dd, "VS", _typed_payload_data(payload["data"]))
+            validate_record_data(dd, "VS", payload["data"])
+            validate_record_entry(dd, payload)
+            assert isinstance(payload["data"]["SYSBP"], int)
+            assert isinstance(payload["data"]["TEMP"], float)
             assert payload["data"]["ARM"] in {"COHORT_A", "COHORT_B"}
             assert "2025-03-01" <= payload["data"]["VISDAT"] <= "2025-03-31"
             assert "08:00:00" <= payload["data"]["VISTIM"] <= "17:00:00"
@@ -661,8 +673,10 @@ def test_generator_enriches_odm_range_checks_and_iso_temporal_bounds(
     min_data = bound_sets[0].payloads[0]["data"]
     max_data = bound_sets[0].payloads[1]["data"]
 
-    assert min_data["SYSBP"] == "81"
-    assert max_data["SYSBP"] == "179"
+    assert min_data["SYSBP"] == 81
+    assert max_data["SYSBP"] == 179
+    assert min_data["TEMP"] == pytest.approx(36.0)
+    assert max_data["TEMP"] == pytest.approx(37.5)
     assert min_data["VISDAT"] == "2025-03-01"
     assert max_data["VISDAT"] == "2025-03-31"
     assert min_data["VISTIM"] == "08:00:00"
@@ -671,7 +685,8 @@ def test_generator_enriches_odm_range_checks_and_iso_temporal_bounds(
     with caplog.at_level(logging.WARNING):
         caplog.clear()
         for payload in bound_sets[0].payloads:
-            validate_record_data(dd, "VS", _typed_payload_data(payload["data"]))
+            validate_record_data(dd, "VS", payload["data"])
+            validate_record_entry(dd, payload)
         assert caplog.records == []
 
     # 3. UATSpecificationBuilder also populates enriched RangeCheck/ISO bounds directly
@@ -699,7 +714,7 @@ def test_generator_enriches_odm_range_checks_and_iso_temporal_bounds(
             ]
         },
         intervals=[],
-        sites=[SnapSite(site_name="SITE-1", site_enrollment_status="Open")],
+        sites=[SnapSite(site_name="SITE-1", site_enrollment_status="Enrollment Open")],
     )
     built_spec = UATSpecificationBuilder(data_dictionary=dd).build(snap, subject_count=2)
     vs_vars = {v.variable_name: v for v in built_spec.form_specs[0].variables}
@@ -712,3 +727,171 @@ def test_generator_enriches_odm_range_checks_and_iso_temporal_bounds(
     assert vs_vars["ARM"].coded_values == ["COHORT_A", "COHORT_B"]
     assert vs_vars["VISDAT"].min_date == "2025-03-01"
     assert vs_vars["VISDAT"].max_date == "2025-03-31"
+
+
+def test_dropdown_memo_keywords_and_schema_cache_and_datadict_validation(mock_snapshot):
+    """Generated records attach keyword_tag and pass validate_record_entry on SchemaCache and DataDictionary."""
+    from imednet.datadict import Choice, DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+    from imednet.models.variables import Variable as APIVariable
+    from imednet.validation import SchemaCache, validate_record_entry
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_REG",
+                variables=[
+                    DDVariable(
+                        variableName="AGE",
+                        variableType="Integer",
+                        required="Yes",
+                        extraAttributes={"minValue": 18, "maxValue": 65},
+                    ),
+                    DDVariable(
+                        variableName="SCORE",
+                        variableType="Integer",
+                        required="Yes",
+                    ),
+                    DDVariable(
+                        variableName="WEIGHT",
+                        variableType="Float",
+                        required="Yes",
+                    ),
+                    DDVariable(
+                        variableName="ACTIVE",
+                        variableType="Boolean",
+                        required="Yes",
+                    ),
+                    DDVariable(
+                        variableName="CONSENT",
+                        variableType="Yes/No",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceText="Yes", choiceValue="Yes"),
+                            Choice(choiceText="No", choiceValue="No"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="COUNTRY",
+                        variableType="Dropdown",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceText="Netherlands", choiceValue="NL"),
+                            Choice(choiceText="Germany", choiceValue="DE"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="NOTES",
+                        variableType="Memo",
+                        required="No",
+                    ),
+                ],
+            )
+        ]
+    )
+
+    cache = SchemaCache()
+    cache.populate(
+        [
+            APIVariable(form_key="F_REG", variable_name="AGE", variable_type="Integer"),
+            APIVariable(form_key="F_REG", variable_name="SCORE", variable_type="Number"),
+            APIVariable(form_key="F_REG", variable_name="WEIGHT", variable_type="Float"),
+            APIVariable(form_key="F_REG", variable_name="ACTIVE", variable_type="Boolean"),
+            APIVariable(form_key="F_REG", variable_name="CONSENT", variable_type="Yes/No"),
+            APIVariable(form_key="F_REG", variable_name="COUNTRY", variable_type="Dropdown"),
+            APIVariable(form_key="F_REG", variable_name="NOTES", variable_type="Memo"),
+        ]
+    )
+
+    spec = UATSpecification(
+        study_key="S1",
+        study_name="S1",
+        subject_specs=[
+            UATSubjectSpec(
+                site_name="Test Site",
+                subject_count=2,
+                subject_key_prefix="UAT-TEST-",
+                keyword_tag="UAT-PRELIVE",
+            )
+        ],
+        form_specs=[
+            UATFormSpec(
+                form_key="F_REG",
+                form_name="Registration",
+                form_type="Subject",
+                test_type=RecordTestType.REGISTER_SUBJECT,
+                subject_count=2,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="AGE",
+                        variable_key="V1",
+                        variable_type="Integer",
+                        form_key="F_REG",
+                        strategy=VariableTestStrategy.BOUNDARY,
+                        min_value=18.0,
+                        max_value=65.0,
+                    ),
+                    UATVariableSpec(
+                        variable_name="SCORE",
+                        variable_key="V2",
+                        variable_type="Number",
+                        form_key="F_REG",
+                        strategy=VariableTestStrategy.FIXED,
+                        fixed_value="42.0",
+                    ),
+                    UATVariableSpec(
+                        variable_name="WEIGHT",
+                        variable_key="V3",
+                        variable_type="Float",
+                        form_key="F_REG",
+                    ),
+                    UATVariableSpec(
+                        variable_name="ACTIVE",
+                        variable_key="V4",
+                        variable_type="Boolean",
+                        form_key="F_REG",
+                    ),
+                    UATVariableSpec(
+                        variable_name="CONSENT",
+                        variable_key="V5",
+                        variable_type="Yes/No",
+                        form_key="F_REG",
+                    ),
+                    UATVariableSpec(
+                        variable_name="COUNTRY",
+                        variable_key="V6",
+                        variable_type="Dropdown",
+                        form_key="F_REG",
+                    ),
+                    UATVariableSpec(
+                        variable_name="NOTES",
+                        variable_key="V7",
+                        variable_type="Memo",
+                        form_key="F_REG",
+                        max_length=24,
+                    ),
+                ],
+            )
+        ],
+    )
+
+    generator = SyntheticRecordGenerator(seed=17, data_dictionary=dd)
+    record_sets = generator.generate(spec, mock_snapshot)
+    assert len(record_sets) == 1
+    assert len(record_sets[0].payloads) == 2
+
+    for idx, payload in enumerate(record_sets[0].payloads):
+        assert payload["keywords"] == [{"keywordName": "UAT-PRELIVE", "keywordKey": "UAT-PRELIVE"}]
+        data = payload["data"]
+        assert data["AGE"] == (18 if idx == 0 else 65)
+        assert isinstance(data["AGE"], int)
+        assert data["SCORE"] == 42
+        assert isinstance(data["SCORE"], int)
+        assert isinstance(data["WEIGHT"], float)
+        assert isinstance(data["ACTIVE"], bool)
+        assert data["CONSENT"] in {"Yes", "No"}
+        assert data["COUNTRY"] in {"NL", "DE"}
+        assert isinstance(data["NOTES"], str) and 1 <= len(data["NOTES"]) <= 24
+        validate_record_entry(cache, payload)
+        validate_record_entry(dd, payload)

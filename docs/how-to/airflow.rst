@@ -78,12 +78,20 @@ rather than embedding secrets in DAG definitions.
 To prevent credential leakage in Airflow rendered task metadata and XComs,
 templated fields (``study_key``, ``output_path``, ``export_kwargs``,
 ``modified_since``, ``record_filter``, ``record_data_filter``, and
-``stream_name``) reject raw secret keys (such as ``password``, ``auth``,
-``api_key``, ``security_key``, ``token``, or ``conn_str`` containing
-credentials) as well as URIs with embedded userinfo.
+``stream_name``) reject embedded URI userinfo, secrets in query strings,
+single-delimiter credential assignments (such as ``api_key=leak``), and bearer
+JWTs while permitting clinical ``Variable`` filter expressions (for example
+``TOKEN==1`` or ``NOTES=="bearer of card"``) and explicit ``export_kwargs={"auth": "none"}``.
+Secret option keys in ``export_kwargs`` (such as ``password``, ``api_key``,
+``security_key``, ``token``, or non-``"none"`` ``auth``) remain blocked so
+destination credentials are resolved via ``destination_conn_id``.
 
 For task-mapping discovery, health checks, and async trigger execution,
-``ImednetHook`` provides explicit helper methods:
+``ImednetHook`` provides explicit helper methods (falling back to
+``Connection.get_connection_from_secrets`` when ``SUPERVISOR_COMMS`` is absent
+so ``test_connection()`` and ``dag.test()`` resolve database-stored
+``Connection`` entries directly while propagating
+``AirflowSecretsBackendAccessDenied``):
 
 - ``get_conn()`` returns the live :class:`~imednet.ImednetSDK` adhering to the
   standard Airflow BaseHook contract.
@@ -115,9 +123,10 @@ records to any supported destination (CSV, Parquet, DuckDB, SQL / ``sql_by_form`
 / ``long_sql``, Snowflake, Neo4j, MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
-``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
-across plugin sinks and tabular exports without leaking sink-level options into
-Pandas or JSON writer kwargs. PHI masking is enabled by default
+``quality_gate_enabled`` — ``False`` by default and deterministically forwarded
+to tabular and sink targets — and ``min_schema_readiness_score``) work
+consistently across plugin sinks and tabular exports without leaking sink-level
+options into Pandas or JSON writer kwargs. PHI masking is enabled by default
 (``mask_phi=True``) across all tabular and sink destinations, replacing
 registered ``Subject`` identifiers and committed ``StudyConfiguration``
 ``phiFields`` with ``***MASKED***``; authorized enclave workflows can explicitly
@@ -127,11 +136,18 @@ options—such as DuckDB ``table_name`` (or ``table``, defaulting to ``"records"
 Snowflake staging settings (``stage_prefix``,
 ``local_staging_dir``, ``manifest_path``), and Neo4j ``database`` names—can be
 supplied via ``export_kwargs`` or connection ``extra`` metadata.
-``ImednetJobSensor(study_key=..., batch_id=...)`` polls an asynchronous iMednet
-job identified by ``study_key`` and ``batch_id`` until it reaches a terminal
-state (see :ref:`rest_resource_jobs`), fetching and validating any terminal
-``resultUrl`` payload so batch-level or per-``Record`` failures raise a redacted
-``AirflowException``.
+``ImednetJobSensor(study_key=..., batch_id=..., imednet_conn_id=...)`` renders
+templated ``study_key``, ``batch_id``, and ``imednet_conn_id`` fields and polls
+an asynchronous iMednet ``Job`` until it reaches a terminal state (see
+:ref:`rest_resource_jobs`). On completion, both synchronous (``deferrable=False``)
+and deferrable (``deferrable=True``) runs emit an identical, compact ``Job``
+summary XCom with raw ``results`` stripped and ``Subject`` PHI masked via
+:func:`~imednet.utils.security.mask_clinical_phi`. Terminal ``resultUrl``
+payloads are verified so batch-level or per-``Record`` failures scrub ``Subject``
+PHI and raise a redacted ``AirflowException``. When ``soft_fail=True``, polling
+timeouts are converted to ``AirflowSkipException`` in both modes, whereas
+terminal ``FAILED`` ``Job`` states and ``failedRecords > 0`` batches still mark
+the ``DagRun`` as ``FAILED``.
 All operators use ``ImednetHook`` to obtain an :class:`~imednet.ImednetSDK` instance
 from an Airflow connection. The production reference DAG above shows the recommended
 dynamic-mapping pattern: keep static settings (for example ``destination``,
@@ -258,18 +274,25 @@ Deferrable Job Polling with ``ImednetJobTrigger``
 
 ``ImednetJobSensor`` supports Airflow 3 deferrable execution via ``deferrable=True``
 (defaulting to ``airflow.configuration.conf.getboolean("operators", "default_deferrable", fallback=False)``
-when ``deferrable=None``). In deferrable mode, ``execute()`` validates path-safe
-``study_key`` and ``batch_id`` segments and yields the worker slot to
-:class:`~apache_airflow_providers_imednet.ImednetJobTrigger`, which polls
-iMednet asynchronously inside the Airflow triggerer using
+when ``deferrable=None``). In deferrable mode, ``execute()`` validates rendered
+``study_key``, ``batch_id``, and ``imednet_conn_id`` identifiers and yields the
+worker slot to :class:`~apache_airflow_providers_imednet.ImednetJobTrigger`,
+which polls iMednet asynchronously inside the Airflow triggerer using
 :meth:`~apache_airflow_providers_imednet.hooks.ImednetHook.get_async_conn` and
 :class:`~imednet.utils.job_poller.AsyncJobPoller` (including terminal
 ``resultUrl`` verification for per-``Record`` failures).
 
 ``ImednetJobTrigger.serialize()`` persists only non-secret identifiers
 (``study_key``, ``batch_id``, ``imednet_conn_id``, ``poke_interval``, and
-``timeout``) to the Airflow metadata database and scrubs any error messages
-before emitting a ``TriggerEvent``.
+``timeout``) to the Airflow metadata database. ``ImednetJobTrigger.run()``
+excludes ``results`` and applies :func:`~imednet.utils.security.mask_clinical_phi`
+before emitting a ``TriggerEvent`` so ``execute_complete()`` writes the exact
+same PHI-free ``Job`` summary XCom as synchronous ``poke()``. Polling timeouts
+emit ``{"status": "timeout"}`` (raising ``AirflowSensorTimeout``, which
+``soft_fail=True`` skips via ``AirflowSkipException``), while terminal ``Job``
+or ``Record`` failures emit ``{"status": "error"}`` with ``Subject`` PHI and
+secrets scrubbed so broken ``Job`` batches fail the ``DagRun`` even under
+``soft_fail=True``.
 
 .. testcode::
 
@@ -284,6 +307,75 @@ before emitting a ``TriggerEvent``.
        timeout=3600,
        deferrable=True,
    )
+
+URL Path Segment Validation Across Operators, Sensors, and Triggers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Airflow tasks frequently populate ``study_key`` and ``batch_id`` dynamically from DAG
+parameters, mapped upstream XComs, or external REST payloads covering ``Study``,
+``Subject``, ``Site``, ``Form``, ``Record``, ``Visit``, ``Interval``, ``Variable``,
+``Query``, ``Data Dictionary``, and ``Job`` pipelines. Every provider entry point
+validates dynamic URL segments through :func:`~imednet.utils.validate_path_segment`
+(before formatting endpoints via :func:`~imednet.utils.build_safe_path`) and raises
+:class:`~imednet.errors.PathTraversalValidationError` (``status_code=400``) before
+opening connections or issuing HTTP requests:
+
+- ``ImednetExportOperator.execute()`` validates templated ``study_key`` immediately after
+  checking templated attributes for embedded credentials.
+- ``ImednetJobSensor.poke()`` and ``ImednetJobSensor.execute()`` validate both
+  ``study_key`` and ``batch_id`` prior to synchronous job polling or deferrable handoff.
+- :class:`~apache_airflow_providers_imednet.triggers.ImednetJobTrigger` validates
+  ``study_key`` and ``batch_id`` in both ``__init__()`` and ``run()`` alongside
+  control-character and secret-token guards.
+
+.. testcode::
+
+   from typing import Any, cast
+   from apache_airflow_providers_imednet import (
+       ImednetExportOperator,
+       ImednetJobSensor,
+       ImednetJobTrigger,
+   )
+   from imednet.errors import PathTraversalValidationError
+   from imednet.utils import build_safe_path, validate_path_segment
+
+   assert validate_path_segment("MY_STUDY", name="study_key") == "MY_STUDY"
+   assert (
+       build_safe_path("studies", "MY_STUDY", "jobs", "BATCH_001")
+       == "studies/MY_STUDY/jobs/BATCH_001"
+   )
+
+   bad_export_op = ImednetExportOperator(
+       task_id="reject_traversal_export",
+       study_key="../escape",
+       destination="csv",
+   )
+   op_rejected = False
+   raw_export_execute = getattr(
+       ImednetExportOperator.execute, "__wrapped__", ImednetExportOperator.execute
+   )
+   try:
+       raw_export_execute(bad_export_op, cast(Any, {}))
+   except PathTraversalValidationError as op_path_err:
+       op_rejected = True
+       assert op_path_err.status_code == 400
+   assert op_rejected
+
+   bad_job_sensor = ImednetJobSensor(
+       task_id="reject_traversal_sensor",
+       study_key="MY_STUDY",
+       batch_id="%2e%2e%2fsecret",
+       deferrable=False,
+   )
+   try:
+       bad_job_sensor.poke(cast(Any, {}))
+   except PathTraversalValidationError as sensor_path_err:
+       assert sensor_path_err.status_code == 400
+
+   try:
+       ImednetJobTrigger(study_key="MY_STUDY", batch_id="../escape")
+   except PathTraversalValidationError as trigger_path_err:
+       assert trigger_path_err.status_code == 400
 
 OpenLineage Dataset Facets
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

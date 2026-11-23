@@ -152,6 +152,7 @@ class UATSpecification(UATBaseModel):
     variables_snapshot_count: int = 0
     intervals_snapshot_count: int = 0
     sites_snapshot_count: int = 0
+    seed: int | None = None
 
     @field_validator("spec_version")
     @classmethod
@@ -195,13 +196,23 @@ class UATWorkflowState(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
-    def can_transition_to(self, target: UATWorkflowState | str) -> bool:
+    def can_transition_to(
+        self,
+        target: UATWorkflowState | str,
+        *,
+        dry_run: bool = False,
+    ) -> bool:
         """Check if this state can transition to target state."""
-        return is_valid_uat_transition(self, target)
+        return is_valid_uat_transition(self, target, dry_run=dry_run)
 
-    def validate_transition_to(self, target: UATWorkflowState | str) -> bool:
+    def validate_transition_to(
+        self,
+        target: UATWorkflowState | str,
+        *,
+        dry_run: bool = False,
+    ) -> bool:
         """Validate transition from this state to target state."""
-        return validate_uat_transition(self, target)
+        return validate_uat_transition(self, target, dry_run=dry_run)
 
     @property
     def allowed_transitions(self) -> set[UATWorkflowState]:
@@ -288,15 +299,29 @@ def normalize_uat_state(state: UATWorkflowState | str) -> UATWorkflowState:
     raise InvalidUATStateTransitionError(f"Invalid UAT state type: {type(state).__name__}")
 
 
+def _allowed_transitions_for_state(
+    from_state: UATWorkflowState,
+    *,
+    dry_run: bool = False,
+) -> set[UATWorkflowState]:
+    allowed = set(ALLOWED_UAT_TRANSITIONS.get(from_state, set()))
+    if dry_run and from_state == UATWorkflowState.GENERATING:
+        allowed.add(UATWorkflowState.COMPLETED)
+    return allowed
+
+
 def is_valid_uat_transition(
     from_state: UATWorkflowState | str,
     to_state: UATWorkflowState | str,
+    *,
+    dry_run: bool = False,
 ) -> bool:
     """Check if transitioning from from_state to to_state is permitted.
 
     Args:
         from_state: The source state.
         to_state: The target state.
+        dry_run: Whether dry-run mode is active (allowing GENERATING -> COMPLETED).
 
     Returns:
         True if permitted, False otherwise.
@@ -306,18 +331,21 @@ def is_valid_uat_transition(
         to_enum = normalize_uat_state(to_state)
     except (InvalidUATStateTransitionError, ValueError):
         return False
-    return to_enum in ALLOWED_UAT_TRANSITIONS.get(from_enum, set())
+    return to_enum in _allowed_transitions_for_state(from_enum, dry_run=dry_run)
 
 
 def validate_uat_transition(
     from_state: UATWorkflowState | str,
     to_state: UATWorkflowState | str,
+    *,
+    dry_run: bool = False,
 ) -> bool:
     """Validate that transitioning from from_state to to_state is permitted.
 
     Args:
         from_state: The current or originating state.
         to_state: The target state.
+        dry_run: Whether dry-run mode is active (allowing GENERATING -> COMPLETED).
 
     Returns:
         True if the transition is permitted.
@@ -327,7 +355,7 @@ def validate_uat_transition(
     """
     from_enum = normalize_uat_state(from_state)
     to_enum = normalize_uat_state(to_state)
-    allowed = ALLOWED_UAT_TRANSITIONS.get(from_enum, set())
+    allowed = _allowed_transitions_for_state(from_enum, dry_run=dry_run)
     if to_enum not in allowed:
         allowed_names = sorted(s.value for s in allowed)
         raise InvalidUATStateTransitionError(

@@ -233,6 +233,14 @@ Changelogs and release notes per package are available on
 [GitHub Releases](https://github.com/fderuiter/imednet-toolkit/releases).
 
 Configuration requirements:
+- Automated Release PR creation, lockfile commits, and tag-triggered workflows in
+  `.github/workflows/release-please.yml` require a repository-scoped GitHub App (granted
+  `Contents`, `Issues`, and `Pull requests` read/write permissions on `imednet-toolkit`) with
+  `RELEASE_PLEASE_APP_ID` and `RELEASE_PLEASE_PRIVATE_KEY` configured as repository secrets so
+  `pull_request` CI checks and package tag releases start automatically:
+  ```bash
+  bash scripts/wizards/setup-release-please-app.sh
+  ```
 - Publishing requires PyPI Trusted Publishers (OIDC) configured for each package on PyPI, **or**
   a `PYPI_API_TOKEN` repository secret as a fallback. An interactive wizard is available to guide this multi-package setup:
   ```bash

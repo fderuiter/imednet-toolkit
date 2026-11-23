@@ -217,8 +217,10 @@ def dataframe_to_records(
 ) -> list[JsonDict]:
     """Convert a ``pandas.DataFrame`` into REST create-records payload dicts.
 
-    Strips read-only :class:`~imednet.models.records.Record` metadata columns,
-    maps snake_case and camelCase identifiers (``formKey``/``formId``,
+    Strips read-only :class:`~imednet.models.records.Record` system audit columns,
+    preserves record update identifiers and metadata (``recordId``, ``recordOid``,
+    ``visitId``, ``recordStatus``, ``reasonForChange``), maps snake_case and
+    camelCase identifiers (``formKey``/``formId``,
     ``subjectKey``/``subjectOid``/``subjectId``, ``siteName``/``siteId``,
     ``intervalName``/``intervalId``), drops ``NaN`` and blank cells, coerces
     integer-valued floats (``45.0 -> 45``), and raises
@@ -246,15 +248,24 @@ def import_records_csv(
 ) -> BatchSubmissionSummary:
     """Import records from a CSV file into ``study_key`` using stdlib CSV parsing.
 
-    Works in ``packages/core`` even when ``pandas`` is not installed. Rejects
+    Preserves ``recordId``, ``recordOid``, ``visitId``, ``recordStatus``, and
+    ``reasonForChange`` for symmetric round-trip updates. Works in
+    ``packages/core`` even when ``pandas`` is not installed, and rejects
     ``***MASKED***`` sentinels before any HTTP request is sent.
     """
     records = csv_to_records(file_path, schema=schema)
+    effective_schema = schema
+    if dry_run and effective_schema is None and not skip_validation:
+        from imednet.datadict.loaders.api import can_load_from_api, load_from_api
+
+        if can_load_from_api(sdk):
+            effective_schema = load_from_api(sdk, study_key)
+            records = csv_to_records(file_path, schema=effective_schema)
     return sdk.records.create_batch(
         study_key,
         records,
         email_notify=email_notify,
-        schema=schema,
+        schema=effective_schema,
         chunk_size=chunk_size,
         skip_validation=skip_validation,
         wait_for_completion=wait_for_completion,

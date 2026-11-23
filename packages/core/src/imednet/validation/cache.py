@@ -1561,10 +1561,10 @@ def calculate_readiness_score(
     *,
     study_key: str | None = None,
 ) -> tuple[float, list[str]]:
-    """Calculate the schema readiness score for a record's data.
+    """Calculate the schema readiness score for a Study Record's data.
 
     Returns:
-        A tuple of (score, list of validation failure reasons).
+        A tuple of (score, list of validation failure or warning reasons).
     """
     variables = (
         schema.variables_for_form(form_key, study_key=study_key)
@@ -1578,21 +1578,44 @@ def calculate_readiness_score(
     if expected_count == 0:
         return 100.0, []
 
+    data_map: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
     valid_count = 0
     reasons: list[str] = []
 
-    unknown = [k for k in data if k not in variables]
+    if not data_map:
+        for name, var in variables.items():
+            constraints = extract_variable_constraints(var)
+            if constraints.required_policy == "yes":
+                reasons.append(f"Missing required variable: {name}")
+            elif constraints.required_policy == "auto_query":
+                reasons.append(f"Auto Query warning for variable {name}: variable is missing")
+        if not reasons:
+            reasons.append("Empty record data")
+        return 0.0, reasons
+
+    unknown = [k for k in data_map if k not in variables]
     if unknown:
         reasons.append(f"Unknown variables: {', '.join(unknown)}")
 
+    has_clinical_data = any(k in variables and not _is_empty_value(v) for k, v in data_map.items())
     is_cache = isinstance(schema, BaseSchemaCache)
 
     for name, var in variables.items():
-        if name not in data:
-            reasons.append(f"Missing expected variable: {name}")
+        if name not in data_map:
+            constraints = extract_variable_constraints(var)
+            if constraints.required_policy == "yes":
+                reasons.append(f"Missing required variable: {name}")
+            elif constraints.required_policy == "auto_query":
+                reasons.append(f"Auto Query warning for variable {name}: variable is missing")
+                if has_clinical_data:
+                    valid_count += 1
+            elif has_clinical_data:
+                valid_count += 1
+            else:
+                reasons.append(f"Missing expected variable: {name}")
             continue
 
-        value = data[name]
+        value = data_map[name]
         vtype = getattr(var, "variable_type", getattr(var, "variableType", None))
         try:
             _check_type(vtype, value)
@@ -1607,6 +1630,8 @@ def calculate_readiness_score(
                     raise ValidationError("Required variable is empty")
                 if constraints.required_policy == "auto_query":
                     reasons.append(f"Auto Query warning for variable {name}: value is empty")
+                if not has_clinical_data:
+                    continue
             elif not is_cache:
                 if constraints.choices:
                     _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
@@ -1655,7 +1680,7 @@ def calculate_readiness_score(
         rules_getter = getattr(schema, "rules_for_form", None)
         if callable(rules_getter):
             report = _LOGIC_EVALUATOR.evaluate_rules(
-                rules_getter(form_key), data, form_key=form_key
+                rules_getter(form_key), dict(data_map), form_key=form_key
             )
             for err in report.errors:
                 reasons.append(
@@ -1769,6 +1794,90 @@ def validate_record_entry(
             collect_errors=collect_errors,
             record_index=record_index,
         )
+
+    raw_data = record.get("recordData", record.get("data", {}))
+    if isinstance(raw_data, Mapping) and raw_data:
+        forms_attr = getattr(schema, "forms", None)
+        is_datadict_like = isinstance(forms_attr, Sequence) and not isinstance(
+            schema, BaseSchemaCache
+        )
+        if is_datadict_like or collect_errors:
+            form_keys: Iterable[str]
+            if isinstance(schema, BaseSchemaCache):
+                form_keys = schema.forms_for_study(eff_study_key) if eff_study_key else schema.forms
+            elif isinstance(forms_attr, Sequence):
+                form_keys = [
+                    str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
+                    for f in forms_attr
+                    if getattr(f, "form_key", None) or getattr(f, "formKey", None)
+                ]
+            else:
+                form_keys = ()
+
+            known_vars: dict[str, list[Any]] = {}
+            for candidate_fk in form_keys:
+                f_vars = (
+                    schema.variables_for_form(candidate_fk, study_key=eff_study_key)
+                    if isinstance(schema, BaseSchemaCache)
+                    else schema.variables_for_form(candidate_fk)
+                )
+                for v_name, v_obj in f_vars.items():
+                    known_vars.setdefault(v_name, []).append(v_obj)
+
+            if known_vars:
+                formless_errors: list[RecordValidationIssue] = []
+                for var_name, var_val in raw_data.items():
+                    candidates = known_vars.get(var_name)
+                    if not candidates:
+                        msg = f"Unknown variable {var_name}"
+                        if not collect_errors:
+                            raise ValidationError(msg)
+                        formless_errors.append(
+                            RecordValidationIssue(
+                                record_index=record_index,
+                                form_key=None,
+                                variable_name=var_name,
+                                message=msg,
+                                rule_id="unknown_variable",
+                            )
+                        )
+                        continue
+                    if not _is_empty_value(var_val):
+                        distinct_types = {
+                            str(getattr(vo, "variable_type", getattr(vo, "variableType", "")) or "")
+                            .strip()
+                            .lower()
+                            for vo in candidates
+                        }
+                        distinct_types.discard("")
+                        if len(distinct_types) == 1:
+                            vtype = getattr(
+                                candidates[0],
+                                "variable_type",
+                                getattr(candidates[0], "variableType", None),
+                            )
+                            try:
+                                _check_type(vtype, var_val)
+                            except ValidationError as exc:
+                                if not collect_errors:
+                                    raise
+                                formless_errors.append(
+                                    RecordValidationIssue(
+                                        record_index=record_index,
+                                        form_key=None,
+                                        variable_name=var_name,
+                                        message=str(exc),
+                                        rule_id="invalid_type",
+                                    )
+                                )
+                if formless_errors:
+                    return BatchValidationReport(
+                        total_records=1,
+                        valid_records=0,
+                        invalid_records=1,
+                        errors=formless_errors,
+                    )
+
     if collect_errors:
         return BatchValidationReport(total_records=1, valid_records=1, invalid_records=0)
     return None

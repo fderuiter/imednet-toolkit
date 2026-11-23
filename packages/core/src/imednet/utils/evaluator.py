@@ -6,7 +6,7 @@ import ast
 import functools
 import logging
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from imednet.errors import EvaluationError, RestrictedEvaluationError
@@ -20,10 +20,6 @@ DEFAULT_SAFE_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "str": str,
     "bool": bool,
     "len": len,
-    "abs": abs,
-    "round": round,
-    "min": min,
-    "max": max,
 }
 
 # Default allowed method names (safe read-only operations only)
@@ -222,6 +218,21 @@ def validate_ast(node: ast.AST, allowed_functions: set[str] | None = None) -> No
                     raise RestrictedEvaluationError(msg)
 
 
+def _parse_raw_expression(expr: str) -> ast.Expression:
+    """Parse an expression string into an unvalidated ast.Expression."""
+    if not isinstance(expr, str):
+        raise EvaluationError(f"Expression must be a string, got {type(expr).__name__}")
+
+    stripped = expr.strip()
+    if not stripped:
+        raise EvaluationError("Expression string cannot be empty")
+
+    try:
+        return ast.parse(stripped, mode="eval")
+    except SyntaxError as exc:
+        raise EvaluationError(f"Syntax error parsing expression: {exc}") from exc
+
+
 @functools.lru_cache(maxsize=1024)
 def parse_expression(expr: str) -> ast.Expression:
     """Parse and validate an expression string into a restricted AST.
@@ -236,26 +247,19 @@ def parse_expression(expr: str) -> ast.Expression:
         EvaluationError: If parsing fails due to syntax error or empty input.
         RestrictedEvaluationError: If forbidden syntax or attributes are found.
     """
-    if not isinstance(expr, str):
-        raise EvaluationError(f"Expression must be a string, got {type(expr).__name__}")
-
-    stripped = expr.strip()
-    if not stripped:
-        raise EvaluationError("Expression string cannot be empty")
-
-    try:
-        tree = ast.parse(stripped, mode="eval")
-    except SyntaxError as exc:
-        raise EvaluationError(f"Syntax error parsing expression: {exc}") from exc
-
+    tree = _parse_raw_expression(expr)
     validate_ast(tree)
     return tree
 
 
-def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
+def _eval_node(
+    node: ast.AST,
+    env: dict[str, Any],
+    safe_functions: Mapping[str, Callable[..., Any]] = DEFAULT_SAFE_FUNCTIONS,
+) -> Any:
     """Recursively evaluate an AST node within the given environment."""
     if isinstance(node, ast.Expression):
-        return _eval_node(node.body, env)
+        return _eval_node(node.body, env, safe_functions)
 
     if isinstance(node, ast.Constant):
         return node.value
@@ -274,12 +278,12 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
             return True
         if name == "False":
             return False
-        if name in DEFAULT_SAFE_FUNCTIONS:
-            return DEFAULT_SAFE_FUNCTIONS[name]
+        if name in safe_functions:
+            return safe_functions[name]
         raise EvaluationError(f"Name '{name}' is not defined")
 
     if isinstance(node, ast.UnaryOp):
-        operand = _eval_node(node.operand, env)
+        operand = _eval_node(node.operand, env, safe_functions)
         if isinstance(node.op, ast.UAdd):
             return +operand
         if isinstance(node.op, ast.USub):
@@ -291,8 +295,8 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
         raise EvaluationError(f"Unsupported unary operator: {type(node.op).__name__}")
 
     if isinstance(node, ast.BinOp):
-        left = _eval_node(node.left, env)
-        right = _eval_node(node.right, env)
+        left = _eval_node(node.left, env, safe_functions)
+        right = _eval_node(node.right, env, safe_functions)
         if isinstance(node.op, ast.Add):
             return left + right
         if isinstance(node.op, ast.Sub):
@@ -327,23 +331,23 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
         if isinstance(node.op, ast.And):
             val: Any = True
             for val_node in node.values:
-                val = _eval_node(val_node, env)
+                val = _eval_node(val_node, env, safe_functions)
                 if not val:
                     return val
             return val
         if isinstance(node.op, ast.Or):
             val = False
             for val_node in node.values:
-                val = _eval_node(val_node, env)
+                val = _eval_node(val_node, env, safe_functions)
                 if val:
                     return val
             return val
         raise EvaluationError(f"Unsupported boolean operator: {type(node.op).__name__}")
 
     if isinstance(node, ast.Compare):
-        left = _eval_node(node.left, env)
+        left = _eval_node(node.left, env, safe_functions)
         for op, comparator in zip(node.ops, node.comparators, strict=True):
-            right = _eval_node(comparator, env)
+            right = _eval_node(comparator, env, safe_functions)
             if isinstance(op, ast.Eq):
                 matched = left == right
             elif isinstance(op, ast.NotEq):
@@ -372,10 +376,10 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
         return True
 
     if isinstance(node, ast.IfExp):
-        test_val = _eval_node(node.test, env)
+        test_val = _eval_node(node.test, env, safe_functions)
         if test_val:
-            return _eval_node(node.body, env)
-        return _eval_node(node.orelse, env)
+            return _eval_node(node.body, env, safe_functions)
+        return _eval_node(node.orelse, env, safe_functions)
 
     if isinstance(node, ast.Attribute):
         attr = node.attr
@@ -383,7 +387,7 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
             msg = f"Access to private attribute '{attr}' is forbidden"
             logger.warning(f"Security warning: {msg}")
             raise RestrictedEvaluationError(msg)
-        target = _eval_node(node.value, env)
+        target = _eval_node(node.value, env, safe_functions)
         if isinstance(target, (type, types.ModuleType)):
             msg = f"Access to attributes on type/module '{type(target).__name__}' is forbidden"
             logger.warning(f"Security warning: {msg}")
@@ -401,38 +405,38 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
         return result
 
     if isinstance(node, ast.Subscript):
-        target = _eval_node(node.value, env)
-        index = _eval_node(node.slice, env)
+        target = _eval_node(node.value, env, safe_functions)
+        index = _eval_node(node.slice, env, safe_functions)
         try:
             return target[index]
         except (KeyError, IndexError, TypeError) as exc:
             raise EvaluationError(f"Subscript lookup failed: {exc}") from exc
 
     if isinstance(node, ast.Slice):
-        lower = _eval_node(node.lower, env) if node.lower is not None else None
-        upper = _eval_node(node.upper, env) if node.upper is not None else None
-        step = _eval_node(node.step, env) if node.step is not None else None
+        lower = _eval_node(node.lower, env, safe_functions) if node.lower is not None else None
+        upper = _eval_node(node.upper, env, safe_functions) if node.upper is not None else None
+        step = _eval_node(node.step, env, safe_functions) if node.step is not None else None
         return slice(lower, upper, step)
 
     if isinstance(node, ast.List):
-        return [_eval_node(elt, env) for elt in node.elts]
+        return [_eval_node(elt, env, safe_functions) for elt in node.elts]
 
     if isinstance(node, ast.Tuple):
-        return tuple(_eval_node(elt, env) for elt in node.elts)
+        return tuple(_eval_node(elt, env, safe_functions) for elt in node.elts)
 
     if isinstance(node, ast.Dict):
         dict_val: dict[Any, Any] = {}
         for k, v in zip(node.keys, node.values, strict=True):
             if k is None:
                 raise RestrictedEvaluationError("Dictionary unpacking is forbidden")
-            dict_val[_eval_node(k, env)] = _eval_node(v, env)
+            dict_val[_eval_node(k, env, safe_functions)] = _eval_node(v, env, safe_functions)
         return dict_val
 
     if isinstance(node, ast.Set):
-        return {_eval_node(elt, env) for elt in node.elts}
+        return {_eval_node(elt, env, safe_functions) for elt in node.elts}
 
     if isinstance(node, ast.Call):
-        args = [_eval_node(arg, env) for arg in node.args]
+        args = [_eval_node(arg, env, safe_functions) for arg in node.args]
         kwargs = {}
         for kw in node.keywords:
             if kw.arg and kw.arg.startswith("_"):
@@ -440,15 +444,15 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
                 logger.warning(f"Security warning: {msg}")
                 raise RestrictedEvaluationError(msg)
             if kw.arg:
-                kwargs[kw.arg] = _eval_node(kw.value, env)
+                kwargs[kw.arg] = _eval_node(kw.value, env, safe_functions)
 
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
-            if func_name.startswith("_") or func_name not in DEFAULT_SAFE_FUNCTIONS:
+            if func_name.startswith("_") or func_name not in safe_functions:
                 msg = f"Function '{func_name}' is forbidden"
                 logger.warning(f"Security warning: {msg}")
                 raise RestrictedEvaluationError(msg)
-            func = DEFAULT_SAFE_FUNCTIONS[func_name]
+            func = safe_functions[func_name]
             try:
                 return func(*args, **kwargs)
             except Exception as exc:
@@ -460,7 +464,7 @@ def _eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
                 msg = f"Method '{method_name}' is forbidden"
                 logger.warning(f"Security warning: {msg}")
                 raise RestrictedEvaluationError(msg)
-            target = _eval_node(node.func.value, env)
+            target = _eval_node(node.func.value, env, safe_functions)
             if isinstance(target, (type, types.ModuleType)):
                 msg = f"Method calls on type/module '{type(target).__name__}' are forbidden"
                 logger.warning(f"Security warning: {msg}")
@@ -494,6 +498,8 @@ def evaluate_expression(
     default: Any = None,
     fallback: Any = None,
     raise_on_error: bool = False,
+    *,
+    allowed_functions: Mapping[str, Callable[..., Any]] | None = None,
 ) -> Any:
     """Evaluate a Python expression safely using restricted AST traversal.
 
@@ -503,24 +509,31 @@ def evaluate_expression(
         default: Default value returned if evaluation fails and raise_on_error is False.
         fallback: Alternative name for default value (used if default is None).
         raise_on_error: If True, raise EvaluationError/RestrictedEvaluationError on error.
+        allowed_functions: Optional custom allowlist of safe callable functions.
 
     Returns:
         The result of the evaluated expression, or default/fallback value if evaluation fails.
     """
     effective_default = fallback if fallback is not None and default is None else default
     eval_env = dict(env) if env is not None else {}
+    safe_functions = allowed_functions if allowed_functions is not None else DEFAULT_SAFE_FUNCTIONS
+    allowed_fn_names = set(allowed_functions.keys()) if allowed_functions is not None else None
 
     try:
         tree: ast.AST
         if isinstance(expr, str):
-            tree = parse_expression(expr)
+            if allowed_fn_names is None:
+                tree = parse_expression(expr)
+            else:
+                tree = _parse_raw_expression(expr)
+                validate_ast(tree, allowed_functions=allowed_fn_names)
         elif isinstance(expr, ast.AST):
-            validate_ast(expr)
+            validate_ast(expr, allowed_functions=allowed_fn_names)
             tree = expr
         else:
             raise EvaluationError(f"Expected str or ast.AST, got {type(expr).__name__}")
 
-        return _eval_node(tree, eval_env)
+        return _eval_node(tree, eval_env, safe_functions)
     except (RestrictedEvaluationError, EvaluationError) as exc:
         if raise_on_error:
             raise
@@ -536,14 +549,25 @@ def evaluate_expression(
 class RestrictedAstEvaluator:
     """Object-oriented interface for restricted expression parsing and evaluation."""
 
-    def __init__(self, expr: str) -> None:
+    def __init__(
+        self,
+        expr: str,
+        *,
+        allowed_functions: Mapping[str, Callable[..., Any]] | None = None,
+    ) -> None:
         """Initialize and validate the expression.
 
         Args:
             expr: The expression string to parse and validate.
+            allowed_functions: Optional custom allowlist of safe callable functions.
         """
         self.expr = expr
-        self.tree = parse_expression(expr)
+        self._allowed_functions = allowed_functions
+        if allowed_functions is None:
+            self.tree = parse_expression(expr)
+        else:
+            self.tree = _parse_raw_expression(expr)
+            validate_ast(self.tree, allowed_functions=set(allowed_functions.keys()))
 
     def evaluate(
         self,
@@ -569,6 +593,7 @@ class RestrictedAstEvaluator:
             default=default,
             fallback=fallback,
             raise_on_error=raise_on_error,
+            allowed_functions=self._allowed_functions,
         )
 
 

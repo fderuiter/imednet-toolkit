@@ -5,12 +5,16 @@ from __future__ import annotations
 import html
 import json
 import posixpath
+import re
+from pathlib import Path
 from typing import Any
 
 from docutils import nodes
 from docutils.parsers.rst import Directive
+from sphinx.transforms.post_transforms import SphinxPostTransform
 
 DEFAULT_BUTTON_TEXT = "Activate Interactive Runtime"
+_PYODIDE_CDN_URL_RE = re.compile(r'PYODIDE_CDN_URL\s*=\s*["\']([^"\']+)["\']')
 
 
 class PyodideButtonNode(nodes.General, nodes.Element):
@@ -62,16 +66,69 @@ def _compute_content_root(pagename: str) -> str:
     return "../" * depth
 
 
+def _has_pyodide_button(doctree: Any) -> bool:
+    """Return True when ``doctree`` contains at least one ``PyodideButtonNode``."""
+    if doctree is None:
+        return False
+    next_node = getattr(doctree, "next_node", None)
+    if callable(next_node):
+        return next_node(PyodideButtonNode) is not None
+    findall = getattr(doctree, "findall", None)
+    if callable(findall):
+        return any(True for _ in findall(PyodideButtonNode))
+    return False
+
+
+def _extract_pyodide_cdn_url(srcdir: str | Path | None = None) -> str | None:
+    """Extract ``PYODIDE_CDN_URL`` from ``docs/_static/thebe_pyodide.js``."""
+    candidates: list[Path] = []
+    if srcdir is not None:
+        candidates.append(Path(srcdir) / "_static" / "thebe_pyodide.js")
+    candidates.append(Path(__file__).resolve().parents[1] / "_static" / "thebe_pyodide.js")
+
+    for js_path in candidates:
+        if js_path.is_file():
+            match = _PYODIDE_CDN_URL_RE.search(js_path.read_text(encoding="utf-8"))
+            if match:
+                return match.group(1)
+    return None
+
+
+class _PyodideCdnLinkcheckTransform(SphinxPostTransform):
+    """Expose ``PYODIDE_CDN_URL`` to Sphinx's ``linkcheck`` builder on interactive pages."""
+
+    builders = ("linkcheck",)
+    default_priority = 700
+
+    def run(self, **_kwargs: Any) -> None:
+        button_node = self.document.next_node(PyodideButtonNode)
+        if button_node is None:
+            return
+        cdn_url = _extract_pyodide_cdn_url(getattr(self.app, "srcdir", None))
+        if not cdn_url:
+            return
+        ref = nodes.reference("", "", refuri=cdn_url)
+        ref.source = button_node.source
+        ref.line = button_node.line
+        self.document.append(ref)
+
+
 def _inject_pyodide_page_context(
     app: Any,
     pagename: str,
     _templatename: str,
     context: dict[str, Any],
-    _doctree: Any,
+    doctree: Any,
 ) -> None:
-    """Ensure ``data-content_root`` and ``#imednet-pyodide-config`` JSON are present."""
+    """Ensure ``data-content_root`` and scope Pyodide assets strictly to ``PyodideButtonNode`` pages."""
     if not context.get("content_root"):
         context["content_root"] = _compute_content_root(pagename)
+
+    if not _has_pyodide_button(doctree):
+        return
+
+    if hasattr(app, "add_js_file"):
+        app.add_js_file("thebe_pyodide.js")
 
     raw_config = getattr(app.config, "pyodide_config", None)
     if not isinstance(raw_config, dict):
@@ -87,7 +144,7 @@ def _inject_pyodide_page_context(
 
 
 def setup(app: Any) -> dict[str, Any]:
-    """Register Pyodide directives, nodes, configuration values, and HTML hooks."""
+    """Register Pyodide directives, nodes, configuration values, and HTML/linkcheck hooks."""
     app.add_config_value("pyodide_config", {}, "html")
     app.add_node(
         PyodideButtonNode,
@@ -101,6 +158,8 @@ def setup(app: Any) -> dict[str, Any]:
     app.add_directive("pyodide-button", PyodideButtonDirective, override=True)
     app.add_directive("thebe-button", PyodideButtonDirective, override=True)
     app.connect("html-page-context", _inject_pyodide_page_context)
+    if hasattr(app, "add_post_transform"):
+        app.add_post_transform(_PyodideCdnLinkcheckTransform)
     return {
         "version": "1.0.0",
         "parallel_read_safe": True,

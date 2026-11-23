@@ -27,14 +27,8 @@ _READ_ONLY_RECORD_COLUMNS: frozenset[str] = frozenset(
     {
         "study_key",
         "studyKey",
-        "record_id",
-        "recordId",
-        "record_oid",
-        "recordOid",
         "record_type",
         "recordType",
-        "record_status",
-        "recordStatus",
         "deleted",
         "date_created",
         "dateCreated",
@@ -42,8 +36,6 @@ _READ_ONLY_RECORD_COLUMNS: frozenset[str] = frozenset(
         "dateModified",
         "last_updated",
         "lastUpdated",
-        "visit_id",
-        "visitId",
         "parent_record_id",
         "parentRecordId",
         "keywords",
@@ -54,6 +46,16 @@ _NESTED_DATA_COLUMNS: frozenset[str] = frozenset({"record_data", "recordData", "
 
 _IDENTIFIER_COLUMNS: frozenset[str] = frozenset(
     {
+        "record_id",
+        "recordId",
+        "record_oid",
+        "recordOid",
+        "visit_id",
+        "visitId",
+        "record_status",
+        "recordStatus",
+        "reason_for_change",
+        "reasonForChange",
         "form_key",
         "formKey",
         "form_id",
@@ -329,7 +331,31 @@ def normalize_tabular_row(
 
     envelope: JsonDict = {}
 
-    # 2. Map identifier columns according to REST create-records payload contract
+    # 2. Map identifier and update-envelope columns according to REST create-records contract
+    rec_id_pair = _first_present("recordId", "record_id")
+    if rec_id_pair is not None:
+        envelope["recordId"] = _coerce_int_identifier(
+            rec_id_pair[1], row_index=row_index, column_name=rec_id_pair[0]
+        )
+
+    rec_oid_pair = _first_present("recordOid", "record_oid")
+    if rec_oid_pair is not None:
+        envelope["recordOid"] = _coerce_str_identifier(rec_oid_pair[1])
+
+    visit_id_pair = _first_present("visitId", "visit_id")
+    if visit_id_pair is not None:
+        envelope["visitId"] = _coerce_int_identifier(
+            visit_id_pair[1], row_index=row_index, column_name=visit_id_pair[0]
+        )
+
+    rec_status_pair = _first_present("recordStatus", "record_status")
+    if rec_status_pair is not None:
+        envelope["recordStatus"] = _coerce_str_identifier(rec_status_pair[1])
+
+    reason_pair = _first_present("reasonForChange", "reason_for_change")
+    if reason_pair is not None:
+        envelope["reasonForChange"] = _coerce_str_identifier(reason_pair[1])
+
     form_key_pair = _first_present("formKey", "form_key")
     form_id_pair = _first_present("formId", "form_id")
     resolved_form_key: str | None = None
