@@ -9,6 +9,10 @@ on:
       - 'examples/**'
       - '**/*.md'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions: {}
 
 env:
@@ -17,42 +21,61 @@ env:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    # Keep default GITHUB_TOKEN read-only; all write operations use the
+    # short-lived GitHub App installation token minted below so Release PR
+    # updates automatically trigger pull_request checks and Release PR merges
+    # push package tags that trigger release.yml.
     permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+      contents: read
     steps:
+      - name: Mint GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
       - name: Run Release Please
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          # Use GITHUB_TOKEN for release-please operations.
-          # PyPI deployment is handled in release.yml on release commits to main,
-          # so publishing does not depend on tag-triggered workflow runs.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Checkout Release PR
         if: ${{ steps.release.outputs.prs_created == 'true' }}
-        continue-on-error: true
         id: checkout-release-pr
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: release-please--branches--main
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Set up uv
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
+
       - name: Update uv lockfile
-        if: ${{ steps.release.outputs.prs_created == 'true' && steps.checkout-release-pr.outcome == 'success' }}
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          pip install uv
           uv lock
           if ! git diff --quiet uv.lock; then
             git config --local user.email "github-actions[bot]@users.noreply.github.com"
             git config --local user.name "github-actions[bot]"
             git add uv.lock
             git commit -m "chore: update uv.lock for release"
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" release-please--branches--main
+            AUTH_HEADER="$(printf 'x-access-token:%s' "${APP_TOKEN}" | base64 | tr -d '\n')"
+            GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraheader" \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH_HEADER}" \
+              git push --force-with-lease origin release-please--branches--main
           fi

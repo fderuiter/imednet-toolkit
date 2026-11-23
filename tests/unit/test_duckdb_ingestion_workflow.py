@@ -356,7 +356,7 @@ def test_ingest_revisions_cst_timestamps_and_inclusive_boundary_deduplication() 
                 end_date="2026-02-28",
                 mode="append",
             )
-            == 2
+            == 1
         )
 
         bronze_rows = workflow._connection.execute(

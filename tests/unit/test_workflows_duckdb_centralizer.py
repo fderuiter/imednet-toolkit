@@ -998,7 +998,7 @@ def test_ingest_revisions_boundary_deduplication_and_legacy_table(tmp_path) -> N
             "extract_audit_trail",
             side_effect=[overlapping_batch, next_batch],
         ):
-            assert workflow.ingest_revisions("STUDY", mode="append") == 2
+            assert workflow.ingest_revisions("STUDY", mode="append") == 1
             assert workflow.ingest_revisions("STUDY", mode="append") == 1
 
         rows = workflow._connection.execute("""
@@ -1242,6 +1242,24 @@ def test_build_silver_view_excludes_deleted_partitions_oid_and_preserves_multi_s
         ("STUDY-A", 4, False),
         ("STUDY-A", 5, False),
     ]
+
+    combined_history = workflow._connection.execute("""
+        SELECT study_key, record_revision_id, valid_from, valid_to, is_current
+        FROM silver_records_history
+        WHERE study_key = 'PROT:202' OR record_id = 10
+        ORDER BY study_key, record_revision_id
+        """).fetchall()
+    assert combined_history == [
+        ("PROT:202", 10, datetime(2024, 1, 6, 14, 0, 0), None, True),
+        (
+            "STUDY-A",
+            1,
+            datetime(2024, 1, 1, 10, 0, 0),
+            datetime(2024, 1, 2, 10, 0, 0),
+            False,
+        ),
+        ("STUDY-A", 2, datetime(2024, 1, 2, 10, 0, 0), None, True),
+    ]
     workflow.close()
 
 
@@ -1323,3 +1341,215 @@ def test_duckdb_workflow_close_context_manager_and_persistent_reopen(tmp_path) -
         ]
     finally:
         conn.close()
+
+
+def test_ingest_revisions_deduplicates_keyed_appends_and_preserves_unkeyed() -> None:
+    """Verify repeated append calls deduplicate keyed record_revision_id items while keeping unkeyed rows."""
+    pytest.importorskip("duckdb")
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    batch_one = [
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=101,
+            record_id=10,
+            record_oid="REC-10",
+            form_key="F_VS",
+            record_revision=1,
+            data_revision=1,
+            user="crc1",
+            date_created="2026-11-15T18:10:00Z",
+        ),
+        # Duplicate keyed item inside the same batch
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=101,
+            record_id=10,
+            record_oid="REC-10",
+            form_key="F_VS",
+            record_revision=1,
+            data_revision=1,
+            user="crc1",
+            date_created="2026-11-15T18:10:00Z",
+        ),
+        SimpleNamespace(
+            study_key="STUDY",
+            record_revision_id=None,
+            record_id=99,
+            record_oid="UNKEYED-99",
+            form_key="F_DM",
+            record_revision=1,
+            data_revision=1,
+            user="system",
+            deleted=False,
+            date_created="2026-11-15T18:00:00Z",
+            last_updated=None,
+        ),
+    ]
+    batch_two = [
+        # Previously ingested keyed item
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=101,
+            record_id=10,
+            record_oid="REC-10",
+            form_key="F_VS",
+            record_revision=1,
+            data_revision=1,
+            user="crc1",
+            date_created="2026-11-15T18:10:00Z",
+        ),
+        # New keyed item
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=102,
+            record_id=10,
+            record_oid="REC-10",
+            form_key="F_VS",
+            record_revision=2,
+            data_revision=1,
+            user="pi1",
+            date_created="2026-11-15T18:35:45Z",
+        ),
+        # Second unkeyed fixture should still be staged
+        SimpleNamespace(
+            study_key="STUDY",
+            record_revision_id=None,
+            record_id=99,
+            record_oid="UNKEYED-99",
+            form_key="F_DM",
+            record_revision=2,
+            data_revision=2,
+            user="system",
+            deleted=False,
+            date_created="2026-11-15T18:45:00Z",
+            last_updated=None,
+        ),
+    ]
+
+    with patch.object(
+        DataExtractionWorkflow,
+        "extract_audit_trail",
+        side_effect=[batch_one, batch_two],
+    ):
+        inserted_first = workflow.ingest_revisions("STUDY", mode="append")
+        inserted_second = workflow.ingest_revisions("STUDY", mode="append")
+
+    assert inserted_first == 2
+    assert inserted_second == 2
+
+    rev_rows = workflow._connection.execute(
+        "SELECT record_revision_id, record_id, record_revision "
+        "FROM record_revisions ORDER BY record_id, record_revision"
+    ).fetchall()
+    assert rev_rows == [
+        (101, 10, 1),
+        (102, 10, 2),
+        (None, 99, 1),
+        (None, 99, 2),
+    ]
+
+
+def test_build_silver_view_creates_record_revisions_and_scd2_history_views_with_valid_bounds() -> (
+    None
+):
+    """Verify date-bounded ingest_revisions passes validate_filter_syntax and builds SCD Type 2 views."""
+    pytest.importorskip("duckdb")
+    import respx
+
+    from imednet import ImednetSDK
+    from imednet.utils.filters import validate_filter_syntax
+
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get("https://api.test/api/v1/edc/studies/STUDY/recordRevisions").respond(
+            200,
+            json={
+                "data": [
+                    {
+                        "studyKey": "STUDY",
+                        "recordRevisionId": 9001,
+                        "recordId": 601,
+                        "recordOid": "REC-601",
+                        "formKey": "F_VS",
+                        "recordRevision": 1,
+                        "dataRevision": 1,
+                        "recordStatus": "Complete",
+                        "user": "crc_site201",
+                        "dateCreated": "2026-11-15 18:10:00",
+                        "lastUpdated": "2026-11-15 18:10:00",
+                    },
+                    {
+                        "studyKey": "STUDY",
+                        "recordRevisionId": 9002,
+                        "recordId": 601,
+                        "recordOid": "REC-601",
+                        "formKey": "F_VS",
+                        "recordRevision": 2,
+                        "dataRevision": 1,
+                        "recordStatus": "Verified",
+                        "user": "pi_site201",
+                        "dateCreated": "2026-11-15 18:35:45",
+                        "lastUpdated": "2026-11-15 18:35:45",
+                    },
+                    {
+                        "studyKey": "STUDY",
+                        "recordRevisionId": 9003,
+                        "recordId": 601,
+                        "recordOid": "REC-601",
+                        "formKey": "F_VS",
+                        "recordRevision": 3,
+                        "dataRevision": 2,
+                        "recordStatus": "Complete",
+                        "user": "crc_site201",
+                        "dateCreated": "2026-12-05 09:00:00",
+                        "lastUpdated": "2026-12-05 09:00:00",
+                    },
+                ]
+            },
+        )
+        sdk = ImednetSDK(
+            api_key="audit-key",  # pragma: allowlist secret
+            security_key="audit-sec",  # pragma: allowlist secret
+            base_url="https://api.test",
+        )
+        workflow = DuckDBIngestionWorkflow(sdk, ":memory:")
+        ingested = workflow.ingest_revisions(
+            "STUDY",
+            start_date="2026-11-01",
+            end_date="2026-11-30",
+            mode="append",
+        )
+        assert ingested == 2
+
+        sent_filter = route.calls.last.request.url.params["filter"]
+        validate_filter_syntax(sent_filter)
+        assert sent_filter == "dateCreated>=2026-11-01T00:00:00Z"
+
+    workflow.build_silver_view("STUDY")
+
+    rr_count = workflow._connection.execute("SELECT COUNT(*) FROM record_revisions").fetchone()[0]
+    assert rr_count == 2
+
+    current = workflow._connection.execute(
+        "SELECT record_id, record_revision, record_status FROM silver_current_state"
+    ).fetchall()
+    assert current == [(601, 2, "Verified")]
+
+    history = workflow._connection.execute(
+        "SELECT record_revision, valid_from, valid_to, is_current "
+        "FROM silver_records_history ORDER BY record_revision ASC"
+    ).fetchall()
+    assert history == [
+        (
+            1,
+            datetime(2026, 11, 15, 18, 10, 0),
+            datetime(2026, 11, 15, 18, 35, 45),
+            False,
+        ),
+        (
+            2,
+            datetime(2026, 11, 15, 18, 35, 45),
+            None,
+            True,
+        ),
+    ]

@@ -150,6 +150,7 @@ class DuckDBIngestionWorkflow:
                     raise
             return 0
 
+        existing_overlap_count = 0
         view_name = f"_staging_bronze_revisions_{uuid4().hex}"
         self._connection.register(view_name, staging_relation)
         try:
@@ -164,6 +165,22 @@ class DuckDBIngestionWorkflow:
                 if has_keyed_rows and (
                     mode == "append" or any(row[0] != study_key for row in rows)
                 ):
+                    overlap_query = f"""
+                        SELECT COUNT(*)
+                        FROM "{view_name}" AS staged
+                        WHERE staged.record_revision_id IS NOT NULL
+                          AND EXISTS (
+                              SELECT 1
+                              FROM bronze_revisions AS existing
+                              WHERE existing.study_key = CAST(staged.study_key AS VARCHAR)
+                                AND existing.record_revision_id = CAST(
+                                    staged.record_revision_id AS BIGINT
+                                )
+                          )
+                        """
+                    overlap_row = self._connection.execute(overlap_query).fetchone()  # nosem
+                    existing_overlap_count = int(overlap_row[0]) if overlap_row is not None else 0
+
                     delete_query = f"""
                         DELETE FROM bronze_revisions
                         WHERE record_revision_id IS NOT NULL
@@ -227,10 +244,49 @@ class DuckDBIngestionWorkflow:
                 raise
         finally:
             self._connection.unregister(view_name)
-        return len(rows)
+
+        return max(0, len(rows) - existing_overlap_count)
+
+    def _refresh_combined_silver_view(
+        self, prefix: str, study_key: str, combined_view: str
+    ) -> None:
+        """Union all per-Study views matching prefix into the aggregate silver view."""
+        catalog_rows = self._connection.execute(
+            """
+            SELECT view_name
+            FROM duckdb_views()
+            WHERE database_name = current_database()
+              AND schema_name = current_schema()
+              AND NOT internal
+              AND NOT temporary
+              AND starts_with(view_name, ?)
+            ORDER BY view_name
+            """,
+            [prefix],
+        ).fetchall()
+        built_study_keys = sorted(
+            {
+                study_key,
+                *(
+                    row[0].removeprefix(prefix)
+                    for row in catalog_rows
+                    if isinstance(row[0], str)
+                    and row[0].startswith(prefix)
+                    and _SAFE_STUDY_KEY_PATTERN.fullmatch(row[0].removeprefix(prefix))
+                ),
+            }
+        )
+        union_selects = "\n            UNION ALL\n            ".join(
+            f'SELECT * FROM "{prefix}{key}"' for key in built_study_keys
+        )
+        combined_query = f"""
+            CREATE OR REPLACE VIEW "{combined_view}" AS
+            {union_selects}
+            """
+        self._connection.execute(combined_query)  # nosem
 
     def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
-        """Create or replace per-Study and combined silver_current_state views.
+        """Create or replace per-Study and combined silver current-state and history views.
 
         Args:
             study_key: Study key identifier to materialize.
@@ -239,6 +295,10 @@ class DuckDBIngestionWorkflow:
         self._validate_study_key(study_key)
         self._ensure_bronze_table()
         escaped_study_key = study_key.replace("'", "''")
+        record_partition_expr = (
+            "study_key, COALESCE(CAST(record_id AS VARCHAR), "
+            "NULLIF(record_oid, ''), CAST(record_revision_id AS VARCHAR))"
+        )
         per_study_view = f"silver_current_state_{study_key}"
         deleted_clause = (
             "" if include_deleted else "\n            WHERE NOT COALESCE(deleted, FALSE)"
@@ -285,13 +345,7 @@ class DuckDBIngestionWorkflow:
                 FROM bronze_revisions
                 WHERE study_key = '{escaped_study_key}'
                 QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY
-                        study_key,
-                        COALESCE(
-                            CAST(record_id AS VARCHAR),
-                            NULLIF(record_oid, ''),
-                            CAST(record_revision_id AS VARCHAR)
-                        )
+                    PARTITION BY {record_partition_expr}
                     ORDER BY
                         record_revision DESC NULLS LAST,
                         data_revision DESC NULLS LAST,
@@ -301,41 +355,58 @@ class DuckDBIngestionWorkflow:
             ) AS latest_revisions{deleted_clause}
             """
         self._connection.execute(per_study_query)  # nosem
+        self._refresh_combined_silver_view(
+            "silver_current_state_", study_key, "silver_current_state"
+        )
 
-        prefix = "silver_current_state_"
-        catalog_rows = self._connection.execute("""
-            SELECT view_name
-            FROM duckdb_views()
-            WHERE database_name = current_database()
-              AND schema_name = current_schema()
-              AND NOT internal
-              AND NOT temporary
-              AND starts_with(view_name, 'silver_current_state_')
-            ORDER BY view_name
-            """).fetchall()
-        built_study_keys = sorted(
-            {
+        per_study_history_view = f"silver_records_history_{study_key}"
+        per_study_history_query = f"""
+            CREATE OR REPLACE VIEW "{per_study_history_view}" AS
+            SELECT
                 study_key,
-                *(
-                    row[0].removeprefix(prefix)
-                    for row in catalog_rows
-                    if isinstance(row[0], str)
-                    and row[0].startswith(prefix)
-                    and _SAFE_STUDY_KEY_PATTERN.fullmatch(row[0].removeprefix(prefix))
-                ),
-            }
-        )
-        union_selects = "\n            UNION ALL\n            ".join(
-            f'SELECT * FROM "silver_current_state_{key}"' for key in built_study_keys
-        )
-        combined_query = f"""
-            CREATE OR REPLACE VIEW silver_current_state AS
-            {union_selects}
+                record_revision_id,
+                record_id,
+                record_oid,
+                form_key,
+                subject_key,
+                site_id,
+                interval_id,
+                record_status,
+                record_revision,
+                data_revision,
+                "user",
+                role,
+                reason_for_change,
+                deleted,
+                date_created,
+                last_updated,
+                COALESCE(date_created, last_updated) AS valid_from,
+                LEAD(COALESCE(date_created, last_updated)) OVER (
+                    PARTITION BY {record_partition_expr}
+                    ORDER BY
+                        record_revision ASC NULLS LAST,
+                        data_revision ASC NULLS LAST,
+                        date_created ASC NULLS LAST,
+                        record_revision_id ASC NULLS LAST
+                ) AS valid_to,
+                LEAD(1) OVER (
+                    PARTITION BY {record_partition_expr}
+                    ORDER BY
+                        record_revision ASC NULLS LAST,
+                        data_revision ASC NULLS LAST,
+                        date_created ASC NULLS LAST,
+                        record_revision_id ASC NULLS LAST
+                ) IS NULL AS is_current
+            FROM bronze_revisions
+            WHERE study_key = '{escaped_study_key}'
             """
-        self._connection.execute(combined_query)  # nosem
+        self._connection.execute(per_study_history_query)  # nosem
+        self._refresh_combined_silver_view(
+            "silver_records_history_", study_key, "silver_records_history"
+        )
 
     def _ensure_bronze_table(self) -> None:
-        """Ensure the bronze_revisions table exists in DuckDB."""
+        """Ensure the bronze_revisions table and record_revisions view exist in DuckDB."""
         self._connection.execute("""
             CREATE TABLE IF NOT EXISTS bronze_revisions (
                 study_key VARCHAR,
@@ -357,6 +428,28 @@ class DuckDBIngestionWorkflow:
                 last_updated TIMESTAMP,
                 UNIQUE (study_key, record_revision_id)
             )
+            """)
+        self._connection.execute("""
+            CREATE OR REPLACE VIEW record_revisions AS
+            SELECT
+                study_key,
+                record_revision_id,
+                record_id,
+                record_oid,
+                form_key,
+                subject_key,
+                site_id,
+                interval_id,
+                record_status,
+                record_revision,
+                data_revision,
+                "user",
+                role,
+                reason_for_change,
+                deleted,
+                date_created,
+                last_updated
+            FROM bronze_revisions
             """)
 
     @staticmethod

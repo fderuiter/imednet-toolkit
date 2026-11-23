@@ -30,7 +30,8 @@ Fetching Open Queries and State Counts
 
    open_queries = workflow.get_open_queries("STUDY")
    counts = workflow.get_query_state_counts("STUDY")
-   assert counts["open"] == counts[QueryStatus.OPEN]
+   assert len(open_queries) == 2
+   assert counts["open"] == counts[QueryStatus.OPEN] == 2
    print(len(open_queries), counts["OPEN"], counts["CLOSED"])
 
 Filtering Queries by Subject or Site
@@ -51,8 +52,10 @@ to resolve enrolled ``Subject`` keys at a ``Site`` and retrieve every associated
    scoped_sdk = ImednetSDK(simulation_mode=True)
    scoped_workflow = QueryManagementWorkflow(cast(Any, scoped_sdk))
 
-   subject_queries = scoped_workflow.get_queries_for_subject("STUDY", "SUBJ-001")
+   subject_queries = scoped_workflow.get_queries_for_subject("STUDY", "SUB1")
    site_queries = scoped_workflow.get_queries_by_site("STUDY", "SITE")
+   assert len(subject_queries) == 2
+   assert len(site_queries) == 2
    print(len(subject_queries), len(site_queries))
 
 For persistent local review queues, assignment tracking, and transition history,

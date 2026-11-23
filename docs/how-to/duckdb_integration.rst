@@ -163,10 +163,11 @@ For incremental bronze/silver ``Record`` revision ingestion, use
 
 The key methods are
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.ingest_revisions`
-for incremental loads,
+for incremental ``bronze_revisions`` (and ``record_revisions`` view) loads,
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.build_silver_view`
-for current-state materialization (both ``"silver_current_state_{study_key}"`` and
-combined ``silver_current_state``), and
+for current-state and SCD Type 2 history materialization (per-Study
+``"silver_current_state_{study_key}"`` / ``"silver_records_history_{study_key}"`` and
+combined ``silver_current_state`` / ``silver_records_history``), and
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.close`
 (or a ``with`` block) to release the DuckDB connection cleanly.
 

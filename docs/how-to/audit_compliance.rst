@@ -9,7 +9,7 @@ verify monotonic 21 CFR Part 11 audit chains, enforce secure-by-default PHI
 WCAG 2.1 Level AA conformance disclosures.
 
 .. seealso::
-   * :doc:`duckdb_integration` — Ingest ``RecordRevision`` logs into ``bronze_revisions`` and build deduplicated ``silver_current_state`` analytical views in DuckDB.
+   * :doc:`duckdb_integration` — Ingest ``RecordRevision`` logs into ``bronze_revisions`` and build deduplicated ``silver_current_state`` and SCD Type 2 ``silver_records_history`` analytical views in DuckDB.
    * :doc:`export_destinations` — Enforce default ``mask_phi=True`` redaction and explicit ``StudyConfiguration`` PHI policies across CSV, Parquet, SQL, and Snowflake sinks.
    * :doc:`/reference/governance` — Track immutable SHA-256 configuration snapshots with ``ConfigVersionStore``.
    * :doc:`/reference/VPAT` — Review Voluntary Product Accessibility Template (WCAG 2.1 Level AA) conformance statements.
@@ -135,34 +135,48 @@ accounts, ``Site`` identifiers, or ``Form`` keys, use
 :meth:`DataExtractionWorkflow.extract_audit_trail <imednet_workflows.data_extraction.DataExtractionWorkflow.extract_audit_trail>`
 alongside synchronous or asynchronous SDK endpoints:
 
-.. code-block:: python
+.. testcode::
 
+   import asyncio
    from imednet import AsyncImednetSDK, ImednetSDK
    from imednet.models.record_revisions import RecordRevision
+   from imednet.simulation import reset_default_simulation_state
    from imednet_workflows.data_extraction import DataExtractionWorkflow
 
 
    def extract_verified_audit_trail(study_key: str) -> list[RecordRevision]:
-       with ImednetSDK() as sdk:
+       with ImednetSDK(simulation_mode=True) as sdk:
            workflow = DataExtractionWorkflow(sdk)
            revisions = workflow.extract_audit_trail(
                study_key=study_key,
-               start_date="2026-11-01",
-               end_date="2026-11-30",
-               user="pi_site201",
+               start_date="2026-01-01",
+               end_date="2026-01-31",
+               user="sim_user",
+               sort="recordRevision,asc",
            )
            return RecordRevision.validate_chain(revisions)
 
 
    async def stream_form_revisions_async(study_key: str) -> list[RecordRevision]:
-       async with AsyncImednetSDK() as async_sdk:
+       async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
            revisions = [
                rev
                async for rev in async_sdk.record_revisions.list(
-                   study_key, formKey="F_VS"
+                   study_key,
+                   formKey="F_VS",
+                   sort="recordRevision,asc",
                )
            ]
            return RecordRevision.validate_chain(revisions)
+
+
+   reset_default_simulation_state()
+   audit_trail = extract_verified_audit_trail("STUDY")
+   form_revisions = asyncio.run(stream_form_revisions_async("STUDY"))
+   assert len(audit_trail) == 2
+   assert all(rev.user == "sim_user" for rev in audit_trail)
+   assert len(form_revisions) == 1
+   assert form_revisions[0].form_key == "F_VS"
 
 ``extract_audit_trail`` automatically normalizes ISO-8601 ``start_date`` and
 ``end_date`` inputs to inclusive UTC bounds on ``dateCreated`` while preserving
@@ -175,9 +189,11 @@ Combine ``RecordRevision`` verification with downstream compliance controls
 across the toolkit:
 
 1. **DuckDB Lakehouse Lineage** (:doc:`duckdb_integration`): Load ``RecordRevision``
-   audit history into ``bronze_revisions`` with ``DuckDBIngestionWorkflow.ingest_revisions``
-   and materialize deduplicated ``silver_current_state`` (and per-Study
-   ``"silver_current_state_{study_key}"``) current-state views via ``build_silver_view``.
+   audit history into ``bronze_revisions`` (and its ``record_revisions`` view) with
+   ``DuckDBIngestionWorkflow.ingest_revisions``, then materialize deduplicated
+   ``silver_current_state`` (and per-Study ``"silver_current_state_{study_key}"``)
+   current-state views plus SCD Type 2 ``silver_records_history`` views via
+   ``build_silver_view``.
 2. **PHI Masking & Redaction** (:doc:`export_destinations`): All sink plugins
    default to ``mask_phi=True`` and support explicit ``StudyConfiguration`` PHI
    ``Variable`` declarations so unredacted identifiers cannot leak accidentally.
