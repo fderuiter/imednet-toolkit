@@ -9,7 +9,7 @@ file locking dependencies.
 Development and documentation checkouts require Python **3.11.5+** to install
 patched selector dependencies. Published packages retain Python 3.11+ support.
 
-Full documentation: <https://fderuiter.github.io/imednet-toolkit/> | [Simulation Scenario Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)
+Full documentation: <https://fderuiter.github.io/imednet-toolkit/> | [Quick Start (Live Pyodide)](https://fderuiter.github.io/imednet-toolkit/tutorials/quick_start.html) | [Async Quick Start (Live Pyodide)](https://fderuiter.github.io/imednet-toolkit/tutorials/async_quick_start.html) | [Simulation Scenario Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)
 
 <div align="center">
 
@@ -17,7 +17,7 @@ Full documentation: <https://fderuiter.github.io/imednet-toolkit/> | [Simulation
 [![PyPI - Downloads](https://img.shields.io/pypi/dm/imednet.svg)](https://pypi.org/project/imednet/)
 [![PyPI - Wheel](https://img.shields.io/pypi/wheel/imednet.svg)](https://pypi.org/project/imednet/)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/imednet.svg)](https://pypi.org/project/imednet/)
-[![License](https://img.shields.io/pypi/l/imednet.svg)](LICENSE)
+[![License](https://img.shields.io/pypi/l/imednet.svg)](https://github.com/fderuiter/imednet-toolkit/blob/main/LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/fderuiter/imednet-toolkit/main.yml?branch=main)](https://github.com/fderuiter/imednet-toolkit/actions/workflows/main.yml)
 
 </div>
@@ -29,56 +29,80 @@ reimplementing HTTP logic.
 
 ## Documentation
 
-Our documentation is organized according to the **Diátaxis framework**, which categorizes information based on user intent.
+Our documentation is organized according to the **Diátaxis framework**, which categorizes information based on user intent, and offers two distinct browser-based interactive experiences:
 
-### ⚡ [Simulation Scenario Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)
-*Browse verified Python SDK and REST snippets, inspect instant simulation previews for Study, Form, Record, and Query resources, validate form variable schemas, and review audit trails directly in your browser without credentials or backend servers.*
+### ⚡ [Simulation Scenario Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase) *(Read-Only Offline Fixture Explorer)*
+*Browse verified Python SDK and REST snippets, inspect instant precomputed simulation fixture previews for Study, Form, Record, and Query resources, validate Form Variable schemas, and review audit trails directly in your browser without credentials or backend servers.*
 - [Integration Engineer Live Console](https://fderuiter.github.io/imednet-toolkit/#panel-integration)
 - [Clinical Data Manager Form Validator](https://fderuiter.github.io/imednet-toolkit/#panel-datamanager)
 - [Regulatory Compliance Auditor Verification](https://fderuiter.github.io/imednet-toolkit/#panel-auditor)
 
-### 📚 [Tutorials](docs/tutorials/)
+### 🧪 Live Executable Pyodide Tutorials
+*Unlike the read-only fixture explorer on the landing page, these tutorial pages embed live WebAssembly Python cells (**Activate Interactive Runtime**) where you can edit and run `ImednetSDK` and `AsyncImednetSDK` code directly in your browser.*
+- [Quick Start](https://fderuiter.github.io/imednet-toolkit/tutorials/quick_start.html) — Edit and execute synchronous `ImednetSDK(simulation_mode=True)` cells live in Pyodide
+- [Async Quick Start](https://fderuiter.github.io/imednet-toolkit/tutorials/async_quick_start.html) — Edit and execute concurrent `AsyncImednetSDK(simulation_mode=True)` cells live in Pyodide
+
+### 📚 [Tutorials](https://fderuiter.github.io/imednet-toolkit/#documentation-overview)
 *Learning-oriented guides for getting started.*
-- [Quick Start](docs/tutorials/quick_start.rst) (and [Interactive Showcase](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase))
-- [Async Quick Start](docs/tutorials/async_quick_start.rst)
-- [Examples](docs/tutorials/examples/)
+- [Quick Start](https://fderuiter.github.io/imednet-toolkit/tutorials/quick_start.html) (live Pyodide runtime; compare with the read-only [Simulation Scenario Explorer](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase))
+- [Async Quick Start](https://fderuiter.github.io/imednet-toolkit/tutorials/async_quick_start.html) (live Pyodide runtime)
+- [Examples](https://fderuiter.github.io/imednet-toolkit/tutorials/examples/index.html)
 
-### 🛠️ [How-To Guides](docs/how-to/)
+### 🛠️ [How-To Guides](https://fderuiter.github.io/imednet-toolkit/#documentation-overview)
 *Problem-oriented guides for completing specific tasks.*
-- [Data Dictionary & Schema Validation](docs/how-to/data_dictionary.rst) — Compile, convert, validate, and diff Study schemas with `imednet datadict` (`from-csv`, `from-odm`, `to-odm`, `from-redcap`, `from-api`, `validate`, `diff`, and `schema`)
-- [CLI Usage](docs/how-to/cli.rst)
-- [UAT Workflow](docs/how-to/workflows/uat_workflow.rst)
-- [Registering Subjects](docs/how-to/register_subjects.rst)
-- [Bulk Record Creation](docs/how-to/workflows/bulk_submission.rst)
-- [Audit & 21 CFR Part 11 Compliance](docs/how-to/audit_compliance.rst)
-- [Export Destinations](docs/how-to/export_destinations.rst)
+- [Data Dictionary & Schema Validation](https://fderuiter.github.io/imednet-toolkit/how-to/data_dictionary.html) — Compile, convert, validate, and diff Study schemas with `imednet datadict` (`from-csv`, `from-odm`, `to-odm`, `from-redcap`, `from-api`, `validate`, `diff`, and `schema`)
+- [CLI Usage](https://fderuiter.github.io/imednet-toolkit/how-to/cli.html)
+- [UAT Workflow](https://fderuiter.github.io/imednet-toolkit/how-to/workflows/uat_workflow.html)
+- [Registering Subjects](https://fderuiter.github.io/imednet-toolkit/how-to/register_subjects.html)
+- [Bulk Record Creation](https://fderuiter.github.io/imednet-toolkit/how-to/workflows/bulk_submission.html)
+- [Audit & 21 CFR Part 11 Compliance](https://fderuiter.github.io/imednet-toolkit/how-to/audit_compliance.html)
+- [Export Destinations](https://fderuiter.github.io/imednet-toolkit/how-to/export_destinations.html)
 
-### 💡 [Explanation](docs/explanation/)
+### 💡 [Explanation](https://fderuiter.github.io/imednet-toolkit/#documentation-overview)
 *Understanding-oriented concepts and architectural overviews.*
-- [Architecture](docs/explanation/architecture.rst)
-- [API Overview](docs/explanation/api_overview.rst)
-- [Plugins System](docs/explanation/plugins.rst)
+- [Architecture](https://fderuiter.github.io/imednet-toolkit/explanation/architecture.html)
+- [API Overview](https://fderuiter.github.io/imednet-toolkit/explanation/api_overview.html)
+- [Plugins System](https://fderuiter.github.io/imednet-toolkit/explanation/plugins.html)
 
-### 📖 [Reference](docs/reference/)
+### 📖 [Reference](https://fderuiter.github.io/imednet-toolkit/#documentation-overview)
 *Information-oriented material like API documentation and contributor rules.*
-- [REST API Reference](docs/reference/rest_api_reference.rst)
-- [Configuration](docs/reference/configuration.rst)
-- [Contributor Rules](docs/reference/agent_rules.rst)
-- [Automated API Reference](docs/reference/api/)
+- [REST API Reference](https://fderuiter.github.io/imednet-toolkit/reference/rest_api_reference.html)
+- [Configuration](https://fderuiter.github.io/imednet-toolkit/reference/configuration.html)
+- [Contributor Rules](https://fderuiter.github.io/imednet-toolkit/reference/agent_rules.html)
+- [Automated API Reference](https://fderuiter.github.io/imednet-toolkit/reference/api/core.html)
 
 ## Installation
 
+### Published PyPI Releases
+
+Install the core SDK or CLI from PyPI:
+
 ```bash
-# PyPI release
 pip install imednet
+pip install "imednet[cli]"
 ```
 
-For extended integrations, you can install optional dependencies:
+Install published export and database destination extras or companion packages:
+
 ```bash
 pip install "imednet[export]"
-pip install "imednet[tui]"
+pip install "imednet[duckdb]"
+pip install "imednet[mongodb]"
+pip install "imednet[neo4j]"
+pip install "imednet[snowflake]"
+pip install imednet-plugins-sinks
 pip install imednet-workflows
 pip install apache-airflow-providers-imednet
+```
+
+### Source Checkouts (Pre-Release Packages & Extras)
+
+`imednet-tui` and the `imednet[tui]` extra are not yet tagged on PyPI. Install them from a repository source checkout until an `imednet-tui-v*` release tag is published:
+
+```bash
+git clone https://github.com/fderuiter/imednet-toolkit.git
+cd imednet-toolkit
+pip install -e ./packages/plugins-tui -e "./packages/core[tui]"
 ```
 
 ## Developer Quickstart & Environment Setup
@@ -108,8 +132,8 @@ uv sync --locked --all-packages --all-extras
 
 ## Contributing
 
-Contributions are welcome! Please see our [Contributor Guide](AGENTS.md) and [Verification Loop](docs/how-to/verification.rst) to get started.
+Contributions are welcome! Please see our [Contributor Guide](https://github.com/fderuiter/imednet-toolkit/blob/main/AGENTS.md) and [Verification Loop](https://fderuiter.github.io/imednet-toolkit/how-to/verification.html) to get started.
 
 ## License
 
-This project is licensed under the MIT license. See [LICENSE](LICENSE) for details.
+This project is licensed under the MIT license. See [LICENSE](https://github.com/fderuiter/imednet-toolkit/blob/main/LICENSE) for details.

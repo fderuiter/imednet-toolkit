@@ -19,7 +19,7 @@ Environment variables
 .. code-block:: bash
 
    export IMEDNET_API_KEY=...
-   export IMEDNET_SECURITY_KEY=...      # if required by your environment
+   export IMEDNET_SECURITY_KEY=...      # required outside simulation mode
    export NEO4J_URI=bolt://localhost:7687
    export NEO4J_USER=neo4j
    export NEO4J_PASSWORD=...            # never hardcode

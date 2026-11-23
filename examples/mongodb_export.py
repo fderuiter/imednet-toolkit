@@ -5,7 +5,7 @@ Requires:
 
 Environment variables:
     IMEDNET_API_KEY       – iMednet API key
-    IMEDNET_SECURITY_KEY  – iMednet security key (if required)
+    IMEDNET_SECURITY_KEY  – iMednet security key (required outside simulation mode)
     IMEDNET_STUDY_KEY     – Target Study key (default: MY_STUDY)
     MONGODB_URI           – MongoDB connection URI (never hardcode credentials)
     MONGODB_DATABASE      – Target MongoDB database (default: imednet)
@@ -33,7 +33,8 @@ _SIM_MODE = os.environ.get("IMEDNET_SIMULATION_MODE", "").strip().lower() in {
 sdk = ImednetSDK(
     api_key=os.environ.get("IMEDNET_API_KEY")
     or ("sim-api-placeholder" if _SIM_MODE else os.environ["IMEDNET_API_KEY"]),
-    security_key=os.environ.get("IMEDNET_SECURITY_KEY", ""),
+    security_key=os.environ.get("IMEDNET_SECURITY_KEY")
+    or ("sim-sec-placeholder" if _SIM_MODE else os.environ["IMEDNET_SECURITY_KEY"]),
 )
 
 STUDY_KEY = os.environ.get("IMEDNET_STUDY_KEY") or "MY_STUDY"

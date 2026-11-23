@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from defusedxml import ElementTree as DefusedET
+from packaging.version import InvalidVersion, Version
 
 
 def check_todos_in_init(roots: Sequence[Path] | None = None) -> bool:
@@ -442,9 +443,18 @@ def check_packages_registered() -> bool:
 
     if readme_path.exists():
         readme_content = readme_path.read_text(encoding="utf-8")
-        if "imednet[tui]" not in readme_content:
-            print("Error: 'imednet[tui]' is missing from README.md installation instructions.")
-            has_errors = True
+        for required_pkg in (
+            "imednet",
+            "imednet-workflows",
+            "apache-airflow-providers-imednet",
+            "imednet-plugins-sinks",
+            "imednet-tui",
+        ):
+            if required_pkg not in readme_content:
+                print(
+                    f"Error: '{required_pkg}' is missing from README.md installation instructions."
+                )
+                has_errors = True
         if "uv sync --locked --all-packages --all-extras" not in readme_content:
             print(
                 "Error: 'uv sync --locked --all-packages --all-extras' is missing from README.md."
@@ -469,17 +479,72 @@ def check_packages_registered() -> bool:
     return has_errors
 
 
-def check_package_docs() -> bool:
-    """Validate that all packages have README.md, CHANGELOG.md, and are mentioned in root CHANGELOG.md."""
+_MD_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+_MD_HEADING_RE = re.compile(r"^\s*(#{1,6})\s+(.*?)\s*$")
+_MD_LINK_RE = re.compile(
+    r"""(?<!!)\[(?:[^\[\]]|`[^`]*`)*\]\(\s*([^)\s>]+|<[^>]+>)(?:\s+["'][^"']*["'])?\s*\)"""
+)
+_MD_AUTOLINK_RE = re.compile(r"<(https?://[^>\s]+)>")
+_INLINE_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
+_GITHUB_PAGES_BASE = "https://fderuiter.github.io/imednet-toolkit/"
+_SOURCE_SECTION_KEYWORDS = (
+    "source checkout",
+    "source install",
+    "from source",
+    "editable",
+    "developer quickstart",
+)
+_PIP_REQ_TOKEN_RE = re.compile(r"^([A-Za-z0-9_.-]+)(?:\[([A-Za-z0-9_,\s-]+)\])?")
+
+
+def _extract_markdown_links(path: Path) -> list[tuple[int, str]]:
+    """Extract (1-based line number, link target) outside fenced code blocks in a Markdown file."""
+    links: list[tuple[int, str]] = []
+    in_fence = False
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if _MD_FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        for match in _MD_LINK_RE.finditer(line):
+            raw_target = match.group(1).strip()
+            if raw_target.startswith("<") and raw_target.endswith(">"):
+                raw_target = raw_target[1:-1].strip()
+            if raw_target:
+                links.append((lineno, raw_target))
+        scrubbed_inline = _INLINE_CODE_SPAN_RE.sub("", line)
+        scrubbed_links = _MD_LINK_RE.sub("", scrubbed_inline)
+        for auto_match in _MD_AUTOLINK_RE.finditer(scrubbed_links):
+            links.append((lineno, auto_match.group(1).strip()))
+    return links
+
+
+class _HTMLAnchorCollector(HTMLParser):
+    """Collect id and name anchor targets from rendered HTML files."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchors: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del tag
+        for attr_name, attr_val in attrs:
+            if attr_name in ("id", "name") and attr_val:
+                self.anchors.add(attr_val)
+
+
+def check_package_docs(repo_root: Path = Path(".")) -> bool:
+    """Validate package README/CHANGELOG files, pyproject wheel metadata, and absolute README links."""
     print(
-        "Checking if all packages have local documentation and are mentioned in root CHANGELOG.md..."
+        "Checking if all packages have local documentation, wheel metadata, and absolute README links..."
     )
-    packages_dir = Path("packages")
+    packages_dir = repo_root / "packages"
     if not packages_dir.exists():
         print(f"Warning: Path {packages_dir} not found.")
         return False
 
-    root_changelog = Path("CHANGELOG.md")
+    root_changelog = repo_root / "CHANGELOG.md"
     if not root_changelog.exists():
         print("Error: Root CHANGELOG.md not found.")
         return True
@@ -488,7 +553,7 @@ def check_package_docs() -> bool:
 
     has_errors = False
 
-    for pkg_dir in packages_dir.iterdir():
+    for pkg_dir in sorted(packages_dir.iterdir()):
         if not pkg_dir.is_dir() or pkg_dir.name.startswith("."):
             continue
 
@@ -499,6 +564,57 @@ def check_package_docs() -> bool:
         if not readme_path.exists():
             print(f"Error: Package {pkg_name} is missing a local README.md.")
             has_errors = True
+        else:
+            for lineno, target in _extract_markdown_links(readme_path):
+                base_target = target.split("#", 1)[0]
+                if base_target.endswith(".rst"):
+                    print(
+                        f"Error: Raw .rst link '{target}' found in {readme_path}:{lineno}; "
+                        f"use rendered {_GITHUB_PAGES_BASE} HTML URLs."
+                    )
+                    has_errors = True
+                elif not target.startswith(("https://", "mailto:", "#")):
+                    print(
+                        f"Error: Relative or non-HTTPS link '{target}' found in {readme_path}:{lineno}; "
+                        "package READMEs must use absolute https:// URLs for PyPI rendering."
+                    )
+                    has_errors = True
+
+        # Check pyproject.toml wheel metadata (readme and license)
+        pyproject_path = pkg_dir / "pyproject.toml"
+        if not pyproject_path.exists():
+            print(f"Error: Package {pkg_name} is missing pyproject.toml.")
+            has_errors = True
+        else:
+            project_meta = tomllib.loads(pyproject_path.read_text(encoding="utf-8")).get(
+                "project", {}
+            )
+            readme_field = project_meta.get("readme")
+            readme_rel: str | None = None
+            if isinstance(readme_field, str) and readme_field.strip():
+                readme_rel = readme_field.strip()
+            elif isinstance(readme_field, dict) and isinstance(readme_field.get("file"), str):
+                readme_rel = readme_field["file"].strip()
+            if not readme_rel:
+                print(f"Error: Package {pkg_name} ({pyproject_path}) is missing [project].readme.")
+                has_errors = True
+            elif not (pkg_dir / readme_rel).is_file():
+                print(
+                    f"Error: Package {pkg_name} ({pyproject_path}) [project].readme '{readme_rel}' does not exist."
+                )
+                has_errors = True
+
+            license_field = project_meta.get("license")
+            license_val = ""
+            if isinstance(license_field, str):
+                license_val = license_field.strip()
+            elif isinstance(license_field, dict) and isinstance(license_field.get("text"), str):
+                license_val = license_field["text"].strip()
+            if license_val != "MIT":
+                print(
+                    f"Error: Package {pkg_name} ({pyproject_path}) must declare license = \"MIT\" (got {license_field!r})."
+                )
+                has_errors = True
 
         # Check for local CHANGELOG.md
         changelog_path = pkg_dir / "CHANGELOG.md"
@@ -513,6 +629,400 @@ def check_package_docs() -> bool:
 
     if not has_errors:
         print("All package docs checks passed.")
+    return has_errors
+
+
+def check_readme_github_pages_routes(
+    html_dir: Path | None = None,
+    *,
+    require_exists: bool = False,
+    repo_root: Path = Path("."),
+) -> bool:
+    """Verify zero raw .rst/docs links in READMEs and resolve all GitHub Pages URLs and #fragments."""
+    print("Checking README GitHub Pages routes and #fragment anchors...")
+    readme_files: list[Path] = []
+    root_readme = repo_root / "README.md"
+    if root_readme.is_file():
+        readme_files.append(root_readme)
+    packages_dir = repo_root / "packages"
+    if packages_dir.is_dir():
+        readme_files.extend(sorted(packages_dir.glob("*/README.md")))
+
+    has_errors = False
+    pages_links: list[tuple[Path, int, str]] = []
+
+    for readme_path in readme_files:
+        for lineno, target in _extract_markdown_links(readme_path):
+            base_part = target.split("#", 1)[0]
+            if base_part.endswith(".rst"):
+                print(
+                    f"Error: Raw .rst link '{target}' in {readme_path}:{lineno}; "
+                    f"replace with a rendered {_GITHUB_PAGES_BASE} HTML URL."
+                )
+                has_errors = True
+                continue
+            if base_part == "docs" or base_part.startswith(("docs/", "./docs/", "../docs/")):
+                print(
+                    f"Error: Relative docs/ link '{target}' in {readme_path}:{lineno}; "
+                    f"replace with a rendered {_GITHUB_PAGES_BASE} HTML URL."
+                )
+                has_errors = True
+                continue
+            if target.startswith("http://fderuiter.github.io/"):
+                print(f"Error: Non-HTTPS GitHub Pages URL '{target}' in {readme_path}:{lineno}.")
+                has_errors = True
+                continue
+            if target == _GITHUB_PAGES_BASE.rstrip("/"):
+                print(
+                    f"Error: GitHub Pages URL '{target}' in {readme_path}:{lineno} is missing trailing slash."
+                )
+                has_errors = True
+                continue
+            if target.startswith(_GITHUB_PAGES_BASE):
+                pages_links.append((readme_path, lineno, target))
+
+    if html_dir is None:
+        if not has_errors:
+            print(
+                f"README route syntax check passed ({len(pages_links)} GitHub Pages URL(s), 0 raw .rst links)."
+            )
+        return has_errors
+
+    if not html_dir.is_dir():
+        if require_exists:
+            print(f"Error: Rendered HTML directory {html_dir} does not exist.")
+            return True
+        if not has_errors:
+            print(
+                f"Skipping HTML route target resolution ({html_dir} not built); 0 raw .rst links found."
+            )
+        return has_errors
+
+    anchor_cache: dict[Path, set[str]] = {}
+    for readme_path, lineno, url in pages_links:
+        rel_spec = url[len(_GITHUB_PAGES_BASE) :]
+        if "#" in rel_spec:
+            rel_path_str, fragment = rel_spec.split("#", 1)
+            if not fragment:
+                print(f"Error: Empty '#' fragment in '{url}' at {readme_path}:{lineno}.")
+                has_errors = True
+                continue
+        else:
+            rel_path_str, fragment = rel_spec, None
+
+        if rel_path_str == "":
+            target_html = html_dir / "index.html"
+        elif rel_path_str.endswith("/"):
+            target_html = html_dir / rel_path_str.rstrip("/") / "index.html"
+        else:
+            target_html = html_dir / rel_path_str
+
+        if not target_html.is_file():
+            print(
+                f"Error: Broken GitHub Pages URL '{url}' at {readme_path}:{lineno} "
+                f"(expected {target_html} in {html_dir})."
+            )
+            has_errors = True
+            continue
+
+        if fragment is not None:
+            resolved_html = target_html.resolve()
+            if resolved_html not in anchor_cache:
+                collector = _HTMLAnchorCollector()
+                collector.feed(resolved_html.read_text(encoding="utf-8"))
+                anchor_cache[resolved_html] = collector.anchors
+            if fragment not in anchor_cache[resolved_html]:
+                print(
+                    f"Error: Missing HTML fragment '#{fragment}' for '{url}' at {readme_path}:{lineno} "
+                    f"(not found in {target_html.relative_to(html_dir)})."
+                )
+                has_errors = True
+
+    if not has_errors:
+        print(
+            f"README GitHub Pages route check passed ({len(pages_links)} URL(s) and fragments resolved in {html_dir})."
+        )
+    return has_errors
+
+
+def _normalize_dist_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def _discover_published_tag_extras(
+    repo_root: Path,
+) -> tuple[dict[str, str], dict[str, set[str]], set[str]] | None:
+    """Discover latest <package>-v* git tags and their declared extras for workspace packages."""
+    packages_dir = repo_root / "packages"
+    if not packages_dir.is_dir():
+        return {}, {}, set()
+
+    workspace_manifests: dict[str, str] = {}
+    for pyproject_path in sorted(packages_dir.glob("*/pyproject.toml")):
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        raw_name = data.get("project", {}).get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            norm_name = _normalize_dist_name(raw_name)
+            workspace_manifests[norm_name] = pyproject_path.relative_to(repo_root).as_posix()
+
+    if not workspace_manifests:
+        return {}, {}, set()
+
+    tag_proc = subprocess.run(
+        ["git", "-C", str(repo_root), "tag", "-l"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if tag_proc.returncode != 0:
+        print(f"Warning: Unable to list git tags in {repo_root}: {tag_proc.stderr.strip()}")
+        return None
+
+    all_tags = [line.strip() for line in tag_proc.stdout.splitlines() if line.strip()]
+    latest_tags: dict[str, tuple[Version, str]] = {}
+    for tag in all_tags:
+        for pkg_name in workspace_manifests:
+            prefix = f"{pkg_name}-v"
+            if tag.startswith(prefix):
+                ver_str = tag[len(prefix) :]
+                try:
+                    parsed_ver = Version(ver_str)
+                except InvalidVersion:
+                    continue
+                current = latest_tags.get(pkg_name)
+                if current is None or parsed_ver > current[0]:
+                    latest_tags[pkg_name] = (parsed_ver, tag)
+
+    if not latest_tags:
+        shallow_proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--is-shallow-repository"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if shallow_proc.returncode == 0 and shallow_proc.stdout.strip() == "true":
+            print(
+                "Warning: Shallow git checkout has no '<package>-v*' tags; skipping tag parity check."
+            )
+            return None
+
+    tag_names: dict[str, str] = {}
+    published_extras: dict[str, set[str]] = {}
+    for pkg_name, (_, tag_name) in latest_tags.items():
+        manifest_rel = workspace_manifests[pkg_name]
+        show_proc = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{tag_name}:{manifest_rel}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if show_proc.returncode != 0:
+            continue
+        tag_data = tomllib.loads(show_proc.stdout)
+        opt_deps = tag_data.get("project", {}).get("optional-dependencies", {})
+        extras_set = (
+            {str(k).strip().lower() for k in opt_deps} if isinstance(opt_deps, dict) else set()
+        )
+        tag_names[pkg_name] = tag_name
+        published_extras[pkg_name] = extras_set
+
+    return tag_names, published_extras, set(workspace_manifests.keys())
+
+
+def _extract_pip_install_specs(cmd_text: str) -> list[tuple[str, list[str]]]:
+    """Parse pip install command text and return (normalized_pkg_name, [extras]) specs."""
+    try:
+        tokens = shlex.split(cmd_text, comments=True)
+    except ValueError:
+        return []
+
+    specs: list[tuple[str, list[str]]] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        is_pip_install = (
+            (tok in ("pip", "pip3") or tok.endswith("/pip"))
+            and i + 1 < n
+            and tokens[i + 1] == "install"
+        )
+        if not is_pip_install:
+            i += 1
+            continue
+        i += 2
+        skip_next = False
+        while i < n:
+            arg = tokens[i]
+            i += 1
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in ("&&", "||", ";", "|"):
+                break
+            if arg in (
+                "-r",
+                "--requirement",
+                "-c",
+                "--constraint",
+                "-f",
+                "--find-links",
+                "-i",
+                "--index-url",
+                "--extra-index-url",
+                "--target",
+                "-t",
+                "--prefix",
+            ):
+                skip_next = True
+                continue
+            if arg in ("-e", "--editable"):
+                # Editable path target follows; skip local path specs while still flagging bare package names if misused
+                if i < n and (
+                    tokens[i].startswith((".", "/", "~")) or "/" in tokens[i] or "\\" in tokens[i]
+                ):
+                    i += 1
+                continue
+            if arg.startswith("-"):
+                continue
+            if arg.startswith((".", "/", "~")) or "/" in arg or "\\" in arg:
+                continue
+            req_match = _PIP_REQ_TOKEN_RE.match(arg)
+            if not req_match:
+                continue
+            pkg_norm = _normalize_dist_name(req_match.group(1))
+            raw_extras = req_match.group(2) or ""
+            extras = [item.strip().lower() for item in raw_extras.split(",") if item.strip()]
+            specs.append((pkg_norm, extras))
+    return specs
+
+
+def check_pypi_install_tags(repo_root: Path = Path(".")) -> bool:
+    """Verify PyPI install blocks in READMEs advertise only packages and extras in latest <package>-v* tags."""
+    print("Checking README PyPI install commands against published <package>-v* git tags...")
+    discovered = _discover_published_tag_extras(repo_root)
+    if discovered is None:
+        return False
+    latest_tag_names, published_extras, workspace_pkgs = discovered
+    if not workspace_pkgs:
+        return False
+
+    readme_files: list[Path] = []
+    root_readme = repo_root / "README.md"
+    if root_readme.is_file():
+        readme_files.append(root_readme)
+    packages_dir = repo_root / "packages"
+    if packages_dir.is_dir():
+        readme_files.extend(sorted(packages_dir.glob("*/README.md")))
+
+    has_errors = False
+    checked_specs = 0
+
+    for readme_path in readme_files:
+        lines = readme_path.read_text(encoding="utf-8").splitlines()
+        heading_stack: dict[int, str] = {}
+        i = 0
+        n = len(lines)
+        while i < n:
+            line = lines[i]
+            heading_match = _MD_HEADING_RE.match(line)
+            if heading_match:
+                level = len(heading_match.group(1))
+                for existing_lvl in [lvl for lvl in heading_stack if lvl >= level]:
+                    del heading_stack[existing_lvl]
+                heading_stack[level] = heading_match.group(2).strip().lower()
+                i += 1
+                continue
+
+            in_source_section = any(
+                any(keyword in heading_text for keyword in _SOURCE_SECTION_KEYWORDS)
+                for heading_text in heading_stack.values()
+            )
+
+            if re.match(r"^\s*```(?:bash|sh|shell|console|zsh)?\s*$", line):
+                fence_start = i + 2
+                i += 1
+                block_lines: list[tuple[int, str]] = []
+                while i < n and not re.match(r"^\s*```\s*$", lines[i]):
+                    block_lines.append((fence_start + len(block_lines), lines[i]))
+                    i += 1
+                i += 1
+                if in_source_section:
+                    continue
+
+                # Join line continuations inside shell block
+                logical_cmds: list[tuple[int, str]] = []
+                acc_line = ""
+                acc_start = fence_start
+                for cmd_lineno, raw_cmd in block_lines:
+                    stripped = raw_cmd.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if not acc_line:
+                        acc_start = cmd_lineno
+                    if stripped.endswith("\\"):
+                        acc_line += stripped[:-1] + " "
+                    else:
+                        acc_line += stripped
+                        logical_cmds.append((acc_start, acc_line))
+                        acc_line = ""
+                if acc_line:
+                    logical_cmds.append((acc_start, acc_line))
+
+                for cmd_lineno, cmd_str in logical_cmds:
+                    for pkg_norm, extras in _extract_pip_install_specs(cmd_str):
+                        if pkg_norm not in workspace_pkgs:
+                            continue
+                        checked_specs += 1
+                        if pkg_norm not in published_extras:
+                            print(
+                                f"Error: Unpublished workspace package '{pkg_norm}' in PyPI install block "
+                                f"at {readme_path}:{cmd_lineno} (no '{pkg_norm}-v*' git tag exists; "
+                                "move to a Source Checkout section)."
+                            )
+                            has_errors = True
+                            continue
+                        allowed_extras = published_extras[pkg_norm]
+                        for extra in extras:
+                            if extra not in allowed_extras:
+                                print(
+                                    f"Error: Unreleased extra '{pkg_norm}[{extra}]' in PyPI install block "
+                                    f"at {readme_path}:{cmd_lineno} (latest tag {latest_tag_names[pkg_norm]} "
+                                    f"declares extras: {sorted(allowed_extras)})."
+                                )
+                                has_errors = True
+                continue
+
+            if not in_source_section:
+                for inline_match in _INLINE_CODE_SPAN_RE.finditer(line):
+                    inline_code = inline_match.group(1)
+                    if "pip install" not in inline_code:
+                        continue
+                    for pkg_norm, extras in _extract_pip_install_specs(inline_code):
+                        if pkg_norm not in workspace_pkgs:
+                            continue
+                        checked_specs += 1
+                        if pkg_norm not in published_extras:
+                            print(
+                                f"Error: Unpublished workspace package '{pkg_norm}' in inline PyPI install "
+                                f"at {readme_path}:{i + 1} (no '{pkg_norm}-v*' git tag exists)."
+                            )
+                            has_errors = True
+                            continue
+                        allowed_extras = published_extras[pkg_norm]
+                        for extra in extras:
+                            if extra not in allowed_extras:
+                                print(
+                                    f"Error: Unreleased extra '{pkg_norm}[{extra}]' in inline PyPI install "
+                                    f"at {readme_path}:{i + 1} (latest tag {latest_tag_names[pkg_norm]} "
+                                    f"declares extras: {sorted(allowed_extras)})."
+                                )
+                                has_errors = True
+            i += 1
+
+    if not has_errors:
+        print(
+            f"README PyPI install tag check passed ({checked_specs} published package/extra spec(s) verified)."
+        )
     return has_errors
 
 
@@ -1422,6 +1932,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     cli_failed = check_cli_snippets()
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
+    pypi_tags_failed = check_pypi_install_tags()
     adr_failed = check_adr_records()
     githubpages_failed = check_sphinx_githubpages_extension()
     baseurl_failed = check_sphinx_html_baseurl()
@@ -1429,6 +1940,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     suppression_failed = check_no_duplicate_suppression()
     api_html_dir = args.html_dir if args.require_html or args.html_dir != DEFAULT_HTML_DIR else None
     api_html_failed = check_rendered_api_reference(api_html_dir)
+    routes_failed = check_readme_github_pages_routes(
+        args.html_dir,
+        require_exists=args.require_html,
+    )
     html_seo_failed = check_built_html_seo(args.html_dir, require_exists=args.require_html)
 
     if (
@@ -1437,12 +1952,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         or cli_failed
         or packages_failed
         or docs_failed
+        or pypi_tags_failed
         or adr_failed
         or githubpages_failed
         or baseurl_failed
         or seo_config_failed
         or suppression_failed
         or api_html_failed
+        or routes_failed
         or html_seo_failed
     ):
         print("Validation failed.")

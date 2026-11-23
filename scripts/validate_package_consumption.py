@@ -4,6 +4,8 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import zipfile
+from email.parser import Parser
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.resolve()
@@ -44,6 +46,58 @@ def build_wheels(dist_dir: Path):
                 run([*build_cmd, "--offline"])
             except subprocess.CalledProcessError:
                 run(build_cmd)
+
+
+def validate_wheel_metadata(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
+    """Verify every built wheel in dist_dir declares License, text/markdown, and a non-empty METADATA body."""
+    all_wheels = sorted(dist_dir.glob("*.whl"))
+    if not all_wheels:
+        raise ValueError(f"No built wheels (.whl) found in {dist_dir}")
+
+    if packages_dir.is_dir():
+        for pkg_path in sorted(packages_dir.iterdir()):
+            manifest = pkg_path / "pyproject.toml"
+            if pkg_path.is_dir() and manifest.is_file():
+                pkg_name = tomllib.loads(manifest.read_text(encoding="utf-8"))["project"]["name"]
+                normalized_pkg = pkg_name.replace("-", "_")
+                if not any(w.name.startswith(normalized_pkg + "-") for w in all_wheels):
+                    raise ValueError(
+                        f"Missing built wheel for workspace package '{pkg_name}' in {dist_dir}"
+                    )
+
+    parser = Parser()
+    for wheel_path in all_wheels:
+        with zipfile.ZipFile(wheel_path, "r") as zf:
+            metadata_members = [
+                member for member in zf.namelist() if member.endswith(".dist-info/METADATA")
+            ]
+            if len(metadata_members) != 1:
+                raise ValueError(
+                    f"{wheel_path.name}: Expected exactly 1 .dist-info/METADATA file, found {metadata_members}"
+                )
+            raw_metadata = zf.read(metadata_members[0]).decode("utf-8")
+
+        msg = parser.parsestr(raw_metadata)
+        license_val = (msg.get("License") or msg.get("License-Expression") or "").strip()
+        if license_val != "MIT":
+            raise ValueError(
+                f"{wheel_path.name}: Expected License or License-Expression 'MIT' in METADATA, got {license_val!r}"
+            )
+
+        content_type = (msg.get("Description-Content-Type") or "").strip()
+        if content_type.lower().split(";", 1)[0].strip() != "text/markdown":
+            raise ValueError(
+                f"{wheel_path.name}: Expected Description-Content-Type 'text/markdown', got {content_type!r}"
+            )
+
+        payload = msg.get_payload()
+        body = payload.strip() if isinstance(payload, str) else ""
+        if not body:
+            raise ValueError(f"{wheel_path.name}: Wheel METADATA long description body is empty")
+        print(
+            f"Verified wheel METADATA for {wheel_path.name} "
+            f"(license={license_val}, content_type={content_type}, body_chars={len(body)})."
+        )
 
 
 def validate_scenario(name, install_items, smoke_checks, dist_dir: Path):
@@ -175,6 +229,7 @@ def main():
     dist_dir = ROOT / "dist_validation"
     try:
         build_wheels(dist_dir)
+        validate_wheel_metadata(dist_dir)
 
         scenarios = [
             {

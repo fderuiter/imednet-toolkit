@@ -1160,7 +1160,8 @@ def test_persona_routing_and_datadict_subcommands_surfaced() -> None:
         assert cmd in index_rst, f"Subcommand '{cmd}' missing from docs/index.rst"
         assert cmd in readme_md, f"Subcommand '{cmd}' missing from README.md"
 
-    assert "docs/how-to/data_dictionary.rst" in readme_md
+    assert "https://fderuiter.github.io/imednet-toolkit/how-to/data_dictionary.html" in readme_md
+    assert "docs/how-to/data_dictionary.rst" not in readme_md
     assert "how-to/data_dictionary" in index_rst
     assert "how-to/audit_compliance" in index_rst
     assert "LogicTreeEvaluator" in datadict_rst
