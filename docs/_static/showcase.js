@@ -1303,6 +1303,11 @@
     // Keyboard focus management for overflowing preformatted code blocks
     // -------------------------------------------------------------------------
     function initAccessibleCodeBlocks() {
+        if (globalThis.__imednetCodeBlocksInitialized) {
+            checkCodeBlocks();
+            return;
+        }
+        globalThis.__imednetCodeBlocksInitialized = true;
         checkCodeBlocks();
         window.addEventListener("resize", scheduleCheckCodeBlocks);
         window.addEventListener("load", scheduleCheckCodeBlocks);

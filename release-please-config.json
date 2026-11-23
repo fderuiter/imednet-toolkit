@@ -3,7 +3,17 @@
     "packages/core": {
       "release-type": "python",
       "package-name": "imednet",
-      "changelog-path": "CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "/packages/core/src/imednet/__init__.py"
+        },
+        {
+          "type": "generic",
+          "path": "/docs/_static/thebe_pyodide.js"
+        }
+      ]
     },
     "packages/providers-airflow": {
       "release-type": "python",

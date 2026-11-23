@@ -159,23 +159,21 @@ def test_code_block_keyboard_accessibility() -> None:
     """Ensure preformatted code blocks receive keyboard accessibility attributes and focus styles."""
     css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
     js_content = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
+    code_blocks_js = (REPO_ROOT / "docs/_static/code_blocks.js").read_text(encoding="utf-8")
 
     # Verify CSS focus-visible rule for preformatted code blocks
     assert "pre:focus-visible" in css_content
     assert "outline: 2px solid var(--color-brand-primary)" in css_content
 
-    # Verify script logic detects pre elements and tests horizontal overflow
-    assert "querySelectorAll" in js_content and "pre" in js_content
-    assert "scrollWidth >" in js_content and "clientWidth" in js_content
-
-    # Verify accessible region and tabindex attributes are assigned to overflowing containers
-    assert 'tabindex' in js_content and '"0"' in js_content
-    assert 'role' in js_content and '"region"' in js_content
-    assert 'aria-label' in js_content and '"Code snippet"' in js_content
-
-    # Verify dynamic updates on window resize and removal when not overflowing
-    assert "resize" in js_content
-    assert "removeAttribute" in js_content and "tabindex" in js_content
+    # Verify script logic detects pre elements and tests horizontal overflow in both global and showcase scripts
+    for script_src in (js_content, code_blocks_js):
+        assert "querySelectorAll" in script_src and "pre" in script_src
+        assert "scrollWidth >" in script_src and "clientWidth" in script_src
+        assert "tabindex" in script_src and '"0"' in script_src
+        assert "role" in script_src and '"region"' in script_src
+        assert "aria-label" in script_src and '"Code snippet"' in script_src
+        assert "resize" in script_src
+        assert "removeAttribute" in script_src and "tabindex" in script_src
 
 
 @pytest.mark.unit
@@ -821,10 +819,13 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
     assert _compute_content_root("tutorials/quick_start") == "../"
     assert _compute_content_root("tutorials/examples/quick_start") == "../../"
 
-    # Verify page context hook injects #imednet-pyodide-config and backports content_root
+    # Verify page context hook scopes #imednet-pyodide-config and thebe_pyodide.js to PyodideButtonNode pages
+    from docutils.utils import new_document
+
     class _DummyApp:
         def __init__(self) -> None:
             self.directives: list[str] = []
+            self.js_files: list[str] = []
             self.config = type("Cfg", (), {"pyodide_config": pyodide_cfg})()
 
         def add_config_value(self, *_args: object, **_kwargs: object) -> None:
@@ -836,6 +837,9 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
         def add_directive(self, name: str, *_args: object, **_kwargs: object) -> None:
             self.directives.append(name)
 
+        def add_js_file(self, filename: str, **_kwargs: object) -> None:
+            self.js_files.append(filename)
+
         def connect(self, *_args: object, **_kwargs: object) -> None:
             pass
 
@@ -845,10 +849,21 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
     assert "pyodide-button" in dummy_app.directives
     assert "thebe-button" in dummy_app.directives
 
+    non_interactive_ctx: dict[str, str] = {"metatags": ""}
+    _inject_pyodide_page_context(dummy_app, "404", "page.html", non_interactive_ctx, None)
+    assert non_interactive_ctx["content_root"] == "./"
+    assert 'id="imednet-pyodide-config"' not in non_interactive_ctx["metatags"]
+    assert dummy_app.js_files == []
+
+    interactive_doc = new_document("tutorials/quick_start")
+    interactive_doc += PyodideButtonNode()
     ctx: dict[str, str] = {"metatags": ""}
-    _inject_pyodide_page_context(dummy_app, "tutorials/quick_start", "page.html", ctx, None)
+    _inject_pyodide_page_context(
+        dummy_app, "tutorials/quick_start", "page.html", ctx, interactive_doc
+    )
     assert ctx["content_root"] == "../"
     assert '<script id="imednet-pyodide-config" type="application/json">' in ctx["metatags"]
+    assert dummy_app.js_files == ["thebe_pyodide.js"]
 
 
 @pytest.mark.unit

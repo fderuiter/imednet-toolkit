@@ -54,7 +54,7 @@
 
   function getConfig() {
     const defaultWheels = [
-      "_static/wheels/imednet-1.1.0-py3-none-any.whl",
+      "_static/wheels/imednet-1.1.0-py3-none-any.whl", // x-release-please-version
       "_static/wheels/imednet_workflows-1.1.0-py3-none-any.whl",
       "_static/wheels/imednet_plugins_sinks-1.0.1-py3-none-any.whl",
     ];
