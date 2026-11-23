@@ -255,15 +255,44 @@ class BaseRecordRequest(ImednetBaseModel):
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Per the API documentation, registering a subject only requires ``formKey``
-    and ``siteName``.  The system assigns the subject identifier upon creation.
-    Do **not** include a ``subjectKey`` here — doing so causes the server to
-    treat the request as an update and reject it when the key is unknown.
+    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
+    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
+    ``None`` so server-assigned subject keys continue working by default.
     """
 
     site_name: str = Field(
         "", alias="siteName", description="Name of the site where the subject is enrolled"
     )
+    site_id: int | None = Field(
+        default=None,
+        alias="siteId",
+        description="Numeric ID of the site where the subject is enrolled",
+    )
+    subject_key: str | None = Field(
+        default=None,
+        alias="subjectKey",
+        description="Optional client-assigned subject key",
+    )
+    subject_oid: str | None = Field(
+        default=None,
+        alias="subjectOid",
+        description="Optional subject OID",
+    )
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        """Serialize enrollment payload, omitting ``None`` optional attributes by default."""
+        kwargs.setdefault("exclude_none", True)
+        if not self.site_name and self.site_id is not None:
+            raw_exclude = kwargs.get("exclude")
+            if raw_exclude is None:
+                kwargs["exclude"] = {"site_name"}
+            elif isinstance(raw_exclude, set):
+                kwargs["exclude"] = raw_exclude | {"site_name"}
+            elif isinstance(raw_exclude, dict):
+                merged = dict(raw_exclude)
+                merged["site_name"] = True
+                kwargs["exclude"] = merged
+        return super().model_dump(**kwargs)
 
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):

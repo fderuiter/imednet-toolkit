@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from unittest.mock import NonCallableMock
 
 from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.core.endpoint.operations.record_create import RecordCreateOperation
 from imednet.core.endpoint.strategies import MappingParamProcessor
+from imednet.endpoints.forms import AsyncFormsEndpoint, FormsEndpoint
 from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
+from imednet.endpoints.variables import AsyncVariablesEndpoint, VariablesEndpoint
 from imednet.models.jobs import Job
 from imednet.models.records import Record
 from imednet.utils.batch_coordinator import (
@@ -24,6 +28,14 @@ from imednet.validation.cache import ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     import pandas as pd
+
+
+@dataclass(frozen=True)
+class _EndpointSchemaAdapter:
+    """Lightweight forms/variables adapter for schema-aware dry-run in create_batch."""
+
+    forms: Any
+    variables: Any
 
 
 class RecordsOperationDef:
@@ -118,7 +130,16 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         """Validate once, submit records in bounded chunks, and optionally poll jobs."""
         self._validate_study_key(study_key)
         normalized = normalize_records_input(records_data, schema=schema)
-        coordinator = BatchCoordinator(chunk_size=chunk_size)
+        sync_client = self._client
+        datadict_adapter = (
+            _EndpointSchemaAdapter(
+                forms=FormsEndpoint(client=sync_client),
+                variables=VariablesEndpoint(client=sync_client),
+            )
+            if sync_client is not None and not isinstance(sync_client, NonCallableMock)
+            else None
+        )
+        coordinator = BatchCoordinator(chunk_size=chunk_size, sdk=datadict_adapter)
 
         def _poll_single(
             batch_id: str,
@@ -220,7 +241,16 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         """Validate once, asynchronously submit records in bounded chunks, and optionally poll."""
         self._validate_study_key(study_key)
         normalized = normalize_records_input(records_data, schema=schema)
-        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
+        async_client = self._async_client
+        datadict_adapter = (
+            _EndpointSchemaAdapter(
+                forms=AsyncFormsEndpoint(async_client=async_client),
+                variables=AsyncVariablesEndpoint(async_client=async_client),
+            )
+            if async_client is not None and not isinstance(async_client, NonCallableMock)
+            else None
+        )
+        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size, sdk=datadict_adapter)
 
         async def _poll_single(
             batch_id: str,

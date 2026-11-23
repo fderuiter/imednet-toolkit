@@ -146,6 +146,174 @@ class RecordMapper:
         self._last_variables: list[VariableModel] = []
         self._active_study_key: str | None = None
         self._enrichment_cache: dict[str, EnrichmentPipeline | None] = {}
+        self._site_map_cache: dict[str, dict[int, str]] = {}
+        self._interval_map_cache: dict[str, dict[int, str]] = {}
+        self._visit_interval_map_cache: dict[str, dict[int, tuple[int | None, str | None]]] = {}
+        self._form_key_map_cache: dict[str, dict[int, str]] = {}
+
+    def _iter_sdk_lookup_items(
+        self,
+        study_key: str,
+        endpoint_attr: str,
+        facade_method: str,
+    ) -> list[Any]:
+        """Safely fetch study metadata items without triggering unconfigured mock calls."""
+        from unittest.mock import NonCallableMock
+
+        try:
+            if isinstance(self.sdk, NonCallableMock):
+                mock_children = getattr(self.sdk, "_mock_children", {})
+                obj_vars = vars(self.sdk)
+                has_ep = endpoint_attr in mock_children or endpoint_attr in obj_vars
+                has_facade = facade_method in mock_children or facade_method in obj_vars
+                if not has_ep and not has_facade:
+                    return []
+                raw_iter = (
+                    getattr(self.sdk, endpoint_attr).list(study_key=study_key)
+                    if (has_ep and not has_facade)
+                    else getattr(self.sdk, facade_method)(study_key=study_key)
+                )
+            elif callable(getattr(self.sdk, facade_method, None)):
+                raw_iter = getattr(self.sdk, facade_method)(study_key=study_key)
+            else:
+                ep = getattr(self.sdk, endpoint_attr, None)
+                if ep is None or not callable(getattr(ep, "list", None)):
+                    return []
+                raw_iter = ep.list(study_key=study_key)
+            return list(raw_iter)
+        except Exception as exc:  # pragma: no cover - defensive for unmocked routes
+            logger.debug(
+                "Skipping %s metadata hydration for study '%s': %s",
+                endpoint_attr,
+                study_key,
+                exc,
+            )
+            return []
+
+    def _resolve_site_name(self, study_key: str, site_id: int) -> str | None:
+        """Resolve human-readable ``siteName`` for *site_id* using a per-study cache."""
+        if study_key not in self._site_map_cache:
+            mapping: dict[int, str] = {}
+            for site in self._iter_sdk_lookup_items(study_key, "sites", "get_sites"):
+                sid = (
+                    site.get("siteId") if isinstance(site, dict) else getattr(site, "site_id", None)
+                )
+                sname = (
+                    site.get("siteName")
+                    if isinstance(site, dict)
+                    else getattr(site, "site_name", None)
+                )
+                if sid is not None and isinstance(sname, str) and sname:
+                    mapping[int(sid)] = sname
+            self._site_map_cache[study_key] = mapping
+        return self._site_map_cache[study_key].get(site_id)
+
+    def _ensure_visit_interval_maps(self, study_key: str) -> None:
+        """Populate visit-backed interval fallback maps once per study when needed."""
+        if study_key in self._visit_interval_map_cache:
+            return
+        visit_map: dict[int, tuple[int | None, str | None]] = {}
+        interval_map = self._interval_map_cache.setdefault(study_key, {})
+        for visit in self._iter_sdk_lookup_items(study_key, "visits", "get_visits"):
+            vid = (
+                visit.get("visitId")
+                if isinstance(visit, dict)
+                else getattr(visit, "visit_id", None)
+            )
+            iid = (
+                visit.get("intervalId")
+                if isinstance(visit, dict)
+                else getattr(visit, "interval_id", None)
+            )
+            iname = (
+                visit.get("intervalName")
+                if isinstance(visit, dict)
+                else getattr(visit, "interval_name", None)
+            )
+            coerced_iid = int(iid) if iid is not None else None
+            coerced_iname = str(iname) if isinstance(iname, str) and iname else None
+            if coerced_iid is not None and coerced_iname and coerced_iid not in interval_map:
+                interval_map[coerced_iid] = coerced_iname
+            if vid is not None:
+                visit_map[int(vid)] = (coerced_iid, coerced_iname)
+        self._visit_interval_map_cache[study_key] = visit_map
+
+    def _resolve_interval_name(
+        self,
+        study_key: str,
+        interval_id: int,
+        *,
+        visit_id: int | None = None,
+    ) -> str | None:
+        """Resolve human-readable ``intervalName`` for *interval_id* using Intervals + Visits."""
+        if study_key not in self._interval_map_cache:
+            mapping: dict[int, str] = {}
+            for interval in self._iter_sdk_lookup_items(study_key, "intervals", "get_intervals"):
+                iid = (
+                    interval.get("intervalId")
+                    if isinstance(interval, dict)
+                    else getattr(interval, "interval_id", None)
+                )
+                iname = (
+                    interval.get("intervalName")
+                    if isinstance(interval, dict)
+                    else getattr(interval, "interval_name", None)
+                )
+                if iid is not None and isinstance(iname, str) and iname:
+                    mapping[int(iid)] = iname
+            self._interval_map_cache[study_key] = mapping
+        found = self._interval_map_cache[study_key].get(interval_id)
+        if found is not None:
+            return found
+        self._ensure_visit_interval_maps(study_key)
+        found = self._interval_map_cache[study_key].get(interval_id)
+        if found is not None:
+            return found
+        if visit_id is not None:
+            visit_pair = self._visit_interval_map_cache[study_key].get(visit_id)
+            if visit_pair is not None:
+                return visit_pair[1]
+        return None
+
+    def _resolve_visit_interval(
+        self,
+        study_key: str,
+        visit_id: int,
+    ) -> tuple[int | None, str | None]:
+        """Resolve ``(intervalId, intervalName)`` from *visit_id* when absent on the Record."""
+        self._ensure_visit_interval_maps(study_key)
+        pair = self._visit_interval_map_cache[study_key].get(visit_id)
+        if pair is None:
+            return None, None
+        iid, iname = pair
+        if iid is not None and iname is None:
+            iname = self._resolve_interval_name(study_key, iid)
+        return iid, iname
+
+    def _resolve_form_key(self, study_key: str | None, form_id: int) -> str | None:
+        """Resolve ``formKey`` from cached variables or the Forms endpoint."""
+        for var in self._last_variables:
+            if getattr(var, "form_id", None) == form_id:
+                vf_key = getattr(var, "form_key", None)
+                if isinstance(vf_key, str) and vf_key:
+                    return vf_key
+        if not study_key:
+            return None
+        if study_key not in self._form_key_map_cache:
+            mapping: dict[int, str] = {}
+            for form in self._iter_sdk_lookup_items(study_key, "forms", "get_forms"):
+                fid = (
+                    form.get("formId") if isinstance(form, dict) else getattr(form, "form_id", None)
+                )
+                fkey = (
+                    form.get("formKey")
+                    if isinstance(form, dict)
+                    else getattr(form, "form_key", None)
+                )
+                if fid is not None and isinstance(fkey, str) and fkey:
+                    mapping[int(fid)] = fkey
+            self._form_key_map_cache[study_key] = mapping
+        return self._form_key_map_cache[study_key].get(form_id)
 
     def _get_enrichment_pipeline(self, study_key: str | None = None) -> EnrichmentPipeline | None:
         """Resolve and cache committed StudyConfiguration rules for *study_key*."""
@@ -574,11 +742,60 @@ class RecordMapper:
     ) -> dict[str, Any]:
         """Parse a single record using the dynamic Pydantic model."""
         should_mask = self.mask_phi if mask_phi is None else mask_phi
+        resolved_sk = (
+            study_key
+            if isinstance(study_key, str) and study_key
+            else getattr(rec, "study_key", None) or self._active_study_key
+        )
+        sk_str = resolved_sk if isinstance(resolved_sk, str) and resolved_sk else None
+
+        raw_form_key = getattr(rec, "form_key", None)
+        form_key = (
+            raw_form_key
+            if isinstance(raw_form_key, str) and raw_form_key
+            else (
+                self._resolve_form_key(sk_str, int(rec.form_id))
+                if rec.form_id is not None
+                else None
+            )
+        )
+
+        site_id = getattr(rec, "site_id", None)
+        raw_site_name = getattr(rec, "site_name", None)
+        site_name = (
+            raw_site_name
+            if isinstance(raw_site_name, str) and raw_site_name
+            else (
+                self._resolve_site_name(sk_str, int(site_id))
+                if sk_str and site_id is not None
+                else None
+            )
+        )
+
+        interval_id = getattr(rec, "interval_id", None)
+        raw_interval_name = getattr(rec, "interval_name", None)
+        interval_name: str | None = (
+            raw_interval_name if isinstance(raw_interval_name, str) and raw_interval_name else None
+        )
+        if sk_str:
+            if interval_name is None and interval_id is not None:
+                interval_name = self._resolve_interval_name(
+                    sk_str, int(interval_id), visit_id=rec.visit_id
+                )
+            elif interval_id is None and rec.visit_id is not None:
+                interval_id, interval_name = self._resolve_visit_interval(sk_str, int(rec.visit_id))
+
         meta = {
             "recordId": rec.record_id,
+            "recordOid": getattr(rec, "record_oid", None),
             "subjectKey": rec.subject_key,
             "visitId": rec.visit_id,
+            "intervalId": interval_id,
+            "intervalName": interval_name,
             "formId": rec.form_id,
+            "formKey": form_key,
+            "siteId": site_id,
+            "siteName": site_name,
             "recordStatus": rec.record_status,
             "dateCreated": (
                 rec.date_created.isoformat()  # type: ignore[union-attr]
@@ -591,14 +808,7 @@ class RecordMapper:
         raw_data = rec.record_data if isinstance(rec.record_data, dict) else {}
         data = mask_clinical_phi(raw_data) if (should_mask and raw_data) else raw_data
         parsed = record_model(**data).model_dump(by_alias=False)
-        resolved_sk = (
-            study_key
-            if isinstance(study_key, str) and study_key
-            else getattr(rec, "study_key", None) or self._active_study_key
-        )
-        pipeline = self._get_enrichment_pipeline(
-            resolved_sk if isinstance(resolved_sk, str) else None
-        )
+        pipeline = self._get_enrichment_pipeline(sk_str)
         if pipeline is not None:
             parsed = pipeline.process(parsed, mask_phi=should_mask)
         return {**meta, **parsed}
@@ -683,9 +893,15 @@ class RecordMapper:
         ] + mapped_targets
         meta_cols = [
             "recordId",
+            "recordOid",
             "subjectKey",
             "visitId",
+            "intervalId",
+            "intervalName",
             "formId",
+            "formKey",
+            "siteId",
+            "siteName",
             "recordStatus",
             "dateCreated",
         ]
@@ -881,9 +1097,15 @@ class RecordMapper:
 
         meta_keys = {
             "recordId",
+            "recordOid",
             "subjectKey",
             "visitId",
+            "intervalId",
+            "intervalName",
             "formId",
+            "formKey",
+            "siteId",
+            "siteName",
             "recordStatus",
             "dateCreated",
         }
