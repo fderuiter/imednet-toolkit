@@ -23,11 +23,17 @@ from scripts.validate_docs import (
     _verify_core_html,
     _verify_pagination_html,
     _verify_sdk_html,
+    check_adr_records,
     check_cli_snippets,
+    check_diataxis_sidebar_isolation,
     check_docs_hygiene,
     check_documented_code_symbols,
     check_documented_extras,
+    check_examples_index_parity,
     check_no_duplicate_suppression,
+    check_package_docs,
+    check_packages_registered,
+    check_release_please_parity,
     check_rendered_api_reference,
     check_todos_in_init,
 )
@@ -513,7 +519,8 @@ def test_check_documented_code_symbols_rejects_stale_imports_and_classes(
     guide_file.write_text(
         "Architecture\n============\n\n"
         "Use :class:`~imednet.core.EdcSyncListGetEndpoint`, "
-        ":attr:`~imednet.pagination.Paginator.page_size`, and ``ENDPOINT_REGISTRY``.\n",
+        ":attr:`~imednet.pagination.Paginator.page_size`, "
+        ":attr:`~imednet.errors.ApiError.errors`, and ``ENDPOINT_REGISTRY``.\n",
         encoding="utf-8",
     )
     ref_file.write_text(
@@ -543,3 +550,132 @@ def test_check_documented_code_symbols_rejects_stale_imports_and_classes(
         encoding="utf-8",
     )
     assert check_documented_code_symbols(tmp_path) is True
+
+
+def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All default validate_docs checks anchor to REPO_ROOT from any CWD and fail fast on missing dirs."""
+    monkeypatch.chdir(tmp_path)
+    assert check_todos_in_init() is False
+    assert check_documented_extras() is False
+    assert check_cli_snippets() is False
+    assert check_docs_hygiene() is False
+    assert check_documented_code_symbols() is False
+    assert check_packages_registered() is False
+    assert check_package_docs() is False
+    assert check_release_please_parity() is False
+    assert check_examples_index_parity() is False
+    assert check_diataxis_sidebar_isolation() is False
+    assert check_adr_records() is False
+
+    empty_root = tmp_path / "empty_workspace"
+    empty_root.mkdir()
+    assert check_todos_in_init(repo_root=empty_root) is True
+    assert check_documented_extras(empty_root) is True
+    assert check_cli_snippets(empty_root) is True
+    assert check_docs_hygiene(empty_root) is True
+    assert check_documented_code_symbols(empty_root) is True
+    assert check_packages_registered(empty_root) is True
+    assert check_package_docs(empty_root) is True
+    assert check_release_please_parity(empty_root) is True
+    assert check_examples_index_parity(empty_root) is True
+    assert check_diataxis_sidebar_isolation(empty_root) is True
+    assert check_adr_records(empty_root) is True
+
+
+def test_check_examples_index_parity_detects_unindexed_script(tmp_path: Path) -> None:
+    """check_examples_index_parity fails when an examples/*.py script lacks an index entry."""
+    ex_dir = tmp_path / "examples"
+    wrappers_dir = tmp_path / "docs" / "tutorials" / "examples"
+    ex_dir.mkdir(parents=True)
+    wrappers_dir.mkdir(parents=True)
+
+    (ex_dir / "indexed_script.py").write_text('"""Indexed."""\n', encoding="utf-8")
+    (wrappers_dir / "indexed_script.rst").write_text(
+        "Indexed\n=======\n\n.. literalinclude:: /../examples/indexed_script.py\n   :language: python\n",
+        encoding="utf-8",
+    )
+    (wrappers_dir / "index.rst").write_text(
+        "Examples\n========\n\n.. toctree::\n   :maxdepth: 1\n\n   indexed_script\n",
+        encoding="utf-8",
+    )
+    assert check_examples_index_parity(tmp_path) is False
+
+    (ex_dir / "orphan_script.py").write_text('"""Unindexed."""\n', encoding="utf-8")
+    assert check_examples_index_parity(tmp_path) is True
+
+
+def test_check_release_please_parity_detects_version_drift_and_missing_extra_files(
+    tmp_path: Path,
+) -> None:
+    """check_release_please_parity enforces extra-files and version parity with manifest."""
+    import json
+
+    for pkg, ver in (
+        ("packages/core", "1.1.0"),
+        ("packages/plugins-workflows", "1.1.0"),
+        ("packages/plugins-sinks", "1.0.1"),
+    ):
+        pkg_dir = tmp_path / pkg
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / "pyproject.toml").write_text(
+            f'[project]\nname = "demo"\nversion = "{ver}"\n',
+            encoding="utf-8",
+        )
+
+    init_py = tmp_path / "packages" / "core" / "src" / "imednet" / "__init__.py"
+    init_py.parent.mkdir(parents=True)
+    init_py.write_text('__version__ = "1.1.0"  # x-release-please-version\n', encoding="utf-8")
+
+    thebe_js = tmp_path / "docs" / "_static" / "thebe_pyodide.js"
+    thebe_js.parent.mkdir(parents=True)
+    thebe_js.write_text(
+        '"_static/wheels/imednet-1.1.0-py3-none-any.whl", // x-release-please-version\n'
+        '"_static/wheels/imednet_workflows-1.1.0-py3-none-any.whl",\n'
+        '"_static/wheels/imednet_plugins_sinks-1.0.1-py3-none-any.whl",\n',
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "packages/core": "1.1.0",
+        "packages/plugins-workflows": "1.1.0",
+        "packages/plugins-sinks": "1.0.1",
+    }
+    (tmp_path / ".release-please-manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+    cfg = {
+        "packages": {
+            "packages/core": {
+                "extra-files": [
+                    {"type": "generic", "path": "/packages/core/src/imednet/__init__.py"},
+                    {"type": "generic", "path": "/docs/_static/thebe_pyodide.js"},
+                ]
+            },
+            "packages/plugins-workflows": {},
+            "packages/plugins-sinks": {},
+        }
+    }
+    (tmp_path / "release-please-config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    assert check_release_please_parity(tmp_path) is False
+
+    # Drift in __init__.py version fails parity
+    init_py.write_text('__version__ = "1.0.0"  # x-release-please-version\n', encoding="utf-8")
+    assert check_release_please_parity(tmp_path) is True
+
+
+def test_check_diataxis_sidebar_isolation_rejects_internal_leak_and_duplicate_toctree(
+    tmp_path: Path,
+) -> None:
+    """check_diataxis_sidebar_isolation fails when maintainer files leak into Reference or Explanation."""
+    docs_dir = tmp_path / "docs" / "reference"
+    docs_dir.mkdir(parents=True)
+    (tmp_path / "docs" / "index.rst").write_text(
+        "Docs\n====\n\n"
+        ".. toctree::\n   :caption: Reference:\n\n   reference/changelogs/index\n   reference/agent_rules\n",
+        encoding="utf-8",
+    )
+    (docs_dir / "contributing.rst").write_text("Contributing\n============\n", encoding="utf-8")
+    assert check_diataxis_sidebar_isolation(tmp_path) is True

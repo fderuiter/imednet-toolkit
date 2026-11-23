@@ -329,18 +329,8 @@ This documentation is organized according to the Diátaxis framework into four m
    reference/rest_api_reference
    reference/configuration
    reference/compatibility
-   reference/agent_rules
-   reference/test_skip_conditions
-   reference/live_test_charter
-   reference/live_test_plan
-   reference/live_tests
-   reference/contributing
-   reference/issue_management
-   reference/project_standards
-   reference/triage_playbook
+   reference/changelogs/index
    reference/governance
-   reference/verification_reports
-   reference/security_exceptions
    reference/VPAT
    adr/index
    reference/api/core
@@ -348,6 +338,22 @@ This documentation is organized according to the Diátaxis framework into four m
    reference/api/plugins-tui
    reference/api/plugins-workflows
    reference/api/providers-airflow
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Maintainer & Contributor:
+
+   reference/contributing
+   reference/project_standards
+   reference/issue_management
+   reference/triage_playbook
+   reference/agent_rules
+   reference/test_skip_conditions
+   reference/live_test_charter
+   reference/live_test_plan
+   reference/live_tests
+   reference/verification_reports
+   reference/security_exceptions
 
 Indices and tables
 ==================

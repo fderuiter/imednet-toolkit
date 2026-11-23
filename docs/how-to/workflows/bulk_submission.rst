@@ -74,7 +74,7 @@ When ``Subject`` enrollment is already complete and you want schema-validated, c
            {
                "formKey": "F_VS",
                "siteName": "SITE",
-               "subjectKey": "SUBJ-001",
+               "subjectKey": "SUB1",
                "intervalName": "Baseline",
                "data": {"V_WEIGHT": 71.0},
            }
@@ -83,6 +83,8 @@ When ``Subject`` enrollment is already complete and you want schema-validated, c
        poll_interval=1,
        chunk_size=50,
    )
+   assert chunk_summary.total_records == 1
+   assert chunk_summary.all_successful is True
    print(chunk_summary.batch_ids, chunk_summary.all_successful)
    reset_default_simulation_state()
 
