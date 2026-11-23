@@ -8,7 +8,6 @@ import functools
 import logging
 import re
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from typing import Any
 
@@ -250,6 +249,8 @@ class CentralizedMapper:
         as_sdtm: bool = False,
         sdtm_domain: str | None = None,
         seq_counters: dict[str, int] | None = None,
+        existing_record_seqs: dict[str, int] | None = None,
+        include_record_id: bool = False,
     ):
         """Initialize the mapper.
 
@@ -262,6 +263,8 @@ class CentralizedMapper:
             as_sdtm: When True, transform records directly into CDISC SDTM domain rows.
             sdtm_domain: Optional SDTM domain code (e.g. 'AE', 'VS', 'DM').
             seq_counters: Optional per-USUBJID sequence counter map shared across batches.
+            existing_record_seqs: Optional canonical RECORD_ID to assigned sequence map.
+            include_record_id: Whether to include ``RECORD_ID`` in SDTM output rows.
         """
         self.mode = mode
         self.post_processor = post_processor
@@ -273,7 +276,9 @@ class CentralizedMapper:
             else None
         )
         self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
+        self.include_record_id = bool(include_record_id)
         self._seq_counters: dict[str, int] = seq_counters if seq_counters is not None else {}
+        self._existing_record_seqs: dict[str, int] | None = existing_record_seqs
         self._pipeline_cache: dict[str, Any] = {}
         self._sens_snapshot: frozenset[str] = frozenset()
         self._exempt_snapshot: frozenset[str] = frozenset()
@@ -384,18 +389,28 @@ class CentralizedMapper:
                 include_deleted=True,
                 mask_phi=self.mask_phi,
                 seq_counters=self._seq_counters,
+                existing_record_seqs=self._existing_record_seqs,
                 phi_keys=pipeline_phi_keys or None,
                 pipeline=active_pipeline if has_active_rules else None,
+                include_record_id=self.include_record_id,
             )
-            mapped_sdtm = (
-                sdtm_rows[0]
-                if sdtm_rows
-                else {
-                    "STUDYID": sk,
-                    "DOMAIN": target_domain,
-                    "USUBJID": "",
-                }
-            )
+            if sdtm_rows:
+                mapped_sdtm = sdtm_rows[0]
+            else:
+                mapped_sdtm = {"STUDYID": sk}
+                if self.include_record_id:
+                    raw_rec_id = (
+                        record.get("record_id")
+                        if is_mapping and record.get("record_id") is not None
+                        else (
+                            record.get("recordId")
+                            if is_mapping
+                            else getattr(record, "record_id", None)
+                        )
+                    )
+                    mapped_sdtm["RECORD_ID"] = raw_rec_id
+                mapped_sdtm["DOMAIN"] = target_domain
+                mapped_sdtm["USUBJID"] = ""
             if self.post_processor:
                 mapped_sdtm = self.post_processor(mapped_sdtm)
             return mapped_sdtm
@@ -452,13 +467,18 @@ class CentralizedMapper:
             mapped['deleted'] = False
 
         date_mod = (
-            record.get('date_modified') or record.get('dateModified')
-            if is_mapping
-            else getattr(record, 'date_modified', None)
+            record.get('date_modified')
+            if is_mapping and record.get('date_modified') is not None
+            else (
+                record.get('dateModified') if is_mapping else getattr(record, 'date_modified', None)
+            )
         )
-        if date_mod is None:
-            date_mod = datetime.now(tz=UTC).isoformat()
-        mapped['date_modified'] = date_mod
+        if isinstance(date_mod, str) and not date_mod.strip():
+            date_mod = None
+        if masked_meta_fields and date_mod is not None and "date_modified" in masked_meta_fields:
+            mapped['date_modified'] = _MASKED_VALUE
+        else:
+            mapped['date_modified'] = date_mod
 
         if study_key is not None:
             mapped['study_key'] = study_key

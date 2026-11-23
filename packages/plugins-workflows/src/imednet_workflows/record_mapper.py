@@ -11,7 +11,7 @@ import heapq
 import inspect
 import logging
 import types
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 try:
@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
+from imednet.spi.errors import ImednetAPIError
 from imednet.spi.models import (
     _SDTM_RECORDS_SORT,
     _UNSET_PIPELINE,
@@ -71,6 +72,7 @@ def transform_records_to_sdtm(
     seq_counters: dict[str, int] | None = None,
     phi_keys: Iterable[str] | None = None,
     registry: Any | None = None,
+    include_record_id: bool = False,
 ) -> pd.DataFrame:
     """Transform clinical records into a normalized CDISC SDTM domain DataFrame.
 
@@ -96,6 +98,7 @@ def transform_records_to_sdtm(
         phi_keys=phi_keys,
         registry=registry,
         pipeline=resolved_pipeline,
+        include_record_id=include_record_id,
     )
 
 
@@ -333,7 +336,7 @@ class RecordMapper:
         *,
         record_data_filter: str | None = None,
         include_deleted: bool | None = None,
-        sort: str | None = None,
+        sort: str | Sequence[str] | None = None,
         group_by_subject: bool = False,
     ) -> Iterator[RecordModel]:
         """Lazily stream records from the SDK, applying visit/form/deleted filters."""
@@ -431,7 +434,7 @@ class RecordMapper:
                 if not effective_include_deleted and is_record_deleted(rec):
                     continue
                 yield rec
-        except ValueError:
+        except (ValueError, ImednetAPIError):
             raise
         except Exception as exc:  # pragma: no cover - unexpected
             logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
@@ -495,7 +498,7 @@ class RecordMapper:
         *,
         record_data_filter: str | None = None,
         include_deleted: bool | None = None,
-        sort: str | None = None,
+        sort: str | Sequence[str] | None = None,
         group_by_subject: bool = False,
     ) -> Iterable[RecordModel]:
         """Iterate lazily over records for a study, using cache if available."""
@@ -931,17 +934,26 @@ class RecordMapper:
                             remapped[target_key] = v
                 parsed_data = remapped
 
-            # Automatically perform lookups for parent record identifiers using available metadata
-            resolved_parent_id = getattr(rec, "parent_record_id", None)
-            if not resolved_parent_id:
-                resolved_parent_id = (
-                    f"{rec.visit_id}_{rec.form_id}" if rec.visit_id is not None else None
-                )
+            # Preserve None for root records with null or zero parentRecordId
+            raw_parent_id = getattr(rec, "parent_record_id", None)
+            if raw_parent_id is None and isinstance(rec, Mapping):
+                raw_parent_id = rec.get("parent_record_id")
+                if raw_parent_id is None:
+                    raw_parent_id = rec.get("parentRecordId")
+            resolved_parent_id = None if raw_parent_id in (None, 0, "") else raw_parent_id
 
-            if "parent_record_id" not in parsed_data or parsed_data.get("parent_record_id") is None:
+            if "parent_record_id" not in parsed_data or parsed_data.get("parent_record_id") in (
+                None,
+                0,
+                "",
+            ):
                 parsed_data["parent_record_id"] = resolved_parent_id
-                if use_labels_as_keys and "parentRecordId" in parsed_data:
-                    parsed_data["parentRecordId"] = resolved_parent_id
+            if (
+                use_labels_as_keys
+                and "parentRecordId" in parsed_data
+                and parsed_data.get("parentRecordId") in (None, 0, "")
+            ):
+                parsed_data["parentRecordId"] = resolved_parent_id
 
             subj_key = rec.subject_key
             if subj_key not in tree:
@@ -994,6 +1006,7 @@ class RecordMapper:
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
         seq_counters: dict[str, int] | None = None,
+        include_record_id: bool = False,
     ) -> pd.DataFrame:
         """Transform an iterable of records into a normalized SDTM domain DataFrame."""
         effective_include_deleted = (
@@ -1009,6 +1022,7 @@ class RecordMapper:
             mask_phi=should_mask,
             enrichment_pipeline=pipeline,
             seq_counters=seq_counters,
+            include_record_id=include_record_id,
         )
 
     def sdtm_dataframe(
@@ -1021,6 +1035,7 @@ class RecordMapper:
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        include_record_id: bool = False,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` transformed into a CDISC SDTM domain dataset."""
         if pd is None:
@@ -1038,6 +1053,7 @@ class RecordMapper:
                 form_whitelist=form_whitelist,
                 mask_phi=should_mask,
                 include_deleted=include_deleted,
+                include_record_id=include_record_id,
             )
         )
         if not frames:
@@ -1047,6 +1063,7 @@ class RecordMapper:
                 study_key=study_key,
                 mask_phi=should_mask,
                 enrichment_pipeline=self._get_enrichment_pipeline(study_key),
+                include_record_id=include_record_id,
             )
         return pd.concat(frames, ignore_index=True)
 
@@ -1055,19 +1072,20 @@ class RecordMapper:
         records: Iterable[Any],
         allowed_vars: set[str],
     ) -> Iterator[Any]:
-        """Lazily project ``record_data`` dictionaries down to ``allowed_vars``."""
+        """Lazily project ``record_data`` / ``recordData`` dictionaries down to ``allowed_vars``."""
         for rec in records:
             rec_data = getattr(rec, "record_data", None)
             if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
                 yield rec.model_copy(
                     update={"record_data": {k: v for k, v in rec_data.items() if k in allowed_vars}}
                 )
-            elif isinstance(rec, dict):
+            elif isinstance(rec, Mapping):
                 copied = dict(rec)
-                if isinstance(copied.get("record_data"), dict):
-                    copied["record_data"] = {
-                        k: v for k, v in copied["record_data"].items() if k in allowed_vars
-                    }
+                for rd_key in ("record_data", "recordData"):
+                    if isinstance(copied.get(rd_key), Mapping):
+                        copied[rd_key] = {
+                            k: v for k, v in copied[rd_key].items() if k in allowed_vars
+                        }
                 yield copied
             else:
                 yield rec
@@ -1082,6 +1100,7 @@ class RecordMapper:
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        include_record_id: bool = False,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked pandas DataFrames transformed into an SDTM domain dataset."""
         if pd is None:
@@ -1127,7 +1146,7 @@ class RecordMapper:
             visit_key=visit_key,
             extra_filters=extra_filters or None,
             include_deleted=effective_include_deleted,
-            sort=_SDTM_RECORDS_SORT,
+            sort=list(_SDTM_RECORDS_SORT),
             group_by_subject=True,
         )
         if allowed_vars is not None:
@@ -1141,6 +1160,7 @@ class RecordMapper:
             include_deleted=effective_include_deleted,
             mask_phi=should_mask,
             pipeline=pipeline,
+            include_record_id=include_record_id,
         )
         if normalizer.remaps_usubjid:
             source_is_ordered = False

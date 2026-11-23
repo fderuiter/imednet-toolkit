@@ -419,7 +419,7 @@ def test_centralized_mapper_cached_fields_and_shared_pipeline() -> None:
         mapped_sparse = doc_mapper.map_record(sparse_record, study_key=None)
         assert doc_mapper._cached_fields is not None
         assert mapped_sparse["deleted"] is False
-        assert isinstance(mapped_sparse["date_modified"], str)
+        assert mapped_sparse["date_modified"] is None
         assert mapped_sparse["study_key"] is None
         assert doc_mapper._pipeline_cache["UNKNOWN"] is _DEFAULT_PIPELINE
         assert mapped_sparse["record_data"]["nested_obj"] == {"innerVal": 1}

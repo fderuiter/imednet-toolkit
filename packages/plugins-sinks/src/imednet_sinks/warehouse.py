@@ -101,6 +101,7 @@ from imednet.spi.sinks import (
     extract_record_id,
     format_variable_name,
     normalize_sink_value,
+    resolve_sdtm_domain,
     run_streaming_export,
 )
 from imednet.spi.utils import flatten, global_sensitivity_registry, mask_clinical_phi
@@ -837,7 +838,7 @@ def _resolve_column_types(arrow_table: Any, columns: Sequence[str]) -> dict[str,
         if sf_type is None:
             if col == "deleted":
                 sf_type = "BOOLEAN"
-            elif col in _BIGINT_METADATA_COLUMNS:
+            elif col.lower() in _BIGINT_METADATA_COLUMNS:
                 sf_type = "BIGINT"
             else:
                 sf_type = "VARCHAR"
@@ -855,6 +856,9 @@ def _resolve_merge_keys(
     """Resolve Snowflake ``MERGE INTO`` natural key columns for the active schema mode."""
     col_set = set(columns)
     if as_sdtm:
+        if "RECORD_ID" in col_set:
+            present_sdtm = tuple(c for c in ("STUDYID", "RECORD_ID") if c in col_set)
+            return present_sdtm if present_sdtm else (columns[0],)
         seq_col = next(
             (c for c in columns if c.endswith("SEQ") and c not in ("STUDYID", "DOMAIN", "USUBJID")),
             None,
@@ -939,6 +943,7 @@ def _records_to_arrow_table(
                 mask_phi=mask_phi,
                 as_sdtm=True,
                 sdtm_domain=sdtm_domain,
+                include_record_id=True,
             )
         else:
             post_proc = (
@@ -1027,6 +1032,30 @@ def _records_to_arrow_table(
     return pa.Table.from_pylist(rows)
 
 
+def _extract_sql_key_seq(
+    row: Any, key_name: str, seq_name: str | None = None
+) -> tuple[str, int] | None:
+    """Extract a ``(key_str, positive_seq_int)`` pair from a Snowflake cursor row."""
+    key_raw: Any = None
+    seq_raw: Any = None
+    if isinstance(row, Mapping):
+        key_raw = row.get(key_name) or row.get(key_name.lower())
+        if seq_name is not None:
+            seq_raw = row.get(seq_name) or row.get(seq_name.lower())
+        else:
+            seq_raw = next((v for k, v in row.items() if str(k).upper() != key_name), None)
+    elif isinstance(row, (tuple, list)) and len(row) >= 2:
+        key_raw, seq_raw = row[0], row[1]
+    if key_raw is None or seq_raw is None or isinstance(seq_raw, bool):
+        return None
+    try:
+        seq_int = int(seq_raw)
+    except (TypeError, ValueError):
+        return None
+    key_str = str(key_raw).strip()
+    return (key_str, seq_int) if key_str and seq_int > 0 else None
+
+
 class SnowflakeExportSink(ExportSink):
     """Stage Parquet files and bulk-load them into Snowflake.
 
@@ -1051,6 +1080,9 @@ class SnowflakeExportSink(ExportSink):
         super().__init__(config)
         self._cfg: SnowflakeSinkConfig = config
         self._seq_counters: dict[str, int] = {}
+        self._existing_record_seqs: dict[str, int] = {}
+        self._seeded_sdtm_domains: set[str] = set()
+        self._domains_with_existing_seq: set[str] = set()
         self._conn: Any = None
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
@@ -1111,23 +1143,15 @@ class SnowflakeExportSink(ExportSink):
     # ExportSink interface
     # ------------------------------------------------------------------
 
-    def _ensure_table_schema(
-        self,
-        cur: Any,
-        target_table: str,
-        arrow_table: Any,
-        columns: Sequence[str],
-    ) -> None:
-        """Create missing Snowflake destination table or evolve new variable columns."""
+    def _fetch_existing_table_columns(self, cur: Any) -> set[str]:
+        """Query ``INFORMATION_SCHEMA.COLUMNS`` and return lowercase column names."""
         cfg = self._cfg
-        col_types = _resolve_column_types(arrow_table, columns)
         info_schema_cols = f"{_quote_identifier(cfg.database)}.INFORMATION_SCHEMA.COLUMNS"
         cur.execute(
             f"SELECT COLUMN_NAME FROM {info_schema_cols} "  # noqa: S608
             f"WHERE UPPER(TABLE_SCHEMA) = UPPER('{cfg.schema}') "
             f"AND UPPER(TABLE_NAME) = UPPER('{cfg.table}')"
         )  # nosem
-
         fetched = cur.fetchall()
         existing_cols: set[str] = set()
         if hasattr(fetched, "__iter__"):
@@ -1140,6 +1164,92 @@ class SnowflakeExportSink(ExportSink):
                     existing_cols.add(str(item[0]).lower())
                 elif isinstance(item, str):
                     existing_cols.add(item.lower())
+        return existing_cols
+
+    def _seed_sdtm_seq_counters(
+        self,
+        cur: Any,
+        target_table: str,
+        existing_cols: set[str],
+        records: Sequence[Any],
+    ) -> None:
+        """Seed ``self._seq_counters`` from destination ``MAX(<DOM>SEQ)`` per ``USUBJID``."""
+        cfg = self._cfg
+        raw_dom = cfg.sdtm_domain
+        if not raw_dom and records:
+            first_rec = records[0]
+            raw_dom = (
+                first_rec.get("DOMAIN")
+                or first_rec.get("domain")
+                or first_rec.get("form_key")
+                or first_rec.get("formKey")
+                if isinstance(first_rec, Mapping)
+                else getattr(first_rec, "form_key", None)
+            )
+        target_domain = resolve_sdtm_domain(raw_dom, fallback="AE")
+        if target_domain == "DM":
+            return
+        seq_col = f"{target_domain}SEQ"
+        if "usubjid" not in existing_cols or seq_col.lower() not in existing_cols:
+            self._seeded_sdtm_domains.add(target_domain)
+            return
+        quoted_seq = _quote_identifier(seq_col)
+        if target_domain not in self._seeded_sdtm_domains:
+            self._seeded_sdtm_domains.add(target_domain)
+            cur.execute(
+                f'SELECT "USUBJID", MAX({quoted_seq}) FROM {target_table} '  # noqa: S608
+                f'WHERE "STUDYID" = %s GROUP BY "USUBJID"',
+                [cfg.study_key],
+            )  # nosem
+            rows = cur.fetchall()
+            if hasattr(rows, "__iter__"):
+                for row in rows:
+                    parsed = _extract_sql_key_seq(row, "USUBJID")
+                    if parsed is not None:
+                        usubjid, max_seq_int = parsed
+                        self._domains_with_existing_seq.add(target_domain)
+                        self._seq_counters[usubjid] = max(
+                            self._seq_counters.get(usubjid, 0),
+                            max_seq_int,
+                        )
+
+        if target_domain in self._domains_with_existing_seq and "record_id" in existing_cols:
+            lookup_ids = [
+                rid
+                for rec in records
+                if (rid := extract_record_id(rec)) is not None
+                and not isinstance(rid, bool)
+                and (cid := str(rid).strip())
+                and cid not in self._existing_record_seqs
+            ]
+            if lookup_ids:
+                placeholders = ", ".join(["%s"] * len(lookup_ids))
+                cur.execute(
+                    f'SELECT "RECORD_ID", {quoted_seq} FROM {target_table} '  # noqa: S608
+                    f'WHERE "STUDYID" = %s AND "RECORD_ID" IN ({placeholders})',
+                    [cfg.study_key, *lookup_ids],
+                )  # nosem
+                id_rows = cur.fetchall()
+                if hasattr(id_rows, "__iter__"):
+                    for id_row in id_rows:
+                        parsed = _extract_sql_key_seq(id_row, "RECORD_ID", seq_col)
+                        if parsed is not None:
+                            cid, seq_int = parsed
+                            self._existing_record_seqs[cid] = seq_int
+
+    def _ensure_table_schema(
+        self,
+        cur: Any,
+        target_table: str,
+        arrow_table: Any,
+        columns: Sequence[str],
+        *,
+        existing_cols: set[str] | None = None,
+    ) -> None:
+        """Create missing Snowflake destination table or evolve new variable columns."""
+        col_types = _resolve_column_types(arrow_table, columns)
+        if existing_cols is None:
+            existing_cols = self._fetch_existing_table_columns(cur)
 
         if not existing_cols:
             col_defs = ", ".join(
@@ -1194,38 +1304,66 @@ class SnowflakeExportSink(ExportSink):
             mode="tabular",
             post_processor=post_proc,
             seq_counters=self._seq_counters,
+            existing_record_seqs=self._existing_record_seqs,
         )
 
-        arrow_table = _records_to_arrow_table(
-            records,
-            mask_phi=self.config.mask_phi,
-            study_key=cfg.study_key,
-            mapper=mapper,
-            as_sdtm=cfg.as_sdtm,
-            sdtm_domain=cfg.sdtm_domain,
-            naming_convention=cfg.naming_convention,
-        )
-        merge_columns = _resolve_merge_columns(arrow_table)
         local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
         pq = _require_optional_dep("pyarrow.parquet", "snowflake")
-        pq.write_table(arrow_table, str(local_path))
+        arrow_table: Any | None = None
+        merge_columns: list[str] = []
+
+        if not (cfg.as_sdtm and self.config.idempotent):
+            arrow_table = _records_to_arrow_table(
+                records,
+                mask_phi=self.config.mask_phi,
+                study_key=cfg.study_key,
+                mapper=mapper,
+                as_sdtm=cfg.as_sdtm,
+                sdtm_domain=cfg.sdtm_domain,
+                naming_convention=cfg.naming_convention,
+            )
+            merge_columns = _resolve_merge_columns(arrow_table)
+            pq.write_table(arrow_table, str(local_path))
 
         stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{safe_batch}.parquet"
 
         def execute_export() -> int:
             """Execute PUT, schema evolution DDL, and staged MERGE INTO (or COPY INTO) in Snowflake."""
+            nonlocal arrow_table, merge_columns
             cur = self._conn.cursor()
             try:
-                cur.execute(
-                    f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/' "
-                    f"AUTO_COMPRESS = FALSE OVERWRITE = TRUE"
-                )  # nosem
                 target_table = (
                     f"{_quote_identifier(cfg.database)}."
                     f"{_quote_identifier(cfg.schema)}."
                     f"{_quote_identifier(cfg.table)}"
                 )
-                self._ensure_table_schema(cur, target_table, arrow_table, merge_columns)
+                prefetched_cols: set[str] | None = None
+                if arrow_table is None:
+                    prefetched_cols = self._fetch_existing_table_columns(cur)
+                    self._seed_sdtm_seq_counters(cur, target_table, prefetched_cols, records)
+                    arrow_table = _records_to_arrow_table(
+                        records,
+                        mask_phi=self.config.mask_phi,
+                        study_key=cfg.study_key,
+                        mapper=mapper,
+                        as_sdtm=cfg.as_sdtm,
+                        sdtm_domain=cfg.sdtm_domain,
+                        naming_convention=cfg.naming_convention,
+                    )
+                    merge_columns = _resolve_merge_columns(arrow_table)
+                    pq.write_table(arrow_table, str(local_path))
+
+                cur.execute(
+                    f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/' "
+                    f"AUTO_COMPRESS = FALSE OVERWRITE = TRUE"
+                )  # nosem
+                self._ensure_table_schema(
+                    cur,
+                    target_table,
+                    arrow_table,
+                    merge_columns,
+                    existing_cols=prefetched_cols,
+                )
 
                 if self.config.idempotent:
                     staging_table = (
@@ -1250,11 +1388,20 @@ class SnowflakeExportSink(ExportSink):
                     )
                     non_key_cols = [col for col in merge_columns if col not in merge_keys]
                     if non_key_cols:
-                        update_clause = ", ".join(
-                            f"target.{_quote_identifier(col.upper())} = "
-                            f"source.{_quote_identifier(col.upper())}"
-                            for col in non_key_cols
-                        )
+                        update_assignments: list[str] = []
+                        for col in non_key_cols:
+                            q_col = _quote_identifier(col.upper())
+                            if (
+                                cfg.as_sdtm
+                                and col.endswith("SEQ")
+                                and col not in ("STUDYID", "DOMAIN", "USUBJID", "RECORD_ID")
+                            ):
+                                update_assignments.append(
+                                    f"target.{q_col} = COALESCE(target.{q_col}, source.{q_col})"
+                                )
+                            else:
+                                update_assignments.append(f"target.{q_col} = source.{q_col}")
+                        update_clause = ", ".join(update_assignments)
                     else:
                         first_key = _quote_identifier(merge_keys[0].upper())
                         update_clause = f"target.{first_key} = source.{first_key}"
@@ -1363,7 +1510,7 @@ class SnowflakeExportSink(ExportSink):
 
         if cfg.naming_convention == "camelCase":
             where_clause = f'"STUDYKEY" = %s AND "RECORDID" IN ({placeholders})'
-        elif cfg.naming_convention == "sdtm":
+        elif cfg.as_sdtm or cfg.naming_convention == "sdtm":
             where_clause = f'"STUDYID" = %s AND "RECORD_ID" IN ({placeholders})'
         else:
             where_clause = f"STUDY_KEY = %s AND RECORD_ID IN ({placeholders})"

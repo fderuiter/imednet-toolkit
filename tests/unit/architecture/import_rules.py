@@ -13,6 +13,10 @@ PUBLIC_CORE = (
     "imednet.errors",
 )
 PUBLIC_SYMBOLS = {
+    "ApiError",
+    "ImednetAPIError",
+    "ImednetError",
+    "NotFoundError",
     "ImednetSDK",
     "AsyncImednetSDK",
     "Config",

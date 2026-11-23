@@ -1429,12 +1429,14 @@ def test_sdtm_sort_query_simulation_transport_multi_form_and_cached_loader_parit
     ]
 
     transport = SimulationTransport(state=state)
-    record_query_params: list[dict[str, str]] = []
+    record_query_params: list[httpx.QueryParams] = []
+    record_urls: list[str] = []
     orig_handle = transport.handle_request
 
     def spy_handle(request: httpx.Request) -> httpx.Response:
         if request.method.upper() == "GET" and request.url.path.endswith("/records"):
-            record_query_params.append(dict(request.url.params))
+            record_query_params.append(request.url.params)
+            record_urls.append(str(request.url))
         return orig_handle(request)
 
     transport.handle_request = spy_handle  # type: ignore[method-assign]
@@ -1446,15 +1448,18 @@ def test_sdtm_sort_query_simulation_transport_multi_form_and_cached_loader_parit
     assert record_query_params
     assert all("sort" not in params for params in record_query_params)
 
-    # Single-query and multi-form SDTM streams request sort="subjectKey,asc;recordId,asc"
+    # Single-query and multi-form SDTM streams request repeated sort parameters
     record_query_params.clear()
+    record_urls.clear()
     sdk_sdtm_chunks = list(
         non_sdtm_mapper.iter_sdtm_dataframes("STUDY-SIM", domain="AE", form_whitelist=[10, 20])
     )
     assert record_query_params
     assert all(
-        params.get("sort") == "subjectKey,asc;recordId,asc" for params in record_query_params
+        params.get_list("sort") == ["subjectKey,asc", "recordId,asc"]
+        for params in record_query_params
     )
+    assert all("sort=subjectKey%2Casc&sort=recordId%2Casc" in url for url in record_urls)
     sdk_sdtm_df = pd.concat(sdk_sdtm_chunks, ignore_index=True)
 
     # CachedRecordsLoader produces identical <DOM>SEQ assignments

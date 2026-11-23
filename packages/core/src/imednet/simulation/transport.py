@@ -417,30 +417,29 @@ def _parse_sort_specs(raw_sorts: list[str]) -> list[dict[str, str]]:
     for raw in raw_sorts:
         if not raw or not raw.strip():
             continue
-        for token in raw.split(";"):
-            part = token.strip()
-            if not part:
-                continue
-            if "," in part:
-                prop_raw, dir_raw = part.split(",", 1)
-            elif ":" in part:
-                prop_raw, dir_raw = part.split(":", 1)
-            else:
-                prop_raw, dir_raw = part, "ASC"
+        part = raw.strip()
+        if ";" in part or ":" in part:
+            raise _FilterParseError(
+                "Invalid sort delimiter. Repeat 'sort=<property>,<asc|desc>' parameters instead of using ';' or ':'.",
+                attribute="sort",
+                value=raw,
+            )
+        if "," in part:
+            prop_raw, dir_raw = part.split(",", 1)
+        else:
+            prop_raw, dir_raw = part, "ASC"
 
-            prop = prop_raw.strip()
-            direction = dir_raw.strip().upper()
-            if not prop:
-                raise _FilterParseError(
-                    "Sort property cannot be empty", attribute="sort", value=raw
-                )
-            if direction not in ("ASC", "DESC"):
-                raise _FilterParseError(
-                    f"Invalid sort direction '{dir_raw}'. Expected ASC or DESC.",
-                    attribute="sort",
-                    value=raw,
-                )
-            specs.append({"property": prop, "direction": direction})
+        prop = prop_raw.strip()
+        direction = dir_raw.strip().upper()
+        if not prop:
+            raise _FilterParseError("Sort property cannot be empty", attribute="sort", value=raw)
+        if direction not in ("ASC", "DESC"):
+            raise _FilterParseError(
+                f"Invalid sort direction '{dir_raw}'. Expected ASC or DESC.",
+                attribute="sort",
+                value=raw,
+            )
+        specs.append({"property": prop, "direction": direction})
     return specs
 
 

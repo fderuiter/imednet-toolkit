@@ -4,6 +4,7 @@ This module implements the ParamProcessor strategy pattern, allowing endpoints
 to customize how filters are processed and special parameters are extracted.
 """
 
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from imednet.core.protocols import ParamProcessor
@@ -20,6 +21,54 @@ COMMON_LIST_PARAM_MAPPING: dict[str, str] = {
 _RAW_PASSTHROUGH_API_KEYS: frozenset[str] = frozenset(
     {*COMMON_LIST_PARAM_MAPPING.values(), "recordDataFilter"}
 )
+
+
+def _format_sort_clause(item: Any) -> str:
+    """Format a single sort clause as ``<property>,asc`` or ``<property>,desc``."""
+    if (
+        isinstance(item, tuple)
+        and len(item) == 2
+        and isinstance(item[0], str)
+        and isinstance(item[1], str)
+    ):
+        prop = item[0].strip()
+        direction = item[1].strip()
+        dir_lower = direction.lower()
+        if prop and dir_lower in {"asc", "desc"}:
+            return f"{prop},{dir_lower}"
+        return f"{prop},{direction}"
+
+    text = str(item).strip()
+    if not text or ";" in text or ":" in text:
+        return text
+    if "," in text:
+        prop_part, dir_part = text.split(",", 1)
+        prop_clean = prop_part.strip()
+        dir_lower = dir_part.strip().lower()
+        if prop_clean and dir_lower in {"asc", "desc"}:
+            return f"{prop_clean},{dir_lower}"
+        return text
+    return f"{text},asc"
+
+
+def _normalize_sort_param(value: Any) -> Any:
+    """Normalize multi-key ``sort`` inputs into repeated ``<property>,<asc|desc>`` parameters."""
+    if isinstance(value, (str, bytes)):
+        return value
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and isinstance(value[0], str)
+        and isinstance(value[1], str)
+        and "," not in value[0]
+        and ";" not in value[0]
+        and ":" not in value[0]
+        and value[1].strip().lower() in {"asc", "desc"}
+    ):
+        return _format_sort_clause(value)
+    if isinstance(value, Sequence):
+        return [_format_sort_clause(item) for item in value]
+    return value
 
 
 class DefaultParamProcessor(ParamProcessor):
@@ -41,11 +90,13 @@ class DefaultParamProcessor(ParamProcessor):
         """
         cleaned = filters.copy()
         special_params: dict[str, Any] = {}
-        for key, api_key in COMMON_LIST_PARAM_MAPPING.items():
+        for key, param_name in COMMON_LIST_PARAM_MAPPING.items():
             if key in cleaned:
                 value = cleaned.pop(key)
                 if value is not None:
-                    special_params[api_key] = value
+                    special_params[param_name] = (
+                        _normalize_sort_param(value) if param_name == "sort" else value
+                    )
         return cleaned, special_params
 
 
@@ -89,7 +140,7 @@ class MappingParamProcessor(ParamProcessor):
         filters = filters.copy()
         special_params: dict[str, Any] = {}
 
-        for filter_key, api_key in self.mapping.items():
+        for filter_key, param_name in self.mapping.items():
             value = None
             if filter_key in filters:
                 value = filters.pop(filter_key)
@@ -97,16 +148,17 @@ class MappingParamProcessor(ParamProcessor):
                 value = self.defaults[filter_key]
 
             if value is not None:
-                formatted = (
-                    str(value).lower()
-                    if isinstance(value, bool) and api_key not in _RAW_PASSTHROUGH_API_KEYS
-                    else value
-                )
-                if api_key in special_params and special_params[api_key] != formatted:
+                if param_name == "sort":
+                    formatted: Any = _normalize_sort_param(value)
+                elif isinstance(value, bool) and param_name not in _RAW_PASSTHROUGH_API_KEYS:
+                    formatted = str(value).lower()
+                else:
+                    formatted = value
+                if param_name in special_params and special_params[param_name] != formatted:
                     raise ConfigurationError(
-                        f"Conflicting values provided for query parameter '{api_key}'."
+                        f"Conflicting values provided for query parameter '{param_name}'."
                     )
-                special_params[api_key] = formatted
+                special_params[param_name] = formatted
 
         return filters, special_params
 

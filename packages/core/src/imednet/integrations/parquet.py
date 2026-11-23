@@ -5,12 +5,18 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+from collections.abc import Mapping
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 from unittest.mock import NonCallableMock
 
+from ..models.sdtm import (
+    get_sdtm_domain_variables,
+    resolve_sdtm_domain,
+    transform_records_to_sdtm_rows,
+)
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
 from .enrichment import resolve_enrichment_pipeline
@@ -24,6 +30,7 @@ from .export import (
     _is_incremental_config,
     _mask_df,
     _record_mapper,
+    _record_seq_int,
     _stream_records_across_forms,
 )
 from .parquet_engine import PyArrowDatasetPartitionedStorageEngine
@@ -147,6 +154,80 @@ def _write_hive_form_rows(
         form_key=form_key,
     )
     return len(df)
+
+
+def _seed_hive_sdtm_seq_state(
+    files: list[Path],
+    domain: str,
+    seq_counters: dict[str, int],
+    existing_record_seqs: dict[str, int],
+) -> None:
+    """Seed per-USUBJID max ``<DOM>SEQ`` and ``RECORD_ID -> <DOM>SEQ`` from partition Parquet files."""
+    if not files or domain == "DM":
+        return
+    pq_module = import_module("pyarrow.parquet")
+    seq_col = f"{domain}SEQ"
+    for pf_path in files:
+        if not pf_path.exists():
+            continue
+        with pq_module.ParquetFile(str(pf_path)) as pf:
+            schema_names = set(pf.schema_arrow.names)
+            if seq_col not in schema_names:
+                continue
+            id_col = next(
+                (c for c in ("RECORD_ID", "recordId", "record_id") if c in schema_names),
+                None,
+            )
+            read_cols = [c for c in ("USUBJID", id_col, seq_col) if c and c in schema_names]
+            for rb in pf.iter_batches(columns=read_cols):
+                batch_dict = rb.to_pydict()
+                seq_vals = batch_dict.get(seq_col, [])
+                usubj_vals = batch_dict.get("USUBJID", [None] * len(seq_vals))
+                id_vals = (
+                    batch_dict.get(id_col, [None] * len(seq_vals))
+                    if id_col
+                    else [None] * len(seq_vals)
+                )
+                for usubj_raw, id_raw, seq_raw in zip(usubj_vals, id_vals, seq_vals, strict=False):
+                    seq_int = _record_seq_int(seq_raw)
+                    if seq_int is None:
+                        continue
+                    usubjid = str(usubj_raw or "").strip()
+                    if usubjid:
+                        seq_counters[usubjid] = max(seq_counters.get(usubjid, 0), seq_int)
+                    cid = _canonical_record_id(id_raw)
+                    if cid is not None:
+                        existing_record_seqs[cid] = seq_int
+
+
+def _project_hive_sdtm_whitelist(
+    batch: list[Any],
+    variable_whitelist: list[str] | None,
+) -> list[Any]:
+    """Filter ``record_data`` / ``recordData`` keys to ``variable_whitelist`` before SDTM transform."""
+    if variable_whitelist is None:
+        return batch
+    allowed = set(variable_whitelist)
+    projected: list[Any] = []
+    for rec in batch:
+        rec_data = getattr(rec, "record_data", None)
+        if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
+            projected.append(
+                rec.model_copy(
+                    update={"record_data": {k: v for k, v in rec_data.items() if k in allowed}}
+                )
+            )
+        elif isinstance(rec, Mapping) and isinstance(rec.get("record_data"), Mapping):
+            cloned = dict(rec)
+            cloned["record_data"] = {k: v for k, v in rec["record_data"].items() if k in allowed}
+            projected.append(cloned)
+        elif isinstance(rec, Mapping) and isinstance(rec.get("recordData"), Mapping):
+            cloned = dict(rec)
+            cloned["recordData"] = {k: v for k, v in rec["recordData"].items() if k in allowed}
+            projected.append(cloned)
+        else:
+            projected.append(rec)
+    return projected
 
 
 def _prune_hive_partition_record_ids(
@@ -277,28 +358,78 @@ def export_to_hive_parquet(
                     sorted(part_dir.rglob("*.parquet")) if part_dir.exists() else []
                 )
 
+        form_seq_counters: dict[str, dict[str, int]] = {ctx.form_key: {} for ctx in contexts}
+        form_existing_seqs: dict[str, dict[str, int]] = {ctx.form_key: {} for ctx in contexts}
+        seeded_forms: set[str] = set()
+
         def _on_hive_active(ctx: _FormExportContext, batch: list[Any], _batch_idx: int) -> int:
-            parsed_rows, _ = mapper._parse_records(batch, ctx.record_model)
-            rows = (
-                [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
-                if pipeline is not None and not has_native_enrichment
-                else parsed_rows
-            )
-            written = _write_hive_form_rows(
-                rows,
-                mapper=mapper,
-                variable_keys=ctx.variable_keys,
-                label_map=ctx.label_map,
-                use_labels_as_columns=use_labels_as_columns,
-                mask_phi=effective_mask_phi,
-                phi_keys=phi_keys,
-                pyarrow_module=pyarrow_module,
-                storage_engine=storage_engine,
-                base_dir=base_dir,
-                study_key=study_key,
-                form_key=ctx.form_key,
-                skip_empty=True,
-            )
+            if config.as_sdtm:
+                target_domain = resolve_sdtm_domain(
+                    ctx.sdtm_domain or config.sdtm_domain or ctx.form_key,
+                    fallback="AE",
+                )
+                if is_incremental and config.idempotent and ctx.form_key not in seeded_forms:
+                    seeded_forms.add(ctx.form_key)
+                    _seed_hive_sdtm_seq_state(
+                        preexisting_files.get(ctx.form_key, []),
+                        target_domain,
+                        form_seq_counters[ctx.form_key],
+                        form_existing_seqs[ctx.form_key],
+                    )
+                projected_batch = _project_hive_sdtm_whitelist(batch, config.variable_whitelist)
+                sdtm_rows = transform_records_to_sdtm_rows(
+                    projected_batch,
+                    domain=target_domain,
+                    study_key=study_key,
+                    include_deleted=config.include_deleted,
+                    mask_phi=effective_mask_phi,
+                    seq_counters=form_seq_counters[ctx.form_key],
+                    phi_keys=phi_keys or None,
+                    pipeline=pipeline,
+                    include_record_id=True,
+                    existing_record_seqs=form_existing_seqs[ctx.form_key],
+                )
+                if not sdtm_rows:
+                    return 0
+                pandas_module = _ensure_pandas()
+                sdtm_df = pandas_module.DataFrame(sdtm_rows)
+                std_vars = get_sdtm_domain_variables(target_domain, include_record_id=True)
+                ordered_cols = [c for c in std_vars if c in sdtm_df.columns] + [
+                    c for c in sdtm_df.columns if c not in std_vars
+                ]
+                sdtm_df = sdtm_df[ordered_cols]
+                sdtm_df.columns = sdtm_df.columns.astype(str)
+                sdtm_df = sdtm_df.loc[:, ~sdtm_df.columns.str.lower().duplicated()]
+                sdtm_table = pyarrow_module.Table.from_pandas(sdtm_df, preserve_index=False)
+                storage_engine.write_form_table(
+                    sdtm_table,
+                    base_dir=base_dir,
+                    study_key=study_key,
+                    form_key=ctx.form_key,
+                )
+                written = len(sdtm_df)
+            else:
+                parsed_rows, _ = mapper._parse_records(batch, ctx.record_model)
+                rows = (
+                    [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
+                    if pipeline is not None and not has_native_enrichment
+                    else parsed_rows
+                )
+                written = _write_hive_form_rows(
+                    rows,
+                    mapper=mapper,
+                    variable_keys=ctx.variable_keys,
+                    label_map=ctx.label_map,
+                    use_labels_as_columns=use_labels_as_columns,
+                    mask_phi=effective_mask_phi,
+                    phi_keys=phi_keys,
+                    pyarrow_module=pyarrow_module,
+                    storage_engine=storage_engine,
+                    base_dir=base_dir,
+                    study_key=study_key,
+                    form_key=ctx.form_key,
+                    skip_empty=True,
+                )
             if is_incremental and config.idempotent and written > 0:
                 for rec in batch:
                     cid = _canonical_record_id(extract_record_id(rec))

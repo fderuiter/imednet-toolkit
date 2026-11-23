@@ -389,9 +389,13 @@ def add_list_query_args(
         )
     parser.add_argument(
         "--sort",
+        action="append",
         dest="sort",
         default=None,
-        help="Server sort specification (e.g., 'dateCreated,desc' or 'recordId,asc').",
+        help=(
+            "Server sort specification (e.g., 'dateCreated,desc' or 'recordId,asc'). "
+            "Repeat --sort for multi-key sorting."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -413,7 +417,7 @@ def prepare_list_query(
     *,
     filter_args: list[str] | None = None,
     record_data_filter: str | None = None,
-    sort: str | None = None,
+    sort: str | Sequence[str] | None = None,
     limit: int | None = None,
     fetch_all: bool = False,
     output_format: str | None = None,
@@ -436,9 +440,17 @@ def prepare_list_query(
         print_error("Error: --limit must be a positive integer.")
         sys.exit(1)
 
-    if sort is not None and not sort.strip():
-        print_error("Error: --sort cannot be empty.")
-        sys.exit(1)
+    cleaned_sorts: list[str] = []
+    if sort is not None:
+        raw_sort_items: Sequence[str] = [sort] if isinstance(sort, str) else sort
+        if not raw_sort_items:
+            print_error("Error: --sort cannot be empty.")
+            sys.exit(1)
+        for item in raw_sort_items:
+            if not isinstance(item, str) or not item.strip():
+                print_error("Error: --sort cannot be empty.")
+                sys.exit(1)
+            cleaned_sorts.append(item.strip())
 
     request_kwargs: dict[str, Any] = {}
     parsed_filters = parse_filter_args(
@@ -454,8 +466,8 @@ def prepare_list_query(
     if parsed_record_data_filter is not None:
         request_kwargs["record_data_filter"] = parsed_record_data_filter
 
-    if sort is not None:
-        request_kwargs["sort"] = sort.strip()
+    if cleaned_sorts:
+        request_kwargs["sort"] = cleaned_sorts[0] if len(cleaned_sorts) == 1 else cleaned_sorts
 
     resolved_format = resolve_output_format(output_format)
     effective_limit: int | None = None

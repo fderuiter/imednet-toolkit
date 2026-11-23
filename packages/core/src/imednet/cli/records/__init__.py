@@ -160,7 +160,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         output_format: str | None = None,
         record_filter: list[str] | None = None,
         record_data_filter: str | None = None,
-        sort: str | None = None,
+        sort: str | list[str] | None = None,
         limit: int | None = None,
         fetch_all: bool = False,
         no_interactive: bool = False,

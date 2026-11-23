@@ -298,6 +298,7 @@ class RecordMapperProtocol(Protocol):
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
         seq_counters: dict[str, int] | None = None,
+        include_record_id: bool = False,
     ) -> pd.DataFrame:
         """Transform records into a normalized SDTM domain DataFrame."""
         ...
@@ -312,6 +313,7 @@ class RecordMapperProtocol(Protocol):
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        include_record_id: bool = False,
     ) -> pd.DataFrame:
         """Return study records mapped to a CDISC SDTM domain DataFrame."""
         ...
@@ -326,6 +328,7 @@ class RecordMapperProtocol(Protocol):
         *,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
+        include_record_id: bool = False,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked DataFrames mapped to a CDISC SDTM domain."""
         ...

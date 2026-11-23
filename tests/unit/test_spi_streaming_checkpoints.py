@@ -342,7 +342,7 @@ def test_record_mapper_iter_dataframes_streams_lazily() -> None:
 
     # SDTM chunked streaming across ordered Subjects yields lazily with 1-record boundary lookahead
     def _lazy_ordered_subjects(**kwargs: Any) -> Iterator[Record]:
-        assert kwargs.get("sort") == "subjectKey,asc;recordId,asc"
+        assert list(kwargs.get("sort") or ()) == ["subjectKey,asc", "recordId,asc"]
         for idx in range(1, 6):
             reads[0] += 1
             yield _make_record(

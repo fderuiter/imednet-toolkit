@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import math
 import re
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -24,7 +24,7 @@ except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
 
 _MASKED_SENTINEL = "***MASKED***"
-_SDTM_RECORDS_SORT = "subjectKey,asc;recordId,asc"
+_SDTM_RECORDS_SORT: tuple[str, str] = ("subjectKey,asc", "recordId,asc")
 _ISO_YEAR_RE = re.compile(r"^\d{4}$")
 _ISO_YEAR_MONTH_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
 _PARTIAL_UNKNOWN_YEAR_RE = re.compile(r"^(\d{4})-(?:UN|UNK|-)", re.IGNORECASE)
@@ -362,7 +362,7 @@ SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
             "ARM",
         ],
         "aliases": {
-            "SUBJID": ["subjid", "SUBJID", "subject_id", "subjectId", "subjectKey", "subject_key"],
+            "SUBJID": ["subjid", "SUBJID", "subjectKey", "subject_key", "subject_id", "subjectId"],
             "BRTHDTC": [
                 "brthdat",
                 "birthDate",
@@ -723,24 +723,56 @@ def format_variable_name(
     return re.sub(r"[^A-Za-z0-9]", "", snake).upper()
 
 
-_BASE_SDTM_CONSUMED_KEYS: frozenset[str] = frozenset(
+RECORD_ENVELOPE_KEYS: frozenset[str] = frozenset(
     {
-        "USUBJID",
+        "studyKey",
+        "study_key",
+        "intervalId",
+        "interval_id",
+        "formId",
+        "form_id",
+        "formKey",
+        "form_key",
+        "siteId",
+        "site_id",
+        "recordId",
+        "record_id",
+        "recordOid",
+        "record_oid",
+        "recordType",
+        "record_type",
+        "recordStatus",
+        "record_status",
+        "deleted",
+        "dateCreated",
+        "date_created",
+        "dateModified",
+        "date_modified",
+        "subjectId",
+        "subject_id",
+        "subjectOid",
+        "subject_oid",
         "subjectKey",
         "subject_key",
-        "study_key",
-        "studyKey",
+        "visitId",
+        "visit_id",
+        "parentRecordId",
+        "parent_record_id",
+        "recordData",
+        "record_data",
+        "lastUpdated",
+        "last_updated",
+        "keywords",
+    }
+)
+
+_BASE_SDTM_CONSUMED_KEYS: frozenset[str] = RECORD_ENVELOPE_KEYS | frozenset(
+    {
+        "USUBJID",
         "STUDYID",
         "DOMAIN",
         "domain",
-        "recordId",
-        "record_id",
-        "formId",
-        "form_id",
-        "visitId",
-        "visit_id",
-        "recordStatus",
-        "record_status",
+        "RECORD_ID",
     }
 )
 
@@ -904,6 +936,20 @@ def _extract_stream_usubjid_and_id(rec: Any) -> tuple[str, tuple[int, int, str]]
     return str(usubjid), _record_id_sort_key(raw_id)
 
 
+def _canonicalize_sdtm_record_id(raw_id: Any) -> str | None:
+    """Normalize a non-missing record identifier to a canonical string lookup key."""
+    if raw_id is None or isinstance(raw_id, bool):
+        return None
+    if isinstance(raw_id, int):
+        return str(raw_id)
+    if isinstance(raw_id, float):
+        if math.isnan(raw_id) or math.isinf(raw_id):
+            return None
+        return str(int(raw_id)) if raw_id.is_integer() else str(raw_id)
+    text = str(raw_id).strip()
+    return text if text else None
+
+
 @dataclass
 class _PreparedSdtmRow:
     """Normalized SDTM row prior to final per-subject sequence number assignment."""
@@ -911,6 +957,7 @@ class _PreparedSdtmRow:
     usubjid: str
     sort_key: tuple[tuple[int, str], tuple[tuple[int, str], ...], tuple[int, int, str], int]
     row: dict[str, Any]
+    canonical_record_id: str | None = None
 
 
 class _SdtmNormalizer:
@@ -926,12 +973,14 @@ class _SdtmNormalizer:
         pipeline: Any | None = None,
         phi_keys: Iterable[str] | None = None,
         registry: SensitivityRegistry | None = None,
+        include_record_id: bool = False,
     ) -> None:
         domain_clean = resolve_sdtm_domain(domain)
         self.domain_clean = domain_clean
         self.study_key = study_key
         self.include_deleted = include_deleted
         self.mask_phi = mask_phi
+        self.include_record_id = include_record_id
         self.pipeline = pipeline
         self.registry: SensitivityRegistry = (
             global_sensitivity_registry if registry is None else registry
@@ -964,6 +1013,9 @@ class _SdtmNormalizer:
                 f"{domain_clean}TEST",
                 "SUBJID",
             )
+        if self.include_record_id and "RECORD_ID" not in self.std_vars:
+            insert_pos = self.std_vars.index("STUDYID") + 1 if "STUDYID" in self.std_vars else 0
+            self.std_vars.insert(insert_pos, "RECORD_ID")
 
         self.has_enrichment_transforms = bool(
             pipeline is not None
@@ -1031,7 +1083,7 @@ class _SdtmNormalizer:
                 vname in self._topic_set,
             )
             for vname in self.std_vars
-            if vname not in ("STUDYID", "DOMAIN", "USUBJID", self.seq_var)
+            if vname not in ("STUDYID", "RECORD_ID", "DOMAIN", "USUBJID", self.seq_var)
         )
 
     def _is_exempt_key(self, key: str) -> bool:
@@ -1084,39 +1136,46 @@ class _SdtmNormalizer:
         all_field_aliases: dict[str, set[str]] = {}
         base_consumed: frozenset[str] | set[str] = _BASE_SDTM_CONSUMED_KEYS
 
-        raw_record_id: Any = getattr(rec, "record_id", None)
-        if raw_record_id is None:
-            raw_record_id = getattr(rec, "recordId", None)
+        explicit_record_id: Any = getattr(rec, "record_id", None)
+        if explicit_record_id is None:
+            explicit_record_id = getattr(rec, "recordId", None)
 
         if hasattr(rec, "record_data") and getattr(rec, "record_data", None) is not None:
-            rec_dict = dict(rec.record_data) if isinstance(rec.record_data, dict) else {}
+            rec_dict = dict(rec.record_data) if isinstance(rec.record_data, Mapping) else {}
             if getattr(rec, "subject_key", None):
-                rec_dict["subject_key"] = rec.subject_key
-                rec_dict["subjectKey"] = rec.subject_key
-            if getattr(rec, "date_created", None):
-                rec_dict["date_created"] = rec.date_created
+                rec_dict.setdefault("subjectKey", rec.subject_key)
+                rec_dict.setdefault("subject_key", rec.subject_key)
+            elif getattr(rec, "subject_id", None) is not None:
+                rec_dict.setdefault("subjectId", rec.subject_id)
+                rec_dict.setdefault("subject_id", rec.subject_id)
         elif isinstance(rec, BaseModel):
             rec_dict = rec.model_dump(by_alias=True)
             model_cls = type(rec)
             model_field_to_serialized, all_field_aliases = _get_model_field_aliases(model_cls)
             base_consumed = _get_model_consumed_keys(model_cls)
-        elif isinstance(rec, dict):
+        elif isinstance(rec, Mapping):
             rec_dict = dict(rec)
         else:
             rec_dict = dict(getattr(rec, "__dict__", {}))
 
-        if "record_data" in rec_dict and isinstance(rec_dict["record_data"], dict):
-            nested_data = dict(rec_dict.pop("record_data"))
-            for k, v in nested_data.items():
-                if k not in rec_dict:
-                    rec_dict[k] = v
+        if explicit_record_id is None:
+            for id_key in ("recordId", "record_id", "RECORD_ID"):
+                if id_key in rec_dict and rec_dict[id_key] is not None:
+                    explicit_record_id = rec_dict[id_key]
+                    break
 
+        for rd_key in ("record_data", "recordData"):
+            if rd_key in rec_dict and isinstance(rec_dict[rd_key], Mapping):
+                nested_data = dict(rec_dict.pop(rd_key))
+                for k, v in nested_data.items():
+                    if k not in rec_dict:
+                        rec_dict[k] = v
+
+        raw_record_id: Any = explicit_record_id
         if raw_record_id is None:
-            raw_record_id = (
-                rec_dict.get("recordId")
-                if "recordId" in rec_dict
-                else rec_dict.get("record_id") or getattr(rec, "record_oid", None)
-            )
+            raw_record_id = getattr(rec, "record_oid", None)
+            if raw_record_id is None:
+                raw_record_id = rec_dict.get("recordOid") or rec_dict.get("record_oid")
 
         if self.pipeline is not None and (
             self.has_enrichment_transforms or not hasattr(self.pipeline, "terminology")
@@ -1153,11 +1212,11 @@ class _SdtmNormalizer:
         ):
             usubjid = _MASKED_SENTINEL
 
-        row: dict[str, Any] = {
-            "STUDYID": self.study_key,
-            "DOMAIN": self.domain_clean,
-            "USUBJID": usubjid,
-        }
+        row: dict[str, Any] = {"STUDYID": self.study_key}
+        if self.include_record_id:
+            row["RECORD_ID"] = explicit_record_id
+        row["DOMAIN"] = self.domain_clean
+        row["USUBJID"] = usubjid
         if self.include_seq:
             row[self.seq_var] = 0
 
@@ -1325,21 +1384,42 @@ class _SdtmNormalizer:
             _record_id_sort_key(raw_record_id),
             orig_idx,
         )
-        return _PreparedSdtmRow(usubjid=usubjid, sort_key=sort_key, row=row)
+        return _PreparedSdtmRow(
+            usubjid=usubjid,
+            sort_key=sort_key,
+            row=row,
+            canonical_record_id=_canonicalize_sdtm_record_id(explicit_record_id),
+        )
 
     def finalize_subject_group(
         self,
         group: list[_PreparedSdtmRow],
         seq_counters: dict[str, int],
+        existing_record_seqs: Mapping[str, int] | None = None,
     ) -> list[dict[str, Any]]:
         """Sort a Subject's normalized rows and stamp sequential <DOM>SEQ values."""
         group.sort(key=lambda item: item.sort_key)
         rows: list[dict[str, Any]] = []
         for item in group:
             if self.include_seq:
-                next_seq = seq_counters.get(item.usubjid, 0) + 1
-                seq_counters[item.usubjid] = next_seq
-                item.row[self.seq_var] = next_seq
+                if (
+                    existing_record_seqs is not None
+                    and item.canonical_record_id is not None
+                    and item.canonical_record_id in existing_record_seqs
+                ):
+                    existing_seq = existing_record_seqs[item.canonical_record_id]
+                    item.row[self.seq_var] = existing_seq
+                    if existing_seq > seq_counters.get(item.usubjid, 0):
+                        seq_counters[item.usubjid] = existing_seq
+                else:
+                    next_seq = seq_counters.get(item.usubjid, 0) + 1
+                    seq_counters[item.usubjid] = next_seq
+                    item.row[self.seq_var] = next_seq
+                    if (
+                        isinstance(existing_record_seqs, MutableMapping)
+                        and item.canonical_record_id is not None
+                    ):
+                        existing_record_seqs[item.canonical_record_id] = next_seq
             rows.append(item.row)
         return rows
 
@@ -1481,15 +1561,20 @@ def _resolve_sdtm_pipeline(
     return resolve_enrichment_pipeline(study_key)
 
 
-def get_sdtm_domain_variables(domain: str) -> list[str]:
+def get_sdtm_domain_variables(domain: str, *, include_record_id: bool = False) -> list[str]:
     """Return standard uppercase SDTM variable list for ``domain``."""
     domain_clean = resolve_sdtm_domain(domain)
     spec = SDTM_DOMAIN_SPECS.get(domain_clean)
     if spec is not None:
-        return list(spec["variables"])
-    if domain_clean == "DM":
-        return ["STUDYID", "DOMAIN", "USUBJID"]
-    return ["STUDYID", "DOMAIN", "USUBJID", f"{domain_clean}SEQ"]
+        variables = list(spec["variables"])
+    elif domain_clean == "DM":
+        variables = ["STUDYID", "DOMAIN", "USUBJID"]
+    else:
+        variables = ["STUDYID", "DOMAIN", "USUBJID", f"{domain_clean}SEQ"]
+    if include_record_id and "RECORD_ID" not in variables:
+        insert_pos = variables.index("STUDYID") + 1 if "STUDYID" in variables else 0
+        variables.insert(insert_pos, "RECORD_ID")
+    return variables
 
 
 def transform_records_to_sdtm_rows(
@@ -1500,10 +1585,12 @@ def transform_records_to_sdtm_rows(
     include_deleted: bool = False,
     mask_phi: bool = True,
     seq_counters: dict[str, int] | None = None,
+    existing_record_seqs: Mapping[str, int] | None = None,
     phi_keys: Iterable[str] | None = None,
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
     enrichment_pipeline: Any = _UNSET_PIPELINE,
+    include_record_id: bool = False,
 ) -> list[dict[str, Any]]:
     """Transform clinical records into normalized CDISC SDTM row dictionaries.
 
@@ -1523,6 +1610,7 @@ def transform_records_to_sdtm_rows(
         pipeline=resolved_pipeline,
         phi_keys=phi_keys,
         registry=registry,
+        include_record_id=include_record_id,
     )
     counters = seq_counters if seq_counters is not None else {}
 
@@ -1534,7 +1622,13 @@ def transform_records_to_sdtm_rows(
 
     rows: list[dict[str, Any]] = []
     for usubjid in sorted(grouped):
-        rows.extend(normalizer.finalize_subject_group(grouped[usubjid], counters))
+        rows.extend(
+            normalizer.finalize_subject_group(
+                grouped[usubjid],
+                counters,
+                existing_record_seqs=existing_record_seqs,
+            )
+        )
     return rows
 
 
@@ -1546,10 +1640,12 @@ def transform_records_to_sdtm(
     include_deleted: bool = False,
     mask_phi: bool = True,
     seq_counters: dict[str, int] | None = None,
+    existing_record_seqs: Mapping[str, int] | None = None,
     phi_keys: Iterable[str] | None = None,
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
     enrichment_pipeline: Any = _UNSET_PIPELINE,
+    include_record_id: bool = False,
 ) -> pd.DataFrame:
     """Transform clinical records into a normalized CDISC SDTM domain DataFrame.
 
@@ -1574,6 +1670,7 @@ def transform_records_to_sdtm(
         pipeline=resolved_pipeline,
         phi_keys=phi_keys,
         registry=registry,
+        include_record_id=include_record_id,
     )
     counters = seq_counters if seq_counters is not None else {}
 
@@ -1585,12 +1682,19 @@ def transform_records_to_sdtm(
 
     rows: list[dict[str, Any]] = []
     for usubjid in sorted(grouped):
-        rows.extend(normalizer.finalize_subject_group(grouped[usubjid], counters))
+        rows.extend(
+            normalizer.finalize_subject_group(
+                grouped[usubjid],
+                counters,
+                existing_record_seqs=existing_record_seqs,
+            )
+        )
 
     return normalizer.rows_to_dataframe(rows)
 
 
 __all__ = [
+    "RECORD_ENVELOPE_KEYS",
     "SDTM_DOMAIN_SPECS",
     "VALID_NAMING_CONVENTIONS",
     "_SDTM_RECORDS_SORT",

@@ -67,7 +67,7 @@ def test_build_hierarchy(mock_get_study_structure):
     rec1 = f10["records"][0]
     assert rec1["Label1"] == "a"
     assert rec1["Label2"] == "b"
-    assert rec1["parent_record_id"] == "1_10"
+    assert rec1["parent_record_id"] is None
 
     v2 = subj["visits"][1]
     f10_2 = v2["forms"][0]
@@ -207,7 +207,7 @@ def test_build_hierarchy_empty_variables(mock_get_study_structure):
 
     tree = mapper.build_hierarchy("STUDY")
     assert len(tree) == 1
-    assert tree[0]["visits"][0]["forms"][0]["records"][0]["parent_record_id"] == "1_50"
+    assert tree[0]["visits"][0]["forms"][0]["records"][0]["parent_record_id"] is None
 
 
 @patch("imednet_workflows.study_structure.get_study_structure")

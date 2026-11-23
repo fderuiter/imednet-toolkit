@@ -304,3 +304,6 @@ class ForbiddenError(AuthorizationError):
 
 class ConflictError(ApiError):
     """Raised for HTTP 409 conflict errors."""
+
+
+ImednetAPIError = ApiError

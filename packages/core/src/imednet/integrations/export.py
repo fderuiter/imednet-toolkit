@@ -887,14 +887,15 @@ def _build_sdtm_contract_types(
     domain: str | None,
     *,
     variable_whitelist: Sequence[str] | None = None,
+    include_record_id: bool = True,
 ) -> dict[str, str | None]:
     """Derive expected uppercase SDTM column names and logical types for ``domain``."""
     dom = resolve_sdtm_domain(domain, fallback="AE")
-    std_vars = get_sdtm_domain_variables(dom)
+    std_vars = get_sdtm_domain_variables(dom, include_record_id=include_record_id)
     seq_col = f"{dom}SEQ"
     contract: dict[str, str | None] = {}
     for col in std_vars:
-        if col in {seq_col, "AGE"}:
+        if col in {seq_col, "AGE", "RECORD_ID"}:
             contract[col] = "int64"
         else:
             contract[col] = "string"
@@ -2106,6 +2107,194 @@ class _TabularCollectingSink(ExportSink):
         self._voided_ids.clear()
 
 
+def _record_seq_int(value: Any) -> int | None:
+    """Coerce a stored SDTM ``<DOM>SEQ`` value into an integer if valid."""
+    if value is None or value is pd.NA or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value) or not value.is_integer():
+            return None
+        as_int = int(value)
+        return as_int if as_int > 0 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            as_int = int(stripped)
+        except ValueError:
+            try:
+                as_float = float(stripped)
+            except ValueError:
+                return None
+            if not as_float.is_integer():
+                return None
+            as_int = int(as_float)
+        return as_int if as_int > 0 else None
+    if _is_missing_scalar(value):
+        return None
+    try:
+        as_int = int(value)
+    except (TypeError, ValueError):
+        return None
+    return as_int if as_int > 0 else None
+
+
+def _seed_sdtm_seq_state_from_sink(
+    inner: ExportSink,
+    domain: str,
+    seq_counters: dict[str, int],
+    existing_record_seqs: dict[str, int],
+) -> None:
+    """Populate per-USUBJID max ``<DOM>SEQ`` and ``RECORD_ID -> <DOM>SEQ`` from existing sink data."""
+    if domain == "DM":
+        return
+    seq_col = f"{domain}SEQ"
+
+    if isinstance(inner, TabularCSVSink):
+        csv_path = Path(inner.path)
+        if not (csv_path.exists() and csv_path.stat().st_size > 0):
+            return
+        sep = str(inner._cfg.pandas_kwargs.get("sep", ","))
+        with open(csv_path, encoding="utf-8", newline="") as src_f:
+            reader = csv.DictReader(src_f, delimiter=sep)
+            fields = set(reader.fieldnames or ())
+            if seq_col not in fields:
+                return
+            for row in reader:
+                seq_int = _record_seq_int(row.get(seq_col))
+                if seq_int is None:
+                    continue
+                usubjid = str(row.get("USUBJID") or "").strip()
+                if usubjid:
+                    seq_counters[usubjid] = max(seq_counters.get(usubjid, 0), seq_int)
+                cid = _extract_row_canonical_id(row)
+                if cid is not None:
+                    existing_record_seqs[cid] = seq_int
+        return
+
+    if isinstance(inner, TabularParquetSink):
+        pq_path = Path(inner.path)
+        if not (pq_path.exists() and pq_path.stat().st_size > 0):
+            return
+        import pyarrow.parquet as pq
+
+        with cast(Any, pq).ParquetFile(str(pq_path)) as pf:
+            schema_names = set(pf.schema_arrow.names)
+            if seq_col not in schema_names:
+                return
+            id_col = next(
+                (c for c in ("RECORD_ID", "recordId", "record_id") if c in schema_names),
+                None,
+            )
+            read_cols = [c for c in ("USUBJID", id_col, seq_col) if c and c in schema_names]
+            for rb in pf.iter_batches(columns=read_cols):
+                batch_dict = rb.to_pydict()
+                seq_vals = batch_dict.get(seq_col, [])
+                usubj_vals = batch_dict.get("USUBJID", [None] * len(seq_vals))
+                id_vals = (
+                    batch_dict.get(id_col, [None] * len(seq_vals))
+                    if id_col
+                    else [None] * len(seq_vals)
+                )
+                for usubj_raw, id_raw, seq_raw in zip(usubj_vals, id_vals, seq_vals, strict=False):
+                    seq_int = _record_seq_int(seq_raw)
+                    if seq_int is None:
+                        continue
+                    usubjid = str(usubj_raw or "").strip()
+                    if usubjid:
+                        seq_counters[usubjid] = max(seq_counters.get(usubjid, 0), seq_int)
+                    cid = _canonical_record_id(id_raw)
+                    if cid is not None:
+                        existing_record_seqs[cid] = seq_int
+        return
+
+    if isinstance(inner, TabularDuckDBSink):
+        if not inner._table_exists():
+            return
+        cols = {
+            str(row[1])
+            for row in inner._conn.execute(f"PRAGMA table_info('{inner.table_name}')").fetchall()
+        }
+        if seq_col not in cols:
+            return
+        quoted_tbl = _quote_duckdb_identifier(inner.table_name)
+        quoted_seq = _quote_duckdb_column(seq_col)
+        if "USUBJID" in cols:
+            max_rows = inner._conn.execute(
+                f'SELECT "USUBJID", MAX({quoted_seq}) FROM {quoted_tbl} '
+                f'WHERE "USUBJID" IS NOT NULL AND {quoted_seq} IS NOT NULL GROUP BY "USUBJID"'
+            ).fetchall()
+            for usubj_raw, max_seq_raw in max_rows:
+                seq_int = _record_seq_int(max_seq_raw)
+                usubjid = str(usubj_raw or "").strip()
+                if usubjid and seq_int is not None:
+                    seq_counters[usubjid] = max(seq_counters.get(usubjid, 0), seq_int)
+        id_col = next((c for c in ("RECORD_ID", "recordId", "record_id") if c in cols), None)
+        if id_col is not None:
+            quoted_id = _quote_duckdb_column(id_col)
+            id_rows = inner._conn.execute(
+                f"SELECT {quoted_id}, {quoted_seq} FROM {quoted_tbl} "
+                f"WHERE {quoted_id} IS NOT NULL AND {quoted_seq} IS NOT NULL"
+            ).fetchall()
+            for id_raw, seq_raw in id_rows:
+                cid = _canonical_record_id(id_raw)
+                seq_int = _record_seq_int(seq_raw)
+                if cid is not None and seq_int is not None:
+                    existing_record_seqs[cid] = seq_int
+        return
+
+    if isinstance(inner, TabularSQLSink):
+        if isinstance(inner.engine, NonCallableMock):
+            return
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy import text as sa_text
+
+        inspector = sa_inspect(inner.engine)
+        if not inspector.has_table(inner.table):
+            return
+        existing_cols = {c["name"] for c in inspector.get_columns(inner.table)}
+        if seq_col not in existing_cols:
+            return
+        preparer = inner.engine.dialect.identifier_preparer
+        quoted_table = preparer.quote(inner.table)
+        quoted_seq = preparer.quote(seq_col)
+        with inner.engine.connect() as conn:
+            if "USUBJID" in existing_cols:
+                quoted_usubj = preparer.quote("USUBJID")
+                max_rows = conn.execute(
+                    sa_text(
+                        f"SELECT {quoted_usubj}, MAX({quoted_seq}) FROM {quoted_table} "
+                        f"WHERE {quoted_usubj} IS NOT NULL AND {quoted_seq} IS NOT NULL "
+                        f"GROUP BY {quoted_usubj}"
+                    )
+                ).fetchall()
+                for usubj_raw, max_seq_raw in max_rows:
+                    seq_int = _record_seq_int(max_seq_raw)
+                    usubjid = str(usubj_raw or "").strip()
+                    if usubjid and seq_int is not None:
+                        seq_counters[usubjid] = max(seq_counters.get(usubjid, 0), seq_int)
+            id_col = next(
+                (c for c in ("RECORD_ID", "recordId", "record_id") if c in existing_cols),
+                None,
+            )
+            if id_col is not None:
+                quoted_id = preparer.quote(id_col)
+                id_rows = conn.execute(
+                    sa_text(
+                        f"SELECT {quoted_id}, {quoted_seq} FROM {quoted_table} "
+                        f"WHERE {quoted_id} IS NOT NULL AND {quoted_seq} IS NOT NULL"
+                    )
+                ).fetchall()
+                for id_raw, seq_raw in id_rows:
+                    cid = _canonical_record_id(id_raw)
+                    seq_int = _record_seq_int(seq_raw)
+                    if cid is not None and seq_int is not None:
+                        existing_record_seqs[cid] = seq_int
+
+
 class _TabularTransformSink(ExportSink):
     """Adapts record batches into masked/sanitized DataFrames before delegating to ``inner``."""
 
@@ -2135,6 +2324,8 @@ class _TabularTransformSink(ExportSink):
         self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
         self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
         self._seq_counters: dict[str, int] = {}
+        self._existing_record_seqs: dict[str, int] = {}
+        self._seeded_domains: set[str] = set()
         self._meta_cols = {name for name, _ in _RECORD_META_CONTRACT_TYPES}
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
@@ -2153,6 +2344,20 @@ class _TabularTransformSink(ExportSink):
                     else getattr(first_rec, "form_key", None)
                 )
             target_domain = resolve_sdtm_domain(raw_domain, fallback="AE")
+            if (
+                _is_incremental_config(self._cfg)
+                and self._cfg.idempotent
+                and target_domain != "DM"
+                and target_domain not in self._seeded_domains
+            ):
+                self._seeded_domains.add(target_domain)
+                _seed_sdtm_seq_state_from_sink(
+                    self._inner,
+                    target_domain,
+                    self._seq_counters,
+                    self._existing_record_seqs,
+                )
+
             batch_records: Sequence[Any] = records
             if self._cfg.variable_whitelist is not None:
                 allowed = set(self._cfg.variable_whitelist)
@@ -2175,6 +2380,12 @@ class _TabularTransformSink(ExportSink):
                             k: v for k, v in rec["record_data"].items() if k in allowed
                         }
                         projected.append(cloned)
+                    elif isinstance(rec, Mapping) and isinstance(rec.get("recordData"), Mapping):
+                        cloned = dict(rec)
+                        cloned["recordData"] = {
+                            k: v for k, v in rec["recordData"].items() if k in allowed
+                        }
+                        projected.append(cloned)
                     else:
                         projected.append(rec)
                 batch_records = projected
@@ -2188,6 +2399,8 @@ class _TabularTransformSink(ExportSink):
                 seq_counters=self._seq_counters,
                 phi_keys=self._phi_keys,
                 pipeline=self._pipeline,
+                include_record_id=True,
+                existing_record_seqs=self._existing_record_seqs,
             )
             if df.empty:
                 return 0

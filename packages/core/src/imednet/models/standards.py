@@ -13,6 +13,7 @@ from imednet.models.base import ImednetBaseModel
 from imednet.models.sdtm import (
     _SDTM_RECORDS_SORT,
     _UNSET_PIPELINE,
+    RECORD_ENVELOPE_KEYS,
     SDTM_DOMAIN_SPECS,
     VALID_NAMING_CONVENTIONS,
     _collapse_alnum_key,
@@ -1067,6 +1068,7 @@ __all__ = [
     "DOMAIN_PREFIXES",
     "NORMALIZATION_TERMINOLOGY",
     "PROFILE_REGISTRY",
+    "RECORD_ENVELOPE_KEYS",
     "SDTM_DOMAIN_SPECS",
     "UNIVERSAL_CDASH_IDENTIFIERS",
     "VALID_NAMING_CONVENTIONS",

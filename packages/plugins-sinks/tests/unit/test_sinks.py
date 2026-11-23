@@ -3409,6 +3409,7 @@ class TestPluginSinksSdtmAndNamingConventionParity:
         t1 = pq.read_table(sf_stage_dir / "b1.parquet").to_pylist()
         t2 = pq.read_table(sf_stage_dir / "b2.parquet").to_pylist()
         assert t1[0]["STUDYID"] == "SDTM_STUDY"
+        assert t1[0]["RECORD_ID"] == 1
         assert t1[0]["DOMAIN"] == "AE"
         assert t1[0]["USUBJID"] == "SUBJ-9"
         assert t1[0]["AESEQ"] == 1
@@ -3416,9 +3417,14 @@ class TestPluginSinksSdtmAndNamingConventionParity:
         assert t1[0]["AESER"] == "Y"
         assert t1[0]["patientName"] == "***MASKED***"
         assert "record_data" not in t1[0]
+        assert t2[0]["RECORD_ID"] == 2
         assert t2[0]["AESEQ"] == 2
         executed_sql = "\n".join(c.args[0] for c in cursor.execute.call_args_list)
-        assert 'PARTITION BY "STUDYID", "DOMAIN", "USUBJID", "AESEQ"' in executed_sql
+        assert 'PARTITION BY "STUDYID", "RECORD_ID"' in executed_sql
+        assert (
+            'ON target."STUDYID" = source."STUDYID" AND target."RECORD_ID" = source."RECORD_ID"'
+            in executed_sql
+        )
 
         # 2. MongoDbExportSink
         pymongo_mod, _client, collection = _fake_pymongo_module()
@@ -3459,9 +3465,17 @@ class TestPluginSinksSdtmAndNamingConventionParity:
             neo_sink.write_batch(batch_1, batch_id="b1")
             neo_sink.write_batch(batch_2, batch_id="b2")
         neo_calls = driver.session.return_value.__enter__.return_value.run.call_args_list
-        assert "MERGE (s:Study   {STUDYID: row.STUDYID})" in neo_calls[0].args[0]
-        assert neo_calls[0].kwargs["rows"][0]["AESEQ"] == 1
-        assert neo_calls[1].kwargs["rows"][0]["AESEQ"] == 2
+        merge_calls = [c for c in neo_calls if "UNWIND $rows AS row" in c.args[0]]
+        assert len(merge_calls) == 2
+        assert "MERGE (s:Study   {STUDYID: row.STUDYID})" in merge_calls[0].args[0]
+        assert (
+            "MERGE (r:Record   {STUDYID: row.STUDYID, RECORD_ID: row.RECORD_ID})"
+            in merge_calls[0].args[0]
+        )
+        assert merge_calls[0].kwargs["rows"][0]["RECORD_ID"] == 1
+        assert merge_calls[0].kwargs["rows"][0]["AESEQ"] == 1
+        assert merge_calls[1].kwargs["rows"][0]["RECORD_ID"] == 2
+        assert merge_calls[1].kwargs["rows"][0]["AESEQ"] == 2
 
     @pytest.mark.parametrize("convention", ["snake_case", "camelCase", "sdtm"])
     def test_naming_convention_parity_across_parquet_snowflake_mongodb_and_neo4j(

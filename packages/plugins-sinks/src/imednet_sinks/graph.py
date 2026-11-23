@@ -64,7 +64,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -87,6 +87,7 @@ from imednet.spi.sinks import (
     build_sink_mapper,
     extract_record_id,
     normalize_sink_value,
+    resolve_sdtm_domain,
     run_streaming_export,
 )
 
@@ -233,13 +234,23 @@ def _build_convention_cypher(
     return merge_cypher, create_cypher
 
 
-def _build_sdtm_cypher(seq_prop: str | None, has_visit: bool) -> tuple[str, str]:
+def _build_sdtm_cypher(
+    seq_prop: str | None,
+    has_visit: bool,
+    *,
+    has_record_id: bool = True,
+) -> tuple[str, str]:
     """Build MERGE and CREATE Cypher statements for SDTM domain rows."""
-    record_key_props = (
-        f"STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, {seq_prop}: row.{seq_prop}"
-        if seq_prop
-        else "STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID"
-    )
+    if has_record_id:
+        record_key_props = "STUDYID: row.STUDYID, RECORD_ID: row.RECORD_ID"
+    elif seq_prop:
+        record_key_props = (
+            f"STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, "
+            f"{seq_prop}: row.{seq_prop}"
+        )
+    else:
+        record_key_props = "STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID"
+
     if has_visit:
         visit_block = (
             "FOREACH (_ IN CASE WHEN row.VISITNUM IS NOT NULL THEN [1] ELSE [] END |\n"
@@ -254,12 +265,20 @@ def _build_sdtm_cypher(seq_prop: str | None, has_visit: bool) -> tuple[str, str]
     else:
         visit_block = "MERGE (su)-[:HAS_RECORD]->(r)\n"
 
+    if has_record_id and seq_prop:
+        set_block = (
+            f"WITH row, s, su, r, r.{seq_prop} AS _prev_seq\n"
+            f"SET r += row, r.{seq_prop} = coalesce(_prev_seq, row.{seq_prop})\n"
+        )
+    else:
+        set_block = "SET r += row\n"
+
     merge_cypher = (
         "UNWIND $rows AS row\n"
         "MERGE (s:Study   {STUDYID: row.STUDYID})\n"
         "MERGE (su:Subject {USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
         f"MERGE (r:Record   {{{record_key_props}}})\n"
-        "SET r += row\n"
+        f"{set_block}"
         "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
         f"{visit_block}"
     )
@@ -347,6 +366,28 @@ def _record_to_row(
     return mapper.map_record(record, study_key=study_key)
 
 
+def _extract_cypher_key_seq(item: Any, key_name: str, seq_name: str) -> tuple[str, int] | None:
+    """Extract a ``(key_str, positive_seq_int)`` pair from a Neo4j row/record."""
+    key_raw: Any = None
+    seq_raw: Any = None
+    if isinstance(item, Mapping):
+        key_raw = item.get(key_name) or item.get(key_name.upper())
+        seq_raw = item.get(seq_name)
+    elif isinstance(item, (tuple, list)) and len(item) >= 2:
+        key_raw, seq_raw = item[0], item[1]
+    elif hasattr(item, "get") and callable(item.get):
+        key_raw = item.get(key_name)
+        seq_raw = item.get(seq_name)
+    if key_raw is None or seq_raw is None or isinstance(seq_raw, bool):
+        return None
+    try:
+        seq_int = int(seq_raw)
+    except (TypeError, ValueError):
+        return None
+    key_str = str(key_raw).strip()
+    return (key_str, seq_int) if key_str and seq_int > 0 else None
+
+
 class Neo4jExportSink(ExportSink):
     """Export iMednet records as Neo4j graph nodes and relationships.
 
@@ -372,6 +413,9 @@ class Neo4jExportSink(ExportSink):
         self._auth = self.config.auth
         self._study_key = self.config.study_key
         self._seq_counters: dict[str, int] = {}
+        self._existing_record_seqs: dict[str, int] = {}
+        self._seeded_sdtm_domains: set[str] = set()
+        self._domains_with_existing_seq: set[str] = set()
         self._driver: Any = None
         self._connect()
 
@@ -394,6 +438,70 @@ class Neo4jExportSink(ExportSink):
     # ExportSink interface
     # ------------------------------------------------------------------
 
+    def _seed_sdtm_seq_counters(self, session: Any, records: Sequence[Any]) -> None:
+        """Seed ``self._seq_counters`` from destination ``max(r.<DOM>SEQ)`` per ``USUBJID``."""
+        raw_dom = self.config.sdtm_domain
+        if not raw_dom and records:
+            first_rec = records[0]
+            raw_dom = (
+                first_rec.get("DOMAIN")
+                or first_rec.get("domain")
+                or first_rec.get("form_key")
+                or first_rec.get("formKey")
+                if isinstance(first_rec, Mapping)
+                else getattr(first_rec, "form_key", None)
+            )
+        target_domain = resolve_sdtm_domain(raw_dom, fallback="AE")
+        if target_domain == "DM":
+            return
+        seq_prop = f"{target_domain}SEQ"
+        if target_domain not in self._seeded_sdtm_domains:
+            self._seeded_sdtm_domains.add(target_domain)
+            seed_cypher = (
+                "MATCH (r:Record {STUDYID: $study_key, DOMAIN: $domain})\n"
+                f"WHERE r.USUBJID IS NOT NULL AND r.{seq_prop} IS NOT NULL\n"
+                f"RETURN r.USUBJID AS usubjid, max(r.{seq_prop}) AS max_seq"
+            )
+            result = session.run(seed_cypher, study_key=self._study_key, domain=target_domain)
+            if hasattr(result, "__iter__"):
+                for item in result:
+                    parsed = _extract_cypher_key_seq(item, "usubjid", "max_seq")
+                    if parsed is not None:
+                        usubjid, max_seq_int = parsed
+                        self._domains_with_existing_seq.add(target_domain)
+                        self._seq_counters[usubjid] = max(
+                            self._seq_counters.get(usubjid, 0),
+                            max_seq_int,
+                        )
+
+        if target_domain in self._domains_with_existing_seq:
+            lookup_ids = [
+                rid
+                for rec in records
+                if (rid := extract_record_id(rec)) is not None
+                and not isinstance(rid, bool)
+                and (cid := str(rid).strip())
+                and cid not in self._existing_record_seqs
+            ]
+            if lookup_ids:
+                id_cypher = (
+                    "MATCH (r:Record {STUDYID: $study_key, DOMAIN: $domain})\n"
+                    f"WHERE r.RECORD_ID IN $record_ids AND r.{seq_prop} IS NOT NULL\n"
+                    f"RETURN r.RECORD_ID AS record_id, r.{seq_prop} AS seq"
+                )
+                id_result = session.run(
+                    id_cypher,
+                    study_key=self._study_key,
+                    domain=target_domain,
+                    record_ids=lookup_ids,
+                )
+                if hasattr(id_result, "__iter__"):
+                    for item in id_result:
+                        parsed = _extract_cypher_key_seq(item, "record_id", "seq")
+                        if parsed is not None:
+                            cid, seq_int = parsed
+                            self._existing_record_seqs[cid] = seq_int
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
         if not records:
@@ -405,6 +513,7 @@ class Neo4jExportSink(ExportSink):
             mode="document",
             post_processor=post_proc,
             seq_counters=self._seq_counters,
+            existing_record_seqs=self._existing_record_seqs,
         )
         database = getattr(self.config, "database", "neo4j")
         mapped_rows: list[dict[str, Any]] | None = None
@@ -413,42 +522,51 @@ class Neo4jExportSink(ExportSink):
         def execute_export() -> int:
             """Execute Cypher transaction to write or merge records in Neo4j."""
             nonlocal mapped_rows, cypher
-            if mapped_rows is None:
-                try:
-                    mapped_rows = [
-                        _record_to_row(r, self._study_key, mapper=mapper) for r in records
-                    ]
-                except ExportConfigurationError:
-                    raise
-                except Exception:
-                    raise TypeError("Malformed Neo4j record batch payload.") from None
-            if not mapped_rows:
-                return 0
-            if cypher is None:
-                if self.config.as_sdtm:
-                    sample_row = mapped_rows[0]
-                    seq_prop = next(
-                        (
-                            k
-                            for k in sample_row
-                            if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
-                        ),
-                        None,
-                    )
-                    has_visit = any("VISITNUM" in r for r in mapped_rows)
-                    merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
-                elif self.config.naming_convention == "camelCase":
-                    merge_cypher, create_cypher = _build_convention_cypher(
-                        "studyKey", "subjectKey", "recordId", "visitId"
-                    )
-                elif self.config.naming_convention == "sdtm":
-                    merge_cypher, create_cypher = _build_convention_cypher(
-                        "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
-                    )
-                else:
-                    merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
-                cypher = merge_cypher if self.config.idempotent else create_cypher
             with self._driver.session(database=database) as session:
+                if mapped_rows is None:
+                    if self.config.as_sdtm and self.config.idempotent:
+                        self._seed_sdtm_seq_counters(session, records)
+                    try:
+                        mapped_rows = [
+                            _record_to_row(r, self._study_key, mapper=mapper) for r in records
+                        ]
+                    except ExportConfigurationError:
+                        raise
+                    except Exception:
+                        raise TypeError("Malformed Neo4j record batch payload.") from None
+                if not mapped_rows:
+                    return 0
+                if cypher is None:
+                    if self.config.as_sdtm:
+                        sample_row = mapped_rows[0]
+                        seq_prop = next(
+                            (
+                                k
+                                for k in sample_row
+                                if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
+                            ),
+                            None,
+                        )
+                        has_visit = any("VISITNUM" in r for r in mapped_rows)
+                        has_record_id = any(
+                            "RECORD_ID" in r and r["RECORD_ID"] is not None for r in mapped_rows
+                        )
+                        merge_cypher, create_cypher = _build_sdtm_cypher(
+                            seq_prop,
+                            has_visit,
+                            has_record_id=has_record_id,
+                        )
+                    elif self.config.naming_convention == "camelCase":
+                        merge_cypher, create_cypher = _build_convention_cypher(
+                            "studyKey", "subjectKey", "recordId", "visitId"
+                        )
+                    elif self.config.naming_convention == "sdtm":
+                        merge_cypher, create_cypher = _build_convention_cypher(
+                            "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
+                        )
+                    else:
+                        merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
+                    cypher = merge_cypher if self.config.idempotent else create_cypher
                 session.run(cypher, rows=mapped_rows)
             logger.debug("Wrote batch %s (%d records)", batch_id, len(mapped_rows))
             return len(mapped_rows)
@@ -479,7 +597,7 @@ class Neo4jExportSink(ExportSink):
                 "MATCH (r:Record {recordId: rid, studyKey: $study_key})\n"
                 "DETACH DELETE r\n"
             )
-        elif cfg.naming_convention == "sdtm":
+        elif cfg.as_sdtm or cfg.naming_convention == "sdtm":
             delete_cypher = (
                 "UNWIND $record_ids AS rid\n"
                 "MATCH (r:Record {RECORD_ID: rid, STUDYID: $study_key})\n"

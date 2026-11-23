@@ -97,6 +97,7 @@ from tenacity import wait_exponential
 from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
+from imednet.models.sdtm import RECORD_ENVELOPE_KEYS
 from imednet.models.standards import (
     SDTM_DOMAIN_SPECS,
     StandardsProfile,
@@ -949,25 +950,14 @@ def _require_optional_dep(package: str, extras_key: str) -> Any:
         raise
 
 
-_STANDARDS_ENVELOPE_KEYS: frozenset[str] = frozenset(
+_STANDARDS_ENVELOPE_KEYS: frozenset[str] = RECORD_ENVELOPE_KEYS | frozenset(
     {
-        "record_id",
-        "recordId",
-        "form_id",
-        "formId",
-        "form_key",
-        "formKey",
-        "study_key",
-        "studyKey",
-        "visit_id",
-        "visitId",
-        "site_id",
-        "siteId",
-        "deleted",
-        "date_modified",
-        "dateModified",
-        "date_created",
-        "dateCreated",
+        "USUBJID",
+        "STUDYID",
+        "DOMAIN",
+        "domain",
+        "RECORD_ID",
+        "data",
     }
 )
 
@@ -1333,14 +1323,18 @@ def is_record_deleted(record: Any) -> bool:
 
 
 def extract_record_id(record: Any) -> Any | None:
-    """Extract ``record_id`` / ``recordId`` from a record object or mapping."""
+    """Extract ``record_id`` / ``recordId`` / ``RECORD_ID`` from a record object or mapping."""
     if isinstance(record, Mapping):
-        rec_id = record.get("record_id")
-        return rec_id if rec_id is not None else record.get("recordId")
-    rec_id = getattr(record, "record_id", None)
-    if rec_id is None:
-        rec_id = getattr(record, "recordId", None)
-    return rec_id
+        for key in ("record_id", "recordId", "RECORD_ID"):
+            rec_id = record.get(key)
+            if rec_id is not None:
+                return rec_id
+        return None
+    for attr in ("record_id", "recordId", "RECORD_ID"):
+        rec_id = getattr(record, attr, None)
+        if rec_id is not None:
+            return rec_id
+    return None
 
 
 def extract_record_form_ref(record: Any) -> tuple[int | None, str | None]:

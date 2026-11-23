@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .config import Config, load_config
     from .core.base_client import BaseClient
     from .core.retry import DefaultRetryPolicy, RetryPolicy, RetryState
-    from .errors import ApiError, ImednetError, NotFoundError, PluginLoadError
+    from .errors import ApiError, ImednetAPIError, ImednetError, NotFoundError, PluginLoadError
     from .errors.orchestration import FilterConflictError, OrchestratorError
     from .orchestration import (
         MultiStudyOrchestrator,
@@ -47,6 +47,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "FilterConflictError": ("imednet.errors.orchestration", "FilterConflictError"),
     "FilterScalar": ("imednet.utils.typing", "FilterScalar"),
     "FilterValue": ("imednet.utils.typing", "FilterValue"),
+    "ImednetAPIError": ("imednet.errors", "ImednetAPIError"),
     "ImednetClient": ("imednet.sdk", "ImednetSDK"),
     "ImednetError": ("imednet.errors", "ImednetError"),
     "ImednetSDK": ("imednet.sdk", "ImednetSDK"),
@@ -102,6 +103,7 @@ __all__ = [
     "FilterConflictError",
     "FilterScalar",
     "FilterValue",
+    "ImednetAPIError",
     "ImednetClient",
     "ImednetError",
     "ImednetSDK",

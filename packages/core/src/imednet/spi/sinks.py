@@ -34,6 +34,7 @@ from imednet.integrations.sink_base import (
     validate_max_buffered_records,
 )
 from imednet.models.sdtm import (
+    RECORD_ENVELOPE_KEYS,
     SDTM_DOMAIN_SPECS,
     format_variable_name,
     get_sdtm_domain_variables,
@@ -45,6 +46,7 @@ from imednet.models.sdtm import (
 
 __all__ = [
     "DEFAULT_MAX_BUFFERED_RECORDS",
+    "RECORD_ENVELOPE_KEYS",
     "SDTM_DOMAIN_SPECS",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
     "BoundedFormBufferRouter",
@@ -87,19 +89,28 @@ def build_sink_mapper(
     mode: str = "document",
     post_processor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     seq_counters: dict[str, int] | None = None,
+    existing_record_seqs: dict[str, int] | None = None,
+    include_record_id: bool | None = None,
 ) -> CentralizedMapper:
     """Create a CentralizedMapper configured with SinkConfig PHI, SDTM, and naming rules."""
     extra = getattr(config, "extra", None)
     extra_dict = extra if isinstance(extra, dict) else {}
+    as_sdtm = bool(getattr(config, "as_sdtm", False))
+    sdtm_domain = getattr(config, "sdtm_domain", None)
+    effective_include_record_id = (
+        bool(as_sdtm or sdtm_domain is not None) if include_record_id is None else include_record_id
+    )
     mapper = CentralizedMapper(
         mode=mode,
         post_processor=post_processor,
         mask_phi=getattr(config, "mask_phi", True),
         study_config=extra_dict.get("study_config"),
         naming_convention=getattr(config, "naming_convention", None),
-        as_sdtm=bool(getattr(config, "as_sdtm", False)),
-        sdtm_domain=getattr(config, "sdtm_domain", None),
+        as_sdtm=as_sdtm,
+        sdtm_domain=sdtm_domain,
         seq_counters=seq_counters,
+        existing_record_seqs=existing_record_seqs,
+        include_record_id=effective_include_record_id,
     )
     custom_pipeline = extra_dict.get("enrichment_pipeline")
     if custom_pipeline is not None and hasattr(custom_pipeline, "process"):

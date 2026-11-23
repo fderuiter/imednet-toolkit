@@ -57,6 +57,7 @@ FilterScalar = Union[str, int, float, bool, None]  # noqa: UP007
 FilterValue = Union[  # noqa: UP007
     FilterScalar,
     tuple[str, FilterScalar],
+    tuple[str, ...],
     list[tuple[str, FilterScalar]],
     list[FilterScalar],
 ]

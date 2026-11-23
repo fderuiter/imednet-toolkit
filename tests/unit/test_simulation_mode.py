@@ -738,10 +738,32 @@ def test_simulation_filter_sort_and_state_edge_cases():
         == 2
     )
 
-    # Multi-field sort (;), colon direction (:), default ASC, ISO sort, and missing recordData sort
+    # Semicolon (;) and colon (:) sort delimiters are rejected with HTTP 400
+    assert (
+        client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"sort": "subjectKey,asc;recordId,asc"},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"sort": "dateCreated:desc"},
+        ).status_code
+        == 400
+    )
+
+    # Repeated sort params (<property>,asc|desc), default ASC, ISO sort, and missing recordData sort
     sort_resp = client.get(
         "/api/v1/edc/studies/STUDY/records",
-        params={"sort": "deleted;dateCreated:desc;V_AGE,asc", "page": "invalid", "size": "-5"},
+        params=[
+            ("sort", "deleted"),
+            ("sort", "dateCreated,desc"),
+            ("sort", "V_AGE,asc"),
+            ("page", "invalid"),
+            ("size", "-5"),
+        ],
     )
     assert sort_resp.status_code == 200
     assert [r["recordId"] for r in sort_resp.json()["data"]] == [602, 601]
