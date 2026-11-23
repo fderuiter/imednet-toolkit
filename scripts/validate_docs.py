@@ -17,6 +17,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+import yaml  # type: ignore[import-untyped]
 from defusedxml import ElementTree as DefusedET
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1069,10 +1070,66 @@ def check_packages_registered(repo_root: Path | None = None) -> bool:
     return has_errors
 
 
+REQUIRED_PYTHON_CLASSIFIERS = (
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+)
+WORKSPACE_PACKAGE_IDS = (
+    "core",
+    "plugins-workflows",
+    "plugins-sinks",
+    "plugins-tui",
+    "providers-airflow",
+)
+LIVE_GITHUB_AREA_NAMES = frozenset(
+    {
+        "core",
+        "http",
+        "models",
+        "auth",
+        "pagination",
+        "cli",
+        "workflows",
+        "airflow",
+        "docs",
+        "tests",
+        "release",
+        "github",
+        "ci",
+        "testing",
+        "streamlit",
+        "mapping",
+        "records",
+        "standards",
+        "dashboard",
+        "review-workbench",
+        "terminology",
+        "governance",
+        "performance",
+    }
+)
+RETIRED_GITHUB_LABELS = (
+    "type:maintenance",
+    "area:workflows-plugin",
+    "area:airflow-provider",
+    "area:contributing",
+    "status:needs-info",
+    "risk:medium",
+    "risk:high",
+)
+RETIRED_REPO_SLUG = "imednet-python-sdk"
+OBSOLETE_CHANGELOG_TOKENS = (
+    "docs/contributing.rst",
+    "imednet.compat.v1",
+    "imednet-python-sdk",
+)
+
+
 def check_package_docs(repo_root: Path | None = None) -> bool:
-    """Validate package README/CHANGELOG files, root CHANGELOG index hygiene, and MyST changelog hub."""
+    """Validate package README/CHANGELOG files, root CHANGELOG index hygiene, MyST changelog hub, and wheel manifest metadata."""
     print(
-        "Checking if all packages have local documentation, clean root CHANGELOG.md, and MyST includes..."
+        "Checking package local documentation, manifest metadata, root CHANGELOG.md, and MyST includes..."
     )
     root = repo_root or REPO_ROOT
     packages_dir = root / "packages"
@@ -1088,12 +1145,10 @@ def check_package_docs(repo_root: Path | None = None) -> bool:
     root_changelog_content = root_changelog.read_text(encoding="utf-8")
     has_errors = False
 
-    if "imednet-python-sdk" in root_changelog_content:
-        print("Error: Root CHANGELOG.md contains legacy 'imednet-python-sdk' links.")
-        has_errors = True
-    if "imednet.compat.v1" in root_changelog_content:
-        print("Error: Root CHANGELOG.md contains stale 'imednet.compat.v1' deprecation claims.")
-        has_errors = True
+    for token in OBSOLETE_CHANGELOG_TOKENS:
+        if token in root_changelog_content:
+            print(f"Error: Root CHANGELOG.md contains obsolete reference '{token}'.")
+            has_errors = True
     if re.search(r"\bctx\b", root_changelog_content):
         print("Error: Root CHANGELOG.md contains stale 'ctx' deprecation claims.")
         has_errors = True
@@ -1158,8 +1213,203 @@ def check_package_docs(repo_root: Path | None = None) -> bool:
             )
             has_errors = True
 
+        # Check pyproject.toml wheel metadata fields
+        manifest_path = pkg_dir / "pyproject.toml"
+        if not manifest_path.is_file():
+            print(f"Error: Package {pkg_name} is missing pyproject.toml.")
+            has_errors = True
+            continue
+
+        manifest_data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        project = manifest_data.get("project", {})
+
+        readme_decl = project.get("readme")
+        readme_rel = (
+            readme_decl
+            if isinstance(readme_decl, str)
+            else readme_decl.get("file")
+            if isinstance(readme_decl, dict)
+            else None
+        )
+        if not isinstance(readme_rel, str) or not readme_rel.strip():
+            print(f"Error: {manifest_path} is missing [project].readme.")
+            has_errors = True
+        else:
+            declared_readme = pkg_dir / readme_rel
+            if (
+                not declared_readme.is_file()
+                or not declared_readme.read_text(encoding="utf-8").strip()
+            ):
+                print(
+                    f"Error: {manifest_path} [project].readme points to missing or empty file '{readme_rel}'."
+                )
+                has_errors = True
+
+        if project.get("license") != "MIT":
+            print(
+                f"Error: {manifest_path} must declare license = \"MIT\" (got {project.get('license')!r})."
+            )
+            has_errors = True
+
+        classifiers = set(project.get("classifiers", []))
+        for required_classifier in REQUIRED_PYTHON_CLASSIFIERS:
+            if required_classifier not in classifiers:
+                print(f"Error: {manifest_path} is missing classifier '{required_classifier}'.")
+                has_errors = True
+
     if not has_errors:
-        print("All package docs and MyST changelog checks passed.")
+        print("All package docs, MyST changelogs, and manifest metadata checks passed.")
+    return has_errors
+
+
+def check_governance_and_issue_templates(repo_root: Path | None = None) -> bool:
+    """Validate governance URLs, live GitHub triage labels, issue templates, and README package/extra listings."""
+    print("Checking governance files, issue templates, and triage label vocabulary...")
+    root = repo_root or REPO_ROOT
+    issue_template_dir = root / ".github" / "ISSUE_TEMPLATE"
+    docs_dir = root / "docs"
+    if not issue_template_dir.is_dir() or not docs_dir.is_dir():
+        print(
+            f"Error: Required governance directories missing under {root} "
+            f"(expected '.github/ISSUE_TEMPLATE/' and 'docs/')."
+        )
+        return True
+
+    has_errors = False
+
+    url_scan_files: list[Path] = []
+    for root_file in (
+        "README.md",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+        "AGENTS.md",
+        "CHANGELOG.md",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+    ):
+        candidate = root / root_file
+        if candidate.is_file():
+            url_scan_files.append(candidate)
+
+    url_scan_files.extend(sorted(p for p in issue_template_dir.iterdir() if p.is_file()))
+
+    packages_dir = root / "packages"
+    if packages_dir.is_dir():
+        url_scan_files.extend(sorted(packages_dir.glob("*/pyproject.toml")))
+        url_scan_files.extend(sorted(packages_dir.glob("*/README.md")))
+
+    public_doc_files: list[Path] = []
+    for doc_path in sorted([*docs_dir.rglob("*.rst"), *docs_dir.rglob("*.md")]):
+        rel_parts = doc_path.relative_to(root).parts
+        if any(part in _DOC_EXCLUDED_PARTS for part in rel_parts):
+            continue
+        public_doc_files.append(doc_path)
+
+    seen_url_files: set[Path] = set()
+    for path in [*url_scan_files, *public_doc_files]:
+        resolved = path.resolve()
+        if resolved in seen_url_files or not path.is_file():
+            continue
+        seen_url_files.add(resolved)
+        text = path.read_text(encoding="utf-8")
+        if RETIRED_REPO_SLUG in text:
+            print(
+                f"Error: Retired repository slug '{RETIRED_REPO_SLUG}' found in {path.relative_to(root)}."
+            )
+            has_errors = True
+
+    label_scan_files = [
+        *public_doc_files,
+        *sorted(p for p in issue_template_dir.iterdir() if p.is_file()),
+    ]
+
+    label_patterns = {
+        label: re.compile(rf"(?<![a-z0-9:-]){re.escape(label)}(?![a-z0-9-])")
+        for label in RETIRED_GITHUB_LABELS
+    }
+    for path in label_scan_files:
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for label, pattern in label_patterns.items():
+            if pattern.search(text):
+                print(
+                    f"Error: Nonexistent GitHub label '{label}' found in {path.relative_to(root)}."
+                )
+                has_errors = True
+
+    for yml_path in sorted(issue_template_dir.glob("*.yml")):
+        if yml_path.name == "config.yml":
+            continue
+        data = yaml.safe_load(yml_path.read_text(encoding="utf-8")) or {}
+        body = data.get("body", [])
+        fields_by_id = {
+            item.get("id"): item
+            for item in body
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+
+        area_field = fields_by_id.get("area")
+        area_options = (
+            area_field.get("attributes", {}).get("options", [])
+            if isinstance(area_field, dict)
+            else []
+        )
+        if not area_options:
+            print(
+                f"Error: Issue template {yml_path.relative_to(root)} is missing 'area' dropdown options."
+            )
+            has_errors = True
+        else:
+            invalid_areas = [opt for opt in area_options if str(opt) not in LIVE_GITHUB_AREA_NAMES]
+            if invalid_areas:
+                print(
+                    f"Error: Issue template {yml_path.relative_to(root)} contains non-live area options: {invalid_areas}."
+                )
+                has_errors = True
+
+        pkg_field = fields_by_id.get("package")
+        pkg_options = (
+            {
+                str(opt).split(" ", 1)[0]
+                for opt in pkg_field.get("attributes", {}).get("options", [])
+            }
+            if isinstance(pkg_field, dict)
+            else set()
+        )
+        missing_pkgs = [pkg for pkg in WORKSPACE_PACKAGE_IDS if pkg not in pkg_options]
+        if missing_pkgs:
+            print(
+                f"Error: Issue template {yml_path.relative_to(root)} 'package' dropdown is missing workspace packages: {missing_pkgs}."
+            )
+            has_errors = True
+
+    root_readme = root / "README.md"
+    core_manifest = root / "packages" / "core" / "pyproject.toml"
+    if root_readme.is_file() and core_manifest.is_file():
+        readme_text = root_readme.read_text(encoding="utf-8")
+        core_data = tomllib.loads(core_manifest.read_text(encoding="utf-8"))
+        core_extras = sorted(core_data.get("project", {}).get("optional-dependencies", {}).keys())
+        for extra in core_extras:
+            if not re.search(rf"\b{re.escape(extra)}\b", readme_text):
+                print(f"Error: Core extra '{extra}' is not documented in root README.md.")
+                has_errors = True
+        for pkg_dist in ("imednet-plugins-sinks", "imednet-tui"):
+            if pkg_dist not in readme_text:
+                print(f"Error: Workspace package '{pkg_dist}' is missing from root README.md.")
+                has_errors = True
+
+    core_readme = root / "packages" / "core" / "README.md"
+    if core_readme.is_file():
+        core_readme_text = core_readme.read_text(encoding="utf-8")
+        for pkg_dist in ("imednet-plugins-sinks", "imednet-tui"):
+            if pkg_dist not in core_readme_text:
+                print(
+                    f"Error: Workspace package '{pkg_dist}' is missing from packages/core/README.md."
+                )
+                has_errors = True
+
+    if not has_errors:
+        print("Governance, issue template, and triage label checks passed.")
     return has_errors
 
 
@@ -2445,6 +2695,443 @@ def check_built_html_seo(
     return has_errors
 
 
+_IMEDNET_ENV_NAME_RE = re.compile(r"^IMEDNET_[A-Z0-9_]+$")
+_DOCUMENTED_IMEDNET_ENV_RE = re.compile(r"\b(IMEDNET_[A-Z0-9_]+)\b")
+
+
+def _is_os_environ_expr(node: ast.AST) -> bool:
+    """Return True if AST node represents ``os.environ`` or ``environ``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    ) or (isinstance(node, ast.Name) and node.id == "environ")
+
+
+def _resolve_env_expr(expr: ast.AST, const_map: dict[str, str]) -> list[str]:
+    """Resolve an AST expression to matching ``IMEDNET_*`` environment variable names."""
+    if (
+        isinstance(expr, ast.Constant)
+        and isinstance(expr.value, str)
+        and _IMEDNET_ENV_NAME_RE.match(expr.value)
+    ):
+        return [expr.value]
+    if isinstance(expr, ast.Name) and expr.id in const_map:
+        return [const_map[expr.id]]
+    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+        items: list[str] = []
+        for elt in expr.elts:
+            items.extend(_resolve_env_expr(elt, const_map))
+        return items
+    return []
+
+
+def _extract_runtime_env_vars(packages_dir: Path) -> set[str]:
+    """Extract runtime ``IMEDNET_*`` environment variables read across ``packages/*/src/**/*.py``."""
+    discovered: set[str] = set()
+    if not packages_dir.exists():
+        return discovered
+
+    for py_file in sorted(packages_dir.glob("*/src/**/*.py")):
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+        except (OSError, SyntaxError):
+            continue
+
+        const_map: dict[str, str] = {}
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant):
+                if isinstance(stmt.value.value, str) and _IMEDNET_ENV_NAME_RE.match(
+                    stmt.value.value
+                ):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name):
+                            const_map[target.id] = stmt.value.value
+            elif (
+                isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+                and _IMEDNET_ENV_NAME_RE.match(stmt.value.value)
+            ):
+                const_map[stmt.target.id] = stmt.value.value
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and node.args:
+                func = node.func
+                is_os_getenv = (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "getenv"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                ) or (isinstance(func, ast.Name) and func.id == "getenv")
+                is_environ_method = (
+                    isinstance(func, ast.Attribute)
+                    and func.attr in {"get", "pop", "setdefault"}
+                    and _is_os_environ_expr(func.value)
+                )
+                if is_os_getenv or is_environ_method:
+                    discovered.update(_resolve_env_expr(node.args[0], const_map))
+            elif isinstance(node, ast.Subscript) and _is_os_environ_expr(node.value):
+                discovered.update(_resolve_env_expr(node.slice, const_map))
+            elif isinstance(node, ast.Compare):
+                operands = [node.left, *node.comparators]
+                if any(_is_os_environ_expr(op) for op in operands):
+                    for op in operands:
+                        if not _is_os_environ_expr(op):
+                            discovered.update(_resolve_env_expr(op, const_map))
+            elif isinstance(node, ast.For):
+                candidates = _resolve_env_expr(node.iter, const_map)
+                if candidates and any(
+                    isinstance(sub, ast.Attribute) and sub.attr in {"environ", "getenv"}
+                    for sub in ast.walk(node)
+                ):
+                    discovered.update(candidates)
+
+    return discovered
+
+
+def check_env_vars_documented(repo_root: Path | None = None) -> bool:
+    """Verify every runtime ``IMEDNET_*`` environment variable in ``packages/*/src`` is in ``configuration.rst``."""
+    print("Checking runtime IMEDNET_* environment variables against configuration.rst...")
+    root = repo_root or REPO_ROOT
+    packages_dir = root / "packages"
+    config_rst = root / "docs" / "reference" / "configuration.rst"
+    if not packages_dir.is_dir() or not config_rst.is_file():
+        print(
+            f"Error: Missing packages directory ({packages_dir}) or configuration reference ({config_rst})."
+        )
+        return True
+
+    runtime_vars = _extract_runtime_env_vars(packages_dir)
+    documented_vars = set(
+        _DOCUMENTED_IMEDNET_ENV_RE.findall(config_rst.read_text(encoding="utf-8"))
+    )
+    missing = sorted(runtime_vars - documented_vars)
+    if missing:
+        for var_name in missing:
+            print(
+                f"Error: Runtime environment variable '{var_name}' is undocumented in {config_rst}."
+            )
+        return True
+
+    print(
+        f"Environment variable parity verified ({len(runtime_vars)} runtime IMEDNET_* variable(s) documented)."
+    )
+    return False
+
+
+def check_sdtm_and_phi_parity(repo_root: Path | None = None) -> bool:
+    """Verify all SDTM_DOMAIN_SPECS domains, SensitivityRegistry keys, and SinkConfig controls are in record_mapping.rst."""
+    print("Checking SDTM domains and SensitivityRegistry keys against record_mapping.rst...")
+    root = repo_root or REPO_ROOT
+    core_src = str(REPO_ROOT / "packages" / "core" / "src")
+    if core_src not in sys.path:
+        sys.path.insert(0, core_src)
+
+    record_mapping_rst = root / "docs" / "how-to" / "record_mapping.rst"
+    if not record_mapping_rst.is_file():
+        print(f"Error: Missing record mapping guide at {record_mapping_rst}.")
+        return True
+
+    from imednet.models.sdtm import SDTM_DOMAIN_SPECS
+    from imednet.utils.security import SensitivityRegistry
+
+    content = record_mapping_rst.read_text(encoding="utf-8")
+    registry = SensitivityRegistry()
+    has_errors = False
+
+    for domain_code in sorted(SDTM_DOMAIN_SPECS):
+        if f"``{domain_code}``" not in content:
+            print(
+                f"Error: SDTM domain '{domain_code}' from SDTM_DOMAIN_SPECS is undocumented in {record_mapping_rst}."
+            )
+            has_errors = True
+
+    for phi_key in sorted(registry._sensitive_keys):
+        if f"``{phi_key}``" not in content:
+            print(
+                f"Error: Default PHI key '{phi_key}' from SensitivityRegistry is undocumented in {record_mapping_rst}."
+            )
+            has_errors = True
+
+    for exempt_key in sorted(registry._exempt_keys):
+        if f"``{exempt_key}``" not in content:
+            print(
+                f"Error: Exempt structural key '{exempt_key}' from SensitivityRegistry is undocumented in {record_mapping_rst}."
+            )
+            has_errors = True
+
+    required_sink_controls = (
+        "as_sdtm",
+        "sdtm_domain",
+        "standards_profile",
+        "min_standards_score",
+        "naming_convention",
+    )
+    for ctrl in required_sink_controls:
+        if f"``{ctrl}``" not in content:
+            print(
+                f"Error: SinkConfig SDTM/standards control '{ctrl}' is undocumented in {record_mapping_rst}."
+            )
+            has_errors = True
+
+    if not has_errors:
+        print(
+            f"SDTM and PHI parity verified ({len(SDTM_DOMAIN_SPECS)} domains, "
+            f"{len(registry._sensitive_keys)} sensitive keys, {len(registry._exempt_keys)} exempt keys)."
+        )
+    return has_errors
+
+
+_DUCKDB_CREATE_REL_RE = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
+    re.IGNORECASE,
+)
+_STALE_RECORD_REVISIONS_TABLE_RE = re.compile(
+    r"``record_revisions``\s+tables?\b",
+    re.IGNORECASE,
+)
+
+
+def check_duckdb_relations_parity(repo_root: Path | None = None) -> bool:
+    """Verify DuckDB relation names in audit_compliance.rst and CI audit commands in security_exceptions.rst."""
+    print("Checking DuckDB relation names and security audit commands...")
+    root = repo_root or REPO_ROOT
+    centralizer_py = (
+        root
+        / "packages"
+        / "plugins-workflows"
+        / "src"
+        / "imednet_workflows"
+        / "duckdb_centralizer.py"
+    )
+    audit_rst = root / "docs" / "how-to" / "audit_compliance.rst"
+    security_rst = root / "docs" / "reference" / "security_exceptions.rst"
+
+    for required_path in (centralizer_py, audit_rst, security_rst):
+        if not required_path.is_file():
+            print(f"Error: Missing required file for parity validation: {required_path}.")
+            return True
+
+    centralizer_text = centralizer_py.read_text(encoding="utf-8")
+    expected_relations = set(_DUCKDB_CREATE_REL_RE.findall(centralizer_text))
+    if not expected_relations:
+        print(f"Error: Could not extract any DuckDB relations from {centralizer_py}.")
+        return True
+
+    audit_text = audit_rst.read_text(encoding="utf-8")
+    has_errors = False
+
+    for rel_name in sorted(expected_relations):
+        if f"``{rel_name}``" not in audit_text:
+            print(
+                f"Error: DuckDB relation '{rel_name}' from duckdb_centralizer.py is missing from {audit_rst}."
+            )
+            has_errors = True
+
+    if "silver_records_history" in expected_relations:
+        for scd_col in ("valid_from", "valid_to", "is_current"):
+            if f"``{scd_col}``" not in audit_text:
+                print(
+                    f"Error: SCD Type 2 column '{scd_col}' from silver_records_history is missing from {audit_rst}."
+                )
+                has_errors = True
+
+    if _STALE_RECORD_REVISIONS_TABLE_RE.search(audit_text):
+        print(
+            f"Error: Stale 'record_revisions' DuckDB table reference found in {audit_rst} "
+            "(expected 'bronze_revisions' table and 'record_revisions' view)."
+        )
+        has_errors = True
+
+    security_text = security_rst.read_text(encoding="utf-8")
+    if "lint:audit" in security_text:
+        print(
+            f"Error: Stale 'lint:audit' command found in {security_rst}; expected locked uv export + pip-audit."
+        )
+        has_errors = True
+    if "uv export" not in security_text or "pip-audit" not in security_text:
+        print(f"Error: {security_rst} must document the CI 'uv export' + 'pip-audit' workflow.")
+        has_errors = True
+
+    if not has_errors:
+        print(f"DuckDB relation and security audit parity verified ({sorted(expected_relations)}).")
+    return has_errors
+
+
+class _ComplianceLinkParser(HTMLParser):
+    """Parse HTML page anchors, internal links, and unlinked Sphinx Python cross-references."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ids: set[str] = set()
+        self.internal_links: list[tuple[str, str]] = []
+        self.unlinked_py_xrefs: list[str] = []
+        self._active_href: str | None = None
+        self._link_text_parts: list[str] = []
+        self._in_unlinked_xref = False
+        self._xref_depth = 0
+        self._xref_text_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = dict(attrs)
+        elem_id = attr_map.get("id")
+        if elem_id:
+            self.ids.add(elem_id)
+
+        classes = set((attr_map.get("class") or "").split())
+        if tag == "a" and "reference" in classes and "internal" in classes:
+            href = attr_map.get("href")
+            if href:
+                self._active_href = href
+                self._link_text_parts = []
+
+        if self._in_unlinked_xref:
+            self._xref_depth += 1
+        elif tag == "code" and "xref" in classes and "py" in classes and self._active_href is None:
+            self._in_unlinked_xref = True
+            self._xref_depth = 1
+            self._xref_text_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._active_href is not None:
+            self._link_text_parts.append(data)
+        if self._in_unlinked_xref:
+            self._xref_text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._active_href is not None:
+            self.internal_links.append((self._active_href, "".join(self._link_text_parts).strip()))
+            self._active_href = None
+            self._link_text_parts = []
+        if self._in_unlinked_xref:
+            self._xref_depth -= 1
+            if self._xref_depth <= 0:
+                text = "".join(self._xref_text_parts).strip()
+                if text:
+                    self.unlinked_py_xrefs.append(text)
+                self._in_unlinked_xref = False
+                self._xref_text_parts = []
+
+
+_FIRST_PARTY_XREF_PREFIXES = (
+    "imednet",
+    "apache_airflow_providers_imednet",
+    "RecordRevision",
+    "ConfigVersionStore",
+    "DuckDBIngestionWorkflow",
+    "OIDCAuth",
+    "AuthStrategy",
+    "ApiKeyAuth",
+    "CredentialSource",
+    "MemoryCredentialStore",
+    "Credentials",
+    "StandardsReadinessValidator",
+    "SinkConfig",
+    "ExportSink",
+    "transform_records_to_sdtm_rows",
+    "evaluate_standards_readiness",
+)
+
+
+def check_compliance_html_links(html_dir: Path | None, *, require_exists: bool = False) -> bool:
+    """Verify compliance/SPI cross-references resolve to valid HTML files and anchor IDs."""
+    if html_dir is None:
+        return False
+
+    print(f"Checking compliance and SPI HTML cross-references in {html_dir}...")
+    if not html_dir.exists():
+        if require_exists:
+            print(f"Error: Rendered HTML directory {html_dir} does not exist.")
+            return True
+        print(f"Skipping compliance HTML link check ({html_dir} not built yet).")
+        return False
+
+    required_page_symbols: dict[str, tuple[str, ...]] = {
+        "how-to/audit_compliance.html": ("RecordRevision.validate_chain",),
+        "explanation/architecture.html": (
+            "transform_records_to_sdtm_rows",
+            "evaluate_standards_readiness",
+        ),
+        "how-to/record_mapping.html": (
+            "transform_records_to_sdtm_rows",
+            "evaluate_standards_readiness",
+        ),
+        "reference/governance.html": ("rollback_config",),
+        "explanation/api_overview.html": ("AuthStrategy", "OIDCAuth", "MemoryCredentialStore"),
+    }
+
+    models_html = html_dir / "reference" / "api" / "imednet.models.html"
+    if not models_html.is_file():
+        print(f"Error: Missing rendered API reference page {models_html}.")
+        return True
+
+    parsed_cache: dict[Path, _ComplianceLinkParser] = {}
+
+    def _get_parsed(page_path: Path) -> _ComplianceLinkParser:
+        resolved = page_path.resolve()
+        if resolved not in parsed_cache:
+            parser = _ComplianceLinkParser()
+            parser.feed(resolved.read_text(encoding="utf-8"))
+            parsed_cache[resolved] = parser
+        return parsed_cache[resolved]
+
+    has_errors = False
+    models_parsed = _get_parsed(models_html)
+    validate_chain_id = "imednet.models.record_revisions.RecordRevision.validate_chain"
+    if validate_chain_id not in models_parsed.ids:
+        print(f"Error: Method anchor '{validate_chain_id}' missing from {models_html}.")
+        has_errors = True
+
+    for rel_page, expected_symbols in required_page_symbols.items():
+        page_path = html_dir / rel_page
+        if not page_path.is_file():
+            print(f"Error: Expected rendered guide {page_path} does not exist.")
+            has_errors = True
+            continue
+
+        parsed = _get_parsed(page_path)
+
+        for unlinked in parsed.unlinked_py_xrefs:
+            if unlinked.startswith(_FIRST_PARTY_XREF_PREFIXES):
+                print(f"Error: Unresolved Python cross-reference '{unlinked}' on {rel_page}.")
+                has_errors = True
+
+        for sym in expected_symbols:
+            matching_hrefs = [href for href, text in parsed.internal_links if sym in text]
+            if not matching_hrefs:
+                print(f"Error: Expected linked cross-reference '{sym}' missing from {rel_page}.")
+                has_errors = True
+
+        for href, link_text in parsed.internal_links:
+            if href.startswith(("http://", "https://", "mailto:")):
+                continue
+            rel_part, _, frag = href.partition("#")
+            target_file = (
+                (page_path.parent / rel_part).resolve() if rel_part else page_path.resolve()
+            )
+            if not target_file.is_file():
+                print(
+                    f"Error: Broken internal link '{href}' ({link_text}) on {rel_page}: target file missing."
+                )
+                has_errors = True
+                continue
+            if frag and frag not in _get_parsed(target_file).ids:
+                print(
+                    f"Error: Broken internal anchor '{href}' ({link_text}) on {rel_page}: '#{frag}' missing."
+                )
+                has_errors = True
+
+    if not has_errors:
+        print(
+            f"Compliance and SPI HTML cross-references verified across {len(required_page_symbols)} guide(s)."
+        )
+    return has_errors
+
+
 DEFAULT_HTML_DIR = REPO_ROOT / "docs" / "_build" / "html"
 
 
@@ -2478,16 +3165,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     tui_parity_failed = check_tui_bindings_parity()
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
+    governance_failed = check_governance_and_issue_templates()
     release_please_failed = check_release_please_parity()
     examples_failed = check_examples_index_parity()
     sidebars_failed = check_diataxis_sidebar_isolation()
     adr_failed = check_adr_records()
+    env_vars_failed = check_env_vars_documented()
+    sdtm_phi_failed = check_sdtm_and_phi_parity()
+    duckdb_parity_failed = check_duckdb_relations_parity()
     githubpages_failed = check_sphinx_githubpages_extension()
     baseurl_failed = check_sphinx_html_baseurl()
     seo_config_failed = check_sphinx_seo_configuration()
     suppression_failed = check_no_duplicate_suppression()
     api_html_dir = args.html_dir if args.require_html or args.html_dir != DEFAULT_HTML_DIR else None
     api_html_failed = check_rendered_api_reference(api_html_dir)
+    compliance_links_failed = check_compliance_html_links(
+        api_html_dir, require_exists=args.require_html
+    )
     html_seo_failed = check_built_html_seo(args.html_dir, require_exists=args.require_html)
 
     if (
@@ -2501,15 +3195,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         or tui_parity_failed
         or packages_failed
         or docs_failed
+        or governance_failed
         or release_please_failed
         or examples_failed
         or sidebars_failed
         or adr_failed
+        or env_vars_failed
+        or sdtm_phi_failed
+        or duckdb_parity_failed
         or githubpages_failed
         or baseurl_failed
         or seo_config_failed
         or suppression_failed
         or api_html_failed
+        or compliance_links_failed
         or html_seo_failed
     ):
         print("Validation failed.")

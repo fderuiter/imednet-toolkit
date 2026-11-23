@@ -22,28 +22,28 @@ Environment Variables
      - Security key used for authentication (also used as fallback key material for ``ConfigVersionStore`` when ``IMEDNET_ENCRYPTION_KEY`` is unset).
      - None
    * - IMEDNET_OIDC_TOKEN
-     - Optional OIDC bearer token used instead of API/security key pairs.
+     - Optional OIDC bearer token used instead of API/security key pairs (takes precedence over static keys).
      - None
    * - IMEDNET_OIDC_PUBLIC_KEY
-     - Optional PEM public key or shared secret used by ``OIDCAuth`` to verify JWT signatures locally.
+     - Optional PEM public key (or symmetric key when a symmetric algorithm is explicitly configured) used by ``OIDCAuth`` to verify JWT signatures locally.
      - None
    * - IMEDNET_OIDC_JWKS_URL
-     - Optional JWKS endpoint URL queried by ``OIDCAuth`` to resolve signing keys dynamically.
+     - Optional HTTPS JWKS endpoint URL queried by ``OIDCAuth`` to resolve asymmetric signing keys dynamically.
      - None
    * - IMEDNET_OIDC_AUDIENCE
-     - Optional expected ``aud`` claim enforced by ``OIDCAuth`` during JWT validation.
+     - Optional expected JWT ``aud`` claim enforced by ``OIDCAuth`` during validation.
      - None
    * - IMEDNET_OIDC_ALGORITHMS
-     - Optional comma-separated allowlist of JWS signing algorithms (for example ``RS256,ES256``) accepted by ``OIDCAuth``.
+     - Optional comma-separated allowlist of JWS signing algorithms (for example ``RS256,ES256``) enforced by ``OIDCAuth`` (defaults to asymmetric ``RS*``, ``PS*``, ``ES*``, and ``EdDSA`` algorithms unless symmetric key verification is explicitly configured).
      - None (key-matched defaults)
    * - IMEDNET_OIDC_ISSUER
-     - Optional expected ``iss`` claim enforced by ``OIDCAuth`` during JWT validation.
+     - Optional expected JWT ``iss`` claim enforced by ``OIDCAuth`` during validation.
      - None
    * - IMEDNET_BASE_URL
-     - Optional base URL override for private or regional deployments (client defaults to ``https://edc.prod.imednetapi.com`` when unset).
+     - Optional base URL override for private or regional Mednet EDC deployments (client defaults to ``https://edc.prod.imednetapi.com`` when unset; also scopes dynamic ``ConfigVersionStore`` host directories).
      - None
    * - IMEDNET_TIMEOUT
-     - Default HTTP request timeout in seconds loaded by :func:`imednet.config.load_config`.
+     - Default HTTP request timeout in seconds loaded by :func:`imednet.config.load_config` for synchronous and asynchronous SDK clients.
      - ``30.0``
    * - IMEDNET_SIMULATION_MODE
      - Set to ``true`` / ``1`` (or pass ``--simulation``) to run offline against ``SimulationTransport``.
@@ -52,7 +52,7 @@ Environment Variables
      - Set to ``true`` / ``1`` to raise validation errors on unexpected upstream response drift or untyped scalar coercion.
      - ``false``
    * - IMEDNET_STRICT_CDASH
-     - Set to ``true`` / ``1`` to enable opt-in CDASH Variable naming/prefix heuristics on ``MappingRule`` and ``StudyConfiguration``.
+     - Set to ``true`` / ``1`` to enable the opt-in local CDASH ``Variable`` naming/prefix heuristic on ``MappingRule`` and ``StudyConfiguration``.
      - ``false``
    * - IMEDNET_NON_INTERACTIVE
      - Set to ``1`` / ``true`` / ``yes`` (or pass ``--no-interactive``) to disable full-screen curses grids, ``imednet tui``, live ``stderr`` spinners, and interactive ``stdin`` prompts.
@@ -61,37 +61,37 @@ Environment Variables
      - Set to ``json`` to default ``--format``-capable CLI commands and ``datadict diff`` to JSON output unless an explicit ``--format`` flag overrides it.
      - ``table``
    * - IMEDNET_HIGH_CONTRAST
-     - Set to ``1`` (or pass ``--high-contrast``) to enable high-contrast palettes across CLI tables, ``InteractiveDataGrid``, and ``imednet tui``.
+     - Set to ``1`` (or pass ``--high-contrast``) to enable WCAG AAA high-contrast palettes across CLI tables, ``InteractiveDataGrid``, and ``imednet tui``.
      - ``0`` (disabled)
    * - IMEDNET_OPENAPI_PATH
-     - Optional filesystem path to an OpenAPI specification file overriding bundled contract models in ``imednet.models.engine``.
+     - Optional filesystem path to an OpenAPI specification file overriding bundled contract models in ``imednet.models.engine`` (``ModelEngine``).
      - None
    * - IMEDNET_POSTMAN_PATH
-     - Optional filesystem path to a Postman collection JSON file overriding bundled contract models when ``IMEDNET_OPENAPI_PATH`` is unset.
+     - Optional filesystem path to a Postman collection JSON file overriding bundled contract models in ``ModelEngine`` when ``IMEDNET_OPENAPI_PATH`` is unset.
      - None
    * - IMEDNET_CONFIG_DB_PATH
-     - SQLite database file path storing append-only ``StudyConfiguration`` history for ``ConfigVersionStore``.
+     - Base SQLite database file path storing append-only ``StudyConfiguration`` history for ``ConfigVersionStore`` (prior to dynamic host and ``Study`` directory scoping).
      - ``~/.imednet/config_versions.sqlite3``
    * - IMEDNET_ENCRYPTION_KEY
-     - Optional AES-256 Fernet key or passphrase encrypting ``ConfigVersionStore`` payloads (falls back to ``IMEDNET_SECURITY_KEY`` when unset).
+     - Optional AES-256 Fernet key or passphrase encrypting ``ConfigVersionStore`` ``StudyConfiguration`` payloads at rest (falls back to ``IMEDNET_SECURITY_KEY`` when unset).
      - None
    * - IMEDNET_WORKFLOW_LEDGER_PATH
      - Default JSON file path storing incremental high-water mark checkpoints for ``FileStateProvider`` / ``ExtractionStateLedger``.
      - ``~/.imednet/pipeline_ledger.json``
    * - IMEDNET_TRIAGE_DB_PATH
-     - Default SQLite database file path storing ``Record`` triage items and history for ``TriageStore``.
+     - Default SQLite database file path storing operational ``Record`` / ``Query`` triage items and history for ``TriageStore``.
      - ``~/.imednet/triage.sqlite3``
    * - IMEDNET_STUDY_KEY
-     - Study identifier used by examples and some tests.
+     - ``Study`` identifier used by CLI defaults, examples, and integration tests.
      - None
    * - IMEDNET_RUN_E2E
      - Set to ``1`` to enable end-to-end tests that hit a live environment.
      - None
    * - IMEDNET_BATCH_ID
-     - Batch identifier used by job polling tests. Created automatically if unset.
+     - Batch identifier used by ``Job`` polling tests. Created automatically if unset.
      - None
    * - IMEDNET_FORM_KEY
-     - Form key for record-creation tests. If unset, the first form is used.
+     - ``Form`` key for ``Record``-creation tests. If unset, the first ``Form`` is used.
      - None
    * - IMEDNET_ALLOW_MUTATION
      - Set to ``1`` to allow workflow tests that submit data.

@@ -73,12 +73,21 @@ Our documentation is organized according to the **Diátaxis framework**, which c
 pip install imednet
 ```
 
-For extended integrations, you can install optional dependencies:
+For extended integrations, you can install core optional extras or companion workspace packages:
 ```bash
+# Core SDK optional extras
 pip install "imednet[cli]"
+pip install "imednet[duckdb]"
 pip install "imednet[export]"
+pip install "imednet[mongodb]"
+pip install "imednet[neo4j]"
+pip install "imednet[snowflake]"
 pip install "imednet[tui]"
+
+# Companion workspace packages
 pip install imednet-workflows
+pip install imednet-plugins-sinks
+pip install imednet-tui
 pip install apache-airflow-providers-imednet
 ```
 

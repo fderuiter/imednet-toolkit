@@ -65,9 +65,9 @@ Alternatively, commands can be launched via standard CLI structures mapped to th
 - **Multi-backend Support**: Tailored exporters mapping Study Records to Document Store (MongoDB), Property Graph (Neo4j), or Data Warehouse (Snowflake) systems.
 - **Dynamic Lazy Imports**: Keeps package initialization light by lazy-loading heavy drivers (e.g. PyMongo, Neo4j, Snowflake Connector, PyArrow) at execution time.
 - **Idempotency & Resiliency**:
-  - **MongoDB**: Uses bulk upserts mapping unique compound keys (`<study_key>/<record_id>`) using PyMongo `bulk_write` update/upsert actions.
-  - **Neo4j**: Merges hierarchies (`Study -> Subject -> Visit -> Record`) idempotently using query templates.
-  - **Snowflake**: Two-phase loading converting Study Records to Apache Arrow tables, writing staged Parquet batches, and running staged `COPY INTO` + `MERGE INTO` keyed on `(study_key, record_id)`.
+  - **MongoDB**: Uses PyMongo `bulk_write` upserts keyed on deterministic `_id` `<study_key>/<record_id>` (falling back to `<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>`, with `*SEQ` defaulting to `1`, when `as_sdtm=True` and `record_id` is absent), encoding pure `date` values as ISO-8601 strings and `Decimal` values as `bson.Decimal128`.
+  - **Neo4j**: Merges `Study -> Subject -> Visit -> Record` for scheduled `Visit` items while normalizing `visit_id <= 0` to `None` so unscheduled `Record` nodes link directly via `(:Subject)-[:HAS_RECORD]->(:Record)`, keying `as_sdtm=True` `Record` nodes on `(STUDYID, DOMAIN, USUBJID, *SEQ)` (or `(STUDYID, DOMAIN, USUBJID)` for domains without `*SEQ` such as `DM`).
+  - **Snowflake**: Two-phase loading converting `Study` `Record` batches to Apache Arrow tables, writing staged Parquet files, and running `COPY INTO` + `MERGE INTO` keyed on `(study_key, record_id)` (`snake_case`), `(studyKey, recordId)` (`camelCase`), `(STUDYID, RECORD_ID)` (`sdtm`), or `(STUDYID, DOMAIN, USUBJID, *SEQ)` when `as_sdtm=True` (`(STUDYID, DOMAIN, USUBJID)` for `DM` without `*SEQ`).
 - **Unified SDK Namespace Integration**: Seamless integration through the `SinksNamespace` registered directly with the core SDK client.
 
 ## Component Description Table
