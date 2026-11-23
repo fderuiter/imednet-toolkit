@@ -19,19 +19,20 @@ from imednet.spi.utils import (
 from ._airflow_compat import AirflowException
 
 _CREDENTIAL_KEY_EXPR = (
-    r"x-imn-security-key|x-api-key|"
+    r"x-imn-security-key|x-api-key|x-amz-signature|x-goog-signature|"
+    r"x-amz-credential|x-goog-credential|"
     r"(?:[a-z0-9]+[_-]+)*(?:api[_-]?key|security[_-]?key|auth[_-]?key|access[_-]?key|"
     r"private[_-]?key(?:[_-]?passphrase)?|secret[_-]?key|csrf[_-]?key|client[_-]?secret|"
     r"oidc[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?token|"
     r"auth[_-]?token|bearer[_-]?token|session[_-]?token|csrf[_-]?token)|"
     r"(?:[a-z0-9]+[_-]+)+(?:token|tokens|secret|secrets|password|passwords|passwd|"
-    r"passphrase|credential|credentials)|"
-    r"authorization|token|tokens|password|passwords|passwd|pwd|passphrase|"
-    r"secret|secrets|credential|credentials"
+    r"passphrase|passphrases|credential|credentials|signature|signatures)|"
+    r"authorization|token|tokens|password|passwords|passwd|pwd|passphrase|passphrases|"
+    r"secret|secrets|credential|credentials|signature|signatures|sig"
 )
 
 _SINGLE_ASSIGNMENT_SECRET_RE = re.compile(
-    rf"(?i)(?<![a-z0-9_])([\"']?)(?<![a-z0-9_])({_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])\1"
+    rf"(?i)(?<![a-z0-9_-])([\"']?)(?<![a-z0-9_-])({_CREDENTIAL_KEY_EXPR})(?![a-z0-9_-])\1"
     r"\s*(?<![=!<>])[:=](?!=)\s*"
     r"(?:([\"'])(?!\*{3})(?:[^\"'\r\n]+)\3|(?:(?:bearer|basic)\s+)?(?!\*{3})[^\s,;\"')\]}&]+)"
 )

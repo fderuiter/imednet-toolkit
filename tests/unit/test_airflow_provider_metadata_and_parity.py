@@ -1205,7 +1205,11 @@ def test_trigger_and_sensor_phi_scrubbing_timeout_and_lexical_id_guards() -> Non
 
     for bad_id in (
         "api_key=leak",  # pragma: allowlist secret
+        "X-Amz-Signature=leak",  # pragma: allowlist secret
+        "sig=leak",  # pragma: allowlist secret
         "https://user:secret@host",  # pragma: allowlist secret
+        "https://pat_token@host",  # pragma: allowlist secret
+        "file:airflow.db?mode=rw&key=leak",  # pragma: allowlist secret
         "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.c2ln",  # pragma: allowlist secret
     ):
         with pytest.raises(AirflowException):
