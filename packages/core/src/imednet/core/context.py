@@ -61,7 +61,7 @@ def is_strict_mode() -> bool:
     active = _active_strict_mode.get()
     if active is not None:
         return active
-    return parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false"))
+    return parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false"), strict=False)
 
 
 @contextmanager

@@ -73,7 +73,7 @@ def get_sdk() -> ImednetSDK:
     """Initialize and return the SDK instance using :func:`load_config`."""
     if not (
         os.getenv("IMEDNET_OIDC_TOKEN", "").strip()
-        or parse_bool(os.getenv(SIMULATION_MODE_ENV, "false"))
+        or parse_bool(os.getenv(SIMULATION_MODE_ENV, "false"), strict=False)
         or (
             os.getenv("IMEDNET_API_KEY", "").strip()
             and os.getenv("IMEDNET_SECURITY_KEY", "").strip()

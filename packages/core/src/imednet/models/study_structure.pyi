@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import overload
 
 from pydantic import Field
 
@@ -28,36 +27,27 @@ class FormStructure(ImednetBaseModel):
     date_modified: datetime = Field(..., alias="dateModified")
     variables: list[Variable] = Field(default_factory=list)
 
-    @overload
     def __init__(
         self,
         *,
-        form_id: int,
-        form_key: str,
-        form_name: str,
-        form_type: str,
+        form_id: int = ...,
+        formId: int = ...,
+        form_key: str = ...,
+        formKey: str = ...,
+        form_name: str = ...,
+        formName: str = ...,
+        form_type: str = ...,
+        formType: str = ...,
         revision: int,
         disabled: bool | None = None,
-        epro_form: bool,
-        allow_copy: bool,
-        date_created: datetime,
-        date_modified: datetime,
-        variables: list[Variable] = ...,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        formId: int,
-        formKey: str,
-        formName: str,
-        formType: str,
-        revision: int,
-        disabled: bool | None = None,
-        eproForm: bool,
-        allowCopy: bool,
-        dateCreated: datetime,
-        dateModified: datetime,
+        epro_form: bool = ...,
+        eproForm: bool = ...,
+        allow_copy: bool = ...,
+        allowCopy: bool = ...,
+        date_created: datetime = ...,
+        dateCreated: datetime = ...,
+        date_modified: datetime = ...,
+        dateModified: datetime = ...,
         variables: list[Variable] = ...,
     ) -> None: ...
     @classmethod
@@ -76,32 +66,24 @@ class IntervalStructure(ImednetBaseModel):
     date_modified: datetime = Field(..., alias="dateModified")
     forms: list[FormStructure] = Field(default_factory=list)
 
-    @overload
     def __init__(
         self,
         *,
-        interval_id: int,
-        interval_name: str,
-        interval_sequence: int,
-        interval_description: str,
-        interval_group_name: str,
+        interval_id: int = ...,
+        intervalId: int = ...,
+        interval_name: str = ...,
+        intervalName: str = ...,
+        interval_sequence: int = ...,
+        intervalSequence: int = ...,
+        interval_description: str = ...,
+        intervalDescription: str = ...,
+        interval_group_name: str = ...,
+        intervalGroupName: str = ...,
         disabled: bool | None = None,
-        date_created: datetime,
-        date_modified: datetime,
-        forms: list[FormStructure] = ...,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        intervalId: int,
-        intervalName: str,
-        intervalSequence: int,
-        intervalDescription: str,
-        intervalGroupName: str,
-        disabled: bool | None = None,
-        dateCreated: datetime,
-        dateModified: datetime,
+        date_created: datetime = ...,
+        dateCreated: datetime = ...,
+        date_modified: datetime = ...,
+        dateModified: datetime = ...,
         forms: list[FormStructure] = ...,
     ) -> None: ...
     @classmethod
@@ -114,19 +96,11 @@ class StudyStructure(ImednetBaseModel):
     intervals: list[IntervalStructure] = Field(default_factory=list)
     forms: list[FormStructure] = Field(default_factory=list)
 
-    @overload
     def __init__(
         self,
         *,
-        study_key: str,
-        intervals: list[IntervalStructure] = ...,
-        forms: list[FormStructure] = ...,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        studyKey: str,
+        study_key: str = ...,
+        studyKey: str = ...,
         intervals: list[IntervalStructure] = ...,
         forms: list[FormStructure] = ...,
     ) -> None: ...
