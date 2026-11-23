@@ -60,7 +60,10 @@ def test_job_sensor(monkeypatch):
     monkeypatch.setattr(sensors, "ImednetHook", MagicMock(return_value=hook_inst))
 
     sensor = sensors.ImednetJobSensor(task_id="t", study_key="S", batch_id="B")
-    assert sensor.poke({}) is True
+    poke_res = sensor.poke({})
+    assert isinstance(poke_res, _airflow_compat.PokeReturnValue)
+    assert bool(poke_res) is True
+    assert poke_res.xcom_value == {"study_key": "S", "batch_id": "B", "state": "COMPLETED"}
     sdk.jobs.get.assert_called_once_with("S", "B")
     sensors.ImednetHook.assert_called_once_with("imednet_default")
     hook_inst.get_sdk_client.assert_called_once_with()
@@ -138,9 +141,12 @@ def test_job_sensor_fetches_result_url_and_fails_on_record_errors(monkeypatch):
     hook_inst = MagicMock(get_sdk_client=MagicMock(side_effect=_make_sdk))
     monkeypatch.setattr(sensors, "ImednetHook", MagicMock(return_value=hook_inst))
 
-    # 1. All Record items succeeded -> poke returns True
+    # 1. All Record items succeeded -> poke returns PokeReturnValue with results excluded
     sensor_ok = sensors.ImednetJobSensor(task_id="s_ok", study_key="S", batch_id="B-1")
-    assert sensor_ok.poke({}) is True
+    poke_ok = sensor_ok.poke({})
+    assert isinstance(poke_ok, _airflow_compat.PokeReturnValue)
+    assert bool(poke_ok) is True
+    assert "results" not in poke_ok.xcom_value
 
     # 2. Terminal COMPLETED Job with failed Record item in resultUrl -> raises AirflowException
     sensor_rec_fail = sensors.ImednetJobSensor(task_id="s_fail", study_key="S", batch_id="B-1")
@@ -196,6 +202,10 @@ def test_provider_info_and_hook_metadata_contract():
         "port",
         "extra",
     ]
+    assert (
+        conn_type_meta["ui-field-behaviour"]["placeholders"]
+        == ImednetHook.get_ui_field_behaviour()["placeholders"]
+    )
     assert conn_type_meta["conn-fields"]["oidc_token"]["schema"]["format"] == "password"
     assert set(conn_type_meta["conn-fields"]) == {
         "base_url",
@@ -323,14 +333,35 @@ def test_airflow_compat_centralizes_sdk_exports_and_offline_fallbacks(monkeypatc
 
     assert compat.__all__ == [
         "AirflowException",
+        "AirflowNotFoundException",
+        "AirflowSecretsBackendAccessDenied",
+        "AirflowSensorTimeout",
+        "AirflowSkipException",
         "BaseHook",
         "BaseOperator",
         "BaseSensorOperator",
         "BaseTrigger",
         "Context",
+        "PokeReturnValue",
+        "TaskDeferralError",
+        "TaskDeferralTimeout",
         "TaskDeferred",
         "TriggerEvent",
     ]
+    # Verify offline PokeReturnValue and resume_execution stubs work without Airflow installed
+    offline_poke = compat.PokeReturnValue(is_done=True, xcom_value={"state": "COMPLETED"})
+    assert bool(offline_poke) is True
+    assert offline_poke == compat.PokeReturnValue(is_done=True, xcom_value={"state": "COMPLETED"})
+    offline_sensor_soft = sensors_mod.ImednetJobSensor(
+        task_id="off_soft",
+        study_key="S1",
+        batch_id="B1",
+        soft_fail=True,
+    )
+    with pytest.raises(compat.AirflowSkipException):
+        offline_sensor_soft.resume_execution("__fail__", {"error": "Trigger timeout"}, {})
+    with pytest.raises(compat.TaskDeferralError):
+        offline_sensor_soft.resume_execution("__fail__", {"error": "Worker crashed"}, {})
     assert blocked_v2_imports == []
     assert export_mod.BaseOperator is compat.BaseOperator
     assert sensors_mod.BaseSensorOperator is compat.BaseSensorOperator
