@@ -13,7 +13,7 @@ Pass ``simulation_mode=True`` to :class:`~imednet.ImednetSDK` or
 :class:`~imednet.AsyncImednetSDK`—or set ``IMEDNET_SIMULATION_MODE=true`` in the
 environment—to route all endpoint requests through ``SimulationTransport`` backed
 by deterministic fixtures for ``Study`` ``"STUDY"`` (including ``Site`` ``"SITE"``,
-``Form`` definitions ``"F_DM"`` and ``"F_VS"``, ``Subject`` ``"SUBJ-001"``,
+``Form`` definitions ``"F_DM"`` and ``"F_VS"``, ``Subject`` ``"SUB1"``,
 ``Visit`` / ``Interval`` schedules, ``Record`` items, ``RecordRevision`` audit
 entries, and ``Query`` items):
 
@@ -25,13 +25,15 @@ entries, and ``Query`` items):
    with ImednetSDK(simulation_mode=True) as sdk:
        studies = list(sdk.studies.list())
        forms = list(sdk.forms.list(study_key="STUDY"))
+       assert len(studies) >= 1
+       assert len(forms) == 2
        job = sdk.records.create(
            "STUDY",
            [
                {
                    "formKey": "F_VS",
                    "siteName": "SITE",
-                   "subjectKey": "SUBJ-001",
+                   "subjectKey": "SUB1",
                    "intervalName": "Baseline",
                    "data": {"V_WEIGHT": 74.0},
                }
