@@ -21,38 +21,16 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from enum import Enum
 from pathlib import Path
-from typing import Any, Generic, TypeVar, Union, get_args, get_origin, get_type_hints
+from typing import Any, Generic, TypeVar, get_args, get_origin, get_type_hints
 
 import pydantic._internal._utils as _pydantic_internal_utils
 from pydantic import BaseModel, RootModel
-from sphinx.ext.autodoc import MethodDocumenter
 from sphinx.util.nodes import make_refnode
 
 if not hasattr(_pydantic_internal_utils, "MappingIntStrAny"):
     _pydantic_internal_utils.MappingIntStrAny = Mapping[int, Any] | Mapping[str, Any]
 if not hasattr(_pydantic_internal_utils, "AbstractSetIntStr"):
     _pydantic_internal_utils.AbstractSetIntStr = AbstractSet[int] | AbstractSet[str]
-
-"""
-Configuration file for the Sphinx documentation builder.
-This module contains all necessary configurations for building documentation
-using Sphinx. It sets up the project information, extensions, and theme settings.
-Attributes:
-    project (str): The name of the project ("imednet")
-    author (str): The author's name ("Frederick de Ruiter")
-    release (str): The full project version from ``imednet.__version__``
-    version (str): The short project version from ``imednet.__version__``
-    extensions (list): List of Sphinx extensions to be used
-    templates_path (list[str]): Path to custom templates
-    exclude_patterns (list[str]): Patterns to exclude from documentation
-    html_static_path (list[str]): Path to static files
-    html_theme (str): The HTML theme to be used ("furo")
-    html_theme_path (list): Path to the HTML theme
-Note:
-    This configuration uses the Furo theme and includes support for
-    automatic documentation generation from docstrings and type hints.
-"""
-
 
 # Add package source roots and local Sphinx extensions so API modules and directives resolve.
 _DOCS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +43,15 @@ sys.path[:0] = [
     os.path.abspath("../packages/plugins-sinks/src"),
     os.path.abspath("../packages/plugins-tui/src"),
 ]
+
+from api_reference import (
+    build_pydantic_field_specs,
+    format_rst_annotation,
+    get_mock_roots,
+    is_noindex_options,
+    should_skip_structured_or_inherited_member,
+    upsert_attribute_directives,
+)
 
 # Mock heavy optional dependencies so autodoc does not require them.
 # Mock pandas to avoid heavy dependency while building docs if not installed.
@@ -117,7 +104,6 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.viewcode",
     "sphinx.ext.napoleon",
-    "sphinx_autodoc_typehints",
     "sphinx.ext.autosummary",
     "sphinxcontrib.mermaid",
     "sphinxarg.ext",
@@ -125,6 +111,7 @@ extensions = [
     "myst_parser",
     "sphinx.ext.githubpages",
     "pyodide_cells",
+    "api_reference",
 ]
 
 # Configure Mermaid 10.2.0 with hex-only themeVariables (khroma-compatible)
@@ -337,9 +324,6 @@ pyodide_config = {
 autosummary_generate = False
 
 # Mock heavy optional dependencies so autodoc does not import them.
-# opentelemetry is listed here so that `if TYPE_CHECKING: from opentelemetry…`
-# blocks (evaluated when set_type_checking_flag=True) do not cause
-# ModuleNotFoundError during the docs build.
 autodoc_mock_imports = [
     "matplotlib",
     "opentelemetry",
@@ -348,7 +332,6 @@ autodoc_mock_imports = [
 suppress_warnings = [
     "autodoc.import",
     "autodoc",
-    "sphinx_autodoc_typehints",
 ]
 
 _DOCS_PATH = Path(_DOCS_DIR).resolve()
@@ -670,80 +653,25 @@ def _unwrap_shadowed_bases(app: Any, name: str, obj: Any, options: Any, bases: l
 
 def _format_rst_annotation(annotation: Any) -> str:
     """Format a runtime annotation into PEP 604 RST with qualified first-party type targets."""
-    if annotation is Any:
-        return "Any"
-    if annotation is None or annotation is type(None):
-        return "None"
-
-    origin = get_origin(annotation)
-    if origin is Union or origin is types.UnionType:
-        args = get_args(annotation)
-        parts = [_format_rst_annotation(a) for a in args if a is not type(None)]
-        if any(a is type(None) for a in args):
-            parts.append("None")
-        return " | ".join(parts)
-
-    if origin is not None:
-        origin_name = getattr(origin, "__name__", str(origin).replace("typing.", ""))
-        args = get_args(annotation)
-        if args:
-            inner = ", ".join(_format_rst_annotation(a) for a in args)
-            return f"{origin_name}[{inner}]"
-        return origin_name
-
-    if isinstance(annotation, type):
-        mod = getattr(annotation, "__module__", "builtins")
-        if mod and mod != "builtins" and mod.split(".")[0] in _FIRST_PARTY_ROOTS:
-            return f"~{mod}.{annotation.__qualname__}"
-        return annotation.__name__
-
-    return str(annotation).replace("typing.", "").replace("NoneType", "None")
+    return format_rst_annotation(annotation, qualify_first_party=True, short_prefix=True)
 
 
 def _emit_pydantic_model_fields(
     app: Any,
     what: str,
-    name: str,
+    name: str,  # noqa: ARG001
     obj: Any,
     options: Any,
     lines: list[str],
 ) -> None:
-    """Emit .. py:attribute:: blocks for Pydantic v2 model_fields."""
+    """Emit .. py:attribute:: blocks with :type: and :value:/Required for Pydantic v2 model_fields."""
     if what != "class" or not isinstance(obj, type):
         return
     if not issubclass(obj, BaseModel) or obj in (BaseModel, RootModel):
         return
 
-    model_fields = getattr(obj, "model_fields", None)
-    if not isinstance(model_fields, dict) or not model_fields:
-        return
-
-    existing_attrs: set[str] = set()
-    for line in lines:
-        match = _PY_ATTR_DIRECTIVE_RE.match(line.strip())
-        if match:
-            existing_attrs.add(match.group(1))
-
-    appended: list[str] = []
-    for field_name, field_info in model_fields.items():
-        if field_name in existing_attrs:
-            continue
-        type_str = _format_rst_annotation(field_info.annotation)
-        description = field_info.description or ""
-        if not description and field_info.alias and field_info.alias != field_name:
-            description = f"API field ``{field_info.alias}``."
-
-        appended.append("")
-        appended.append(f".. py:attribute:: {field_name}")
-        appended.append(f"   :type: {type_str}")
-        if description:
-            appended.append("")
-            for desc_line in description.splitlines():
-                appended.append(f"   {desc_line}" if desc_line else "")
-
-    if appended:
-        lines.extend(appended)
-        lines.append("")
+    specs = build_pydantic_field_specs(obj, mock_roots=get_mock_roots(app))
+    upsert_attribute_directives(lines, specs, noindex=is_noindex_options(options))
 
 
 def _find_defining_class(cls: type, member_name: str) -> type | None:
@@ -852,7 +780,7 @@ def _resolve_callable_return_hint(obj: Any) -> Any:
 
 
 def _before_process_endpoint_signature(app: Any, obj: Any, bound_method: bool) -> None:  # noqa: ARG001
-    """Normalize endpoint Operation return annotations before sphinx_autodoc_typehints runs."""
+    """Normalize endpoint Operation return annotations before autodoc signature formatting runs."""
     if not callable(obj) or inspect.isclass(obj):
         return
     anns = getattr(obj, "__annotations__", None)
@@ -893,24 +821,6 @@ def _process_endpoint_signature(
                 return signature, _format_rst_annotation(normalized)
             return signature, None
     return None
-
-
-class _AsyncAwareMethodDocumenter(MethodDocumenter):
-    """MethodDocumenter that marks descriptor-dispatched async coroutines with :async:."""
-
-    def add_directive_header(self, sig: str) -> None:
-        super().add_directive_header(sig)
-        raw = (
-            self.parent.__dict__.get(self.object_name, self.object)
-            if isinstance(self.parent, type)
-            else self.object
-        )
-        raw_is_async = inspect.iscoroutinefunction(raw) or inspect.isasyncgenfunction(raw)
-        bound_is_async = inspect.iscoroutinefunction(self.object) or inspect.isasyncgenfunction(
-            self.object
-        )
-        if bound_is_async and not raw_is_async:
-            self.add_line("   :async:", self.get_sourcename())
 
 
 def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: Any) -> Any:
@@ -972,16 +882,28 @@ def _skip_non_canonical_or_internal(
     name: str,
     obj: Any,
     skip: bool,
-    options: Any,
+    options: Any,  # noqa: ARG001
 ) -> bool | None:
     """Skip non-canonical module re-exports and external/internal inherited class members."""
-    if skip:
-        return None
-
     env = getattr(app, "env", None)
     temp_data = getattr(env, "temp_data", {}) if env is not None else {}
     current_mod = temp_data.get("autodoc:module")
     current_cls_name = temp_data.get("autodoc:class")
+
+    if what in ("class", "exception") and current_mod and current_cls_name and name == "__init__":
+        mod = sys.modules.get(current_mod)
+        cls = getattr(mod, current_cls_name, None) if mod is not None else None
+        if isinstance(cls, type):
+            _, _, cls_ast_map = _analyze_module_symbols(current_mod)
+            local_ast_members = cls_ast_map.get(current_cls_name)
+            init_decision = should_skip_structured_or_inherited_member(
+                cls, "__init__", local_ast_members
+            )
+            if init_decision is not None:
+                return init_decision
+
+    if skip:
+        return None
 
     if what == "module" and current_mod:
         if isinstance(obj, types.ModuleType):
@@ -1016,6 +938,14 @@ def _skip_non_canonical_or_internal(
         mod = sys.modules.get(current_mod)
         cls = getattr(mod, current_cls_name, None) if mod is not None else None
         if isinstance(cls, type):
+            _, _, cls_ast_map = _analyze_module_symbols(current_mod)
+            local_ast_members = cls_ast_map.get(current_cls_name)
+            structured_skip = should_skip_structured_or_inherited_member(
+                cls, name, local_ast_members
+            )
+            if structured_skip is not None:
+                return structured_skip
+
             if name in ("__iter__", "__aiter__") and issubclass(
                 cls, (BaseModel, Enum, dict, list, tuple, set, frozenset, str, bytes)
             ):
@@ -1030,8 +960,6 @@ def _skip_non_canonical_or_internal(
 
             defining_cls = _find_defining_class(cls, name)
             if defining_cls is cls:
-                _, _, cls_ast_map = _analyze_module_symbols(current_mod)
-                local_ast_members = cls_ast_map.get(current_cls_name)
                 if local_ast_members is not None and name not in local_ast_members:
                     for parent in cls.__mro__[1:]:
                         if name in parent.__dict__:
@@ -1292,7 +1220,7 @@ def _on_build_finished(app: Any, exception: Exception | None) -> None:
     (outdir / "robots.txt").write_text(robots_txt, encoding="utf-8")
 
 
-def setup(app: Any) -> None:  # pragma: no cover
+def setup(app: Any) -> dict[str, Any]:  # pragma: no cover
     """Register Sphinx autodoc, viewcode, and native SEO / GitHub Pages hooks.
 
     Args:
@@ -1301,19 +1229,24 @@ def setup(app: Any) -> None:  # pragma: no cover
     _get_documented_modules.cache_clear()
     _analyze_module_symbols.cache_clear()
 
-    app.add_autodocumenter(_AsyncAwareMethodDocumenter, override=True)
     app.connect("autodoc-process-bases", _unwrap_shadowed_bases)
     app.connect(
         "autodoc-before-process-signature", _before_process_endpoint_signature, priority=400
     )
     app.connect("autodoc-process-signature", _process_endpoint_signature, priority=600)
     app.connect("autodoc-process-docstring", _emit_pydantic_model_fields, priority=600)
-    app.connect("autodoc-skip-member", _skip_non_canonical_or_internal)
+    app.connect("autodoc-skip-member", _skip_non_canonical_or_internal, priority=400)
+    app.connect("autodoc-skip-member", _skip_non_canonical_or_internal, priority=600)
     app.connect("missing-reference", _resolve_reexported_py_reference)
     app.connect("html-collect-pages", _sanitize_viewcode_modules, priority=100)
 
     app.connect("html-page-context", _inject_seo_metadata)
     app.connect("build-finished", _on_build_finished)
+    return {
+        "version": "1.0.0",
+        "parallel_read_safe": True,
+        "parallel_write_safe": True,
+    }
 
 
 # Display type hints in the description instead of the signature to keep
@@ -1324,14 +1257,10 @@ autodoc_typehints = "description"
 autodoc_default_options = {
     "members": True,
     "inherited-members": _SCOPED_INHERITED_EXCLUSIONS,
-    "special-members": "__iter__, __aiter__",
+    "special-members": "__iter__, __aiter__, __call__",
     "show-inheritance": True,
 }
 autodoc_class_signature = "separated"
-
-# Force sphinx-autodoc-typehints to evaluate TYPE_CHECKING blocks so that
-# forward references used only under `if TYPE_CHECKING:` are resolved.
-set_type_checking_flag = True
 
 # Napoleon – enforce Google-style docstrings.
 napoleon_google_docstring = True

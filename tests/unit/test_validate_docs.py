@@ -20,11 +20,13 @@ from scripts.build_docs import (
     scope_apidoc_inherited_members,
 )
 from scripts.validate_docs import (
+    _verify_api_reference_parity,
     _verify_core_html,
     _verify_pagination_html,
     _verify_sdk_html,
     check_cli_snippets,
     check_documented_extras,
+    check_no_autodoc_typehints_dependency,
     check_no_duplicate_suppression,
     check_rendered_api_reference,
     check_todos_in_init,
@@ -462,3 +464,250 @@ def test_generate_api_reference_preserves_existing_docs_on_staging_failure(
     with pytest.raises(FileNotFoundError):
         monkeypatch.setattr(build_docs_mod.shutil, "which", lambda _t: None)
         require_sphinx_tools("sphinx-apidoc", "sphinx-build")
+
+
+def _load_api_reference_ext():
+    """Load docs/_ext/api_reference.py directly for isolated helper testing."""
+    ext_path = Path(__file__).resolve().parents[2] / "docs" / "_ext" / "api_reference.py"
+    spec = importlib.util.spec_from_file_location("_test_api_reference_ext", ext_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_test_api_reference_ext"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_no_autodoc_typehints_dependency_check(tmp_path: Path) -> None:
+    """sphinx-autodoc-typehints is uninstalled and flagged if re-added to pyproject.toml or conf.py."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert importlib.util.find_spec("sphinx_autodoc_typehints") is None
+    assert check_no_autodoc_typehints_dependency(repo_root) is False
+
+    bad_root = tmp_path / "bad_pyproject"
+    (bad_root / "docs").mkdir(parents=True)
+    (bad_root / "pyproject.toml").write_text(
+        '[dependency-groups]\ndocs = ["sphinx>=8.0", "sphinx-autodoc-typehints>=2.0"]\n',
+        encoding="utf-8",
+    )
+    (bad_root / "docs" / "conf.py").write_text(
+        'extensions = ["sphinx.ext.autodoc"]\n', encoding="utf-8"
+    )
+    assert check_no_autodoc_typehints_dependency(bad_root) is True
+
+    bad_conf_root = tmp_path / "bad_conf"
+    (bad_conf_root / "docs").mkdir(parents=True)
+    (bad_conf_root / "pyproject.toml").write_text(
+        '[dependency-groups]\ndocs = ["sphinx>=8.0"]\n',
+        encoding="utf-8",
+    )
+    (bad_conf_root / "docs" / "conf.py").write_text(
+        'extensions = ["sphinx.ext.autodoc", "sphinx_autodoc_typehints"]\n',
+        encoding="utf-8",
+    )
+    assert check_no_autodoc_typehints_dependency(bad_conf_root) is True
+
+
+def test_api_reference_ast_type_checking_and_formatting_helpers() -> None:
+    """AST TYPE_CHECKING resolution, PEP 604 unions, TypeVar/ParamSpec, factories, and BaseModel.__init__ skipping."""
+    import imednet.plugins as plugins_mod
+    from imednet.cli.decorators import P
+    from imednet.utils.validators import T
+    from imednet_sinks.warehouse import SnowflakeSinkConfig
+
+    api_ext = _load_api_reference_ext()
+    conf = _load_docs_conf()
+
+    before_keys = set(plugins_mod.__dict__.keys())
+    ns = api_ext.resolve_module_type_checking_ns("imednet.plugins")
+    assert set(plugins_mod.__dict__.keys()) == before_keys
+    assert "Record" in ns
+
+    rendered_union = conf._format_rst_annotation(str | int | None)
+    assert rendered_union == "str | int | None"
+    assert "UnionType" not in rendered_union
+
+    assert conf._format_rst_annotation(P) == "P"
+    assert conf._format_rst_annotation(T) == "T"
+    assert conf._format_rst_annotation(list[T]) == "list[T]"
+
+    assert api_ext.format_factory_call(dict) == "dict()"
+    sample_lambda = lambda: ["default"]  # noqa: E731
+    assert api_ext.format_factory_call(sample_lambda) == "['default']"
+
+    import inspect
+
+    api_ext.prepare_dataclass_init_signature(SnowflakeSinkConfig)
+    sig = inspect.signature(SnowflakeSinkConfig.__init__)
+    sig_str = api_ext.format_clean_signature(sig)
+    assert "<factory>" not in sig_str
+    assert "extra: dict[str, Any] = dict()" in sig_str
+    assert "password: str = ..." in sig_str
+    assert "password: str = ''" not in sig_str
+
+    fake_app = SimpleNamespace(
+        env=SimpleNamespace(
+            temp_data={"autodoc:module": "imednet.models.records", "autodoc:class": "Record"}
+        )
+    )
+    assert (
+        conf._skip_non_canonical_or_internal(
+            fake_app, "class", "__init__", Record.__init__, False, SimpleNamespace()
+        )
+        is True
+    )
+
+
+def test_sphinx_html_renders_overloads_enums_dataclasses_typeddicts_protocols_and_models(
+    tmp_path: Path,
+) -> None:
+    """Strict Sphinx HTML build renders overloads, Enums, dataclasses, TypedDicts, Protocols, and BaseModels."""
+    repo_root = Path(__file__).resolve().parents[2]
+    src_dir = tmp_path / "docs"
+    api_dir = src_dir / "reference" / "api"
+    api_dir.mkdir(parents=True)
+    html_dir = tmp_path / "_build" / "html"
+
+    (src_dir / "index.rst").write_text(
+        "Test Docs\n=========\n\n"
+        ".. meta::\n   :description: Test docs\n\n"
+        ".. toctree::\n   :maxdepth: 2\n\n"
+        "   reference/api/sample\n",
+        encoding="utf-8",
+    )
+    (src_dir / "404.rst").write_text(":orphan:\n\nNot Found\n=========\n", encoding="utf-8")
+    target_modules = (
+        "imednet.models.jobs",
+        "imednet.orchestration.types",
+        "imednet.plugins",
+        "imednet.validation.cache",
+        "imednet.cli.decorators",
+        "imednet.utils.validators",
+        "imednet_sinks.warehouse",
+        "imednet_sinks.plugin",
+        "imednet_workflows.uat.inspector",
+    )
+    rst_blocks = ["Sample API\n==========\n"]
+    for mod_name in target_modules:
+        rst_blocks.append(
+            f".. automodule:: {mod_name}\n"
+            f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
+            "   :members:\n"
+            "   :show-inheritance:\n"
+        )
+    (api_dir / "sample.rst").write_text("\n".join(rst_blocks), encoding="utf-8")
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sphinx",
+            "-b",
+            "html",
+            "-W",
+            "--keep-going",
+            "-c",
+            str(repo_root / "docs"),
+            str(src_dir),
+            str(html_dir),
+        ],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, f"Strict Sphinx failed:\n{res.stdout}\n{res.stderr}"
+
+    built_api = html_dir / "reference" / "api"
+    assert _verify_api_reference_parity(built_api, repo_root) is False
+
+
+@pytest.mark.parametrize(
+    ("case_name", "html_body"),
+    [
+        (
+            "empty_class_shell",
+            '<dl class="py class"><dt id="pkg.EmptyShell">class pkg.EmptyShell</dt>'
+            "<dd><p>Bases: <code>object</code></p></dd></dl>",
+        ),
+        (
+            "missing_enum_member",
+            '<dl class="py class"><dt id="imednet.models.jobs.JobState">class JobState</dt>'
+            '<dd><dl class="py attribute"><dt id="imednet.models.jobs.JobState.OPEN">'
+            "OPEN: str = 'OPEN'</dt><dd></dd></dl></dd></dl>",
+        ),
+        (
+            "leaked_repr_false_password_default",
+            '<dl class="py class">'
+            '<dt id="imednet_sinks.warehouse.SnowflakeSinkConfig">'
+            "class SnowflakeSinkConfig(study_key, password='')</dt>"
+            '<dd><dl class="py attribute">'
+            '<dt id="imednet_sinks.warehouse.SnowflakeSinkConfig.password">'
+            "password: str = ''</dt><dd></dd></dl></dd></dl>",
+        ),
+        (
+            "missing_typeddict_key",
+            '<dl class="py class">'
+            '<dt id="imednet.orchestration.types.OrchestratorResult">class OrchestratorResult</dt>'
+            '<dd><dl class="py attribute">'
+            '<dt id="imednet.orchestration.types.OrchestratorResult.study_key">'
+            "study_key: str</dt><dd><p>Optional.</p></dd></dl></dd></dl>",
+        ),
+        (
+            "missing_protocol_attribute",
+            '<dl class="py class">'
+            '<dt id="imednet.plugins.MongoDbSinkConfigProtocol">class MongoDbSinkConfigProtocol</dt>'
+            "<dd><p>Protocol docs.</p></dd></dl>",
+        ),
+        (
+            "missing_callable_protocol_call",
+            '<dl class="py class">'
+            '<dt id="imednet.plugins.PluginProtocol">class PluginProtocol</dt>'
+            "<dd><p>Callable protocol without __call__.</p></dd></dl>",
+        ),
+        (
+            "collapsed_single_dt_overload",
+            '<dl class="py method">'
+            '<dt id="imednet_sinks.plugin.SinksNamespace.export_to_mongodb">'
+            "export_to_mongodb(*args, **kwargs)</dt><dd><p>Export.</p></dd></dl>",
+        ),
+        (
+            "inherited_basemodel_init_leak",
+            '<dl class="py class"><dt id="imednet.models.records.Record">class Record</dt>'
+            '<dd><dl class="py method"><dt id="imednet.models.records.Record.__init__">'
+            "__init__(**data)</dt><dd></dd></dl></dd></dl>",
+        ),
+        (
+            "forbidden_pydantic_validation_error",
+            "<p>Raises pydantic_core.ValidationError when invalid.</p>",
+        ),
+        (
+            "forbidden_union_type_token",
+            "<p>Returns UnionType[str, int, None].</p>",
+        ),
+        (
+            "forbidden_factory_token",
+            "<p>extra=&lt;factory&gt;</p>",
+        ),
+        (
+            "forbidden_tilde_paramspec",
+            '<dl class="py function"><dt id="pkg.fn">fn(*args: ~P.args)</dt><dd><p>Doc.</p></dd></dl>',
+        ),
+        (
+            "forbidden_tilde_typevar",
+            '<dl class="py function"><dt id="pkg.fn2">fn2(items: list[~T])</dt><dd><p>Doc.</p></dd></dl>',
+        ),
+    ],
+)
+def test_verify_api_reference_parity_rejects_regressions(
+    tmp_path: Path, case_name: str, html_body: str
+) -> None:
+    """_verify_api_reference_parity and check_rendered_api_reference fail on every regression pattern."""
+    repo_root = Path(__file__).resolve().parents[2]
+    api_dir = tmp_path / case_name / "reference" / "api"
+    api_dir.mkdir(parents=True)
+    (api_dir / "imednet.html").write_text(
+        f"<html><body>{html_body}</body></html>\n",
+        encoding="utf-8",
+    )
+    assert _verify_api_reference_parity(api_dir, repo_root) is True
+    assert check_rendered_api_reference(tmp_path / case_name) is True
