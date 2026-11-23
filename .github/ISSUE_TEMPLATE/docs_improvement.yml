@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Use a normalized title such as `docs(contributing): clarify issue triage workflow`.
+        Use a normalized title such as `docs(github): clarify issue triage workflow`.
         Documentation issues should identify the current gap and the desired learning outcome.
   - type: dropdown
     id: area
@@ -13,11 +13,32 @@ body:
       label: Area
       options:
         - docs
-        - contributing
+        - github
         - cli
         - core
-        - workflows-plugin
-        - airflow-provider
+        - workflows
+        - airflow
+        - standards
+        - records
+        - mapping
+        - dashboard
+        - testing
+        - ci
+        - release
+    validations:
+      required: true
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected package
+      options:
+        - docs
+        - core
+        - plugins-workflows
+        - plugins-sinks
+        - plugins-tui
+        - providers-airflow
+        - ci
     validations:
       required: true
   - type: dropdown

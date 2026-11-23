@@ -33,7 +33,16 @@ pip install "imednet[neo4j]"
 pip install "imednet[snowflake]"
 ```
 
-Published companion packages on PyPI:
+Optional core extras can be installed for CLI enhancements, analytical exports,
+and warehouse sinks (`imednet[cli]`, `imednet[duckdb]`, `imednet[export]`,
+`imednet[mongodb]`, `imednet[neo4j]`, and `imednet[snowflake]`), alongside the
+pre-release `imednet[tui]` extra below.
+
+Published companion workspace packages provide extended Study and Record integrations:
+
+- `imednet-workflows` for higher-level Study and Record workflows and CLI subcommands
+- `imednet-plugins-sinks` for MongoDB, Neo4j, and Snowflake export sinks
+- `apache-airflow-providers-imednet` for Apache Airflow hooks, operators, and sensors
 
 ```bash
 pip install imednet-plugins-sinks

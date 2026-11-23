@@ -1,8 +1,12 @@
 Neo4j Export Example
 ====================
 
-Export Study Records into a Neo4j property graph preserving the
-``Study → Subject → Visit → Record`` hierarchy.
+Export ``Study`` ``Record`` items into a Neo4j property graph preserving the
+``Study → Subject → Visit → Record`` hierarchy for scheduled ``Visit`` items,
+normalizing ``visit_id <= 0`` to ``None`` so unscheduled ``Record`` nodes link
+directly via ``(:Subject)-[:HAS_RECORD]->(:Record)``, and keying ``as_sdtm=True``
+domain nodes on ``(STUDYID, DOMAIN, USUBJID, *SEQ)`` (or ``(STUDYID, DOMAIN, USUBJID)``
+for domains without ``*SEQ`` such as ``DM``).
 
 Prerequisites
 -------------

@@ -1,6 +1,6 @@
 # Changelog
 
-All distributions in the `imednet-toolkit` workspace follow independent Semantic Versioning managed by Release Please. Release history, breaking changes, and migration notes are maintained in each package's `CHANGELOG.md`:
+All distributions in the `imednet-toolkit` workspace follow independent Semantic Versioning managed by Release Please. Release history, breaking changes, and migration notes are maintained in each package's `CHANGELOG.md` and published on [GitHub Releases](https://github.com/fderuiter/imednet-toolkit/releases):
 
 | Distribution | Workspace Directory | Package Changelog |
 | :--- | :--- | :--- |

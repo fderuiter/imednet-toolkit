@@ -82,14 +82,17 @@ pip install imednet
 pip install "imednet[cli]"
 ```
 
-Install published export and database destination extras or companion packages:
+Install published export and database destination extras or companion workspace packages:
 
 ```bash
-pip install "imednet[export]"
+# Core SDK optional extras
 pip install "imednet[duckdb]"
+pip install "imednet[export]"
 pip install "imednet[mongodb]"
 pip install "imednet[neo4j]"
 pip install "imednet[snowflake]"
+
+# Companion workspace packages
 pip install imednet-plugins-sinks
 pip install imednet-workflows
 pip install apache-airflow-providers-imednet

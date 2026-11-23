@@ -20,14 +20,20 @@ from scripts.build_docs import (
     scope_apidoc_inherited_members,
 )
 from scripts.validate_docs import (
+    RETIRED_GITHUB_LABELS,
+    WORKSPACE_PACKAGE_IDS,
     _verify_core_html,
     _verify_pagination_html,
     _verify_sdk_html,
     check_adr_records,
     check_cli_snippets,
+    check_compliance_html_links,
     check_diataxis_sidebar_isolation,
     check_documented_extras,
+    check_duckdb_relations_parity,
+    check_env_vars_documented,
     check_examples_index_parity,
+    check_governance_and_issue_templates,
     check_no_duplicate_suppression,
     check_package_docs,
     check_packages_registered,
@@ -35,6 +41,7 @@ from scripts.validate_docs import (
     check_readme_github_pages_routes,
     check_release_please_parity,
     check_rendered_api_reference,
+    check_sdtm_and_phi_parity,
     check_todos_in_init,
 )
 
@@ -472,8 +479,71 @@ def test_generate_api_reference_preserves_existing_docs_on_staging_failure(
         require_sphinx_tools("sphinx-apidoc", "sphinx-build")
 
 
+def test_repo_package_docs_and_governance_validators_pass() -> None:
+    """Repository manifests, docs, and issue templates pass check_package_docs and governance checks."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_package_docs(repo_root) is False
+    assert check_governance_and_issue_templates(repo_root) is False
+
+
+def test_check_package_docs_detects_manifest_and_changelog_drift(tmp_path: Path) -> None:
+    """check_package_docs flags missing readme/license/classifiers and obsolete CHANGELOG tokens."""
+    pkg_dir = tmp_path / "packages" / "sample"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "README.md").write_text("# Sample\n", encoding="utf-8")
+    (pkg_dir / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
+    valid_manifest = (
+        '[project]\nname = "imednet-sample"\nversion = "0.1.0"\n'
+        'readme = "README.md"\nlicense = "MIT"\n'
+        "classifiers = [\n"
+        '  "Programming Language :: Python :: 3.11",\n'
+        '  "Programming Language :: Python :: 3.12",\n'
+        '  "Programming Language :: Python :: 3.13",\n'
+        "]\n"
+    )
+    (pkg_dir / "pyproject.toml").write_text(valid_manifest, encoding="utf-8")
+    changelogs_dir = tmp_path / "docs" / "reference" / "changelogs"
+    changelogs_dir.mkdir(parents=True)
+    (changelogs_dir / "index.rst").write_text(
+        "Changelogs\n==========\n\n.. toctree::\n\n   sample\n",
+        encoding="utf-8",
+    )
+    (changelogs_dir / "sample.md").write_text(
+        "```{include} ../../../packages/sample/CHANGELOG.md\n```\n",
+        encoding="utf-8",
+    )
+    ref_dir = tmp_path / "docs" / "reference"
+    (ref_dir / "compatibility.rst").write_text(
+        "See :doc:`changelogs/index`.\n",
+        encoding="utf-8",
+    )
+    (ref_dir / "contributing.rst").write_text(
+        "See :doc:`changelogs/index`.\n",
+        encoding="utf-8",
+    )
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text("# Changelog\n\nSee packages/sample/CHANGELOG.md.\n", encoding="utf-8")
+
+    assert check_package_docs(tmp_path) is False
+
+    # Obsolete token in root CHANGELOG.md
+    changelog.write_text(
+        "# Changelog\n\nSee packages/sample/CHANGELOG.md and docs/contributing.rst.\n",
+        encoding="utf-8",
+    )
+    assert check_package_docs(tmp_path) is True
+    changelog.write_text("# Changelog\n\nSee packages/sample/CHANGELOG.md.\n", encoding="utf-8")
+
+    # Missing readme / license / classifiers in pyproject.toml
+    (pkg_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet-sample"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+    assert check_package_docs(tmp_path) is True
+
+
 def test_check_package_docs_enforces_wheel_metadata_and_absolute_links(tmp_path: Path) -> None:
-    """check_package_docs requires readme/license in pyproject.toml and rejects relative links in package READMEs."""
+    """check_package_docs requires readme/license/classifiers in pyproject.toml and rejects relative links in package READMEs."""
     (tmp_path / "CHANGELOG.md").write_text(
         "# Changelog\n\n- [demo](packages/demo-pkg/CHANGELOG.md)\n",
         encoding="utf-8",
@@ -503,10 +573,15 @@ def test_check_package_docs_enforces_wheel_metadata_and_absolute_links(tmp_path:
         "# demo-pkg\n\nSee [Docs](https://fderuiter.github.io/imednet-toolkit/).\n",
         encoding="utf-8",
     )
-    (pkg_dir / "pyproject.toml").write_text(
-        '[project]\nname = "demo"\nreadme = "README.md"\nlicense = "MIT"\n',
-        encoding="utf-8",
+    valid_manifest = (
+        '[project]\nname = "demo"\nreadme = "README.md"\nlicense = "MIT"\n'
+        "classifiers = [\n"
+        '  "Programming Language :: Python :: 3.11",\n'
+        '  "Programming Language :: Python :: 3.12",\n'
+        '  "Programming Language :: Python :: 3.13",\n'
+        "]\n"
     )
+    (pkg_dir / "pyproject.toml").write_text(valid_manifest, encoding="utf-8")
     assert check_package_docs(tmp_path) is False
 
     # Relative link in package README fails
@@ -526,6 +601,75 @@ def test_check_package_docs_enforces_wheel_metadata_and_absolute_links(tmp_path:
         encoding="utf-8",
     )
     assert check_package_docs(tmp_path) is True
+
+
+def test_check_governance_and_issue_templates_detects_retired_urls_labels_and_dropdowns(
+    tmp_path: Path,
+) -> None:
+    """check_governance_and_issue_templates rejects retired URLs, nonexistent labels, and stale dropdowns."""
+    templates_dir = tmp_path / ".github" / "ISSUE_TEMPLATE"
+    templates_dir.mkdir(parents=True)
+    docs_ref = tmp_path / "docs" / "reference"
+    docs_ref.mkdir(parents=True)
+    docs_agents = tmp_path / "docs" / "agents"
+    docs_agents.mkdir(parents=True)
+
+    # Excluded docs/agents/ directory may mention legacy labels in translation tables
+    (docs_agents / "triage-labels.md").write_text(
+        "Legacy status:needs-info maps to question.\n",
+        encoding="utf-8",
+    )
+
+    pkg_opts = "\n".join(f"        - {pkg}" for pkg in WORKSPACE_PACKAGE_IDS)
+    valid_form = (
+        "name: Bug Report\n"
+        "description: Report a bug\n"
+        "body:\n"
+        "  - type: dropdown\n"
+        "    id: area\n"
+        "    attributes:\n"
+        "      label: Area\n"
+        "      options:\n"
+        "        - core\n"
+        "        - workflows\n"
+        "  - type: dropdown\n"
+        "    id: package\n"
+        "    attributes:\n"
+        "      label: Package\n"
+        "      options:\n"
+        f"{pkg_opts}\n"
+    )
+    form_path = templates_dir / "bug_report.yml"
+    form_path.write_text(valid_form, encoding="utf-8")
+    (templates_dir / "config.yml").write_text(
+        "blank_issues_enabled: false\n",
+        encoding="utf-8",
+    )
+    issue_doc = docs_ref / "issue_management.rst"
+    issue_doc.write_text("Use ``question`` and ``area:workflows``.\n", encoding="utf-8")
+    coc = tmp_path / "CODE_OF_CONDUCT.md"
+    coc.write_text("https://github.com/fderuiter/imednet-toolkit/issues\n", encoding="utf-8")
+
+    assert check_governance_and_issue_templates(tmp_path) is False
+
+    # Retired repo URL
+    coc.write_text("https://github.com/fderuiter/imednet-python-sdk/issues\n", encoding="utf-8")
+    assert check_governance_and_issue_templates(tmp_path) is True
+    coc.write_text("https://github.com/fderuiter/imednet-toolkit/issues\n", encoding="utf-8")
+
+    # Every retired GitHub label is blocked in docs/reference/
+    for retired_label in RETIRED_GITHUB_LABELS:
+        issue_doc.write_text(f"Do not apply ``{retired_label}``.\n", encoding="utf-8")
+        assert check_governance_and_issue_templates(tmp_path) is True
+    issue_doc.write_text("Use ``question`` and ``area:workflows``.\n", encoding="utf-8")
+
+    # Invalid area option in issue template
+    form_path.write_text(valid_form.replace("- workflows", "- workflows-plugin"), encoding="utf-8")
+    assert check_governance_and_issue_templates(tmp_path) is True
+
+    # Missing workspace package in issue template
+    form_path.write_text(valid_form.replace("        - plugins-tui\n", ""), encoding="utf-8")
+    assert check_governance_and_issue_templates(tmp_path) is True
 
 
 def test_check_readme_github_pages_routes_resolves_pages_and_fragments(tmp_path: Path) -> None:
@@ -650,12 +794,16 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_cli_snippets() is False
     assert check_packages_registered() is False
     assert check_package_docs() is False
+    assert check_governance_and_issue_templates() is False
     assert check_pypi_install_tags() is False
     assert check_readme_github_pages_routes(None) is False
     assert check_release_please_parity() is False
     assert check_examples_index_parity() is False
     assert check_diataxis_sidebar_isolation() is False
     assert check_adr_records() is False
+    assert check_env_vars_documented() is False
+    assert check_sdtm_and_phi_parity() is False
+    assert check_duckdb_relations_parity() is False
 
     empty_root = tmp_path / "empty_workspace"
     empty_root.mkdir()
@@ -664,12 +812,16 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_cli_snippets(empty_root) is True
     assert check_packages_registered(empty_root) is True
     assert check_package_docs(empty_root) is True
+    assert check_governance_and_issue_templates(empty_root) is True
     assert check_pypi_install_tags(empty_root) is True
     assert check_readme_github_pages_routes(None, repo_root=empty_root) is True
     assert check_release_please_parity(empty_root) is True
     assert check_examples_index_parity(empty_root) is True
     assert check_diataxis_sidebar_isolation(empty_root) is True
     assert check_adr_records(empty_root) is True
+    assert check_env_vars_documented(empty_root) is True
+    assert check_sdtm_and_phi_parity(empty_root) is True
+    assert check_duckdb_relations_parity(empty_root) is True
 
 
 def test_check_examples_index_parity_detects_unindexed_script(tmp_path: Path) -> None:
@@ -767,3 +919,218 @@ def test_check_diataxis_sidebar_isolation_rejects_internal_leak_and_duplicate_to
     )
     (docs_dir / "contributing.rst").write_text("Contributing\n============\n", encoding="utf-8")
     assert check_diataxis_sidebar_isolation(tmp_path) is True
+
+
+def test_check_env_vars_documented_passes_repo_and_detects_missing_var(tmp_path: Path) -> None:
+    """check_env_vars_documented passes on repo and fails fast when a runtime IMEDNET_* var is undocumented."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_env_vars_documented(repo_root) is False
+
+    pkg_src = tmp_path / "packages" / "core" / "src" / "imednet"
+    pkg_src.mkdir(parents=True)
+    (pkg_src / "sample.py").write_text(
+        'import os\nEXTRA_ENV = "IMEDNET_SYNTHETIC_EXTRA"\n'
+        'val_a = os.getenv("IMEDNET_OIDC_ISSUER")\n'
+        "val_b = os.environ.get(EXTRA_ENV)\n",
+        encoding="utf-8",
+    )
+    conf_rst = tmp_path / "docs" / "reference" / "configuration.rst"
+    conf_rst.parent.mkdir(parents=True)
+    conf_rst.write_text("Configuration\n=============\n\nIMEDNET_OIDC_ISSUER\n", encoding="utf-8")
+
+    assert check_env_vars_documented(tmp_path) is True
+
+    conf_rst.write_text(
+        "Configuration\n=============\n\nIMEDNET_OIDC_ISSUER\nIMEDNET_SYNTHETIC_EXTRA\n",
+        encoding="utf-8",
+    )
+    assert check_env_vars_documented(tmp_path) is False
+
+
+def test_check_sdtm_and_phi_parity_passes_repo_and_rejects_omissions(tmp_path: Path) -> None:
+    """check_sdtm_and_phi_parity passes on repo and rejects missing SDTM domains or PHI keys."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_sdtm_and_phi_parity(repo_root) is False
+
+    real_text = (repo_root / "docs" / "how-to" / "record_mapping.rst").read_text(encoding="utf-8")
+    target_rst = tmp_path / "docs" / "how-to" / "record_mapping.rst"
+    target_rst.parent.mkdir(parents=True)
+
+    # Removing an SDTM domain fails parity
+    target_rst.write_text(real_text.replace("``MH``", "``XX``"), encoding="utf-8")
+    assert check_sdtm_and_phi_parity(tmp_path) is True
+
+    # Removing a SensitivityRegistry PHI key fails parity
+    target_rst.write_text(real_text.replace("``subjinit``", "``other_field``"), encoding="utf-8")
+    assert check_sdtm_and_phi_parity(tmp_path) is True
+
+    # Removing an exempt structural key fails parity
+    target_rst.write_text(real_text.replace("``usubjid``", "``other_id``"), encoding="utf-8")
+    assert check_sdtm_and_phi_parity(tmp_path) is True
+
+
+def test_check_duckdb_relations_parity_passes_repo_and_rejects_stale_names(tmp_path: Path) -> None:
+    """check_duckdb_relations_parity enforces bronze_revisions/silver_current_state and rejects stale names."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_duckdb_relations_parity(repo_root) is False
+
+    centralizer_dst = (
+        tmp_path
+        / "packages"
+        / "plugins-workflows"
+        / "src"
+        / "imednet_workflows"
+        / "duckdb_centralizer.py"
+    )
+    centralizer_dst.parent.mkdir(parents=True)
+    centralizer_dst.write_text(
+        (
+            repo_root
+            / "packages"
+            / "plugins-workflows"
+            / "src"
+            / "imednet_workflows"
+            / "duckdb_centralizer.py"
+        ).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    audit_dst = tmp_path / "docs" / "how-to" / "audit_compliance.rst"
+    audit_dst.parent.mkdir(parents=True)
+    security_dst = tmp_path / "docs" / "reference" / "security_exceptions.rst"
+    security_dst.parent.mkdir(parents=True)
+
+    real_audit = (repo_root / "docs" / "how-to" / "audit_compliance.rst").read_text(
+        encoding="utf-8"
+    )
+    real_security = (repo_root / "docs" / "reference" / "security_exceptions.rst").read_text(
+        encoding="utf-8"
+    )
+
+    security_dst.write_text(real_security, encoding="utf-8")
+    audit_dst.write_text(
+        real_audit.replace("``silver_records_history``", "``legacy_history``"),
+        encoding="utf-8",
+    )
+    assert check_duckdb_relations_parity(tmp_path) is True
+
+    audit_dst.write_text(
+        real_audit + "\nStale ``record_revisions`` table wording.\n",
+        encoding="utf-8",
+    )
+    assert check_duckdb_relations_parity(tmp_path) is True
+
+    audit_dst.write_text(real_audit, encoding="utf-8")
+    security_dst.write_text(real_security + "\nRun uvx hatch run lint:audit\n", encoding="utf-8")
+    assert check_duckdb_relations_parity(tmp_path) is True
+
+
+def test_sphinx_shadowed_methods_and_spi_compliance_html_links(tmp_path: Path) -> None:
+    """Sphinx renders RecordRevision.validate_chain and resolves imednet.spi.* links verified by check_compliance_html_links."""
+    repo_root = Path(__file__).resolve().parents[2]
+    src_dir = tmp_path / "docs_src"
+    html_dir = tmp_path / "html_out"
+    for sub in ("how-to", "explanation", "reference/api"):
+        (src_dir / sub).mkdir(parents=True)
+
+    (src_dir / "index.rst").write_text(
+        "Index\n=====\n\n.. toctree::\n\n"
+        "   how-to/audit_compliance\n"
+        "   how-to/record_mapping\n"
+        "   explanation/architecture\n"
+        "   explanation/api_overview\n"
+        "   reference/governance\n"
+        "   reference/api/imednet.models\n"
+        "   reference/api/imednet.integrations\n"
+        "   reference/api/imednet.auth\n"
+        "   reference/api/imednet_workflows\n",
+        encoding="utf-8",
+    )
+    (src_dir / "404.rst").write_text(":orphan:\n\nNot Found\n=========\n", encoding="utf-8")
+
+    (src_dir / "how-to" / "audit_compliance.rst").write_text(
+        "Audit\n=====\n\n"
+        "See :meth:`RecordRevision.validate_chain <imednet.models.record_revisions.RecordRevision.validate_chain>`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "explanation" / "architecture.rst").write_text(
+        "Architecture\n============\n\n"
+        "Use :func:`~imednet.spi.models.transform_records_to_sdtm_rows` and "
+        ":func:`~imednet.spi.sink_base.evaluate_standards_readiness`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "how-to" / "record_mapping.rst").write_text(
+        "Record Mapping\n==============\n\n"
+        "Call :func:`~imednet.spi.models.transform_records_to_sdtm_rows` and "
+        ":func:`~imednet.spi.sink_base.evaluate_standards_readiness`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "governance.rst").write_text(
+        "Governance\n==========\n\n"
+        "See :meth:`~imednet_workflows.config_version_control.ConfigVersionStore.rollback_config`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "explanation" / "api_overview.rst").write_text(
+        "API Overview\n============\n\n"
+        "Use :class:`~imednet.auth.strategy.AuthStrategy`, "
+        ":class:`~imednet.auth.oidc.OIDCAuth`, and "
+        ":class:`~imednet.auth.credentials.MemoryCredentialStore`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "api" / "imednet.models.rst").write_text(
+        "imednet.models\n==============\n\n"
+        ".. automodule:: imednet.models.record_revisions\n"
+        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
+        "   :members:\n   :show-inheritance:\n\n"
+        ".. automodule:: imednet.models.sdtm\n"
+        "   :members:\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "api" / "imednet.integrations.rst").write_text(
+        "imednet.integrations\n====================\n\n"
+        ".. automodule:: imednet.integrations.sink_base\n"
+        "   :members:\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "api" / "imednet.auth.rst").write_text(
+        "imednet.auth\n============\n\n"
+        ".. automodule:: imednet.auth.strategy\n   :members:\n\n"
+        ".. automodule:: imednet.auth.oidc\n   :members:\n\n"
+        ".. automodule:: imednet.auth.credentials\n   :members:\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "api" / "imednet_workflows.rst").write_text(
+        "imednet_workflows\n=================\n\n"
+        ".. automodule:: imednet_workflows.config_version_control\n"
+        "   :members:\n",
+        encoding="utf-8",
+    )
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sphinx",
+            "-b",
+            "html",
+            "-c",
+            str(repo_root / "docs"),
+            str(src_dir),
+            str(html_dir),
+        ],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, f"Sphinx failed:\n{res.stdout}\n{res.stderr}"
+    assert check_compliance_html_links(html_dir, require_exists=True) is False
+
+    # Corrupting an anchor must fail check_compliance_html_links
+    arch_html = html_dir / "explanation" / "architecture.html"
+    arch_html.write_text(
+        arch_html.read_text(encoding="utf-8").replace(
+            "#imednet.models.sdtm.transform_records_to_sdtm_rows", "#broken.anchor"
+        ),
+        encoding="utf-8",
+    )
+    assert check_compliance_html_links(html_dir, require_exists=True) is True

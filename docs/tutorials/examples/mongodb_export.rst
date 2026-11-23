@@ -1,7 +1,11 @@
 MongoDB Export Example
 ======================
 
-Export Study Records to MongoDB while preserving nested ``record_data`` payloads.
+Export ``Study`` ``Record`` items to MongoDB while preserving nested ``record_data``
+envelopes (or flat CDISC SDTM domain documents when ``as_sdtm=True``), encoding pure
+``date`` values as ISO-8601 strings and ``Decimal`` values as ``bson.Decimal128``, and
+keying ``_id`` on ``<study_key>/<record_id>`` (or ``<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>``
+fallback when ``as_sdtm=True`` and ``record_id`` is absent).
 
 Prerequisites
 -------------

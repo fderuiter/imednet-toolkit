@@ -1,11 +1,19 @@
 """Unit tests for pyproject metadata."""
 
 import ast
+import email
 import re
+import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
-from scripts.validate_docs import check_sphinx_html_baseurl
+from scripts.validate_docs import REQUIRED_PYTHON_CLASSIFIERS, check_sphinx_html_baseurl
+from scripts.validate_package_consumption import (
+    build_wheels,
+    validate_wheel_metadata,
+    verify_wheel_metadata,
+)
 
 import imednet
 
@@ -155,30 +163,133 @@ def test_baseurl_validation_is_independent_of_working_directory(monkeypatch, tmp
     assert check_sphinx_html_baseurl() is False
 
 
-def test_all_workspace_packages_declare_readme_and_mit_license() -> None:
-    """Verify all five workspace packages declare readme = 'README.md' and license = 'MIT'."""
-    import tomllib
-
+def test_all_workspace_packages_declare_readme_license_and_python_classifiers() -> None:
+    """Every publishable workspace package declares readme, MIT license, and Python 3.11-3.13 classifiers."""
     packages_dir = Path(__file__).resolve().parents[2] / "packages"
-    pkg_dirs = sorted(
-        d for d in packages_dir.iterdir() if d.is_dir() and (d / "pyproject.toml").is_file()
-    )
-    assert len(pkg_dirs) == 5
+    expected_dirs = {
+        "core",
+        "plugins-workflows",
+        "plugins-sinks",
+        "plugins-tui",
+        "providers-airflow",
+    }
+    discovered_dirs = {
+        p.name for p in packages_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
+    }
+    assert discovered_dirs == expected_dirs
 
-    for pkg_dir in pkg_dirs:
-        data = tomllib.loads((pkg_dir / "pyproject.toml").read_text(encoding="utf-8"))
+    for pkg_name in sorted(expected_dirs):
+        manifest_path = packages_dir / pkg_name / "pyproject.toml"
+        data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
         project = data["project"]
-        assert project.get("readme") == "README.md", f"{pkg_dir.name} missing readme = 'README.md'"
-        assert (pkg_dir / "README.md").is_file(), f"{pkg_dir.name}/README.md missing on disk"
-        assert project.get("license") == "MIT", f"{pkg_dir.name} missing license = 'MIT'"
+
+        readme_rel = project.get("readme")
+        assert isinstance(readme_rel, str) and readme_rel == "README.md"
+        readme_file = manifest_path.parent / readme_rel
+        assert readme_file.is_file()
+        assert readme_file.read_text(encoding="utf-8").strip() != ""
+
+        assert project.get("license") == "MIT"
+
+        classifiers = set(project.get("classifiers", []))
+        for py_classifier in REQUIRED_PYTHON_CLASSIFIERS:
+            assert py_classifier in classifiers, (
+                f"{manifest_path} missing classifier {py_classifier!r}"
+            )
+
+
+def test_built_workspace_wheels_emit_markdown_description_and_mit_license(tmp_path: Path) -> None:
+    """Building all five workspace wheels populates METADATA description and License-Expression."""
+    dist_dir = tmp_path / "wheels"
+    build_wheels(dist_dir)
+
+    built_wheels = sorted(dist_dir.glob("*.whl"))
+    assert len(built_wheels) == 5
+
+    expected_names = {
+        "imednet",
+        "imednet-workflows",
+        "imednet-plugins-sinks",
+        "imednet-tui",
+        "apache-airflow-providers-imednet",
+    }
+    found_names: set[str] = set()
+    for wheel_path in built_wheels:
+        with zipfile.ZipFile(wheel_path) as zf:
+            meta_name = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
+            msg = email.message_from_bytes(zf.read(meta_name))
+
+        found_names.add(msg["Name"])
+        assert msg["Description-Content-Type"] == "text/markdown"
+        assert msg["License-Expression"] == "MIT"
+        payload = msg.get_payload()
+        assert isinstance(payload, str) and len(payload.strip()) > 50
+        classifiers = set(msg.get_all("Classifier", []))
+        for py_classifier in REQUIRED_PYTHON_CLASSIFIERS:
+            assert py_classifier in classifiers
+
+    assert found_names == expected_names
+
+
+def test_verify_wheel_metadata_rejects_missing_description_or_license(tmp_path: Path) -> None:
+    """verify_wheel_metadata fails when a wheel omits Markdown description, MIT license, or classifiers."""
+    pkgs_dir = tmp_path / "packages"
+    sample_pkg = pkgs_dir / "sample"
+    sample_pkg.mkdir(parents=True)
+    (sample_pkg / "pyproject.toml").write_text(
+        '[project]\nname = "imednet-sample"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+
+    # Missing wheel
+    with pytest.raises(ValueError, match="Missing built wheel"):
+        verify_wheel_metadata(dist_dir, packages_dir=pkgs_dir)
+
+    wheel_path = dist_dir / "imednet_sample-0.1.0-py3-none-any.whl"
+
+    def _write_wheel(headers: str, body: str) -> None:
+        with zipfile.ZipFile(wheel_path, "w") as zf:
+            zf.writestr(
+                "imednet_sample-0.1.0.dist-info/METADATA",
+                f"Metadata-Version: 2.4\nName: imednet-sample\nVersion: 0.1.0\n{headers}\n{body}",
+            )
+
+    # Missing Description-Content-Type
+    _write_wheel("License-Expression: MIT\n", "# Sample\n")
+    with pytest.raises(ValueError, match="Description-Content-Type"):
+        verify_wheel_metadata(dist_dir, packages_dir=pkgs_dir)
+
+    # Empty description body
+    _write_wheel("Description-Content-Type: text/markdown\nLicense-Expression: MIT\n", "   \n")
+    with pytest.raises(ValueError, match="empty METADATA description body"):
+        verify_wheel_metadata(dist_dir, packages_dir=pkgs_dir)
+
+    # Missing License-Expression
+    _write_wheel("Description-Content-Type: text/markdown\n", "# Sample\n")
+    with pytest.raises(ValueError, match="License-Expression"):
+        verify_wheel_metadata(dist_dir, packages_dir=pkgs_dir)
+
+    # Missing Python classifiers
+    _write_wheel(
+        "Description-Content-Type: text/markdown\nLicense-Expression: MIT\n",
+        "# Sample\n",
+    )
+    with pytest.raises(ValueError, match="missing classifiers"):
+        verify_wheel_metadata(dist_dir, packages_dir=pkgs_dir)
+
+    # Valid wheel passes
+    classifier_headers = "".join(f"Classifier: {c}\n" for c in REQUIRED_PYTHON_CLASSIFIERS)
+    _write_wheel(
+        f"Description-Content-Type: text/markdown\nLicense-Expression: MIT\n{classifier_headers}",
+        "# Sample README\n",
+    )
+    verify_wheel_metadata(dist_dir, packages_dir=pkgs_dir)
 
 
 def test_validate_wheel_metadata_enforces_license_markdown_and_body(tmp_path: Path) -> None:
-    """Verify validate_wheel_metadata checks License, Description-Content-Type, and non-empty body."""
-    import zipfile
-
-    from scripts.validate_package_consumption import validate_wheel_metadata
-
+    """Verify validate_wheel_metadata checks License/License-Expression, Description-Content-Type, and non-empty body."""
     pkgs_dir = tmp_path / "packages" / "demo"
     pkgs_dir.mkdir(parents=True)
     (pkgs_dir / "pyproject.toml").write_text('[project]\nname = "demo-pkg"\n', encoding="utf-8")
@@ -195,7 +306,7 @@ def test_validate_wheel_metadata_enforces_license_markdown_and_body(tmp_path: Pa
         "Metadata-Version: 2.4\n"
         "Name: demo-pkg\n"
         "Version: 1.0.0\n"
-        "License-Expression: MIT\n"
+        "License: MIT\n"
         "Description-Content-Type: text/markdown\n\n"
         "# demo-pkg\n\nRendered package documentation.\n"
     )
