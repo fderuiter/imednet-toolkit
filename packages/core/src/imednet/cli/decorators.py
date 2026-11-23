@@ -95,14 +95,30 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
                 ):
                     validate_cli_path_segment(seg_val, name=seg_param)
 
+        is_offline_dry_run = False
+        for arg_val in bound.arguments.values():
+            if hasattr(arg_val, "dry_run") and hasattr(arg_val, "schema_source"):
+                is_offline_dry_run = _context_mod.is_offline_schema_dry_run(
+                    dry_run=bool(getattr(arg_val, "dry_run", False)),
+                    schema_source=getattr(arg_val, "schema_source", None),
+                )
+                break
+        if not is_offline_dry_run and "dry_run" in bound.arguments:
+            raw_schema_src = bound.arguments.get("schema_source")
+            is_offline_dry_run = _context_mod.is_offline_schema_dry_run(
+                dry_run=bool(bound.arguments.get("dry_run", False)),
+                schema_source=raw_schema_src if isinstance(raw_schema_src, str) else None,
+            )
+
         mod_get_sdk = func.__globals__.get("get_sdk")
-        if (
-            callable(mod_get_sdk)
-            and getattr(mod_get_sdk, "__module__", None) != "imednet.cli.utils.context"
-        ):
-            sdk = mod_get_sdk()
-        else:
-            sdk = _context_mod.get_sdk()
+        with _context_mod.offline_dry_run_context(is_offline_dry_run):
+            if (
+                callable(mod_get_sdk)
+                and getattr(mod_get_sdk, "__module__", None) != "imednet.cli.utils.context"
+            ):
+                sdk = mod_get_sdk()
+            else:
+                sdk = _context_mod.get_sdk()
         try:
             return func(sdk, *args, **kwargs)
         except SystemExit:
