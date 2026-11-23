@@ -59,7 +59,7 @@ package/Python matrix jobs supplement the full workspace gate. Duplicate global
 similarity execution is removed; the canonical ``lint:pylint-sim`` and
 ``duplication:check`` tasks retain their documented scopes and thresholds.
 
-Fuzzing/performance tracks require their pytest flags; container integration
+Fuzzing and performance tracks require their pytest flags and write structured ``VerificationReport`` JSON files under gitignored ``reports/verification/`` (with mutable fuzz corpora under ``.cache/verification/``): run ``pytest tests/core/test_performance.py -m performance`` (pass ``--update-perf-baseline`` when intentionally refreshing ``tests/core/baselines/performance_baseline.json``), ``pytest tests/core/test_fuzz.py -m fuzzing`` (controlled by ``IMEDNET_FUZZ_RUNS``, defaulting to ``25000``), and ``python scripts/aggregate_verification.py --report-dir reports/verification --expect-track <track>`` (which exits ``1`` on missing tracks, malformed files, or ``status: "failed"``). Container integration
 requires ``IMEDNET_TEST_CONTAINERS=1`` with ``docker compose up -d`` and
 ``docker compose down -v`` teardown (see ``CONTRIBUTING.md``). Live tests remain outside the default
 suite and require explicit authorization and the live-test charter. Security
