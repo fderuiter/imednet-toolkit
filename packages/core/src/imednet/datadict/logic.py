@@ -6,6 +6,7 @@ import math
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any, Literal
 
 import defusedxml.ElementTree as ET  # noqa: N817
@@ -275,6 +276,34 @@ _NON_CONDITION_RULE_KEYS = frozenset(
 )
 
 
+RangeCheckComparator = Literal["LT", "LE", "GT", "GE", "EQ", "NE", "IN", "NOTIN"]
+
+_VALID_RANGE_COMPARATORS: frozenset[str] = frozenset(
+    {"LT", "LE", "GT", "GE", "EQ", "NE", "IN", "NOTIN"}
+)
+
+_TEMPORAL_COMPARE_MDY_RE = re.compile(
+    r"^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])-([0-9]{4})"
+    r"(?:[ T]([01][0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9])(?:\.([0-9]{1,6})[0-9]*)?)?)?"
+    r"(Z|[+-](?:[01][0-9]|2[0-3]):?[0-5][0-9])?$"
+)
+_TEMPORAL_COMPARE_YMD_RE = re.compile(
+    r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
+    r"(?:[ T]([01][0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9])(?:\.([0-9]{1,6})[0-9]*)?)?)?"
+    r"(Z|[+-](?:[01][0-9]|2[0-3]):?[0-5][0-9])?$"
+)
+
+
+@dataclass(frozen=True)
+class RangeCheckConstraint:
+    """Normalized CDISC ODM RangeCheck comparator, check values, and SoftHard severity."""
+
+    comparator: RangeCheckComparator
+    check_values: tuple[str, ...]
+    soft_hard: Literal["Soft", "Hard"] = "Hard"
+    error_message: str | None = None
+
+
 @dataclass(frozen=True)
 class VariableConstraints:
     """Normalized validation constraints extracted from a DataDictionary Variable."""
@@ -285,6 +314,7 @@ class VariableConstraints:
     max_value: float | None = None
     min_length: int | None = None
     max_length: int | None = None
+    range_checks: tuple[RangeCheckConstraint, ...] = ()
 
 
 def _lookup_attr_or_extra(var: Any, keys: tuple[str, ...]) -> Any:
@@ -302,6 +332,68 @@ def _lookup_attr_or_extra(var: Any, keys: tuple[str, ...]) -> Any:
         if low in lower_extra and lower_extra[low] is not None and lower_extra[low] != "":
             return lower_extra[low]
     return None
+
+
+def _parse_tz_offset(tz_suffix: str | None) -> timezone | None:
+    """Parse an ISO-8601 timezone suffix ('Z', '+HH:MM', '-HHMM') into a timezone."""
+    if not tz_suffix:
+        return None
+    if tz_suffix == "Z":
+        return UTC
+    sign = 1 if tz_suffix[0] == "+" else -1
+    digits = tz_suffix[1:].replace(":", "")
+    hours = int(digits[:2])
+    minutes = int(digits[2:4])
+    return timezone(sign * timedelta(hours=hours, minutes=minutes))
+
+
+def _parse_comparable_temporal(value: Any) -> datetime | None:
+    """Parse MM-DD-YYYY or YYYY-MM-DD temporal inputs into a UTC-normalized naive datetime."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if not isinstance(value, str):
+        return None
+
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    year: int
+    month: int
+    day: int
+    mdy_match = _TEMPORAL_COMPARE_MDY_RE.match(cleaned)
+    if mdy_match is not None:
+        month = int(mdy_match.group(1))
+        day = int(mdy_match.group(2))
+        year = int(mdy_match.group(3))
+        hh, mm, ss, frac, tz_tok = mdy_match.group(4, 5, 6, 7, 8)
+    else:
+        ymd_match = _TEMPORAL_COMPARE_YMD_RE.match(cleaned)
+        if ymd_match is None:
+            return None
+        year = int(ymd_match.group(1))
+        month = int(ymd_match.group(2))
+        day = int(ymd_match.group(3))
+        hh, mm, ss, frac, tz_tok = ymd_match.group(4, 5, 6, 7, 8)
+
+    hour = int(hh) if hh is not None else 0
+    minute = int(mm) if mm is not None else 0
+    second = int(ss) if ss is not None else 0
+    microsecond = int(frac.ljust(6, "0")) if frac is not None else 0
+    tz_info = _parse_tz_offset(tz_tok)
+    try:
+        dt = datetime(year, month, day, hour, minute, second, microsecond, tzinfo=tz_info)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(UTC).replace(tzinfo=None)
+    return dt
 
 
 def _to_finite_float(value: Any) -> float | None:
@@ -334,6 +426,63 @@ def _to_non_negative_int(value: Any) -> int | None:
         if stripped.isdigit():
             return int(stripped)
     return None
+
+
+def _extract_odm_range_checks(
+    var: Any,
+) -> tuple[tuple[RangeCheckConstraint, ...], float | None, float | None]:
+    """Extract normalized ODM RangeCheck constraints and implied min/max bounds."""
+    extra: Mapping[str, Any] = getattr(var, "extraAttributes", None) or {}
+    raw_checks = extra.get("rangeChecks")
+    if not isinstance(raw_checks, list) or not raw_checks:
+        return (), None, None
+
+    parsed: list[RangeCheckConstraint] = []
+    implied_min: float | None = None
+    implied_max: float | None = None
+
+    for item in raw_checks:
+        if not isinstance(item, Mapping):
+            continue
+        raw_comp = item.get("comparator") or item.get("Comparator")
+        if not isinstance(raw_comp, str) or not raw_comp.strip():
+            continue
+        comp_norm = raw_comp.strip().upper().replace(" ", "").replace("_", "")
+        if comp_norm not in _VALID_RANGE_COMPARATORS:
+            continue
+
+        check_vals: list[str] = []
+        raw_multi = item.get("checkValues")
+        if isinstance(raw_multi, list):
+            check_vals = [str(v).strip() for v in raw_multi if v is not None and str(v).strip()]
+        elif item.get("checkValue") is not None and str(item["checkValue"]).strip():
+            check_vals = [str(item["checkValue"]).strip()]
+        if not check_vals:
+            continue
+
+        raw_sh = str(item.get("softHard") or item.get("SoftHard") or "").strip().lower()
+        soft_hard: Literal["Soft", "Hard"] = "Soft" if raw_sh == "soft" else "Hard"
+        raw_err = item.get("errorMessage")
+        err_msg = str(raw_err).strip() if isinstance(raw_err, str) and raw_err.strip() else None
+
+        parsed.append(
+            RangeCheckConstraint(
+                comparator=comp_norm,  # type: ignore[arg-type]
+                check_values=tuple(check_vals),
+                soft_hard=soft_hard,
+                error_message=err_msg,
+            )
+        )
+
+        if len(check_vals) == 1:
+            num_bound = _to_finite_float(check_vals[0])
+            if num_bound is not None:
+                if comp_norm in {"GE", "GT"}:
+                    implied_min = num_bound if implied_min is None else max(implied_min, num_bound)
+                elif comp_norm in {"LE", "LT"}:
+                    implied_max = num_bound if implied_max is None else min(implied_max, num_bound)
+
+    return tuple(parsed), implied_min, implied_max
 
 
 def extract_variable_constraints(var: Any) -> VariableConstraints:
@@ -369,6 +518,12 @@ def extract_variable_constraints(var: Any) -> VariableConstraints:
 
     min_value = _to_finite_float(_lookup_attr_or_extra(var, _MIN_BOUND_KEYS))
     max_value = _to_finite_float(_lookup_attr_or_extra(var, _MAX_BOUND_KEYS))
+    range_checks, implied_min, implied_max = _extract_odm_range_checks(var)
+    if min_value is None and implied_min is not None:
+        min_value = implied_min
+    if max_value is None and implied_max is not None:
+        max_value = implied_max
+
     min_length = _to_non_negative_int(_lookup_attr_or_extra(var, _MIN_LENGTH_KEYS))
     max_length = _to_non_negative_int(_lookup_attr_or_extra(var, _MAX_LENGTH_KEYS))
 
@@ -400,6 +555,7 @@ def extract_variable_constraints(var: Any) -> VariableConstraints:
         max_value=max_value,
         min_length=min_length,
         max_length=max_length,
+        range_checks=range_checks,
     )
 
 
@@ -443,6 +599,7 @@ class RuleEvaluationResult:
     message: str
     skipped: bool = False
     skip_reason: str | None = None
+    is_cross_scope: bool = False
 
 
 @dataclass(frozen=True)
@@ -662,6 +819,7 @@ class LogicTreeEvaluator:
                 message=default_msg,
                 skipped=True,
                 skip_reason=skip_reason or "cross_scope",
+                is_cross_scope=is_cross_scope,
             )
 
         return RuleEvaluationResult(
@@ -693,6 +851,10 @@ class LogicTreeEvaluator:
             return False, False, "no_conditions"
 
         conditions, is_cross_scope = self._collect_leaf_conditions(cond_root, form_key)
+        if not is_cross_scope and not form_key:
+            cond_forms = {c.form for c in conditions if c.form}
+            if len(cond_forms) > 1:
+                is_cross_scope = True
         if is_cross_scope:
             return False, True, "cross_scope"
         if not conditions:
@@ -1123,12 +1285,22 @@ class LogicTreeEvaluator:
             return None, True
 
         compare_var: str | None = None
+        raw_cv_form = cond.get("compareForm") or cond.get("@compareForm")
+        cond_cv_form = (
+            str(raw_cv_form).strip()
+            if isinstance(raw_cv_form, str) and raw_cv_form.strip()
+            else None
+        )
         for cv_key in _COMPARE_VAR_KEYS:
-            cv_raw = cond.get(cv_key)
+            cv_raw = cond.get(cv_key) or cond.get(f"@{cv_key}")
             if isinstance(cv_raw, str) and cv_raw.strip():
-                cv_name, _, cv_cross = self._resolve_scoped_variable(cv_raw, cond_form, form_key)
-                if cv_cross:
+                cv_name, cv_form, cv_cross = self._resolve_scoped_variable(
+                    cv_raw, cond_cv_form, form_key or resolved_form
+                )
+                if cv_cross or (resolved_form and cv_form and cv_form != resolved_form):
                     return None, True
+                if resolved_form is None and cv_form is not None:
+                    resolved_form = cv_form
                 compare_var = cv_name
                 break
 
@@ -1363,7 +1535,7 @@ class LogicTreeEvaluator:
         else:
             rhs = cond.value
             # Empty XML tag <value/> parses to True via _parse_xml_element
-            if rhs is True and not isinstance(actual, bool):
+            if rhs is True:
                 rhs = ""
 
             if _is_empty_record_value(actual):
@@ -1444,7 +1616,8 @@ class LogicTreeEvaluator:
                     return actual is exp_bool
                 if op == "!=":
                     return actual is not exp_bool
-            return False
+                return False
+            return op == "!="
 
         # Numeric comparison when both operands parse cleanly as finite numbers
         num_actual = _to_finite_float(actual)
@@ -1464,7 +1637,25 @@ class LogicTreeEvaluator:
                 return num_actual >= num_expected
             return False
 
-        # Fallback lexical/string comparison (supports Coded strings and ISO-8601 dates)
+        # Chronological comparison when both operands parse as valid MM-DD-YYYY or ISO dates
+        dt_actual = _parse_comparable_temporal(actual)
+        dt_expected = _parse_comparable_temporal(expected)
+        if dt_actual is not None and dt_expected is not None:
+            if op == "==":
+                return dt_actual == dt_expected
+            if op == "!=":
+                return dt_actual != dt_expected
+            if op == "<":
+                return dt_actual < dt_expected
+            if op == "<=":
+                return dt_actual <= dt_expected
+            if op == ">":
+                return dt_actual > dt_expected
+            if op == ">=":
+                return dt_actual >= dt_expected
+            return False
+
+        # Fallback lexical/string comparison (supports Coded strings)
         str_actual = str(actual).strip()
         str_expected = str(expected).strip()
         if op == "==":

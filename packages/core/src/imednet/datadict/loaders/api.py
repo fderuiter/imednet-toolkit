@@ -68,6 +68,22 @@ def _extract_attr(obj: Any, *keys: str) -> Any:
     return None
 
 
+def _is_truthy_flag(val: Any) -> bool:
+    """Return True only when ``val`` is explicitly boolean True or a truthy string flag."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in {"true", "yes", "y", "1"}
+    return False
+
+
+def _is_retired_api_variable(item: Any) -> bool:
+    """Return True if an API variable item is marked deleted or disabled."""
+    return _is_truthy_flag(_extract_attr(item, "deleted")) or _is_truthy_flag(
+        _extract_attr(item, "disabled")
+    )
+
+
 def _extract_extra_attributes(obj: Any, excluded_camel_keys: set[str]) -> dict[str, Any]:
     """Extract non-null extra properties from a dict, Pydantic model, or object into camelCase."""
     raw_items: dict[str, Any]
@@ -145,6 +161,18 @@ def load_from_api(
     variables_list = sdk.variables.list(study_key=study_key)
     for idx, item in enumerate(variables_list):
         f_key = str(_extract_attr(item, "form_key", "formKey", "form_name", "form") or "")
+        f_id = _extract_attr(item, "form_id", "formId")
+        if _is_retired_api_variable(item):
+            if f_key:
+                if f_key not in forms_map:
+                    forms_map[f_key] = Form(
+                        formKey=f_key,
+                        formId=normalize_form_id(f_id, form_key=f_key),
+                        formType=normalize_form_type(None, default="Subject"),
+                    )
+                elif forms_map[f_key].formId is None and f_id is not None:
+                    forms_map[f_key].formId = normalize_form_id(f_id, form_key=f_key)
+            continue
         v_name = str(
             _extract_attr(item, "variable_name", "variableName", "variable_oid", "name") or ""
         )

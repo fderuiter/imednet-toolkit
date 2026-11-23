@@ -144,6 +144,8 @@ _CANONICAL_VARIABLE_TYPES: dict[str, str] = {
     "date ymd": "Date",
     "date mdy": "Date",
     "date dmy": "Date",
+    "partialdate": "Date",
+    "incompletedate": "Date",
     "datetime": "DateTime",
     "date/time": "DateTime",
     "date time": "DateTime",
@@ -151,7 +153,11 @@ _CANONICAL_VARIABLE_TYPES: dict[str, str] = {
     "datetime precision": "DateTime",
     "durationdatetime": "DateTime",
     "intervaldatetime": "DateTime",
+    "partialdatetime": "DateTime",
+    "incompletedatetime": "DateTime",
     "time": "Time",
+    "partialtime": "Time",
+    "incompletetime": "Time",
     "bool": "Boolean",
     "boolean": "Boolean",
     "radio": "Radio",
@@ -413,7 +419,7 @@ def _is_file_target(target: Any) -> bool:
         target_str = target.strip()
         if target_str.startswith(("<", "{", "[")):
             return False
-        if target_str.lower().endswith((".json", ".xml", ".csv")):
+        if target_str.lower().endswith((".json", ".xml", ".csv", ".zip")):
             return True
         if "/" in target_str or "\\" in target_str:
             return True
