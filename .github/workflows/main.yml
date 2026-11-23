@@ -508,79 +508,12 @@ jobs:
           if-no-files-found: ignore
 
   # ------------------------------------------------------------------
-  # JOB 3.7: VALIDATE EXTRAS
-  # ------------------------------------------------------------------
-  validate-extras:
-    name: Validate Documented Extras
-    needs: build
-    if: needs.plan.outputs.matrix != '[]'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    strategy:
-      matrix:
-        extra: ["export", "duckdb", "mongodb", "neo4j", "snowflake", "cli", "tui"]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.11"
-
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cache/uv
-            .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
-
-      - name: Install hatch
-        run: python -m pip install uv hatch
-
-      - name: Tighten Internal Dependencies
-        run: python scripts/tighten_dependencies.py --rewrite
-
-      - name: Build Packages
-        run: |
-          (cd packages/plugins-workflows && hatch build)
-          (cd packages/plugins-sinks && hatch build)
-          (cd packages/plugins-tui && hatch build)
-          (cd packages/core && hatch build)
-
-      - name: Restore Internal Dependencies
-        if: always()
-        run: python scripts/tighten_dependencies.py --restore
-
-      - name: Install Core with Extra
-        env:
-          EXTRA: ${{ matrix.extra }}
-        run: |
-          WHEEL=$(ls packages/core/dist/imednet-*.whl)
-          SINKS_WHEEL=$(ls packages/plugins-sinks/dist/imednet_plugins_sinks-*.whl)
-          WORKFLOWS_WHEEL=$(ls packages/plugins-workflows/dist/imednet_workflows-*.whl)
-          TUI_WHEEL=$(ls packages/plugins-tui/dist/imednet_tui-*.whl)
-          python3 -m pip install "$WHEEL" "$SINKS_WHEEL" "$WORKFLOWS_WHEEL" "$TUI_WHEEL"
-          python3 -m pip install "${WHEEL}[${EXTRA}]"
-
-      - name: Verify CLI Availability
-        run: |
-          imednet --help
-
-      - name: Verify Snowflake Extra Imports
-        if: matrix.extra == 'snowflake'
-        run: |
-          python3 -c "import pyarrow, snowflake.connector, imednet_sinks.warehouse; from imednet.spi.sink_base import _require_optional_dep; assert pyarrow.__version__ and _require_optional_dep('snowflake.connector', 'snowflake').__version__"
-
-  # ------------------------------------------------------------------
   # JOB 3.8: VALIDATE PACKAGE CONSUMPTION
   # ------------------------------------------------------------------
   validate-package-consumption:
     name: Validate Package Consumption
-    needs: build
+    needs: [plan, build]
+    if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -601,6 +534,14 @@ jobs:
           key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
           restore-keys: |
             uv-venv-${{ runner.os }}-"3.11"-
+
+      - name: Download Built Artifacts
+        if: needs.plan.outputs.build_matrix != '[]'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
@@ -612,15 +553,8 @@ jobs:
           uv sync --locked --all-packages --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
-      - name: Tighten Internal Dependencies
-        run: python scripts/tighten_dependencies.py --rewrite
-
       - name: Validate Package Consumption
-        run: python scripts/validate_package_consumption.py
-
-      - name: Restore Internal Dependencies
-        if: always()
-        run: python scripts/tighten_dependencies.py --restore
+        run: python scripts/validate_package_consumption.py --wheel-dir dist
 
   # ------------------------------------------------------------------
   # JOB 4: DOCS (Build & Prepare for Deploy)

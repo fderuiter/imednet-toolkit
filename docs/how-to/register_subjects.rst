@@ -59,7 +59,7 @@ and returns a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
        {
            "formKey": "F_DM",
            "siteName": "SITE",
-           "data": {"SUBJID": "SUBJ-001", "V_AGE": 41, "V_GENDER": "F"},
+           "data": {"SUBJID": "SUB1", "V_AGE": 41, "V_GENDER": "F"},
        },
        {
            "formKey": "F_DM",
@@ -78,6 +78,9 @@ and returns a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
        filter_enrolled=True,
        subject_key_field="SUBJID",
    )
+   assert batch_summary.total_records == 1
+   assert batch_summary.skipped_count == 1
+   assert batch_summary.all_successful is True
    print(batch_summary.total_records, batch_summary.skipped_count, batch_summary.all_successful)
    reset_default_simulation_state()
 

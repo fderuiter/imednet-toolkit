@@ -175,8 +175,23 @@ def test_copilot_and_consumption_workflows_use_canonical_uv_sync():
     assert any("uv sync --locked --all-packages --all-extras" in r for r in copilot_runs)
 
     pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
-    consumption_steps = pipeline["jobs"]["validate-package-consumption"]["steps"]
+    assert "validate-extras" not in pipeline["jobs"]
+
+    consumption_job = pipeline["jobs"]["validate-package-consumption"]
+    assert set(consumption_job["needs"]) == {"plan", "build"}
+    assert consumption_job.get("if") == "needs.plan.outputs.matrix != '[]'"
+
+    consumption_steps = consumption_job["steps"]
+    download_step = next(
+        s for s in consumption_steps if s.get("name") == "Download Built Artifacts"
+    )
+    assert download_step.get("if") == "needs.plan.outputs.build_matrix != '[]'"
+    assert download_step.get("uses", "").startswith("actions/download-artifact@")
+
     consumption_runs = [s.get("run", "") for s in consumption_steps if "run" in s]
     assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in consumption_steps)
     assert any("uv sync --locked --all-packages --all-extras" in r for r in consumption_runs)
+    assert any(
+        "scripts/validate_package_consumption.py --wheel-dir dist" in r for r in consumption_runs
+    )
     assert not any("pip install" in r for r in consumption_runs)

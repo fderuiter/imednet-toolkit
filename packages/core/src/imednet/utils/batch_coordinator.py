@@ -286,11 +286,17 @@ def _handle_validation_report(
 class BatchCoordinator:
     """Coordinate single-pass validation, bounded chunking, and job polling."""
 
-    def __init__(self, chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE) -> None:
+    def __init__(
+        self,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        *,
+        sdk: Any = None,
+    ) -> None:
         """Initialize the synchronous batch coordinator."""
         if chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer.")
         self.chunk_size = chunk_size
+        self._sdk = sdk
 
     @staticmethod
     def _call_sync_validate_batch(
@@ -317,6 +323,7 @@ class BatchCoordinator:
         skip_validation: bool,
         dry_run: bool,
         collect_errors: bool,
+        sdk: Any = None,
     ) -> BatchValidationReport | None:
         if validate_batch_fn is not None and inspect.iscoroutinefunction(validate_batch_fn):
             raise TypeError(
@@ -341,6 +348,7 @@ class BatchCoordinator:
                 _validate_records_with_schema(schema, records_data, study_key=study_key)
             return None
 
+        effective_sdk = sdk if sdk is not None else self._sdk
         report: BatchValidationReport
         if validate_batch_fn is not None and _accepts_kwarg(validate_batch_fn, "collect_errors"):
             report = cast(
@@ -357,11 +365,26 @@ class BatchCoordinator:
                 valid_records=len(records_data),
             )
         elif schema is not None:
-            report = validate_records_batch(
-                schema, records_data, study_key=study_key, collect_errors=True
-            )
+            masked_report = _masked_only_report(records_data)
+            if not masked_report.is_valid:
+                report = masked_report
+            else:
+                report = validate_records_batch(
+                    schema, records_data, study_key=study_key, collect_errors=True
+                )
         else:
             report = _masked_only_report(records_data)
+            if report.is_valid and dry_run and effective_sdk is not None:
+                from imednet.datadict.loaders.api import can_load_from_api, load_from_api
+
+                if can_load_from_api(effective_sdk):
+                    loaded_schema = load_from_api(effective_sdk, study_key)
+                    report = validate_records_batch(
+                        loaded_schema,
+                        records_data,
+                        study_key=study_key,
+                        collect_errors=True,
+                    )
 
         _handle_validation_report(report, dry_run=dry_run, collect_errors=collect_errors)
         return report
@@ -384,6 +407,7 @@ class BatchCoordinator:
         raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
+        sdk: Any = None,
     ) -> BatchSubmissionSummary:
         """Validate once, submit in bounded chunks, and optionally poll to completion."""
         report = self._run_sync_validation(
@@ -394,6 +418,7 @@ class BatchCoordinator:
             skip_validation=skip_validation,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            sdk=sdk,
         )
 
         if dry_run:
@@ -475,11 +500,17 @@ class BatchCoordinator:
 class AsyncBatchCoordinator:
     """Asynchronously coordinate single-pass validation, bounded chunking, and job polling."""
 
-    def __init__(self, chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE) -> None:
+    def __init__(
+        self,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        *,
+        sdk: Any = None,
+    ) -> None:
         """Initialize the asynchronous batch coordinator."""
         if chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer.")
         self.chunk_size = chunk_size
+        self._sdk = sdk
 
     async def _run_async_validation(
         self,
@@ -491,6 +522,7 @@ class AsyncBatchCoordinator:
         skip_validation: bool,
         dry_run: bool,
         collect_errors: bool,
+        sdk: Any = None,
     ) -> BatchValidationReport | None:
         if skip_validation:
             ensure_no_masked_sentinel(records_data)
@@ -509,6 +541,7 @@ class AsyncBatchCoordinator:
                 _validate_records_with_schema(schema, records_data, study_key=study_key)
             return None
 
+        effective_sdk = sdk if sdk is not None else self._sdk
         report: BatchValidationReport
         if validate_batch_fn is not None and _accepts_kwarg(validate_batch_fn, "collect_errors"):
             report = cast(
@@ -523,11 +556,26 @@ class AsyncBatchCoordinator:
                 valid_records=len(records_data),
             )
         elif schema is not None:
-            report = validate_records_batch(
-                schema, records_data, study_key=study_key, collect_errors=True
-            )
+            masked_report = _masked_only_report(records_data)
+            if not masked_report.is_valid:
+                report = masked_report
+            else:
+                report = validate_records_batch(
+                    schema, records_data, study_key=study_key, collect_errors=True
+                )
         else:
             report = _masked_only_report(records_data)
+            if report.is_valid and dry_run and effective_sdk is not None:
+                from imednet.datadict.loaders.api import async_load_from_api, can_load_from_api
+
+                if can_load_from_api(effective_sdk):
+                    loaded_schema = await async_load_from_api(effective_sdk, study_key)
+                    report = validate_records_batch(
+                        loaded_schema,
+                        records_data,
+                        study_key=study_key,
+                        collect_errors=True,
+                    )
 
         _handle_validation_report(report, dry_run=dry_run, collect_errors=collect_errors)
         return report
@@ -550,6 +598,7 @@ class AsyncBatchCoordinator:
         raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
+        sdk: Any = None,
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit bounded chunks, and optionally poll."""
         report = await self._run_async_validation(
@@ -560,6 +609,7 @@ class AsyncBatchCoordinator:
             skip_validation=skip_validation,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            sdk=sdk,
         )
 
         if dry_run:
