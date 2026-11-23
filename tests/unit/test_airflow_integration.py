@@ -78,7 +78,7 @@ def test_export_operator_calls_helper(monkeypatch):
 
     result = op.execute({})
 
-    export_mock.assert_called_once_with(sdk, "S", "/tmp/out.csv")
+    export_mock.assert_called_once_with(sdk, "S", "/tmp/out.csv", quality_gate_enabled=False)
     assert result == "/tmp/out.csv"
 
 
@@ -135,7 +135,9 @@ def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monke
 
     hook_cls.assert_called_once_with("imednet_default")
     hook_inst.get_sdk_client.assert_called_once_with()
-    export_mock.assert_called_once_with(sdk, "S", "/tmp/out.json", orient="records")
+    export_mock.assert_called_once_with(
+        sdk, "S", "/tmp/out.json", orient="records", quality_gate_enabled=False
+    )
     assert result == "/tmp/out.json"
 
 
@@ -605,7 +607,11 @@ def test_export_operator_template_field_rendering_simulation(monkeypatch):
     result = op.execute({})
 
     export_mock.assert_called_once_with(
-        sdk, "RENDERED-STUDY-001", "/data/RENDERED-STUDY-001.csv", index=False
+        sdk,
+        "RENDERED-STUDY-001",
+        "/data/RENDERED-STUDY-001.csv",
+        index=False,
+        quality_gate_enabled=False,
     )
     assert result == "/data/RENDERED-STUDY-001.csv"
 

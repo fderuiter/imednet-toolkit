@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
@@ -533,7 +534,7 @@ class ImednetExportOperator(BaseOperator):
         *,
         dest: str = "records",
     ) -> dict[str, Any]:
-        """Merge explicitly configured operational parameters into tabular export kwargs."""
+        """Merge operational parameters and deterministic quality-gate state into tabular kwargs."""
         merged = dict(runtime_kwargs)
         if "domain" in merged and "sdtm_domain" not in merged:
             merged["sdtm_domain"] = merged.pop("domain")
@@ -544,6 +545,10 @@ class ImednetExportOperator(BaseOperator):
             current_val = getattr(self, key)
             if key not in merged and (key in explicit or current_val != default_val):
                 merged[key] = current_val
+        if "quality_gate_enabled" in merged:
+            merged["quality_gate_enabled"] = bool(merged["quality_gate_enabled"])
+        else:
+            merged["quality_gate_enabled"] = bool(getattr(self, "quality_gate_enabled", False))
         for key, val in self._collect_streaming_options(runtime_kwargs).items():
             merged.setdefault(key, val)
         if (
@@ -555,6 +560,28 @@ class ImednetExportOperator(BaseOperator):
             if "stream_name" not in merged:
                 merged["stream_name"] = self._default_airflow_stream_name(dest)
         return merged
+
+    @staticmethod
+    def _filter_callable_kwargs(
+        export_callable: Any,
+        tabular_kwargs: dict[str, Any],
+        *,
+        implicit_quality_gate: bool,
+    ) -> dict[str, Any]:
+        """Omit implicit ``quality_gate_enabled`` only when a custom callable rejects sink kwargs."""
+        if not implicit_quality_gate or "quality_gate_enabled" not in tabular_kwargs:
+            return tabular_kwargs
+        try:
+            params = inspect.signature(export_callable).parameters
+        except (TypeError, ValueError):
+            return tabular_kwargs
+        if "quality_gate_enabled" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            return tabular_kwargs
+        filtered = dict(tabular_kwargs)
+        filtered.pop("quality_gate_enabled", None)
+        return filtered
 
     def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
         """Dynamically load and configure the target sink from the SDK, handling dependencies lazily."""
@@ -933,7 +960,19 @@ class ImednetExportOperator(BaseOperator):
                 if not export_callable:
                     raise AirflowException(f"Unsupported destination or export_func '{dest}'")
 
-                tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs, dest=dest)
+                explicit_opts: frozenset[str] = getattr(
+                    self, "_explicit_tabular_options", frozenset()
+                )
+                implicit_gate = (
+                    "quality_gate_enabled" not in runtime_kwargs
+                    and "quality_gate_enabled" not in explicit_opts
+                    and not bool(getattr(self, "quality_gate_enabled", False))
+                )
+                tabular_kwargs = self._filter_callable_kwargs(
+                    export_callable,
+                    self._build_tabular_kwargs(runtime_kwargs, dest=dest),
+                    implicit_quality_gate=implicit_gate,
+                )
                 if dest == "duckdb":
                     conn_settings = self._resolve_destination_connection(dest)
                     db_path_arg = (
