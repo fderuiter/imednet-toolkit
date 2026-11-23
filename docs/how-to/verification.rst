@@ -46,7 +46,10 @@ Canonical tasks
 
 ``pyproject.toml`` defines ``hatch run verify-static`` (format, lint and the
 typing targets), ``hatch run verify-tests`` (offline workspace tests and
-90% coverage), and ``hatch run docs`` (strict documentation checks).
+90% coverage), ``hatch run docs`` (strict documentation checks), and
+``hatch run validate-package-consumption`` (isolated clean-venv wheel and
+optional-dependency smoke checks across all workspace packages and 21 extras;
+pass ``--wheel-dir <dir>`` to reuse prebuilt wheels).
 ``hatch run verify`` runs ``verify-static`` and ``verify-tests`` in order; the
 Pipeline ``docs`` job runs ``uv run python scripts/build_docs.py`` once on the
 synced ``.venv`` workspace. The expanded commands above are useful for diagnostics.
