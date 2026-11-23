@@ -767,6 +767,170 @@ __result__ = {
 
 
 @pytest.mark.unit
+def test_accessible_html5_translator_toctree_caption_aria_levels(tmp_path: Path) -> None:
+    """Verify _AccessibleHTML5Translator emits contextual aria-level on toctree captions (WCAG 4.1.2, 1.3.1, ARIA12, G141)."""
+    from docs import conf as docs_conf
+    from docutils import nodes
+    from docutils.utils import new_document
+    from furo.navigation import get_navigation_tree
+    from sphinx import addnodes
+    from sphinx.application import Sphinx
+    from sphinx.util.docutils import docutils_namespace
+
+    # 1. Verify setup(app) registers _AccessibleHTML5Translator for both html and dirhtml
+    class _TranslatorAppStub:
+        def __init__(self) -> None:
+            self.translators: dict[str, object] = {}
+
+        def set_translator(self, name: str, translator_class: object, **_kwargs: object) -> None:
+            self.translators[name] = translator_class
+
+        def add_autodocumenter(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def connect(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    stub_app = _TranslatorAppStub()
+    docs_conf.setup(stub_app)
+    assert stub_app.translators["html"] is docs_conf._AccessibleHTML5Translator
+    assert stub_app.translators["dirhtml"] is docs_conf._AccessibleHTML5Translator
+
+    # 2. Spin up minimal Sphinx html and dirhtml apps wired with docs/conf.py translator
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "conf.py").write_text(
+        'project = "test"\nhtml_theme = "furo"\nmaster_doc = "index"\n',
+        encoding="utf-8",
+    )
+    (src_dir / "index.rst").write_text("Root\n====\n", encoding="utf-8")
+
+    def _make_toctree_caption(text: str) -> addnodes.compact_paragraph:
+        cp = addnodes.compact_paragraph(toctree=True)
+        cp += nodes.title("", text)
+        return cp
+
+    with docutils_namespace():
+        dirhtml_app = Sphinx(
+            srcdir=str(src_dir),
+            confdir=str(src_dir),
+            outdir=str(tmp_path / "out_dirhtml"),
+            doctreedir=str(tmp_path / "doctrees_dirhtml"),
+            buildername="dirhtml",
+        )
+        dirhtml_app.set_translator("dirhtml", docs_conf._AccessibleHTML5Translator)
+        assert dirhtml_app.builder.get_translator_class() is docs_conf._AccessibleHTML5Translator
+        dirhtml_partial = dirhtml_app.builder.render_partial(_make_toctree_caption("Reference:"))[
+            "fragment"
+        ]
+        assert 'aria-level="2"' in dirhtml_partial
+
+    with docutils_namespace():
+        app = Sphinx(
+            srcdir=str(src_dir),
+            confdir=str(src_dir),
+            outdir=str(tmp_path / "out_html"),
+            doctreedir=str(tmp_path / "doctrees_html"),
+            buildername="html",
+        )
+        app.set_translator("html", docs_conf._AccessibleHTML5Translator)
+        assert app.builder.get_translator_class() is docs_conf._AccessibleHTML5Translator
+
+        # 3. Partial sidebar rendering (section_level == 0 -> aria-level="2") + Furo sidebar tree
+        sidebar_partial = app.builder.render_partial(_make_toctree_caption("Tutorials:"))[
+            "fragment"
+        ]
+        assert (
+            '<p aria-level="2" class="caption" role="heading"><span class="caption-text">Tutorials:</span></p>'
+            in sidebar_partial
+        )
+        furo_sidebar_html = get_navigation_tree(sidebar_partial)
+        assert 'role="heading"' in furo_sidebar_html
+        assert 'aria-level="2"' in furo_sidebar_html
+
+        # 4. Full document hierarchy: h1 section -> 2, h2 section -> 3, deep sections -> clamped to 6,
+        #    plus topic/admonition and table captions delegated cleanly to super().visit_title
+        app.builder.prepare_writing({"index"})
+        app.builder.current_docname = "index"
+        app.builder.secnumbers = {"#h2-sec": (1, 1)}
+        app.builder.fignumbers = {"table": {"tbl-1": (1, 1)}}
+
+        doc = new_document("index", app.builder.docsettings)
+
+        sec_h1 = nodes.section(ids=["h1-sec"])
+        sec_h1 += nodes.title("", "Contributing")
+        sec_h1 += _make_toctree_caption("Contributor Guides")
+
+        sec_h2 = nodes.section(ids=["h2-sec"])
+        sec_h2 += nodes.title("", "Documentation Overview")
+        sec_h2 += _make_toctree_caption("How-to Guides:")
+
+        # Nest down to depth 7 (section_level 7 + initial_header_level 1 = 8 -> clamped to 6)
+        parent_sec = sec_h2
+        for depth in range(3, 8):
+            nested = nodes.section(ids=[f"sec-{depth}"])
+            nested += nodes.title("", f"Heading {depth}")
+            if depth in (5, 6, 7):
+                nested += _make_toctree_caption(f"Deep Caption {depth}")
+            parent_sec += nested
+            parent_sec = nested
+
+        # Non-toctree topic title must not get role="heading" or aria-level
+        topic_node = nodes.topic()
+        topic_node += nodes.title("", "Topic Summary")
+        sec_h1 += topic_node
+
+        # Table with title must preserve caption-text wrapper and fignumber without aria-level
+        table = nodes.table(ids=["tbl-1"])
+        table += nodes.title("", "API Stability Matrix")
+        tgroup = nodes.tgroup(cols=1)
+        tgroup += nodes.colspec(colwidth=1)
+        tbody = nodes.tbody()
+        row = nodes.row()
+        entry = nodes.entry()
+        entry += nodes.paragraph(text="Stable")
+        row += entry
+        tbody += row
+        tgroup += tbody
+        table += tgroup
+        sec_h1 += table
+
+        sec_h1 += sec_h2
+        doc += sec_h1
+
+        translator = docs_conf._AccessibleHTML5Translator(doc, app.builder)
+        doc.walkabout(translator)
+        rendered = "".join(translator.body)
+
+    assert (
+        '<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributor Guides</span></p>'
+        in rendered
+    )
+    assert (
+        '<p aria-level="3" class="caption" role="heading"><span class="caption-text">How-to Guides:</span></p>'
+        in rendered
+    )
+    for depth in (5, 6, 7):
+        assert (
+            f'<p aria-level="6" class="caption" role="heading"><span class="caption-text">Deep Caption {depth}</span></p>'
+            in rendered
+        )
+
+    assert '<p class="topic-title">Topic Summary</p>' in rendered
+    # Section numbering and figure numbering stay intact without duplication
+    assert rendered.count('<span class="section-number">1.1. </span>') == 1
+    assert rendered.count('<span class="caption-number">Table 1.1 </span>') == 1
+    assert (
+        '<caption><span class="caption-number">Table 1.1 </span><span class="caption-text">API Stability Matrix</span>'
+        in rendered
+    )
+    assert (
+        "<caption>" in rendered
+        and "aria-level" not in rendered.split("<caption>", 1)[1].split("</caption>", 1)[0]
+    )
+
+
+@pytest.mark.unit
 def test_pyodide_cells_sphinx_extension_and_conf() -> None:
     """Verify native Sphinx Pyodide extension directives, HTML context hooks, and conf.py config."""
     from docs import conf as docs_conf
@@ -1451,6 +1615,88 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
             cwd=str(REPO_ROOT),
         )
 
+    class _HeadingRoleAuditParser:
+        """Scan built HTML files for [role='heading'] elements and validate aria-level."""
+
+        @staticmethod
+        def audit_directory(
+            root_dir: Path,
+        ) -> tuple[int, list[str], dict[str, list[tuple[str, str | None]]]]:
+            from html.parser import HTMLParser
+
+            class _Parser(HTMLParser):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.headings: list[tuple[str, str | None, str]] = []
+                    self._stack: list[tuple[str, set[str]]] = []
+
+                def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                    attr_map = dict(attrs)
+                    classes = set((attr_map.get("class") or "").split())
+                    if attr_map.get("role") == "heading":
+                        in_sidebar = any("sidebar-tree" in c for _, c in self._stack)
+                        in_toctree = any("toctree-wrapper" in c for _, c in self._stack)
+                        zone = (
+                            "sidebar-tree"
+                            if in_sidebar
+                            else ("toctree-wrapper" if in_toctree else "other")
+                        )
+                        self.headings.append((zone, attr_map.get("aria-level"), tag))
+                    self._stack.append((tag, classes))
+
+                def handle_endtag(self, tag: str) -> None:
+                    for idx in range(len(self._stack) - 1, -1, -1):
+                        if self._stack[idx][0] == tag:
+                            del self._stack[idx:]
+                            break
+
+            total_headings = 0
+            violations: list[str] = []
+            by_page: dict[str, list[tuple[str, str | None]]] = {}
+            valid_levels = {"1", "2", "3", "4", "5", "6"}
+
+            for html_file in sorted(root_dir.rglob("*.html")):
+                rel = html_file.relative_to(root_dir).as_posix()
+                parser = _Parser()
+                parser.feed(html_file.read_text(encoding="utf-8", errors="ignore"))
+                by_page[rel] = [(zone, lvl) for zone, lvl, _tag in parser.headings]
+                for zone, lvl, tag in parser.headings:
+                    total_headings += 1
+                    if lvl not in valid_levels:
+                        violations.append(
+                            f"{rel}: <{tag} role='heading'> in {zone} has invalid aria-level={lvl!r}"
+                        )
+                    elif zone == "sidebar-tree" and lvl != "2":
+                        violations.append(
+                            f"{rel}: .sidebar-tree heading expected aria-level='2', got {lvl!r}"
+                        )
+            return total_headings, violations, by_page
+
+    total_role_headings, heading_violations, page_headings = (
+        _HeadingRoleAuditParser.audit_directory(html_dir)
+    )
+    assert total_role_headings > 0, (
+        "Expected captioned toctree [role='heading'] nodes in built HTML"
+    )
+    assert heading_violations == [], (
+        "Invalid or missing aria-level on [role='heading'] elements:\n"
+        + "\n".join(heading_violations[:25])
+    )
+    idx_wrapper_levels = [
+        lvl for zone, lvl in page_headings.get("index.html", []) if zone == "toctree-wrapper"
+    ]
+    assert idx_wrapper_levels == ["3", "3", "3", "3"], (
+        f"Expected four aria-level='3' toctree captions under <h2> on index.html, got {idx_wrapper_levels}"
+    )
+    contrib_wrapper_levels = [
+        lvl
+        for zone, lvl in page_headings.get("reference/contributing.html", [])
+        if zone == "toctree-wrapper"
+    ]
+    assert contrib_wrapper_levels == ["2"], (
+        f"Expected aria-level='2' toctree caption under <h1> on reference/contributing.html, got {contrib_wrapper_levels}"
+    )
+
     class _QuietHandler(SimpleHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             return
@@ -1844,6 +2090,66 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     f"http://127.0.0.1:{port}/index.html",
                     wait_until="load",
                 )
+
+                # Verify [role="heading"] aria-level hierarchy & caption styling in Chromium
+                idx_heading_audit = idx_page.evaluate(
+                    """() => {
+                        return Array.from(document.querySelectorAll('[role="heading"]')).map((el) => {
+                            const cs = getComputedStyle(el);
+                            return {
+                                text: (el.textContent || '').trim(),
+                                tag: el.tagName,
+                                ariaLevel: el.getAttribute('aria-level'),
+                                inSidebar: !!el.closest('.sidebar-tree'),
+                                inToctreeWrapper: !!el.closest('.toctree-wrapper'),
+                                borderBottomStyle: cs.borderBottomStyle,
+                                borderBottomWidth: parseFloat(cs.borderBottomWidth)
+                            };
+                        });
+                    }"""
+                )
+                assert len(idx_heading_audit) >= 8
+                for h_item in idx_heading_audit:
+                    assert h_item["ariaLevel"] in {"1", "2", "3", "4", "5", "6"}, (
+                        f"index.html [role='heading'] ({h_item['text']!r}) has invalid aria-level={h_item['ariaLevel']!r}"
+                    )
+                    if h_item["inSidebar"]:
+                        assert h_item["ariaLevel"] == "2"
+                    if h_item["inToctreeWrapper"]:
+                        assert h_item["ariaLevel"] == "3"
+                        assert h_item["borderBottomWidth"] == 0.0, (
+                            f"index.html caption {h_item['text']!r} unexpectedly picked up h2 bottom border"
+                        )
+
+                contrib_page = context.new_page()
+                contrib_page.goto(
+                    f"http://127.0.0.1:{port}/reference/contributing.html",
+                    wait_until="load",
+                )
+                contrib_heading_audit = contrib_page.evaluate(
+                    """() => {
+                        return Array.from(document.querySelectorAll('[role="heading"]')).map((el) => {
+                            const cs = getComputedStyle(el);
+                            return {
+                                text: (el.textContent || '').trim(),
+                                ariaLevel: el.getAttribute('aria-level'),
+                                inSidebar: !!el.closest('.sidebar-tree'),
+                                inToctreeWrapper: !!el.closest('.toctree-wrapper'),
+                                borderBottomWidth: parseFloat(cs.borderBottomWidth)
+                            };
+                        });
+                    }"""
+                )
+                contrib_wrapper = [h for h in contrib_heading_audit if h["inToctreeWrapper"]]
+                assert len(contrib_wrapper) == 1
+                assert contrib_wrapper[0]["text"] == "Contributor Guides"
+                assert contrib_wrapper[0]["ariaLevel"] == "2"
+                assert contrib_wrapper[0]["borderBottomWidth"] == 0.0
+                for h_item in contrib_heading_audit:
+                    assert h_item["ariaLevel"] in {"1", "2", "3", "4", "5", "6"}
+                    if h_item["inSidebar"]:
+                        assert h_item["ariaLevel"] == "2"
+                contrib_page.close()
 
                 sc_253_checks = idx_page.evaluate(
                     """() => {

@@ -692,15 +692,17 @@ def test_dynamic_sqlite_selection_per_base_url(tmp_path: Path, mock_sdk: MockSDK
 
 
 def test_dynamic_sqlite_selection_per_study_context(tmp_path: Path) -> None:
-    """Verify separate SQLite subdirectories are structured based on active study context."""
+    """Verify ConfigVersionStore DB path remains invariant to active study_context."""
     from imednet.core.context import reset_study_context, set_study_context
 
     store = ConfigVersionStore(db_path=tmp_path / "versions.sqlite3")
+    unscoped_path = store.db_path
 
     t1 = set_study_context("STUDY-XYZ")
     try:
         path1 = store.db_path
-        assert "STUDY-XYZ" in str(path1)
+        assert path1 == unscoped_path
+        assert "STUDY-XYZ" not in str(path1)
     finally:
         reset_study_context(t1)
 
@@ -766,14 +768,14 @@ def test_dynamic_db_path_invalid_study_key_raises_traversal_error(
 
 @pytest.mark.parametrize("valid_key", ["STUDY-01", "study_abc", "STUDY123", "study-01_v2"])
 def test_dynamic_db_path_valid_study_keys_stay_within_base(tmp_path: Path, valid_key: str) -> None:
-    """Verify that valid study keys resolve strictly inside the allowed base directory."""
+    """Verify valid study_context keys pass traversal checks without splitting the DB path."""
     from imednet.core.context import reset_study_context, set_study_context
 
     token = set_study_context(valid_key)
     try:
         store = ConfigVersionStore(db_path=tmp_path / "versions.sqlite3")
         db_file = store.db_path
-        assert valid_key in str(db_file)
+        assert valid_key not in str(db_file)
         assert db_file.resolve().is_relative_to(tmp_path.resolve())
         assert db_file.exists()
     finally:
@@ -812,7 +814,7 @@ def test_dynamic_db_path_missing_base_url_fallback(
         store = ConfigVersionStore(db_path=tmp_path / "versions.sqlite3")
         db_file = store.db_path
         assert "localhost" in str(db_file)
-        assert "STUDY-FALLBACK" in str(db_file)
+        assert "STUDY-FALLBACK" not in str(db_file)
         assert db_file.resolve().is_relative_to(tmp_path.resolve())
         assert db_file.exists()
     finally:
@@ -978,3 +980,241 @@ def test_resolve_committed_config_fast_path_and_mock_fallback(
 
     with patch.object(ConfigVersionStore, "get_history", return_value=[]):
         assert ConfigVersionStore.resolve_committed_config("STUDY-01") is None
+
+
+def test_governance_quickstart_without_env_encryption_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify docs/reference/governance.rst quick-start works without env encryption keys."""
+    import respx
+
+    from imednet import ImednetSDK
+    from imednet.constants import DEFAULT_BASE_URL
+    from imednet.core.context import reset_security_key_context, set_security_key_context
+
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(tmp_path / "config_versions.sqlite3"))
+
+    sec_token = set_security_key_context(None)
+    try:
+        with respx.mock(assert_all_called=True) as router:
+            router.get(f"{DEFAULT_BASE_URL}/api/v1/edc/studies/MY_STUDY/sites").respond(
+                200,
+                json={
+                    "data": [{"siteId": 1, "studyKey": "MY_STUDY"}],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 1,
+                        "totalPages": 1,
+                        "totalElements": 1,
+                    },
+                },
+            )
+
+            sdk = ImednetSDK(
+                api_key="quickstart-api-token",  # pragma: allowlist secret
+                security_key="quickstart-sec-token",  # pragma: allowlist secret
+            )
+            store = ConfigVersionStore()
+            config = StudyConfiguration(
+                study_key="MY_STUDY",
+                phi_fields=["PAT_SSN", "PAT_DOB"],
+            )
+            commit_id = store.commit_config(
+                study_key="MY_STUDY",
+                config=config,
+                sdk=sdk,
+                desc="Add custom PHI field overrides for trial MY_STUDY",
+            )
+
+            history = store.get_history("MY_STUDY")
+            assert len(history) == 1
+            assert history[0]["commit_id"] == commit_id
+
+            old_config = store.rollback_config("MY_STUDY", commit_id)
+            assert old_config.phi_fields == ["PAT_SSN", "PAT_DOB"]
+    finally:
+        reset_security_key_context(sec_token)
+
+
+def test_exports_mask_custom_phi_across_study_context_orchestrator_and_base_urls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify exports mask committed phiFields inside study_context, MultiStudyOrchestrator, and default/explicit base_url."""
+    import pandas as pd
+
+    from imednet import ImednetSDK
+    from imednet.constants import DEFAULT_BASE_URL
+    from imednet.core.context import reset_security_key_context, set_security_key_context
+    from imednet.integrations.export import export_to_csv
+    from imednet.orchestration.orchestrator import MultiStudyOrchestrator
+    from imednet.simulation import SimulationState, create_simulation_transport
+
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(tmp_path / "config_versions.sqlite3"))
+
+    state = SimulationState()
+    state.variables.append(
+        {
+            "studyKey": "STUDY",
+            "variableId": 777,
+            "variableName": "CUSTOM_TRIAL_ID_SECRET",
+            "variableType": "TEXT",
+            "formId": 301,
+            "formKey": "F_DM",
+            "formName": "Demographics",
+            "label": "Custom Trial Secret",
+            "deleted": False,
+        }
+    )
+    for rec in state.records:
+        if rec.get("studyKey") == "STUDY" and rec.get("formKey") == "F_DM":
+            rec.setdefault("recordData", {})["CUSTOM_TRIAL_ID_SECRET"] = "RAW-PHI-999"
+
+    transport = create_simulation_transport(state)
+    sec_token = set_security_key_context(None)
+    try:
+        # 1. Commit configuration using default base_url SDK without env encryption keys
+        sdk_default = ImednetSDK(
+            api_key="gov-api-key",  # pragma: allowlist secret
+            security_key="gov-sec-key",  # pragma: allowlist secret
+            transport=transport,
+            simulation_mode=True,
+        )
+        store = ConfigVersionStore()
+        cfg = StudyConfiguration(
+            study_key="STUDY",
+            phi_fields=["CUSTOM_TRIAL_ID_SECRET"],
+        )
+        store.commit_config(
+            study_key="STUDY",
+            config=cfg,
+            sdk=sdk_default,
+            desc="Declare CUSTOM_TRIAL_ID_SECRET as PHI",
+        )
+
+        # 2. Export inside sdk.study_context("STUDY")
+        csv_ctx = tmp_path / "study_ctx.csv"
+        with sdk_default.study_context("STUDY"):
+            export_to_csv(sdk_default, "STUDY", csv_ctx, quality_gate_enabled=False)
+        df_ctx = pd.read_csv(csv_ctx)
+        assert set(df_ctx["CUSTOM_TRIAL_ID_SECRET"].dropna()) == {"***MASKED***"}
+
+        # 3. Export from an explicit DEFAULT_BASE_URL SDK session
+        sdk_explicit = ImednetSDK(
+            api_key="gov-api-key",  # pragma: allowlist secret
+            security_key="gov-sec-key",  # pragma: allowlist secret
+            base_url=DEFAULT_BASE_URL,
+            transport=transport,
+            simulation_mode=True,
+        )
+        csv_explicit = tmp_path / "explicit_base.csv"
+        export_to_csv(sdk_explicit, "STUDY", csv_explicit, quality_gate_enabled=False)
+        df_explicit = pd.read_csv(csv_explicit)
+        assert set(df_explicit["CUSTOM_TRIAL_ID_SECRET"].dropna()) == {"***MASKED***"}
+
+        # 4. Export inside MultiStudyOrchestrator worker threads (even when main thread context is cleared)
+        reset_security_key_context(sec_token)
+        sec_token = set_security_key_context(None)
+
+        def _worker(study_key: str, worker_sdk: ImednetSDK, _logger: object) -> Path:
+            out_file = tmp_path / f"orch_{study_key}.csv"
+            export_to_csv(worker_sdk, study_key, out_file, quality_gate_enabled=False)
+            return out_file
+
+        orch = MultiStudyOrchestrator(sdk_explicit, max_workers=2)
+        results = orch.execute_pipeline(_worker, whitelist={"STUDY"})
+        assert results["STUDY"]["status"] == "SUCCESS"
+        df_orch = pd.read_csv(results["STUDY"]["data"])
+        assert set(df_orch["CUSTOM_TRIAL_ID_SECRET"].dropna()) == {"***MASKED***"}
+    finally:
+        reset_security_key_context(sec_token)
+
+
+def test_legacy_study_partitioned_sqlite_fallback_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify legacy <host>/<study_key>/config_versions.sqlite3 resolves and bad keys fail closed."""
+    from imednet.core.context import reset_base_url_context, set_base_url_context
+    from imednet.errors import PathTraversalValidationError
+    from imednet.integrations.enrichment import CentralizedMapper, resolve_study_configuration
+    from imednet_workflows.config_version_control import _encrypt_payload, _sha256_of
+
+    base_db = tmp_path / "config_versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(base_db))
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "legacy-secret-key")  # pragma: allowlist secret
+
+    b_tok = set_base_url_context("https://edc.prod.imednetapi.com")
+    try:
+        legacy_file = tmp_path / "edc.prod.imednetapi.com" / "STUDY-LEG" / "config_versions.sqlite3"
+        legacy_file.parent.mkdir(parents=True, exist_ok=True)
+        cfg = StudyConfiguration(study_key="STUDY-LEG", phi_fields=["LEGACY_MRN"])
+        cfg_json = json.dumps(cfg.model_dump(mode="json", by_alias=True), sort_keys=True)
+        commit_hash = _sha256_of(cfg_json)
+        enc_payload = _encrypt_payload(cfg_json)
+
+        with sqlite3.connect(legacy_file) as conn:
+            conn.execute(
+                """
+                CREATE TABLE config_commits (
+                    commit_id TEXT PRIMARY KEY,
+                    study_key TEXT NOT NULL,
+                    version_tag TEXT NOT NULL,
+                    config_data TEXT NOT NULL,
+                    modified_by TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    parent_commit_id TEXT,
+                    content_hash TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO config_commits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    commit_hash,
+                    "STUDY-LEG",
+                    "1.0",
+                    enc_payload,
+                    "auditor",
+                    "legacy study-partitioned commit",
+                    "2026-01-01T00:00:00+00:00",
+                    None,
+                    commit_hash,
+                ),
+            )
+            conn.commit()
+
+        # Canonical unpartitioned file does not exist; resolve_study_configuration falls back to legacy path
+        resolved = resolve_study_configuration("STUDY-LEG")
+        assert resolved is not None
+        assert resolved.phi_fields == ["LEGACY_MRN"]
+
+        # Direct traversal validation raises on store methods and fails closed to None in enrichment
+        with pytest.raises(PathTraversalValidationError):
+            ConfigVersionStore.resolve_committed_config("../escape")
+        assert resolve_study_configuration("../escape") is None
+
+        # Wrong decryption key fails closed to default SensitivityRegistry masking
+        monkeypatch.setenv("IMEDNET_SECURITY_KEY", "wrong-key")  # pragma: allowlist secret
+        assert resolve_study_configuration("STUDY-LEG") is None
+        mapper = CentralizedMapper()
+        mapped = mapper.map_record(
+            {
+                "studyKey": "STUDY-LEG",
+                "recordId": 1,
+                "recordData": {"patient_name": "Alice Doe", "LEGACY_MRN": "123"},
+            }
+        )
+        assert mapped["record_data"]["patient_name"] == "***MASKED***"
+    finally:
+        reset_base_url_context(b_tok)
