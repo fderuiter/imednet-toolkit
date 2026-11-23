@@ -123,6 +123,7 @@ from imednet.utils.filters import (
     validate_record_filter,
 )
 from imednet.utils.security import (
+    SensitivityRegistry,
     _normalize_key,
     global_sensitivity_registry,
     mask_clinical_phi,
@@ -408,6 +409,120 @@ class SinkConfig:
 # ---------------------------------------------------------------------------
 
 
+_TABULAR_BATCH_STAMP_ATTR = "_imednet_tabular_batch_stamp"
+_CONTAINER_CELL_TYPES = (dict, list, tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class TabularBatchStamp:
+    """Immutable preparation stamp bound to a prepared pandas DataFrame batch."""
+
+    mask_phi: bool
+    registry_snapshot: tuple[frozenset[str], frozenset[str]]
+    phi_keys: frozenset[str]
+    columns: tuple[Any, ...]
+    sanitized: bool = False
+
+
+def normalize_phi_keys_snapshot(
+    phi_keys: Iterable[str] | None,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> frozenset[str]:
+    """Normalize custom StudyConfiguration PHI keys into a canonical collapsed frozenset."""
+    if not phi_keys:
+        return frozenset()
+    active_registry = global_sensitivity_registry if registry is None else registry
+    normalized: set[str] = set()
+    for raw_key in phi_keys:
+        if raw_key is None or active_registry.is_exempt(raw_key):
+            continue
+        norm = _normalize_key(raw_key)
+        if norm:
+            collapsed = norm.replace("_", "")
+            if collapsed:
+                normalized.add(collapsed)
+    return frozenset(normalized)
+
+
+def stamp_tabular_batch(
+    df: Any,
+    *,
+    mask_phi: bool,
+    phi_keys: Iterable[str] | None = None,
+    sanitized: bool = False,
+    registry: SensitivityRegistry | None = None,
+) -> Any:
+    """Attach a :class:`TabularBatchStamp` to ``df`` binding active PHI and header state."""
+    columns = getattr(df, "columns", None)
+    obj_dict = getattr(df, "__dict__", None)
+    if not isinstance(obj_dict, dict) or columns is None:
+        return df
+    active_registry = global_sensitivity_registry if registry is None else registry
+    obj_dict[_TABULAR_BATCH_STAMP_ATTR] = TabularBatchStamp(
+        mask_phi=bool(mask_phi),
+        registry_snapshot=active_registry.snapshot(),
+        phi_keys=normalize_phi_keys_snapshot(phi_keys, registry=active_registry)
+        if mask_phi
+        else frozenset(),
+        columns=tuple(columns),
+        sanitized=bool(sanitized),
+    )
+    return df
+
+
+def get_tabular_batch_stamp(df: Any) -> TabularBatchStamp | None:
+    """Return ``df``'s :class:`TabularBatchStamp` when present and matching ``df.columns``."""
+    columns = getattr(df, "columns", None)
+    obj_dict = getattr(df, "__dict__", None)
+    if not isinstance(obj_dict, dict) or columns is None:
+        return None
+    stamp = obj_dict.get(_TABULAR_BATCH_STAMP_ATTR)
+    if not isinstance(stamp, TabularBatchStamp):
+        return None
+    if tuple(columns) != stamp.columns:
+        return None
+    return stamp
+
+
+def has_valid_tabular_batch_stamp(
+    df: Any,
+    *,
+    mask_phi: bool = True,
+    phi_keys: Iterable[str] | None = None,
+    require_sanitized: bool = False,
+    registry: SensitivityRegistry | None = None,
+) -> bool:
+    """Verify whether ``df`` carries a valid preparation stamp for the requested requirements."""
+    stamp = get_tabular_batch_stamp(df)
+    if stamp is None:
+        return False
+    if mask_phi:
+        if not stamp.mask_phi:
+            return False
+        active_registry = global_sensitivity_registry if registry is None else registry
+        if stamp.registry_snapshot != active_registry.snapshot():
+            return False
+        required_phi = normalize_phi_keys_snapshot(phi_keys, registry=active_registry)
+        if not required_phi.issubset(stamp.phi_keys):
+            return False
+    return not (require_sanitized and not stamp.sanitized)
+
+
+def _mask_series_containers_default_phi(series: Any) -> Any:
+    """Mask nested container cells in a pandas Series without invoking scalar mask_clinical_phi."""
+    values = series.tolist()
+    if not any(isinstance(v, _CONTAINER_CELL_TYPES) for v in values):
+        return series
+    pd_mod = sys.modules.get("pandas")
+    new_vals = [mask_clinical_phi(v) if isinstance(v, _CONTAINER_CELL_TYPES) else v for v in values]
+    if pd_mod is not None:
+        return pd_mod.Series(new_vals, index=series.index, dtype=object)
+    return series.apply(
+        lambda v: mask_clinical_phi(v) if isinstance(v, _CONTAINER_CELL_TYPES) else v
+    )
+
+
 def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
     """Return a PHI-redacted copy of a pandas DataFrame without mutating caller state."""
     masked = df.copy()
@@ -433,9 +548,9 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
     for col in object_cols:
         target = masked[col]
         if hasattr(target, "columns"):
-            masked[col] = target.apply(lambda s: s.apply(mask_clinical_phi))
+            masked[col] = target.apply(_mask_series_containers_default_phi)
         else:
-            masked[col] = target.apply(mask_clinical_phi)
+            masked[col] = _mask_series_containers_default_phi(target)
     return masked
 
 
@@ -2270,6 +2385,7 @@ __all__ = [
     "ExportSink",
     "SinkConfig",
     "StateProviderProtocol",
+    "TabularBatchStamp",
     "_redact_uri",
     "_require_optional_dep",
     "apply_quality_gate",
@@ -2279,13 +2395,17 @@ __all__ = [
     "extract_record_id",
     "extract_record_timestamp",
     "get_state_provider",
+    "get_tabular_batch_stamp",
+    "has_valid_tabular_batch_stamp",
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
+    "normalize_phi_keys_snapshot",
     "normalize_sink_value",
     "normalize_watermark_datetime",
     "redact_batch_records",
     "resolve_max_buffered_records",
     "run_streaming_export",
+    "stamp_tabular_batch",
     "validate_max_buffered_records",
 ]

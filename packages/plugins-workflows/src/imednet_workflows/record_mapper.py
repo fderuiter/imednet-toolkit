@@ -43,10 +43,13 @@ from imednet.spi.models import (
 from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import (
     EnrichmentPipeline,
+    get_tabular_batch_stamp,
     global_sensitivity_registry,
     mask_clinical_phi,
     mask_custom_phi_recursive,
+    normalize_phi_keys_snapshot,
     resolve_enrichment_pipeline,
+    stamp_tabular_batch,
 )
 
 from .cached_loader import CachedRecordsLoader
@@ -57,6 +60,48 @@ if TYPE_CHECKING:
 
 # Setup basic logging
 logger = logging.getLogger(__name__)
+
+_CONTAINER_CELL_TYPES = (dict, list, tuple)
+_SCALAR_CELL_CLASSES = frozenset({str, int, float, bool, type(None)})
+
+
+class _IngressPreparedRows(list[dict[str, Any]]):
+    """Parsed record rows carrying verified ingress PHI-masking provenance."""
+
+    def __init__(
+        self,
+        rows: Iterable[dict[str, Any]] = (),
+        *,
+        ingress_masked: bool = False,
+        registry_snapshot: tuple[frozenset[str], frozenset[str]] | None = None,
+        phi_keys: frozenset[str] = frozenset(),
+        has_nested_containers: bool = False,
+    ) -> None:
+        super().__init__(rows)
+        self.ingress_masked = ingress_masked
+        self.registry_snapshot = registry_snapshot
+        self.phi_keys = phi_keys
+        self.has_nested_containers = has_nested_containers
+
+
+def _mask_series_nested_containers(
+    series: pd.Series,
+    phi_keys: set[str],
+) -> pd.Series:
+    """Mask nested dict/list/tuple cells in ``series`` without scalar mask_clinical_phi calls."""
+    values = series.tolist()
+    if not any(isinstance(v, _CONTAINER_CELL_TYPES) for v in values):
+        return series
+    new_values: list[Any] = []
+    for val in values:
+        if isinstance(val, _CONTAINER_CELL_TYPES):
+            masked_val = mask_clinical_phi(val)
+            if phi_keys:
+                masked_val = mask_custom_phi_recursive(masked_val, phi_keys)
+            new_values.append(masked_val)
+        else:
+            new_values.append(val)
+    return pd.Series(new_values, index=series.index, dtype=object)
 
 
 def transform_records_to_sdtm(
@@ -603,6 +648,13 @@ class RecordMapper:
             parsed = pipeline.process(parsed, mask_phi=should_mask)
         return {**meta, **parsed}
 
+    def _uses_standard_parse_record(self) -> bool:
+        """Return True when ``self._parse_record`` has not been overridden or monkeypatched."""
+        return (
+            getattr(type(self), "_parse_record", None) is RecordMapper._parse_record
+            and "_parse_record" not in self.__dict__
+        )
+
     def _parse_records(
         self,
         records: Iterable[RecordModel],
@@ -613,13 +665,81 @@ class RecordMapper:
         """Parse raw records into row dictionaries and count failures."""
         rows: list[dict[str, Any]] = []
         errors = 0
+        all_verified = True
+        saw_chunks = False
+        reg_snap: tuple[frozenset[str], frozenset[str]] | None = None
+        common_phi_keys: frozenset[str] | None = None
+        has_nested = False
         for chunk_rows, chunk_errors in self._iter_parsed_rows(
             records,
             record_model,
             mask_phi=mask_phi,
         ):
+            saw_chunks = True
             rows.extend(chunk_rows)
             errors += chunk_errors
+            if (
+                all_verified
+                and isinstance(chunk_rows, _IngressPreparedRows)
+                and chunk_rows.ingress_masked
+            ):
+                if reg_snap is None:
+                    reg_snap = chunk_rows.registry_snapshot
+                elif chunk_rows.registry_snapshot != reg_snap:
+                    all_verified = False
+                if chunk_rows:
+                    common_phi_keys = (
+                        chunk_rows.phi_keys
+                        if common_phi_keys is None
+                        else (common_phi_keys & chunk_rows.phi_keys)
+                    )
+                if chunk_rows.has_nested_containers:
+                    has_nested = True
+            else:
+                all_verified = False
+
+        should_mask = bool(self.mask_phi if mask_phi is None else mask_phi)
+        if not saw_chunks and should_mask and self._uses_standard_parse_record():
+            active_pipeline = self._get_enrichment_pipeline(None)
+            empty_phi = (
+                normalize_phi_keys_snapshot(active_pipeline.phi_keys)
+                if active_pipeline is not None
+                else frozenset()
+            )
+            return (
+                _IngressPreparedRows(
+                    rows,
+                    ingress_masked=True,
+                    registry_snapshot=global_sensitivity_registry.snapshot(),
+                    phi_keys=empty_phi,
+                    has_nested_containers=False,
+                ),
+                errors,
+            )
+
+        if (
+            saw_chunks
+            and all_verified
+            and reg_snap is not None
+            and global_sensitivity_registry.snapshot() == reg_snap
+        ):
+            if common_phi_keys is None:
+                active_pipeline = self._get_enrichment_pipeline(None)
+                common_phi_keys = (
+                    normalize_phi_keys_snapshot(active_pipeline.phi_keys)
+                    if active_pipeline is not None
+                    else frozenset()
+                )
+            return (
+                _IngressPreparedRows(
+                    rows,
+                    ingress_masked=True,
+                    registry_snapshot=reg_snap,
+                    phi_keys=common_phi_keys,
+                    has_nested_containers=has_nested,
+                ),
+                errors,
+            )
         return rows, errors
 
     def _iter_parsed_rows(
@@ -630,12 +750,42 @@ class RecordMapper:
         mask_phi: bool | None = None,
     ) -> Iterator[tuple[list[dict[str, Any]], int]]:
         """Iterate over records and parse them in chunks."""
+        should_mask = bool(self.mask_phi if mask_phi is None else mask_phi)
         for chunk in iter_chunks(records, chunk_size=self._pipeline.chunk_size):
             rows: list[dict[str, Any]] = []
             errors = 0
+            can_track_ingress = should_mask and self._uses_standard_parse_record()
+            reg_snap = global_sensitivity_registry.snapshot() if can_track_ingress else None
+            common_phi_keys: frozenset[str] | None = None
+            phi_snap_by_sk: dict[str | None, frozenset[str]] = {}
+            has_nested = False
+            scalar_classes = _SCALAR_CELL_CLASSES
             for rec in chunk:
                 try:
-                    rows.append(self._parse_record(rec, record_model, mask_phi=mask_phi))
+                    row = self._parse_record(rec, record_model, mask_phi=mask_phi)
+                    rows.append(row)
+                    if reg_snap is not None:
+                        if not has_nested:
+                            for v in row.values():
+                                if v.__class__ not in scalar_classes and isinstance(
+                                    v, _CONTAINER_CELL_TYPES
+                                ):
+                                    has_nested = True
+                                    break
+                        resolved_sk = getattr(rec, "study_key", None) or self._active_study_key
+                        sk_key = resolved_sk if isinstance(resolved_sk, str) else None
+                        row_phi = phi_snap_by_sk.get(sk_key)
+                        if row_phi is None:
+                            pipeline = self._get_enrichment_pipeline(sk_key)
+                            row_phi = (
+                                normalize_phi_keys_snapshot(pipeline.phi_keys)
+                                if pipeline is not None
+                                else frozenset()
+                            )
+                            phi_snap_by_sk[sk_key] = row_phi
+                        common_phi_keys = (
+                            row_phi if common_phi_keys is None else (common_phi_keys & row_phi)
+                        )
                 except (ValidationError, TypeError) as exc:
                     errors += 1
                     logger.warning(
@@ -646,7 +796,26 @@ class RecordMapper:
                 except Exception as exc:  # pragma: no cover - unexpected
                     errors += 1
                     logger.error("Unexpected error processing recordId %s: %s", rec.record_id, exc)
-            yield rows, errors
+            if reg_snap is not None and global_sensitivity_registry.snapshot() == reg_snap:
+                if common_phi_keys is None:
+                    active_pipeline = self._get_enrichment_pipeline(None)
+                    common_phi_keys = (
+                        normalize_phi_keys_snapshot(active_pipeline.phi_keys)
+                        if active_pipeline is not None
+                        else frozenset()
+                    )
+                yield (
+                    _IngressPreparedRows(
+                        rows,
+                        ingress_masked=True,
+                        registry_snapshot=reg_snap,
+                        phi_keys=common_phi_keys,
+                        has_nested_containers=has_nested,
+                    ),
+                    errors,
+                )
+            else:
+                yield rows, errors
 
     def _build_dataframe(
         self,
@@ -663,9 +832,10 @@ class RecordMapper:
         if df.empty:
             return df
 
-        should_mask = self.mask_phi if mask_phi is None else mask_phi
+        should_mask = bool(self.mask_phi if mask_phi is None else mask_phi)
         pipeline = self._get_enrichment_pipeline(study_key)
         pipeline_phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
+        required_phi_snap = normalize_phi_keys_snapshot(pipeline_phi_keys)
         mapped_targets: list[str] = []
         replaced_sources: set[str] = set()
         if pipeline is not None and pipeline.mappings:
@@ -700,38 +870,76 @@ class RecordMapper:
         df = df[meta_cols + unique_effective_var_keys]
         if should_mask:
             collapsed_phi_keys = {_collapse_alnum_key(pk) for pk in pipeline_phi_keys}
-            sensitive_vars = [
-                key
-                for key in unique_effective_var_keys
-                if global_sensitivity_registry.is_sensitive(key)
-                or (
+
+            def _is_header_sensitive(header: str) -> bool:
+                return global_sensitivity_registry.is_sensitive(header) or (
                     bool(collapsed_phi_keys)
-                    and not global_sensitivity_registry.is_exempt(key)
-                    and _collapse_alnum_key(key) in collapsed_phi_keys
+                    and not global_sensitivity_registry.is_exempt(header)
+                    and _collapse_alnum_key(header) in collapsed_phi_keys
                 )
-            ]
+
+            for mcol in meta_cols:
+                if _is_header_sensitive(mcol):
+                    df[mcol] = "***MASKED***"
+
+            sensitive_vars: list[str] = []
+            for key in unique_effective_var_keys:
+                if _is_header_sensitive(key):
+                    sensitive_vars.append(key)
+                    continue
+                if use_labels:
+                    mapped_label = str(label_map.get(key, key))
+                    if mapped_label != key and _is_header_sensitive(mapped_label):
+                        sensitive_vars.append(key)
+
             for key in sensitive_vars:
                 df[key] = "***MASKED***"
 
-            non_sensitive_vars = [
-                key for key in unique_effective_var_keys if key not in set(sensitive_vars)
-            ]
-            if non_sensitive_vars:
-                var_frame = df[non_sensitive_vars]
-                try:
-                    obj_cols = var_frame.select_dtypes(include=[object, "str"]).columns
-                except TypeError:
-                    obj_cols = var_frame.select_dtypes(include=[object]).columns
-                for col in obj_cols:
-                    df[col] = df[col].apply(mask_clinical_phi)
-                    if pipeline_phi_keys:
-                        df[col] = df[col].apply(
-                            lambda val: mask_custom_phi_recursive(val, pipeline_phi_keys)
-                        )
+            current_reg_snap = global_sensitivity_registry.snapshot()
+            ingress_verified = (
+                isinstance(rows, _IngressPreparedRows)
+                and rows.ingress_masked
+                and rows.registry_snapshot == current_reg_snap
+                and required_phi_snap.issubset(rows.phi_keys)
+            )
+            should_scan_containers = (not ingress_verified) or (
+                isinstance(rows, _IngressPreparedRows) and rows.has_nested_containers
+            )
+            if should_scan_containers:
+                sensitive_var_set = set(sensitive_vars)
+                non_sensitive_vars = [
+                    key for key in unique_effective_var_keys if key not in sensitive_var_set
+                ]
+                if non_sensitive_vars:
+                    var_frame = df[non_sensitive_vars]
+                    try:
+                        obj_cols = var_frame.select_dtypes(include=[object, "str"]).columns
+                    except TypeError:
+                        obj_cols = var_frame.select_dtypes(include=[object]).columns
+                    for col in obj_cols:
+                        target = df[col]
+                        if isinstance(target, pd.DataFrame):
+                            df[col] = target.apply(
+                                lambda s: _mask_series_nested_containers(s, pipeline_phi_keys)
+                            )
+                        else:
+                            df[col] = _mask_series_nested_containers(target, pipeline_phi_keys)
 
         if use_labels:
             rename_map = {key: label_map.get(key, key) for key in unique_effective_var_keys}
             df = df.rename(columns=rename_map)
+
+        effective_phi_keys: Iterable[str] = (
+            (rows.phi_keys | required_phi_snap)
+            if isinstance(rows, _IngressPreparedRows) and rows.ingress_masked
+            else required_phi_snap
+        )
+        stamp_tabular_batch(
+            df,
+            mask_phi=should_mask,
+            phi_keys=effective_phi_keys,
+            sanitized=False,
+        )
         return df
 
     def iter_dataframes(
@@ -887,6 +1095,8 @@ class RecordMapper:
             "recordStatus",
             "dateCreated",
         }
+        collapsed_phi_keys = {_collapse_alnum_key(pk) for pk in pipeline_phi_keys}
+        standard_parse = self._uses_standard_parse_record()
         tree: dict[str, dict[str, Any]] = {}
 
         for rec in record_iter:
@@ -915,9 +1125,18 @@ class RecordMapper:
                 continue
 
             if should_mask:
-                parsed_data = mask_clinical_phi(parsed_data)
-                if pipeline_phi_keys:
-                    parsed_data = mask_custom_phi_recursive(parsed_data, pipeline_phi_keys)
+                if not standard_parse:
+                    parsed_data = mask_clinical_phi(parsed_data)
+                    if pipeline_phi_keys:
+                        parsed_data = mask_custom_phi_recursive(parsed_data, pipeline_phi_keys)
+                else:
+                    for k in list(parsed_data):
+                        if global_sensitivity_registry.is_sensitive(k) or (
+                            bool(collapsed_phi_keys)
+                            and not global_sensitivity_registry.is_exempt(k)
+                            and _collapse_alnum_key(k) in collapsed_phi_keys
+                        ):
+                            parsed_data[k] = "***MASKED***"
 
             if use_labels_as_keys:
                 remapped: dict[str, Any] = {}
@@ -928,7 +1147,17 @@ class RecordMapper:
                         lbl = label_map.get(k)
                         target_key = lbl if lbl is not None else k
                         if target_key not in meta_keys:
-                            remapped[target_key] = v
+                            if should_mask and (
+                                global_sensitivity_registry.is_sensitive(target_key)
+                                or (
+                                    bool(collapsed_phi_keys)
+                                    and not global_sensitivity_registry.is_exempt(target_key)
+                                    and _collapse_alnum_key(target_key) in collapsed_phi_keys
+                                )
+                            ):
+                                remapped[target_key] = "***MASKED***"
+                            else:
+                                remapped[target_key] = v
                 parsed_data = remapped
 
             # Automatically perform lookups for parent record identifiers using available metadata
@@ -1199,7 +1428,34 @@ class RecordMapper:
         )
         if not frames:
             return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
+        combined = pd.concat(frames, ignore_index=True)
+        first_stamp = get_tabular_batch_stamp(frames[0])
+        if (
+            first_stamp is not None
+            and all(
+                (st := get_tabular_batch_stamp(f)) is not None
+                and st.mask_phi == first_stamp.mask_phi
+                and st.registry_snapshot == first_stamp.registry_snapshot
+                for f in frames[1:]
+            )
+            and (
+                not first_stamp.mask_phi
+                or first_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
+            )
+        ):
+            common_phi = first_stamp.phi_keys.intersection(
+                *(get_tabular_batch_stamp(f).phi_keys for f in frames[1:])  # type: ignore[union-attr]
+            )
+            stamp_tabular_batch(
+                combined,
+                mask_phi=first_stamp.mask_phi,
+                phi_keys=common_phi,
+                sanitized=all(
+                    bool(get_tabular_batch_stamp(f).sanitized)  # type: ignore[union-attr]
+                    for f in frames
+                ),
+            )
+        return combined
 
 
 __all__ = [

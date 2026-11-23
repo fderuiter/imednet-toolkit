@@ -19,6 +19,7 @@ from .export import (
     _build_tabular_sink_config,
     _canonical_record_id,
     _config_has_streaming_options,
+    _dedup_case_insensitive_columns,
     _filter_df_excluding_record_ids,
     _FormExportContext,
     _is_incremental_config,
@@ -135,8 +136,7 @@ def _write_hive_form_rows(
     )
     if skip_empty and df.empty:
         return 0
-    df.columns = df.columns.astype(str)
-    df = df.loc[:, ~df.columns.str.lower().duplicated()]
+    df = _dedup_case_insensitive_columns(df, ensure_str_columns=True)
     if mask_phi and not df.empty:
         df = _mask_df(df, phi_keys=phi_keys)
     table = pyarrow_module.Table.from_pandas(df, preserve_index=False)

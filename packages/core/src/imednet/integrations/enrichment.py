@@ -153,14 +153,24 @@ def _mask_custom_phi_recursive(value: Any, phi_keys: set[str]) -> Any:
             k: (
                 _MASKED_VALUE
                 if isinstance(k, str) and _matches_custom_phi_key(k, phi_keys)
-                else _mask_custom_phi_recursive(v, phi_keys)
+                else (
+                    _mask_custom_phi_recursive(v, phi_keys)
+                    if isinstance(v, (dict, list, tuple))
+                    else v
+                )
             )
             for k, v in value.items()
         }
     if isinstance(value, list):
-        return [_mask_custom_phi_recursive(v, phi_keys) for v in value]
+        return [
+            _mask_custom_phi_recursive(v, phi_keys) if isinstance(v, (dict, list, tuple)) else v
+            for v in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_mask_custom_phi_recursive(v, phi_keys) for v in value)
+        return tuple(
+            _mask_custom_phi_recursive(v, phi_keys) if isinstance(v, (dict, list, tuple)) else v
+            for v in value
+        )
     return value
 
 
