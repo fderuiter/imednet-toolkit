@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 import types
@@ -20,6 +21,7 @@ from scripts.build_docs import (
     scope_apidoc_inherited_members,
 )
 from scripts.validate_docs import (
+    _verify_airflow_provider_html,
     _verify_core_html,
     _verify_pagination_html,
     _verify_sdk_html,
@@ -462,3 +464,109 @@ def test_generate_api_reference_preserves_existing_docs_on_staging_failure(
     with pytest.raises(FileNotFoundError):
         monkeypatch.setattr(build_docs_mod.shutil, "which", lambda _t: None)
         require_sphinx_tools("sphinx-apidoc", "sphinx-build")
+
+
+def test_sphinx_airflow_provider_html_and_parity_gates(tmp_path: Path) -> None:
+    """Sphinx renders all 27+1 ImednetExportOperator args with 0 spi.export nitpick warnings and catches drift."""
+    repo_root = Path(__file__).resolve().parents[2]
+    src_dir = tmp_path / "docs"
+    api_dir = src_dir / "reference" / "api"
+    howto_dir = src_dir / "how-to"
+    api_dir.mkdir(parents=True)
+    howto_dir.mkdir(parents=True)
+    html_dir = tmp_path / "_build" / "html"
+
+    (src_dir / "index.rst").write_text(
+        "Test Docs\n=========\n\n"
+        ".. meta::\n   :description: Test docs\n\n"
+        ".. toctree::\n   :maxdepth: 2\n\n"
+        "   how-to/airflow\n"
+        "   reference/api/imednet.integrations\n"
+        "   reference/api/apache_airflow_providers_imednet\n"
+        "   reference/api/apache_airflow_providers_imednet.hooks\n"
+        "   reference/api/apache_airflow_providers_imednet.operators\n",
+        encoding="utf-8",
+    )
+    (src_dir / "404.rst").write_text(":orphan:\n\nNot Found\n=========\n", encoding="utf-8")
+    (howto_dir / "airflow.rst").write_text(
+        (repo_root / "docs" / "how-to" / "airflow.rst").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    for api_name in (
+        "imednet.integrations.rst",
+        "apache_airflow_providers_imednet.rst",
+        "apache_airflow_providers_imednet.hooks.rst",
+        "apache_airflow_providers_imednet.operators.rst",
+    ):
+        (api_dir / api_name).write_text(
+            (repo_root / "docs" / "reference" / "api" / api_name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sphinx",
+            "-b",
+            "html",
+            "-n",
+            "-c",
+            str(repo_root / "docs"),
+            str(src_dir),
+            str(html_dir),
+        ],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, f"Sphinx failed:\n{res.stdout}\n{res.stderr}"
+    spi_export_warnings = [line for line in res.stderr.splitlines() if "imednet.spi.export" in line]
+    assert spi_export_warnings == [], f"Unexpected spi.export warnings: {spi_export_warnings}"
+
+    built_api = html_dir / "reference" / "api"
+    operators_html_path = built_api / "apache_airflow_providers_imednet.operators.html"
+    provider_html_path = built_api / "apache_airflow_providers_imednet.html"
+    airflow_guide_html_path = html_dir / "how-to" / "airflow.html"
+
+    assert (
+        _verify_airflow_provider_html(
+            operators_html_path,
+            provider_html_path,
+            airflow_guide_html_path,
+        )
+        is False
+    )
+
+    # Synthetic undocumented operator parameter fails validation
+    assert (
+        _verify_airflow_provider_html(
+            operators_html_path,
+            provider_html_path,
+            airflow_guide_html_path,
+            expected_operator_params=["study_key", "synthetic_undocumented_arg"],
+        )
+        is True
+    )
+
+    # Blank parameter description in rendered HTML fails validation
+    blanked_operators = tmp_path / "blanked_operators.html"
+    orig_op_html = operators_html_path.read_text(encoding="utf-8")
+    mutated_op_html = re.sub(
+        r"(<li><p><strong>as_sdtm</strong>.*?)\u2013.*?(</p></li>)",
+        lambda match: f"{match.group(1)}\u2013 {match.group(2)}",
+        orig_op_html,
+        count=1,
+        flags=re.DOTALL,
+    )
+    assert mutated_op_html != orig_op_html
+    blanked_operators.write_text(mutated_op_html, encoding="utf-8")
+    assert (
+        _verify_airflow_provider_html(
+            blanked_operators,
+            provider_html_path,
+            airflow_guide_html_path,
+        )
+        is True
+    )

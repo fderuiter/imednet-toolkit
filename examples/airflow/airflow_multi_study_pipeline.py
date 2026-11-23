@@ -74,7 +74,7 @@ with DAG(
 
     ImednetExportOperator.partial(
         task_id="export_records",
-        export_func="export_to_csv",
+        destination="csv",
         imednet_conn_id=IMEDNET_CONN_ID,
         pool=IMEDNET_EXPORT_POOL,
         retries=3,

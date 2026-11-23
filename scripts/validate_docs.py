@@ -4,6 +4,7 @@ import argparse
 import ast
 import contextlib
 import importlib
+import inspect
 import io
 import re
 import shlex
@@ -910,6 +911,224 @@ def _verify_core_html(core_page: Path) -> bool:
     return has_errors
 
 
+class _MethodParamHtmlExtractor(HTMLParser):
+    """Extract ``param_name -> description`` mappings for Sphinx ``<dl class="py method">`` entries."""
+
+    def __init__(self, target_method_id: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.target_method_id = target_method_id
+        self.found_method = False
+        self.param_descriptions: dict[str, str] = {}
+        self._dl_depth = 0
+        self._target_dl_depth: int | None = None
+        self._in_field_dt = False
+        self._field_dt_chunks: list[str] = []
+        self._in_params_dd_depth: int | None = None
+        self._dd_depth = 0
+        self._in_li = False
+        self._li_chunks: list[str] = []
+        self._in_strong = False
+        self._strong_chunks: list[str] = []
+        self._current_param_name: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = dict(attrs)
+        if tag == "dl":
+            self._dl_depth += 1
+        elif tag == "dt":
+            if attr_map.get("id") == self.target_method_id and self._dl_depth > 0:
+                self.found_method = True
+                self._target_dl_depth = self._dl_depth
+            elif self._target_dl_depth is not None:
+                self._in_field_dt = True
+                self._field_dt_chunks = []
+        elif tag == "dd":
+            self._dd_depth += 1
+        elif self._in_params_dd_depth is not None and tag == "li":
+            self._in_li = True
+            self._li_chunks = []
+            self._current_param_name = None
+        elif self._in_li and tag == "strong" and self._current_param_name is None:
+            self._in_strong = True
+            self._strong_chunks = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_field_dt:
+            self._field_dt_chunks.append(data)
+        if self._in_strong:
+            self._strong_chunks.append(data)
+        if self._in_li:
+            self._li_chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "strong" and self._in_strong:
+            self._in_strong = False
+            self._current_param_name = "".join(self._strong_chunks).strip()
+        elif tag == "li" and self._in_li:
+            self._in_li = False
+            if self._current_param_name:
+                full_text = " ".join("".join(self._li_chunks).split())
+                if "\u2013" in full_text:
+                    _, _, raw_desc = full_text.partition("\u2013")
+                elif " -- " in full_text:
+                    _, _, raw_desc = full_text.partition(" -- ")
+                else:
+                    raw_desc = ""
+                self.param_descriptions[self._current_param_name] = raw_desc.strip()
+            self._current_param_name = None
+        elif tag == "dt" and self._in_field_dt:
+            self._in_field_dt = False
+            dt_label = " ".join("".join(self._field_dt_chunks).split())
+            if dt_label.startswith("Parameters"):
+                self._in_params_dd_depth = self._dd_depth + 1
+        elif tag == "dd":
+            if self._in_params_dd_depth is not None and self._dd_depth == self._in_params_dd_depth:
+                self._in_params_dd_depth = None
+            self._dd_depth = max(0, self._dd_depth - 1)
+        elif tag == "dl":
+            if self._target_dl_depth is not None and self._dl_depth == self._target_dl_depth:
+                self._target_dl_depth = None
+                self._in_params_dd_depth = None
+            self._dl_depth = max(0, self._dl_depth - 1)
+
+
+def _expected_signature_param_tokens(callable_obj: Any) -> list[str]:
+    """Return expected rendered Sphinx parameter names (including ``**kwargs``) for ``callable_obj``."""
+    tokens: list[str] = []
+    for param_name, param in inspect.signature(callable_obj).parameters.items():
+        if param_name == "self":
+            continue
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            tokens.append(f"*{param_name}")
+        elif param.kind == inspect.Parameter.VAR_KEYWORD:
+            tokens.append(f"**{param_name}")
+        else:
+            tokens.append(param_name)
+    return tokens
+
+
+def _verify_airflow_provider_html(
+    operators_page: Path,
+    provider_page: Path,
+    airflow_guide_page: Path | None = None,
+    *,
+    expected_operator_params: Sequence[str] | None = None,
+) -> bool:
+    """Verify rendered Airflow provider HTML documents all operator/sensor/trigger args, links, and guides."""
+    repo_root = Path(__file__).resolve().parents[1]
+    for pkg_rel in (
+        "packages/core/src",
+        "packages/plugins-workflows/src",
+        "packages/providers-airflow/src",
+    ):
+        src_path = str(repo_root / pkg_rel)
+        if src_path not in sys.path:
+            sys.path.insert(0, src_path)
+
+    from apache_airflow_providers_imednet import (
+        ImednetExportOperator,
+        ImednetJobSensor,
+        ImednetJobTrigger,
+    )
+    from apache_airflow_providers_imednet import export as airflow_export_mod
+    from apache_airflow_providers_imednet.get_provider_info import get_provider_info
+
+    has_errors = False
+    operators_html = operators_page.read_text(encoding="utf-8")
+    provider_html = provider_page.read_text(encoding="utf-8")
+
+    op_tokens = (
+        list(expected_operator_params)
+        if expected_operator_params is not None
+        else _expected_signature_param_tokens(ImednetExportOperator.__init__)
+    )
+    checks: tuple[tuple[str, str, list[str]], ...] = (
+        (
+            operators_html,
+            "apache_airflow_providers_imednet.operators.export.ImednetExportOperator.__init__",
+            op_tokens,
+        ),
+        (
+            provider_html,
+            "apache_airflow_providers_imednet.sensors.ImednetJobSensor.__init__",
+            _expected_signature_param_tokens(ImednetJobSensor.__init__),
+        ),
+        (
+            provider_html,
+            "apache_airflow_providers_imednet.triggers.ImednetJobTrigger.__init__",
+            _expected_signature_param_tokens(ImednetJobTrigger.__init__),
+        ),
+    )
+
+    for html_text, method_id, expected_tokens in checks:
+        extractor = _MethodParamHtmlExtractor(method_id)
+        extractor.feed(html_text)
+        if not extractor.found_method:
+            print(f"Error: Airflow method '{method_id}' missing from rendered HTML.")
+            has_errors = True
+            continue
+        for token in expected_tokens:
+            fallback_token = token.lstrip("*")
+            desc = extractor.param_descriptions.get(token)
+            if desc is None and fallback_token != token:
+                desc = extractor.param_descriptions.get(fallback_token)
+            if desc is None:
+                print(f"Error: Parameter '{token}' missing from rendered HTML for '{method_id}'.")
+                has_errors = True
+            elif not desc.strip():
+                print(
+                    f"Error: Parameter '{token}' on '{method_id}' has an empty rendered description."
+                )
+                has_errors = True
+
+    if "imednet.spi.export." in provider_html:
+        print(
+            "Error: Unresolved 'imednet.spi.export.*' cross-reference text found in apache_airflow_providers_imednet.html."
+        )
+        has_errors = True
+
+    provider_parsed = _parse_html_file(provider_page)
+    for wrapper_name in getattr(airflow_export_mod, "__all__", ()):
+        wrapper_id = f"apache_airflow_providers_imednet.export.{wrapper_name}"
+        if wrapper_id not in provider_parsed.ids:
+            print(
+                f"Error: Airflow export wrapper '{wrapper_id}' missing from apache_airflow_providers_imednet.html."
+            )
+            has_errors = True
+
+    if airflow_guide_page is not None and airflow_guide_page.exists():
+        guide_html = airflow_guide_page.read_text(encoding="utf-8")
+        hidden_fields = get_provider_info()["connection-types"][0]["ui-field-behaviour"][
+            "hidden-fields"
+        ]
+        for field_name in hidden_fields:
+            if field_name not in guide_html:
+                print(
+                    f"Error: Hidden Airflow UI field '{field_name}' missing from rendered how-to/airflow.html."
+                )
+                has_errors = True
+        for sdtm_opt in (
+            "as_sdtm",
+            "domain",
+            "sdtm_domain",
+            "standards_profile",
+            "min_standards_score",
+            "naming_convention",
+        ):
+            if sdtm_opt not in guide_html:
+                print(
+                    f"Error: Airflow SDTM option '{sdtm_opt}' missing from rendered how-to/airflow.html."
+                )
+                has_errors = True
+        if "export_helpers" not in guide_html or "mypy" not in guide_html:
+            print(
+                "Error: Rendered how-to/airflow.html is missing SPI export_helpers or mypy guidance."
+            )
+            has_errors = True
+
+    return has_errors
+
+
 def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
     """Verify rendered HTML model fields, endpoint methods, _modules/index.html, and [docs] backlinks."""
     print("Checking rendered Sphinx HTML API reference and viewcode backlinks...")
@@ -938,6 +1157,9 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
     sdk_page = api_html_dir / "imednet.html"
     pagination_page = api_html_dir / "imednet.pagination.html"
     core_page = api_html_dir / "imednet.core.html"
+    airflow_provider_page = api_html_dir / "apache_airflow_providers_imednet.html"
+    airflow_operators_page = api_html_dir / "apache_airflow_providers_imednet.operators.html"
+    airflow_guide_page = html_dir / "how-to" / "airflow.html"
     modules_index = html_dir / "_modules" / "index.html"
 
     for required_page in (
@@ -946,6 +1168,8 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
         sdk_page,
         pagination_page,
         core_page,
+        airflow_provider_page,
+        airflow_operators_page,
         modules_index,
     ):
         if not required_page.exists():
@@ -1160,6 +1384,12 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
     if _verify_pagination_html(pagination_page):
         has_errors = True
     if _verify_core_html(core_page):
+        has_errors = True
+    if _verify_airflow_provider_html(
+        airflow_operators_page,
+        airflow_provider_page,
+        airflow_guide_page,
+    ):
         has_errors = True
 
     # 3. Verify _modules/index.html omits builtins.html and all [docs] backlinks resolve

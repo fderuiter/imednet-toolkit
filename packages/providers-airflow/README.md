@@ -30,8 +30,10 @@ pip install ./packages/providers-airflow
 **Required Dependencies:**
 This package requires `imednet`, `imednet-workflows` (for incremental Airflow `Variable` checkpointing), and `apache-airflow>=3.2.0,<4.0.0`.
 
-**Build Targets & Namespace Compatibility (Hatchling):**
-This package uses Hatchling as its build backend, targeting `src/apache_airflow_providers_imednet`, registering the `apache_airflow_provider` discovery entry point (`apache_airflow_providers_imednet:get_provider_info`), and dynamically aliasing `airflow.providers.imednet.*` to the public provider modules.
+**Build Targets & Namespace Compatibility (Hatchling & `mypy --strict`):**
+This package uses Hatchling as its build backend, limiting wheel build targets strictly to `src/apache_airflow_providers_imednet` (including `py.typed`), registering the `apache_airflow_provider` discovery entry point (`apache_airflow_providers_imednet:get_provider_info`), and dynamically aliasing `airflow.providers.imednet.*` at runtime via a `sys.meta_path` module finder (`_ImednetAirflowProviderFinder`).
+- **Static Type Checking (`mypy --strict`)**: Import hooks, operators, sensors, and triggers from the canonical `apache_airflow_providers_imednet` package so `mypy --strict` resolves full inline type annotations without missing-import overrides.
+- **Runtime Airflow Alias**: `airflow.providers.imednet.*` (`airflow.providers.imednet.hooks`, `airflow.providers.imednet.operators`, `airflow.providers.imednet.sensors`, `airflow.providers.imednet.triggers`) resolves identically at Python runtime for Airflow 3 provider discovery, but is not materialized on disk inside the wheel.
 
 ## Usage Guide
 
@@ -73,7 +75,7 @@ with DAG(
 
 ## Using the ImednetHook
 
-The `ImednetHook` resolves credentials from Airflow connections (`imednet` connection type, including custom Airflow UI form widgets and `extra__imednet__*` fields), provides `test_connection()` with automatic secret scrubbing, and exposes both synchronous (`ImednetSDK`) and asynchronous (`AsyncImednetSDK`) clients.
+The `ImednetHook` resolves credentials from Airflow connections (`imednet` connection type, relabeling `login`/`password` as **API Key** and **Security Key**, exposing typed UI widgets `base_url`, `oidc_token`, `timeout`, `strict_mode`, and `simulation_mode`, and hiding `host`, `schema`, `port`, and `extra` in the Airflow 3 UI while still honoring `host` and `extra` JSON configured via Airflow CLI, `AIRFLOW_CONN_*` URIs, or `generic` connections), provides `test_connection()` with automatic secret scrubbing, and exposes both synchronous (`ImednetSDK`) and asynchronous (`AsyncImednetSDK`) clients.
 
 ### Getting the SDK Client
 

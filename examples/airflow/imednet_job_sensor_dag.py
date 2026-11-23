@@ -7,11 +7,15 @@ triggerer (:class:`ImednetJobTrigger`) and polls asynchronously via
 
 Configuration is similar to ``ImednetExportOperator``:
 - Credentials are read from the Airflow connection ``imednet_default`` (or a
-  custom ``imednet_conn_id``) using the login/password or ``extra`` fields.
-  Environment variables ``IMEDNET_API_KEY`` and ``IMEDNET_SECURITY_KEY`` may be
-  used as fallbacks.
-- ``base_url`` can be provided in ``extra`` or via ``IMEDNET_BASE_URL`` when
-  targeting a non-default environment.
+  custom ``imednet_conn_id``) via the **API Key** (``login``) and **Security Key**
+  (``password``) form inputs, typed ``imednet`` connection widgets (``base_url``,
+  ``oidc_token``, ``timeout``, ``strict_mode``, ``simulation_mode``), or
+  ``IMEDNET_API_KEY`` and ``IMEDNET_SECURITY_KEY`` environment fallbacks.
+- Note that the Airflow 3 UI hides ``host``, ``schema``, ``port``, and ``extra``
+  on the ``imednet`` connection form; use the typed ``base_url`` widget or
+  ``IMEDNET_BASE_URL`` in the UI, or define connections via Airflow CLI,
+  ``AIRFLOW_CONN_*`` URIs, or a ``generic`` connection when passing ``host`` or
+  raw ``extra`` JSON.
 
 Update ``STUDY_KEY`` and ``BATCH_ID`` with real values before running.
 """

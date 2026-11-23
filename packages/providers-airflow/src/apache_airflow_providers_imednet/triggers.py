@@ -63,13 +63,15 @@ class ImednetJobTrigger(BaseTrigger):
         poke_interval: float = 60.0,
         timeout: float | None = None,
     ) -> None:
-        """Initialize the asynchronous iMednet job trigger.
+        """Initialize the asynchronous iMednet ``Job`` trigger.
 
-        :param study_key: Study key identifier.
-        :param batch_id: Batch or job identifier to poll.
-        :param imednet_conn_id: Airflow connection ID used to resolve credentials at runtime.
-        :param poke_interval: Delay in seconds between polling attempts.
-        :param timeout: Optional maximum polling duration in seconds.
+        Args:
+            study_key: The ``Study`` key identifier owning the asynchronous ``Job``.
+            batch_id: The batch or ``Job`` identifier to poll until terminal completion.
+            imednet_conn_id: Airflow connection ID used to resolve iMednet API credentials
+                at trigger execution time.
+            poke_interval: Delay in seconds between asynchronous ``Job`` polling attempts.
+            timeout: Optional maximum polling duration in seconds before failing.
         """
         cast(Any, super()).__init__()
         self.study_key = _validate_trigger_identifier(

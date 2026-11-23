@@ -12,6 +12,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from apache_airflow_providers_imednet import (
+    ImednetExportOperator,
+    ImednetHook,
+    ImednetJobSensor,
+    ImednetJobTrigger,
+)
+from apache_airflow_providers_imednet import export as airflow_export_wrappers
+from apache_airflow_providers_imednet.get_provider_info import get_provider_info
 from imednet.integrations.sink_base import SinkConfig
 from imednet.plugins import WorkflowsNamespaceProtocol
 from imednet.sdk import ImednetSDK
@@ -32,6 +40,15 @@ STREAMING_CHECKPOINT_OPTIONS: tuple[str, ...] = (
     "stream_name",
     "ledger_path",
     "state_provider",
+)
+
+AIRFLOW_SDTM_OPTIONS: tuple[str, ...] = (
+    "as_sdtm",
+    "domain",
+    "sdtm_domain",
+    "standards_profile",
+    "min_standards_score",
+    "naming_convention",
 )
 
 
@@ -349,6 +366,182 @@ def validate_workflow_interactions_sections(workflow_interactions_rst: Path) -> 
     return errors
 
 
+def _parse_google_args_section(docstring: str) -> dict[str, str]:
+    """Extract parameter descriptions from a Google-style ``Args:`` docstring block."""
+    lines = inspect.cleandoc(docstring).splitlines()
+    in_args = False
+    args_indent: int | None = None
+    parsed: dict[str, str] = {}
+    current_param: str | None = None
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        if not in_args:
+            if stripped == "Args:":
+                in_args = True
+            continue
+
+        if not stripped:
+            continue
+
+        if args_indent is None:
+            if indent == 0:
+                break
+            args_indent = indent
+
+        if indent < args_indent:
+            break
+
+        if indent == args_indent and ":" in stripped:
+            raw_name, _, first_desc = stripped.partition(":")
+            param_token = raw_name.strip()
+            if re.fullmatch(r"\*{0,2}[A-Za-z_][A-Za-z0-9_]*", param_token):
+                current_param = param_token
+                parsed[current_param] = first_desc.strip()
+                continue
+
+        if current_param is not None and indent > args_indent:
+            prev = parsed[current_param]
+            parsed[current_param] = f"{prev} {stripped}".strip()
+
+    return parsed
+
+
+def validate_google_init_docstring_coverage(
+    target_cls: type,
+    extra_expected_params: Iterable[str] = (),
+) -> list[str]:
+    """Verify ``target_cls.__init__`` uses Google-style ``Args:`` and documents every parameter."""
+    errors: list[str] = []
+    cls_name = f"{target_cls.__module__}.{target_cls.__qualname__}.__init__"
+    docstring = inspect.getdoc(target_cls.__init__) or ""
+    if not docstring:
+        return [f"{cls_name}: Missing __init__ docstring"]
+
+    if re.search(r"(?m)^\s*:param\s+", docstring):
+        errors.append(f"{cls_name}: Uses legacy Sphinx ':param ...:' syntax instead of 'Args:'")
+
+    if not re.search(r"(?m)^\s*Args:\s*$", docstring):
+        errors.append(f"{cls_name}: Missing Google-style 'Args:' section")
+        return errors
+
+    documented_args = _parse_google_args_section(docstring)
+    sig = inspect.signature(target_cls.__init__)
+    expected_tokens: list[str] = []
+    for param_name, param in sig.parameters.items():
+        if param_name == "self":
+            continue
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            expected_tokens.append(f"*{param_name}")
+        elif param.kind == inspect.Parameter.VAR_KEYWORD:
+            expected_tokens.append(f"**{param_name}")
+        else:
+            expected_tokens.append(param_name)
+
+    for extra_name in extra_expected_params:
+        if extra_name not in expected_tokens:
+            expected_tokens.append(extra_name)
+
+    for token in expected_tokens:
+        desc = documented_args.get(token)
+        if desc is None:
+            errors.append(
+                f"{cls_name}: Parameter '{token}' is missing from Google-style 'Args:' block"
+            )
+        elif not desc.strip():
+            errors.append(f"{cls_name}: Parameter '{token}' has an empty docstring description")
+
+    return errors
+
+
+def validate_airflow_guide_parity(
+    docs_dir: Path,
+    hidden_ui_fields: Iterable[str] | None = None,
+    sdtm_options: Iterable[str] = AIRFLOW_SDTM_OPTIONS,
+) -> list[str]:
+    """Verify docs/how-to/airflow.rst covers hidden UI fields, SDTM options, SPI imports, and mypy guidance."""
+    airflow_rst = docs_dir / "how-to" / "airflow.rst"
+    if not airflow_rst.exists():
+        return [f"Missing Airflow guide: {airflow_rst}"]
+
+    provider_info = get_provider_info()
+    provider_hidden = tuple(
+        provider_info["connection-types"][0]["ui-field-behaviour"]["hidden-fields"]
+    )
+    hook_hidden = tuple(ImednetHook.get_ui_field_behaviour()["hidden_fields"])
+    errors: list[str] = []
+    if provider_hidden != hook_hidden:
+        errors.append(
+            f"get_provider_info hidden-fields {provider_hidden} != ImednetHook hidden_fields {hook_hidden}"
+        )
+
+    effective_hidden = tuple(hidden_ui_fields) if hidden_ui_fields is not None else provider_hidden
+    text = airflow_rst.read_text(encoding="utf-8")
+
+    conn_match = re.search(
+        r"Connections\n-+\n(.*?)(?:\n[A-Z][^\n]*\n-+\n|\Z)",
+        text,
+        flags=re.DOTALL,
+    )
+    conn_section = conn_match.group(1) if conn_match else ""
+    if not conn_section:
+        errors.append(f"{airflow_rst}: Missing 'Connections' section")
+    else:
+        if not re.search(r"\bhides?\b", conn_section, flags=re.IGNORECASE):
+            errors.append(
+                f"{airflow_rst}: 'Connections' section does not warn about hidden Airflow UI fields"
+            )
+        for field_name in effective_hidden:
+            if not re.search(rf"``{re.escape(field_name)}``", conn_section):
+                errors.append(
+                    f"{airflow_rst}: Hidden Airflow UI field '{field_name}' is not documented in 'Connections'"
+                )
+        for alt_pattern, label in (
+            (r"airflow connections add|Airflow CLI", "Airflow CLI"),
+            (r"AIRFLOW_CONN_", "AIRFLOW_CONN_* URI"),
+            (r"``generic``", "generic connection"),
+        ):
+            if not re.search(alt_pattern, conn_section):
+                errors.append(
+                    f"{airflow_rst}: 'Connections' section lacks '{label}' alternative for host/extra"
+                )
+
+    for opt_name in sdtm_options:
+        if not re.search(rf"``{re.escape(opt_name)}``", text):
+            errors.append(
+                f"{airflow_rst}: Airflow SDTM option '{opt_name}' lacks narrative documentation"
+            )
+
+    if not re.search(
+        r"\.\.\s+testcode::.*?\bsdtm_domain\s*=.*?\bstandards_profile\s*=",
+        text,
+        flags=re.DOTALL,
+    ):
+        errors.append(
+            f"{airflow_rst}: Missing '.. testcode::' example demonstrating SDTM options on ImednetExportOperator"
+        )
+
+    if "from imednet.spi import export_helpers" not in text:
+        errors.append(
+            f"{airflow_rst}: Missing canonical 'from imednet.spi import export_helpers' import guidance"
+        )
+    if re.search(
+        r"(?:from\s+imednet\.spi\.export_helpers\b|import\s+imednet\.spi\.export_helpers\b)",
+        text,
+    ):
+        errors.append(
+            f"{airflow_rst}: Contains broken submodule import 'imednet.spi.export_helpers'"
+        )
+
+    if "mypy --strict" not in text or "airflow.providers.imednet" not in text:
+        errors.append(
+            f"{airflow_rst}: Missing 'mypy --strict' typing guidance for apache_airflow_providers_imednet vs airflow.providers.imednet"
+        )
+
+    return errors
+
+
 def test_sink_config_and_streaming_checkpoints_narrative_parity() -> None:
     """Assert all SinkConfig fields and streaming checkpoint options are documented in narrative guides."""
     sink_field_names = [f.name for f in dataclasses.fields(SinkConfig)]
@@ -424,3 +617,79 @@ def test_narrative_parity_gates_fail_on_undocumented_additions(tmp_path: Path) -
     sec_errs = validate_workflow_interactions_sections(bare_rst)
     assert any("lacks explanatory prose" in err for err in sec_errs)
     assert any("lacks a '.. testcode::' example" in err for err in sec_errs)
+
+    undoc_op_errs = validate_google_init_docstring_coverage(
+        ImednetExportOperator,
+        extra_expected_params=("undocumented_operator_arg_xyz",),
+    )
+    assert any("undocumented_operator_arg_xyz" in err for err in undoc_op_errs)
+
+    class _LegacySphinxDocOperator:
+        def __init__(self, *, study_key: str) -> None:
+            """Initialize legacy operator.
+
+            :param study_key: Legacy param format.
+            """
+
+    legacy_errs = validate_google_init_docstring_coverage(_LegacySphinxDocOperator)
+    assert any("Uses legacy Sphinx ':param" in err for err in legacy_errs)
+    assert any("Missing Google-style 'Args:'" in err for err in legacy_errs)
+
+    sdtm_errs = validate_airflow_guide_parity(
+        DOCS_DIR,
+        sdtm_options=(*AIRFLOW_SDTM_OPTIONS, "undocumented_sdtm_option_xyz"),
+    )
+    assert any("undocumented_sdtm_option_xyz" in err for err in sdtm_errs)
+
+    ui_errs = validate_airflow_guide_parity(
+        DOCS_DIR,
+        hidden_ui_fields=("host", "schema", "port", "extra", "undocumented_hidden_ui_field_xyz"),
+    )
+    assert any("undocumented_hidden_ui_field_xyz" in err for err in ui_errs)
+
+
+def test_airflow_provider_docstrings_and_guide_parity() -> None:
+    """Assert Airflow provider docstrings, wrapper cross-references, example DAGs, and airflow.rst stay synchronized."""
+    export_sig = inspect.signature(ImednetExportOperator.__init__)
+    kw_only_params = [
+        p.name for p in export_sig.parameters.values() if p.kind == inspect.Parameter.KEYWORD_ONLY
+    ]
+    assert len(kw_only_params) >= 27
+    assert set(AIRFLOW_SDTM_OPTIONS).issubset(set(kw_only_params))
+    assert set(STREAMING_CHECKPOINT_OPTIONS).issubset(set(kw_only_params))
+
+    for cls in (ImednetExportOperator, ImednetJobSensor, ImednetJobTrigger):
+        doc_errors = validate_google_init_docstring_coverage(cls)
+        assert not doc_errors, f"Airflow Google-style docstring parity failed: {doc_errors}"
+
+    for wrapper_name in airflow_export_wrappers.__all__:
+        wrapper_fn = getattr(airflow_export_wrappers, wrapper_name)
+        wrapper_doc = inspect.getdoc(wrapper_fn) or ""
+        assert "imednet.spi.export." not in wrapper_doc, (
+            f"{wrapper_name} docstring still references broken imednet.spi.export target: {wrapper_doc}"
+        )
+        assert f":func:`imednet.integrations.export.{wrapper_name}`" in wrapper_doc
+
+    guide_errors = validate_airflow_guide_parity(DOCS_DIR)
+    assert not guide_errors, f"Airflow how-to guide parity failed: {guide_errors}"
+
+    readme_text = (REPO_ROOT / "packages" / "providers-airflow" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "mypy --strict" in readme_text
+    assert "apache_airflow_providers_imednet" in readme_text
+    assert "airflow.providers.imednet" in readme_text
+
+    for dag_rel in (
+        "examples/airflow/airflow_multi_study_pipeline.py",
+        "examples/airflow/imednet_export_operator_dag.py",
+    ):
+        dag_src = (REPO_ROOT / dag_rel).read_text(encoding="utf-8")
+        assert 'export_func="export_to_csv"' not in dag_src
+        assert 'destination="csv"' in dag_src
+
+    sensor_dag_src = (REPO_ROOT / "examples/airflow/imednet_job_sensor_dag.py").read_text(
+        encoding="utf-8"
+    )
+    for hidden_field in ("host", "schema", "port", "extra"):
+        assert hidden_field in sensor_dag_src

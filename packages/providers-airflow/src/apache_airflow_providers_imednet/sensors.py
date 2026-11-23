@@ -44,14 +44,18 @@ class ImednetJobSensor(BaseSensorOperator):
         deferrable: bool | None = None,
         **kwargs: Any,
     ) -> None:
-        """Initialize the job sensor.
+        """Initialize the ``Job`` sensor.
 
-        :param study_key: The study key identifier.
-        :param batch_id: The batch or job identifier to monitor.
-        :param imednet_conn_id: Airflow connection ID to use for credentials.
-        :param poke_interval: Seconds between polling attempts.
-        :param deferrable: Run asynchronously in the Airflow triggerer instead of occupying a worker slot.
-        :param kwargs: Additional Airflow BaseSensorOperator arguments.
+        Args:
+            study_key: The ``Study`` key identifier owning the asynchronous ``Job``.
+            batch_id: The batch or ``Job`` identifier to monitor until terminal completion.
+            imednet_conn_id: Airflow connection ID used to resolve iMednet API credentials.
+            poke_interval: Delay in seconds between ``Job`` polling attempts.
+            deferrable: Whether to defer polling asynchronously to the Airflow triggerer
+                instead of occupying a worker slot (defaults to Airflow
+                ``[operators] default_deferrable`` when ``None``).
+            **kwargs: Additional keyword arguments forwarded to Airflow
+                ``BaseSensorOperator``.
         """
         super().__init__(poke_interval=poke_interval, **kwargs)
         if not hasattr(self, "poke_interval"):

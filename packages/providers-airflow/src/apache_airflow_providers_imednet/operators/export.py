@@ -273,22 +273,62 @@ class ImednetExportOperator(BaseOperator):
         state_provider: Any = None,
         **kwargs: Any,
     ) -> None:
-        """Initialize the operator.
+        """Initialize the export operator.
 
-        :param study_key: The study key identifier.
-        :param destination: The destination sink format or database.
-        :param output_path: The filesystem path or SQL table target to export to (if applicable).
-        :param export_func: The specific legacy tabular export function to use.
-        :param export_kwargs: Extra non-secret keyword arguments passed to the sink/export function.
-        :param imednet_conn_id: Airflow connection ID to use for iMednet API credentials.
-        :param destination_conn_id: Optional Airflow connection ID to resolve destination credentials at runtime.
-        :param batch_size: Number of records to read and write per batch.
-        :param max_retries: Maximum number of export attempts.
-        :param idempotent: Whether the export execution should be safely repeatable, automatically deduplicating or replacing existing outputs as appropriate.
-        :param mask_phi: Whether to replace sensitive PHI values with ``***MASKED***`` by default.
-        :param quality_gate_enabled: Whether to filter records through the schema readiness quality gate prior to export.
-        :param min_schema_readiness_score: Minimum schema readiness score (0-100) required when the quality gate is enabled.
-        :param kwargs: Additional Airflow BaseOperator arguments.
+        Args:
+            study_key: The ``Study`` key identifier to export ``Record`` items from.
+            destination: Target sink format or database identifier (for example ``"csv"``,
+                ``"parquet"``, ``"duckdb"``, ``"sql"``, ``"sql_by_form"``, ``"long_sql"``,
+                ``"snowflake"``, ``"neo4j"``, or ``"mongodb"``).
+            output_path: Filesystem path, cloud storage URI, or SQL target path to write
+                exported ``Record`` outputs when applicable.
+            export_func: Optional legacy procedural export function name (prefer
+                ``destination`` for new pipelines).
+            export_kwargs: Extra non-secret keyword arguments forwarded to the target
+                sink or tabular export helper.
+            imednet_conn_id: Airflow connection ID used to resolve iMednet API credentials.
+            destination_conn_id: Optional Airflow connection ID used to resolve destination
+                database or warehouse credentials at task execution time.
+            batch_size: Number of ``Record`` items read and written per streaming batch.
+            max_retries: Maximum number of sink or export write attempts before failing.
+            idempotent: Whether execution is safely repeatable by deduplicating or
+                replacing existing destination outputs.
+            mask_phi: Whether to redact registered ``Subject`` identifiers and committed
+                ``StudyConfiguration`` PHI ``Variable`` fields as ``***MASKED***``.
+            quality_gate_enabled: Whether to filter ``Record`` items through the ``Form``
+                schema readiness quality gate before writing.
+            min_schema_readiness_score: Minimum schema readiness score (``0.0``-``100.0``)
+                required when ``quality_gate_enabled`` is ``True``.
+            as_sdtm: Whether to transform exported ``Record`` payloads into standardized
+                CDISC SDTM domain rows (automatically enabled when ``domain`` or
+                ``sdtm_domain`` is supplied).
+            domain: Convenience alias for ``sdtm_domain`` selecting the 2-character CDISC
+                SDTM domain code (for example ``"AE"``, ``"DM"``, or ``"VS"``).
+            sdtm_domain: Optional 2-character CDISC SDTM domain code selecting the target
+                domain for ``as_sdtm`` transformation.
+            standards_profile: Optional CDISC standards validation profile name (for
+                example ``"drug"``, ``"device"``, or ``"general"``) evaluated prior to
+                export.
+            min_standards_score: Optional minimum CDISC standards readiness score
+                (``0.0``-``100.0``) enforced before writing ``Record`` batches.
+            naming_convention: Optional ``Variable`` and metadata key naming convention
+                (``"snake_case"``, ``"camelCase"``, or ``"sdtm"``) applied across mappers.
+            modified_since: Optional initial UTC lower-bound watermark timestamp or ISO-8601
+                string applied when no prior incremental checkpoint exists.
+            record_filter: Optional ``Record`` metadata filter mapping or filter expression.
+            record_data_filter: Optional ``Variable`` payload filter expression forwarded
+                as ``recordDataFilter``.
+            include_deleted: Whether to include voided (``deleted=True``) ``Record`` items
+                directly in exported batches instead of reconciling deletes separately.
+            incremental: Whether to enable transactional high-water mark checkpoint reads
+                and commits across runs.
+            stream_name: Optional logical stream key isolating incremental checkpoints per
+                destination or ``Form``.
+            ledger_path: Optional filesystem path for file-backed checkpoint persistence
+                when ``state_provider`` is not supplied explicitly.
+            state_provider: Optional pre-configured ``StateProviderProtocol`` instance used
+                to persist incremental ``Study`` watermarks.
+            **kwargs: Additional keyword arguments forwarded to Airflow ``BaseOperator``.
         """
         super().__init__(**kwargs)
         self.study_key = study_key

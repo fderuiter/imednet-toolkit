@@ -21,6 +21,6 @@ with DAG(
     export_records = ImednetExportOperator(
         task_id="export_records",
         study_key="STUDY_KEY",
+        destination="csv",
         output_path="/tmp/records.csv",
-        export_func="export_to_csv",
     )

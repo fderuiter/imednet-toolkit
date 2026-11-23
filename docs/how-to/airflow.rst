@@ -52,16 +52,22 @@ Connections
 Create an Airflow connection ``imednet_default`` (connection type ``imednet``,
 registered via ``apache_airflow_providers_imednet:get_provider_info``) or override
 ``imednet_conn_id``.
-Provide ``api_key`` and ``security_key`` via the login/password fields (which the
-Airflow UI relabels as **API Key** and **Security Key** via
-``get_ui_field_behaviour()``), via custom connection form widgets
-(``extra__imednet__*``), or in the ``extra`` JSON. ``base_url``,
+In the Apache Airflow 3 UI, the ``imednet`` connection form hides ``host``,
+``schema``, ``port``, and ``extra`` via ``get_provider_info()`` and
+``ImednetHook.get_ui_field_behaviour()``. When configuring an ``imednet``
+connection in the UI, supply ``api_key`` and ``security_key`` in the ``login``
+and ``password`` fields (relabeled as **API Key** and **Security Key**) and use
+the typed connection form widgets (``extra__imednet__*``) for ``base_url``,
 password-masked ``oidc_token``, ``timeout``, ``strict_mode``, and
-``simulation_mode`` are exposed directly as typed connection form fields. Base URL
-resolution honors an explicit ``base_url`` first, then resolves ``Connection.host``
-(with optional ``scheme`` and ``port``) while stripping ``/api/v1/edc``,
-``/api/v1``, and ``/api`` suffixes before falling back to
-``imednet.config.load_config`` environment defaults.
+``simulation_mode``.
+To pass ``host`` (with optional ``schema`` and ``port``) or raw ``extra`` JSON
+payloads directly, create the connection via the Airflow CLI
+(``airflow connections add``), an ``AIRFLOW_CONN_*`` URI or JSON environment
+variable, or a ``generic`` connection type. Base URL resolution honors an
+explicit ``base_url`` first, then resolves ``Connection.host`` (with optional
+``schema`` and ``port``) while stripping ``/api/v1/edc``, ``/api/v1``, and
+``/api`` suffixes before falling back to ``imednet.config.load_config``
+environment defaults.
 ``ImednetHook.test_connection()`` validates credentials against the ``Study``
 endpoint and redacts sensitive tokens on error.
 
@@ -107,11 +113,19 @@ For task-mapping discovery, health checks, and async trigger execution,
 
 Operators and Sensors
 ---------------------
-The Airflow integration organizes hooks, operators, and sensors in dedicated
-subpackages for clarity.
+The Airflow integration organizes hooks, operators, sensors, and triggers in
+dedicated subpackages under the canonical ``apache_airflow_providers_imednet``
+distribution namespace (shipped with ``py.typed`` markers) while registering a
+runtime ``sys.meta_path`` alias for ``airflow.providers.imednet.*`` so Airflow 3
+provider discovery resolves ``airflow.providers.imednet.hooks``,
+``airflow.providers.imednet.operators``, ``airflow.providers.imednet.sensors``,
+and ``airflow.providers.imednet.triggers`` without duplicating wheel packages on
+disk. Import directly from ``apache_airflow_providers_imednet`` in DAGs validated
+with ``mypy --strict`` because static type checkers inspect installed filesystem
+packages rather than dynamic runtime ``airflow.providers.imednet.*`` aliases.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, DuckDB, SQL / ``sql_by_form``
+``Record`` items to any supported destination (CSV, Parquet, DuckDB, SQL / ``sql_by_form``
 / ``long_sql``, Snowflake, Neo4j, MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
@@ -126,7 +140,10 @@ without mutating ``global_sensitivity_registry``. Destination-specific non-secre
 options—such as DuckDB ``table_name`` (or ``table``, defaulting to ``"records"``),
 Snowflake staging settings (``stage_prefix``,
 ``local_staging_dir``, ``manifest_path``), and Neo4j ``database`` names—can be
-supplied via ``export_kwargs`` or connection ``extra`` metadata.
+supplied via ``export_kwargs`` or via ``extra`` JSON on connections configured
+through the Airflow CLI, ``AIRFLOW_CONN_*`` URIs, ``generic`` connections, or
+destination-specific connection types (because the ``imednet`` UI form hides
+``host`` and ``extra``).
 ``ImednetJobSensor(study_key=..., batch_id=...)`` polls an asynchronous iMednet
 job identified by ``study_key`` and ``batch_id`` until it reaches a terminal
 state (see :ref:`rest_resource_jobs`), fetching and validating any terminal
@@ -198,6 +215,59 @@ resolved only inside ``execute()``:
            "stage_prefix": "imednet/MY_STUDY",
            "manifest_path": "/tmp/imednet_manifest.jsonl",
        },
+   )
+
+CDISC SDTM Mapping and ``Variable`` Naming Conventions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ImednetExportOperator`` forwards all six CDISC SDTM transformation, standards
+readiness, and ``Variable`` naming options across tabular exports (such as
+``destination="csv"``, ``"parquet"``, ``"duckdb"``, and ``"sql"``) and plugin
+sinks:
+
+- ``as_sdtm``: Transform exported ``Record`` payloads into standardized CDISC SDTM
+  domain rows via :func:`~imednet.spi.models.transform_records_to_sdtm_rows`
+  (automatically enabled whenever ``domain`` or ``sdtm_domain`` is set).
+- ``domain``: Convenience alias for ``sdtm_domain`` accepting a 2-character CDISC
+  SDTM domain code (such as ``"AE"``, ``"DM"``, or ``"VS"``) when ``sdtm_domain``
+  is not passed explicitly.
+- ``sdtm_domain``: Explicit 2-character CDISC SDTM target domain code filtering
+  and shaping ``Form`` and ``Record`` outputs.
+- ``standards_profile``: Optional CDISC standards validation profile name (for
+  example ``"drug"``, ``"device"``, or ``"general"``) evaluated against the
+  ``Study`` ``Data Dictionary`` prior to writing.
+- ``min_standards_score``: Optional minimum CDISC standards readiness score
+  (``0.0``–``100.0``) enforced via
+  :func:`~imednet.spi.sink_base.evaluate_standards_readiness` before export.
+- ``naming_convention``: Optional ``Variable`` and metadata key naming convention
+  (``"snake_case"``, ``"camelCase"``, or ``"sdtm"``) applied across tabular,
+  document, graph, and warehouse mappers.
+
+.. testcode::
+
+   from apache_airflow_providers_imednet import ImednetExportOperator
+
+   sdtm_vs_export = ImednetExportOperator(
+       task_id="export_sdtm_vital_signs",
+       study_key="MY_STUDY",
+       destination="csv",
+       output_path="/tmp/vs_domain.csv",
+       imednet_conn_id="imednet_default",
+       as_sdtm=True,
+       domain=None,
+       sdtm_domain="VS",
+       standards_profile="drug",
+       min_standards_score=90.0,
+       naming_convention="sdtm",
+   )
+
+   sdtm_ae_alias_export = ImednetExportOperator(
+       task_id="export_sdtm_adverse_events",
+       study_key="MY_STUDY",
+       destination="csv",
+       output_path="/tmp/ae_domain.csv",
+       imednet_conn_id="imednet_default",
+       domain="AE",
    )
 
 Incremental Checkpoints with ``AirflowStateProvider`` and ``ExtractionStateLedger``
@@ -312,8 +382,20 @@ is installed, ``tests/integration/test_airflow_dag.py`` runs a small DAG with
 ``ImednetExportOperator`` and ``ImednetJobSensor``. It is
 skipped automatically if Airflow is missing.
 
-Procedural export helpers use ``imednet.spi.export_helpers``, an explicit
-module namespace for CSV, JSON, Excel, Parquet and SQL helpers. The legacy
-``imednet.spi.export`` binding remains available for compatibility; provider
-delegation does not depend on whether that name resolves to a dispatcher or
-an imported module.
+Procedural export helpers are exposed lazily on :mod:`imednet.spi` via module
+``__getattr__`` (aliasing :mod:`imednet.integrations.export` without registering
+``imednet.spi.export_helpers`` in ``sys.modules``). Custom Airflow tasks and
+plugins should import ``export_helpers`` as an attribute from ``imednet.spi``
+rather than importing ``imednet.spi.export_helpers`` as a submodule:
+
+.. testcode::
+
+   from imednet.spi import export_helpers
+
+   assert callable(export_helpers.export_to_csv)
+
+The ``apache_airflow_providers_imednet.export`` wrappers delegate directly to
+``from imednet.spi import export_helpers`` for CSV, DuckDB, Parquet, Excel,
+JSON, and SQL (``export_to_sql``, ``export_to_sql_by_form``,
+``export_to_long_sql``) exports, while the legacy ``from imednet.spi import export``
+attribute remains available for backward compatibility.
