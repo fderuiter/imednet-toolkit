@@ -917,6 +917,16 @@ class UATRunResultProtocol(Protocol):
         ...
 
     @property
+    def dry_run(self) -> bool:
+        """Whether the run executed in local dry-run validation mode."""
+        ...
+
+    @property
+    def validation_report(self) -> Any:
+        """Local batch validation report captured during dry-run execution, if any."""
+        ...
+
+    @property
     def phase_durations(self) -> Mapping[str, float]:
         """Elapsed seconds recorded per execution phase."""
         ...
@@ -944,7 +954,7 @@ class UATWorkflowProtocol(Protocol):
         """Result from the most recent ``run()`` invocation, if any."""
         ...
 
-    def transition_to(self, target: str) -> str:
+    def transition_to(self, target: str, *, dry_run: bool = False) -> str:
         """Transition workflow state along a valid lifecycle edge."""
         ...
 
@@ -958,6 +968,9 @@ class UATWorkflowProtocol(Protocol):
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
         data_dictionary: DataDictionary | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        seed: int | None = None,
+        dry_run: bool = False,
     ) -> UATRunResultProtocol:
         """Execute the end-to-end UAT pipeline and return its run result."""
         ...
