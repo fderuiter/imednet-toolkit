@@ -672,21 +672,26 @@ def normalize_naming_convention(convention: str | None) -> str | None:
     )
 
 
+_SDTM_DOMAIN_NON_ALNUM_RE = re.compile(r"[^A-Z0-9]+")
+
+
 def resolve_sdtm_domain(domain: str | None, *, fallback: str = "AE") -> str:
     """Canonicalize an SDTM domain code or form/domain alias (e.g. 'PD' -> 'DV')."""
     if not domain or not isinstance(domain, str) or not domain.strip():
         return fallback
-    cleaned = domain.strip()
-    compact = "".join(ch for ch in cleaned.upper() if ch.isalnum())
+    upper = domain.strip().upper()
+    compact = _SDTM_DOMAIN_NON_ALNUM_RE.sub("", upper)
+    if not compact:
+        return fallback
     if compact in _DOMAIN_NAME_ALIASES:
         return _DOMAIN_NAME_ALIASES[compact]
     # Prefix heuristics for common EDC form keys (e.g. 'F_AE', 'AE_FORM', 'VS_VITALS')
-    upper = cleaned.upper()
-    tokens = [tok for tok in upper.replace("-", "_").split("_") if tok and tok != "F"]
+    tokens = [tok for tok in _SDTM_DOMAIN_NON_ALNUM_RE.split(upper) if tok and tok != "F"]
     for tok in tokens:
         if tok in _DOMAIN_NAME_ALIASES:
             return _DOMAIN_NAME_ALIASES[tok]
-    return upper
+    sanitized = compact.lstrip("0123456789")
+    return sanitized if sanitized else fallback
 
 
 def format_variable_name(
@@ -1903,16 +1908,10 @@ __all__ = [
     "VALID_NAMING_CONVENTIONS",
     "_SDTM_RECORDS_SORT",
     "_UNSET_PIPELINE",
-    "_PreparedSdtmRow",
     "_SdtmNormalizer",
     "_collapse_alnum_key",
     "_extract_stream_usubjid_and_id",
-    "_format_sdtm_flag",
-    "_format_usubjid",
-    "_get_model_consumed_keys",
-    "_get_model_field_aliases",
     "_iter_sorted_sdtm_frames",
-    "_normalize_key",
     "extract_suppqual_rows",
     "format_iso8601_dtc",
     "format_variable_name",

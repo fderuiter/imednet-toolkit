@@ -1,0 +1,64 @@
+{
+  "item": [
+    {
+      "name": "studies",
+      "item": [
+        {
+          "name": "List studies",
+          "request": {
+            "method": "GET",
+            "url": {
+              "path": ["studies"]
+            }
+          },
+          "response": [
+            {
+              "name": "Study information",
+              "body": "{\"data\": [{\"studyKey\": \"DEMO\", \"studyName\": \"Demo Study\", \"studyDescription\": \"Seed study\"}]}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "records",
+      "item": [
+        {
+          "name": "List records",
+          "request": {
+            "method": "GET",
+            "url": {
+              "path": ["studies", ":studyKey", "records"]
+            }
+          },
+          "response": [
+            {
+              "name": "Record list",
+              "body": "{\"data\": [{\"studyKey\": \"DEMO\", \"recordId\": 1, \"formKey\": \"AE\", \"subjectKey\": \"001\", \"recordData\": {\"AETERM\": \"Headache\"}}]}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "codings",
+      "item": [
+        {
+          "name": "List codings",
+          "request": {
+            "method": "GET",
+            "url": {
+              "path": ["studies", ":studyKey", "codings"]
+            }
+          },
+          "response": [
+            {
+              "name": "Coding list",
+              "body": "{\"data\": [{\"studyKey\": \"DEMO\", \"codingId\": 10, \"code\": \"10019211\", \"dictionaryName\": \"MedDRA\"}]}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

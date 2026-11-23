@@ -184,6 +184,27 @@ def _get_config_store_cls() -> Any:
     return _CACHED_STORE_CLS
 
 
+def _coerce_resolved_study_config(candidate: Any) -> StudyConfiguration | None:
+    """Coerce a resolved store payload into a validated :class:`StudyConfiguration`."""
+    if isinstance(candidate, StudyConfiguration):
+        return candidate
+    if isinstance(candidate, Mapping) and candidate:
+        return StudyConfiguration.model_validate(candidate)
+    return None
+
+
+def _resolve_from_store_instance(store: Any, study_key: str) -> StudyConfiguration | None:
+    """Resolve latest committed :class:`StudyConfiguration` via ``get_history``/``rollback_config``."""
+    history = store.get_history(study_key)
+    if not history or not isinstance(history, list):
+        return None
+    latest_entry = history[-1]
+    if not isinstance(latest_entry, Mapping) or "commit_id" not in latest_entry:
+        return None
+    latest_commit = latest_entry["commit_id"]
+    return _coerce_resolved_study_config(store.rollback_config(study_key, latest_commit))
+
+
 def resolve_study_configuration(study_key: str | None) -> StudyConfiguration | None:
     """Resolve the latest committed :class:`StudyConfiguration` for *study_key* via entry points.
 
@@ -194,30 +215,29 @@ def resolve_study_configuration(study_key: str | None) -> StudyConfiguration | N
     if not study_key or not isinstance(study_key, str) or study_key == "UNKNOWN":
         return None
     try:
+        from imednet.core.context import study_context
+        from imednet.utils.security import validate_partition_key
+
+        validate_partition_key(study_key)
         store_cls = _get_config_store_cls()
         if store_cls is None:
             return None
         fast_resolve = getattr(store_cls, "resolve_committed_config", None)
         if callable(fast_resolve):
-            resolved = fast_resolve(study_key)
-            if isinstance(resolved, StudyConfiguration):
+            resolved = _coerce_resolved_study_config(fast_resolve(study_key))
+            if resolved is not None:
                 return resolved
-            if isinstance(resolved, Mapping) and resolved:
-                return StudyConfiguration.model_validate(resolved)
+            legacy_resolve = getattr(store_cls, "resolve_legacy_committed_config", None)
+            if callable(legacy_resolve):
+                return _coerce_resolved_study_config(legacy_resolve(study_key))
             return None
         store = store_cls()
-        history = store.get_history(study_key)
-        if not history or not isinstance(history, list):
-            return None
-        latest_entry = history[-1]
-        if not isinstance(latest_entry, Mapping) or "commit_id" not in latest_entry:
-            return None
-        latest_commit = latest_entry["commit_id"]
-        study_cfg = store.rollback_config(study_key, latest_commit)
-        if isinstance(study_cfg, StudyConfiguration):
-            return study_cfg
-        if isinstance(study_cfg, Mapping) and study_cfg:
-            return StudyConfiguration.model_validate(study_cfg)
+        resolved = _resolve_from_store_instance(store, study_key)
+        if resolved is not None:
+            return resolved
+        with study_context(study_key):
+            legacy_store = store_cls()
+            return _resolve_from_store_instance(legacy_store, study_key)
     except Exception as exc:
         logger.debug("Could not resolve StudyConfiguration for %r: %s", study_key, exc)
     return None
@@ -250,6 +270,7 @@ class CentralizedMapper:
         as_sdtm: bool = False,
         sdtm_domain: str | None = None,
         seq_counters: dict[str, int] | None = None,
+        include_unmapped: bool = False,
     ):
         """Initialize the mapper.
 
@@ -262,6 +283,7 @@ class CentralizedMapper:
             as_sdtm: When True, transform records directly into CDISC SDTM domain rows.
             sdtm_domain: Optional SDTM domain code (e.g. 'AE', 'VS', 'DM').
             seq_counters: Optional per-USUBJID sequence counter map shared across batches.
+            include_unmapped: When True, retain unmapped custom record keys inline in SDTM rows.
         """
         self.mode = mode
         self.post_processor = post_processor
@@ -273,6 +295,7 @@ class CentralizedMapper:
             else None
         )
         self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
+        self.include_unmapped = bool(include_unmapped)
         self._seq_counters: dict[str, int] = seq_counters if seq_counters is not None else {}
         self._pipeline_cache: dict[str, Any] = {}
         self._sens_snapshot: frozenset[str] = frozenset()
@@ -345,7 +368,10 @@ class CentralizedMapper:
             if self._default_pipeline is not None:
                 self._pipeline_cache[sk] = self._default_pipeline
             else:
-                resolved_cfg = resolve_study_configuration(sk)
+                from imednet.core.context import sdk_governance_context
+
+                with sdk_governance_context(getattr(self, "sdk", None)):
+                    resolved_cfg = resolve_study_configuration(sk)
                 self._pipeline_cache[sk] = (
                     EnrichmentPipeline(resolved_cfg)
                     if resolved_cfg is not None
@@ -386,6 +412,7 @@ class CentralizedMapper:
                 seq_counters=self._seq_counters if target_domain != "DM" else None,
                 phi_keys=pipeline_phi_keys or None,
                 pipeline=active_pipeline if has_active_rules else None,
+                include_unmapped=self.include_unmapped,
             )
             mapped_sdtm = (
                 sdtm_rows[0]

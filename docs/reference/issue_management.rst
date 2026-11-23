@@ -46,7 +46,7 @@ Examples:
 
 - ``bug(http): delegate URL path construction to httpx``
 - ``refactor(core): decouple async and sync client hierarchies``
-- ``docs(contributing): document issue triage workflow``
+- ``docs(github): document issue triage workflow``
 - ``epic(core): architecture modernization and thread-safety``
 
 Avoid the following title patterns:
@@ -71,13 +71,15 @@ Type labels
 
 - ``type:bug``
 - ``type:feature``
+- ``type:enhancement``
 - ``type:refactor``
+- ``type:tech-debt``
 - ``type:docs``
 - ``type:test``
 - ``type:ci``
 - ``type:security``
-- ``type:maintenance``
 - ``type:epic``
+- ``type:research``
 
 Priority labels
 ^^^^^^^^^^^^^^^
@@ -96,23 +98,38 @@ Area labels
 - ``area:auth``
 - ``area:pagination``
 - ``area:cli``
+- ``area:workflows``
+- ``area:airflow``
 - ``area:docs``
 - ``area:tests``
+- ``area:testing``
 - ``area:ci``
 - ``area:release``
-- ``area:workflows-plugin``
-- ``area:airflow-provider``
-- ``area:contributing``
+- ``area:github``
+- ``area:streamlit``
+- ``area:mapping``
+- ``area:records``
+- ``area:standards``
+- ``area:dashboard``
+- ``area:review-workbench``
+- ``area:terminology``
+- ``area:governance``
+- ``area:performance``
 
-Status labels
-^^^^^^^^^^^^^
+Status and triage labels
+^^^^^^^^^^^^^^^^^^^^^^^^
 
 - ``status:triage``
+- ``status:needs-design``
 - ``status:ready``
 - ``status:in-progress``
+- ``status:review``
 - ``status:blocked``
-- ``status:needs-info``
 - ``status:done``
+- ``ready-for-agent`` — pair with ``status:ready`` when fully specified for automated execution
+- ``help wanted`` — pair with ``status:ready`` (without ``ready-for-agent``) for manual human work
+- ``question`` — waiting on reporter or maintainer clarification
+- ``wontfix``, ``duplicate``, ``invalid`` — resolution labels recorded with closing rationale
 
 Size labels
 ^^^^^^^^^^^
@@ -127,8 +144,9 @@ Risk labels
 ^^^^^^^^^^^
 
 - ``risk:low``
-- ``risk:medium``
-- ``risk:high``
+
+Only ``risk:low`` exists as a GitHub label; document elevated compatibility, security,
+or transport risk directly in the issue body and reflect urgency in ``priority:*``.
 
 Required issue content
 ----------------------

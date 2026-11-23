@@ -104,6 +104,7 @@ def build_sink_mapper(
         as_sdtm=bool(getattr(config, "as_sdtm", False)),
         sdtm_domain=getattr(config, "sdtm_domain", None),
         seq_counters=seq_counters,
+        include_unmapped=bool(extra_dict.get("include_unmapped", False)),
     )
     custom_pipeline = extra_dict.get("enrichment_pipeline")
     if custom_pipeline is not None and hasattr(custom_pipeline, "process"):

@@ -97,6 +97,7 @@ from tenacity import wait_exponential
 from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
+from imednet.models.sdtm import _format_usubjid
 from imednet.models.standards import (
     PROFILE_REGISTRY,
     SDTM_DOMAIN_SPECS,
@@ -104,7 +105,6 @@ from imednet.models.standards import (
     StandardsReadinessReport,
     StandardsReadinessValidator,
     ValidationViolation,
-    _format_usubjid,
     normalize_naming_convention,
     resolve_sdtm_domain,
     resolve_standards_profile,
@@ -1297,9 +1297,9 @@ def apply_quality_gate(
                 data = rec_dict.get("recordData")
             if data is None:
                 data = rec_dict.get("data", {})
-            if data is None:
+            if not isinstance(data, Mapping):
                 data = {}
-            score, reasons = calculate_readiness_score(validator.schema, fk, data)
+            score, reasons = calculate_readiness_score(validator.schema, fk, dict(data))
         finally:
             reset_study_context(ctx_token)
 
@@ -2165,7 +2165,10 @@ def run_streaming_export(
     total_reconciled = 0
     max_ts: datetime | None = None
 
+    from imednet.core.context import sdk_governance_context
+
     with contextlib.ExitStack() as stack:
+        stack.enter_context(sdk_governance_context(sdk))
         tx: dict[str, Any] | None = None
         if provider is not None:
             tx = stack.enter_context(

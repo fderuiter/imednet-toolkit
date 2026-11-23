@@ -64,9 +64,9 @@ jobs:
           EXIT_CODE=$?
           set -e
 
-          echo "pytest_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          echo "pytest_exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
-          python scripts/aggregate_verification.py
+          python scripts/aggregate_verification.py --report-dir reports/verification --expect-track drift
 
       - name: Summarize Live Validation
         if: always()
@@ -82,13 +82,22 @@ jobs:
             printf 'Drift violations: %s\n' "${DRIFT_COUNT:-unknown}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Save Verification Artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: drift-report
+          path: reports/verification/drift_report.json
+          if-no-files-found: error
+
       - name: Fail if validation failed
         if: always()
         env:
           PYTEST_EXIT_CODE: ${{ steps.live_tests.outputs.pytest_exit_code }}
           VALIDATION_OUTCOME: ${{ steps.live_tests.outcome }}
+          DRIFT_DETECTED: ${{ steps.live_tests.outputs.drift_detected }}
         run: |
-          if [[ "$VALIDATION_OUTCOME" != "success" || "$PYTEST_EXIT_CODE" != "0" ]]; then
+          if [[ "$VALIDATION_OUTCOME" != "success" || "$PYTEST_EXIT_CODE" != "0" || "$DRIFT_DETECTED" == "true" ]]; then
             if [[ -f pytest_output.txt ]]; then
               cat pytest_output.txt
             fi

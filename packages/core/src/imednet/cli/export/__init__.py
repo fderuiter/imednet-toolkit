@@ -110,20 +110,20 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         dest="quality_gate_enabled",
         action="store_true",
         default=None,
-        help="Enable pre-write record schema readiness quality gate filtering.",
+        help="Enable opt-in pre-write Record schema readiness quality gate filtering (disabled by default).",
     )
     parser.add_argument(
         "--no-quality-gate",
         dest="quality_gate_enabled",
         action="store_false",
-        help="Disable pre-write record schema readiness quality gate filtering.",
+        help="Disable pre-write Record schema readiness quality gate filtering.",
     )
     parser.add_argument(
         "--min-readiness-score",
         dest="min_schema_readiness_score",
         type=float,
         default=None,
-        help="Minimum record schema readiness score (0-100) when quality gate is enabled.",
+        help="Minimum Record schema readiness score (0-100) when quality gate is enabled.",
     )
     parser.add_argument(
         "--as-sdtm",
