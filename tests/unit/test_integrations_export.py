@@ -2414,7 +2414,9 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
     vitals_payloads = dataframe_to_records(vitals_unmasked_df, schema=schema)
     assert demo_payloads == [
         {
-            "formId": 10,
+            "recordId": 101,
+            "visitId": 1,
+            "formKey": "DEMO",
             "subjectKey": "SUBJ-1",
             "data": {
                 "patientName": "Jane Doe",
@@ -2426,7 +2428,9 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
     ]
     assert vitals_payloads == [
         {
-            "formId": 20,
+            "recordId": 201,
+            "visitId": 1,
+            "formKey": "VITALS",
             "subjectKey": "SUBJ-1",
             "data": {"HR": 72},
         }

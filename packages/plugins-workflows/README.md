@@ -74,4 +74,4 @@ The following components are exposed via Python entry points:
 | `ChunkedRecordPipeline` | Memory-efficient streaming partitions to export sequence-numbered tabular files. |
 | `SchemaProfiler` | Profiles clinical records schemas against expected structures. |
 | `StandardsReadinessValidator` | Validates records against standard CDISC definitions. |
-| `UatOrchestrator` | Test generation engine that generates valid and invalid mock payloads. |
+| `UATWorkflow` | Test generation engine that generates valid and invalid mock payloads. |

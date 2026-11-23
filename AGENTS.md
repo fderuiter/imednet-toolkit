@@ -3,7 +3,7 @@
 **Note:** Authoritative instructions for AI agents and human contributors working across **OpenAI Codex / ChatGPT**, **Claude Code**, and **Google Antigravity** in `imednet-toolkit`.
 
 1. **Stack & Rules:** Follow dependencies, credential redaction, testing boundaries, and PR rules in `docs/reference/agent_rules.rst`.
-2. **Verification:** Bootstrap with `uv sync --locked --all-packages --all-extras`, then run local CI gates per `docs/how-to/verification.rst`: `uvx pre-commit run --all-files`, `hatch run verify` (`>=90%` coverage across all five packages), `hatch run docs`, and `uvx hatch run quality:all packages` before opening PRs.
+2. **Verification:** Bootstrap with `uv sync --locked --all-packages --all-extras`, then run local CI gates per `docs/how-to/verification.rst`: `uvx pre-commit run --all-files`, `hatch run verify` (`>=90%` coverage across all five packages), `hatch run docs`, `hatch run validate-package-consumption`, and `uvx hatch run quality:all packages` before opening PRs.
 3. **Architecture:** Adhere to package layering in `docs/explanation/architecture.rst` and `tests/unit/architecture/import_rules.py`.
 
 ## Cross-Harness Agent Skills Workflow
