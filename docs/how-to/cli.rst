@@ -25,7 +25,7 @@ dashboard for browsing studies, sites, subjects, and background jobs:
 
    pip install "imednet[tui]"
    imednet tui
-   imednet tui --study DEMO-STUDY --batch BATCH-001 --batch BATCH-002
+   imednet tui --study DEMO-STUDY --batch BATCH --batch JOB-1002
    imednet tui DEMO-STUDY --simulation
    imednet tui --high-contrast
    IMEDNET_HIGH_CONTRAST=1 imednet --high-contrast tui
@@ -88,17 +88,17 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
 .. code-block:: bash
 
    imednet studies list --simulation --format json
-   imednet subjects list STUDY --filter subject_status=Screened --format json
+   imednet subjects list STUDY --filter subject_status=Enrolled --format json
    imednet subjects list --study-key STUDY --format json
    imednet users list STUDY --include-inactive --format json
    imednet codings list STUDY -f dictionaryName=MedDRA --format json
    imednet records list STUDY --format json
    imednet jobs status STUDY BATCH --format json
-   imednet jobs wait STUDY BATCH --timeout 60 --format json
+   imednet jobs wait STUDY JOB-1002 --timeout 60 --format json
    imednet workflows extract-records STUDY --format json
    imednet workflows state show --study-key STUDY --format json
    imednet workflows uat run STUDY --dry-run --simulation --format json
-   imednet subject-data STUDY SUBJ-001 --format json
+   imednet subject-data STUDY SUB1 --format json
    IMEDNET_CLI_OUTPUT_FORMAT=json imednet studies list
 
 Supported core list resources are studies, queries, variables, record-revisions,
@@ -232,8 +232,8 @@ literal ``none`` bypass) to filter Form Variable values on the server. All twelv
 
 .. code-block:: bash
 
-   imednet records list STUDY --filter "formKey==AE;recordId>=100" \
-       --record-data-filter "AESER==Serious;AGE>=18" --sort dateCreated,desc --limit 50
+   imednet records list STUDY --filter "formKey==F_DM;recordId>=600" \
+       --record-data-filter "V_GENDER==Female;V_AGE>=18" --sort dateCreated,desc --limit 50
    imednet queries list STUDY --filter "type==record,type==question" --sort annotationId,desc
    imednet users list STUDY --include-inactive --sort login,asc --limit 25
 

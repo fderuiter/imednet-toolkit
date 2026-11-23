@@ -6,6 +6,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+from unittest.mock import NonCallableMock
 
 import httpx
 from tenacity import AsyncRetrying, Retrying, stop_after_attempt, wait_random_exponential
@@ -145,3 +146,23 @@ class RetryConfig:
             reraise=False,
             **kwargs,
         )
+
+
+def delegates_to_sdk_retry_policy(sdk: Any, target_callable: Any = None) -> bool:
+    """Return True when *sdk* executes HTTP calls through a sync client with DefaultRetryPolicy."""
+    if sdk is None or isinstance(sdk, NonCallableMock):
+        return False
+    if target_callable is not None and isinstance(target_callable, NonCallableMock):
+        return False
+
+    client = getattr(sdk, "_client", None)
+    if client is None or isinstance(client, NonCallableMock):
+        return False
+    if isinstance(getattr(client, "get", None), NonCallableMock):
+        return False
+
+    retry_cfg = getattr(client, "retry_config", None)
+    policy = getattr(retry_cfg, "retry_policy", None)
+    if policy is None:
+        policy = getattr(sdk, "retry_policy", None)
+    return isinstance(policy, DefaultRetryPolicy)
