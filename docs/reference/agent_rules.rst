@@ -59,18 +59,18 @@ Testing Boundaries
    * - Test location
      - Network access
      - Required mock library
-   * - ``tests/unit/``
+   * - ``tests/unit/``, ``packages/plugins-sinks/tests/unit/``, ``packages/plugins-tui/tests/``
      - Forbidden — no live requests
-     - ``respx`` for ``httpx``, ``responses`` for ``requests``
-   * - ``tests/integration/``
-     - Forbidden — use recorded fixtures
-     - ``respx`` / ``responses``
+     - ``respx``, ``httpx.MockTransport``, or ``SimulationTransport`` for ``httpx``
+   * - ``tests/integration/``, ``packages/plugins-sinks/tests/integration/``
+     - Forbidden for live EDC — use recorded fixtures or local containers
+     - ``respx`` / ``httpx.MockTransport`` (or containerized local sinks)
    * - ``tests/live/``
      - Permitted — real API calls
      - None (guarded by ``IMEDNET_RUN_E2E`` env var)
 
 
-- All new or modified code must include or update tests in ``tests/unit/``.
+- All new or modified code must include or update offline tests in ``tests/unit/`` or the owning package's test suite under ``testpaths`` (``tests``, ``packages/plugins-sinks/tests``, ``packages/plugins-tui/tests``).
 - Coverage must remain ≥ 90%.
 - Do not add ``tests/live/`` calls to the default ``pytest`` run.
 
@@ -79,7 +79,7 @@ Commit Messages and Pull Requests
 - PR titles must follow Conventional Commits. Permitted prefixes: ``feat:``, ``fix:``, ``chore:``, ``docs:``, ``ci:``, ``test:``, ``refactor:``, ``perf:``, ``revert:``. The ``Semantic PR Title`` CI check enforces this.
 - Security updates and CVE remediations must use the ``fix:`` prefix (e.g. ``fix(deps):`` or ``fix(security):``), which directly maps to patch releases in ``release-please``. Do not use unpermitted prefixes such as ``security:``.
 - Merge to ``main`` via **Squash and merge** so the PR title becomes the commit message.
-- Changes that affect the public API, CLI interface, or environment variables must be noted in the PR description for Render deployment review.
+- Changes that affect the public API, CLI interface, or environment variables must be noted in the ``Surface Impact`` section of ``.github/PULL_REQUEST_TEMPLATE.md`` for release and documentation review.
 
 Release Process
 ^^^^^^^^^^^^^^^

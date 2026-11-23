@@ -26,7 +26,7 @@ dependencies that control skipping.
 
 CLI Tests (``test_cli_live.py``)
 --------------------------------
-These checks invoke the CLI using ``typer.testing.CliRunner`` and expect a zero exit code:
+These checks invoke ``imednet.cli.app`` using the ``argparse`` ``CliRunner`` helper in ``tests/live/test_cli_live.py`` and expect a zero exit code:
 
 - ``imednet studies list`` — Lists available studies.
 - ``imednet sites list <STUDY_KEY>`` — Lists sites for the chosen study.

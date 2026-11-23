@@ -58,10 +58,254 @@ def check_todos_in_init(roots: Sequence[Path] | None = None) -> bool:
     return has_todos
 
 
-_DOC_EXCLUDED_PARTS = {"_build", "agents", "superpowers"}
+_DOC_EXCLUDED_PARTS = {"_build"}
 _DOCUMENTED_EXTRA_RE = re.compile(
     r"\b(imednet(?:-[a-z0-9]+)*|apache-airflow-providers-imednet)\[([a-z0-9_,\s-]+)\]"
 )
+_WINDOWS_USER_PATH_RE = re.compile(r"\b[A-Za-z]:\\Users\\", re.IGNORECASE)
+_UNCHECKED_CHECKBOX_RE = re.compile(r"^\s*[-*+]\s+\[\s\]\s+")
+_WORKSPACE_PREFIXES = (
+    "imednet",
+    "imednet_workflows",
+    "imednet_sinks",
+    "imednet_tui",
+    "apache_airflow_providers_imednet",
+)
+_ALLOWED_NON_MODULE_DOTTED = frozenset(
+    {
+        "imednet.workflows",
+        "imednet.sinks",
+        "imednet.cli_plugins",
+        "imednet.state_providers",
+        "imednet.exporters",
+        "imednet.drift",
+    }
+)
+_FILE_SUFFIXES = (
+    ".html",
+    ".rst",
+    ".py",
+    ".pyi",
+    ".json",
+    ".toml",
+    ".md",
+    ".yaml",
+    ".yml",
+    ".whl",
+    ".xml",
+    ".csv",
+    ".mmd",
+)
+_SPHINX_PY_ROLE_RE = re.compile(
+    r":(?:py:)?(?:mod|class|func|meth|attr|obj|data|exc):`~?(?:[^`<]*<)?([A-Za-z_][A-Za-z0-9_.]*)>?`"
+)
+_MYST_PY_ROLE_RE = re.compile(
+    r"\{(?:py:)?(?:mod|class|func|meth|attr|obj|data|exc)\}`~?(?:[^`<]*<)?([A-Za-z_][A-Za-z0-9_.]*)>?`"
+)
+_INLINE_DOTTED_CODE_RE = re.compile(
+    r"`+~?((?:" + "|".join((*_WORKSPACE_PREFIXES, "typer")) + r")(?:\.[A-Za-z_][A-Za-z0-9_]*)+)"
+)
+_INLINE_SYMBOL_TOKEN_RE = re.compile(
+    r"(?<!`)`{1,2}([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)(?:\([^`]*\))?`{1,2}(?!`)"
+)
+_TRACKED_CLASS_SUFFIXES = (
+    "Endpoint",
+    "Workflow",
+    "Mixin",
+    "Poller",
+    "Manager",
+    "Paginator",
+    "Inspector",
+    "Validator",
+    "Orchestrator",
+    "Mapper",
+    "Sink",
+    "Sensor",
+    "Operator",
+    "Hook",
+    "Loader",
+)
+
+
+def _ensure_workspace_import_paths(repo_root: Path) -> None:
+    """Ensure workspace package src directories are importable."""
+    default_root = Path(__file__).resolve().parent.parent
+    for root in (repo_root, default_root):
+        for pkg_sub in (
+            "packages/core/src",
+            "packages/plugins-workflows/src",
+            "packages/plugins-sinks/src",
+            "packages/plugins-tui/src",
+            "packages/providers-airflow/src",
+        ):
+            src_dir = (root / pkg_sub).resolve()
+            if src_dir.is_dir() and str(src_dir) not in sys.path:
+                sys.path.insert(0, str(src_dir))
+
+
+def _collect_workspace_ast_symbols(repo_root: Path) -> set[str]:
+    """Collect AST class, function, method, and module constant symbols across workspace sources."""
+    default_root = Path(__file__).resolve().parent.parent
+    roots_to_scan: list[Path] = []
+    for base in (repo_root, default_root):
+        for sub in ("packages", "tests"):
+            candidate = base / sub
+            if candidate.is_dir():
+                roots_to_scan.append(candidate)
+        if roots_to_scan:
+            break
+
+    symbols: set[str] = set()
+    for base in roots_to_scan:
+        for py_file in base.rglob("*.py"):
+            try:
+                tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            except (OSError, SyntaxError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    symbols.add(node.name)
+                    for child in node.body:
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            symbols.add(child.name)
+                            symbols.add(f"{node.name}.{child.name}")
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    symbols.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            symbols.add(target.id)
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    symbols.add(node.target.id)
+    return symbols
+
+
+def _resolve_workspace_dotted_symbol(qname: str) -> bool:
+    """Return True if a dotted workspace module/attribute path resolves at runtime."""
+    if qname in _ALLOWED_NON_MODULE_DOTTED:
+        return True
+    parts = qname.split(".")
+    for idx in range(len(parts), 0, -1):
+        mod_name = ".".join(parts[:idx])
+        try:
+            obj: Any = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        rem = parts[idx:]
+        resolved = True
+        for pos, attr in enumerate(rem):
+            if hasattr(obj, attr):
+                obj = getattr(obj, attr)
+                continue
+            is_last = pos == len(rem) - 1
+            if is_last and isinstance(obj, type):
+                has_ann = any(attr in getattr(cls, "__annotations__", {}) for cls in obj.__mro__)
+                has_field = attr in getattr(obj, "model_fields", {})
+                if has_ann or has_field:
+                    return True
+            resolved = False
+            break
+        if resolved:
+            return True
+    return False
+
+
+def _is_tracked_component_class(name: str) -> bool:
+    """Return True if name is a multi-word PascalCase component class name."""
+    if not name or not name[0].isupper():
+        return False
+    return any(name.endswith(sfx) and len(name) > len(sfx) for sfx in _TRACKED_CLASS_SUFFIXES)
+
+
+def check_docs_hygiene(repo_root: Path = Path(".")) -> bool:
+    """Reject personal Windows user paths and unchecked '- [ ]' checkboxes across docs/."""
+    print("Checking documentation note hygiene (Windows user paths and unchecked checkboxes)...")
+    docs_dir = repo_root / "docs"
+    if not docs_dir.is_dir():
+        print(f"Warning: Documentation directory {docs_dir} not found.")
+        return False
+
+    has_errors = False
+    for path in sorted([*docs_dir.rglob("*.rst"), *docs_dir.rglob("*.md")]):
+        rel_parts = path.relative_to(repo_root).parts
+        if any(part in _DOC_EXCLUDED_PARTS for part in rel_parts):
+            continue
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if _WINDOWS_USER_PATH_RE.search(line):
+                print(f"Error: Personal Windows path found at {path}:{lineno}")
+                has_errors = True
+            if _UNCHECKED_CHECKBOX_RE.search(line):
+                print(f"Error: Unchecked checkbox '- [ ]' found at {path}:{lineno}")
+                has_errors = True
+
+    if not has_errors:
+        print("Documentation note hygiene checks passed.")
+    return has_errors
+
+
+def check_documented_code_symbols(repo_root: Path = Path(".")) -> bool:
+    """Validate documented Python module paths, Sphinx roles, and component symbols across docs/."""
+    print("Checking documented code symbols across ADRs, guides, and reference pages...")
+    docs_dir = repo_root / "docs"
+    if not docs_dir.is_dir():
+        print(f"Warning: Documentation directory {docs_dir} not found.")
+        return False
+
+    _ensure_workspace_import_paths(repo_root)
+    ast_symbols = _collect_workspace_ast_symbols(repo_root)
+
+    has_errors = False
+    for path in sorted([*docs_dir.rglob("*.rst"), *docs_dir.rglob("*.md")]):
+        rel_parts = path.relative_to(repo_root).parts
+        if any(part in _DOC_EXCLUDED_PARTS for part in rel_parts):
+            continue
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for role_re in (_SPHINX_PY_ROLE_RE, _MYST_PY_ROLE_RE):
+                for match in role_re.finditer(line):
+                    qname = match.group(1)
+                    if qname.startswith("typer."):
+                        print(f"Error: Stale non-workspace CLI symbol '{qname}' at {path}:{lineno}")
+                        has_errors = True
+                    elif qname.startswith(
+                        _WORKSPACE_PREFIXES
+                    ) and not _resolve_workspace_dotted_symbol(qname):
+                        print(f"Error: Unresolved code symbol '{qname}' at {path}:{lineno}")
+                        has_errors = True
+
+            for match in _INLINE_DOTTED_CODE_RE.finditer(line):
+                qname = match.group(1)
+                if qname.endswith(_FILE_SUFFIXES):
+                    continue
+                if qname.startswith("typer."):
+                    print(f"Error: Stale non-workspace CLI symbol '{qname}' at {path}:{lineno}")
+                    has_errors = True
+                elif not _resolve_workspace_dotted_symbol(qname):
+                    print(f"Error: Unresolved dotted code symbol '{qname}' at {path}:{lineno}")
+                    has_errors = True
+
+            for match in _INLINE_SYMBOL_TOKEN_RE.finditer(line):
+                token = match.group(1)
+                if "." in token:
+                    cls_name, _ = token.split(".", 1)
+                    if (
+                        _is_tracked_component_class(cls_name)
+                        and token not in ast_symbols
+                        and cls_name not in ast_symbols
+                    ):
+                        print(f"Error: Stale component symbol '{token}' at {path}:{lineno}")
+                        has_errors = True
+                elif (
+                    _is_tracked_component_class(token)
+                    or (token.endswith("_REGISTRY") and "ENDPOINT" in token)
+                ) and token not in ast_symbols:
+                    print(f"Error: Stale code symbol '{token}' at {path}:{lineno}")
+                    has_errors = True
+
+    if not has_errors:
+        print("All documented code symbols resolved cleanly.")
+    return has_errors
 
 
 def _load_declared_package_extras(repo_root: Path) -> dict[str, set[str]]:
@@ -1420,6 +1664,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     todos_failed = check_todos_in_init()
     extras_failed = check_documented_extras()
     cli_failed = check_cli_snippets()
+    hygiene_failed = check_docs_hygiene()
+    symbols_failed = check_documented_code_symbols()
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
     adr_failed = check_adr_records()
@@ -1435,6 +1681,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         todos_failed
         or extras_failed
         or cli_failed
+        or hygiene_failed
+        or symbols_failed
         or packages_failed
         or docs_failed
         or adr_failed

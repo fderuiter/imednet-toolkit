@@ -24,6 +24,8 @@ from scripts.validate_docs import (
     _verify_pagination_html,
     _verify_sdk_html,
     check_cli_snippets,
+    check_docs_hygiene,
+    check_documented_code_symbols,
     check_documented_extras,
     check_no_duplicate_suppression,
     check_rendered_api_reference,
@@ -462,3 +464,82 @@ def test_generate_api_reference_preserves_existing_docs_on_staging_failure(
     with pytest.raises(FileNotFoundError):
         monkeypatch.setattr(build_docs_mod.shutil, "which", lambda _t: None)
         require_sphinx_tools("sphinx-apidoc", "sphinx-build")
+
+
+def test_check_docs_hygiene_rejects_windows_paths_and_unchecked_checkboxes(
+    tmp_path: Path,
+) -> None:
+    """check_docs_hygiene scans docs/ including agents/ and superpowers/ for paths and checkboxes."""
+    agents_dir = tmp_path / "docs" / "agents"
+    plans_dir = tmp_path / "docs" / "superpowers" / "specs"
+    agents_dir.mkdir(parents=True)
+    plans_dir.mkdir(parents=True)
+
+    clean_note = agents_dir / "domain.md"
+    clean_note.write_text("# Clean Note\n\n- [x] Completed item\n", encoding="utf-8")
+    assert check_docs_hygiene(tmp_path) is False
+
+    clean_note.write_text(
+        r"Local clone: `D:\Users\Dev\Documents\GitHub\imednet-toolkit`" + "\n",
+        encoding="utf-8",
+    )
+    assert check_docs_hygiene(tmp_path) is True
+
+    clean_note.write_text("# Clean Note\n", encoding="utf-8")
+    spec_note = plans_dir / "plan.md"
+    spec_note.write_text("# Plan\n\n- [ ] Unchecked step\n", encoding="utf-8")
+    assert check_docs_hygiene(tmp_path) is True
+
+
+def test_check_documented_code_symbols_rejects_stale_imports_and_classes(
+    tmp_path: Path,
+) -> None:
+    """check_documented_code_symbols accepts real symbols and rejects deleted modules/classes."""
+    adr_dir = tmp_path / "docs" / "adr"
+    guide_dir = tmp_path / "docs" / "explanation"
+    ref_dir = tmp_path / "docs" / "reference"
+    adr_dir.mkdir(parents=True)
+    guide_dir.mkdir(parents=True)
+    ref_dir.mkdir(parents=True)
+
+    adr_file = adr_dir / "0004-datadict.md"
+    guide_file = guide_dir / "architecture.rst"
+    ref_file = ref_dir / "live_tests.rst"
+
+    adr_file.write_text(
+        "# Data Dictionary\n\nImport `DataDictionary` from `imednet.datadict`.\n",
+        encoding="utf-8",
+    )
+    guide_file.write_text(
+        "Architecture\n============\n\n"
+        "Use :class:`~imednet.core.EdcSyncListGetEndpoint`, "
+        ":attr:`~imednet.pagination.Paginator.page_size`, and ``ENDPOINT_REGISTRY``.\n",
+        encoding="utf-8",
+    )
+    ref_file.write_text(
+        "Live Tests\n==========\n\nInvoke ``imednet.cli.app`` via ``CliRunner``.\n",
+        encoding="utf-8",
+    )
+    assert check_documented_code_symbols(tmp_path) is False
+
+    adr_file.write_text(
+        "# Data Dictionary\n\nImport from `imednet.validation.data_dictionary`.\n",
+        encoding="utf-8",
+    )
+    assert check_documented_code_symbols(tmp_path) is True
+
+    adr_file.write_text("# Data Dictionary\n\nUse `imednet.datadict`.\n", encoding="utf-8")
+    guide_file.write_text(
+        "Architecture\n============\n\nRegister in ``_ENDPOINT_REGISTRY`` or ``ListGetEndpointMixin``.\n",
+        encoding="utf-8",
+    )
+    assert check_documented_code_symbols(tmp_path) is True
+
+    guide_file.write_text(
+        "Architecture\n============\n\nUse ``ENDPOINT_REGISTRY``.\n", encoding="utf-8"
+    )
+    ref_file.write_text(
+        "Live Tests\n==========\n\nUse ``typer.testing.CliRunner``.\n",
+        encoding="utf-8",
+    )
+    assert check_documented_code_symbols(tmp_path) is True

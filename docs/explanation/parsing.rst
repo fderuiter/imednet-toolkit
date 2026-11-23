@@ -102,9 +102,10 @@ Models can implement custom parsing logic by providing a ``from_json`` classmeth
 Integration with Endpoints
 ---------------------------
 
-All endpoints use this centralized parsing strategy internally. The
-``ListGetEndpointMixin`` uses ``get_model_parser`` to resolve the appropriate
-parsing function for each endpoint's model type.
+All endpoints use this centralized parsing strategy internally.
+:meth:`~imednet.core.endpoint.base.GenericEndpoint._parse_item` uses
+``get_model_parser`` to resolve the appropriate parsing function for each
+endpoint's ``MODEL`` type within ``strict_mode_context``.
 
 This ensures consistent behavior across the SDK while allowing endpoints to
 customize parsing when needed by overriding the ``_parse_item`` method.

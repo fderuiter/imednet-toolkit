@@ -23,7 +23,8 @@ If `CONTEXT.md` lacks a domain concept needed for a new workflow or model, resol
     ├── core/
     ├── plugins-workflows/
     ├── providers-airflow/
-    └── plugins-sinks/
+    ├── plugins-sinks/
+    └── plugins-tui/
 ```
 
 ## ADR Publishing Rules (`scripts/build_docs.py`)

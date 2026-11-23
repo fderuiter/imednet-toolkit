@@ -1,8 +1,12 @@
 # Data Dictionary Standardization
 
+**Status:** Accepted (temporary compatibility shim in item 9 retired; `imednet.datadict` is canonical)
+
+> **Supersession Note:** `imednet.datadict` remains the canonical Data Dictionary package across the workspace. Item 9 and Consequence 3 below are **superseded**: the temporary backward-compatibility re-export shim in the legacy validation module was removed after workspace migration, so callers must import `DataDictionary`, loaders, diffs, and rule evaluators directly from `imednet.datadict` (and `imednet.spi.validation` for validator protocols). Item 10 has also expanded to include `from-odm`, `to-odm`, and `from-redcap` CLI subcommands alongside `from-csv`, `from-api`, `validate`, `diff`, and `schema` (see [ADR-0007](0007-cli-framework-and-output-contracts.md)).
+
 ## Context and Decision
 
-The iMednet platform provides study metadata across multiple surfaces, primarily through 4-file CSV data dictionary exports (`FORMS.csv`, `QUESTIONS.csv`, `CHOICES.csv`, `BUSINESS_LOGIC.csv`) and through EDC REST API endpoints (`/forms`, `/variables`). Previously, data dictionary handling was minimal, consisting of untyped dictionary rows in `imednet.validation.data_dictionary`, with no unified schema, structural diffing, or typed representations of complex business logic rules.
+The iMednet platform provides Study metadata across multiple surfaces, primarily through 4-file CSV Data Dictionary exports (`FORMS.csv`, `QUESTIONS.csv`, `CHOICES.csv`, `BUSINESS_LOGIC.csv`) and through EDC REST API endpoints (`/forms`, `/variables`). Previously, Data Dictionary handling was minimal, consisting of untyped dictionary rows in a legacy validation helper (since removed in favor of `imednet.datadict`), with no unified schema, structural diffing, or typed representations of complex business logic rules.
 
 Furthermore, several inconsistencies existed in nomenclature and structure:
 1. **Domain Nomenclature**: Domain terminology in `CONTEXT.md` establishes `Variable` as the canonical term for a CRF data point, yet CSV exports historically labeled the file `QUESTIONS.csv`.
@@ -20,11 +24,11 @@ We decided to establish a canonical `imednet.datadict` module with the following
 6. **Dual Representation and Optional Raw XML**: Support both structured `logic` AST and verbatim `logicRawXml`, allowing `logicRawXml` to be omitted via `--no-raw-xml`. Unknown columns are tracked in `metadata.validationWarnings` and `extraAttributes`.
 7. **Rule Routing**: Route `Form`-scoped rules to `form.businessLogic`, and other rule types (`Workflow`, `Query`, `Approval`, `Required`) to top-level `unassignedBusinessLogic`.
 8. **Deterministic JSON Emission & Equality**: Sort forms by `formKey`, variables by `sequence` then `variableName`, choices by `position`, and rules by `sequence` then `id`. Exclude `generatedAt` during fixture and model equality comparisons.
-9. **Backward-Compatible Shims**: Refactor `imednet.validation.data_dictionary` to re-export `DataDictionary` and provide deprecated `DataDictionaryLoader` methods issuing `FutureWarning`.
-10. **Argparse CLI Integration**: Integrate `imednet datadict` subcommands (`from-csv`, `from-api`, `validate`, `diff`, `schema`) into the core CLI framework.
+9. **Backward-Compatible Shims** *(Superseded)*: Originally provided a temporary deprecated re-export module in `imednet.validation` issuing `FutureWarning` during migration. That transitional shim has been removed; import `DataDictionary` and CSV/API/ODM/REDCap loaders directly from `imednet.datadict`.
+10. **Argparse CLI Integration**: Integrate `imednet datadict` subcommands (`from-csv`, `from-api`, `from-odm`, `to-odm`, `from-redcap`, `validate`, `diff`, `schema`) into the core `argparse` CLI framework.
 
 ## Consequences
 
-- All tools, pipelines, and agents share a single canonical JSON representation and JSON Schema (`resources/data-dictionary-1.0.0.schema.json`) for clinical study metadata.
-- Automated diffing, migration testing, and CI validation can deterministically detect changes in study configurations across environments.
-- Full backward compatibility is preserved for existing tests and consumers, including `UATExecutionEngine`.
+- All tools, pipelines, and agents share a single canonical JSON representation and JSON Schema (`resources/data-dictionary-1.0.0.schema.json`) for clinical Study metadata.
+- Automated diffing, migration testing, and CI validation can deterministically detect changes in Study configurations across environments.
+- *(Superseded)* The temporary transition shim for legacy callers was retired once all workspace consumers, including `UATExecutionEngine`, migrated to `imednet.datadict`.

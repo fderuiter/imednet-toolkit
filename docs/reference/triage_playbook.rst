@@ -24,8 +24,8 @@ For each new issue:
 4. Add size and risk labels when they improve planning clarity.
 5. Link the issue to an epic or initiative when the work is part of a larger stream.
 
-If the issue lacks enough information to schedule work, move it to
-``status:needs-info`` and request the missing details.
+If the issue lacks enough information to schedule work, apply ``question``
+(optionally paired with ``status:blocked``) and request the missing details.
 
 Required maintainer checks
 --------------------------
@@ -72,8 +72,10 @@ Use the following guidance when assigning priority:
 ``priority:p3``
    Nice-to-have work, backlog grooming, or longer-range improvements.
 
-Use ``risk:high`` for work that could affect public API compatibility, credential
-handling, concurrency, or critical transport logic.
+Assign ``priority:p0`` or ``priority:p1`` and document elevated risk explicitly
+in the issue body for work that could affect public API compatibility, credential
+handling, concurrency, or critical transport logic (only ``risk:low`` exists as a
+GitHub label).
 
 Epic and sub-issue management
 -----------------------------
@@ -106,8 +108,8 @@ Blocked and stale issues
 ------------------------
 
 - Use ``status:blocked`` when an issue cannot proceed because of an upstream dependency.
-- Use ``status:needs-info`` when the reporter or maintainer must provide more detail.
-- Revisit blocked or needs-info issues during backlog review instead of leaving them unlabeled.
+- Use ``question`` (optionally paired with ``status:blocked``) when the reporter or maintainer must provide more detail.
+- Revisit ``status:blocked`` and ``question`` issues during backlog review instead of leaving them unlabeled.
 
 Definition of done for triage
 -----------------------------

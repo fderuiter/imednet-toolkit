@@ -78,7 +78,7 @@ non-destructive calls. Each bullet corresponds to a separate live test.
 CLI Commands
 ------------
 
-Live tests should execute the CLI via ``typer.testing.CliRunner``.
+Live tests should execute ``imednet.cli.app`` via the ``argparse`` ``CliRunner`` helper in ``tests/live/test_cli_live.py``.
 Run each command with minimal arguments and verify a successful exit code:
 
 - ``imednet studies list``

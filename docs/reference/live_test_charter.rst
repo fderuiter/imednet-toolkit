@@ -60,7 +60,7 @@ The live suite covers:
 
 * all ``list`` and ``get`` operations for every endpoint,
 * record creation and job polling (when mutation is enabled),
-* CLI commands via ``typer.testing.CliRunner``,
+* CLI commands via the ``argparse`` ``CliRunner`` helper in ``tests/live/test_cli_live.py``,
 * export helpers (CSV, Excel, JSON, Parquet, SQL),
 * Airflow hook and operator integration (when Airflow is installed),
 * workflow utilities (extract, register, update) when mutation is enabled.

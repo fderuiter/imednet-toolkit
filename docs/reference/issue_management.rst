@@ -46,7 +46,7 @@ Examples:
 
 - ``bug(http): delegate URL path construction to httpx``
 - ``refactor(core): decouple async and sync client hierarchies``
-- ``docs(contributing): document issue triage workflow``
+- ``docs(governance): document issue triage workflow``
 - ``epic(core): architecture modernization and thread-safety``
 
 Avoid the following title patterns:
@@ -71,13 +71,15 @@ Type labels
 
 - ``type:bug``
 - ``type:feature``
+- ``type:enhancement``
 - ``type:refactor``
+- ``type:tech-debt``
 - ``type:docs``
 - ``type:test``
 - ``type:ci``
 - ``type:security``
-- ``type:maintenance``
 - ``type:epic``
+- ``type:research``
 
 Priority labels
 ^^^^^^^^^^^^^^^
@@ -96,23 +98,38 @@ Area labels
 - ``area:auth``
 - ``area:pagination``
 - ``area:cli``
+- ``area:workflows``
+- ``area:airflow``
 - ``area:docs``
 - ``area:tests``
+- ``area:testing``
 - ``area:ci``
 - ``area:release``
-- ``area:workflows-plugin``
-- ``area:airflow-provider``
-- ``area:contributing``
+- ``area:github``
+- ``area:mapping``
+- ``area:records``
+- ``area:standards``
+- ``area:terminology``
+- ``area:governance``
+- ``area:performance``
+- ``area:dashboard``
+- ``area:review-workbench``
+- ``area:streamlit``
 
-Status labels
-^^^^^^^^^^^^^
+Status and triage labels
+^^^^^^^^^^^^^^^^^^^^^^^^
 
 - ``status:triage``
+- ``status:needs-design``
 - ``status:ready``
 - ``status:in-progress``
 - ``status:blocked``
-- ``status:needs-info``
+- ``status:review``
 - ``status:done``
+- ``question`` (waiting on reporter or maintainer clarification)
+- ``ready-for-agent`` (fully specified brief ready for automated execution, paired with ``status:ready``)
+- ``help wanted``
+- ``wontfix`` / ``duplicate`` / ``invalid``
 
 Size labels
 ^^^^^^^^^^^
@@ -126,9 +143,7 @@ Size labels
 Risk labels
 ^^^^^^^^^^^
 
-- ``risk:low``
-- ``risk:medium``
-- ``risk:high``
+- ``risk:low`` (only ``risk:low`` exists on GitHub; document medium or high risk explicitly in the issue body alongside ``priority:*`` rather than applying non-existent risk labels)
 
 Required issue content
 ----------------------

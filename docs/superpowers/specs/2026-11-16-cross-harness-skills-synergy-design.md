@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-16
 **Target PR Branch:** `remove_matts_skills` (synced to `origin/main` `4c856c34`)
-**Research Provenance:** [skills-synergy-research.md](../../agents/skills-synergy-research.md)
+**Research Provenance:** Pre-unification audit of `.agents/skills/` and repository governance (archived upon PR merge)
 
 ---
 
@@ -179,4 +179,4 @@ This design turns `.agents/skills/`, `AGENTS.md`, `docs/agents/*`, and thin repo
 ## 7. Left to the Builder / Implementation Plan
 
 - Exact copy refactoring inside individual `SKILL.md` sections and reference docs, preserving all §5 constraints with LF endings, zero trailing spaces, `typos` clean, and Ruff-clean Python helpers.
-- Exact task sequencing and TDD assertions in `docs/superpowers/plans/2026-11-16-cross-harness-skills-synergy.md`.
+- Exact task sequencing and TDD assertions executed during implementation of PR #1768 / follow-up unification commits.

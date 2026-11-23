@@ -20,18 +20,21 @@ The following diagram illustrates the internal two-phase orchestration:
 
     sequenceDiagram
         accTitle: Two-Phase Bulk Record Submission Sequence
-        accDescr: Sequence showing Phase 1 subject registration batch submission and job polling followed by Phase 2 clinical data batch submission
+        accDescr: Sequence showing Phase 1 Subject registration batch submission and Job polling via ImednetFacade.poll_jobs and JobPoller followed by Phase 2 Record data batch submission
         participant User
         participant Orchestrator as BulkRecordSubmissionWorkflow
         participant API as iMednet API
-        participant Poller as PollingManager
+        participant Facade as ImednetFacade.poll_jobs
+        participant Poller as JobPoller
 
         User->>Orchestrator: submit(Study, RecordSets)
         Note over Orchestrator,API: Phase 1: Registration
         Orchestrator->>API: create_record(Registration Batches)
         API-->>Orchestrator: Job IDs (Registration)
-        Orchestrator->>Poller: poll(Registration Job IDs)
-        Poller-->>Orchestrator: Completed
+        Orchestrator->>Facade: poll_jobs(Study, Registration Job IDs)
+        Facade->>Poller: poll_many(Study, Registration Job IDs)
+        Poller-->>Facade: JobStatus Results
+        Facade-->>Orchestrator: Completed
         Note over Orchestrator,API: Phase 2: Data Submission
         Orchestrator->>API: create_record(Data Batches)
         API-->>Orchestrator: Job IDs (Data)

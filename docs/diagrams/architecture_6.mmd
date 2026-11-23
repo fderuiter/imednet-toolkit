@@ -1,13 +1,14 @@
 graph TD
     accTitle: Tabular and Structured Data Export Sink Topology
-    accDescr: Flowchart comparing RecordMapper DataFrame exports to CSV, SQL, Parquet, and Snowflake against DataExtractionWorkflow exports to MongoDB and Neo4j
-    SDK["ImednetSDK"] --> RM["RecordMapper (tabular)"]
-    SDK --> DEW["DataExtractionWorkflow (structured)"]
-    RM --> DF["pandas.DataFrame"]
+    accDescr: Flowchart showing ImednetSDK routing tabular exports via SinkConfig and pandas.DataFrame to CSV, SQL, and Parquet, and streaming structured exports via CentralizedMapper to MongoDbExportSink, Neo4jExportSink, and SnowflakeExportSink
+    SDK["ImednetSDK"] --> TAB["SinkConfig (tabular)"]
+    SDK --> STREAM["run_streaming_export"]
+    TAB --> DF["pandas.DataFrame"]
     DF --> T1["CSV / Excel / JSON"]
     DF --> T2["SQL / DuckDB"]
     DF --> T3["Parquet (local)"]
-    DEW --> REC["Typed Record list"]
-    REC --> D["MongoDbExportSink"]
-    REC --> G["Neo4jExportSink"]
-    T3 --> W["SnowflakeExportSink (COPY INTO)"]
+    STREAM --> CM["CentralizedMapper"]
+    CM --> D["MongoDbExportSink"]
+    CM --> G["Neo4jExportSink"]
+    CM --> STAGE["Parquet staging"]
+    STAGE --> W["SnowflakeExportSink"]

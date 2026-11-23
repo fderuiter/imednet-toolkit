@@ -321,7 +321,6 @@ This documentation is organized according to the Diátaxis framework into four m
    explanation/schema_validation
    explanation/plugins
    explanation/workflow_interactions
-   explanation/refactoring_patterns
 
 .. toctree::
    :maxdepth: 2
@@ -331,7 +330,6 @@ This documentation is organized according to the Diátaxis framework into four m
    reference/configuration
    reference/compatibility
    reference/agent_rules
-   reference/refactoring_roadmaps
    reference/test_skip_conditions
    reference/live_test_charter
    reference/live_test_plan

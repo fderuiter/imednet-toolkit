@@ -1,6 +1,6 @@
 # Triage Labels & Live GitHub Vocabulary
 
-**Precedence rule:** This guide is the **authoritative label reference** for automated skills and agents in `imednet-toolkit` (`fderuiter/imednet-toolkit`), verified against live GitHub labels. Until `docs/reference/{issue_management,triage_playbook}.rst` and `.github/ISSUE_TEMPLATE/*.yml` are synchronized in a follow-up docs PR, **this file overrides any non-existent legacy label strings** listed there.
+**Precedence rule:** This guide is the **authoritative label reference** for automated skills and agents in `imednet-toolkit` (`fderuiter/imednet-toolkit`), verified against live GitHub labels and synchronized with `docs/reference/issue_management.rst` and `docs/reference/triage_playbook.rst`. Where `.github/ISSUE_TEMPLATE/*.yml` or historical issues cite older label strings, **this file overrides any non-existent legacy spellings**.
 
 ## Canonical Triage Role Mapping
 
@@ -20,9 +20,9 @@
 - **Docs / CI / Tests / Security:** `type:docs`, `type:ci`, `type:test`, `type:security`
 - **Multi-PR Epics & Research (`wayfinder` / `to-spec`):** `type:epic`, `type:research` (with `status:needs-design`, `status:blocked`, `status:ready`, `status:in-progress`, `status:review`, `status:done`)
 
-## Legacy `.rst` / `.github/ISSUE_TEMPLATE/` Translation Table
+## Legacy `.github/ISSUE_TEMPLATE/` & Historical Issue Translation Table
 
-When other repo docs cite legacy spellings absent on GitHub, translate them as follows:
+When `.github/ISSUE_TEMPLATE/*.yml` or historical issues cite legacy spellings absent on GitHub, translate them as follows:
 
 | Documented legacy spelling | Live GitHub label to apply |
 | --- | --- |

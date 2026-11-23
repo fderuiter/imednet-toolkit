@@ -12,14 +12,15 @@ The following diagram illustrates the internal orchestration logic of the UAT wo
 
     sequenceDiagram
         accTitle: End-to-End UAT Workflow Orchestration Sequence
-        accDescr: Sequence across User, UATWorkflow, StudySchemaInspector, UATSpecificationBuilder, SyntheticRecordGenerator, BulkRecordSubmissionWorkflow, and PollingManager
+        accDescr: Sequence across User, UATWorkflow, StudySchemaInspector, UATSpecificationBuilder, SyntheticRecordGenerator, BulkRecordSubmissionWorkflow, ImednetFacade.poll_jobs, and JobPoller
         participant User
         participant Orchestrator as UATWorkflow
         participant Inspector as StudySchemaInspector
         participant Builder as UATSpecificationBuilder
         participant Generator as SyntheticRecordGenerator
         participant Submitter as BulkRecordSubmissionWorkflow
-        participant Poller as PollingManager
+        participant Facade as ImednetFacade.poll_jobs
+        participant Poller as JobPoller
 
         User->>Orchestrator: run("STUDY_KEY")
         Orchestrator->>Inspector: inspect("STUDY_KEY")
@@ -30,8 +31,10 @@ The following diagram illustrates the internal orchestration logic of the UAT wo
         Generator-->>Orchestrator: List[GeneratedRecordSet]
         Orchestrator->>Submitter: submit("STUDY_KEY", List[GeneratedRecordSet])
         Submitter-->>Orchestrator: SubmissionResult (with Job IDs)
-        Orchestrator->>Poller: monitor(Job IDs)
-        Poller-->>Orchestrator: UATRunResult (Pass/Fail)
+        Orchestrator->>Facade: poll_jobs("STUDY_KEY", Job IDs)
+        Facade->>Poller: poll_many("STUDY_KEY", Job IDs)
+        Poller-->>Facade: JobStatus Results
+        Facade-->>Orchestrator: UATRunResult (Pass/Fail)
         Orchestrator-->>User: UATRunResult
 
 Usage Example

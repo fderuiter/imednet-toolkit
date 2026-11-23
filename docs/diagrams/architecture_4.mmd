@@ -1,6 +1,6 @@
 graph LR
-    accTitle: User Entry Points and Client Caching Flow
-    accDescr: Left-to-right diagram showing User interactions with CLI and SDK flowing through Workflows, Endpoints, Client, API, and Caches
+    accTitle: User Entry Points and Schema Caching Flow
+    accDescr: Left-to-right diagram showing User interactions with CLI and SDK flowing through Workflows, SchemaCache, Endpoints, Client, and API
     User --> |runs| CLI
     User --> |imports| SDK
     CLI --> |uses| Workflows
@@ -8,4 +8,4 @@ graph LR
     Workflows --> |call| Endpoints
     Endpoints --> |delegate| Client
     Client --> |talks to| API
-    Client --> |uses| Cache["(Caches)"]
+    Workflows --> |uses| SchemaCache

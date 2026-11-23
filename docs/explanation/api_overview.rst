@@ -33,27 +33,39 @@ private deployment. See :doc:`/reference/configuration` for details.
 Authentication
 --------------
 
-All requests must include ``x-api-key`` and ``x-imn-security-key`` headers. The
-:class:`~imednet.core.base_client.BaseClient` handles shared initialization
-while the :class:`~imednet.core.client.Client` and
-:class:`~imednet.core.async_client.AsyncClient` rely on
-:func:`imednet.config.load_config` to read ``IMEDNET_API_KEY`` and
-``IMEDNET_SECURITY_KEY`` from the environment and populate these headers
-automatically. See :doc:`/reference/configuration` for more information.
+Requests authenticate using either an API/security key pair
+(``x-api-key`` and ``x-imn-security-key`` headers) or an OIDC bearer token
+(``oidc_token``, sent via ``Authorization: Bearer <token>``).
+:class:`~imednet.core.base_client.BaseClient` initializes the configured
+:class:`~imednet.auth.strategy.AuthStrategy`, while
+:class:`~imednet.core.client.Client` and
+:class:`~imednet.core.async_client.AsyncClient` call
+:func:`imednet.config.load_config` (and :class:`~imednet.config.Config` /
+:class:`~imednet.config.CredentialSource`) to resolve ``IMEDNET_API_KEY`` +
+``IMEDNET_SECURITY_KEY`` or ``IMEDNET_OIDC_TOKEN`` from explicit arguments or
+environment variables. Supplying both an incomplete key pair and ambiguous
+credentials raises :class:`~imednet.errors.ConfigurationError`. See
+:doc:`/reference/configuration` for precedence details.
 
 HTTP methods and errors
 -----------------------
 
-The API primarily supports ``GET`` and ``POST`` requests. Non‐successful status
-codes raise typed exceptions:
+The API primarily supports ``GET`` and ``POST`` requests. Non-successful
+responses are mapped through :func:`imednet.errors.get_error_class`, which
+inspects structured ``metadata.error`` codes and ``metadata.status`` strings
+(:class:`~imednet.errors.ValidationError`,
+:class:`~imednet.errors.AuthenticationError`,
+:class:`~imednet.errors.ForbiddenError`, and
+:class:`~imednet.errors.ServerError`) before falling back to HTTP status codes:
 
-* ``400`` – :class:`~imednet.errors.BadRequestError`
-* ``401`` – :class:`~imednet.errors.UnauthorizedError`
-* ``403`` – :class:`~imednet.errors.ForbiddenError`
+* ``400`` – :class:`~imednet.errors.BadRequestError` (or :class:`~imednet.errors.ValidationError` on ``metadata.error.code == "1000"`` / ``VALIDATION_ERROR``)
+* ``401`` – :class:`~imednet.errors.UnauthorizedError` (or :class:`~imednet.errors.AuthenticationError` on ``metadata.error.code == "9001"`` / ``AUTHENTICATION_FAILED``)
+* ``403`` – :class:`~imednet.errors.ForbiddenError` (preserved even when ``metadata.error.code == "9001"``)
 * ``404`` – :class:`~imednet.errors.NotFoundError`
 * ``409`` – :class:`~imednet.errors.ConflictError`
 * ``429`` – :class:`~imednet.errors.RateLimitError`
 * ``5xx`` – :class:`~imednet.errors.ServerError`
+* other – :class:`~imednet.errors.ApiError`
 
 See :doc:`/how-to/retry_policy` for examples of handling these errors and configuring
 custom retry logic.
@@ -125,13 +137,13 @@ Error codes
 ~~~~~~~~~~~
 
 ``1000``
-  Validation error. Request contain invalid value.
+  Validation error (:class:`~imednet.errors.ValidationError`). Request contains an invalid value.
 
 ``9000``
-  Unknown error. Please contact Mednet support for assistance.
+  Server error (:class:`~imednet.errors.ServerError`). Unknown error; contact Mednet support for assistance.
 
 ``9001``
-  Unauthorized error. Insufficient permission to retrieve data.
+  Authorization or authentication error (:class:`~imednet.errors.ForbiddenError` on HTTP ``403`` / ``FORBIDDEN``, or :class:`~imednet.errors.AuthenticationError` otherwise).
 
 Integrations and analytical exports
 -----------------------------------

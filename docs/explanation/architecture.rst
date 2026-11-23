@@ -59,7 +59,20 @@ Timeouts
 Status-code error mapping
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Response errors are mapped via :func:`imednet.errors.get_error_class`:
+Response errors are mapped via :func:`imednet.errors.get_error_class`. Before
+falling back to HTTP status codes, ``get_error_class`` inspects structured
+``metadata.error`` payloads and ``metadata.status`` strings:
+
+* ``metadata.error`` code ``1000`` (or status ``VALIDATION_ERROR``) raises
+  :class:`imednet.errors.ValidationError`.
+* ``metadata.error`` code ``9000`` raises :class:`imednet.errors.ServerError`.
+* ``metadata.error`` code ``9001`` raises :class:`imednet.errors.ForbiddenError`
+  when paired with HTTP ``403`` or ``metadata.status == "FORBIDDEN"``, and
+  :class:`imednet.errors.AuthenticationError` otherwise (matching
+  ``AUTHENTICATION_FAILED`` / ``UNAUTHORIZED`` metadata statuses).
+
+When no specific ``metadata`` code or status overrides dispatch, HTTP status
+codes map as follows:
 
 .. list-table::
    :header-rows: 1
@@ -115,20 +128,30 @@ Endpoints
 ---------
 
 Each endpoint, such as :class:`~imednet.endpoints.studies.StudiesEndpoint`,
-wraps a related set of API operations. Endpoints now use **composition**:
-`GenericListGetEndpoint` composes operation classes (for example
-``ListOperation`` and ``FilterGetOperation``) rather than inheriting deep
-operation mixin chains. This keeps method resolution straightforward, improves
-IDE autocomplete, and avoids MRO-related typing ambiguity. Endpoints expose
-``list``/``get`` methods that return typed models.
+wraps a related set of API operations. Concrete EDC endpoints inherit dedicated
+sync and async bases from :mod:`imednet.core` (:class:`~imednet.core.EdcSyncListGetEndpoint`,
+:class:`~imednet.core.EdcAsyncListGetEndpoint`, :class:`~imednet.core.EdcSyncListEndpoint`,
+:class:`~imednet.core.EdcAsyncListEndpoint`, :class:`~imednet.core.EdcSyncGetEndpoint`,
+and :class:`~imednet.core.EdcAsyncGetEndpoint`) built on
+:class:`~imednet.core.endpoint.base.GenericEndpoint`, composing operation
+descriptors (``ListOperation``, ``FilterGetOperation``, and ``PathGetOperation``)
+rather than deep mixin chains. This keeps method resolution straightforward,
+improves IDE autocomplete, and exposes typed ``list`` and ``get`` signatures.
 
 Workflows
 ---------
 
-Workflows orchestrate several endpoints to perform higher level tasks. For
-example, :class:`~imednet_workflows.record_update.RecordUpdateWorkflow` validates
-record payloads, submits them, and polls resulting jobs. Workflows have sync and
-async variants and are available under ``sdk.workflows``.
+Workflows orchestrate several endpoints to perform higher-level tasks and are
+discovered via ``imednet.workflows`` entry points under ``sdk.workflows``.
+Async-capable workflows (``record_update``, ``register_subjects``, and
+``uat_inspector``, such as
+:class:`~imednet_workflows.record_update.RecordUpdateWorkflow`) expose both
+synchronous and asynchronous methods on :class:`~imednet.sdk.ImednetSDK` and
+:class:`~imednet.sdk.AsyncImednetSDK`. Synchronous-only workflows listed in
+``_SYNC_ONLY_WORKFLOW_NAMES`` (``data_extraction``, ``duckdb_centralizer``,
+``query_management``, ``record_mapper``, ``subject_data``, and ``uat``) require
+:class:`~imednet.sdk.ImednetSDK` and raise :exc:`TypeError` when accessed on
+:class:`~imednet.sdk.AsyncImednetSDK`.
 
 Caching
 -------
@@ -157,11 +180,21 @@ Extension Points
 Adding New Endpoints
 --------------------
 
-* Subclass :class:`~imednet.core.endpoint.base.GenericEndpoint` or
-  :class:`~imednet.core.endpoint.base.GenericListGetEndpoint`.
-* Register the class in ``_ENDPOINT_REGISTRY`` within
-  :mod:`imednet.sdk` so ``ImednetSDK`` exposes it.
-* Document the endpoint in ``docs/endpoints/`` and add tests.
+* Subclass the appropriate EDC base from :mod:`imednet.core`
+  (:class:`~imednet.core.EdcSyncListGetEndpoint`,
+  :class:`~imednet.core.EdcAsyncListGetEndpoint`,
+  :class:`~imednet.core.EdcSyncListEndpoint`,
+  :class:`~imednet.core.EdcAsyncListEndpoint`,
+  :class:`~imednet.core.EdcSyncGetEndpoint`, or
+  :class:`~imednet.core.EdcAsyncGetEndpoint`), or subclass
+  :class:`~imednet.core.endpoint.base.GenericEndpoint` directly for non-EDC
+  resources.
+* Register the sync and async classes in ``ENDPOINT_REGISTRY`` and
+  ``ASYNC_ENDPOINT_REGISTRY`` within :mod:`imednet.endpoints.registry` so
+  :class:`~imednet.sdk.ImednetSDK` and :class:`~imednet.sdk.AsyncImednetSDK`
+  resolve them lazily.
+* Regenerate the API reference under ``docs/reference/api/`` via
+  ``uv run python scripts/build_docs.py`` and add unit and typing contract tests.
 
 Adding New Workflows
 --------------------
@@ -441,7 +474,8 @@ Adding New Export Sinks
 Static boundary checks
 ----------------------
 
-The repository guard scans core, workflows, sinks and Airflow source roots.
+The repository guard scans ``core``, ``plugins-workflows``, ``plugins-sinks``,
+``plugins-tui``, and ``providers-airflow`` source roots.
 It resolves relative imports before checking segment-aware package boundaries;
 missing source trees fail explicitly. Type-only references follow the same
 layering rules, without executing optional modules. Core's SPI is an intentional
