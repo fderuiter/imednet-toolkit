@@ -152,7 +152,23 @@ def test_real_airflow_hook_get_conn_with_json_extra(monkeypatch, real_airflow, m
     assert isinstance(client, sdk_cls)
     assert client.config.api_key == "extra-api-key"  # pragma: allowlist secret
     assert client.config.security_key == "extra-sec-key"  # pragma: allowlist secret
-    assert str(client.config.base_url).rstrip("/") == "https://extra.synthetic.example/api"
+    assert str(client.config.base_url).rstrip("/") == "https://extra.synthetic.example"
+
+    for suffix in ("/api", "/api/v1", "/api/v1/edc"):
+        conn_suffix = connection_cls(
+            conn_id="imednet_extra_suffix",
+            conn_type="imednet",
+            login="extra-api-key",
+            password="extra-sec-key",  # pragma: allowlist secret
+            extra=json.dumps({"base_url": f"https://extra.synthetic.example{suffix}"}),
+        )
+        monkeypatch.setattr(
+            base_hook_cls,
+            "get_connection",
+            classmethod(lambda cls, conn_id, _c=conn_suffix: _c),
+        )
+        suffix_client = managed_sdk(hook_cls(imednet_conn_id="imednet_extra_suffix").get_conn())
+        assert str(suffix_client.config.base_url).rstrip("/") == "https://extra.synthetic.example"
 
 
 def test_real_airflow_hook_get_sdk_client_delegates_exactly_once(

@@ -14,13 +14,13 @@ from imednet import ImednetSDK
 from imednet.spi import sink_base
 from imednet.spi.sinks import redact_uri
 from imednet.spi.utils import (
-    redact_sensitive_payload,
     redact_sensitive_text,
     validate_path_segment,
 )
 
 from .. import export
 from .._airflow_compat import AirflowException, BaseOperator, Context
+from .._guards import has_embedded_uri_credentials, has_inline_secret_tokens
 from ..hooks import ImednetHook
 
 logger = logging.getLogger(__name__)
@@ -78,30 +78,26 @@ _TABULAR_OPTION_DEFAULTS: dict[str, Any] = {
 }
 
 
-def _has_embedded_uri_credentials(value: str) -> bool:
-    """Return True if *value* embeds plaintext URI userinfo credentials."""
-    if "://" not in value or "://***@" in value:
-        return False
-    return redact_uri(value) != value
+def _is_allowed_auth_none(key_norm: str, item: Any) -> bool:
+    """Return True when ``export_kwargs`` explicitly disables auth via ``auth='none'``."""
+    return key_norm == "auth" and isinstance(item, str) and item.strip().lower() == "none"
 
 
-def _has_inline_secret_tokens(value: str) -> bool:
-    """Return True if *value* embeds sensitive query params, headers, or credential pairs."""
-    existing_masks = value.count("***")
-    if redact_sensitive_text(value).count("***") > existing_masks:
-        return True
-    return str(redact_sensitive_payload(value)).count("***") > existing_masks
-
-
-def _validate_no_secrets_in_value(value: Any, *, field_name: str = "export_kwargs") -> None:
+def _validate_no_secrets_in_value(
+    value: Any,
+    *,
+    field_name: str = "export_kwargs",
+    check_secret_keys: bool | None = None,
+) -> None:
     """Reject secret keys or embedded credentials in templated operator fields."""
+    enforce_keys = field_name == "export_kwargs" if check_secret_keys is None else check_secret_keys
     if isinstance(value, str):
-        if _has_embedded_uri_credentials(value):
+        if has_embedded_uri_credentials(value):
             raise AirflowException(
                 f"Plaintext URI credentials are not allowed in '{field_name}'. "
                 "Configure an Airflow Connection and pass 'destination_conn_id' instead."
             )
-        if _has_inline_secret_tokens(value):
+        if has_inline_secret_tokens(value):
             raise AirflowException(
                 f"Embedded credentials or secret tokens are not allowed in '{field_name}'. "
                 "Configure an Airflow Connection instead."
@@ -110,16 +106,28 @@ def _validate_no_secrets_in_value(value: Any, *, field_name: str = "export_kwarg
     if isinstance(value, Mapping):
         for key, item in value.items():
             key_norm = str(key).strip().lower()
-            if key_norm in _SECRET_EXPORT_KEYS:
+            if (
+                enforce_keys
+                and key_norm in _SECRET_EXPORT_KEYS
+                and not _is_allowed_auth_none(key_norm, item)
+            ):
                 raise AirflowException(
                     f"Secret key '{key}' is not allowed in '{field_name}'. "
                     "Configure an Airflow Connection and pass 'destination_conn_id' instead."
                 )
-            _validate_no_secrets_in_value(item, field_name=field_name)
+            _validate_no_secrets_in_value(
+                item,
+                field_name=field_name,
+                check_secret_keys=enforce_keys,
+            )
         return
     if isinstance(value, (list, tuple, set)):
         for item in value:
-            _validate_no_secrets_in_value(item, field_name=field_name)
+            _validate_no_secrets_in_value(
+                item,
+                field_name=field_name,
+                check_secret_keys=enforce_keys,
+            )
 
 
 def _load_openlineage_types() -> tuple[Any, Any] | None:
@@ -640,6 +648,11 @@ class ImednetExportOperator(BaseOperator):
                     "Neo4j sink is not available in the installed sinks plugin. "
                     "Please install the required sink dependencies: pip install 'imednet-plugins-sinks[neo4j]'"
                 )
+            neo4j_auth = (
+                ("", "")
+                if _is_allowed_auth_none("auth", runtime_kwargs.get("auth"))
+                else conn_settings.get("auth", ("", ""))
+            )
             neo4j_config = config_cls(
                 study_key=config.study_key,
                 batch_size=config.batch_size,
@@ -650,7 +663,7 @@ class ImednetExportOperator(BaseOperator):
                 quality_gate_enabled=config.quality_gate_enabled,
                 min_schema_readiness_score=config.min_schema_readiness_score,
                 uri=runtime_kwargs.get("uri") or conn_settings.get("uri", ""),
-                auth=conn_settings.get("auth", ("", "")),
+                auth=neo4j_auth,
                 database=runtime_kwargs.get("database") or conn_settings.get("database", "neo4j"),
                 **stream_opts,
             )
