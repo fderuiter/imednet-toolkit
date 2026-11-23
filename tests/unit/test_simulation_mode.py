@@ -1195,8 +1195,9 @@ async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
             demo_revisions = [
                 rev async for rev in async_sdk.record_revisions.list(study_key="DEMO-STUDY")
             ]
-            assert len(demo_revisions) == 1
-            assert demo_revisions[0].subject_id == 203
+            assert len(demo_revisions) == 3
+            assert [r.subject_id for r in demo_revisions] == [202, 202, 203]
+            validate_record_revision_chain(demo_revisions)
             validate_record_revision_chain(study_revisions)
 
             rev_602 = [r for r in study_revisions if r.record_id == 602]
@@ -1234,3 +1235,223 @@ async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
         assert state._next_subject_id == 202
         assert state._next_revision_id == 1202
         assert len(state.record_revisions) == 2
+
+
+def test_simulation_study_coherent_foreign_keys_and_cleared_fixtures():
+    """Verify synthesized clinical foreign keys across Studies, Query types, and cleared-fixture guards."""
+    state = SimulationState()
+    transport = create_simulation_transport(state)
+    client = httpx.Client(transport=transport, base_url="https://sim.local")
+
+    with patch.dict(os.environ, {"IMEDNET_STRICT_MODE": "true"}, clear=True):
+        sdk = ImednetSDK(transport=transport, simulation_mode=True)
+
+        expected_study_profiles = [
+            ("STUDY", 101, "SITE", 201, "SUB1"),
+            ("DEMO-STUDY", 102, "North Site", 202, "SUBJ-001"),
+            ("MY_STUDY", 103, "Main Site", 201, "SUB1"),
+            ("AD-HOC-STUDY", 101, "SITE", 201, "SUB1"),
+        ]
+        for study_key, site_id, site_name, subj_id, subj_key in expected_study_profiles:
+            sites = list(sdk.sites.list(study_key=study_key))
+            assert len(sites) == 1
+            assert sites[0].site_id == site_id
+            assert sites[0].site_name == site_name
+
+            subjects = list(sdk.subjects.list(study_key=study_key, site_id=site_id))
+            assert len(subjects) == 1
+            assert subjects[0].subject_id == subj_id
+            assert subjects[0].subject_key == subj_key
+            assert subjects[0].site_id == site_id
+            assert subjects[0].site_name == site_name
+
+            visits = list(sdk.visits.list(study_key=study_key, subject_key=subj_key))
+            assert len(visits) == 2
+            assert all(v.subject_id == subj_id for v in visits)
+
+            records = list(sdk.records.list(study_key=study_key, subject_key=subj_key))
+            assert len(records) == 2
+            assert all(r.site_id == site_id and r.subject_id == subj_id for r in records)
+            dm_rec = next(r for r in records if r.form_key == "F_DM")
+            assert dm_rec.record_data == {"V_AGE": 45, "V_GENDER": "Female"}
+
+            revisions = list(sdk.record_revisions.list(study_key=study_key))
+            assert len(revisions) == 2
+            assert all(
+                rev.site_id == site_id and rev.subject_id == subj_id and rev.subject_key == subj_key
+                for rev in revisions
+            )
+            validate_record_revision_chain(revisions)
+
+            codings = list(sdk.codings.list(study_key=study_key))
+            assert len(codings) == 2
+            assert all(
+                c.site_id == site_id
+                and c.site_name == site_name
+                and c.subject_id == subj_id
+                and c.subject_key == subj_key
+                for c in codings
+            )
+
+            queries = list(sdk.queries.list(study_key=study_key, type=["record", "question"]))
+            assert len(queries) == 2
+            assert {q.type for q in queries} == {"record", "question"}
+            assert all(q.subject_id == subj_id and q.subject_key == subj_key for q in queries)
+
+            raw_queries = client.get(f"/api/v1/edc/studies/{study_key}/queries").json()["data"]
+            assert all("status" not in q for q in raw_queries)
+
+    # Clearing fixture collections suppresses fallback synthesis
+    cleared_state = SimulationState()
+    cleared_state.sites.clear()
+    cleared_state.subjects.clear()
+    cleared_state.visits.clear()
+    cleared_state.records.clear()
+    cleared_state.record_revisions.clear()
+    cleared_state.codings.clear()
+    cleared_state.queries.clear()
+    assert cleared_state.get_sites("MY_STUDY") == []
+    assert cleared_state.get_subjects("MY_STUDY") == []
+    assert cleared_state.get_visits("MY_STUDY") == []
+    assert cleared_state.get_records("MY_STUDY") == []
+    assert cleared_state.get_record_revisions("MY_STUDY") == []
+    assert cleared_state.get_codings("MY_STUDY") == []
+    assert cleared_state.get_queries("MY_STUDY") == []
+
+
+def test_simulation_create_records_materializes_unseeded_study_and_isolates_jobs():
+    """Verify unseeded Study materialization in create_records, cross-Study 404s, and per-Study JOB-1002 polling."""
+    state = SimulationState()
+    state.jobs["BATCH-ACTIVE-STUDY"] = {
+        "jobId": "JOB-ACTIVE-STUDY",
+        "batchId": "BATCH-ACTIVE-STUDY",
+        "state": "RUNNING",
+        "progress": 50,
+        "totalRecords": 1,
+        "successfulRecords": 0,
+        "failedRecords": 0,
+        "results": [{"recordId": 601, "status": "SUCCESS"}],
+        "dateCreated": "2026-04-01T00:00:00Z",
+        "dateStarted": "2026-04-01T00:00:00Z",
+        "dateFinished": None,
+        "_study_key": "STUDY",
+    }
+    transport = create_simulation_transport(state)
+    client = httpx.Client(transport=transport, base_url="https://sim.local")
+
+    with patch.dict(os.environ, {"IMEDNET_STRICT_MODE": "true"}, clear=True):
+        sdk = ImednetSDK(transport=transport, simulation_mode=True)
+
+        # Scheduled update on unseeded MY_STUDY materializes baseline SUB1/records/revisions first
+        my_study_job = sdk.records.create(
+            study_key="MY_STUDY",
+            records_data=[
+                UpdateScheduledRecordRequest(
+                    subjectKey="SUB1",
+                    formKey="F_VS",
+                    intervalName="Baseline",
+                    data=RecordData({"V_WEIGHT": 77.5}),
+                ).model_dump(by_alias=True),
+                RegisterSubjectRequest(
+                    formKey="F_DM",
+                    siteName="Main Site",
+                    data=RecordData({"V_AGE": 34, "V_GENDER": "Male"}),
+                ).model_dump(by_alias=True),
+            ],
+        )
+        my_subjects = list(sdk.subjects.list(study_key="MY_STUDY", site_id=103))
+        assert len(my_subjects) == 2
+        assert {s.subject_key for s in my_subjects} == {"SUB1", "SUBJ-1001"}
+
+        my_records = list(sdk.records.list(study_key="MY_STUDY"))
+        assert len(my_records) == 3
+        updated_vs = next(r for r in my_records if r.record_id == 602)
+        assert updated_vs.record_data["V_WEIGHT"] == 77.5
+        assert updated_vs.site_id == 103
+
+        my_revisions = list(sdk.record_revisions.list(study_key="MY_STUDY"))
+        assert len(my_revisions) == 4
+        validate_record_revision_chain(my_revisions)
+
+        # BATCH-* job created in STUDY returns 404 in DEMO-STUDY and MY_STUDY, while /jobs/{batchId} works
+        study_job = sdk.records.create(
+            study_key="STUDY",
+            records_data=[{"subjectKey": "SUB1", "formKey": "F_VS", "data": {"V_WEIGHT": 70.0}}],
+        )
+        study_batch_id = study_job.batch_id
+        assert study_batch_id is not None
+
+        assert client.get(f"/api/v1/edc/studies/STUDY/jobs/{study_batch_id}").status_code == 200
+        assert (
+            client.get(f"/api/v1/edc/studies/STUDY/jobs/{study_batch_id}/results").status_code
+            == 200
+        )
+        assert (
+            client.get(f"/api/v1/edc/studies/DEMO-STUDY/jobs/{study_batch_id}").status_code == 404
+        )
+        assert (
+            client.get(f"/api/v1/edc/studies/DEMO-STUDY/jobs/{study_batch_id}/results").status_code
+            == 404
+        )
+        assert client.get(f"/api/v1/edc/studies/MY_STUDY/jobs/{study_batch_id}").status_code == 404
+        assert client.get(f"/api/v1/edc/jobs/{study_batch_id}").status_code == 200
+        assert client.get(f"/api/v1/edc/jobs/{study_batch_id}/results").status_code == 200
+
+        demo_visible_batches = {
+            j["batchId"] for j in client.get("/api/v1/edc/studies/DEMO-STUDY/jobs").json()
+        }
+        assert study_batch_id not in demo_visible_batches
+        assert my_study_job.batch_id not in demo_visible_batches
+
+        # Cross-study lookup against active STUDY job returns 404 without advancing STUDY poll counter
+        with pytest.raises(NotFoundError):
+            sdk.jobs.get("DEMO-STUDY", "BATCH-ACTIVE-STUDY")
+        assert "BATCH-ACTIVE-STUDY" not in state._job_poll_counts
+        first_owner_poll = sdk.jobs.get("STUDY", "BATCH-ACTIVE-STUDY")
+        assert first_owner_poll.state == JobState.RUNNING
+
+        # Polling shared template JOB-1002 to completion in DEMO-STUDY leaves MY_STUDY and STUDY at RUNNING (50%)
+        demo_completed = sdk.jobs.poll("DEMO-STUDY", "JOB-1002", interval=0.001, timeout=5.0)
+        assert demo_completed.state == JobState.COMPLETED
+        assert demo_completed.progress == 100
+
+        my_study_poll_1 = sdk.jobs.get("MY_STUDY", "JOB-1002")
+        assert my_study_poll_1.state == JobState.RUNNING
+        assert my_study_poll_1.progress == 50
+
+        study_poll_1 = sdk.jobs.get("STUDY", "JOB-1002")
+        assert study_poll_1.state == JobState.RUNNING
+        assert study_poll_1.progress == 50
+
+
+def test_simulation_workflows_subject_data_and_queries_by_site():
+    """Verify SubjectDataWorkflow and QueryManagementWorkflow joins succeed across simulated Studies."""
+    pytest.importorskip("imednet_workflows")
+    from imednet_workflows.query_management import QueryManagementWorkflow
+    from imednet_workflows.subject_data import SubjectDataWorkflow
+
+    with patch.dict(os.environ, {"IMEDNET_STRICT_MODE": "true"}, clear=True):
+        with ImednetSDK(simulation_mode=True) as sdk:
+            subj_wf = SubjectDataWorkflow(sdk)
+            for study_key, subj_key, expected_site in [
+                ("DEMO-STUDY", "SUBJ-001", "North Site"),
+                ("STUDY", "SUB1", "SITE"),
+                ("MY_STUDY", "SUB1", "Main Site"),
+            ]:
+                bundle = subj_wf.get_all_subject_data(study_key, subj_key)
+                assert bundle.subject_details is not None
+                assert bundle.subject_details.site_name == expected_site
+                assert len(bundle.visits) == 2
+                assert len(bundle.records) == 2
+                assert len(bundle.queries) == 2
+
+            query_wf = QueryManagementWorkflow(sdk)
+            north_queries = query_wf.get_queries_by_site("DEMO-STUDY", "North Site")
+            assert len(north_queries) == 2
+            assert all(q.subject_key == "SUBJ-001" for q in north_queries)
+            assert {q.type for q in north_queries} == {"record", "question"}
+
+            main_queries = query_wf.get_queries_by_site("MY_STUDY", "Main Site")
+            assert len(main_queries) == 2
+            assert all(q.subject_key == "SUB1" for q in main_queries)
+            assert {q.type for q in main_queries} == {"record", "question"}

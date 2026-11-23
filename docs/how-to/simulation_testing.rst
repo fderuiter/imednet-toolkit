@@ -12,10 +12,13 @@ Enabling Simulation Mode in ``ImednetSDK``
 Pass ``simulation_mode=True`` to :class:`~imednet.ImednetSDK` or
 :class:`~imednet.AsyncImednetSDK`—or set ``IMEDNET_SIMULATION_MODE=true`` in the
 environment—to route all endpoint requests through ``SimulationTransport`` backed
-by deterministic fixtures for ``Study`` ``"STUDY"`` (including ``Site`` ``"SITE"``,
-``Form`` definitions ``"F_DM"`` and ``"F_VS"``, ``Subject`` ``"SUBJ-001"``,
-``Visit`` / ``Interval`` schedules, ``Record`` items, ``RecordRevision`` audit
-entries, and ``Query`` items):
+by Study-coherent fixtures across ``Study`` ``"STUDY"`` (``Site`` ``"SITE"`` and
+``Subject`` ``"SUB1"``), ``"DEMO-STUDY"`` (``Site`` ``"North Site"`` and ``Subject``
+``"SUBJ-001"``), and ``"MY_STUDY"`` (``Site`` ``"Main Site"`` and ``Subject``
+``"SUB1"``), including ``Form`` definitions ``"F_DM"`` and ``"F_VS"``, ``Visit`` /
+``Interval`` schedules, ``Record`` items, ``RecordRevision`` audit entries, typed
+``Query`` items (``"record"`` and ``"question"``), and Study-isolated ``Job``
+batches:
 
 .. testcode::
 
@@ -31,7 +34,7 @@ entries, and ``Query`` items):
                {
                    "formKey": "F_VS",
                    "siteName": "SITE",
-                   "subjectKey": "SUBJ-001",
+                   "subjectKey": "SUB1",
                    "intervalName": "Baseline",
                    "data": {"V_WEIGHT": 74.0},
                }
@@ -53,10 +56,13 @@ exports, write commands, workflows, and the Textual TUI offline without API keys
 
    imednet studies list --simulation --no-interactive
    imednet forms list STUDY --simulation --format json
+   imednet queries list STUDY --simulation --filter "type==record,type==question" --format json
    imednet datadict from-api STUDY --simulation -o sim_datadict.json
    imednet export json STUDY ./sim_records.json --simulation --no-interactive
    imednet subject-data STUDY SUB1 --simulation --format json
-   imednet tui STUDY --simulation
+   imednet subject-data DEMO-STUDY SUBJ-001 --simulation --format json
+   imednet jobs status STUDY JOB-1002 --simulation --format json
+   imednet tui DEMO-STUDY --simulation
 
 Isolated Per-Test ``SimulationState`` Injection
 -----------------------------------------------
