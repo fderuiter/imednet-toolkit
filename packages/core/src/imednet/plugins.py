@@ -342,6 +342,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
@@ -359,6 +360,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -379,6 +381,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Register a new subject by submitting a single enrollment record."""
@@ -398,6 +401,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Update an existing scheduled record for a subject."""
@@ -415,6 +419,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Create a new unscheduled record for an existing subject."""
@@ -432,6 +437,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
@@ -449,6 +455,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -469,6 +476,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously register a new subject via the Records API."""
@@ -488,6 +496,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously update an existing scheduled record for a subject."""
@@ -505,6 +514,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously create a new unscheduled record for an existing subject."""
@@ -989,6 +999,7 @@ class UATWorkflowProtocol(Protocol):
         snapshot: Any,
         *,
         data_dictionary: DataDictionary | None = None,
+        seed: int | None = None,
     ) -> list[Any]:
         """Generate synthetic record sets from a UAT specification and snapshot."""
         ...
@@ -998,6 +1009,8 @@ class UATWorkflowProtocol(Protocol):
         study_key: str,
         record_sets: list[Any],
         email_notify: bool | str | None = None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> Any:
         """Submit generated UAT record sets in two phases."""
         ...

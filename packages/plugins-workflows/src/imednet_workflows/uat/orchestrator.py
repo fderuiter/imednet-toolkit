@@ -6,7 +6,7 @@ import math
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -31,6 +31,12 @@ from imednet.spi.validation import (
 )
 
 from .generator import GeneratedRecordSet
+from .inspector import (
+    is_disabled_form,
+    is_enrollment_form,
+    is_non_subject_form,
+    is_unscheduled_form,
+)
 from .models import (
     TERMINAL_UAT_STATES,
     InvalidUATStateTransitionError,
@@ -271,7 +277,7 @@ class UATSpecificationBuilder:
 
         form_specs = []
         for form in snapshot.forms:
-            if getattr(form, "disabled", False):
+            if is_disabled_form(form) or is_non_subject_form(form):
                 continue
             if validated_form_keys is not None and form.form_key not in validated_form_keys:
                 continue
@@ -288,7 +294,8 @@ class UATSpecificationBuilder:
                     form_key=form_key_str,
                 )
                 for v in variables
-                if not getattr(v, "disabled", False)
+                if getattr(v, "disabled", None) is not True
+                and getattr(v, "deleted", None) is not True
             ]
             required_names = [vs.variable_name for vs in var_specs if vs.required]
 
@@ -318,11 +325,10 @@ class UATSpecificationBuilder:
         )
 
     def _infer_test_type(self, form: Any) -> RecordTestType:
-        """Heuristic: enrollment forms → REGISTER_SUBJECT, rest → CREATE_NEW_RECORD."""
-        form_type = getattr(form, "form_type", "")
-        if form_type in ("Enrollment", "Registration"):
+        """Heuristic: enrollment forms -> REGISTER_SUBJECT, unscheduled -> CREATE_NEW_RECORD."""
+        if is_enrollment_form(form):
             return RecordTestType.REGISTER_SUBJECT
-        if getattr(form, "unscheduled_visit", False):
+        if is_unscheduled_form(form):
             return RecordTestType.CREATE_NEW_RECORD
         return RecordTestType.UPDATE_SCHEDULED_RECORD
 
@@ -356,13 +362,32 @@ class UATSpecificationBuilder:
             if source_dd_var is not None
             else None
         )
+        snap_norm = snap_type.strip().lower() if isinstance(snap_type, str) else ""
+        dd_norm = dd_type.strip().lower() if isinstance(dd_type, str) else ""
         if dd_type and (
             not snap_type
             or (
-                snap_type == "Coded"
-                and dd_type in ("Radio", "Single Select", "Checkbox", "Multi Select", "Yes/No")
+                snap_norm == "coded"
+                and dd_norm
+                in {
+                    "radio",
+                    "single select",
+                    "dropdown",
+                    "drop down",
+                    "dropdownlist",
+                    "dropdown list",
+                    "select",
+                    "checkbox",
+                    "check box",
+                    "multi select",
+                    "multiselect",
+                    "yes/no",
+                    "yesno",
+                    "yes no",
+                    "true/false",
+                }
             )
-            or (snap_type == "Text" and dd_type != "Text")
+            or (snap_norm == "text" and dd_norm != "text")
         ):
             resolved_type = dd_type
         else:
@@ -401,7 +426,7 @@ class UATSpecificationBuilder:
             form_obj = forms_by_key.get(key)
             if form_obj is None:
                 unknown_keys.append(key)
-            elif getattr(form_obj, "disabled", False):
+            elif is_disabled_form(form_obj):
                 disabled_keys.append(key)
 
         if unknown_keys or disabled_keys:
@@ -423,21 +448,23 @@ class UATSpecificationBuilder:
                 raise ValueError("siteName is required")
             sites_by_name = {s.site_name: s for s in snapshot.sites if s.site_name}
             if cleaned not in sites_by_name:
-                raise ValueError(f"site '{cleaned}' not found")
+                raise ValueError(f"Site '{cleaned}' not found in study '{snapshot.study_key}'.")
             site_obj = sites_by_name[cleaned]
             site_status = getattr(site_obj, "site_enrollment_status", None)
             if not is_site_enrollment_eligible(site_status):
                 raise ValueError(
-                    f"site '{cleaned}' is not eligible for enrollment (status: {site_status!s})"
+                    f"Site '{cleaned}' is not eligible for enrollment (status: {site_status!s})."
                 )
             return site_obj.site_name or cleaned
 
-        active_sites = snapshot.active_sites()
-        if active_sites:
-            return active_sites[0].site_name or "Default Site"
+        for site in snapshot.sites:
+            if is_site_enrollment_eligible(site.site_enrollment_status):
+                return site.site_name or "Default Site"
 
         if snapshot.sites:
-            return snapshot.sites[0].site_name or "Default Site"
+            raise ValueError(
+                f"No enrollment-eligible open sites found in study '{snapshot.study_key}'."
+            )
 
         return "Default Site"
 
@@ -446,10 +473,12 @@ class UATSpecificationBuilder:
         return self.resolve_site_name(snapshot, site_name)
 
     def _resolve_interval(self, snapshot: StudySnapshot, form_key: str | None) -> str | None:
-        """Find the first interval that contains this form."""
+        """Find the first active (non-disabled) interval that contains this form."""
         if not form_key:
             return None
         for interval in snapshot.intervals:
+            if getattr(interval, "disabled", None) is True:
+                continue
             for f_summary in getattr(interval, "forms", []) or []:
                 if f_summary.form_key == form_key:
                     return interval.interval_name
@@ -537,7 +566,7 @@ def _coerce_payloads_for_validation(
 
         new_data: dict[str, Any] = {}
         for var_name, val in raw_data.items():
-            var_meta = form_vars.get(var_name) if isinstance(form_vars, dict) else None
+            var_meta = form_vars.get(var_name) if isinstance(form_vars, Mapping) else None
             if var_meta is None or not isinstance(val, str) or val == "":
                 new_data[var_name] = val
                 continue
@@ -919,7 +948,20 @@ class UATWorkflow:
                 # 4. Submit
                 self.transition_to(UATWorkflowState.SUBMITTING)
                 t0 = time.monotonic()
-                submission_result = self.submit(study_key, record_sets, email_notify=email_notify)
+                effective_submit_schema = schema if schema is not None else active_dd
+                if effective_submit_schema is not None:
+                    submission_result = self.submit(
+                        study_key,
+                        record_sets,
+                        email_notify=email_notify,
+                        schema=effective_submit_schema,
+                    )
+                else:
+                    submission_result = self.submit(
+                        study_key,
+                        record_sets,
+                        email_notify=email_notify,
+                    )
                 phase_durations[UATRunPhase.SUBMIT] = time.monotonic() - t0
 
                 # 5. Monitor
@@ -1076,6 +1118,8 @@ class UATWorkflow:
         study_key: str,
         record_sets: list[GeneratedRecordSet],
         email_notify: bool | str | None = None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> SubmissionResult:
         """Execute the two-phase bulk submission."""
         active = self._active_context.get()
@@ -1088,6 +1132,14 @@ class UATWorkflow:
                 else self._create_submitter()
             )
         )
+        active_dd = schema if schema is not None else self._data_dictionary
+        if active_dd is not None:
+            return submitter.submit(  # type: ignore[no-any-return]
+                study_key,
+                record_sets,
+                email_notify=email_notify,
+                schema=active_dd,
+            )
         return submitter.submit(study_key, record_sets, email_notify=email_notify)  # type: ignore[no-any-return]
 
     def monitor(self, study_key: str, submission_result: SubmissionResult) -> Any:

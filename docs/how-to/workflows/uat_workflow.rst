@@ -254,3 +254,68 @@ While ``UATWorkflow`` verifies positive Record submission across Study Forms, :c
         assert float(verification_report.results[0]["test_data"]["V_WEIGHT"]) < 35.0
 
 See :doc:`/how-to/data_dictionary` for loading Study Data Dictionaries and evaluating XML business logic offline before UAT runs.
+
+Path and Partition Validation in UAT and Config Stores
+------------------------------------------------------
+
+Workflow engines enforce dynamic URL and filesystem path boundaries via
+:func:`~imednet.utils.validate_path_segment`, :func:`~imednet.utils.build_safe_path`,
+and :class:`~imednet.errors.PathTraversalValidationError` (``status_code=400``):
+
+* **UAT verification (``UATExecutionEngine``):** ``run_verification(study_key, ...)``
+  validates ``study_key`` with :func:`~imednet.utils.validate_path_segment` before
+  inspecting ``Form``, ``Subject``, ``Site``, ``Interval``, ``Visit``, ``Variable``,
+  ``Query``, or ``Record`` resources. When asynchronous ``Job`` creation responses are
+  parsed, ``_extract_job_batch_id`` rejects raw ASCII control characters and validates
+  the stripped ``batch_id`` before polling ``/studies/{study_key}/jobs/{batch_id}`` via
+  :func:`~imednet.utils.build_safe_path`.
+* **Versioned Study configuration store (``ConfigVersionStore``):** When resolving
+  Study-scoped SQLite ledgers, ``ConfigVersionStore`` validates active ``Study``
+  partition keys (via ``validate_partition_key``) and verifies that the resolved ledger
+  directory stays inside the configured base directory (``is_relative_to``), raising
+  :class:`~imednet.errors.PathTraversalValidationError` if a context key attempts to
+  escape the root directory.
+
+.. testcode::
+
+    from pathlib import Path
+    import tempfile
+    from imednet import ImednetSDK
+    from imednet.core.context import study_context
+    from imednet.datadict import DataDictionary, Metadata
+    from imednet.errors import PathTraversalValidationError
+    from imednet.simulation import SimulationState, SimulationTransport
+    from imednet.utils import build_safe_path, validate_path_segment
+    from imednet_workflows.config_version_control import ConfigVersionStore
+    from imednet_workflows.uat import UATExecutionEngine
+
+    assert (
+        build_safe_path("studies", "STUDY", "jobs", "B_1")
+        == "studies/STUDY/jobs/B_1"
+    )
+    assert validate_path_segment("B_1", name="batch_id") == "B_1"
+
+    guard_dd = DataDictionary(metadata=Metadata.create(study_key="STUDY"), forms=[])
+    with ImednetSDK(
+        simulation_mode=True,
+        transport=SimulationTransport(SimulationState()),
+    ) as guard_sdk:
+        guard_engine = UATExecutionEngine(guard_sdk, guard_dd, poll_interval=0.0)
+        try:
+            guard_engine.run_verification("../escape")
+        except PathTraversalValidationError as study_path_err:
+            assert study_path_err.status_code == 400
+
+        for bad_job_payload in ({"batchId": "../escape"}, {"batchId": "batch\n01"}):
+            try:
+                guard_engine._extract_job_batch_id(bad_job_payload)
+            except PathTraversalValidationError as batch_path_err:
+                assert batch_path_err.status_code == 400
+
+    with tempfile.TemporaryDirectory() as tmp_ledger_dir:
+        base_ledger = Path(tmp_ledger_dir) / "config_versions.sqlite3"
+        with study_context("../escape"):
+            try:
+                ConfigVersionStore._get_dynamic_db_path_no_create(base_ledger)
+            except PathTraversalValidationError as store_path_err:
+                assert store_path_err.status_code == 400

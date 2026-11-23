@@ -67,11 +67,11 @@ List record revisions
    * - ``size``
      - Integer
      - ``25``
-     - Maximum number of records to return per page.
+     - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
      - None
-     - Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).
+     - Sorting expression (e.g. ``recordRevisionId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String
      - None
