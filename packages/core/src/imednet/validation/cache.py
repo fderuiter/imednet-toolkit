@@ -1355,6 +1355,90 @@ def validate_record_entry(
             collect_errors=collect_errors,
             record_index=record_index,
         )
+
+    raw_data = record.get("recordData", record.get("data", {}))
+    if isinstance(raw_data, Mapping) and raw_data:
+        forms_attr = getattr(schema, "forms", None)
+        is_datadict_like = isinstance(forms_attr, Sequence) and not isinstance(
+            schema, BaseSchemaCache
+        )
+        if is_datadict_like or collect_errors:
+            form_keys: Iterable[str]
+            if isinstance(schema, BaseSchemaCache):
+                form_keys = schema.forms_for_study(eff_study_key) if eff_study_key else schema.forms
+            elif isinstance(forms_attr, Sequence):
+                form_keys = [
+                    str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
+                    for f in forms_attr
+                    if getattr(f, "form_key", None) or getattr(f, "formKey", None)
+                ]
+            else:
+                form_keys = ()
+
+            known_vars: dict[str, list[Any]] = {}
+            for candidate_fk in form_keys:
+                f_vars = (
+                    schema.variables_for_form(candidate_fk, study_key=eff_study_key)
+                    if isinstance(schema, BaseSchemaCache)
+                    else schema.variables_for_form(candidate_fk)
+                )
+                for v_name, v_obj in f_vars.items():
+                    known_vars.setdefault(v_name, []).append(v_obj)
+
+            if known_vars:
+                formless_errors: list[RecordValidationIssue] = []
+                for var_name, var_val in raw_data.items():
+                    candidates = known_vars.get(var_name)
+                    if not candidates:
+                        msg = f"Unknown variable {var_name}"
+                        if not collect_errors:
+                            raise ValidationError(msg)
+                        formless_errors.append(
+                            RecordValidationIssue(
+                                record_index=record_index,
+                                form_key=None,
+                                variable_name=var_name,
+                                message=msg,
+                                rule_id="unknown_variable",
+                            )
+                        )
+                        continue
+                    if not _is_empty_value(var_val):
+                        distinct_types = {
+                            str(getattr(vo, "variable_type", getattr(vo, "variableType", "")) or "")
+                            .strip()
+                            .lower()
+                            for vo in candidates
+                        }
+                        distinct_types.discard("")
+                        if len(distinct_types) == 1:
+                            vtype = getattr(
+                                candidates[0],
+                                "variable_type",
+                                getattr(candidates[0], "variableType", None),
+                            )
+                            try:
+                                _check_type(vtype, var_val)
+                            except ValidationError as exc:
+                                if not collect_errors:
+                                    raise
+                                formless_errors.append(
+                                    RecordValidationIssue(
+                                        record_index=record_index,
+                                        form_key=None,
+                                        variable_name=var_name,
+                                        message=str(exc),
+                                        rule_id="invalid_type",
+                                    )
+                                )
+                if formless_errors:
+                    return BatchValidationReport(
+                        total_records=1,
+                        valid_records=0,
+                        invalid_records=1,
+                        errors=formless_errors,
+                    )
+
     if collect_errors:
         return BatchValidationReport(total_records=1, valid_records=1, invalid_records=0)
     return None

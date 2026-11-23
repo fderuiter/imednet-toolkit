@@ -812,9 +812,15 @@ class TabularCSVSink(ExportSink):
 
 _RECORD_META_CONTRACT_TYPES: tuple[tuple[str, str], ...] = (
     ("recordId", "int64"),
+    ("recordOid", "string"),
     ("subjectKey", "string"),
     ("visitId", "int64"),
+    ("intervalId", "int64"),
+    ("intervalName", "string"),
     ("formId", "int64"),
+    ("formKey", "string"),
+    ("siteId", "int64"),
+    ("siteName", "string"),
     ("recordStatus", "string"),
     ("dateCreated", "string"),
 )

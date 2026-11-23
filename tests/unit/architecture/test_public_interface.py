@@ -459,3 +459,68 @@ _bad_validation: Any = validation.nonexistent_helper_xyz
             f':{line_no}: error: Module has no attribute "nonexistent_helper_xyz"  [attr-defined]'
         )
         assert expected_err in stdout, f"Expected {expected_err!r}, got:\n{stdout}"
+
+
+# ---------------------------------------------------------------------------
+# SDTM helper surface boundaries
+# ---------------------------------------------------------------------------
+
+UNUSED_SDTM_PRIVATE_HELPERS = (
+    "_PreparedSdtmRow",
+    "_format_sdtm_flag",
+    "_get_model_consumed_keys",
+    "_get_model_field_aliases",
+    "_normalize_key",
+)
+
+PUBLIC_SDTM_EXPORTS = (
+    "SDTM_DOMAIN_SPECS",
+    "VALID_NAMING_CONVENTIONS",
+    "format_iso8601_dtc",
+    "format_variable_name",
+    "get_sdtm_domain_variables",
+    "normalize_naming_convention",
+    "resolve_sdtm_domain",
+    "transform_records_to_sdtm",
+    "transform_records_to_sdtm_rows",
+)
+
+ACTIVE_SDTM_SPI_HELPERS = (
+    "_SDTM_RECORDS_SORT",
+    "_UNSET_PIPELINE",
+    "_SdtmNormalizer",
+    "_collapse_alnum_key",
+    "_extract_stream_usubjid_and_id",
+    "_iter_sorted_sdtm_frames",
+)
+
+
+def test_unused_sdtm_private_helpers_are_not_reexported() -> None:
+    """Internal-only SDTM helpers stay inside imednet.models.sdtm without downstream re-exports."""
+    from importlib.util import find_spec
+
+    import imednet.models as models_mod
+    import imednet.models.sdtm as sdtm_mod
+    import imednet.models.standards as standards_mod
+    import imednet.spi.models as spi_models_mod
+
+    for helper in UNUSED_SDTM_PRIVATE_HELPERS:
+        assert hasattr(sdtm_mod, helper), f"imednet.models.sdtm must retain {helper} internally"
+        assert helper not in sdtm_mod.__all__, (
+            f"imednet.models.sdtm.__all__ must not export {helper}"
+        )
+
+    downstream_modules = [standards_mod, models_mod, spi_models_mod]
+    if find_spec("imednet_workflows") is not None:
+        downstream_modules.append(importlib.import_module("imednet_workflows.record_mapper"))
+
+    for mod in downstream_modules:
+        for helper in UNUSED_SDTM_PRIVATE_HELPERS:
+            assert not hasattr(mod, helper), f"{mod.__name__} must not expose {helper}"
+            assert helper not in mod.__all__, f"{mod.__name__}.__all__ must not list {helper}"
+
+    for export_name in (*PUBLIC_SDTM_EXPORTS, *ACTIVE_SDTM_SPI_HELPERS):
+        assert export_name in spi_models_mod.__all__, (
+            f"imednet.spi.models.__all__ must retain {export_name}"
+        )
+        assert hasattr(spi_models_mod, export_name), f"imednet.spi.models must expose {export_name}"

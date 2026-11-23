@@ -190,6 +190,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
@@ -205,11 +206,22 @@ class RecordUpdateWorkflow:
         if not is_offline:
             self._validate_form_key(study_key, normalized)
         sdk = cast("ImednetFacade", self._sdk)
-        coordinator = BatchCoordinator(chunk_size=chunk_size or self._batch_size)
+        coordinator = BatchCoordinator(chunk_size=chunk_size or self._batch_size, sdk=sdk)
+
+        def _submit_chunk(chunk: list[dict[str, Any]]) -> Job:
+            if email_notify is not None:
+                return sdk.create_record(
+                    study_key,
+                    chunk,
+                    email_notify=email_notify,
+                    schema=active_schema,
+                )
+            return sdk.create_record(study_key, chunk, schema=active_schema)
+
         return coordinator.submit(
             study_key,
             normalized,
-            lambda chunk: sdk.create_record(study_key, chunk, schema=active_schema),
+            _submit_chunk,
             schema=active_schema,
             validate_batch_fn=(
                 None if is_offline else cast(SchemaValidator, self._validator).validate_batch
@@ -245,6 +257,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -258,6 +271,7 @@ class RecordUpdateWorkflow:
             wait_for_completion=wait_for_completion,
             timeout=timeout,
             poll_interval=poll_interval,
+            email_notify=email_notify,
             schema=schema,
             on_progress=on_progress,
             dry_run=dry_run,
@@ -275,6 +289,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
@@ -287,11 +302,22 @@ class RecordUpdateWorkflow:
         if not is_offline:
             await self._async_validate_form_key(study_key, normalized)
         sdk = cast("AsyncImednetFacade", self._sdk)
-        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size or self._batch_size)
+        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size or self._batch_size, sdk=sdk)
+
+        async def _submit_chunk_async(chunk: list[dict[str, Any]]) -> Job:
+            if email_notify is not None:
+                return await sdk.async_create_record(
+                    study_key,
+                    chunk,
+                    email_notify=email_notify,
+                    schema=active_schema,
+                )
+            return await sdk.async_create_record(study_key, chunk, schema=active_schema)
+
         return await coordinator.submit(
             study_key,
             normalized,
-            lambda chunk: sdk.async_create_record(study_key, chunk, schema=active_schema),
+            _submit_chunk_async,
             schema=active_schema,
             validate_batch_fn=(
                 None if is_offline else cast(AsyncSchemaValidator, self._validator).validate_batch
@@ -327,6 +353,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -339,6 +366,7 @@ class RecordUpdateWorkflow:
             wait_for_completion=wait_for_completion,
             timeout=timeout,
             poll_interval=poll_interval,
+            email_notify=email_notify,
             schema=schema,
             on_progress=on_progress,
             dry_run=dry_run,
@@ -403,6 +431,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Registers a new subject by submitting a single record.
@@ -417,6 +446,7 @@ class RecordUpdateWorkflow:
             wait_for_completion: If True, wait for the job to complete.
             timeout: Timeout in seconds for waiting.
             poll_interval: Polling interval in seconds.
+            email_notify: Optional email notification flag or recipient address.
             schema: Optional validation schema override.
 
         Returns:
@@ -436,6 +466,7 @@ class RecordUpdateWorkflow:
             wait_for_completion=wait_for_completion,
             timeout=timeout,
             poll_interval=poll_interval,
+            email_notify=email_notify,
             schema=schema,
         )
 
@@ -451,6 +482,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously register a new subject by submitting a single record."""
@@ -467,6 +499,7 @@ class RecordUpdateWorkflow:
             wait_for_completion=wait_for_completion,
             timeout=timeout,
             poll_interval=poll_interval,
+            email_notify=email_notify,
             schema=schema,
         )
 
@@ -484,6 +517,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Updates an existing scheduled record for a subject.
@@ -500,6 +534,7 @@ class RecordUpdateWorkflow:
             wait_for_completion: If True, wait for the job to complete.
             timeout: Timeout in seconds for waiting.
             poll_interval: Polling interval in seconds.
+            email_notify: Optional email notification flag or recipient address.
             schema: Optional validation schema override.
 
         Returns:
@@ -521,6 +556,7 @@ class RecordUpdateWorkflow:
             wait_for_completion=wait_for_completion,
             timeout=timeout,
             poll_interval=poll_interval,
+            email_notify=email_notify,
             schema=schema,
         )
 
@@ -538,6 +574,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously update an existing scheduled record for a subject."""
@@ -556,6 +593,7 @@ class RecordUpdateWorkflow:
             wait_for_completion=wait_for_completion,
             timeout=timeout,
             poll_interval=poll_interval,
+            email_notify=email_notify,
             schema=schema,
         )
 
@@ -571,6 +609,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Creates a new (unscheduled) record for an existing subject.
@@ -585,6 +624,7 @@ class RecordUpdateWorkflow:
             wait_for_completion: If True, wait for the job to complete.
             timeout: Timeout in seconds for waiting.
             poll_interval: Polling interval in seconds.
+            email_notify: Optional email notification flag or recipient address.
             schema: Optional validation schema override.
 
         Returns:
@@ -604,6 +644,7 @@ class RecordUpdateWorkflow:
             wait_for_completion=wait_for_completion,
             timeout=timeout,
             poll_interval=poll_interval,
+            email_notify=email_notify,
             schema=schema,
         )
 
@@ -619,6 +660,7 @@ class RecordUpdateWorkflow:
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously create a new (unscheduled) record for an existing subject."""
@@ -635,6 +677,7 @@ class RecordUpdateWorkflow:
             wait_for_completion=wait_for_completion,
             timeout=timeout,
             poll_interval=poll_interval,
+            email_notify=email_notify,
             schema=schema,
         )
 
@@ -646,10 +689,15 @@ class RecordUpdateWorkflow:
         wait_for_completion: bool,
         timeout: int,
         poll_interval: int,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None,
     ) -> Job:
         """Submit a single constructed record payload synchronously."""
-        extra_kwargs: dict[str, Any] = {"schema": schema} if schema is not None else {}
+        extra_kwargs: dict[str, Any] = {}
+        if schema is not None:
+            extra_kwargs["schema"] = schema
+        if email_notify is not None:
+            extra_kwargs["email_notify"] = email_notify
         return self.create_or_update_records(
             study_key=study_key,
             records_data=[record],
@@ -667,10 +715,15 @@ class RecordUpdateWorkflow:
         wait_for_completion: bool,
         timeout: int,
         poll_interval: int,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None,
     ) -> Job:
         """Submit a single constructed record payload asynchronously."""
-        extra_kwargs: dict[str, Any] = {"schema": schema} if schema is not None else {}
+        extra_kwargs: dict[str, Any] = {}
+        if schema is not None:
+            extra_kwargs["schema"] = schema
+        if email_notify is not None:
+            extra_kwargs["email_notify"] = email_notify
         return await self.async_create_or_update_records(
             study_key=study_key,
             records_data=[record],

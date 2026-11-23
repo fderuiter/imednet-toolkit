@@ -58,17 +58,22 @@ def _apply_registration_defaults(
     *,
     default_form_key: str | None = None,
     default_site_name: str | None = None,
+    default_site_id: int | None = None,
 ) -> list[JsonDict]:
-    """Fill missing ``formKey`` / ``siteName`` from optional defaults."""
-    if not default_form_key and not default_site_name:
+    """Fill missing ``formKey`` / ``siteName`` / ``siteId`` from optional defaults."""
+    if not default_form_key and not default_site_name and default_site_id is None:
         return records
     resolved: list[JsonDict] = []
     for item in records:
         copied = dict(item)
         if default_form_key and not (copied.get("formKey") or copied.get("form_key")):
             copied["formKey"] = default_form_key
-        if default_site_name and not (copied.get("siteName") or copied.get("site_name")):
+        has_site_name = bool(copied.get("siteName") or copied.get("site_name"))
+        has_site_id = copied.get("siteId") is not None or copied.get("site_id") is not None
+        if default_site_name and not has_site_name and not has_site_id:
             copied["siteName"] = default_site_name
+        elif default_site_id is not None and not has_site_name and not has_site_id:
+            copied["siteId"] = default_site_id
         resolved.append(copied)
     return resolved
 
@@ -78,6 +83,7 @@ def normalize_subject_registration_inputs(
     *,
     default_form_key: str | None = None,
     default_site_name: str | None = None,
+    default_site_id: int | None = None,
     schema: _validation.ValidationSchemaProtocol | None = None,
 ) -> list[tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]]:
     """Normalize registration requests from models, dicts, DataFrame, or CSV/JSON file path."""
@@ -95,6 +101,7 @@ def normalize_subject_registration_inputs(
             records,
             default_form_key=default_form_key,
             default_site_name=default_site_name,
+            default_site_id=default_site_id,
         )
     elif _is_dataframe_instance(subjects):
         records = dataframe_rows_to_records(subjects, schema=schema)
@@ -102,6 +109,7 @@ def normalize_subject_registration_inputs(
             records,
             default_form_key=default_form_key,
             default_site_name=default_site_name,
+            default_site_id=default_site_id,
         )
     else:
         raw_items = subjects
@@ -112,22 +120,33 @@ def normalize_subject_registration_inputs(
         normalized_raw: RegisterSubjectRequest | dict[str, Any]
         if isinstance(raw_subj, RegisterSubjectRequest):
             model_subj = raw_subj
-            if (default_form_key and not model_subj.form_key) or (
-                default_site_name and not model_subj.site_name
-            ):
-                patched = model_subj.model_dump(by_alias=True)
-                if default_form_key and not patched.get("formKey"):
+            needs_form = bool(default_form_key and not model_subj.form_key)
+            needs_site = bool(
+                (default_site_name or default_site_id is not None)
+                and not model_subj.site_name
+                and model_subj.site_id is None
+            )
+            if needs_form or needs_site:
+                patched = model_subj.model_dump(by_alias=True, exclude_none=True)
+                if needs_form and default_form_key:
                     patched["formKey"] = default_form_key
-                if default_site_name and not patched.get("siteName"):
-                    patched["siteName"] = default_site_name
+                if needs_site:
+                    if default_site_name:
+                        patched["siteName"] = default_site_name
+                    elif default_site_id is not None:
+                        patched["siteId"] = default_site_id
                 model_subj = RegisterSubjectRequest.model_validate(patched)
             normalized_raw = model_subj
         elif isinstance(raw_subj, Mapping):
             raw_dict = dict(raw_subj)
             if default_form_key and not (raw_dict.get("formKey") or raw_dict.get("form_key")):
                 raw_dict["formKey"] = default_form_key
-            if default_site_name and not (raw_dict.get("siteName") or raw_dict.get("site_name")):
+            has_site_name = bool(raw_dict.get("siteName") or raw_dict.get("site_name"))
+            has_site_id = raw_dict.get("siteId") is not None or raw_dict.get("site_id") is not None
+            if default_site_name and not has_site_name and not has_site_id:
                 raw_dict["siteName"] = default_site_name
+            elif default_site_id is not None and not has_site_name and not has_site_id:
+                raw_dict["siteId"] = default_site_id
             normalized_raw = raw_dict
             model_subj = RegisterSubjectRequest.model_validate(raw_dict)
         else:
@@ -136,7 +155,7 @@ def normalize_subject_registration_inputs(
                 f"got {type(raw_subj).__name__}."
             )
         pairs.append((normalized_raw, model_subj))
-        dumped_for_check.append(model_subj.model_dump(by_alias=True))
+        dumped_for_check.append(model_subj.model_dump(by_alias=True, exclude_none=True))
 
     ensure_no_masked_sentinel(dumped_for_check)
     return pairs
@@ -146,24 +165,50 @@ def validate_subject_registration_sites(
     normalized_pairs: Sequence[
         tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]
     ],
-    sites: Iterable[Site],
+    sites: Iterable[Site] | None,
 ) -> None:
-    """Validate that every registration request targets an existing, enrollment-eligible site."""
-    sites_by_name = {s.site_name: s for s in sites if s.site_name}
+    """Validate that every registration request targets an existing, enrollment-eligible site.
+
+    When ``sites`` is ``None`` (offline dry-run), only verifies that a site
+    identifier (``siteName`` or ``siteId``) is present on each request.
+    """
     errors: list[str] = []
+    if sites is None:
+        for idx, (_raw_subj, subj) in enumerate(normalized_pairs):
+            if not subj.site_name and subj.site_id is None:
+                errors.append(f"Index {idx}: siteName is required")
+        if errors:
+            raise ValueError("; ".join(errors))
+        return
+
+    materialized_sites = list(sites)
+    sites_by_name = {s.site_name: s for s in materialized_sites if s.site_name}
+    sites_by_id = {s.site_id: s for s in materialized_sites if s.site_id is not None}
     for idx, (_raw_subj, subj) in enumerate(normalized_pairs):
-        if not subj.site_name:
-            errors.append(f"Index {idx}: siteName is required")
-        elif subj.site_name not in sites_by_name:
-            errors.append(f"Index {idx}: site '{subj.site_name}' not found")
+        if subj.site_name:
+            if subj.site_name not in sites_by_name:
+                errors.append(f"Index {idx}: site '{subj.site_name}' not found")
+            else:
+                site_obj = sites_by_name[subj.site_name]
+                site_status = getattr(site_obj, "site_enrollment_status", None)
+                if not is_site_enrollment_eligible(site_status):
+                    errors.append(
+                        f"Index {idx}: site '{subj.site_name}' is not eligible for enrollment "
+                        f"(status: {site_status!s})"
+                    )
+        elif subj.site_id is not None:
+            if subj.site_id not in sites_by_id:
+                errors.append(f"Index {idx}: siteId {subj.site_id} not found")
+            else:
+                site_obj = sites_by_id[subj.site_id]
+                site_status = getattr(site_obj, "site_enrollment_status", None)
+                if not is_site_enrollment_eligible(site_status):
+                    errors.append(
+                        f"Index {idx}: siteId {subj.site_id} is not eligible for enrollment "
+                        f"(status: {site_status!s})"
+                    )
         else:
-            site_obj = sites_by_name[subj.site_name]
-            site_status = getattr(site_obj, "site_enrollment_status", None)
-            if not is_site_enrollment_eligible(site_status):
-                errors.append(
-                    f"Index {idx}: site '{subj.site_name}' is not eligible for enrollment "
-                    f"(status: {site_status!s})"
-                )
+            errors.append(f"Index {idx}: siteName is required")
     if errors:
         raise ValueError("; ".join(errors))
 
@@ -205,7 +250,7 @@ def filter_existing_subject_registrations(
     skipped_count = 0
     seen_in_batch: set[str] = set()
     for raw_subj, subj in normalized_pairs:
-        dumped = subj.model_dump(by_alias=True)
+        dumped = subj.model_dump(by_alias=True, exclude_none=True)
         if should_filter:
             cand_id = extract_candidate_subject_key(
                 raw_subj, payload=dumped, subject_key_field=subject_key_field
