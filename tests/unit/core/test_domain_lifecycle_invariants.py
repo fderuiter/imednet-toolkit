@@ -221,38 +221,65 @@ def test_record_revision_bounds_and_monotonic_chain_validation() -> None:
     with pytest.raises(ValueError, match="cannot exceed"):
         RecordRevision(recordId=1, recordRevision=2, dataRevision=3)
 
-    # Reject booleans masquerading as ints
+    # Reject booleans, floats, and non-integer strings before truncation
     with pytest.raises(ValueError):
         RecordRevision(recordId=1, recordRevision=True, dataRevision=0)  # type: ignore[arg-type]
+    for bad_rev in [0.5, 1.5, 0.0, "0.5", "abc", "0", ""]:
+        with pytest.raises(ValueError):
+            RecordRevision(recordId=1, recordRevision=bad_rev, dataRevision=0)  # type: ignore[arg-type]
+    for bad_data_rev in [0.5, 1.0, "0.5", "abc", ""]:
+        with pytest.raises(ValueError):
+            RecordRevision(recordId=1, recordRevision=2, dataRevision=bad_data_rev)  # type: ignore[arg-type]
+
+    # Signed/unpadded integer strings coerce cleanly
+    coerced = RecordRevision(recordId=1, recordRevision="2", dataRevision="1")  # type: ignore[arg-type]
+    assert coerced.record_revision == 2
+    assert coerced.data_revision == 1
 
     # Guard post-init attribute mutation
     r1 = RecordRevision(
+        studyKey="STUDY_A",
         recordId=100,
         recordOid="REC-100",
         recordRevision=1,
         dataRevision=1,
         recordStatus="Record Incomplete",
+        user="alice",
+        reasonForChange="Initial entry",
+        dateCreated="2026-01-01T10:00:00Z",
     )
     assert r1.record_status == RecordStatus.RECORD_INCOMPLETE
     with pytest.raises(ValueError, match="cannot exceed"):
         r1.data_revision = 2
     with pytest.raises(ValueError, match="record_revision must be >= 1"):
         r1.record_revision = 0
+    with pytest.raises(ValueError, match="must be an integer"):
+        r1.record_revision = 1.5  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="must be an integer"):
+        r1.record_revision = "abc"  # type: ignore[assignment]
 
     # Status-only revision increments record_revision while keeping data_revision constant
     r2 = RecordRevision(
+        studyKey="STUDY_A",
         recordId=100,
         recordOid="REC-100",
         recordRevision=2,
         dataRevision=1,
         recordStatus="Record Complete",
+        user="bob",
+        reasonForChange="Marked complete",
+        dateCreated="2026-01-01T05:00:00-06:00",  # 11:00:00Z >= 10:00:00Z
     )
     r3 = RecordRevision(
+        studyKey="STUDY_A",
         recordId=100,
         recordOid="REC-100",
         recordRevision=3,
         dataRevision=2,
         recordStatus="Verified",
+        user="carol",
+        reasonForChange="Verified data",
+        dateCreated="2026-01-01T12:00:00Z",
     )
 
     assert r2.validate_follows(r1) is True
@@ -262,23 +289,123 @@ def test_record_revision_bounds_and_monotonic_chain_validation() -> None:
     assert len(validate_record_revision_chain([r1, r2, r3])) == 3
     assert is_valid_record_revision_chain([r1, r2, r3]) is True
 
+    # Sequence gaps (1 -> 3) and non-1 starts fail unless allow_partial=True for contiguous slices
+    with pytest.raises(ValueError, match="Missing record_revision in chain"):
+        validate_record_revision_chain([r1, r3])
+    with pytest.raises(ValueError, match="must start at record_revision 1"):
+        validate_record_revision_chain([r2, r3])
+    assert len(validate_record_revision_chain([r2, r3], allow_partial=True)) == 2
+    assert is_valid_record_revision_chain([r2, r3], allow_partial=True) is True
+    assert is_valid_record_revision_chain([r1, r3], allow_partial=True) is False
+
     # Non-increasing record_revision fails
-    dup_rev = RecordRevision(recordId=100, recordOid="REC-100", recordRevision=2, dataRevision=2)
+    dup_rev = RecordRevision(
+        studyKey="STUDY_A",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=2,
+        dataRevision=2,
+        user="dave",
+        reasonForChange="Duplicate rev",
+        dateCreated="2026-01-01T12:00:00Z",
+    )
     with pytest.raises(ValueError, match="Non-monotonic record_revision"):
         validate_record_revision_chain([r1, r2, dup_rev])
     assert is_valid_record_revision_chain([r1, r2, dup_rev]) is False
 
     # Decreasing data_revision fails
     regressed_data = RecordRevision(
-        recordId=100, recordOid="REC-100", recordRevision=3, dataRevision=0
+        studyKey="STUDY_A",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=3,
+        dataRevision=0,
+        user="dave",
+        reasonForChange="Regressed data",
+        dateCreated="2026-01-01T12:00:00Z",
     )
     with pytest.raises(ValueError, match="Decreasing data_revision"):
         validate_record_revision_chain([r1, r2, regressed_data])
     assert is_valid_record_revision_chain([r1, r2, regressed_data]) is False
 
-    # Separate records in a combined stream validate independently per record_id
-    other_rec = RecordRevision(recordId=200, recordOid="REC-200", recordRevision=1, dataRevision=0)
-    assert len(validate_record_revision_chain([r1, other_rec, r2, r3])) == 4
+    # Regressed UTC timestamp fails
+    regressed_ts = RecordRevision(
+        studyKey="STUDY_A",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=3,
+        dataRevision=2,
+        user="dave",
+        reasonForChange="Backdated",
+        dateCreated="2026-01-01T10:30:00Z",  # before r2's 11:00:00Z
+    )
+    with pytest.raises(ValueError, match="Regressed UTC date_created"):
+        validate_record_revision_chain([r1, r2, regressed_ts])
+
+    # Missing user, reason_for_change, or date_created fails
+    for missing_field, kwargs in [
+        ("user", {"user": "   ", "reasonForChange": "ok", "dateCreated": "2026-01-01T10:00:00Z"}),
+        (
+            "reason_for_change",
+            {"user": "alice", "reasonForChange": "", "dateCreated": "2026-01-01T10:00:00Z"},
+        ),
+        ("date_created", {"user": "alice", "reasonForChange": "ok"}),
+    ]:
+        bad_meta = RecordRevision(recordId=999, recordRevision=1, dataRevision=0, **kwargs)
+        with pytest.raises(ValueError, match=missing_field):
+            validate_record_revision_chain([bad_meta])
+
+    # DELETED resurrection fails
+    r_deleted = RecordRevision(
+        studyKey="STUDY_A",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=4,
+        dataRevision=2,
+        deleted=True,
+        recordStatus="Deleted",
+        user="eve",
+        reasonForChange="Soft delete",
+        dateCreated="2026-01-01T13:00:00Z",
+    )
+    r_resurrected = RecordRevision(
+        studyKey="STUDY_A",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=5,
+        dataRevision=3,
+        deleted=False,
+        recordStatus="Record Complete",
+        user="eve",
+        reasonForChange="Resurrected",
+        dateCreated="2026-01-01T14:00:00Z",
+    )
+    assert len(validate_record_revision_chain([r1, r2, r3, r_deleted])) == 4
+    with pytest.raises(ValueError, match="Cannot transition soft-deleted Record"):
+        validate_record_revision_chain([r1, r2, r3, r_deleted, r_resurrected])
+
+    # Separate records and separate Studies validate independently in a combined stream
+    other_rec = RecordRevision(
+        studyKey="STUDY_A",
+        recordId=200,
+        recordOid="REC-200",
+        recordRevision=1,
+        dataRevision=0,
+        user="alice",
+        reasonForChange="Initial 200",
+        dateCreated="2026-01-01T09:00:00Z",
+    )
+    sibling_study_rec = RecordRevision(
+        studyKey="STUDY_B",
+        recordId=100,
+        recordOid="REC-100",
+        recordRevision=1,
+        dataRevision=1,
+        user="bob",
+        reasonForChange="Initial Study B",
+        dateCreated="2026-01-01T08:00:00Z",
+    )
+    assert len(validate_record_revision_chain([r1, other_rec, sibling_study_rec, r2, r3])) == 5
 
     # Missing record_revision in chain raises ValueError
     missing_rev = RecordRevision(recordId=300)

@@ -183,10 +183,18 @@ def test_extract_records_by_criteria_scaling_benchmark() -> None:
 
 
 def test_extract_audit_trail_builds_filters_and_dates() -> None:
-    """Test that extract audit trail normalizes UTC bounds and builds dateCreated range filters."""
+    """Test single REST dateCreated pushdown and local half-open UTC bound filtering."""
     sdk = MagicMock()
-    revisions = [RecordRevision(record_revision_id=1)]
-    sdk.get_record_revisions.return_value = revisions
+    in_range = RecordRevision(
+        record_revision_id=1,
+        date_created="2026-02-01T23:59:59.500000Z",
+    )
+    next_day = RecordRevision(
+        record_revision_id=2,
+        date_created="2026-02-02T00:00:00Z",
+    )
+    missing_date = RecordRevision(record_revision_id=3)
+    sdk.get_record_revisions.return_value = [in_range, next_day, missing_date]
 
     wf = DataExtractionWorkflow(sdk)
     result = wf.extract_audit_trail(
@@ -201,16 +209,13 @@ def test_extract_audit_trail_builds_filters_and_dates() -> None:
         "STUDY",
         role="data",
         status="open",
-        dateCreated=[
-            (">=", "2026-01-01T00:00:00Z"),
-            ("<=", "2026-02-01T23:59:59Z"),
-        ],
+        dateCreated=(">=", "2026-01-01T00:00:00Z"),
     )
-    assert result == revisions
+    assert result == [in_range]
 
 
-def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -> None:
-    """Test that extract_audit_trail sends dateCreated>=...;dateCreated<=... over HTTP."""
+def test_extract_audit_trail_emits_single_date_created_http_filter_and_filters_locally() -> None:
+    """Test HTTP pushdown of single dateCreated predicate and local evaluation of upper/CST bounds."""
     import respx
 
     from imednet.sdk import ImednetSDK
@@ -218,7 +223,28 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
     with respx.mock(assert_all_called=True) as router:
         route = router.get("https://api.test/api/v1/edc/studies/STUDY/recordRevisions").respond(
             200,
-            json={"data": [{"recordRevisionId": 5, "recordId": 10, "recordRevision": 1}]},
+            json={
+                "data": [
+                    {
+                        "recordRevisionId": 5,
+                        "recordId": 10,
+                        "recordRevision": 1,
+                        "dateCreated": "2026-02-01T23:59:59.500000Z",
+                    },
+                    {
+                        "recordRevisionId": 6,
+                        "recordId": 10,
+                        "recordRevision": 2,
+                        "dateCreated": "2026-02-01T17:30:00-06:00",
+                    },
+                    {
+                        "recordRevisionId": 7,
+                        "recordId": 10,
+                        "recordRevision": 3,
+                        "dateCreated": "2026-02-02T00:00:00Z",
+                    },
+                ]
+            },
         )
         sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
         wf = DataExtractionWorkflow(sdk)
@@ -230,9 +256,38 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
         )
 
         sent_filter = route.calls.last.request.url.params["filter"]
-        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z"
+        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z"
         assert "studyKey" not in sent_filter
         assert "startDate" not in sent_filter
         assert "endDate" not in sent_filter
-        assert len(revisions) == 1
-        assert revisions[0].record_revision_id == 5
+        assert [r.record_revision_id for r in revisions] == [5, 6]
+
+
+def test_extract_audit_trail_end_only_and_user_filter_date_created() -> None:
+    """Test end_date-only pushdown and local evaluation when user_filter supplies dateCreated."""
+    sdk = MagicMock()
+    rev_ok = RecordRevision(record_revision_id=10, date_created="2026-01-15T12:00:00Z")
+    rev_late = RecordRevision(record_revision_id=11, date_created="2026-02-02T00:00:00Z")
+    sdk.get_record_revisions.return_value = [rev_ok, rev_late]
+
+    wf = DataExtractionWorkflow(sdk)
+    end_only = wf.extract_audit_trail("STUDY", end_date="2026-02-01")
+    sdk.get_record_revisions.assert_called_once_with(
+        "STUDY",
+        dateCreated=("<", "2026-02-02T00:00:00Z"),
+    )
+    assert end_only == [rev_ok, rev_late]
+
+    sdk.get_record_revisions.reset_mock()
+    rev_early = RecordRevision(record_revision_id=9, date_created="2025-12-31T23:59:59Z")
+    sdk.get_record_revisions.return_value = [rev_early, rev_ok]
+    combined = wf.extract_audit_trail(
+        "STUDY",
+        end_date="2026-02-01T23:59:59Z",
+        user_filter={"date_created": (">=", "2026-01-01T00:00:00Z")},
+    )
+    sdk.get_record_revisions.assert_called_once_with(
+        "STUDY",
+        dateCreated=("<=", "2026-02-01T23:59:59Z"),
+    )
+    assert combined == [rev_ok]

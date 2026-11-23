@@ -140,7 +140,7 @@ For incremental bronze/silver ``Record`` revision ingestion, use
    sdk = ImednetSDK(api_key="mock", security_key="mock")
    workflow = DuckDBIngestionWorkflow(sdk, "./centralized.duckdb")
 
-   # Incremental bronze load
+   # Incremental bronze load (keyed upsert on (study_key, record_revision_id))
    inserted = workflow.ingest_revisions(
        "STUDY",
        start_date="2026-01-01",
@@ -150,23 +150,32 @@ For incremental bronze/silver ``Record`` revision ingestion, use
    assert inserted > 0
    print(f"Inserted {inserted} revision rows")
 
-   # Build silver current-state projection
+   # Build silver current-state and SCD Type 2 history views
    workflow.build_silver_view("STUDY")
 
-   conn = duckdb.connect("./centralized.duckdb")
+   conn = duckdb.connect("./centralized.duckdb", config={"threads": "1"})
    silver_rows = conn.execute(
        'SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created '
        "FROM silver_current_state ORDER BY record_id LIMIT 10"
    ).fetchall()
-   assert len(silver_rows) > 0
+   history_rows = conn.execute(
+       "SELECT record_id, record_revision, valid_from, valid_to, is_current "
+       "FROM silver_records_history ORDER BY record_id, record_revision LIMIT 10"
+   ).fetchall()
+   assert len(silver_rows) > 0 and len(history_rows) > 0
    print(silver_rows)
    conn.close()
 
 The two key methods are
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.ingest_revisions`
-for incremental loads and
+(which normalizes ``-06:00`` CST and UTC timestamps to UTC, upserts on
+``(study_key, record_revision_id)`` in ``append`` mode, and scopes ``replace``
+loads to ``DELETE FROM bronze_revisions WHERE study_key = ?`` so sibling Studies
+remain intact) and
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.build_silver_view`
-for current-state materialization.
+(which partitions by ``(study_key, COALESCE(CAST(record_id AS VARCHAR), record_oid))``,
+excludes ``deleted=True`` records from ``silver_current_state``, and creates the
+SCD Type 2 ``silver_records_history`` view with ``valid_from`` and ``valid_to``).
 
 Incremental checkpoints for DuckDB and Hive Parquet helpers
 -----------------------------------------------------------

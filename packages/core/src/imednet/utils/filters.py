@@ -886,6 +886,8 @@ def _build_filter_part(
                 op, val = item
                 validate_filter_operator(op)
                 tuple_parts.append(f"{camel_key}{op}{_format_filter_value(val)}")
+            if and_connector.strip() in (";", "and") and len(tuple_parts) > 1:
+                raise ValueError(f"Duplicate filter attribute '{camel_key}' in AND clause")
             return and_connector.join(tuple_parts)
         subparts = [f"{camel_key}=={_format_filter_value(v)}" for v in value]
         return or_connector.join(subparts)
@@ -900,10 +902,11 @@ def build_filter_string(
     """Return a filter string constructed according to iMednet rules.
 
     Each key in ``filters`` is converted to camelCase. Raw values imply
-    equality, tuples allow explicit operators, lists of ``(operator, value)``
-    tuples on one key join with ``and_connector``, and lists of scalars
+    equality, tuples allow explicit operators, single-element lists of
+    ``(operator, value)`` tuples serialize one predicate, and lists of scalars
     generate multiple equality filters joined by ``or_connector``. Conditions
-    across keys are joined by ``and_connector``.
+    across keys are joined by ``and_connector``, and duplicate attributes in
+    ``;`` (AND) clauses are rejected via ``validate_filter_syntax``.
 
     Example:
     >>> from imednet.utils.filters import build_filter_string
@@ -927,7 +930,10 @@ def build_filter_string(
         )
     non_empty_parts = [part for part in parts if part]
     result = and_connector.join(non_empty_parts)
-    validate_connector_exclusivity(result)
+    if and_connector == ";" and or_connector == ",":
+        validate_filter_syntax(result)
+    else:
+        validate_connector_exclusivity(result)
     return result
 
 

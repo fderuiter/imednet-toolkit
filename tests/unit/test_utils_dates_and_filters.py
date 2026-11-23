@@ -12,6 +12,7 @@ from imednet.spi.utils import (
     normalize_utc_timestamp_bound,
     parse_filter_expression,
     parse_filter_expressions,
+    resolve_utc_timestamp_bound,
 )
 from imednet.utils.dates import format_iso_datetime, parse_iso_datetime
 from imednet.utils.filters import (
@@ -436,7 +437,11 @@ def test_ordered_filter_operators_and_expression_parsing() -> None:
 
 
 def test_build_filter_string_joins_multiple_operator_tuples_on_one_key() -> None:
-    """Test programmatic operator tuple lists on one key and CLI duplicate AND rejection."""
+    """Test duplicate AND rejection in build_filter_string, endpoints, and SimulationTransport."""
+    import httpx
+
+    from imednet.simulation.transport import SimulationTransport
+
     with pytest.raises(ValueError, match="Duplicate filter attribute 'dateCreated'"):
         parse_filter_expressions(
             [
@@ -449,14 +454,85 @@ def test_build_filter_string_joins_multiple_operator_tuples_on_one_key() -> None
     programmatic_bounds = {
         "dateCreated": [
             (">=", "2026-01-01T00:00:00Z"),
-            ("<=", "2026-02-01T23:59:59Z"),
+            ("<", "2026-02-02T00:00:00Z"),
         ],
         "studyKey": ("==", "STUDY"),
     }
-    assert (
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'dateCreated'"):
         build_filter_string(programmatic_bounds)
-        == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z;studyKey==STUDY"
+
+    # Single-tuple list and OR-connected lists remain valid
+    assert (
+        build_filter_string(
+            {
+                "dateCreated": [(">=", "2026-01-01T00:00:00Z")],
+                "studyKey": ("==", "STUDY"),
+            }
+        )
+        == "dateCreated>=2026-01-01T00:00:00Z;studyKey==STUDY"
     )
+    assert (
+        build_filter_string(
+            {"recordStatus": [("==", "Verified"), ("==", "Locked")]},
+            and_connector=",",
+        )
+        == "recordStatus==Verified,recordStatus==Locked"
+    )
+
+    # BaseEndpoint._resolve_params rejects duplicate snake_case + camelCase kwargs without raw filter
+    endpoint = RecordsEndpoint(MagicMock())
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'recordId'"):
+        endpoint._resolve_params(
+            study_key="STUDY",
+            extra_params={},
+            filters={"record_id": 1, "recordId": 2},
+        )
+
+    # SimulationTransport rejects duplicate attributes in AND clauses for filter and recordDataFilter
+    transport = SimulationTransport()
+    with pytest.raises(Exception, match="Duplicate filter attribute 'recordId'"):
+        transport._split_filter_clauses("record_id==1;recordId==2", attribute="filter")
+    with pytest.raises(Exception, match="Duplicate filter attribute 'DM.AGE'"):
+        transport._split_filter_clauses("DM.AGE>=18;DM.AGE<=65", attribute="recordDataFilter")
+
+    # recordDataFilter keeps case-sensitive variable identifiers and allows OR clauses
+    assert (
+        len(
+            transport._split_filter_clauses("DM.age>=18;DM.AGE<=65", attribute="recordDataFilter")[
+                1
+            ]
+        )
+        == 2
+    )
+    assert (
+        len(
+            transport._split_filter_clauses("DM.AGE==18,DM.AGE==65", attribute="recordDataFilter")[
+                1
+            ]
+        )
+        == 2
+    )
+
+    studies_resp = transport.handle_request(
+        httpx.Request("GET", "https://sim.test/api/v1/edc/studies")
+    )
+    study_key = studies_resp.json()["data"][0]["studyKey"]
+    bad_filter_resp = transport.handle_request(
+        httpx.Request(
+            "GET",
+            f"https://sim.test/api/v1/edc/studies/{study_key}/records",
+            params={"filter": "dateCreated>=2026-01-01T00:00:00Z;dateCreated<2026-02-02T00:00:00Z"},
+        )
+    )
+    assert bad_filter_resp.status_code == 400
+    bad_rdf_resp = transport.handle_request(
+        httpx.Request(
+            "GET",
+            f"https://sim.test/api/v1/edc/studies/{study_key}/records",
+            params={"recordDataFilter": "DM.AGE>=18;DM.AGE<=65"},
+        )
+    )
+    assert bad_rdf_resp.status_code == 400
 
     with pytest.raises(ValueError, match="cannot mix operator tuples and scalar values"):
         build_filter_string({"age": [(">", 18), 30]})
@@ -466,17 +542,31 @@ def test_build_filter_string_joins_multiple_operator_tuples_on_one_key() -> None
 
 
 def test_normalize_utc_timestamp_bound() -> None:
-    """Test date-only and timestamp normalization for UTC audit bounds."""
+    """Test date-only and timestamp normalization for half-open UTC audit bounds."""
     assert normalize_utc_timestamp_bound("2026-01-01", is_end=False) == "2026-01-01T00:00:00Z"
-    assert normalize_utc_timestamp_bound("2026-02-01", is_end=True) == "2026-02-01T23:59:59Z"
+    assert normalize_utc_timestamp_bound("2026-02-01", is_end=True) == "2026-02-02T00:00:00Z"
     assert (
         normalize_utc_timestamp_bound("2026-01-15T14:30:00+02:00", is_end=False)
         == "2026-01-15T12:30:00Z"
+    )
+    assert resolve_utc_timestamp_bound("2026-01-01", is_end=False) == (
+        ">=",
+        "2026-01-01T00:00:00Z",
+    )
+    assert resolve_utc_timestamp_bound("2026-02-01", is_end=True) == (
+        "<",
+        "2026-02-02T00:00:00Z",
+    )
+    assert resolve_utc_timestamp_bound("2026-02-01T23:59:59-06:00", is_end=True) == (
+        "<=",
+        "2026-02-02T05:59:59Z",
     )
     with pytest.raises(ValueError):
         normalize_utc_timestamp_bound("")
     with pytest.raises(ValueError):
         normalize_utc_timestamp_bound("2026-99-99")
+    with pytest.raises(ValueError, match="out of range"):
+        resolve_utc_timestamp_bound("9999-12-31", is_end=True)
 
 
 def test_model_less_scalar_coercion_unpadded_digits_and_unicode() -> None:

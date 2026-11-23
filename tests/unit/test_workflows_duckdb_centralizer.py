@@ -80,12 +80,12 @@ def test_workflows_namespace_duckdb_centralizer_caching() -> None:
 
 
 def test_duckdb_centralizer_default_memory() -> None:
-    """Test that DuckDBIngestionWorkflow defaults to in-memory mode."""
+    """Test that DuckDBIngestionWorkflow defaults to in-memory mode with single-thread config."""
     pytest.importorskip("duckdb")
     sdk = MagicMock()
     with patch("duckdb.connect") as mock_connect:
         DuckDBIngestionWorkflow(sdk)
-        mock_connect.assert_called_once_with(":memory:")
+        mock_connect.assert_called_once_with(":memory:", config={"threads": "1"})
 
 
 def test_ingest_revisions_and_build_silver_view() -> None:

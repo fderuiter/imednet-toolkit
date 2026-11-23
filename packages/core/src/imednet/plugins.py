@@ -158,8 +158,8 @@ class DuckDBIngestionWorkflowProtocol(Protocol):
         """Ingest study record revisions into the DuckDB bronze table."""
         ...
 
-    def build_silver_view(self, study_key: str) -> None:
-        """Create or replace the deduplicated DuckDB silver view for a study."""
+    def build_silver_view(self, study_key: str | None = None) -> None:
+        """Create or replace the deduplicated DuckDB silver current-state and history views."""
         ...
 
 

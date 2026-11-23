@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         normalize_iso_date,
         normalize_utc_timestamp_bound,
         parse_iso_datetime,
+        resolve_utc_timestamp_bound,
     )
     from imednet.utils.db import get_sqlite_connection, sqlite_connection
     from imednet.utils.enrollment import (
@@ -191,6 +192,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "imednet.integrations.enrichment",
         "resolve_study_configuration",
     ),
+    "resolve_utc_timestamp_bound": ("imednet.utils.dates", "resolve_utc_timestamp_bound"),
     "sanitize_base_url": ("imednet.utils.url", "sanitize_base_url"),
     "sanitize_csv_formula": ("imednet.utils.security", "sanitize_csv_formula"),
     "set_base_url_context": ("imednet.core.context", "set_base_url_context"),
@@ -295,6 +297,7 @@ __all__ = [
     "resolve_enrichment_pipeline",
     "resolve_sdk_result_fetcher",
     "resolve_study_configuration",
+    "resolve_utc_timestamp_bound",
     "sanitize_base_url",
     "sanitize_csv_formula",
     "set_base_url_context",

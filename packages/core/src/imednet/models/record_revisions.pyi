@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, overload
 
 from pydantic import Field, field_validator, model_validator
@@ -11,8 +13,12 @@ from pydantic import Field, field_validator, model_validator
 from imednet.models.base import ImednetBaseModel
 from imednet.models.records import RecordStatus
 
+_SIGNED_ASCII_INT_RE = re.compile("^[+-]?[0-9]+$")
+
 def _coerce_optional_int_for_bounds(value: Any, field_name: str) -> int | None: ...
 def _validate_revision_bounds(record_revision: int | None, data_revision: int | None) -> None: ...
+def _is_revision_deleted(revision: RecordRevision) -> bool: ...
+def _validate_revision_attribution_and_timestamp(revision: RecordRevision) -> datetime: ...
 
 class RecordRevision(ImednetBaseModel):
     """Historical version of a record including change reason and user."""
@@ -95,12 +101,18 @@ class RecordRevision(ImednetBaseModel):
     def validate_follows(self, previous: RecordRevision) -> bool: ...
     def can_follow(self, previous: RecordRevision) -> bool: ...
     @classmethod
-    def validate_chain(cls, revisions: Sequence[RevisionInput]) -> list[RecordRevision]: ...
+    def validate_chain(
+        cls, revisions: Sequence[RevisionInput], *, allow_partial: bool = False
+    ) -> list[RecordRevision]: ...
 
 RevisionInput = RecordRevision | dict[str, Any]
 
-def validate_record_revision_chain(revisions: Sequence[RevisionInput]) -> list[RecordRevision]: ...
-def is_valid_record_revision_chain(revisions: Sequence[RevisionInput]) -> bool: ...
+def validate_record_revision_chain(
+    revisions: Sequence[RevisionInput], *, allow_partial: bool = False
+) -> list[RecordRevision]: ...
+def is_valid_record_revision_chain(
+    revisions: Sequence[RevisionInput], *, allow_partial: bool = False
+) -> bool: ...
 
 __all__ = [
     "RecordRevision",

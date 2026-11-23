@@ -11,6 +11,7 @@ from .dates import (
     normalize_iso_date,
     normalize_utc_timestamp_bound,
     parse_iso_datetime,
+    resolve_utc_timestamp_bound,
 )
 from .filters import (
     ALLOWED_OPERATORS,
@@ -162,6 +163,7 @@ __all__ = [
     "poll_facade_single_sync",
     "queries_to_dataframe",
     "records_to_dataframe",
+    "resolve_utc_timestamp_bound",
     "sanitize_base_url",
     "sanitize_csv_formula",
     "sites_to_dataframe",

@@ -12,6 +12,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
+from imednet.spi.utils import parse_iso_datetime
+
 from .data_extraction import DataExtractionWorkflow
 
 if TYPE_CHECKING:
@@ -59,7 +61,7 @@ class DuckDBIngestionWorkflow:
                 "Install with `pip install 'imednet[duckdb]'`."
             ) from error
 
-        self._connection: Any = duckdb.connect(db_path)
+        self._connection: Any = duckdb.connect(db_path, config={"threads": "1"})
         self._extractor = DataExtractionWorkflow(sdk)
 
     def ingest_revisions(
@@ -80,11 +82,14 @@ class DuckDBIngestionWorkflow:
             end_date=end_date,
         )
 
-        if mode == "replace":
-            self._connection.execute("DROP TABLE IF EXISTS bronze_revisions")
-
         self._ensure_bronze_table()
-        rows = list(self._to_rows(study_key, revisions))
+        if mode == "replace":
+            self._connection.execute(
+                "DELETE FROM bronze_revisions WHERE study_key = ?",
+                [study_key],
+            )
+
+        rows = self._deduplicate_rows(self._to_rows(study_key, revisions))
         if not rows:
             return 0
 
@@ -92,27 +97,7 @@ class DuckDBIngestionWorkflow:
         view_name = f"_staging_bronze_revisions_{uuid4().hex}"
         self._connection.register(view_name, staging_relation)
         try:
-            insert_query = f"""
-                INSERT INTO bronze_revisions (
-                    study_key,
-                    record_revision_id,
-                    record_id,
-                    record_oid,
-                    form_key,
-                    subject_key,
-                    site_id,
-                    interval_id,
-                    record_status,
-                    record_revision,
-                    data_revision,
-                    "user",
-                    role,
-                    reason_for_change,
-                    deleted,
-                    date_created,
-                    last_updated
-                )
-                SELECT
+            select_columns = """
                     CAST(study_key AS VARCHAR),
                     CAST(record_revision_id AS BIGINT),
                     CAST(record_id AS BIGINT),
@@ -130,23 +115,110 @@ class DuckDBIngestionWorkflow:
                     CAST(deleted AS BOOLEAN),
                     CAST(CAST(date_created AS VARCHAR) AS TIMESTAMP),
                     CAST(CAST(last_updated AS VARCHAR) AS TIMESTAMP)
-                FROM "{view_name}"
-                """
-            self._connection.execute(insert_query)  # nosem
+            """
+            target_columns = """
+                    study_key,
+                    record_revision_id,
+                    record_id,
+                    record_oid,
+                    form_key,
+                    subject_key,
+                    site_id,
+                    interval_id,
+                    record_status,
+                    record_revision,
+                    data_revision,
+                    "user",
+                    role,
+                    reason_for_change,
+                    deleted,
+                    date_created,
+                    last_updated
+            """
+            has_keyed = any(row[1] is not None for row in rows)
+            has_unkeyed = any(row[1] is None for row in rows)
+
+            if has_keyed:
+                upsert_query = f"""
+                    INSERT INTO bronze_revisions ({target_columns})
+                    SELECT {select_columns}
+                    FROM "{view_name}"
+                    WHERE record_revision_id IS NOT NULL
+                    ON CONFLICT (study_key, record_revision_id) DO UPDATE SET
+                        record_id = EXCLUDED.record_id,
+                        record_oid = EXCLUDED.record_oid,
+                        form_key = EXCLUDED.form_key,
+                        subject_key = EXCLUDED.subject_key,
+                        site_id = EXCLUDED.site_id,
+                        interval_id = EXCLUDED.interval_id,
+                        record_status = EXCLUDED.record_status,
+                        record_revision = EXCLUDED.record_revision,
+                        data_revision = EXCLUDED.data_revision,
+                        "user" = EXCLUDED."user",
+                        role = EXCLUDED.role,
+                        reason_for_change = EXCLUDED.reason_for_change,
+                        deleted = EXCLUDED.deleted,
+                        date_created = EXCLUDED.date_created,
+                        last_updated = EXCLUDED.last_updated
+                    """
+                self._connection.execute(upsert_query)  # nosem
+
+            if has_unkeyed:
+                insert_null_query = f"""
+                    INSERT INTO bronze_revisions ({target_columns})
+                    SELECT {select_columns}
+                    FROM "{view_name}"
+                    WHERE record_revision_id IS NULL
+                    """
+                self._connection.execute(insert_null_query)  # nosem
         finally:
             self._connection.unregister(view_name)
         return len(rows)
 
-    def build_silver_view(self, study_key: str) -> None:
-        """Create or replace the silver_current_state view."""
-        if not isinstance(study_key, str) or not _SAFE_STUDY_KEY_PATTERN.fullmatch(study_key):
-            raise ValueError(
-                f"Invalid study key: {study_key!r}. Only alphanumeric characters and ._:- are allowed."
-            )
+    def build_silver_view(self, study_key: str | None = None) -> None:
+        """Create or replace the silver_current_state and silver_records_history views."""
+        where_clause = ""
+        if study_key is not None:
+            if not isinstance(study_key, str) or not _SAFE_STUDY_KEY_PATTERN.fullmatch(study_key):
+                raise ValueError(
+                    f"Invalid study key: {study_key!r}. Only alphanumeric characters and ._:- are allowed."
+                )
+            escaped_study_key = study_key.replace("'", "''")
+            where_clause = f"WHERE study_key = '{escaped_study_key}'"
+
         self._ensure_bronze_table()
-        escaped_study_key = study_key.replace("'", "''")
-        query = f"""
+        current_state_query = f"""
             CREATE OR REPLACE VIEW silver_current_state AS
+            WITH latest_revisions AS (
+                SELECT
+                    study_key,
+                    record_revision_id,
+                    record_id,
+                    record_oid,
+                    form_key,
+                    subject_key,
+                    site_id,
+                    interval_id,
+                    record_status,
+                    record_revision,
+                    data_revision,
+                    "user",
+                    role,
+                    reason_for_change,
+                    deleted,
+                    date_created,
+                    last_updated
+                FROM bronze_revisions
+                {where_clause}
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY study_key, COALESCE(CAST(record_id AS VARCHAR), record_oid)
+                    ORDER BY
+                        record_revision DESC NULLS LAST,
+                        data_revision DESC NULLS LAST,
+                        date_created DESC NULLS LAST,
+                        record_revision_id DESC NULLS LAST
+                ) = 1
+            )
             SELECT
                 study_key,
                 record_revision_id,
@@ -165,21 +237,60 @@ class DuckDBIngestionWorkflow:
                 deleted,
                 date_created,
                 last_updated
-            FROM bronze_revisions
-            WHERE study_key = '{escaped_study_key}'
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY record_id
-                ORDER BY
-                    record_revision DESC NULLS LAST,
-                    data_revision DESC NULLS LAST,
-                    date_created DESC NULLS LAST,
-                    record_revision_id DESC NULLS LAST
-            ) = 1
+            FROM latest_revisions
+            WHERE NOT COALESCE(deleted, FALSE)
+              AND UPPER(TRIM(COALESCE(record_status, ''))) != 'DELETED'
             """
-        self._connection.execute(query)  # nosem
+        self._connection.execute(current_state_query)  # nosem
+
+        history_query = f"""
+            CREATE OR REPLACE VIEW silver_records_history AS
+            SELECT
+                study_key,
+                record_revision_id,
+                record_id,
+                record_oid,
+                form_key,
+                subject_key,
+                site_id,
+                interval_id,
+                record_status,
+                record_revision,
+                data_revision,
+                "user",
+                role,
+                reason_for_change,
+                deleted,
+                date_created,
+                last_updated,
+                date_created AS valid_from,
+                LEAD(date_created) OVER (
+                    PARTITION BY study_key, COALESCE(CAST(record_id AS VARCHAR), record_oid)
+                    ORDER BY
+                        record_revision ASC NULLS LAST,
+                        data_revision ASC NULLS LAST,
+                        date_created ASC NULLS LAST,
+                        record_revision_id ASC NULLS LAST
+                ) AS valid_to,
+                (
+                    ROW_NUMBER() OVER (
+                        PARTITION BY study_key, COALESCE(CAST(record_id AS VARCHAR), record_oid)
+                        ORDER BY
+                            record_revision DESC NULLS LAST,
+                            data_revision DESC NULLS LAST,
+                            date_created DESC NULLS LAST,
+                            record_revision_id DESC NULLS LAST
+                    ) = 1
+                    AND NOT COALESCE(deleted, FALSE)
+                    AND UPPER(TRIM(COALESCE(record_status, ''))) != 'DELETED'
+                ) AS is_current
+            FROM bronze_revisions
+            {where_clause}
+            """
+        self._connection.execute(history_query)  # nosem
 
     def _ensure_bronze_table(self) -> None:
-        """Ensure the bronze_revisions table exists in DuckDB."""
+        """Ensure the bronze_revisions table exists in DuckDB with a composite unique key."""
         self._connection.execute("""
             CREATE TABLE IF NOT EXISTS bronze_revisions (
                 study_key VARCHAR,
@@ -198,9 +309,24 @@ class DuckDBIngestionWorkflow:
                 reason_for_change VARCHAR,
                 deleted BOOLEAN,
                 date_created TIMESTAMP,
-                last_updated TIMESTAMP
+                last_updated TIMESTAMP,
+                UNIQUE (study_key, record_revision_id)
             )
             """)
+
+    @staticmethod
+    def _deduplicate_rows(rows: Iterable[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+        """Deduplicate rows on non-null (study_key, record_revision_id), keeping latest."""
+        materialized = list(rows)
+        last_index_by_key: dict[tuple[Any, Any], int] = {}
+        for idx, row in enumerate(materialized):
+            if row[1] is not None:
+                last_index_by_key[(row[0], row[1])] = idx
+        return [
+            row
+            for idx, row in enumerate(materialized)
+            if row[1] is None or last_index_by_key[(row[0], row[1])] == idx
+        ]
 
     @staticmethod
     def _optional_int(value: Any) -> int | None:
@@ -220,7 +346,7 @@ class DuckDBIngestionWorkflow:
 
     @staticmethod
     def _optional_timestamp(value: Any) -> str | None:
-        """Normalize timestamps to naive UTC ISO strings and blank strings to None."""
+        """Normalize timestamps (including CST/offset ISO strings) to naive UTC ISO strings."""
         if value is None:
             return None
         if isinstance(value, datetime):
@@ -229,7 +355,16 @@ class DuckDBIngestionWorkflow:
                 dt = dt.astimezone(UTC).replace(tzinfo=None)
             return dt.isoformat()
         if isinstance(value, str):
-            return value if value.strip() else None
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                parsed = parse_iso_datetime(stripped)
+            except ValueError:
+                return stripped
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+            return parsed.isoformat()
         return str(value)
 
     def _to_rows(

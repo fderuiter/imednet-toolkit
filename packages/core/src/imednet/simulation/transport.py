@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 
 from imednet.simulation.state import SimulationState, get_default_simulation_state
-from imednet.utils.filters import ORDERED_FILTER_OPERATORS, validate_filter_key
+from imednet.utils.filters import ORDERED_FILTER_OPERATORS, _snake_to_camel, validate_filter_key
 
 _ISO_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}|\b|$)")
 _TWO_CHAR_OPS = frozenset(op for op in ORDERED_FILTER_OPERATORS if len(op) == 2)
@@ -211,6 +211,18 @@ def _split_filter_clauses(filter_str: str, *, attribute: str) -> tuple[str, list
         _parse_single_clause(tok, attribute=attribute, full_expr=filter_str) for tok in tokens
     ]
     connector = "or" if has_or else "and"
+    if connector == "and" and len(clauses) > 1:
+        seen_and_attrs: set[str] = set()
+        is_record_data = attribute == "recordDataFilter"
+        for clause in clauses:
+            dedup_attr = clause.field if is_record_data else _snake_to_camel(clause.field)
+            if dedup_attr in seen_and_attrs:
+                raise _FilterParseError(
+                    f"Duplicate filter attribute '{dedup_attr}' in AND clause",
+                    attribute=attribute,
+                    value=filter_str,
+                )
+            seen_and_attrs.add(dedup_attr)
     return connector, clauses
 
 
@@ -484,6 +496,8 @@ def _apply_sort(
 
 class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
     """In-memory HTTP transport implementing offline clinical REST simulation."""
+
+    _split_filter_clauses = staticmethod(_split_filter_clauses)
 
     def __init__(self, state: SimulationState | None = None) -> None:
         """Initialize the transport with an in-memory state store."""

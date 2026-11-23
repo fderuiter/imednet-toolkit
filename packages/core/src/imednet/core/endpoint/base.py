@@ -278,6 +278,7 @@ class _ListEndpointBase(GenericEndpoint[T]):
                 validate_filter_syntax(combined_filter)
                 params["filter"] = combined_filter
             else:
+                validate_filter_syntax(built_filter)
                 params["filter"] = built_filter
 
         if "size" in params and params["size"] is not None:

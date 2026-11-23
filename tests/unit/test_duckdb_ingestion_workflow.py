@@ -299,3 +299,217 @@ def test_ingest_revisions_bigint_aware_timestamps_and_pandas_fallback(
         datetime(2024, 3, 15, 12, 30, 0),
         None,
     )
+
+
+def test_duckdb_cst_timestamps_upsert_study_scoped_replace_and_silver_views() -> None:
+    """Verify CST string UTC normalization, keyed upserts, Study-scoped replace, and SCD2 views."""
+    pytest.importorskip("duckdb")
+
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+    study_a_batch_1 = [
+        SimpleNamespace(
+            record_revision_id=101,
+            record_id=10,
+            record_oid="OID-10",
+            form_key="DEMO",
+            subject_key="S1",
+            site_id=1,
+            interval_id=1,
+            record_status="Record Incomplete",
+            record_revision=1,
+            data_revision=1,
+            user="alice",
+            role="CRC",
+            reason_for_change="Initial",
+            deleted=False,
+            date_created="2024-05-01T22:30:00-06:00",
+            last_updated="2024-05-01T22:30:00-06:00",
+        ),
+        # Duplicate record_revision_id within the same batch updates cleanly
+        SimpleNamespace(
+            record_revision_id=101,
+            record_id=10,
+            record_oid="OID-10",
+            form_key="DEMO",
+            subject_key="S1",
+            site_id=1,
+            interval_id=1,
+            record_status="Record Complete",
+            record_revision=1,
+            data_revision=1,
+            user="alice",
+            role="CRC",
+            reason_for_change="Initial corrected",
+            deleted=False,
+            date_created="2024-05-01T22:30:00-06:00",
+            last_updated="2024-05-01T22:35:00-06:00",
+        ),
+        SimpleNamespace(
+            record_revision_id=102,
+            record_id=10,
+            record_oid="OID-10",
+            form_key="DEMO",
+            subject_key="S1",
+            site_id=1,
+            interval_id=1,
+            record_status="Verified",
+            record_revision=2,
+            data_revision=2,
+            user="bob",
+            role="DM",
+            reason_for_change="Verified",
+            deleted=False,
+            date_created="2024-05-02T10:00:00Z",
+            last_updated="2024-05-02T10:00:00Z",
+        ),
+        # Soft-deleted record (rev 1 active -> rev 2 deleted) must be omitted from current_state
+        SimpleNamespace(
+            record_revision_id=201,
+            record_id=20,
+            record_oid="OID-20",
+            form_key="AE",
+            subject_key="S1",
+            site_id=1,
+            interval_id=1,
+            record_status="Record Complete",
+            record_revision=1,
+            data_revision=1,
+            user="alice",
+            role="CRC",
+            reason_for_change="Created AE",
+            deleted=False,
+            date_created="2024-05-01T12:00:00Z",
+            last_updated="2024-05-01T12:00:00Z",
+        ),
+        SimpleNamespace(
+            record_revision_id=202,
+            record_id=20,
+            record_oid="OID-20",
+            form_key="AE",
+            subject_key="S1",
+            site_id=1,
+            interval_id=1,
+            record_status="Deleted",
+            record_revision=2,
+            data_revision=1,
+            user="bob",
+            role="DM",
+            reason_for_change="Entered in error",
+            deleted=True,
+            date_created="2024-05-03T12:00:00Z",
+            last_updated="2024-05-03T12:00:00Z",
+        ),
+        # Null record_id records partitioned distinctly by record_oid
+        SimpleNamespace(
+            record_revision_id=301,
+            record_id=None,
+            record_oid="OID-NULL-1",
+            form_key="CM",
+            subject_key="S1",
+            site_id=1,
+            interval_id=1,
+            record_status="Record Complete",
+            record_revision=1,
+            data_revision=1,
+            user="alice",
+            role="CRC",
+            reason_for_change="CM 1",
+            deleted=False,
+            date_created="2024-05-01T13:00:00Z",
+            last_updated="2024-05-01T13:00:00Z",
+        ),
+        SimpleNamespace(
+            record_revision_id=302,
+            record_id=None,
+            record_oid="OID-NULL-2",
+            form_key="CM",
+            subject_key="S1",
+            site_id=1,
+            interval_id=1,
+            record_status="Record Complete",
+            record_revision=1,
+            data_revision=1,
+            user="alice",
+            role="CRC",
+            reason_for_change="CM 2",
+            deleted=False,
+            date_created="2024-05-01T14:00:00Z",
+            last_updated="2024-05-01T14:00:00Z",
+        ),
+    ]
+
+    study_b_batch = [
+        SimpleNamespace(
+            record_revision_id=101,
+            record_id=10,
+            record_oid="OID-B-10",
+            form_key="DEMO",
+            subject_key="SB1",
+            site_id=2,
+            interval_id=1,
+            record_status="Locked",
+            record_revision=1,
+            data_revision=1,
+            user="carol",
+            role="PI",
+            reason_for_change="Initial B",
+            deleted=False,
+            date_created="2024-06-01T08:00:00Z",
+            last_updated="2024-06-01T08:00:00Z",
+        )
+    ]
+
+    with patch.object(
+        DataExtractionWorkflow,
+        "extract_audit_trail",
+        side_effect=[study_a_batch_1, study_a_batch_1, study_b_batch],
+    ):
+        assert workflow.ingest_revisions("STUDY_A", mode="append") == 6
+        # Re-appending identical revisions upserts without duplicating rows
+        assert workflow.ingest_revisions("STUDY_A", mode="append") == 6
+        assert workflow.ingest_revisions("STUDY_B", mode="append") == 1
+
+    # CST -06:00 string is stored as naive UTC (2024-05-02 04:30:00)
+    cst_row = workflow._connection.execute(
+        "SELECT date_created, reason_for_change FROM bronze_revisions "
+        "WHERE study_key = 'STUDY_A' AND record_revision_id = 101"
+    ).fetchone()
+    assert cst_row == (datetime(2024, 5, 2, 4, 30, 0), "Initial corrected")
+
+    total_rows = workflow._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()[0]
+    assert total_rows == 7
+
+    # Unfiltered build_silver_view partitions by study_key + COALESCE(record_id, record_oid)
+    workflow.build_silver_view()
+    current_rows = workflow._connection.execute(
+        "SELECT study_key, record_oid, record_revision FROM silver_current_state "
+        "ORDER BY study_key, record_oid"
+    ).fetchall()
+    assert current_rows == [
+        ("STUDY_A", "OID-10", 2),
+        ("STUDY_A", "OID-NULL-1", 1),
+        ("STUDY_A", "OID-NULL-2", 1),
+        ("STUDY_B", "OID-B-10", 1),
+    ]
+
+    # SCD Type 2 history view exposes valid_from, valid_to, and is_current
+    history_rows = workflow._connection.execute(
+        "SELECT record_revision, valid_from, valid_to, is_current "
+        "FROM silver_records_history "
+        "WHERE study_key = 'STUDY_A' AND record_id = 10 "
+        "ORDER BY record_revision"
+    ).fetchall()
+    assert history_rows == [
+        (1, datetime(2024, 5, 2, 4, 30, 0), datetime(2024, 5, 2, 10, 0, 0), False),
+        (2, datetime(2024, 5, 2, 10, 0, 0), None, True),
+    ]
+
+    # Replacing STUDY_A preserves STUDY_B rows in bronze_revisions
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=[]):
+        assert workflow.ingest_revisions("STUDY_A", mode="replace") == 0
+
+    remaining = workflow._connection.execute(
+        "SELECT study_key, record_oid FROM bronze_revisions"
+    ).fetchall()
+    assert remaining == [("STUDY_B", "OID-B-10")]

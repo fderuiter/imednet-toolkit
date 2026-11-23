@@ -60,8 +60,11 @@ def test_extract_records_by_criteria_filters_subject_and_visit(schema) -> None:
 
 def test_extract_audit_trail_builds_filters_and_dates() -> None:
     """Test that extract audit trail builds filters and dates."""
+    from datetime import datetime, timezone
+
     sdk = MagicMock()
     revision = RecordRevision.from_json(fake_data.fake_record_revision())
+    revision.date_created = datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
     sdk.get_record_revisions.return_value = [revision]
 
     wf = DataExtractionWorkflow(sdk)
@@ -77,9 +80,6 @@ def test_extract_audit_trail_builds_filters_and_dates() -> None:
         "STUDY",
         role="data",
         status="open",
-        dateCreated=[
-            (">=", "2021-01-01T00:00:00Z"),
-            ("<=", "2021-01-02T23:59:59Z"),
-        ],
+        dateCreated=(">=", "2021-01-01T00:00:00Z"),
     )
     assert result == [revision]

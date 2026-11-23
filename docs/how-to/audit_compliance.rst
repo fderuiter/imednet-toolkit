@@ -53,18 +53,22 @@ all 18 revision-level attributes (``recordRevisionId``, ``recordId``,
 Verifying Monotonic 21 CFR Part 11 Chains
 -----------------------------------------
 
-Under 21 CFR Part 11, historical revisions for any ``Record`` (grouped by
-``recordId`` or ``recordOid``) must maintain strictly increasing
-``record_revision`` counters (``>= 1``) and monotonically non-decreasing
-``data_revision`` counters (``0 <= data_revision <= record_revision``). When an
-investigator verifies or signs a ``Record`` without altering clinical
-``Variable`` values, ``record_revision`` increments while ``data_revision``
-remains unchanged.
+Under 21 CFR 11.10(e), historical revisions for any ``Record`` (grouped by
+Study-scoped ``(studyKey, recordId)`` or ``(studyKey, recordOid)``) must
+maintain contiguous ``record_revision`` counters (``1..N`` by default, or
+contiguous ``k..m`` slices when ``allow_partial=True``), monotonically
+non-decreasing ``data_revision`` counters (``0 <= data_revision <= record_revision``),
+monotonic UTC ``date_created`` timestamps, non-empty ``user`` and
+``reason_for_change`` operator attribution, and terminal soft-delete protection
+blocking resurrection out of ``DELETED``. When an investigator verifies or signs
+a ``Record`` without altering clinical ``Variable`` values, ``record_revision``
+increments while ``data_revision`` remains unchanged.
 
 Use :meth:`RecordRevision.validate_chain <imednet.models.record_revisions.RecordRevision.validate_chain>`,
 ``validate_record_revision_chain``, or ``is_valid_record_revision_chain`` to
-verify chronological audit integrity and detect missing, out-of-order, or
-regressing revisions:
+verify chronological audit integrity and detect sequence gaps, out-of-order
+revisions, regressed UTC timestamps, missing attribution, or resurrected
+``DELETED`` records:
 
 .. testcode::
 
@@ -149,9 +153,9 @@ alongside synchronous or asynchronous SDK endpoints:
                study_key=study_key,
                start_date="2026-11-01",
                end_date="2026-11-30",
-               user="pi_site201",
+               formKey="F_VS",
            )
-           return RecordRevision.validate_chain(revisions)
+           return RecordRevision.validate_chain(revisions, allow_partial=True)
 
 
    async def stream_form_revisions_async(study_key: str) -> list[RecordRevision]:
@@ -164,9 +168,13 @@ alongside synchronous or asynchronous SDK endpoints:
            ]
            return RecordRevision.validate_chain(revisions)
 
-``extract_audit_trail`` automatically normalizes ISO-8601 ``start_date`` and
-``end_date`` inputs to inclusive UTC bounds on ``dateCreated`` while preserving
-additional equality or operator filters in ``user_filter`` and ``**filters``.
+``extract_audit_trail`` pushes a single ``dateCreated`` predicate to the REST
+endpoint (satisfying the iMednet Common API unique AND-attribute rule) and
+evaluates extra UTC bounds—including half-open ``< next_day_00:00:00Z`` bounds
+for date-only ``end_date`` inputs that retain sub-second UTC revisions—locally
+in Python while preserving additional filters in ``user_filter`` and
+``**filters``. Pass ``allow_partial=True`` to ``validate_chain`` when validating
+date-bounded slices whose ``Record`` chains began prior to ``start_date``.
 
 Analytical Lineage, PHI Controls & Governance
 ---------------------------------------------
@@ -174,10 +182,12 @@ Analytical Lineage, PHI Controls & Governance
 Combine ``RecordRevision`` verification with downstream compliance controls
 across the toolkit:
 
-1. **DuckDB Lakehouse Lineage** (:doc:`duckdb_integration`): Load immutable
-   ``record_revisions`` tables with ``DuckDBIngestionWorkflow.ingest_revisions``
-   and materialize Slowly Changing Dimension (SCD Type 2) ``silver_records_history``
-   views via ``build_silver_view``.
+1. **DuckDB Lakehouse Lineage** (:doc:`duckdb_integration`): Upsert immutable
+   ``bronze_revisions`` rows keyed on ``(study_key, record_revision_id)`` with
+   ``DuckDBIngestionWorkflow.ingest_revisions``, and materialize active
+   ``silver_current_state`` (excluding ``deleted=True`` records) plus Slowly
+   Changing Dimension (SCD Type 2) ``silver_records_history`` (``valid_from`` /
+   ``valid_to``) views via ``build_silver_view``.
 2. **PHI Masking & Redaction** (:doc:`export_destinations`): All sink plugins
    default to ``mask_phi=True`` and support explicit ``StudyConfiguration`` PHI
    ``Variable`` declarations so unredacted identifiers cannot leak accidentally.

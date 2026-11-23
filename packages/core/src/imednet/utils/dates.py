@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 # Python 3.11+ supports Z and any precision of fractional seconds in fromisoformat
@@ -184,19 +184,23 @@ def normalize_iso_date(value: Any, *, date_order: Literal["MDY", "DMY"] | None =
     return value
 
 
-def normalize_utc_timestamp_bound(value: str, *, is_end: bool = False) -> str:
-    """Normalize a date or timestamp string to an ISO 8601 UTC timestamp bound.
+def resolve_utc_timestamp_bound(
+    value: str, *, is_end: bool = False
+) -> tuple[Literal[">=", "<=", "<"], str]:
+    """Resolve an operator and canonical ISO 8601 UTC timestamp bound.
 
-    Date-only inputs expand to ``T00:00:00Z`` when ``is_end`` is ``False`` and
-    ``T23:59:59Z`` when ``is_end`` is ``True``. Full timestamps are converted
-    to UTC ending with ``Z``.
+    Date-only inputs expand to ``(">=", "YYYY-MM-DDT00:00:00Z")`` when ``is_end``
+    is ``False`` and a half-open ``("<", "<next_day>T00:00:00Z")`` bound when
+    ``is_end`` is ``True`` so sub-second UTC events on the end date are retained.
+    Explicit timestamp inputs convert to UTC ending with ``Z`` using ``>=`` or
+    ``<=``.
 
     Args:
         value: Date or ISO 8601 datetime string.
-        is_end: Whether to use end-of-day time for date-only inputs.
+        is_end: Whether to compute an upper bound instead of a lower bound.
 
     Returns:
-        Canonical ISO 8601 UTC timestamp string ending with ``Z``.
+        Tuple of ``(operator, utc_iso_timestamp)``.
 
     Raises:
         ValueError: If ``value`` is empty or cannot be parsed as a valid date or datetime.
@@ -209,9 +213,36 @@ def normalize_utc_timestamp_bound(value: str, *, is_end: bool = False) -> str:
     candidate = normalized if isinstance(normalized, str) else stripped
 
     if _ISO_DATE_REGEX.fullmatch(candidate):
-        date.fromisoformat(candidate)
-        suffix = "T23:59:59Z" if is_end else "T00:00:00Z"
-        return f"{candidate}{suffix}"
+        parsed_date = date.fromisoformat(candidate)
+        if is_end:
+            try:
+                next_day = parsed_date + timedelta(days=1)
+            except OverflowError as exc:
+                raise ValueError(f"Date filter bound out of range: {value!r}") from exc
+            return ("<", f"{next_day.isoformat()}T00:00:00Z")
+        return (">=", f"{candidate}T00:00:00Z")
 
     dt = parse_iso_datetime(candidate)
-    return format_iso_datetime(dt)
+    op: Literal[">=", "<="] = "<=" if is_end else ">="
+    return (op, format_iso_datetime(dt))
+
+
+def normalize_utc_timestamp_bound(value: str, *, is_end: bool = False) -> str:
+    """Normalize a date or timestamp string to an ISO 8601 UTC timestamp bound.
+
+    Date-only inputs expand to ``T00:00:00Z`` when ``is_end`` is ``False`` and
+    half-open ``<next_day>T00:00:00Z`` when ``is_end`` is ``True``. Full
+    timestamps are converted to UTC ending with ``Z``.
+
+    Args:
+        value: Date or ISO 8601 datetime string.
+        is_end: Whether to use the exclusive next-day UTC bound for date-only inputs.
+
+    Returns:
+        Canonical ISO 8601 UTC timestamp string ending with ``Z``.
+
+    Raises:
+        ValueError: If ``value`` is empty or cannot be parsed as a valid date or datetime.
+    """
+    _, bound = resolve_utc_timestamp_bound(value, is_end=is_end)
+    return bound

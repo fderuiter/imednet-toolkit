@@ -42,12 +42,17 @@ Extracting 21 CFR Part 11 Audit Trails
 Use :meth:`~imednet_workflows.data_extraction.DataExtractionWorkflow.extract_audit_trail`
 to fetch :class:`~imednet.models.record_revisions.RecordRevision` entries bounded
 by UTC ``start_date`` and ``end_date`` timestamps alongside optional ``User`` or
-``Form`` filters:
+``Form`` filters. ``extract_audit_trail`` sends a single ``dateCreated``
+predicate to the iMednet REST API (preserving unique AND-attribute rules) and
+evaluates additional UTC bounds—including half-open ``< next_day_00:00:00Z``
+bounds for date-only ``end_date`` values so sub-second revisions are retained—in
+Python:
 
 .. testcode::
 
    from typing import Any, cast
    from imednet import ImednetSDK
+   from imednet.models.record_revisions import RecordRevision
    from imednet_workflows.data_extraction import DataExtractionWorkflow
 
    audit_sdk = ImednetSDK(simulation_mode=True)
@@ -59,6 +64,7 @@ by UTC ``start_date`` and ``end_date`` timestamps alongside optional ``User`` or
        end_date="2026-12-31",
        user_filter={"form_key": "F_VS"},
    )
+   RecordRevision.validate_chain(revisions, allow_partial=True)
    print(len(revisions))
 
 Combining Extraction with ``RecordMapper``
