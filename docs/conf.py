@@ -25,7 +25,9 @@ from typing import Any, Generic, TypeVar, get_args, get_origin, get_type_hints
 
 import pydantic._internal._utils as _pydantic_internal_utils
 from pydantic import BaseModel, RootModel
+from sphinx import addnodes
 from sphinx.util.nodes import make_refnode
+from sphinx.writers.html5 import HTML5Translator
 
 if not hasattr(_pydantic_internal_utils, "MappingIntStrAny"):
     _pydantic_internal_utils.MappingIntStrAny = Mapping[int, Any] | Mapping[str, Any]
@@ -317,7 +319,7 @@ pyodide_config = {
         "IMEDNET_API_KEY": "dummy_api_key",  # pragma: allowlist secret
         "IMEDNET_SECURITY_KEY": "dummy_security_key",  # pragma: allowlist secret
         "SNOWFLAKE_PASSWORD": "dummy_password",  # pragma: allowlist secret
-        "IMEDNET_STUDY_KEY": "MY_STUDY",
+        "IMEDNET_STUDY_KEY": "STUDY",
     },
 }
 
@@ -783,19 +785,20 @@ def _before_process_endpoint_signature(app: Any, obj: Any, bound_method: bool) -
     """Normalize endpoint Operation return annotations before autodoc signature formatting runs."""
     if not callable(obj) or inspect.isclass(obj):
         return
-    anns = getattr(obj, "__annotations__", None)
+    target: Any = obj.__func__ if inspect.ismethod(obj) else obj
+    anns = getattr(target, "__annotations__", None)
     if not isinstance(anns, dict) or "return" not in anns:
         return
-    resolved_ret = _resolve_callable_return_hint(obj)
+    resolved_ret = _resolve_callable_return_hint(target)
     owner_cls = _resolve_owner_class(app)
     normalized = _normalize_operation_return_type(resolved_ret, owner_cls)
-    if normalized is not anns["return"]:
+    if normalized is not resolved_ret:
         updated_anns = dict(anns)
         updated_anns["return"] = normalized
-        obj.__annotations__ = updated_anns
+        target.__annotations__ = updated_anns
         try:
-            sig = inspect.signature(obj)
-            obj.__signature__ = sig.replace(return_annotation=normalized)
+            sig = inspect.signature(target)
+            target.__signature__ = sig.replace(return_annotation=normalized)
         except (TypeError, ValueError):
             pass
 
@@ -823,16 +826,161 @@ def _process_endpoint_signature(
     return None
 
 
+_REEXPORT_NAMESPACES: frozenset[str] = frozenset(
+    {
+        "imednet",
+        "imednet.errors",
+        "imednet.utils",
+        "imednet.spi",
+    }
+)
+
+
+def _is_reexport_namespace(mod_name: str) -> bool:
+    """Return True if mod_name is a curated re-export facade package or SPI submodule."""
+    return mod_name in _REEXPORT_NAMESPACES or mod_name.startswith("imednet.spi.")
+
+
+def _iter_import_reexport_hops(mod_name: str, attr_name: str) -> list[tuple[str, str]]:
+    """Yield every (module, symbol) hop along an AST import re-export chain."""
+    hops: list[tuple[str, str]] = []
+    visited: set[tuple[str, str]] = set()
+    cur_mod, cur_name = mod_name, attr_name
+    while (cur_mod, cur_name) not in visited:
+        visited.add((cur_mod, cur_name))
+        if cur_mod.split(".")[0] not in _FIRST_PARTY_ROOTS:
+            break
+        imported, defined, _ = _analyze_module_symbols(cur_mod)
+        if cur_name in defined or cur_name not in imported:
+            break
+        next_mod, orig_name = imported[cur_name]
+        resolved_name = orig_name or cur_name
+        hops.append((next_mod, resolved_name))
+        if not orig_name:
+            break
+        cur_mod, cur_name = next_mod, resolved_name
+    return hops
+
+
+def _resolve_reexport_candidates(
+    reftarget: str,
+    documented_modules: frozenset[str],
+    _seen_refs: set[str] | None = None,
+) -> list[str]:
+    """Resolve re-exported imednet, errors, utils, and spi targets to canonical anchors."""
+    seen = set() if _seen_refs is None else _seen_refs
+    if reftarget in seen:
+        return []
+    seen.add(reftarget)
+
+    parts = reftarget.split(".")
+    if len(parts) < 2:
+        return []
+
+    candidates: list[str] = []
+
+    def _add(cand: str) -> None:
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    def _record_origin(origin_mod: str, origin_name: str, tail_str: str) -> None:
+        suffix = f".{tail_str}" if tail_str else ""
+        _add(f"{origin_mod}.{origin_name}{suffix}")
+        doc_mod = _find_canonical_documented_module(origin_mod, origin_name, documented_modules)
+        if doc_mod is not None:
+            _add(f"{doc_mod}.{origin_name}{suffix}")
+        if origin_mod.startswith("imednet.core."):
+            _add(f"imednet.core.{origin_name}{suffix}")
+            _add(f"imednet.pagination.{origin_name}{suffix}")
+
+    for idx in range(len(parts) - 1, 0, -1):
+        mod_name = ".".join(parts[:idx])
+        if not _is_reexport_namespace(mod_name):
+            continue
+        sym_name = parts[idx]
+        tail_parts = parts[idx + 1 :]
+        tail_str = ".".join(tail_parts)
+
+        try:
+            mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+        except Exception:
+            mod = None
+
+        if mod is not None:
+            lazy_attrs = getattr(mod, "_LAZY_ATTRS", None)
+            if isinstance(lazy_attrs, dict) and sym_name in lazy_attrs:
+                lazy_entry = lazy_attrs[sym_name]
+                if (
+                    isinstance(lazy_entry, tuple)
+                    and len(lazy_entry) == 2
+                    and isinstance(lazy_entry[0], str)
+                    and isinstance(lazy_entry[1], str)
+                ):
+                    target_mod, target_attr = lazy_entry
+                    _record_origin(target_mod, target_attr, tail_str)
+                    for hop_mod, hop_name in _iter_import_reexport_hops(target_mod, target_attr):
+                        _record_origin(hop_mod, hop_name, tail_str)
+                    nested_ref = f"{target_mod}.{target_attr}" + (
+                        f".{tail_str}" if tail_str else ""
+                    )
+                    for nested in _resolve_reexport_candidates(
+                        nested_ref, documented_modules, seen
+                    ):
+                        _add(nested)
+
+            lazy_submods = getattr(mod, "_LAZY_SUBMODULES", None)
+            if isinstance(lazy_submods, dict) and sym_name in lazy_submods and tail_parts:
+                submod_target = lazy_submods[sym_name]
+                if isinstance(submod_target, str):
+                    sub_ref = f"{submod_target}.{tail_str}"
+                    _add(sub_ref)
+                    for nested in _resolve_reexport_candidates(sub_ref, documented_modules, seen):
+                        _add(nested)
+
+        for hop_mod, hop_name in _iter_import_reexport_hops(mod_name, sym_name):
+            _record_origin(hop_mod, hop_name, tail_str)
+            nested_ref = f"{hop_mod}.{hop_name}" + (f".{tail_str}" if tail_str else "")
+            for nested in _resolve_reexport_candidates(nested_ref, documented_modules, seen):
+                _add(nested)
+
+        if mod is not None:
+            try:
+                runtime_obj = getattr(mod, sym_name)
+            except Exception:
+                runtime_obj = None
+
+            if isinstance(runtime_obj, types.ModuleType):
+                runtime_mod_name = getattr(runtime_obj, "__name__", "")
+                if runtime_mod_name and tail_parts:
+                    sub_ref = f"{runtime_mod_name}.{tail_str}"
+                    _add(sub_ref)
+                    for nested in _resolve_reexport_candidates(sub_ref, documented_modules, seen):
+                        _add(nested)
+            elif runtime_obj is not None:
+                obj_mod = getattr(runtime_obj, "__module__", None)
+                obj_qualname = getattr(runtime_obj, "__qualname__", None) or getattr(
+                    runtime_obj, "__name__", sym_name
+                )
+                if isinstance(obj_mod, str) and obj_mod.split(".")[0] in _FIRST_PARTY_ROOTS:
+                    top_name = obj_qualname.split(".")[0]
+                    qual_tail = ".".join(obj_qualname.split(".")[1:] + tail_parts)
+                    _record_origin(obj_mod, top_name, qual_tail)
+
+    return candidates
+
+
 def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: Any) -> Any:
-    """Resolve internal imednet.core.* cross-references to curated imednet.core or imednet.pagination anchors."""
+    """Resolve re-exported imednet, core, errors, utils, spi, and first-party py references to canonical anchors."""
     if node.get("refdomain") != "py" or not hasattr(app.builder, "get_relative_uri"):
         return None
     reftarget = node.get("reftarget", "")
     if not isinstance(reftarget, str) or not reftarget:
         return None
 
-    py_objects = env.domaindata.get("py", {}).get("objects", {})
-    if not py_objects:
+    py_domain = env.domaindata.get("py", {})
+    py_objects = py_domain.get("objects", {})
+    py_modules = py_domain.get("modules", {})
+    if not py_objects and not py_modules:
         return None
 
     alias_rewrites = {
@@ -844,10 +992,22 @@ def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: An
     candidates: list[str] = []
     if reftarget == "imednet.core.context.study_context":
         candidates.append("imednet.sdk.ImednetSDK.study_context")
+    elif reftarget == "write_batch":
+        candidates.append("imednet.integrations.sink_base.ExportSink.write_batch")
     elif reftarget.startswith("imednet.core.paginator."):
         tail = reftarget.removeprefix("imednet.core.paginator.")
         candidates.extend([f"imednet.pagination.{tail}", f"imednet.core.{tail}"])
     elif reftarget.startswith("imednet.core."):
+        if node.get("reftype") == "mod" and "imednet.core" in py_modules:
+            mod_entry = py_modules["imednet.core"]
+            return make_refnode(
+                app.builder,
+                node["refdoc"],
+                mod_entry.docname,
+                mod_entry.node_id,
+                contnode,
+                "imednet.core",
+            )
         parts = reftarget.split(".")
         for idx in range(2, len(parts)):
             tail_parts = list(parts[idx:])
@@ -859,8 +1019,67 @@ def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: An
         head, dot, rest = reftarget.partition(".")
         mapped_head = alias_rewrites.get(head, head)
         norm_target = f"{mapped_head}{dot}{rest}"
-        for prefix in ("imednet.core", "imednet.pagination", "imednet.sdk", "imednet.endpoints"):
+        for prefix in (
+            "imednet.core",
+            "imednet.pagination",
+            "imednet.sdk",
+            "imednet.endpoints",
+            "imednet.auth",
+            "imednet.models",
+            "imednet.integrations.sink_base",
+        ):
             candidates.append(f"{prefix}.{norm_target}")
+
+    if "." in reftarget:
+        documented_modules = _get_documented_modules()
+        for cand in _resolve_reexport_candidates(reftarget, documented_modules):
+            if cand not in candidates:
+                candidates.append(cand)
+        if reftarget.split(".")[0] in _FIRST_PARTY_ROOTS:
+            parts = reftarget.split(".")
+            for idx in range(len(parts) - 1, 0, -1):
+                mod_name = ".".join(parts[:idx])
+                attr_chain = parts[idx:]
+                sym_name = attr_chain[0]
+                rest_attrs = attr_chain[1:]
+
+                canon_mod, canon_name = _resolve_canonical_origin(mod_name, sym_name)
+                if canon_mod != mod_name or canon_name != sym_name:
+                    cand_canon = ".".join([canon_mod, canon_name, *rest_attrs])
+                    if cand_canon not in candidates:
+                        candidates.append(cand_canon)
+                    doc_home = _find_canonical_documented_module(
+                        canon_mod, canon_name, documented_modules
+                    )
+                    if doc_home is not None:
+                        cand_canon_doc = ".".join([doc_home, canon_name, *rest_attrs])
+                        if cand_canon_doc not in candidates:
+                            candidates.append(cand_canon_doc)
+
+                mod_obj: Any = None
+                try:
+                    mod_obj = importlib.import_module(mod_name)
+                except Exception:
+                    mod_obj = None
+                if mod_obj is None:
+                    continue
+                sym_obj = getattr(mod_obj, sym_name, None)
+                if sym_obj is None:
+                    continue
+                obj_mod = getattr(sym_obj, "__module__", None)
+                obj_qual = getattr(sym_obj, "__qualname__", getattr(sym_obj, "__name__", sym_name))
+                if isinstance(obj_mod, str) and obj_mod:
+                    cand_obj = ".".join([obj_mod, obj_qual, *rest_attrs])
+                    if cand_obj not in candidates:
+                        candidates.append(cand_obj)
+                    doc_home = _find_canonical_documented_module(
+                        obj_mod, obj_qual.split(".")[0], documented_modules
+                    )
+                    if doc_home is not None:
+                        cand_obj_doc = ".".join([doc_home, obj_qual, *rest_attrs])
+                        if cand_obj_doc not in candidates:
+                            candidates.append(cand_obj_doc)
+                break
 
     for cand in candidates:
         entry = py_objects.get(cand)
@@ -1149,6 +1368,10 @@ def _inject_seo_metadata(
     )
     context["metatags"] = prefix + "\n".join(injected_lines) + "\n"
 
+    master_docname = getattr(app.config, "master_doc", "index") or "index"
+    if pagename == master_docname and hasattr(app, "add_js_file"):
+        app.add_js_file("showcase.js")
+
 
 def _rewrite_not_found_assets(not_found_path: Path, base_path: str) -> None:
     """Rewrite relative asset and navigation URLs on 404.html so nested paths render cleanly."""
@@ -1205,7 +1428,11 @@ def _on_build_finished(app: Any, exception: Exception | None) -> None:
 
     _rewrite_not_found_assets(outdir / "404.html", base_path)
 
-    found_docs = sorted(doc for doc in getattr(app.env, "found_docs", set()) if doc != "404")
+    found_docs = sorted(
+        doc
+        for doc in getattr(app.env, "found_docs", set())
+        if doc != "404" and not doc.startswith("_includes/")
+    )
     sitemap_lines = [
         '<?xml version="1.0" encoding="utf-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
@@ -1220,6 +1447,31 @@ def _on_build_finished(app: Any, exception: Exception | None) -> None:
     (outdir / "robots.txt").write_text(robots_txt, encoding="utf-8")
 
 
+class _AccessibleHTML5Translator(HTML5Translator):
+    """HTML5 translator that adds contextual ``aria-level`` to toctree captions."""
+
+    def visit_title(self, node: Any) -> None:
+        """Emit hierarchical ``aria-level`` on captioned toctree headings (ARIA12, G141)."""
+        if isinstance(node.parent, addnodes.compact_paragraph) and node.parent.get("toctree"):
+            aria_level = min(6, max(2, self.section_level + self.initial_header_level))
+            self.body.append(
+                self.starttag(
+                    node,
+                    "p",
+                    "",
+                    CLASS="caption",
+                    ROLE="heading",
+                    **{"aria-level": str(aria_level)},
+                )
+            )
+            self.body.append('<span class="caption-text">')
+            self.context.append("</span></p>\n")
+            self.add_secnumber(node)
+            self.add_fignumber(node.parent)
+            return
+        super().visit_title(node)
+
+
 def setup(app: Any) -> dict[str, Any]:  # pragma: no cover
     """Register Sphinx autodoc, viewcode, and native SEO / GitHub Pages hooks.
 
@@ -1229,6 +1481,8 @@ def setup(app: Any) -> dict[str, Any]:  # pragma: no cover
     _get_documented_modules.cache_clear()
     _analyze_module_symbols.cache_clear()
 
+    app.set_translator("html", _AccessibleHTML5Translator)
+    app.set_translator("dirhtml", _AccessibleHTML5Translator)
     app.connect("autodoc-process-bases", _unwrap_shadowed_bases)
     app.connect(
         "autodoc-before-process-signature", _before_process_endpoint_signature, priority=400
@@ -1270,6 +1524,7 @@ napoleon_include_init_with_doc = True
 # Templates and static paths
 templates_path: list[str] = []
 exclude_patterns: list[str] = [
+    "_includes/**",
     "tutorials/examples/dummy.py",
     "agents/**",
     "superpowers/**",
@@ -1277,10 +1532,11 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["showcase.js", "thebe_pyodide.js"]
+html_js_files: list[str] = ["code_blocks.js"]
 
 doctest_global_setup = """
 import builtins
+import contextlib
 import logging
 import os
 import sys
@@ -1290,6 +1546,10 @@ from unittest.mock import MagicMock, patch
 
 for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")]:
     del sys.modules[_mod]
+
+with contextlib.suppress(ImportError):
+    from airflow.sdk.bases.operator import ExecutorSafeguard
+    ExecutorSafeguard.test_mode = True
 
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
@@ -1302,6 +1562,11 @@ os.environ["IMEDNET_SECURITY_KEY"] = "dummy_security_key"  # pragma: allowlist s
 os.environ["SNOWFLAKE_PASSWORD"] = "dummy_password"  # pragma: allowlist secret
 os.environ["IMEDNET_STUDY_KEY"] = "STUDY"
 os.environ["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
+os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
+
+with contextlib.suppress(Exception):
+    from airflow.sdk.bases.operator import ExecutorSafeguard
+    ExecutorSafeguard.test_mode = True
 
 _doctest_orig_cwd = os.getcwd()
 _doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
@@ -1458,8 +1723,9 @@ master_doc = 'index'
 # Linkcheck configuration
 linkcheck_ignore = [
     r"https://.*\.imednet\.com.*",
-    r"https://cdn\.jsdelivr\.net/.*",
+    r"https://cdn\.jsdelivr\.net/(?!pyodide/).*",
     r"https://unpkg\.com/.*",
+    r"https://github\.com/fderuiter/(?:imednet-toolkit|imednet-python-sdk)/(?:commit|compare|issues|pull)/.*",
 ]
 linkcheck_timeout = 30
 linkcheck_retries = 3

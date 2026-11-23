@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "record_count": 10000,
+  "calibration_iterations": 5000,
+  "median_runs": 5,
+  "max_regression_tolerance": 0.45,
+  "reference_calibration_seconds": 0.038512,
+  "metrics": {
+    "record_generation_latency": {
+      "static_ceiling_seconds": 4.5,
+      "normalized_ratio": 31.7157
+    },
+    "mongo_conversion_latency": {
+      "static_ceiling_seconds": 0.35,
+      "normalized_ratio": 1.6315
+    },
+    "snowflake_arrow_conversion_latency": {
+      "static_ceiling_seconds": 1.25,
+      "normalized_ratio": 23.5955
+    },
+    "neo4j_conversion_latency": {
+      "static_ceiling_seconds": 0.2,
+      "normalized_ratio": 0.2876
+    }
+  }
+}
