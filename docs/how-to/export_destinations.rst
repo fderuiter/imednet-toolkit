@@ -215,11 +215,14 @@ mapper ingress **by default** (``mask_phi=True``):
   ``terminologyLookups``, and ``mappings`` across flat, hierarchical, and sink
   paths. Store errors, missing plugins, or missing encryption keys fail closed
   so ``global_sensitivity_registry`` PHI redaction still applies.
-* **Pre-write quality-gate filtering**: Setting ``quality_gate_enabled=True``
-  (and optional ``min_schema_readiness_score``) on ``SnowflakeSinkConfig``,
-  ``MongoDbSinkConfig``, ``Neo4jSinkConfig``, or tabular exports runs
-  ``apply_quality_gate`` before batch writes to drop low-readiness ``Record``
-  items consistently across warehouse, document, and graph targets.
+* **Pre-write quality-gate filtering**: Quality-gate filtering is opt-in
+  (``quality_gate_enabled=False`` by default across all CSV, Parquet, Excel,
+  JSON, DuckDB, SQL, warehouse, document, and graph exports). Setting
+  ``quality_gate_enabled=True`` (and optional ``min_schema_readiness_score``)
+  on ``SnowflakeSinkConfig``, ``MongoDbSinkConfig``, ``Neo4jSinkConfig``, or
+  tabular exports runs ``apply_quality_gate`` before batch writes to drop
+  empty drafts or invalid ``Record`` items while retaining sparse ``Record``
+  payloads that omit optional ``Variable`` fields.
 * **Study-specific rules**: Study-level ``StudyConfiguration(phiFields=[...])``
   rules normalize camelCase, PascalCase, uppercase acronyms, and ``snake_case``
   field names automatically across both ``document`` and ``tabular`` mapper

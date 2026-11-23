@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
@@ -14,13 +15,13 @@ from imednet import ImednetSDK
 from imednet.spi import sink_base
 from imednet.spi.sinks import redact_uri
 from imednet.spi.utils import (
-    redact_sensitive_payload,
     redact_sensitive_text,
     validate_path_segment,
 )
 
 from .. import export
 from .._airflow_compat import AirflowException, BaseOperator, Context
+from .._guards import has_embedded_uri_credentials, has_inline_secret_tokens
 from ..hooks import ImednetHook
 
 logger = logging.getLogger(__name__)
@@ -78,30 +79,26 @@ _TABULAR_OPTION_DEFAULTS: dict[str, Any] = {
 }
 
 
-def _has_embedded_uri_credentials(value: str) -> bool:
-    """Return True if *value* embeds plaintext URI userinfo credentials."""
-    if "://" not in value or "://***@" in value:
-        return False
-    return redact_uri(value) != value
+def _is_allowed_auth_none(key_norm: str, item: Any) -> bool:
+    """Return True when ``export_kwargs`` explicitly disables auth via ``auth='none'``."""
+    return key_norm == "auth" and isinstance(item, str) and item.strip().lower() == "none"
 
 
-def _has_inline_secret_tokens(value: str) -> bool:
-    """Return True if *value* embeds sensitive query params, headers, or credential pairs."""
-    existing_masks = value.count("***")
-    if redact_sensitive_text(value).count("***") > existing_masks:
-        return True
-    return str(redact_sensitive_payload(value)).count("***") > existing_masks
-
-
-def _validate_no_secrets_in_value(value: Any, *, field_name: str = "export_kwargs") -> None:
+def _validate_no_secrets_in_value(
+    value: Any,
+    *,
+    field_name: str = "export_kwargs",
+    check_secret_keys: bool | None = None,
+) -> None:
     """Reject secret keys or embedded credentials in templated operator fields."""
+    enforce_keys = field_name == "export_kwargs" if check_secret_keys is None else check_secret_keys
     if isinstance(value, str):
-        if _has_embedded_uri_credentials(value):
+        if has_embedded_uri_credentials(value):
             raise AirflowException(
                 f"Plaintext URI credentials are not allowed in '{field_name}'. "
                 "Configure an Airflow Connection and pass 'destination_conn_id' instead."
             )
-        if _has_inline_secret_tokens(value):
+        if has_inline_secret_tokens(value):
             raise AirflowException(
                 f"Embedded credentials or secret tokens are not allowed in '{field_name}'. "
                 "Configure an Airflow Connection instead."
@@ -110,16 +107,28 @@ def _validate_no_secrets_in_value(value: Any, *, field_name: str = "export_kwarg
     if isinstance(value, Mapping):
         for key, item in value.items():
             key_norm = str(key).strip().lower()
-            if key_norm in _SECRET_EXPORT_KEYS:
+            if (
+                enforce_keys
+                and key_norm in _SECRET_EXPORT_KEYS
+                and not _is_allowed_auth_none(key_norm, item)
+            ):
                 raise AirflowException(
                     f"Secret key '{key}' is not allowed in '{field_name}'. "
                     "Configure an Airflow Connection and pass 'destination_conn_id' instead."
                 )
-            _validate_no_secrets_in_value(item, field_name=field_name)
+            _validate_no_secrets_in_value(
+                item,
+                field_name=field_name,
+                check_secret_keys=enforce_keys,
+            )
         return
     if isinstance(value, (list, tuple, set)):
         for item in value:
-            _validate_no_secrets_in_value(item, field_name=field_name)
+            _validate_no_secrets_in_value(
+                item,
+                field_name=field_name,
+                check_secret_keys=enforce_keys,
+            )
 
 
 def _load_openlineage_types() -> tuple[Any, Any] | None:
@@ -533,7 +542,7 @@ class ImednetExportOperator(BaseOperator):
         *,
         dest: str = "records",
     ) -> dict[str, Any]:
-        """Merge explicitly configured operational parameters into tabular export kwargs."""
+        """Merge operational parameters and deterministic quality-gate state into tabular kwargs."""
         merged = dict(runtime_kwargs)
         if "domain" in merged and "sdtm_domain" not in merged:
             merged["sdtm_domain"] = merged.pop("domain")
@@ -544,6 +553,10 @@ class ImednetExportOperator(BaseOperator):
             current_val = getattr(self, key)
             if key not in merged and (key in explicit or current_val != default_val):
                 merged[key] = current_val
+        if "quality_gate_enabled" in merged:
+            merged["quality_gate_enabled"] = bool(merged["quality_gate_enabled"])
+        else:
+            merged["quality_gate_enabled"] = bool(getattr(self, "quality_gate_enabled", False))
         for key, val in self._collect_streaming_options(runtime_kwargs).items():
             merged.setdefault(key, val)
         if (
@@ -555,6 +568,28 @@ class ImednetExportOperator(BaseOperator):
             if "stream_name" not in merged:
                 merged["stream_name"] = self._default_airflow_stream_name(dest)
         return merged
+
+    @staticmethod
+    def _filter_callable_kwargs(
+        export_callable: Any,
+        tabular_kwargs: dict[str, Any],
+        *,
+        implicit_quality_gate: bool,
+    ) -> dict[str, Any]:
+        """Omit implicit ``quality_gate_enabled`` only when a custom callable rejects sink kwargs."""
+        if not implicit_quality_gate or "quality_gate_enabled" not in tabular_kwargs:
+            return tabular_kwargs
+        try:
+            params = inspect.signature(export_callable).parameters
+        except (TypeError, ValueError):
+            return tabular_kwargs
+        if "quality_gate_enabled" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            return tabular_kwargs
+        filtered = dict(tabular_kwargs)
+        filtered.pop("quality_gate_enabled", None)
+        return filtered
 
     def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
         """Dynamically load and configure the target sink from the SDK, handling dependencies lazily."""
@@ -640,6 +675,11 @@ class ImednetExportOperator(BaseOperator):
                     "Neo4j sink is not available in the installed sinks plugin. "
                     "Please install the required sink dependencies: pip install 'imednet-plugins-sinks[neo4j]'"
                 )
+            neo4j_auth = (
+                ("", "")
+                if _is_allowed_auth_none("auth", runtime_kwargs.get("auth"))
+                else conn_settings.get("auth", ("", ""))
+            )
             neo4j_config = config_cls(
                 study_key=config.study_key,
                 batch_size=config.batch_size,
@@ -650,7 +690,7 @@ class ImednetExportOperator(BaseOperator):
                 quality_gate_enabled=config.quality_gate_enabled,
                 min_schema_readiness_score=config.min_schema_readiness_score,
                 uri=runtime_kwargs.get("uri") or conn_settings.get("uri", ""),
-                auth=conn_settings.get("auth", ("", "")),
+                auth=neo4j_auth,
                 database=runtime_kwargs.get("database") or conn_settings.get("database", "neo4j"),
                 **stream_opts,
             )
@@ -933,7 +973,19 @@ class ImednetExportOperator(BaseOperator):
                 if not export_callable:
                     raise AirflowException(f"Unsupported destination or export_func '{dest}'")
 
-                tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs, dest=dest)
+                explicit_opts: frozenset[str] = getattr(
+                    self, "_explicit_tabular_options", frozenset()
+                )
+                implicit_gate = (
+                    "quality_gate_enabled" not in runtime_kwargs
+                    and "quality_gate_enabled" not in explicit_opts
+                    and not bool(getattr(self, "quality_gate_enabled", False))
+                )
+                tabular_kwargs = self._filter_callable_kwargs(
+                    export_callable,
+                    self._build_tabular_kwargs(runtime_kwargs, dest=dest),
+                    implicit_quality_gate=implicit_gate,
+                )
                 if dest == "duckdb":
                     conn_settings = self._resolve_destination_connection(dest)
                     db_path_arg = (
