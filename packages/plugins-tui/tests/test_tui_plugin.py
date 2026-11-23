@@ -4046,7 +4046,7 @@ async def test_job_monitor_preserves_failure_warning_and_toggles_inline_detail_p
                 "subjectKey": "SUBJ-007",
                 "formKey": "AE",
                 "patient_name": "Jane Doe",
-                "api_key": "sk-secret-inline",
+                "api_key": "sk-secret-inline",  # pragma: allowlist secret
                 "error": "Invalid onset date for ssn=123-45-6789",
             },
             {
