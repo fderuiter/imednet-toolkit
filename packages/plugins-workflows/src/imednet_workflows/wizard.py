@@ -10,7 +10,13 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-from imednet.spi.cli import print_error, supports_interactive_stdin
+from imednet.spi.cli import (
+    is_json_output_mode,
+    parse_email_notify,
+    print_error,
+    redact_cli_secrets,
+    supports_interactive_stdin,
+)
 
 from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
 
@@ -31,7 +37,9 @@ def print_progress(message: str) -> None:
 
     This ensures stdout remains clean for structured data piping.
     """
-    sys.stderr.write(f"{message}\n")
+    if is_json_output_mode():
+        return
+    sys.stderr.write(f"{redact_cli_secrets(message)}\n")
     sys.stderr.flush()
 
 
@@ -336,6 +344,45 @@ def prompt_positive_int(prompt_text: str, default: int = 1) -> int:
             print_progress("Validation Error: Value must be a positive integer (> 0).")
         except ValueError:
             print_progress(f"Validation Error: '{raw}' is not a valid integer.")
+
+
+def prompt_subject_count(
+    prompt_text: str = "Enter number of test subjects",
+    default: int = 2,
+) -> int:
+    """Prompt for a UAT subject count bounded within 1..100 before Study inspection."""
+    while True:
+        raw = prompt_input(prompt_text, default=str(default))
+        try:
+            val = int(raw)
+        except ValueError:
+            print_progress(f"Validation Error: '{raw}' is not a valid integer.")
+            continue
+        if 1 <= val <= 100:
+            return val
+        print_progress("Validation Error: subject_count must be between 1 and 100.")
+
+
+def prompt_email_notify(
+    prompt_text: str = (
+        "Enter email notification ('true', 'false', email address, or leave blank)"
+    ),
+    default: str | bool | None = None,
+) -> bool | str | None:
+    """Prompt for and validate an optional ``--email-notify`` value before Study inspection."""
+    default_str = (
+        ""
+        if default is None
+        else (str(default).lower() if isinstance(default, bool) else str(default))
+    )
+    while True:
+        raw = prompt_input(prompt_text, default=default_str)
+        if not raw:
+            return None
+        try:
+            return parse_email_notify(raw)
+        except ValueError as err:
+            print_progress(f"Validation Error: {redact_cli_secrets(str(err))}")
 
 
 def prompt_non_negative_int(prompt_text: str, default: int = 0) -> int:
