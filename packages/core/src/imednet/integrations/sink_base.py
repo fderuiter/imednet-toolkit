@@ -1257,9 +1257,9 @@ def apply_quality_gate(
                 data = rec_dict.get("recordData")
             if data is None:
                 data = rec_dict.get("data", {})
-            if data is None:
+            if not isinstance(data, Mapping):
                 data = {}
-            score, reasons = calculate_readiness_score(validator.schema, fk, data)
+            score, reasons = calculate_readiness_score(validator.schema, fk, dict(data))
         finally:
             reset_study_context(ctx_token)
 

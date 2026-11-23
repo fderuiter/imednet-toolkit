@@ -2624,38 +2624,27 @@ def export_to_csv(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
-    quality_gate_enabled: bool = True,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export study records to a CSV file.
+    """Export Study Records to a CSV file.
 
-    All exports now inherit StudyConfiguration rules by default.
+    All exports inherit StudyConfiguration rules by default.
 
     Parameters
     ----------
     use_labels_as_columns:
-        When ``True``, variable labels are used for column names instead of
-        variable names.
+        When ``True``, Variable labels are used for column names instead of
+        Variable names.
+    quality_gate_enabled:
+        When ``True``, filters Study Records through :func:`apply_quality_gate`
+        before writing. Defaults to ``False``.
     mask_phi:
-        When ``True`` (default), sensitive PHI values are replaced with
+        When ``True`` (default), sensitive Subject PHI values are replaced with
         ``***MASKED***``.
     """
-    has_sdtm_or_standards_opts = bool(
-        kwargs.get("as_sdtm")
-        or kwargs.get("sdtm_domain") is not None
-        or kwargs.get("domain") is not None
-        or kwargs.get("standards_profile") is not None
-        or kwargs.get("min_standards_score") is not None
-    )
-    effective_default_gate = (
-        False
-        if has_sdtm_or_standards_opts
-        and "quality_gate_enabled" not in kwargs
-        and quality_gate_enabled is True
-        else quality_gate_enabled
-    )
-    kwargs.setdefault("quality_gate_enabled", effective_default_gate)
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     kwargs.setdefault("sanitize", True)
     config = _build_tabular_sink_config(
         study_key,
@@ -2664,7 +2653,7 @@ def export_to_csv(
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         manifest_path=manifest_path or str(Path(path).with_suffix(".manifest.jsonl")),
-        default_quality_gate=effective_default_gate,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
 
@@ -3309,24 +3298,27 @@ def export_to_sql(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
-    quality_gate_enabled: bool = True,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export study records to a SQL table.
+    """Export Study Records to a SQL table.
 
-    All exports now inherit StudyConfiguration rules by default.
+    All exports inherit StudyConfiguration rules by default.
 
     Parameters
     ----------
     use_labels_as_columns:
-        When ``True``, variable labels are used for column names instead of
-        variable names.
+        When ``True``, Variable labels are used for column names instead of
+        Variable names.
     manifest_path:
         Optional path to a file where manifest entries should be logged.
         Defaults to ``None``.
+    quality_gate_enabled:
+        When ``True``, filters Study Records through :func:`apply_quality_gate`
+        before writing. Defaults to ``False``.
     mask_phi:
-        When ``True`` (default), sensitive PHI values are replaced with
+        When ``True`` (default), sensitive Subject PHI values are replaced with
         ``***MASKED***``.
     """
     from sqlalchemy import create_engine
@@ -3875,29 +3867,33 @@ def export_to_duckdb_by_form(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export records to separate DuckDB tables for each form.
+    """Export Study Records to separate DuckDB tables for each Form.
 
-    Each form is exported to a table named after ``form.form_key``.
+    Each Form is exported to a table named after ``form.form_key``.
 
     Parameters
     ----------
     sdk:
-        Authenticated SDK instance used to fetch study records.
+        Authenticated SDK instance used to fetch Study Records.
     study_key:
         Study identifier to export.
     db_path:
         Path to the target ``.duckdb`` database file.
     use_labels_as_columns:
-        When ``True``, variable labels are used for DataFrame column names.
+        When ``True``, Variable labels are used for DataFrame column names.
     variable_whitelist:
-        Optional list of variable names to include.
+        Optional list of Variable names to include.
     form_whitelist:
-        Optional list of form IDs to include.
+        Optional list of Form IDs to include.
+    quality_gate_enabled:
+        When ``True``, filters Study Records through :func:`apply_quality_gate`
+        before writing. Defaults to ``False``.
     mask_phi:
-        When ``True`` (default), sensitive PHI values are replaced with
+        When ``True`` (default), sensitive Subject PHI values are replaced with
         ``***MASKED***``.
 
     Raises:
@@ -3914,6 +3910,7 @@ def export_to_duckdb_by_form(
         ) from error
 
     manifest_path = kwargs.pop("manifest_path", None)
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
@@ -3921,6 +3918,7 @@ def export_to_duckdb_by_form(
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         manifest_path=manifest_path,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
     mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
@@ -4058,13 +4056,15 @@ def export_to_sql_by_form(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export records to separate SQL tables for each form."""
+    """Export Study Records to separate SQL tables for each Form."""
     from sqlalchemy import create_engine
 
     manifest_path = kwargs.pop("manifest_path", None)
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
@@ -4072,6 +4072,7 @@ def export_to_sql_by_form(
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         manifest_path=manifest_path,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
     resolved_if_exists: Literal["fail", "replace", "append", "delete_rows"] = (
@@ -4405,10 +4406,11 @@ def export_to_long_sql(
     conn_str: str,
     *,
     chunk_size: int = 1000,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export records to a normalized long-format SQL table."""
+    """Export Study Records to a normalized long-format SQL table."""
     if pd is None:
         raise ImportError(
             "pandas is required for export_to_long_sql. Install with "
@@ -4417,10 +4419,12 @@ def export_to_long_sql(
     from sqlalchemy import create_engine
 
     manifest_path = kwargs.pop("manifest_path", None)
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
         manifest_path=manifest_path,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
     engine = create_engine(conn_str)
