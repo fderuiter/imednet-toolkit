@@ -32,13 +32,18 @@ dashboard for browsing studies, sites, subjects, and background jobs:
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
 ``Enter`` to select a study or site (re-selecting the active site clears the site filter)
-or to register batch IDs in the Jobs tab input, ``Esc`` to move focus from the Jobs batch
-input to the Jobs table or clear an active site filter, ``q`` to quit, ``d`` to toggle
-dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh active study data, and
-``a`` to load all pages when a panel is truncated. Single-key shortcuts are suppressed
-automatically while typing batch IDs in the Jobs tab input. Pass ``--study`` and
-repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
-immediately, and pass ``--force`` only when intentionally bypassing TTY stream checks.
+or to register validated batch IDs in the Jobs tab input, ``Enter`` or ``Space`` on the
+Jobs table to toggle the inline ``#job_detail_panel`` (displaying sanitized ``resultUrl``
+and per-``Record`` diagnostics), ``Esc`` to move focus from the Jobs batch input to the
+Jobs table, close an open ``#job_detail_panel``, or clear an active site filter, ``q`` to
+quit, ``d`` to toggle dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh
+active study data, and ``a`` to load all pages when a panel is truncated. Single-key
+shortcuts are suppressed automatically while typing batch IDs in the Jobs tab input, and
+``LogViewer`` masks ``Subject`` PHI fields to ``***MASKED***`` by default. Pass ``--study``
+and repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
+immediately (or pass ``--batch`` without ``--study`` to stage ``QUEUED`` batches until a
+``Study`` is selected), and pass ``--force`` only when intentionally bypassing TTY stream
+checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
 ``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
@@ -109,9 +114,12 @@ Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
 Usage failures exit 2, SDK-command interruption exits 130, and success/help exits 0.
 
-Legacy ``records list -o/--output json|csv`` still writes ``records.json`` or ``records.csv``
-and emits a ``stderr`` deprecation warning (prefer ``--format json`` for stdout or
-``imednet export`` for file exports); combining ``-o/--output`` with ``--format json`` is an error. Existing ``export``
+Legacy ``records list -o/--output`` accepts ``json``, ``csv``, or an explicit ``.json`` /
+``.csv`` destination path (preserving ``./records.json`` and ``./records.csv`` for
+``-o json`` and ``-o csv``), flattens ``recordData`` variables, masks ``Subject`` PHI to
+``***MASKED***`` by default (``--mask-phi``; opt out with ``--no-mask-phi``), and emits a
+``stderr`` deprecation warning (prefer ``--format json`` for stdout or ``imednet export``
+for file exports); combining ``-o/--output`` with ``--format json`` is an error. Existing ``export``
 commands (which also accept ``--no-interactive`` to suppress live spinners) and ``datadict`` JSON/schema/diff outputs
 (see :doc:`/how-to/data_dictionary`) retain their own contracts. This is not a global JSON wrapper for arbitrary third-party plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
@@ -247,9 +255,12 @@ out explicitly with ``--no-mask-phi``.
 Exports also support native CDISC SDTM transformation (``--as-sdtm`` and
 ``--sdtm-domain``), batch-level CDISC standards readiness gating via
 ``StandardsReadinessValidator`` (``--standards-profile`` and
-``--min-standards-score``), raw variable casing alignment
-(``--naming-convention snake_case|camelCase|sdtm``), and pre-write ``Record``
-schema readiness filtering (``--quality-gate`` and ``--min-readiness-score``):
+``--min-standards-score``), raw ``Variable`` casing alignment
+(``--naming-convention snake_case|camelCase|sdtm``), and opt-in pre-write
+``Record`` schema readiness filtering (disabled by default across all nine
+subcommands, including SQLite per-``Form``, ``--single-table``, and
+``--long-format`` SQL exports; enable with ``--quality-gate`` and optional
+``--min-readiness-score``):
 
 .. code-block:: bash
 
