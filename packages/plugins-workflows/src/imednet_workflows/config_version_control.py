@@ -23,9 +23,12 @@ from urllib.parse import urlparse
 from imednet.spi.models import StudyConfiguration
 from imednet.spi.utils import (
     PathTraversalValidationError,
+    extract_sdk_security_key,
     flatten,
     get_base_url_context,
+    get_security_key_context,
     get_study_context,
+    sdk_governance_context,
     sqlite_connection,
     validate_partition_key,
 )
@@ -35,7 +38,7 @@ _DEFAULT_DB_PATH = Path(
 )
 _DEFAULT_DB_PATH_STR = str(Path.home() / ".imednet" / "config_versions.sqlite3")
 _READ_STORE_CACHE: dict[Path, ConfigVersionStore] = {}
-_DYNAMIC_PATH_CACHE: dict[tuple[str, str, str | None], Path] = {}
+_DYNAMIC_PATH_CACHE: dict[tuple[str, str], Path] = {}
 _HEAD_INDEX_CACHE: dict[tuple[Path, int, int, int], dict[str, str]] = {}
 
 
@@ -64,9 +67,14 @@ def _sanitize_base_url_for_path(url: str) -> str:
         return "default"
 
 
-def _get_fernet_key() -> bytes:
+def _get_fernet_key(fallback_key: str | None = None) -> bytes:
     """Retrieve and derive a valid 32-byte base64-encoded Fernet key."""
-    raw_key = os.environ.get("IMEDNET_ENCRYPTION_KEY") or os.environ.get("IMEDNET_SECURITY_KEY")
+    raw_key = (
+        os.environ.get("IMEDNET_ENCRYPTION_KEY")
+        or os.environ.get("IMEDNET_SECURITY_KEY")
+        or get_security_key_context()
+        or fallback_key
+    )
     if not raw_key:
         raise ValueError(
             "Encryption/decryption key is missing. Please set IMEDNET_ENCRYPTION_KEY or IMEDNET_SECURITY_KEY."
@@ -83,21 +91,21 @@ def _get_fernet_key() -> bytes:
     return base64.urlsafe_b64encode(digest)
 
 
-def _encrypt_payload(payload: str) -> str:
+def _encrypt_payload(payload: str, *, fallback_key: str | None = None) -> str:
     """Encrypt payload string using AES-256 Fernet encryption."""
     from cryptography.fernet import Fernet
 
-    key = _get_fernet_key()
+    key = _get_fernet_key(fallback_key=fallback_key)
     f = Fernet(key)
     return f.encrypt(payload.encode("utf-8")).decode("utf-8")
 
 
-def _decrypt_payload(encrypted_payload: str) -> str:
+def _decrypt_payload(encrypted_payload: str, *, fallback_key: str | None = None) -> str:
     """Decrypt Fernet encrypted payload or raise clear ValueError if key is incorrect or missing."""
     from cryptography.fernet import Fernet, InvalidToken
 
     try:
-        key = _get_fernet_key()
+        key = _get_fernet_key(fallback_key=fallback_key)
     except Exception as exc:
         raise ValueError(
             "Configuration data integrity check failed: "
@@ -125,19 +133,25 @@ class ConfigVersionStore:
             ``~/.imednet/config_versions.sqlite3``.
     """
 
-    def __init__(self, db_path: str | Path = _DEFAULT_DB_PATH) -> None:
+    def __init__(self, db_path: str | Path | None = None) -> None:
         """Initialize the configuration version store.
 
         Args:
             db_path: Path to the SQLite database file.
         """
-        self._original_db_path = Path(db_path).expanduser()
+        resolved_path = (
+            Path(db_path)
+            if db_path is not None
+            else Path(os.environ.get("IMEDNET_CONFIG_DB_PATH") or _DEFAULT_DB_PATH)
+        )
+        self._original_db_path = resolved_path.expanduser()
         self._lock = RLock()
+        self._sdk_security_key: str | None = None
         self._ensure_schema_initialized(self.db_path)
 
     @property
     def db_path(self) -> Path:
-        """Return the dynamically selected database file path based on environment and context."""
+        """Return the dynamically selected database file path based on active base URL context."""
         return self._get_get_dynamic_db_path()
 
     @db_path.setter
@@ -147,23 +161,22 @@ class ConfigVersionStore:
 
     @staticmethod
     def _get_dynamic_db_path_no_create(base_db_path: Path) -> Path:
-        """Compute dynamic DB path without creating directories on disk."""
+        """Compute host-scoped dynamic DB path without splitting by study_context or creating dirs."""
         base_url = (
             get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
         )
         ctx_study_key = get_study_context()
-        cache_key = (str(base_db_path), base_url, ctx_study_key)
+        if ctx_study_key:
+            validate_partition_key(ctx_study_key)
+
+        cache_key = (str(base_db_path), base_url)
         cached = _DYNAMIC_PATH_CACHE.get(cache_key)
         if cached is not None:
             return cached
 
         sanitized_url = _sanitize_base_url_for_path(base_url)
         base_dir = base_db_path.parent
-        if ctx_study_key:
-            validate_partition_key(ctx_study_key)
-            target_dir = base_dir / sanitized_url / ctx_study_key
-        else:
-            target_dir = base_dir / sanitized_url
+        target_dir = base_dir / sanitized_url
 
         resolved_base = base_dir.resolve()
         resolved_target = target_dir.resolve()
@@ -177,9 +190,158 @@ class ConfigVersionStore:
         _DYNAMIC_PATH_CACHE[cache_key] = result
         return result
 
+    @staticmethod
+    def _get_legacy_db_paths_no_create(base_db_path: Path, study_key: str) -> list[Path]:
+        """Return legacy study_context-partitioned and flat candidate SQLite paths without creating dirs."""
+        validate_partition_key(study_key)
+        base_url = (
+            get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
+        )
+        sanitized_url = _sanitize_base_url_for_path(base_url)
+        base_dir = base_db_path.parent
+        resolved_base = base_dir.resolve()
+
+        candidates: list[Path] = []
+        if study_key:
+            legacy_study_dir = base_dir / sanitized_url / study_key
+            if legacy_study_dir.resolve().is_relative_to(resolved_base):
+                candidates.append(legacy_study_dir / base_db_path.name)
+        if base_db_path.resolve().is_relative_to(resolved_base):
+            candidates.append(base_db_path)
+        return candidates
+
+    @classmethod
+    def _read_committed_from_sqlite_path(
+        cls,
+        candidate_path: Path,
+        study_key: str,
+        *,
+        raw_db_path: Path | None = None,
+        use_cached_store: bool = False,
+    ) -> StudyConfiguration | None:
+        """Read and verify the latest committed StudyConfiguration for *study_key* from *candidate_path*."""
+        try:
+            db_stat = os.stat(candidate_path)
+        except OSError:
+            return None
+
+        if use_cached_store and raw_db_path is not None:
+            cached_store = _READ_STORE_CACHE.get(candidate_path)
+            if cached_store is None:
+                if len(_READ_STORE_CACHE) > 32:
+                    _READ_STORE_CACHE.clear()
+                cached_store = cls(db_path=raw_db_path)
+                _READ_STORE_CACHE[candidate_path] = cached_store
+            if hasattr(cls.get_head, "_mock_name") or hasattr(cached_store.get_head, "_mock_name"):
+                head_id = cached_store.get_head(study_key)
+                return cached_store.rollback_config(study_key, head_id) if head_id else None
+        else:
+            cached_store = None
+
+        wal_mtime = 0
+        with suppress(OSError):
+            wal_mtime = os.stat(f"{candidate_path}-wal").st_mtime_ns
+        snap_key = (candidate_path, db_stat.st_mtime_ns, db_stat.st_size, wal_mtime)
+        head_index = _HEAD_INDEX_CACHE.get(snap_key)
+        if head_index is None:
+            if len(_HEAD_INDEX_CACHE) > 32:
+                _HEAD_INDEX_CACHE.clear()
+            try:
+                with sqlite_connection(candidate_path, timeout=30.0) as conn:
+                    tables = {
+                        str(r[0])
+                        for r in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall()
+                    }
+                    if "config_commits" not in tables:
+                        return None
+                    rows = (
+                        conn.execute(
+                            "SELECT study_key, head_commit_id FROM config_heads"
+                        ).fetchall()
+                        if "config_heads" in tables
+                        else []
+                    )
+                    indexed = {str(r["study_key"]): str(r["head_commit_id"]) for r in rows}
+                    fallback_rows = conn.execute(
+                        "SELECT study_key, commit_id FROM config_commits ORDER BY timestamp ASC, rowid ASC"
+                    ).fetchall()
+                    missing_keys = {str(r["study_key"]) for r in fallback_rows} - {
+                        str(r["study_key"]) for r in rows
+                    }
+                    for r in fallback_rows:
+                        sk = str(r["study_key"])
+                        if sk not in indexed or sk in missing_keys:
+                            indexed[sk] = str(r["commit_id"])
+            except sqlite3.Error:
+                return None
+            head_index = indexed
+            _HEAD_INDEX_CACHE[snap_key] = head_index
+
+        head_id = head_index.get(study_key)
+        if not head_id:
+            return None
+
+        if cached_store is not None:
+            return cached_store.rollback_config(study_key, head_id)
+
+        with sqlite_connection(candidate_path, timeout=30.0) as conn:
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(config_commits)").fetchall()}
+            if "parent_commit_id" in cols and "content_hash" in cols:
+                row = conn.execute(
+                    """
+                    SELECT commit_id, study_key, config_data, parent_commit_id, content_hash
+                    FROM config_commits
+                    WHERE commit_id = ? AND study_key = ?
+                    """,
+                    (head_id, study_key),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT
+                        commit_id,
+                        study_key,
+                        config_data,
+                        NULL AS parent_commit_id,
+                        NULL AS content_hash
+                    FROM config_commits
+                    WHERE commit_id = ? AND study_key = ?
+                    """,
+                    (head_id, study_key),
+                ).fetchone()
+        if row is None:
+            return None
+        decrypted_data = _decrypt_payload(row["config_data"])
+        cls._verify_commit_signature_static(
+            str(row["commit_id"]),
+            decrypted_data,
+            content_hash=row["content_hash"],
+            parent_commit_id=row["parent_commit_id"],
+            study_key=str(row["study_key"]),
+        )
+        return StudyConfiguration.model_validate_json(decrypted_data)
+
+    @classmethod
+    def resolve_legacy_committed_config(cls, study_key: str) -> StudyConfiguration | None:
+        """Read latest committed StudyConfiguration from legacy study-partitioned SQLite paths."""
+        validate_partition_key(study_key)
+        raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
+        raw_db_path = Path(raw_env).expanduser() if raw_env else Path(_DEFAULT_DB_PATH_STR)
+        canonical_path = cls._get_dynamic_db_path_no_create(raw_db_path)
+        for legacy_path in cls._get_legacy_db_paths_no_create(raw_db_path, study_key):
+            if legacy_path == canonical_path:
+                continue
+            resolved = cls._read_committed_from_sqlite_path(legacy_path, study_key)
+            if resolved is not None:
+                return resolved
+        return None
+
     @classmethod
     def resolve_committed_config(cls, study_key: str) -> StudyConfiguration | None:
         """Read the latest committed :class:`StudyConfiguration` without creating empty DB files."""
+        validate_partition_key(study_key)
         if hasattr(cls.get_history, "_mock_name") or hasattr(cls.rollback_config, "_mock_name"):
             store = cls()
             history = store.get_history(study_key)
@@ -194,88 +356,21 @@ class ConfigVersionStore:
         raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
         raw_db_path = Path(raw_env).expanduser() if raw_env else Path(_DEFAULT_DB_PATH_STR)
         candidate_path = cls._get_dynamic_db_path_no_create(raw_db_path)
-        try:
-            db_stat = os.stat(candidate_path)
-        except OSError:
-            return None
-
-        cached_store = _READ_STORE_CACHE.get(candidate_path)
-        if cached_store is None:
-            if len(_READ_STORE_CACHE) > 32:
-                _READ_STORE_CACHE.clear()
-            cached_store = cls(db_path=raw_db_path)
-            _READ_STORE_CACHE[candidate_path] = cached_store
-
-        if hasattr(cls.get_head, "_mock_name") or hasattr(cached_store.get_head, "_mock_name"):
-            head_id = cached_store.get_head(study_key)
-        else:
-            wal_mtime = 0
-            with suppress(OSError):
-                wal_mtime = os.stat(f"{candidate_path}-wal").st_mtime_ns
-            snap_key = (candidate_path, db_stat.st_mtime_ns, db_stat.st_size, wal_mtime)
-            head_index = _HEAD_INDEX_CACHE.get(snap_key)
-            if head_index is None:
-                if len(_HEAD_INDEX_CACHE) > 32:
-                    _HEAD_INDEX_CACHE.clear()
-                with cached_store._lock, cached_store._connection() as conn:
-                    rows = conn.execute(
-                        "SELECT study_key, head_commit_id FROM config_heads"
-                    ).fetchall()
-                    indexed = {str(r["study_key"]): str(r["head_commit_id"]) for r in rows}
-                    fallback_rows = conn.execute(
-                        "SELECT study_key, commit_id FROM config_commits ORDER BY timestamp ASC, rowid ASC"
-                    ).fetchall()
-                    for r in fallback_rows:
-                        sk = str(r["study_key"])
-                        if sk not in indexed:
-                            indexed[sk] = str(r["commit_id"])
-                    # Overwrite fallback with latest ordered commit where config_heads lacked an entry
-                    missing_keys = {str(r["study_key"]) for r in fallback_rows} - {
-                        str(r["study_key"]) for r in rows
-                    }
-                    if missing_keys:
-                        for r in fallback_rows:
-                            sk = str(r["study_key"])
-                            if sk in missing_keys:
-                                indexed[sk] = str(r["commit_id"])
-                head_index = indexed
-                _HEAD_INDEX_CACHE[snap_key] = head_index
-            head_id = head_index.get(study_key)
-        if not head_id:
-            return None
-        return cached_store.rollback_config(study_key, head_id)
+        resolved = cls._read_committed_from_sqlite_path(
+            candidate_path,
+            study_key,
+            raw_db_path=raw_db_path,
+            use_cached_store=True,
+        )
+        if resolved is not None:
+            return resolved
+        return cls.resolve_legacy_committed_config(study_key)
 
     def _get_get_dynamic_db_path(self) -> Path:
-        """Resolve database path dynamically based on active base URL and study key context."""
-        from imednet.spi.utils import (
-            PathTraversalValidationError,
-            get_base_url_context,
-            get_study_context,
-            validate_partition_key,
-        )
-
-        base_url = (
-            get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
-        )
-        sanitized_url = _sanitize_base_url_for_path(base_url)
-        base_dir = self._original_db_path.parent
-
-        ctx_study_key = get_study_context()
-        if ctx_study_key:
-            validate_partition_key(ctx_study_key)
-            target_dir = base_dir / sanitized_url / ctx_study_key
-        else:
-            target_dir = base_dir / sanitized_url
-
-        resolved_base = base_dir.resolve()
-        resolved_target = target_dir.resolve()
-        if not resolved_target.is_relative_to(resolved_base):
-            raise PathTraversalValidationError(
-                f"Resolved target directory {resolved_target} escapes base directory {resolved_base}"
-            )
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-        return target_dir / self._original_db_path.name
+        """Resolve database path dynamically based on active base URL without splitting by study_context."""
+        result = self._get_dynamic_db_path_no_create(self._original_db_path)
+        result.parent.mkdir(parents=True, exist_ok=True)
+        return result
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -414,6 +509,7 @@ class ConfigVersionStore:
             PermissionError: If an authenticated SDK session is not provided,
                 or if the authenticated session does not have manager/admin role.
         """
+        validate_partition_key(study_key)
         if sdk is None:
             raise PermissionError(
                 "An authenticated SDK session is required to commit configuration."
@@ -458,91 +554,99 @@ class ConfigVersionStore:
         if not author:
             raise ValueError("A user identifier is required to commit.")
 
+        sdk_sec_key = extract_sdk_security_key(sdk)
+        if sdk_sec_key is not None:
+            self._sdk_security_key = sdk_sec_key
+
         config_json = json.dumps(config.model_dump(mode="json", by_alias=True), sort_keys=True)
         content_hash = _sha256_of(config_json)
         timestamp = datetime.now(UTC).isoformat()
 
-        # Secure the payload using Fernet encryption before writing to SQLite
-        encrypted_config_json = _encrypt_payload(config_json)
+        with sdk_governance_context(sdk):
+            # Secure the payload using Fernet encryption before writing to SQLite
+            encrypted_config_json = _encrypt_payload(
+                config_json, fallback_key=self._sdk_security_key
+            )
 
-        with self._lock, self._connection() as conn:
-            head_row = conn.execute(
-                """
-                SELECT c.commit_id, c.content_hash
-                FROM config_heads h
-                JOIN config_commits c ON c.commit_id = h.head_commit_id
-                WHERE h.study_key = ?
-                """,
-                (study_key,),
-            ).fetchone()
-            if head_row is None:
+            with self._lock, self._connection() as conn:
                 head_row = conn.execute(
                     """
-                    SELECT commit_id, content_hash
-                    FROM config_commits
-                    WHERE study_key = ?
-                    ORDER BY timestamp DESC, rowid DESC
-                    LIMIT 1
+                    SELECT c.commit_id, c.content_hash
+                    FROM config_heads h
+                    JOIN config_commits c ON c.commit_id = h.head_commit_id
+                    WHERE h.study_key = ?
                     """,
                     (study_key,),
                 ).fetchone()
+                if head_row is None:
+                    head_row = conn.execute(
+                        """
+                        SELECT commit_id, content_hash
+                        FROM config_commits
+                        WHERE study_key = ?
+                        ORDER BY timestamp DESC, rowid DESC
+                        LIMIT 1
+                        """,
+                        (study_key,),
+                    ).fetchone()
 
-            parent_commit_id: str | None = None
-            if head_row is not None:
-                parent_commit_id = str(head_row["commit_id"])
-                head_content_hash = str(head_row["content_hash"] or head_row["commit_id"])
-                if head_content_hash == content_hash:
-                    raise ValueError(
-                        f"Commit {parent_commit_id!r} already exists — configuration is unchanged."
-                    )
+                parent_commit_id: str | None = None
+                if head_row is not None:
+                    parent_commit_id = str(head_row["commit_id"])
+                    head_content_hash = str(head_row["content_hash"] or head_row["commit_id"])
+                    if head_content_hash == content_hash:
+                        raise ValueError(
+                            f"Commit {parent_commit_id!r} already exists — configuration is unchanged."
+                        )
 
-            commit_id = _compute_chained_commit_id(content_hash, parent_commit_id)
-            existing = conn.execute(
-                "SELECT study_key FROM config_commits WHERE commit_id = ?",
-                (commit_id,),
-            ).fetchone()
-            if existing is not None:
-                if str(existing["study_key"]) == study_key:
-                    raise ValueError(
-                        f"Commit {commit_id!r} already exists — configuration is unchanged."
-                    )
-                commit_id = _sha256_of(f"{study_key}:{parent_commit_id or ''}:{content_hash}")
+                commit_id = _compute_chained_commit_id(content_hash, parent_commit_id)
+                existing = conn.execute(
+                    "SELECT study_key FROM config_commits WHERE commit_id = ?",
+                    (commit_id,),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["study_key"]) == study_key:
+                        raise ValueError(
+                            f"Commit {commit_id!r} already exists — configuration is unchanged."
+                        )
+                    commit_id = _sha256_of(f"{study_key}:{parent_commit_id or ''}:{content_hash}")
 
-            conn.execute(
-                """
-                INSERT INTO config_commits
-                    (commit_id, study_key, version_tag, config_data,
-                     modified_by, description, timestamp, parent_commit_id, content_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    commit_id,
-                    study_key,
-                    config.version,
-                    encrypted_config_json,
-                    author,
-                    desc,
-                    timestamp,
-                    parent_commit_id,
-                    content_hash,
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO config_heads (study_key, head_commit_id, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(study_key) DO UPDATE SET
-                    head_commit_id = excluded.head_commit_id,
-                    updated_at = excluded.updated_at
-                """,
-                (study_key, commit_id, timestamp),
-            )
-            conn.commit()
+                conn.execute(
+                    """
+                    INSERT INTO config_commits
+                        (commit_id, study_key, version_tag, config_data,
+                         modified_by, description, timestamp, parent_commit_id, content_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        commit_id,
+                        study_key,
+                        config.version,
+                        encrypted_config_json,
+                        author,
+                        desc,
+                        timestamp,
+                        parent_commit_id,
+                        content_hash,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO config_heads (study_key, head_commit_id, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(study_key) DO UPDATE SET
+                        head_commit_id = excluded.head_commit_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (study_key, commit_id, timestamp),
+                )
+                conn.commit()
 
         return commit_id
 
     def get_head(self, study_key: str) -> str | None:
         """Return the current head ``commit_id`` for *study_key*, or ``None`` if empty."""
+        validate_partition_key(study_key)
         with self._lock, self._connection() as conn:
             row = conn.execute(
                 "SELECT head_commit_id FROM config_heads WHERE study_key = ?",
@@ -575,6 +679,7 @@ class ConfigVersionStore:
             is intentionally omitted to keep the payload small — use
             :meth:`rollback_config` to retrieve the full body for a specific commit.
         """
+        validate_partition_key(study_key)
         with self._lock, self._connection() as conn:
             rows = conn.execute(
                 """
@@ -587,11 +692,12 @@ class ConfigVersionStore:
                 """,
                 (study_key,),
             ).fetchall()
+        fallback_key = getattr(self, "_sdk_security_key", None)
         history: list[dict[str, Any]] = []
         for row in rows:
             commit = dict(row)
             # Decrypt payload before verification
-            decrypted_data = _decrypt_payload(commit["config_data"])
+            decrypted_data = _decrypt_payload(commit["config_data"], fallback_key=fallback_key)
             self._verify_commit_signature(
                 commit["commit_id"],
                 decrypted_data,
@@ -660,6 +766,7 @@ class ConfigVersionStore:
             KeyError: If the commit is not found or does not belong to the
                 requested study.
         """
+        validate_partition_key(study_key)
         with self._lock, self._connection() as conn:
             row = conn.execute(
                 """
@@ -672,7 +779,9 @@ class ConfigVersionStore:
         if row is None:
             raise KeyError(f"Commit {commit_id!r} not found for study {study_key!r}.")
         # Decrypt payload before validation
-        decrypted_data = _decrypt_payload(row["config_data"])
+        decrypted_data = _decrypt_payload(
+            row["config_data"], fallback_key=getattr(self, "_sdk_security_key", None)
+        )
         self._verify_commit_signature(
             row["commit_id"],
             decrypted_data,
@@ -700,7 +809,9 @@ class ConfigVersionStore:
         if row is None:
             raise KeyError(f"Commit {commit_id!r} not found.")
         # Decrypt payload first
-        decrypted_data = _decrypt_payload(row["config_data"])
+        decrypted_data = _decrypt_payload(
+            row["config_data"], fallback_key=getattr(self, "_sdk_security_key", None)
+        )
         self._verify_commit_signature(
             row["commit_id"],
             decrypted_data,
@@ -710,8 +821,8 @@ class ConfigVersionStore:
         )
         return json.loads(decrypted_data)  # type: ignore[no-any-return]
 
-    def _verify_commit_signature(
-        self,
+    @staticmethod
+    def _verify_commit_signature_static(
         commit_id: str,
         config_data: str,
         *,
@@ -737,6 +848,24 @@ class ConfigVersionStore:
                     "Configuration data integrity check failed: "
                     f"SHA-256 hash mismatch for commit {commit_id!r}"
                 )
+
+    def _verify_commit_signature(
+        self,
+        commit_id: str,
+        config_data: str,
+        *,
+        content_hash: str | None = None,
+        parent_commit_id: str | None = None,
+        study_key: str | None = None,
+    ) -> None:
+        """Verify that the decrypted payload matches its content hash and parent-chained commit ID."""
+        self._verify_commit_signature_static(
+            commit_id,
+            config_data,
+            content_hash=content_hash,
+            parent_commit_id=parent_commit_id,
+            study_key=study_key,
+        )
 
 
 __all__ = ["ConfigVersionStore"]

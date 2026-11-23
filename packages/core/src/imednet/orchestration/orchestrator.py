@@ -43,6 +43,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any
 
+from imednet.core.context import sdk_governance_context as _sdk_governance_context
 from imednet.core.context import study_context as _study_context
 from imednet.errors.orchestration import FilterConflictError
 from imednet.orchestration.logging import StudyContextLogAdapter, make_study_logger
@@ -141,7 +142,7 @@ def _run_with_context(
     if limiter:
         limiter.acquire()
     try:
-        with _study_context(study_key):
+        with _sdk_governance_context(sdk), _study_context(study_key):
             return func(study_key, sdk, study_logger, *args, **kwargs)
     finally:
         if limiter:

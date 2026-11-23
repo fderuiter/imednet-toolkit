@@ -85,14 +85,29 @@ class DuckDBIngestionWorkflow:
         )
 
         if mode == "replace":
+            self._connection.execute("DROP VIEW IF EXISTS record_revisions")
             self._connection.execute("DROP TABLE IF EXISTS bronze_revisions")
 
         self._ensure_bronze_table()
-        rows = list(self._to_rows(study_key, revisions))
-        if not rows:
+        raw_rows = list(self._to_rows(study_key, revisions))
+        if not raw_rows:
             return 0
 
-        staging_relation = self._build_staging_relation(rows)
+        deduped_rows: list[tuple[Any, ...]] = []
+        seen_keys: set[tuple[str, int]] = set()
+        for row in raw_rows:
+            rev_id = row[1]
+            if rev_id is not None:
+                dedup_key = (str(row[0]), int(rev_id))
+                if dedup_key in seen_keys:
+                    continue
+                seen_keys.add(dedup_key)
+            deduped_rows.append(row)
+
+        before_row = self._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()
+        before_count = int(before_row[0]) if before_row is not None else 0
+
+        staging_relation = self._build_staging_relation(deduped_rows)
         view_name = f"_staging_bronze_revisions_{uuid4().hex}"
         self._connection.register(view_name, staging_relation)
         try:
@@ -117,39 +132,49 @@ class DuckDBIngestionWorkflow:
                     last_updated
                 )
                 SELECT
-                    CAST(study_key AS VARCHAR),
-                    CAST(record_revision_id AS BIGINT),
-                    CAST(record_id AS BIGINT),
-                    CAST(record_oid AS VARCHAR),
-                    CAST(form_key AS VARCHAR),
-                    CAST(subject_key AS VARCHAR),
-                    CAST(site_id AS BIGINT),
-                    CAST(interval_id AS BIGINT),
-                    CAST(record_status AS VARCHAR),
-                    CAST(record_revision AS INTEGER),
-                    CAST(data_revision AS INTEGER),
-                    CAST("user" AS VARCHAR),
-                    CAST(role AS VARCHAR),
-                    CAST(reason_for_change AS VARCHAR),
-                    CAST(deleted AS BOOLEAN),
-                    CAST(CAST(date_created AS VARCHAR) AS TIMESTAMP),
-                    CAST(CAST(last_updated AS VARCHAR) AS TIMESTAMP)
-                FROM "{view_name}"
+                    CAST(staging.study_key AS VARCHAR),
+                    CAST(staging.record_revision_id AS BIGINT),
+                    CAST(staging.record_id AS BIGINT),
+                    CAST(staging.record_oid AS VARCHAR),
+                    CAST(staging.form_key AS VARCHAR),
+                    CAST(staging.subject_key AS VARCHAR),
+                    CAST(staging.site_id AS BIGINT),
+                    CAST(staging.interval_id AS BIGINT),
+                    CAST(staging.record_status AS VARCHAR),
+                    CAST(staging.record_revision AS INTEGER),
+                    CAST(staging.data_revision AS INTEGER),
+                    CAST(staging."user" AS VARCHAR),
+                    CAST(staging.role AS VARCHAR),
+                    CAST(staging.reason_for_change AS VARCHAR),
+                    CAST(staging.deleted AS BOOLEAN),
+                    CAST(CAST(staging.date_created AS VARCHAR) AS TIMESTAMP),
+                    CAST(CAST(staging.last_updated AS VARCHAR) AS TIMESTAMP)
+                FROM "{view_name}" AS staging
+                WHERE staging.record_revision_id IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM bronze_revisions AS existing
+                       WHERE existing.study_key = CAST(staging.study_key AS VARCHAR)
+                         AND existing.record_revision_id = CAST(staging.record_revision_id AS BIGINT)
+                   )
                 """
             self._connection.execute(insert_query)  # nosem
         finally:
             self._connection.unregister(view_name)
-        return len(rows)
+
+        after_row = self._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()
+        after_count = int(after_row[0]) if after_row is not None else before_count
+        return max(0, after_count - before_count)
 
     def build_silver_view(self, study_key: str) -> None:
-        """Create or replace the silver_current_state view."""
+        """Create or replace record_revisions, silver_current_state, and silver_records_history views."""
         if not isinstance(study_key, str) or not _SAFE_STUDY_KEY_PATTERN.fullmatch(study_key):
             raise ValueError(
                 f"Invalid study key: {study_key!r}. Only alphanumeric characters and ._:- are allowed."
             )
         self._ensure_bronze_table()
         escaped_study_key = study_key.replace("'", "''")
-        query = f"""
+        current_state_query = f"""
             CREATE OR REPLACE VIEW silver_current_state AS
             SELECT
                 study_key,
@@ -172,7 +197,7 @@ class DuckDBIngestionWorkflow:
             FROM bronze_revisions
             WHERE study_key = '{escaped_study_key}'
             QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY record_id
+                PARTITION BY COALESCE(CAST(record_id AS VARCHAR), record_oid)
                 ORDER BY
                     record_revision DESC NULLS LAST,
                     data_revision DESC NULLS LAST,
@@ -180,10 +205,52 @@ class DuckDBIngestionWorkflow:
                     record_revision_id DESC NULLS LAST
             ) = 1
             """
-        self._connection.execute(query)  # nosem
+        self._connection.execute(current_state_query)  # nosem
+
+        history_query = f"""
+            CREATE OR REPLACE VIEW silver_records_history AS
+            SELECT
+                study_key,
+                record_revision_id,
+                record_id,
+                record_oid,
+                form_key,
+                subject_key,
+                site_id,
+                interval_id,
+                record_status,
+                record_revision,
+                data_revision,
+                "user",
+                role,
+                reason_for_change,
+                deleted,
+                date_created,
+                last_updated,
+                COALESCE(date_created, last_updated) AS valid_from,
+                LEAD(COALESCE(date_created, last_updated)) OVER (
+                    PARTITION BY COALESCE(CAST(record_id AS VARCHAR), record_oid)
+                    ORDER BY
+                        record_revision ASC NULLS LAST,
+                        data_revision ASC NULLS LAST,
+                        date_created ASC NULLS LAST,
+                        record_revision_id ASC NULLS LAST
+                ) AS valid_to,
+                LEAD(1) OVER (
+                    PARTITION BY COALESCE(CAST(record_id AS VARCHAR), record_oid)
+                    ORDER BY
+                        record_revision ASC NULLS LAST,
+                        data_revision ASC NULLS LAST,
+                        date_created ASC NULLS LAST,
+                        record_revision_id ASC NULLS LAST
+                ) IS NULL AS is_current
+            FROM bronze_revisions
+            WHERE study_key = '{escaped_study_key}'
+            """
+        self._connection.execute(history_query)  # nosem
 
     def _ensure_bronze_table(self) -> None:
-        """Ensure the bronze_revisions table exists in DuckDB."""
+        """Ensure the bronze_revisions table and record_revisions view exist in DuckDB."""
         self._connection.execute("""
             CREATE TABLE IF NOT EXISTS bronze_revisions (
                 study_key VARCHAR,
@@ -204,6 +271,28 @@ class DuckDBIngestionWorkflow:
                 date_created TIMESTAMP,
                 last_updated TIMESTAMP
             )
+            """)
+        self._connection.execute("""
+            CREATE OR REPLACE VIEW record_revisions AS
+            SELECT
+                study_key,
+                record_revision_id,
+                record_id,
+                record_oid,
+                form_key,
+                subject_key,
+                site_id,
+                interval_id,
+                record_status,
+                record_revision,
+                data_revision,
+                "user",
+                role,
+                reason_for_change,
+                deleted,
+                date_created,
+                last_updated
+            FROM bronze_revisions
             """)
 
     @staticmethod

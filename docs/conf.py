@@ -25,8 +25,10 @@ from typing import Any, Generic, TypeVar, Union, get_args, get_origin, get_type_
 
 import pydantic._internal._utils as _pydantic_internal_utils
 from pydantic import BaseModel, RootModel
+from sphinx import addnodes
 from sphinx.ext.autodoc import MethodDocumenter
 from sphinx.util.nodes import make_refnode
+from sphinx.writers.html5 import HTML5Translator
 
 if not hasattr(_pydantic_internal_utils, "MappingIntStrAny"):
     _pydantic_internal_utils.MappingIntStrAny = Mapping[int, Any] | Mapping[str, Any]
@@ -1456,6 +1458,31 @@ def _on_build_finished(app: Any, exception: Exception | None) -> None:
     (outdir / "robots.txt").write_text(robots_txt, encoding="utf-8")
 
 
+class _AccessibleHTML5Translator(HTML5Translator):
+    """HTML5 translator that adds contextual ``aria-level`` to toctree captions."""
+
+    def visit_title(self, node: Any) -> None:
+        """Emit hierarchical ``aria-level`` on captioned toctree headings (ARIA12, G141)."""
+        if isinstance(node.parent, addnodes.compact_paragraph) and node.parent.get("toctree"):
+            aria_level = min(6, max(2, self.section_level + self.initial_header_level))
+            self.body.append(
+                self.starttag(
+                    node,
+                    "p",
+                    "",
+                    CLASS="caption",
+                    ROLE="heading",
+                    **{"aria-level": str(aria_level)},
+                )
+            )
+            self.body.append('<span class="caption-text">')
+            self.context.append("</span></p>\n")
+            self.add_secnumber(node)
+            self.add_fignumber(node.parent)
+            return
+        super().visit_title(node)
+
+
 def setup(app: Any) -> None:  # pragma: no cover
     """Register Sphinx autodoc, viewcode, and native SEO / GitHub Pages hooks.
 
@@ -1465,6 +1492,8 @@ def setup(app: Any) -> None:  # pragma: no cover
     _get_documented_modules.cache_clear()
     _analyze_module_symbols.cache_clear()
 
+    app.set_translator("html", _AccessibleHTML5Translator)
+    app.set_translator("dirhtml", _AccessibleHTML5Translator)
     app.add_autodocumenter(_AsyncAwareMethodDocumenter, override=True)
     app.connect("autodoc-process-bases", _unwrap_shadowed_bases)
     app.connect(
