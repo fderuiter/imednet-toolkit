@@ -1,5 +1,29 @@
 /* Custom stylesheet for imednet documentation */
 
+/* Keyboard focus visibility, sticky-header scroll offsets (WCAG 2.4.11 C43) & reduced motion */
+html {
+    scroll-padding-top: 3.5rem;
+}
+
+@media (max-width: 63em) {
+    html {
+        scroll-padding-top: 6rem;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    html,
+    .sidebar-scroll,
+    .toc-scroll {
+        scroll-behavior: auto;
+    }
+}
+
+#furo-main-content:focus-visible {
+    outline: 2px solid var(--color-brand-primary);
+    outline-offset: 2px;
+}
+
 /* Typography & readability enhancements */
 body {
     letter-spacing: -0.01em;
@@ -1564,6 +1588,7 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
         border: 1px solid CanvasText !important;
     }
 
+    #furo-main-content:focus-visible,
     .thebe-editor:focus-visible,
     .thebe-launch-button:focus-visible,
     .thebelab-button:focus-visible,
