@@ -6,7 +6,6 @@ import logging
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import closing
-from dataclasses import replace
 from typing import Any, cast
 from urllib.parse import quote_plus, urlsplit
 
@@ -902,27 +901,16 @@ class ImednetExportOperator(BaseOperator):
                     raw_run_id = context.get("run_id") or context.get("ts_nodash")
                     if isinstance(raw_run_id, str) and raw_run_id.strip():
                         run_token = f"{raw_run_id.strip()}/{uuid.uuid4().hex[:8]}"
-                stream_config = config
-                if (
-                    dest == "snowflake"
-                    and config.idempotent
-                    and not config.include_deleted
-                    and "include_deleted" not in runtime_kwargs
-                    and not config.incremental
-                    and config.modified_since is None
-                    and config.state_provider is None
-                ):
-                    stream_config = replace(config, include_deleted=True)
                 default_sink_stream = (
                     self._default_airflow_stream_name(dest, sink_prefix=True)
-                    if stream_config.ledger_path is None and stream_config.state_provider is None
+                    if config.ledger_path is None and config.state_provider is None
                     else f"airflow_{dest}"
                 )
                 sink_base.run_streaming_export(
                     sdk,
                     self.study_key,
                     sink,
-                    stream_config,
+                    config,
                     stream_name=default_sink_stream,
                     batch_id_prefix=f"{self.study_key}/batch/{run_token}",
                     quality_gate_fn=sink_base.apply_quality_gate,

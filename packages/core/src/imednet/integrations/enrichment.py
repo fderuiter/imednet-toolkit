@@ -250,6 +250,8 @@ class CentralizedMapper:
         as_sdtm: bool = False,
         sdtm_domain: str | None = None,
         seq_counters: dict[str, int] | None = None,
+        record_seqs: dict[str, int] | None = None,
+        preserve_record_id: bool = False,
     ):
         """Initialize the mapper.
 
@@ -262,6 +264,8 @@ class CentralizedMapper:
             as_sdtm: When True, transform records directly into CDISC SDTM domain rows.
             sdtm_domain: Optional SDTM domain code (e.g. 'AE', 'VS', 'DM').
             seq_counters: Optional per-USUBJID sequence counter map shared across batches.
+            record_seqs: Optional per-Record sequence map for idempotent incremental reruns.
+            preserve_record_id: When True, retain RECORD_ID in transformed SDTM rows.
         """
         self.mode = mode
         self.post_processor = post_processor
@@ -274,6 +278,8 @@ class CentralizedMapper:
         )
         self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
         self._seq_counters: dict[str, int] = seq_counters if seq_counters is not None else {}
+        self._record_seqs: dict[str, int] | None = record_seqs
+        self._preserve_record_id = bool(preserve_record_id)
         self._pipeline_cache: dict[str, Any] = {}
         self._sens_snapshot: frozenset[str] = frozenset()
         self._exempt_snapshot: frozenset[str] = frozenset()
@@ -384,6 +390,8 @@ class CentralizedMapper:
                 include_deleted=True,
                 mask_phi=self.mask_phi,
                 seq_counters=self._seq_counters,
+                record_seqs=self._record_seqs,
+                preserve_record_id=self._preserve_record_id,
                 phi_keys=pipeline_phi_keys or None,
                 pipeline=active_pipeline if has_active_rules else None,
             )

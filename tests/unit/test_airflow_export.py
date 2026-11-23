@@ -1044,7 +1044,7 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     staged_rows: list[dict[str, object]] = []
     stage_paths: list[str] = []
 
-    def fake_execute(sql: str) -> None:
+    def fake_execute(sql: str, params: object = None) -> None:
         nonlocal staged_rows
         if "INFORMATION_SCHEMA.COLUMNS" in sql:
             cursor.fetchall.return_value = [(c,) for c in known_cols]
@@ -1077,6 +1077,12 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
                         warehouse_rows[key].update(row)
                 elif not (hard_del and is_del):
                     warehouse_rows[key] = dict(row)
+            cursor.fetchall.return_value = []
+        elif sql.startswith("DELETE FROM"):
+            assert isinstance(params, list) and len(params) >= 2
+            study_val = str(params[0])
+            for rid in params[1:]:
+                warehouse_rows.pop((study_val, int(rid)), None)
             cursor.fetchall.return_value = []
         else:
             cursor.fetchall.return_value = []
@@ -1150,35 +1156,65 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     ]
 
     manifest_file = tmp_path / "manifest.jsonl"
+    op_default = ImednetExportOperator(
+        task_id="daily_sf_sync_default",
+        study_key="STUDY_AF_SF",
+        destination="snowflake",
+        destination_conn_id="sf_dest",
+        export_kwargs={
+            "stage_prefix": "imednet/airflow",
+            "local_staging_dir": str(tmp_path / "stage_default"),
+            "manifest_path": str(manifest_file),
+            "include_deleted": False,
+            "hard_delete": False,
+        },
+    )
+    monkeypatch.setattr(op_default, "_get_sdk", lambda: sdk)
+
+    sdk.records.list.side_effect = lambda **_kw: iter(run1)
+    op_default.execute({"run_id": "scheduled__2026-04-01T00:00:00+00:00"})
+
+    unmatched_voided = Record(
+        record_id=99,
+        form_id=10,
+        form_key="F1",
+        subject_key="S99",
+        deleted=True,
+        date_modified="2026-04-02T08:10:00Z",
+        record_data={"score": 0, "newBiomarker": "NA"},
+    )
+    sdk.records.list.side_effect = lambda **_kw: iter([*run2, unmatched_voided])
+    op_default.execute({"run_id": "scheduled__2026-04-02T00:00:00+00:00"})
+
+    assert len(stage_paths) == 2
+    assert stage_paths[0] != stage_paths[1]
+    assert "NEW_BIOMARKER" in known_cols
+    assert list(warehouse_rows.keys()) == [("STUDY_AF_SF", 1)]
+    assert warehouse_rows[("STUDY_AF_SF", 1)]["score"] == 15
+    assert warehouse_rows[("STUDY_AF_SF", 1)]["new_biomarker"] == "POS"
+
+    # Explicit include_deleted=True, hard_delete=False retains deleted=True tombstones
     op_soft = ImednetExportOperator(
-        task_id="daily_sf_sync",
+        task_id="daily_sf_sync_soft",
         study_key="STUDY_AF_SF",
         destination="snowflake",
         destination_conn_id="sf_dest",
         export_kwargs={
             "stage_prefix": "imednet/airflow",
             "local_staging_dir": str(tmp_path / "stage_soft"),
-            "manifest_path": str(manifest_file),
+            "include_deleted": True,
             "hard_delete": False,
         },
     )
     monkeypatch.setattr(op_soft, "_get_sdk", lambda: sdk)
-
     sdk.records.list.side_effect = lambda **_kw: iter(run1)
-    op_soft.execute({"run_id": "scheduled__2026-04-01T00:00:00+00:00"})
-
+    op_soft.execute({"run_id": "scheduled__2026-04-02T12:00:00+00:00"})
     sdk.records.list.side_effect = lambda **_kw: iter(run2)
-    op_soft.execute({"run_id": "scheduled__2026-04-02T00:00:00+00:00"})
-
-    assert len(stage_paths) == 2
-    assert stage_paths[0] != stage_paths[1]
-    assert "NEW_BIOMARKER" in known_cols
+    op_soft.execute({"run_id": "scheduled__2026-04-02T18:00:00+00:00"})
     assert len(warehouse_rows) == 2
-    assert warehouse_rows[("STUDY_AF_SF", 1)]["score"] == 15
-    assert warehouse_rows[("STUDY_AF_SF", 1)]["new_biomarker"] == "POS"
     assert warehouse_rows[("STUDY_AF_SF", 2)]["deleted"] is True
 
-    # Run 3 with hard_delete=True removes matched deleted=True record 2
+    # Run with include_deleted=True, hard_delete=True removes matched deleted=True record 2
     op_hard = ImednetExportOperator(
         task_id="daily_sf_sync_hard",
         study_key="STUDY_AF_SF",
@@ -1187,11 +1223,12 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
         export_kwargs={
             "stage_prefix": "imednet/airflow",
             "local_staging_dir": str(tmp_path / "stage_hard"),
+            "include_deleted": True,
             "hard_delete": True,
         },
     )
     monkeypatch.setattr(op_hard, "_get_sdk", lambda: sdk)
-    sdk.records.list.side_effect = lambda **_kw: iter(run2)
+    sdk.records.list.side_effect = lambda **_kw: iter([*run2, unmatched_voided])
     op_hard.execute({"run_id": "scheduled__2026-04-03T00:00:00+00:00"})
 
     assert list(warehouse_rows.keys()) == [("STUDY_AF_SF", 1)]

@@ -274,7 +274,7 @@ Shared :class:`~imednet.spi.sink_base.SinkConfig` fields:
      - Base delay (seconds); grows exponentially as ``retry_backoff * 2^attempt``.
    * - ``idempotent``
      - ``True``
-     - Use upsert / ``MERGE`` semantics keyed on deterministic ``Record`` identifiers.
+     - Use upsert / ``MERGE`` semantics keyed on deterministic ``Record`` identifiers (required when ``incremental=True`` or ``state_provider`` is supplied).
    * - ``mask_phi``
      - ``True``
      - Redact registered sensitive ``Subject`` and ``StudyConfiguration`` ``phiFields`` values to ``***MASKED***`` before serialization.
@@ -357,7 +357,8 @@ Incremental exports decouple destination sinks from checkpoint persistence throu
      combining ``watermark``, ``record_filter``, and ``record_data_filter`` into AND-safe query branches.
   3. Tracks the maximum observed ``Record`` modification timestamp while routing voided
      (``deleted=True``) items to ``sink.reconcile_deleted(...)`` on incremental idempotent runs
-     when ``include_deleted=False``.
+     (and full idempotent runs for persistent sinks setting
+     ``reconciles_deleted_on_full_sync = True``) when ``include_deleted=False``.
   4. Applies :func:`~imednet.spi.sink_base.apply_quality_gate` and streams fixed-size chunks
      into ``sink.write_batch(...)``.
   5. Flushes and closes the sink before exiting ``provider.transaction(...)``, ensuring the

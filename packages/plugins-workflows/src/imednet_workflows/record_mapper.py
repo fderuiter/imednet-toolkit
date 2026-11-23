@@ -69,6 +69,8 @@ def transform_records_to_sdtm(
     enrichment_pipeline: EnrichmentPipeline | None = _UNSET_PIPELINE,
     pipeline: EnrichmentPipeline | None = _UNSET_PIPELINE,
     seq_counters: dict[str, int] | None = None,
+    record_seqs: dict[str, int] | None = None,
+    preserve_record_id: bool = False,
     phi_keys: Iterable[str] | None = None,
     registry: Any | None = None,
 ) -> pd.DataFrame:
@@ -93,6 +95,8 @@ def transform_records_to_sdtm(
         include_deleted=include_deleted,
         mask_phi=mask_phi,
         seq_counters=seq_counters,
+        record_seqs=record_seqs,
+        preserve_record_id=preserve_record_id,
         phi_keys=phi_keys,
         registry=registry,
         pipeline=resolved_pipeline,
@@ -994,6 +998,8 @@ class RecordMapper:
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
         seq_counters: dict[str, int] | None = None,
+        record_seqs: dict[str, int] | None = None,
+        preserve_record_id: bool = False,
     ) -> pd.DataFrame:
         """Transform an iterable of records into a normalized SDTM domain DataFrame."""
         effective_include_deleted = (
@@ -1009,6 +1015,8 @@ class RecordMapper:
             mask_phi=should_mask,
             enrichment_pipeline=pipeline,
             seq_counters=seq_counters,
+            record_seqs=record_seqs,
+            preserve_record_id=preserve_record_id,
         )
 
     def sdtm_dataframe(

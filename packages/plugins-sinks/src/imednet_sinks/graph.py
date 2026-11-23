@@ -84,6 +84,7 @@ from imednet.spi.sinks import (
     ExportSink,
     SinkConfig,
     apply_quality_gate,
+    bind_sdtm_stream_metadata,
     build_sink_mapper,
     extract_record_id,
     normalize_sink_value,
@@ -233,13 +234,22 @@ def _build_convention_cypher(
     return merge_cypher, create_cypher
 
 
-def _build_sdtm_cypher(seq_prop: str | None, has_visit: bool) -> tuple[str, str]:
+def _build_sdtm_cypher(
+    seq_prop: str | None,
+    has_visit: bool,
+    *,
+    has_record_id: bool = False,
+) -> tuple[str, str]:
     """Build MERGE and CREATE Cypher statements for SDTM domain rows."""
-    record_key_props = (
-        f"STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, {seq_prop}: row.{seq_prop}"
-        if seq_prop
-        else "STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID"
-    )
+    if has_record_id:
+        record_key_props = "STUDYID: row.STUDYID, RECORD_ID: row.RECORD_ID"
+    elif seq_prop:
+        record_key_props = (
+            f"STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, "
+            f"{seq_prop}: row.{seq_prop}"
+        )
+    else:
+        record_key_props = "STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID"
     if has_visit:
         visit_block = (
             "FOREACH (_ IN CASE WHEN row.VISITNUM IS NOT NULL THEN [1] ELSE [] END |\n"
@@ -360,6 +370,8 @@ class Neo4jExportSink(ExportSink):
         ImportError: When the ``neo4j`` package is not installed.
     """
 
+    reconciles_deleted_on_full_sync = True
+
     def __init__(self, config: Neo4jSinkConfig) -> None:
         """Initialize the Neo4j export sink.
 
@@ -372,8 +384,14 @@ class Neo4jExportSink(ExportSink):
         self._auth = self.config.auth
         self._study_key = self.config.study_key
         self._seq_counters: dict[str, int] = {}
+        self._record_seqs: dict[str, int] = {}
         self._driver: Any = None
         self._connect()
+
+    def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
+        """Hydrate and bind SDTM sequence counters into transactional stream metadata."""
+        if self.config.as_sdtm:
+            bind_sdtm_stream_metadata(metadata, self._seq_counters, self._record_seqs)
 
     # ------------------------------------------------------------------
     # Connection management
@@ -405,6 +423,7 @@ class Neo4jExportSink(ExportSink):
             mode="document",
             post_processor=post_proc,
             seq_counters=self._seq_counters,
+            record_seqs=self._record_seqs,
         )
         database = getattr(self.config, "database", "neo4j")
         mapped_rows: list[dict[str, Any]] | None = None
@@ -436,7 +455,12 @@ class Neo4jExportSink(ExportSink):
                         None,
                     )
                     has_visit = any("VISITNUM" in r for r in mapped_rows)
-                    merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
+                    has_record_id = "RECORD_ID" in sample_row
+                    merge_cypher, create_cypher = _build_sdtm_cypher(
+                        seq_prop,
+                        has_visit,
+                        has_record_id=has_record_id,
+                    )
                 elif self.config.naming_convention == "camelCase":
                     merge_cypher, create_cypher = _build_convention_cypher(
                         "studyKey", "subjectKey", "recordId", "visitId"
@@ -479,7 +503,7 @@ class Neo4jExportSink(ExportSink):
                 "MATCH (r:Record {recordId: rid, studyKey: $study_key})\n"
                 "DETACH DELETE r\n"
             )
-        elif cfg.naming_convention == "sdtm":
+        elif cfg.as_sdtm or cfg.naming_convention == "sdtm":
             delete_cypher = (
                 "UNWIND $record_ids AS rid\n"
                 "MATCH (r:Record {RECORD_ID: rid, STUDYID: $study_key})\n"
