@@ -284,3 +284,43 @@ def test_uat_workflow_state_normalize() -> None:
 
     with pytest.raises(InvalidUATStateTransitionError, match="Invalid UAT state type: int"):
         normalize_uat_state(123)  # type: ignore[arg-type]
+
+
+def test_uat_workflow_state_generating_to_completed_requires_dry_run() -> None:
+    """GENERATING -> COMPLETED is rejected by default and permitted only when dry_run=True."""
+    from imednet_workflows.uat.models import (
+        InvalidUATStateTransitionError,
+        UATWorkflowState,
+        is_valid_uat_transition,
+        validate_uat_transition,
+    )
+
+    assert UATWorkflowState.GENERATING.can_transition_to(UATWorkflowState.COMPLETED) is False
+    assert is_valid_uat_transition(UATWorkflowState.GENERATING, UATWorkflowState.COMPLETED) is False
+    with pytest.raises(InvalidUATStateTransitionError):
+        validate_uat_transition(UATWorkflowState.GENERATING, UATWorkflowState.COMPLETED)
+
+    assert (
+        UATWorkflowState.GENERATING.can_transition_to(UATWorkflowState.COMPLETED, dry_run=True)
+        is True
+    )
+    assert (
+        UATWorkflowState.GENERATING.validate_transition_to(UATWorkflowState.COMPLETED, dry_run=True)
+        is True
+    )
+    assert (
+        is_valid_uat_transition(
+            UATWorkflowState.GENERATING, UATWorkflowState.COMPLETED, dry_run=True
+        )
+        is True
+    )
+
+
+def test_uat_specification_persists_seed_in_json(tmp_path: Path) -> None:
+    """UATSpecification stores seed and round-trips through JSON serialization."""
+    spec = UATSpecification(study_key="S1", study_name="Study", seed=1337)
+    assert spec.seed == 1337
+    out_file = tmp_path / "spec_seed.json"
+    out_file.write_text(spec.model_dump_json(by_alias=True), encoding="utf-8")
+    reloaded = UATSpecification.from_json(out_file)
+    assert reloaded.seed == 1337

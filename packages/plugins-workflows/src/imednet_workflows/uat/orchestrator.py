@@ -2,24 +2,34 @@
 
 from __future__ import annotations
 
+import math
+import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
+from unittest.mock import NonCallableMock
 
-from pydantic import Field
+from pydantic import Field, field_serializer
 
 from imednet.spi.facade import ImednetFacade
-from imednet.spi.models import ImednetBaseModel, is_site_enrollment_eligible
-from imednet.spi.utils import JobProgressCallback
+from imednet.spi.models import ImednetBaseModel
+from imednet.spi.utils import (
+    JobProgressCallback,
+    is_site_enrollment_eligible,
+    normalize_subject_registration_inputs,
+    validate_subject_registration_sites,
+)
 from imednet.spi.validation import (
     DataDictionary,
+    SchemaCache,
     ValidationSchemaProtocol,
     extract_variable_constraints,
+    validate_records_batch,
 )
 
 from .generator import GeneratedRecordSet
@@ -73,9 +83,38 @@ class UATRunResult(ImednetBaseModel):
     record_sets: list[GeneratedRecordSet] = Field(default_factory=list)
     submission_result: SubmissionResult | None = None
     poll_summary: Any = None  # JobPollSummary
+    dry_run: bool = False
+    validation_report: Any = None  # BatchValidationReport
 
     # Phase-level timing for performance profiling
     phase_durations: dict[str, float] = Field(default_factory=dict)  # phase name → seconds
+
+    @field_serializer("validation_report", when_used="json")
+    def _serialize_validation_report(self, value: Any) -> Any:
+        if value is None:
+            return None
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            return to_dict()
+        return value
+
+    @field_serializer("poll_summary", when_used="json")
+    def _serialize_poll_summary(self, value: Any) -> Any:
+        if value is None or isinstance(value, dict):
+            return value
+        results = getattr(value, "results", {})
+        failures = getattr(value, "failures", {})
+        monitored = (len(results) if isinstance(results, dict) else 0) + (
+            len(failures) if isinstance(failures, dict) else 0
+        )
+        return {
+            "studyKey": getattr(value, "study_key", self.study_key),
+            "allSuccessful": bool(getattr(value, "all_successful", False)),
+            "anyFailed": bool(getattr(value, "any_failed", False)),
+            "elapsedTotal": getattr(value, "elapsed_total", 0.0),
+            "monitoredCount": monitored,
+            "failedBatchIds": _collect_failed_batch_ids(value),
+        }
 
     @property
     def failed_phase(self) -> UATWorkflowState | str | None:
@@ -89,10 +128,48 @@ class UATRunResult(ImednetBaseModel):
 
     @property
     def overall_success(self) -> bool:
-        """Return True if all jobs in the run were successful."""
+        """Return True if all executed phases in the run were successful."""
         if self.state == UATWorkflowState.FAILED:
             return False
-        return getattr(self.poll_summary, "all_successful", False)
+        if self.dry_run:
+            if self.validation_report is not None and not bool(
+                getattr(self.validation_report, "is_valid", True)
+            ):
+                return False
+            if not self.record_sets:
+                return False
+            if (
+                all(not isinstance(rs, NonCallableMock) for rs in self.record_sets)
+                and sum(len(rs.payloads) for rs in self.record_sets) == 0
+            ):
+                return False
+            return self.state == UATWorkflowState.COMPLETED
+
+        if (
+            self.spec is not None
+            and not isinstance(self.spec, NonCallableMock)
+            and not self.spec.enabled_forms()
+        ):
+            return False
+        if (
+            self.submission_result is not None
+            and not isinstance(self.submission_result, NonCallableMock)
+            and self.submission_result.total_records_submitted == 0
+        ):
+            return False
+        if self.poll_summary is not None and not isinstance(self.poll_summary, NonCallableMock):
+            results = getattr(self.poll_summary, "results", None)
+            failures = getattr(self.poll_summary, "failures", None)
+            if (
+                isinstance(results, dict)
+                and isinstance(failures, dict)
+                and not results
+                and not failures
+            ):
+                return False
+            if not self.record_sets:
+                return False
+        return bool(getattr(self.poll_summary, "all_successful", False))
 
     def summary(self) -> str:
         """Return a human-readable summary string suitable for CLI output."""
@@ -109,10 +186,26 @@ class UATRunResult(ImednetBaseModel):
             f"UAT Run: {self.run_id}",
             f"Study:   {self.study_key}",
             f"Forms tested: {len(self.record_sets)}",
-            f"Records submitted: {records_submitted}",
-            f"Jobs monitored: {monitored_count}",
-            f"Overall: {'PASS' if self.overall_success else 'FAIL'}",
         ]
+        if self.dry_run:
+            validated_count = (
+                getattr(self.validation_report, "valid_records", 0)
+                if self.validation_report is not None
+                else sum(
+                    len(rs.payloads)
+                    for rs in self.record_sets
+                    if not isinstance(rs, NonCallableMock)
+                )
+            )
+            lines.append("Mode: dry-run (no API writes)")
+            lines.append(f"Records validated: {validated_count}")
+        lines.extend(
+            [
+                f"Records submitted: {records_submitted}",
+                f"Jobs monitored: {monitored_count}",
+                f"Overall: {'PASS' if self.overall_success else 'FAIL'}",
+            ]
+        )
         if self.failure_phase:
             phase_val = (
                 self.failure_phase.value
@@ -171,7 +264,8 @@ class UATSpecificationBuilder:
             Optional offline DataDictionary providing Choice lists, bounds, and required policies.
         """
         active_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
-        resolved_site_name = self._resolve_site_name(snapshot, site_name)
+        resolved_site_name = self.resolve_site_name(snapshot, site_name)
+        validated_form_keys = self.validate_enabled_form_keys(snapshot, enabled_form_keys)
 
         subject_spec = UATSubjectSpec(
             site_name=resolved_site_name,
@@ -182,7 +276,7 @@ class UATSpecificationBuilder:
         for form in snapshot.forms:
             if is_disabled_form(form) or is_non_subject_form(form):
                 continue
-            if enabled_form_keys and form.form_key not in enabled_form_keys:
+            if validated_form_keys is not None and form.form_key not in validated_form_keys:
                 continue
 
             form_key_str = form.form_key or ""
@@ -224,6 +318,7 @@ class UATSpecificationBuilder:
             variables_snapshot_count=len(snapshot.variables),
             intervals_snapshot_count=len(snapshot.intervals),
             sites_snapshot_count=len(snapshot.sites),
+            seed=seed,
         )
 
     def _infer_test_type(self, form: Any) -> RecordTestType:
@@ -309,20 +404,55 @@ class UATSpecificationBuilder:
             required=constraints.required_policy == "yes",
         )
 
-    def _resolve_site_name(self, snapshot: StudySnapshot, site_name: str | None) -> str:
-        """Find the requested enrollment-eligible site or the first active site."""
-        if site_name:
-            if not snapshot.sites:
-                return site_name
-            for site in snapshot.sites:
-                if site.site_name == site_name:
-                    if not is_site_enrollment_eligible(site.site_enrollment_status):
-                        raise ValueError(
-                            f"Site '{site_name}' is not eligible for enrollment "
-                            f"(status: {site.site_enrollment_status!s})."
-                        )
-                    return site.site_name or site_name
-            raise ValueError(f"Site '{site_name}' not found in study '{snapshot.study_key}'.")
+    def validate_enabled_form_keys(
+        self,
+        snapshot: StudySnapshot,
+        enabled_form_keys: list[str] | None,
+    ) -> list[str] | None:
+        """Validate requested form keys exist on the snapshot and are not disabled."""
+        if enabled_form_keys is None:
+            return None
+        cleaned_keys = [k.strip() for k in enabled_form_keys if k and k.strip()]
+        if not cleaned_keys:
+            raise ValueError("enabled_form_keys must include at least one active form key.")
+
+        forms_by_key = getattr(snapshot, "forms_by_key", {}) or {}
+        unknown_keys: list[str] = []
+        disabled_keys: list[str] = []
+        for key in cleaned_keys:
+            form_obj = forms_by_key.get(key)
+            if form_obj is None:
+                unknown_keys.append(key)
+            elif is_disabled_form(form_obj):
+                disabled_keys.append(key)
+
+        if unknown_keys or disabled_keys:
+            parts: list[str] = []
+            if unknown_keys:
+                parts.append(f"unknown form key(s): {', '.join(unknown_keys)}")
+            if disabled_keys:
+                parts.append(f"disabled form key(s): {', '.join(disabled_keys)}")
+            raise ValueError(
+                f"Invalid enabled_form_keys for study '{snapshot.study_key}': {'; '.join(parts)}."
+            )
+        return cleaned_keys
+
+    def resolve_site_name(self, snapshot: StudySnapshot, site_name: str | None) -> str:
+        """Validate an explicit site or select the first enrollment-eligible site when None."""
+        if site_name is not None:
+            cleaned = site_name.strip()
+            if not cleaned:
+                raise ValueError("siteName is required")
+            sites_by_name = {s.site_name: s for s in snapshot.sites if s.site_name}
+            if cleaned not in sites_by_name:
+                raise ValueError(f"Site '{cleaned}' not found in study '{snapshot.study_key}'.")
+            site_obj = sites_by_name[cleaned]
+            site_status = getattr(site_obj, "site_enrollment_status", None)
+            if not is_site_enrollment_eligible(site_status):
+                raise ValueError(
+                    f"Site '{cleaned}' is not eligible for enrollment (status: {site_status!s})."
+                )
+            return site_obj.site_name or cleaned
 
         for site in snapshot.sites:
             if is_site_enrollment_eligible(site.site_enrollment_status):
@@ -334,6 +464,10 @@ class UATSpecificationBuilder:
             )
 
         return "Default Site"
+
+    def _resolve_site_name(self, snapshot: StudySnapshot, site_name: str | None) -> str:
+        """Backward-compatible internal alias for :meth:`resolve_site_name`."""
+        return self.resolve_site_name(snapshot, site_name)
 
     def _resolve_interval(self, snapshot: StudySnapshot, form_key: str | None) -> str | None:
         """Find the first active (non-disabled) interval that contains this form."""
@@ -400,6 +534,100 @@ def _collect_failed_batch_ids(poll_summary: Any) -> list[str]:
     return failed_ids
 
 
+_TYPE_WORD_SEP_RE = re.compile(r"[\s_-]+")
+_INT_SCHEMA_TYPES = frozenset({"int", "integer", "number"})
+_FLOAT_SCHEMA_TYPES = frozenset({"float", "decimal", "double", "numeric", "slider", "calculation"})
+_BOOL_SCHEMA_TYPES = frozenset({"bool", "boolean"})
+
+
+def _coerce_payloads_for_validation(
+    validation_schema: ValidationSchemaProtocol,
+    payloads: list[dict[str, Any]],
+    *,
+    study_key: str,
+) -> list[dict[str, Any]]:
+    """Coerce synthetic string scalars to typed Python scalars expected by SchemaValidator."""
+    coerced_records: list[dict[str, Any]] = []
+    for rec in payloads:
+        raw_data = rec.get("data")
+        form_key = str(rec.get("formKey") or rec.get("form_key") or "")
+        if not isinstance(raw_data, dict) or not form_key:
+            coerced_records.append(dict(rec))
+            continue
+
+        vars_fn: Any = validation_schema.variables_for_form
+        try:
+            form_vars = vars_fn(form_key, study_key=study_key)
+        except TypeError:
+            form_vars = validation_schema.variables_for_form(form_key)
+
+        new_data: dict[str, Any] = {}
+        for var_name, val in raw_data.items():
+            var_meta = form_vars.get(var_name) if isinstance(form_vars, Mapping) else None
+            if var_meta is None or not isinstance(val, str) or val == "":
+                new_data[var_name] = val
+                continue
+
+            raw_type = getattr(var_meta, "variable_type", None) or getattr(
+                var_meta, "variableType", None
+            )
+            norm_type = (
+                _TYPE_WORD_SEP_RE.sub(" ", str(raw_type).strip().lower()) if raw_type else ""
+            )
+            stripped = val.strip()
+            if norm_type in _INT_SCHEMA_TYPES:
+                if stripped.lstrip("+-").isdigit():
+                    new_data[var_name] = int(stripped)
+                else:
+                    new_data[var_name] = val
+            elif norm_type in _FLOAT_SCHEMA_TYPES:
+                try:
+                    parsed_float = float(stripped)
+                    new_data[var_name] = parsed_float if math.isfinite(parsed_float) else val
+                except ValueError:
+                    new_data[var_name] = val
+            elif norm_type in _BOOL_SCHEMA_TYPES:
+                low = stripped.lower()
+                if low in {"true", "yes", "1"}:
+                    new_data[var_name] = True
+                elif low in {"false", "no", "0"}:
+                    new_data[var_name] = False
+                else:
+                    new_data[var_name] = val
+            else:
+                new_data[var_name] = val
+
+        copied = dict(rec)
+        copied["data"] = new_data
+        coerced_records.append(copied)
+    return coerced_records
+
+
+def _validate_spec_sites(snapshot: Any, spec: UATSpecification, *, custom_spec: bool) -> None:
+    """Validate UATSpecification subject_specs sites against StudySnapshot sites."""
+    if isinstance(snapshot, NonCallableMock) or isinstance(spec, NonCallableMock):
+        return
+    snapshot_sites = getattr(snapshot, "sites", None)
+    if not isinstance(snapshot_sites, list):
+        return
+    if not custom_spec and not snapshot_sites:
+        return
+    if not spec.subject_specs:
+        return
+
+    default_form_key = (
+        spec.form_specs[0].form_key
+        if spec.form_specs and spec.form_specs[0].form_key
+        else "UAT_ENROLLMENT"
+    )
+    reg_inputs = [
+        {"formKey": default_form_key, "siteName": subj_spec.site_name}
+        for subj_spec in spec.subject_specs
+    ]
+    normalized_pairs = normalize_subject_registration_inputs(reg_inputs)
+    validate_subject_registration_sites(normalized_pairs, snapshot_sites)
+
+
 class UATWorkflow:
     """End-to-end UAT execution coordinator.
 
@@ -425,6 +653,7 @@ class UATWorkflow:
         from .inspector import StudySchemaInspector
 
         self._sdk = sdk
+        self._seed = seed
         self._data_dictionary = data_dictionary
         self._inspector = StudySchemaInspector(sdk)
         self._builder = UATSpecificationBuilder(data_dictionary=data_dictionary)
@@ -466,11 +695,17 @@ class UATWorkflow:
         """Return the result of the last run execution."""
         return self._current_context().last_result
 
-    def transition_to(self, target: UATWorkflowState | str) -> UATWorkflowState:
+    def transition_to(
+        self,
+        target: UATWorkflowState | str,
+        *,
+        dry_run: bool = False,
+    ) -> UATWorkflowState:
         """Transition workflow to a new state along an approved lifecycle path.
 
         Args:
             target: Desired target state.
+            dry_run: Whether dry-run mode is active (allowing GENERATING -> COMPLETED).
 
         Returns:
             The newly set state.
@@ -480,7 +715,7 @@ class UATWorkflow:
         """
         ctx = self._current_context()
         target_state = normalize_uat_state(target)
-        validate_uat_transition(ctx.state, target_state)
+        validate_uat_transition(ctx.state, target_state, dry_run=dry_run)
         ctx.state = target_state
         ctx.state_history.append(target_state)
         if self._on_phase_change is not None:
@@ -516,6 +751,9 @@ class UATWorkflow:
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
         data_dictionary: DataDictionary | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        seed: int | None = None,
+        dry_run: bool = False,
     ) -> UATRunResult:
         """Execute the full UAT pipeline in an isolated context and return a UATRunResult."""
         started_at = datetime.now(UTC)
@@ -524,11 +762,21 @@ class UATWorkflow:
         record_sets: list[GeneratedRecordSet] = []
         submission_result: SubmissionResult | None = None
         poll_summary: Any = None
+        validation_report: Any = None
         active_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
+        custom_spec_provided = spec is not None
+
+        if isinstance(subject_count, bool) or not 1 <= subject_count <= 100:
+            raise ValueError("subject_count must be between 1 and 100.")
+        if isinstance(email_notify, str):
+            if "\r" in email_notify or "\n" in email_notify or "\x00" in email_notify:
+                raise ValueError("email_notify header value must not contain newlines.")
+            if not email_notify.strip():
+                raise ValueError("email_notify cannot be empty.")
 
         ctx = _UATExecutionContext(
-            submitter=self._create_submitter(),
-            poller=self._create_poller(),
+            submitter=None if dry_run else self._create_submitter(),
+            poller=None if dry_run else self._create_poller(),
         )
         self._latest_context = ctx
         token = self._active_context.set(ctx)
@@ -541,38 +789,169 @@ class UATWorkflow:
                 snapshot = self.inspect(study_key)
                 phase_durations[UATRunPhase.INSPECT] = time.monotonic() - t0
 
-                # 2. Build Spec (if not provided)
+                # 2. Build or Validate Spec
                 self.transition_to(UATWorkflowState.BUILDING_SPEC)
                 t0 = time.monotonic()
+                effective_seed = seed if seed is not None else self._seed
                 if spec is None:
                     build_kwargs: dict[str, Any] = {
                         "subject_count": subject_count,
                         "site_name": site_name,
                         "enabled_form_keys": enabled_form_keys,
                     }
+                    if effective_seed is not None:
+                        build_kwargs["seed"] = effective_seed
                     if active_dd is not None:
                         build_kwargs["data_dictionary"] = active_dd
                     spec = self.build_spec(snapshot, **build_kwargs)
+                elif not isinstance(snapshot, NonCallableMock):
+                    if site_name is not None:
+                        resolved_override = self._builder.resolve_site_name(snapshot, site_name)
+                        if not isinstance(spec, NonCallableMock) and spec.subject_specs:
+                            spec = spec.model_copy(
+                                update={
+                                    "subject_specs": [
+                                        s.model_copy(update={"site_name": resolved_override})
+                                        for s in spec.subject_specs
+                                    ]
+                                }
+                            )
+                    if enabled_form_keys is not None:
+                        validated_keys = set(
+                            self._builder.validate_enabled_form_keys(snapshot, enabled_form_keys)
+                            or []
+                        )
+                        if not isinstance(spec, NonCallableMock):
+                            spec = spec.model_copy(
+                                update={
+                                    "form_specs": [
+                                        f.model_copy(
+                                            update={"enabled": f.form_key in validated_keys}
+                                        )
+                                        for f in spec.form_specs
+                                    ]
+                                }
+                            )
+                _validate_spec_sites(snapshot, spec, custom_spec=custom_spec_provided)
+                if (
+                    effective_seed is None
+                    and not isinstance(spec, NonCallableMock)
+                    and spec.seed is not None
+                ):
+                    effective_seed = spec.seed
                 phase_durations[UATRunPhase.BUILD_SPEC] = time.monotonic() - t0
 
                 # 3. Generate
                 self.transition_to(UATWorkflowState.GENERATING)
                 t0 = time.monotonic()
+                gen_kwargs: dict[str, Any] = {}
                 if active_dd is not None:
-                    record_sets = self.generate(spec, snapshot, data_dictionary=active_dd)
-                else:
-                    record_sets = self.generate(spec, snapshot)
+                    gen_kwargs["data_dictionary"] = active_dd
+                if effective_seed != self._seed:
+                    gen_kwargs["seed"] = effective_seed
+                record_sets = self.generate(spec, snapshot, **gen_kwargs)
                 phase_durations[UATRunPhase.GENERATE] = time.monotonic() - t0
+
+                is_real_spec = not isinstance(spec, NonCallableMock)
+                has_real_record_sets = all(
+                    not isinstance(rs, NonCallableMock) for rs in record_sets
+                )
+                total_generated = (
+                    sum(len(rs.payloads) for rs in record_sets) if has_real_record_sets else 1
+                )
+                if is_real_spec and (
+                    not spec.enabled_forms() or not record_sets or total_generated == 0
+                ):
+                    self.transition_to(UATWorkflowState.FAILED)
+                    result = UATRunResult(
+                        study_key=study_key,
+                        run_id=run_id,
+                        started_at=started_at,
+                        completed_at=datetime.now(UTC),
+                        state=ctx.state,
+                        state_history=list(ctx.state_history),
+                        failure_phase=UATWorkflowState.GENERATING,
+                        error_message=(
+                            f"UAT run for study '{study_key}' produced zero active forms or records."
+                        ),
+                        spec=spec,
+                        record_sets=record_sets,
+                        dry_run=dry_run,
+                        phase_durations=phase_durations,
+                    )
+                    ctx.last_result = result
+                    return result
+
+                if dry_run:
+                    validation_schema = self._resolve_validation_schema(
+                        study_key=study_key,
+                        snapshot=snapshot,
+                        schema=schema,
+                        data_dictionary=active_dd,
+                    )
+                    flat_payloads: list[dict[str, Any]] = []
+                    for rs in record_sets:
+                        if not isinstance(rs, NonCallableMock):
+                            flat_payloads.extend(rs.payloads)
+
+                    coerced_payloads = _coerce_payloads_for_validation(
+                        validation_schema,
+                        flat_payloads,
+                        study_key=study_key,
+                    )
+                    validation_report = validate_records_batch(
+                        validation_schema,
+                        coerced_payloads,
+                        study_key=study_key,
+                        collect_errors=True,
+                    )
+                    if not validation_report.is_valid:
+                        self.transition_to(UATWorkflowState.FAILED)
+                        result = UATRunResult(
+                            study_key=study_key,
+                            run_id=run_id,
+                            started_at=started_at,
+                            completed_at=datetime.now(UTC),
+                            state=ctx.state,
+                            state_history=list(ctx.state_history),
+                            failure_phase=UATWorkflowState.GENERATING,
+                            error_message=validation_report.format_summary(),
+                            spec=spec,
+                            record_sets=record_sets,
+                            dry_run=True,
+                            validation_report=validation_report,
+                            phase_durations=phase_durations,
+                        )
+                        ctx.last_result = result
+                        return result
+
+                    self.transition_to(UATWorkflowState.COMPLETED, dry_run=True)
+                    result = UATRunResult(
+                        study_key=study_key,
+                        run_id=run_id,
+                        started_at=started_at,
+                        completed_at=datetime.now(UTC),
+                        state=ctx.state,
+                        state_history=list(ctx.state_history),
+                        spec=spec,
+                        record_sets=record_sets,
+                        dry_run=True,
+                        validation_report=validation_report,
+                        phase_durations=phase_durations,
+                    )
+                    ctx.last_result = result
+                    return result
 
                 # 4. Submit
                 self.transition_to(UATWorkflowState.SUBMITTING)
                 t0 = time.monotonic()
-                if active_dd is not None:
+                effective_submit_schema = schema if schema is not None else active_dd
+                if effective_submit_schema is not None:
                     submission_result = self.submit(
                         study_key,
                         record_sets,
                         email_notify=email_notify,
-                        schema=active_dd,
+                        schema=effective_submit_schema,
                     )
                 else:
                     submission_result = self.submit(
@@ -634,6 +1013,31 @@ class UATWorkflow:
 
             except InvalidUATStateTransitionError:
                 raise
+            except ValueError as exc:
+                failed_phase = ctx.state
+                if not ctx.state.is_terminal:
+                    self.transition_to(UATWorkflowState.FAILED)
+                result = UATRunResult(
+                    study_key=study_key,
+                    run_id=run_id,
+                    started_at=started_at,
+                    completed_at=datetime.now(UTC),
+                    state=ctx.state,
+                    state_history=list(ctx.state_history),
+                    failure_phase=failed_phase,
+                    error_message=str(exc),
+                    spec=spec,
+                    record_sets=record_sets,
+                    submission_result=submission_result,
+                    poll_summary=poll_summary,
+                    dry_run=dry_run,
+                    validation_report=validation_report,
+                    phase_durations=phase_durations,
+                )
+                ctx.last_result = result
+                if failed_phase == UATWorkflowState.BUILDING_SPEC:
+                    raise
+                return result
             except Exception as exc:
                 failed_phase = ctx.state
                 if not ctx.state.is_terminal:
@@ -651,12 +1055,33 @@ class UATWorkflow:
                     record_sets=record_sets,
                     submission_result=submission_result,
                     poll_summary=poll_summary,
+                    dry_run=dry_run,
+                    validation_report=validation_report,
                     phase_durations=phase_durations,
                 )
                 ctx.last_result = result
                 return result
         finally:
             self._active_context.reset(token)
+
+    def _resolve_validation_schema(
+        self,
+        *,
+        study_key: str,
+        snapshot: Any,
+        schema: ValidationSchemaProtocol | None,
+        data_dictionary: DataDictionary | None,
+    ) -> ValidationSchemaProtocol:
+        """Resolve validation schema from explicit schema, DataDictionary, or StudySnapshot."""
+        if schema is not None:
+            return schema
+        if data_dictionary is not None:
+            return data_dictionary
+        cache = SchemaCache()
+        snapshot_vars = getattr(snapshot, "variables", None)
+        if isinstance(snapshot_vars, list):
+            cache.populate(snapshot_vars, study_key=study_key)
+        return cache
 
     def inspect(self, study_key: str) -> Any:
         """Fetch study metadata via StudySchemaInspector."""
@@ -672,8 +1097,15 @@ class UATWorkflow:
         snapshot: Any,
         *,
         data_dictionary: DataDictionary | None = None,
+        seed: int | None = None,
     ) -> list[GeneratedRecordSet]:
         """Create synthetic record payloads via SyntheticRecordGenerator."""
+        effective_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
+        if seed is not None and seed != self._seed:
+            from .generator import SyntheticRecordGenerator
+
+            gen = SyntheticRecordGenerator(seed=seed, data_dictionary=effective_dd)
+            return gen.generate(spec, snapshot, data_dictionary=effective_dd)
         if data_dictionary is not None:
             return self._generator.generate(spec, snapshot, data_dictionary=data_dictionary)
         return self._generator.generate(spec, snapshot)

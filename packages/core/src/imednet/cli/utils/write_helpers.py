@@ -108,16 +108,40 @@ def validate_write_numeric_flags(
         sys.exit(1)
 
 
-def parse_email_notify(raw_email_notify: str | None) -> bool | str | None:
-    """Normalize ``--email-notify`` value into bool or email string."""
+def parse_email_notify(raw_email_notify: str | bool | None) -> bool | str | None:
+    """Normalize and validate ``--email-notify`` value into bool or header-safe email string."""
     if raw_email_notify is None:
         return None
-    low = raw_email_notify.strip().lower()
+    if isinstance(raw_email_notify, bool):
+        return raw_email_notify
+    if "\r" in raw_email_notify or "\n" in raw_email_notify or "\x00" in raw_email_notify:
+        raise ValueError("Invalid --email-notify value: header value must not contain newlines.")
+    cleaned = raw_email_notify.strip()
+    if not cleaned:
+        raise ValueError("Invalid --email-notify value: cannot be empty.")
+    low = cleaned.lower()
     if low == "true":
         return True
     if low == "false":
         return False
-    return raw_email_notify.strip()
+    if any(ch.isspace() for ch in cleaned):
+        raise ValueError(
+            f"Invalid --email-notify value '{cleaned}': expected 'true', 'false', or a valid email address."
+        )
+    local, sep, domain = cleaned.partition("@")
+    if (
+        sep != "@"
+        or not local
+        or not domain
+        or "@" in domain
+        or "." not in domain
+        or domain.startswith(".")
+        or domain.endswith(".")
+    ):
+        raise ValueError(
+            f"Invalid --email-notify value '{cleaned}': expected 'true', 'false', or a valid email address."
+        )
+    return cleaned
 
 
 def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSchemaProtocol:
@@ -134,6 +158,8 @@ def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSche
         return load_from_cdisc_odm(path, study_key=study_key)
     if suffix == ".csv":
         return load_from_redcap(path, study_key=study_key)
+    if suffix == ".zip":
+        return load_from_csv(path)
     raise ValueError(
         f"Unsupported schema file format '{path.suffix}'. Expected .json, .xml, .csv, or directory."
     )
