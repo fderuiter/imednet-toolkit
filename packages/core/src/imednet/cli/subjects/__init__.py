@@ -12,7 +12,6 @@ from ...utils.batch_coordinator import BatchSubmissionSummary
 from ...utils.enrollment import (
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
-    validate_local_subject_registration_sites,
     validate_subject_registration_sites,
 )
 from ..decorators import validate_cli_path_segment, with_sdk
@@ -21,6 +20,7 @@ from ..utils.args import (
     add_study_key_args,
     resolve_study_key,
 )
+from ..utils.context import is_offline_schema_dry_run
 from ..utils.write_helpers import (
     add_write_common_args,
     assemble_cli_write_records,
@@ -108,9 +108,20 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         help="Enrollment site name (siteName) for inline registration or file default.",
     )
     register_parser.add_argument(
+        "--site-id",
+        type=int,
+        default=None,
+        help="Enrollment site ID (siteId) for inline registration or file default.",
+    )
+    register_parser.add_argument(
         "--subject-key",
         default=None,
         help="Subject key (subjectKey) for inline registration.",
+    )
+    register_parser.add_argument(
+        "--subject-oid",
+        default=None,
+        help="Subject OID (subjectOid) for inline registration.",
     )
     register_parser.add_argument(
         "-d",
@@ -137,25 +148,36 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def register_subjects_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
+        offline_dry_run = is_offline_schema_dry_run(
+            dry_run=args.dry_run,
+            schema_source=args.schema_source,
+        )
+
         def _run() -> BatchSubmissionSummary:
-            resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
+            resolved_schema = resolve_cli_schema(
+                sdk,
+                args.study_key,
+                args.schema_source,
+                dry_run=args.dry_run,
+            )
             raw_inputs = _load_cli_subject_inputs(args, schema=resolved_schema)
             normalized_pairs = normalize_subject_registration_inputs(
                 raw_inputs,
                 default_form_key=args.form_key,
                 default_site_name=args.site_name,
+                default_site_id=args.site_id,
                 schema=resolved_schema,
             )
-            if args.dry_run:
-                validate_local_subject_registration_sites(normalized_pairs)
-                existing_subjects = None
-            else:
-                sites = list(sdk.sites.list(args.study_key))
-                validate_subject_registration_sites(normalized_pairs, sites)
-                existing_subjects = (
-                    list(sdk.subjects.list(args.study_key)) if args.skip_existing else None
-                )
+            sites = (
+                None if (args.dry_run and offline_dry_run) else list(sdk.sites.list(args.study_key))
+            )
+            validate_subject_registration_sites(normalized_pairs, sites)
 
+            existing_subjects = (
+                list(sdk.subjects.list(args.study_key))
+                if (args.skip_existing and not offline_dry_run)
+                else None
+            )
             subjects_data, skipped_count = filter_existing_subject_registrations(
                 normalized_pairs,
                 existing_subjects,
@@ -195,7 +217,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if (
             not args.input_file
             and not args.json_payload
-            and (not args.form_key or not args.site_name)
+            and (not args.form_key or (not args.site_name and args.site_id is None))
         ):
             print_error(
                 "Error: Provide --file, --json, or both --form-key and --site-name to register subjects."

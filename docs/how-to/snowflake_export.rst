@@ -66,7 +66,10 @@ batching, staging, and cleanup automatically:
    from imednet import ImednetSDK
    from imednet_sinks.warehouse import export_to_snowflake, SnowflakeSinkConfig
 
-   sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+   sdk = ImednetSDK(
+       api_key=os.environ["IMEDNET_API_KEY"],
+       security_key=os.environ["IMEDNET_SECURITY_KEY"],
+   )
 
    snowflake_cfg = SnowflakeSinkConfig(
        study_key="MY_STUDY",
@@ -96,7 +99,10 @@ per-batch control, custom ``batch_id`` keys, or integration with a workflow engi
    from imednet.spi.sink_base import iter_batches
    from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
 
-   sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+   sdk = ImednetSDK(
+       api_key=os.environ["IMEDNET_API_KEY"],
+       security_key=os.environ["IMEDNET_SECURITY_KEY"],
+   )
    records = list(sdk.records.list(study_key="MY_STUDY"))
 
    snowflake_cfg_advanced = SnowflakeSinkConfig(
