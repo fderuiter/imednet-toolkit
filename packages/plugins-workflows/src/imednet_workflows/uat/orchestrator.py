@@ -16,7 +16,7 @@ from pydantic import Field
 from imednet.spi.models import ImednetBaseModel
 from imednet.spi.validation import DataDictionary, extract_variable_constraints
 
-from .generator import GeneratedRecordSet
+from .generator import GeneratedRecordSet, SyntheticRecordGenerator
 from .models import (
     TERMINAL_UAT_STATES,
     InvalidUATStateTransitionError,
@@ -270,18 +270,14 @@ class UATSpecificationBuilder:
             resolved_type = snap_type or dd_type or "Text"
 
         constraints = extract_variable_constraints(source_dd_var)
-        return UATVariableSpec(
+        base_spec = UATVariableSpec(
             variable_name=var_name,
             variable_key=var_key,
             variable_type=resolved_type,
             form_key=resolved_form_key,
             strategy=VariableTestStrategy.SYNTHETIC,
-            min_value=constraints.min_value,
-            max_value=constraints.max_value,
-            max_length=constraints.max_length,
-            coded_values=list(constraints.choices),
-            required=constraints.required_policy == "yes",
         )
+        return SyntheticRecordGenerator.enrich_variable_spec(base_spec, constraints)
 
     def _resolve_site_name(self, snapshot: StudySnapshot, site_name: str | None) -> str:
         """Find the requested site or the first active site."""

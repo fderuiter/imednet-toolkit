@@ -51,8 +51,13 @@ class UATVariableSpec(UATBaseModel):
     fixed_value: Any | None = None
     min_value: float | None = None
     max_value: float | None = None
+    min_date: str | None = None
+    max_date: str | None = None
+    min_exclusive: bool = False
+    max_exclusive: bool = False
     max_length: int | None = None
     coded_values: list[str] = Field(default_factory=list)
+    excluded_values: list[str] = Field(default_factory=list)
     required: bool = False
     notes: str | None = None
 

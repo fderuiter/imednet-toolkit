@@ -37,19 +37,19 @@ constraint and rule pipeline:
    * - Unknown Variable detection on Form
      - Enforced
      - Enforced
-   * - Scalar Variable data type (``Number``, ``Integer``, ``Float``, ``Date``, ``Text``)
+   * - Scalar & ISO temporal data types (``Number``, ``Integer``, ``Float``, ``Date``, ``DateTime``, ``DurationDateTime``, ``IntervalDateTime``, ``Date/Time Precision``, ``Time``, ``Text``)
      - Enforced
      - Enforced
-   * - Required Variable policies (``Yes`` raises error; ``Auto Query`` logs warning)
+   * - Required Variable policies (``Yes`` raises error; ``Auto Query`` logs warning; ODM/REDCap conditional exemptions)
      - Skipped
      - Enforced
    * - Choice codelist membership (``Radio``, ``Single Select``, ``Multi Select``, ``Checkbox``, ``Yes/No``)
      - Skipped
      - Enforced
-   * - Numeric (``minValue`` / ``maxValue``) & text length (``minLength`` / ``maxLength``) bounds
+   * - Numeric (``minValue`` / ``maxValue``), ISO temporal (``minDate`` / ``maxDate``), ODM ``RangeCheck`` (``Hard`` / ``Soft``), & text length (``minLength`` / ``maxLength``) bounds
      - Skipped
      - Enforced
-   * - Conditional XML business logic rules via :class:`~imednet.datadict.logic.LogicTreeEvaluator`
+   * - Conditional XML, ODM ``ConditionDef`` / ``MethodDef``, & REDCap ``branchingLogic`` AST rules via :class:`~imednet.datadict.logic.LogicTreeEvaluator`
      - Skipped
      - Enforced
 

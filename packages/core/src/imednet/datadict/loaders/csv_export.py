@@ -133,6 +133,7 @@ def load_from_csv_files(
 
     # 1. Parse Forms
     forms_by_key: dict[str, Form] = {}
+    forms_list: list[Form] = []
     for row in raw_forms:
         known, extra, row_warns = normalize_row_data(row, KNOWN_FORM_FIELDS, "FORMS.csv")
         for w in row_warns:
@@ -150,7 +151,11 @@ def load_from_csv_files(
             formType=normalize_form_type(known.get("formType"), default="Subject"),
             extraAttributes=extra,
         )
-        forms_by_key[fk] = form
+        if fk in forms_by_key:
+            record_warning(f"Duplicate formKey '{fk}' in FORMS.csv")
+        else:
+            forms_by_key[fk] = form
+        forms_list.append(form)
 
     # 2. Parse Variables (QUESTIONS)
     vars_by_key: dict[tuple[str, str], Variable] = {}
@@ -168,10 +173,12 @@ def load_from_csv_files(
         if fk not in forms_by_key:
             record_warning(f"Question '{vname}' references undefined form '{fk}'")
             # Create form placeholder in non-strict mode
-            forms_by_key[fk] = Form(
+            placeholder_form = Form(
                 formKey=fk,
                 formType=normalize_form_type(None, default="Subject"),
             )
+            forms_by_key[fk] = placeholder_form
+            forms_list.append(placeholder_form)
 
         req_val = known.get("required") or known.get("requiredField")
         seq_val = known.get("sequence")
@@ -189,6 +196,8 @@ def load_from_csv_files(
             extraAttributes=extra,
         )
         forms_by_key[fk].variables.append(variable)
+        if (fk, vname) in vars_by_key:
+            record_warning(f"Duplicate variableName '{vname}' on form '{fk}' in QUESTIONS.csv")
         vars_by_key[(fk, vname)] = variable
 
     # 3. Parse Choices
@@ -317,7 +326,7 @@ def load_from_csv_files(
 
     return DataDictionary(
         metadata=metadata,
-        forms=list(forms_by_key.values()),
+        forms=forms_list,
         unassignedBusinessLogic=unassigned_logic,
     )
 

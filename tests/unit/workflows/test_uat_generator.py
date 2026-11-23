@@ -519,3 +519,196 @@ def test_canonical_variable_types_and_datadictionary_enrichment(mock_snapshot):
     assert data["DTP_V"] == "2026-02-15"
     assert 10 <= int(data["CALC_V"]) <= 20
     assert data["YESNO_V"] in {"Yes", "No"}
+
+
+def test_generator_enriches_odm_range_checks_and_iso_temporal_bounds(
+    mock_snapshot,
+    caplog,
+) -> None:
+    """SYNTHETIC and BOUNDARY UAT payloads honor ODM Hard/Soft RangeChecks and ISO date/time limits."""
+    import logging
+
+    from imednet.datadict import load_from_cdisc_odm
+    from imednet.spi.validation import RangeCheckConstraint, VariableConstraints
+    from imednet.validation import validate_record_data
+
+    assert RangeCheckConstraint is not None
+    assert VariableConstraints is not None
+
+    odm_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" ODMVersion="1.3.2" FileType="Snapshot" FileOID="F.UAT" CreationDateTime="2026-01-01T00:00:00Z">
+  <Study OID="S.UAT">
+    <GlobalVariables>
+      <StudyName>UAT</StudyName>
+      <StudyDescription>UAT</StudyDescription>
+      <ProtocolName>UAT-1</ProtocolName>
+    </GlobalVariables>
+    <MetaDataVersion OID="MDV.1" Name="v1">
+      <FormDef OID="VS" Name="Vital Signs" Repeating="No">
+        <ItemGroupRef ItemGroupOID="IG.VS" Mandatory="Yes"/>
+      </FormDef>
+      <ItemGroupDef OID="IG.VS" Name="Vitals" Repeating="No">
+        <ItemRef ItemOID="IT.VS.SYSBP" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.VS.TEMP" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.VS.ARM" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.VS.VISDAT" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.VS.VISTIM" Mandatory="Yes"/>
+      </ItemGroupDef>
+      <ItemDef OID="IT.VS.SYSBP" Name="SYSBP" DataType="integer">
+        <RangeCheck Comparator="GT" SoftHard="Hard"><CheckValue>80</CheckValue></RangeCheck>
+        <RangeCheck Comparator="LT" SoftHard="Hard"><CheckValue>180</CheckValue></RangeCheck>
+      </ItemDef>
+      <ItemDef OID="IT.VS.TEMP" Name="TEMP" DataType="float" SignificantDigits="1">
+        <RangeCheck Comparator="GE" SoftHard="Soft"><CheckValue>36.0</CheckValue></RangeCheck>
+        <RangeCheck Comparator="LE" SoftHard="Soft"><CheckValue>37.5</CheckValue></RangeCheck>
+      </ItemDef>
+      <ItemDef OID="IT.VS.ARM" Name="ARM" DataType="text">
+        <RangeCheck Comparator="IN" SoftHard="Hard">
+          <CheckValue>COHORT_A</CheckValue>
+          <CheckValue>COHORT_B</CheckValue>
+        </RangeCheck>
+      </ItemDef>
+      <ItemDef OID="IT.VS.VISDAT" Name="VISDAT" DataType="date">
+        <RangeCheck Comparator="GE" SoftHard="Hard"><CheckValue>2025-03-01</CheckValue></RangeCheck>
+        <RangeCheck Comparator="LE" SoftHard="Hard"><CheckValue>2025-03-31</CheckValue></RangeCheck>
+      </ItemDef>
+      <ItemDef OID="IT.VS.VISTIM" Name="VISTIM" DataType="time">
+        <RangeCheck Comparator="GE" SoftHard="Hard"><CheckValue>08:00:00</CheckValue></RangeCheck>
+        <RangeCheck Comparator="LE" SoftHard="Hard"><CheckValue>17:00:00</CheckValue></RangeCheck>
+      </ItemDef>
+    </MetaDataVersion>
+  </Study>
+</ODM>"""
+    dd = load_from_cdisc_odm(odm_xml, strict=True)
+
+    def _make_spec(strategy: VariableTestStrategy) -> UATSpecification:
+        return UATSpecification(
+            study_key="S.UAT",
+            study_name="UAT",
+            form_specs=[
+                UATFormSpec(
+                    form_key="VS",
+                    form_name="Vital Signs",
+                    form_type="Subject",
+                    test_type=RecordTestType.CREATE_NEW_RECORD,
+                    subject_count=3,
+                    variables=[
+                        UATVariableSpec(
+                            variable_name="SYSBP",
+                            variable_key="V1",
+                            variable_type="Integer",
+                            form_key="VS",
+                            strategy=strategy,
+                        ),
+                        UATVariableSpec(
+                            variable_name="TEMP",
+                            variable_key="V2",
+                            variable_type="Float",
+                            form_key="VS",
+                            strategy=strategy,
+                        ),
+                        UATVariableSpec(
+                            variable_name="ARM",
+                            variable_key="V3",
+                            variable_type="Text",
+                            form_key="VS",
+                            strategy=VariableTestStrategy.SYNTHETIC,
+                        ),
+                        UATVariableSpec(
+                            variable_name="VISDAT",
+                            variable_key="V4",
+                            variable_type="Date",
+                            form_key="VS",
+                            strategy=strategy,
+                        ),
+                        UATVariableSpec(
+                            variable_name="VISTIM",
+                            variable_key="V5",
+                            variable_type="Time",
+                            form_key="VS",
+                            strategy=strategy,
+                        ),
+                    ],
+                )
+            ],
+        )
+
+    generator = SyntheticRecordGenerator(seed=42, data_dictionary=dd)
+
+    def _typed_payload_data(raw: dict[str, object]) -> dict[str, object]:
+        typed = dict(raw)
+        if isinstance(typed.get("SYSBP"), str):
+            typed["SYSBP"] = int(typed["SYSBP"])
+        if isinstance(typed.get("TEMP"), str):
+            typed["TEMP"] = float(typed["TEMP"])
+        return typed
+
+    # 1. SYNTHETIC payloads pass preflight with zero errors and zero Soft warnings
+    synth_sets = generator.generate(_make_spec(VariableTestStrategy.SYNTHETIC), mock_snapshot)
+    assert len(synth_sets[0].payloads) == 3
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        for payload in synth_sets[0].payloads:
+            validate_record_data(dd, "VS", _typed_payload_data(payload["data"]))
+            assert payload["data"]["ARM"] in {"COHORT_A", "COHORT_B"}
+            assert "2025-03-01" <= payload["data"]["VISDAT"] <= "2025-03-31"
+            assert "08:00:00" <= payload["data"]["VISTIM"] <= "17:00:00"
+        assert caplog.records == []
+
+    # 2. BOUNDARY payloads step inside strict GT/LT bounds and match inclusive date/time bounds
+    bound_sets = generator.generate(_make_spec(VariableTestStrategy.BOUNDARY), mock_snapshot)
+    assert len(bound_sets[0].payloads) == 2
+    min_data = bound_sets[0].payloads[0]["data"]
+    max_data = bound_sets[0].payloads[1]["data"]
+
+    assert min_data["SYSBP"] == "81"
+    assert max_data["SYSBP"] == "179"
+    assert min_data["VISDAT"] == "2025-03-01"
+    assert max_data["VISDAT"] == "2025-03-31"
+    assert min_data["VISTIM"] == "08:00:00"
+    assert max_data["VISTIM"] == "17:00:00"
+
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        for payload in bound_sets[0].payloads:
+            validate_record_data(dd, "VS", _typed_payload_data(payload["data"]))
+        assert caplog.records == []
+
+    # 3. UATSpecificationBuilder also populates enriched RangeCheck/ISO bounds directly
+    from imednet.models.forms import Form as SnapForm
+    from imednet.models.sites import Site as SnapSite
+    from imednet.models.variables import Variable as SnapVar
+    from imednet_workflows.uat.inspector import StudySnapshot
+    from imednet_workflows.uat.orchestrator import UATSpecificationBuilder
+
+    snap = StudySnapshot(
+        study_key="STUDY",
+        forms=[SnapForm(form_key="VS", form_name="Vital Signs", form_type="Standard")],
+        variables=[
+            SnapVar(variable_name="SYSBP", variable_type="Integer", form_key="VS"),
+            SnapVar(variable_name="TEMP", variable_type="Float", form_key="VS"),
+            SnapVar(variable_name="ARM", variable_type="Text", form_key="VS"),
+            SnapVar(variable_name="VISDAT", variable_type="Date", form_key="VS"),
+        ],
+        variables_by_form={
+            "VS": [
+                SnapVar(variable_name="SYSBP", variable_type="Integer", form_key="VS"),
+                SnapVar(variable_name="TEMP", variable_type="Float", form_key="VS"),
+                SnapVar(variable_name="ARM", variable_type="Text", form_key="VS"),
+                SnapVar(variable_name="VISDAT", variable_type="Date", form_key="VS"),
+            ]
+        },
+        intervals=[],
+        sites=[SnapSite(site_name="SITE-1", site_enrollment_status="Open")],
+    )
+    built_spec = UATSpecificationBuilder(data_dictionary=dd).build(snap, subject_count=2)
+    vs_vars = {v.variable_name: v for v in built_spec.form_specs[0].variables}
+    assert vs_vars["SYSBP"].min_value == pytest.approx(80.0)
+    assert vs_vars["SYSBP"].max_value == pytest.approx(180.0)
+    assert vs_vars["SYSBP"].min_exclusive is True
+    assert vs_vars["SYSBP"].max_exclusive is True
+    assert vs_vars["TEMP"].min_value == pytest.approx(36.0)
+    assert vs_vars["TEMP"].max_value == pytest.approx(37.5)
+    assert vs_vars["ARM"].coded_values == ["COHORT_A", "COHORT_B"]
+    assert vs_vars["VISDAT"].min_date == "2025-03-01"
+    assert vs_vars["VISDAT"].max_date == "2025-03-31"

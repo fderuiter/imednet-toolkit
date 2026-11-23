@@ -82,7 +82,7 @@ iMednet Data Dictionary exports contain four CSV files: ``FORMS.csv``, ``QUESTIO
 From CDISC ODM 1.3 XML
 ~~~~~~~~~~~~~~~~~~~~~~
 
-Use :func:`~imednet.datadict.to_odm_xml` (or :func:`~imednet.datadict.to_odm_file`) to serialize a :class:`~imednet.datadict.DataDictionary` to CDISC ODM 1.3 XML, and :func:`~imednet.datadict.load_from_cdisc_odm` to parse ODM ``FormDef``, ``ItemGroupDef``, ``ItemDef``, ``CodeList``, ``RangeCheck``, ``ConditionDef``, and ``MethodDef`` definitions into the canonical model:
+Use :func:`~imednet.datadict.to_odm_xml` (or :func:`~imednet.datadict.to_odm_file`) to serialize a :class:`~imednet.datadict.DataDictionary` to CDISC ODM 1.3 XML, and :func:`~imednet.datadict.load_from_cdisc_odm` to parse ODM ``FormDef``, ``ItemGroupDef``, ``ItemDef``, ``CodeList``, ``RangeCheck``, ``ConditionDef`` (compiled into conditional ``Required`` AST nodes), and ``MethodDef`` (compiled into calculated-variable AST expressions) into the canonical model:
 
 .. testcode::
 
@@ -101,7 +101,7 @@ Use :func:`~imednet.datadict.to_odm_xml` (or :func:`~imednet.datadict.to_odm_fil
 From REDCap CSV Data Dictionaries
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Use :func:`~imednet.datadict.load_from_redcap` to convert REDCap instrument CSV files—mapping REDCap field types, ``Choices, Calculations, or Slider Labels``, ``Required Field?``, and ``Text Validation Min`` / ``Max`` bounds into canonical Forms, Variables, and Choices:
+Use :func:`~imednet.datadict.load_from_redcap` to convert REDCap instrument CSV files—mapping REDCap field types, ``Choices, Calculations, or Slider Labels``, ``Branching Logic`` (compiled into conditional ``Required`` AST rules), ``Required Field?``, and numeric or ISO temporal ``Text Validation Min`` / ``Max`` bounds into canonical Forms, Variables, Choices, and rules:
 
 .. testcode::
 
@@ -147,7 +147,7 @@ Use :func:`~imednet.datadict.load_from_api` with an initialized :class:`~imednet
 JSON Emission, Schema Export, and Validation
 --------------------------------------------
 
-:func:`~imednet.datadict.to_json` (and :func:`~imednet.datadict.to_file`) deterministically sorts Forms by ``formKey``, Variables by ``sequence`` then ``variableName``, Choices by ``position``, and rules by ``sequence`` then ``id``. Use :func:`~imednet.datadict.get_schema` to export the Draft 2020-12 JSON Schema, and :func:`~imednet.datadict.validate` to verify a dictionary, JSON string, file path, or :class:`~imednet.datadict.DataDictionary` instance:
+:func:`~imednet.datadict.to_json` (and :func:`~imednet.datadict.to_file`) deterministically sorts Forms by ``formKey``, Variables by ``sequence`` then ``variableName``, Choices by ``position``, and rules by ``sequence`` then ``id``. Use :func:`~imednet.datadict.get_schema` to export the Draft 2020-12 JSON Schema, and :func:`~imednet.datadict.validate` to structurally and semantically verify a dictionary, JSON/ODM/REDCap string, JSON file, 4-file CSV directory or ``.zip`` archive, CDISC ODM XML file, REDCap CSV file, or :class:`~imednet.datadict.DataDictionary` instance (checking duplicate keys/choices, empty categorical choice lists, inverted bounds, unknown ``variableType`` values, malformed ``logicRawXml``, and broken Form/Variable/OID references):
 
 .. testcode::
 
@@ -226,10 +226,10 @@ Validating Record Submissions with ``schema=data_dictionary``
 
 Unlike :class:`~imednet.validation.cache.SchemaCache` (which only checks Form existence, unknown Variables, and basic scalar types), passing a :class:`~imednet.datadict.DataDictionary` via ``schema=data_dictionary`` enforces:
 
-1. **Required Variable policies** (``required="Yes"`` raises :class:`~imednet.errors.ValidationError`; ``required="Auto Query"`` logs a warning).
-2. **Choice membership** for categorical Variables (``Radio``, ``Single Select``, ``Multi Select``).
-3. **Numeric and string length bounds** (``minValue`` / ``maxValue`` and ``minLength`` / ``maxLength``).
-4. **Active XML edit checks** via :class:`~imednet.datadict.LogicTreeEvaluator` before any HTTP POST is sent.
+1. **Required Variable policies** (``required="Yes"`` raises :class:`~imednet.errors.ValidationError`; ``required="Auto Query"`` logs a warning; conditional ODM ``CollectionExceptionConditionOID`` and REDCap ``branchingLogic`` exemptions skip required checks when the condition evaluates false).
+2. **Choice membership** for categorical Variables (``Radio``, ``Single Select``, ``Multi Select``, ``Checkbox``, ``Yes/No``) and ISO calendar/clock formatting for ``Date``, ``DateTime``, ``DurationDateTime``, ``IntervalDateTime``, ``Date/Time Precision``, and ``Time``.
+3. **Numeric, ISO temporal, and string length bounds** (``minValue`` / ``maxValue``, ``minDate`` / ``maxDate``, ``minLength`` / ``maxLength``, and ODM ``RangeCheck`` comparators with ``Hard`` errors and ``Soft`` warnings).
+4. **Active XML, ODM ``ConditionDef`` / ``MethodDef``, and REDCap ``branchingLogic`` rules** via :class:`~imednet.datadict.LogicTreeEvaluator` and ``RestrictedAstEvaluator`` (never ``eval()``) before any HTTP POST is sent.
 
 Pass ``schema=data_dictionary`` to :meth:`~imednet.endpoints.records.RecordsEndpoint.create`, :meth:`~imednet.endpoints.records.RecordsEndpoint.create_batch`, :class:`~imednet_workflows.record_update.RecordUpdateWorkflow`, or :class:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow` (see :doc:`/explanation/schema_validation`, :doc:`/how-to/register_subjects`, and :doc:`/how-to/workflows/bulk_submission`):
 

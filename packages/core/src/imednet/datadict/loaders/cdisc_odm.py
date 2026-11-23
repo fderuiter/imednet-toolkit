@@ -8,6 +8,7 @@ from typing import Any, BinaryIO, TextIO
 import defusedxml.ElementTree as ET  # noqa: N817
 from defusedxml.common import DefusedXmlException
 
+from ..logic import compile_odm_formal_expression
 from ..models import (
     BusinessLogicRule,
     Choice,
@@ -520,7 +521,18 @@ def _extract_item_units_and_ranges(
                 record_warning,
             )
             if fe_elem.text and fe_elem.text.strip():
-                rc_entry["formalExpression"] = fe_elem.text.strip()
+                fe_text = fe_elem.text.strip()
+                rc_entry["formalExpression"] = fe_text
+                try:
+                    compile_odm_formal_expression(
+                        fe_text,
+                        context=_get_attr(fe_elem, "Context"),
+                        self_var=it_oid,
+                    )
+                except ValueError as exc:
+                    record_warning(
+                        f"Malformed FormalExpression on RangeCheck for item '{it_oid}': {exc}"
+                    )
             if ctx := _get_attr(fe_elem, "Context"):
                 rc_entry["context"] = ctx.strip()
 
@@ -561,6 +573,7 @@ def _parse_formal_rule_element(
     target_vars: list[str],
     no_raw_xml: bool,
     record_warning: Any,
+    item_alias_map: dict[str, str] | None = None,
 ) -> BusinessLogicRule:
     """Convert an ODM ConditionDef or MethodDef element into a BusinessLogicRule without eval."""
     known_attrs = (
@@ -607,10 +620,45 @@ def _parse_formal_rule_element(
         extra["description"] = desc
     if formal_expressions:
         logic_ast["formalExpressions"] = formal_expressions
+        compiled_exprs = []
+        for fe_dict in formal_expressions:
+            fe_body = fe_dict.get("expression", "")
+            if not fe_body:
+                continue
+            try:
+                compiled_exprs.append(
+                    compile_odm_formal_expression(
+                        fe_body,
+                        context=fe_dict.get("context"),
+                        item_alias_map=item_alias_map,
+                    )
+                )
+            except ValueError as exc:
+                record_warning(
+                    f"Malformed FormalExpression on {odm_element_type} "
+                    f"'{rule_oid or rule_name}': {exc}"
+                )
+        if compiled_exprs:
+            primary = compiled_exprs[0]
+            logic_ast["compiledExpression"] = primary.compiled_expression
+            logic_ast["variableMap"] = primary.variable_map
+            ref_forms = list(dict.fromkeys(f for c in compiled_exprs for f in c.referenced_forms))
+            if ref_forms:
+                logic_ast["referencedForms"] = ref_forms
+            if odm_element_type == "ConditionDef":
+                cond_trees = [
+                    c.conditions_tree for c in compiled_exprs if c.conditions_tree is not None
+                ]
+                if len(cond_trees) == 1:
+                    logic_ast["conditions"] = cond_trees[0]
+                elif len(cond_trees) > 1:
+                    logic_ast["conditions"] = {"and": cond_trees}
     if aliases:
         extra["aliases"] = aliases
     if target_vars:
-        extra["targetVariables"] = list(dict.fromkeys(target_vars))
+        dedup_targets = list(dict.fromkeys(target_vars))
+        logic_ast["targetVariables"] = dedup_targets
+        extra["targetVariables"] = dedup_targets
     extra["odmElement"] = odm_element_type
 
     if len(referencing_forms) == 1 and not is_protocol_scoped:
@@ -762,33 +810,64 @@ def load_from_cdisc_odm(
     method_def_elems: dict[str, ET.Element] = {}
 
     for mdv in mdv_elements:
+        mdv_se_oids: set[str] = set()
+        mdv_cl_oids: set[str] = set()
+        mdv_item_oids: set[str] = set()
+        mdv_ig_oids: set[str] = set()
+        mdv_form_oids: set[str] = set()
+        mdv_cond_oids: set[str] = set()
+        mdv_meth_oids: set[str] = set()
+
         for proto in _find_children(mdv, "Protocol"):
             protocol_elems.append(proto)
         for se in _find_children(mdv, "StudyEventDef"):
             se_oid = _get_attr(se, "OID")
             if se_oid:
+                if se_oid in mdv_se_oids:
+                    record_warning(f"Duplicate StudyEventDef OID '{se_oid}' in MetaDataVersion.")
+                mdv_se_oids.add(se_oid)
                 study_event_def_elems[se_oid] = se
         for cl in _find_children(mdv, "CodeList"):
             cl_oid = _get_attr(cl, "OID")
             if cl_oid:
+                if cl_oid in mdv_cl_oids:
+                    record_warning(f"Duplicate CodeList OID '{cl_oid}' in MetaDataVersion.")
+                mdv_cl_oids.add(cl_oid)
                 codelist_elems[cl_oid] = cl
         for item in _find_children(mdv, "ItemDef"):
             item_oid = _get_attr(item, "OID")
             if item_oid:
+                if item_oid in mdv_item_oids:
+                    record_warning(f"Duplicate ItemDef OID '{item_oid}' in MetaDataVersion.")
+                mdv_item_oids.add(item_oid)
                 item_def_elems[item_oid] = item
         for ig in _find_children(mdv, "ItemGroupDef"):
             ig_oid = _get_attr(ig, "OID")
             if ig_oid:
+                if ig_oid in mdv_ig_oids:
+                    record_warning(f"Duplicate ItemGroupDef OID '{ig_oid}' in MetaDataVersion.")
+                mdv_ig_oids.add(ig_oid)
                 item_group_def_elems[ig_oid] = ig
         for f in _find_children(mdv, "FormDef"):
+            f_oid = _get_attr(f, "OID")
+            if f_oid:
+                if f_oid in mdv_form_oids:
+                    record_warning(f"Duplicate FormDef OID '{f_oid}' in MetaDataVersion.")
+                mdv_form_oids.add(f_oid)
             form_def_elems.append(f)
         for cond in _find_children(mdv, "ConditionDef"):
             cond_oid = _get_attr(cond, "OID")
             if cond_oid:
+                if cond_oid in mdv_cond_oids:
+                    record_warning(f"Duplicate ConditionDef OID '{cond_oid}' in MetaDataVersion.")
+                mdv_cond_oids.add(cond_oid)
                 condition_def_elems[cond_oid] = cond
         for meth in _find_children(mdv, "MethodDef"):
             meth_oid = _get_attr(meth, "OID")
             if meth_oid:
+                if meth_oid in mdv_meth_oids:
+                    record_warning(f"Duplicate MethodDef OID '{meth_oid}' in MetaDataVersion.")
+                mdv_meth_oids.add(meth_oid)
                 method_def_elems[meth_oid] = meth
 
     known_form_oids = {oid for f in form_def_elems if (oid := (_get_attr(f, "OID") or "").strip())}
@@ -1132,6 +1211,7 @@ def load_from_cdisc_odm(
     # 5. Parse Forms and nested ItemGroups/Items
     forms: list[Form] = []
     forms_by_oid: dict[str, Form] = {}
+    form_item_aliases: dict[str, dict[str, str]] = {}
 
     for form_elem in form_def_elems:
         f_oid = _get_attr(form_elem, "OID") or ""
@@ -1255,21 +1335,62 @@ def load_from_cdisc_odm(
         forms.append(form)
         if f_oid:
             forms_by_oid[f_oid] = form
+            aliases_for_form: dict[str, str] = {}
+            name_counts: dict[str, int] = {}
+            for ref_oid, _ in form_sibling_refs:
+                r_def = item_def_elems.get(ref_oid)
+                if r_def is not None:
+                    r_name = (_get_attr(r_def, "Name") or "").strip()
+                    if r_name:
+                        name_counts[r_name] = name_counts.get(r_name, 0) + 1
+            for ref_oid, ref_ig in form_sibling_refs:
+                r_def = item_def_elems.get(ref_oid)
+                if r_def is None:
+                    continue
+                resolved_vname = _resolve_variable_name(
+                    r_def,
+                    ref_oid,
+                    f_oid,
+                    ref_ig,
+                    sibling_refs=form_sibling_refs,
+                    item_def_elems=item_def_elems,
+                )
+                aliases_for_form[ref_oid] = resolved_vname
+                r_name = (_get_attr(r_def, "Name") or "").strip()
+                if r_name and name_counts.get(r_name, 0) == 1:
+                    aliases_for_form.setdefault(r_name, resolved_vname)
+            for (_, ref_ig), form_var in zip(form_sibling_refs, form.variables, strict=False):
+                vname = form_var.variableName
+                if not vname:
+                    continue
+                aliases_for_form.setdefault(f"IT.{f_oid}.{vname}", vname)
+                aliases_for_form.setdefault(f"{f_oid}.{vname}", vname)
+                if ref_ig:
+                    aliases_for_form.setdefault(f"IT.{ref_ig}.{vname}", vname)
+                    aliases_for_form.setdefault(f"{ref_ig}.{vname}", vname)
+            form_item_aliases[f_oid] = aliases_for_form
 
     # 5b. Map ConditionDef and MethodDef elements into BusinessLogicRule entries
     unassigned_logic: list[BusinessLogicRule] = []
     rule_seq = 1
 
     for cond_oid, cond_elem in condition_def_elems.items():
+        c_forms = condition_form_refs.get(cond_oid, set())
+        c_alias_map = (
+            form_item_aliases.get(next(iter(c_forms)))
+            if len(c_forms) == 1 and cond_oid not in condition_protocol_scoped
+            else None
+        )
         rule = _parse_formal_rule_element(
             cond_elem,
             "ConditionDef",
             rule_seq,
-            condition_form_refs.get(cond_oid, set()),
+            c_forms,
             cond_oid in condition_protocol_scoped,
             condition_target_vars.get(cond_oid, []),
             no_raw_xml,
             record_warning,
+            item_alias_map=c_alias_map,
         )
         rule_seq += 1
         if rule.form and rule.form in forms_by_oid:
@@ -1278,15 +1399,18 @@ def load_from_cdisc_odm(
             unassigned_logic.append(rule)
 
     for meth_oid, meth_elem in method_def_elems.items():
+        m_forms = method_form_refs.get(meth_oid, set())
+        m_alias_map = form_item_aliases.get(next(iter(m_forms))) if len(m_forms) == 1 else None
         rule = _parse_formal_rule_element(
             meth_elem,
             "MethodDef",
             rule_seq,
-            method_form_refs.get(meth_oid, set()),
+            m_forms,
             False,
             method_target_vars.get(meth_oid, []),
             no_raw_xml,
             record_warning,
+            item_alias_map=m_alias_map,
         )
         rule_seq += 1
         if rule.form and rule.form in forms_by_oid:

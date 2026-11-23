@@ -605,3 +605,319 @@ async def test_seeded_simulation_state_f_dm_validates_sync_and_async() -> None:
         )
         assert async_score == pytest.approx(100.0)
         assert async_reasons == []
+
+
+@pytest.mark.parametrize(
+    ("var_type", "valid_values", "invalid_values"),
+    [
+        (
+            "Date",
+            ["2024-02-29", "2025-12-31"],
+            ["2023-02-29", "2024-04-31", "2024-13-01", "01/15/2024", "not-a-date", 20240101],
+        ),
+        (
+            "DateTime",
+            [
+                "2024-02-29T14:30:00",
+                "2024-02-29T14:30:00Z",
+                "2024-02-29 14:30:59.123+02:00",
+            ],
+            ["2024-02-29", "2023-02-29T10:00:00", "2024-01-01T25:00:00", "invalid-dt"],
+        ),
+        (
+            "Date/Time Precision",
+            ["2024", "2024-02", "2024-02-29", "2024-02-29T08:15"],
+            ["2023-02-29", "2024-13", "2024/02/01", "partial-text"],
+        ),
+        (
+            "Time",
+            ["00:00", "12:30:45", "23:59:59.500"],
+            ["24:00:00", "12:60:00", "12:00:60", "8am", 1230],
+        ),
+        (
+            "DurationDatetime",
+            ["P3Y6M4DT12H30M5S", "PT15M", "P2W"],
+            ["P", "PT", "3 days"],
+        ),
+        (
+            "IntervalDatetime",
+            ["2024-01-01T00:00:00Z/2024-01-02T00:00:00Z", "2024-01-01T00:00:00/P7D"],
+            ["2024-01-01", "bad/interval"],
+        ),
+    ],
+)
+def test_calendar_and_clock_temporal_validators(
+    var_type: str,
+    valid_values: list[object],
+    invalid_values: list[object],
+) -> None:
+    """Temporal variable types enforce real ISO calendar and clock validity instead of free text."""
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_TEMP",
+                variables=[DDVariable(variableName="T_VAL", variableType=var_type)],
+            )
+        ]
+    )
+    for ok_val in valid_values:
+        validate_record_data(dd, "F_TEMP", {"T_VAL": ok_val})
+
+    for bad_val in invalid_values:
+        with pytest.raises(ValidationError):
+            validate_record_data(dd, "F_TEMP", {"T_VAL": bad_val})
+
+
+def test_preflight_temporal_bounds_odm_range_checks_conditions_methods_and_redcap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """validate_record_data and calculate_readiness_score enforce date bounds, ODM rules, and REDCap branching."""
+    from imednet.datadict import load_from_cdisc_odm
+
+    odm_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" ODMVersion="1.3.2" FileType="Snapshot" FileOID="F.VAL" CreationDateTime="2026-01-01T00:00:00Z">
+  <Study OID="S.VAL">
+    <GlobalVariables>
+      <StudyName>Val</StudyName>
+      <StudyDescription>Val</StudyDescription>
+      <ProtocolName>VAL-1</ProtocolName>
+    </GlobalVariables>
+    <MetaDataVersion OID="MDV.1" Name="v1">
+      <FormDef OID="VS" Name="Vital Signs" Repeating="No">
+        <ItemGroupRef ItemGroupOID="IG.VS" Mandatory="Yes"/>
+      </FormDef>
+      <ItemGroupDef OID="IG.VS" Name="Vitals" Repeating="No">
+        <ItemRef ItemOID="IT.VS.POS" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.VS.SYSBP" Mandatory="Yes" CollectionExceptionConditionOID="COND.NOT_SEATED"/>
+        <ItemRef ItemOID="IT.VS.DIABP" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.VS.VISDAT" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.VS.MAP" Mandatory="No" MethodOID="METH.MAP"/>
+      </ItemGroupDef>
+      <ItemDef OID="IT.VS.POS" Name="POS" DataType="text"/>
+      <ItemDef OID="IT.VS.SYSBP" Name="SYSBP" DataType="integer">
+        <RangeCheck Comparator="GT" SoftHard="Hard"><CheckValue>40</CheckValue></RangeCheck>
+        <RangeCheck Comparator="LT" SoftHard="Hard"><CheckValue>260</CheckValue></RangeCheck>
+        <RangeCheck Comparator="GE" SoftHard="Soft"><CheckValue>90</CheckValue></RangeCheck>
+        <RangeCheck Comparator="LE" SoftHard="Soft"><CheckValue>140</CheckValue></RangeCheck>
+      </ItemDef>
+      <ItemDef OID="IT.VS.DIABP" Name="DIABP" DataType="integer"/>
+      <ItemDef OID="IT.VS.VISDAT" Name="VISDAT" DataType="date">
+        <RangeCheck Comparator="GE" SoftHard="Hard"><CheckValue>2025-01-01</CheckValue></RangeCheck>
+        <RangeCheck Comparator="LE" SoftHard="Hard"><CheckValue>2026-12-31</CheckValue></RangeCheck>
+      </ItemDef>
+      <ItemDef OID="IT.VS.MAP" Name="MAP" DataType="float" SignificantDigits="1"/>
+      <ConditionDef OID="COND.NOT_SEATED" Name="Do not collect SYSBP when not seated">
+        <FormalExpression Context="XPath">../POS != 'SEATED'</FormalExpression>
+      </ConditionDef>
+      <MethodDef OID="METH.MAP" Name="Compute MAP" Type="Computation">
+        <FormalExpression Context="XPath">round((2 * ../DIABP + ../SYSBP) div 3, 1)</FormalExpression>
+      </MethodDef>
+    </MetaDataVersion>
+  </Study>
+</ODM>"""
+    dd = load_from_cdisc_odm(odm_xml, strict=True)
+
+    # 1. CollectionExceptionConditionOID exempts Mandatory SYSBP when POS == 'STANDING'
+    validate_record_data(
+        dd,
+        "VS",
+        {"POS": "STANDING", "DIABP": 80, "VISDAT": "2025-06-15"},
+    )
+    score_exempt, reasons_exempt = calculate_readiness_score(
+        dd,
+        "VS",
+        {"POS": "STANDING", "SYSBP": "", "DIABP": 80, "VISDAT": "2025-06-15", "MAP": ""},
+    )
+    assert score_exempt == pytest.approx(100.0)
+    assert reasons_exempt == []
+
+    # When POS == 'SEATED', missing SYSBP fails Mandatory check
+    with pytest.raises(ValidationError, match="SYSBP"):
+        validate_record_data(
+            dd,
+            "VS",
+            {"POS": "SEATED", "DIABP": 80, "VISDAT": "2025-06-15"},
+        )
+
+    # 2. Hard RangeCheck comparator GT 40 rejects boundary 40; Soft RangeCheck logs warning on 155
+    with pytest.raises(ValidationError, match="SYSBP"):
+        validate_record_data(
+            dd,
+            "VS",
+            {"POS": "SEATED", "SYSBP": 40, "DIABP": 80, "VISDAT": "2025-06-15"},
+        )
+
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        validate_record_data(
+            dd,
+            "VS",
+            {"POS": "SEATED", "SYSBP": 155, "DIABP": 80, "VISDAT": "2025-06-15"},
+        )
+        assert any("SYSBP" in rec.message for rec in caplog.records)
+
+    score_soft, reasons_soft = calculate_readiness_score(
+        dd,
+        "VS",
+        {"POS": "SEATED", "SYSBP": 155, "DIABP": 80, "VISDAT": "2025-06-15", "MAP": ""},
+    )
+    assert score_soft == pytest.approx(100.0)
+    assert any("SYSBP" in r for r in reasons_soft)
+
+    # 3. ISO date bounds reject out-of-range dates
+    with pytest.raises(ValidationError, match="VISDAT"):
+        validate_record_data(
+            dd,
+            "VS",
+            {"POS": "STANDING", "DIABP": 80, "VISDAT": "2024-12-31"},
+        )
+
+    # 4. MethodDef rejects mismatched derived value and accepts matching computation
+    with pytest.raises(ValidationError, match="MAP"):
+        validate_record_data(
+            dd,
+            "VS",
+            {"POS": "SEATED", "SYSBP": 120, "DIABP": 80, "VISDAT": "2025-06-15", "MAP": 50.0},
+        )
+    validate_record_data(
+        dd,
+        "VS",
+        {"POS": "SEATED", "SYSBP": 120, "DIABP": 80, "VISDAT": "2025-06-15", "MAP": 93.3},
+    )
+
+    # 5. REDCap branchingLogic conditional required preflight
+    rc_dd = load_from_redcap(
+        '"Variable / Field Name","Form Name","Field Type","Field Label",'
+        '"Choices, Calculations, OR Slider Labels","Branching Logic (Show field only if...)","Required Field?"\n'
+        '"sex","dm","radio","Sex","F, Female | M, Male",,"y"\n'
+        '"preg","dm","yesno","Pregnant?","1, Yes | 0, No","[sex] = \'F\'","y"\n',
+        strict=True,
+    )
+    validate_record_data(rc_dd, "dm", {"sex": "M"})
+    with pytest.raises(ValidationError, match="preg"):
+        validate_record_data(rc_dd, "dm", {"sex": "F"})
+    validate_record_data(rc_dd, "dm", {"sex": "F", "preg": "0"})
+
+
+def test_phi_values_masked_in_temporal_bound_and_rule_messages(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """PHI variable values registered in SensitivityRegistry are masked in validation errors and warnings."""
+    from imednet.utils.security import global_sensitivity_registry
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    phi_dob = "PHI_BIRTH_DATE_TEST_VAR"
+    phi_bp = "PHI_SYSBP_TEST_VAR"
+    global_sensitivity_registry.add_sensitive_key(phi_dob)
+    global_sensitivity_registry.add_sensitive_key(phi_bp)
+
+    try:
+        dd = DataDictionary(
+            forms=[
+                DDForm(
+                    formKey="F_PHI",
+                    variables=[
+                        DDVariable(
+                            variableName=phi_dob,
+                            variableType="Date",
+                            extraAttributes={"minDate": "2000-01-01", "maxDate": "2020-12-31"},
+                        ),
+                        DDVariable(
+                            variableName=phi_bp,
+                            variableType="Integer",
+                            extraAttributes={
+                                "rangeChecks": [
+                                    {"comparator": "GE", "softHard": "Hard", "checkValue": "50"},
+                                    {"comparator": "LE", "softHard": "Soft", "checkValue": "140"},
+                                ]
+                            },
+                        ),
+                    ],
+                )
+            ]
+        )
+
+        # 1. Invalid calendar date value must be masked
+        secret_bad_date = "1985-02-29"
+        with pytest.raises(ValidationError) as exc_fmt:
+            validate_record_data(dd, "F_PHI", {phi_dob: secret_bad_date})
+        assert secret_bad_date not in str(exc_fmt.value)
+        assert MASKED_SENTINEL in str(exc_fmt.value)
+
+        # 2. Out-of-bounds date value must be masked
+        secret_early_date = "1977-07-04"
+        with pytest.raises(ValidationError) as exc_bound:
+            validate_record_data(dd, "F_PHI", {phi_dob: secret_early_date})
+        assert secret_early_date not in str(exc_bound.value)
+        assert MASKED_SENTINEL in str(exc_bound.value)
+
+        # 3. Hard RangeCheck failure masks raw numeric PHI value
+        secret_low_bp = 37
+        with pytest.raises(ValidationError) as exc_rc:
+            validate_record_data(dd, "F_PHI", {phi_bp: secret_low_bp})
+        assert "37" not in str(exc_rc.value)
+        assert MASKED_SENTINEL in str(exc_rc.value)
+
+        # 4. Soft RangeCheck warning & readiness reasons mask raw numeric PHI value
+        secret_soft_bp = 189
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            validate_record_data(dd, "F_PHI", {phi_bp: secret_soft_bp})
+            assert all("189" not in rec.message for rec in caplog.records)
+            assert any(MASKED_SENTINEL in rec.message for rec in caplog.records)
+
+        _, reasons = calculate_readiness_score(dd, "F_PHI", {phi_bp: secret_soft_bp})
+        assert all("189" not in r for r in reasons)
+        assert any(MASKED_SENTINEL in r for r in reasons)
+    finally:
+        global_sensitivity_registry.remove_sensitive_key(phi_dob)
+        global_sensitivity_registry.remove_sensitive_key(phi_bp)
+
+
+def test_hybrid_range_check_and_explicit_bounds_both_enforced() -> None:
+    """Explicit minDate/maxDate and minValue/maxValue remain enforced alongside NE RangeChecks."""
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_HYB",
+                variables=[
+                    DDVariable(
+                        variableName="VIS_DATE",
+                        variableType="Date",
+                        extraAttributes={
+                            "minDate": "2025-01-01",
+                            "maxDate": "2025-12-31",
+                            "rangeChecks": [
+                                {
+                                    "comparator": "NE",
+                                    "softHard": "Hard",
+                                    "checkValue": "2025-07-04",
+                                }
+                            ],
+                        },
+                    ),
+                    DDVariable(
+                        variableName="DOSE",
+                        variableType="Integer",
+                        extraAttributes={
+                            "minValue": 10,
+                            "maxValue": 100,
+                            "rangeChecks": [
+                                {"comparator": "NE", "softHard": "Hard", "checkValue": "50"}
+                            ],
+                        },
+                    ),
+                ],
+            )
+        ]
+    )
+
+    validate_record_data(dd, "F_HYB", {"VIS_DATE": "2025-06-01", "DOSE": 25})
+    with pytest.raises(ValidationError, match="2025-07-04"):
+        validate_record_data(dd, "F_HYB", {"VIS_DATE": "2025-07-04", "DOSE": 25})
+    with pytest.raises(ValidationError, match="before minimum date '2025-01-01'"):
+        validate_record_data(dd, "F_HYB", {"VIS_DATE": "2024-12-31", "DOSE": 25})
+    with pytest.raises(ValidationError, match="50"):
+        validate_record_data(dd, "F_HYB", {"VIS_DATE": "2025-06-01", "DOSE": 50})
+    with pytest.raises(ValidationError, match="below minimum 10"):
+        validate_record_data(dd, "F_HYB", {"VIS_DATE": "2025-06-01", "DOSE": 5})

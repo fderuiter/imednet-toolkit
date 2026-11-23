@@ -7,7 +7,12 @@ import io
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
+from ..logic import (
+    build_redcap_conditional_required_logic,
+    compile_redcap_branching_logic,
+)
 from ..models import (
+    BusinessLogicRule,
     Choice,
     DataDictionary,
     Form,
@@ -295,9 +300,13 @@ def load_from_redcap(
         else:
             header_map[raw_col] = to_camel_case(raw_col.strip())
 
+    if "variableName" not in header_map.values():
+        record_warning("REDCap CSV is missing required 'Variable / Field Name' header column.")
+
     # 2. Iterate rows and group variables by form
     forms_order: list[str] = []
     forms_vars: dict[str, list[Variable]] = {}
+    forms_rules: dict[str, list[BusinessLogicRule]] = {}
 
     for row_idx, raw_row in enumerate(reader, start=1):
         if not raw_row or not any(v and v.strip() for v in raw_row.values()):
@@ -335,6 +344,7 @@ def load_from_redcap(
         if form_key not in forms_vars:
             forms_order.append(form_key)
             forms_vars[form_key] = []
+            forms_rules[form_key] = []
 
         field_type = known.get("fieldType")
         val_type = known.get("textValidationType")
@@ -344,6 +354,10 @@ def load_from_redcap(
         raw_choices = known.get("choices")
         if (field_type or "").lower() == "calc" and raw_choices:
             extra["calculation"] = raw_choices
+        elif (field_type or "").lower() == "sql":
+            extra["originalFieldType"] = "sql"
+            if raw_choices:
+                extra["sqlQuery"] = raw_choices
 
         for extra_key in (
             "branchingLogic",
@@ -373,7 +387,33 @@ def load_from_redcap(
         choices = _parse_redcap_choices(raw_choices, field_type)
 
         req_raw = (known.get("requiredField") or "").lower()
-        req_val = "Yes" if req_raw in ("y", "yes", "1", "true") else ("No" if req_raw else None)
+        is_req = req_raw in ("y", "yes", "1", "true")
+        branching_raw = known.get("branchingLogic") or ""
+        branching_valid = False
+        if branching_raw:
+            try:
+                compile_redcap_branching_logic(branching_raw)
+                branching_valid = True
+            except ValueError as exc:
+                record_warning(f"Malformed branchingLogic on variable '{var_name}': {exc}")
+
+        if is_req and branching_raw and branching_valid:
+            req_val: str | None = "No"
+            extra["conditionalRequired"] = True
+            cond_rule_logic = build_redcap_conditional_required_logic(branching_raw, var_name)
+            forms_rules[form_key].append(
+                BusinessLogicRule(
+                    id=f"RC_REQ_{form_key}_{var_name}",
+                    name=f"Conditional Required: {var_name}",
+                    type="Required",
+                    status="Active",
+                    form=form_key,
+                    sequence=len(forms_rules[form_key]) + 1,
+                    logic=cond_rule_logic,
+                )
+            )
+        else:
+            req_val = "Yes" if is_req else ("No" if req_raw else None)
 
         seq = len(forms_vars[form_key]) + 1
 
@@ -400,6 +440,7 @@ def load_from_redcap(
             formId=None,
             formType=normalize_form_type(None, default="Subject"),
             variables=forms_vars[f_key],
+            businessLogic=forms_rules[f_key],
         )
         forms.append(form)
 

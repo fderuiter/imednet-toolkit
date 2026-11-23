@@ -364,9 +364,19 @@ def normalize_variable_bounds(extra_attrs: dict[str, Any] | None) -> list[dict[s
                     entry["checkValues"] = vals
             elif (cv := rc.get("checkValue")) is not None and str(cv).strip():
                 entry["checkValue"] = str(cv).strip()
-            if (fe := rc.get("formalExpression")) is not None and str(fe).strip():
+            fe = rc.get("formalExpression")
+            if isinstance(fe, dict):
+                if (expr := fe.get("expression")) is not None and str(expr).strip():
+                    entry["formalExpression"] = str(expr).strip()
+                if (fe_ctx := fe.get("context")) is not None and str(fe_ctx).strip():
+                    entry["context"] = str(fe_ctx).strip()
+            elif fe is not None and str(fe).strip():
                 entry["formalExpression"] = str(fe).strip()
-            if (ctx := rc.get("context")) is not None and str(ctx).strip():
+            if (
+                "context" not in entry
+                and (ctx := rc.get("context")) is not None
+                and str(ctx).strip()
+            ):
                 entry["context"] = str(ctx).strip()
             if (mu_oid := rc.get("measurementUnitOid")) is not None and str(mu_oid).strip():
                 entry["measurementUnitOid"] = str(mu_oid).strip()
@@ -377,21 +387,27 @@ def normalize_variable_bounds(extra_attrs: dict[str, Any] | None) -> list[dict[s
             return normalized_checks
 
     bounds: list[dict[str, Any]] = []
+    min_hard = "Soft"
     min_val: Any = None
-    for k in ("textValidationMin", "minValue", "min", "minimum"):
+    for k in ("textValidationMin", "minValue", "min", "minimum", "minDate", "hardMin", "softMin"):
         if k in extra_attrs and extra_attrs[k] is not None and str(extra_attrs[k]).strip():
             min_val = str(extra_attrs[k]).strip()
+            if k == "hardMin":
+                min_hard = "Hard"
             break
     if min_val is not None:
-        bounds.append({"comparator": "GE", "softHard": "Soft", "checkValue": min_val})
+        bounds.append({"comparator": "GE", "softHard": min_hard, "checkValue": min_val})
 
+    max_hard = "Soft"
     max_val: Any = None
-    for k in ("textValidationMax", "maxValue", "max", "maximum"):
+    for k in ("textValidationMax", "maxValue", "max", "maximum", "maxDate", "hardMax", "softMax"):
         if k in extra_attrs and extra_attrs[k] is not None and str(extra_attrs[k]).strip():
             max_val = str(extra_attrs[k]).strip()
+            if k == "hardMax":
+                max_hard = "Hard"
             break
     if max_val is not None:
-        bounds.append({"comparator": "LE", "softHard": "Soft", "checkValue": max_val})
+        bounds.append({"comparator": "LE", "softHard": max_hard, "checkValue": max_val})
 
     return bounds
 

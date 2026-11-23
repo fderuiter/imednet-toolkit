@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import calendar
 import logging
+import math
 import random
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 from pydantic import Field
 
 from imednet.spi.models import ImednetBaseModel
-from imednet.spi.validation import DataDictionary, extract_variable_constraints
+from imednet.spi.validation import (
+    DataDictionary,
+    RangeCheckConstraint,
+    VariableConstraints,
+    extract_variable_constraints,
+)
 
 from .inspector import StudySnapshot
 from .models import (
@@ -84,6 +91,182 @@ class SyntheticRecordGenerator:
             sentences.append(" ".join(sentence_words) + ".")
         return " ".join(sentences)
 
+    @staticmethod
+    def _matches_numeric_bound(raw: str | None, bound: float | None) -> bool:
+        if raw is None or bound is None:
+            return False
+        try:
+            return math.isclose(float(raw), bound, rel_tol=1e-9, abs_tol=1e-12)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _parse_iso_date_bound(raw: str | None, *, is_upper: bool) -> date | None:
+        if not raw or not raw.strip():
+            return None
+        s = raw.strip()
+        if len(s) == 4 and s.isdigit():
+            yr = int(s)
+            return date(yr, 12, 31) if is_upper else date(yr, 1, 1)
+        if len(s) == 7 and s[4] == "-" and s[:4].isdigit() and s[5:7].isdigit():
+            yr, mo = int(s[:4]), int(s[5:7])
+            if 1 <= mo <= 12:
+                last_day = calendar.monthrange(yr, mo)[1]
+                return date(yr, mo, last_day) if is_upper else date(yr, mo, 1)
+            return None
+        date_part = s.split("T", 1)[0].split(" ", 1)[0]
+        try:
+            return date.fromisoformat(date_part)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _parse_iso_datetime_bound(cls, raw: str | None, *, is_upper: bool) -> datetime | None:
+        if not raw or not raw.strip():
+            return None
+        s = raw.strip()
+        if "T" in s or " " in s:
+            norm = s.replace(" ", "T", 1)
+            if norm.endswith("Z"):
+                norm = norm[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(norm)
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+                return parsed
+            except ValueError:
+                return None
+        d_bound = cls._parse_iso_date_bound(s, is_upper=is_upper)
+        if d_bound is None:
+            return None
+        return datetime.combine(
+            d_bound,
+            time(23, 59, 59) if is_upper else time(0, 0, 0),
+        )
+
+    @staticmethod
+    def _parse_iso_time_seconds(raw: str | None) -> int | None:
+        if not raw or not raw.strip():
+            return None
+        s = raw.strip()
+        if "T" in s:
+            s = s.split("T", 1)[1]
+        for tz_sep in ("Z", "+", "-"):
+            if tz_sep in s:
+                s = s.split(tz_sep, 1)[0]
+        try:
+            t_val = time.fromisoformat(s)
+        except ValueError:
+            return None
+        return t_val.hour * 3600 + t_val.minute * 60 + t_val.second
+
+    @staticmethod
+    def _format_time_seconds(total_seconds: int) -> str:
+        clamped = max(0, min(86399, total_seconds))
+        hh, rem = divmod(clamped, 3600)
+        mm, ss = divmod(rem, 60)
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+    @classmethod
+    def _apply_range_checks_to_updates(
+        cls,
+        v: UATVariableSpec,
+        constraints: VariableConstraints,
+        eff_min: float | None,
+        eff_max: float | None,
+        updates: dict[str, Any],
+    ) -> None:
+        in_values: list[str] = []
+        excluded: list[str] = list(v.excluded_values)
+        range_checks: tuple[RangeCheckConstraint, ...] = constraints.range_checks
+
+        for rc in range_checks:
+            comp = (rc.comparator or "").upper()
+            if comp == "IN" and rc.check_values:
+                for val in rc.check_values:
+                    if val not in in_values:
+                        in_values.append(val)
+            elif comp == "EQ" and rc.check_value is not None:
+                if rc.check_value not in in_values:
+                    in_values.append(rc.check_value)
+            elif comp == "NE" and rc.check_value is not None:
+                if rc.check_value not in excluded:
+                    excluded.append(rc.check_value)
+            elif comp == "NOTIN" and rc.check_values:
+                for val in rc.check_values:
+                    if val not in excluded:
+                        excluded.append(val)
+            elif (
+                comp == "GT"
+                and rc.check_value is not None
+                and not v.min_exclusive
+                and (
+                    cls._matches_numeric_bound(rc.check_value, eff_min)
+                    or (
+                        constraints.min_date is not None
+                        and rc.check_value.strip() == constraints.min_date
+                    )
+                )
+            ):
+                updates["min_exclusive"] = True
+            elif (
+                comp == "LT"
+                and rc.check_value is not None
+                and not v.max_exclusive
+                and (
+                    cls._matches_numeric_bound(rc.check_value, eff_max)
+                    or (
+                        constraints.max_date is not None
+                        and rc.check_value.strip() == constraints.max_date
+                    )
+                )
+            ):
+                updates["max_exclusive"] = True
+
+        if not v.coded_values:
+            if constraints.choices:
+                filtered = [c for c in constraints.choices if c not in excluded]
+                updates["coded_values"] = filtered or list(constraints.choices)
+            elif in_values:
+                filtered = [c for c in in_values if c not in excluded]
+                updates["coded_values"] = filtered or in_values
+
+        if excluded != v.excluded_values:
+            updates["excluded_values"] = excluded
+
+    @classmethod
+    def enrich_variable_spec(
+        cls, v: UATVariableSpec, constraints: VariableConstraints
+    ) -> UATVariableSpec:
+        """Return an enriched copy of ``v`` populated from ``VariableConstraints``."""
+        updates: dict[str, Any] = {}
+        eff_min = (
+            constraints.min_value
+            if constraints.min_value is not None
+            else constraints.soft_min_value
+        )
+        eff_max = (
+            constraints.max_value
+            if constraints.max_value is not None
+            else constraints.soft_max_value
+        )
+        if v.min_value is None and eff_min is not None:
+            updates["min_value"] = eff_min
+        if v.max_value is None and eff_max is not None:
+            updates["max_value"] = eff_max
+        if v.min_date is None and constraints.min_date is not None:
+            updates["min_date"] = constraints.min_date
+        if v.max_date is None and constraints.max_date is not None:
+            updates["max_date"] = constraints.max_date
+        cls._apply_range_checks_to_updates(v, constraints, eff_min, eff_max, updates)
+        if v.max_length is None and constraints.max_length is not None:
+            updates["max_length"] = constraints.max_length
+        if not v.required and constraints.required_policy == "yes":
+            updates["required"] = True
+        if not updates:
+            return v
+        return v.model_copy(update=updates)
+
     def _enrich_form_spec(
         self, form_spec: UATFormSpec, data_dictionary: DataDictionary | None
     ) -> UATFormSpec:
@@ -102,22 +285,10 @@ class SyntheticRecordGenerator:
                 enriched_vars.append(v)
                 continue
             constraints = extract_variable_constraints(dd_var)
-            updates: dict[str, Any] = {}
-            if not v.coded_values and constraints.choices:
-                updates["coded_values"] = list(constraints.choices)
-            if v.min_value is None and constraints.min_value is not None:
-                updates["min_value"] = constraints.min_value
-            if v.max_value is None and constraints.max_value is not None:
-                updates["max_value"] = constraints.max_value
-            if v.max_length is None and constraints.max_length is not None:
-                updates["max_length"] = constraints.max_length
-            if not v.required and constraints.required_policy == "yes":
-                updates["required"] = True
-            if updates:
+            enriched_v = self.enrich_variable_spec(v, constraints)
+            if enriched_v is not v:
                 changed = True
-                enriched_vars.append(v.model_copy(update=updates))
-            else:
-                enriched_vars.append(v)
+            enriched_vars.append(enriched_v)
 
         if not changed:
             return form_spec
@@ -241,12 +412,160 @@ class SyntheticRecordGenerator:
 
         return self._synthesize_value(var_spec, spec)
 
+    @classmethod
+    def _effective_int_bounds(cls, var_spec: UATVariableSpec) -> tuple[int, int]:
+        lo = math.ceil(var_spec.min_value) if var_spec.min_value is not None else 1
+        hi = math.floor(var_spec.max_value) if var_spec.max_value is not None else max(100, lo)
+        if (
+            var_spec.min_exclusive
+            and var_spec.min_value is not None
+            and math.isclose(var_spec.min_value, lo)
+        ):
+            lo += 1
+        if (
+            var_spec.max_exclusive
+            and var_spec.max_value is not None
+            and math.isclose(var_spec.max_value, hi)
+        ):
+            hi -= 1
+        hi = max(hi, lo)
+        excluded_ints: set[int] = set()
+        for ex in var_spec.excluded_values:
+            try:
+                excluded_ints.add(int(float(ex)))
+            except ValueError:
+                continue
+        while lo in excluded_ints and lo < hi:
+            lo += 1
+        while hi in excluded_ints and hi > lo:
+            hi -= 1
+        return lo, hi
+
+    @classmethod
+    def _effective_float_bounds(cls, var_spec: UATVariableSpec) -> tuple[float, float]:
+        lo = var_spec.min_value if var_spec.min_value is not None else 1.0
+        hi = var_spec.max_value if var_spec.max_value is not None else max(100.0, lo)
+        if var_spec.min_value is not None and var_spec.max_value is not None:
+            span = max(0.0, hi - lo)
+            delta = 1.0 if span > 2.0 else (round(span * 0.25, 4) if span > 0 else 0.01)
+        else:
+            delta = 1.0
+        if var_spec.min_exclusive and var_spec.min_value is not None:
+            lo = round(lo + delta, 4)
+        if var_spec.max_exclusive and var_spec.max_value is not None:
+            hi = round(hi - delta, 4)
+        hi = max(hi, lo)
+        return lo, hi
+
+    @classmethod
+    def _effective_date_bounds(
+        cls, var_spec: UATVariableSpec, spec: UATSpecification
+    ) -> tuple[date, date]:
+        lo_d = cls._parse_iso_date_bound(var_spec.min_date, is_upper=False)
+        hi_d = cls._parse_iso_date_bound(var_spec.max_date, is_upper=True)
+        if lo_d is not None and var_spec.min_exclusive:
+            lo_d = lo_d + timedelta(days=1)
+        if hi_d is not None and var_spec.max_exclusive:
+            hi_d = hi_d - timedelta(days=1)
+        anchor = spec.global_date_value or date.today()
+        if lo_d is None and hi_d is None:
+            return anchor, anchor
+        if lo_d is None and hi_d is not None:
+            lo_d = min(anchor, hi_d - timedelta(days=30))
+        if hi_d is None and lo_d is not None:
+            hi_d = max(anchor, lo_d + timedelta(days=30))
+        assert lo_d is not None
+        assert hi_d is not None
+        hi_d = max(hi_d, lo_d)
+        return lo_d, hi_d
+
+    @classmethod
+    def _effective_datetime_bounds(cls, var_spec: UATVariableSpec) -> tuple[datetime, datetime]:
+        lo_dt = cls._parse_iso_datetime_bound(var_spec.min_date, is_upper=False)
+        hi_dt = cls._parse_iso_datetime_bound(var_spec.max_date, is_upper=True)
+        if lo_dt is not None and var_spec.min_exclusive:
+            lo_dt = lo_dt + timedelta(seconds=1)
+        if hi_dt is not None and var_spec.max_exclusive:
+            hi_dt = hi_dt - timedelta(seconds=1)
+        anchor = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+        if lo_dt is None and hi_dt is None:
+            return anchor, anchor
+        if lo_dt is None and hi_dt is not None:
+            lo_dt = min(anchor, hi_dt - timedelta(days=1))
+        if hi_dt is None and lo_dt is not None:
+            hi_dt = max(anchor, lo_dt + timedelta(days=1))
+        assert lo_dt is not None
+        assert hi_dt is not None
+        hi_dt = max(hi_dt, lo_dt)
+        return lo_dt, hi_dt
+
+    @classmethod
+    def _effective_time_bounds(cls, var_spec: UATVariableSpec) -> tuple[int, int]:
+        lo_sec = cls._parse_iso_time_seconds(var_spec.min_date)
+        hi_sec = cls._parse_iso_time_seconds(var_spec.max_date)
+        if lo_sec is not None and var_spec.min_exclusive:
+            lo_sec += 1
+        if hi_sec is not None and var_spec.max_exclusive:
+            hi_sec -= 1
+        if lo_sec is None and hi_sec is None:
+            return 43200, 43200
+        if lo_sec is None and hi_sec is not None:
+            lo_sec = max(0, hi_sec - 3600)
+        if hi_sec is None and lo_sec is not None:
+            hi_sec = min(86399, lo_sec + 3600)
+        assert lo_sec is not None
+        assert hi_sec is not None
+        lo_sec = max(0, min(86399, lo_sec))
+        hi_sec = max(lo_sec, min(86399, hi_sec))
+        return lo_sec, hi_sec
+
+    def _boundary_value(
+        self, var_spec: UATVariableSpec, spec: UATSpecification, *, is_upper: bool
+    ) -> str | None:
+        """Compute lower or upper BOUNDARY string for numeric or temporal variables."""
+        v_norm = (var_spec.variable_type or "").strip().lower()
+        if v_norm in ("integer", "int"):
+            if var_spec.coded_values:
+                return var_spec.coded_values[-1 if is_upper else 0]
+            lo_i, hi_i = self._effective_int_bounds(var_spec)
+            if not is_upper and var_spec.min_value is None:
+                return "1"
+            if is_upper and var_spec.max_value is None:
+                return "100"
+            return str(hi_i if is_upper else lo_i)
+
+        if v_norm in ("number", "float", "decimal", "slider", "calculation"):
+            if var_spec.coded_values:
+                return var_spec.coded_values[-1 if is_upper else 0]
+            lo_f, hi_f = self._effective_float_bounds(var_spec)
+            if not is_upper:
+                if var_spec.min_value is None:
+                    return "1"
+                return str(lo_f) if var_spec.min_exclusive else str(var_spec.min_value)
+            if var_spec.max_value is None:
+                return "100"
+            return str(hi_f) if var_spec.max_exclusive else str(var_spec.max_value)
+
+        if v_norm in ("date", "date/time precision", "datetime precision", "date ymd"):
+            lo_d, hi_d = self._effective_date_bounds(var_spec, spec)
+            return (hi_d if is_upper else lo_d).isoformat()
+
+        if v_norm in ("datetime", "date/time", "durationdatetime", "intervaldatetime"):
+            lo_dt, hi_dt = self._effective_datetime_bounds(var_spec)
+            return (hi_dt if is_upper else lo_dt).strftime("%Y-%m-%dT%H:%M:%S")
+
+        if v_norm == "time":
+            lo_sec, hi_sec = self._effective_time_bounds(var_spec)
+            return self._format_time_seconds(hi_sec if is_upper else lo_sec)
+
+        return None
+
     def _synthesize_value(self, var_spec: UATVariableSpec, spec: UATSpecification) -> str:
         """Return a mocked value appropriate for the canonical variable type."""
         v_type = var_spec.variable_type
         v_norm = (v_type or "").strip().lower()
 
-        if v_norm in ("coded", "radio", "single select"):
+        if v_norm in ("coded", "radio", "single select", "dropdown", "select"):
             if var_spec.coded_values:
                 return self._rng.choice(var_spec.coded_values)
             return ""
@@ -267,34 +586,61 @@ class SyntheticRecordGenerator:
             if var_spec.coded_values:
                 return self._rng.choice(var_spec.coded_values)
             max_len = var_spec.max_length or spec.global_text_length or 10
-            return self._lexify("?" * max_len)
+            candidate = self._lexify("?" * max_len)
+            if var_spec.excluded_values and candidate in var_spec.excluded_values:
+                for _ in range(5):
+                    candidate = self._lexify("?" * max_len)
+                    if candidate not in var_spec.excluded_values:
+                        break
+            return candidate
 
         if v_norm in ("number", "integer", "int"):
             if var_spec.coded_values:
                 return self._rng.choice(var_spec.coded_values)
-            min_i = int(var_spec.min_value) if var_spec.min_value is not None else 1
-            max_i = int(var_spec.max_value) if var_spec.max_value is not None else max(100, min_i)
-            max_i = max(max_i, min_i)
-            return str(self._rng.randint(min_i, max_i))
+            min_i, max_i = self._effective_int_bounds(var_spec)
+            chosen_i = self._rng.randint(min_i, max_i)
+            if var_spec.excluded_values and str(chosen_i) in var_spec.excluded_values:
+                for cand in range(min_i, max_i + 1):
+                    if str(cand) not in var_spec.excluded_values:
+                        chosen_i = cand
+                        break
+            return str(chosen_i)
 
         if v_norm in ("float", "decimal", "slider"):
             if var_spec.coded_values:
                 return self._rng.choice(var_spec.coded_values)
-            min_f = var_spec.min_value if var_spec.min_value is not None else 1.0
-            max_f = var_spec.max_value if var_spec.max_value is not None else max(100.0, min_f)
-            max_f = max(max_f, min_f)
+            min_f, max_f = self._effective_float_bounds(var_spec)
             val = self._rng.uniform(min_f, max_f)
-            return f"{val:.2f}"
+            formatted = f"{val:.2f}"
+            if var_spec.excluded_values and formatted in var_spec.excluded_values:
+                mid = (min_f + max_f) / 2.0
+                formatted = f"{mid:.2f}"
+            return formatted
 
-        if v_norm in ("date", "date/time precision"):
+        if v_norm in ("date", "date/time precision", "datetime precision", "date ymd"):
+            if var_spec.min_date is not None or var_spec.max_date is not None:
+                lo_d, hi_d = self._effective_date_bounds(var_spec, spec)
+                if spec.global_date_value and lo_d <= spec.global_date_value <= hi_d:
+                    return spec.global_date_value.isoformat()
+                span_days = max(0, (hi_d - lo_d).days)
+                offset = self._rng.randint(0, span_days)
+                return (lo_d + timedelta(days=offset)).isoformat()
             if spec.global_date_value:
                 return spec.global_date_value.isoformat()
             return date.today().isoformat()
 
-        if v_norm == "datetime":
+        if v_norm in ("datetime", "date/time", "durationdatetime", "intervaldatetime"):
+            if var_spec.min_date is not None or var_spec.max_date is not None:
+                lo_dt, hi_dt = self._effective_datetime_bounds(var_spec)
+                span_sec = max(0, int((hi_dt - lo_dt).total_seconds()))
+                offset_sec = self._rng.randint(0, span_sec)
+                return (lo_dt + timedelta(seconds=offset_sec)).strftime("%Y-%m-%dT%H:%M:%S")
             return datetime.now(UTC).isoformat()
 
         if v_norm == "time":
+            if var_spec.min_date is not None or var_spec.max_date is not None:
+                lo_sec, hi_sec = self._effective_time_bounds(var_spec)
+                return self._format_time_seconds(self._rng.randint(lo_sec, hi_sec))
             return "12:00:00"
 
         if v_norm == "textarea":
@@ -304,9 +650,7 @@ class SyntheticRecordGenerator:
             return text
 
         if v_norm == "calculation":
-            min_c = var_spec.min_value if var_spec.min_value is not None else 1.0
-            max_c = var_spec.max_value if var_spec.max_value is not None else max(100.0, min_c)
-            max_c = max(max_c, min_c)
+            min_c, max_c = self._effective_float_bounds(var_spec)
             return str(int(self._rng.uniform(min_c, max_c)))
 
         if v_norm in ("signature", "file", "descriptive"):
@@ -357,13 +701,13 @@ class SyntheticRecordGenerator:
             # Min boundary
             data_min = {}
             for v in form_spec.variables:
-                if v.strategy == VariableTestStrategy.BOUNDARY and v.variable_type in (
-                    "Number",
-                    "Integer",
-                    "Float",
-                    "Decimal",
-                ):
-                    data_min[v.variable_name] = str(v.min_value) if v.min_value is not None else "1"
+                b_min = (
+                    self._boundary_value(v, spec, is_upper=False)
+                    if v.strategy == VariableTestStrategy.BOUNDARY
+                    else None
+                )
+                if b_min is not None:
+                    data_min[v.variable_name] = b_min
                 else:
                     val = self._generate_value(v, spec)
                     if val is not None:
@@ -374,15 +718,13 @@ class SyntheticRecordGenerator:
             # Max boundary
             data_max = {}
             for v in form_spec.variables:
-                if v.strategy == VariableTestStrategy.BOUNDARY and v.variable_type in (
-                    "Number",
-                    "Integer",
-                    "Float",
-                    "Decimal",
-                ):
-                    data_max[v.variable_name] = (
-                        str(v.max_value) if v.max_value is not None else "100"
-                    )
+                b_max = (
+                    self._boundary_value(v, spec, is_upper=True)
+                    if v.strategy == VariableTestStrategy.BOUNDARY
+                    else None
+                )
+                if b_max is not None:
+                    data_max[v.variable_name] = b_max
                 else:
                     val = self._generate_value(v, spec)
                     if val is not None:

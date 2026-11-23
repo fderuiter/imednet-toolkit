@@ -20,6 +20,10 @@ DEFAULT_SAFE_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "str": str,
     "bool": bool,
     "len": len,
+    "abs": abs,
+    "round": round,
+    "min": min,
+    "max": max,
 }
 
 # Default allowed method names (safe read-only operations only)

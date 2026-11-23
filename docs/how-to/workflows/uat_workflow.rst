@@ -56,8 +56,9 @@ Enriching Synthetic Data with a Data Dictionary
 
 REST ``/variables`` metadata exposes basic Variable types (such as ``Number``, ``Float``, and ``Coded``) without Choice codelists, numeric ranges, text length limits, or required-field policies. Passing a :class:`~imednet.datadict.models.DataDictionary` via ``data_dictionary=...`` to :class:`~imednet_workflows.uat.UATWorkflow`, :class:`~imednet_workflows.uat.UATSpecificationBuilder`, or :class:`~imednet_workflows.uat.SyntheticRecordGenerator` enriches each :class:`~imednet_workflows.uat.UATVariableSpec` with:
 
-- ``coded_values`` from :class:`~imednet.datadict.models.Choice` definitions (so ``Radio``, ``Single Select``, ``Multi Select``, ``Checkbox``, and ``Yes/No`` Variables emit valid Study codes),
-- ``min_value`` and ``max_value`` numeric bounds,
+- ``coded_values`` from :class:`~imednet.datadict.models.Choice` definitions and ODM ``IN`` / ``EQ`` ``RangeCheck`` constraints (while filtering ``NE`` / ``NOTIN`` ``excluded_values``),
+- ``min_value`` and ``max_value`` numeric bounds (including ``Soft`` warning bounds and strict ``GT`` / ``LT`` exclusivity for ``BOUNDARY`` and ``SYNTHETIC`` strategies),
+- ``min_date`` and ``max_date`` ISO temporal bounds for ``Date``, ``DateTime``, ``Date/Time Precision``, and ``Time`` Variables,
 - ``max_length`` text length caps, and
 - ``required=True`` when the Variable's required policy is ``Yes``.
 

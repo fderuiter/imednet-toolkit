@@ -25,7 +25,22 @@ from typing import (
 from typing_extensions import Protocol, runtime_checkable
 
 from imednet.core.context import get_study_context
-from imednet.datadict.logic import LogicTreeEvaluator, extract_variable_constraints
+from imednet.datadict.logic import (
+    LogicTreeEvaluator,
+    RangeCheckConstraint,
+    _to_finite_float,
+    compare_temporal_strings,
+    compile_odm_formal_expression,
+    compile_redcap_branching_logic,
+    evaluate_compiled_ast_expression,
+    extract_variable_constraints,
+    is_valid_iso_date,
+    is_valid_iso_datetime,
+    is_valid_iso_datetime_precision,
+    is_valid_iso_duration_datetime,
+    is_valid_iso_interval_datetime,
+    is_valid_iso_time,
+)
 from imednet.datadict.models import DataDictionary
 from imednet.errors import UnknownVariableTypeError, ValidationError
 from imednet.utils.security import global_sensitivity_registry
@@ -482,6 +497,56 @@ def _validate_text(value: Any) -> None:
         raise ValidationError("Value must be a string")
 
 
+def _validate_date(value: Any) -> None:
+    """Validate that the value is a strict calendar ISO YYYY-MM-DD date string."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be an ISO YYYY-MM-DD date string")
+    if not is_valid_iso_date(value):
+        raise ValidationError("Invalid calendar date; expected ISO YYYY-MM-DD")
+
+
+def _validate_datetime(value: Any) -> None:
+    """Validate that the value is a strict calendar+clock ISO datetime string."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be an ISO datetime string")
+    if not is_valid_iso_datetime(value):
+        raise ValidationError("Invalid datetime; expected ISO YYYY-MM-DDTHH:MM[:SS]")
+
+
+def _validate_duration_datetime(value: Any) -> None:
+    """Validate that the value is an ISO-8601 duration or datetime string."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be an ISO duration or datetime string")
+    if not is_valid_iso_duration_datetime(value):
+        raise ValidationError("Invalid duration/datetime; expected ISO-8601 format")
+
+
+def _validate_interval_datetime(value: Any) -> None:
+    """Validate that the value is an ISO-8601 interval or datetime string."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be an ISO interval or datetime string")
+    if not is_valid_iso_interval_datetime(value):
+        raise ValidationError("Invalid interval/datetime; expected ISO-8601 format")
+
+
+def _validate_datetime_precision(value: Any) -> None:
+    """Validate partial or full ISO date/time precision strings."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be an ISO partial or full date/time string")
+    if not is_valid_iso_datetime_precision(value):
+        raise ValidationError(
+            "Invalid date/time precision; expected YYYY, YYYY-MM, YYYY-MM-DD, or ISO datetime"
+        )
+
+
+def _validate_time(value: Any) -> None:
+    """Validate that the value is a strict 24-hour clock ISO HH:MM[:SS] string."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be an ISO HH:MM[:SS] time string")
+    if not is_valid_iso_time(value):
+        raise ValidationError("Invalid clock time; expected 24-hour HH:MM[:SS]")
+
+
 def _validate_single_choice(value: Any) -> None:
     """Validate that a single-choice categorical value is text or a whole-number code."""
     if isinstance(value, str):
@@ -578,19 +643,19 @@ _CANONICAL_VARIABLE_TAXONOMY: dict[str, tuple[str, Any, Callable[[Any], None]]] 
     "notes": ("memo", "example memo", _validate_text),
     "note": ("memo", "example memo", _validate_text),
     # Temporal & precision date/time types
-    "date": ("date", "2024-01-01", _validate_text),
-    "date ymd": ("date", "2024-01-01", _validate_text),
-    "date mdy": ("date", "2024-01-01", _validate_text),
-    "date dmy": ("date", "2024-01-01", _validate_text),
-    "datetime": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "date/time": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "date time": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "durationdatetime": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "intervaldatetime": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "date/time precision": ("date/time precision", "2024-01-01", _validate_text),
-    "datetime precision": ("date/time precision", "2024-01-01", _validate_text),
-    "date time precision": ("date/time precision", "2024-01-01", _validate_text),
-    "time": ("time", "12:00:00", _validate_text),
+    "date": ("date", "2024-01-01", _validate_date),
+    "date ymd": ("date", "2024-01-01", _validate_date),
+    "date mdy": ("date", "2024-01-01", _validate_date),
+    "date dmy": ("date", "2024-01-01", _validate_date),
+    "datetime": ("datetime", "2024-01-01T00:00:00", _validate_datetime),
+    "date/time": ("datetime", "2024-01-01T00:00:00", _validate_datetime),
+    "date time": ("datetime", "2024-01-01T00:00:00", _validate_datetime),
+    "durationdatetime": ("datetime", "2024-01-01T00:00:00", _validate_duration_datetime),
+    "intervaldatetime": ("datetime", "2024-01-01T00:00:00", _validate_interval_datetime),
+    "date/time precision": ("date/time precision", "2024-01-01", _validate_datetime_precision),
+    "datetime precision": ("date/time precision", "2024-01-01", _validate_datetime_precision),
+    "date time precision": ("date/time precision", "2024-01-01", _validate_datetime_precision),
+    "time": ("time", "12:00:00", _validate_time),
     # Computed & range types
     "calculation": ("calculation", 1, _validate_calculation),
     "calc": ("calculation", 1, _validate_calculation),
@@ -644,10 +709,10 @@ for _key, _validator in list(_NORMALIZED_TYPE_VALIDATORS.items()):
 _TYPE_VALIDATORS.update(
     {
         "TextArea": _validate_text,
-        "DateTime": _validate_text,
-        "DateTimePrecision": _validate_text,
-        "DurationDateTime": _validate_text,
-        "IntervalDateTime": _validate_text,
+        "DateTime": _validate_datetime,
+        "DateTimePrecision": _validate_datetime_precision,
+        "DurationDateTime": _validate_duration_datetime,
+        "IntervalDateTime": _validate_interval_datetime,
         "RadioButton": _validate_single_choice,
         "DropdownList": _validate_single_choice,
         "SingleSelect": _validate_single_choice,
@@ -657,6 +722,27 @@ _TYPE_VALIDATORS.update(
         "FileUpload": _validate_text,
     }
 )
+
+_TEMPORAL_VALIDATOR_FNS = frozenset(
+    {
+        _validate_date,
+        _validate_datetime,
+        _validate_duration_datetime,
+        _validate_interval_datetime,
+        _validate_datetime_precision,
+        _validate_time,
+    }
+)
+
+
+def is_known_variable_type(var_type: str | None) -> bool:
+    """Return True if ``var_type`` resolves to a canonical validator."""
+    if not var_type or not var_type.strip():
+        return False
+    if var_type in _TYPE_VALIDATORS:
+        return True
+    norm = _normalize_variable_type_key(var_type)
+    return bool(norm and norm in _NORMALIZED_TYPE_VALIDATORS)
 
 
 @lru_cache(maxsize=256)
@@ -793,6 +879,203 @@ def _display_constraint_value(name: str, value: Any) -> Any:
     if global_sensitivity_registry.is_sensitive(name):
         return MASKED_SENTINEL
     return value
+
+
+def _mask_phi_in_text(message: str, data: Mapping[str, Any]) -> str:
+    """Redact any PHI variable values from ``data`` that appear in a diagnostic string."""
+    redacted = message
+    for key, val in data.items():
+        if not global_sensitivity_registry.is_sensitive(key) or val is None:
+            continue
+        if isinstance(val, (list, tuple, set, frozenset)):
+            candidates = [str(item) for item in val if item is not None and str(item)]
+        else:
+            sval = str(val)
+            candidates = [sval] if sval else []
+        for cand in candidates:
+            if cand and cand != MASKED_SENTINEL and cand in redacted:
+                redacted = redacted.replace(cand, MASKED_SENTINEL)
+    return redacted
+
+
+def _validate_temporal_bounds(
+    name: str,
+    form_key: str,
+    value: Any,
+    min_date: str | None,
+    max_date: str | None,
+) -> None:
+    if not isinstance(value, str) or not value.strip():
+        return
+    shown_val = _display_constraint_value(name, value)
+    if min_date is not None:
+        cmp_min = compare_temporal_strings(value, ">=", min_date)
+        if cmp_min is False:
+            raise ValidationError(
+                f"Value '{shown_val}' for variable '{name}' on form '{form_key}' "
+                f"is before minimum date '{min_date}'"
+            )
+    if max_date is not None:
+        cmp_max = compare_temporal_strings(value, "<=", max_date)
+        if cmp_max is False:
+            raise ValidationError(
+                f"Value '{shown_val}' for variable '{name}' on form '{form_key}' "
+                f"is after maximum date '{max_date}'"
+            )
+
+
+def _check_single_range_check(
+    name: str,
+    value: Any,
+    rc: RangeCheckConstraint,
+    data: Mapping[str, Any],
+) -> bool:
+    """Return True if ``value`` satisfies ``rc``, or False if violated."""
+    comp = (rc.comparator or "").upper()
+    if comp in {"IN", "NOTIN"}:
+        allowed_vals = rc.check_values or ((rc.check_value,) if rc.check_value is not None else ())
+        val_str = str(value).strip()
+        val_num = _to_finite_float(value)
+        matched = val_str in {v.strip() for v in allowed_vals}
+        if not matched and val_num is not None:
+            for cand in allowed_vals:
+                cand_num = _to_finite_float(cand)
+                if cand_num is not None and math.isclose(
+                    val_num, cand_num, rel_tol=1e-9, abs_tol=1e-12
+                ):
+                    matched = True
+                    break
+        return matched if comp == "IN" else (not matched)
+
+    if comp in {"LT", "LE", "GT", "GE", "EQ", "NE"} and rc.check_value is not None:
+        if isinstance(value, str):
+            t_res = compare_temporal_strings(value, comp, rc.check_value)
+            if t_res is not None:
+                return t_res
+        val_num = _to_finite_float(value)
+        exp_num = _to_finite_float(rc.check_value)
+        if val_num is not None and exp_num is not None:
+            if comp == "LT":
+                return val_num < exp_num
+            if comp == "LE":
+                return val_num <= exp_num
+            if comp == "GT":
+                return val_num > exp_num
+            if comp == "GE":
+                return val_num >= exp_num
+            if comp == "EQ":
+                return math.isclose(val_num, exp_num, rel_tol=1e-9, abs_tol=1e-12)
+            return not math.isclose(val_num, exp_num, rel_tol=1e-9, abs_tol=1e-12)
+
+        act_s = str(value).strip()
+        exp_s = rc.check_value.strip()
+        if comp == "LT":
+            return act_s < exp_s
+        if comp == "LE":
+            return act_s <= exp_s
+        if comp == "GT":
+            return act_s > exp_s
+        if comp == "GE":
+            return act_s >= exp_s
+        if comp == "EQ":
+            return act_s == exp_s
+        return act_s != exp_s
+
+    if rc.formal_expression:
+        try:
+            compiled = compile_odm_formal_expression(
+                rc.formal_expression, context=rc.context, self_var=name
+            )
+        except ValueError:
+            return True
+        eval_ctx = dict(data)
+        eval_ctx[name] = value
+        ok, res = evaluate_compiled_ast_expression(
+            compiled.compiled_expression, compiled.variable_map, eval_ctx
+        )
+        return bool(res) if ok else True
+
+    return True
+
+
+def _format_range_check_message(
+    name: str,
+    form_key: str,
+    value: Any,
+    rc: RangeCheckConstraint,
+    data: Mapping[str, Any],
+) -> str:
+    shown_val = _display_constraint_value(name, value)
+    if rc.error_message:
+        safe_err = _mask_phi_in_text(rc.error_message, {**data, name: value})
+        return (
+            f"RangeCheck ({rc.soft_hard}) failed for variable '{name}' "
+            f"on form '{form_key}' (value={shown_val!r}): {safe_err}"
+        )
+    target_desc: Any = (
+        list(rc.check_values)
+        if rc.comparator in {"IN", "NOTIN"}
+        else (rc.check_value if rc.check_value is not None else rc.formal_expression)
+    )
+    return (
+        f"RangeCheck ({rc.soft_hard}) {rc.comparator or 'FormalExpression'} {target_desc} "
+        f"failed for variable '{name}' on form '{form_key}' (value={shown_val!r})"
+    )
+
+
+def _is_conditionally_exempt_from_required(
+    schema: Any,
+    form_key: str,
+    var_obj: Any,
+    data: Mapping[str, Any],
+) -> bool:
+    """Return True if ODM CollectionExceptionConditionOID or REDCap branchingLogic exempts var."""
+    extra_attrs: Mapping[str, Any] = getattr(var_obj, "extraAttributes", None) or {}
+    if not isinstance(extra_attrs, Mapping):
+        return False
+
+    cond_oid = extra_attrs.get("collectionExceptionConditionOid")
+    if isinstance(cond_oid, str) and cond_oid.strip():
+        target_oid = cond_oid.strip()
+        candidate_rules: list[Any] = []
+        rules_getter = getattr(schema, "rules_for_form", None)
+        if callable(rules_getter):
+            candidate_rules.extend(rules_getter(form_key))
+        all_rules = getattr(schema, "business_logic", None)
+        if isinstance(all_rules, list):
+            candidate_rules.extend(all_rules)
+        unassigned_rules = getattr(schema, "unassignedBusinessLogic", None)
+        if isinstance(unassigned_rules, list):
+            candidate_rules.extend(unassigned_rules)
+        for rule in candidate_rules:
+            r_id = getattr(rule, "id", None) if not isinstance(rule, Mapping) else rule.get("id")
+            if r_id is not None and str(r_id).strip() == target_oid:
+                cond_res = _LOGIC_EVALUATOR.evaluate_condition(rule, data, form_key=form_key)
+                if cond_res is True:
+                    return True
+                break
+
+    branching = extra_attrs.get("branchingLogic")
+    if isinstance(branching, str) and branching.strip():
+        try:
+            compiled = compile_redcap_branching_logic(branching)
+        except ValueError:
+            return False
+        if compiled.is_cross_scope:
+            return True
+        if compiled.conditions_tree is not None:
+            triggered, is_cross, skip_reason = _LOGIC_EVALUATOR.evaluate_tree(
+                {"conditions": compiled.conditions_tree},
+                data,
+                form_key=form_key,
+                rule_type="ConditionDef",
+            )
+            if is_cross:
+                return True
+            if skip_reason is None and not triggered:
+                return True
+
+    return False
 
 
 def _validate_choice_membership(
@@ -1061,7 +1344,17 @@ def validate_record_data(
             _check_type(vtype, value)
         except ValidationError as exc:
             type_failed_vars.add(name)
-            _record_error(exc.message, variable_name=name, rule_id="type", exc=exc)
+            resolved_fn = _TYPE_VALIDATORS.get(vtype or "") or (
+                _NORMALIZED_TYPE_VALIDATORS.get(_normalize_variable_type_key(vtype))
+                if vtype
+                else None
+            )
+            if resolved_fn in _TEMPORAL_VALIDATOR_FNS:
+                shown_val = _display_constraint_value(name, value)
+                msg = f"{exc.message} for variable '{name}' on form '{form_key}' (value={shown_val!r})"
+                _record_error(msg, variable_name=name, rule_id="type", exc=ValidationError(msg))
+            else:
+                _record_error(exc.message, variable_name=name, rule_id="type", exc=exc)
 
     # Fast path for API SchemaCache (enforce required flags when defined; skip codelists, bounds, and XML rules)
     if isinstance(schema, BaseSchemaCache):
@@ -1082,6 +1375,10 @@ def validate_record_data(
         constraints = extract_variable_constraints(var_obj)
         is_missing = name not in data or _is_empty_value(data[name])
         if is_missing:
+            if constraints.required_policy in {"yes", "auto_query"} and (
+                _is_conditionally_exempt_from_required(schema, form_key, var_obj, data)
+            ):
+                continue
             if constraints.required_policy == "yes":
                 _record_error(
                     f"Required variable '{name}' on form '{form_key}' is missing or empty",
@@ -1114,13 +1411,84 @@ def validate_record_data(
                 _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
             except ValidationError as exc:
                 _record_error(exc.message, variable_name=name, rule_id="choice", exc=exc)
-        if constraints.min_value is not None or constraints.max_value is not None:
+
+        has_hard_min_rc = False
+        has_hard_max_rc = False
+        has_soft_min_rc = False
+        has_soft_max_rc = False
+        has_date_min_rc = False
+        has_date_max_rc = False
+        if constraints.range_checks:
+            for rc in constraints.range_checks:
+                rc_comp = (rc.comparator or "").upper()
+                rc_is_num = _to_finite_float(rc.check_value) is not None
+                if rc_comp in {"GT", "GE", "EQ"} and rc.check_value is not None:
+                    if rc_is_num:
+                        if rc.soft_hard == "Hard":
+                            has_hard_min_rc = True
+                        else:
+                            has_soft_min_rc = True
+                    else:
+                        has_date_min_rc = True
+                if rc_comp in {"LT", "LE", "EQ"} and rc.check_value is not None:
+                    if rc_is_num:
+                        if rc.soft_hard == "Hard":
+                            has_hard_max_rc = True
+                        else:
+                            has_soft_max_rc = True
+                    else:
+                        has_date_max_rc = True
+                if not _check_single_range_check(name, value, rc, data):
+                    rc_msg = _format_range_check_message(name, form_key, value, rc, data)
+                    if rc.soft_hard == "Hard":
+                        _record_error(rc_msg, variable_name=name, rule_id="range_check")
+                    else:
+                        logger.warning("%s", rc_msg)
+                        warnings.append(
+                            RecordValidationIssue(
+                                record_index=record_index,
+                                form_key=form_key,
+                                variable_name=name,
+                                message=rc_msg,
+                                rule_id="range_check_soft",
+                                severity="warning",
+                            )
+                        )
+
+        eff_hard_min = None if has_hard_min_rc else constraints.min_value
+        eff_hard_max = None if has_hard_max_rc else constraints.max_value
+        if eff_hard_min is not None or eff_hard_max is not None:
             try:
-                _validate_numeric_bounds(
-                    name, form_key, value, constraints.min_value, constraints.max_value
-                )
+                _validate_numeric_bounds(name, form_key, value, eff_hard_min, eff_hard_max)
             except ValidationError as exc:
                 _record_error(exc.message, variable_name=name, rule_id="bounds", exc=exc)
+
+        eff_soft_min = None if has_soft_min_rc else constraints.soft_min_value
+        eff_soft_max = None if has_soft_max_rc else constraints.soft_max_value
+        if eff_soft_min is not None or eff_soft_max is not None:
+            try:
+                _validate_numeric_bounds(name, form_key, value, eff_soft_min, eff_soft_max)
+            except ValidationError as exc:
+                logger.warning("%s", exc.message)
+                warnings.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=form_key,
+                        variable_name=name,
+                        message=exc.message,
+                        rule_id="bounds_soft",
+                        severity="warning",
+                    )
+                )
+
+        eff_min_date = None if has_date_min_rc else constraints.min_date
+        eff_max_date = None if has_date_max_rc else constraints.max_date
+        if eff_min_date is not None or eff_max_date is not None:
+            try:
+                _validate_temporal_bounds(name, form_key, value, eff_min_date, eff_max_date)
+            except ValidationError as exc:
+                _record_error(exc.message, variable_name=name, rule_id="date_bounds", exc=exc)
+
         if isinstance(value, str) and (
             constraints.min_length is not None or constraints.max_length is not None
         ):
@@ -1137,18 +1505,22 @@ def validate_record_data(
         if rules:
             report = _LOGIC_EVALUATOR.evaluate_rules(rules, data, form_key=form_key)
             for warn in report.warnings:
+                safe_warn_msg = _mask_phi_in_text(warn.message, data)
                 logger.warning(
                     "Query rule '%s' triggered on form '%s': %s",
                     warn.rule_name,
                     form_key,
-                    warn.message,
+                    safe_warn_msg,
                 )
                 warnings.append(
                     RecordValidationIssue(
                         record_index=record_index,
                         form_key=form_key,
                         variable_name=None,
-                        message=f"Query rule '{warn.rule_name}' triggered on form '{form_key}': {warn.message}",
+                        message=(
+                            f"Query rule '{warn.rule_name}' triggered on form '{form_key}': "
+                            f"{safe_warn_msg}"
+                        ),
                         rule_id=str(warn.rule_id) if warn.rule_id is not None else warn.rule_name,
                         severity="warning",
                     )
@@ -1156,10 +1528,12 @@ def validate_record_data(
             if report.errors:
                 if not collect_errors:
                     first_err = report.errors[0]
+                    safe_first = _mask_phi_in_text(first_err.message, data)
                     raise ValidationError(
-                        f"Rule '{first_err.rule_name}' failed on form '{form_key}': {first_err.message}"
+                        f"Rule '{first_err.rule_name}' failed on form '{form_key}': {safe_first}"
                     )
                 for rule_err in report.errors:
+                    safe_err = _mask_phi_in_text(rule_err.message, data)
                     errors.append(
                         RecordValidationIssue(
                             record_index=record_index,
@@ -1167,7 +1541,7 @@ def validate_record_data(
                             variable_name=None,
                             message=(
                                 f"Rule '{rule_err.rule_name}' failed on form '{form_key}': "
-                                f"{rule_err.message}"
+                                f"{safe_err}"
                             ),
                             rule_id=(
                                 str(rule_err.rule_id)
@@ -1224,6 +1598,11 @@ def calculate_readiness_score(
             _check_type(vtype, value)
             constraints = extract_variable_constraints(var)
             if _is_empty_value(value):
+                if not is_cache and _is_conditionally_exempt_from_required(
+                    schema, form_key, var, data
+                ):
+                    valid_count += 1
+                    continue
                 if constraints.required_policy == "yes":
                     raise ValidationError("Required variable is empty")
                 if constraints.required_policy == "auto_query":
@@ -1231,10 +1610,37 @@ def calculate_readiness_score(
             elif not is_cache:
                 if constraints.choices:
                     _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
-                if constraints.min_value is not None or constraints.max_value is not None:
-                    _validate_numeric_bounds(
-                        name, form_key, value, constraints.min_value, constraints.max_value
-                    )
+                rc_hmin = False
+                rc_hmax = False
+                rc_dmin = False
+                rc_dmax = False
+                if constraints.range_checks:
+                    for rc in constraints.range_checks:
+                        rc_comp = (rc.comparator or "").upper()
+                        rc_is_num = _to_finite_float(rc.check_value) is not None
+                        if rc_comp in {"GT", "GE", "EQ"} and rc.check_value is not None:
+                            if rc_is_num and rc.soft_hard == "Hard":
+                                rc_hmin = True
+                            elif not rc_is_num:
+                                rc_dmin = True
+                        if rc_comp in {"LT", "LE", "EQ"} and rc.check_value is not None:
+                            if rc_is_num and rc.soft_hard == "Hard":
+                                rc_hmax = True
+                            elif not rc_is_num:
+                                rc_dmax = True
+                        if not _check_single_range_check(name, value, rc, data):
+                            rc_msg = _format_range_check_message(name, form_key, value, rc, data)
+                            if rc.soft_hard == "Hard":
+                                raise ValidationError(rc_msg)
+                            reasons.append(rc_msg)
+                eff_hmin = None if rc_hmin else constraints.min_value
+                eff_hmax = None if rc_hmax else constraints.max_value
+                if eff_hmin is not None or eff_hmax is not None:
+                    _validate_numeric_bounds(name, form_key, value, eff_hmin, eff_hmax)
+                eff_dmin = None if rc_dmin else constraints.min_date
+                eff_dmax = None if rc_dmax else constraints.max_date
+                if eff_dmin is not None or eff_dmax is not None:
+                    _validate_temporal_bounds(name, form_key, value, eff_dmin, eff_dmax)
                 if isinstance(value, str) and (
                     constraints.min_length is not None or constraints.max_length is not None
                 ):
@@ -1243,7 +1649,7 @@ def calculate_readiness_score(
                     )
             valid_count += 1
         except Exception as e:
-            reasons.append(f"Variable {name} invalid: {e!s}")
+            reasons.append(f"Variable {name} invalid: {_mask_phi_in_text(str(e), data)}")
 
     if not is_cache:
         rules_getter = getattr(schema, "rules_for_form", None)
@@ -1252,9 +1658,13 @@ def calculate_readiness_score(
                 rules_getter(form_key), data, form_key=form_key
             )
             for err in report.errors:
-                reasons.append(f"Rule {err.rule_name} failed: {err.message}")
+                reasons.append(
+                    f"Rule {err.rule_name} failed: {_mask_phi_in_text(err.message, data)}"
+                )
             for warn in report.warnings:
-                reasons.append(f"Rule {warn.rule_name} warning: {warn.message}")
+                reasons.append(
+                    f"Rule {warn.rule_name} warning: {_mask_phi_in_text(warn.message, data)}"
+                )
 
     score = (valid_count / expected_count) * 100.0
     return score, reasons

@@ -120,8 +120,9 @@ Data Dictionary commands
 ------------------------
 
 The ``imednet datadict`` subcommands convert Study metadata across 4-file CSV exports,
-CDISC ODM 1.3 XML, REDCap CSV files, and the EDC REST API, validate canonical JSON
-files, export the JSON Schema, and compute structural revision diffs (see
+CDISC ODM 1.3 XML, REDCap CSV files, and the EDC REST API, validate canonical JSON,
+4-file CSV directories/ZIP archives, CDISC ODM XML, or REDCap CSV inputs, export the
+JSON Schema, and compute structural revision diffs (see
 :doc:`/how-to/data_dictionary` for Python equivalents and Record validation):
 
 .. code-block:: bash
@@ -134,6 +135,9 @@ files, export the JSON Schema, and compute structural revision diffs (see
    imednet datadict from-api STUDY --simulation -o sim_dd.json
    imednet datadict schema -o data-dictionary.schema.json
    imednet datadict validate study_dd.json --schema data-dictionary.schema.json
+   imednet datadict validate ./study_odm.xml
+   imednet datadict validate ./datadict_export.zip
+   imednet datadict validate ./redcap_dictionary.csv
    imednet datadict diff baseline_dd.json study_dd.json --format md
 
 Terminal capabilities and non-interactive mode

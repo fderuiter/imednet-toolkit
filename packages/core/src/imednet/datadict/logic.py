@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import ast
+import datetime as dt
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import defusedxml.ElementTree as ET  # noqa: N817
 from defusedxml.common import DefusedXmlException
 
-from .normalize import to_camel_case
+from imednet.errors import EvaluationError, RestrictedEvaluationError
+from imednet.utils.evaluator import (
+    DEFAULT_SAFE_FUNCTIONS,
+    RestrictedAstEvaluator,
+    parse_expression,
+)
+
+from .normalize import normalize_variable_bounds, to_camel_case
 
 
 def _parse_xml_element(elem: ET.Element) -> Any:
@@ -259,6 +268,260 @@ _OR_GROUP_KEYS = ("or", "orGroup", "any", "OR")
 _AND_GROUP_KEYS = ("and", "andGroup", "all", "AND")
 _NOT_GROUP_KEYS = ("not", "NOT")
 _CONTAINER_GROUP_KEYS = ("condition", "conditions", "conditionGroup", "group", "if")
+_SOFT_MIN_BOUND_KEYS = (
+    "softMin",
+    "soft_min",
+    "softMinValue",
+    "soft_min_value",
+)
+
+_SOFT_MAX_BOUND_KEYS = (
+    "softMax",
+    "soft_max",
+    "softMaxValue",
+    "soft_max_value",
+)
+
+_EXPLICIT_MIN_DATE_KEYS = (
+    "minDate",
+    "min_date",
+)
+
+_EXPLICIT_MAX_DATE_KEYS = (
+    "maxDate",
+    "max_date",
+)
+
+_TEMPORAL_VARIABLE_TYPES = frozenset(
+    {
+        "date",
+        "date ymd",
+        "date mdy",
+        "date dmy",
+        "datetime",
+        "date/time",
+        "date time",
+        "date/time precision",
+        "datetime precision",
+        "date time precision",
+        "datetimeprecision",
+        "durationdatetime",
+        "intervaldatetime",
+        "time",
+    }
+)
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_YEAR_RE = re.compile(r"^\d{4}$")
+_ISO_YEAR_MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:?\d{2})?$"
+)
+_ISO_TIME_RE = re.compile(r"^\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:?\d{2})?$")
+_ISO_DURATION_RE = re.compile(
+    r"^P(?=\d|T\d)(\d+Y)?(\d+M)?(\d+W)?(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+(\.\d+)?S)?)?$"
+)
+
+VALID_RANGE_COMPARATORS = frozenset({"LT", "LE", "GT", "GE", "EQ", "NE", "IN", "NOTIN"})
+
+
+def _normalize_iso_tz_suffix(raw: str) -> str:
+    """Normalize trailing Z or +-HHMM offsets for stdlib fromisoformat."""
+    if raw.endswith("Z"):
+        return raw[:-1] + "+00:00"
+    if len(raw) >= 5 and raw[-5] in "+-" and raw[-4:].isdigit():
+        return f"{raw[:-2]}:{raw[-2:]}"
+    return raw
+
+
+def is_valid_iso_date(value: Any) -> bool:
+    """Return True when ``value`` is a strict calendar ISO YYYY-MM-DD string."""
+    if not isinstance(value, str) or not _ISO_DATE_RE.match(value):
+        return False
+    try:
+        dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def is_valid_iso_datetime(value: Any) -> bool:
+    """Return True when ``value`` is a strict calendar+clock ISO datetime string."""
+    if not isinstance(value, str) or not _ISO_DATETIME_RE.match(value):
+        return False
+    try:
+        dt.datetime.fromisoformat(_normalize_iso_tz_suffix(value))
+    except ValueError:
+        return False
+    return True
+
+
+def is_valid_iso_datetime_precision(value: Any) -> bool:
+    """Return True when ``value`` is YYYY, YYYY-MM, YYYY-MM-DD, or full ISO datetime."""
+    if not isinstance(value, str):
+        return False
+    if _ISO_YEAR_RE.match(value):
+        year = int(value)
+        return 1 <= year <= 9999
+    if _ISO_YEAR_MONTH_RE.match(value):
+        year = int(value[:4])
+        return 1 <= year <= 9999
+    return is_valid_iso_date(value) or is_valid_iso_datetime(value)
+
+
+def is_valid_iso_time(value: Any) -> bool:
+    """Return True when ``value`` is a strict 24-hour clock ISO HH:MM[:SS] string."""
+    if not isinstance(value, str) or not _ISO_TIME_RE.match(value):
+        return False
+    try:
+        dt.time.fromisoformat(_normalize_iso_tz_suffix(value))
+    except ValueError:
+        return False
+    return True
+
+
+def is_valid_iso_duration_datetime(value: Any) -> bool:
+    """Return True when ``value`` is an ISO-8601 duration or ISO datetime string."""
+    if not isinstance(value, str):
+        return False
+    return bool(_ISO_DURATION_RE.match(value)) or is_valid_iso_datetime(value)
+
+
+def is_valid_iso_interval_datetime(value: Any) -> bool:
+    """Return True when ``value`` is an ISO-8601 interval (start/end) or ISO datetime."""
+    if not isinstance(value, str):
+        return False
+    if "/" in value:
+        parts = value.split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return False
+        left_ok = (
+            is_valid_iso_date(parts[0])
+            or is_valid_iso_datetime(parts[0])
+            or bool(_ISO_DURATION_RE.match(parts[0]))
+        )
+        right_ok = (
+            is_valid_iso_date(parts[1])
+            or is_valid_iso_datetime(parts[1])
+            or bool(_ISO_DURATION_RE.match(parts[1]))
+        )
+        return left_ok and right_ok
+    return is_valid_iso_datetime(value)
+
+
+def is_valid_iso_temporal_bound(value: Any, *, allow_partial: bool = False) -> bool:
+    """Return True when ``value`` is a valid ISO date, datetime, or time bound."""
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if (
+        is_valid_iso_date(stripped)
+        or is_valid_iso_datetime(stripped)
+        or is_valid_iso_time(stripped)
+    ):
+        return True
+    return bool(allow_partial and is_valid_iso_datetime_precision(stripped))
+
+
+def _expand_partial_date_range(raw: str) -> tuple[dt.date, dt.date] | None:
+    """Expand YYYY, YYYY-MM, or YYYY-MM-DD into inclusive (start_date, end_date)."""
+    if is_valid_iso_date(raw):
+        parsed = dt.date.fromisoformat(raw)
+        return parsed, parsed
+    if _ISO_YEAR_MONTH_RE.match(raw):
+        year = int(raw[:4])
+        month = int(raw[5:7])
+        if not (1 <= year <= 9999):
+            return None
+        start = dt.date(year, month, 1)
+        if month == 12:
+            end = dt.date(year, 12, 31)
+        else:
+            end = dt.date(year, month + 1, 1) - dt.timedelta(days=1)
+        return start, end
+    if _ISO_YEAR_RE.match(raw):
+        year = int(raw)
+        if not (1 <= year <= 9999):
+            return None
+        return dt.date(year, 1, 1), dt.date(year, 12, 31)
+    return None
+
+
+def _eval_ordered_pair(lhs: Any, op: str, rhs: Any) -> bool | None:
+    if op in {"==", "EQ"}:
+        return bool(lhs == rhs)
+    if op in {"!=", "NE"}:
+        return bool(lhs != rhs)
+    if op in {"<", "LT"}:
+        return bool(lhs < rhs)
+    if op in {"<=", "LE"}:
+        return bool(lhs <= rhs)
+    if op in {">", "GT"}:
+        return bool(lhs > rhs)
+    if op in {">=", "GE"}:
+        return bool(lhs >= rhs)
+    return None
+
+
+def compare_temporal_strings(actual: str, op: str, expected: str) -> bool | None:
+    """Compare two validated ISO temporal strings accurately across date/datetime/time."""
+    act = actual.strip()
+    exp = expected.strip()
+
+    if is_valid_iso_time(act) and is_valid_iso_time(exp):
+        t_act = dt.time.fromisoformat(_normalize_iso_tz_suffix(act)).replace(tzinfo=None)
+        t_exp = dt.time.fromisoformat(_normalize_iso_tz_suffix(exp)).replace(tzinfo=None)
+        return _eval_ordered_pair(t_act, op, t_exp)
+
+    if is_valid_iso_datetime(act) and is_valid_iso_datetime(exp):
+        dt_act = dt.datetime.fromisoformat(_normalize_iso_tz_suffix(act))
+        dt_exp = dt.datetime.fromisoformat(_normalize_iso_tz_suffix(exp))
+        if (dt_act.tzinfo is None) != (dt_exp.tzinfo is None):
+            dt_act = (
+                dt_act.replace(tzinfo=dt.UTC)
+                if dt_act.tzinfo is None
+                else dt_act.astimezone(dt.UTC)
+            )
+            dt_exp = (
+                dt_exp.replace(tzinfo=dt.UTC)
+                if dt_exp.tzinfo is None
+                else dt_exp.astimezone(dt.UTC)
+            )
+        return _eval_ordered_pair(dt_act, op, dt_exp)
+
+    if is_valid_iso_datetime(act) and is_valid_iso_date(exp):
+        d_act = dt.datetime.fromisoformat(_normalize_iso_tz_suffix(act)).date()
+        d_exp = dt.date.fromisoformat(exp)
+        return _eval_ordered_pair(d_act, op, d_exp)
+
+    if is_valid_iso_date(act) and is_valid_iso_datetime(exp):
+        d_act = dt.date.fromisoformat(act)
+        d_exp = dt.datetime.fromisoformat(_normalize_iso_tz_suffix(exp)).date()
+        return _eval_ordered_pair(d_act, op, d_exp)
+
+    act_range = _expand_partial_date_range(act)
+    exp_range = _expand_partial_date_range(exp)
+    if act_range is not None and exp_range is not None:
+        if act_range[0] == act_range[1] and exp_range[0] == exp_range[1]:
+            return _eval_ordered_pair(act_range[0], op, exp_range[0])
+        # Partial precision date comparison: check if partial span satisfies bound
+        if op in ("<=", "LE"):
+            return act_range[0] <= exp_range[1]
+        if op in ("<", "LT"):
+            return act_range[1] < exp_range[0]
+        if op in (">=", "GE"):
+            return act_range[1] >= exp_range[0]
+        if op in (">", "GT"):
+            return act_range[0] > exp_range[1]
+        if op in ("==", "EQ"):
+            return act == exp
+        if op in ("!=", "NE"):
+            return act != exp
+    return None
+
+
 _NON_CONDITION_RULE_KEYS = frozenset(
     {
         "actions",
@@ -271,8 +534,34 @@ _NON_CONDITION_RULE_KEYS = frozenset(
         "name",
         "status",
         "form",
+        "odmElement",
+        "methodType",
+        "formalExpressions",
+        "aliases",
+        "compiledExpression",
+        "variableMap",
+        "checkboxMap",
+        "targetVariables",
+        "sourceFormat",
+        "branchingExpression",
+        "compiledBranching",
+        "referencedForms",
     }
 )
+
+
+@dataclass(frozen=True)
+class RangeCheckConstraint:
+    """Normalized ODM RangeCheck or validation bound constraint."""
+
+    comparator: str | None = None
+    soft_hard: Literal["Hard", "Soft"] = "Hard"
+    check_value: str | None = None
+    check_values: tuple[str, ...] = ()
+    formal_expression: str | None = None
+    context: str | None = None
+    measurement_unit_oid: str | None = None
+    error_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -285,6 +574,11 @@ class VariableConstraints:
     max_value: float | None = None
     min_length: int | None = None
     max_length: int | None = None
+    min_date: str | None = None
+    max_date: str | None = None
+    soft_min_value: float | None = None
+    soft_max_value: float | None = None
+    range_checks: tuple[RangeCheckConstraint, ...] = ()
 
 
 def _lookup_attr_or_extra(var: Any, keys: tuple[str, ...]) -> Any:
@@ -336,8 +630,65 @@ def _to_non_negative_int(value: Any) -> int | None:
     return None
 
 
+def _extract_temporal_bound(
+    var: Any,
+    explicit_keys: tuple[str, ...],
+    fallback_keys: tuple[str, ...],
+    *,
+    is_temporal_var: bool,
+) -> str | None:
+    raw_explicit = _lookup_attr_or_extra(var, explicit_keys)
+    if isinstance(raw_explicit, str) and is_valid_iso_temporal_bound(
+        raw_explicit, allow_partial=True
+    ):
+        return raw_explicit.strip()
+
+    raw_fallback = _lookup_attr_or_extra(var, fallback_keys)
+    if isinstance(raw_fallback, str):
+        candidate = raw_fallback.strip()
+        if is_temporal_var and is_valid_iso_temporal_bound(candidate, allow_partial=True):
+            return candidate
+        if (("-" in candidate and not candidate.startswith("-")) or ":" in candidate) and (
+            is_valid_iso_temporal_bound(candidate, allow_partial=False)
+        ):
+            return candidate
+    return None
+
+
+def _parse_range_checks(extra_attrs: Mapping[str, Any] | None) -> tuple[RangeCheckConstraint, ...]:
+    """Normalize explicit ODM rangeChecks via normalize_variable_bounds."""
+    if not isinstance(extra_attrs, Mapping) or not extra_attrs.get("rangeChecks"):
+        return ()
+
+    normalized = normalize_variable_bounds(dict(extra_attrs))
+    out: list[RangeCheckConstraint] = []
+    for entry in normalized:
+        sh_raw = str(entry.get("softHard") or "Hard").strip().lower()
+        soft_hard: Literal["Hard", "Soft"] = "Soft" if sh_raw == "soft" else "Hard"
+        comp_raw = entry.get("comparator")
+        comp = str(comp_raw).strip().upper() if comp_raw else None
+        cvals_raw = entry.get("checkValues")
+        check_values = tuple(str(v) for v in cvals_raw) if isinstance(cvals_raw, list) else ()
+        check_val = entry.get("checkValue")
+        if check_val is None and len(check_values) == 1 and comp not in {"IN", "NOTIN"}:
+            check_val = check_values[0]
+        out.append(
+            RangeCheckConstraint(
+                comparator=comp,
+                soft_hard=soft_hard,
+                check_value=str(check_val) if check_val is not None else None,
+                check_values=check_values,
+                formal_expression=entry.get("formalExpression"),
+                context=entry.get("context"),
+                measurement_unit_oid=entry.get("measurementUnitOid"),
+                error_message=entry.get("errorMessage"),
+            )
+        )
+    return tuple(out)
+
+
 def extract_variable_constraints(var: Any) -> VariableConstraints:
-    """Extract choices, required policy, numeric bounds, and string lengths from a Variable."""
+    """Extract choices, required policy, numeric/temporal bounds, and ODM RangeChecks."""
     if var is None:
         return VariableConstraints()
 
@@ -367,18 +718,45 @@ def extract_variable_constraints(var: Any) -> VariableConstraints:
         elif norm_req in {"auto query", "auto_query", "autoquery", "query", "soft"}:
             required_policy = "auto_query"
 
-    min_value = _to_finite_float(_lookup_attr_or_extra(var, _MIN_BOUND_KEYS))
-    max_value = _to_finite_float(_lookup_attr_or_extra(var, _MAX_BOUND_KEYS))
+    vtype = (
+        re.sub(
+            r"[\s_]+",
+            " ",
+            str(getattr(var, "variableType", None) or getattr(var, "variable_type", None) or ""),
+        )
+        .strip()
+        .lower()
+    )
+    is_temporal_var = vtype in _TEMPORAL_VARIABLE_TYPES
+
+    min_date = _extract_temporal_bound(
+        var, _EXPLICIT_MIN_DATE_KEYS, _MIN_BOUND_KEYS, is_temporal_var=is_temporal_var
+    )
+    max_date = _extract_temporal_bound(
+        var, _EXPLICIT_MAX_DATE_KEYS, _MAX_BOUND_KEYS, is_temporal_var=is_temporal_var
+    )
+
+    min_value = (
+        None if is_temporal_var else _to_finite_float(_lookup_attr_or_extra(var, _MIN_BOUND_KEYS))
+    )
+    max_value = (
+        None if is_temporal_var else _to_finite_float(_lookup_attr_or_extra(var, _MAX_BOUND_KEYS))
+    )
+    soft_min_value = (
+        None
+        if is_temporal_var
+        else _to_finite_float(_lookup_attr_or_extra(var, _SOFT_MIN_BOUND_KEYS))
+    )
+    soft_max_value = (
+        None
+        if is_temporal_var
+        else _to_finite_float(_lookup_attr_or_extra(var, _SOFT_MAX_BOUND_KEYS))
+    )
     min_length = _to_non_negative_int(_lookup_attr_or_extra(var, _MIN_LENGTH_KEYS))
     max_length = _to_non_negative_int(_lookup_attr_or_extra(var, _MAX_LENGTH_KEYS))
 
     if max_length is None:
         fmt = getattr(var, "format", None)
-        vtype = (
-            (getattr(var, "variableType", None) or getattr(var, "variable_type", None) or "")
-            .strip()
-            .lower()
-        )
         if (
             isinstance(fmt, str)
             and fmt.strip().isdigit()
@@ -393,6 +771,56 @@ def extract_variable_constraints(var: Any) -> VariableConstraints:
             if parsed_len > 0:
                 max_length = parsed_len
 
+    extra_raw = getattr(var, "extraAttributes", None)
+    extra_attrs = extra_raw if isinstance(extra_raw, Mapping) else None
+    range_checks = _parse_range_checks(extra_attrs)
+
+    for rc in range_checks:
+        comp = rc.comparator
+        cval = rc.check_value
+        if cval is None or comp is None:
+            continue
+        if not is_temporal_var:
+            fval = _to_finite_float(cval)
+            if fval is not None:
+                if comp in {"GE", "GT"}:
+                    if rc.soft_hard == "Hard":
+                        min_value = fval if min_value is None else max(min_value, fval)
+                    else:
+                        soft_min_value = (
+                            fval if soft_min_value is None else max(soft_min_value, fval)
+                        )
+                elif comp in {"LE", "LT"}:
+                    if rc.soft_hard == "Hard":
+                        max_value = fval if max_value is None else min(max_value, fval)
+                    else:
+                        soft_max_value = (
+                            fval if soft_max_value is None else min(soft_max_value, fval)
+                        )
+                elif comp == "EQ":
+                    if rc.soft_hard == "Hard":
+                        min_value = fval if min_value is None else max(min_value, fval)
+                        max_value = fval if max_value is None else min(max_value, fval)
+                    else:
+                        soft_min_value = (
+                            fval if soft_min_value is None else max(soft_min_value, fval)
+                        )
+                        soft_max_value = (
+                            fval if soft_max_value is None else min(soft_max_value, fval)
+                        )
+                continue
+
+        if is_valid_iso_temporal_bound(cval, allow_partial=True):
+            if comp in {"GE", "GT"}:
+                if min_date is None or compare_temporal_strings(cval, ">", min_date):
+                    min_date = cval
+            elif comp in {"LE", "LT"}:
+                if max_date is None or compare_temporal_strings(cval, "<", max_date):
+                    max_date = cval
+            elif comp == "EQ":
+                min_date = cval
+                max_date = cval
+
     return VariableConstraints(
         choices=choices,
         required_policy=required_policy,
@@ -400,7 +828,568 @@ def extract_variable_constraints(var: Any) -> VariableConstraints:
         max_value=max_value,
         min_length=min_length,
         max_length=max_length,
+        min_date=min_date,
+        max_date=max_date,
+        soft_min_value=soft_min_value,
+        soft_max_value=soft_max_value,
+        range_checks=range_checks,
     )
+
+
+@dataclass(frozen=True)
+class CompiledClinicalExpression:
+    """AST-validated representation of an ODM FormalExpression or REDCap branchingLogic."""
+
+    compiled_expression: str
+    variable_map: dict[str, str] = field(default_factory=dict)
+    checkbox_map: dict[str, tuple[str, str]] = field(default_factory=dict)
+    conditions_tree: dict[str, Any] | None = None
+    referenced_forms: tuple[str, ...] = ()
+    is_cross_scope: bool = False
+
+
+_QUOTED_LITERAL_RE = re.compile(r"'(?:\\.|''|[^'])*'|\"(?:\\.|\"\"|[^\"])*\"")
+_XPATH_FORM_OID_RE = re.compile(r"FormData\[\s*@FormOID\s*=\s*__QSTR(\d+)__\s*\]")
+_XPATH_ITEM_DATA_RE = re.compile(
+    r"(?:(?:\.\./|\./|//|/)*(?:StudyEventData\[[^\]]*\]/)?"
+    r"(?:FormData\[[^\]]*\]/)?(?:ItemGroupData\[[^\]]*\]/)*)?"
+    r"ItemData\[\s*@ItemOID\s*=\s*__QSTR(\d+)__\s*\](?:/@Value)?"
+)
+_XPATH_REL_VAR_RE = re.compile(r"(?:\.\./|\./)+\$?([A-Za-z_][A-Za-z0-9_.-]*)")
+_REDCAP_CROSS_BRACKET_RE = re.compile(r"\[([A-Za-z0-9_]+)\]\s*\[([^\[\]]+)\]")
+_REDCAP_BRACKET_RE = re.compile(r"\[([^\[\]]*)\]")
+_REDCAP_CHECKBOX_INNER_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(([A-Za-z0-9_.-]+)\)$")
+_REDCAP_VAR_INNER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SINGLE_EQ_RE = re.compile(r"(?<![<>!=])=(?!=)")
+_IDENT_OR_DOTTED_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_.]*\b")
+_PYTHON_KEYWORDS_AND_BUILTINS = frozenset(
+    {"and", "or", "not", "in", "is", "if", "else", "True", "False", "None"}
+    | set(DEFAULT_SAFE_FUNCTIONS.keys())
+)
+_FLIPPED_COMPARE_OPS = {
+    "==": "==",
+    "!=": "!=",
+    "<": ">",
+    "<=": ">=",
+    ">": "<",
+    ">=": "<=",
+}
+
+
+def _extract_quoted_strings(raw: str) -> tuple[str, list[str]]:
+    strings: list[str] = []
+
+    def _repl(match: re.Match[str]) -> str:
+        tok = match.group(0)
+        quote = tok[0]
+        inner = tok[1:-1]
+        if quote == "'":
+            inner = inner.replace("''", "'").replace("\\'", "'")
+        else:
+            inner = inner.replace('""', '"').replace('\\"', '"')
+        idx = len(strings)
+        strings.append(inner)
+        return f"__QSTR{idx}__"
+
+    masked = _QUOTED_LITERAL_RE.sub(_repl, raw)
+    # Check for unbalanced quotes outside masked regions
+    if "'" in masked or '"' in masked:
+        raise ValueError(f"Unterminated string literal in expression: {raw!r}")
+    return masked, strings
+
+
+def _restore_quoted_strings(masked: str, strings: list[str]) -> str:
+    def _repl(match: re.Match[str]) -> str:
+        idx = int(match.group(1))
+        return repr(strings[idx])
+
+    return re.sub(r"__QSTR(\d+)__", _repl, masked)
+
+
+def _normalize_boolean_and_rel_ops(masked: str, *, allow_xpath_math: bool) -> str:
+    s = masked.replace("<>", "!=")
+    s = _SINGLE_EQ_RE.sub("==", s)
+    if allow_xpath_math:
+        s = re.sub(r"\bdiv\b", "/", s)
+        s = re.sub(r"\bmod\b", "%", s)
+    s = re.sub(r"\band\b", "and", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bor\b", "or", s, flags=re.IGNORECASE)
+    return re.sub(r"\bnot\b", "not", s, flags=re.IGNORECASE)
+
+
+def _ast_literal_value(node: ast.AST) -> tuple[bool, Any]:
+    if isinstance(node, ast.Constant):
+        return True, node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        ok, inner = _ast_literal_value(node.operand)
+        if ok and isinstance(inner, (int, float)) and not isinstance(inner, bool):
+            return True, (-inner if isinstance(node.op, ast.USub) else +inner)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        vals: list[Any] = []
+        for elt in node.elts:
+            ok, item = _ast_literal_value(elt)
+            if not ok:
+                return False, None
+            vals.append(item)
+        return True, vals
+    return False, None
+
+
+def _ast_compare_op_str(op: ast.cmpop) -> str | None:
+    if isinstance(op, ast.Eq):
+        return "=="
+    if isinstance(op, ast.NotEq):
+        return "!="
+    if isinstance(op, ast.Lt):
+        return "<"
+    if isinstance(op, ast.LtE):
+        return "<="
+    if isinstance(op, ast.Gt):
+        return ">"
+    if isinstance(op, ast.GtE):
+        return ">="
+    if isinstance(op, ast.In):
+        return "in"
+    if isinstance(op, ast.NotIn):
+        return "not_in"
+    return None
+
+
+def _single_compare_to_leaf(
+    left: ast.AST,
+    op: ast.cmpop,
+    right: ast.AST,
+    variable_map: Mapping[str, str],
+    checkbox_map: Mapping[str, tuple[str, str]],
+) -> dict[str, Any] | None:
+    op_str = _ast_compare_op_str(op)
+    if op_str is None:
+        return None
+
+    # Handle REDCap checkbox comparison: cb0 == '1' / '0'
+    for cb_side, val_side in ((left, right), (right, left)):
+        if isinstance(cb_side, ast.Name) and cb_side.id in checkbox_map:
+            ok, lit_val = _ast_literal_value(val_side)
+            if ok and op_str in {"==", "!="}:
+                var_name, code = checkbox_map[cb_side.id]
+                norm_lit = str(lit_val).strip().lower()
+                is_one = norm_lit in {"1", "true", "yes", "y"}
+                is_zero = norm_lit in {"0", "false", "no", "n", ""}
+                if (op_str == "==" and is_one) or (op_str == "!=" and is_zero):
+                    return {
+                        "variable": var_name,
+                        "operator": "checkbox_checked",
+                        "value": code,
+                        "@literalVariable": True,
+                        "@gating": True,
+                    }
+                if (op_str == "==" and is_zero) or (op_str == "!=" and is_one):
+                    return {
+                        "variable": var_name,
+                        "operator": "checkbox_unchecked",
+                        "value": code,
+                        "@literalVariable": True,
+                        "@gating": True,
+                    }
+            return None
+
+    # Variable vs Variable
+    if (
+        isinstance(left, ast.Name)
+        and left.id in variable_map
+        and isinstance(right, ast.Name)
+        and right.id in variable_map
+        and op_str not in {"in", "not_in"}
+    ):
+        return {
+            "variable": variable_map[left.id],
+            "operator": op_str,
+            "compareVariable": variable_map[right.id],
+            "@literalVariable": True,
+            "@gating": True,
+        }
+
+    # Variable vs Constant
+    if isinstance(left, ast.Name) and left.id in variable_map:
+        ok, lit_val = _ast_literal_value(right)
+        if ok:
+            return {
+                "variable": variable_map[left.id],
+                "operator": op_str,
+                "value": "" if lit_val is None else lit_val,
+                "@literalVariable": True,
+                "@gating": True,
+            }
+
+    # Constant vs Variable (reversed)
+    if isinstance(right, ast.Name) and right.id in variable_map and op_str in _FLIPPED_COMPARE_OPS:
+        ok, lit_val = _ast_literal_value(left)
+        if ok:
+            return {
+                "variable": variable_map[right.id],
+                "operator": _FLIPPED_COMPARE_OPS[op_str],
+                "value": "" if lit_val is None else lit_val,
+                "@literalVariable": True,
+                "@gating": True,
+            }
+
+    return None
+
+
+def _ast_node_to_logic_tree(
+    node: ast.AST,
+    full_expr: str,
+    variable_map: Mapping[str, str],
+    checkbox_map: Mapping[str, tuple[str, str]],
+) -> dict[str, Any]:
+    if isinstance(node, ast.BoolOp):
+        key = "and" if isinstance(node.op, ast.And) else "or"
+        return {
+            key: [
+                _ast_node_to_logic_tree(child, ast.unparse(child), variable_map, checkbox_map)
+                for child in node.values
+            ]
+        }
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return {
+            "not": _ast_node_to_logic_tree(
+                node.operand, ast.unparse(node.operand), variable_map, checkbox_map
+            )
+        }
+
+    if isinstance(node, ast.Compare):
+        if len(node.ops) == 1:
+            leaf = _single_compare_to_leaf(
+                node.left, node.ops[0], node.comparators[0], variable_map, checkbox_map
+            )
+            if leaf is not None:
+                return leaf
+        else:
+            chained_leaves: list[dict[str, Any]] = []
+            cur_left = node.left
+            all_ok = True
+            for cmp_op, cmp_right in zip(node.ops, node.comparators, strict=True):
+                sub_leaf = _single_compare_to_leaf(
+                    cur_left, cmp_op, cmp_right, variable_map, checkbox_map
+                )
+                if sub_leaf is None:
+                    all_ok = False
+                    break
+                chained_leaves.append(sub_leaf)
+                cur_left = cmp_right
+            if all_ok and chained_leaves:
+                return {"and": chained_leaves}
+
+    if isinstance(node, ast.Name) and node.id in variable_map:
+        return {
+            "variable": variable_map[node.id],
+            "operator": "not_empty",
+            "@literalVariable": True,
+            "@gating": True,
+        }
+
+    used_names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    sub_var_map = {k: v for k, v in variable_map.items() if k in used_names}
+    sub_cb_map = {k: list(v) for k, v in checkbox_map.items() if k in used_names}
+    return {
+        "astExpression": full_expr,
+        "variableMap": sub_var_map,
+        "checkboxMap": sub_cb_map,
+    }
+
+
+def compile_odm_formal_expression(
+    expression: str,
+    *,
+    context: str | None = None,
+    self_var: str | None = None,
+    item_alias_map: Mapping[str, str] | None = None,
+) -> CompiledClinicalExpression:
+    """Compile an ODM FormalExpression (XPath or clinical math/predicate) into safe AST nodes.
+
+    Raises:
+        ValueError: If the expression has invalid syntax or uses forbidden constructs.
+    """
+    _ = context
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("ODM FormalExpression cannot be empty")
+
+    masked, strings = _extract_quoted_strings(expression.strip())
+    referenced_forms = tuple(
+        dict.fromkeys(strings[int(m.group(1))] for m in _XPATH_FORM_OID_RE.finditer(masked))
+    )
+    is_cross_event = "StudyEventData[" in masked
+
+    variable_map: dict[str, str] = {}
+    rev_var_map: dict[str, str] = {}
+
+    def _alloc_var(var_name: str) -> str:
+        cleaned = var_name.strip()
+        if item_alias_map and cleaned in item_alias_map:
+            cleaned = item_alias_map[cleaned]
+        if cleaned not in rev_var_map:
+            placeholder = f"v{len(rev_var_map)}"
+            rev_var_map[cleaned] = placeholder
+            variable_map[placeholder] = cleaned
+        return rev_var_map[cleaned]
+
+    # 1. XPath ItemData[@ItemOID='...']
+    def _repl_item_data(match: re.Match[str]) -> str:
+        oid = strings[int(match.group(1))]
+        return _alloc_var(oid)
+
+    masked = _XPATH_ITEM_DATA_RE.sub(_repl_item_data, masked)
+
+    # 2. XPath relative variable ../VAR or ./VAR
+    masked = _XPATH_REL_VAR_RE.sub(lambda m: _alloc_var(m.group(1)), masked)
+
+    # 3. @Value or standalone '.' when evaluating RangeCheck FormalExpression
+    if self_var:
+        masked = re.sub(r"\$?@Value\b", lambda _: _alloc_var(self_var), masked)
+        masked = re.sub(
+            r"(?<![0-9A-Za-z_.])\.(?![0-9A-Za-z_.])", lambda _: _alloc_var(self_var), masked
+        )
+
+    # 4. Normalize operators
+    masked = _normalize_boolean_and_rel_ops(masked, allow_xpath_math=True)
+
+    # 5. Map remaining bare variable identifiers (preserving keywords, QSTRs, and functions)
+    def _repl_ident(match: re.Match[str]) -> str:
+        tok = match.group(0)
+        if tok.startswith("__QSTR") and tok.endswith("__"):
+            return tok
+        if tok in variable_map:
+            return tok
+        if tok in _PYTHON_KEYWORDS_AND_BUILTINS:
+            return tok
+        # Check if numeric with decimal like 30.0 (will not match [A-Za-z_] start anyway)
+        # Reject attribute access chains like ''.__class__ or str.format by leaving method calls intact
+        end_pos = match.end()
+        rest = masked[end_pos:].lstrip()
+        if rest.startswith("(") and "." not in tok:
+            # Function call; let validate_ast enforce allowlist
+            return tok
+        if tok.startswith("_") or ".__" in tok:
+            return tok
+        return _alloc_var(tok)
+
+    masked = _IDENT_OR_DOTTED_RE.sub(_repl_ident, masked)
+    py_expr = _restore_quoted_strings(masked, strings)
+
+    try:
+        tree = parse_expression(py_expr)
+    except (EvaluationError, RestrictedEvaluationError) as exc:
+        raise ValueError(f"Invalid ODM FormalExpression {expression!r}: {exc}") from exc
+
+    cond_tree = _ast_node_to_logic_tree(tree.body, py_expr, variable_map, {})
+    return CompiledClinicalExpression(
+        compiled_expression=py_expr,
+        variable_map=variable_map,
+        checkbox_map={},
+        conditions_tree=cond_tree,
+        referenced_forms=referenced_forms,
+        is_cross_scope=is_cross_event,
+    )
+
+
+def compile_redcap_branching_logic(branching_logic: str) -> CompiledClinicalExpression:
+    """Compile REDCap branchingLogic into safe LogicTreeEvaluator and RestrictedAstEvaluator nodes.
+
+    Raises:
+        ValueError: If bracket variable syntax or expression syntax is malformed.
+    """
+    if not isinstance(branching_logic, str) or not branching_logic.strip():
+        raise ValueError("REDCap branchingLogic cannot be empty")
+
+    masked, strings = _extract_quoted_strings(branching_logic.strip())
+    is_cross_scope = False
+
+    # Detect cross-event syntax: [event_1_arm_1][var_name]
+    def _strip_event_prefix(match: re.Match[str]) -> str:
+        nonlocal is_cross_scope
+        is_cross_scope = True
+        return f"[{match.group(2)}]"
+
+    masked = _REDCAP_CROSS_BRACKET_RE.sub(_strip_event_prefix, masked)
+
+    variable_map: dict[str, str] = {}
+    rev_var_map: dict[str, str] = {}
+    checkbox_map: dict[str, tuple[str, str]] = {}
+    rev_cb_map: dict[tuple[str, str], str] = {}
+
+    def _repl_bracket(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        if not inner:
+            raise ValueError(
+                f"Empty variable reference '[]' in branchingLogic: {branching_logic!r}"
+            )
+        cb_match = _REDCAP_CHECKBOX_INNER_RE.match(inner)
+        if cb_match:
+            key = (cb_match.group(1), cb_match.group(2))
+            if key not in rev_cb_map:
+                ph = f"cb{len(rev_cb_map)}"
+                rev_cb_map[key] = ph
+                checkbox_map[ph] = key
+            return rev_cb_map[key]
+        if _REDCAP_VAR_INNER_RE.match(inner):
+            if inner not in rev_var_map:
+                ph = f"v{len(rev_var_map)}"
+                rev_var_map[inner] = ph
+                variable_map[ph] = inner
+            return rev_var_map[inner]
+        raise ValueError(
+            f"Invalid REDCap variable reference '[{inner}]' in branchingLogic: {branching_logic!r}"
+        )
+
+    masked = _REDCAP_BRACKET_RE.sub(_repl_bracket, masked)
+    if "[" in masked or "]" in masked:
+        raise ValueError(f"Unbalanced brackets in REDCap branchingLogic: {branching_logic!r}")
+
+    masked = _normalize_boolean_and_rel_ops(masked, allow_xpath_math=False)
+    py_expr = _restore_quoted_strings(masked, strings)
+
+    try:
+        tree = parse_expression(py_expr)
+    except (EvaluationError, RestrictedEvaluationError) as exc:
+        raise ValueError(f"Invalid REDCap branchingLogic {branching_logic!r}: {exc}") from exc
+
+    cond_tree = _ast_node_to_logic_tree(tree.body, py_expr, variable_map, checkbox_map)
+    if is_cross_scope:
+        cond_tree = {"crossForm": True, "conditions": cond_tree}
+
+    return CompiledClinicalExpression(
+        compiled_expression=py_expr,
+        variable_map=variable_map,
+        checkbox_map=checkbox_map,
+        conditions_tree=cond_tree,
+        is_cross_scope=is_cross_scope,
+    )
+
+
+def build_redcap_conditional_required_logic(
+    branching_logic: str,
+    target_variable: str,
+) -> dict[str, Any]:
+    """Build a LogicTreeEvaluator AST for a REDCap field gated by branchingLogic."""
+    compiled = compile_redcap_branching_logic(branching_logic)
+    cond_node: dict[str, Any]
+    if compiled.is_cross_scope:
+        cond_node = {"crossForm": True}
+    else:
+        assert compiled.conditions_tree is not None
+        cond_node = {
+            "and": [
+                compiled.conditions_tree,
+                {
+                    "variable": target_variable,
+                    "operator": "empty",
+                    "@literalVariable": True,
+                },
+            ]
+        }
+    return {
+        "sourceFormat": "redcap_branching",
+        "branchingExpression": branching_logic,
+        "compiledBranching": {
+            "compiledExpression": compiled.compiled_expression,
+            "variableMap": compiled.variable_map,
+            "checkboxMap": {k: list(v) for k, v in compiled.checkbox_map.items()},
+        },
+        "conditions": cond_node,
+        "actions": {
+            "action": {
+                "type": "error",
+                "message": (
+                    f"Variable '{target_variable}' is required when "
+                    f"branching logic ({branching_logic}) is satisfied"
+                ),
+            }
+        },
+    }
+
+
+def _is_checkbox_code_selected(data: Mapping[str, Any], var_name: str, code: str) -> bool:
+    """Evaluate REDCap checkbox selection across list, delimited string, or var___code keys."""
+    dummy_key = f"{var_name}___{code}"
+    if dummy_key in data:
+        dval = data[dummy_key]
+        return str(dval).strip().lower() in {"1", "true", "yes", "y"}
+
+    raw_val = data.get(var_name)
+    if _is_empty_record_value(raw_val):
+        return False
+    if isinstance(raw_val, Mapping):
+        for k, v in raw_val.items():
+            if str(k).strip() == code:
+                return str(v).strip().lower() in {"1", "true", "yes", "y"}
+        return False
+    if isinstance(raw_val, (list, tuple, set)):
+        return code in {str(item).strip() for item in raw_val}
+    sval = str(raw_val).strip()
+    if "`" in sval:
+        return code in {tok.strip() for tok in sval.split("`") if tok.strip()}
+    if "," in sval:
+        return code in {tok.strip() for tok in sval.split(",") if tok.strip()}
+    return sval == code
+
+
+def evaluate_compiled_ast_expression(
+    compiled_expression: str,
+    variable_map: Mapping[str, str],
+    data: Mapping[str, Any],
+    *,
+    checkbox_map: Mapping[str, Sequence[str] | tuple[str, str]] | None = None,
+    numeric_preferred: bool = False,
+) -> tuple[bool, Any]:
+    """Safely evaluate a compiled expression with RestrictedAstEvaluator (never eval).
+
+    Returns:
+        ``(ok, result)`` where ``ok`` is False when required input variables are missing
+        or evaluation fails.
+    """
+    env: dict[str, Any] = {}
+    for ph, var_name in variable_map.items():
+        if var_name not in data or _is_empty_record_value(data[var_name]):
+            return False, None
+        raw = data[var_name]
+        fval = _to_finite_float(raw)
+        if fval is not None and (numeric_preferred or isinstance(raw, (int, float))):
+            env[ph] = fval
+        elif fval is not None and isinstance(raw, str):
+            # Coerce clean numeric strings if expression uses arithmetic/numeric comparison
+            env[ph] = fval if numeric_preferred else raw
+        else:
+            env[ph] = raw
+
+    if checkbox_map:
+        for ph, pair in checkbox_map.items():
+            var_name, code = str(pair[0]), str(pair[1])
+            env[ph] = "1" if _is_checkbox_code_selected(data, var_name, code) else "0"
+
+    try:
+        evaluator = RestrictedAstEvaluator(compiled_expression)
+        res = evaluator.evaluate(env, raise_on_error=True)
+        return True, res
+    except (EvaluationError, RestrictedEvaluationError, TypeError, ValueError):
+        if not numeric_preferred:
+            # Retry once coercing numeric strings to float for mixed string/number comparisons
+            retry_env = dict(env)
+            changed = False
+            for ph, var_name in variable_map.items():
+                fval = _to_finite_float(data.get(var_name))
+                if fval is not None and not isinstance(retry_env.get(ph), float):
+                    retry_env[ph] = fval
+                    changed = True
+            if changed:
+                try:
+                    res = RestrictedAstEvaluator(compiled_expression).evaluate(
+                        retry_env, raise_on_error=True
+                    )
+                    return True, res
+                except (EvaluationError, RestrictedEvaluationError, TypeError, ValueError):
+                    return False, None
+        return False, None
 
 
 @dataclass(frozen=True)
@@ -413,6 +1402,7 @@ class ExtractedCondition:
     expected_truth: bool = True
     form: str | None = None
     compare_variable: str | None = None
+    is_gating: bool = False
 
 
 @dataclass(frozen=True)
@@ -631,6 +1621,17 @@ class LogicTreeEvaluator:
             )
 
         unwrapped = self._unwrap_root(logic_ast)
+        odm_elem = unwrapped.get("odmElement")
+
+        if odm_elem == "MethodDef":
+            return self._evaluate_odm_method_rule(
+                rule_id=rule_id,
+                rule_name=rule_name,
+                rule_type=rule_type,
+                unwrapped=unwrapped,
+                data=data,
+            )
+
         severity, is_ui_only, action_message = self._classify_rule(rule_type, unwrapped)
         default_msg = action_message or f"Business logic rule '{rule_name}' failed"
 
@@ -671,6 +1672,160 @@ class LogicTreeEvaluator:
             severity=severity,
             triggered=triggered,
             message=default_msg,
+        )
+
+    def evaluate_method(
+        self,
+        rule: Any,
+        data: Mapping[str, Any],
+        *,
+        form_key: str | None = None,
+    ) -> Any:
+        """Evaluate an ODM MethodDef equation via RestrictedAstEvaluator."""
+        logic_ast, xml_err = self._resolve_logic_ast(rule)
+        if xml_err is not None or not isinstance(logic_ast, Mapping):
+            return None
+        unwrapped = self._unwrap_root(logic_ast)
+        ref_forms = unwrapped.get("referencedForms")
+        if (
+            form_key
+            and isinstance(ref_forms, (list, tuple))
+            and ref_forms
+            and any(str(f) != form_key for f in ref_forms)
+        ):
+            return None
+        expr = unwrapped.get("compiledExpression")
+        var_map = unwrapped.get("variableMap")
+        if not isinstance(expr, str) or not isinstance(var_map, Mapping):
+            formal_list = unwrapped.get("formalExpressions")
+            if isinstance(formal_list, list) and formal_list:
+                first_expr = formal_list[0]
+                raw_fe = (
+                    first_expr.get("expression")
+                    if isinstance(first_expr, Mapping)
+                    else str(first_expr)
+                )
+                if isinstance(raw_fe, str) and raw_fe.strip():
+                    try:
+                        compiled = compile_odm_formal_expression(raw_fe)
+                    except ValueError:
+                        return None
+                    expr = compiled.compiled_expression
+                    var_map = compiled.variable_map
+        if not isinstance(expr, str) or not isinstance(var_map, Mapping):
+            return None
+        ok, val = evaluate_compiled_ast_expression(expr, var_map, data, numeric_preferred=True)
+        return val if ok else None
+
+    def evaluate_condition(
+        self,
+        rule: Any,
+        data: Mapping[str, Any],
+        *,
+        form_key: str | None = None,
+    ) -> bool | None:
+        """Evaluate a ConditionDef or conditional rule predicate, returning None if cross-scope."""
+        logic_ast, xml_err = self._resolve_logic_ast(rule)
+        if xml_err is not None or not isinstance(logic_ast, Mapping):
+            return None
+        unwrapped = self._unwrap_root(logic_ast)
+        ref_forms = unwrapped.get("referencedForms")
+        if (
+            form_key
+            and isinstance(ref_forms, (list, tuple))
+            and ref_forms
+            and any(str(f) != form_key for f in ref_forms)
+        ):
+            return None
+        triggered, is_cross, skip_reason = self.evaluate_tree(
+            unwrapped, data, form_key=form_key, rule_type="ConditionDef"
+        )
+        if is_cross:
+            return None
+        if skip_reason is not None:
+            expr = unwrapped.get("compiledExpression")
+            var_map = unwrapped.get("variableMap")
+            if isinstance(expr, str) and isinstance(var_map, Mapping):
+                ok, res = evaluate_compiled_ast_expression(expr, var_map, data)
+                return bool(res) if ok else False
+            return None
+        return triggered
+
+    def _evaluate_odm_method_rule(
+        self,
+        *,
+        rule_id: str | int | None,
+        rule_name: str,
+        rule_type: str | None,
+        unwrapped: Mapping[str, Any],
+        data: Mapping[str, Any],
+    ) -> RuleEvaluationResult:
+        computed = self.evaluate_method({"logic": unwrapped}, data)
+        if computed is None:
+            return RuleEvaluationResult(
+                rule_id=rule_id,
+                rule_name=rule_name,
+                rule_type=rule_type,
+                severity="none",
+                triggered=False,
+                message=rule_name,
+                skipped=True,
+                skip_reason="missing_inputs",
+            )
+        targets = unwrapped.get("targetVariables")
+        if not isinstance(targets, list) or not targets:
+            return RuleEvaluationResult(
+                rule_id=rule_id,
+                rule_name=rule_name,
+                rule_type=rule_type,
+                severity="none",
+                triggered=False,
+                message=rule_name,
+                skipped=True,
+                skip_reason="no_target_variables",
+            )
+
+        populated_targets = [
+            str(t) for t in targets if str(t) in data and not _is_empty_record_value(data[str(t)])
+        ]
+        if not populated_targets:
+            return RuleEvaluationResult(
+                rule_id=rule_id,
+                rule_name=rule_name,
+                rule_type=rule_type,
+                severity="warning",
+                triggered=False,
+                message=rule_name,
+                skipped=True,
+                skip_reason="target_not_populated",
+            )
+
+        for target_var in populated_targets:
+            actual = data[target_var]
+            num_act = _to_finite_float(actual)
+            num_exp = _to_finite_float(computed)
+            if num_act is not None and num_exp is not None:
+                matched = math.isclose(num_act, num_exp, rel_tol=1e-4, abs_tol=1e-2)
+            else:
+                matched = str(actual).strip() == str(computed).strip()
+            if not matched:
+                msg = f"Computed value mismatch for '{target_var}' in MethodDef '{rule_name}'"
+                return RuleEvaluationResult(
+                    rule_id=rule_id,
+                    rule_name=rule_name,
+                    rule_type=rule_type,
+                    severity="error",
+                    triggered=True,
+                    message=msg,
+                )
+
+        return RuleEvaluationResult(
+            rule_id=rule_id,
+            rule_name=rule_name,
+            rule_type=rule_type,
+            severity="error",
+            triggered=False,
+            message=rule_name,
         )
 
     def evaluate_tree(
@@ -870,6 +2025,13 @@ class LogicTreeEvaluator:
         has_query_action = any(at in _QUERY_ACTION_TYPES for at in action_types)
         has_warning_only_action = any(at in _WARNING_ACTION_TYPES for at in action_types)
 
+        if (
+            unwrapped.get("odmElement") == "ConditionDef"
+            and not has_error_action
+            and not has_query_action
+        ):
+            return "none", True, message
+
         if action_types and set(action_types).issubset(_UI_ACTION_TYPES):
             return "none", True, message
         if rt in {"workflow", "approval"} and not has_error_action and not has_query_action:
@@ -991,7 +2153,7 @@ class LogicTreeEvaluator:
 
     @staticmethod
     def _is_leaf_condition(node: Mapping[str, Any]) -> bool:
-        return any(k in node for k in ("variable", "field", "var", "@variable"))
+        return any(k in node for k in ("variable", "field", "var", "@variable", "astExpression"))
 
     def _collect_leaf_conditions(
         self,
@@ -1023,6 +2185,47 @@ class LogicTreeEvaluator:
                 return [], True
 
         if self._is_leaf_condition(node):
+            if "astExpression" in node:
+                var_map = node.get("variableMap")
+                cb_map = node.get("checkboxMap")
+                ast_conds: list[ExtractedCondition] = []
+                if isinstance(var_map, Mapping):
+                    for vname in var_map.values():
+                        ast_conds.append(
+                            ExtractedCondition(
+                                variable=str(vname),
+                                operator="ast",
+                                value=str(node["astExpression"]),
+                                expected_truth=not negated,
+                                form=form_key,
+                                is_gating=True,
+                            )
+                        )
+                if isinstance(cb_map, Mapping):
+                    for pair in cb_map.values():
+                        if isinstance(pair, (list, tuple)) and pair:
+                            ast_conds.append(
+                                ExtractedCondition(
+                                    variable=str(pair[0]),
+                                    operator="checkbox_checked",
+                                    value=str(pair[1]) if len(pair) > 1 else "",
+                                    expected_truth=not negated,
+                                    form=form_key,
+                                    is_gating=True,
+                                )
+                            )
+                if not ast_conds:
+                    ast_conds.append(
+                        ExtractedCondition(
+                            variable="__constant__",
+                            operator="ast",
+                            value=str(node["astExpression"]),
+                            expected_truth=not negated,
+                            form=form_key,
+                            is_gating=True,
+                        )
+                    )
+                return ast_conds, False
             leaf, is_cross = self._parse_leaf_condition(
                 node,
                 form_key,
@@ -1115,10 +2318,17 @@ class LogicTreeEvaluator:
         cond_form = (
             str(raw_form).strip() if isinstance(raw_form, str) and raw_form.strip() else None
         )
+        literal_var = bool(cond.get("literalVariable") or cond.get("@literalVariable"))
+        is_gating = bool(cond.get("gating") or cond.get("@gating"))
 
-        var_name, resolved_form, is_cross = self._resolve_scoped_variable(
-            raw_var, cond_form, form_key
-        )
+        if literal_var:
+            var_name = raw_var
+            resolved_form = cond_form
+            is_cross = bool(form_key and resolved_form and resolved_form != form_key)
+        else:
+            var_name, resolved_form, is_cross = self._resolve_scoped_variable(
+                raw_var, cond_form, form_key
+            )
         if is_cross:
             return None, True
 
@@ -1126,10 +2336,15 @@ class LogicTreeEvaluator:
         for cv_key in _COMPARE_VAR_KEYS:
             cv_raw = cond.get(cv_key)
             if isinstance(cv_raw, str) and cv_raw.strip():
-                cv_name, _, cv_cross = self._resolve_scoped_variable(cv_raw, cond_form, form_key)
-                if cv_cross:
-                    return None, True
-                compare_var = cv_name
+                if literal_var:
+                    compare_var = cv_raw.strip()
+                else:
+                    cv_name, _, cv_cross = self._resolve_scoped_variable(
+                        cv_raw, cond_form, form_key
+                    )
+                    if cv_cross:
+                        return None, True
+                    compare_var = cv_name
                 break
 
         raw_op = str(cond.get("operator") or cond.get("@operator") or cond.get("op") or "").strip()
@@ -1175,6 +2390,7 @@ class LogicTreeEvaluator:
                 expected_truth=expected_truth,
                 form=resolved_form or form_key,
                 compare_variable=compare_var,
+                is_gating=is_gating,
             ),
             False,
         )
@@ -1246,6 +2462,17 @@ class LogicTreeEvaluator:
             return False
 
         if self._is_leaf_condition(node):
+            if "astExpression" in node:
+                expr_str = str(node["astExpression"])
+                var_map = node.get("variableMap")
+                cb_map = node.get("checkboxMap")
+                ok, val = evaluate_compiled_ast_expression(
+                    expr_str,
+                    var_map if isinstance(var_map, Mapping) else {},
+                    data,
+                    checkbox_map=cb_map if isinstance(cb_map, Mapping) else None,
+                )
+                return bool(val) if ok else False
             leaf, is_cross = self._parse_leaf_condition(
                 node,
                 form_key,
@@ -1348,6 +2575,14 @@ class LogicTreeEvaluator:
         actual = data.get(cond.variable)
         op = cond.operator
 
+        if op == "checkbox_checked":
+            base = _is_checkbox_code_selected(data, cond.variable, str(cond.value))
+            return base if cond.expected_truth else (not base)
+
+        if op == "checkbox_unchecked":
+            base = not _is_checkbox_code_selected(data, cond.variable, str(cond.value))
+            return base if cond.expected_truth else (not base)
+
         if op == "empty":
             base = _is_empty_record_value(actual)
             return base if cond.expected_truth else (not base)
@@ -1373,6 +2608,8 @@ class LogicTreeEvaluator:
                     if op == "!=":
                         base = not base
                     return base if cond.expected_truth else (not base)
+                if cond.is_gating:
+                    return False
                 # Required rule checking missingness via <false/>
                 return (rule_type or "").strip().lower() == "required" and not cond.expected_truth
 

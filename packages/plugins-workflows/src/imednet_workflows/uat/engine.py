@@ -278,6 +278,17 @@ class UATExecutionEngine:
                 data[cond.variable] = "OTHER_VALUE"
             return
 
+        if op in {"checkbox_checked", "checkbox_unchecked"}:
+            code_str = str(raw_val)
+            if (op == "checkbox_checked" and want_match) or (
+                op == "checkbox_unchecked" and not want_match
+            ):
+                data[cond.variable] = [code_str]
+            else:
+                alt = [c for c in choices if c != code_str]
+                data[cond.variable] = [alt[0]] if alt else []
+            return
+
         data[cond.variable] = "Invalid_Test_Value"
 
     def _populate_other_required_fields(self, form_key: str | None, data: dict[str, Any]) -> None:
@@ -312,7 +323,15 @@ class UATExecutionEngine:
                 elif vtype in {"yes/no", "yesno"}:
                     data[vname] = "Yes"
                 elif vtype in {"date", "date/time precision"}:
-                    data[vname] = "2026-01-01"
+                    data[vname] = constraints.min_date or "2026-01-01"
+                elif vtype in {"datetime", "date/time"}:
+                    data[vname] = constraints.min_date or "2026-01-01T12:00:00"
+                elif vtype == "time":
+                    data[vname] = constraints.min_date or "12:00:00"
+                elif vtype in {"durationdatetime", "duration"}:
+                    data[vname] = "P1D"
+                elif vtype in {"intervaldatetime", "interval"}:
+                    data[vname] = "2026-01-01T00:00:00Z/2026-01-02T00:00:00Z"
                 else:
                     max_l = constraints.max_length or 5
                     data[vname] = "X" * min(max_l, 5)

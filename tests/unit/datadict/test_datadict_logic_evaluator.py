@@ -1036,3 +1036,215 @@ def test_nested_and_or_not_explicit_group_combinations() -> None:
         evaluator.evaluate_rule(mixed_or_group, {"A": 0, "B": 2, "C": 0}, form_key="F1").triggered
         is False
     )
+
+
+def test_variable_constraints_iso_dates_and_odm_range_checks() -> None:
+    """extract_variable_constraints normalizes Hard/Soft numeric and ISO date bounds plus RangeChecks."""
+    num_var = Variable(
+        variableName="SYSBP",
+        variableType="Integer",
+        required="Yes",
+        extraAttributes={
+            "rangeChecks": [
+                {"comparator": "GE", "softHard": "Hard", "checkValue": "50"},
+                {"comparator": "LE", "softHard": "Hard", "checkValue": "260"},
+                {"comparator": "GE", "softHard": "Soft", "checkValue": "90"},
+                {"comparator": "LE", "softHard": "Soft", "checkValue": "140"},
+                {"comparator": "NE", "softHard": "Soft", "checkValue": "999"},
+            ]
+        },
+    )
+    c_num = extract_variable_constraints(num_var)
+    assert c_num.min_value == 50.0
+    assert c_num.max_value == 260.0
+    assert c_num.soft_min_value == 90.0
+    assert c_num.soft_max_value == 140.0
+    assert len(c_num.range_checks) == 5
+
+    date_var = Variable(
+        variableName="VISDAT",
+        variableType="Date",
+        extraAttributes={
+            "textValidationMin": "2024-01-01",
+            "textValidationMax": "2026-12-31",
+        },
+    )
+    c_date = extract_variable_constraints(date_var)
+    assert c_date.min_date == "2024-01-01"
+    assert c_date.max_date == "2026-12-31"
+    assert c_date.min_value is None
+    assert c_date.max_value is None
+
+
+def test_odm_condition_def_and_method_def_ast_compilation_without_eval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ODM ConditionDef and MethodDef compile to safe AST nodes without calling builtins.eval and round-trip."""
+    import builtins
+
+    from imednet.datadict import diff, load_from_cdisc_odm, to_odm_xml
+
+    def _forbid_eval(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("builtins.eval must never be called")
+
+    monkeypatch.setattr(builtins, "eval", _forbid_eval)
+
+    odm_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" ODMVersion="1.3.2" FileType="Snapshot" FileOID="F.AST" CreationDateTime="2026-01-01T00:00:00Z">
+  <Study OID="S.AST">
+    <GlobalVariables>
+      <StudyName>AST Trial</StudyName>
+      <StudyDescription>ODM AST Compilation</StudyDescription>
+      <ProtocolName>AST-01</ProtocolName>
+    </GlobalVariables>
+    <MetaDataVersion OID="MDV.1" Name="v1">
+      <FormDef OID="VS" Name="Vital Signs" Repeating="No">
+        <ItemGroupRef ItemGroupOID="IG.VS" Mandatory="Yes"/>
+      </FormDef>
+      <ItemGroupDef OID="IG.VS" Name="Vitals" Repeating="No">
+        <ItemRef ItemOID="IT.VS.POS" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.VS.SYSBP" Mandatory="Yes" CollectionExceptionConditionOID="COND.SEATED"/>
+        <ItemRef ItemOID="IT.VS.DIABP" Mandatory="Yes"/>
+        <ItemRef ItemOID="IT.VS.MAP" Mandatory="No" MethodOID="METH.MAP"/>
+      </ItemGroupDef>
+      <ItemDef OID="IT.VS.POS" Name="POS" DataType="text"/>
+      <ItemDef OID="IT.VS.SYSBP" Name="SYSBP" DataType="integer"/>
+      <ItemDef OID="IT.VS.DIABP" Name="DIABP" DataType="integer"/>
+      <ItemDef OID="IT.VS.MAP" Name="MAP" DataType="float" SignificantDigits="1"/>
+      <ConditionDef OID="COND.SEATED" Name="Seated Condition">
+        <Description><TranslatedText xml:lang="en">Collect SYSBP when seated</TranslatedText></Description>
+        <FormalExpression Context="XPath">../POS = 'SEATED'</FormalExpression>
+      </ConditionDef>
+      <MethodDef OID="METH.MAP" Name="Mean Arterial Pressure" Type="Computation">
+        <Description><TranslatedText xml:lang="en">MAP = (2 * DIABP + SYSBP) / 3</TranslatedText></Description>
+        <FormalExpression Context="XPath">round((2 * ItemData[@ItemOID='IT.VS.DIABP'] + ../SYSBP) div 3, 1)</FormalExpression>
+      </MethodDef>
+    </MetaDataVersion>
+  </Study>
+</ODM>"""
+
+    dd = load_from_cdisc_odm(odm_xml, strict=True)
+    vs_form = dd.forms[0]
+    rules_by_id = {r.id: r for r in vs_form.businessLogic}
+    cond_rule = rules_by_id["COND.SEATED"]
+    meth_rule = rules_by_id["METH.MAP"]
+
+    assert isinstance(cond_rule.logic, dict)
+    assert "conditions" in cond_rule.logic
+    assert isinstance(meth_rule.logic, dict)
+    assert "compiledExpression" in meth_rule.logic
+
+    evaluator = LogicTreeEvaluator()
+    # ConditionDef evaluates true when POS == 'SEATED', false when STANDING
+    assert evaluator.evaluate_condition(cond_rule, {"POS": "SEATED"}, form_key="VS") is True
+    assert evaluator.evaluate_condition(cond_rule, {"POS": "STANDING"}, form_key="VS") is False
+
+    # MethodDef computes expected value and verifies populated target variable
+    computed = evaluator.evaluate_method(meth_rule, {"SYSBP": 120, "DIABP": 80}, form_key="VS")
+    assert computed == pytest.approx(93.3)
+
+    ok_res = evaluator.evaluate_rule(
+        meth_rule, {"SYSBP": 120, "DIABP": 80, "MAP": 93.3}, form_key="VS"
+    )
+    assert ok_res.triggered is False
+
+    bad_res = evaluator.evaluate_rule(
+        meth_rule, {"SYSBP": 120, "DIABP": 80, "MAP": 110.0}, form_key="VS"
+    )
+    assert bad_res.triggered is True
+    assert bad_res.severity == "error"
+
+    # Verify ODM XML export and reload remain lossless
+    exported_xml = to_odm_xml(dd)
+    reloaded_dd = load_from_cdisc_odm(exported_xml, strict=True)
+    reloaded_rules = {r.id: r for r in reloaded_dd.forms[0].businessLogic}
+    assert reloaded_rules["COND.SEATED"].logic == cond_rule.logic
+    assert reloaded_rules["METH.MAP"].logic == meth_rule.logic
+    assert (
+        diff(reloaded_dd, load_from_cdisc_odm(to_odm_xml(reloaded_dd), strict=True)).has_changes
+        is False
+    )
+
+
+def test_redcap_branching_logic_conditional_required_without_eval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REDCap branchingLogic + requiredField='y' compiles into conditional Required rules without eval."""
+    import builtins
+
+    from imednet.datadict import load_from_redcap
+
+    def _forbid_eval(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("builtins.eval must never be called")
+
+    monkeypatch.setattr(builtins, "eval", _forbid_eval)
+
+    redcap_csv = (
+        '"Variable / Field Name","Form Name","Field Type","Field Label",'
+        '"Choices, Calculations, OR Slider Labels","Branching Logic (Show field only if...)","Required Field?"\n'
+        '"sex","screening","radio","Biological Sex","F, Female | M, Male",,"y"\n'
+        '"age","screening","text","Age in Years",,,"y"\n'
+        '"preg_test","screening","yesno","Pregnancy Test","1, Positive | 0, Negative","[sex] = \'F\' and [age] >= 18","y"\n'
+        '"symptoms","screening","checkbox","Symptoms","1, Fever | 2, Rash | 3, Cough",,""\n'
+        '"rash_location","screening","text","Rash Location",,"[symptoms(2)] = \'1\'","y"\n'
+        '"followup_note","screening","text","Cross-Event Note",,"[baseline_arm_1][sex] = \'F\'","y"\n'
+    )
+    dd = load_from_redcap(redcap_csv, strict=True)
+    form = dd.forms[0]
+    vars_by_name = {v.variableName: v for v in form.variables}
+
+    # Unconditional required stays "Yes"; conditional required becomes "No" + rule
+    assert vars_by_name["sex"].required == "Yes"
+    assert vars_by_name["preg_test"].required == "No"
+    assert vars_by_name["preg_test"].extraAttributes["conditionalRequired"] is True
+    assert vars_by_name["rash_location"].required == "No"
+
+    rules_by_id = {r.id: r for r in form.businessLogic}
+    preg_rule = rules_by_id["RC_REQ_screening_preg_test"]
+    rash_rule = rules_by_id["RC_REQ_screening_rash_location"]
+    cross_rule = rules_by_id["RC_REQ_screening_followup_note"]
+
+    evaluator = LogicTreeEvaluator()
+    # Male subject: preg_test not required
+    assert (
+        evaluator.evaluate_rule(preg_rule, {"sex": "M", "age": 30}, form_key="screening").triggered
+        is False
+    )
+    # Adult female missing preg_test: triggers blocking Required error
+    trig = evaluator.evaluate_rule(preg_rule, {"sex": "F", "age": 30}, form_key="screening")
+    assert trig.triggered is True
+    assert trig.severity == "error"
+    # Adult female with preg_test populated: satisfied
+    assert (
+        evaluator.evaluate_rule(
+            preg_rule, {"sex": "F", "age": 30, "preg_test": "0"}, form_key="screening"
+        ).triggered
+        is False
+    )
+
+    # Checkbox [symptoms(2)] = '1' checked via backtick-delimited string, list, or dict
+    assert (
+        evaluator.evaluate_rule(rash_rule, {"symptoms": "1`3"}, form_key="screening").triggered
+        is False
+    )
+    assert (
+        evaluator.evaluate_rule(rash_rule, {"symptoms": "1`2"}, form_key="screening").triggered
+        is True
+    )
+    assert (
+        evaluator.evaluate_rule(
+            rash_rule, {"symptoms": ["2"], "rash_location": "Arm"}, form_key="screening"
+        ).triggered
+        is False
+    )
+    assert (
+        evaluator.evaluate_rule(
+            rash_rule, {"symptoms": {"2": True}}, form_key="screening"
+        ).triggered
+        is True
+    )
+
+    # Cross-event branching logic is safely marked skipped instead of false-positive failure
+    cross_res = evaluator.evaluate_rule(cross_rule, {"sex": "F"}, form_key="screening")
+    assert cross_res.triggered is False
+    assert cross_res.skipped is True

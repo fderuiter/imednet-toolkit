@@ -473,3 +473,94 @@ def test_cli_datadict_keyboard_interrupt_exits_130(
     cap_api = capsys.readouterr()
     assert cap_api.out == ""
     assert "Aborted by user." in cap_api.err
+
+
+def test_cli_validate_multiformat_inputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLI `datadict validate` validates CSV directory, CSV ZIP, CDISC ODM XML, and REDCap CSV."""
+    import zipfile
+
+    schema_file = tmp_path / "schema.json"
+    app(["datadict", "schema", "-o", str(schema_file)])
+    capsys.readouterr()
+
+    # 1. 4-file CSV directory and ZIP archive
+    csv_dir = tmp_path / "csv_bundle"
+    csv_dir.mkdir()
+    (csv_dir / "FORMS.csv").write_text(
+        "Form ID,Form Key,Form Type,Form Name\n10,VS,Subject,Vital Signs\n",
+        encoding="utf-8",
+    )
+    (csv_dir / "QUESTIONS.csv").write_text(
+        "Form,Variable Type,Variable Name,Label\nVS,Integer,SYSBP,Systolic BP\n",
+        encoding="utf-8",
+    )
+    (csv_dir / "CHOICES.csv").write_text(
+        "Form,Variable Type,Variable Name,Choice Text,Choice Value,Position\n",
+        encoding="utf-8",
+    )
+    (csv_dir / "BUSINESS_LOGIC.csv").write_text(
+        "Type,Name,Status,ID,Form\n",
+        encoding="utf-8",
+    )
+
+    app(["datadict", "validate", str(csv_dir), "--schema", str(schema_file)])
+    assert "Validation passed" in capsys.readouterr().out
+
+    zip_file = tmp_path / "csv_bundle.zip"
+    with zipfile.ZipFile(zip_file, "w") as zf:
+        for p in csv_dir.iterdir():
+            zf.write(p, arcname=p.name)
+
+    app(["datadict", "validate", str(zip_file)])
+    assert "Validation passed" in capsys.readouterr().out
+
+    # FIXTURES_DIR has an orphaned AESEV choice in CHOICES.csv -> fails raw directory validation
+    with pytest.raises(SystemExit) as exc_bad_csv:
+        app(["datadict", "validate", str(FIXTURES_DIR)])
+    assert exc_bad_csv.value.code == 1
+    assert "AESEV" in capsys.readouterr().err
+
+    # 2. CDISC ODM XML
+    odm_file = tmp_path / "study.xml"
+    odm_file.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" ODMVersion="1.3.2" FileType="Snapshot" '
+        'FileOID="F1" CreationDateTime="2026-01-01T00:00:00Z">'
+        '<Study OID="S1"><GlobalVariables><StudyName>S</StudyName>'
+        '<StudyDescription>D</StudyDescription><ProtocolName>P</ProtocolName></GlobalVariables>'
+        '<MetaDataVersion OID="M1" Name="v1">'
+        '<FormDef OID="VS" Name="Vitals" Repeating="No">'
+        '<ItemGroupRef ItemGroupOID="IG.VS" Mandatory="Yes"/></FormDef>'
+        '<ItemGroupDef OID="IG.VS" Name="Vitals" Repeating="No">'
+        '<ItemRef ItemOID="IT.HR" Mandatory="Yes"/></ItemGroupDef>'
+        '<ItemDef OID="IT.HR" Name="HR" DataType="integer"/>'
+        '</MetaDataVersion></Study></ODM>',
+        encoding="utf-8",
+    )
+    app(["datadict", "validate", str(odm_file), "--schema", str(schema_file)])
+    assert "Validation passed" in capsys.readouterr().out
+
+    # 3. REDCap CSV
+    rc_file = tmp_path / "redcap.csv"
+    rc_file.write_text(
+        '"Variable / Field Name","Form Name","Field Type","Field Label",'
+        '"Choices, Calculations, OR Slider Labels"\n'
+        '"arm","enrollment","radio","Study Arm","1, Arm A | 2, Arm B"\n',
+        encoding="utf-8",
+    )
+    app(["datadict", "validate", str(rc_file), "--schema", str(schema_file)])
+    assert "Validation passed" in capsys.readouterr().out
+
+    bad_rc_file = tmp_path / "bad_redcap.csv"
+    bad_rc_file.write_text(
+        '"Variable / Field Name","Form Name","Field Type","Field Label",'
+        '"Choices, Calculations, OR Slider Labels"\n'
+        '"arm","enrollment","radio","Empty Choices Arm",""\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as exc_bad_rc:
+        app(["datadict", "validate", str(bad_rc_file)])
+    assert exc_bad_rc.value.code == 1
+    assert "empty Choice list" in capsys.readouterr().err

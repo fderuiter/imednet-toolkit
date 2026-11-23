@@ -13,8 +13,14 @@ from imednet.validation.cache import (
     _normalize_variable_type_key,
     _validate_bool,
     _validate_calculation,
+    _validate_date,
+    _validate_datetime,
+    _validate_datetime_precision,
+    _validate_duration_datetime,
     _validate_float,
     _validate_int,
+    _validate_interval_datetime,
+    _validate_time,
 )
 
 from .data_generator import generator as faker
@@ -126,6 +132,16 @@ def _fake_value(var_type: str) -> Any:
             return faker.pyfloat(left_digits=2, right_digits=2, positive=True)
         if validator is _validate_bool:
             return faker.boolean()
+        if validator in (_validate_date, _validate_datetime_precision):
+            return faker.date_time().strftime("%Y-%m-%d")
+        if validator is _validate_datetime:
+            return faker.date_time().strftime("%Y-%m-%dT%H:%M:%S")
+        if validator is _validate_duration_datetime:
+            return "P1D"
+        if validator is _validate_interval_datetime:
+            return "2025-01-01/2025-01-02"
+        if validator is _validate_time:
+            return faker.date_time().strftime("%H:%M:%S")
     return faker.word()
 
 

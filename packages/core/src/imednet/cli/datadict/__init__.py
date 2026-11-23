@@ -160,7 +160,7 @@ def _handle_validate(args: argparse.Namespace) -> None:
             print_error(redact_cli_secrets(f"Error reading schema file '{args.schema}': {exc}"))
             sys.exit(1)
 
-    errors = validate(args.file, schema=schema_dict)
+    errors = validate(Path(args.file), schema=schema_dict)
     if errors:
         print_error(f"Validation failed with {len(errors)} error(s):")
         for err in errors:
@@ -356,11 +356,17 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     # 3. validate
     val_parser = cmd_subparsers.add_parser(
         "validate",
-        help="Validate a data dictionary JSON file against model and schema rules.",
+        help=(
+            "Validate a data dictionary (JSON, CSV directory/ZIP, CDISC ODM XML, or REDCap CSV) "
+            "against model, schema, and semantic rules."
+        ),
     )
     val_parser.add_argument(
         "file",
-        help="Path to data dictionary JSON file to validate.",
+        help=(
+            "Path to data dictionary JSON file, 4-file CSV directory/ZIP archive, "
+            "CDISC ODM XML file, or REDCap CSV file."
+        ),
     )
     val_parser.add_argument(
         "--schema",
