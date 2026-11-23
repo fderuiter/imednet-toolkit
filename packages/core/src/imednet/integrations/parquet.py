@@ -238,11 +238,16 @@ def export_to_hive_parquet(
             f"export_to_hive_parquet() got an unexpected keyword argument {unexpected!r}"
         )
 
-    effective_mask_phi = config.mask_phi
-    mapper = _build_record_mapper(sdk, chunk_size=config.batch_size, mask_phi=effective_mask_phi)
-    if hasattr(mapper, "_active_study_key"):
-        mapper._active_study_key = study_key
-    pipeline = resolve_enrichment_pipeline(study_key)
+    from imednet.core.context import sdk_governance_context
+
+    with sdk_governance_context(sdk):
+        effective_mask_phi = config.mask_phi
+        mapper = _build_record_mapper(
+            sdk, chunk_size=config.batch_size, mask_phi=effective_mask_phi
+        )
+        if hasattr(mapper, "_active_study_key"):
+            mapper._active_study_key = study_key
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
