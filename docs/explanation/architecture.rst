@@ -201,22 +201,32 @@ Export Path Decision Matrix
      - Destination is a document store (for example MongoDB) and should keep
        nested ``record_data`` payloads with metadata envelope fields (aligned
        to ``naming_convention``) or emit flat CDISC SDTM domain documents
-       when ``as_sdtm=True``.
+       when ``as_sdtm=True``. Encodes pure ``date`` scalars as ISO-8601
+       strings and ``Decimal`` values as ``bson.Decimal128``, keying ``_id``
+       on ``<study_key>/<record_id>`` (falling back to
+       ``<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>`` when ``as_sdtm=True`` and
+       ``record_id`` is absent).
      - ``imednet.spi.sinks.build_sink_mapper`` / ``CentralizedMapper`` →
        :class:`~imednet_sinks.document.MongoDbExportSink`
    * - **Graph**
-     - Destination models relationships natively (for example Neo4j) and the
-       hierarchy *Study → Subject → Visit → Record* should be preserved
+     - Destination models relationships natively (for example Neo4j),
+       preserving *Study → Subject → Visit → Record* for scheduled ``Visit``
+       items while normalizing ``visit_id <= 0`` to ``None`` so unscheduled
+       ``Record`` nodes link directly via ``(:Subject)-[:HAS_RECORD]->(:Record)``
        under either ``naming_convention`` properties or CDISC SDTM domain
-       node properties (``as_sdtm=True``).
+       node properties (``as_sdtm=True``, keyed on
+       ``(STUDYID, DOMAIN, USUBJID, *SEQ)`` or ``(STUDYID, DOMAIN, USUBJID)``
+       for domains without ``*SEQ`` such as ``DM``).
      - ``imednet.spi.sinks.build_sink_mapper`` / ``CentralizedMapper`` →
        :class:`~imednet_sinks.graph.Neo4jExportSink`
    * - **Warehouse**
      - Destination is a cloud data warehouse with a native bulk loader.
-       Records are mapped via core SPI (supporting ``snake_case``,
-       ``camelCase``, ``sdtm`` naming conventions, and ``as_sdtm=True`` SDTM
-       domains), staged as Parquet files, and loaded via ``MERGE INTO`` /
-       ``COPY INTO`` for best throughput.
+       ``Record`` items are mapped via core SPI (supporting ``snake_case``
+       ``(study_key, record_id)``, ``camelCase`` ``(studyKey, recordId)``,
+       ``sdtm`` ``(STUDYID, RECORD_ID)``, and ``as_sdtm=True`` SDTM domain
+       merge keys ``(STUDYID, DOMAIN, USUBJID, *SEQ)`` or
+       ``(STUDYID, DOMAIN, USUBJID)`` for ``DM``), staged as Parquet files,
+       and loaded via ``MERGE INTO`` / ``COPY INTO`` for best throughput.
      - ``imednet.spi.sinks.build_sink_mapper`` / ``CentralizedMapper`` →
        Parquet staging →
        :class:`~imednet_sinks.warehouse.SnowflakeExportSink`
@@ -355,13 +365,22 @@ Incremental exports decouple destination sinks from checkpoint persistence throu
      resolving the active watermark from the stored ``last_timestamp`` or ``modified_since`` fallback.
   2. Streams paginated ``Record`` items via :func:`~imednet.spi.sink_base.iter_filtered_sdk_records`,
      combining ``watermark``, ``record_filter``, and ``record_data_filter`` into AND-safe query branches.
-  3. Tracks the maximum observed ``Record`` modification timestamp while routing voided
-     (``deleted=True``) items to ``sink.reconcile_deleted(...)`` on incremental idempotent runs
-     when ``include_deleted=False``.
+  3. Observes ``Record`` modification timestamps while routing voided
+     (``deleted=True``) items to ``sink.reconcile_deleted(...)`` on incremental idempotent
+     runs when ``include_deleted=False`` (with multi-``Form`` tabular helpers routing
+     single-pass ``Record`` streams through
+     :class:`~imednet.spi.sink_base.BoundedFormBufferRouter`).
   4. Applies :func:`~imednet.spi.sink_base.apply_quality_gate` and streams fixed-size chunks
-     into ``sink.write_batch(...)``.
+     into ``sink.write_batch(...)``. When ``quality_gate_enabled=True`` and
+     ``apply_quality_gate`` drops low-readiness ``Record`` items, both
+     ``run_streaming_export`` and multi-``Form`` tabular streaming cap the candidate
+     ``max_ts`` watermark at ``min_rejected_ts`` (selecting the highest exported ``Record``
+     timestamp ``<= min_rejected_ts``, or leaving ``max_ts`` as ``None`` when no exported
+     timestamp precedes ``min_rejected_ts`` or any rejected ``Record`` lacks a timestamp)
+     so rejected ``Record`` items are re-evaluated on subsequent incremental runs.
   5. Flushes and closes the sink before exiting ``provider.transaction(...)``, ensuring the
-     high-water mark advances **only** after every batch and ``sink.flush()`` succeed.
+     capped high-water mark commits **only** after every batch, delete reconciliation, and
+     ``sink.flush()`` succeed.
 
 Error propagation
 ~~~~~~~~~~~~~~~~~
@@ -406,10 +425,12 @@ Extras naming:
 Public API exposure
 ~~~~~~~~~~~~~~~~~~~
 
-* :mod:`imednet.integrations` exports tabular helpers, while
+* :mod:`imednet.integrations` registers all 10 tabular helpers on
+  :class:`~imednet.integrations.dispatcher.ExportRegistry`, while
   :mod:`imednet.spi.sinks` (and :mod:`imednet.spi.sink_base`) defines shared
-  sink contracts (:class:`~imednet.spi.sink_base.SinkConfig` and
-  :class:`~imednet.spi.sink_base.ExportSink`).
+  sink contracts (:class:`~imednet.spi.sink_base.SinkConfig`,
+  :class:`~imednet.spi.sink_base.ExportSink`, and
+  :class:`~imednet.spi.sink_base.BoundedFormBufferRouter`).
 * Document, graph, and warehouse sinks are exposed from :mod:`imednet_sinks`
   (and dynamically via ``sdk.sinks`` when ``imednet-plugins-sinks`` is installed)
   or directly from their submodules:
@@ -418,11 +439,19 @@ Public API exposure
   * :mod:`imednet_sinks.graph`
   * :mod:`imednet_sinks.warehouse`
 
-* :mod:`apache_airflow_providers_imednet.export` wraps **only** the
-  tabular helpers, while
+* :mod:`apache_airflow_providers_imednet.export` wraps the 8 single-target
+  tabular helpers (``export_to_csv``, ``export_to_duckdb``, ``export_to_excel``,
+  ``export_to_json``, ``export_to_long_sql``, ``export_to_parquet``,
+  ``export_to_sql``, and ``export_to_sql_by_form``; multi-artifact
+  ``export_to_duckdb_by_form`` and ``export_to_hive_parquet`` remain in
+  :mod:`imednet.integrations`).
   :class:`~apache_airflow_providers_imednet.operators.export.ImednetExportOperator`
-  resolves ``mongodb``, ``neo4j``, and ``snowflake`` destinations dynamically
-  via ``sdk.sinks`` at runtime.
+  dispatches those 8 tabular targets alongside ``mongodb``, ``neo4j``, and
+  ``snowflake`` plugin sinks resolved dynamically via ``sdk.sinks`` at runtime
+  (keeping ``apache_airflow_providers_imednet`` decoupled from ``imednet_sinks``),
+  while :meth:`~apache_airflow_providers_imednet.hooks.ImednetHook.resolve_destination_connection`
+  resolves ``destination_conn_id`` settings for ``snowflake``, ``neo4j``,
+  ``mongodb``, ``duckdb``, ``sql``, ``sql_by_form``, and ``long_sql``.
 
 Adding New Export Sinks
 ~~~~~~~~~~~~~~~~~~~~~~~
