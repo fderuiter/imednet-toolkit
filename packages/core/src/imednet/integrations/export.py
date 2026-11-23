@@ -35,6 +35,7 @@ from imednet.integrations.sink_base import (
     StateProviderProtocol,
     _enforce_batch_standards_readiness,
     _extract_safe_config_options,
+    _require_optional_dep,
     apply_quality_gate,
     extract_record_form_ref,
     extract_record_id,
@@ -1419,6 +1420,7 @@ class TabularParquetSink(ExportSink):
     ) -> None:
         """Initialize the Parquet sink."""
         super().__init__(config)
+        _require_optional_dep("pyarrow", "export")
         self.path: str = _coerce_path_str(path)
         self._cfg = config
         self._writer: Any = None
@@ -1542,8 +1544,8 @@ class TabularParquetSink(ExportSink):
             return 0
 
         def execute_export() -> int:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
+            pa = _require_optional_dep("pyarrow", "export")
+            pq = _require_optional_dep("pyarrow.parquet", "export")
 
             table, schema_evolved = self._align_batch_table(pa, df)
             target_path = self._active_writer_path()

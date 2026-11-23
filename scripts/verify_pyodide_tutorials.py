@@ -30,6 +30,7 @@ EXPECTED_PYODIDE_PACKAGES: tuple[str, ...] = (
     "pydantic",
     "cryptography",
     "pandas",
+    "jsonschema",
     "ssl",
     "sqlite3",
 )
@@ -40,6 +41,11 @@ EXPECTED_REQUIREMENTS: tuple[str, ...] = (
     "python-dotenv",
     "filelock",
 )
+EXPECTED_LAZY_PYODIDE_PACKAGES: tuple[str, ...] = (
+    "duckdb",
+    "sqlalchemy",
+)
+EXPECTED_LAZY_REQUIREMENTS: tuple[str, ...] = ("openpyxl",)
 TUTORIAL_PAGES: tuple[str, ...] = (
     "tutorials/quick_start.html",
     "tutorials/async_quick_start.html",
@@ -148,6 +154,28 @@ def verify_built_tutorial_html(html_dir: Path) -> list[str]:
                     f"{rel_page}: Missing pure-Python requirement '{req}' in requirements"
                 )
 
+        lazy_pyodide_pkgs = set(config.get("lazy_pyodide_packages", []))
+        for lazy_pkg in EXPECTED_LAZY_PYODIDE_PACKAGES:
+            if lazy_pkg not in lazy_pyodide_pkgs:
+                errors.append(
+                    f"{rel_page}: Missing lazy Pyodide package '{lazy_pkg}' in lazy_pyodide_packages"
+                )
+            if lazy_pkg in pyodide_pkgs:
+                errors.append(
+                    f"{rel_page}: Analytical package '{lazy_pkg}' must be lazy, not in pyodide_packages"
+                )
+
+        lazy_reqs = config.get("lazy_requirements", [])
+        for lazy_req in EXPECTED_LAZY_REQUIREMENTS:
+            if not any(str(item).startswith(lazy_req) for item in lazy_reqs):
+                errors.append(
+                    f"{rel_page}: Missing lazy requirement '{lazy_req}' in lazy_requirements"
+                )
+            if any(str(item).startswith(lazy_req) for item in requirements):
+                errors.append(
+                    f"{rel_page}: Analytical requirement '{lazy_req}' must be lazy, not in requirements"
+                )
+
         env_cfg = config.get("env", {})
         if not isinstance(env_cfg, dict) or env_cfg.get("IMEDNET_SIMULATION_MODE") != "true":
             errors.append(f"{rel_page}: env.IMEDNET_SIMULATION_MODE must be 'true'")
@@ -212,7 +240,7 @@ def verify_tutorials_in_browser(
     screenshot_dir: Path | None = None,
 ) -> list[str]:
     """Serve built HTML locally and execute all interactive tutorial cells in headless Chromium."""
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
 
     errors: list[str] = []
     handler = functools.partial(_QuietStaticHandler, directory=str(html_dir.resolve()))
@@ -233,8 +261,10 @@ def verify_tutorials_in_browser(
                 # 1. Verify synchronous + mixed tutorial cells on tutorials/quick_start.html
                 qs_page = context.new_page()
                 qs_wheel_responses: dict[str, int] = {}
+                qs_fetched_urls: list[str] = []
 
                 def _record_qs_response(response: Any) -> None:
+                    qs_fetched_urls.append(response.url)
                     if response.url.endswith(".whl") and f"127.0.0.1:{port}" in response.url:
                         qs_wheel_responses[Path(response.url).name] = response.status
 
@@ -302,13 +332,31 @@ def verify_tutorials_in_browser(
                         full_page=True,
                     )
 
-                # Verify SimulationTransport routing, plugin wheel imports, and SystemExit capture
+                # Verify zero extra analytical packages downloaded during initial boot + standard cells
+                for deferred_pkg in (*EXPECTED_LAZY_PYODIDE_PACKAGES, *EXPECTED_LAZY_REQUIREMENTS):
+                    eager_hits = [
+                        url
+                        for url in qs_fetched_urls
+                        if re.search(rf"[/_-]{re.escape(deferred_pkg)}[._-]", url, re.IGNORECASE)
+                    ]
+                    if eager_hits:
+                        errors.append(
+                            f"quick_start.html eagerly downloaded lazy package '{deferred_pkg}' "
+                            f"before cell request: {eager_hits}"
+                        )
+
+                # Verify SimulationTransport routing, plugin wheel imports, sequential polling,
+                # UATWorkflow, MultiStudyOrchestrator, datadict schema validation, lazy analytical
+                # exports, fast-fail Parquet export, and SystemExit capture
                 if cell_count >= 3:
                     editor = qs_page.locator("#thebe-codecell-2 .thebe-editor")
                     editor.fill(
+                        "import sys\n"
                         "import imednet_workflows, imednet_sinks\n"
                         "assert type(sdk._client._transport).__name__ == 'SimulationTransport', "
                         "type(sdk._client._transport).__name__\n"
+                        "for _mod in ('duckdb', 'sqlalchemy', 'openpyxl'):\n"
+                        "    assert _mod not in sys.modules, f'{_mod} eagerly imported'\n"
                         "print('PLUGINS_READY', sdk.workflows is not None, sdk.sinks is not None)\n"
                     )
                     plugin_outcome = _run_cell_and_wait(qs_page, 2, timeout_ms)
@@ -317,6 +365,186 @@ def verify_tutorials_in_browser(
                         or "PLUGINS_READY True True" not in plugin_outcome["stdout"]
                     ):
                         errors.append(f"quick_start.html plugin check failed: {plugin_outcome}")
+
+                    # Sequential Job polling, create_records_batch, UATWorkflow, MultiStudyOrchestrator
+                    editor.fill(
+                        "from imednet import ImednetSDK\n"
+                        "from imednet.datadict import (\n"
+                        "    BusinessLogicRule, Choice, DataDictionary, Form, Metadata, Variable, parse_logic_xml\n"
+                        ")\n"
+                        "from imednet.orchestration import MultiStudyOrchestrator\n"
+                        "from imednet.simulation import SimulationState, SimulationTransport\n"
+                        "from imednet_workflows.uat import UATExecutionEngine, UATWorkflow\n"
+                        "\n"
+                        "sim_sdk = ImednetSDK(simulation_mode=True, transport=SimulationTransport(SimulationState()))\n"
+                        "single_batch = sim_sdk.create_records_batch(\n"
+                        "    'STUDY',\n"
+                        "    [{'formKey': 'F_VS', 'data': {'V_WEIGHT': 70.5}}],\n"
+                        "    skip_validation=True,\n"
+                        "    wait_for_completion=True,\n"
+                        "    interval=0.0,\n"
+                        ")\n"
+                        "multi_batch = sim_sdk.create_records_batch(\n"
+                        "    'STUDY',\n"
+                        "    [\n"
+                        "        {'formKey': 'F_VS', 'data': {'V_WEIGHT': 71.0}},\n"
+                        "        {'formKey': 'F_VS', 'data': {'V_WEIGHT': 72.0}},\n"
+                        "    ],\n"
+                        "    chunk_size=1,\n"
+                        "    skip_validation=True,\n"
+                        "    wait_for_completion=True,\n"
+                        "    interval=0.0,\n"
+                        ")\n"
+                        "polled = sim_sdk.poll_jobs('STUDY', list(multi_batch.batch_ids), interval=0.0)\n"
+                        "assert len(polled.results) == 2 and not polled.failures, polled\n"
+                        "\n"
+                        "rule_xml = (\n"
+                        "    '<rule><conditions><condition variable=\"V_WEIGHT\" operator=\"&lt;\" value=\"35\"/></conditions>'\n"
+                        "    '<actions><action type=\"error\" message=\"Baseline weight must be at least 35 kg.\"/></actions></rule>'\n"
+                        ")\n"
+                        "dd = DataDictionary(\n"
+                        "    metadata=Metadata.create(study_key='STUDY'),\n"
+                        "    forms=[\n"
+                        "        Form(\n"
+                        "            formKey='F_DM', formName='Demographics', formType='Enrollment',\n"
+                        "            variables=[\n"
+                        "                Variable(variableName='V_AGE', variableType='Integer', required='Yes', extraAttributes={'minValue': 18, 'maxValue': 85}),\n"
+                        "                Variable(variableName='V_GENDER', variableType='Radio', required='Yes', choices=[Choice(choiceValue='Female', choiceText='Female'), Choice(choiceValue='Male', choiceText='Male')]),\n"
+                        "            ],\n"
+                        "        ),\n"
+                        "        Form(\n"
+                        "            formKey='F_VS', formName='Vital Signs', formType='Standard',\n"
+                        "            variables=[Variable(variableName='V_WEIGHT', variableType='Float', required='Yes', extraAttributes={'minValue': 35.0, 'maxValue': 180.0})],\n"
+                        "            businessLogic=[BusinessLogicRule(id='101', name='Min Weight', type='Form', status='Active', form='F_VS', logic=parse_logic_xml(rule_xml))],\n"
+                        "        ),\n"
+                        "    ],\n"
+                        ")\n"
+                        "uat_res = UATWorkflow(sim_sdk, poll_interval=0.0, seed=42, data_dictionary=dd).run('STUDY', subject_count=2)\n"
+                        "assert uat_res.overall_success, uat_res.summary()\n"
+                        "ver_rep = UATExecutionEngine(sim_sdk, dd, poll_interval=0.0).run_verification('STUDY', form_scope='F_VS')\n"
+                        "assert ver_rep.total_rules == 1, ver_rep\n"
+                        "orch = MultiStudyOrchestrator(sim_sdk, max_workers=1)\n"
+                        "orch_res = orch.execute_pipeline(lambda sk, s, log: len(list(s.forms.list(study_key=sk))), whitelist={'STUDY'})\n"
+                        "assert orch_res['STUDY']['status'] == 'SUCCESS', orch_res\n"
+                        "print('SEQUENTIAL_WORKFLOWS_OK', len(single_batch.batch_ids), len(polled.results), uat_res.overall_success, orch_res['STUDY']['status'])\n"
+                    )
+                    seq_outcome = _run_cell_and_wait(qs_page, 2, timeout_ms)
+                    if (
+                        seq_outcome["status"] != "Execution completed."
+                        or "SEQUENTIAL_WORKFLOWS_OK 1 2 True SUCCESS" not in seq_outcome["stdout"]
+                    ):
+                        errors.append(
+                            f"quick_start.html sequential polling/UAT/orchestrator check failed: {seq_outcome}"
+                        )
+
+                    # Data Dictionary JSON Schema validation + CLI `imednet datadict validate --schema`
+                    editor.fill(
+                        "import json\n"
+                        "from pathlib import Path\n"
+                        "from imednet.cli import app as cli_app\n"
+                        "from imednet.datadict import get_schema, load_from_csv_files, to_json, validate\n"
+                        "\n"
+                        "work = Path('/tmp/pyodide_dd_check')\n"
+                        "work.mkdir(parents=True, exist_ok=True)\n"
+                        "(work / 'FORMS.csv').write_text('Form Key,Form Name,Form ID,Form Type\\nF_DM,Demographics,301,Enrollment\\n', encoding='utf-8')\n"
+                        "(work / 'QUESTIONS.csv').write_text('Form Key,Variable Name,Label,Variable Type,Sequence,Required Field,Minimum,Maximum\\nF_DM,V_AGE,Age,Integer,1,Yes,18,95\\n', encoding='utf-8')\n"
+                        "(work / 'CHOICES.csv').write_text('Form Key,Variable Name,Choice Value,Choice Text,Position\\n', encoding='utf-8')\n"
+                        "(work / 'BUSINESS_LOGIC.csv').write_text('ID,Name,Type,Status,Form,Sequence,Logic\\n', encoding='utf-8')\n"
+                        "csv_dd = load_from_csv_files(\n"
+                        "    forms_file=work / 'FORMS.csv',\n"
+                        "    questions_file=work / 'QUESTIONS.csv',\n"
+                        "    choices_file=work / 'CHOICES.csv',\n"
+                        "    business_logic_file=work / 'BUSINESS_LOGIC.csv',\n"
+                        "    study_key='STUDY',\n"
+                        ")\n"
+                        "schema_doc = get_schema()\n"
+                        "schema_errors = validate(to_json(csv_dd), schema=schema_doc)\n"
+                        "assert schema_errors == [], schema_errors\n"
+                        "dd_file = work / 'dd.json'\n"
+                        "schema_file = work / 'schema.json'\n"
+                        "dd_file.write_text(to_json(csv_dd), encoding='utf-8')\n"
+                        "schema_file.write_text(json.dumps(schema_doc), encoding='utf-8')\n"
+                        "cli_app(['datadict', 'validate', str(dd_file), '--schema', str(schema_file)])\n"
+                        "print('DATADICT_SCHEMA_OK')\n"
+                    )
+                    dd_outcome = _run_cell_and_wait(qs_page, 2, timeout_ms)
+                    if (
+                        dd_outcome["status"] != "Execution completed."
+                        or "DATADICT_SCHEMA_OK" not in dd_outcome["stdout"]
+                        or "Validation passed" not in dd_outcome["stdout"]
+                    ):
+                        errors.append(
+                            f"quick_start.html DataDictionary schema validation failed: {dd_outcome}"
+                        )
+
+                    # Fast-fail export_to_parquet without pyarrow (< 1s, 1 attempt, no retry sleep)
+                    editor.fill(
+                        "import time\n"
+                        "from imednet.errors import ExportBatchError\n"
+                        "from imednet.integrations import export_to_parquet\n"
+                        "\n"
+                        "t0 = time.monotonic()\n"
+                        "caught_import_err = False\n"
+                        "try:\n"
+                        "    export_to_parquet(sim_sdk, 'STUDY', '/tmp/unsupported.parquet')\n"
+                        "except ImportError:\n"
+                        "    caught_import_err = True\n"
+                        "except ExportBatchError as exc:\n"
+                        "    caught_import_err = isinstance(exc.__cause__, ImportError)\n"
+                        "elapsed = time.monotonic() - t0\n"
+                        "assert caught_import_err, 'Expected ImportError for missing pyarrow'\n"
+                        "assert elapsed < 1.0, f'Expected fast-fail < 1.0s, took {elapsed:.3f}s'\n"
+                        "print('PARQUET_FAST_FAIL_OK', round(elapsed, 4))\n"
+                    )
+                    parquet_outcome = _run_cell_and_wait(qs_page, 2, timeout_ms)
+                    if (
+                        parquet_outcome["status"] != "Execution completed."
+                        or "PARQUET_FAST_FAIL_OK" not in parquet_outcome["stdout"]
+                    ):
+                        errors.append(
+                            f"quick_start.html export_to_parquet fast-fail check failed: {parquet_outcome}"
+                        )
+
+                    # Lazy analytical exports: duckdb_centralizer, export_to_duckdb, export_to_sql, export_to_excel
+                    editor.fill(
+                        "from imednet.integrations import export_to_duckdb, export_to_excel, export_to_sql\n"
+                        "\n"
+                        "central_wf = sim_sdk.workflows.duckdb_centralizer\n"
+                        "rev_cnt = central_wf.ingest_revisions('STUDY')\n"
+                        "central_wf.build_silver_view('STUDY')\n"
+                        "silver_cnt = central_wf._connection.execute('SELECT COUNT(*) FROM silver_current_state').fetchone()[0]\n"
+                        "\n"
+                        "export_to_duckdb(sim_sdk, 'STUDY', '/tmp/records.duckdb', 'study_records')\n"
+                        "export_to_sql(sim_sdk, 'STUDY', 'study_records', 'sqlite:////tmp/records.sqlite')\n"
+                        "export_to_excel(sim_sdk, 'STUDY', '/tmp/records.xlsx')\n"
+                        "\n"
+                        "import duckdb, openpyxl, sqlalchemy\n"
+                        "with duckdb.connect('/tmp/records.duckdb', config={'threads': '1'}) as conn:\n"
+                        "    duck_rows = conn.execute('SELECT COUNT(*) FROM study_records').fetchone()[0]\n"
+                        "eng = sqlalchemy.create_engine('sqlite:////tmp/records.sqlite')\n"
+                        "with eng.connect() as sconn:\n"
+                        "    sql_rows = sconn.execute(sqlalchemy.text('SELECT COUNT(*) FROM study_records')).scalar()\n"
+                        "eng.dispose()\n"
+                        "wb = openpyxl.load_workbook('/tmp/records.xlsx')\n"
+                        "excel_sheets = len(wb.sheetnames)\n"
+                        "wb.close()\n"
+                        "assert duck_rows > 0 and sql_rows > 0 and excel_sheets > 0, (duck_rows, sql_rows, excel_sheets)\n"
+                        "print('LAZY_EXPORTS_OK', rev_cnt >= 0, silver_cnt >= 0, duck_rows > 0, sql_rows > 0, excel_sheets > 0)\n"
+                    )
+                    lazy_outcome = _run_cell_and_wait(qs_page, 2, timeout_ms)
+                    if (
+                        lazy_outcome["status"] != "Execution completed."
+                        or "LAZY_EXPORTS_OK True True True True True" not in lazy_outcome["stdout"]
+                    ):
+                        errors.append(
+                            f"quick_start.html lazy analytical exports check failed: {lazy_outcome}"
+                        )
+
+                    if screenshot_dir is not None:
+                        qs_page.screenshot(
+                            path=str(screenshot_dir / "quick_start_lazy_exports_pyodide.png"),
+                            full_page=True,
+                        )
 
                     editor.fill(
                         "import sys\n"

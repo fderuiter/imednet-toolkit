@@ -88,6 +88,20 @@ def test_duckdb_centralizer_default_memory() -> None:
         mock_connect.assert_called_once_with(":memory:")
 
 
+def test_duckdb_centralizer_emscripten_sets_single_thread_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DuckDBIngestionWorkflow configures threads=1 when running under Emscripten."""
+    import sys
+
+    pytest.importorskip("duckdb")
+    monkeypatch.setattr(sys, "platform", "emscripten")
+    sdk = MagicMock()
+    with patch("duckdb.connect") as mock_connect:
+        DuckDBIngestionWorkflow(sdk, "/tmp/browser.duckdb")
+        mock_connect.assert_called_once_with("/tmp/browser.duckdb", config={"threads": "1"})
+
+
 def test_ingest_revisions_and_build_silver_view() -> None:
     """Test that ingest revisions and build silver view."""
     pytest.importorskip("duckdb")

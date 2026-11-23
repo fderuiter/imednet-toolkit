@@ -2747,3 +2747,58 @@ def test_incremental_reconciliation_with_sdtm_naming_convention(tmp_path: Path) 
         engine.dispose()
     assert sql_df["RECORD_ID"].tolist() == [1]
     assert sql_df["SYSBP"].tolist() == [135]
+
+
+def test_export_to_parquet_missing_pyarrow_fails_fast_without_retries(tmp_path, monkeypatch):
+    """export_to_parquet fails on attempt 1 in < 1s without backoff sleeps when pyarrow is unavailable."""
+    import builtins
+    import sys
+    import time
+    from types import SimpleNamespace
+
+    import imednet.integrations.export as export_mod
+    from imednet.models.variables import Variable
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("tenacity.nap.time.sleep", sleeps.append)
+
+    real_import = builtins.__import__
+
+    def block_pyarrow(name, globals_=None, locals_=None, fromlist=(), level=0):
+        if name == "pyarrow" or name.startswith("pyarrow."):
+            raise ModuleNotFoundError("No module named 'pyarrow'", name="pyarrow")
+        return real_import(name, globals_, locals_, fromlist, level)
+
+    for mod_name in [k for k in list(sys.modules) if k == "pyarrow" or k.startswith("pyarrow.")]:
+        monkeypatch.delitem(sys.modules, mod_name, raising=False)
+    monkeypatch.setattr(builtins, "__import__", block_pyarrow)
+
+    sdk = MagicMock()
+    vars_list = [
+        Variable(
+            variable_name="SYSBP",
+            label="Systolic BP",
+            variable_type="int",
+            form_id=1,
+            form_key="VS",
+        )
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.forms.list.return_value = [SimpleNamespace(form_id=1, form_key="VS")]
+    rec = Record(
+        record_id=1,
+        study_key="FAST_FAIL",
+        subject_key="S1",
+        form_id=1,
+        form_key="VS",
+        record_data={"SYSBP": 120},
+    )
+    sdk.records.list.side_effect = lambda **_kw: iter([rec])
+
+    start = time.monotonic()
+    with pytest.raises(ImportError, match="pyarrow"):
+        export_mod.export_to_parquet(sdk, "FAST_FAIL", str(tmp_path / "out.parquet"))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0
+    assert sleeps == []

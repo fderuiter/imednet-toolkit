@@ -160,7 +160,10 @@ def test_sink_success_stops_retries(monkeypatch):
     assert sleeps == [0.25]
 
 
-@pytest.mark.parametrize("error_type", [ExportConfigurationError, ValueError, TypeError])
+@pytest.mark.parametrize(
+    "error_type",
+    [ExportConfigurationError, ValueError, TypeError, ImportError],
+)
 def test_sink_permanent_failures_do_not_retry_or_expose_driver_message(
     monkeypatch, caplog, error_type
 ):
@@ -342,3 +345,32 @@ def test_sink_batch_error_cause_scrubs_structured_dict_args_and_custom_exception
     assert "1975-08-19" not in str(cause)
     assert "***MASKED***" in str(cause)
     assert "10" in str(cause)
+
+
+def test_sink_import_error_fast_fails_preserving_scrubbed_import_error_cause(monkeypatch, caplog):
+    sleeps = []
+    monkeypatch.setattr("tenacity.nap.time.sleep", sleeps.append)
+    tracer = MagicMock()
+    sink = SyntheticSink(SinkConfig(study_key="synthetic", max_retries=3, tracer=tracer))
+    raw_import_err = ImportError(
+        "Missing driver for postgresql://admin:super_secret_pw@db.internal:5432/edc "  # pragma: allowlist secret
+        "patient_name='John Doe' ssn=123-45-6789"
+    )
+    destination = MagicMock(side_effect=raw_import_err)
+
+    with pytest.raises(ExportBatchError, match="after 1 attempts") as caught:
+        sink._execute_with_retry("synthetic_write", "synthetic/imp", destination)
+
+    assert destination.call_count == 1
+    assert sleeps == []
+    assert sink._circuit_breaker.consecutive_failures == 0
+    cause = caught.value.__cause__
+    assert isinstance(cause, ImportError)
+    cause_text = str(cause)
+    assert "postgresql://***@db.internal:5432/edc" in cause_text
+    assert "***MASKED***" in cause_text
+    for leaked in ("super_secret_pw", "John Doe", "123-45-6789"):
+        assert leaked not in cause_text
+        assert leaked not in str(caught.value)
+        assert leaked not in caplog.text
+        assert leaked not in str(tracer.mock_calls)

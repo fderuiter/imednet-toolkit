@@ -552,3 +552,91 @@ async def test_poll_many_records_result_url_errors(monkeypatch: pytest.MonkeyPat
     async_err = async_summary.failures["B_ASYNC_ERR"]
     assert isinstance(async_err, JobFailedError)
     assert async_err.result_error == "Connection reset fetching resultUrl"
+
+
+def test_poll_many_bypasses_thread_pool_on_single_batch_and_emscripten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """poll_many runs sequentially without ThreadPoolExecutor on Emscripten or <=1 batch ID."""
+    import concurrent.futures
+    import contextvars
+    import sys
+
+    ctx_var: contextvars.ContextVar[str] = contextvars.ContextVar("poll_ctx", default="unset")
+    seen_ctx: dict[str, str] = {}
+
+    def failing_executor(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", failing_executor)
+
+    def get_job(study_key: str, batch_id: str) -> JobStatus:
+        seen_ctx[batch_id] = ctx_var.get()
+        return JobStatus(
+            batchId=batch_id,
+            state="COMPLETED",
+            progress=100,
+            resultUrl=f"https://example.test/res/{batch_id}",
+        )
+
+    poller = JobPoller(get_job, fetch_result=lambda url: {"url": url})
+    token = ctx_var.set("trace-123")
+    try:
+        single_summary = poller.poll_many("ST", ["B1"], interval=0)
+        assert single_summary.all_successful is True
+        assert single_summary.results["B1"].results == {"url": "https://example.test/res/B1"}
+        assert seen_ctx["B1"] == "trace-123"
+
+        monkeypatch.setattr(sys, "platform", "emscripten")
+        multi_summary = poller.poll_many("ST", ["B2", "B3"], interval=0)
+        assert multi_summary.all_successful is True
+        assert set(multi_summary.results) == {"B2", "B3"}
+        assert seen_ctx["B2"] == "trace-123"
+        assert seen_ctx["B3"] == "trace-123"
+    finally:
+        ctx_var.reset(token)
+
+
+def test_poll_many_emscripten_fail_fast_stops_subsequent_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sequential Emscripten poll_many aborts remaining jobs when fail_fast=True."""
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "emscripten")
+    polled_batches: list[str] = []
+
+    def get_job(study_key: str, batch_id: str) -> JobStatus:
+        polled_batches.append(batch_id)
+        if batch_id == "B_FAIL":
+            return JobStatus(batchId=batch_id, state="FAILED", progress=100)
+        return JobStatus(batchId=batch_id, state="COMPLETED", progress=100)
+
+    poller = JobPoller(get_job)
+    with pytest.raises(JobFailedError):
+        poller.poll_many("ST", ["B_FAIL", "B_NEVER"], interval=0, fail_fast=True)
+
+    assert polled_batches == ["B_FAIL"]
+
+
+def test_poll_many_cpython_multi_batch_preserves_thread_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Standard CPython poll_many continues using ThreadPoolExecutor when len(batch_ids) > 1."""
+    import concurrent.futures
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    real_tpe = concurrent.futures.ThreadPoolExecutor
+    tpe_calls = 0
+
+    def spy_tpe(*args: object, **kwargs: object) -> concurrent.futures.ThreadPoolExecutor:
+        nonlocal tpe_calls
+        tpe_calls += 1
+        return real_tpe(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", spy_tpe)
+    poller = JobPoller(lambda _sk, bid: JobStatus(batchId=bid, state="COMPLETED", progress=100))
+    summary = poller.poll_many("ST", ["B1", "B2"], interval=0)
+    assert summary.all_successful is True
+    assert tpe_calls == 1

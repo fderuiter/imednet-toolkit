@@ -145,3 +145,64 @@ def test_empty_study_list_returns_empty_dict(mock_sdk: MagicMock) -> None:
     results = orchestrator.execute_pipeline(lambda *_args, **_kwargs: True)
 
     assert results == {}
+
+
+def test_execute_pipeline_bypasses_thread_pool_for_max_workers_one_and_emscripten(
+    mock_sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MultiStudyOrchestrator runs sequentially without ThreadPoolExecutor when max_workers==1 or on Emscripten."""
+    import sys
+
+    import imednet.orchestration.orchestrator as orch_mod
+
+    def forbid_tpe(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(orch_mod, "ThreadPoolExecutor", forbid_tpe)
+
+    def pipeline(study_key: str, sdk: object, logger: logging.LoggerAdapter) -> str:
+        if study_key == "STUDY-B":
+            raise ValueError("isolated-study-error")
+        return f"ok:{get_current_study()}"
+
+    single_worker_orch = MultiStudyOrchestrator(mock_sdk, max_workers=1)
+    single_res = single_worker_orch.execute_pipeline(pipeline)
+    assert single_res["STUDY-A"]["status"] == "SUCCESS"
+    assert single_res["STUDY-A"]["data"] == "ok:STUDY-A"
+    assert single_res["STUDY-B"]["status"] == "FAILED"
+    assert "isolated-study-error" in (single_res["STUDY-B"]["error"] or "")
+    assert single_res["STUDY-C"]["status"] == "SUCCESS"
+
+    monkeypatch.setattr(sys, "platform", "emscripten")
+    emscripten_orch = MultiStudyOrchestrator(mock_sdk, max_workers=4)
+    em_res = emscripten_orch.execute_pipeline(pipeline)
+    assert em_res["STUDY-A"]["status"] == "SUCCESS"
+    assert em_res["STUDY-B"]["status"] == "FAILED"
+    assert em_res["STUDY-C"]["status"] == "SUCCESS"
+
+
+def test_execute_pipeline_sequential_enforces_300s_global_timeout(
+    mock_sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sequential MultiStudyOrchestrator aborts remaining studies once 300s global timeout elapses."""
+    import imednet.orchestration.orchestrator as orch_mod
+
+    ticks = iter([0.0, 0.0, 305.0, 305.0, 305.1, 305.2])
+    monkeypatch.setattr(orch_mod.time, "monotonic", lambda: next(ticks))
+
+    orch = MultiStudyOrchestrator(mock_sdk, max_workers=1)
+    executed: list[str] = []
+
+    def pipeline(study_key: str, sdk: object, logger: logging.LoggerAdapter) -> str:
+        executed.append(study_key)
+        return study_key
+
+    results = orch.execute_pipeline(pipeline)
+    assert executed == ["STUDY-A"]
+    assert results["STUDY-A"]["status"] == "SUCCESS"
+    assert results["STUDY-B"]["status"] == "FAILED"
+    assert results["STUDY-B"]["error"] == "TimeoutError: Global orchestration timeout reached."
+    assert results["STUDY-C"]["status"] == "FAILED"
+    assert results["STUDY-C"]["error"] == "TimeoutError: Global orchestration timeout reached."

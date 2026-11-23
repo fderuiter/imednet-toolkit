@@ -852,6 +852,53 @@ def test_validate_staged_wheels_child_process_environment_isolation(
     assert not errors, f"Subprocess validation failed due to leaked variables: {errors}"
 
 
+def test_validate_staged_wheels_verifies_wheel_metadata_against_pyodide_config(
+    tmp_path: Path,
+) -> None:
+    """Verify validate_staged_wheels catches Requires-Dist packages missing from pyodide_config even if installed in dev."""
+    wheels_dir = tmp_path / "wheels"
+    docs_dir = tmp_path / "docs"
+    wheels_dir.mkdir(parents=True)
+    docs_dir.mkdir(parents=True)
+
+    (docs_dir / "conf.py").write_text(
+        "pyodide_config = {\n"
+        '    "pyodide_packages": ["pydantic", "jsonschema"],\n'
+        '    "requirements": ["httpx", "tenacity", "defusedxml"],\n'
+        '    "lazy_pyodide_packages": ["duckdb", "sqlalchemy"],\n'
+        '    "lazy_requirements": ["openpyxl"],\n'
+        "}\n",
+        encoding="utf-8",
+    )
+
+    wheel = wheels_dir / "imednet-1.1.0-py3-none-any.whl"
+    # 'pytest' is installed in host [dev] Python, but absent from pyodide_config;
+    # 'snowflake-connector-python' is guarded by extra == 'snowflake' and must be ignored.
+    metadata = (
+        "Metadata-Version: 2.1\n"
+        "Name: imednet\n"
+        "Version: 1.1.0\n"
+        "Requires-Dist: pydantic>=2.11.3\n"
+        "Requires-Dist: jsonschema>=4.20.0\n"
+        "Requires-Dist: pytest>=8.0.0\n"
+        "Requires-Dist: snowflake-connector-python>=3.0.0; extra == 'snowflake'\n\n"
+    )
+    with zipfile.ZipFile(wheel, "w") as zf:
+        zf.writestr("imednet/__init__.py", "class ImednetSDK:\n    pass\n")
+        zf.writestr("imednet/sdk.py", "")
+        zf.writestr("imednet/config.py", "")
+        zf.writestr("imednet-1.1.0.dist-info/METADATA", metadata)
+
+    errors = validate_staged_wheels(
+        wheels_dir,
+        expected_packages=("imednet",),
+        docs_dir=docs_dir,
+    )
+    assert len(errors) == 1, f"Expected 1 missing browser dependency error, got: {errors}"
+    assert "requires 'pytest'" in errors[0]
+    assert "snowflake-connector-python" not in errors[0]
+
+
 def test_missing_workspace_symbol_in_showcase_detected(tmp_path: Path) -> None:
     """Verify showcase validation fails when an example imports a removed or nonexistent workspace symbol."""
     examples_dir = tmp_path / "examples"

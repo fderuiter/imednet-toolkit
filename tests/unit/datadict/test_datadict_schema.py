@@ -112,3 +112,38 @@ def test_validate_existing_file(tmp_path: Path) -> None:
 
     # Str
     assert validate(str(data_file)) == []
+
+
+def test_validate_raises_import_error_when_schema_passed_without_jsonschema(
+    monkeypatch: object,
+) -> None:
+    """Passing explicit schema when jsonschema is unavailable raises ImportError."""
+    import builtins
+    import sys
+
+    import pytest
+
+    mp = pytest.MonkeyPatch()
+    real_import = builtins.__import__
+
+    def block_jsonschema(
+        name: str,
+        globals_: object = None,
+        locals_: object = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        if name == "jsonschema" or name.startswith("jsonschema."):
+            raise ModuleNotFoundError("No module named 'jsonschema'", name="jsonschema")
+        return real_import(name, globals_, locals_, fromlist, level)  # type: ignore[arg-type]
+
+    schema = get_schema()
+    valid_dict = {"forms": [{"formKey": "F1", "variables": []}]}
+    try:
+        mp.delitem(sys.modules, "jsonschema", raising=False)
+        mp.setattr(builtins, "__import__", block_jsonschema)
+        with pytest.raises(ImportError, match="jsonschema"):
+            validate(valid_dict, schema=schema)
+        assert validate(valid_dict, schema=None) == []
+    finally:
+        mp.undo()

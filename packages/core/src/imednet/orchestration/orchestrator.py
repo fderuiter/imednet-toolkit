@@ -37,6 +37,7 @@ and never propagate as exceptions, ensuring fault isolation.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -264,6 +265,16 @@ class MultiStudyOrchestrator:
         limiter = AdaptiveConcurrencyLimiter(self._max_workers)
 
         timeout_seconds = 300.0  # Mandatory maximum timeout for concurrent groups
+        if self._max_workers == 1 or sys.platform == "emscripten":
+            return self._execute_pipeline_sequential(
+                target_studies,
+                pipeline_func,
+                args,
+                kwargs,
+                limiter,
+                timeout_seconds,
+            )
+
         executor = ThreadPoolExecutor(max_workers=self._max_workers)
 
         try:
@@ -335,6 +346,82 @@ class MultiStudyOrchestrator:
                         )
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+
+        return results
+
+    def _execute_pipeline_sequential(
+        self,
+        target_studies: list[str],
+        pipeline_func: StudyWorkerCallable[Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        limiter: AdaptiveConcurrencyLimiter,
+        timeout_seconds: float,
+    ) -> dict[str, OrchestratorResult]:
+        """Execute a pipeline function sequentially across resolved study contexts."""
+        results: dict[str, OrchestratorResult] = {}
+        if not target_studies:
+            return results
+
+        pipeline_start = time.monotonic()
+
+        for idx, study_key in enumerate(target_studies):
+            study_start = time.monotonic()
+            if (study_start - pipeline_start) >= timeout_seconds:
+                logger.error(
+                    "Global orchestration timeout (%.2fs) reached. Aborting pending studies.",
+                    timeout_seconds,
+                )
+                for pending_key in target_studies[idx:]:
+                    duration = time.monotonic() - pipeline_start
+                    results[pending_key] = OrchestratorResult(
+                        status="FAILED",
+                        data=None,
+                        error="TimeoutError: Global orchestration timeout reached.",
+                        duration_seconds=round(duration, _DURATION_PRECISION),
+                    )
+                break
+
+            study_logger = make_study_logger(study_key)
+            try:
+                data = _run_with_context(
+                    study_key,
+                    self._sdk,
+                    study_logger,
+                    pipeline_func,
+                    args,
+                    kwargs,
+                    limiter,
+                )
+                duration = time.monotonic() - study_start
+                limiter.record_latency(duration)
+                results[study_key] = OrchestratorResult(
+                    status="SUCCESS",
+                    data=data,
+                    error=None,
+                    duration_seconds=round(duration, _DURATION_PRECISION),
+                )
+                logger.info(
+                    "[%s] Pipeline completed successfully in %.2fs.",
+                    study_key,
+                    duration,
+                )
+            except Exception as exc:
+                duration = time.monotonic() - study_start
+                limiter.record_latency(duration)
+                results[study_key] = OrchestratorResult(
+                    status="FAILED",
+                    data=None,
+                    error=repr(exc),
+                    duration_seconds=round(duration, _DURATION_PRECISION),
+                )
+                logger.error(
+                    "[%s] Pipeline execution failed after %.2fs: %s",
+                    study_key,
+                    duration,
+                    repr(exc),
+                    exc_info=True,
+                )
 
         return results
 

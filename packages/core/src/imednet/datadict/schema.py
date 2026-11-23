@@ -78,21 +78,21 @@ def validate(
     else:
         return [f"Unsupported target type for validation: {type(target)}"]
 
-    # 2. If a custom JSON schema is provided, validate via jsonschema if available
+    # 2. If a custom JSON schema is provided, validate via jsonschema
     if schema is not None:
         try:
             import jsonschema
+        except ImportError as exc:
+            raise ImportError(
+                "Validating against an explicit JSON Schema requires the 'jsonschema' package."
+            ) from exc
 
-            validator = jsonschema.Draft202012Validator(schema)
-            for err in validator.iter_errors(data):
-                loc = ".".join(str(p) for p in err.absolute_path)
-                prefix = f"[{loc}] " if loc else ""
-                errors.append(f"{prefix}{err.message}")
-            return errors
-        except ImportError:
-            errors.append(
-                "jsonschema library is not installed; falling back to Pydantic model validation."
-            )
+        validator = jsonschema.Draft202012Validator(schema)
+        for err in validator.iter_errors(data):
+            loc = ".".join(str(p) for p in err.absolute_path)
+            prefix = f"[{loc}] " if loc else ""
+            errors.append(f"{prefix}{err.message}")
+        return errors
 
     # 3. Model validation via Pydantic
     try:

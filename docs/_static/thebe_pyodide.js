@@ -41,6 +41,38 @@
   let executionId = 0;
   const pendingRequests = new Map();
   const installedMainWheels = new Set();
+  const loadedMainLazyPyodidePackages = new Set();
+  const loadedMainLazyRequirements = new Set();
+  let activeRuntimeConfig = null;
+
+  function detectLazyPackages(code, lazyPyodidePackages, lazyRequirements) {
+    const source = String(code || "");
+    const triggerPatterns = {
+      duckdb:
+        /\b(?:duckdb|duckdb_centralizer|DuckDBIngestionWorkflow|export_to_duckdb|export_to_duckdb_by_form|TabularDuckDBSink)\b|\.duckdb\b/,
+      sqlalchemy:
+        /\b(?:sqlalchemy|export_to_sql|export_to_sql_by_form|export_to_long_sql|TabularSQLSink)\b|(?:sqlite|postgresql|mysql|mssql|oracle)(?:\+[a-z0-9_]+)?:\//i,
+      openpyxl: /\b(?:openpyxl|export_to_excel|to_excel|read_excel)\b|\.xlsx\b/i,
+    };
+
+    function matchesPackage(pkgSpec) {
+      const raw = String(pkgSpec || "").trim();
+      if (!raw) return false;
+      const base = raw.split(/[<>=!~;\[\s]/)[0].trim();
+      const normalized = base.toLowerCase().replace(/-/g, "_");
+      const customPattern = triggerPatterns[normalized] || triggerPatterns[base.toLowerCase()];
+      if (customPattern && customPattern.test(source)) {
+        return true;
+      }
+      const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp("\\b" + escaped + "\\b").test(source);
+    }
+
+    return {
+      pyodidePackages: (lazyPyodidePackages || []).filter(matchesPackage),
+      requirements: (lazyRequirements || []).filter(matchesPackage),
+    };
+  }
 
   function isAllowedBrowserWheel(wheelPath) {
     const filename = String(wheelPath || "").split("/").pop() || "";
@@ -63,6 +95,7 @@
       "pydantic",
       "cryptography",
       "pandas",
+      "jsonschema",
       "ssl",
       "sqlite3",
     ];
@@ -74,6 +107,8 @@
       "filelock",
       "python-json-logger",
     ];
+    const defaultLazyPyodidePackages = ["duckdb", "sqlalchemy"];
+    const defaultLazyRequirements = ["openpyxl"];
     const defaultEnv = {
       IMEDNET_SIMULATION_MODE: "true",
       IMEDNET_API_KEY: "dummy_api_key", // pragma: allowlist secret
@@ -119,6 +154,10 @@
     const requirements =
       (rawConfig && (rawConfig.requirements || rawConfig.micropip_requirements)) ||
       defaultRequirements;
+    const lazyPyodidePackages =
+      (rawConfig && rawConfig.lazy_pyodide_packages) || defaultLazyPyodidePackages;
+    const lazyRequirements =
+      (rawConfig && rawConfig.lazy_requirements) || defaultLazyRequirements;
     const env = Object.assign({}, defaultEnv, (rawConfig && rawConfig.env) || {});
     const selector = (rawConfig && rawConfig.selector) || "div.highlight-python";
 
@@ -161,6 +200,8 @@
       wheels: resolvedWheels,
       pyodidePackages: pyodidePackages,
       requirements: requirements,
+      lazyPyodidePackages: lazyPyodidePackages,
+      lazyRequirements: lazyRequirements,
       env: env,
     };
   }
@@ -179,11 +220,51 @@
     let pyodide = null;
     let ready = false;
     let initPromise = null;
+    let runtimeConfig = null;
     let execQueue = Promise.resolve();
     const installedWheels = new Set();
+    const loadedLazyPyodidePackages = new Set();
+    const loadedLazyRequirements = new Set();
+
+    ${detectLazyPackages.toString()}
+
+    async function ensureLazyPackages(code) {
+      if (!pyodide || !runtimeConfig) return;
+      const needed = detectLazyPackages(
+        code,
+        runtimeConfig.lazyPyodidePackages,
+        runtimeConfig.lazyRequirements
+      );
+      const missingPyodidePkgs = needed.pyodidePackages.filter(
+        (pkg) => !loadedLazyPyodidePackages.has(pkg)
+      );
+      if (missingPyodidePkgs.length > 0) {
+        await pyodide.loadPackage(missingPyodidePkgs);
+        missingPyodidePkgs.forEach((pkg) => loadedLazyPyodidePackages.add(pkg));
+      }
+
+      const missingReqs = needed.requirements.filter(
+        (req) => !loadedLazyRequirements.has(req)
+      );
+      if (missingReqs.length > 0) {
+        const reqsProxy = pyodide.toPy(missingReqs);
+        pyodide.globals.set("__pyodide_lazy_reqs__", reqsProxy);
+        try {
+          await pyodide.runPythonAsync(\`
+import micropip
+await micropip.install([str(_r) for _r in __pyodide_lazy_reqs__])
+\`);
+          missingReqs.forEach((req) => loadedLazyRequirements.add(req));
+        } finally {
+          pyodide.globals.delete("__pyodide_lazy_reqs__");
+          reqsProxy.destroy();
+        }
+      }
+    }
 
     async function initRuntime(config) {
       if (ready) return;
+      runtimeConfig = config || {};
       importScripts("${PYODIDE_CDN_URL}");
       pyodide = await loadPyodide();
 
@@ -192,10 +273,12 @@
         "pydantic",
         "cryptography",
         "pandas",
+        "jsonschema",
         "ssl",
         "sqlite3"
       ];
       await pyodide.loadPackage(pyodidePackages);
+      pyodidePackages.forEach((pkg) => loadedLazyPyodidePackages.add(pkg));
 
       const envVars = (config && config.env) || {};
       const envProxy = pyodide.toPy(envVars);
@@ -258,6 +341,7 @@ await micropip.install("\${wheelUrl}", deps=False)
       }
 
       try {
+        await ensureLazyPackages(code);
         pyodide.globals.set("__thebe_user_code__", code);
         const runnerScript = \`
 import ast
@@ -439,6 +523,7 @@ finally:
     if (pyodideReady) return;
     setCellRunButtonsDisabled(true);
     const config = getConfig();
+    activeRuntimeConfig = config;
     const script = document.createElement("script");
     script.src = PYODIDE_CDN_URL;
     script.onload = async () => {
@@ -449,10 +534,12 @@ finally:
           "pydantic",
           "cryptography",
           "pandas",
+          "jsonschema",
           "ssl",
           "sqlite3",
         ];
         await mainThreadPyodide.loadPackage(pyodidePackages);
+        pyodidePackages.forEach((pkg) => loadedMainLazyPyodidePackages.add(pkg));
 
         const envProxy = mainThreadPyodide.toPy(config.env || {});
         mainThreadPyodide.globals.set("__pyodide_init_env__", envProxy);
@@ -536,6 +623,37 @@ await micropip.install("${wheelUrl}", deps=False)
     } else if (mainThreadPyodide) {
       mainExecQueue = mainExecQueue.then(async () => {
         try {
+          const cfg = activeRuntimeConfig || getConfig();
+          const needed = detectLazyPackages(
+            code,
+            cfg.lazyPyodidePackages,
+            cfg.lazyRequirements
+          );
+          const missingPyodidePkgs = needed.pyodidePackages.filter(
+            (pkg) => !loadedMainLazyPyodidePackages.has(pkg)
+          );
+          if (missingPyodidePkgs.length > 0) {
+            await mainThreadPyodide.loadPackage(missingPyodidePkgs);
+            missingPyodidePkgs.forEach((pkg) => loadedMainLazyPyodidePackages.add(pkg));
+          }
+          const missingReqs = needed.requirements.filter(
+            (req) => !loadedMainLazyRequirements.has(req)
+          );
+          if (missingReqs.length > 0) {
+            const reqsProxy = mainThreadPyodide.toPy(missingReqs);
+            mainThreadPyodide.globals.set("__pyodide_lazy_reqs__", reqsProxy);
+            try {
+              await mainThreadPyodide.runPythonAsync(`
+import micropip
+await micropip.install([str(_r) for _r in __pyodide_lazy_reqs__])
+`);
+              missingReqs.forEach((req) => loadedMainLazyRequirements.add(req));
+            } finally {
+              mainThreadPyodide.globals.delete("__pyodide_lazy_reqs__");
+              reqsProxy.destroy();
+            }
+          }
+
           mainThreadPyodide.globals.set("__thebe_user_code__", code);
           const runnerScript = `
 import ast

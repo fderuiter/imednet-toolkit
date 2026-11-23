@@ -797,6 +797,7 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
         "pydantic",
         "cryptography",
         "pandas",
+        "jsonschema",
         "ssl",
         "sqlite3",
     }
@@ -807,6 +808,8 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
         "python-dotenv",
         "filelock",
     }
+    assert set(pyodide_cfg["lazy_pyodide_packages"]) == {"duckdb", "sqlalchemy"}
+    assert set(pyodide_cfg["lazy_requirements"]) == {"openpyxl"}
     assert pyodide_cfg["env"]["IMEDNET_SIMULATION_MODE"] == "true"
 
     # Verify button HTML rendering & escaping
@@ -998,6 +1001,7 @@ def test_verify_built_tutorial_html_invariants(tmp_path: Path) -> None:
             "pydantic",
             "cryptography",
             "pandas",
+            "jsonschema",
             "ssl",
             "sqlite3",
         ],
@@ -1008,6 +1012,8 @@ def test_verify_built_tutorial_html_invariants(tmp_path: Path) -> None:
             "python-dotenv",
             "filelock",
         ],
+        "lazy_pyodide_packages": ["duckdb", "sqlalchemy"],
+        "lazy_requirements": ["openpyxl"],
         "wheels": [f"_static/wheels/{name}" for name in wheel_names],
         "env": {"IMEDNET_SIMULATION_MODE": "true"},
     }

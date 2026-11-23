@@ -501,3 +501,51 @@ def test_sdk_create_records_batch_with_data_dictionary_prevalidates_once() -> No
         assert post_chunks == [100, 5]
     finally:
         sdk.close()
+
+
+def test_sdk_create_records_batch_routes_single_chunk_via_poll_job() -> None:
+    """Single-chunk create_records_batch(wait_for_completion=True) dispatches poll_job via poll_single."""
+    import json
+    from unittest.mock import patch
+
+    import httpx
+
+    from imednet import ImednetSDK
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={"jobId": f"J-{len(payload)}", "batchId": "BATCH-SINGLE"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/jobs/BATCH-SINGLE"):
+            return httpx.Response(
+                200,
+                json={"batchId": "BATCH-SINGLE", "state": "COMPLETED", "progress": 100},
+            )
+        return httpx.Response(500, json={"error": f"Unexpected {request.url.path}"})
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with (
+            patch.object(sdk, "poll_job", wraps=sdk.poll_job) as spy_single,
+            patch.object(sdk, "poll_jobs", wraps=sdk.poll_jobs) as spy_many,
+        ):
+            summary = sdk.create_records_batch(
+                "STUDY",
+                [{"formKey": "F1", "data": {"age": 30}}],
+                skip_validation=True,
+                wait_for_completion=True,
+                interval=0.0,
+            )
+        assert summary.batch_ids == ["BATCH-SINGLE"]
+        assert spy_single.call_count == 1
+        assert spy_many.call_count == 0
+    finally:
+        sdk.close()

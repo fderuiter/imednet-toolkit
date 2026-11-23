@@ -313,6 +313,7 @@ pyodide_config = {
         "pydantic",
         "cryptography",
         "pandas",
+        "jsonschema",
         "ssl",
         "sqlite3",
     ],
@@ -323,6 +324,13 @@ pyodide_config = {
         "python-dotenv",
         "filelock",
         "python-json-logger",
+    ],
+    "lazy_pyodide_packages": [
+        "duckdb",
+        "sqlalchemy",
+    ],
+    "lazy_requirements": [
+        "openpyxl",
     ],
     "wheels": _resolve_pyodide_wheels(),
     "env": {

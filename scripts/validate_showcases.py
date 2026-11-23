@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import email.parser
 import importlib
 import importlib.util
 import io
@@ -1381,15 +1382,111 @@ WHEEL_REQUIRED_ENTRIES: dict[str, tuple[str, ...]] = {
 }
 
 
+def _canonicalize_pkg_name(name: str) -> str:
+    """Normalize a Python distribution name per PEP 503."""
+    base = re.split(r"[<>=!~;\[\s]", name.strip(), maxsplit=1)[0]
+    return re.sub(r"[-_.]+", "-", base).lower()
+
+
+def _extract_pyodide_configured_packages(docs_dir: Path) -> set[str] | None:
+    """Extract configured browser package names from docs/conf.py pyodide_config."""
+    conf_path = docs_dir / "conf.py"
+    if not conf_path.is_file():
+        return None
+
+    try:
+        tree = ast.parse(conf_path.read_text(encoding="utf-8"), filename=str(conf_path))
+    except SyntaxError:
+        return None
+
+    configured: set[str] = set()
+    config_keys = {
+        "pyodide_packages",
+        "requirements",
+        "lazy_pyodide_packages",
+        "lazy_requirements",
+    }
+    for node in tree.body:
+        value_node: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "pyodide_config" for t in node.targets):
+                value_node = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "pyodide_config"
+        ):
+            value_node = node.value
+
+        if not isinstance(value_node, ast.Dict):
+            continue
+
+        for key_node, val_node in zip(value_node.keys, value_node.values, strict=False):
+            if (
+                isinstance(key_node, ast.Constant)
+                and key_node.value in config_keys
+                and isinstance(val_node, (ast.List, ast.Tuple))
+            ):
+                for elt in val_node.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        configured.add(_canonicalize_pkg_name(elt.value))
+        return configured
+
+    return None
+
+
+def _verify_wheel_metadata_dependencies(
+    zf: zipfile.ZipFile,
+    wheel_name: str,
+    allowed_browser_packages: set[str],
+) -> list[str]:
+    """Verify unguarded Requires-Dist entries in wheel METADATA exist in pyodide_config."""
+    from packaging.requirements import Requirement
+
+    metadata_entries = [name for name in zf.namelist() if name.endswith(".dist-info/METADATA")]
+    if not metadata_entries:
+        return []
+
+    pyodide_marker_env = {
+        "extra": "",
+        "sys_platform": "emscripten",
+        "os_name": "posix",
+        "platform_system": "Emscripten",
+        "platform_machine": "wasm32",
+        "implementation_name": "cpython",
+        "python_version": "3.12",
+        "python_full_version": "3.12.7",
+    }
+    dep_errors: list[str] = []
+    parser = email.parser.Parser()
+    for meta_entry in metadata_entries:
+        raw_meta = zf.read(meta_entry).decode("utf-8", errors="replace")
+        msg = parser.parsestr(raw_meta)
+        for raw_req in msg.get_all("Requires-Dist", []) or []:
+            req = Requirement(raw_req)
+            if req.marker is not None and not req.marker.evaluate(pyodide_marker_env):
+                continue
+            dep_name = _canonicalize_pkg_name(req.name)
+            if dep_name not in allowed_browser_packages:
+                dep_errors.append(
+                    f"Staged wheel '{wheel_name}' requires '{req.name}' ({raw_req}), "
+                    "which is missing from docs/conf.py pyodide_config"
+                )
+    return dep_errors
+
+
 def validate_staged_wheels(
     wheels_dir: Path,
     expected_packages: Sequence[str] = BROWSER_WHEEL_PACKAGES,
+    *,
+    docs_dir: Path | None = None,
 ) -> list[str]:
     """Verify that staged wheels exist, contain required modules, and can be imported in simulated Pyodide.
 
     Args:
         wheels_dir: Path to directory containing staged wheel artifacts (*.whl).
         expected_packages: Names of packages expected to have staged wheels.
+        docs_dir: Optional path to docs/ directory containing conf.py pyodide_config.
 
     Returns:
         list[str]: Validation error messages, or an empty list if valid.
@@ -1401,6 +1498,18 @@ def validate_staged_wheels(
     wheel_files = sorted(wheels_dir.glob("*.whl"))
     if not wheel_files:
         return [f"No staged wheel artifacts (*.whl) found in {wheels_dir}"]
+
+    resolved_docs_dir = docs_dir or (Path(__file__).resolve().parent.parent / "docs")
+    configured_browser_pkgs = _extract_pyodide_configured_packages(resolved_docs_dir)
+    allowed_browser_packages: set[str] | None = None
+    if configured_browser_pkgs is not None:
+        allowed_browser_packages = set(configured_browser_pkgs)
+        for pkg_item in expected_packages:
+            allowed_browser_packages.add(_canonicalize_pkg_name(pkg_item))
+        for stdlib_mod in sys.stdlib_module_names:
+            allowed_browser_packages.add(_canonicalize_pkg_name(stdlib_mod))
+        # Common transitive pure-Python/Pyodide sub-dependencies bundled by Pyodide packages
+        allowed_browser_packages.add("typing-extensions")
 
     core_wheels = [w for w in wheel_files if w.name.startswith("imednet-")]
 
@@ -1430,6 +1539,14 @@ def validate_staged_wheels(
                         errors.append(
                             f"Staged wheel '{wheel_path.name}' is missing required module entry '{req}'"
                         )
+                if allowed_browser_packages is not None:
+                    errors.extend(
+                        _verify_wheel_metadata_dependencies(
+                            zf,
+                            wheel_path.name,
+                            allowed_browser_packages,
+                        )
+                    )
         except Exception as exc:
             errors.append(f"Failed to inspect wheel archive '{wheel_path.name}': {exc}")
             continue
@@ -2140,7 +2257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         try:
             print(f"Validating staged wheels and simulated Pyodide imports in {wheels_dir}...")
-            wheel_errors = validate_staged_wheels(wheels_dir)
+            wheel_errors = validate_staged_wheels(wheels_dir, docs_dir=docs_dir)
         finally:
             if created_temp_wheels and args.wheels_dir is None:
                 shutil.rmtree(wheels_dir, ignore_errors=True)

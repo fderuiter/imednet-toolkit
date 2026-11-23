@@ -30,6 +30,7 @@ dependencies = [
     "httpx>=0.28.1,<0.29.0",
     "tenacity>=9.1.2,<10.0.0",
     "defusedxml>=0.7.1",
+    "jsonschema>=4.20.0",
 ]
 
 [project.urls]

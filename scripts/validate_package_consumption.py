@@ -133,14 +133,14 @@ def validate_scenario(name, install_items, smoke_checks, dist_dir: Path):
             try:
                 if cmd.startswith("import "):
                     print(f"Checking import: {cmd} (expect_fail={expect_fail})")
-                    res = run([str(python_bin), "-c", cmd])
+                    res = run([str(python_bin), "-c", cmd], cwd=tmpdir)
                 elif cmd.startswith("imednet "):
                     print(f"Checking command: {cmd} (expect_fail={expect_fail})")
                     full_cmd = [str(imednet_bin), *cmd.split(" ")[1:]]
-                    res = run(full_cmd)
+                    res = run(full_cmd, cwd=tmpdir)
                 else:
                     print(f"Running custom command: {cmd} (expect_fail={expect_fail})")
-                    res = run([str(python_bin), "-c", cmd])
+                    res = run([str(python_bin), "-c", cmd], cwd=tmpdir)
 
                 output = res.stdout + res.stderr
                 if expect_fail:
@@ -188,6 +188,23 @@ def main():
                     },
                     {
                         "cmd": "from imednet.models.records import Record; assert 'record_id' in Record.model_fields",
+                    },
+                    {
+                        "cmd": (
+                            "import json; from pathlib import Path; "
+                            "from imednet.datadict import DataDictionary, Form, Metadata, Variable, get_schema, to_json, validate; "
+                            "dd = DataDictionary(metadata=Metadata.create(study_key='STUDY'), forms=[Form(formKey='F_DM', formName='Demographics', formType='Enrollment', variables=[Variable(variableName='V_AGE', variableType='Integer', required='Yes')])]); "
+                            "schema = get_schema(); "
+                            "dd_json = to_json(dd); "
+                            "assert validate(dd_json, schema=schema) == []; "
+                            "Path('dd.json').write_text(dd_json, encoding='utf-8'); "
+                            "Path('schema.json').write_text(json.dumps(schema), encoding='utf-8')"
+                        ),
+                    },
+                    {
+                        "cmd": "imednet datadict validate dd.json --schema schema.json",
+                        "expect_fail": False,
+                        "contains": "Validation passed",
                     },
                     {
                         "cmd": "imednet --help",

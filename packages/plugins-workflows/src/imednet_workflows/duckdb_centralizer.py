@@ -6,6 +6,7 @@ Provides an incremental record centralization pipeline using DuckDB.
 from __future__ import annotations
 
 import re
+import sys
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from enum import Enum
@@ -59,7 +60,10 @@ class DuckDBIngestionWorkflow:
                 "Install with `pip install 'imednet[duckdb]'`."
             ) from error
 
-        self._connection: Any = duckdb.connect(db_path)
+        connect_kwargs: dict[str, Any] = (
+            {"config": {"threads": "1"}} if sys.platform == "emscripten" else {}
+        )
+        self._connection: Any = duckdb.connect(db_path, **connect_kwargs)
         self._extractor = DataExtractionWorkflow(sdk)
 
     def ingest_revisions(

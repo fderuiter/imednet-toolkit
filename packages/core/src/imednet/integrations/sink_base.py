@@ -241,7 +241,10 @@ class _SinkRetryPolicy(OperationRetryPolicy):
 
     def should_retry(self, exception: Exception) -> bool:
         """Retry destination failures, preserving the existing driver fallback."""
-        return not isinstance(exception, (ExportConfigurationError, ValueError, TypeError))
+        return not isinstance(
+            exception,
+            (ExportConfigurationError, ValueError, TypeError, ImportError),
+        )
 
 
 def validate_max_buffered_records(value: int | None) -> int | None:
@@ -667,6 +670,9 @@ class ExportSink(ABC):
             except ValueError as exc:
                 last_raw_exc = exc
                 raise ValueError("Invalid export batch input.") from None
+            except ImportError as exc:
+                last_raw_exc = exc
+                raise ImportError("Missing optional export dependency.") from None
             except Exception as exc:
                 last_raw_exc = exc
                 raise RuntimeError("Export destination operation failed.") from None

@@ -7,6 +7,7 @@ import concurrent.futures
 import contextvars
 import inspect
 import logging
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -648,13 +649,19 @@ class JobPoller(BaseJobPoller):
                         first_failure = exc
                         stop_event.set()
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(contextvars.copy_context().run, _poll_one, batch_id)
-                for batch_id in batch_ids
-            ]
-            for future in futures:
-                future.result()
+        if sys.platform == "emscripten" or len(batch_ids) <= 1:
+            for batch_id in batch_ids:
+                if fail_fast and stop_event.is_set():
+                    break
+                contextvars.copy_context().run(_poll_one, batch_id)
+        else:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [
+                    executor.submit(contextvars.copy_context().run, _poll_one, batch_id)
+                    for batch_id in batch_ids
+                ]
+                for future in futures:
+                    future.result()
 
         if fail_fast and first_failure is not None:
             raise first_failure

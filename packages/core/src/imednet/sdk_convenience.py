@@ -449,6 +449,13 @@ class SyncSDKConvenienceMixin:
             schema=schema,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
+            poll_single=lambda batch_id, *, on_progress=None: self.poll_job(
+                study_key,
+                batch_id,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+            ),
             poll_many=lambda batch_ids, *, on_progress=None: self.poll_jobs(
                 study_key,
                 batch_ids,
@@ -614,6 +621,13 @@ class AsyncSDKConvenienceMixin:
             schema=schema,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
+            poll_single=lambda batch_id, *, on_progress=None: self.async_poll_job(
+                study_key,
+                batch_id,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+            ),
             poll_many=lambda batch_ids, *, on_progress=None: self.async_poll_jobs(
                 study_key,
                 batch_ids,
