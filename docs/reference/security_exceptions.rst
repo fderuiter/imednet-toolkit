@@ -1,8 +1,10 @@
 Security audit policy
 =====================
 
-Run ``uvx hatch run lint:audit`` for the audit used by the CI quality gate.
-The scanner environment includes workspace packages and security tools.
+Run ``uv export --locked --all-packages --all-extras --no-emit-workspace --no-hashes --format requirements-txt``
+followed by ``uvx pip-audit -s osv --timeout 60 --disable-pip --no-deps -r ...``
+(shown below) for the locked workspace dependency audit enforced by the CI
+``quality`` gate in ``.github/workflows/main.yml``.
 Filelock must resolve to version 4.2.1 or newer; no filelock advisory is ignored.
 Workspace development and documentation require Python >=3.11.5 so patched
 Soup Sieve releases can install. Published package Python metadata is unchanged.

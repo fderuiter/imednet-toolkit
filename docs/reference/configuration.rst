@@ -22,25 +22,76 @@ Environment Variables
      - Security key used for authentication.
      - None
    * - IMEDNET_OIDC_TOKEN
-     - Optional OIDC bearer token used instead of API/security key pairs.
+     - Optional OIDC bearer token used instead of API/security key pairs (takes precedence over static keys).
+     - None
+   * - IMEDNET_OIDC_PUBLIC_KEY
+     - Optional PEM public key (or symmetric key when a symmetric algorithm is explicitly configured) used by ``OIDCAuth`` to verify JWT signatures.
+     - None
+   * - IMEDNET_OIDC_JWKS_URL
+     - Optional HTTPS JWKS endpoint URL used by ``OIDCAuth`` to fetch asymmetric verification keys.
+     - None
+   * - IMEDNET_OIDC_AUDIENCE
+     - Optional expected JWT ``aud`` claim enforced by ``OIDCAuth``.
+     - None
+   * - IMEDNET_OIDC_ALGORITHMS
+     - Optional comma-separated list of allowed JWS signing algorithms enforced by ``OIDCAuth`` (defaults to asymmetric ``RS*``, ``PS*``, ``ES*``, and ``EdDSA`` algorithms).
+     - None
+   * - IMEDNET_OIDC_ISSUER
+     - Optional expected JWT ``iss`` claim enforced by ``OIDCAuth``.
      - None
    * - IMEDNET_SIMULATION_MODE
      - Set to ``true`` / ``1`` (or pass ``--simulation``) to run offline against ``SimulationTransport``.
      - ``false``
    * - IMEDNET_BASE_URL
-     - Optional base URL for private deployments.
+     - Optional base URL for private Mednet EDC deployments (also scopes dynamic ``ConfigVersionStore`` host directories).
+     - ``https://edc.prod.imednetapi.com``
+   * - IMEDNET_TIMEOUT
+     - HTTP request timeout in seconds for synchronous and asynchronous SDK clients.
+     - ``30.0``
+   * - IMEDNET_STRICT_MODE
+     - Enable strict SDK response-drift validation when parsing API payloads and untyped primitives.
+     - ``false``
+   * - IMEDNET_STRICT_CDASH
+     - Enable the opt-in local CDASH/SDTM naming-prefix heuristic on ``MappingRule`` and ``StudyConfiguration``.
+     - ``false``
+   * - IMEDNET_ENCRYPTION_KEY
+     - Fernet key or passphrase used by ``ConfigVersionStore`` to encrypt and decrypt ``StudyConfiguration`` payloads at rest (falls back to ``IMEDNET_SECURITY_KEY``).
+     - None
+   * - IMEDNET_CONFIG_DB_PATH
+     - Base SQLite ledger path for ``ConfigVersionStore`` prior to dynamic host and ``Study`` directory scoping.
+     - ``~/.imednet/config_versions.sqlite3``
+   * - IMEDNET_WORKFLOW_LEDGER_PATH
+     - Filesystem path for ``FileStateProvider`` / ``ExtractionStateLedger`` incremental high-water mark checkpoints.
+     - ``.imednet_workflow_state.json``
+   * - IMEDNET_TRIAGE_DB_PATH
+     - SQLite database path for ``TriageStore`` operational ``Query`` triage state in ``imednet-workflows``.
+     - ``~/.imednet/triage.sqlite3``
+   * - IMEDNET_CLI_OUTPUT_FORMAT
+     - Default output format (``table``, ``json``, or ``csv``) for ``imednet`` CLI commands when ``--format`` is omitted.
+     - ``table``
+   * - IMEDNET_HIGH_CONTRAST
+     - Set to ``1`` / ``true`` to enable WCAG AAA high-contrast rendering in CLI tables and the ``imednet-tui`` terminal dashboard.
+     - ``false``
+   * - IMEDNET_NON_INTERACTIVE
+     - Set to ``1`` / ``true`` to suppress interactive prompts and spinners in automated CI/CD shells.
+     - ``false``
+   * - IMEDNET_OPENAPI_PATH
+     - Optional filesystem path to an OpenAPI contract JSON override loaded by ``ModelEngine``.
+     - None
+   * - IMEDNET_POSTMAN_PATH
+     - Optional filesystem path to a Postman collection JSON override loaded by ``ModelEngine``.
      - None
    * - IMEDNET_STUDY_KEY
-     - Study identifier used by examples and some tests.
+     - ``Study`` identifier used by CLI defaults, examples, and integration tests.
      - None
    * - IMEDNET_RUN_E2E
      - Set to ``1`` to enable end-to-end tests that hit a live environment.
      - None
    * - IMEDNET_BATCH_ID
-     - Batch identifier used by job polling tests. Created automatically if unset.
+     - Batch identifier used by ``Job`` polling tests. Created automatically if unset.
      - None
    * - IMEDNET_FORM_KEY
-     - Form key for record-creation tests. If unset, the first form is used.
+     - ``Form`` key for ``Record``-creation tests. If unset, the first ``Form`` is used.
      - None
    * - IMEDNET_ALLOW_MUTATION
      - Set to ``1`` to allow workflow tests that submit data.
