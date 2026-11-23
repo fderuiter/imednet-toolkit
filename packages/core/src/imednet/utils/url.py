@@ -19,6 +19,24 @@ __all__ = [
 
 _FORBIDDEN_SEGMENT_CHARS = frozenset({"/", "\\", "?", "#"})
 _FORBIDDEN_RAW_PATH_CHARS = frozenset({"\\", "?", "#"})
+_URI_USERINFO_RE = re.compile(r"(://)[^@/\s\"']+@")
+_TEXT_URL_OR_URI_RE = re.compile(
+    r"""(?:[a-zA-Z][a-zA-Z0-9+.-]*://|(?i:file|sqlite(?:\+[a-zA-Z0-9_.-]+)?):(?!//))"""
+    r"""[^\s"'>]*[^\s"'>.,;:!?\)\]]"""
+)
+_URI_SENSITIVE_QUERY_KEYS = frozenset(
+    {
+        "api_key",
+        "security_key",
+        "token",
+        "secret",
+        "password",
+        "passphrase",
+        "key",
+        "sig",
+        "signature",
+    }
+)
 
 
 def redact_sensitive_text(text: Any) -> str:
@@ -31,17 +49,15 @@ def redact_sensitive_text(text: Any) -> str:
     else:
         text_str = text
 
-    # Redact passwords in connection strings: e.g., mongodb://user:password@host  # pragma: allowlist secret
-    text_str = re.sub(r"(://[^:]+:)[^@]+(@)", r"\g<1>***\g<2>", text_str)
+    # Redact userinfo in connection strings: e.g., mongodb://user:password@host or https://token@host  # pragma: allowlist secret
+    text_str = _URI_USERINFO_RE.sub(r"\1***@", text_str)
 
-    # Redact query parameters in any URLs
+    # Redact query parameters and userinfo in scheme:// URLs and authority-less file:/sqlite: URIs
     def replace_url(match: re.Match[str]) -> str:
-        """Redact query parameters in the matched URL string."""
+        """Redact query parameters in the matched URL or URI string."""
         return redact_url_query(match.group(0))
 
-    text_str = re.sub(
-        r'''[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'>]*[^\s"'>.,;:!?\)\]]''', replace_url, text_str
-    )
+    text_str = _TEXT_URL_OR_URI_RE.sub(replace_url, text_str)
 
     return str(text_str)
 
@@ -53,28 +69,52 @@ def sanitize_base_url(url: str) -> str:
 
 
 def redact_url_query(url: str, sensitive_params: set[str] | None = None) -> str:
-    """Return URL with sensitive query parameters redacted."""
+    """Return URL or URI with userinfo and sensitive query parameters redacted."""
     from imednet.utils.secrets import is_sensitive_key
 
-    default_params = {"api_key", "security_key", "token", "secret", "password"}
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return _URI_USERINFO_RE.sub(r"\1***@", url)
 
-    parsed = urlparse(url)
-    query_params = parse_qsl(parsed.query, keep_blank_values=True)
+    has_userinfo = "@" in parsed.netloc
+    if not has_userinfo and not parsed.query:
+        return url
 
-    new_query_params = []
-    for key, value in query_params:
-        is_secret = (
-            key in sensitive_params
-            if sensitive_params is not None
-            else (key.lower() in default_params or is_sensitive_key(key))
-        )
-        if is_secret:
-            new_query_params.append((key, "***"))
-        else:
-            new_query_params.append((key, value))
+    new_netloc = parsed.netloc
+    if has_userinfo:
+        userinfo, _, hostport = parsed.netloc.rpartition("@")
+        if userinfo:
+            new_netloc = f"***@{hostport}"
 
-    new_query = urlencode(new_query_params, safe="*")
-    return urlunparse(parsed._replace(query=new_query))
+    new_query = parsed.query
+    redacted_any_query = False
+    if parsed.query:
+        query_params = parse_qsl(parsed.query, keep_blank_values=True)
+        new_query_params = []
+        for key, value in query_params:
+            is_secret = (
+                key in sensitive_params
+                if sensitive_params is not None
+                else (key.lower() in _URI_SENSITIVE_QUERY_KEYS or is_sensitive_key(key))
+            )
+            if is_secret:
+                new_query_params.append((key, "***"))
+                redacted_any_query = True
+            else:
+                new_query_params.append((key, value))
+        if redacted_any_query:
+            new_query = urlencode(new_query_params, safe="*")
+
+    if not has_userinfo and not redacted_any_query:
+        return url
+
+    if not new_netloc and parsed.query:
+        before_q, _, after_q = url.partition("?")
+        _, hash_sep, fragment = after_q.partition("#")
+        return f"{before_q}?{new_query}{hash_sep}{fragment}"
+
+    return urlunparse(parsed._replace(netloc=new_netloc, query=new_query))
 
 
 def _has_control_chars(value: str) -> bool:

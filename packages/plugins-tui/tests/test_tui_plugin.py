@@ -3944,3 +3944,37 @@ async def test_app_env_subtitle_resolution_simulation_client_and_default_fallbac
         assert bare_app.sub_title == f"Env: {DEFAULT_BASE_URL}"
         assert "None" not in bare_app.sub_title
         assert "Unknown" not in bare_app.sub_title
+
+    # 5. Single-token userinfo and pre-signed/SAS/file: secrets are scrubbed in subtitle and logs
+    from imednet_tui.app import _resolve_env_subtitle, _sanitize_text
+
+    canary_pat = "CANARY_TUI_USERINFO_PAT_AAA"  # pragma: allowlist secret
+    canary_s3 = "CANARY_TUI_S3_SIG_111"  # pragma: allowlist secret
+    canary_gcs = "CANARY_TUI_GCS_SIG_222"  # pragma: allowlist secret
+    canary_sas = "CANARY_TUI_SAS_333"  # pragma: allowlist secret
+    canary_sql = "CANARY_TUI_SQL_KEY_444"  # pragma: allowlist secret
+
+    pat_sdk = MagicMock(
+        simulation_mode=False,
+        config=MagicMock(
+            base_url=(
+                f"https://{canary_pat}@edc.example.test"  # pragma: allowlist secret
+                f"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature={canary_s3}&sig={canary_sas}"  # pragma: allowlist secret
+            ),
+            simulation_mode=False,
+        ),
+    )
+    subtitle = _resolve_env_subtitle(pat_sdk)
+    for canary in (canary_pat, canary_s3, canary_sas):
+        assert canary not in subtitle
+    assert "https://***@edc.example.test" in subtitle
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in subtitle
+
+    sanitized_log = _sanitize_text(
+        f"Export failed https://{canary_pat}@exports.example.test/out.json"  # pragma: allowlist secret
+        f"?X-Goog-Signature={canary_gcs}&sig={canary_sas} "  # pragma: allowlist secret
+        f"store=file:tui_cache.db?mode=rw&key={canary_sql}"  # pragma: allowlist secret
+    )
+    for canary in (canary_pat, canary_gcs, canary_sas, canary_sql):
+        assert canary not in sanitized_log
+    assert "mode=rw" in sanitized_log

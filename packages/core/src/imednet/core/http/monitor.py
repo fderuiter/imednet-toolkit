@@ -11,7 +11,8 @@ from tenacity import RetryError
 
 from imednet.core.operations.monitor_base import _BaseMonitor
 from imednet.errors import DiagnosticContext, RequestError
-from imednet.utils.url import redact_url_query
+from imednet.utils.secrets import redact_sensitive_payload
+from imednet.utils.url import redact_sensitive_text, redact_url_query
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer  # pragma: no cover
@@ -33,7 +34,7 @@ class RequestMonitor(_BaseMonitor):
             url: URL of the request (will be redacted for logging).
         """
         self.method = method
-        self.safe_url = redact_url_query(url)
+        self.safe_url = str(redact_sensitive_payload(redact_sensitive_text(redact_url_query(url))))
         super().__init__(
             tracer=tracer,
             span_name="http_request",
@@ -74,7 +75,9 @@ class RequestMonitor(_BaseMonitor):
                 req = None
             if req is not None:
                 resolved_method = req.method or resolved_method
-                resolved_url = redact_url_query(str(req.url))
+                resolved_url = str(
+                    redact_sensitive_payload(redact_sensitive_text(redact_url_query(str(req.url))))
+                )
 
         valid_attempts = (
             attempt_count

@@ -16,7 +16,11 @@ from filelock import FileLock
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from imednet.spi.models import Record
-from imednet.spi.utils import build_filter_string, redact_sensitive_text
+from imednet.spi.utils import (
+    build_filter_string,
+    redact_sensitive_payload,
+    redact_sensitive_text,
+)
 
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE
 
@@ -575,7 +579,9 @@ class CachedRecordsLoader:
 
     def _fail_study_sync(self, conn: sqlite3.Connection, study_key: str, exc: Exception) -> None:
         """Record sync failure metadata while preserving the existing ``high_water_mark``."""
-        safe_error = redact_sensitive_text(str(exc)) or type(exc).__name__
+        safe_error = (
+            str(redact_sensitive_payload(redact_sensitive_text(str(exc)))) or type(exc).__name__
+        )
         with self._lock, conn:
             conn.execute(
                 """

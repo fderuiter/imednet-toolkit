@@ -107,7 +107,8 @@ class ImednetJobSensor(BaseSensorOperator):
                     return is_done
                 except (JobFailedError, InvalidJobTransitionError, InvalidJobStateError) as e:
                     self._last_state = getattr(job, "state", None)
-                    raise AirflowException(str(e)) from e
+                    safe_err = str(redact_sensitive_payload(redact_sensitive_text(str(e))))
+                    raise AirflowException(safe_err) from e
 
             try:
                 if getattr(job, "is_terminal", False):
@@ -118,7 +119,8 @@ class ImednetJobSensor(BaseSensorOperator):
                     )
                 return evaluate_job_state(job)
             except (JobFailedError, InvalidJobTransitionError, InvalidJobStateError) as e:
-                raise AirflowException(str(e)) from e
+                safe_err = str(redact_sensitive_payload(redact_sensitive_text(str(e))))
+                raise AirflowException(safe_err) from e
 
     def execute(self, context: Context) -> Any:
         """Execute sensor synchronously or defer polling to ``ImednetJobTrigger``."""
@@ -182,7 +184,17 @@ class ImednetJobSensor(BaseSensorOperator):
             raise AirflowException(
                 f"Unexpected trigger event status '{status}' for job '{self.batch_id}'."
             )
-        return event.get("job")
+        job_data = event.get("job")
+        if isinstance(job_data, Mapping):
+            sanitized_job = dict(job_data)
+            for field_name in ("result_url", "resultUrl", "result_error", "resultError"):
+                raw_val = sanitized_job.get(field_name)
+                if isinstance(raw_val, str) and raw_val:
+                    sanitized_job[field_name] = str(
+                        redact_sensitive_payload(redact_sensitive_text(raw_val))
+                    )
+            return sanitized_job
+        return job_data
 
 
 __all__ = ["ImednetJobSensor"]

@@ -6,9 +6,12 @@ from typing import Any
 SENSITIVE_KEYS = frozenset(
     {
         "password",
+        "passphrase",
         "token",
         "secret",
         "credential",
+        "signature",
+        "sig",
         "api_key",
         "apikey",
         "auth_key",
@@ -19,6 +22,10 @@ SENSITIVE_KEYS = frozenset(
         "authorization",
         "x-api-key",
         "x-imn-security-key",
+        "x-amz-signature",
+        "x-goog-signature",
+        "x-amz-credential",
+        "x-goog-credential",
     }
 )
 
@@ -31,9 +38,11 @@ _EXACT_SENSITIVE_KEYS = frozenset(
         *(k.lower().replace("-", "_") for k in SENSITIVE_KEYS),
         "passwd",
         "pwd",
+        "passphrases",
         "tokens",
         "secrets",
         "credentials",
+        "signatures",
         "authkey",
         "accesskey",
         "securitykey",
@@ -92,6 +101,8 @@ _SENSITIVE_ANYWHERE_TOKENS = frozenset(
         "passwords",
         "passwd",
         "pwd",
+        "passphrase",
+        "passphrases",
         "secret",
         "secrets",
         "credential",
@@ -129,32 +140,35 @@ _SENSITIVE_KEY_MODIFIERS = frozenset(
 )
 
 _EXPLICIT_CREDENTIAL_KEY_EXPR = (
-    r"x-imn-security-key|x-api-key|"
+    r"x-imn-security-key|x-api-key|x-amz-signature|x-goog-signature|"
+    r"x-amz-credential|x-goog-credential|"
     r"(?:[a-z0-9]+[_-]+)*(?:api[_-]?key|security[_-]?key|auth[_-]?key|access[_-]?key|"
     r"private[_-]?key|secret[_-]?key|csrf[_-]?key|client[_-]?secret|"
     r"oidc[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?token|"
     r"auth[_-]?token|bearer[_-]?token|session[_-]?token|csrf[_-]?token)|"
-    r"(?:[a-z0-9]+[_-]+)+(?:token|tokens|secret|secrets|password|passwords|passwd|credential|credentials)|"
+    r"(?:[a-z0-9]+[_-]+)+(?:token|tokens|secret|secrets|password|passwords|passwd|"
+    r"passphrase|passphrases|credential|credentials|signature|signatures)|"
     r"authorization"
 )
 _GENERIC_CREDENTIAL_KEY_EXPR = (
-    r"token|tokens|password|passwords|passwd|pwd|secret|secrets|credential|credentials"
+    r"token|tokens|password|passwords|passwd|pwd|passphrase|passphrases|"
+    r"secret|secrets|credential|credentials|signature|signatures|sig"
 )
 _ALL_CREDENTIAL_KEY_EXPR = rf"{_EXPLICIT_CREDENTIAL_KEY_EXPR}|{_GENERIC_CREDENTIAL_KEY_EXPR}"
 
 _QUOTED_SENSITIVE_PATTERN = re.compile(
-    rf"(?i)(?<![a-z0-9_])([\"']?)(?<![a-z0-9_])({_ALL_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])\1(\s*[:=]\s*)([\"'])([^\"'\r\n]*)\4"
+    rf"(?i)(?<!://)(?<![a-z0-9_-])([\"']?)(?<![a-z0-9_-])({_ALL_CREDENTIAL_KEY_EXPR})(?![a-z0-9_-])\1(\s*[:=]\s*)([\"'])([^\"'\r\n]*)\4"
 )
 _EQUALS_SENSITIVE_PATTERN = re.compile(
-    rf"(?i)(?<![a-z0-9_])({_ALL_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])(\s*=\s*)"
-    r"(?:(?:bearer|basic)\s+)?([^\s,;\"')\]}]+)"
+    rf"(?i)(?<!://)(?<![a-z0-9_-])({_ALL_CREDENTIAL_KEY_EXPR})(?![a-z0-9_-])(\s*=\s*)"
+    r"(?:(?:bearer|basic)\s+)?([^\s&,;\"')\]}]+)"
 )
 _HEADER_COLON_SENSITIVE_PATTERN = re.compile(
-    rf"(?i)(?<![a-z0-9_])({_EXPLICIT_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])(\s*:\s*)"
+    rf"(?i)(?<!://)(?<![a-z0-9_-])({_EXPLICIT_CREDENTIAL_KEY_EXPR})(?![a-z0-9_-])(\s*:\s*)"
     r"(?:(?:bearer|basic)\s+)?([^\s,;\"')\]}]+)"
 )
 _STANDALONE_COLON_SENSITIVE_PATTERN = re.compile(
-    rf"(?i)(?<![a-z0-9_])({_GENERIC_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])(\s*:\s*)"
+    rf"(?i)(?<!://)(?<![a-z0-9_-])({_GENERIC_CREDENTIAL_KEY_EXPR})(?![a-z0-9_-])(\s*:\s*)"
     r"([^\s,;\"')\]}]+)(?=\s*(?:[,;)\]}\r\n]|$))"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\b(bearer\s+)([^\s,;\"')\]}]+)")
@@ -188,7 +202,7 @@ def is_sensitive_key(key: Any) -> bool:
     if any(tok in _SENSITIVE_ANYWHERE_TOKENS for tok in tokens):
         return True
 
-    if tokens[-1] in {"token", "tokens"} or tokens[-2:] in {
+    if tokens[-1] in {"token", "tokens", "signature", "signatures"} or tokens[-2:] in {
         ("token", "value"),
         ("token", "val"),
     }:

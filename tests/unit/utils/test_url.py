@@ -5,6 +5,7 @@ import pytest
 from imednet.errors.validation import PathTraversalValidationError
 from imednet.utils.url import (
     build_safe_path,
+    redact_sensitive_text,
     redact_url_query,
     sanitize_base_url,
     validate_path_segment,
@@ -33,7 +34,7 @@ def test_sanitize_base_url(url: str, expected: str) -> None:
 
 def test_redact_url_query() -> None:
     """Test URL query parameter redaction."""
-    url = "https://api.example.com/v1/resource?api_key=secret123&token=abc&other=value"
+    url = "https://api.example.com/v1/resource?api_key=secret123&token=abc&other=value"  # pragma: allowlist secret
     expected = "https://api.example.com/v1/resource?api_key=***&token=***&other=value"
     assert redact_url_query(url) == expected
 
@@ -48,6 +49,85 @@ def test_redact_url_query() -> None:
 
     # Test empty params
     assert redact_url_query("https://example.com") == "https://example.com"
+
+
+def test_redact_url_query_and_sensitive_text_presigned_sas_userinfo_and_file_uris() -> None:
+    """Verify cloud pre-signed signatures, SAS sig, userinfo, and file:/sqlite: URIs are scrubbed."""
+    from imednet.spi import utils as spi_utils
+
+    assert spi_utils.redact_url_query is redact_url_query
+    assert spi_utils.redact_sensitive_text is redact_sensitive_text
+
+    presigned_url = (
+        "https://exports.example.test/study-export.json"
+        "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=CANARY_CRED_000"  # pragma: allowlist secret
+        "&X-Amz-Signature=CANARY_S3_SIG_111"  # pragma: allowlist secret
+        "&X-Goog-Credential=CANARY_GOOG_CRED_001&X-Goog-Signature=CANARY_GCS_SIG_222"  # pragma: allowlist secret
+        "&Signature=CANARY_LEGACY_SIG_223&sv=2024-11-04&sig=CANARY_AZURE_SAS_333"  # pragma: allowlist secret
+        "&page=2&size=50&sort=recordId&filter=studyKey==S1"
+    )
+    sqlite_uri = (
+        "file:triage_corrupt.db?mode=rw"
+        "&key=CANARY_SQLCIPHER_KEY_444&password=CANARY_SQLITE_PASS_555"  # pragma: allowlist secret
+        "&passphrase=CANARY_SQL_PASSPHRASE_666"  # pragma: allowlist secret
+    )
+    sqlite_scheme_uri = (
+        "sqlite:///tmp/local.db?mode=ro&key=CANARY_SQLITE3_KEY_777"  # pragma: allowlist secret
+    )
+    userinfo_single = (
+        "Request failed (Method: GET, URL: "
+        "https://CANARY_USERINFO_PAT_AAA@edc.example.test/api/v1/edc/studies)"  # pragma: allowlist secret
+    )
+    userinfo_pair = "Connection error for postgresql://admin:CANARY_PG_PASS_BBB@db.example.test:5432/edc"  # pragma: allowlist secret
+
+    redacted_presigned = redact_url_query(presigned_url)
+    redacted_presigned_text = redact_sensitive_text(f"Fetching ({presigned_url}).")
+    redacted_sqlite = redact_sensitive_text(sqlite_uri)
+    redacted_sqlite_scheme = redact_sensitive_text(sqlite_scheme_uri)
+    redacted_single = redact_sensitive_text(userinfo_single)
+    redacted_pair = redact_sensitive_text(userinfo_pair)
+    redacted_direct_userinfo = redact_url_query(
+        "https://CANARY_USERINFO_PAT_AAA@edc.example.test/api/v1/edc/studies"  # pragma: allowlist secret
+    )
+
+    for canary in (
+        "CANARY_CRED_000",
+        "CANARY_S3_SIG_111",
+        "CANARY_GOOG_CRED_001",
+        "CANARY_GCS_SIG_222",
+        "CANARY_LEGACY_SIG_223",
+        "CANARY_AZURE_SAS_333",
+        "CANARY_SQLCIPHER_KEY_444",
+        "CANARY_SQLITE_PASS_555",
+        "CANARY_SQL_PASSPHRASE_666",
+        "CANARY_SQLITE3_KEY_777",
+        "CANARY_USERINFO_PAT_AAA",
+        "CANARY_PG_PASS_BBB",
+    ):
+        for output in (
+            redacted_presigned,
+            redacted_presigned_text,
+            redacted_sqlite,
+            redacted_sqlite_scheme,
+            redacted_single,
+            redacted_pair,
+            redacted_direct_userinfo,
+        ):
+            assert canary not in output
+
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in redacted_presigned
+    assert "sv=2024-11-04" in redacted_presigned
+    assert "page=2" in redacted_presigned
+    assert "size=50" in redacted_presigned
+    assert "sort=recordId" in redacted_presigned
+    assert "mode=rw" in redacted_sqlite
+    assert redacted_sqlite_scheme == "sqlite:///tmp/local.db?mode=ro&key=***"
+    assert (
+        redacted_single
+        == "Request failed (Method: GET, URL: https://***@edc.example.test/api/v1/edc/studies)"
+    )
+    assert redacted_pair == "Connection error for postgresql://***@db.example.test:5432/edc"
+    assert redacted_direct_userinfo == "https://***@edc.example.test/api/v1/edc/studies"
 
 
 @pytest.mark.parametrize(

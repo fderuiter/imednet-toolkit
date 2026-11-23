@@ -1004,3 +1004,109 @@ def test_airflow_state_provider_and_example_dags_airflow3_compat(tmp_path: Path)
         check=False,
     )
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+
+def test_airflow_hook_trigger_and_sensor_redact_presigned_sas_file_and_userinfo() -> None:
+    """ImednetHook, ImednetJobTrigger, and ImednetJobSensor scrub pre-signed, SAS, file:, and userinfo secrets."""
+    from apache_airflow_providers_imednet._airflow_compat import AirflowException
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.sensors import ImednetJobSensor
+    from apache_airflow_providers_imednet.triggers import ImednetJobTrigger
+    from imednet.spi.models import JobStatus
+
+    canary_s3 = "CANARY_AF_S3_SIG_111"  # pragma: allowlist secret
+    canary_gcs = "CANARY_AF_GCS_SIG_222"  # pragma: allowlist secret
+    canary_sas = "CANARY_AF_SAS_333"  # pragma: allowlist secret
+    canary_sql = "CANARY_AF_SQL_KEY_444"  # pragma: allowlist secret
+    canary_pat = "CANARY_AF_PAT_555"  # pragma: allowlist secret
+
+    presigned_url = (
+        f"https://{canary_pat}@exports.example.test/study-export.json"  # pragma: allowlist secret
+        f"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature={canary_s3}"  # pragma: allowlist secret
+        f"&X-Goog-Signature={canary_gcs}&sv=2024-11-04&sig={canary_sas}"  # pragma: allowlist secret
+    )
+    sqlite_err = f"State store error file:airflow.db?mode=rw&key={canary_sql} fetching {presigned_url}"  # pragma: allowlist secret
+
+    hook = ImednetHook(imednet_conn_id="imednet_default")
+    with (
+        patch.object(
+            hook,
+            "_resolved_config",
+            return_value=SimpleNamespace(api_key="k", security_key="s", oidc_token=None),
+        ),
+        patch.object(hook, "get_sdk_client", side_effect=RuntimeError(sqlite_err)),
+    ):
+        ok, conn_msg = hook.test_connection()
+    assert ok is False
+    for canary in (canary_s3, canary_gcs, canary_sas, canary_sql, canary_pat):
+        assert canary not in conn_msg
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in conn_msg
+    assert "mode=rw" in conn_msg
+
+    async def _run_async_checks() -> None:
+        with patch.object(
+            hook,
+            "_aget_airflow_connection",
+            new=AsyncMock(side_effect=RuntimeError("no conn")),
+        ):
+            redacted_msg = await hook.redact_error_message(sqlite_err)
+        for canary in (canary_s3, canary_gcs, canary_sas, canary_sql, canary_pat):
+            assert canary not in redacted_msg
+
+        # Trigger error event masks pre-signed URL, SAS, file: key, and userinfo
+        err_sdk = MagicMock()
+        err_sdk.jobs.get = AsyncMock(side_effect=RuntimeError(sqlite_err))
+        err_sdk.__aenter__ = AsyncMock(return_value=err_sdk)
+        err_sdk.__aexit__ = AsyncMock(return_value=None)
+
+        trigger = ImednetJobTrigger(study_key="S_AF", batch_id="B_AF", poke_interval=0.01)
+        with (
+            patch.object(ImednetHook, "get_async_conn", new=AsyncMock(return_value=err_sdk)),
+            patch.object(
+                ImednetHook,
+                "_aget_airflow_connection",
+                new=AsyncMock(side_effect=RuntimeError("no conn")),
+            ),
+        ):
+            err_events = [ev async for ev in trigger.run()]
+
+        assert err_events[0].payload["status"] == "error"
+        for canary in (canary_s3, canary_gcs, canary_sas, canary_sql, canary_pat):
+            assert canary not in err_events[0].payload["message"]
+
+        # Trigger success event masks pre-signed resultUrl while preserving study/clinical records
+        ok_job = JobStatus.model_validate(
+            {
+                "batchId": "B_AF_OK",
+                "state": "COMPLETED",
+                "progress": 100,
+                "resultUrl": presigned_url,
+            }
+        )
+        ok_sdk = MagicMock()
+        ok_sdk.jobs.get = AsyncMock(return_value=ok_job)
+        ok_sdk.jobs.fetch_result = AsyncMock(
+            return_value=[{"status": "SUCCESS", "study_key": "S_AF", "key": "ROW_1"}]
+        )
+        ok_sdk.__aenter__ = AsyncMock(return_value=ok_sdk)
+        ok_sdk.__aexit__ = AsyncMock(return_value=None)
+
+        ok_trigger = ImednetJobTrigger(study_key="S_AF", batch_id="B_AF_OK", poke_interval=0.01)
+        with patch.object(ImednetHook, "get_async_conn", new=AsyncMock(return_value=ok_sdk)):
+            ok_events = [ev async for ev in ok_trigger.run()]
+
+        assert ok_events[0].payload["status"] == "success"
+        dumped_str = str(ok_events[0].payload)
+        for canary in (canary_s3, canary_gcs, canary_sas, canary_pat):
+            assert canary not in dumped_str
+        assert "ROW_1" in dumped_str
+
+    asyncio.run(_run_async_checks())
+
+    sensor = ImednetJobSensor(task_id="wait_af", study_key="S_AF", batch_id="B_AF", deferrable=True)
+    with pytest.raises(AirflowException) as sensor_err:
+        sensor.execute_complete({}, {"status": "error", "message": sqlite_err})
+    for canary in (canary_s3, canary_gcs, canary_sas, canary_sql, canary_pat):
+        assert canary not in str(sensor_err.value)
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in str(sensor_err.value)
+    assert "mode=rw" in str(sensor_err.value)

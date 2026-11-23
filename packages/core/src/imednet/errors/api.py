@@ -3,9 +3,25 @@
 from http import HTTPStatus
 from typing import Any
 
-from imednet.utils.secrets import redact_sensitive_payload as _redact_sensitive_value
+from imednet.utils.secrets import redact_sensitive_payload
 
 from .base import DiagnosticContext, ImednetError
+
+
+def _redact_sensitive_value(data: Any) -> Any:
+    """Redact sensitive dictionary keys, inline credentials, and URLs/URIs in API error bodies."""
+    from imednet.utils.url import redact_sensitive_text
+
+    redacted = redact_sensitive_payload(data)
+    if isinstance(redacted, dict):
+        return {k: _redact_sensitive_value(v) for k, v in redacted.items()}
+    if isinstance(redacted, list):
+        return [_redact_sensitive_value(item) for item in redacted]
+    if isinstance(redacted, tuple):
+        return tuple(_redact_sensitive_value(item) for item in redacted)
+    if isinstance(redacted, str):
+        return str(redact_sensitive_payload(redact_sensitive_text(redacted)))
+    return redacted
 
 
 def _parse_int_code(raw_code: Any) -> int | None:

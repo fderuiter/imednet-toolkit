@@ -40,8 +40,14 @@ _SENSITIVE_KEYS = {
     "secret",
     "secret_key",
     "security_key",
+    "sig",
+    "signature",
     "token",
+    "x-amz-credential",
+    "x-amz-signature",
     "x-api-key",
+    "x-goog-credential",
+    "x-goog-signature",
     "x-imn-security-key",
 }
 
@@ -500,7 +506,9 @@ class ImednetHook(BaseHook):
 
         env_url = self._string_or_none(os.environ.get("IMEDNET_BASE_URL"))
         resolved = raw_url or (sanitize_base_url(env_url) if env_url else None) or default_url
-        return redact_uri(redact_sensitive_text(resolved)).rstrip("/")
+        return str(redact_sensitive_payload(redact_sensitive_text(redact_uri(resolved)))).rstrip(
+            "/"
+        )
 
     @classmethod
     def _to_primitive(cls, value: Any) -> PrimitiveContainer:
@@ -521,8 +529,15 @@ class ImednetHook(BaseHook):
             output: dict[str, PrimitiveContainer] = {}
             for key, item in value.items():
                 key_str = str(key)
-                if key_str.lower() in _SENSITIVE_KEYS:
+                key_lower = key_str.lower()
+                if key_lower in _SENSITIVE_KEYS:
                     output[key_str] = "***"
+                elif (
+                    key_lower in {"result_url", "resulturl", "result_error", "resulterror"}
+                    and isinstance(item, str)
+                    and item
+                ):
+                    output[key_str] = str(redact_sensitive_payload(redact_sensitive_text(item)))
                 else:
                     output[key_str] = cls._to_primitive(item)
             return output
@@ -547,7 +562,7 @@ class ImednetHook(BaseHook):
 
         from imednet.spi.sinks import redact_uri
 
-        message = str(redact_sensitive_payload(redact_uri(redact_sensitive_text(raw_message))))
+        message = str(redact_sensitive_payload(redact_sensitive_text(redact_uri(raw_message))))
         with contextlib.suppress(Exception):
             conn = await self._aget_airflow_connection(self.imednet_conn_id)
             config = self._config_from_connection(conn)
@@ -577,7 +592,7 @@ class ImednetHook(BaseHook):
         except Exception as exc:
             from imednet.spi.sinks import redact_uri
 
-            message = str(redact_sensitive_payload(redact_uri(redact_sensitive_text(str(exc)))))
+            message = str(redact_sensitive_payload(redact_sensitive_text(redact_uri(str(exc)))))
             if config is not None:
                 for secret in (config.api_key, config.security_key, config.oidc_token):
                     if isinstance(secret, str) and secret:

@@ -76,9 +76,10 @@ _ACTIVE_STATE_NAMES: frozenset[str] = frozenset(
     {"PROCESSING", "PENDING", "RUNNING", "QUEUED", "OPEN", "ACTIVE"}
 )
 _QUOTED_SENSITIVE_KEY_RE = re.compile(
-    r"""(?i)(['"])(x-imn-security-key|x-api-key|api[_-]?key|security[_-]?key|"""
+    r"""(?i)(['"])(x-imn-security-key|x-api-key|x-amz-signature|x-goog-signature|"""
+    r"""x-amz-credential|x-goog-credential|api[_-]?key|security[_-]?key|"""
     r"""authorization|client[_-]?secret|private[_-]?key|access[_-]?key|auth[_-]?key|"""
-    r"""credential|token|password|secret)\1(\s*:\s*)(['"])[^'"]*\4"""
+    r"""credential|token|password|passphrase|secret|signature|sig)\1(\s*:\s*)(['"])[^'"]*\4"""
 )
 
 
@@ -92,7 +93,7 @@ def _sanitize_text(value: Any) -> str:
     else:
         payload_source = value
     redacted_payload = redact_sensitive_payload(payload_source)
-    sanitized = redact_sensitive_text(str(redacted_payload))
+    sanitized = str(redact_sensitive_payload(redact_sensitive_text(str(redacted_payload))))
     return _QUOTED_SENSITIVE_KEY_RE.sub(r"\1\2\1\3\4***\4", sanitized)
 
 
@@ -145,7 +146,7 @@ def _resolve_env_subtitle(sdk: object) -> str:
         if isinstance(client_url, str) and client_url.strip():
             return f"Env: {_sanitize_text(client_url.strip())}"
 
-    return f"Env: {DEFAULT_BASE_URL}"
+    return f"Env: {_sanitize_text(DEFAULT_BASE_URL)}"
 
 
 def _normalize_batch_ids(raw_values: Sequence[str] | str | None) -> list[str]:

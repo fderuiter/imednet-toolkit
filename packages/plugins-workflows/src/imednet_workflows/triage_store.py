@@ -708,10 +708,8 @@ class TriageStore:
 
     def _redact_sqlite_target(self, target: str) -> str:
         """Redact sensitive information from a SQLite connection string."""
-        if "://" not in target and not target.startswith("file:"):
-            return target
-        return redact_sensitive_text(target)
+        return str(redact_sensitive_payload(redact_sensitive_text(target)))
 
     def _redact_error_text(self, message: str) -> str:
         """Redact sensitive information from an error message."""
-        return str(redact_sensitive_payload(message))
+        return str(redact_sensitive_payload(redact_sensitive_text(message)))

@@ -80,7 +80,7 @@ if TYPE_CHECKING:
         dataframe_to_records,
         import_records_csv,
     )
-    from imednet.utils.secrets import redact_sensitive_payload
+    from imednet.utils.secrets import is_sensitive_key, redact_sensitive_payload
     from imednet.utils.security import (
         SensitivityRegistry,
         global_sensitivity_registry,
@@ -96,7 +96,12 @@ if TYPE_CHECKING:
         normalize_tabular_row,
     )
     from imednet.utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
-    from imednet.utils.url import redact_sensitive_text, sanitize_base_url, validate_path_segment
+    from imednet.utils.url import (
+        redact_sensitive_text,
+        redact_url_query,
+        sanitize_base_url,
+        validate_path_segment,
+    )
     from imednet.utils.validators import is_boolean_token, is_missing_value, parse_bool
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
@@ -156,6 +161,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "import_records_csv": ("imednet.utils.pandas", "import_records_csv"),
     "is_boolean_token": ("imednet.utils.validators", "is_boolean_token"),
     "is_missing_value": ("imednet.utils.validators", "is_missing_value"),
+    "is_sensitive_key": ("imednet.utils.secrets", "is_sensitive_key"),
     "is_site_enrollment_eligible": ("imednet.utils.enrollment", "is_site_enrollment_eligible"),
     "mask_clinical_phi": ("imednet.utils.security", "mask_clinical_phi"),
     "mask_custom_phi_recursive": (
@@ -181,6 +187,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "poll_facade_single_sync": ("imednet.utils.batch_coordinator", "poll_facade_single_sync"),
     "redact_sensitive_payload": ("imednet.utils.secrets", "redact_sensitive_payload"),
     "redact_sensitive_text": ("imednet.utils.url", "redact_sensitive_text"),
+    "redact_url_query": ("imednet.utils.url", "redact_url_query"),
     "reset_base_url_context": ("imednet.core.context", "reset_base_url_context"),
     "resolve_enrichment_pipeline": (
         "imednet.integrations.enrichment",
@@ -272,6 +279,7 @@ __all__ = [
     "import_records_csv",
     "is_boolean_token",
     "is_missing_value",
+    "is_sensitive_key",
     "is_site_enrollment_eligible",
     "mask_clinical_phi",
     "mask_custom_phi_recursive",
@@ -291,6 +299,7 @@ __all__ = [
     "poll_facade_single_sync",
     "redact_sensitive_payload",
     "redact_sensitive_text",
+    "redact_url_query",
     "reset_base_url_context",
     "resolve_enrichment_pipeline",
     "resolve_sdk_result_fetcher",

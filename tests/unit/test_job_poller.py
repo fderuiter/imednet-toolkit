@@ -552,3 +552,47 @@ async def test_poll_many_records_result_url_errors(monkeypatch: pytest.MonkeyPat
     async_err = async_summary.failures["B_ASYNC_ERR"]
     assert isinstance(async_err, JobFailedError)
     assert async_err.result_error == "Connection reset fetching resultUrl"
+
+
+@pytest.mark.asyncio
+async def test_job_poller_redacts_presigned_sas_and_userinfo_in_result_url_errors() -> None:
+    """fetch_terminal_job_result and AsyncJobPoller.run mask pre-signed, SAS, and userinfo secrets."""
+    from imednet.utils.job_poller import fetch_terminal_job_result
+
+    canary_s3 = "CANARY_S3_JOB_SIG_111"  # pragma: allowlist secret
+    canary_sas = "CANARY_SAS_JOB_SIG_222"  # pragma: allowlist secret
+    canary_pat = "CANARY_JOB_PAT_333"  # pragma: allowlist secret
+    leak_url = (
+        f"https://{canary_pat}@exports.example.test/job.json"  # pragma: allowlist secret
+        f"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature={canary_s3}&sig={canary_sas}"  # pragma: allowlist secret
+    )
+
+    sync_status = JobStatus(
+        batchId="B_SYNC_SIG", state="COMPLETED", progress=100, resultUrl=leak_url
+    )
+
+    def _fail_sync(_url: str) -> object:
+        raise RuntimeError(f"Failed GET {leak_url}")
+
+    with pytest.raises(JobFailedError) as sync_exc:
+        fetch_terminal_job_result(sync_status, _fail_sync, batch_id="B_SYNC_SIG")
+
+    for canary in (canary_s3, canary_sas, canary_pat):
+        assert canary not in str(sync_exc.value)
+        assert canary not in (sync_status.result_error or "")
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in str(sync_exc.value)
+
+    async def _get_async(_sk: str, batch_id: str) -> JobStatus:
+        return JobStatus(batchId=batch_id, state="COMPLETED", progress=100, resultUrl=leak_url)
+
+    async def _fail_async(_url: str) -> object:
+        raise RuntimeError(f"Failed async GET {leak_url}")
+
+    poller = AsyncJobPoller(_get_async, fetch_result=_fail_async)
+    with pytest.raises(JobFailedError) as async_exc:
+        await poller.run("ST", "B_ASYNC_SIG", interval=0)
+
+    for canary in (canary_s3, canary_sas, canary_pat):
+        assert canary not in str(async_exc.value)
+        assert canary not in (async_exc.value.result_error or "")
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in str(async_exc.value)

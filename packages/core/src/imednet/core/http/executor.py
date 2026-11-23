@@ -26,7 +26,8 @@ from imednet.core.operations.circuit_breaker import (
 )
 from imednet.core.retry import RetryConfig, RetryState
 from imednet.errors import DiagnosticContext
-from imednet.utils.url import redact_url_query
+from imednet.utils.secrets import redact_sensitive_payload
+from imednet.utils.url import redact_sensitive_text, redact_url_query
 
 _SUPPRESSED_LOG_LEVEL = logging.CRITICAL + 1
 
@@ -135,7 +136,11 @@ class BaseRequestExecutor(ABC):
         if isinstance(params, Mapping) and params and "?" not in url:
             query = urlencode(list(params.items()), doseq=True)
             if query:
-                return redact_url_query(f"{url}?{query}")
+                return str(
+                    redact_sensitive_payload(
+                        redact_sensitive_text(redact_url_query(f"{url}?{query}"))
+                    )
+                )
         return url
 
     def _finalize_response(

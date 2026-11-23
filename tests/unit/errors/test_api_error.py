@@ -569,3 +569,80 @@ def test_diagnostic_context_immutability_retry_after_and_cli_forbidden(
     captured = capsys.readouterr()
     assert "Permission Denied:" in captured.err
     assert "Authentication Failed:" not in captured.err
+
+
+def test_presigned_userinfo_and_structural_keys_redaction_contracts() -> None:
+    """Verify is_sensitive_key, DiagnosticContext, ApiError, and redact_cli_secrets guardrails."""
+    from imednet.cli.decorators import redact_cli_secrets
+    from imednet.errors import DiagnosticContext
+    from imednet.utils.secrets import is_sensitive_key, redact_sensitive_payload
+
+    for sensitive_name in (
+        "X-Amz-Signature",
+        "X-Goog-Signature",
+        "Signature",
+        "X-Amz-Credential",
+        "X-Goog-Credential",
+        "sig",
+        "passphrase",
+        "private_key_passphrase",
+    ):
+        assert is_sensitive_key(sensitive_name) is True, f"Expected sensitive: {sensitive_name}"
+
+    for structural_name in (
+        "study_key",
+        "subject_key",
+        "form_key",
+        "record_key",
+        "site_key",
+        "key",
+        "X-Amz-Algorithm",
+        "X-Amz-Date",
+        "signature_date",
+        "signature_status",
+    ):
+        assert is_sensitive_key(structural_name) is False, f"Expected unmasked: {structural_name}"
+
+    structural_payload = {
+        "study_key": "STUDY_ALPHA",
+        "subject_key": "SUBJ_101",
+        "form_key": "FORM_AE",
+        "key": "PRIMARY_ROW_KEY",
+        "X-Amz-Signature": "CANARY_S3_SIG_111",  # pragma: allowlist secret
+        "X-Goog-Signature": "CANARY_GCS_SIG_222",  # pragma: allowlist secret
+        "sig": "CANARY_SAS_SIG_333",  # pragma: allowlist secret
+        "passphrase": "CANARY_PASSPHRASE_444",  # pragma: allowlist secret
+    }
+    redacted_dict = redact_sensitive_payload(structural_payload)
+    assert redacted_dict["study_key"] == "STUDY_ALPHA"
+    assert redacted_dict["subject_key"] == "SUBJ_101"
+    assert redacted_dict["form_key"] == "FORM_AE"
+    assert redacted_dict["key"] == "PRIMARY_ROW_KEY"
+    assert redacted_dict["X-Amz-Signature"] == "***"
+    assert redacted_dict["X-Goog-Signature"] == "***"
+    assert redacted_dict["sig"] == "***"
+    assert redacted_dict["passphrase"] == "***"
+
+    diag = DiagnosticContext(
+        method="get",
+        url=(
+            "https://CANARY_PAT_TOKEN@exports.example.test/out.json"  # pragma: allowlist secret
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=CANARY_S3_SIG_111"  # pragma: allowlist secret
+            "&sig=CANARY_SAS_SIG_333"  # pragma: allowlist secret
+        ),
+    )
+    assert diag.url is not None
+    assert "CANARY_PAT_TOKEN" not in diag.url
+    assert "CANARY_S3_SIG_111" not in diag.url
+    assert "CANARY_SAS_SIG_333" not in diag.url
+    assert "https://***@exports.example.test/out.json" in diag.url
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in diag.url
+
+    cli_scrubbed = redact_cli_secrets(
+        "Failed opening file:triage.db?mode=rw&key=CANARY_SQL_KEY "  # pragma: allowlist secret
+        "or https://CANARY_PAT_TOKEN@edc.example.test/api?sig=CANARY_SAS_SIG_333"  # pragma: allowlist secret
+    )
+    for canary in ("CANARY_SQL_KEY", "CANARY_PAT_TOKEN", "CANARY_SAS_SIG_333"):
+        assert canary not in cli_scrubbed
+    assert "mode=rw" in cli_scrubbed
+    assert "https://***@edc.example.test/api?sig=***" in cli_scrubbed

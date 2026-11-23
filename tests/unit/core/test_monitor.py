@@ -349,3 +349,106 @@ def test_operation_monitor_on_failure() -> None:
         monitor.on_failure(ValueError("Bad value"))
 
     span.set_attribute.assert_called_once_with("status", "failed")
+
+
+@pytest.mark.asyncio
+async def test_request_monitor_and_external_url_redact_presigned_and_userinfo_while_preserving_wire(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RequestMonitor logs/spans/errors mask pre-signed, SAS, and userinfo secrets without altering wire URLs."""
+    import logging
+
+    from imednet.core.async_client import AsyncClient
+    from imednet.core.client import Client
+    from imednet.errors import ApiError
+
+    canary_s3 = "CANARY_S3_SIG_111"  # pragma: allowlist secret
+    canary_cred = "CANARY_S3_CRED_112"  # pragma: allowlist secret
+    canary_gcs = "CANARY_GCS_SIG_222"  # pragma: allowlist secret
+    canary_sas = "CANARY_AZURE_SAS_333"  # pragma: allowlist secret
+    canary_pat = "CANARY_USERINFO_PAT_AAA"  # pragma: allowlist secret
+
+    userinfo_url = (
+        f"https://{canary_pat}@exports.example.test/study-export.json"  # pragma: allowlist secret
+        f"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={canary_cred}"  # pragma: allowlist secret
+        f"&X-Amz-Signature={canary_s3}&X-Goog-Signature={canary_gcs}"  # pragma: allowlist secret
+        f"&sv=2024-11-04&sig={canary_sas}"  # pragma: allowlist secret
+    )
+
+    tracer = MagicMock()
+    span_cm = MagicMock()
+    span = MagicMock()
+    span_cm.__enter__.return_value = span
+    tracer.start_as_current_span.return_value = span_cm
+
+    caplog.set_level(logging.INFO, logger="imednet.core.http.monitor")
+    monitor = RequestMonitor(tracer, "GET", userinfo_url)
+    with monitor:
+        resp = httpx.Response(200, request=httpx.Request("GET", userinfo_url))
+        monitor.on_success(resp)
+
+    endpoint_attr = tracer.start_as_current_span.call_args.kwargs["attributes"]["endpoint"]
+    assert "https://***@exports.example.test/study-export.json" in endpoint_attr
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in endpoint_attr
+    assert "sv=2024-11-04" in endpoint_attr
+
+    req_err_exc = httpx.ConnectError("boom", request=httpx.Request("GET", userinfo_url))
+    with pytest.raises(RequestError) as req_exc_info:
+        monitor.on_request_error(req_err_exc)
+
+    for canary in (canary_s3, canary_cred, canary_gcs, canary_sas, canary_pat):
+        assert canary not in monitor.safe_url
+        assert canary not in endpoint_attr
+        assert canary not in str(req_exc_info.value)
+        for rec in caplog.records:
+            assert canary not in rec.getMessage()
+            assert canary not in str(getattr(rec, "url", ""))
+
+    # Outbound Client.fetch_external_url and AsyncClient.fetch_external_url preserve wire query tokens
+    presigned_wire_url = (
+        "https://exports.example.test/study-export.json"
+        f"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature={canary_s3}"  # pragma: allowlist secret
+        f"&sv=2024-11-04&sig={canary_sas}"  # pragma: allowlist secret
+    )
+    seen_sync_urls: list[str] = []
+    seen_async_urls: list[str] = []
+
+    def sync_handler(request: httpx.Request) -> httpx.Response:
+        seen_sync_urls.append(str(request.url))
+        if len(seen_sync_urls) == 1:
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(403, text=f"Expired signature at {presigned_wire_url}")
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        seen_async_urls.append(str(request.url))
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(Client, "_should_resolve_external_dns", lambda self: False)
+    monkeypatch.setattr(AsyncClient, "_should_resolve_external_dns", lambda self: False)
+
+    with Client(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://edc.example.test",
+        transport=httpx.MockTransport(sync_handler),
+    ) as client:
+        ok_resp = client.fetch_external_url(presigned_wire_url)
+        assert ok_resp.status_code == 200
+        assert seen_sync_urls[0] == presigned_wire_url
+
+        with pytest.raises(ApiError) as api_exc:
+            client.fetch_external_url(presigned_wire_url)
+        assert canary_s3 not in str(api_exc.value)
+        assert canary_sas not in str(api_exc.value)
+        assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in str(api_exc.value)
+
+    async with AsyncClient(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://edc.example.test",
+        transport=httpx.MockTransport(async_handler),
+    ) as aclient:
+        a_resp = await aclient.fetch_external_url(presigned_wire_url)
+        assert a_resp.status_code == 200
+        assert seen_async_urls[0] == presigned_wire_url

@@ -9,7 +9,8 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 from imednet.errors import DiagnosticContext, get_error_class
-from imednet.utils.url import redact_url_query
+from imednet.utils.secrets import redact_sensitive_payload
+from imednet.utils.url import redact_sensitive_text, redact_url_query
 
 
 def parse_retry_after_seconds(response: httpx.Response) -> float | None:
@@ -56,7 +57,11 @@ def handle_response(
 
         resolved_method = req.method if req is not None else method
         raw_url = str(req.url) if req is not None else url
-        safe_url = redact_url_query(raw_url) if raw_url is not None else None
+        safe_url = (
+            str(redact_sensitive_payload(redact_sensitive_text(redact_url_query(raw_url))))
+            if raw_url is not None
+            else None
+        )
         retry_after = parse_retry_after_seconds(response)
         diagnostic_context = DiagnosticContext(
             method=resolved_method,

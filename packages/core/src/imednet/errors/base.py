@@ -23,9 +23,12 @@ class DiagnosticContext:
         if self.url is not None:
             raw_url = str(self.url).strip()
             if raw_url:
+                from imednet.utils.secrets import redact_sensitive_payload
                 from imednet.utils.url import redact_sensitive_text, redact_url_query
 
-                sanitized_url = redact_url_query(redact_sensitive_text(raw_url))
+                sanitized_url = str(
+                    redact_sensitive_payload(redact_url_query(redact_sensitive_text(raw_url)))
+                )
                 object.__setattr__(self, "url", sanitized_url)
             else:
                 object.__setattr__(self, "url", None)

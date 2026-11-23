@@ -23,7 +23,7 @@ from imednet.models.jobs import (
     validate_job_transition,
 )
 from imednet.utils.secrets import redact_sensitive_payload
-from imednet.utils.url import validate_path_segment
+from imednet.utils.url import redact_sensitive_text, validate_path_segment
 
 logger = logging.getLogger(__name__)
 _ORIGINAL_TIME_SLEEP = time.sleep
@@ -208,7 +208,7 @@ class JobFailedError(Exception):
             result_error if result_error is not None else getattr(status, "result_error", None)
         )
         resolved_result_error = (
-            str(redact_sensitive_payload(raw_res_err))
+            str(redact_sensitive_payload(redact_sensitive_text(raw_res_err)))
             if isinstance(raw_res_err, str) and raw_res_err
             else None
         )
@@ -321,7 +321,7 @@ def fetch_terminal_job_result(
         res = fetch_result(cast(str, result_url))
         return _attach_fetched_result(status, res)
     except Exception as exc:
-        redacted_err = str(redact_sensitive_payload(str(exc)))
+        redacted_err = str(redact_sensitive_payload(redact_sensitive_text(str(exc))))
         status.result_error = redacted_err
         logger.error(
             "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",
@@ -741,7 +741,9 @@ class AsyncJobPoller(BaseJobPoller):
                         res = await self._fetch_result(status.result_url)  # type: ignore
                         self._process_fetch_result(status, res)
                     except Exception as exc:
-                        redacted_err = str(redact_sensitive_payload(str(exc)))
+                        redacted_err = str(
+                            redact_sensitive_payload(redact_sensitive_text(str(exc)))
+                        )
                         status.result_error = redacted_err
                         logger.error(
                             "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",

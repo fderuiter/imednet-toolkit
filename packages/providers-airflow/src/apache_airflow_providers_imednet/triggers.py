@@ -52,6 +52,16 @@ def _make_trigger_event(payload: dict[str, Any]) -> TriggerEvent:
     return cast(TriggerEvent, event_cls(payload))
 
 
+def _sanitize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Redact pre-signed URLs and inline credentials from serialized job metadata."""
+    sanitized = dict(payload)
+    for field_name in ("result_url", "resultUrl", "result_error", "resultError"):
+        raw_val = sanitized.get(field_name)
+        if isinstance(raw_val, str) and raw_val:
+            sanitized[field_name] = str(redact_sensitive_payload(redact_sensitive_text(raw_val)))
+    return sanitized
+
+
 class ImednetJobTrigger(BaseTrigger):
     """Asynchronously poll an iMednet batch job in the Airflow triggerer."""
 
@@ -141,7 +151,7 @@ class ImednetJobTrigger(BaseTrigger):
             if callable(model_dump):
                 dumped = model_dump(mode="json")
                 if isinstance(dumped, dict):
-                    job_payload = dumped
+                    job_payload = _sanitize_job_payload(dumped)
             yield _make_trigger_event(
                 {
                     "status": "success",
@@ -154,7 +164,8 @@ class ImednetJobTrigger(BaseTrigger):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            safe_message = await hook.redact_error_message(str(exc))
+            hook_message = await hook.redact_error_message(str(exc))
+            safe_message = str(redact_sensitive_payload(redact_sensitive_text(hook_message)))
             yield _make_trigger_event(
                 {
                     "status": "error",

@@ -495,3 +495,38 @@ def test_triage_store_default_path_and_entry_point_registration(
     default_store = loaded_cls()
     assert default_store.db_path == env_db
     assert env_db.exists()
+
+
+def test_triage_store_redacts_file_uri_keys_and_passwords_on_operational_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TriageStore OperationalError masks file:/sqlite: encryption keys while keeping mode=rw."""
+    store = TriageStore(tmp_path / "triage.sqlite3", retry_attempts=1)
+    sqlite_uri = (
+        "file:triage_corrupt.db?mode=rw"
+        "&key=CANARY_SQLCIPHER_KEY_444&password=CANARY_SQLITE_PASS_555"  # pragma: allowlist secret
+        "&passphrase=CANARY_SQLITE_PASSPHRASE_666"  # pragma: allowlist secret
+    )
+    store.db_path = Path(sqlite_uri)
+
+    def _fail_conn(*_args: object, **_kwargs: object) -> object:
+        raise sqlite3.OperationalError(
+            f"unable to open {sqlite_uri} via https://CANARY_PAT_777@db.example.test"  # pragma: allowlist secret
+        )
+
+    monkeypatch.setattr("imednet_workflows.triage_store.sqlite_connection", _fail_conn)
+
+    with pytest.raises(sqlite3.OperationalError) as exc_info:
+        with store._connection():
+            pass
+
+    err_msg = str(exc_info.value)
+    for canary in (
+        "CANARY_SQLCIPHER_KEY_444",
+        "CANARY_SQLITE_PASS_555",
+        "CANARY_SQLITE_PASSPHRASE_666",
+        "CANARY_PAT_777",
+    ):
+        assert canary not in err_msg
+    assert "mode=rw" in err_msg
+    assert "key=***" in err_msg

@@ -914,3 +914,38 @@ def test_iter_cached_records_order_by_subject_groups_subjects_cleanly(tmp_path: 
 
     subject_grouped = list(loader.iter_cached_records("STUDY", chunk_size=2, order_by_subject=True))
     assert [r.record_id for r in subject_grouped] == [40, 20, 50, 10, 30]
+
+
+def test_fail_study_sync_redacts_userinfo_presigned_file_keys_and_bearer_tokens(
+    tmp_path: Path,
+) -> None:
+    """CachedRecordsLoader._fail_study_sync stores zero canary secrets in study_sync_state."""
+    from imednet_workflows.cached_loader import StudySyncStatus
+
+    sdk = MagicMock()
+    sdk.get_records.side_effect = RuntimeError(
+        "Sync failed for https://CANARY_SYNC_PAT_111@edc.example.test/api/v1/edc/records"  # pragma: allowlist secret
+        "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=CANARY_SYNC_SIG_222"  # pragma: allowlist secret
+        "&sig=CANARY_SYNC_SAS_333 "  # pragma: allowlist secret
+        "cache=file:records.db?mode=rw&key=CANARY_SYNC_KEY_444 "  # pragma: allowlist secret
+        "Authorization: Bearer CANARY_SYNC_BEARER_555"  # pragma: allowlist secret
+    )
+
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "redact-cache")
+    with pytest.raises(RuntimeError):
+        loader.sync_records("STUDY_SECRET")
+
+    state = loader.get_study_sync_state("STUDY_SECRET")
+    assert state.status == StudySyncStatus.FAILED
+    assert state.error_message is not None
+    for canary in (
+        "CANARY_SYNC_PAT_111",
+        "CANARY_SYNC_SIG_222",
+        "CANARY_SYNC_SAS_333",
+        "CANARY_SYNC_KEY_444",
+        "CANARY_SYNC_BEARER_555",
+    ):
+        assert canary not in state.error_message
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in state.error_message
+    assert "mode=rw" in state.error_message
+    assert "https://***@edc.example.test" in state.error_message

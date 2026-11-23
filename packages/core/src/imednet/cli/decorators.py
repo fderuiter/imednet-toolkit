@@ -21,7 +21,7 @@ from imednet.errors import (
     UnauthorizedError,
 )
 from imednet.utils.secrets import redact_sensitive_payload
-from imednet.utils.url import validate_path_segment
+from imednet.utils.url import redact_sensitive_text, validate_path_segment
 
 if TYPE_CHECKING:
     from ..sdk import ImednetSDK
@@ -41,7 +41,7 @@ def redact_cli_secrets(msg: str) -> str:
             stripped = val.strip()
             if stripped and stripped in redacted:
                 redacted = redacted.replace(stripped, "********")
-    return str(redact_sensitive_payload(redacted))
+    return str(redact_sensitive_payload(redact_sensitive_text(redacted)))
 
 
 _redact_secrets = redact_cli_secrets
