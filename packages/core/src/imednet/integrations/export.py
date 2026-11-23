@@ -59,6 +59,7 @@ try:
 except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
 from imednet.constants import MAX_SQLITE_COLUMNS
+from imednet.core.context import sdk_governance_context
 from imednet.utils import sanitize_csv_formula
 from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
 from imednet.utils.tabular import MASKED_SENTINEL
@@ -229,16 +230,17 @@ def _prepare_export_df(
     _mapper: Any = None,
 ) -> pd.DataFrame:
     """Prepare a DataFrame for export by fetching records and optionally sanitizing."""
-    df = _records_df(
-        sdk,
-        study_key,
-        use_labels_as_columns=use_labels_as_columns,
-        variable_whitelist=variable_whitelist,
-        form_whitelist=form_whitelist,
-        mask_phi=mask_phi,
-        _mapper=_mapper,
-    )
-    pipeline = resolve_enrichment_pipeline(study_key)
+    with sdk_governance_context(sdk):
+        df = _records_df(
+            sdk,
+            study_key,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            mask_phi=mask_phi,
+            _mapper=_mapper,
+        )
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     if mask_phi:
         df = _mask_df(df, phi_keys=phi_keys)
@@ -2310,6 +2312,26 @@ def _tabular_export(
     *,
     stream_name: str | None = None,
 ) -> None:
+    with sdk_governance_context(sdk):
+        _tabular_export_impl(
+            sdk,
+            study_key,
+            sink,
+            config,
+            sanitize=sanitize,
+            stream_name=stream_name,
+        )
+
+
+def _tabular_export_impl(
+    sdk: Any,
+    study_key: str,
+    sink: ExportSink,
+    config: TabularSinkConfig,
+    sanitize: bool = False,
+    *,
+    stream_name: str | None = None,
+) -> None:
     mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
     empty_whitelist = (
         config.variable_whitelist is not None and len(config.variable_whitelist) == 0
@@ -3166,10 +3188,11 @@ def export_to_json(
             hier_kwargs["mask_phi"] = False
 
         if is_mock_hier_mapper and not _config_has_streaming_options(config):
-            data = mapper.build_hierarchy(study_key, **hier_kwargs)
-            if config.mask_phi:
-                data = mask_clinical_phi(data)
-            data = _apply_json_enrichment(study_key, data, mask_phi=config.mask_phi)
+            with sdk_governance_context(sdk):
+                data = mapper.build_hierarchy(study_key, **hier_kwargs)
+                if config.mask_phi:
+                    data = mask_clinical_phi(data)
+                data = _apply_json_enrichment(study_key, data, mask_phi=config.mask_phi)
             with _TabularCallableSink(
                 config,
                 "export_json",
@@ -3232,7 +3255,8 @@ def export_to_json(
                 )
         if df_mock is not None:
             mock_data = _dataframe_to_json_records(df_mock)
-            mock_data = _apply_json_enrichment(study_key, mock_data, mask_phi=config.mask_phi)
+            with sdk_governance_context(sdk):
+                mock_data = _apply_json_enrichment(study_key, mock_data, mask_phi=config.mask_phi)
             with _TabularCallableSink(
                 config,
                 "export_json",
@@ -3921,10 +3945,11 @@ def export_to_duckdb_by_form(
         default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
-    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-    if hasattr(mapper, "_active_study_key"):
-        mapper._active_study_key = study_key
-    pipeline = resolve_enrichment_pipeline(study_key)
+    with sdk_governance_context(sdk):
+        mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+        if hasattr(mapper, "_active_study_key"):
+            mapper._active_study_key = study_key
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
@@ -4079,10 +4104,11 @@ def export_to_sql_by_form(
         if_exists if if_exists is not None else ("replace" if config.idempotent else "append")
     )
 
-    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-    if hasattr(mapper, "_active_study_key"):
-        mapper._active_study_key = study_key
-    pipeline = resolve_enrichment_pipeline(study_key)
+    with sdk_governance_context(sdk):
+        mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+        if hasattr(mapper, "_active_study_key"):
+            mapper._active_study_key = study_key
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     engine = create_engine(conn_str)
@@ -4428,8 +4454,9 @@ def export_to_long_sql(
         mask_phi=mask_phi,
     )
     engine = create_engine(conn_str)
-    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-    pipeline = resolve_enrichment_pipeline(study_key)
+    with sdk_governance_context(sdk):
+        mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
 
     if _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config):

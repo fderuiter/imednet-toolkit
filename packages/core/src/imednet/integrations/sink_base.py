@@ -2123,7 +2123,10 @@ def run_streaming_export(
     total_reconciled = 0
     max_ts: datetime | None = None
 
+    from imednet.core.context import sdk_governance_context
+
     with contextlib.ExitStack() as stack:
+        stack.enter_context(sdk_governance_context(sdk))
         tx: dict[str, Any] | None = None
         if provider is not None:
             tx = stack.enter_context(
