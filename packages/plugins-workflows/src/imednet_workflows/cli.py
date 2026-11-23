@@ -15,7 +15,7 @@ import contextlib
 import json
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
@@ -24,13 +24,16 @@ from typing import TYPE_CHECKING, Any
 from imednet.spi.cli import (
     NON_INTERACTIVE_ENV,
     OUTPUT_FORMAT_ENV,
+    PanelSection,
     UniqueStoreAction,
     add_no_interactive,
     add_output_format,
+    add_pagination_bound_args,
     add_simulation_arg,
     add_study_key_args,
     clear_line,
     cli_execution_guard,
+    collect_list_items_with_remainder,
     console,
     display_list,
     emit_json,
@@ -38,6 +41,7 @@ from imednet.spi.cli import (
     is_json_output_mode,
     parse_filter_args,
     positive_int,
+    prepare_list_query,
     print_error,
     redact_cli_secrets,
     resolve_hybrid_study_and_key,
@@ -143,9 +147,12 @@ def _mask_workflow_value(value: Any, *, custom_phi_fields: set[str]) -> Any:
         rebuilt: dict[Any, Any] = {}
         for k, v in value.items():
             if _is_key_phi_sensitive(str(k), custom_phi_fields):
-                rebuilt[k] = "***MASKED***"
-                if v != "***MASKED***":
-                    changed = True
+                if v is None or v == "":
+                    rebuilt[k] = v
+                else:
+                    rebuilt[k] = "***MASKED***"
+                    if v != "***MASKED***":
+                        changed = True
             else:
                 masked_v = _mask_workflow_value(v, custom_phi_fields=custom_phi_fields)
                 rebuilt[k] = masked_v
@@ -181,13 +188,13 @@ def _mask_workflow_value(value: Any, *, custom_phi_fields: set[str]) -> Any:
         updates: dict[str, Any] = {}
         for fname, finfo in model_fields.items():
             raw_val = getattr(value, fname, None)
-            if raw_val is None:
+            if raw_val is None or raw_val == "":
                 continue
             alias = getattr(finfo, "alias", None)
             if _is_key_phi_sensitive(fname, custom_phi_fields) or (
                 isinstance(alias, str) and _is_key_phi_sensitive(alias, custom_phi_fields)
             ):
-                if isinstance(raw_val, str) and raw_val != "***MASKED***":
+                if raw_val != "***MASKED***":
                     updates[fname] = "***MASKED***"
                 continue
             masked_val = _mask_workflow_value(raw_val, custom_phi_fields=custom_phi_fields)
@@ -675,8 +682,26 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         default=True,
         help="Mask clinical PHI fields with '***MASKED***' (default: enabled).",
     )
+    add_pagination_bound_args(extract_parser)
     add_output_format(extract_parser)
     add_simulation_arg(extract_parser)
+
+    def _to_extract_view_row(record: Any) -> dict[str, Any]:
+        if isinstance(record, Mapping):
+            return {
+                "ID": record.get("record_id"),
+                "Subject": record.get("subject_key"),
+                "Form": record.get("form_key"),
+                "Status": record.get("record_status"),
+                "Created": record.get("date_created"),
+            }
+        return {
+            "ID": getattr(record, "record_id", None),
+            "Subject": getattr(record, "subject_key", None),
+            "Form": getattr(record, "form_key", None),
+            "Status": getattr(record, "record_status", None),
+            "Created": getattr(record, "date_created", None),
+        }
 
     @with_sdk
     def extract_records(
@@ -689,6 +714,9 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         no_interactive: bool = False,
         output_format: str | None = None,
         mask_phi: bool = True,
+        limit: int | None = None,
+        fetch_all: bool = False,
+        _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
         from imednet.spi.models import Record, Subject, Visit
 
@@ -696,6 +724,16 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
         resolved_format = resolve_output_format(output_format)
         json_mode = resolved_format == "json" or is_json_output_mode()
+        req_kwargs, effective_limit = (
+            _prepared_query
+            if _prepared_query is not None
+            else prepare_list_query(
+                limit=limit,
+                fetch_all=fetch_all,
+                output_format=resolved_format,
+                no_interactive=no_interactive,
+            )
+        )
 
         if interactive:
             from .wizard import ensure_interactive_stdin, prompt_filters, prompt_study_key
@@ -730,63 +768,73 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         parsed_subject_filter = parse_filter_args(subject_filter, model=Subject)
         parsed_visit_filter = parse_filter_args(visit_filter, model=Visit)
 
+        progress_cb = (
+            (lambda msg: print_progress(f"[Progress] {msg}"))
+            if interactive and not json_mode
+            else None
+        )
         if not json_mode:
             print_progress(f"Extracting records for study '{study_key}'...")
-        if interactive and not json_mode:
-            records = workflow.extract_records_by_criteria(
+
+        wf_dict = getattr(workflow, "__dict__", {})
+        supports_lazy_iter = (
+            callable(getattr(type(workflow), "iter_records_by_criteria", None))
+            or "iter_records_by_criteria" in wf_dict
+        )
+        if supports_lazy_iter:
+            record_source: Any = workflow.iter_records_by_criteria(
                 study_key=study_key,
                 record_filter=parsed_record_filter,
                 subject_filter=parsed_subject_filter,
                 visit_filter=parsed_visit_filter,
-                on_progress=lambda msg: print_progress(f"[Progress] {msg}"),
+                on_progress=progress_cb,
+                **req_kwargs,
+            )
+        elif progress_cb is not None:
+            record_source = workflow.extract_records_by_criteria(
+                study_key=study_key,
+                record_filter=parsed_record_filter,
+                subject_filter=parsed_subject_filter,
+                visit_filter=parsed_visit_filter,
+                on_progress=progress_cb,
             )
         else:
-            records = workflow.extract_records_by_criteria(
+            record_source = workflow.extract_records_by_criteria(
                 study_key=study_key,
                 record_filter=parsed_record_filter,
                 subject_filter=parsed_subject_filter,
                 visit_filter=parsed_visit_filter,
             )
 
+        records, truncated, load_remaining = collect_list_items_with_remainder(
+            record_source,
+            effective_limit,
+        )
         masked_records = _mask_workflow_item(records, study_key=study_key, mask_phi=mask_phi)
 
         if resolved_format == "json":
             display_list(masked_records, "records", output_format="json")
             return
 
-        view_models = [
-            {
-                "ID": r.get("record_id")
-                if isinstance(r, Mapping)
-                else getattr(r, "record_id", None),
-                "Subject": (
-                    r.get("subject_key")
-                    if isinstance(r, Mapping)
-                    else getattr(r, "subject_key", None)
-                ),
-                "Form": r.get("form_key")
-                if isinstance(r, Mapping)
-                else getattr(r, "form_key", None),
-                "Status": (
-                    r.get("record_status")
-                    if isinstance(r, Mapping)
-                    else getattr(r, "record_status", None)
-                ),
-                "Created": (
-                    r.get("date_created")
-                    if isinstance(r, Mapping)
-                    else getattr(r, "date_created", None)
-                ),
-            }
-            for r in masked_records
-        ]
+        view_models = [_to_extract_view_row(r) for r in masked_records]
+        extract_loader: Callable[[], Any] | None = None
+        if load_remaining is not None:
+
+            def _transform_extract_batch(more: list[Any]) -> tuple[list[dict[str, Any]], list[Any]]:
+                masked_more = _mask_workflow_item(more, study_key=study_key, mask_phi=mask_phi)
+                return [_to_extract_view_row(r) for r in masked_more], masked_more
+
+            extract_loader = load_remaining.map_batches(_transform_extract_batch)
+
         display_list(
             view_models,
             "matching records",
             "No records found matching the criteria.",
             details=masked_records,
+            truncated=truncated,
             interactive=False if no_interactive else None,
             output_format=resolved_format,
+            on_load_all=extract_loader,
         )
 
     def _handle_extract_records(args: argparse.Namespace) -> None:
@@ -795,6 +843,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         if args.interactive and output_format == "json":
             print_error("Error: Cannot combine --interactive with --format json.")
             sys.exit(1)
+        limit = getattr(args, "limit", None)
+        fetch_all = bool(getattr(args, "fetch_all", False))
+        prepared = prepare_list_query(
+            limit=limit,
+            fetch_all=fetch_all,
+            output_format=output_format,
+            no_interactive=no_interactive,
+        )
         study_key = resolve_study_key(extract_parser, args, required=not args.interactive)
         if args.interactive:
             from .wizard import ensure_interactive_stdin
@@ -818,6 +874,9 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 no_interactive=no_interactive,
                 output_format=output_format,
                 mask_phi=getattr(args, "mask_phi", True),
+                limit=limit,
+                fetch_all=fetch_all,
+                _prepared_query=prepared,
             )
 
     extract_parser.set_defaults(func=_handle_extract_records)
@@ -1313,6 +1372,18 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             return
 
         if isinstance(masked_data, Mapping):
+            from .subject_data import build_subject_panel_sections
+
+            class _SubjectDataPanelMapping(dict[str, Any]):
+                def to_panel_sections(self) -> list[PanelSection]:
+                    subj_raw = self.get("subject_details")
+                    return build_subject_panel_sections(
+                        subj_raw if subj_raw is not None else None,
+                        list(self.get("visits") or []),
+                        list(self.get("records") or []),
+                        list(self.get("queries") or []),
+                    )
+
             subj_dict = masked_data.get("subject_details")
             subj_map = subj_dict if isinstance(subj_dict, Mapping) else masked_data
             raw_keywords = subj_map.get("keywords") or []
@@ -1337,6 +1408,7 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 "queries": len(masked_data.get("queries") or []),
                 "keywords": keywords_str or None,
             }
+            masked_data = _SubjectDataPanelMapping(masked_data)
         else:
             subj = masked_data.subject_details
             raw_keywords = getattr(subj, "keywords", None) or []

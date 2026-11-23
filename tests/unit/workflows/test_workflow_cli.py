@@ -899,3 +899,439 @@ def test_workflows_validate_standards_reports_scores_and_enforces_min_score(
     assert res_gated.exit_code == 1
     assert "Standards Readiness Report" in res_gated.stdout
     assert "Violations" in res_gated.stdout
+
+
+def test_subject_data_side_panel_places_subject_first_and_emits_zero_repr(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """imednet subject-data renders Subject attributes first and emits zero raw repr() dicts/timestamps."""
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+
+    import imednet.cli.utils.grid as grid_mod
+    from imednet.models.queries import Query, QueryComment
+    from imednet.models.records import Record
+    from imednet.models.subjects import Subject, SubjectKeyword
+    from imednet.models.visits import Visit
+    from imednet_workflows.subject_data import SubjectComprehensiveData
+
+    sample = SubjectComprehensiveData(
+        subject_details=Subject(
+            study_key="STUDY-1",
+            subject_id=10,
+            subject_key="SUBJ-001",
+            subject_status="Enrolled",
+            site_id=3,
+            site_name="General Hospital",
+            enrollment_start_date="2026-01-15",
+            keywords=[
+                SubjectKeyword(
+                    keyword_name="HighPriority",
+                    keyword_key="HP",
+                    keyword_id=1,
+                    date_added=datetime(2026, 1, 15, 8, 30, tzinfo=timezone.utc),
+                )
+            ],
+        ),
+        visits=[
+            Visit(
+                study_key="STUDY-1",
+                visit_id=55,
+                subject_key="SUBJ-001",
+                interval_name="Screening",
+                start_date="2026-01-15",
+            )
+        ],
+        records=[
+            Record(
+                study_key="STUDY-1",
+                record_id=101,
+                subject_key="SUBJ-001",
+                form_key="DEMO",
+                record_status="Record Complete",
+                date_created=datetime(2026, 1, 15, 9, 45, tzinfo=timezone.utc),
+                record_data={
+                    "DOB": None,
+                    "EMAIL": "",
+                    "PHONE": None,
+                    "SSN": "123-45-6789",
+                    "AGE": 44,
+                },
+            )
+        ],
+        queries=[
+            Query(
+                study_key="STUDY-1",
+                annotation_id=900,
+                subject_key="SUBJ-001",
+                record_id=101,
+                variable="DOB",
+                description="Verify birth date",
+                query_comments=[
+                    QueryComment(sequence=1, user="dm_lead", comment="Please confirm if unknown")
+                ],
+            )
+        ],
+    )
+
+    workflow_subj = MagicMock()
+    workflow_subj.get_all_subject_data.return_value = sample
+    monkeypatch.setattr(
+        "imednet_workflows.cli.SubjectDataWorkflow", MagicMock(return_value=workflow_subj)
+    )
+    monkeypatch.setattr(grid_mod, "is_interactive_terminal", lambda: True)
+
+    captured_panel_lines: list[str] = []
+
+    class _PanelWin:
+        def __init__(self) -> None:
+            self.writes: list[tuple[int, int, str]] = []
+
+        def getmaxyx(self) -> tuple[int, int]:
+            return 60, 120
+
+        def erase(self) -> None:
+            self.writes.clear()
+
+        def refresh(self) -> None:
+            pass
+
+        def keypad(self, _flag: bool) -> None:
+            pass
+
+        def move(self, _y: int, _x: int) -> None:
+            pass
+
+        def addstr(self, y: int, x: int, text: str, _attr: int = 0) -> None:
+            self.writes.append((y, x, text))
+
+    def _drive_subject_grid(**kwargs: Any) -> bool:
+        win = _PanelWin()
+        with (
+            patch("curses.has_colors", return_value=False),
+            patch("curses.curs_set"),
+        ):
+            grid = grid_mod.InteractiveDataGrid(
+                win,
+                items=kwargs["items"],
+                fields=kwargs["fields"],
+                label=kwargs["label"],
+                details=kwargs["details"],
+            )
+            grid._handle_normal_input(" ")
+            grid.draw()
+            panel_x = int(120 * 0.55)
+            content_x = panel_x + 2
+            captured_panel_lines.extend(
+                text.strip()
+                for y, x, text in win.writes
+                if y >= 2 and x == content_x and text.strip()
+            )
+        return True
+
+    monkeypatch.setattr(grid_mod, "run_interactive_grid", _drive_subject_grid)
+    res = runner.invoke(cli.app, ["subject-data", "STUDY-1", "SUBJ-001"])
+    assert res.exit_code == 0
+
+    panel_text = "\n".join(captured_panel_lines)
+    assert panel_text.index("SUBJECT DETAILS") < panel_text.index("VISITS")
+    assert panel_text.index("VISITS") < panel_text.index("RECORDS")
+    assert panel_text.index("RECORDS") < panel_text.index("QUERIES")
+    assert panel_text.index("subject_key: SUBJ-001") < panel_text.index("VISITS")
+    assert "subject_status: Enrolled" in panel_text
+    assert "site_name: General Hospital" in panel_text
+    assert "2026-01-15 09:45" in panel_text
+    assert "DOB: -" in panel_text
+    assert "EMAIL: -" in panel_text
+    assert "PHONE: -" in panel_text
+    assert "SSN: ***MASKED***" in panel_text
+    assert "123-45-6789" not in panel_text
+    assert "datetime.datetime(" not in panel_text
+    assert "{'" not in panel_text
+    assert "[{'" not in panel_text
+
+
+def test_null_and_empty_phi_variables_stay_unmasked_in_json_and_render_dash_in_panels(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Null or empty DOB, EMAIL, and PHONE stay unmasked in JSON, render '-' in panels, and mask SSN."""
+    import json
+    from unittest.mock import patch
+
+    import imednet.cli.utils.grid as grid_mod
+    from imednet.models.records import Record
+    from imednet.models.subjects import Subject
+    from imednet_workflows.subject_data import SubjectComprehensiveData
+
+    rec = Record(
+        record_id=77,
+        study_key="STUDY-PHI",
+        form_key="DEMO",
+        subject_key="SUBJ-077",
+        record_status="Record Complete",
+        record_data={
+            "DOB": None,
+            "EMAIL": "",
+            "PHONE": None,
+            "SSN": "987-65-4321",
+            "WEIGHT": 70.5,
+        },
+    )
+
+    extraction_wf = MagicMock()
+    extraction_wf.extract_records_by_criteria.return_value = [rec]
+    monkeypatch.setattr(
+        "imednet_workflows.cli.DataExtractionWorkflow",
+        MagicMock(return_value=extraction_wf),
+    )
+
+    subj_wf = MagicMock()
+    subj_wf.get_all_subject_data.return_value = SubjectComprehensiveData(
+        subject_details=Subject(study_key="STUDY-PHI", subject_key="SUBJ-077"),
+        records=[rec],
+    )
+    monkeypatch.setattr(
+        "imednet_workflows.cli.SubjectDataWorkflow",
+        MagicMock(return_value=subj_wf),
+    )
+
+    # 1. JSON output in extract-records keeps DOB=None, EMAIL="", PHONE=None and masks SSN
+    ext_json = runner.invoke(
+        cli.app, ["workflows", "extract-records", "STUDY-PHI", "--format", "json"]
+    )
+    assert ext_json.exit_code == 0
+    ext_vars = json.loads(ext_json.stdout)["items"][0]["recordData"]
+    assert ext_vars["DOB"] is None
+    assert ext_vars["EMAIL"] == ""
+    assert ext_vars["PHONE"] is None
+    assert ext_vars["SSN"] == "***MASKED***"
+    assert ext_vars["WEIGHT"] == 70.5
+    assert "987-65-4321" not in ext_json.stdout
+
+    # 2. JSON output in subject-data keeps DOB=None, EMAIL="", PHONE=None and masks SSN
+    subj_json = runner.invoke(
+        cli.app, ["subject-data", "STUDY-PHI", "SUBJ-077", "--format", "json"]
+    )
+    assert subj_json.exit_code == 0
+    subj_vars = json.loads(subj_json.stdout)["items"][0]["records"][0]["recordData"]
+    assert subj_vars["DOB"] is None
+    assert subj_vars["EMAIL"] == ""
+    assert subj_vars["PHONE"] is None
+    assert subj_vars["SSN"] == "***MASKED***"
+
+    # 3. InteractiveDataGrid side panel in extract-records renders '-' for DOB, EMAIL, PHONE
+    monkeypatch.setattr(grid_mod, "is_interactive_terminal", lambda: True)
+    panel_dump: list[str] = []
+
+    class _SimpleWin:
+        def __init__(self) -> None:
+            self.writes: list[tuple[int, int, str]] = []
+
+        def getmaxyx(self) -> tuple[int, int]:
+            return 40, 110
+
+        def erase(self) -> None:
+            self.writes.clear()
+
+        def refresh(self) -> None:
+            pass
+
+        def keypad(self, _flag: bool) -> None:
+            pass
+
+        def move(self, _y: int, _x: int) -> None:
+            pass
+
+        def addstr(self, y: int, x: int, text: str, _attr: int = 0) -> None:
+            self.writes.append((y, x, text))
+
+    def _capture_extract_panel(**kwargs: Any) -> bool:
+        win = _SimpleWin()
+        with (
+            patch("curses.has_colors", return_value=False),
+            patch("curses.curs_set"),
+        ):
+            grid = grid_mod.InteractiveDataGrid(
+                win,
+                items=kwargs["items"],
+                fields=kwargs["fields"],
+                label=kwargs["label"],
+                details=kwargs["details"],
+            )
+            grid._handle_normal_input(" ")
+            grid.draw()
+            content_x = int(110 * 0.55) + 2
+            panel_dump.extend(
+                text.strip() for y, x, text in win.writes if y >= 2 and x == content_x
+            )
+        return True
+
+    monkeypatch.setattr(grid_mod, "run_interactive_grid", _capture_extract_panel)
+    tty_ext = runner.invoke(cli.app, ["workflows", "extract-records", "STUDY-PHI"])
+    assert tty_ext.exit_code == 0
+    joined_panel = "\n".join(panel_dump)
+    assert "DOB: -" in joined_panel
+    assert "EMAIL: -" in joined_panel
+    assert "PHONE: -" in joined_panel
+    assert "SSN: ***MASKED***" in joined_panel
+    assert "987-65-4321" not in joined_panel
+
+
+def test_extract_records_tty_bounds_100_items_supports_load_all_retry_and_limit_all(
+    monkeypatch: pytest.MonkeyPatch,
+    respx_mock: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """workflows extract-records fetches 100 items initially on TTY, supports [a] retry, and honors --limit/--all."""
+    import json
+    from unittest.mock import patch
+
+    import httpx
+
+    import imednet.cli.utils.grid as grid_mod
+    from imednet.sdk import ImednetSDK
+
+    requested_pages: list[tuple[int, int]] = []
+    fail_page_two_once = True
+
+    def _responder(request: httpx.Request) -> httpx.Response:
+        nonlocal fail_page_two_once
+        page = int(request.url.params["page"])
+        size = int(request.url.params["size"])
+        requested_pages.append((page, size))
+        if page == 2 and fail_page_two_once:
+            fail_page_two_once = False
+            return httpx.Response(503, json={"message": "temporary upstream error"})
+        total_items = 250
+        total_pages = (total_items + size - 1) // size
+        start = page * size
+        count = max(0, min(size, total_items - start))
+        items = [
+            {
+                "recordId": start + idx + 1,
+                "studyKey": "STUDY-LARGE",
+                "subjectKey": f"SUBJ-{start + idx + 1:04d}",
+                "formKey": "DEMO",
+                "recordStatus": "Record Complete",
+                "recordData": {"SSN": f"000-00-{start + idx + 1:04d}", "DOB": None},
+            }
+            for idx in range(count)
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "data": items,
+                "pagination": {
+                    "page": page,
+                    "size": size,
+                    "totalPages": total_pages,
+                    "totalItems": total_items,
+                },
+            },
+        )
+
+    respx_mock.get("https://api.test/api/v1/edc/studies/STUDY-LARGE/records").mock(
+        side_effect=_responder
+    )
+    monkeypatch.setattr(
+        "imednet.cli.utils.context.get_sdk",
+        lambda: ImednetSDK(
+            api_key="k",  # pragma: allowlist secret
+            security_key="s",  # pragma: allowlist secret
+            base_url="https://api.test",
+            retries=0,
+        ),
+    )
+
+    # 1. TTY session fetches only 100 items initially and supports [a] retry across 503
+    monkeypatch.setattr(grid_mod, "is_interactive_terminal", lambda: True)
+    snapshots: list[tuple[int, bool]] = []
+    last_ssn_values: list[Any] = []
+
+    class _GridWin:
+        def getmaxyx(self) -> tuple[int, int]:
+            return 24, 100
+
+        def erase(self) -> None:
+            pass
+
+        def refresh(self) -> None:
+            pass
+
+        def keypad(self, _flag: bool) -> None:
+            pass
+
+        def move(self, _y: int, _x: int) -> None:
+            pass
+
+        def addstr(self, _y: int, _x: int, _text: str, _attr: int = 0) -> None:
+            pass
+
+    def _drive_extract_grid(**kwargs: Any) -> bool:
+        assert requested_pages == [(0, 100)]
+        with (
+            patch("curses.has_colors", return_value=False),
+            patch("curses.curs_set"),
+        ):
+            grid = grid_mod.InteractiveDataGrid(
+                _GridWin(),
+                items=kwargs["items"],
+                fields=kwargs["fields"],
+                label=kwargs["label"],
+                details=kwargs["details"],
+                status_notice=kwargs.get("status_notice"),
+                truncated=kwargs.get("truncated"),
+                on_load_all=kwargs.get("on_load_all"),
+            )
+            snapshots.append((len(grid.all_entries), grid.truncated))
+            # First [a]: commits page 1 (200 total), hits 503 on page 2
+            grid._handle_normal_input("a")
+            snapshots.append((len(grid.all_entries), grid.truncated))
+            # Second [a]: retries page 2 (250 total, truncated=False)
+            grid._handle_normal_input("a")
+            snapshots.append((len(grid.all_entries), grid.truncated))
+            last_detail = grid.all_entries[-1][1]
+            last_ssn_values.append(last_detail.record_data["SSN"])
+            last_ssn_values.append(last_detail.record_data["DOB"])
+        return True
+
+    monkeypatch.setattr(grid_mod, "run_interactive_grid", _drive_extract_grid)
+    capsys.readouterr()
+    cli.app(["workflows", "extract-records", "STUDY-LARGE"])
+    assert requested_pages == [(0, 100), (1, 100), (2, 100), (2, 100)]
+    assert snapshots == [(100, True), (200, True), (250, False)]
+    assert last_ssn_values == ["***MASKED***", None]
+
+    # 2. --limit 25 bounds fetch to 25 items in a single HTTP request
+    requested_pages.clear()
+    capsys.readouterr()
+    cli.app(["workflows", "extract-records", "STUDY-LARGE", "--limit", "25", "--format", "json"])
+    limit_captured = capsys.readouterr()
+    assert requested_pages == [(0, 25)]
+    assert json.loads(limit_captured.out)["count"] == 25
+
+    # 3. --all on TTY fetches all 250 items upfront without truncation
+    requested_pages.clear()
+    all_snapshots: list[tuple[int, bool]] = []
+
+    def _capture_all_grid(**kwargs: Any) -> bool:
+        all_snapshots.append((len(kwargs["items"]), bool(kwargs.get("truncated", False))))
+        return True
+
+    monkeypatch.setattr(grid_mod, "run_interactive_grid", _capture_all_grid)
+    capsys.readouterr()
+    cli.app(["workflows", "extract-records", "STUDY-LARGE", "--all"])
+    assert all_snapshots == [(250, False)]
+
+    # 4. --limit + --all conflict exits 1 before HTTP
+    requested_pages.clear()
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc_info:
+        cli.app(["workflows", "extract-records", "STUDY-LARGE", "--limit", "10", "--all"])
+    assert exc_info.value.code == 1
+    assert "Cannot combine --limit and --all" in capsys.readouterr().err
+    assert requested_pages == []

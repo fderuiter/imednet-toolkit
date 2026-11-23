@@ -1238,3 +1238,155 @@ def test_records_list_rejects_duplicate_and_attributes_in_preflight(
     captured = capfd.readouterr()
     assert captured.out == ""
     assert "Duplicate filter attribute 'recordId'" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("argv", "endpoint_path", "item_factory"),
+    [
+        (
+            ["studies", "list"],
+            "/api/v1/edc/studies",
+            lambda n: {"studyKey": f"ST-{n:04d}", "studyName": f"Study {n}"},
+        ),
+        (
+            ["sites", "list", "S1"],
+            "/api/v1/edc/studies/S1/sites",
+            lambda n: {"siteId": n, "studyKey": "S1", "siteName": f"Site {n}"},
+        ),
+        (
+            ["forms", "list", "S1"],
+            "/api/v1/edc/studies/S1/forms",
+            lambda n: {"formId": n, "studyKey": "S1", "formKey": f"FM-{n:04d}"},
+        ),
+        (
+            ["intervals", "list", "S1"],
+            "/api/v1/edc/studies/S1/intervals",
+            lambda n: {"intervalId": n, "studyKey": "S1", "intervalName": f"IV-{n:04d}"},
+        ),
+        (
+            ["queries", "list", "S1"],
+            "/api/v1/edc/studies/S1/queries",
+            lambda n: {"annotationId": n, "studyKey": "S1", "description": f"Q-{n:04d}"},
+        ),
+        (
+            ["record-revisions", "list", "S1"],
+            "/api/v1/edc/studies/S1/recordRevisions",
+            lambda n: {"recordRevisionId": n, "studyKey": "S1", "subjectKey": f"RV-{n:04d}"},
+        ),
+        (
+            ["variables", "list", "S1"],
+            "/api/v1/edc/studies/S1/variables",
+            lambda n: {"variableId": n, "studyKey": "S1", "variableName": f"VR_{n:04d}"},
+        ),
+        (
+            ["visits", "list", "S1"],
+            "/api/v1/edc/studies/S1/visits",
+            lambda n: {"visitId": n, "studyKey": "S1", "subjectKey": f"VS-{n:04d}"},
+        ),
+        (
+            ["records", "list", "S1"],
+            "/api/v1/edc/studies/S1/records",
+            lambda n: {
+                "recordId": n,
+                "studyKey": "S1",
+                "subjectKey": f"RC-{n:04d}",
+                "formKey": "DM",
+                "recordStatus": "Active",
+            },
+        ),
+        (
+            ["subjects", "list", "S1"],
+            "/api/v1/edc/studies/S1/subjects",
+            lambda n: {"subjectId": n, "studyKey": "S1", "subjectKey": f"SB-{n:04d}"},
+        ),
+        (
+            ["codings", "list", "S1"],
+            "/api/v1/edc/studies/S1/codings",
+            lambda n: {"codingId": n, "studyKey": "S1", "code": f"CD-{n:04d}", "variable": "AE"},
+        ),
+        (
+            ["users", "list", "S1"],
+            "/api/v1/edc/studies/S1/users",
+            lambda n: {"userId": f"U-{n}", "login": f"user_{n:04d}"},
+        ),
+    ],
+)
+@pytest.mark.parametrize("failure_status", [429, 503])
+@respx.mock
+def test_all_twelve_list_commands_keep_intermediate_pages_and_retry_after_429_or_503(
+    argv: list[str],
+    endpoint_path: str,
+    item_factory: Any,
+    failure_status: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP 429/503 during [a] keeps intermediate pages, preserves truncated=True, and resumes on retry."""
+    sdk = ImednetSDK(
+        api_key="test-key",  # pragma: allowlist secret
+        security_key="test-secret",  # pragma: allowlist secret
+        base_url="https://api.test",
+        retries=0,
+    )
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+
+    requested_pages: list[int] = []
+    failed_once = False
+
+    def _responder(request: httpx.Request) -> httpx.Response:
+        nonlocal failed_once
+        page = int(request.url.params["page"])
+        size = int(request.url.params["size"])
+        requested_pages.append(page)
+        if page == 2 and not failed_once:
+            failed_once = True
+            return httpx.Response(failure_status, json={"message": f"upstream {failure_status}"})
+        start = page * 100
+        count = 100 if page < 3 else 50
+        data = [item_factory(start + idx + 1) for idx in range(count)]
+        return httpx.Response(
+            200,
+            json=_paginated_payload(data, page=page, size=size, total_pages=4, total_items=350),
+        )
+
+    respx.get(f"https://api.test{endpoint_path}").mock(side_effect=_responder)
+
+    snapshots: list[tuple[int, bool, str | None]] = []
+
+    def _drive_grid(**kwargs: Any) -> bool:
+        assert requested_pages == [0]
+        win = _CaptureWindow(height=24, width=100)
+        with (
+            patch("curses.has_colors", return_value=False),
+            patch("curses.curs_set"),
+        ):
+            grid = InteractiveDataGrid(
+                win,
+                items=kwargs["items"],
+                fields=kwargs["fields"],
+                label=kwargs["label"],
+                details=kwargs["details"],
+                status_notice=kwargs.get("status_notice"),
+                truncated=kwargs.get("truncated"),
+                on_load_all=kwargs.get("on_load_all"),
+            )
+            assert len(grid.all_entries) == 100
+            assert grid.truncated is True
+
+            # First [a]: page 1 commits (200 total), page 2 fails with 429/503
+            grid._handle_normal_input("a")
+            snapshots.append((len(grid.all_entries), grid.truncated, grid._transient_notice))
+
+            # Second [a] retry: resumes at page 2, loads page 2 + page 3 (350 total)
+            grid._handle_normal_input("a")
+            snapshots.append((len(grid.all_entries), grid.truncated, grid._transient_notice))
+        return True
+
+    monkeypatch.setattr("imednet.cli.utils.grid.run_interactive_grid", _drive_grid)
+    cli.app(argv)
+
+    assert requested_pages == [0, 1, 2, 2, 3]
+    assert snapshots[0][0] == 200
+    assert snapshots[0][1] is True
+    assert snapshots[0][2] is not None and "Load all failed:" in snapshots[0][2]
+    assert snapshots[1] == (350, False, None)

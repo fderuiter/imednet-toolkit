@@ -57,6 +57,14 @@ imednet.cli.utils.output module
    :members:
    :show-inheritance:
 
+imednet.cli.utils.panel module
+------------------------------
+
+.. automodule:: imednet.cli.utils.panel
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 imednet.cli.utils.terminal module
 ---------------------------------
 

@@ -98,6 +98,7 @@ class BasePaginator(Generic[ClientT]):
         self._cursor: int | None = None
         self._remaining_in_page: int = 0
         self._exhausted = False
+        self._started = False
 
     @property
     def cursor(self) -> int | None:
@@ -108,6 +109,23 @@ class BasePaginator(Generic[ClientT]):
     def has_more(self) -> bool:
         """Return True if unconsumed items remain in the current page or subsequent pages."""
         return self._remaining_in_page > 0 or self._cursor is not None
+
+    def _reset_cursor_state(self) -> None:
+        """Reset pagination state prior to a fresh full iteration."""
+        self._started = False
+        self._exhausted = False
+        self._remaining_in_page = 0
+        self._cursor = None
+        self._remaining_limit = self._explicit_limit
+
+    def _ensure_cursor_started(self) -> None:
+        """Initialize the page cursor lazily on the first page step."""
+        if not self._started:
+            self._started = True
+            self._exhausted = False
+            self._remaining_in_page = 0
+            self._cursor = self._explicit_page if self._explicit_page is not None else 0
+            self._remaining_limit = self._explicit_limit
 
     def _build_params(self, page: int) -> dict[str, Any]:
         """Build the query parameters for a specific page."""
@@ -192,6 +210,8 @@ class BasePaginator(Generic[ClientT]):
             self._remaining_limit -= len(items)
             if self._remaining_limit <= 0:
                 next_cursor = None
+        if next_cursor is None:
+            self._exhausted = True
         self._cursor = next_cursor
         return items
 
@@ -208,14 +228,27 @@ class Paginator(BasePaginator[RequesterProtocol]):
     The requester owns retries, circuit breaking and HTTP telemetry.
     """
 
+    def next_page(self) -> list[Any]:
+        """Fetch and process a single page, advancing ``_cursor`` only after success."""
+        self._ensure_cursor_started()
+        if self._exhausted or self._cursor is None:
+            self._exhausted = True
+            self._cursor = None
+            return []
+        if self._remaining_limit is not None and self._remaining_limit <= 0:
+            self._exhausted = True
+            self._cursor = None
+            return []
+        response = self.client.get(self.path, params=self._get_page_params())
+        payload = response.json()
+        return self._process_page_response(payload)
+
     def __iter__(self) -> Iterator[Any]:
         """Iterate over all items across all pages."""
-        self._cursor = self._explicit_page if self._explicit_page is not None else 0
-        self._remaining_in_page = 0
-        self._remaining_limit = self._explicit_limit
-        while self._cursor is not None:
-            response = self.client.get(self.path, params=self._get_page_params())
-            items = self._process_page_response(response.json())
+        self._reset_cursor_state()
+        self._ensure_cursor_started()
+        while not self._exhausted and self._cursor is not None:
+            items = self.next_page()
             total_in_page = len(items)
             for idx, item in enumerate(items):
                 self._remaining_in_page = total_in_page - idx - 1
@@ -244,10 +277,18 @@ class AsyncPaginator(BasePaginator[AsyncRequesterProtocol]):
 class JsonListPaginator(Paginator):
     """Paginator for endpoints returning a raw list."""
 
-    def __iter__(self) -> Iterator[Any]:
-        """Iterate over a single response that returns a list directly."""
+    def next_page(self) -> list[Any]:
+        """Fetch a single raw-list response, marking exhausted only after success."""
+        self._ensure_cursor_started()
+        if self._exhausted or self._cursor is None:
+            self._exhausted = True
+            self._cursor = None
+            return []
         response = self.client.get(self.path, params=self.params)
-        yield from self._process_json_list_response(response.json())
+        items = self._process_json_list_response(response.json())
+        self._cursor = None
+        self._exhausted = True
+        return items
 
 
 class AsyncJsonListPaginator(AsyncPaginator):

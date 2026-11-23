@@ -12,9 +12,10 @@ except ImportError:
 _CURSES_ERROR: tuple[type[BaseException], ...] = (curses.error,) if curses is not None else ()
 import locale
 import os
+import re
 import unicodedata
 from collections.abc import Callable, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Any
 
@@ -33,10 +34,14 @@ from .output import (
     _sanitize_cell_text,
     _slice_display_width,
 )
+from .panel import PanelSection, PanelSectionsProtocol
 from .terminal import supports_fullscreen_ui
 
 _MIN_READABLE_CELL_WIDTH = 12
 _MAX_SCROLL_COL_WIDTH = 36
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?$"
+)
 
 
 def _normalize_nested_value(val: Any) -> Any:
@@ -343,8 +348,9 @@ class InteractiveDataGrid:
             return self.color_attrs[color_name]
         return 0
 
-    def filter_entries(self) -> None:
+    def filter_entries(self, *, preserve_panel_scroll: bool = False) -> None:
         """Filter in-memory entries immediately based on current search query."""
+        prev_panel_scroll = self.side_panel_scroll
         if not self.search_query.strip():
             self.filtered_entries = list(self.all_entries)
         else:
@@ -361,6 +367,10 @@ class InteractiveDataGrid:
 
                 meta, variables = extract_item_details(detail_obj)
                 detail_tokens = _collect_search_tokens(meta) + _collect_search_tokens(variables)
+                if isinstance(detail_obj, PanelSectionsProtocol):
+                    for sec in detail_obj.to_panel_sections():
+                        sec_payload = sec.content if isinstance(sec, PanelSection) else sec[1]
+                        detail_tokens.extend(_collect_search_tokens(sec_payload))
                 if query in " ".join(detail_tokens).lower():
                     matches.append((row_dict, detail_obj))
 
@@ -373,26 +383,12 @@ class InteractiveDataGrid:
         else:
             self.selected_idx = max(0, min(self.selected_idx, total - 1))
             self.top_idx = max(0, min(self.top_idx, total - 1))
-        self.side_panel_scroll = 0
+        self.side_panel_scroll = prev_panel_scroll if preserve_panel_scroll else 0
         self._side_panel_max_scroll = None
         self.col_offset = max(0, min(self.col_offset, self._max_col_offset()))
 
-    def action_load_all(self) -> None:
-        """Load all remaining pages via ``on_load_all`` and re-run ``filter_entries``."""
-        if not self.truncated or self.on_load_all is None:
-            return
-
-        self._transient_notice = f"Loading all {self.label}..."
-        self.draw()
-
-        try:
-            loaded = self.on_load_all()
-        except Exception as exc:
-            redacted = _sanitize_cell_text(_redact_secrets(str(exc))).strip()
-            reason = redacted or type(exc).__name__
-            self._transient_notice = f"Load all failed: {reason}"
-            return
-
+    def _unpack_loaded_batch(self, loaded: Any) -> list[tuple[dict[str, Any], Any]]:
+        """Normalize a single loaded batch into ``(row_dict, detail_obj)`` pairs."""
         new_entries: list[tuple[dict[str, Any], Any]] = []
         if (
             isinstance(loaded, tuple)
@@ -417,13 +413,75 @@ class InteractiveDataGrid:
                     new_entries.append((dumped if isinstance(dumped, dict) else {}, entry))
                 else:
                     new_entries.append(({f: getattr(entry, f, None) for f in self.fields}, entry))
+        return new_entries
 
-        self.all_entries.extend(new_entries)
+    def action_load_all(self) -> None:
+        """Step ``on_load_all`` page-by-page, committing each completed page immediately."""
+        if not self.truncated or self.on_load_all is None:
+            return
+
+        self._transient_notice = f"Loading all {self.label}..."
+        self.draw()
+
+        loader = self.on_load_all
+        is_stepped = hasattr(loader, "has_more")
+        appended_any = False
+        empty_steps = 0
+
+        try:
+            while True:
+                loaded = loader()
+                new_entries = self._unpack_loaded_batch(loaded)
+                if new_entries:
+                    if not self.fields and new_entries[0][0]:
+                        self.fields = list(new_entries[0][0].keys())
+                    self.all_entries.extend(new_entries)
+                    appended_any = True
+                    empty_steps = 0
+                else:
+                    empty_steps += 1
+
+                still_has_more = bool(getattr(loader, "has_more", False)) if is_stepped else False
+                if not still_has_more or empty_steps >= 10000:
+                    break
+
+                if new_entries:
+                    self.filter_entries(preserve_panel_scroll=True)
+                    self._transient_notice = (
+                        f"Loading all {self.label}... ({len(self.all_entries)} loaded)"
+                    )
+                    self.draw()
+        except KeyboardInterrupt:
+            if appended_any:
+                self.filter_entries(preserve_panel_scroll=True)
+            remaining = bool(getattr(loader, "has_more", True)) if is_stepped else True
+            if remaining:
+                self.truncated = True
+                self._transient_notice = "Load all cancelled; press [a] to resume"
+            else:
+                self.truncated = False
+                self.on_load_all = None
+                self.status_notice = None
+                self._transient_notice = None
+            return
+        except Exception as exc:
+            if appended_any:
+                self.filter_entries(preserve_panel_scroll=True)
+            redacted = _sanitize_cell_text(_redact_secrets(str(exc))).strip()
+            reason = redacted or type(exc).__name__
+            self._transient_notice = f"Load all failed: {reason}"
+            return
+
+        if is_stepped and bool(getattr(loader, "has_more", False)):
+            self.truncated = True
+            self.filter_entries(preserve_panel_scroll=True)
+            return
+
         self.truncated = False
         self.on_load_all = None
         self.status_notice = None
         self._transient_notice = None
-        self.filter_entries()
+        self.filter_entries(preserve_panel_scroll=True)
 
     def _format_cell(self, value: Any, key: str | None = None) -> str:
         """Format a single cell value for table display."""
@@ -757,7 +815,8 @@ class InteractiveDataGrid:
         return result if result else [("", attr)]
 
     def _format_panel_scalar(self, val: Any, key: str | None = None) -> str:
-        """Format scalar, boolean, datetime, or enum value while sanitizing C* controls."""
+        """Format scalar, boolean, date/datetime, or enum value while sanitizing C* controls."""
+        del key
         if isinstance(val, Enum):
             val = val.value
         if val is None or val == "":
@@ -766,6 +825,11 @@ class InteractiveDataGrid:
             return "Yes" if val else "No"
         if isinstance(val, datetime):
             return val.strftime("%Y-%m-%d %H:%M")
+        if isinstance(val, date):
+            return val.isoformat()
+        if isinstance(val, str) and _ISO_DATETIME_RE.match(val):
+            with contextlib.suppress(ValueError):
+                return datetime.fromisoformat(val).strftime("%Y-%m-%d %H:%M")
         raw = str(val).replace("\r\n", "\n").replace("\r", "\n")
         return "".join(
             ch if (ch in ("\n", "\t") or not unicodedata.category(ch).startswith("C")) else " "
@@ -780,73 +844,179 @@ class InteractiveDataGrid:
         raw_key: str,
         content_w: int,
         indent: str = "  ",
+        *,
+        preserve_empty_values: bool = False,
     ) -> None:
-        """Append formatted scalar or nested list/dict lines to the side panel."""
-        if isinstance(value, dict):
-            non_empty = {k: v for k, v in value.items() if v is not None and v != ""}
-            if not non_empty:
-                lines.extend(self._wrap_panel_line(f"{indent}{display_key}: {{}}", content_w))
+        """Append formatted scalar or nested list/dict lines recursively without ``repr()``."""
+        normalized = _normalize_nested_value(value)
+        effective_preserve_empty = preserve_empty_values or raw_key in ("record_data", "variables")
+
+        if isinstance(normalized, dict):
+            items_map = (
+                dict(normalized)
+                if effective_preserve_empty
+                else {k: v for k, v in normalized.items() if v is not None and v != ""}
+            )
+            if not items_map:
+                empty_line = f"{indent}{display_key}: {{}}" if display_key else f"{indent}-"
+                lines.extend(self._wrap_panel_line(empty_line, content_w))
                 return
-            lines.extend(self._wrap_panel_line(f"{indent}{display_key}:", content_w))
-            for sub_k, sub_v in non_empty.items():
-                self._append_panel_value(
-                    lines,
-                    str(sub_k),
-                    sub_v,
-                    str(sub_k),
-                    content_w,
-                    indent=indent + "  ",
-                )
+            if display_key:
+                lines.extend(self._wrap_panel_line(f"{indent}{display_key}:", content_w))
+                child_indent = indent + "  "
+            else:
+                child_indent = indent
+            for sub_k, sub_v in items_map.items():
+                sub_key_str = str(sub_k)
+                if effective_preserve_empty and (sub_v is None or sub_v == ""):
+                    lines.extend(
+                        self._wrap_panel_line(f"{child_indent}{sub_key_str}: -", content_w)
+                    )
+                else:
+                    self._append_panel_value(
+                        lines,
+                        sub_key_str,
+                        sub_v,
+                        sub_key_str,
+                        content_w,
+                        indent=child_indent,
+                        preserve_empty_values=sub_key_str in ("record_data", "variables"),
+                    )
             return
 
-        if isinstance(value, list):
-            if not value:
-                lines.extend(self._wrap_panel_line(f"{indent}{display_key}: []", content_w))
+        if isinstance(normalized, list):
+            if not normalized:
+                empty_list = f"{indent}{display_key}: []" if display_key else f"{indent}None"
+                lines.extend(self._wrap_panel_line(empty_list, content_w))
                 return
-            if all(isinstance(x, (str, int, float, bool, Enum, datetime)) for x in value):
-                joined = ", ".join(self._format_panel_scalar(x) for x in value)
-                lines.extend(
-                    self._wrap_panel_line(
-                        f"{indent}{display_key}: {joined}",
-                        content_w,
-                        cont_indent=indent + "  ",
-                    )
-                )
+            if all(
+                isinstance(x, (str, int, float, bool, Enum, datetime, date)) for x in normalized
+            ):
+                joined = ", ".join(self._format_panel_scalar(x) for x in normalized)
+                prefix = f"{indent}{display_key}: {joined}" if display_key else f"{indent}{joined}"
+                cont = indent + "  " if display_key else indent
+                lines.extend(self._wrap_panel_line(prefix, content_w, cont_indent=cont))
                 return
-            lines.extend(self._wrap_panel_line(f"{indent}{display_key}:", content_w))
-            for entry in value:
+            if display_key:
+                lines.extend(self._wrap_panel_line(f"{indent}{display_key}:", content_w))
+                item_indent = indent + "  "
+            else:
+                item_indent = indent
+            for entry in normalized:
                 if isinstance(entry, dict):
-                    entry_pairs = [
-                        f"{ek}: {self._format_panel_scalar(ev, key=str(ek))}"
-                        for ek, ev in entry.items()
-                        if ev is not None and ev != ""
-                    ]
-                    item_str = ", ".join(entry_pairs) if entry_pairs else "{}"
-                    lines.extend(
-                        self._wrap_panel_line(
-                            f"{indent}  - {item_str}",
-                            content_w,
-                            cont_indent=indent + "    ",
+                    scalar_pairs: list[str] = []
+                    nested_children: list[tuple[str, Any, bool]] = []
+                    for ek, ev in entry.items():
+                        ek_str = str(ek)
+                        if isinstance(ev, (dict, list)):
+                            is_var_dict = ek_str in ("record_data", "variables")
+                            if is_var_dict:
+                                if ev:
+                                    nested_children.append((ek_str, ev, True))
+                            else:
+                                has_content = (
+                                    any(v is not None and v != "" for v in ev.values())
+                                    if isinstance(ev, dict)
+                                    else bool(ev)
+                                )
+                                if has_content:
+                                    nested_children.append((ek_str, ev, False))
+                        elif ev is not None and ev != "":
+                            scalar_pairs.append(
+                                f"{ek_str}: {self._format_panel_scalar(ev, key=ek_str)}"
+                            )
+                    if scalar_pairs:
+                        item_str = ", ".join(scalar_pairs)
+                        lines.extend(
+                            self._wrap_panel_line(
+                                f"{item_indent}- {item_str}",
+                                content_w,
+                                cont_indent=item_indent + "  ",
+                            )
                         )
+                    elif nested_children:
+                        lines.extend(self._wrap_panel_line(f"{item_indent}-", content_w))
+                    else:
+                        lines.extend(self._wrap_panel_line(f"{item_indent}- {{}}", content_w))
+
+                    for child_key, child_val, child_preserve in nested_children:
+                        self._append_panel_value(
+                            lines,
+                            child_key,
+                            child_val,
+                            child_key,
+                            content_w,
+                            indent=item_indent + "  ",
+                            preserve_empty_values=child_preserve,
+                        )
+                elif isinstance(entry, list):
+                    lines.extend(self._wrap_panel_line(f"{item_indent}-", content_w))
+                    self._append_panel_value(
+                        lines,
+                        "",
+                        entry,
+                        raw_key,
+                        content_w,
+                        indent=item_indent + "  ",
                     )
                 else:
                     lines.extend(
                         self._wrap_panel_line(
-                            f"{indent}  - {self._format_panel_scalar(entry)}",
+                            f"{item_indent}- {self._format_panel_scalar(entry)}",
                             content_w,
-                            cont_indent=indent + "    ",
+                            cont_indent=item_indent + "  ",
                         )
                     )
             return
 
-        v_str = self._format_panel_scalar(value, key=raw_key)
-        lines.extend(
-            self._wrap_panel_line(
-                f"{indent}{display_key}: {v_str}",
-                content_w,
-                cont_indent=indent + "  ",
+        v_str = self._format_panel_scalar(normalized, key=raw_key)
+        prefix = f"{indent}{display_key}: {v_str}" if display_key else f"{indent}{v_str}"
+        cont = indent + "  " if display_key else indent
+        lines.extend(self._wrap_panel_line(prefix, content_w, cont_indent=cont))
+
+    def _render_spi_panel_sections(
+        self,
+        detail_obj: PanelSectionsProtocol,
+        content_w: int,
+    ) -> list[tuple[str, int]]:
+        """Render ordered :class:`PanelSection` projections from a protocol provider."""
+        lines: list[tuple[str, int]] = []
+        sections = detail_obj.to_panel_sections()
+        for idx, raw_section in enumerate(sections):
+            if idx > 0:
+                lines.append(("", 0))
+            if isinstance(raw_section, PanelSection):
+                sec_title = raw_section.title
+                sec_content = raw_section.content
+                sec_empty = raw_section.empty_placeholder
+                sec_preserve = raw_section.preserve_empty_values
+            else:
+                sec_title, sec_content = raw_section
+                sec_empty = "None"
+                sec_preserve = False
+            lines.append((_sanitize_cell_text(sec_title).upper(), curses.A_BOLD))
+            normalized_content = _normalize_nested_value(sec_content)
+            is_empty = normalized_content in (None, "", []) or (
+                isinstance(normalized_content, dict)
+                and (
+                    not normalized_content
+                    if sec_preserve
+                    else not any(v is not None and v != "" for v in normalized_content.values())
+                )
             )
-        )
+            if is_empty:
+                lines.append((f"  {_sanitize_cell_text(sec_empty)}", curses.A_DIM))
+            else:
+                self._append_panel_value(
+                    lines,
+                    "",
+                    normalized_content,
+                    "",
+                    content_w,
+                    indent="  ",
+                    preserve_empty_values=sec_preserve,
+                )
+        return lines
 
     def _draw_side_panel(self, panel_x: int, panel_width: int, max_y: int) -> None:
         """Render the side inspection panel displaying variables and metadata."""
@@ -879,85 +1049,91 @@ class InteractiveDataGrid:
             return
 
         _, detail_obj = self.filtered_entries[self.selected_idx]
-        meta, variables = extract_item_details(detail_obj)
 
-        lines: list[tuple[str, int]] = []
-        primary_header = "RECORD METADATA" if is_records else f"{self.label.upper()} METADATA"
-        lines.append((primary_header, curses.A_BOLD))
-
-        record_primary_keys = [
-            "record_id",
-            "subject_key",
-            "form_key",
-            "record_status",
-            "subject_status",
-            "site_name",
-            "date_created",
-            "date_modified",
-            "enrollment_start_date",
-        ]
-        if is_records:
-            priority_keys = record_primary_keys
+        if isinstance(detail_obj, PanelSectionsProtocol):
+            lines = self._render_spi_panel_sections(detail_obj, content_w)
         else:
-            seen_keys: set[str] = set()
-            priority_keys = []
-            for candidate in (*self.fields, *record_primary_keys):
-                if candidate not in seen_keys:
-                    seen_keys.add(candidate)
-                    priority_keys.append(candidate)
+            meta, variables = extract_item_details(detail_obj)
 
-        rendered_meta: set[str] = set()
-        for k in priority_keys:
-            if k in meta and meta[k] is not None and meta[k] != "":
-                self._append_panel_value(
-                    lines,
-                    k.replace("_", " ").title(),
-                    meta[k],
-                    k,
-                    content_w,
-                )
-                rendered_meta.add(k)
+            lines = []
+            primary_header = "RECORD METADATA" if is_records else f"{self.label.upper()} METADATA"
+            lines.append((primary_header, curses.A_BOLD))
 
-        other_meta = [
-            (k, v) for k, v in meta.items() if k not in rendered_meta and v is not None and v != ""
-        ]
-
-        # If no priority keys matched for a non-record entity, show attributes directly under main header
-        if not rendered_meta and not is_records and other_meta:
-            for k, v in other_meta:
-                self._append_panel_value(
-                    lines,
-                    k.replace("_", " ").title(),
-                    v,
-                    k,
-                    content_w,
-                )
-                rendered_meta.add(k)
-            other_meta = []
-
-        if is_records or variables:
-            lines.append(("", 0))
-            lines.append(("FORM VARIABLES", curses.A_BOLD))
-            if not variables:
-                lines.append(("  (No submitted variables recorded)", curses.A_DIM))
+            record_primary_keys = [
+                "record_id",
+                "subject_key",
+                "form_key",
+                "record_status",
+                "subject_status",
+                "site_name",
+                "date_created",
+                "date_modified",
+                "enrollment_start_date",
+            ]
+            if is_records:
+                priority_keys = record_primary_keys
             else:
-                for var_key, var_val in sorted(variables.items()):
-                    if var_val is None or var_val == "":
-                        lines.extend(self._wrap_panel_line(f"  {var_key}: -", content_w))
-                    else:
-                        self._append_panel_value(lines, var_key, var_val, var_key, content_w)
+                seen_keys: set[str] = set()
+                priority_keys = []
+                for candidate in (*self.fields, *record_primary_keys):
+                    if candidate not in seen_keys:
+                        seen_keys.add(candidate)
+                        priority_keys.append(candidate)
 
-        if other_meta:
-            lines.append(("", 0))
-            lines.append(("ADDITIONAL INFO", curses.A_BOLD))
-            for k, v in other_meta:
-                self._append_panel_value(
-                    lines,
-                    k.replace("_", " ").title(),
-                    v,
-                    k,
-                    content_w,
-                )
+            rendered_meta: set[str] = set()
+            for k in priority_keys:
+                if k in meta and meta[k] is not None and meta[k] != "":
+                    self._append_panel_value(
+                        lines,
+                        k.replace("_", " ").title(),
+                        meta[k],
+                        k,
+                        content_w,
+                    )
+                    rendered_meta.add(k)
+
+            other_meta = [
+                (k, v)
+                for k, v in meta.items()
+                if k not in rendered_meta and v is not None and v != ""
+            ]
+
+            # If no priority keys matched for a non-record entity, show attributes directly under main header
+            if not rendered_meta and not is_records and other_meta:
+                for k, v in other_meta:
+                    self._append_panel_value(
+                        lines,
+                        k.replace("_", " ").title(),
+                        v,
+                        k,
+                        content_w,
+                    )
+                    rendered_meta.add(k)
+                other_meta = []
+
+            if is_records or variables:
+                lines.append(("", 0))
+                lines.append(("FORM VARIABLES", curses.A_BOLD))
+                if not variables:
+                    lines.append(("  (No submitted variables recorded)", curses.A_DIM))
+                else:
+                    for var_key, var_val in sorted(variables.items()):
+                        if var_val is None or var_val == "":
+                            lines.extend(self._wrap_panel_line(f"  {var_key}: -", content_w))
+                        else:
+                            self._append_panel_value(lines, var_key, var_val, var_key, content_w)
+
+            if other_meta:
+                lines.append(("", 0))
+                lines.append(("ADDITIONAL INFO", curses.A_BOLD))
+                for k, v in other_meta:
+                    self._append_panel_value(
+                        lines,
+                        k.replace("_", " ").title(),
+                        v,
+                        k,
+                        content_w,
+                    )
 
         # Render lines with scroll offset
         visible_slots = max(1, viewport_lines - 2)

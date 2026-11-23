@@ -6,6 +6,7 @@ from the API, handling pagination seamlessly.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any, Generic, TypeVar
 
@@ -16,25 +17,94 @@ T = TypeVar("T")
 
 
 class _PaginatedIterator(Iterator[T]):
-    """Synchronous iterator over parsed items exposing pagination truncation state."""
+    """Synchronous iterator over parsed items with buffered single-page stepping."""
 
     def __init__(self, paginator: Any, parse_func: Callable[[Any], T]) -> None:
         self._paginator = paginator
         self._parse_func = parse_func
-        self._iterator: Iterator[Any] | None = None
+        self._buffer: deque[T] = deque()
+        self._started = False
+        self._fallback_iter: Iterator[Any] | None = None
+        self._fallback_exhausted = False
+
+    def _supports_step_page(self) -> bool:
+        """Return True if the underlying paginator exposes synchronous page stepping."""
+        return callable(getattr(self._paginator, "next_page", None)) and isinstance(
+            getattr(self._paginator, "has_more", None), bool
+        )
 
     @property
     def has_more(self) -> bool:
-        """Return True if more items remain in the underlying paginator."""
+        """Return True if buffered items or subsequent server pages remain."""
+        if self._buffer:
+            return True
+        if self._fallback_iter is not None:
+            return not self._fallback_exhausted and bool(
+                getattr(self._paginator, "has_more", False)
+            )
         return bool(getattr(self._paginator, "has_more", False))
+
+    def next_page(self) -> list[T]:
+        """Return buffered partial-page items first, or fetch and parse the next page."""
+        if self._buffer:
+            buffered = list(self._buffer)
+            self._buffer.clear()
+            return buffered
+
+        if self._supports_step_page():
+            step_fn = self._paginator.next_page
+            self._started = True
+            raw_items = step_fn()
+            if not raw_items:
+                return []
+            return [self._parse_func(item) for item in raw_items]
+
+        if self._fallback_exhausted:
+            return []
+        if self._fallback_iter is None:
+            self._fallback_iter = iter(self._paginator)
+        batch_size = max(1, int(getattr(self._paginator, "page_size", 100)))
+        parsed_batch: list[T] = []
+        for _ in range(batch_size):
+            try:
+                raw_item = next(self._fallback_iter)
+            except StopIteration:
+                self._fallback_exhausted = True
+                break
+            parsed_batch.append(self._parse_func(raw_item))
+        return parsed_batch
 
     def __iter__(self) -> _PaginatedIterator[T]:
         return self
 
     def __next__(self) -> T:
-        if self._iterator is None:
-            self._iterator = iter(self._paginator)
-        return self._parse_func(next(self._iterator))
+        if not self._supports_step_page():
+            if self._fallback_iter is None:
+                self._fallback_iter = iter(self._paginator)
+            try:
+                return self._parse_func(next(self._fallback_iter))
+            except StopIteration:
+                self._fallback_exhausted = True
+                raise
+
+        step_fn = self._paginator.next_page
+        sentinel = object()
+        while not self._buffer:
+            if self._started and not bool(getattr(self._paginator, "has_more", False)):
+                raise StopIteration
+            was_started = self._started
+            prev_cursor = getattr(self._paginator, "cursor", sentinel)
+            self._started = True
+            raw_items = step_fn()
+            if not raw_items:
+                curr_cursor = getattr(self._paginator, "cursor", sentinel)
+                if not bool(getattr(self._paginator, "has_more", False)) or (
+                    was_started and curr_cursor == prev_cursor
+                ):
+                    raise StopIteration
+                continue
+            self._buffer.extend(self._parse_func(item) for item in raw_items)
+        return self._buffer.popleft()
 
 
 class _AsyncPaginatedIterator(AsyncIterator[T]):

@@ -236,3 +236,121 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
         assert "endDate" not in sent_filter
         assert len(revisions) == 1
         assert revisions[0].record_revision_id == 5
+
+
+def test_iter_records_by_criteria_streams_pages_lazily_and_supports_next_page() -> None:
+    """iter_records_by_criteria fetches pages lazily, filters deleted/non-matching items, and steps pages."""
+    import itertools
+
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    requested_pages: list[int] = []
+
+    def _records_responder(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+        if page == 0:
+            data = [
+                {"recordId": 1, "studyKey": "STUDY", "subjectKey": "S1", "visitId": 10},
+                {
+                    "recordId": 2,
+                    "studyKey": "STUDY",
+                    "subjectKey": "S1",
+                    "visitId": 10,
+                    "deleted": True,
+                },
+                {"recordId": 3, "studyKey": "STUDY", "subjectKey": "S2", "visitId": 10},
+                {"recordId": 4, "studyKey": "STUDY", "subjectKey": "S1", "visitId": 10},
+            ]
+        else:
+            data = [
+                {"recordId": 5, "studyKey": "STUDY", "subjectKey": "S1", "visitId": 10},
+            ]
+        return httpx.Response(
+            200,
+            json={"data": data, "pagination": {"page": page, "size": 4, "totalPages": 2}},
+        )
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get("https://api.test/api/v1/edc/studies/STUDY/subjects").respond(
+            200,
+            json={"data": [{"subjectId": 1, "studyKey": "STUDY", "subjectKey": "S1"}]},
+        )
+        router.get("https://api.test/api/v1/edc/studies/STUDY/visits").respond(
+            200,
+            json={"data": [{"visitId": 10, "studyKey": "STUDY", "subjectKey": "S1"}]},
+        )
+        router.get("https://api.test/api/v1/edc/studies/STUDY/records").mock(
+            side_effect=_records_responder
+        )
+
+        sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test", retries=0)
+        wf = DataExtractionWorkflow(sdk)
+        stream = wf.iter_records_by_criteria(
+            "STUDY",
+            subject_filter={"subject_status": "Screened"},
+            visit_filter={"interval_name": "V1"},
+            size=4,
+        )
+
+        # Taking 1 matching item fetches only page 0 and buffers recordId=4
+        first = list(itertools.islice(stream, 1))
+        assert [r.record_id for r in first] == [1]
+        assert requested_pages == [0]
+        assert stream.has_more is True  # type: ignore[attr-defined]
+
+        # next_page() drains buffered recordId=4 from page 0 without a new HTTP call
+        buffered_batch = stream.next_page()  # type: ignore[attr-defined]
+        assert [r.record_id for r in buffered_batch] == [4]
+        assert requested_pages == [0]
+        assert stream.has_more is True  # type: ignore[attr-defined]
+
+        # Subsequent next_page() fetches page 1 and marks stream exhausted
+        final_batch = stream.next_page()  # type: ignore[attr-defined]
+        assert [r.record_id for r in final_batch] == [5]
+        assert requested_pages == [0, 1]
+        assert stream.has_more is False  # type: ignore[attr-defined]
+
+
+def test_iter_records_by_criteria_plain_iterator_fallback_and_lookahead() -> None:
+    """iter_records_by_criteria supports plain iterables for both __next__ and next_page batches."""
+    from unittest.mock import MagicMock
+
+    from imednet.models.records import Record
+    from imednet_workflows.data_extraction import DataExtractionWorkflow
+
+    raw_records = [
+        Record(
+            record_id=idx,
+            study_key="S1",
+            subject_key="SUB-OK" if idx % 2 == 1 else "SUB-SKIP",
+            deleted=(idx == 3),
+        )
+        for idx in range(1, 225)
+    ]
+
+    mock_sdk = MagicMock()
+    mock_sdk.get_subjects.return_value = [MagicMock(subject_key="SUB-OK")]
+    mock_sdk.records.list.side_effect = lambda *_a, **_kw: (r for r in raw_records)
+
+    wf = DataExtractionWorkflow(mock_sdk)
+    stream = wf.iter_records_by_criteria(
+        "S1",
+        subject_filter={"subject_status": "Enrolled"},
+    )
+    first_item = next(stream)
+    assert first_item.record_id == 1
+    assert stream.has_more is True  # type: ignore[attr-defined]
+
+    batch_one = stream.next_page()  # type: ignore[attr-defined]
+    assert len(batch_one) == 100
+    assert 3 not in [r.record_id for r in batch_one]
+    assert stream.has_more is True  # type: ignore[attr-defined]
+
+    batch_two = stream.next_page()  # type: ignore[attr-defined]
+    assert len(batch_two) == 10
+    assert stream.has_more is False  # type: ignore[attr-defined]
+    assert stream.next_page() == []  # type: ignore[attr-defined]

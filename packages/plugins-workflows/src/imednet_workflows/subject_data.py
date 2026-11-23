@@ -1,14 +1,117 @@
 """Provides a workflow to retrieve comprehensive data for a specific subject."""
 
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
+from imednet.spi.cli import PanelSection
 from imednet.spi.models import Query, Record, Subject, Visit
 from imednet.spi.sink_base import is_record_deleted
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
+
+_SUBJECT_PRIORITY_KEYS: tuple[str, ...] = (
+    "subject_key",
+    "subject_status",
+    "site_name",
+    "site_id",
+    "enrollment_start_date",
+    "subject_id",
+    "subject_oid",
+    "study_key",
+    "date_created",
+    "date_modified",
+    "keywords",
+)
+_VISIT_PRIORITY_KEYS: tuple[str, ...] = (
+    "visit_id",
+    "interval_name",
+    "visit_date",
+    "start_date",
+    "end_date",
+    "visit_date_form",
+    "visit_date_question",
+    "date_created",
+    "date_modified",
+)
+_RECORD_PRIORITY_KEYS: tuple[str, ...] = (
+    "record_id",
+    "form_key",
+    "record_status",
+    "visit_id",
+    "interval_id",
+    "date_created",
+    "date_modified",
+    "keywords",
+    "record_data",
+)
+_QUERY_PRIORITY_KEYS: tuple[str, ...] = (
+    "annotation_id",
+    "variable",
+    "annotation_type",
+    "description",
+    "record_id",
+    "date_created",
+    "date_modified",
+    "query_comments",
+)
+
+
+def _model_or_mapping_to_ordered_dict(
+    item: Any,
+    priority_keys: Sequence[str],
+    *,
+    omit_keys: frozenset[str] = frozenset(),
+) -> Any:
+    """Convert a model or mapping into a key-ordered dictionary while preserving nested values."""
+    if item is None:
+        return None
+    if isinstance(item, BaseModel):
+        raw: dict[str, Any] = item.model_dump(by_alias=False)
+    elif isinstance(item, Mapping):
+        raw = dict(item)
+    else:
+        return item
+
+    ordered: dict[str, Any] = {}
+    for key in priority_keys:
+        if key in raw and key not in omit_keys:
+            ordered[key] = raw[key]
+    for key, val in raw.items():
+        if key not in ordered and key not in omit_keys:
+            ordered[key] = val
+    return ordered
+
+
+def build_subject_panel_sections(
+    subject_details: Any,
+    visits: Sequence[Any],
+    records: Sequence[Any],
+    queries: Sequence[Any],
+) -> list[PanelSection]:
+    """Build ordered side-panel sections with Subject details first, then Visits, Records, Queries."""
+    redundant_child_keys = frozenset({"study_key", "subject_id", "subject_key", "subject_oid"})
+    projected_subject = _model_or_mapping_to_ordered_dict(subject_details, _SUBJECT_PRIORITY_KEYS)
+    projected_visits = [
+        _model_or_mapping_to_ordered_dict(v, _VISIT_PRIORITY_KEYS, omit_keys=redundant_child_keys)
+        for v in visits
+    ]
+    projected_records = [
+        _model_or_mapping_to_ordered_dict(r, _RECORD_PRIORITY_KEYS, omit_keys=redundant_child_keys)
+        for r in records
+    ]
+    projected_queries = [
+        _model_or_mapping_to_ordered_dict(q, _QUERY_PRIORITY_KEYS, omit_keys=redundant_child_keys)
+        for q in queries
+    ]
+    return [
+        PanelSection("Subject Details", projected_subject, empty_placeholder="None"),
+        PanelSection("Visits", projected_visits, empty_placeholder="No visits recorded"),
+        PanelSection("Records", projected_records, empty_placeholder="No records recorded"),
+        PanelSection("Queries", projected_queries, empty_placeholder="No queries recorded"),
+    ]
 
 
 class SubjectComprehensiveData(BaseModel):
@@ -22,6 +125,15 @@ class SubjectComprehensiveData(BaseModel):
     queries: list[Query] = Field(
         default_factory=list, description="List of queries related to the subject."
     )
+
+    def to_panel_sections(self) -> list[PanelSection]:
+        """Project ordered side-panel sections via the CLI SPI protocol."""
+        return build_subject_panel_sections(
+            self.subject_details,
+            self.visits,
+            self.records,
+            self.queries,
+        )
 
 
 class SubjectDataWorkflow:

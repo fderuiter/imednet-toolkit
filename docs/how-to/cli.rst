@@ -47,7 +47,7 @@ table with live filtering and a side inspection panel:
 * ``Up`` / ``Down`` (or ``k`` / ``j``), ``Page Up`` / ``Page Down``, ``Home`` / ``End``: navigate rows.
 * ``Left`` / ``Right`` (or ``h`` / ``l``): scroll columns horizontally across wide tables.
 * ``/``: enter live search mode across table columns, record metadata, and form variables (``Enter`` or ``Esc`` exits search input; in normal mode, ``Esc`` closes an open side panel first and then clears the active filter).
-* ``a``: load all remaining pages into ``InteractiveDataGrid`` when the initial 100-item TTY view is truncated, re-evaluating any active ``/`` filter.
+* ``a``: load remaining pages incrementally into ``InteractiveDataGrid`` when the initial 100-item TTY view is truncated, re-evaluating any active ``/`` filter (press ``Ctrl+C`` to cancel mid-fetch or press ``a`` again to resume after a transient error).
 * ``Space``: toggle the side inspection panel (``[`` / ``]`` scrolls overflowing panel lines and ``{`` / ``}`` scrolls panel pages with ``Lines X-Y of Z`` ``▲`` / ``▼`` cues; ``Esc`` or ``Space`` closes the panel).
 * ``q``: exit ``InteractiveDataGrid``.
 
@@ -173,9 +173,9 @@ and boolean attributes reject invalid values on ``stderr`` with exit code ``1``.
 ``--filter`` before issuing requests, whereas ``imednet studies list`` accepts them.
 ``records list`` additionally exposes ``--record-data-filter`` (supporting ``=~``
 regular-expression matching in addition to the six standard operators, plus the
-literal ``none`` bypass) to filter Form Variable values on the server. All twelve
-``list`` commands—including ``users list``—accept ``--sort``, ``--limit``, and
-``--all``.
+literal ``none`` bypass) to filter Form Variable values on the server. All twelve ``list`` commands—including ``users list``—accept ``--sort``, ``--limit``,
+and ``--all``, and ``workflows extract-records`` likewise accepts ``--limit`` and
+``--all`` with 100-item default TTY bounding.
 
 .. code-block:: bash
 

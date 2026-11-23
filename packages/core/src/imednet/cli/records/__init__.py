@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -197,10 +198,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             export_list_to_file(records, "records", output.lower())
         else:
             view_models = [_record_view_model(r) for r in records]
-
-            def _load_more_records() -> tuple[list[dict[str, Any]], list[Any]]:
-                more = load_remaining() if load_remaining is not None else []
-                return [_record_view_model(r) for r in more], more
+            records_loader: Callable[[], Any] | None = None
+            if load_remaining is not None:
+                records_loader = load_remaining.map_batches(
+                    lambda more: ([_record_view_model(r) for r in more], more)
+                )
 
             display_list(
                 view_models,
@@ -210,7 +212,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 truncated=truncated,
                 interactive=False if no_interactive else None,
                 output_format=resolved_format,
-                on_load_all=_load_more_records if load_remaining is not None else None,
+                on_load_all=records_loader,
             )
 
     def _dispatch_list_records(args: argparse.Namespace) -> None:

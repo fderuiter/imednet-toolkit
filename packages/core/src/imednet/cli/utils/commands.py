@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from imednet.cli.decorators import validate_cli_path_segment, with_sdk
 
 from .args import (
+    RemainderLoader,
     add_list_query_args,
     add_no_interactive,
     add_output_format,
@@ -49,7 +50,7 @@ def _render_list_results(
     resolved_format: str,
     truncated: bool,
     no_interactive: bool,
-    load_remaining: Callable[[], list[Any]] | None,
+    load_remaining: RemainderLoader | Callable[[], list[Any]] | None,
 ) -> None:
     """Render fetched SDK items via ``display_list`` with optional table ``row_mapper``."""
     if resolved_format == "json":
@@ -58,10 +59,18 @@ def _render_list_results(
 
     if row_mapper is not None:
         mapped_items = [row_mapper(item) for item in items]
+        mapped_loader: Callable[[], Any] | None = None
+        if isinstance(load_remaining, RemainderLoader):
+            mapped_loader = load_remaining.map_batches(
+                lambda more: ([row_mapper(item) for item in more], more)
+            )
+        elif load_remaining is not None:
 
-        def _load_more_mapped() -> tuple[list[dict[str, Any]], list[Any]]:
-            more = load_remaining() if load_remaining is not None else []
-            return [row_mapper(item) for item in more], more
+            def _load_more_mapped() -> tuple[list[dict[str, Any]], list[Any]]:
+                more = load_remaining()
+                return [row_mapper(item) for item in more], more
+
+            mapped_loader = _load_more_mapped
 
         display_list(
             mapped_items,
@@ -72,7 +81,7 @@ def _render_list_results(
             details=items,
             truncated=truncated,
             interactive=False if no_interactive else None,
-            on_load_all=_load_more_mapped if load_remaining is not None else None,
+            on_load_all=mapped_loader,
         )
         return
 

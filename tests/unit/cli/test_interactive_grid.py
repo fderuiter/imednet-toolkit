@@ -1535,3 +1535,194 @@ def test_run_interactive_grid_guards_locale_error() -> None:
     ):
         assert run_interactive_grid(items=items, fields=["ID"]) is True
         mock_wrapper.assert_called_once()
+
+
+def test_ctrl_c_during_action_load_all_keeps_grid_filters_and_panel_and_exits_zero_on_q() -> None:
+    """Ctrl+C inside action_load_all keeps InteractiveDataGrid open, retains filters/pages, and exits on q."""
+    from datetime import datetime, timezone
+    from typing import Any
+
+    from imednet.cli.utils.args import RemainderLoader
+
+    # Sequence of keystrokes: open search '/', type 'SUB-2', Enter, open side panel ' ',
+    # press 'a' (page 1 commits, page 2 raises KeyboardInterrupt), press 'a' again to finish, then 'q'
+    keystrokes: list[int | str] = ["/", "S", "U", "B", "-", "2", 10, " ", "a", "a", "q"]
+    key_iter = iter(keystrokes)
+    win = MockWindow(height=24, width=100)
+    win.get_wch = lambda: next(key_iter)  # type: ignore[attr-defined]
+
+    pages: list[list[dict[str, Any]]] = [
+        [
+            {
+                "ID": 2,
+                "Subject": "SUB-201",
+                "Created": datetime(2026, 3, 1, 9, 0, tzinfo=timezone.utc),
+            }
+        ],
+        [
+            {
+                "ID": 3,
+                "Subject": "SUB-202",
+                "Created": datetime(2026, 3, 2, 10, 0, tzinfo=timezone.utc),
+            }
+        ],
+    ]
+    page_idx = 0
+    interrupted_once = False
+    observed_mid_run: dict[str, Any] = {}
+
+    def _step() -> list[dict[str, Any]]:
+        nonlocal page_idx, interrupted_once
+        if page_idx == 1 and not interrupted_once:
+            interrupted_once = True
+            raise KeyboardInterrupt
+        batch = pages[page_idx]
+        page_idx += 1
+        return batch
+
+    loader = RemainderLoader(_step, lambda: page_idx < len(pages))
+
+    orig_handle = InteractiveDataGrid._handle_normal_input
+
+    def _spy_handle(self: InteractiveDataGrid, ch: int | str) -> bool:
+        res = orig_handle(self, ch)
+        if ch == "a" and "after_cancel" not in observed_mid_run:
+            observed_mid_run["after_cancel"] = {
+                "all_count": len(self.all_entries),
+                "filtered_count": len(self.filtered_entries),
+                "search_query": self.search_query,
+                "side_panel_open": self.side_panel_open,
+                "truncated": self.truncated,
+                "notice": self._transient_notice,
+            }
+        elif ch == "a":
+            observed_mid_run["after_resume"] = {
+                "all_count": len(self.all_entries),
+                "filtered_count": len(self.filtered_entries),
+                "truncated": self.truncated,
+                "notice": self._transient_notice,
+            }
+        return res
+
+    with (
+        patch("curses.has_colors", return_value=False),
+        patch("curses.curs_set"),
+        patch.object(InteractiveDataGrid, "_handle_normal_input", _spy_handle),
+    ):
+        grid = InteractiveDataGrid(
+            win,
+            items=[{"ID": 1, "Subject": "SUB-100", "Created": "2026-03-01"}],
+            fields=["ID", "Subject", "Created"],
+            label="records",
+            truncated=True,
+            on_load_all=loader,
+        )
+        grid.run()
+
+    assert observed_mid_run["after_cancel"] == {
+        "all_count": 2,
+        "filtered_count": 1,
+        "search_query": "SUB-2",
+        "side_panel_open": True,
+        "truncated": True,
+        "notice": "Load all cancelled; press [a] to resume",
+    }
+    assert observed_mid_run["after_resume"] == {
+        "all_count": 3,
+        "filtered_count": 2,
+        "truncated": False,
+        "notice": None,
+    }
+    assert grid.search_query == "SUB-2"
+    assert grid.side_panel_open is True
+
+
+def test_idle_ctrl_c_during_run_exits_grid_cleanly_without_regression() -> None:
+    """Pressing Ctrl+C while InteractiveDataGrid.run waits idle for input exits cleanly."""
+    win = MockWindow(height=24, width=80)
+
+    def _raise_sigint() -> str:
+        raise KeyboardInterrupt
+
+    win.get_wch = _raise_sigint  # type: ignore[attr-defined]
+
+    with (
+        patch("curses.has_colors", return_value=False),
+        patch("curses.curs_set"),
+        patch("curses.wrapper", side_effect=lambda fn: fn(win)),
+    ):
+        assert run_interactive_grid(items=[{"ID": 1}], fields=["ID"]) is True
+
+
+def test_spi_panel_sections_protocol_and_recursive_nested_collections_without_repr() -> None:
+    """PanelSectionsProtocol renders sections in order and formats nested dicts/lists/timestamps cleanly."""
+    from datetime import date, datetime, timezone
+    from typing import Any
+
+    from imednet.spi.cli import PanelSection, PanelSectionsProtocol
+
+    class _CustomProjection:
+        def to_panel_sections(self) -> list[PanelSection | tuple[str, Any]]:
+            return [
+                PanelSection(
+                    "Primary Summary",
+                    {
+                        "code": "P-100",
+                        "created_at": datetime(2026, 5, 1, 14, 30, tzinfo=timezone.utc),
+                        "visit_day": date(2026, 5, 1),
+                    },
+                ),
+                (
+                    "Nested Events",
+                    [
+                        {
+                            "event_id": 10,
+                            "record_data": {"DOB": None, "EMAIL": "", "AGE": 52},
+                            "comments": [
+                                {
+                                    "seq": 1,
+                                    "logged": datetime(2026, 5, 2, 8, 15, tzinfo=timezone.utc),
+                                    "note": "Verified",
+                                }
+                            ],
+                        }
+                    ],
+                ),
+                PanelSection("Empty Bucket", [], empty_placeholder="Nothing queued"),
+            ]
+
+    detail = _CustomProjection()
+    assert isinstance(detail, PanelSectionsProtocol)
+
+    win = MockWindow(height=40, width=110)
+    with (
+        patch("curses.has_colors", return_value=False),
+        patch("curses.curs_set"),
+    ):
+        grid = InteractiveDataGrid(
+            win,
+            items=[{"code": "P-100"}],
+            fields=["code"],
+            label="custom",
+            details=[detail],
+        )
+        grid._handle_normal_input(" ")
+        grid.draw()
+
+    panel_x = int(110 * 0.55)
+    content_x = panel_x + 2
+    panel_lines = [text.rstrip() for y, x, text, _ in win.strings if y >= 2 and x == content_x]
+    joined = "\n".join(panel_lines)
+
+    assert joined.index("PRIMARY SUMMARY") < joined.index("NESTED EVENTS")
+    assert joined.index("NESTED EVENTS") < joined.index("EMPTY BUCKET")
+    assert "2026-05-01 14:30" in joined
+    assert "2026-05-01" in joined
+    assert "DOB: -" in joined
+    assert "EMAIL: -" in joined
+    assert "AGE: 52" in joined
+    assert "2026-05-02 08:15" in joined
+    assert "Nothing queued" in joined
+    assert "datetime.datetime(" not in joined
+    assert "{'" not in joined
+    assert "[{'" not in joined

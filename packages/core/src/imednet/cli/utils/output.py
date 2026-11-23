@@ -792,8 +792,7 @@ def display_list(
             grid_kwargs["status_notice"] = grid_notice
         if on_load_all is not None:
 
-            def _wrapped_load_all() -> tuple[list[dict[str, Any]], list[Any]]:
-                loaded = on_load_all()
+            def _project_loaded_batch(loaded: Any) -> tuple[list[dict[str, Any]], list[Any]]:
                 if (
                     isinstance(loaded, tuple)
                     and len(loaded) == 2
@@ -805,14 +804,29 @@ def display_list(
                         for r in raw_rows
                     ]
                     return projected, list(raw_details)
-                raw_items = list(loaded)
+                raw_items = list(loaded) if loaded is not None else []
                 projected_items = [
                     _project_item_to_row(r, field_keys, explicit_fields=explicit_fields)
                     for r in raw_items
                 ]
                 return projected_items, raw_items
 
-            grid_kwargs["on_load_all"] = _wrapped_load_all
+            map_batches = getattr(on_load_all, "map_batches", None)
+            if callable(map_batches):
+                grid_kwargs["on_load_all"] = map_batches(_project_loaded_batch)
+            elif hasattr(on_load_all, "has_more"):
+                from .args import RemainderLoader
+
+                grid_kwargs["on_load_all"] = RemainderLoader(
+                    step_fn=lambda: _project_loaded_batch(on_load_all()),
+                    has_more_fn=lambda: bool(getattr(on_load_all, "has_more", False)),
+                )
+            else:
+
+                def _wrapped_load_all() -> tuple[list[dict[str, Any]], list[Any]]:
+                    return _project_loaded_batch(on_load_all())
+
+                grid_kwargs["on_load_all"] = _wrapped_load_all
         grid_ran = run_interactive_grid(**grid_kwargs)
         if grid_ran:
             return

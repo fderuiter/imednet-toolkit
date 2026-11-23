@@ -7,6 +7,7 @@ import itertools
 import os
 import sys
 import weakref
+from collections import deque
 from collections.abc import Callable, Collection, Iterable, Sequence
 from typing import Any
 
@@ -393,6 +394,11 @@ def add_list_query_args(
         default=None,
         help="Server sort specification (e.g., 'dateCreated,desc' or 'recordId,asc').",
     )
+    add_pagination_bound_args(parser)
+
+
+def add_pagination_bound_args(parser: argparse.ArgumentParser) -> None:
+    """Attach ``--limit`` and ``--all`` pagination bound flags to a CLI subparser."""
     parser.add_argument(
         "--limit",
         dest="limit",
@@ -479,14 +485,45 @@ def prepare_list_query(
     return request_kwargs, effective_limit
 
 
+class RemainderLoader:
+    """Repeatable single-page remainder loader exposing ``has_more`` state."""
+
+    def __init__(
+        self,
+        step_fn: Callable[[], Any],
+        has_more_fn: Callable[[], bool],
+    ) -> None:
+        """Initialize the remainder loader with step and cursor-state callables."""
+        self._step_fn = step_fn
+        self._has_more_fn = has_more_fn
+
+    @property
+    def has_more(self) -> bool:
+        """Return True while buffered items or unfetched pages remain."""
+        return self._has_more_fn()
+
+    def __call__(self) -> Any:
+        """Fetch and return the next batch of remaining items."""
+        if not self._has_more_fn():
+            return []
+        return self._step_fn()
+
+    def map_batches(self, transform: Callable[[Any], Any]) -> RemainderLoader:
+        """Return a chained :class:`RemainderLoader` applying *transform* to each batch."""
+        return RemainderLoader(
+            step_fn=lambda: transform(self._step_fn()),
+            has_more_fn=self._has_more_fn,
+        )
+
+
 def collect_list_items_with_remainder(
     source: Iterable[Any],
     effective_limit: int | None,
-) -> tuple[list[Any], bool, Callable[[], list[Any]] | None]:
-    """Materialize items up to ``effective_limit`` and return a remainder loader when truncated.
+) -> tuple[list[Any], bool, RemainderLoader | None]:
+    """Materialize items up to ``effective_limit`` and return a repeatable remainder loader.
 
-    Preserves the live ``_PaginatedIterator`` cursor so subsequent ``[a]`` loads drain
-    remaining pages starting at page 1 without re-fetching page 0.
+    Preserves the live ``_PaginatedIterator`` page cursor and buffered items so
+    subsequent ``[a]`` loads fetch one page at a time and resume cleanly on retry.
 
     Returns:
         Tuple of ``(items, truncated, load_remaining)``.
@@ -501,12 +538,12 @@ def collect_list_items_with_remainder(
             return initial, False, None
         remaining = list(source[effective_limit:])
 
-        def _drain_sequence() -> list[Any]:
+        def _step_sequence() -> list[Any]:
             rest = list(remaining)
             remaining.clear()
             return rest
 
-        return initial, True, _drain_sequence
+        return initial, True, RemainderLoader(_step_sequence, lambda: bool(remaining))
 
     if hasattr(source, "has_more"):
         iterator = iter(source)
@@ -515,10 +552,32 @@ def collect_list_items_with_remainder(
         if not truncated:
             return items, False, None
 
-        def _drain_paginated() -> list[Any]:
-            return list(iterator)
+        step_page = getattr(source, "next_page", None)
+        if callable(step_page):
+            return (
+                items,
+                True,
+                RemainderLoader(step_page, lambda: bool(getattr(source, "has_more", False))),
+            )
 
-        return items, True, _drain_paginated
+        exhausted = False
+        chunk_size = max(1, effective_limit)
+
+        def _step_has_more_iterable() -> list[Any]:
+            nonlocal exhausted
+            batch = list(itertools.islice(iterator, chunk_size))
+            if not batch or not bool(getattr(source, "has_more", False)):
+                exhausted = True
+            return batch
+
+        return (
+            items,
+            True,
+            RemainderLoader(
+                _step_has_more_iterable,
+                lambda: not exhausted and bool(getattr(source, "has_more", False)),
+            ),
+        )
 
     iterator = iter(source)
     batch = list(itertools.islice(iterator, effective_limit + 1))
@@ -526,14 +585,32 @@ def collect_list_items_with_remainder(
     initial = batch[:effective_limit]
     if not truncated:
         return initial, False, None
-    overflow = batch[effective_limit:]
 
-    def _drain_iterable() -> list[Any]:
-        rest = [*overflow, *iterator]
-        overflow.clear()
-        return rest
+    overflow: deque[Any] = deque(batch[effective_limit:])
+    iter_done = False
 
-    return initial, True, _drain_iterable
+    def _step_iterable() -> list[Any]:
+        nonlocal iter_done
+        chunk_target = max(1, effective_limit)
+        out: list[Any] = []
+        while overflow and len(out) < chunk_target:
+            out.append(overflow.popleft())
+        if not iter_done and len(out) < chunk_target:
+            needed = chunk_target - len(out)
+            fetched = list(itertools.islice(iterator, needed))
+            out.extend(fetched)
+            if len(fetched) < needed:
+                iter_done = True
+        if not iter_done and not overflow:
+            sentinel = object()
+            probe = next(iterator, sentinel)
+            if probe is sentinel:
+                iter_done = True
+            else:
+                overflow.append(probe)
+        return out
+
+    return initial, True, RemainderLoader(_step_iterable, lambda: bool(overflow) or not iter_done)
 
 
 def collect_list_items(

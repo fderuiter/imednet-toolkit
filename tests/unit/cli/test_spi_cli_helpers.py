@@ -41,14 +41,20 @@ def _clean_cli_env(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_spi_cli_exports_shared_helpers() -> None:
-    """Verify imednet.spi.cli exposes shared study-key, simulation, and redaction helpers."""
+    """Verify imednet.spi.cli exposes shared study-key, simulation, panel SPI, and bound helpers."""
     expected = {
+        "PanelSection",
+        "PanelSectionsProtocol",
+        "RemainderLoader",
         "SIMULATION_MODE_ENV",
         "UniqueStoreAction",
+        "add_pagination_bound_args",
         "add_simulation_arg",
         "add_study_key_args",
         "cli_execution_guard",
+        "collect_list_items_with_remainder",
         "positive_int",
+        "prepare_list_query",
         "redact_cli_secrets",
         "resolve_hybrid_study_and_key",
         "resolve_study_key",
