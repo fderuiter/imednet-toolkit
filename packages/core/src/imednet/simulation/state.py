@@ -264,6 +264,7 @@ class SimulationState:
             self.records: list[dict[str, Any]] = [
                 {
                     "recordId": 601,
+                    "recordOid": "REC-601",
                     "studyKey": "STUDY",
                     "subjectKey": "SUB1",
                     "subjectId": 201,
@@ -282,6 +283,7 @@ class SimulationState:
                 },
                 {
                     "recordId": 602,
+                    "recordOid": "REC-602",
                     "studyKey": "STUDY",
                     "subjectKey": "SUB1",
                     "subjectId": 201,
@@ -1054,6 +1056,14 @@ class SimulationState:
                     else dict(raw_item)
                 )
                 rec_data = self._extract_record_data(item)
+                has_explicit_form = any(
+                    item.get(k) is not None and str(item.get(k)).strip() != ""
+                    for k in ("formKey", "form_key", "formId", "form_id")
+                )
+                is_registration_item = any(
+                    item.get(k) is not None and str(item.get(k)).strip() != ""
+                    for k in ("siteName", "site_name", "siteId", "site_id")
+                )
                 form_id, form_key = self._resolve_form_identifiers(study_key, item)
                 raw_subj_key = str(item.get("subjectKey") or item.get("subject_key") or "").strip()
                 requested_rec_id = (
@@ -1061,9 +1071,46 @@ class SimulationState:
                     if item.get("recordId") is not None
                     else item.get("record_id")
                 )
+                raw_record_oid = item.get("recordOid") or item.get("record_oid")
+                record_oid = (
+                    str(raw_record_oid).strip()
+                    if raw_record_oid is not None and str(raw_record_oid).strip()
+                    else None
+                )
+                raw_visit_id = (
+                    item.get("visitId") if item.get("visitId") is not None else item.get("visit_id")
+                )
                 resolved_interval_id, resolved_visit_id = self._resolve_interval_and_visit(
                     study_key, raw_subj_key, item
                 )
+
+                def _select_candidate_record(
+                    candidates: list[dict[str, Any]],
+                    current_data: dict[str, Any],
+                ) -> dict[str, Any] | None:
+                    if not candidates:
+                        return None
+                    if len(candidates) == 1 or not current_data:
+                        return candidates[0]
+                    data_keys = set(current_data)
+                    var_pool = [
+                        v for v in self.variables if v.get("studyKey") == study_key
+                    ] or self.variables
+                    for cand in candidates:
+                        cand_data = cand.get("recordData") or {}
+                        if data_keys & set(cand_data):
+                            return cand
+                        cand_fk = cand.get("formKey")
+                        cand_fid = cand.get("formId")
+                        cand_vars = {
+                            str(v.get("variableName"))
+                            for v in var_pool
+                            if (cand_fk and v.get("formKey") == cand_fk)
+                            or (cand_fid is not None and v.get("formId") == cand_fid)
+                        }
+                        if data_keys & cand_vars:
+                            return cand
+                    return candidates[0]
 
                 existing_record: dict[str, Any] | None = None
                 if requested_rec_id is not None:
@@ -1076,19 +1123,56 @@ class SimulationState:
                         ),
                         None,
                     )
-                elif raw_subj_key and resolved_interval_id is not None:
+                elif record_oid is not None:
                     existing_record = next(
                         (
                             r
                             for r in self.records
                             if r.get("studyKey") == study_key
-                            and r.get("subjectKey") == raw_subj_key
-                            and (r.get("formKey") == form_key or r.get("formId") == form_id)
-                            and r.get("intervalId") == resolved_interval_id
-                            and not r.get("deleted", False)
+                            and (
+                                r.get("recordOid") == record_oid
+                                or f"REC-{r.get('recordId')}" == record_oid
+                            )
                         ),
                         None,
                     )
+                elif raw_visit_id is not None and resolved_visit_id is not None:
+                    visit_candidates = [
+                        r
+                        for r in self.records
+                        if r.get("studyKey") == study_key
+                        and r.get("visitId") == resolved_visit_id
+                        and not r.get("deleted", False)
+                        and (not raw_subj_key or r.get("subjectKey") == raw_subj_key)
+                        and (
+                            not has_explicit_form
+                            or r.get("formKey") == form_key
+                            or r.get("formId") == form_id
+                        )
+                    ]
+                    existing_record = _select_candidate_record(visit_candidates, rec_data)
+                elif resolved_interval_id is not None and (
+                    raw_subj_key or not is_registration_item
+                ):
+                    interval_candidates = [
+                        r
+                        for r in self.records
+                        if r.get("studyKey") == study_key
+                        and (not raw_subj_key or r.get("subjectKey") == raw_subj_key)
+                        and (
+                            not has_explicit_form
+                            or r.get("formKey") == form_key
+                            or r.get("formId") == form_id
+                        )
+                        and r.get("intervalId") == resolved_interval_id
+                        and not r.get("deleted", False)
+                    ]
+                    if (
+                        raw_subj_key
+                        or len(interval_candidates) == 1
+                        or (interval_candidates and rec_data)
+                    ):
+                        existing_record = _select_candidate_record(interval_candidates, rec_data)
 
                 modified_ts = str(
                     item.get("dateModified") or item.get("date_modified") or "2026-11-15T00:00:00Z"
@@ -1096,13 +1180,21 @@ class SimulationState:
                 updated_ts = str(item.get("lastUpdated") or item.get("last_updated") or modified_ts)
                 user_str = str(item.get("user") or "sim_user")
                 role_str = str(item.get("role") or "Investigator")
-                record_oid = item.get("recordOid") or item.get("record_oid")
-                subject_oid = item.get("subjectOid") or item.get("subject_oid")
+                raw_subject_oid = item.get("subjectOid") or item.get("subject_oid")
+                subject_oid = (
+                    str(raw_subject_oid).strip()
+                    if raw_subject_oid is not None and str(raw_subject_oid).strip()
+                    else None
+                )
 
                 if existing_record is not None:
                     rec_id = int(existing_record["recordId"])
                     subj_id = int(existing_record.get("subjectId", 201))
                     subj_key = raw_subj_key or str(existing_record.get("subjectKey", "SUB1"))
+                    if not has_explicit_form:
+                        form_key = str(existing_record.get("formKey") or form_key)
+                        if existing_record.get("formId") is not None:
+                            form_id = int(existing_record["formId"])
                     prev_data = copy.deepcopy(existing_record.get("recordData") or {})
                     merged_data = copy.deepcopy(prev_data)
                     merged_data.update(rec_data)
@@ -1134,8 +1226,12 @@ class SimulationState:
                     data_changed = merged_data != prev_data
                     existing_record["recordData"] = merged_data
                     existing_record["formKey"] = form_key
-                    if existing_record.get("formId") is None:
+                    if existing_record.get("formId") is None or has_explicit_form:
                         existing_record["formId"] = form_id
+                    if record_oid is not None:
+                        existing_record["recordOid"] = record_oid
+                    else:
+                        existing_record.setdefault("recordOid", f"REC-{rec_id}")
                     existing_record["dateModified"] = modified_ts
                     existing_record["lastUpdated"] = updated_ts
 
@@ -1218,25 +1314,24 @@ class SimulationState:
                         )
                         self._next_subject_id = max(self._next_subject_id, max_subj_id) + 1
                         subj_id = self._next_subject_id
-                    self.subjects.append(
-                        {
-                            "subjectId": subj_id,
-                            "subjectKey": subj_key,
-                            "studyKey": study_key,
-                            "siteId": site_id,
-                            "siteName": site_name,
-                            "subjectStatus": str(
-                                item.get("subjectStatus")
-                                or item.get("subject_status")
-                                or "Enrolled"
-                            ),
-                            "deleted": False,
-                            "keywords": copy.deepcopy(item.get("keywords", [])),
-                            "dateCreated": created_ts,
-                            "dateModified": modified_ts,
-                            "lastUpdated": updated_ts,
-                        }
-                    )
+                    new_subject: dict[str, Any] = {
+                        "subjectId": subj_id,
+                        "subjectKey": subj_key,
+                        "studyKey": study_key,
+                        "siteId": site_id,
+                        "siteName": site_name,
+                        "subjectStatus": str(
+                            item.get("subjectStatus") or item.get("subject_status") or "Enrolled"
+                        ),
+                        "deleted": False,
+                        "keywords": copy.deepcopy(item.get("keywords", [])),
+                        "dateCreated": created_ts,
+                        "dateModified": modified_ts,
+                        "lastUpdated": updated_ts,
+                    }
+                    if subject_oid is not None:
+                        new_subject["subjectOid"] = subject_oid
+                    self.subjects.append(new_subject)
 
                 if resolved_interval_id is not None and resolved_visit_id is None:
                     _, resolved_visit_id = self._resolve_interval_and_visit(
@@ -1255,6 +1350,7 @@ class SimulationState:
 
                 record_entry = {
                     "recordId": rec_id,
+                    "recordOid": record_oid if record_oid is not None else f"REC-{rec_id}",
                     "studyKey": study_key,
                     "subjectKey": subj_key,
                     "subjectId": subj_id,

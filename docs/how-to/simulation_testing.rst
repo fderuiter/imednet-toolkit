@@ -12,13 +12,13 @@ Enabling Simulation Mode in ``ImednetSDK``
 Pass ``simulation_mode=True`` to :class:`~imednet.ImednetSDK` or
 :class:`~imednet.AsyncImednetSDK`—or set ``IMEDNET_SIMULATION_MODE=true`` in the
 environment—to route all endpoint requests through ``SimulationTransport`` backed
-by Study-coherent fixtures across ``Study`` ``"STUDY"`` (``Site`` ``"SITE"`` and
-``Subject`` ``"SUB1"``), ``"DEMO-STUDY"`` (``Site`` ``"North Site"`` and ``Subject``
-``"SUBJ-001"``), and ``"MY_STUDY"`` (``Site`` ``"Main Site"`` and ``Subject``
-``"SUB1"``), including ``Form`` definitions ``"F_DM"`` and ``"F_VS"``, ``Visit`` /
-``Interval`` schedules, ``Record`` items, ``RecordRevision`` audit entries, typed
-``Query`` items (``"record"`` and ``"question"``), and Study-isolated ``Job``
-batches:
+by deterministic, Study-coherent fixtures across ``Study`` ``"STUDY"`` (``Site``
+``"SITE"`` and ``Subject`` ``"SUB1"``), ``"DEMO-STUDY"`` (``Site`` ``"North Site"``
+and ``Subject`` ``"SUBJ-001"``), and ``"MY_STUDY"`` (``Site`` ``"Main Site"`` and
+``Subject`` ``"SUB1"``), including ``Form`` definitions ``"F_DM"`` and ``"F_VS"``,
+``Visit`` / ``Interval`` schedules, ``Record`` items, ``RecordRevision`` audit
+entries, typed ``Query`` items (``"record"`` and ``"question"``), and Study-isolated
+``Job`` batches:
 
 .. testcode::
 
@@ -28,6 +28,8 @@ batches:
    with ImednetSDK(simulation_mode=True) as sdk:
        studies = list(sdk.studies.list())
        forms = list(sdk.forms.list(study_key="STUDY"))
+       assert len(studies) >= 1
+       assert len(forms) == 2
        job = sdk.records.create(
            "STUDY",
            [

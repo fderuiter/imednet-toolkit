@@ -285,6 +285,75 @@ before emitting a ``TriggerEvent``.
        deferrable=True,
    )
 
+URL Path Segment Validation Across Operators, Sensors, and Triggers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Airflow tasks frequently populate ``study_key`` and ``batch_id`` dynamically from DAG
+parameters, mapped upstream XComs, or external REST payloads covering ``Study``,
+``Subject``, ``Site``, ``Form``, ``Record``, ``Visit``, ``Interval``, ``Variable``,
+``Query``, ``Data Dictionary``, and ``Job`` pipelines. Every provider entry point
+validates dynamic URL segments through :func:`~imednet.utils.validate_path_segment`
+(before formatting endpoints via :func:`~imednet.utils.build_safe_path`) and raises
+:class:`~imednet.errors.PathTraversalValidationError` (``status_code=400``) before
+opening connections or issuing HTTP requests:
+
+- ``ImednetExportOperator.execute()`` validates templated ``study_key`` immediately after
+  checking templated attributes for embedded credentials.
+- ``ImednetJobSensor.poke()`` and ``ImednetJobSensor.execute()`` validate both
+  ``study_key`` and ``batch_id`` prior to synchronous job polling or deferrable handoff.
+- :class:`~apache_airflow_providers_imednet.triggers.ImednetJobTrigger` validates
+  ``study_key`` and ``batch_id`` in both ``__init__()`` and ``run()`` alongside
+  control-character and secret-token guards.
+
+.. testcode::
+
+   import contextlib
+   import io
+   from typing import Any, cast
+   from apache_airflow_providers_imednet import (
+       ImednetExportOperator,
+       ImednetJobSensor,
+       ImednetJobTrigger,
+   )
+   from imednet.errors import PathTraversalValidationError
+   from imednet.utils import build_safe_path, validate_path_segment
+
+   assert validate_path_segment("MY_STUDY", name="study_key") == "MY_STUDY"
+   assert (
+       build_safe_path("studies", "MY_STUDY", "jobs", "BATCH_001")
+       == "studies/MY_STUDY/jobs/BATCH_001"
+   )
+
+   bad_export_op = ImednetExportOperator(
+       task_id="reject_traversal_export",
+       study_key="../escape",
+       destination="csv",
+   )
+   op_rejected = False
+   try:
+       with contextlib.redirect_stdout(io.StringIO()):
+           ImednetExportOperator.execute(bad_export_op, cast(Any, {}))
+   except PathTraversalValidationError as op_path_err:
+       op_rejected = True
+       assert op_path_err.status_code == 400
+   assert op_rejected
+
+   bad_job_sensor = ImednetJobSensor(
+       task_id="reject_traversal_sensor",
+       study_key="MY_STUDY",
+       batch_id="%2e%2e%2fsecret",
+       deferrable=False,
+   )
+   try:
+       bad_job_sensor.poke(cast(Any, {}))
+   except PathTraversalValidationError as sensor_path_err:
+       assert sensor_path_err.status_code == 400
+
+   try:
+       ImednetJobTrigger(study_key="MY_STUDY", batch_id="../escape")
+   except PathTraversalValidationError as trigger_path_err:
+       assert trigger_path_err.status_code == 400
+
 OpenLineage Dataset Facets
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
