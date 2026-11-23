@@ -8,15 +8,18 @@ import math
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
-from imednet.spi.sinks import redact_uri
 from imednet.spi.utils import (
     AsyncJobPoller,
-    redact_sensitive_payload,
-    redact_sensitive_text,
+    JobTimeoutError,
     validate_path_segment,
 )
 
 from ._airflow_compat import AirflowException, BaseTrigger, TriggerEvent
+from ._guards import (
+    build_job_summary,
+    scrub_job_error_message,
+    validate_non_secret_identifier,
+)
 from .hooks import ImednetHook
 
 
@@ -27,39 +30,18 @@ def _validate_trigger_identifier(
     path_segment: bool = False,
 ) -> str:
     """Validate a trigger identifier and reject blank, unsafe, or credential-bearing strings."""
-    if not isinstance(value, str) or not value.strip():
-        raise AirflowException(f"'{field_name}' must be a non-empty string.")
-    if "://" in value and "://***@" not in value and redact_uri(value) != value:
-        raise AirflowException(
-            f"Plaintext URI credentials are not allowed in trigger parameter '{field_name}'."
-        )
-    existing_masks = value.count("***")
-    if (
-        redact_sensitive_text(value).count("***") > existing_masks
-        or str(redact_sensitive_payload(value)).count("***") > existing_masks
-    ):
-        raise AirflowException(
-            f"Sensitive credentials or tokens are not allowed in trigger parameter '{field_name}'."
-        )
-    if path_segment:
-        validate_path_segment(value, name=field_name)
-    return value
+    return validate_non_secret_identifier(
+        value,
+        field_name=field_name,
+        path_segment=path_segment,
+        parameter_kind="trigger parameter",
+    )
 
 
 def _make_trigger_event(payload: dict[str, Any]) -> TriggerEvent:
     """Instantiate ``TriggerEvent`` cleanly under strict MyPy."""
     event_cls: Any = TriggerEvent
     return cast(TriggerEvent, event_cls(payload))
-
-
-def _sanitize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Redact pre-signed URLs and inline credentials from serialized job metadata."""
-    sanitized = dict(payload)
-    for field_name in ("result_url", "resultUrl", "result_error", "resultError"):
-        raw_val = sanitized.get(field_name)
-        if isinstance(raw_val, str) and raw_val:
-            sanitized[field_name] = str(redact_sensitive_payload(redact_sensitive_text(raw_val)))
-    return sanitized
 
 
 class ImednetJobTrigger(BaseTrigger):
@@ -146,12 +128,11 @@ class ImednetJobTrigger(BaseTrigger):
                     interval=self.poke_interval,
                     timeout=effective_timeout,
                 )
-            job_payload: dict[str, Any] | None = None
-            model_dump = getattr(status, "model_dump", None)
-            if callable(model_dump):
-                dumped = model_dump(mode="json")
-                if isinstance(dumped, dict):
-                    job_payload = _sanitize_job_payload(dumped)
+            job_payload = build_job_summary(
+                status,
+                study_key=self.study_key,
+                batch_id=self.batch_id,
+            )
             yield _make_trigger_event(
                 {
                     "status": "success",
@@ -163,9 +144,18 @@ class ImednetJobTrigger(BaseTrigger):
             )
         except asyncio.CancelledError:
             raise
+        except JobTimeoutError as exc:
+            safe_timeout = await hook.redact_error_message(scrub_job_error_message(exc))
+            yield _make_trigger_event(
+                {
+                    "status": "timeout",
+                    "study_key": self.study_key,
+                    "batch_id": self.batch_id,
+                    "message": safe_timeout or exc.__class__.__name__,
+                }
+            )
         except Exception as exc:
-            hook_message = await hook.redact_error_message(str(exc))
-            safe_message = str(redact_sensitive_payload(redact_sensitive_text(hook_message)))
+            safe_message = await hook.redact_error_message(scrub_job_error_message(exc))
             yield _make_trigger_event(
                 {
                     "status": "error",

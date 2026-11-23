@@ -359,6 +359,10 @@ def test_uat_execution_engine_routes_polling_through_facade_poll_jobs() -> None:
                         "resultUrl": S3_RESULT_URL,
                     },
                 )
+            if request.method == "GET" and request.url.path.endswith(
+                ("/forms", "/variables", "/intervals", "/sites", "/subjects")
+            ):
+                return httpx.Response(200, json={"data": []})
         if request.url.host == "imednet-results.s3.us-east-1.amazonaws.com":
             s3_headers_seen.append({k.lower(): v for k, v in request.headers.items()})
             return httpx.Response(

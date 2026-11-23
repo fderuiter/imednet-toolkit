@@ -297,15 +297,20 @@ def test_airflow_job_sensor_stale_response_protection(monkeypatch: pytest.Monkey
         sdk.jobs.get.return_value = running_job
         assert sensor.poke({}) is False
 
-        # 2. Terminal completion poke -> returns True
+        # 2. Terminal completion poke -> returns PokeReturnValue with is_done=True
         completed_job = JobStatus(batchId="B", state="COMPLETED")
         sdk.jobs.get.return_value = completed_job
-        assert sensor.poke({}) is True
+        terminal_poke = sensor.poke({})
+        assert isinstance(terminal_poke, sensors.PokeReturnValue)
+        assert bool(terminal_poke) is True
 
-        # 3. Subsequent stale non-terminal poke -> succeeds deterministically (returns True)
+        # 3. Subsequent stale non-terminal poke -> succeeds deterministically with cached summary
         stale_job = JobStatus(batchId="B", state="RUNNING")
         sdk.jobs.get.return_value = stale_job
-        assert sensor.poke({}) is True
+        stale_poke = sensor.poke({})
+        assert isinstance(stale_poke, sensors.PokeReturnValue)
+        assert bool(stale_poke) is True
+        assert stale_poke.xcom_value == terminal_poke.xcom_value
     finally:
         for mod in list(sys.modules):
             if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
-import re
 import sys
 from collections.abc import Mapping, MutableMapping
 from contextlib import closing
@@ -20,7 +20,11 @@ from imednet.spi.utils import (
     sanitize_base_url,
 )
 
-from .._airflow_compat import BaseHook
+from .._airflow_compat import (
+    AirflowNotFoundException,
+    AirflowSecretsBackendAccessDenied,
+    BaseHook,
+)
 
 Primitive = Union[str, int, float, bool, None]  # noqa: UP007
 # Primitive-only payload contract for discovery helpers that feed Airflow mapping/XCom.
@@ -161,9 +165,39 @@ class ImednetHook(BaseHook):
             return parse_bool(value)
         return None
 
+    @staticmethod
+    def _supervisor_comms() -> Any:
+        """Return active Airflow Task SDK ``SUPERVISOR_COMMS`` instance when present."""
+        try:
+            from airflow.sdk.execution_time import task_runner
+        except (ImportError, ModuleNotFoundError):
+            return None
+        return getattr(task_runner, "SUPERVISOR_COMMS", None)
+
+    @staticmethod
+    def _orm_get_connection_from_secrets(
+        conn_id: str,
+        *,
+        fallback_exc: BaseException,
+    ) -> Any:
+        """Load a database/secrets Connection via Airflow ORM when SUPERVISOR_COMMS is absent."""
+        try:
+            from airflow import settings
+            from airflow.models.connection import Connection as OrmConnection
+        except (ImportError, ModuleNotFoundError):
+            raise fallback_exc from None
+
+        with contextlib.suppress(Exception):
+            if getattr(settings, "Session", None) is None:
+                configure_orm = getattr(settings, "configure_orm", None)
+                if callable(configure_orm):
+                    configure_orm()
+
+        return OrmConnection.get_connection_from_secrets(conn_id)
+
     @classmethod
     def _get_airflow_connection(cls, conn_id: str) -> Any:
-        """Retrieve an Airflow connection across SDK and compatibility shims."""
+        """Retrieve an Airflow connection across SDK, ORM fallback, and compatibility shims."""
         hook_cls: Any
         try:
             from airflow.sdk.bases.hook import BaseHook as SdkBaseHook
@@ -171,7 +205,19 @@ class ImednetHook(BaseHook):
             hook_cls = SdkBaseHook
         except (ImportError, ModuleNotFoundError):
             hook_cls = BaseHook
-        return hook_cls.get_connection(conn_id)
+
+        get_conn_attr = hook_cls.__dict__.get("get_connection")
+        get_mod = getattr(getattr(get_conn_attr, "__func__", get_conn_attr), "__module__", "")
+        is_stock_get = bool(get_mod and get_mod.startswith("airflow."))
+
+        try:
+            return hook_cls.get_connection(conn_id)
+        except AirflowSecretsBackendAccessDenied:
+            raise
+        except AirflowNotFoundException as exc:
+            if is_stock_get and cls._supervisor_comms() is None:
+                return cls._orm_get_connection_from_secrets(conn_id, fallback_exc=exc)
+            raise
 
     @classmethod
     async def _aget_airflow_connection(cls, conn_id: str) -> Any:
@@ -187,6 +233,8 @@ class ImednetHook(BaseHook):
                     if hasattr(custom_aget, "__func__")
                     else await fn(conn_id)
                 )
+            except AirflowSecretsBackendAccessDenied:
+                raise
             except RuntimeError:
                 return await asyncio.to_thread(cls._get_airflow_connection, conn_id)
 
@@ -202,15 +250,35 @@ class ImednetHook(BaseHook):
             hook_cls = BaseHook
 
         get_conn_attr = hook_cls.__dict__.get("get_connection")
+        aget_conn_attr = hook_cls.__dict__.get("aget_connection")
         aget_conn = getattr(hook_cls, "aget_connection", None)
         # Preserve synchronous monkeypatches on BaseHook.get_connection in unit tests
         sync_patched = getattr(getattr(get_conn_attr, "__func__", get_conn_attr), "__module__", "")
+        aget_mod = getattr(getattr(aget_conn_attr, "__func__", aget_conn_attr), "__module__", "")
+        is_stock_aget = bool(aget_mod and aget_mod.startswith("airflow."))
         if callable(aget_conn) and (not sync_patched or sync_patched.startswith("airflow.")):
             try:
                 return await aget_conn(conn_id)
+            except AirflowSecretsBackendAccessDenied:
+                raise
+            except AirflowNotFoundException as exc:
+                comms = cls._supervisor_comms()
+                if is_stock_aget and comms is None:
+                    return await asyncio.to_thread(
+                        cls._orm_get_connection_from_secrets,
+                        conn_id,
+                        fallback_exc=exc,
+                    )
+                if (
+                    is_stock_aget
+                    and comms is not None
+                    and not callable(getattr(comms, "".join(("a", "send")), None))
+                ):
+                    return await asyncio.to_thread(hook_cls.get_connection, conn_id)
+                raise
             except RuntimeError:
-                return await asyncio.to_thread(hook_cls.get_connection, conn_id)
-        return await asyncio.to_thread(hook_cls.get_connection, conn_id)
+                return await asyncio.to_thread(cls._get_airflow_connection, conn_id)
+        return await asyncio.to_thread(cls._get_airflow_connection, conn_id)
 
     @classmethod
     def resolve_destination_connection(cls, conn_id: str, destination: str) -> dict[str, Any]:
@@ -437,8 +505,7 @@ class ImednetHook(BaseHook):
         """Resolve an iMednet base URL from explicit extras first, then Connection host/scheme/port."""
         explicit_base_url = cls._string_or_none(cls._extra_field(extras, "base_url"))
         if explicit_base_url is not None:
-            cleaned_explicit = explicit_base_url.rstrip("/")
-            return re.sub(r"/api/v1(?:/edc)?$", "", cleaned_explicit).rstrip("/")
+            return sanitize_base_url(explicit_base_url)
 
         raw_host = cls._string_or_none(getattr(conn, "host", None))
         if raw_host is None:
@@ -501,6 +568,8 @@ class ImednetHook(BaseHook):
             conn = self._get_airflow_connection(self.imednet_conn_id)
             extras_dict = self._connection_extras(conn)
             raw_url = self._resolve_connection_base_url(conn, extras_dict)
+        except AirflowSecretsBackendAccessDenied:
+            raise
         except Exception:
             raw_url = None
 
@@ -584,11 +653,15 @@ class ImednetHook(BaseHook):
         try:
             try:
                 config = self._resolved_config()
+            except AirflowSecretsBackendAccessDenied:
+                raise
             except Exception:
                 config = None
             with closing(self.get_sdk_client()) as sdk:
                 next(iter(sdk.studies.list()), None)
             return True, "Connection successfully tested"
+        except AirflowSecretsBackendAccessDenied:
+            raise
         except Exception as exc:
             from imednet.spi.sinks import redact_uri
 

@@ -699,14 +699,48 @@ def test_export_operator_jinja_templating_and_secret_rejection() -> None:
     assert "modified_since" not in call_kwargs
     assert call_kwargs["stream_name"] == "csv_blank_watermark_export"
 
-    # Inline secrets in newly templated fields are rejected eagerly at construction and execute()
+    # Non-secret record_filter keys and clinical Variable equality filters are accepted,
+    # while inline credentials, credentialed URIs, and bearer JWTs are rejected eagerly.
+    clinical_op = ImednetExportOperator(
+        task_id="clinical_filter_export",
+        study_key="bearer 1",
+        destination="csv",
+        output_path="/tmp/out.csv",
+        record_filter={"secret": "no", "token": "1"},
+        record_data_filter='TOKEN==1;SECRET==0;PASSWORD==1;NOTES=="bearer of card"',
+        export_kwargs={"auth": "none"},
+    )
+    assert clinical_op.study_key == "bearer 1"
+    assert clinical_op.record_filter == {"secret": "no", "token": "1"}
+    assert clinical_op.export_kwargs == {"auth": "none"}
+
     with pytest.raises(AirflowException, match="Secret key"):
+        ImednetExportOperator(
+            task_id="secret_auth_tuple_export",
+            study_key="STUDY_JINJA",
+            destination="neo4j",
+            export_kwargs={"auth": ("neo4j", "do-not-allow")},  # pragma: allowlist secret
+        )
+
+    with pytest.raises(AirflowException, match="Embedded credentials"):
         ImednetExportOperator(
             task_id="secret_filter_export",
             study_key="STUDY_JINJA",
             destination="csv",
             output_path="/tmp/out.csv",
-            record_filter=[{"api_key": "do-not-allow"}],  # pragma: allowlist secret
+            record_filter=[{"filter": "api_key=do-not-allow"}],  # pragma: allowlist secret
+        )
+
+    with pytest.raises(AirflowException, match="Embedded credentials"):
+        ImednetExportOperator(
+            task_id="secret_jwt_export",
+            study_key="STUDY_JINJA",
+            destination="csv",
+            output_path="/tmp/out.csv",
+            record_data_filter=(
+                "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"  # pragma: allowlist secret
+                ".eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl"
+            ),
         )
 
     with pytest.raises(AirflowException, match="Embedded credentials"):
@@ -1074,10 +1108,11 @@ def test_airflow_hook_trigger_and_sensor_redact_presigned_sas_file_and_userinfo(
         for canary in (canary_s3, canary_gcs, canary_sas, canary_sql, canary_pat):
             assert canary not in err_events[0].payload["message"]
 
-        # Trigger success event masks pre-signed resultUrl while preserving study/clinical records
+        # Trigger success event masks pre-signed resultUrl while excluding raw results per summary contract
         ok_job = JobStatus.model_validate(
             {
                 "batchId": "B_AF_OK",
+                "studyKey": "S_AF",
                 "state": "COMPLETED",
                 "progress": 100,
                 "resultUrl": presigned_url,
@@ -1096,12 +1131,23 @@ def test_airflow_hook_trigger_and_sensor_redact_presigned_sas_file_and_userinfo(
             ok_events = [ev async for ev in ok_trigger.run()]
 
         assert ok_events[0].payload["status"] == "success"
+        assert "results" not in ok_events[0].payload["job"]
         dumped_str = str(ok_events[0].payload)
         for canary in (canary_s3, canary_gcs, canary_sas, canary_pat):
             assert canary not in dumped_str
-        assert "ROW_1" in dumped_str
+        assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in dumped_str
+        assert "sv=2024-11-04" in dumped_str
 
     asyncio.run(_run_async_checks())
+
+    primitive_doc = ImednetHook._to_primitive(
+        {"study_key": "S_AF", "key": "ROW_1", "resultUrl": presigned_url}
+    )
+    assert isinstance(primitive_doc, dict)
+    assert primitive_doc["study_key"] == "S_AF"
+    assert primitive_doc["key"] == "ROW_1"
+    for canary in (canary_s3, canary_gcs, canary_sas, canary_pat):
+        assert canary not in str(primitive_doc["resultUrl"])
 
     sensor = ImednetJobSensor(task_id="wait_af", study_key="S_AF", batch_id="B_AF", deferrable=True)
     with pytest.raises(AirflowException) as sensor_err:
@@ -1110,3 +1156,333 @@ def test_airflow_hook_trigger_and_sensor_redact_presigned_sas_file_and_userinfo(
         assert canary not in str(sensor_err.value)
     assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in str(sensor_err.value)
     assert "mode=rw" in str(sensor_err.value)
+
+    completed_summary = sensor.execute_complete(
+        {},
+        {"status": "success", "job": {"batch_id": "B_AF", "result_url": presigned_url}},
+    )
+    for canary in (canary_s3, canary_gcs, canary_sas, canary_pat):
+        assert canary not in str(completed_summary)
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in str(completed_summary)
+
+
+def test_trigger_and_sensor_phi_scrubbing_timeout_and_lexical_id_guards() -> None:
+    """Verify PHI-free Job summaries, PHI-scrubbed Record errors, timeout events, and ID guards."""
+    from apache_airflow_providers_imednet._airflow_compat import (
+        AirflowException,
+        AirflowSecretsBackendAccessDenied,
+        AirflowSensorTimeout,
+        AirflowSkipException,
+        PokeReturnValue,
+    )
+    from apache_airflow_providers_imednet.get_provider_info import get_provider_info
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.sensors import ImednetJobSensor
+    from apache_airflow_providers_imednet.triggers import ImednetJobTrigger
+    from imednet.spi.models import JobStatus
+
+    # 1. UI placeholder keys match identically between get_provider_info and ImednetHook
+    assert (
+        get_provider_info()["connection-types"][0]["ui-field-behaviour"]["placeholders"]
+        == ImednetHook.get_ui_field_behaviour()["placeholders"]
+    )
+    assert set(ImednetHook.get_ui_field_behaviour()["placeholders"]) == {
+        "login",
+        "password",
+        "extra__imednet__base_url",
+        "extra__imednet__timeout",
+    }
+
+    # 2. Trigger & Sensor lexical ID guards accept "bearer 1" and clinical == tokens, reject secrets
+    ok_trigger = ImednetJobTrigger(
+        study_key="bearer 1",
+        batch_id="TOKEN==1",
+        imednet_conn_id="imednet_conn_1",
+        poke_interval=1.0,
+    )
+    assert ok_trigger.study_key == "bearer 1"
+    assert ok_trigger.batch_id == "TOKEN==1"
+
+    for bad_id in (
+        "api_key=leak",  # pragma: allowlist secret
+        "https://user:secret@host",  # pragma: allowlist secret
+        "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.c2ln",  # pragma: allowlist secret
+    ):
+        with pytest.raises(AirflowException):
+            ImednetJobTrigger(study_key="S1", batch_id="B1", imednet_conn_id=bad_id)
+
+    sensor_bad_conn = ImednetJobSensor(
+        task_id="bad_conn_sensor",
+        study_key="S1",
+        batch_id="B1",
+        imednet_conn_id="api_key=leak",  # pragma: allowlist secret
+    )
+    assert "imednet_conn_id" in ImednetJobSensor.template_fields
+    with pytest.raises(AirflowException, match="imednet_conn_id"):
+        sensor_bad_conn.poke({})
+    sensor_bad_conn.deferrable = True
+    with pytest.raises(AirflowException, match="imednet_conn_id"):
+        sensor_bad_conn.execute({})
+
+    # 3. PHI-free summary parity & per-Record PHI scrubbing across sync poke and async trigger
+    def _make_terminal_job(*, failed_record: bool = False) -> JobStatus:
+        payload: dict[str, Any] = {
+            "batchId": "BATCH_PHI",
+            "studyKey": "STUDY_PHI",
+            "state": "COMPLETED",
+            "progress": 100,
+            "patient_name": "Alice Clinical",
+            "resultUrl": "https://edc.trn.imednetapi.com/results/BATCH_PHI.json",
+        }
+        return JobStatus.model_validate(payload)
+
+    ok_records = [
+        {
+            "recordKey": "REC-1",
+            "subjectKey": "SUBJ-SECRET-01",
+            "patient_name": "Alice Clinical",
+            "dob": "1980-05-10",
+            "status": "SUCCESS",
+        }
+    ]
+    fail_records = [
+        {
+            "recordKey": "REC-2",
+            "subjectKey": "SUBJ-SECRET-02",
+            "patient_name": "Bob Clinical",
+            "ssn": "123-45-6789",
+            "status": "FAILED",
+            "error": {
+                "patient_name": "Bob Clinical",
+                "dob": "1975-02-20",
+                "reason": "Out of protocol window",
+            },
+        }
+    ]
+
+    sync_sdk_ok = SimpleNamespace(
+        jobs=SimpleNamespace(
+            get=lambda _sk, _bid: _make_terminal_job(),
+            fetch_result=lambda _url: list(ok_records),
+        ),
+        close=lambda: None,
+    )
+    sync_sensor = ImednetJobSensor(
+        task_id="sync_phi",
+        study_key="STUDY_PHI",
+        batch_id="BATCH_PHI",
+        deferrable=False,
+    )
+    with patch.object(ImednetJobSensor, "_get_sdk", return_value=sync_sdk_ok):
+        poke_ret = sync_sensor.poke({})
+
+    assert isinstance(poke_ret, PokeReturnValue)
+    assert poke_ret.is_done is True
+    sync_summary = poke_ret.xcom_value
+    assert isinstance(sync_summary, dict)
+    assert "results" not in sync_summary
+    assert sync_summary["batch_id"] == "BATCH_PHI"
+    assert sync_summary["state"] == "COMPLETED"
+    assert "Alice Clinical" not in repr(sync_summary)
+    assert "SUBJ-SECRET-01" not in repr(sync_summary)
+    assert "1980-05-10" not in repr(sync_summary)
+
+    # Also verify mask_clinical_phi masks PHI keys directly on Job summary payloads
+    phi_summary_job = SimpleNamespace(
+        batch_id="BATCH_PHI_DICT",
+        state="COMPLETED",
+        is_terminal=True,
+        is_failed=False,
+        is_successful=True,
+        model_dump=lambda mode="json", **kw: {
+            "batch_id": "BATCH_PHI_DICT",
+            "state": "COMPLETED",
+            "patient_name": "Alice Clinical",
+            "dob": "1980-05-10",
+            "results": ok_records,
+        },
+    )
+    phi_dict_sdk = MagicMock()
+    phi_dict_sdk.jobs.get.return_value = phi_summary_job
+    phi_dict_sensor = ImednetJobSensor(
+        task_id="sync_phi_dict",
+        study_key="STUDY_PHI",
+        batch_id="BATCH_PHI_DICT",
+    )
+    with patch.object(ImednetJobSensor, "_get_sdk", return_value=phi_dict_sdk):
+        phi_dict_poke = phi_dict_sensor.poke({})
+    assert isinstance(phi_dict_poke, PokeReturnValue)
+    assert phi_dict_poke.xcom_value == {
+        "batch_id": "BATCH_PHI_DICT",
+        "state": "COMPLETED",
+        "patient_name": "***MASKED***",
+        "dob": "***MASKED***",
+    }
+    assert (
+        phi_dict_sensor.execute_complete(
+            {},
+            {
+                "status": "success",
+                "job": {
+                    "batch_id": "BATCH_PHI_DICT",
+                    "state": "COMPLETED",
+                    "patient_name": "Alice Clinical",
+                    "dob": "1980-05-10",
+                    "results": ok_records,
+                },
+            },
+        )
+        == phi_dict_poke.xcom_value
+    )
+
+    # Stale non-terminal poll after terminal completion returns the same cached PokeReturnValue
+    stale_sdk = MagicMock()
+    stale_sdk.jobs.get.return_value = JobStatus.model_validate(
+        {"batchId": "BATCH_PHI", "state": "PROCESSING"}
+    )
+    with patch.object(ImednetJobSensor, "_get_sdk", return_value=stale_sdk):
+        stale_ret = sync_sensor.poke({})
+    assert isinstance(stale_ret, PokeReturnValue)
+    assert stale_ret.xcom_value == sync_summary
+
+    # Sync poke failure scrubs Subject PHI from per-Record diagnostics
+    sync_sdk_fail = SimpleNamespace(
+        jobs=SimpleNamespace(
+            get=lambda _sk, _bid: _make_terminal_job(failed_record=True),
+            fetch_result=lambda _url: list(fail_records),
+        ),
+        close=lambda: None,
+    )
+    fail_sensor = ImednetJobSensor(
+        task_id="sync_phi_fail",
+        study_key="STUDY_PHI",
+        batch_id="BATCH_PHI",
+        deferrable=False,
+    )
+    with (
+        patch.object(ImednetJobSensor, "_get_sdk", return_value=sync_sdk_fail),
+        pytest.raises(AirflowException, match="Out of protocol window") as sync_err_exc,
+    ):
+        fail_sensor.poke({})
+    assert "Bob Clinical" not in str(sync_err_exc.value)
+    assert "123-45-6789" not in str(sync_err_exc.value)
+    assert "1975-02-20" not in str(sync_err_exc.value)
+    assert "SUBJ-SECRET-02" not in str(sync_err_exc.value)
+    assert "***MASKED***" in str(sync_err_exc.value)
+
+    async def _run_async_checks() -> None:
+        # Async trigger summary matches sync poke summary identically
+        async_sdk_ok = MagicMock()
+        async_sdk_ok.jobs.get = AsyncMock(return_value=_make_terminal_job())
+        async_sdk_ok.jobs.fetch_result = AsyncMock(return_value=list(ok_records))
+        async_sdk_ok.__aenter__ = AsyncMock(return_value=async_sdk_ok)
+        async_sdk_ok.__aexit__ = AsyncMock(return_value=None)
+
+        trig_ok = ImednetJobTrigger(study_key="STUDY_PHI", batch_id="BATCH_PHI", poke_interval=0.01)
+        with patch.object(ImednetHook, "get_async_conn", new=AsyncMock(return_value=async_sdk_ok)):
+            trig_events = [ev async for ev in trig_ok.run()]
+
+        assert len(trig_events) == 1
+        assert trig_events[0].payload["status"] == "success"
+        assert "results" not in trig_events[0].payload["job"]
+        def_sensor = ImednetJobSensor(
+            task_id="def_phi",
+            study_key="STUDY_PHI",
+            batch_id="BATCH_PHI",
+            deferrable=True,
+        )
+        def_summary = def_sensor.execute_complete({}, trig_events[0].payload)
+        assert def_summary == sync_summary
+
+        # Async trigger Record error scrubs PHI before yielding error event
+        async_sdk_fail = MagicMock()
+        async_sdk_fail.jobs.get = AsyncMock(return_value=_make_terminal_job(failed_record=True))
+        async_sdk_fail.jobs.fetch_result = AsyncMock(return_value=list(fail_records))
+        async_sdk_fail.__aenter__ = AsyncMock(return_value=async_sdk_fail)
+        async_sdk_fail.__aexit__ = AsyncMock(return_value=None)
+
+        trig_fail = ImednetJobTrigger(
+            study_key="STUDY_PHI",
+            batch_id="BATCH_PHI",
+            poke_interval=0.01,
+        )
+        with patch.object(
+            ImednetHook, "get_async_conn", new=AsyncMock(return_value=async_sdk_fail)
+        ):
+            err_events = [ev async for ev in trig_fail.run()]
+
+        assert err_events[0].payload["status"] == "error"
+        err_msg = err_events[0].payload["message"]
+        assert "Out of protocol window" in err_msg
+        assert "Bob Clinical" not in err_msg
+        assert "123-45-6789" not in err_msg
+        assert "1975-02-20" not in err_msg
+        assert "SUBJ-SECRET-02" not in err_msg
+
+        # Async trigger timeout emits status="timeout", which soft_fail skips via resume_execution
+        async_sdk_timeout = MagicMock()
+        async_sdk_timeout.jobs.get = AsyncMock(
+            return_value=JobStatus.model_validate({"batchId": "BATCH_TO", "state": "PROCESSING"})
+        )
+        async_sdk_timeout.__aenter__ = AsyncMock(return_value=async_sdk_timeout)
+        async_sdk_timeout.__aexit__ = AsyncMock(return_value=None)
+
+        trig_timeout = ImednetJobTrigger(
+            study_key="STUDY_PHI",
+            batch_id="BATCH_TO",
+            poke_interval=0.01,
+            timeout=0.02,
+        )
+        with patch.object(
+            ImednetHook, "get_async_conn", new=AsyncMock(return_value=async_sdk_timeout)
+        ):
+            to_events = [ev async for ev in trig_timeout.run()]
+
+        assert to_events[0].payload["status"] == "timeout"
+
+        soft_sensor = ImednetJobSensor(
+            task_id="soft_sensor",
+            study_key="STUDY_PHI",
+            batch_id="BATCH_TO",
+            soft_fail=True,
+            deferrable=True,
+        )
+        with pytest.raises(AirflowSkipException):
+            soft_sensor.resume_execution("execute_complete", {"event": to_events[0].payload}, {})
+        with pytest.raises(AirflowException, match="Out of protocol window"):
+            soft_sensor.resume_execution("execute_complete", {"event": err_events[0].payload}, {})
+
+        hard_sensor = ImednetJobSensor(
+            task_id="hard_sensor",
+            study_key="STUDY_PHI",
+            batch_id="BATCH_TO",
+            soft_fail=False,
+            deferrable=True,
+        )
+        with pytest.raises(AirflowSensorTimeout):
+            hard_sensor.resume_execution("execute_complete", {"event": to_events[0].payload}, {})
+
+        # AirflowSecretsBackendAccessDenied propagates immediately across sync, async, and test_connection
+        from airflow.sdk.bases.hook import BaseHook as SdkBaseHook
+
+        with patch.object(
+            SdkBaseHook,
+            "get_connection",
+            side_effect=AirflowSecretsBackendAccessDenied("Denied by Execution API"),
+        ):
+            with pytest.raises(AirflowSecretsBackendAccessDenied):
+                ImednetHook("denied_conn").get_conn()
+            with pytest.raises(AirflowSecretsBackendAccessDenied):
+                ImednetHook("denied_conn").test_connection()
+            with pytest.raises(AirflowSecretsBackendAccessDenied):
+                ImednetHook("denied_conn").get_base_url()
+
+        with patch.object(
+            SdkBaseHook,
+            "aget_connection",
+            new=AsyncMock(side_effect=AirflowSecretsBackendAccessDenied("Denied async")),
+        ):
+            with pytest.raises(AirflowSecretsBackendAccessDenied):
+                await ImednetHook("denied_conn").get_async_conn()
+
+    asyncio.run(_run_async_checks())
