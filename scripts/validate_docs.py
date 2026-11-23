@@ -1394,6 +1394,437 @@ def check_built_html_seo(
     return has_errors
 
 
+_IMEDNET_ENV_NAME_RE = re.compile(r"^IMEDNET_[A-Z0-9_]+$")
+_DOCUMENTED_IMEDNET_ENV_RE = re.compile(r"\b(IMEDNET_[A-Z0-9_]+)\b")
+
+
+def _is_os_environ_expr(node: ast.AST) -> bool:
+    """Return True if AST node represents ``os.environ`` or ``environ``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    ) or (isinstance(node, ast.Name) and node.id == "environ")
+
+
+def _resolve_env_expr(expr: ast.AST, const_map: dict[str, str]) -> list[str]:
+    """Resolve an AST expression to matching ``IMEDNET_*`` environment variable names."""
+    if (
+        isinstance(expr, ast.Constant)
+        and isinstance(expr.value, str)
+        and _IMEDNET_ENV_NAME_RE.match(expr.value)
+    ):
+        return [expr.value]
+    if isinstance(expr, ast.Name) and expr.id in const_map:
+        return [const_map[expr.id]]
+    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+        items: list[str] = []
+        for elt in expr.elts:
+            items.extend(_resolve_env_expr(elt, const_map))
+        return items
+    return []
+
+
+def _extract_runtime_env_vars(packages_dir: Path) -> set[str]:
+    """Extract runtime ``IMEDNET_*`` environment variables read across ``packages/*/src/**/*.py``."""
+    discovered: set[str] = set()
+    if not packages_dir.exists():
+        return discovered
+
+    for py_file in sorted(packages_dir.glob("*/src/**/*.py")):
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+        except (OSError, SyntaxError):
+            continue
+
+        const_map: dict[str, str] = {}
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant):
+                if isinstance(stmt.value.value, str) and _IMEDNET_ENV_NAME_RE.match(
+                    stmt.value.value
+                ):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name):
+                            const_map[target.id] = stmt.value.value
+            elif (
+                isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+                and _IMEDNET_ENV_NAME_RE.match(stmt.value.value)
+            ):
+                const_map[stmt.target.id] = stmt.value.value
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and node.args:
+                func = node.func
+                is_os_getenv = (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "getenv"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                ) or (isinstance(func, ast.Name) and func.id == "getenv")
+                is_environ_method = (
+                    isinstance(func, ast.Attribute)
+                    and func.attr in {"get", "pop", "setdefault"}
+                    and _is_os_environ_expr(func.value)
+                )
+                if is_os_getenv or is_environ_method:
+                    discovered.update(_resolve_env_expr(node.args[0], const_map))
+            elif isinstance(node, ast.Subscript) and _is_os_environ_expr(node.value):
+                discovered.update(_resolve_env_expr(node.slice, const_map))
+            elif isinstance(node, ast.Compare):
+                operands = [node.left, *node.comparators]
+                if any(_is_os_environ_expr(op) for op in operands):
+                    for op in operands:
+                        if not _is_os_environ_expr(op):
+                            discovered.update(_resolve_env_expr(op, const_map))
+            elif isinstance(node, ast.For):
+                candidates = _resolve_env_expr(node.iter, const_map)
+                if candidates and any(
+                    isinstance(sub, ast.Attribute) and sub.attr in {"environ", "getenv"}
+                    for sub in ast.walk(node)
+                ):
+                    discovered.update(candidates)
+
+    return discovered
+
+
+def check_env_vars_documented(repo_root: Path | None = None) -> bool:
+    """Verify every runtime ``IMEDNET_*`` environment variable in ``packages/*/src`` is in ``configuration.rst``."""
+    print("Checking runtime IMEDNET_* environment variables against configuration.rst...")
+    root = repo_root or Path(__file__).resolve().parents[1]
+    config_rst = root / "docs" / "reference" / "configuration.rst"
+    if not config_rst.is_file():
+        print(f"Error: Missing configuration reference at {config_rst}.")
+        return True
+
+    runtime_vars = _extract_runtime_env_vars(root / "packages")
+    documented_vars = set(
+        _DOCUMENTED_IMEDNET_ENV_RE.findall(config_rst.read_text(encoding="utf-8"))
+    )
+    missing = sorted(runtime_vars - documented_vars)
+    if missing:
+        for var_name in missing:
+            print(
+                f"Error: Runtime environment variable '{var_name}' is undocumented in {config_rst}."
+            )
+        return True
+
+    print(
+        f"Environment variable parity verified ({len(runtime_vars)} runtime IMEDNET_* variable(s) documented)."
+    )
+    return False
+
+
+def check_sdtm_and_phi_parity(repo_root: Path | None = None) -> bool:
+    """Verify all SDTM_DOMAIN_SPECS domains, SensitivityRegistry keys, and SinkConfig controls are in record_mapping.rst."""
+    print("Checking SDTM domains and SensitivityRegistry keys against record_mapping.rst...")
+    root = repo_root or Path(__file__).resolve().parents[1]
+    core_src = str(root / "packages" / "core" / "src")
+    if core_src not in sys.path:
+        sys.path.insert(0, core_src)
+
+    record_mapping_rst = root / "docs" / "how-to" / "record_mapping.rst"
+    if not record_mapping_rst.is_file():
+        print(f"Error: Missing record mapping guide at {record_mapping_rst}.")
+        return True
+
+    from imednet.models.sdtm import SDTM_DOMAIN_SPECS
+    from imednet.utils.security import SensitivityRegistry
+
+    content = record_mapping_rst.read_text(encoding="utf-8")
+    registry = SensitivityRegistry()
+    has_errors = False
+
+    for domain_code in sorted(SDTM_DOMAIN_SPECS):
+        if f"``{domain_code}``" not in content:
+            print(
+                f"Error: SDTM domain '{domain_code}' from SDTM_DOMAIN_SPECS is undocumented in {record_mapping_rst}."
+            )
+            has_errors = True
+
+    for phi_key in sorted(registry._sensitive_keys):
+        if f"``{phi_key}``" not in content:
+            print(
+                f"Error: Default PHI key '{phi_key}' from SensitivityRegistry is undocumented in {record_mapping_rst}."
+            )
+            has_errors = True
+
+    for exempt_key in sorted(registry._exempt_keys):
+        if f"``{exempt_key}``" not in content:
+            print(
+                f"Error: Exempt structural key '{exempt_key}' from SensitivityRegistry is undocumented in {record_mapping_rst}."
+            )
+            has_errors = True
+
+    required_sink_controls = (
+        "as_sdtm",
+        "sdtm_domain",
+        "standards_profile",
+        "min_standards_score",
+        "naming_convention",
+    )
+    for ctrl in required_sink_controls:
+        if f"``{ctrl}``" not in content:
+            print(
+                f"Error: SinkConfig SDTM/standards control '{ctrl}' is undocumented in {record_mapping_rst}."
+            )
+            has_errors = True
+
+    if not has_errors:
+        print(
+            f"SDTM and PHI parity verified ({len(SDTM_DOMAIN_SPECS)} domains, "
+            f"{len(registry._sensitive_keys)} sensitive keys, {len(registry._exempt_keys)} exempt keys)."
+        )
+    return has_errors
+
+
+_DUCKDB_CREATE_REL_RE = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
+    re.IGNORECASE,
+)
+_STALE_RECORD_REVISIONS_TABLE_RE = re.compile(
+    r"``record_revisions``\s+tables?\b|FROM\s+record_revisions\b",
+    re.IGNORECASE,
+)
+
+
+def check_duckdb_relations_parity(repo_root: Path | None = None) -> bool:
+    """Verify DuckDB relation names in audit_compliance.rst and CI audit commands in security_exceptions.rst."""
+    print("Checking DuckDB relation names and security audit commands...")
+    root = repo_root or Path(__file__).resolve().parents[1]
+    centralizer_py = (
+        root
+        / "packages"
+        / "plugins-workflows"
+        / "src"
+        / "imednet_workflows"
+        / "duckdb_centralizer.py"
+    )
+    audit_rst = root / "docs" / "how-to" / "audit_compliance.rst"
+    security_rst = root / "docs" / "reference" / "security_exceptions.rst"
+
+    for required_path in (centralizer_py, audit_rst, security_rst):
+        if not required_path.is_file():
+            print(f"Error: Missing required file for parity validation: {required_path}.")
+            return True
+
+    centralizer_text = centralizer_py.read_text(encoding="utf-8")
+    expected_relations = set(_DUCKDB_CREATE_REL_RE.findall(centralizer_text))
+    if not expected_relations:
+        print(f"Error: Could not extract any DuckDB relations from {centralizer_py}.")
+        return True
+
+    audit_text = audit_rst.read_text(encoding="utf-8")
+    has_errors = False
+
+    for rel_name in sorted(expected_relations):
+        if f"``{rel_name}``" not in audit_text:
+            print(
+                f"Error: DuckDB relation '{rel_name}' from duckdb_centralizer.py is missing from {audit_rst}."
+            )
+            has_errors = True
+
+    for forbidden_token in ("silver_records_history", "valid_from", "valid_to"):
+        if forbidden_token in audit_text:
+            print(f"Error: Stale DuckDB relation/column '{forbidden_token}' found in {audit_rst}.")
+            has_errors = True
+
+    if _STALE_RECORD_REVISIONS_TABLE_RE.search(audit_text):
+        print(
+            f"Error: Stale 'record_revisions' DuckDB table reference found in {audit_rst} "
+            "(expected 'bronze_revisions')."
+        )
+        has_errors = True
+
+    security_text = security_rst.read_text(encoding="utf-8")
+    if "lint:audit" in security_text:
+        print(
+            f"Error: Stale 'lint:audit' command found in {security_rst}; expected locked uv export + pip-audit."
+        )
+        has_errors = True
+    if "uv export" not in security_text or "pip-audit" not in security_text:
+        print(f"Error: {security_rst} must document the CI 'uv export' + 'pip-audit' workflow.")
+        has_errors = True
+
+    if not has_errors:
+        print(f"DuckDB relation and security audit parity verified ({sorted(expected_relations)}).")
+    return has_errors
+
+
+class _ComplianceLinkParser(HTMLParser):
+    """Parse HTML page anchors, internal links, and unlinked Sphinx Python cross-references."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ids: set[str] = set()
+        self.internal_links: list[tuple[str, str]] = []
+        self.unlinked_py_xrefs: list[str] = []
+        self._active_href: str | None = None
+        self._link_text_parts: list[str] = []
+        self._in_unlinked_xref = False
+        self._xref_depth = 0
+        self._xref_text_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = dict(attrs)
+        elem_id = attr_map.get("id")
+        if elem_id:
+            self.ids.add(elem_id)
+
+        classes = set((attr_map.get("class") or "").split())
+        if tag == "a" and "reference" in classes and "internal" in classes:
+            href = attr_map.get("href")
+            if href:
+                self._active_href = href
+                self._link_text_parts = []
+
+        if self._in_unlinked_xref:
+            self._xref_depth += 1
+        elif tag == "code" and "xref" in classes and "py" in classes and self._active_href is None:
+            self._in_unlinked_xref = True
+            self._xref_depth = 1
+            self._xref_text_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._active_href is not None:
+            self._link_text_parts.append(data)
+        if self._in_unlinked_xref:
+            self._xref_text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._active_href is not None:
+            self.internal_links.append((self._active_href, "".join(self._link_text_parts).strip()))
+            self._active_href = None
+            self._link_text_parts = []
+        if self._in_unlinked_xref:
+            self._xref_depth -= 1
+            if self._xref_depth <= 0:
+                text = "".join(self._xref_text_parts).strip()
+                if text:
+                    self.unlinked_py_xrefs.append(text)
+                self._in_unlinked_xref = False
+                self._xref_text_parts = []
+
+
+_FIRST_PARTY_XREF_PREFIXES = (
+    "imednet",
+    "apache_airflow_providers_imednet",
+    "RecordRevision",
+    "ConfigVersionStore",
+    "DuckDBIngestionWorkflow",
+    "OIDCAuth",
+    "AuthStrategy",
+    "ApiKeyAuth",
+    "CredentialSource",
+    "MemoryCredentialStore",
+    "Credentials",
+    "StandardsReadinessValidator",
+    "SinkConfig",
+    "ExportSink",
+    "transform_records_to_sdtm_rows",
+    "evaluate_standards_readiness",
+)
+
+
+def check_compliance_html_links(html_dir: Path | None, *, require_exists: bool = False) -> bool:
+    """Verify compliance/SPI cross-references resolve to valid HTML files and anchor IDs."""
+    if html_dir is None:
+        return False
+
+    print(f"Checking compliance and SPI HTML cross-references in {html_dir}...")
+    if not html_dir.exists():
+        if require_exists:
+            print(f"Error: Rendered HTML directory {html_dir} does not exist.")
+            return True
+        print(f"Skipping compliance HTML link check ({html_dir} not built yet).")
+        return False
+
+    required_page_symbols: dict[str, tuple[str, ...]] = {
+        "how-to/audit_compliance.html": ("RecordRevision.validate_chain",),
+        "explanation/architecture.html": (
+            "transform_records_to_sdtm_rows",
+            "evaluate_standards_readiness",
+        ),
+        "how-to/record_mapping.html": (
+            "transform_records_to_sdtm_rows",
+            "evaluate_standards_readiness",
+        ),
+        "reference/governance.html": ("rollback_config",),
+        "explanation/api_overview.html": ("AuthStrategy", "OIDCAuth", "MemoryCredentialStore"),
+    }
+
+    models_html = html_dir / "reference" / "api" / "imednet.models.html"
+    if not models_html.is_file():
+        print(f"Error: Missing rendered API reference page {models_html}.")
+        return True
+
+    parsed_cache: dict[Path, _ComplianceLinkParser] = {}
+
+    def _get_parsed(page_path: Path) -> _ComplianceLinkParser:
+        resolved = page_path.resolve()
+        if resolved not in parsed_cache:
+            parser = _ComplianceLinkParser()
+            parser.feed(resolved.read_text(encoding="utf-8"))
+            parsed_cache[resolved] = parser
+        return parsed_cache[resolved]
+
+    has_errors = False
+    models_parsed = _get_parsed(models_html)
+    validate_chain_id = "imednet.models.record_revisions.RecordRevision.validate_chain"
+    if validate_chain_id not in models_parsed.ids:
+        print(f"Error: Method anchor '{validate_chain_id}' missing from {models_html}.")
+        has_errors = True
+
+    for rel_page, expected_symbols in required_page_symbols.items():
+        page_path = html_dir / rel_page
+        if not page_path.is_file():
+            print(f"Error: Expected rendered guide {page_path} does not exist.")
+            has_errors = True
+            continue
+
+        parsed = _get_parsed(page_path)
+
+        for unlinked in parsed.unlinked_py_xrefs:
+            if unlinked.startswith(_FIRST_PARTY_XREF_PREFIXES):
+                print(f"Error: Unresolved Python cross-reference '{unlinked}' on {rel_page}.")
+                has_errors = True
+
+        for sym in expected_symbols:
+            matching_hrefs = [href for href, text in parsed.internal_links if sym in text]
+            if not matching_hrefs:
+                print(f"Error: Expected linked cross-reference '{sym}' missing from {rel_page}.")
+                has_errors = True
+
+        for href, link_text in parsed.internal_links:
+            if href.startswith(("http://", "https://", "mailto:")):
+                continue
+            rel_part, _, frag = href.partition("#")
+            target_file = (
+                (page_path.parent / rel_part).resolve() if rel_part else page_path.resolve()
+            )
+            if not target_file.is_file():
+                print(
+                    f"Error: Broken internal link '{href}' ({link_text}) on {rel_page}: target file missing."
+                )
+                has_errors = True
+                continue
+            if frag and frag not in _get_parsed(target_file).ids:
+                print(
+                    f"Error: Broken internal anchor '{href}' ({link_text}) on {rel_page}: '#{frag}' missing."
+                )
+                has_errors = True
+
+    if not has_errors:
+        print(
+            f"Compliance and SPI HTML cross-references verified across {len(required_page_symbols)} guide(s)."
+        )
+    return has_errors
+
+
 DEFAULT_HTML_DIR = Path("docs/_build/html")
 
 
@@ -1423,12 +1854,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     packages_failed = check_packages_registered()
     docs_failed = check_package_docs()
     adr_failed = check_adr_records()
+    env_vars_failed = check_env_vars_documented()
+    sdtm_phi_failed = check_sdtm_and_phi_parity()
+    duckdb_parity_failed = check_duckdb_relations_parity()
     githubpages_failed = check_sphinx_githubpages_extension()
     baseurl_failed = check_sphinx_html_baseurl()
     seo_config_failed = check_sphinx_seo_configuration()
     suppression_failed = check_no_duplicate_suppression()
     api_html_dir = args.html_dir if args.require_html or args.html_dir != DEFAULT_HTML_DIR else None
     api_html_failed = check_rendered_api_reference(api_html_dir)
+    compliance_links_failed = check_compliance_html_links(
+        api_html_dir, require_exists=args.require_html
+    )
     html_seo_failed = check_built_html_seo(args.html_dir, require_exists=args.require_html)
 
     if (
@@ -1438,11 +1875,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         or packages_failed
         or docs_failed
         or adr_failed
+        or env_vars_failed
+        or sdtm_phi_failed
+        or duckdb_parity_failed
         or githubpages_failed
         or baseurl_failed
         or seo_config_failed
         or suppression_failed
         or api_html_failed
+        or compliance_links_failed
         or html_seo_failed
     ):
         print("Validation failed.")
