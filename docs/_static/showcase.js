@@ -580,6 +580,93 @@
     };
 
     // -------------------------------------------------------------------------
+    // Helper: Evaluate QueryStatus.OPEN from nested queryComments
+    // -------------------------------------------------------------------------
+    const QUERY_CLAUSE_SPLIT_RE = /[,;|/()]|\bbut\b/;
+    const QUERY_WORD_TOKEN_RE = /[a-z0-9']+/g;
+    const QUERY_NEGATION_RE = /^(?:not|no|non|un|never|without|neither|nor|cannot|.*n't)$/;
+    const QUERY_ANSWER_TOKEN_RE = /^(?:re)?answer(?:s|ed|ing)?$/;
+    const QUERY_CANCEL_TOKEN_RE = /^(?:re)?cancel(?:s|ed|led|ing|ling|lation)?$/;
+    const QUERY_CLOSE_TOKEN_RE = /^(?:re)?(?:close|closes|closed|closing|closure)$/;
+
+    function hasNonNegatedQueryToken(text, pattern) {
+        if (!text) return false;
+        const clauses = String(text).toLowerCase().split(QUERY_CLAUSE_SPLIT_RE);
+        for (let cIdx = 0; cIdx < clauses.length; cIdx++) {
+            const tokens = clauses[cIdx].match(QUERY_WORD_TOKEN_RE) || [];
+            for (let tIdx = 0; tIdx < tokens.length; tIdx++) {
+                if (pattern.test(tokens[tIdx])) {
+                    const lookback = tokens.slice(Math.max(0, tIdx - 3), tIdx);
+                    const isNegated = lookback.some(function (prev) {
+                        return QUERY_NEGATION_RE.test(prev);
+                    });
+                    if (!isNegated) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    function isOpenQuery(queryItem) {
+        if (!queryItem || typeof queryItem !== "object") return false;
+        if (typeof queryItem.status === "string" && queryItem.status.trim() !== "") {
+            return queryItem.status.trim().toUpperCase() === "OPEN";
+        }
+        const comments = Array.isArray(queryItem.queryComments) ? queryItem.queryComments : [];
+        if (comments.length === 0) return true;
+
+        let latestComment = comments[0];
+        let latestSeq = Number.isInteger(Number(latestComment && latestComment.sequence))
+            ? parseInt(latestComment.sequence, 10)
+            : -1;
+        if (Number.isNaN(latestSeq)) latestSeq = -1;
+        let latestIdx = 0;
+
+        for (let idx = 1; idx < comments.length; idx++) {
+            const commentObj = comments[idx];
+            const parsedSeq =
+                commentObj && commentObj.sequence !== null && commentObj.sequence !== undefined
+                    ? parseInt(commentObj.sequence, 10)
+                    : -1;
+            const seq = Number.isNaN(parsedSeq) ? -1 : parsedSeq;
+            if (seq > latestSeq || (seq === latestSeq && idx > latestIdx)) {
+                latestComment = commentObj;
+                latestSeq = seq;
+                latestIdx = idx;
+            }
+        }
+
+        if (!latestComment || typeof latestComment !== "object") return true;
+        const rawClosed = latestComment.closed;
+        let isClosed = null;
+        if (typeof rawClosed === "boolean") {
+            isClosed = rawClosed;
+        } else if (typeof rawClosed === "string") {
+            const normalizedClosed = rawClosed.trim().toLowerCase();
+            if (normalizedClosed === "true" || normalizedClosed === "false") {
+                isClosed = normalizedClosed === "true";
+            }
+        }
+
+        const rawStatus =
+            latestComment.annotation_status !== undefined && latestComment.annotation_status !== null
+                ? latestComment.annotation_status
+                : latestComment.annotationStatus;
+        const statusText = rawStatus ? String(rawStatus).trim() : "";
+
+        if (isClosed === false) {
+            return !hasNonNegatedQueryToken(statusText, QUERY_ANSWER_TOKEN_RE);
+        }
+        if (isClosed === true) {
+            return false;
+        }
+        if (hasNonNegatedQueryToken(statusText, QUERY_CANCEL_TOKEN_RE)) return false;
+        if (hasNonNegatedQueryToken(statusText, QUERY_ANSWER_TOKEN_RE)) return false;
+        if (hasNonNegatedQueryToken(statusText, QUERY_CLOSE_TOKEN_RE)) return false;
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
     // Helper: Escape HTML
     // -------------------------------------------------------------------------
     function escapeHtml(str) {
@@ -1045,7 +1132,7 @@
                 data = MOCK_DATA.formsCatalog;
                 caption = "Study Forms Catalog (STUDY)";
             } else if (datasetKey === "queries") {
-                data = MOCK_DATA.queries;
+                data = MOCK_DATA.queries.filter(isOpenQuery);
                 caption = "Study Queries Ledger (STUDY)";
             }
 

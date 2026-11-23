@@ -330,7 +330,7 @@ pyodide_config = {
         "IMEDNET_API_KEY": "dummy_api_key",  # pragma: allowlist secret
         "IMEDNET_SECURITY_KEY": "dummy_security_key",  # pragma: allowlist secret
         "SNOWFLAKE_PASSWORD": "dummy_password",  # pragma: allowlist secret
-        "IMEDNET_STUDY_KEY": "MY_STUDY",
+        "IMEDNET_STUDY_KEY": "STUDY",
     },
 }
 
