@@ -1187,10 +1187,10 @@ def calculate_readiness_score(
     *,
     study_key: str | None = None,
 ) -> tuple[float, list[str]]:
-    """Calculate the schema readiness score for a record's data.
+    """Calculate the schema readiness score for a Study Record's data.
 
     Returns:
-        A tuple of (score, list of validation failure reasons).
+        A tuple of (score, list of validation failure or warning reasons).
     """
     variables = (
         schema.variables_for_form(form_key, study_key=study_key)
@@ -1204,21 +1204,44 @@ def calculate_readiness_score(
     if expected_count == 0:
         return 100.0, []
 
+    data_map: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
     valid_count = 0
     reasons: list[str] = []
 
-    unknown = [k for k in data if k not in variables]
+    if not data_map:
+        for name, var in variables.items():
+            constraints = extract_variable_constraints(var)
+            if constraints.required_policy == "yes":
+                reasons.append(f"Missing required variable: {name}")
+            elif constraints.required_policy == "auto_query":
+                reasons.append(f"Auto Query warning for variable {name}: variable is missing")
+        if not reasons:
+            reasons.append("Empty record data")
+        return 0.0, reasons
+
+    unknown = [k for k in data_map if k not in variables]
     if unknown:
         reasons.append(f"Unknown variables: {', '.join(unknown)}")
 
+    has_clinical_data = any(k in variables and not _is_empty_value(v) for k, v in data_map.items())
     is_cache = isinstance(schema, BaseSchemaCache)
 
     for name, var in variables.items():
-        if name not in data:
-            reasons.append(f"Missing expected variable: {name}")
+        if name not in data_map:
+            constraints = extract_variable_constraints(var)
+            if constraints.required_policy == "yes":
+                reasons.append(f"Missing required variable: {name}")
+            elif constraints.required_policy == "auto_query":
+                reasons.append(f"Auto Query warning for variable {name}: variable is missing")
+                if has_clinical_data:
+                    valid_count += 1
+            elif has_clinical_data:
+                valid_count += 1
+            else:
+                reasons.append(f"Missing expected variable: {name}")
             continue
 
-        value = data[name]
+        value = data_map[name]
         vtype = getattr(var, "variable_type", getattr(var, "variableType", None))
         try:
             _check_type(vtype, value)
@@ -1228,6 +1251,8 @@ def calculate_readiness_score(
                     raise ValidationError("Required variable is empty")
                 if constraints.required_policy == "auto_query":
                     reasons.append(f"Auto Query warning for variable {name}: value is empty")
+                if not has_clinical_data:
+                    continue
             elif not is_cache:
                 if constraints.choices:
                     _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
@@ -1249,7 +1274,7 @@ def calculate_readiness_score(
         rules_getter = getattr(schema, "rules_for_form", None)
         if callable(rules_getter):
             report = _LOGIC_EVALUATOR.evaluate_rules(
-                rules_getter(form_key), data, form_key=form_key
+                rules_getter(form_key), dict(data_map), form_key=form_key
             )
             for err in report.errors:
                 reasons.append(f"Rule {err.rule_name} failed: {err.message}")

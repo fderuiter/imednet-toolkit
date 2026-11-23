@@ -115,9 +115,10 @@ records to any supported destination (CSV, Parquet, DuckDB, SQL / ``sql_by_form`
 / ``long_sql``, Snowflake, Neo4j, MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
-``quality_gate_enabled``, and ``min_schema_readiness_score``) work consistently
-across plugin sinks and tabular exports without leaking sink-level options into
-Pandas or JSON writer kwargs. PHI masking is enabled by default
+``quality_gate_enabled`` — ``False`` by default and deterministically forwarded
+to tabular and sink targets — and ``min_schema_readiness_score``) work
+consistently across plugin sinks and tabular exports without leaking sink-level
+options into Pandas or JSON writer kwargs. PHI masking is enabled by default
 (``mask_phi=True``) across all tabular and sink destinations, replacing
 registered ``Subject`` identifiers and committed ``StudyConfiguration``
 ``phiFields`` with ``***MASKED***``; authorized enclave workflows can explicitly

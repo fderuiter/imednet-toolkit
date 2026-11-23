@@ -206,9 +206,12 @@ out explicitly with ``--no-mask-phi``.
 Exports also support native CDISC SDTM transformation (``--as-sdtm`` and
 ``--sdtm-domain``), batch-level CDISC standards readiness gating via
 ``StandardsReadinessValidator`` (``--standards-profile`` and
-``--min-standards-score``), raw variable casing alignment
-(``--naming-convention snake_case|camelCase|sdtm``), and pre-write ``Record``
-schema readiness filtering (``--quality-gate`` and ``--min-readiness-score``):
+``--min-standards-score``), raw ``Variable`` casing alignment
+(``--naming-convention snake_case|camelCase|sdtm``), and opt-in pre-write
+``Record`` schema readiness filtering (disabled by default across all nine
+subcommands, including SQLite per-``Form``, ``--single-table``, and
+``--long-format`` SQL exports; enable with ``--quality-gate`` and optional
+``--min-readiness-score``):
 
 .. code-block:: bash
 
