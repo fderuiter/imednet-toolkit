@@ -501,3 +501,319 @@ def test_sdk_create_records_batch_with_data_dictionary_prevalidates_once() -> No
         assert post_chunks == [100, 5]
     finally:
         sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_coordinator_attaches_summaries_and_supports_raise_on_poll_failure_false() -> (
+    None
+):
+    """Sync and async coordinators attach batch_summary and poll_summary and honor raise_on_poll_failure=False."""
+    from imednet.errors import ApiError
+    from imednet.utils.batch_coordinator import BatchSubmissionSummary
+    from imednet.utils.job_poller import JobTimeoutError
+
+    coordinator = BatchCoordinator(chunk_size=2)
+    records = [{"x": 1}, {"x": 2}, {"x": 3}]
+
+    def submit_chunk(chunk: list[dict[str, Any]]) -> Job:
+        bid = "b1" if chunk[0]["x"] == 1 else "b2"
+        return Job(jobId=f"j-{bid}", batchId=bid, state="PROCESSING")
+
+    def poll_many_fail(batch_ids: list[str]) -> JobPollSummary:
+        return JobPollSummary(
+            study_key="STUDY",
+            results={"b1": JobStatus(batchId="b1", state="COMPLETED")},
+            failures={"b2": JobFailedError("b2", JobStatus(batchId="b2", state="FAILED"))},
+            elapsed_total=1.25,
+        )
+
+    with pytest.raises(JobFailedError) as exc_info:
+        coordinator.submit(
+            "STUDY",
+            records,
+            submit_chunk,
+            wait_for_completion=True,
+            poll_many=poll_many_fail,
+        )
+    assert isinstance(exc_info.value.batch_summary, BatchSubmissionSummary)
+    assert exc_info.value.batch_summary.batch_ids == ["b1", "b2"]
+    assert exc_info.value.batch_summary.jobs[0].state == "COMPLETED"
+    assert exc_info.value.batch_summary.jobs[1].state == "FAILED"
+    assert exc_info.value.poll_summary is exc_info.value.batch_summary.poll_summary
+    assert exc_info.value.poll_summary is not None
+    assert exc_info.value.poll_summary.elapsed_total == 1.25
+
+    no_raise_summary = coordinator.submit(
+        "STUDY",
+        records,
+        submit_chunk,
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+        poll_many=poll_many_fail,
+    )
+    assert no_raise_summary.batch_ids == ["b1", "b2"]
+    assert no_raise_summary.all_successful is False
+    assert no_raise_summary.poll_summary is not None
+    assert "b2" in no_raise_summary.poll_summary.failures
+
+    # Also verify timeout and API error carry batch_summary and poll_summary in async coordinator
+    async_coord = AsyncBatchCoordinator(chunk_size=2)
+
+    async def async_submit(chunk: list[dict[str, Any]]) -> Job:
+        bid = "ab1" if chunk[0]["x"] == 1 else "ab2"
+        return Job(jobId=f"aj-{bid}", batchId=bid, state="PROCESSING")
+
+    for err in (
+        JobTimeoutError("Timed out polling ab2"),
+        ApiError("Upstream 502 while polling ab2", status_code=502),
+    ):
+
+        async def async_poll_err(
+            _bids: list[str],
+            _err: Exception = err,
+        ) -> JobPollSummary:
+            return JobPollSummary(
+                study_key="STUDY",
+                results={"ab1": JobStatus(batchId="ab1", state="COMPLETED")},
+                failures={"ab2": _err},
+                elapsed_total=0.75,
+            )
+
+        with pytest.raises(type(err)) as async_exc:
+            await async_coord.submit(
+                "STUDY",
+                records,
+                async_submit,
+                wait_for_completion=True,
+                poll_many=async_poll_err,
+            )
+        assert isinstance(getattr(async_exc.value, "batch_summary", None), BatchSubmissionSummary)
+        assert getattr(async_exc.value, "poll_summary", None) is not None
+        assert getattr(async_exc.value, "batch_summary").batch_ids == ["ab1", "ab2"]
+
+        suppressed = await async_coord.submit(
+            "STUDY",
+            records,
+            async_submit,
+            wait_for_completion=True,
+            raise_on_poll_failure=False,
+            poll_many=async_poll_err,
+        )
+        assert suppressed.all_successful is False
+        assert suppressed.poll_summary is not None
+        assert "ab2" in suppressed.poll_summary.failures
+
+
+@pytest.mark.asyncio
+async def test_single_poller_and_facade_fallbacks_poll_all_batches_and_measure_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Single-poller and facade fallback loops poll all batch_ids without early abort and measure elapsed_total."""
+    from imednet.errors import ApiError
+    from imednet.utils import batch_coordinator as bc_mod
+    from imednet.utils.batch_coordinator import poll_facade_many_async, poll_facade_many_sync
+    from imednet.utils.job_poller import JobTimeoutError
+
+    clock_state = 10.0
+
+    def step_monotonic() -> float:
+        nonlocal clock_state
+        clock_state += 1.25
+        return clock_state
+
+    monkeypatch.setattr(bc_mod.time, "monotonic", step_monotonic)
+
+    polled_sync: list[str] = []
+
+    def poll_one_sync(bid: str) -> JobStatus:
+        polled_sync.append(bid)
+        if bid == "b1":
+            raise JobTimeoutError("b1 timed out")
+        if bid == "b2":
+            return JobStatus(batchId="b2", state="COMPLETED")
+        raise ApiError("b3 HTTP 503", status_code=503)
+
+    coord = BatchCoordinator(chunk_size=1)
+    summary = coord.submit(
+        "STUDY",
+        [{"x": 1}, {"x": 2}, {"x": 3}],
+        lambda chunk: Job(batchId=f"b{chunk[0]['x']}", state="PROCESSING"),
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+        poll_single=poll_one_sync,
+    )
+    assert polled_sync == ["b1", "b2", "b3"]
+    assert summary.poll_summary is not None
+    assert set(summary.poll_summary.results) == {"b2"}
+    assert set(summary.poll_summary.failures) == {"b1", "b3"}
+    assert summary.poll_summary.elapsed_total == pytest.approx(1.25)
+
+    polled_async: list[str] = []
+
+    async def poll_one_async(bid: str) -> JobStatus:
+        polled_async.append(bid)
+        if bid == "ab1":
+            raise JobFailedError("ab1", JobStatus(batchId="ab1", state="FAILED"))
+        return JobStatus(batchId=bid, state="COMPLETED")
+
+    async_coord = AsyncBatchCoordinator(chunk_size=1)
+    async_summary = await async_coord.submit(
+        "STUDY",
+        [{"x": 1}, {"x": 2}],
+        lambda chunk: _async_return(Job(batchId=f"ab{chunk[0]['x']}", state="PROCESSING")),
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+        poll_single=poll_one_async,
+    )
+    assert polled_async == ["ab1", "ab2"]
+    assert async_summary.poll_summary is not None
+    assert set(async_summary.poll_summary.results) == {"ab2"}
+    assert set(async_summary.poll_summary.failures) == {"ab1"}
+    assert async_summary.poll_summary.elapsed_total == pytest.approx(1.25)
+
+    class _SyncFacadeStub:
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        def poll_job(
+            self, study_key: str, batch_id: str, *, interval: int = 5, timeout: int = 300
+        ) -> JobStatus:
+            self.seen.append(batch_id)
+            if batch_id == "fb1":
+                raise JobTimeoutError("fb1 timeout")
+            return JobStatus(batchId=batch_id, state="COMPLETED")
+
+    sync_stub = _SyncFacadeStub()
+    facade_sync_summary = poll_facade_many_sync(
+        sync_stub, "STUDY", ["fb1", "fb2", "fb3"], poll_interval=0, timeout=1
+    )
+    assert sync_stub.seen == ["fb1", "fb2", "fb3"]
+    assert set(facade_sync_summary.results) == {"fb2", "fb3"}
+    assert set(facade_sync_summary.failures) == {"fb1"}
+    assert facade_sync_summary.elapsed_total == pytest.approx(1.25)
+
+    class _AsyncFacadeStub:
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        async def async_poll_job(
+            self, study_key: str, batch_id: str, *, interval: int = 5, timeout: int = 300
+        ) -> JobStatus:
+            self.seen.append(batch_id)
+            if batch_id == "afb1":
+                raise JobTimeoutError("afb1 timeout")
+            return JobStatus(batchId=batch_id, state="COMPLETED")
+
+    async_stub = _AsyncFacadeStub()
+    facade_async_summary = await poll_facade_many_async(
+        async_stub, "STUDY", ["afb1", "afb2"], poll_interval=0, timeout=1
+    )
+    assert async_stub.seen == ["afb1", "afb2"]
+    assert set(facade_async_summary.results) == {"afb2"}
+    assert set(facade_async_summary.failures) == {"afb1"}
+    assert facade_async_summary.elapsed_total == pytest.approx(1.25)
+
+
+async def _async_return(val: Any) -> Any:
+    return val
+
+
+@pytest.mark.asyncio
+async def test_sdk_and_endpoint_create_records_batch_raise_on_poll_failure_and_422_mapping() -> (
+    None
+):
+    """SDK and endpoint create_batch forward raise_on_poll_failure and map HTTP 422 to ValidationError."""
+    from imednet.errors import ValidationError
+
+    call_idx = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_idx
+        path = request.url.path
+        if request.method == "POST" and path.endswith("/records"):
+            body = json.loads(request.content.decode("utf-8"))
+            if body and body[0].get("trigger422"):
+                return httpx.Response(422, json={"message": "Edit check rule rejected value"})
+            call_idx += 1
+            return httpx.Response(
+                200,
+                json={"jobId": f"J-{call_idx}", "batchId": f"B-{call_idx}", "state": "PROCESSING"},
+            )
+        if request.method == "GET" and "/jobs/B-" in path:
+            bid = path.rsplit("/", 1)[-1]
+            state = "FAILED" if bid.endswith(("2", "4")) else "COMPLETED"
+            return httpx.Response(200, json={"jobId": f"J-{bid}", "batchId": bid, "state": state})
+        return httpx.Response(404)
+
+    records = [{"formKey": "F1", "data": {"age": i}} for i in range(150)]
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        jobs = sdk.create_records_batch(
+            "STUDY",
+            records,
+            skip_validation=True,
+            wait_for_completion=True,
+            interval=0,
+            timeout=5,
+            raise_on_poll_failure=False,
+        )
+        assert [j.state for j in jobs] == ["COMPLETED", "FAILED"]
+
+        with pytest.raises(JobFailedError) as exc_info:
+            sdk.records.create_batch(
+                "STUDY",
+                records,
+                skip_validation=True,
+                wait_for_completion=True,
+                interval=0,
+                timeout=5,
+                raise_on_poll_failure=True,
+            )
+        assert exc_info.value.batch_summary is not None
+        assert exc_info.value.poll_summary is not None
+        assert len(exc_info.value.batch_summary.jobs) == 2
+
+        with pytest.raises(ValidationError):
+            sdk.create_record(
+                "STUDY",
+                [{"formKey": "F1", "trigger422": True, "data": {"age": -5}}],
+                skip_validation=True,
+            )
+    finally:
+        sdk.close()
+
+    call_idx = 0
+    async with AsyncImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(handler),
+    ) as async_sdk:
+        async_jobs = await async_sdk.async_create_records_batch(
+            "STUDY",
+            records,
+            skip_validation=True,
+            wait_for_completion=True,
+            interval=0,
+            timeout=5,
+            raise_on_poll_failure=False,
+        )
+        assert [j.state for j in async_jobs] == ["COMPLETED", "FAILED"]
+
+        with pytest.raises(JobFailedError) as async_exc:
+            await async_sdk.records.create_batch(
+                "STUDY",
+                records,
+                skip_validation=True,
+                wait_for_completion=True,
+                interval=0,
+                timeout=5,
+                raise_on_poll_failure=True,
+            )
+        assert async_exc.value.batch_summary is not None
+        assert async_exc.value.poll_summary is not None

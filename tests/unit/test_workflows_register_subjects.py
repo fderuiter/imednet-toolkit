@@ -163,3 +163,101 @@ def test_register_subjects_skips_soft_deleted_existing_subject_and_filters_activ
         subjects=[deleted_subj, active_subj],
     )
     assert snapshot.active_sites() == [open_site]
+
+
+@pytest.mark.asyncio
+async def test_register_subjects_require_batch_id_and_raise_on_poll_failure_contracts() -> None:
+    """RegisterSubjectsWorkflow sets require_batch_id=wait_for_completion and forwards raise_on_poll_failure."""
+    from unittest.mock import AsyncMock
+
+    from imednet.models.jobs import JobStatus
+    from imednet.utils.job_poller import JobFailedError
+
+    active_site = Site(studyKey="STUDY", siteId=1, siteName="SITE", siteEnrollmentStatus="Active")
+    req = RegisterSubjectRequest(formKey="F", siteName="SITE", subjectKey="SUBJ-1")
+
+    # 1. Sync: empty batchId is non-blocking when wait_for_completion=False, raises ValueError when True
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.get_sites.return_value = [active_site]
+    sync_sdk.create_record.return_value = Job(jobId="1", batchId="", state="PROCESSING")
+
+    wf = RegisterSubjectsWorkflow(sync_sdk)
+    non_blocking = wf.register_subjects_batch("STUDY", [req], wait_for_completion=False)
+    assert len(non_blocking.jobs) == 1
+    assert non_blocking.batch_ids == []
+
+    with pytest.raises(ValueError, match="no batch_id received"):
+        wf.register_subjects_batch("STUDY", [req], wait_for_completion=True)
+
+    # 2. Sync: raise_on_poll_failure=False returns summary/terminal job; True attaches summaries
+    sync_sdk.create_record.return_value = Job(jobId="2", batchId="RB-FAIL", state="PROCESSING")
+    sync_sdk.poll_job.side_effect = lambda *_a, **_kw: (_ for _ in ()).throw(
+        JobFailedError("RB-FAIL", JobStatus(batchId="RB-FAIL", state="FAILED"))
+    )
+    suppressed = wf.register_subjects_batch(
+        "STUDY",
+        [req],
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+    )
+    assert suppressed.all_successful is False
+    assert suppressed.jobs[0].state == "FAILED"
+
+    terminal_job = wf.register_subjects(
+        "STUDY",
+        [req],
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+    )
+    assert terminal_job.state == "FAILED"
+
+    with pytest.raises(JobFailedError) as exc_info:
+        wf.register_subjects(
+            "STUDY",
+            [req],
+            wait_for_completion=True,
+            raise_on_poll_failure=True,
+        )
+    assert exc_info.value.batch_summary is not None
+    assert exc_info.value.poll_summary is not None
+
+    # 3. Async native + sync fallback (functools.partial): empty batchId & raise_on_poll_failure=False
+    fallback_summary = await wf.async_register_subjects_batch(
+        "STUDY",
+        [req],
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+    )
+    assert fallback_summary.all_successful is False
+
+    async_sdk = MagicMock()
+    async_sdk.async_get_sites = AsyncMock(return_value=[active_site])
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="3", batchId="", state="PROCESSING")
+    )
+    async_wf = RegisterSubjectsWorkflow(async_sdk)
+
+    async_non_blocking = await async_wf.async_register_subjects_batch(
+        "STUDY", [req], wait_for_completion=False
+    )
+    assert async_non_blocking.batch_ids == []
+
+    with pytest.raises(ValueError, match="no batch_id received"):
+        await async_wf.async_register_subjects_batch("STUDY", [req], wait_for_completion=True)
+
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="4", batchId="ARB-FAIL", state="PROCESSING")
+    )
+    async_sdk.async_poll_job = AsyncMock(
+        side_effect=lambda *_a, **_kw: (_ for _ in ()).throw(
+            JobFailedError("ARB-FAIL", JobStatus(batchId="ARB-FAIL", state="FAILED"))
+        )
+    )
+    async_job = await async_wf.async_register_subjects(
+        "STUDY",
+        [req],
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+    )
+    assert async_job.state == "FAILED"

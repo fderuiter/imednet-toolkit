@@ -195,6 +195,7 @@ class RecordUpdateWorkflow:
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -235,6 +236,7 @@ class RecordUpdateWorkflow:
             ),
             on_progress=on_progress,
             require_batch_id=True,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -249,6 +251,7 @@ class RecordUpdateWorkflow:
         *,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
@@ -262,6 +265,7 @@ class RecordUpdateWorkflow:
             poll_interval=poll_interval,
             schema=schema,
             on_progress=on_progress,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -280,6 +284,7 @@ class RecordUpdateWorkflow:
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -317,6 +322,7 @@ class RecordUpdateWorkflow:
             ),
             on_progress=on_progress,
             require_batch_id=True,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -331,6 +337,7 @@ class RecordUpdateWorkflow:
         *,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
@@ -343,6 +350,7 @@ class RecordUpdateWorkflow:
             poll_interval=poll_interval,
             schema=schema,
             on_progress=on_progress,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )

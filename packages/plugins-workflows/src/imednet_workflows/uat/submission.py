@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -15,11 +16,13 @@ from imednet.spi.facade import ImednetFacade
 from imednet.spi.models import ImednetBaseModel, Job, JobState, normalize_job_state
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
+    BatchCoordinator,
     JobFailedError,
     JobPoller,
     JobPollSummary,
     JobTimeoutError,
     chunk_records,
+    resolve_sdk_result_fetcher,
 )
 
 from .generator import GeneratedRecordSet, SyntheticRecordGenerator
@@ -72,8 +75,37 @@ def _is_unconfigured_mock_method(fn: Any) -> bool:
         return False
     if getattr(fn, "side_effect", None) is not None:
         return False
+    if getattr(fn, "_mock_wraps", None) is not None:
+        return False
     ret = getattr(fn, "return_value", None)
     return type(ret).__module__.startswith("unittest.mock")
+
+
+def _callable_accepts_kwarg(fn: Any, kwarg_name: str) -> bool:
+    """Return True if ``fn`` (or its mock ``side_effect``/``wraps``) explicitly accepts ``kwarg_name``."""
+    target = fn
+    if type(fn).__module__.startswith("unittest.mock"):
+        wrapped = getattr(fn, "_mock_wraps", None)
+        side_effect = getattr(fn, "side_effect", None)
+        if callable(wrapped):
+            target = wrapped
+        elif callable(side_effect):
+            target = side_effect
+        else:
+            return False
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == kwarg_name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
 
 def _clean_str(val: Any) -> str | None:
@@ -316,6 +348,7 @@ class SubmissionResult(ImednetBaseModel):
     completed_at: datetime | None = None
     registration_batches: list[BatchSubmission] = Field(default_factory=list)
     data_batches: list[BatchSubmission] = Field(default_factory=list)
+    registration_poll_summary: Any = None  # JobPollSummary | None
     enrolled_subject_keys: list[str] = Field(default_factory=list)
     skipped_forms: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -329,6 +362,11 @@ class SubmissionResult(ImednetBaseModel):
     def all_batch_ids(self) -> list[str]:
         """Return all batch IDs from all submitted jobs."""
         return [b.job.batch_id for b in self.all_batches if b.job.batch_id]
+
+    @property
+    def data_batch_ids(self) -> list[str]:
+        """Return all batch IDs from Phase 2 data submission jobs."""
+        return [b.job.batch_id for b in self.data_batches if b.job.batch_id]
 
     @property
     def total_records_submitted(self) -> int:
@@ -348,6 +386,37 @@ class BulkSubmissionError(Exception):
         """
         super().__init__(message)
         self.failed_batches = failed_batches
+
+
+def _subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
+    """Return True if ``subj`` has a keyword matching ``keyword_tag``."""
+    if not keyword_tag:
+        return True
+    keywords = subj.get("keywords") if isinstance(subj, dict) else getattr(subj, "keywords", None)
+    if not keywords:
+        return False
+    for kw in keywords:
+        if isinstance(kw, str):
+            if kw == keyword_tag:
+                return True
+            continue
+        if isinstance(kw, dict):
+            candidates = (
+                kw.get("keyword_key"),
+                kw.get("keywordKey"),
+                kw.get("keyword_name"),
+                kw.get("keywordName"),
+            )
+        else:
+            candidates = (
+                getattr(kw, "keyword_key", None),
+                getattr(kw, "keywordKey", None),
+                getattr(kw, "keyword_name", None),
+                getattr(kw, "keywordName", None),
+            )
+        if keyword_tag in candidates:
+            return True
+    return False
 
 
 class BulkRecordSubmissionWorkflow:
@@ -503,18 +572,18 @@ class BulkRecordSubmissionWorkflow:
                     result.skipped_forms.append(rs.form_key)
                     continue
 
+                reg_batches = self._submit_record_chunks(
+                    study_key,
+                    filtered_payloads,
+                    phase="registration",
+                    form_key=rs.form_key,
+                    form_name=rs.form_name,
+                    email_notify=email_notify,
+                )
                 offset = 0
-                for chunk in self._chunk_payloads(filtered_payloads):
-                    chunk_items = filtered_items[offset : offset + len(chunk)]
-                    offset += len(chunk)
-                    batch = self._submit_batch(
-                        study_key,
-                        chunk,
-                        phase="registration",
-                        form_key=rs.form_key,
-                        form_name=rs.form_name,
-                        email_notify=email_notify,
-                    )
+                for batch in reg_batches:
+                    chunk_items = filtered_items[offset : offset + batch.record_count]
+                    offset += batch.record_count
                     for item in chunk_items:
                         item.batch_id = batch.job.batch_id
                     result.registration_batches.append(batch)
@@ -527,6 +596,7 @@ class BulkRecordSubmissionWorkflow:
                 poll_summary = self._poll_and_validate_registration_batches(
                     study_key, result.registration_batches
                 )
+                result.registration_poll_summary = poll_summary
                 if batch_item_groups:
                     must_correlate = self._requires_phase2_correlation(data_sets, poll_summary)
                     enrolled_keys, correlation_error = self._correlate_enrolled_subjects(
@@ -561,16 +631,15 @@ class BulkRecordSubmissionWorkflow:
 
             # Phase 2: Data Submission
             for rs in data_sets:
-                for chunk in self._chunk_payloads(rs.payloads):
-                    batch = self._submit_batch(
-                        study_key,
-                        chunk,
-                        phase="data",
-                        form_key=rs.form_key,
-                        form_name=rs.form_name,
-                        email_notify=email_notify,
-                    )
-                    result.data_batches.append(batch)
+                data_batches = self._submit_record_chunks(
+                    study_key,
+                    rs.payloads,
+                    phase="data",
+                    form_key=rs.form_key,
+                    form_name=rs.form_name,
+                    email_notify=email_notify,
+                )
+                result.data_batches.extend(data_batches)
             self.transition_to(SubmissionPhase.COMPLETED)
         except InvalidSubmissionPhaseTransitionError:
             raise
@@ -586,6 +655,54 @@ class BulkRecordSubmissionWorkflow:
         """Yield successive batch_size chunks of payloads."""
         yield from chunk_records(payloads, self.batch_size)
 
+    def _call_create_record(
+        self,
+        study_key: str,
+        payloads: list[dict[str, Any]],
+        *,
+        email_notify: bool | str | None,
+    ) -> Job:
+        """Invoke ``sdk.create_record`` forwarding ``skip_validation=True`` when supported."""
+        if _callable_accepts_kwarg(self.sdk.create_record, "skip_validation"):
+            return self.sdk.create_record(
+                study_key,
+                payloads,
+                email_notify=email_notify,
+                skip_validation=True,
+            )
+        return self.sdk.create_record(study_key, payloads, email_notify=email_notify)
+
+    def _submit_record_chunks(
+        self,
+        study_key: str,
+        payloads: list[dict[str, Any]],
+        *,
+        phase: Literal["registration", "data"] | SubmissionPhase,
+        form_key: str | None,
+        form_name: str | None,
+        email_notify: bool | str | None,
+    ) -> list[BatchSubmission]:
+        """Submit payloads in bounded chunks via ``BatchCoordinator`` with ``skip_validation=True``."""
+        if not payloads:
+            return []
+        coordinator = BatchCoordinator(chunk_size=self.batch_size)
+        batch_summary = coordinator.submit(
+            study_key,
+            payloads,
+            lambda chunk: self._call_create_record(study_key, chunk, email_notify=email_notify),
+            skip_validation=True,
+        )
+        return [
+            BatchSubmission(
+                phase=phase,
+                form_key=form_key,
+                form_name=form_name,
+                record_count=chunk_len,
+                job=job,
+            )
+            for job, chunk_len in zip(batch_summary.jobs, batch_summary.chunk_sizes, strict=False)
+        ]
+
     def _submit_batch(
         self,
         study_key: str,
@@ -596,7 +713,7 @@ class BulkRecordSubmissionWorkflow:
         email_notify: bool | str | None,
     ) -> BatchSubmission:
         """Submit a single batch and return a BatchSubmission."""
-        job = self.sdk.create_record(study_key, payloads, email_notify=email_notify)
+        job = self._call_create_record(study_key, payloads, email_notify=email_notify)
         return BatchSubmission(
             phase=phase,
             form_key=form_key,
@@ -615,7 +732,7 @@ class BulkRecordSubmissionWorkflow:
             poll_kwargs["interval"] = float(self.registration_poll_interval)
 
         poll_jobs_fn = getattr(self.sdk, "poll_jobs", None)
-        if callable(poll_jobs_fn):
+        if callable(poll_jobs_fn) and not _is_unconfigured_mock_method(poll_jobs_fn):
             candidate = poll_jobs_fn(
                 study_key,
                 batch_ids,
@@ -624,7 +741,10 @@ class BulkRecordSubmissionWorkflow:
             if isinstance(candidate, JobPollSummary):
                 return candidate
 
-        poller = JobPoller(get_job=self.sdk.get_job)
+        poller = JobPoller(
+            get_job=self.sdk.get_job,
+            fetch_result=resolve_sdk_result_fetcher(self.sdk),
+        )
         return poller.poll_many(
             study_key,
             batch_ids,
@@ -1105,35 +1225,7 @@ class BulkRecordSubmissionWorkflow:
     @staticmethod
     def _subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
         """Return True if the subject has a keyword matching keyword_tag."""
-        if not keyword_tag:
-            return True
-        keywords = (
-            subj.get("keywords") if isinstance(subj, dict) else getattr(subj, "keywords", None)
-        )
-        if not keywords:
-            return False
-        for kw in keywords:
-            if isinstance(kw, str):
-                if kw == keyword_tag:
-                    return True
-                continue
-            if isinstance(kw, dict):
-                candidates = (
-                    kw.get("keyword_key"),
-                    kw.get("keywordKey"),
-                    kw.get("keyword_name"),
-                    kw.get("keywordName"),
-                )
-            else:
-                candidates = (
-                    getattr(kw, "keyword_key", None),
-                    getattr(kw, "keywordKey", None),
-                    getattr(kw, "keyword_name", None),
-                    getattr(kw, "keywordName", None),
-                )
-            if keyword_tag in candidates:
-                return True
-        return False
+        return _subject_has_keyword(subj, keyword_tag)
 
     def _find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
         """Query non-deleted subjects and inspect Subject keywords locally for UAT tags."""

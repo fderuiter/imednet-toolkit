@@ -607,3 +607,121 @@ def test_workflow_run_monitoring_poll_summary_any_failed_transitions_to_failed(m
     assert result2.failure_phase == UATWorkflowState.MONITORING
     assert result2.overall_success is False
     assert "batch-rec-err" in (result2.error_message or "")
+
+
+def test_uat_workflow_monitor_skips_registration_batches_merges_summaries_and_fetches_result_url() -> (
+    None
+):
+    """UATWorkflow.monitor polls only unpolled batch IDs, merges registration_poll_summary, and fetches resultUrl."""
+    import json
+
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.spi.models import Job, JobStatus
+    from imednet.spi.utils import JobPollSummary
+    from imednet_workflows.uat.submission import BatchSubmission
+
+    job_poll_counts: dict[str, int] = {}
+    result_fetches: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.endswith("/subjects"):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and path.endswith("/records"):
+            body = json.loads(request.content.decode("utf-8"))
+            is_reg = "siteName" in body[0]
+            bid = "REG-B1" if is_reg else "DATA-B2"
+            return httpx.Response(
+                200, json={"jobId": f"J-{bid}", "batchId": bid, "state": "QUEUED"}
+            )
+        if request.method == "GET" and "/jobs/" in path and not path.endswith("/results"):
+            bid = path.rsplit("/", 1)[-1]
+            job_poll_counts[bid] = job_poll_counts.get(bid, 0) + 1
+            return httpx.Response(
+                200,
+                json={
+                    "jobId": f"J-{bid}",
+                    "batchId": bid,
+                    "state": "COMPLETED",
+                    "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/STUDY/jobs/{bid}/results",
+                },
+            )
+        if request.method == "GET" and path.endswith("/results"):
+            bid = path.split("/")[-2]
+            result_fetches.append(bid)
+            if bid == "REG-B1":
+                return httpx.Response(
+                    200, json=[{"subjectKey": "UAT-SUBJ-001", "status": "SUCCESS"}]
+                )
+            return httpx.Response(200, json=[{"recordId": 99, "status": "SUCCESS"}])
+        return httpx.Response(404)
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        # Hide poll_jobs on thin wrapper to verify UATWorkflow._create_poller binds resolve_sdk_result_fetcher
+        class _FallbackSDK:
+            def __init__(self, inner: ImednetSDK) -> None:
+                self.jobs = inner.jobs
+                self.create_record = inner.create_record
+                self.get_job = inner.get_job
+                self.get_subjects = inner.get_subjects
+
+        wf = UATWorkflow(_FallbackSDK(sdk), poll_interval=0.0)  # type: ignore[arg-type]
+        rs_reg = GeneratedRecordSet(
+            form_key="ENROLL",
+            form_name="Enrollment",
+            test_type=RecordTestType.REGISTER_SUBJECT,
+            payloads=[{"formKey": "ENROLL", "siteName": "Site1", "data": {"V1": "x"}}],
+            subject_keys=["UAT-SUBJ-001"],
+        )
+        rs_data = GeneratedRecordSet(
+            form_key="DATA",
+            form_name="Data",
+            test_type=RecordTestType.CREATE_NEW_RECORD,
+            payloads=[{"formKey": "DATA", "subjectKey": "UAT-SUBJ-001", "data": {"V2": 10}}],
+            subject_keys=["UAT-SUBJ-001"],
+        )
+
+        sub_res = wf.submit("STUDY", [rs_reg, rs_data])
+        assert job_poll_counts == {"REG-B1": 1}
+
+        merged = wf.monitor("STUDY", sub_res)
+        # REG-B1 was NOT polled a second time during monitor()!
+        assert job_poll_counts == {"REG-B1": 1, "DATA-B2": 1}
+        assert set(merged.results) == {"REG-B1", "DATA-B2"}
+        assert merged.failures == {}
+        assert merged.results["DATA-B2"].results == [{"recordId": 99, "status": "SUCCESS"}]
+        assert result_fetches == ["REG-B1", "DATA-B2"]
+
+        # When all batches are already in registration_poll_summary, monitor returns without polling
+        reg_only_summary = JobPollSummary(
+            study_key="STUDY",
+            results={"REG-ONLY": JobStatus(batch_id="REG-ONLY", state="COMPLETED")},
+            failures={},
+            elapsed_total=1.75,
+        )
+        reg_only_sub = SubmissionResult(
+            study_key="STUDY",
+            started_at=datetime.now(timezone.utc),
+            registration_batches=[
+                BatchSubmission(
+                    phase="registration",
+                    record_count=1,
+                    job=Job(batch_id="REG-ONLY", state="COMPLETED"),
+                )
+            ],
+            registration_poll_summary=reg_only_summary,
+        )
+        no_extra_poll = wf.monitor("STUDY", reg_only_sub)
+        assert no_extra_poll.results.keys() == {"REG-ONLY"}
+        assert no_extra_poll.elapsed_total == pytest.approx(1.75)
+        assert "REG-ONLY" not in job_poll_counts
+    finally:
+        sdk.close()

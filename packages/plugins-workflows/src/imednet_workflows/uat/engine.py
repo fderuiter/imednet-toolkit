@@ -3,18 +3,37 @@
 from __future__ import annotations
 
 import logging
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from imednet.spi.errors import ApiError, ClientError, ServerError
+from imednet.spi.errors import (
+    AuthenticationError,
+    AuthorizationError,
+    BadRequestError,
+    ForbiddenError,
+    NotFoundError,
+    RateLimitError,
+    ServerError,
+    UnauthorizedError,
+    ValidationError,
+)
 from imednet.spi.facade import ImednetFacade
 from imednet.spi.utils import (
+    DEFAULT_BATCH_CHUNK_SIZE,
+    BatchCoordinator,
     JobFailedError,
     JobPoller,
     JobPollSummary,
     JobTimeoutError,
     PathTraversalValidationError,
+    is_site_enrollment_eligible,
+    mask_clinical_phi,
+    redact_sensitive_payload,
+    redact_sensitive_text,
+    resolve_sdk_result_fetcher,
     validate_path_segment,
 )
 from imednet.spi.validation import (
@@ -24,9 +43,140 @@ from imednet.spi.validation import (
     extract_variable_constraints,
 )
 
+from .submission import (
+    _callable_accepts_kwarg,
+    _clean_str,
+    _extract_batch_result_entries,
+    _get_attr_or_key,
+    _is_unconfigured_mock_method,
+    _subject_has_keyword,
+)
+
 logger = logging.getLogger(__name__)
 
 _LOGIC_EVALUATOR = LogicTreeEvaluator()
+
+_NON_RULE_ERROR_RE = re.compile(
+    r"\b(?:"
+    r"(?:unknown|unrecognized|missing)\s+(?:subject|site|form|interval)s?\b"
+    r"|(?:subject|subjectkey|subject_key|site|sitename|site_name|form|formkey|form_key"
+    r"|interval|intervalname|interval_name)\b[^.;\n]{0,80}"
+    r"\b(?:not\s+found|does\s+not\s+exist|not\s+enrolled|unrecognized)\b"
+    r"|invalid\s+(?:subject(?:\s*key)?|site(?:\s*name)?|form(?:\s*key)?|interval(?:\s*name)?)\b"
+    r"|system\s+(?:error|failure)\b"
+    r"|internal\s+server\s+error\b"
+    r"|database\s+error\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_TRANSPORT_ERROR_TYPES = (
+    AuthenticationError,
+    AuthorizationError,
+    ForbiddenError,
+    NotFoundError,
+    RateLimitError,
+    ServerError,
+    UnauthorizedError,
+)
+_TRANSPORT_ERROR_STATUS_CODES = {401, 403, 404, 429}
+_FAILED_RECORD_ITEM_STATUSES = {"FAIL", "FAILED", "ERROR"}
+
+
+def _redacted_text(val: Any) -> str:
+    """Return a string representation with sensitive tokens/URIs redacted."""
+    return str(redact_sensitive_payload(redact_sensitive_text(str(val))))
+
+
+def _is_non_rule_error_text(text: str) -> bool:
+    """Return True if ``text`` describes a missing subject/site/form/interval or system failure."""
+    return bool(text and _NON_RULE_ERROR_RE.search(text))
+
+
+def _is_transport_level_error(exc: Exception) -> bool:
+    """Return True for HTTP 401/403/404/429/5xx transport errors."""
+    if isinstance(exc, _TRANSPORT_ERROR_TYPES):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    return isinstance(status_code, int) and (
+        status_code in _TRANSPORT_ERROR_STATUS_CODES or status_code >= 500
+    )
+
+
+def _classify_sync_exception(exc: Exception) -> tuple[EditCheckResultStatus, str]:
+    """Classify a synchronous ``create_record`` exception into status and response text."""
+    if _is_transport_level_error(exc):
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(exc, ServerError) or (isinstance(status_code, int) and status_code >= 500):
+            msg = (
+                f"Error: Server error {status_code}"
+                if status_code is not None
+                else f"Error: {_redacted_text(exc)}"
+            )
+            return EditCheckResultStatus.ERROR, msg
+        return EditCheckResultStatus.ERROR, f"Error: {_redacted_text(exc)}"
+
+    if isinstance(exc, (ValidationError, BadRequestError)):
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None or status_code in {400, 422}:
+            raw_msg = str(exc)
+            if _is_non_rule_error_text(raw_msg):
+                return EditCheckResultStatus.ERROR, f"Error: {_redacted_text(raw_msg)}"
+            return EditCheckResultStatus.PASS, "Rejected"
+
+    return EditCheckResultStatus.ERROR, f"Error: {_redacted_text(exc)}"
+
+
+def _extract_item_error_text(item: Any) -> str:
+    """Extract concatenated error text from a per-record JobStatus result entry."""
+    if not isinstance(item, dict):
+        return str(item or "")
+    parts: list[str] = []
+    for key in ("error", "message", "description", "detail"):
+        val = item.get(key)
+        if val:
+            parts.append(str(val))
+    errs = item.get("errors")
+    if isinstance(errs, list):
+        for entry in errs:
+            if isinstance(entry, dict):
+                parts.extend(
+                    str(entry[k]) for k in ("error", "message", "description") if entry.get(k)
+                )
+            elif entry:
+                parts.append(str(entry))
+    elif errs:
+        parts.append(str(errs))
+    return "; ".join(parts)
+
+
+@dataclass
+class _StudyVerificationContext:
+    """Discovered study metadata used to construct valid UAT verification payloads."""
+
+    resolved_site_name: str
+    enrollment_form_keys: set[str] = field(default_factory=set)
+    enrollment_forms: list[str] = field(default_factory=list)
+    scheduled_form_keys: set[str] = field(default_factory=set)
+    unscheduled_form_keys: set[str] = field(default_factory=set)
+    intervals_by_form: dict[str, str] = field(default_factory=dict)
+    default_interval_name: str | None = None
+    subjects: list[Any] | None = None
+    discovery_error: Exception | None = None
+
+
+@dataclass
+class _ActionableRuleEntry:
+    """Prepared negative-test rule entry awaiting batched submission and polling."""
+
+    rule_idx: int
+    rule: dict[str, Any]
+    form_key: str
+    test_data: dict[str, Any]
+    result: dict[str, Any]
+    is_enrollment: bool = False
+    interval_name: str | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 class EditCheckResultStatus(str, Enum):
@@ -60,6 +210,7 @@ class UATExecutionEngine:
         *,
         poll_interval: float = 5.0,
         poll_timeout: float = 300.0,
+        batch_size: int = DEFAULT_BATCH_CHUNK_SIZE,
     ) -> None:
         """Initialize the UAT execution engine.
 
@@ -68,11 +219,15 @@ class UATExecutionEngine:
             data_dictionary: The data dictionary containing business rules.
             poll_interval: Seconds between background job status polls.
             poll_timeout: Maximum seconds to wait for background jobs.
+            batch_size: Maximum number of records per ``BatchCoordinator`` chunk.
         """
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer.")
         self._sdk = sdk
         self._data_dictionary = data_dictionary
         self._poll_interval = poll_interval
         self._poll_timeout = poll_timeout
+        self._batch_size = batch_size
         self._form_variables: dict[str, dict[str, Any]] = {}
         if isinstance(data_dictionary, DataDictionary):
             for form in data_dictionary.forms:
@@ -398,6 +553,12 @@ class UATExecutionEngine:
             return cleaned
         return None
 
+    def _call_create_record(self, study_key: str, payloads: list[dict[str, Any]]) -> Any:
+        """Invoke ``sdk.create_record`` passing ``skip_validation=True`` when supported."""
+        if _callable_accepts_kwarg(self._sdk.create_record, "skip_validation"):
+            return self._sdk.create_record(study_key, payloads, skip_validation=True)
+        return self._sdk.create_record(study_key, payloads)
+
     def _poll_verification_batches(
         self,
         study_key: str,
@@ -407,8 +568,9 @@ class UATExecutionEngine:
         timeout: float,
     ) -> JobPollSummary:
         """Poll UAT verification batches via ImednetFacade.poll_jobs with Mock fallback."""
-        if callable(getattr(self._sdk, "poll_jobs", None)):
-            summary = self._sdk.poll_jobs(
+        poll_jobs_fn = getattr(self._sdk, "poll_jobs", None)
+        if callable(poll_jobs_fn) and not _is_unconfigured_mock_method(poll_jobs_fn):
+            summary = poll_jobs_fn(
                 study_key,
                 batch_ids,
                 interval=interval,
@@ -417,13 +579,217 @@ class UATExecutionEngine:
             )
             if isinstance(summary, JobPollSummary):
                 return summary
-        return JobPoller(get_job=self._sdk.get_job).poll_many(
+        get_job_fn = getattr(self._sdk, "get_job", None)
+        if _is_unconfigured_mock_method(get_job_fn):
+            return JobPollSummary(
+                study_key=study_key,
+                results={},
+                failures={
+                    bid: RuntimeError("Unconfigured mock get_job method on SDK test double")
+                    for bid in batch_ids
+                },
+                elapsed_total=0.0,
+            )
+        return JobPoller(
+            get_job=self._sdk.get_job,
+            fetch_result=resolve_sdk_result_fetcher(self._sdk),
+        ).poll_many(
             study_key,
             batch_ids,
             interval=interval,
             timeout=timeout,
             fail_fast=False,
         )
+
+    @staticmethod
+    def _record_outcome(
+        result: dict[str, Any],
+        status: EditCheckResultStatus,
+        actual_response: str,
+        report: EditCheckVerificationReport,
+    ) -> None:
+        """Assign terminal status and increment ``report`` counters."""
+        result["actual_response"] = actual_response
+        result["status"] = status
+        if status == EditCheckResultStatus.PASS:
+            report.passed_rules += 1
+        else:
+            report.failed_rules += 1
+
+    def _classify_result_entry(
+        self,
+        result: dict[str, Any],
+        item: Any,
+        report: EditCheckVerificationReport,
+    ) -> None:
+        """Classify a single correlated ``JobStatus.results`` entry for a rule."""
+        if isinstance(item, dict):
+            item_status = str(item.get("status") or "").upper()
+            err_text = _extract_item_error_text(item)
+            is_failed_entry = item_status in _FAILED_RECORD_ITEM_STATUSES or (
+                not item_status and bool(err_text)
+            )
+            if is_failed_entry:
+                if _is_non_rule_error_text(err_text):
+                    self._record_outcome(
+                        result,
+                        EditCheckResultStatus.ERROR,
+                        f"Error: {_redacted_text(err_text)}",
+                        report,
+                    )
+                else:
+                    self._record_outcome(result, EditCheckResultStatus.PASS, "Rejected", report)
+                return
+        self._record_outcome(result, EditCheckResultStatus.FAIL, "Accepted", report)
+
+    def _classify_terminal_job_status(
+        self,
+        batch_results: list[dict[str, Any]],
+        status: Any,
+        report: EditCheckVerificationReport,
+        *,
+        record_errors: list[dict[str, Any]] | None = None,
+        result_error: str | None = None,
+        fallback_error_text: str | None = None,
+    ) -> None:
+        """Classify all rule entries belonging to a single polled terminal ``JobStatus``."""
+        raw_state = str(getattr(status, "state", "") or "").upper()
+        res_err = result_error or getattr(status, "result_error", None)
+        if res_err:
+            err_msg = f"Error: {_redacted_text(fallback_error_text or res_err)}"
+            for res in batch_results:
+                self._record_outcome(res, EditCheckResultStatus.ERROR, err_msg, report)
+            return
+
+        if raw_state == "TIMEOUT":
+            for res in batch_results:
+                self._record_outcome(
+                    res, EditCheckResultStatus.ERROR, "Error: Job timed out", report
+                )
+            return
+
+        if raw_state == "CANCELLED":
+            msg = f"Error: {_redacted_text(fallback_error_text or 'Job cancelled')}"
+            for res in batch_results:
+                self._record_outcome(res, EditCheckResultStatus.ERROR, msg, report)
+            return
+
+        raw_results = getattr(status, "results", None)
+        if isinstance(raw_results, dict):
+            for key in ("records", "data", "results"):
+                nested = raw_results.get(key)
+                if isinstance(nested, list):
+                    raw_results = nested
+                    break
+
+        if isinstance(raw_results, list) and len(raw_results) == len(batch_results):
+            for res, entry in zip(batch_results, raw_results, strict=False):
+                self._classify_result_entry(res, entry, report)
+            return
+
+        extracted_errors: list[str] = []
+        if record_errors:
+            extracted_errors.extend(_extract_item_error_text(e) for e in record_errors if e)
+        if isinstance(raw_results, list):
+            for item in raw_results:
+                if isinstance(item, dict):
+                    item_status = str(item.get("status") or "").upper()
+                    txt = _extract_item_error_text(item)
+                    if item_status in _FAILED_RECORD_ITEM_STATUSES or txt:
+                        extracted_errors.append(txt)
+        elif isinstance(raw_results, dict):
+            txt = _extract_item_error_text(raw_results)
+            if txt:
+                extracted_errors.append(txt)
+
+        status_msg = str(
+            _get_attr_or_key(status, "message", "error", "status_message", "description") or ""
+        )
+        combined_err_texts = [
+            t for t in [*extracted_errors, status_msg, fallback_error_text or ""] if t
+        ]
+        for txt in combined_err_texts:
+            if _is_non_rule_error_text(txt):
+                err_msg = f"Error: {_redacted_text(txt)}"
+                for res in batch_results:
+                    self._record_outcome(res, EditCheckResultStatus.ERROR, err_msg, report)
+                return
+
+        failed_recs = getattr(status, "failed_records", None)
+        if not isinstance(failed_recs, int):
+            failed_recs = getattr(status, "record_failure_count", 0) or 0
+        has_failed_recs = isinstance(failed_recs, int) and failed_recs > 0
+        has_record_rejections = has_failed_recs or bool(extracted_errors)
+
+        if raw_state == "FAILED" and not has_record_rejections:
+            err_msg = f"Error: {_redacted_text(fallback_error_text or 'System job failure')}"
+            for res in batch_results:
+                self._record_outcome(res, EditCheckResultStatus.ERROR, err_msg, report)
+            return
+
+        if has_record_rejections:
+            effective_failed = failed_recs if has_failed_recs else len(extracted_errors)
+            if effective_failed >= len(batch_results):
+                for res in batch_results:
+                    self._record_outcome(res, EditCheckResultStatus.PASS, "Rejected", report)
+            else:
+                err_msg = (
+                    f"Error: Partial batch rejection ({effective_failed}/{len(batch_results)}) "
+                    "without per-record result correlation"
+                )
+                for res in batch_results:
+                    self._record_outcome(res, EditCheckResultStatus.ERROR, err_msg, report)
+            return
+
+        if raw_state in {"COMPLETED", "COMPLETE", "SUCCESS"}:
+            for res in batch_results:
+                self._record_outcome(res, EditCheckResultStatus.FAIL, "Accepted", report)
+            return
+
+        err_msg = f"Error: Unexpected job state {raw_state or 'UNKNOWN'}"
+        for res in batch_results:
+            self._record_outcome(res, EditCheckResultStatus.ERROR, err_msg, report)
+
+    def _classify_polled_batch_group(
+        self,
+        batch_results: list[dict[str, Any]],
+        batch_id: str,
+        summary: Any,
+        report: EditCheckVerificationReport,
+    ) -> None:
+        """Classify a polled asynchronous Job batch group into ``EditCheckResultStatus``."""
+        failures = getattr(summary, "failures", {}) or {}
+        results = getattr(summary, "results", {}) or {}
+
+        if batch_id in failures:
+            exc = failures[batch_id]
+            if isinstance(exc, JobTimeoutError):
+                err_msg = f"Error: {_redacted_text(exc)}"
+                for res in batch_results:
+                    self._record_outcome(res, EditCheckResultStatus.ERROR, err_msg, report)
+                return
+            if isinstance(exc, JobFailedError):
+                self._classify_terminal_job_status(
+                    batch_results,
+                    getattr(exc, "status", None),
+                    report,
+                    record_errors=getattr(exc, "record_errors", None),
+                    result_error=getattr(exc, "result_error", None),
+                    fallback_error_text=str(exc),
+                )
+                return
+            err_msg = f"Error: {_redacted_text(exc)}"
+            for res in batch_results:
+                self._record_outcome(res, EditCheckResultStatus.ERROR, err_msg, report)
+            return
+
+        if batch_id in results:
+            self._classify_terminal_job_status(batch_results, results[batch_id], report)
+            return
+
+        missing_msg = f"Error: Missing poll status for batch {batch_id}"
+        for res in batch_results:
+            self._record_outcome(res, EditCheckResultStatus.ERROR, missing_msg, report)
 
     def _classify_polled_batch(
         self,
@@ -432,71 +798,351 @@ class UATExecutionEngine:
         summary: Any,
         report: EditCheckVerificationReport,
     ) -> None:
-        """Classify a polled asynchronous Job batch into ``EditCheckResultStatus``."""
-        failures = getattr(summary, "failures", {}) or {}
-        results = getattr(summary, "results", {}) or {}
+        """Classify a single rule entry against a polled batch summary."""
+        self._classify_polled_batch_group([result], batch_id, summary, report)
 
-        if batch_id in failures:
-            exc = failures[batch_id]
-            if isinstance(exc, JobTimeoutError):
-                result["actual_response"] = f"Error: {exc}"
-                result["status"] = EditCheckResultStatus.ERROR
-                report.failed_rules += 1
-                return
-            if isinstance(exc, JobFailedError):
-                status = getattr(exc, "status", None)
-                raw_state = str(getattr(status, "state", "") or "").upper()
-                failed_recs = getattr(status, "failed_records", 0)
-                has_failed_recs = isinstance(failed_recs, int) and failed_recs > 0
-                res_err = getattr(exc, "result_error", None) or getattr(
-                    status, "result_error", None
-                )
-                is_result_fetch_error = (
-                    bool(res_err)
-                    and not has_failed_recs
-                    and raw_state in {"COMPLETED", "COMPLETE", "SUCCESS"}
-                )
-                if raw_state == "TIMEOUT" or is_result_fetch_error:
-                    result["actual_response"] = f"Error: {exc}"
-                    result["status"] = EditCheckResultStatus.ERROR
-                    report.failed_rules += 1
+    def _fetch_optional_metadata_list(self, study_key: str, method_name: str) -> list[Any] | None:
+        """Call an optional SDK metadata list method if configured, ignoring 404 on minimal mocks."""
+        fn = getattr(self._sdk, method_name, None)
+        if not callable(fn) or _is_unconfigured_mock_method(fn):
+            return None
+        try:
+            items = fn(study_key)
+        except PathTraversalValidationError:
+            raise
+        except NotFoundError:
+            return None
+        return items if isinstance(items, list) else None
+
+    def _discover_study_context(
+        self,
+        study_key: str,
+        site_name: str,
+    ) -> _StudyVerificationContext:
+        """Inspect forms, intervals, sites, and subjects when configured on ``self._sdk``."""
+        requested_site = _clean_str(site_name) or "TestSite"
+        ctx = _StudyVerificationContext(resolved_site_name=requested_site)
+        try:
+            sites = self._fetch_optional_metadata_list(study_key, "get_sites")
+            forms = self._fetch_optional_metadata_list(study_key, "get_forms")
+            intervals = self._fetch_optional_metadata_list(study_key, "get_intervals")
+            subjects = self._fetch_optional_metadata_list(study_key, "get_subjects")
+        except PathTraversalValidationError:
+            raise
+        except Exception as exc:
+            ctx.discovery_error = exc
+            return ctx
+
+        if sites:
+            matched_site: str | None = None
+            for site in sites:
+                cand_name = _clean_str(_get_attr_or_key(site, "site_name", "siteName"))
+                if cand_name == requested_site:
+                    matched_site = cand_name
+                    break
+            if matched_site:
+                ctx.resolved_site_name = matched_site
+            elif site_name == "TestSite":
+                eligible = [
+                    _clean_str(_get_attr_or_key(s, "site_name", "siteName"))
+                    for s in sites
+                    if is_site_enrollment_eligible(
+                        _get_attr_or_key(s, "site_enrollment_status", "siteEnrollmentStatus")
+                    )
+                ]
+                valid_eligible = [s for s in eligible if s]
+                if valid_eligible:
+                    ctx.resolved_site_name = valid_eligible[0]
                 else:
-                    result["actual_response"] = "Rejected"
-                    result["status"] = EditCheckResultStatus.PASS
-                    report.passed_rules += 1
-                return
-            result["actual_response"] = f"Error: {exc}"
-            result["status"] = EditCheckResultStatus.ERROR
-            report.failed_rules += 1
-            return
+                    first_site = _clean_str(_get_attr_or_key(sites[0], "site_name", "siteName"))
+                    if first_site:
+                        ctx.resolved_site_name = first_site
 
-        if batch_id in results:
-            status = results[batch_id]
-            raw_state = str(getattr(status, "state", "") or "").upper()
-            failed_recs = getattr(status, "failed_records", 0)
-            has_failed_recs = isinstance(failed_recs, int) and failed_recs > 0
-            is_failed = getattr(status, "is_failed", None)
-            if raw_state == "TIMEOUT":
-                result["actual_response"] = "Error: Job timed out"
-                result["status"] = EditCheckResultStatus.ERROR
-                report.failed_rules += 1
-            elif (
-                has_failed_recs
-                or raw_state in {"FAILED", "CANCELLED"}
-                or (isinstance(is_failed, bool) and is_failed)
+        if intervals:
+            for interval in intervals:
+                if bool(_get_attr_or_key(interval, "disabled")):
+                    continue
+                iname = _clean_str(_get_attr_or_key(interval, "interval_name", "intervalName"))
+                if not iname:
+                    continue
+                if ctx.default_interval_name is None:
+                    ctx.default_interval_name = iname
+                for f_ref in _get_attr_or_key(interval, "forms") or []:
+                    fk = _clean_str(_get_attr_or_key(f_ref, "form_key", "formKey"))
+                    if fk and fk not in ctx.intervals_by_form:
+                        ctx.intervals_by_form[fk] = iname
+
+        if forms:
+            for form in forms:
+                if bool(_get_attr_or_key(form, "disabled")):
+                    continue
+                fk = _clean_str(_get_attr_or_key(form, "form_key", "formKey"))
+                if not fk:
+                    continue
+                ftype = _clean_str(_get_attr_or_key(form, "form_type", "formType")) or ""
+                if ftype in {"Enrollment", "Registration"}:
+                    ctx.enrollment_form_keys.add(fk)
+                    ctx.enrollment_forms.append(fk)
+                elif bool(_get_attr_or_key(form, "unscheduled_visit", "unscheduledVisit")):
+                    ctx.unscheduled_form_keys.add(fk)
+                else:
+                    ctx.scheduled_form_keys.add(fk)
+
+        ctx.subjects = subjects
+        return ctx
+
+    @staticmethod
+    def _extract_reusable_uat_subjects(
+        subjects: list[Any] | None,
+        resolved_site_name: str,
+    ) -> tuple[list[str], set[str]]:
+        """Return ``(reusable_uat_subject_keys, all_existing_subject_keys)``."""
+        reusable: list[str] = []
+        all_keys: set[str] = set()
+        if not subjects:
+            return reusable, all_keys
+        for subj in subjects:
+            sk = _clean_str(_get_attr_or_key(subj, "subject_key", "subjectKey"))
+            if sk:
+                all_keys.add(sk)
+            if bool(_get_attr_or_key(subj, "deleted")) or not sk:
+                continue
+            subj_site = _clean_str(_get_attr_or_key(subj, "site_name", "siteName"))
+            if subj_site and subj_site != resolved_site_name:
+                continue
+            if (_subject_has_keyword(subj, "UAT") or sk.upper().startswith("UAT")) and (
+                sk not in reusable
             ):
-                result["actual_response"] = "Rejected"
-                result["status"] = EditCheckResultStatus.PASS
-                report.passed_rules += 1
-            else:
-                result["actual_response"] = "Accepted"
-                result["status"] = EditCheckResultStatus.FAIL
-                report.failed_rules += 1
-            return
+                reusable.append(sk)
+        return reusable, all_keys
 
-        result["actual_response"] = f"Error: Missing poll status for batch {batch_id}"
-        result["status"] = EditCheckResultStatus.ERROR
-        report.failed_rules += 1
+    def _build_valid_enrollment_data(
+        self,
+        study_key: str,
+        enroll_form_key: str,
+        index: int,
+    ) -> dict[str, Any]:
+        """Build a valid enrollment payload ``data`` dict for enrolling a UAT subject."""
+        data: dict[str, Any] = {}
+        self._populate_other_required_fields(enroll_form_key, data)
+        variables = self._fetch_optional_metadata_list(study_key, "get_variables")
+        if variables:
+            for var in variables:
+                v_fk = _clean_str(_get_attr_or_key(var, "form_key", "formKey"))
+                v_name = _clean_str(_get_attr_or_key(var, "variable_name", "variableName"))
+                if v_fk != enroll_form_key or not v_name or v_name in data:
+                    continue
+                if bool(_get_attr_or_key(var, "required")):
+                    v_type = (
+                        _clean_str(_get_attr_or_key(var, "variable_type", "variableType")) or ""
+                    ).lower()
+                    if v_type in {"int", "integer", "number"}:
+                        data[v_name] = 25 + index
+                    elif v_type in {"date", "date/time precision"}:
+                        data[v_name] = "2026-01-01"
+                    else:
+                        data[v_name] = f"UAT{index}"
+
+        for rule in self._rules:
+            if rule.get("form") != enroll_form_key:
+                continue
+            var_name = rule.get("variable")
+            if not var_name:
+                continue
+            op = rule.get("operator")
+            raw_val = rule.get("value")
+            xml_conds: list[ExtractedCondition] | None = rule.get("xml_conditions")
+            if xml_conds:
+                target = xml_conds[-1]
+                want_valid = not target.expected_truth
+                inv_cond = ExtractedCondition(
+                    variable=target.variable,
+                    operator=target.operator,
+                    value=target.value,
+                    compare_variable=target.compare_variable,
+                    expected_truth=want_valid,
+                )
+                self._apply_xml_condition(inv_cond, enroll_form_key, data)
+            elif op == ">=":
+                try:
+                    data[var_name] = self._format_typed_value(
+                        enroll_form_key, var_name, float(raw_val or 0) + 1
+                    )
+                except (TypeError, ValueError):
+                    data[var_name] = "1"
+            elif op == "<=":
+                try:
+                    data[var_name] = self._format_typed_value(
+                        enroll_form_key, var_name, float(raw_val or 0) - 1
+                    )
+                except (TypeError, ValueError):
+                    data[var_name] = "0"
+        return data
+
+    def _enroll_uat_subjects(
+        self,
+        study_key: str,
+        ctx: _StudyVerificationContext,
+        needed_count: int,
+        pre_existing_keys: set[str],
+        *,
+        interval: float,
+        timeout: float,
+    ) -> tuple[list[str], str | None]:
+        """Enroll ``needed_count`` UAT subjects on ``ctx.resolved_site_name`` via ``BatchCoordinator``."""
+        enroll_fk = ctx.enrollment_forms[0]
+        payloads = [
+            {
+                "formKey": enroll_fk,
+                "siteName": ctx.resolved_site_name,
+                "data": self._build_valid_enrollment_data(study_key, enroll_fk, i),
+            }
+            for i in range(needed_count)
+        ]
+        try:
+            coordinator = BatchCoordinator(chunk_size=self._batch_size)
+            batch_summary = coordinator.submit(
+                study_key,
+                payloads,
+                lambda chunk: self._call_create_record(study_key, chunk),
+                skip_validation=True,
+            )
+        except PathTraversalValidationError:
+            raise
+        except Exception as exc:
+            return (
+                [],
+                f"Failed to enroll UAT subject at site '{ctx.resolved_site_name}': {_redacted_text(exc)}",
+            )
+
+        batch_ids: list[str] = []
+        for job in batch_summary.jobs:
+            bid = self._extract_job_batch_id(job)
+            if bid is not None:
+                batch_ids.append(bid)
+
+        enrolled_keys: list[str] = []
+        if batch_ids:
+            poll_summary = self._poll_verification_batches(
+                study_key,
+                batch_ids,
+                interval=interval,
+                timeout=timeout,
+            )
+            if poll_summary.any_failed:
+                first_err = (
+                    next(iter(poll_summary.failures.values()))
+                    if poll_summary.failures
+                    else "Registration job failed"
+                )
+                return (
+                    [],
+                    f"Failed to enroll UAT subject at site '{ctx.resolved_site_name}': {_redacted_text(first_err)}",
+                )
+            for bid in batch_ids:
+                status = poll_summary.results.get(bid)
+                for entry in _extract_batch_result_entries(getattr(status, "results", None)):
+                    sk = (
+                        _clean_str(entry)
+                        if isinstance(entry, str)
+                        else _clean_str(_get_attr_or_key(entry, "subjectKey", "subject_key"))
+                    )
+                    if sk and sk not in pre_existing_keys and sk not in enrolled_keys:
+                        enrolled_keys.append(sk)
+
+        if len(enrolled_keys) < needed_count:
+            refreshed = self._fetch_optional_metadata_list(study_key, "get_subjects")
+            if refreshed:
+                for subj in refreshed:
+                    if bool(_get_attr_or_key(subj, "deleted")):
+                        continue
+                    s_site = _clean_str(_get_attr_or_key(subj, "site_name", "siteName"))
+                    if s_site and s_site != ctx.resolved_site_name:
+                        continue
+                    sk = _clean_str(_get_attr_or_key(subj, "subject_key", "subjectKey"))
+                    if sk and sk not in pre_existing_keys and sk not in enrolled_keys:
+                        enrolled_keys.append(sk)
+
+        if not enrolled_keys:
+            return (
+                [],
+                f"Enrolled UAT subject batch completed without resolvable subjectKey at site '{ctx.resolved_site_name}'",
+            )
+        return enrolled_keys, None
+
+    def _submit_entries_in_batches(
+        self,
+        study_key: str,
+        entries: list[_ActionableRuleEntry],
+        report: EditCheckVerificationReport,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Submit actionable rule payloads via ``BatchCoordinator`` and return ``batch_id -> results``."""
+        pending_by_batch: dict[str, list[dict[str, Any]]] = {}
+        if not entries:
+            return pending_by_batch
+
+        payload_to_entry: list[_ActionableRuleEntry] = list(entries)
+        all_payloads = [entry.payload for entry in payload_to_entry]
+        cursor = 0
+
+        def _record_chunk_job(chunk_entries: list[_ActionableRuleEntry], job: Any) -> None:
+            batch_id = self._extract_job_batch_id(job)
+            if batch_id is not None:
+                for entry in chunk_entries:
+                    entry.result["batch_id"] = batch_id
+                pending_by_batch.setdefault(batch_id, []).extend(
+                    entry.result for entry in chunk_entries
+                )
+            else:
+                for entry in chunk_entries:
+                    self._record_outcome(
+                        entry.result, EditCheckResultStatus.FAIL, "Accepted", report
+                    )
+
+        def _isolate_single_entries(chunk_entries: list[_ActionableRuleEntry]) -> None:
+            single_coord = BatchCoordinator(chunk_size=1)
+            for single_entry in chunk_entries:
+                try:
+                    single_summary = single_coord.submit(
+                        study_key,
+                        [single_entry.payload],
+                        lambda one: self._call_create_record(study_key, one),
+                        skip_validation=True,
+                    )
+                    _record_chunk_job([single_entry], single_summary.jobs[0])
+                except PathTraversalValidationError:
+                    raise
+                except Exception as single_exc:
+                    status, actual = _classify_sync_exception(single_exc)
+                    self._record_outcome(single_entry.result, status, actual, report)
+
+        def _submit_chunk(chunk: list[dict[str, Any]]) -> Any:
+            nonlocal cursor
+            chunk_entries = payload_to_entry[cursor : cursor + len(chunk)]
+            cursor += len(chunk)
+            try:
+                job = self._call_create_record(study_key, chunk)
+            except PathTraversalValidationError:
+                raise
+            except Exception as exc:
+                if len(chunk_entries) > 1 and not _is_transport_level_error(exc):
+                    _isolate_single_entries(chunk_entries)
+                else:
+                    status, actual = _classify_sync_exception(exc)
+                    for entry in chunk_entries:
+                        self._record_outcome(entry.result, status, actual, report)
+                return {}
+            _record_chunk_job(chunk_entries, job)
+            return job
+
+        coordinator = BatchCoordinator(chunk_size=self._batch_size)
+        coordinator.submit(
+            study_key,
+            all_payloads,
+            _submit_chunk,
+            skip_validation=True,
+        )
+        return pending_by_batch
 
     def run_verification(
         self,
@@ -508,21 +1154,18 @@ class UATExecutionEngine:
         poll_timeout: float | None = None,
     ) -> EditCheckVerificationReport:
         """Run the end-to-end UAT verification against the EDC API."""
-        del site_name
         validate_path_segment(study_key, name="study_key")
         report = EditCheckVerificationReport(study_key=study_key)
-        pending_jobs: list[tuple[dict[str, Any], str]] = []
+        actionable_entries: list[_ActionableRuleEntry] = []
 
         for idx, rule in enumerate(self._rules):
             if form_scope and rule.get("form") != form_scope:
                 continue
 
             report.total_rules += 1
-            form_key = rule.get("form")
-
+            form_key = str(rule.get("form") or "UnknownForm")
             test_data = self.generate_negative_test_case(rule)
             if not test_data:
-                # If we cannot generate test data (e.g. variable is missing), mark as skipped
                 report.skipped_rules += 1
                 report.results.append(
                     {
@@ -532,69 +1175,119 @@ class UATExecutionEngine:
                     }
                 )
             else:
-                # Use CreateNewRecordRequest format
-                subject_key = f"UAT-SUBJ-{idx}"
-                payload = {"formKey": form_key, "subjectKey": subject_key, "data": test_data}
-
                 result: dict[str, Any] = {
                     "rule_name": rule.get("rule_name"),
                     "form": form_key,
-                    "test_data": test_data,
+                    "test_data": mask_clinical_phi(redact_sensitive_payload(test_data)),
                     "expected_response": "Rejected",
                 }
-
-                try:
-                    job = self._sdk.create_record(study_key, [payload])
-                    batch_id = self._extract_job_batch_id(job)
-                    if batch_id is not None:
-                        result["batch_id"] = batch_id
-                        pending_jobs.append((result, batch_id))
-                    else:
-                        result["actual_response"] = "Accepted"
-                        result["status"] = EditCheckResultStatus.FAIL
-                        report.failed_rules += 1
-                except PathTraversalValidationError:
-                    raise
-                except (ApiError, ClientError) as e:
-                    status_code = getattr(e, "status_code", None)
-                    if isinstance(e, ServerError) or (
-                        isinstance(status_code, int) and status_code >= 500
-                    ):
-                        result["actual_response"] = (
-                            f"Error: Server error {status_code}"
-                            if status_code is not None
-                            else f"Error: {e}"
-                        )
-                        result["status"] = EditCheckResultStatus.ERROR
-                        report.failed_rules += 1
-                    else:
-                        result["actual_response"] = "Rejected"
-                        result["status"] = EditCheckResultStatus.PASS
-                        report.passed_rules += 1
-                except Exception as e:
-                    result["actual_response"] = f"Error: {e}"
-                    result["status"] = EditCheckResultStatus.ERROR
-                    report.failed_rules += 1
-
                 report.results.append(result)
+                actionable_entries.append(
+                    _ActionableRuleEntry(
+                        rule_idx=idx,
+                        rule=rule,
+                        form_key=form_key,
+                        test_data=test_data,
+                        result=result,
+                    )
+                )
 
             if report.total_rules >= 100:
                 logger.warning("Reached maximum subject limit of 100 per UAT run.")
                 break
 
-        if pending_jobs:
-            batch_ids = list(dict.fromkeys(bid for _, bid in pending_jobs))
-            effective_interval = (
-                self._poll_interval if poll_interval is None else float(poll_interval)
-            )
-            effective_timeout = self._poll_timeout if poll_timeout is None else float(poll_timeout)
+        if not actionable_entries:
+            return report
+
+        effective_interval = self._poll_interval if poll_interval is None else float(poll_interval)
+        effective_timeout = self._poll_timeout if poll_timeout is None else float(poll_timeout)
+
+        ctx = self._discover_study_context(study_key, site_name)
+        if ctx.discovery_error is not None:
+            status, actual = _classify_sync_exception(ctx.discovery_error)
+            if status == EditCheckResultStatus.PASS:
+                status = EditCheckResultStatus.ERROR
+                actual = f"Error: {_redacted_text(ctx.discovery_error)}"
+            for entry in actionable_entries:
+                self._record_outcome(entry.result, status, actual, report)
+            return report
+
+        for entry in actionable_entries:
+            if entry.form_key in ctx.enrollment_form_keys:
+                entry.is_enrollment = True
+            elif entry.form_key in ctx.scheduled_form_keys:
+                entry.interval_name = (
+                    ctx.intervals_by_form.get(entry.form_key) or ctx.default_interval_name
+                )
+            elif entry.form_key not in ctx.unscheduled_form_keys:
+                entry.interval_name = ctx.intervals_by_form.get(entry.form_key)
+
+        non_enroll_entries = [e for e in actionable_entries if not e.is_enrollment]
+        reusable_uat_keys, pre_existing_keys = self._extract_reusable_uat_subjects(
+            ctx.subjects, ctx.resolved_site_name
+        )
+
+        entries_to_submit: list[_ActionableRuleEntry] = [
+            e for e in actionable_entries if e.is_enrollment
+        ]
+        for entry in entries_to_submit:
+            entry.payload = {
+                "formKey": entry.form_key,
+                "siteName": ctx.resolved_site_name,
+                "data": entry.test_data,
+            }
+
+        if non_enroll_entries:
+            slot_counts = Counter((e.form_key, e.interval_name) for e in non_enroll_entries)
+            needed_subjects = max(slot_counts.values())
+            enroll_error: str | None = None
+            if len(reusable_uat_keys) < needed_subjects and ctx.enrollment_forms:
+                newly_enrolled, enroll_error = self._enroll_uat_subjects(
+                    study_key,
+                    ctx,
+                    needed_subjects - len(reusable_uat_keys),
+                    pre_existing_keys,
+                    interval=effective_interval,
+                    timeout=effective_timeout,
+                )
+                reusable_uat_keys.extend(newly_enrolled)
+
+            if enroll_error and not reusable_uat_keys:
+                err_msg = f"Error: {enroll_error}"
+                for entry in non_enroll_entries:
+                    self._record_outcome(entry.result, EditCheckResultStatus.ERROR, err_msg, report)
+            else:
+                slot_seen: Counter[tuple[str, str | None]] = Counter()
+                for entry in non_enroll_entries:
+                    slot = (entry.form_key, entry.interval_name)
+                    slot_idx = slot_seen[slot]
+                    slot_seen[slot] += 1
+                    if reusable_uat_keys:
+                        subj_key = reusable_uat_keys[slot_idx % len(reusable_uat_keys)]
+                    else:
+                        subj_key = f"UAT-SUBJ-{entry.rule_idx}"
+                    payload: dict[str, Any] = {
+                        "formKey": entry.form_key,
+                        "subjectKey": subj_key,
+                        "data": entry.test_data,
+                    }
+                    if entry.interval_name:
+                        payload["intervalName"] = entry.interval_name
+                    entry.payload = payload
+                    entries_to_submit.append(entry)
+
+        entries_to_submit.sort(key=lambda e: e.rule_idx)
+        pending_by_batch = self._submit_entries_in_batches(study_key, entries_to_submit, report)
+
+        if pending_by_batch:
+            batch_ids = list(pending_by_batch.keys())
             summary = self._poll_verification_batches(
                 study_key,
                 batch_ids,
                 interval=effective_interval,
                 timeout=effective_timeout,
             )
-            for pending_result, batch_id in pending_jobs:
-                self._classify_polled_batch(pending_result, batch_id, summary, report)
+            for batch_id, batch_results in pending_by_batch.items():
+                self._classify_polled_batch_group(batch_results, batch_id, summary, report)
 
         return report

@@ -464,9 +464,12 @@ class UATWorkflow:
         )
 
     def _create_poller(self) -> Any:
-        from imednet.spi.utils import JobPoller
+        from imednet.spi.utils import JobPoller, resolve_sdk_result_fetcher
 
-        return JobPoller(get_job=self._sdk.get_job)
+        return JobPoller(
+            get_job=self._sdk.get_job,
+            fetch_result=resolve_sdk_result_fetcher(self._sdk),
+        )
 
     def run(
         self,
@@ -647,12 +650,12 @@ class UATWorkflow:
         )
         return submitter.submit(study_key, record_sets, email_notify=email_notify)  # type: ignore[no-any-return]
 
-    def monitor(self, study_key: str, submission_result: SubmissionResult) -> Any:
-        """Poll all resulting jobs to completion via facade poll_jobs (or JobPoller fallback)."""
+    def _poll_batch_ids(self, study_key: str, batch_ids: list[str]) -> Any:
+        """Poll the specified ``batch_ids`` via injected poller, facade ``poll_jobs``, or fallback."""
         if self._poller is not None:
             return self._poller.poll_many(
                 study_key,
-                submission_result.all_batch_ids,
+                batch_ids,
                 interval=self._poll_interval,
                 timeout=self._poll_timeout,
                 on_progress=self._on_progress,
@@ -660,11 +663,13 @@ class UATWorkflow:
 
         from imednet.spi.utils import JobPollSummary
 
+        from .submission import _is_unconfigured_mock_method
+
         poll_jobs_fn = getattr(self._sdk, "poll_jobs", None)
-        if callable(poll_jobs_fn):
+        if callable(poll_jobs_fn) and not _is_unconfigured_mock_method(poll_jobs_fn):
             candidate = poll_jobs_fn(
                 study_key,
-                submission_result.all_batch_ids,
+                batch_ids,
                 interval=self._poll_interval,
                 timeout=self._poll_timeout,
                 on_progress=self._on_progress,
@@ -680,10 +685,47 @@ class UATWorkflow:
         )
         return poller.poll_many(
             study_key,
-            submission_result.all_batch_ids,
+            batch_ids,
             interval=self._poll_interval,
             timeout=self._poll_timeout,
             on_progress=self._on_progress,
+        )
+
+    def monitor(self, study_key: str, submission_result: SubmissionResult) -> Any:
+        """Poll unpolled jobs to completion and merge with any Phase 1 registration poll summary."""
+        from imednet.spi.utils import JobPollSummary
+
+        reg_summary = getattr(submission_result, "registration_poll_summary", None)
+        reg_results = getattr(reg_summary, "results", None) if reg_summary is not None else None
+        reg_failures = getattr(reg_summary, "failures", None) if reg_summary is not None else None
+        if not isinstance(reg_results, dict) or not isinstance(reg_failures, dict):
+            return self._poll_batch_ids(study_key, submission_result.all_batch_ids)
+
+        already_polled = set(reg_results.keys()) | set(reg_failures.keys())
+        remaining_batch_ids = [
+            bid for bid in submission_result.all_batch_ids if bid not in already_polled
+        ]
+        merged_results = dict(reg_results)
+        merged_failures = dict(reg_failures)
+        merged_elapsed = float(getattr(reg_summary, "elapsed_total", 0.0) or 0.0)
+
+        if remaining_batch_ids:
+            data_summary = self._poll_batch_ids(study_key, remaining_batch_ids)
+            data_results = getattr(data_summary, "results", None)
+            if isinstance(data_results, dict):
+                merged_results.update(data_results)
+            data_failures = getattr(data_summary, "failures", None)
+            if isinstance(data_failures, dict):
+                merged_failures.update(data_failures)
+            data_elapsed = getattr(data_summary, "elapsed_total", 0.0)
+            if isinstance(data_elapsed, (int, float)):
+                merged_elapsed += float(data_elapsed)
+
+        return JobPollSummary(
+            study_key=study_key,
+            results=merged_results,
+            failures=merged_failures,
+            elapsed_total=merged_elapsed,
         )
 
 

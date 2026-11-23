@@ -231,6 +231,7 @@ class ImednetFacade(Protocol):
         timeout: float = 300.0,
         interval: float = 5.0,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -475,6 +476,7 @@ class AsyncImednetFacade(Protocol):
         timeout: float = 300.0,
         interval: float = 5.0,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:

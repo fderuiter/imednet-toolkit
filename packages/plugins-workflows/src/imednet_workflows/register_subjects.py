@@ -176,6 +176,7 @@ class RegisterSubjectsWorkflow:
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -234,7 +235,8 @@ class RegisterSubjectsWorkflow:
                 on_progress=on_progress,
             ),
             on_progress=on_progress,
-            require_batch_id=False,
+            require_batch_id=wait_for_completion,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -253,6 +255,7 @@ class RegisterSubjectsWorkflow:
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
@@ -270,6 +273,7 @@ class RegisterSubjectsWorkflow:
             subject_key_field=subject_key_field,
             schema=schema,
             on_progress=on_progress,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -292,6 +296,7 @@ class RegisterSubjectsWorkflow:
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -311,6 +316,7 @@ class RegisterSubjectsWorkflow:
                 subject_key_field=subject_key_field,
                 schema=schema,
                 on_progress=on_progress,
+                raise_on_poll_failure=raise_on_poll_failure,
                 dry_run=dry_run,
                 collect_errors=collect_errors,
             )
@@ -371,7 +377,8 @@ class RegisterSubjectsWorkflow:
                 on_progress=on_progress,
             ),
             on_progress=on_progress,
-            require_batch_id=False,
+            require_batch_id=wait_for_completion,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -390,6 +397,7 @@ class RegisterSubjectsWorkflow:
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
@@ -406,6 +414,7 @@ class RegisterSubjectsWorkflow:
             subject_key_field=subject_key_field,
             schema=schema,
             on_progress=on_progress,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )

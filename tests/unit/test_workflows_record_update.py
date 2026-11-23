@@ -822,3 +822,81 @@ async def test_all_record_update_workflow_methods_accept_clinical_variable_types
         "STUDY", [{"formKey": "F_CLIN", "data": clinical_data}]
     )
     assert async_job.batch_id == "B-ASYNC-CLIN"
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_raise_on_poll_failure_sync_and_async() -> None:
+    """RecordUpdateWorkflow forwards raise_on_poll_failure across sync and async methods."""
+    from imednet.models.jobs import JobStatus
+    from imednet.utils.job_poller import JobFailedError
+
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.get_variables.return_value = [
+        Variable(variable_name="age", variable_type="integer", form_id=1, form_key="F1")
+    ]
+    sync_sdk.create_record.return_value = Job(jobId="1", batchId="B-FAIL", state="PROCESSING")
+    sync_sdk.poll_job.side_effect = lambda _study, _bid, **_kw: (_ for _ in ()).throw(
+        JobFailedError("B-FAIL", JobStatus(batchId="B-FAIL", state="FAILED"))
+    )
+
+    wf = RecordUpdateWorkflow(sync_sdk)
+    summary = wf.create_or_update_records_batch(
+        "STUDY",
+        [{"formKey": "F1", "data": {"age": 30}}],
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+    )
+    assert summary.all_successful is False
+    assert summary.jobs[0].state == "FAILED"
+
+    last_job = wf.create_or_update_records(
+        "STUDY",
+        [{"formKey": "F1", "data": {"age": 30}}],
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+    )
+    assert last_job.state == "FAILED"
+
+    with pytest.raises(JobFailedError) as exc_info:
+        wf.create_or_update_records(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 30}}],
+            wait_for_completion=True,
+            raise_on_poll_failure=True,
+        )
+    assert exc_info.value.batch_summary is not None
+    assert exc_info.value.poll_summary is not None
+
+    async_sdk = MagicMock()
+    async_sdk.async_get_variables = AsyncMock(
+        return_value=[
+            Variable(variable_name="age", variable_type="integer", form_id=1, form_key="F1")
+        ]
+    )
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="2", batchId="AB-FAIL", state="PROCESSING")
+    )
+    async_sdk.async_poll_job = AsyncMock(
+        side_effect=lambda *_a, **_kw: (_ for _ in ()).throw(
+            JobFailedError("AB-FAIL", JobStatus(batchId="AB-FAIL", state="FAILED"))
+        )
+    )
+
+    async_wf = RecordUpdateWorkflow(async_sdk)
+    async_summary = await async_wf.async_create_or_update_records_batch(
+        "STUDY",
+        [{"formKey": "F1", "data": {"age": 42}}],
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+    )
+    assert async_summary.all_successful is False
+    assert async_summary.jobs[0].state == "FAILED"
+
+    async_last_job = await async_wf.async_create_or_update_records(
+        "STUDY",
+        [{"formKey": "F1", "data": {"age": 42}}],
+        wait_for_completion=True,
+        raise_on_poll_failure=False,
+    )
+    assert async_last_job.state == "FAILED"

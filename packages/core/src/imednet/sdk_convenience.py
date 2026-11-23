@@ -427,6 +427,7 @@ class SyncSDKConvenienceMixin:
         timeout: float = 300.0,
         interval: float = 5.0,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -458,6 +459,7 @@ class SyncSDKConvenienceMixin:
             ),
             on_progress=on_progress,
             require_batch_id=wait_for_completion,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -592,6 +594,7 @@ class AsyncSDKConvenienceMixin:
         timeout: float = 300.0,
         interval: float = 5.0,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -623,6 +626,7 @@ class AsyncSDKConvenienceMixin:
             ),
             on_progress=on_progress,
             require_batch_id=wait_for_completion,
+            raise_on_poll_failure=raise_on_poll_failure,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )

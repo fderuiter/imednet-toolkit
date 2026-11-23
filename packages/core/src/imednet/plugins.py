@@ -345,6 +345,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -361,6 +362,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         *,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
@@ -435,6 +437,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -451,6 +454,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         *,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
@@ -569,6 +573,7 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -589,6 +594,7 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
@@ -610,6 +616,7 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -630,6 +637,7 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
@@ -658,6 +666,7 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
@@ -678,6 +687,7 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         subject_key_field: str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
+        raise_on_poll_failure: bool = True,
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:

@@ -26,6 +26,7 @@ STATUS_TO_ERROR: Mapping[int, type[ApiError]] = types.MappingProxyType(
         403: ForbiddenError,
         404: NotFoundError,
         409: ConflictError,
+        422: ValidationError,
         429: RateLimitError,
     }
 )

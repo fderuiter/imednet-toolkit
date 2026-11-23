@@ -1285,3 +1285,111 @@ def test_submission_workflow_api_error_transitions_to_failed_before_propagating(
     assert workflow.phase == SubmissionPhase.FAILED
     with pytest.raises(InvalidSubmissionPhaseTransitionError):
         workflow.transition_to(SubmissionPhase.DATA)
+
+
+def test_submission_uses_batch_coordinator_skip_validation_and_fetches_result_url() -> None:
+    """BulkRecordSubmissionWorkflow delegates via BatchCoordinator(skip_validation=True), stores registration_poll_summary, exposes data_batch_ids, and binds resultUrl fetcher."""
+    import json
+    from unittest.mock import patch
+
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.spi.utils import BatchCoordinator, JobPollSummary
+
+    result_url_fetches: list[str] = []
+    submitted_batches: list[list[dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.endswith("/subjects"):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and path.endswith("/records"):
+            body = json.loads(request.content.decode("utf-8"))
+            submitted_batches.append(body)
+            bid = f"BATCH-{len(submitted_batches)}"
+            return httpx.Response(
+                200, json={"jobId": f"J-{bid}", "batchId": bid, "state": "QUEUED"}
+            )
+        if request.method == "GET" and "/jobs/BATCH-" in path and not path.endswith("/results"):
+            bid = path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={
+                    "jobId": f"J-{bid}",
+                    "batchId": bid,
+                    "state": "COMPLETED",
+                    "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/STUDY/jobs/{bid}/results",
+                },
+            )
+        if request.method == "GET" and path.endswith("/results"):
+            result_url_fetches.append(str(request.url))
+            return httpx.Response(
+                200,
+                json=[{"subjectKey": "ACTUAL-SUBJ-01", "status": "SUCCESS"}],
+            )
+        return httpx.Response(404)
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        # Exercise fallback _poll_registration_batches path by hiding poll_jobs on a thin proxy
+        class _FallbackSDKProxy:
+            def __init__(self, inner: ImednetSDK) -> None:
+                self.jobs = inner.jobs
+                self.create_record = inner.create_record
+                self.get_job = inner.get_job
+                self.get_subjects = inner.get_subjects
+
+        proxy = _FallbackSDKProxy(sdk)
+        wf = BulkRecordSubmissionWorkflow(
+            proxy,  # type: ignore[arg-type]
+            batch_size=2,
+            skip_existing_subjects=False,
+            await_registration=True,
+            registration_poll_interval=0.0,
+        )
+        rs_reg = GeneratedRecordSet(
+            form_key="ENROLL",
+            form_name="Enrollment",
+            test_type=RecordTestType.REGISTER_SUBJECT,
+            payloads=[{"formKey": "ENROLL", "siteName": "Site1", "data": {"V1": "A"}}],
+            subject_keys=["PLACEHOLDER-01"],
+        )
+        rs_data = GeneratedRecordSet(
+            form_key="VIS1",
+            form_name="Visit 1",
+            test_type=RecordTestType.CREATE_NEW_RECORD,
+            payloads=[
+                {"formKey": "VIS1", "subjectKey": "PLACEHOLDER-01", "data": {"V2": 1}},
+                {"formKey": "VIS1", "subjectKey": "PLACEHOLDER-01", "data": {"V2": 2}},
+                {"formKey": "VIS1", "subjectKey": "PLACEHOLDER-01", "data": {"V2": 3}},
+            ],
+            subject_keys=["PLACEHOLDER-01"],
+        )
+
+        with patch.object(
+            BatchCoordinator,
+            "submit",
+            autospec=True,
+            wraps=BatchCoordinator.submit,
+        ) as spy_coord:
+            submission = wf.submit("STUDY", [rs_reg, rs_data])
+
+        assert spy_coord.call_count == 2
+        for call in spy_coord.call_args_list:
+            assert call.kwargs.get("skip_validation") is True
+
+        assert isinstance(submission.registration_poll_summary, JobPollSummary)
+        assert set(submission.registration_poll_summary.results) == {"BATCH-1"}
+        assert submission.data_batch_ids == ["BATCH-2", "BATCH-3"]
+        assert submission.all_batch_ids == ["BATCH-1", "BATCH-2", "BATCH-3"]
+        assert len(result_url_fetches) == 1
+        # Correlated subject key from resultUrl was rewritten into Phase 2 payloads
+        assert submitted_batches[1][0]["subjectKey"] == "ACTUAL-SUBJ-01"
+    finally:
+        sdk.close()

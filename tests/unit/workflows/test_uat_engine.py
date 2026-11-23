@@ -207,8 +207,13 @@ def test_uat_engine_run_verification_failure_and_skip():
     report = engine.run_verification("STUDY1")
 
     assert report.total_rules == 3
-    assert report.failed_rules == 1
+    # Rule1 was accepted (FAIL) and RuleError raised generic ApiError (ERROR) -> 2 non-passing rules
+    assert report.failed_rules == 2
     assert report.skipped_rules == 1
+    status_by_rule = {r["rule_name"]: r["status"] for r in report.results}
+    assert status_by_rule["Rule1"] == EditCheckResultStatus.FAIL
+    assert status_by_rule["RuleError"] == EditCheckResultStatus.ERROR
+    assert status_by_rule["RuleSkip"] == EditCheckResultStatus.SKIPPED
 
 
 def test_uat_engine_parses_and_verifies_xml_business_logic_rules():
@@ -523,7 +528,7 @@ def test_uat_engine_async_job_polling_classifications():
     """UATExecutionEngine polls HTTP 202 Job batch_ids concurrently and classifies outcomes."""
     from unittest.mock import patch
 
-    from imednet.errors import ApiError, ClientError, ServerError
+    from imednet.errors import ApiError, BadRequestError, ServerError
     from imednet.spi.models import Job, JobStatus
     from imednet.spi.utils import JobPoller, JobTimeoutError
 
@@ -599,7 +604,7 @@ def test_uat_engine_async_job_polling_classifications():
         if "V4" in data:
             return Job(batch_id="job-timed-out", state="PENDING")
         if "V5" in data:
-            raise ClientError("HTTP 400 validation error", status_code=400)
+            raise BadRequestError("HTTP 400 validation error", status_code=400)
         if "V6" in data:
             raise ServerError("HTTP 502 bad gateway", status_code=502)
         raise ApiError("HTTP 500 internal error", status_code=500)
@@ -617,7 +622,7 @@ def test_uat_engine_async_job_polling_classifications():
     sdk.get_job.side_effect = get_job_side_effect
 
     dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
-    engine = UATExecutionEngine(sdk, dd, poll_interval=0.01, poll_timeout=5.0)
+    engine = UATExecutionEngine(sdk, dd, poll_interval=0.01, poll_timeout=5.0, batch_size=1)
 
     with patch.object(JobPoller, "poll_many", autospec=True, wraps=JobPoller.poll_many) as spy_poll:
         report = engine.run_verification("STUDY1")
@@ -634,7 +639,8 @@ def test_uat_engine_async_job_polling_classifications():
 
     status_by_rule = {entry["rule_name"]: entry["status"] for entry in report.results}
     assert status_by_rule == {
-        "AsyncFailedState": EditCheckResultStatus.PASS,
+        # System FAILED job without record rejections classifies as ERROR
+        "AsyncFailedState": EditCheckResultStatus.ERROR,
         "AsyncFailedRecords": EditCheckResultStatus.PASS,
         "AsyncAccepted": EditCheckResultStatus.FAIL,
         "AsyncTimeout": EditCheckResultStatus.ERROR,
@@ -643,8 +649,8 @@ def test_uat_engine_async_job_polling_classifications():
         "SyncApi500Err": EditCheckResultStatus.ERROR,
     }
     assert report.total_rules == 7
-    assert report.passed_rules == 3
-    assert report.failed_rules == 4
+    assert report.passed_rules == 2
+    assert report.failed_rules == 5
 
 
 def test_uat_engine_async_job_polling_enforces_100_rule_cap():
@@ -666,22 +672,398 @@ def test_uat_engine_async_job_polling_enforces_100_rule_cap():
         for i in range(135)
     ]
     sdk = Mock()
-    sdk.create_record.side_effect = [
-        Job(batch_id=f"batch-{i}", state="PENDING") for i in range(135)
-    ]
+    sdk.create_record.side_effect = [Job(batch_id=f"batch-{i}", state="PENDING") for i in range(5)]
     sdk.get_job.side_effect = lambda _study, bid: JobStatus(
-        batch_id=bid, state="FAILED", failed_records=1
+        batch_id=bid, state="COMPLETED", failed_records=25
     )
 
     dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
-    engine = UATExecutionEngine(sdk, dd, poll_interval=0.01, poll_timeout=5.0)
+    engine = UATExecutionEngine(sdk, dd, poll_interval=0.01, poll_timeout=5.0, batch_size=25)
 
     with patch.object(JobPoller, "poll_many", autospec=True, wraps=JobPoller.poll_many) as spy_poll:
         report = engine.run_verification("STUDY1")
 
-    assert sdk.create_record.call_count == 100
+    # 135 active rules capped at 100 and batched via BatchCoordinator into 4 chunks of 25
+    assert sdk.create_record.call_count == 4
+    assert [len(c.args[1]) for c in sdk.create_record.call_args_list] == [25, 25, 25, 25]
     spy_poll.assert_called_once()
-    assert len(spy_poll.call_args.args[2]) == 100
+    assert len(spy_poll.call_args.args[2]) == 4
     assert report.total_rules == 100
     assert report.passed_rules == 100
     assert report.failed_rules == 0
+
+
+def test_uat_engine_enrolls_or_reuses_subjects_attaches_intervals_and_fetches_result_url() -> None:
+    """UATExecutionEngine honors site_name, enrolls/reuses UAT subjects, uses RegisterSubjectRequest on Enrollment forms, attaches intervalName on scheduled forms, and fetches resultUrl via fallback JobPoller."""
+    import json
+
+    import httpx
+
+    from imednet import ImednetSDK
+
+    posted_batches: list[list[dict]] = []
+    enrolled_subjects: list[dict] = []
+    result_url_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.endswith("/sites"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "studyKey": "STUDY1",
+                            "siteId": 1,
+                            "siteName": "SiteA",
+                            "siteEnrollmentStatus": "Active",
+                        },
+                        {
+                            "studyKey": "STUDY1",
+                            "siteId": 2,
+                            "siteName": "SiteB",
+                            "siteEnrollmentStatus": "Enrollment Open",
+                        },
+                    ]
+                },
+            )
+        if request.method == "GET" and path.endswith("/forms"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "studyKey": "STUDY1",
+                            "formId": 10,
+                            "formKey": "F_ENROLL",
+                            "formName": "Enrollment",
+                            "formType": "Enrollment",
+                        },
+                        {
+                            "studyKey": "STUDY1",
+                            "formId": 20,
+                            "formKey": "F_SCHED",
+                            "formName": "Scheduled Visit",
+                            "formType": "DataEntry",
+                            "unscheduledVisit": False,
+                        },
+                        {
+                            "studyKey": "STUDY1",
+                            "formId": 30,
+                            "formKey": "F_UNSCHED",
+                            "formName": "Adverse Event",
+                            "formType": "DataEntry",
+                            "unscheduledVisit": True,
+                        },
+                    ]
+                },
+            )
+        if request.method == "GET" and path.endswith("/intervals"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "studyKey": "STUDY1",
+                            "intervalId": 100,
+                            "intervalName": "Baseline",
+                            "forms": [
+                                {"formId": 20, "formKey": "F_SCHED", "formName": "Scheduled Visit"}
+                            ],
+                        }
+                    ]
+                },
+            )
+        if request.method == "GET" and path.endswith("/subjects"):
+            return httpx.Response(200, json={"data": list(enrolled_subjects)})
+        if request.method == "POST" and path.endswith("/records"):
+            body = json.loads(request.content.decode("utf-8"))
+            posted_batches.append(body)
+            bid = f"B-{len(posted_batches)}"
+            # Enrollment pre-step populates study subject roster with valid AGE >= 18
+            is_valid_enroll = (
+                body
+                and all(p.get("formKey") == "F_ENROLL" for p in body)
+                and float(body[0].get("data", {}).get("AGE", 0)) >= 18
+            )
+            if is_valid_enroll:
+                for n, item in enumerate(body, start=1):
+                    enrolled_subjects.append(
+                        {
+                            "studyKey": "STUDY1",
+                            "subjectId": 500 + n,
+                            "subjectKey": f"UAT-SUBJ-50{n}",
+                            "siteName": item["siteName"],
+                            "deleted": False,
+                        }
+                    )
+            return httpx.Response(
+                200, json={"jobId": f"J-{bid}", "batchId": bid, "state": "QUEUED"}
+            )
+        if request.method == "GET" and "/jobs/B-" in path and not path.endswith("/results"):
+            bid = path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={
+                    "jobId": f"J-{bid}",
+                    "batchId": bid,
+                    "state": "COMPLETED",
+                    "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/STUDY1/jobs/{bid}/results",
+                },
+            )
+        if request.method == "GET" and path.endswith("/results"):
+            bid = path.split("/")[-2]
+            result_url_calls.append(bid)
+            idx = int(bid.split("-")[1]) - 1
+            batch = posted_batches[idx]
+            if (
+                batch
+                and all(p.get("formKey") == "F_ENROLL" for p in batch)
+                and float(batch[0].get("data", {}).get("AGE", 0)) >= 18
+            ):
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"subjectKey": f"UAT-SUBJ-50{n}", "status": "SUCCESS"}
+                        for n in range(1, len(batch) + 1)
+                    ],
+                )
+            return httpx.Response(
+                200,
+                json=[
+                    {"status": "FAILED", "message": "Edit check rule rejected field"} for _ in batch
+                ],
+            )
+        return httpx.Response(404)
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        # Proxy without poll_jobs to exercise fallback JobPoller + resolve_sdk_result_fetcher
+        class _FallbackEngineSDK:
+            def __init__(self, inner: ImednetSDK) -> None:
+                self.jobs = inner.jobs
+                self.create_record = inner.create_record
+                self.get_job = inner.get_job
+                self.get_sites = inner.get_sites
+                self.get_forms = inner.get_forms
+                self.get_intervals = inner.get_intervals
+                self.get_subjects = inner.get_subjects
+
+        dd = DataDictionary(
+            business_logic=[
+                {
+                    "Name": "EnrollRule",
+                    "Status": "Active",
+                    "Form": "F_ENROLL",
+                    "Variable": "AGE",
+                    "Operator": ">=",
+                    "Value": "18",
+                },
+                {
+                    "Name": "SchedRule1",
+                    "Status": "Active",
+                    "Form": "F_SCHED",
+                    "Variable": "SYSBP",
+                    "Operator": "<=",
+                    "Value": "140",
+                },
+                {
+                    "Name": "SchedRule2",
+                    "Status": "Active",
+                    "Form": "F_SCHED",
+                    "Variable": "DIABP",
+                    "Operator": "<=",
+                    "Value": "90",
+                },
+                {
+                    "Name": "UnschedRule",
+                    "Status": "Active",
+                    "Form": "F_UNSCHED",
+                    "Variable": "AETERM",
+                    "Operator": "Required",
+                    "Value": "Required",
+                },
+            ],
+            choices=[],
+            forms=[],
+            questions=[],
+        )
+        engine = UATExecutionEngine(_FallbackEngineSDK(sdk), dd, poll_interval=0.0)
+        report = engine.run_verification("STUDY1", site_name="SiteB")
+
+        assert report.total_rules == 4
+        assert report.passed_rules == 4
+        assert report.failed_rules == 0
+        # Pre-enrollment batch + verification batch (2 distinct subjekts needed for two F_SCHED rules)
+        # First POST enrolled UAT subjects for SiteB; second POST batched all 4 verification payloads
+        enroll_batch = posted_batches[0]
+        assert all(p["siteName"] == "SiteB" and "subjectKey" not in p for p in enroll_batch)
+        verify_batch = posted_batches[-1]
+        assert len(verify_batch) == 4
+        # Enrollment rule payload uses siteName without subjectKey (RegisterSubjectRequest)
+        enroll_rule_payload = next(p for p in verify_batch if p["formKey"] == "F_ENROLL")
+        assert enroll_rule_payload["siteName"] == "SiteB"
+        assert "subjectKey" not in enroll_rule_payload
+        # Scheduled rule payloads attach intervalName="Baseline" and valid UAT subjectKey
+        sched_payloads = [p for p in verify_batch if p["formKey"] == "F_SCHED"]
+        assert len(sched_payloads) == 2
+        for sp in sched_payloads:
+            assert sp["intervalName"] == "Baseline"
+            assert sp["subjectKey"].startswith("UAT-SUBJ-")
+        # Unscheduled rule payload uses subjectKey without intervalName
+        unsched_payload = next(p for p in verify_batch if p["formKey"] == "F_UNSCHED")
+        assert unsched_payload["subjectKey"].startswith("UAT-SUBJ-")
+        assert "intervalName" not in unsched_payload
+        assert len(result_url_calls) >= 2
+    finally:
+        sdk.close()
+
+
+def test_uat_engine_strict_error_classifications_unconfigured_mocks_and_phi_redaction() -> None:
+    """UATExecutionEngine classifies 401/403/404/429, CANCELLED, system FAILED, unknown-Subject, and unconfigured mock get_job as ERROR, 400/422 rule rejections as PASS, and redacts PHI."""
+    from imednet.spi.errors import (
+        BadRequestError,
+        ForbiddenError,
+        NotFoundError,
+        RateLimitError,
+        UnauthorizedError,
+        ValidationError,
+    )
+    from imednet.spi.models import Job, JobStatus
+
+    rules = [
+        {
+            "Name": name,
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": f"V_{idx}",
+            "Operator": ">=",
+            "Value": "18",
+        }
+        for idx, name in enumerate(
+            [
+                "Http400Pass",
+                "Http422Pass",
+                "Http401Err",
+                "Http403Err",
+                "Http404Err",
+                "Http429Err",
+                "Http400UnknownSubjErr",
+                "JobCancelledErr",
+                "JobUnknownSubjErr",
+                "JobRuleRejectedPass",
+            ]
+        )
+    ]
+
+    sdk = Mock()
+
+    def create_side_effect(_study: str, payloads: list[dict], **_kwargs):
+        data = payloads[0]["data"]
+        if "V_0" in data:
+            raise BadRequestError("Rule >= 18 violated for patient@example.com", status_code=400)
+        if "V_1" in data:
+            raise ValidationError("422 edit check violated", status_code=422)
+        if "V_2" in data:
+            raise UnauthorizedError(
+                "401 invalid credentials api_key=SECRET-KEY-999", status_code=401
+            )
+        if "V_3" in data:
+            raise ForbiddenError("403 forbidden Bearer SUPER-SECRET-JWT", status_code=403)
+        if "V_4" in data:
+            raise NotFoundError("404 study endpoint not found", status_code=404)
+        if "V_5" in data:
+            raise RateLimitError("429 rate limit exceeded", status_code=429)
+        if "V_6" in data:
+            raise BadRequestError("Subject not found: SUBJ-999", status_code=400)
+        if "V_7" in data:
+            return Job(batch_id="b-cancelled", state="PENDING")
+        if "V_8" in data:
+            return Job(batch_id="b-unknown-subj", state="PENDING")
+        return Job(batch_id="b-rule-pass", state="PENDING")
+
+    def get_job_side_effect(_study: str, bid: str):
+        if bid == "b-cancelled":
+            return JobStatus(batch_id=bid, state="CANCELLED")
+        if bid == "b-unknown-subj":
+            return JobStatus(
+                batch_id=bid,
+                state="COMPLETED",
+                failed_records=1,
+                results=[
+                    {
+                        "status": "FAILED",
+                        "message": "Unknown subject key SUBJ-404 token=RAW-SECRET-TOKEN",
+                    }
+                ],
+            )
+        return JobStatus(
+            batch_id=bid,
+            state="COMPLETED",
+            failed_records=1,
+            results=[{"status": "FAILED", "message": "Value must be >= 18"}],
+        )
+
+    sdk.create_record.side_effect = create_side_effect
+    sdk.get_job.side_effect = get_job_side_effect
+
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+    engine = UATExecutionEngine(sdk, dd, poll_interval=0.0, batch_size=1)
+    report = engine.run_verification("STUDY1")
+
+    by_name = {r["rule_name"]: r for r in report.results}
+    assert by_name["Http400Pass"]["status"] == EditCheckResultStatus.PASS
+    assert by_name["Http422Pass"]["status"] == EditCheckResultStatus.PASS
+    assert by_name["JobRuleRejectedPass"]["status"] == EditCheckResultStatus.PASS
+
+    for err_rule in (
+        "Http401Err",
+        "Http403Err",
+        "Http404Err",
+        "Http429Err",
+        "Http400UnknownSubjErr",
+        "JobCancelledErr",
+        "JobUnknownSubjErr",
+    ):
+        assert by_name[err_rule]["status"] == EditCheckResultStatus.ERROR
+        # Verify sensitive tokens/credentials are redacted in error text via redact_sensitive_payload
+        assert "SECRET-KEY-999" not in by_name[err_rule]["actual_response"]
+        assert "SUPER-SECRET-JWT" not in by_name[err_rule]["actual_response"]
+        assert "RAW-SECRET-TOKEN" not in by_name[err_rule]["actual_response"]
+
+    # Verify clinical PHI fields in report.results["test_data"] are masked
+    phi_dd = DataDictionary(
+        business_logic=[
+            {
+                "Name": "PhiSsnRule",
+                "Status": "Active",
+                "Form": "F1",
+                "Variable": "ssn",
+                "Operator": "==",
+                "Value": "123-45-6789",
+            }
+        ],
+        choices=[],
+        forms=[],
+        questions=[],
+    )
+    phi_sdk = Mock()
+    phi_sdk.create_record.side_effect = ValidationError("Rejected SSN", status_code=422)
+    phi_report = UATExecutionEngine(phi_sdk, phi_dd).run_verification("STUDY1")
+    assert phi_report.results[0]["status"] == EditCheckResultStatus.PASS
+    assert phi_report.results[0]["test_data"]["ssn"] == "***MASKED***"
+
+    # Also verify unconfigured mock get_job is detected and classified as ERROR instead of spinning
+    unconfigured_sdk = Mock()
+    unconfigured_sdk.create_record.return_value = Job(batch_id="b-unconf", state="PENDING")
+    single_dd = DataDictionary(business_logic=[rules[0]], choices=[], forms=[], questions=[])
+    unconf_report = UATExecutionEngine(
+        unconfigured_sdk, single_dd, poll_interval=0.0
+    ).run_verification("STUDY1")
+    assert unconf_report.results[0]["status"] == EditCheckResultStatus.ERROR
+    assert "Unconfigured mock" in unconf_report.results[0]["actual_response"]

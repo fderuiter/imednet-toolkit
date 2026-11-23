@@ -11,7 +11,10 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+
+if TYPE_CHECKING:
+    from imednet.utils.batch_coordinator import BatchSubmissionSummary
 
 from imednet.models.jobs import (
     InvalidJobStateError,
@@ -123,6 +126,9 @@ class JobPollSummary:
 class JobTimeoutError(TimeoutError):
     """Raised when a job does not finish before the timeout."""
 
+    batch_summary: BatchSubmissionSummary | None = None
+    poll_summary: JobPollSummary | None = None
+
 
 def _extract_record_errors(status: JobStatus | Any) -> list[dict[str, Any]]:
     """Extract sanitized per-record error entries from a JobStatus results payload."""
@@ -222,6 +228,8 @@ class JobFailedError(Exception):
         self.status = status
         self.record_errors = resolved_errors
         self.result_error = resolved_result_error
+        self.batch_summary: BatchSubmissionSummary | None = None
+        self.poll_summary: JobPollSummary | None = None
 
 
 def evaluate_job_state(
