@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         set_base_url_context,
         set_security_key_context,
     )
+    from imednet.core.retry import DefaultRetryPolicy, delegates_to_sdk_retry_policy
     from imednet.errors import PathTraversalValidationError
     from imednet.integrations.enrichment import (
         EnrichmentPipeline,
@@ -86,6 +87,11 @@ if TYPE_CHECKING:
         dataframe_to_records,
         import_records_csv,
     )
+    from imednet.utils.record_filter_eval import (
+        RECORDS_FILTER_ATTRIBUTES,
+        CompiledRecordPredicate,
+        compile_record_predicate,
+    )
     from imednet.utils.secrets import redact_sensitive_payload
     from imednet.utils.security import (
         SensitivityRegistry,
@@ -102,7 +108,13 @@ if TYPE_CHECKING:
         normalize_tabular_row,
     )
     from imednet.utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
-    from imednet.utils.url import redact_sensitive_text, sanitize_base_url, validate_path_segment
+    from imednet.utils.url import (
+        normalize_cache_origin,
+        redact_sensitive_text,
+        resolve_sdk_base_url,
+        sanitize_base_url,
+        validate_path_segment,
+    )
     from imednet.utils.validators import is_boolean_token, is_missing_value, parse_bool
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
@@ -111,7 +123,12 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "AsyncJobPoller": ("imednet.utils.job_poller", "AsyncJobPoller"),
     "BatchCoordinator": ("imednet.utils.batch_coordinator", "BatchCoordinator"),
     "BatchSubmissionSummary": ("imednet.utils.batch_coordinator", "BatchSubmissionSummary"),
+    "CompiledRecordPredicate": (
+        "imednet.utils.record_filter_eval",
+        "CompiledRecordPredicate",
+    ),
     "DEFAULT_BATCH_CHUNK_SIZE": ("imednet.utils.batch_coordinator", "DEFAULT_BATCH_CHUNK_SIZE"),
+    "DefaultRetryPolicy": ("imednet.core.retry", "DefaultRetryPolicy"),
     "ELIGIBLE_SITE_ENROLLMENT_STATUSES": (
         "imednet.utils.enrollment",
         "ELIGIBLE_SITE_ENROLLMENT_STATUSES",
@@ -134,13 +151,25 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "MASKED_SENTINEL": ("imednet.utils.tabular", "MASKED_SENTINEL"),
     "ORDERED_FILTER_OPERATORS": ("imednet.utils.filters", "ORDERED_FILTER_OPERATORS"),
     "PathTraversalValidationError": ("imednet.errors", "PathTraversalValidationError"),
+    "RECORDS_FILTER_ATTRIBUTES": (
+        "imednet.utils.record_filter_eval",
+        "RECORDS_FILTER_ATTRIBUTES",
+    ),
     "RecordsInput": ("imednet.utils.typing", "RecordsInput"),
     "RestrictedAstEvaluator": ("imednet.utils.evaluator", "RestrictedAstEvaluator"),
     "SensitivityRegistry": ("imednet.utils.security", "SensitivityRegistry"),
     "build_filter_string": ("imednet.utils.filters", "build_filter_string"),
     "chunk_records": ("imednet.utils.batch_coordinator", "chunk_records"),
+    "compile_record_predicate": (
+        "imednet.utils.record_filter_eval",
+        "compile_record_predicate",
+    ),
     "csv_to_records": ("imednet.utils.pandas", "csv_to_records"),
     "dataframe_to_records": ("imednet.utils.pandas", "dataframe_to_records"),
+    "delegates_to_sdk_retry_policy": (
+        "imednet.core.retry",
+        "delegates_to_sdk_retry_policy",
+    ),
     "ensure_no_masked_sentinel": ("imednet.utils.tabular", "ensure_no_masked_sentinel"),
     "evaluate_expression": ("imednet.utils.evaluator", "evaluate_expression"),
     "evaluate_job_state": ("imednet.utils.job_poller", "evaluate_job_state"),
@@ -170,6 +199,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "imednet.integrations.enrichment",
         "mask_custom_phi_recursive",
     ),
+    "normalize_cache_origin": ("imednet.utils.url", "normalize_cache_origin"),
     "normalize_iso_date": ("imednet.utils.dates", "normalize_iso_date"),
     "normalize_records_input": ("imednet.utils.tabular", "normalize_records_input"),
     "normalize_subject_registration_inputs": (
@@ -195,6 +225,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "imednet.integrations.enrichment",
         "resolve_enrichment_pipeline",
     ),
+    "resolve_sdk_base_url": ("imednet.utils.url", "resolve_sdk_base_url"),
     "resolve_sdk_result_fetcher": ("imednet.utils.job_poller", "resolve_sdk_result_fetcher"),
     "resolve_study_configuration": (
         "imednet.integrations.enrichment",
@@ -242,10 +273,13 @@ __all__ = [
     "ELIGIBLE_SITE_ENROLLMENT_STATUSES",
     "MASKED_SENTINEL",
     "ORDERED_FILTER_OPERATORS",
+    "RECORDS_FILTER_ATTRIBUTES",
     "AsyncBatchCoordinator",
     "AsyncJobPoller",
     "BatchCoordinator",
     "BatchSubmissionSummary",
+    "CompiledRecordPredicate",
+    "DefaultRetryPolicy",
     "EnrichmentPipeline",
     "FilterScalar",
     "FilterValue",
@@ -267,8 +301,10 @@ __all__ = [
     "SensitivityRegistry",
     "build_filter_string",
     "chunk_records",
+    "compile_record_predicate",
     "csv_to_records",
     "dataframe_to_records",
+    "delegates_to_sdk_retry_policy",
     "ensure_no_masked_sentinel",
     "evaluate_expression",
     "evaluate_job_state",
@@ -289,6 +325,7 @@ __all__ = [
     "is_site_enrollment_eligible",
     "mask_clinical_phi",
     "mask_custom_phi_recursive",
+    "normalize_cache_origin",
     "normalize_iso_date",
     "normalize_records_input",
     "normalize_subject_registration_inputs",
@@ -308,6 +345,7 @@ __all__ = [
     "reset_base_url_context",
     "reset_security_key_context",
     "resolve_enrichment_pipeline",
+    "resolve_sdk_base_url",
     "resolve_sdk_result_fetcher",
     "resolve_study_configuration",
     "sanitize_base_url",

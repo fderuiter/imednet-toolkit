@@ -1,5 +1,7 @@
 # Pytest Test Boundaries and Developer Environment Tooling
 
+> **Status:** Accepted (partially updated by current workspace layout in `pyproject.toml`: `[tool.pytest.ini_options]` now configures `addopts = "--junitxml=reports/junit.xml -ra --ignore=tests/live"` and `testpaths = ["tests", "packages/plugins-sinks/tests", "packages/plugins-tui/tests"]`; the historical `tests/browser/` directory was retired in favor of standalone Playwright verification via `scripts/verify_pyodide_tutorials.py`).
+
 ## Context and Decision
 
 During local test execution and CI maintenance, several environment and testing boundaries caused developer friction:

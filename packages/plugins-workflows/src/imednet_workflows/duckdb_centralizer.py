@@ -247,10 +247,8 @@ class DuckDBIngestionWorkflow:
 
         return max(0, len(rows) - existing_overlap_count)
 
-    def _refresh_combined_silver_view(
-        self, prefix: str, study_key: str, combined_view: str
-    ) -> None:
-        """Union all per-Study views matching prefix into the aggregate silver view."""
+    def _build_combined_silver_union_sql(self, prefix: str, study_key: str) -> str:
+        """Build UNION ALL SQL across all per-Study views matching prefix."""
         catalog_rows = self._connection.execute(
             """
             SELECT view_name
@@ -276,14 +274,9 @@ class DuckDBIngestionWorkflow:
                 ),
             }
         )
-        union_selects = "\n            UNION ALL\n            ".join(
+        return "\n            UNION ALL\n            ".join(
             f'SELECT * FROM "{prefix}{key}"' for key in built_study_keys
         )
-        combined_query = f"""
-            CREATE OR REPLACE VIEW "{combined_view}" AS
-            {union_selects}
-            """
-        self._connection.execute(combined_query)  # nosem
 
     def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
         """Create or replace per-Study and combined silver current-state and history views.
@@ -355,9 +348,14 @@ class DuckDBIngestionWorkflow:
             ) AS latest_revisions{deleted_clause}
             """
         self._connection.execute(per_study_query)  # nosem
-        self._refresh_combined_silver_view(
-            "silver_current_state_", study_key, "silver_current_state"
+        current_union_sql = self._build_combined_silver_union_sql(
+            "silver_current_state_", study_key
         )
+        combined_current_query = f"""
+            CREATE OR REPLACE VIEW silver_current_state AS
+            {current_union_sql}
+            """
+        self._connection.execute(combined_current_query)  # nosem
 
         per_study_history_view = f"silver_records_history_{study_key}"
         per_study_history_query = f"""
@@ -401,9 +399,14 @@ class DuckDBIngestionWorkflow:
             WHERE study_key = '{escaped_study_key}'
             """
         self._connection.execute(per_study_history_query)  # nosem
-        self._refresh_combined_silver_view(
-            "silver_records_history_", study_key, "silver_records_history"
+        history_union_sql = self._build_combined_silver_union_sql(
+            "silver_records_history_", study_key
         )
+        combined_history_query = f"""
+            CREATE OR REPLACE VIEW silver_records_history AS
+            {history_union_sql}
+            """
+        self._connection.execute(combined_history_query)  # nosem
 
     def _ensure_bronze_table(self) -> None:
         """Ensure the bronze_revisions table and record_revisions view exist in DuckDB."""

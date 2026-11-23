@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import email
 import os
 import re
 import shutil
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import zipfile
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
@@ -22,6 +24,11 @@ ROOT = Path(__file__).parent.parent.resolve()
 PACKAGES_DIR = ROOT / "packages"
 MANIFEST_PATH = ROOT / ".release-please-manifest.json"
 UV_LOCK_PATH = ROOT / "uv.lock"
+REQUIRED_PYTHON_CLASSIFIERS = (
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+)
 
 
 class ConsumptionValidationError(RuntimeError):
@@ -42,6 +49,58 @@ def _resolve_uv() -> str:
 
 def _normalize_wheel_prefix(pkg_name: str) -> str:
     return re.sub(r"[-_.]+", "_", pkg_name).lower()
+
+
+def verify_wheel_metadata(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
+    """Verify built workspace wheels expose Markdown descriptions, MIT license, and Python 3.11-3.13 classifiers."""
+    for _, pkg_name in discover_workspace_packages(packages_dir):
+        wheel_path = _find_wheel_for_package(dist_dir, pkg_name)
+        if wheel_path is None:
+            raise ValueError(
+                f"Missing built wheel for workspace package '{pkg_name}' in {dist_dir}"
+            )
+
+        with zipfile.ZipFile(wheel_path) as zf:
+            meta_entries = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
+            if not meta_entries:
+                raise ValueError(f"Wheel '{wheel_path.name}' is missing .dist-info/METADATA")
+            msg = email.message_from_bytes(zf.read(meta_entries[0]))
+
+        content_type = (msg.get("Description-Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "text/markdown":
+            raise ValueError(
+                f"Wheel '{wheel_path.name}' expected Description-Content-Type 'text/markdown', "
+                f"got {msg.get('Description-Content-Type')!r}"
+            )
+
+        payload = msg.get_payload()
+        if not isinstance(payload, str) or not payload.strip():
+            raise ValueError(f"Wheel '{wheel_path.name}' has an empty METADATA description body")
+
+        license_expr = (msg.get("License-Expression") or "").strip()
+        if license_expr != "MIT":
+            raise ValueError(
+                f"Wheel '{wheel_path.name}' expected License-Expression 'MIT', got {license_expr!r}"
+            )
+
+        classifiers = set(msg.get_all("Classifier", []))
+        missing_classifiers = [c for c in REQUIRED_PYTHON_CLASSIFIERS if c not in classifiers]
+        if missing_classifiers:
+            raise ValueError(
+                f"Wheel '{wheel_path.name}' is missing classifiers: {missing_classifiers}"
+            )
+
+
+def build_wheels(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
+    uv_bin = _resolve_uv()
+    if dist_dir.exists():
+        shutil.rmtree(dist_dir)
+    dist_dir.mkdir(parents=True)
+
+    for pkg_path, _ in discover_workspace_packages(packages_dir):
+        _build_single_wheel(uv_bin, pkg_path, dist_dir)
+
+    verify_wheel_metadata(dist_dir, packages_dir=packages_dir)
 
 
 def discover_workspace_packages(packages_dir: Path = PACKAGES_DIR) -> list[tuple[Path, str]]:
@@ -969,6 +1028,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         with tempfile.TemporaryDirectory(prefix="imednet-consumption-wheels-") as tmp_wheels:
             dist_dir = Path(tmp_wheels)
             prepare_wheels(dist_dir, args.wheel_dir)
+            verify_wheel_metadata(dist_dir, PACKAGES_DIR)
 
             for scenario in scenarios:
                 try:

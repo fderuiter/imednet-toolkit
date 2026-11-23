@@ -179,7 +179,21 @@ Incremental checkpoints for DuckDB and Hive Parquet helpers
 :func:`imednet.integrations.export_to_hive_parquet` accept all eight streaming
 checkpoint options—``incremental``, ``stream_name``, ``ledger_path``,
 ``state_provider``, ``modified_since``, ``record_filter``, ``record_data_filter``,
-and ``include_deleted``—while keeping ``mask_phi=True`` as the default PHI guard.
+and ``include_deleted``—along with ``max_buffered_records`` and
+``quality_gate_enabled`` while keeping ``mask_phi=True`` as the default PHI guard.
+
+Multi-``Form`` exports (:func:`~imednet.integrations.export_to_duckdb_by_form` and
+:func:`~imednet.integrations.export_to_hive_parquet`) stream ``Study`` ``Record``
+items in a single pass through :class:`~imednet.spi.sink_base.BoundedFormBufferRouter`,
+maintaining isolated per-``Form`` watermarks (``duckdb:<form_key>`` and
+``hive_parquet:<form_key>``, or ``<stream_name>:<form_key>``) and evicting the largest
+buffered ``Form`` whenever total buffered ``Record`` items reach
+``max_buffered_records`` (default ``max(batch_size, 5000)``). When ``idempotent=True``
+and ``include_deleted=False``, incremental runs upsert modified ``recordId`` rows and
+prune voided (``deleted=True``) ``Record`` items (via ``DELETE FROM`` plus
+``INSERT INTO ... BY NAME`` in DuckDB and partition Parquet pruning prior to checkpoint
+commit in Hive Parquet), while capping ``max_ts`` at ``min_rejected_ts`` if
+``quality_gate_enabled=True`` drops low-readiness ``Record`` items.
 
 Use :class:`~imednet_workflows.ExtractionStateLedger`
 (:class:`~imednet_workflows.state_ledger.FileStateProvider`) for local analytical
@@ -240,19 +254,25 @@ Annotated examples:
 Performance notes
 -----------------
 
-The DuckDB path behind :func:`imednet.integrations.export_to_duckdb` and
-:func:`imednet.integrations.export_to_duckdb_by_form` registers a DataFrame directly
-in DuckDB before a ``CREATE TABLE AS SELECT`` operation. Compared to row-by-row insert
-patterns often used with SQLAlchemy targets, this is typically much lower overhead for
-large exports.
+``TabularDuckDBSink`` behind :func:`imednet.integrations.export_to_duckdb` and
+:func:`imednet.integrations.export_to_duckdb_by_form` streams bounded ``batch_size``
+DataFrame chunks rather than materializing an entire ``Study`` in memory. The initial
+batch initializes (or replaces on full idempotent runs) the target table, unseen
+``Variable`` columns in later batches are added via ``ALTER TABLE ... ADD COLUMN``, and
+subsequent and incremental batches register each chunk DataFrame for vectorized
+``INSERT INTO ... BY NAME`` writes instead of row-by-row SQL inserts.
 
-As an illustrative estimate (not a guaranteed benchmark), teams often observe whole-table
-loads finishing in seconds to minutes where row-wise insert flows can take materially
-longer for the same dataset shape.
+For multi-``Form`` workloads, :func:`imednet.integrations.export_to_duckdb_by_form` and
+:func:`imednet.integrations.export_to_hive_parquet` route ``Record`` streams in a single
+API pass via :class:`~imednet.spi.sink_base.BoundedFormBufferRouter`. Each ``Form``
+flushes as soon as its active or voided buffer reaches ``batch_size`` (or ``chunk_size``),
+and if total buffered ``Record`` items across all ``Form`` buffers hit
+``max_buffered_records`` (default ``max(batch_size, 5000)``), the router evicts and
+flushes the largest ``Form`` buffer first to enforce bounded worker memory.
 
 Hive-partitioned Parquet via :func:`imednet.integrations.export_to_hive_parquet` also
-avoids SQLite's 2000-column table ceiling by storing each form independently and allowing
-federated reads through DuckDB.
+avoids SQLite's 2000-column table ceiling by storing each ``Form`` independently and
+allowing federated reads through DuckDB.
 
 Out of scope
 ------------

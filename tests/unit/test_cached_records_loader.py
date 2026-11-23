@@ -63,7 +63,11 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
 
     first_delta_call = sdk.get_records.call_args_list[0]
     second_delta_call = sdk.records.list.call_args_list[0]
-    assert first_delta_call.kwargs == {"study_key": "STUDY", "record_data_filter": None}
+    assert first_delta_call.kwargs == {
+        "study_key": "STUDY",
+        "record_data_filter": None,
+        "deleted": False,
+    }
     assert second_delta_call.kwargs == {
         "study_key": "STUDY",
         "filter": 'dateModified>="2024-01-02 00:00:00+00:00"',
@@ -456,7 +460,7 @@ def test_cached_loader_http_contract_iso_timestamp_and_lowercase_bool(tmp_path: 
         loader.sync_records("STUDY", reconcile=True)
         loader.sync_records("STUDY", reconcile=False)
 
-        assert "filter" not in calls[0]
+        assert calls[0]["filter"] == "deleted==false"
         assert calls[1]["filter"] == "deleted==false"
         assert calls[1]["recordDataFilter"] == "none"
         assert calls[2]["filter"] == "dateModified>=2024-01-02T00:00:00Z"
@@ -625,6 +629,7 @@ def test_study_with_only_null_timestamps_uses_lightweight_reconcile_after_initia
     assert sdk.get_records.call_args_list[0].kwargs == {
         "study_key": "STUDY",
         "record_data_filter": None,
+        "deleted": False,
     }
     assert sdk.get_records.call_args_list[2].kwargs == {
         "study_key": "STUDY",

@@ -1,12 +1,16 @@
 """Tests for contract validation across namespaces and plugins."""
 
+import ast
 import dataclasses
 import importlib.util
 import inspect
 import re
 import sys
+import textwrap
 import tomllib
 from collections.abc import Iterable, Mapping
+from datetime import date
+from decimal import Decimal
 from importlib.metadata import entry_points
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import imednet.integrations as core_integrations
 import imednet.utils.evaluator as evaluator_mod
 from imednet.core.operations.circuit_breaker import CircuitBreaker, CircuitState, ProbeLease
 from imednet.errors import (
@@ -26,18 +31,27 @@ from imednet.errors import (
     RequestError,
     RestrictedEvaluationError,
 )
-from imednet.integrations.sink_base import SinkConfig
+from imednet.integrations import dispatcher as export_dispatcher
+from imednet.integrations.sink_base import BoundedFormBufferRouter, SinkConfig
 from imednet.models.study_config import MappingRule
 from imednet.plugins import WorkflowsNamespaceProtocol
 from imednet.sdk import ImednetSDK
 from imednet.utils.url import build_safe_path, validate_path_segment
+from imednet_sinks.document import (
+    _attach_sdtm_document_id,
+    _encode_bson_scalars,
+    _make_document_id,
+)
+from imednet_sinks.graph import _build_sdtm_cypher, _normalize_visit_id
 from imednet_sinks.plugin import SinksNamespace
+from imednet_sinks.warehouse import _resolve_merge_keys
 from imednet_workflows.duckdb_centralizer import DuckDBIngestionWorkflow
 from imednet_workflows.namespace import Workflows
 from imednet_workflows.register_subjects import RegisterSubjectsWorkflow
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DOCS_DIR = REPO_ROOT / "docs"
+SINKS_README = REPO_ROOT / "packages" / "plugins-sinks" / "README.md"
 
 STREAMING_CHECKPOINT_OPTIONS: tuple[str, ...] = (
     "modified_since",
@@ -299,6 +313,202 @@ def validate_sink_config_narrative_coverage(
                 f"{docs_dir / 'how-to'}: Streaming checkpoint option '{option_name}' lacks how-to guide coverage"
             )
 
+    return errors
+
+
+def _extract_airflow_connection_targets(func: object) -> set[str]:
+    """Extract destination target literals handled by ImednetHook.resolve_destination_connection."""
+    source = textwrap.dedent(inspect.getsource(func))  # type: ignore[arg-type]
+    tree = ast.parse(source)
+    targets: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not (isinstance(node.left, ast.Name) and node.left.id == "dest"):
+            continue
+        for op, comparator in zip(node.ops, node.comparators, strict=False):
+            if isinstance(op, ast.Eq) and isinstance(comparator, ast.Constant):
+                if isinstance(comparator.value, str):
+                    targets.add(comparator.value)
+            elif isinstance(op, ast.In) and isinstance(comparator, (ast.Set, ast.Tuple, ast.List)):
+                for elt in comparator.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        targets.add(elt.value)
+    return targets
+
+
+def validate_tabular_exporters_narrative_coverage(
+    docs_dir: Path,
+    tabular_exporters: Iterable[str],
+) -> list[str]:
+    """Verify export_destinations.rst documents all tabular exporters, upserts, and watermark capping."""
+    errors: list[str] = []
+    export_rst = docs_dir / "how-to" / "export_destinations.rst"
+    arch_rst = docs_dir / "explanation" / "architecture.rst"
+    if not export_rst.exists():
+        return [f"Missing export destinations guide: {export_rst}"]
+
+    export_text = export_rst.read_text(encoding="utf-8")
+    for exporter_name in tabular_exporters:
+        if not re.search(rf"\b{re.escape(exporter_name)}\b", export_text):
+            errors.append(
+                f"{export_rst}: Tabular exporter '{exporter_name}' lacks narrative documentation"
+            )
+
+    for required_token in (
+        "recordId",
+        "reconcile_deleted",
+        ".tmp",
+        "quality_gate_enabled",
+        "min_rejected_ts",
+    ):
+        if required_token not in export_text:
+            errors.append(
+                f"{export_rst}: Missing incremental reconciliation or watermark token '{required_token}'"
+            )
+
+    if arch_rst.exists():
+        arch_text = arch_rst.read_text(encoding="utf-8")
+        for arch_token in ("ExportRegistry", "min_rejected_ts"):
+            if arch_token not in arch_text:
+                errors.append(
+                    f"{arch_rst}: Missing streaming export architecture token '{arch_token}'"
+                )
+
+    return errors
+
+
+def validate_duckdb_streaming_router_narrative_coverage(
+    docs_dir: Path,
+    *,
+    router_cls_name: str = "BoundedFormBufferRouter",
+    router_params: Iterable[str] = ("batch_size", "max_buffered_records"),
+) -> list[str]:
+    """Verify duckdb_integration.rst documents BoundedFormBufferRouter and INSERT INTO ... BY NAME without CTAS claims."""
+    duckdb_rst = docs_dir / "how-to" / "duckdb_integration.rst"
+    if not duckdb_rst.exists():
+        return [f"Missing DuckDB integration guide: {duckdb_rst}"]
+
+    errors: list[str] = []
+    duckdb_text = duckdb_rst.read_text(encoding="utf-8")
+    if not re.search(rf"\b{re.escape(router_cls_name)}\b", duckdb_text):
+        errors.append(f"{duckdb_rst}: Missing narrative documentation for '{router_cls_name}'")
+    for param_name in router_params:
+        if not re.search(rf"\b{re.escape(param_name)}\b", duckdb_text):
+            errors.append(
+                f"{duckdb_rst}: Router parameter '{param_name}' lacks narrative documentation"
+            )
+    if "INSERT INTO ... BY NAME" not in duckdb_text:
+        errors.append(f"{duckdb_rst}: Missing 'INSERT INTO ... BY NAME' batch append documentation")
+    if "CREATE TABLE AS SELECT" in duckdb_text:
+        errors.append(f"{duckdb_rst}: Contains stale whole-table 'CREATE TABLE AS SELECT' claim")
+    return errors
+
+
+def validate_sink_schemas_and_keys_narrative_coverage(
+    docs_dir: Path,
+    sinks_readme: Path,
+    *,
+    extra_required_tokens: Mapping[Path, tuple[str, ...]] | None = None,
+) -> list[str]:
+    """Verify MongoDB, Neo4j, and Snowflake schema/key contracts match narrative guides and sink README."""
+    required_by_file: dict[Path, tuple[str, ...]] = {
+        docs_dir / "how-to" / "export_destinations.rst": (
+            "Decimal128",
+            "ISO-8601",
+            "<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>",
+            "visit_id <= 0",
+            "(:Subject)-[:HAS_RECORD]->(:Record)",
+            "(STUDYID, DOMAIN, USUBJID, *SEQ)",
+        ),
+        docs_dir / "explanation" / "architecture.rst": (
+            "Decimal128",
+            "ISO-8601",
+            "<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>",
+            "visit_id <= 0",
+            "(:Subject)-[:HAS_RECORD]->(:Record)",
+            "(STUDYID, DOMAIN, USUBJID, *SEQ)",
+            "(studyKey, recordId)",
+            "(STUDYID, RECORD_ID)",
+        ),
+        docs_dir / "how-to" / "snowflake_export.rst": (
+            "(study_key, record_id)",
+            "(studyKey, recordId)",
+            "(STUDYID, RECORD_ID)",
+            "(STUDYID, DOMAIN, USUBJID, *SEQ)",
+            "(STUDYID, DOMAIN, USUBJID)",
+        ),
+        docs_dir / "tutorials" / "examples" / "neo4j_export.rst": (
+            "visit_id <= 0",
+            "(:Subject)-[:HAS_RECORD]->(:Record)",
+            "(STUDYID, DOMAIN, USUBJID, *SEQ)",
+        ),
+        docs_dir / "tutorials" / "examples" / "mongodb_export.rst": (
+            "Decimal128",
+            "ISO-8601",
+            "<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>",
+        ),
+        sinks_readme: (
+            "Decimal128",
+            "ISO-8601",
+            "<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>",
+            "visit_id <= 0",
+            "(:Subject)-[:HAS_RECORD]->(:Record)",
+            "(STUDYID, DOMAIN, USUBJID, *SEQ)",
+            "(studyKey, recordId)",
+            "(STUDYID, RECORD_ID)",
+        ),
+    }
+    if extra_required_tokens:
+        for path, tokens in extra_required_tokens.items():
+            required_by_file[path] = required_by_file.get(path, ()) + tuple(tokens)
+
+    errors: list[str] = []
+    for doc_path, tokens in required_by_file.items():
+        if not doc_path.exists():
+            errors.append(f"Missing sink documentation file: {doc_path}")
+            continue
+        content = doc_path.read_text(encoding="utf-8")
+        for token in tokens:
+            if token not in content:
+                errors.append(f"{doc_path}: Missing sink schema/key documentation token '{token}'")
+    return errors
+
+
+def validate_airflow_export_narrative_coverage(
+    docs_dir: Path,
+    airflow_helpers: Iterable[str],
+    connection_targets: Iterable[str],
+) -> list[str]:
+    """Verify architecture.rst documents all Airflow export helpers and destination connection targets."""
+    arch_rst = docs_dir / "explanation" / "architecture.rst"
+    if not arch_rst.exists():
+        return [f"Missing architecture guide: {arch_rst}"]
+
+    arch_text = arch_rst.read_text(encoding="utf-8")
+    anchor = "apache_airflow_providers_imednet.export"
+    anchor_idx = arch_text.find(anchor)
+    airflow_section = arch_text[anchor_idx:] if anchor_idx != -1 else arch_text
+
+    errors: list[str] = []
+    if anchor_idx == -1:
+        errors.append(f"{arch_rst}: Missing '{anchor}' boundary documentation")
+    if "resolve_destination_connection" not in airflow_section:
+        errors.append(f"{arch_rst}: Missing 'resolve_destination_connection' documentation")
+
+    for helper_name in airflow_helpers:
+        if not re.search(rf"\b{re.escape(helper_name)}\b", airflow_section):
+            errors.append(
+                f"{arch_rst}: Airflow export helper '{helper_name}' lacks narrative documentation"
+            )
+    for target in connection_targets:
+        token_pattern = (
+            rf"(?:``{re.escape(target)}``|\"{re.escape(target)}\"|'{re.escape(target)}')"
+        )
+        if not re.search(token_pattern, airflow_section):
+            errors.append(
+                f"{arch_rst}: Airflow destination connection target '{target}' lacks narrative documentation"
+            )
     return errors
 
 
@@ -713,13 +923,147 @@ def test_workflow_interactions_sections_have_prose_mermaid_and_testcode() -> Non
     assert not errors, f"workflow_interactions.rst parity failed: {errors}"
 
 
+def test_tabular_exporters_and_streaming_router_narrative_parity() -> None:
+    """Assert all 10 ExportRegistry tabular exporters and BoundedFormBufferRouter are documented."""
+    registry = export_dispatcher._registry
+    assert isinstance(registry, export_dispatcher.ExportRegistry)
+    registered_tabular_funcs = {func.__name__ for func in registry._tabular_targets.values()}
+    public_export_funcs = {
+        name for name in core_integrations.__all__ if name.startswith("export_to_")
+    }
+    assert registered_tabular_funcs == public_export_funcs
+    assert len(registered_tabular_funcs) == 10
+
+    router_sig = inspect.signature(BoundedFormBufferRouter.__init__)
+    router_params = [
+        name for name in ("batch_size", "max_buffered_records") if name in router_sig.parameters
+    ]
+    assert router_params == ["batch_size", "max_buffered_records"]
+
+    tabular_errors = validate_tabular_exporters_narrative_coverage(
+        DOCS_DIR, sorted(registered_tabular_funcs)
+    )
+    assert not tabular_errors, f"Tabular exporters narrative parity failed: {tabular_errors}"
+
+    duckdb_errors = validate_duckdb_streaming_router_narrative_coverage(
+        DOCS_DIR,
+        router_cls_name=BoundedFormBufferRouter.__name__,
+        router_params=router_params,
+    )
+    assert not duckdb_errors, f"DuckDB streaming router narrative parity failed: {duckdb_errors}"
+
+
+def test_sink_schemas_and_keys_narrative_parity() -> None:
+    """Assert sink key helpers and scalar encoders match narrative docs and sink README."""
+    assert _make_document_id("STUDY_A", 42) == "STUDY_A/42"
+    sdtm_doc = _attach_sdtm_document_id(
+        {"STUDYID": "STUDY_A", "DOMAIN": "AE", "USUBJID": "SUBJ-1", "AESEQ": 3},
+        {},
+        "STUDY_A",
+    )
+    assert sdtm_doc["_id"] == "STUDY_A/AE/SUBJ-1/3"
+    assert _encode_bson_scalars(date(2026, 5, 1)) == "2026-05-01"
+    encoded_decimal = _encode_bson_scalars(Decimal("12.50"))
+    assert type(encoded_decimal).__name__ == "Decimal128"
+
+    assert _normalize_visit_id(0) is None
+    assert _normalize_visit_id(-5) is None
+    sdtm_merge_cypher, _ = _build_sdtm_cypher("AESEQ", has_visit=False)
+    assert "STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, AESEQ: row.AESEQ" in (
+        sdtm_merge_cypher
+    )
+    assert "MERGE (su)-[:HAS_RECORD]->(r)" in sdtm_merge_cypher
+
+    assert _resolve_merge_keys(["STUDYID", "DOMAIN", "USUBJID", "AESEQ"], as_sdtm=True) == (
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "AESEQ",
+    )
+    assert _resolve_merge_keys(["STUDYID", "DOMAIN", "USUBJID"], as_sdtm=True) == (
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+    )
+    assert _resolve_merge_keys(["studyKey", "recordId"], naming_convention="camelCase") == (
+        "studyKey",
+        "recordId",
+    )
+    assert _resolve_merge_keys(["STUDYID", "RECORD_ID"], naming_convention="sdtm") == (
+        "STUDYID",
+        "RECORD_ID",
+    )
+
+    sink_errors = validate_sink_schemas_and_keys_narrative_coverage(DOCS_DIR, SINKS_README)
+    assert not sink_errors, f"Sink schema and key narrative parity failed: {sink_errors}"
+
+
+def test_airflow_export_and_connection_targets_narrative_parity() -> None:
+    """Assert Airflow 8-helper export subset and connection targets match narrative docs."""
+    from apache_airflow_providers_imednet import export as airflow_export
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import _TABULAR_EXPORTS
+
+    airflow_helpers = list(airflow_export.__all__)
+    assert len(airflow_helpers) == 8
+    assert {fn.__name__ for fn in _TABULAR_EXPORTS.values()} == set(airflow_helpers)
+
+    conn_targets = _extract_airflow_connection_targets(ImednetHook.resolve_destination_connection)
+    assert conn_targets == {
+        "snowflake",
+        "neo4j",
+        "mongodb",
+        "duckdb",
+        "sql",
+        "sql_by_form",
+        "long_sql",
+    }
+
+    airflow_errors = validate_airflow_export_narrative_coverage(
+        DOCS_DIR, sorted(airflow_helpers), sorted(conn_targets)
+    )
+    assert not airflow_errors, f"Airflow export narrative parity failed: {airflow_errors}"
+
+
 def test_narrative_parity_gates_fail_on_undocumented_additions(tmp_path: Path) -> None:
-    """Verify parity validators fail when new SinkConfig fields, entry points, or Mermaid sections lack docs."""
+    """Verify parity validators fail when new SinkConfig fields, exporters, Airflow targets, or Mermaid sections lack docs."""
     sink_fields_with_new = [f.name for f in dataclasses.fields(SinkConfig)] + [
         "undocumented_sink_field_xyz"
     ]
     sink_errs = validate_sink_config_narrative_coverage(DOCS_DIR, sink_fields_with_new)
     assert any("undocumented_sink_field_xyz" in err for err in sink_errs)
+
+    exporter_errs = validate_tabular_exporters_narrative_coverage(
+        DOCS_DIR, ["export_to_csv", "export_to_undocumented_xyz"]
+    )
+    assert any("export_to_undocumented_xyz" in err for err in exporter_errs)
+
+    stale_docs = tmp_path / "stale_docs"
+    (stale_docs / "how-to").mkdir(parents=True)
+    (stale_docs / "how-to" / "duckdb_integration.rst").write_text(
+        "DuckDB Integration\n==================\n\n"
+        "Registers a DataFrame before a ``CREATE TABLE AS SELECT`` operation.\n",
+        encoding="utf-8",
+    )
+    duckdb_errs = validate_duckdb_streaming_router_narrative_coverage(stale_docs)
+    assert any("BoundedFormBufferRouter" in err for err in duckdb_errs)
+    assert any("INSERT INTO ... BY NAME" in err for err in duckdb_errs)
+    assert any("CREATE TABLE AS SELECT" in err for err in duckdb_errs)
+
+    sink_key_errs = validate_sink_schemas_and_keys_narrative_coverage(
+        DOCS_DIR,
+        SINKS_README,
+        extra_required_tokens={SINKS_README: ("undocumented_sink_key_xyz",)},
+    )
+    assert any("undocumented_sink_key_xyz" in err for err in sink_key_errs)
+
+    airflow_errs = validate_airflow_export_narrative_coverage(
+        DOCS_DIR,
+        ["export_to_csv", "export_to_undocumented_airflow_xyz"],
+        ["duckdb", "undocumented_airflow_target_xyz"],
+    )
+    assert any("export_to_undocumented_airflow_xyz" in err for err in airflow_errs)
+    assert any("undocumented_airflow_target_xyz" in err for err in airflow_errs)
 
     workflow_errs = validate_workflow_entrypoints_narrative_coverage(
         DOCS_DIR, ["data_extraction", "undocumented_workflow_plugin_xyz"]
