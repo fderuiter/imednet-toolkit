@@ -24,17 +24,22 @@ versions.
 * **AES-256 / Fernet payload encryption** — serialized ``StudyConfiguration``
   JSON payloads are encrypted at rest before SQLite persistence using
   ``cryptography.fernet.Fernet``. Key material is resolved from
-  ``IMEDNET_ENCRYPTION_KEY`` (falling back to ``IMEDNET_SECURITY_KEY``): a
-  32-byte URL-safe base64 Fernet key is used directly, while passphrases are
-  hashed with SHA-256 into a 32-byte key. Missing or mismatched keys fail
-  closed with ``ValueError``.
-* **Dynamic host and Study path scoping** — the base SQLite path defaults to
-  ``IMEDNET_CONFIG_DB_PATH`` or ``~/.imednet/config_versions.sqlite3``. At
-  runtime, ``db_path`` isolates ledger files under
-  ``<base_dir>/<sanitized_host>/[<study_key>/]<filename>`` derived from the
-  active ``base_url_context`` / ``IMEDNET_BASE_URL`` (default ``localhost``)
-  and optional ``study_context`` (validated via ``validate_partition_key`` to
-  prevent path traversal).
+  ``IMEDNET_ENCRYPTION_KEY``, falling back to ``IMEDNET_SECURITY_KEY``, the
+  active ``security_key_context`` bound by ``ImednetSDK`` /
+  ``sdk.study_context(...)``, or the ``sdk`` security key captured during
+  ``commit_config``: a 32-byte URL-safe base64 Fernet key is used directly,
+  while passphrases are hashed with SHA-256 into a 32-byte key. Missing or
+  mismatched keys fail closed with ``ValueError``.
+* **Dynamic host path scoping & legacy fallback** — the base SQLite path
+  defaults to ``IMEDNET_CONFIG_DB_PATH`` or
+  ``~/.imednet/config_versions.sqlite3``. At runtime, ``db_path`` isolates
+  ledger files per host under ``<base_dir>/<sanitized_host>/<filename>`` derived
+  from the active ``base_url_context`` / ``IMEDNET_BASE_URL`` (default
+  ``localhost``), validating ``study_key`` and ``study_context`` via
+  ``validate_partition_key`` to prevent path traversal without splitting
+  directories by ``study_context`` (while ``resolve_committed_config`` falls
+  back read-only to legacy ``<base_dir>/<sanitized_host>/<study_key>/<filename>``
+  and ``<base_dir>/<filename>`` paths).
 * **Parent-chained SHA-256 commit hashes & SQLite immutability** — each payload
   computes ``content_hash = sha256(config_json)``. Root commits use
   ``content_hash`` as ``commit_id``, while child commits chain cryptographically

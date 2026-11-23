@@ -25,7 +25,7 @@ from ..utils.args import (
     resolve_output_format,
     resolve_study_key,
 )
-from ..utils.export import export_list_to_file
+from ..utils.export import export_list_to_file, resolve_records_export_target
 from ..utils.write_helpers import (
     add_write_common_args,
     coerce_batch_summary,
@@ -217,7 +217,23 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     list_parser.add_argument(
         "-o",
         "--output",
-        help="Deprecated: save records to a file (json or csv); prefer --format json or 'imednet export'.",
+        help=(
+            "Deprecated: save records to a file (json, csv, or a .json/.csv path); "
+            "prefer --format json or 'imednet export'."
+        ),
+    )
+    list_parser.add_argument(
+        "--mask-phi",
+        dest="mask_phi",
+        action="store_true",
+        default=True,
+        help="Mask sensitive Subject PHI fields with ***MASKED*** (enabled by default).",
+    )
+    list_parser.add_argument(
+        "--no-mask-phi",
+        dest="mask_phi",
+        action="store_false",
+        help="Disable default PHI masking for authorized raw exports.",
     )
     add_list_query_args(
         list_parser,
@@ -231,8 +247,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if output and output_format == "json":
             print_error("Choose --format json for stdout or --output for a file.")
             sys.exit(1)
-        if output and output.lower() not in {"json", "csv"}:
-            print_error("Invalid output format. Use 'json' or 'csv'.")
+        if output is not None and resolve_records_export_target(output, "records") is None:
+            print_error(
+                "Invalid output format. Use 'json' or 'csv'. "
+                "Explicit '.json' and '.csv' file paths are also supported."
+            )
             sys.exit(1)
         if output:
             print_error(
@@ -252,6 +271,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         limit: int | None = None,
         fetch_all: bool = False,
         no_interactive: bool = False,
+        mask_phi: bool = True,
         _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
         resolved_format = resolve_output_format(output_format)
@@ -282,7 +302,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if resolved_format == "json":
             display_list(records, "records", output_format="json")
         elif output:
-            export_list_to_file(records, "records", output.lower())
+            export_list_to_file(
+                records,
+                "records",
+                output,
+                study_key=study_key,
+                mask_phi=mask_phi,
+            )
         else:
             view_models = [_record_view_model(r) for r in records]
 
@@ -332,6 +358,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 limit=args.limit,
                 fetch_all=args.fetch_all,
                 no_interactive=no_interactive,
+                mask_phi=bool(getattr(args, "mask_phi", True)),
                 _prepared_query=prepared,
             )
 

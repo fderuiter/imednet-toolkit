@@ -3944,3 +3944,397 @@ async def test_app_env_subtitle_resolution_simulation_client_and_default_fallbac
         assert bare_app.sub_title == f"Env: {DEFAULT_BASE_URL}"
         assert "None" not in bare_app.sub_title
         assert "Unknown" not in bare_app.sub_title
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_preserves_failure_warning_and_toggles_inline_detail_panel() -> None:
+    """Preserve JobFailedError warnings and inspect sanitized result/record errors inline."""
+    from textual.color import Color
+
+    from imednet.models.jobs import JobState, JobStatus
+    from imednet.models.sites import Site
+    from imednet.models.studies import Study
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(
+        return_value=[Study(study_key="STUDY-DETAIL", study_name="Detail Study")]
+    )
+    sdk.async_get_sites = AsyncMock(
+        return_value=[Site(study_key="STUDY-DETAIL", site_id=10, site_name="Site Ten")]
+    )
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    res_err_job = JobStatus(
+        job_id="BATCH-RES-ERR",
+        batch_id="BATCH-RES-ERR",
+        state=JobState.COMPLETED,
+        progress=100,
+        total_records=5,
+        failed_records=0,
+        result_url="https://api.example.com/results/BATCH-RES-ERR",
+    )
+    rec_err_job = JobStatus(
+        job_id="BATCH-REC-ERR",
+        batch_id="BATCH-REC-ERR",
+        state=JobState.COMPLETED,
+        progress=100,
+        total_records=4,
+        failed_records=2,
+        results=[
+            {
+                "status": "FAILED",
+                "recordId": 42,
+                "subjectKey": "SUBJ-007",
+                "formKey": "AE",
+                "patient_name": "Jane Doe",
+                "api_key": "sk-secret-inline",
+                "error": "Invalid onset date for ssn=123-45-6789",
+            },
+            {
+                "status": "ERROR",
+                "record_id": 43,
+                "subject_key": "SUBJ-008",
+                "errors": ["Missing AE severity for email=jane@example.com"],
+            },
+        ],
+    )
+    clean_job = JobStatus(
+        job_id="BATCH-OK",
+        batch_id="BATCH-OK",
+        state=JobState.COMPLETED,
+        progress=100,
+        total_records=3,
+        failed_records=0,
+    )
+
+    jobs_by_id = {
+        "BATCH-RES-ERR": res_err_job,
+        "BATCH-REC-ERR": rec_err_job,
+        "BATCH-OK": clean_job,
+    }
+    sdk.async_get_job = AsyncMock(side_effect=lambda _sk, jid: jobs_by_id[jid])
+    sdk.async_client = MagicMock()
+    sdk.async_client.fetch_external_url = AsyncMock(
+        side_effect=RuntimeError(
+            "502 Bad Gateway x-api-key: raw-res-secret patient_name=Alice Smith"
+        )
+    )
+
+    app = ImednetTuiApp(
+        sdk,
+        high_contrast=True,
+        study_key="STUDY-DETAIL",
+        batch_ids=["BATCH-RES-ERR", "BATCH-REC-ERR", "BATCH-OK"],
+    )
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+
+        dashboard = app.screen
+        assert isinstance(dashboard, DashboardScreen)
+        job_monitor = dashboard.query_one(JobMonitor)
+        notice = job_monitor.query_one("#job_monitor_notice", Static)
+        job_table = job_monitor.query_one("#job_table", JobTable)
+        detail_panel = job_monitor.query_one("#job_detail_panel", Static)
+
+        rendered_summary = str(job_monitor.render())
+        assert "502 Bad Gateway" in rendered_summary
+        assert "raw-res-secret" not in rendered_summary
+        assert "Alice Smith" not in rendered_summary
+        assert "***MASKED***" in rendered_summary
+        assert "failed_records=2" in rendered_summary
+        assert "Jane Doe" not in rendered_summary
+        assert "123-45-6789" not in rendered_summary
+
+        notice_text = str(notice.render())
+        assert "Warning:" in notice_text
+        assert "BATCH-RES-ERR" in notice_text
+        assert "BATCH-REC-ERR" in notice_text
+        assert "raw-res-secret" not in notice_text
+        assert "Alice Smith" not in notice_text
+        assert "Jane Doe" not in notice_text
+
+        # Detail panel is hidden initially (no modal overlays)
+        assert not detail_panel.has_class("visible")
+        assert len(app.screen_stack) <= 2
+
+        # Activate a site filter so we can verify Escape closes #job_detail_panel first
+        dashboard.on_site_list_site_selected(SiteList.SiteSelected("10", "Site Ten"))
+        await pilot.pause()
+        assert dashboard.selected_site_id == "10"
+
+        # Press Enter on row 0 (BATCH-RES-ERR) -> opens inline #job_detail_panel
+        job_table.focus()
+        job_table.move_cursor(row=0)
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert detail_panel.has_class("visible")
+        assert detail_panel.styles.background == Color.parse("#000000")
+        assert detail_panel.styles.color == Color.parse("#FFFFFF")
+        panel_text_res = str(detail_panel.render())
+        assert "BATCH-RES-ERR" in panel_text_res
+        assert "Result Error:" in panel_text_res
+        assert "502 Bad Gateway" in panel_text_res
+        assert "raw-res-secret" not in panel_text_res
+        assert "Alice Smith" not in panel_text_res
+        assert "***MASKED***" in panel_text_res
+
+        # Move to row 1 (BATCH-REC-ERR) and press Space -> switches inline panel to BATCH-REC-ERR
+        job_table.move_cursor(row=1)
+        await pilot.pause()
+        await pilot.press("space")
+        await pilot.pause()
+
+        assert detail_panel.has_class("visible")
+        panel_text_rec = str(detail_panel.render())
+        assert "BATCH-REC-ERR" in panel_text_rec
+        assert "Record Errors (2):" in panel_text_rec
+        assert "recordId=42" in panel_text_rec
+        assert "subjectKey=SUBJ-007" in panel_text_rec
+        assert "SUBJ-008" in panel_text_rec
+        assert "Jane Doe" not in panel_text_rec
+        assert "123-45-6789" not in panel_text_rec
+        assert "jane@example.com" not in panel_text_rec
+        assert "sk-secret-inline" not in panel_text_rec
+        assert "***MASKED***" in panel_text_rec
+
+        # Pressing Space again on the same row toggles #job_detail_panel closed
+        await pilot.press("space")
+        await pilot.pause()
+        assert not detail_panel.has_class("visible")
+
+        # Re-open on clean job (row 2) -> shows "No errors reported."
+        job_table.move_cursor(row=2)
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert detail_panel.has_class("visible")
+        assert "No errors reported." in str(detail_panel.render())
+
+        # First Escape closes #job_detail_panel without clearing active site filter
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not detail_panel.has_class("visible")
+        assert dashboard.selected_site_id == "10"
+
+        # Second Escape clears active site filter
+        await pilot.press("escape")
+        await pilot.pause()
+        assert dashboard.selected_site_id is None
+
+
+@pytest.mark.asyncio
+async def test_batch_input_preflight_validation_and_terminal_path_traversal_error() -> None:
+    """Reject invalid #batch_id_input segments before polling and mark PathTraversalValidationError terminal."""
+    from imednet.models.studies import Study
+    from imednet.spi.utils import PathTraversalValidationError
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(
+        return_value=[Study(study_key="STUDY-SAFE", study_name="Safe Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+    sdk.async_get_job = AsyncMock()
+
+    notifications: list[tuple[str, str]] = []
+    app = ImednetTuiApp(sdk, study_key="STUDY-SAFE")
+    orig_notify = app.notify
+
+    def _capture_notify(message: Any, *args: Any, **kwargs: Any) -> Any:
+        notifications.append((str(message), str(kwargs.get("severity", "information"))))
+        return orig_notify(message, *args, **kwargs)
+
+    app.notify = _capture_notify  # type: ignore[method-assign]
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        job_monitor = app.screen.query_one(JobMonitor)
+        notice = job_monitor.query_one("#job_monitor_notice", Static)
+        batch_input = job_monitor.query_one("#batch_id_input", Input)
+        job_table = job_monitor.query_one("#job_table", JobTable)
+
+        for bad_token in ("../bad-segment", "BATCH?foo=1"):
+            notifications.clear()
+            batch_input.focus()
+            batch_input.value = bad_token
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert batch_input.value == ""
+            assert job_table.row_count == 0
+            assert "Validation Warning:" in str(notice.render())
+            assert any(sev == "warning" for _, sev in notifications)
+            sdk.async_get_job.assert_not_called()
+
+        # Also verify _poll_tracked_entry marks PathTraversalValidationError terminal without re-polling
+        sdk.async_get_job = AsyncMock(
+            side_effect=PathTraversalValidationError("batch_id must not contain '..'")
+        )
+        job_monitor.track_jobs(["../forced-bad"], study_key="STUDY-SAFE", refresh=False)
+        await job_monitor.refresh_jobs()
+        assert sdk.async_get_job.call_count == 1
+        assert [str(c) for c in job_table.get_row_at(0)[:2]] == ["../forced-bad", "INVALID"]
+        assert "batch_id" in str(notice.render())
+        assert job_monitor.is_polling_active is False
+
+        # Neither interval refresh nor manual retry_placeholders refresh re-polls it
+        await job_monitor.refresh_jobs()
+        await job_monitor.refresh_jobs(retry_placeholders=True)
+        assert sdk.async_get_job.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_unassigned_cli_batches_render_queued_and_poll_on_study_selection() -> None:
+    """Show CLI batch_ids as QUEUED when study_key=None and poll upon Study selection."""
+    from imednet.models.jobs import JobState, JobStatus
+    from imednet.models.studies import Study
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(
+        return_value=[Study(study_key="STUDY-Q", study_name="Queued Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+    sdk.async_get_job = AsyncMock(
+        side_effect=lambda _sk, jid: JobStatus(
+            job_id=jid,
+            batch_id=jid,
+            state=JobState.COMPLETED,
+            progress=100,
+            total_records=8,
+            failed_records=0,
+        )
+    )
+
+    app = ImednetTuiApp(sdk, batch_ids=["BATCH-01", "BATCH-02"], study_key=None)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        dashboard = app.screen
+        assert isinstance(dashboard, DashboardScreen)
+        job_monitor = dashboard.query_one(JobMonitor)
+        notice = job_monitor.query_one("#job_monitor_notice", Static)
+        job_table = job_monitor.query_one("#job_table", JobTable)
+        detail_panel = job_monitor.query_one("#job_detail_panel", Static)
+
+        assert job_table.row_count == 2
+        assert [str(c) for c in job_table.get_row_at(0)[:2]] == ["BATCH-01", "QUEUED"]
+        assert [str(c) for c in job_table.get_row_at(1)[:2]] == ["BATCH-02", "QUEUED"]
+        assert "Queued Jobs (2)" in str(notice.render())
+        assert "BATCH-01" in str(notice.render())
+        assert job_monitor.is_polling_active is False
+        sdk.async_get_job.assert_not_called()
+
+        # Inspecting a QUEUED job opens #job_detail_panel cleanly
+        job_table.focus()
+        job_table.move_cursor(row=0)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert detail_panel.has_class("visible")
+        assert "BATCH-01 [QUEUED]" in str(detail_panel.render())
+
+        # Untracking BATCH-02 while queued updates the table to 1 queued row
+        job_table.move_cursor(row=1)
+        await pilot.press("delete")
+        await pilot.pause()
+        assert job_table.row_count == 1
+        assert str(job_table.get_row_at(0)[0]) == "BATCH-01"
+
+        # Selecting a Study binds and polls BATCH-01 immediately
+        study_list = dashboard.query_one(StudyList)
+        study_list.focus()
+        study_list.index = 0
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        sdk.async_get_job.assert_called_once_with("STUDY-Q", "BATCH-01")
+        assert job_table.row_count == 1
+        assert [str(c) for c in job_table.get_row_at(0)[:2]] == ["BATCH-01", "COMPLETED"]
+
+
+@pytest.mark.asyncio
+async def test_textual_log_handler_and_sanitize_text_mask_phi_and_preserve_relational_keys() -> (
+    None
+):
+    """Mask Subject PHI dicts and key-value substrings to ***MASKED*** while preserving relational keys."""
+    from imednet.spi.utils import global_sensitivity_registry
+    from imednet_tui.app import LogViewer, _sanitize_text
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(return_value=[])
+
+    global_sensitivity_registry.add_sensitive_key("custom_mrn")
+    try:
+        app = ImednetTuiApp(sdk)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            imednet_logger = logging.getLogger("imednet")
+
+            # 1. Structured dict payload via logger
+            imednet_logger.info(
+                {
+                    "study_key": "STUDY-REL-1",
+                    "subject_key": "SUBJ-REL-2",
+                    "record_id": "REC-REL-3",
+                    "usubjid": "USUBJ-REL-4",
+                    "subjid": "SUBJID-REL-5",
+                    "studyid": "STUDYID-REL-6",
+                    "patient_name": "Jane Doe",
+                    "ssn": "123-45-6789",
+                    "dob": "1980-04-15",
+                    "email": "jane.doe@example.com",
+                    "brthdtc": "1980-04-15",
+                    "custom_mrn": "MRN-998877",
+                }
+            )
+
+            # 2. Formatted key-value text payload via logger
+            imednet_logger.warning(
+                "Subject audit study_key=STUDY-REL-1 subject_key=SUBJ-REL-2 "
+                "patient_name='John Roe' ssn=987-65-4321, dob: 1975-12-31; "
+                "email=john.roe@example.org brthdtc=1975-12-31 custom_mrn=\"MRN-112233\""
+            )
+            await pilot.pause()
+
+            log_viewer = app.screen.query_one(LogViewer)
+            rendered_logs = "\n".join(str(line) for line in log_viewer.lines)
+
+            assert "***MASKED***" in rendered_logs
+            for leaked_phi in (
+                "Jane Doe",
+                "John Roe",
+                "123-45-6789",
+                "987-65-4321",
+                "1980-04-15",
+                "1975-12-31",
+                "jane.doe@example.com",
+                "john.roe@example.org",
+                "MRN-998877",
+                "MRN-112233",
+            ):
+                assert leaked_phi not in rendered_logs
+
+            for relational_id in (
+                "STUDY-REL-1",
+                "SUBJ-REL-2",
+                "REC-REL-3",
+                "USUBJ-REL-4",
+                "SUBJID-REL-5",
+                "STUDYID-REL-6",
+            ):
+                assert relational_id in rendered_logs
+
+            direct = _sanitize_text(
+                RuntimeError(
+                    "Failed record_id=77 patient_name= Clara Oswald & email=clara@tardis.uk"
+                )
+            )
+            assert "record_id=77" in direct
+            assert "Clara Oswald" not in direct
+            assert "clara@tardis.uk" not in direct
+            assert "***MASKED***" in direct
+    finally:
+        global_sensitivity_registry.remove_sensitive_key("custom_mrn")

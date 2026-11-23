@@ -692,7 +692,14 @@ def test_check_duckdb_relations_parity_passes_repo_and_rejects_stale_names(tmp_p
 
     security_dst.write_text(real_security, encoding="utf-8")
     audit_dst.write_text(
-        real_audit + "\nStale silver_records_history reference.\n", encoding="utf-8"
+        real_audit.replace("``silver_records_history``", "``legacy_history``"),
+        encoding="utf-8",
+    )
+    assert check_duckdb_relations_parity(tmp_path) is True
+
+    audit_dst.write_text(
+        real_audit + "\nStale ``record_revisions`` table wording.\n",
+        encoding="utf-8",
     )
     assert check_duckdb_relations_parity(tmp_path) is True
 

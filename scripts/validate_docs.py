@@ -2084,7 +2084,7 @@ _DUCKDB_CREATE_REL_RE = re.compile(
     re.IGNORECASE,
 )
 _STALE_RECORD_REVISIONS_TABLE_RE = re.compile(
-    r"``record_revisions``\s+tables?\b|FROM\s+record_revisions\b",
+    r"``record_revisions``\s+tables?\b",
     re.IGNORECASE,
 )
 
@@ -2125,15 +2125,18 @@ def check_duckdb_relations_parity(repo_root: Path | None = None) -> bool:
             )
             has_errors = True
 
-    for forbidden_token in ("silver_records_history", "valid_from", "valid_to"):
-        if forbidden_token in audit_text:
-            print(f"Error: Stale DuckDB relation/column '{forbidden_token}' found in {audit_rst}.")
-            has_errors = True
+    if "silver_records_history" in expected_relations:
+        for scd_col in ("valid_from", "valid_to", "is_current"):
+            if f"``{scd_col}``" not in audit_text:
+                print(
+                    f"Error: SCD Type 2 column '{scd_col}' from silver_records_history is missing from {audit_rst}."
+                )
+                has_errors = True
 
     if _STALE_RECORD_REVISIONS_TABLE_RE.search(audit_text):
         print(
             f"Error: Stale 'record_revisions' DuckDB table reference found in {audit_rst} "
-            "(expected 'bronze_revisions')."
+            "(expected 'bronze_revisions' table and 'record_revisions' view)."
         )
         has_errors = True
 
