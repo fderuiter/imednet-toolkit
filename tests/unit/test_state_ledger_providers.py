@@ -612,3 +612,219 @@ def test_airflow_legacy_keys_migrate_cleanly_and_sdk_rpc_budgets(
         ("delete", provider._get_variable_key("STUDY_1")),
     ]
     assert provider.get_last_timestamp("STUDY_1_OTHER", "sql_FORM_01") == t3
+    assert provider.delete_entry("STUDY_1") is False
+
+    # Single-stream delete removing one stream, then the final stream
+    provider.set_last_timestamp("SINGLE_DEL", "s1", t1)
+    provider.set_last_timestamp("SINGLE_DEL", "s2", t2)
+    assert provider.delete_entry("SINGLE_DEL", "missing") is False
+    assert provider.delete_entry("SINGLE_DEL", "s1") is True
+    assert provider.get_last_timestamp("SINGLE_DEL", "s1") is None
+    assert provider.get_last_timestamp("SINGLE_DEL", "s2") == t2
+    assert provider.delete_entry("SINGLE_DEL", "s2") is True
+    assert provider._get_variable_key("SINGLE_DEL") not in store
+
+
+def test_airflow_orm_mode_consolidated_migration_and_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify AirflowStateProvider ORM mode reads, legacy migration, deletes, and fallbacks."""
+    import contextlib
+
+    from sqlalchemy import Column, String, Text, create_engine, delete, select
+    from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+    engine = create_engine("sqlite:///:memory:")
+
+    class _Base(DeclarativeBase):
+        pass
+
+    class FakeModelVariable(_Base):
+        __tablename__ = "variable"
+        key = Column(String(250), primary_key=True)
+        val = Column(Text, nullable=True)
+
+        @classmethod
+        def get(cls, key: str, default_var: Any = None, deserialize_json: bool = False) -> Any:
+            with session_factory() as sess:
+                row = sess.get(cls, key)
+                if row is None or row.val is None:
+                    return default_var
+                return json.loads(row.val) if deserialize_json else row.val
+
+        @classmethod
+        def set(
+            cls,
+            key: str,
+            value: Any,
+            serialize_json: bool = False,
+            session: Any = None,
+        ) -> None:
+            serialized = json.dumps(value) if serialize_json else str(value)
+            if session is not None:
+                existing = session.get(cls, key)
+                if existing is None:
+                    session.add(cls(key=key, val=serialized))
+                else:
+                    existing.val = serialized
+                return
+            with session_factory() as sess, sess.begin():
+                existing = sess.get(cls, key)
+                if existing is None:
+                    sess.add(cls(key=key, val=serialized))
+                else:
+                    existing.val = serialized
+
+        @classmethod
+        def delete(cls, key: str) -> int:
+            with session_factory() as sess, sess.begin():
+                res = sess.execute(delete(cls).where(cls.key == key))
+                return int(res.rowcount or 0)
+
+    _Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    invalidated: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_create_session() -> Generator[Any, None, None]:
+        with session_factory() as sess, sess.begin():
+            yield sess
+
+    class FakeSecretCache:
+        @staticmethod
+        def invalidate_variable(key: str) -> None:
+            invalidated.append(key)
+
+    airflow_mod = ModuleType("airflow")
+    settings_mod = ModuleType("airflow.settings")
+    settings_mod.Session = None  # type: ignore[attr-defined]
+
+    def _configure_orm() -> None:
+        settings_mod.Session = session_factory  # type: ignore[attr-defined]
+
+    settings_mod.configure_orm = _configure_orm  # type: ignore[attr-defined]
+    airflow_mod.settings = settings_mod  # type: ignore[attr-defined]
+
+    models_mod = ModuleType("airflow.models")
+    models_var_mod = ModuleType("airflow.models.variable")
+    models_var_mod.Variable = FakeModelVariable  # type: ignore[attr-defined]
+
+    utils_mod = ModuleType("airflow.utils")
+    utils_sess_mod = ModuleType("airflow.utils.session")
+    utils_sess_mod.create_session = fake_create_session  # type: ignore[attr-defined]
+
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.Variable = object()  # type: ignore[attr-defined]
+    sdk_mod.SecretCache = FakeSecretCache  # type: ignore[attr-defined]
+    exec_mod = ModuleType("airflow.sdk.execution_time")
+    runner_mod = ModuleType("airflow.sdk.execution_time.task_runner")
+    runner_mod.SUPERVISOR_COMMS = None  # type: ignore[attr-defined]
+
+    for mod_name, mod_obj in (
+        ("airflow", airflow_mod),
+        ("airflow.settings", settings_mod),
+        ("airflow.models", models_mod),
+        ("airflow.models.variable", models_var_mod),
+        ("airflow.utils", utils_mod),
+        ("airflow.utils.session", utils_sess_mod),
+        ("airflow.sdk", sdk_mod),
+        ("airflow.sdk.execution_time", exec_mod),
+        ("airflow.sdk.execution_time.task_runner", runner_mod),
+    ):
+        monkeypatch.setitem(sys.modules, mod_name, mod_obj)
+
+    provider = AirflowStateProvider()
+    assert provider._has_active_task_sdk_comms() is False
+
+    t1 = datetime(2026, 4, 1, 8, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 4, 2, 8, 0, tzinfo=timezone.utc)
+
+    # Seed legacy per-stream ORM rows and verify fallback read + migration on write
+    leg_1 = provider._get_variable_key("ORM_ST", "sql_DM")
+    leg_2 = provider._get_variable_key("ORM_ST", "sql_VS")
+    FakeModelVariable.set(
+        leg_1,
+        {
+            "study_key": "ORM_ST",
+            "stream_name": "sql_DM",
+            "last_timestamp": t1.isoformat(),
+            "records_processed": 4,
+            "status": "success",
+        },
+        serialize_json=True,
+    )
+    FakeModelVariable.set(
+        leg_2,
+        {
+            "study_key": "ORM_ST",
+            "stream_name": "sql_VS",
+            "last_timestamp": t2.isoformat(),
+            "records_processed": 8,
+            "status": "failed",
+        },
+        serialize_json=True,
+    )
+    assert provider._list_variable_keys("imednet_state:ORM_ST:") == [leg_1, leg_2]
+    assert provider.get_last_timestamp("ORM_ST", "sql_DM") == t1
+    assert str(provider.get_last_status("ORM_ST", "sql_VS")).lower().endswith("failed")
+
+    orm_initial = provider.read_state()
+    assert set(orm_initial.studies["ORM_ST"].streams) == {"sql_DM", "sql_VS"}
+
+    # Migrate legacy rows to consolidated study row via batch_transaction
+    t3 = datetime(2026, 4, 3, 10, 0, tzinfo=timezone.utc)
+    with provider.batch_transaction("ORM_ST", ["sql_DM", "sql_AE"]) as tx_map:
+        assert tx_map["sql_DM"]["last_timestamp"] == t1
+        assert tx_map["sql_AE"]["last_timestamp"] is None
+        tx_map["sql_DM"]["new_timestamp"] = t3
+        tx_map["sql_DM"]["records_processed"] = 15
+        tx_map["sql_AE"]["new_timestamp"] = t3
+        tx_map["sql_AE"]["records_processed"] = 3
+
+    assert set(invalidated) >= {leg_1, leg_2}
+    with session_factory() as check_sess:
+        remaining_keys = sorted(check_sess.scalars(select(FakeModelVariable.key)).all())
+    assert remaining_keys == [provider._get_variable_key("ORM_ST")]
+    assert provider._read_variable(provider._get_variable_key("ORM_ST")) is not None
+    assert provider.get_last_timestamp("ORM_ST", "sql_VS") == t2
+    assert provider.get_last_timestamp("ORM_ST", "sql_AE") == t3
+
+    # Also test create_session fallback when settings.Session is absent
+    settings_mod.Session = None  # type: ignore[attr-defined]
+    settings_mod.configure_orm = None  # type: ignore[attr-defined]
+    orm_after = provider.read_state()
+    assert set(orm_after.studies["ORM_ST"].streams) == {"sql_DM", "sql_VS", "sql_AE"}
+
+    # Remove single stream then full study via ORM delete_entry
+    assert provider.delete_entry("ORM_ST", "sql_AE") is True
+    assert provider.get_last_timestamp("ORM_ST", "sql_AE") is None
+    assert provider.delete_entry("ORM_ST") is True
+    assert provider.delete_entry("ORM_ST") is False
+    provider._delete_listed_variable_key("nonexistent")
+
+    # Flat-map fallback & helper edge cases
+    assert provider._parse_study_variable_key("other_prefix:ST") is None
+    assert provider._parse_study_variable_key("imednet_state:ST:STREAM") is None
+    flat_study, flat_streams = provider._extract_study_streams(
+        {"study_key": "FLAT", "s1": {"status": "success", "last_timestamp": t1.isoformat()}},
+        "FALLBACK",
+    )
+    assert flat_study == "FLAT"
+    assert "s1" in flat_streams
+    assert provider._payload_to_stream_state({"records_processed": 1}) is None
+    assert provider._deserialize_json_dict("{bad-json") is None
+
+    # Airflow unavailable guard paths
+    monkeypatch.setitem(sys.modules, "airflow", None)  # type: ignore[arg-type]
+    assert provider._airflow_available() is False
+    assert provider._has_active_task_sdk_comms() is False
+    assert provider._read_variable("k") is None
+    provider._write_variable("k", {})
+    assert provider._list_variable_keys("p") == []
+    provider._delete_listed_variable_key("k")
+    assert provider._read_stream_entry("S", "f") is None
+    assert provider._load_study_state("S") == ("S", {}, [])
+    provider._save_study_state("S", {})
+    assert provider.delete_entry("S") is False
+    assert provider.read_state().studies == {}
+    engine.dispose()

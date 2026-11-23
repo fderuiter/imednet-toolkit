@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, overload
 
 from pydantic import Field, field_validator, model_validator
@@ -12,6 +13,7 @@ from imednet.models.base import ImednetBaseModel
 from imednet.models.records import RecordStatus
 
 def _coerce_optional_int_for_bounds(value: Any, field_name: str) -> int | None: ...
+def _parse_revision_timestamp(value: Any) -> datetime | None: ...
 def _validate_revision_bounds(record_revision: int | None, data_revision: int | None) -> None: ...
 
 class RecordRevision(ImednetBaseModel):

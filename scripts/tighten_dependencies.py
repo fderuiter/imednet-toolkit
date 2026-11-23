@@ -16,9 +16,10 @@ def get_internal_packages(manifest_path: Path):
     with manifest_path.open("r", encoding="utf-8") as f:
         manifest = json.load(f)
 
+    base_dir = manifest_path.parent
     internal_packages = {}
     for folder, version in manifest.items():
-        pyproject_path = Path(folder) / "pyproject.toml"
+        pyproject_path = base_dir / folder / "pyproject.toml"
         if pyproject_path.exists():
             with pyproject_path.open("rb") as f:
                 data = tomllib.load(f)
