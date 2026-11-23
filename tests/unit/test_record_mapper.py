@@ -1858,3 +1858,50 @@ def test_sdtm_variable_whitelist_projection_and_custom_domain_phi(
     )
     assert ae_df.iloc[0]["AESER"] == "***MASKED***"
     assert ae_df.iloc[0]["AESTDTC"] is None
+
+
+def test_resolve_sdtm_domain_sanitizes_unaliased_domains_and_keeps_seq_var_safe() -> None:
+    """resolve_sdtm_domain strips non-alphanumeric characters and falls back when no valid domain code remains."""
+    from imednet.models.sdtm import resolve_sdtm_domain, transform_records_to_sdtm_rows
+
+    assert resolve_sdtm_domain("ZZ: 1}) //") == "ZZ1"
+    assert resolve_sdtm_domain("F_AE: 1}) //") == "AE"
+    assert resolve_sdtm_domain("FA") == "FA"
+    assert resolve_sdtm_domain("SUPPAE") == "SUPPAE"
+    assert resolve_sdtm_domain("!!! //", fallback="AE") == "AE"
+    assert resolve_sdtm_domain(": 1}) //", fallback="AE") == "AE"
+    assert resolve_sdtm_domain("123", fallback="VS") == "VS"
+    assert resolve_sdtm_domain("²", fallback="LB") == "LB"
+
+    dom_rec = Record(
+        record_id=103,
+        study_key="STUDY_AF_DOM",
+        form_key="ZZ: 1}) //",
+        subject_key="SUBJ-DOM-1",
+        record_data={"note": "unaliased_form_domain"},
+    )
+    rows = transform_records_to_sdtm_rows(
+        [dom_rec],
+        domain=dom_rec.form_key or "AE",
+        study_key="STUDY_AF_DOM",
+    )
+    assert len(rows) == 1
+    assert rows[0]["DOMAIN"] == "ZZ1"
+    assert rows[0]["ZZ1SEQ"] == 1
+    assert all(k.isalnum() or k == "_" for k in rows[0])
+
+    dm_rows = transform_records_to_sdtm_rows(
+        [
+            Record(
+                record_id=101,
+                study_key="STUDY_CLI_DM",
+                form_key="DM",
+                subject_key="SUBJ-DM-1",
+                record_data={"SEX": "F", "PRIORSEQ": 3},
+            )
+        ],
+        domain="DM",
+        study_key="STUDY_CLI_DM",
+    )
+    assert "DMSEQ" not in dm_rows[0]
+    assert dm_rows[0]["PRIORSEQ"] == 3
