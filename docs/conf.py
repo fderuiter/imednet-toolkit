@@ -1369,6 +1369,10 @@ def _inject_seo_metadata(
     )
     context["metatags"] = prefix + "\n".join(injected_lines) + "\n"
 
+    master_docname = getattr(app.config, "master_doc", "index") or "index"
+    if pagename == master_docname and hasattr(app, "add_js_file"):
+        app.add_js_file("showcase.js")
+
 
 def _rewrite_not_found_assets(not_found_path: Path, base_path: str) -> None:
     """Rewrite relative asset and navigation URLs on 404.html so nested paths render cleanly."""
@@ -1425,7 +1429,11 @@ def _on_build_finished(app: Any, exception: Exception | None) -> None:
 
     _rewrite_not_found_assets(outdir / "404.html", base_path)
 
-    found_docs = sorted(doc for doc in getattr(app.env, "found_docs", set()) if doc != "404")
+    found_docs = sorted(
+        doc
+        for doc in getattr(app.env, "found_docs", set())
+        if doc != "404" and not doc.startswith("_includes/")
+    )
     sitemap_lines = [
         '<?xml version="1.0" encoding="utf-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
@@ -1489,6 +1497,7 @@ napoleon_include_init_with_doc = True
 # Templates and static paths
 templates_path: list[str] = []
 exclude_patterns: list[str] = [
+    "_includes/**",
     "tutorials/examples/dummy.py",
     "agents/**",
     "superpowers/**",
@@ -1496,7 +1505,7 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["showcase.js", "thebe_pyodide.js"]
+html_js_files: list[str] = ["code_blocks.js"]
 
 doctest_global_setup = """
 import builtins
@@ -1677,8 +1686,9 @@ master_doc = 'index'
 # Linkcheck configuration
 linkcheck_ignore = [
     r"https://.*\.imednet\.com.*",
-    r"https://cdn\.jsdelivr\.net/.*",
+    r"https://cdn\.jsdelivr\.net/(?!pyodide/).*",
     r"https://unpkg\.com/.*",
+    r"https://github\.com/fderuiter/(?:imednet-toolkit|imednet-python-sdk)/(?:commit|compare|issues|pull)/.*",
 ]
 linkcheck_timeout = 30
 linkcheck_retries = 3
