@@ -1,6 +1,7 @@
 """Integration helpers for exporting study data."""
 
 from collections.abc import Callable
+from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 from . import export as _export_module
@@ -29,6 +30,7 @@ else:
 def _bind_export_attr(attr_name: str) -> Callable[..., Any]:
     """Return a tabular target delegating dynamically to ``imednet.integrations.export``."""
 
+    @wraps(getattr(_export_module, attr_name))
     def _target(sdk: Any, study_key: str, **kwargs: Any) -> Any:
         target_fn: Callable[..., Any] = getattr(_export_module, attr_name)
         return target_fn(sdk, study_key, **kwargs)
