@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ...models.records import RegisterSubjectRequest
 
 from ...errors import ValidationError
 from ...sdk import ImednetSDK
@@ -14,6 +17,7 @@ from ...utils.enrollment import (
     normalize_subject_registration_inputs,
     validate_subject_registration_sites,
 )
+from ...utils.job_poller import JobFailedError
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import print_error, register_list_command, simulation_mode_context
 from ..utils.args import (
@@ -29,6 +33,7 @@ from ..utils.write_helpers import (
     parse_key_value_pairs,
     render_write_summary,
     resolve_cli_schema,
+    summary_from_job_failure,
     validate_write_numeric_flags,
     write_progress_context,
 )
@@ -43,7 +48,7 @@ def _load_cli_subject_inputs(
     if args.input_file and args.json_payload:
         raise ValueError("Cannot combine --file and --json.")
 
-    inline_data = parse_key_value_pairs(args.data_pairs)
+    study_key: str | None = getattr(args, "study_key", None)
     if args.input_file:
         if args.input_file == "-":
             return parse_json_records_text(sys.stdin.read(), source_label="stdin")
@@ -55,6 +60,12 @@ def _load_cli_subject_inputs(
         raise ValueError(
             "Provide --file, --json, or both --form-key and --site-name to register a subject."
         )
+    inline_data = parse_key_value_pairs(
+        args.data_pairs,
+        schema=schema,
+        study_key=study_key,
+        form_key=args.form_key,
+    )
     single: dict[str, Any] = {
         "formKey": args.form_key,
         "siteName": args.site_name,
@@ -157,6 +168,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     @with_sdk
     def register_subjects_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
+        subjects_data: list[dict[str, Any]] = []
+        skipped_count = 0
         try:
             resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
             raw_inputs = _load_cli_subject_inputs(args, schema=resolved_schema)
@@ -165,7 +178,44 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 default_form_key=args.form_key,
                 default_site_name=args.site_name,
                 schema=resolved_schema,
+                study_key=args.study_key,
             )
+            if args.data_pairs and (args.input_file or args.json_payload):
+                updated_pairs: list[
+                    tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]
+                ] = []
+                for _raw_item, model_item in normalized_pairs:
+                    eff_fk = model_item.form_key or args.form_key
+                    extra_data = parse_key_value_pairs(
+                        args.data_pairs,
+                        schema=resolved_schema,
+                        study_key=args.study_key,
+                        form_key=eff_fk or None,
+                    )
+                    dumped_model = model_item.model_dump(by_alias=True)
+                    merged_data = dict(dumped_model.get("data") or {})
+                    merged_data.update(extra_data)
+                    dumped_model["data"] = merged_data
+                    if (
+                        args.subject_key
+                        and len(normalized_pairs) == 1
+                        and not dumped_model.get("subjectKey")
+                    ):
+                        dumped_model["subjectKey"] = args.subject_key
+                    updated_pairs.append((dumped_model, model_item.model_validate(dumped_model)))
+                normalized_pairs = updated_pairs
+            elif (
+                args.subject_key
+                and (args.input_file or args.json_payload)
+                and len(normalized_pairs) == 1
+                and not normalized_pairs[0][1].subject_key
+            ):
+                dumped_only = normalized_pairs[0][1].model_dump(by_alias=True)
+                dumped_only["subjectKey"] = args.subject_key
+                normalized_pairs = [
+                    (dumped_only, normalized_pairs[0][1].model_validate(dumped_only))
+                ]
+
             sites = list(sdk.sites.list(args.study_key))
             validate_subject_registration_sites(normalized_pairs, sites)
 
@@ -199,8 +249,26 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     dry_run=args.dry_run,
                     collect_errors=True,
                 )
+        except JobFailedError as exc:
+            failed_summary = summary_from_job_failure(
+                exc,
+                study_key=args.study_key,
+                total_records=len(subjects_data),
+                skipped_count=skipped_count,
+            )
+            render_write_summary(
+                failed_summary,
+                resource="subjects_register",
+                output_format=args.output_format,
+            )
+            return
         except (ValidationError, ValueError) as exc:
-            exit_cli_validation_error(exc)
+            exit_cli_validation_error(
+                exc,
+                resource="subjects_register",
+                study_key=args.study_key,
+                output_format=args.output_format,
+            )
 
         summary = coerce_batch_summary(
             raw_summary,

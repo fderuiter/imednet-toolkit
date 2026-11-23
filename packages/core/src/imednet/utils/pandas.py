@@ -214,6 +214,9 @@ def dataframe_to_records(
     df: pd.DataFrame,
     *,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
 ) -> list[JsonDict]:
     """Convert a ``pandas.DataFrame`` into REST create-records payload dicts.
 
@@ -225,7 +228,13 @@ def dataframe_to_records(
     :class:`~imednet.errors.ValidationError` if any cell contains ``***MASKED***``.
     """
     check_pandas("dataframe_to_records")
-    return dataframe_rows_to_records(df, schema=schema)
+    return dataframe_rows_to_records(
+        df,
+        schema=schema,
+        study_key=study_key,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+    )
 
 
 def import_records_csv(
@@ -249,7 +258,7 @@ def import_records_csv(
     Works in ``packages/core`` even when ``pandas`` is not installed. Rejects
     ``***MASKED***`` sentinels before any HTTP request is sent.
     """
-    records = csv_to_records(file_path, schema=schema)
+    records = csv_to_records(file_path, schema=schema, study_key=study_key)
     return sdk.records.create_batch(
         study_key,
         records,

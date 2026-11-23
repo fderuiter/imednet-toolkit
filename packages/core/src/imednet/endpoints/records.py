@@ -84,7 +84,7 @@ class RecordsOperationDef:
             The background job for the creation operation.
         """
         self._validate_study_key(study_key)  # type: ignore
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         path = self._get_endpoint_path(study_key)  # type: ignore
         return RecordCreateOperation[Job](
             path=path,
@@ -117,7 +117,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and optionally poll jobs."""
         self._validate_study_key(study_key)
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         coordinator = BatchCoordinator(chunk_size=chunk_size)
 
         def _poll_single(
@@ -219,7 +219,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit records in bounded chunks, and optionally poll."""
         self._validate_study_key(study_key)
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
 
         async def _poll_single(

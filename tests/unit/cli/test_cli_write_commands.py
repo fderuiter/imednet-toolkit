@@ -425,3 +425,338 @@ def test_cli_subjects_register_skip_existing_and_json_output(
     assert item["totalRecords"] == 1
     assert item["skippedCount"] == 1
     assert len(state.get_subjects("STUDY")) == before_subjects + 1
+
+
+def test_cli_records_pipe_list_envelope_into_create_fails_exit_1(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """AC 2 & Req 3: Piping `records list --format json` into `records create --file - --dry-run` exits 1."""
+    import io
+
+    list_res = _invoke_cli(
+        capsys,
+        ["records", "list", "STUDY", "--format", "json"],
+    )
+    assert list_res.exit_code == 0
+    envelope = json.loads(list_res.stdout)
+    assert envelope["schemaVersion"] == "1.0"
+    assert envelope["resource"] == "records"
+
+    monkeypatch.setattr(
+        "imednet.cli.utils.context.get_sdk",
+        lambda **_kwargs: ImednetSDK(
+            client=Client(
+                api_key="sim-key",  # pragma: allowlist secret
+                security_key="sim-secret",  # pragma: allowlist secret
+                base_url="https://edc.sim.imednet.com",
+                transport=SimulationTransport(state=sim_sdk_and_requests[1]),
+            )
+        ),
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(list_res.stdout))
+    create_res = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--file",
+            "-",
+            "--dry-run",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert create_res.exit_code == 1
+    err_json = json.loads(create_res.stdout)
+    assert err_json["schemaVersion"] == "1.0"
+    assert err_json["status"] == "complete"
+    assert err_json["items"][0]["allSuccessful"] is False
+    assert "envelope" in err_json["items"][0]["error"]
+    assert "Error:" in create_res.stderr
+
+
+def test_cli_records_create_preserves_string_data_and_applies_form_key_before_coercion(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 1 & Req 3/4: Preserve '1.0' with/without --schema, apply --form-key first, reject missing formKey."""
+    state = SimulationState()
+    base_transport = SimulationTransport(state=state)
+    requests: list[httpx.Request] = []
+
+    class _MultiCallSpyTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return base_transport.handle_request(request)
+
+    monkeypatch.setattr(
+        "imednet.cli.utils.context.get_sdk",
+        lambda **_kwargs: ImednetSDK(
+            client=Client(
+                api_key="sim-key",  # pragma: allowlist secret
+                security_key="sim-secret",  # pragma: allowlist secret
+                base_url="https://edc.sim.imednet.com",
+                transport=_MultiCallSpyTransport(),
+            )
+        ),
+    )
+
+    dd_path = tmp_path / "schema.json"
+    dd_path.write_text(
+        json.dumps(
+            {
+                "forms": [
+                    {
+                        "formKey": "F_DM",
+                        "variables": [
+                            {"variableName": "V_NOTES", "variableType": "text"},
+                            {"variableName": "V_AGE", "variableType": "integer"},
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 1. Without --schema: -d V_NOTES=1.0 stays exact string "1.0"
+    requests.clear()
+    res_no_schema = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--subject-key",
+            "SUB1",
+            "--site-name",
+            "SITE",
+            "-d",
+            "V_NOTES=1.0",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_no_schema.exit_code == 0, res_no_schema.stderr
+    post_req_1 = next(r for r in requests if r.method == "POST")
+    sent_1 = json.loads(post_req_1.content.decode("utf-8"))
+    assert sent_1[0]["data"]["V_NOTES"] == "1.0"
+
+    # 2. With --schema and CSV lacking formKey column: --form-key applied BEFORE coercion
+    csv_no_fk = tmp_path / "no_form_key.csv"
+    csv_no_fk.write_text(
+        "subjectKey,siteName,V_NOTES,V_AGE\nSUB1,SITE,1.0,33.0\n", encoding="utf-8"
+    )
+    requests.clear()
+    res_with_schema = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--file",
+            str(csv_no_fk),
+            "--form-key",
+            "F_DM",
+            "--schema",
+            str(dd_path),
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_with_schema.exit_code == 0, res_with_schema.stderr
+    post_req_2 = next(r for r in requests if r.method == "POST")
+    sent_2 = json.loads(post_req_2.content.decode("utf-8"))
+    assert sent_2[0]["formKey"] == "F_DM"
+    assert sent_2[0]["data"]["V_NOTES"] == "1.0"
+    assert sent_2[0]["data"]["V_AGE"] == 33
+
+    # 3. Missing both formKey and formId fails validation with exit 1
+    res_missing_form = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--json",
+            '[{"subjectKey": "SUB1", "data": {"V_NOTES": "1.0"}}]',
+            "--dry-run",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_missing_form.exit_code == 1
+    missing_payload = json.loads(res_missing_form.stdout)
+    assert missing_payload["schemaVersion"] == "1.0"
+    assert missing_payload["items"][0]["allSuccessful"] is False
+
+
+def test_cli_subjects_register_rerun_with_explicit_subject_key_creates_zero_duplicates(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 4 & Req 5: Rerunning `imednet subjects register --skip-existing` skips explicit subjectKey rows."""
+    state = SimulationState()
+    monkeypatch.setattr(
+        "imednet.cli.utils.context.get_sdk",
+        lambda **_kwargs: ImednetSDK(
+            client=Client(
+                api_key="sim-key",  # pragma: allowlist secret
+                security_key="sim-secret",  # pragma: allowlist secret
+                base_url="https://edc.sim.imednet.com",
+                transport=SimulationTransport(state=state),
+            )
+        ),
+    )
+    csv_path = tmp_path / "explicit_subjects.csv"
+    csv_path.write_text(
+        "formKey,siteName,subjectKey,V_AGE\nF_DM,SITE,SUB-IDEMP-1,31\nF_DM,SITE,SUB-IDEMP-2,42\n",
+        encoding="utf-8",
+    )
+
+    before_count = len(state.get_subjects("STUDY"))
+    first_run = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--file",
+            str(csv_path),
+            "--skip-existing",
+            "--wait",
+            "--timeout",
+            "5",
+            "--interval",
+            "0",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert first_run.exit_code == 0, first_run.stderr
+    first_item = json.loads(first_run.stdout)["items"][0]
+    assert first_item["totalRecords"] == 2
+    assert first_item["skippedCount"] == 0
+    assert len(state.get_subjects("STUDY")) == before_count + 2
+
+    second_run = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--file",
+            str(csv_path),
+            "--skip-existing",
+            "--wait",
+            "--timeout",
+            "5",
+            "--interval",
+            "0",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert second_run.exit_code == 0, second_run.stderr
+    second_item = json.loads(second_run.stdout)["items"][0]
+    assert second_item["totalRecords"] == 0
+    assert second_item["skippedCount"] == 2
+    assert len(state.get_subjects("STUDY")) == before_count + 2
+
+
+@pytest.mark.parametrize(
+    ("result_content_type", "result_body"),
+    [
+        ("application/json", json.dumps({"errors": [{"message": "Invalid visit window"}]})),
+        ("text/html", "<html><body>502 Bad Gateway</body></html>"),
+    ],
+)
+def test_cli_write_wait_exits_1_and_emits_json_counts_on_result_url_errors_or_html(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    result_content_type: str,
+    result_body: str,
+) -> None:
+    """AC 6 & Req 8: CLI write --wait exits 1 and emits JSON counts when resultUrl returns errors or HTML."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            return httpx.Response(
+                200,
+                json={"jobId": "J-FAIL-1", "batchId": "B-FAIL-1", "state": "PROCESSING"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/jobs/B-FAIL-1"):
+            return httpx.Response(
+                200,
+                json={
+                    "jobId": "J-FAIL-1",
+                    "batchId": "B-FAIL-1",
+                    "state": "COMPLETED",
+                    "progress": 100,
+                    "resultUrl": "https://results.synthetic.example/B-FAIL-1",
+                },
+            )
+        if str(request.url) == "https://results.synthetic.example/B-FAIL-1":
+            return httpx.Response(
+                200,
+                content=result_body.encode("utf-8"),
+                headers={"Content-Type": result_content_type},
+            )
+        return httpx.Response(404)
+
+    custom_sdk = ImednetSDK(
+        client=Client(
+            api_key="sim-key",  # pragma: allowlist secret
+            security_key="sim-secret",  # pragma: allowlist secret
+            base_url="https://edc.sim.imednet.com",
+            transport=httpx.MockTransport(handler),
+        )
+    )
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda **_kwargs: custom_sdk)
+
+    res = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--subject-key",
+            "SUB1",
+            "-d",
+            "V_NOTES=1.0",
+            "--wait",
+            "--timeout",
+            "5",
+            "--interval",
+            "0",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res.exit_code == 1
+    out_payload = json.loads(res.stdout)
+    assert out_payload["schemaVersion"] == "1.0"
+    assert out_payload["resource"] == "records_create"
+    summary_item = out_payload["items"][0]
+    assert summary_item["allSuccessful"] is False
+    assert len(summary_item["jobs"]) == 1
+    job_entry = summary_item["jobs"][0]
+    assert job_entry["batchId"] == "B-FAIL-1"
+    assert job_entry["failedRecords"] >= 1 or bool(job_entry.get("resultError"))
+    assert "Error:" in res.stderr

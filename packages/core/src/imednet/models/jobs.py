@@ -321,16 +321,54 @@ class JobStatus(Job):
         except (TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _count_dict_record_failures(results: dict[str, Any]) -> int:
+        """Count failed record entries inside a dict ``results`` payload."""
+        err_count = 0
+        errors_val = results.get("errors")
+        if isinstance(errors_val, list):
+            err_count = len(errors_val)
+        elif errors_val or results.get("error"):
+            err_count = 1
+
+        records_val = results.get("records")
+        if isinstance(records_val, list):
+            rec_failures = sum(
+                1
+                for r in records_val
+                if isinstance(r, dict)
+                and (
+                    (r.get("status") or "").upper() in {"FAIL", "FAILED", "ERROR"}
+                    or (not r.get("status") and bool(r.get("error") or r.get("errors")))
+                )
+            )
+            err_count = max(err_count, rec_failures)
+        return err_count
+
     @property
     def total_records(self) -> int:
         """Return the total number of records processed."""
         if isinstance(self.results, list):
+            if len(self.results) == 0:
+                if self.record_total_count is not None:
+                    return int(self.record_total_count)
+                if self.record_success_count is not None or self.record_failure_count is not None:
+                    return int(self.record_success_count or 0) + int(self.record_failure_count or 0)
+                return 0
+            if self.record_total_count is not None:
+                return max(len(self.results), int(self.record_total_count))
             return len(self.results)
         if isinstance(self.results, dict):
-            if "total" in self.results:
+            if "total" in self.results and self.results.get("total") is not None:
                 return int(self.results.get("total", 0))
+            err_count = self._count_dict_record_failures(self.results)
+            records_val = self.results.get("records")
+            if isinstance(records_val, list) and len(records_val) > 0:
+                return max(len(records_val), int(self.record_total_count or 0), err_count)
             if self.record_total_count is not None:
-                return int(self.record_total_count)
+                return max(int(self.record_total_count), err_count)
+            if "success" in self.results or err_count > 0:
+                return int(self.results.get("success", 0) or 0) + err_count
             return 0
         if self.record_total_count is not None:
             return int(self.record_total_count)
@@ -342,6 +380,10 @@ class JobStatus(Job):
     def successful_records(self) -> int:
         """Return the total number of successful records processed."""
         if isinstance(self.results, list):
+            if len(self.results) == 0:
+                return (
+                    int(self.record_success_count) if self.record_success_count is not None else 0
+                )
             return sum(
                 1
                 for r in self.results
@@ -349,8 +391,16 @@ class JobStatus(Job):
                 and (r.get("status") or "").upper() in {"PASS", "SUCCESS", "COMPLETED"}
             )
         if isinstance(self.results, dict):
-            if "success" in self.results:
+            if "success" in self.results and self.results.get("success") is not None:
                 return int(self.results.get("success", 0))
+            records_val = self.results.get("records")
+            if isinstance(records_val, list) and len(records_val) > 0:
+                return sum(
+                    1
+                    for r in records_val
+                    if isinstance(r, dict)
+                    and (r.get("status") or "").upper() in {"PASS", "SUCCESS", "COMPLETED"}
+                )
             if self.record_success_count is not None:
                 return int(self.record_success_count)
             return 0
@@ -364,7 +414,11 @@ class JobStatus(Job):
     def failed_records(self) -> int:
         """Return the total number of failed records processed."""
         if isinstance(self.results, list):
-            return sum(
+            if len(self.results) == 0:
+                return (
+                    int(self.record_failure_count) if self.record_failure_count is not None else 0
+                )
+            counted = sum(
                 1
                 for r in self.results
                 if isinstance(r, dict)
@@ -373,9 +427,15 @@ class JobStatus(Job):
                     or (not r.get("status") and bool(r.get("error") or r.get("errors")))
                 )
             )
+            if self.record_failure_count is not None:
+                return max(counted, int(self.record_failure_count))
+            return counted
         if isinstance(self.results, dict):
-            if "failed" in self.results:
-                return int(self.results.get("failed", 0))
+            err_count = self._count_dict_record_failures(self.results)
+            if "failed" in self.results and self.results.get("failed") is not None:
+                return max(int(self.results.get("failed", 0)), err_count)
+            if err_count > 0:
+                return max(err_count, int(self.record_failure_count or 0))
             if self.record_failure_count is not None:
                 return int(self.record_failure_count)
             return 0

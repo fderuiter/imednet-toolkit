@@ -1359,9 +1359,23 @@ def validate_record_entry(
             collect_errors=collect_errors,
             record_index=record_index,
         )
-    if collect_errors:
-        return BatchValidationReport(total_records=1, valid_records=1, invalid_records=0)
-    return None
+    msg = "Record payload must include 'formKey' or 'formId'"
+    if not collect_errors:
+        raise ValidationError(msg)
+    return BatchValidationReport(
+        total_records=1,
+        valid_records=0,
+        invalid_records=1,
+        errors=[
+            RecordValidationIssue(
+                record_index=record_index,
+                form_key=None,
+                variable_name=None,
+                message=msg,
+                rule_id="missing_form_identifier",
+            )
+        ],
+    )
 
 
 def validate_records_batch(

@@ -748,3 +748,90 @@ async def test_async_poll_many_cancels_and_awaits_sibling_tasks_before_raising()
             fail_fast=True,
         )
     assert timeout_sibling_cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_breaker_closed() -> (
+    None
+):
+    """AC 7 & Req 9: Five external resultUrl 503s or five local NaN errors keep EDC breaker CLOSED."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "edc.synthetic.imednet.test":
+            if request.url.path.endswith("/studies"):
+                return httpx.Response(
+                    200,
+                    json={"data": [{"studyKey": "STUDY1", "studyName": "Study 1"}]},
+                )
+            if "/jobs/" in request.url.path:
+                batch_id = request.url.path.rsplit("/", 1)[-1]
+                return httpx.Response(
+                    200,
+                    json={
+                        "jobId": f"J-{batch_id}",
+                        "batchId": batch_id,
+                        "state": "COMPLETED",
+                        "progress": 100,
+                        "resultUrl": S3_RESULT_URL,
+                    },
+                )
+            return httpx.Response(200, json={"jobId": "J-OK", "batchId": "B-OK"})
+        if request.url.host == "imednet-results.s3.us-east-1.amazonaws.com":
+            return httpx.Response(503, json={"error": "Service Unavailable"})
+        return httpx.Response(404)
+
+    # Sync SDK: 5 external resultUrl 503s + 5 local NaN serialization errors
+    with ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url=EDC_BASE_URL,
+        retries=0,
+        transport=httpx.MockTransport(handler),
+    ) as sync_sdk:
+        for i in range(5):
+            with pytest.raises(JobFailedError, match="failed to fetch resultUrl"):
+                sync_sdk.poll_job("STUDY1", f"B-503-{i}", interval=0, timeout=5)
+
+        assert sync_sdk._client._external_circuit_breaker.state == CircuitState.OPEN
+        assert sync_sdk._client._circuit_breaker.state == CircuitState.CLOSED
+        assert sync_sdk._client._circuit_breaker.consecutive_failures == 0
+
+        for _ in range(5):
+            with pytest.raises((ValueError, TypeError)):
+                sync_sdk._client.post(
+                    "/api/v1/edc/studies/STUDY1/records", json={"nan": float("nan")}
+                )
+
+        assert sync_sdk._client._circuit_breaker.state == CircuitState.CLOSED
+        assert sync_sdk._client._circuit_breaker.consecutive_failures == 0
+        studies = sync_sdk.get_studies()
+        assert len(studies) == 1
+        assert studies[0].study_key == "STUDY1"
+
+    # Async SDK: 5 external resultUrl 503s + 5 local NaN serialization errors
+    async with AsyncImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url=EDC_BASE_URL,
+        retries=0,
+        transport=httpx.MockTransport(handler),
+    ) as async_sdk:
+        for i in range(5):
+            with pytest.raises(JobFailedError, match="failed to fetch resultUrl"):
+                await async_sdk.async_poll_job("STUDY1", f"AB-503-{i}", interval=0, timeout=5)
+
+        assert async_sdk._async_client._external_circuit_breaker.state == CircuitState.OPEN
+        assert async_sdk._async_client._circuit_breaker.state == CircuitState.CLOSED
+        assert async_sdk._async_client._circuit_breaker.consecutive_failures == 0
+
+        for _ in range(5):
+            with pytest.raises((ValueError, TypeError)):
+                await async_sdk._async_client.post(
+                    "/api/v1/edc/studies/STUDY1/records", json={"nan": float("nan")}
+                )
+
+        assert async_sdk._async_client._circuit_breaker.state == CircuitState.CLOSED
+        assert async_sdk._async_client._circuit_breaker.consecutive_failures == 0
+        async_studies = await async_sdk.async_get_studies()
+        assert len(async_studies) == 1
+        assert async_studies[0].study_key == "STUDY1"

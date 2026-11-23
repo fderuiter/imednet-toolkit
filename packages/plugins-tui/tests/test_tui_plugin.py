@@ -3562,12 +3562,33 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
                     assert marker_val not in log_dump
                     assert "***" in log_dump
 
-                    # Manual refresh must NOT re-fetch resultUrl for already-fetched terminal jobs
+                    # Manual refresh must NOT re-fetch already-succeeded terminal jobs,
+                    # AND MUST retry terminal jobs whose previous resultUrl fetch failed.
+                    err_res_route.mock(
+                        return_value=httpx.Response(
+                            200,
+                            json=[{"status": "SUCCESS"}, {"status": "SUCCESS"}],
+                        )
+                    )
                     await pilot.press("r")
                     await _settle(pilot)
                     assert clean_res_route.call_count == 1
                     assert partial_res_route.call_count == 1
-                    assert err_res_route.call_count == 1
+                    assert err_res_route.call_count == 2
+                    row_err_recovered = job_table.get_row_at(2)
+                    assert [str(c) for c in row_err_recovered[:5]] == [
+                        "B_RES_ERR",
+                        "COMPLETED",
+                        "100%",
+                        "2",
+                        "0",
+                    ]
+                    assert row_err_recovered[1].style == "green"
+
+                    # Once recovered, further manual refreshes do NOT re-fetch B_RES_ERR
+                    await pilot.press("r")
+                    await _settle(pilot)
+                    assert err_res_route.call_count == 2
 
         # Verify synchronous ImednetSDK also populates resultUrl counts off the main thread
         with ImednetSDK(
@@ -3638,10 +3659,10 @@ async def test_result_url_edge_cases_skip_fetch_safely() -> None:
     assert "B-INLINE" in rendered
     assert "total=1, failed=0" in rendered
 
-    # Case 2: Configured jobs._fetch_result_url spy is NOT called for inline, empty, or <...> URLs
+    # Case 2: Configured async_fetch_job_result spy is NOT called for inline, empty, or <...> URLs
     fetch_spy = AsyncMock(return_value=[{"status": "SUCCESS"}])
     configured_sdk = MagicMock(spec=AsyncImednetFacade)
-    configured_sdk.jobs = MagicMock(_fetch_result_url=fetch_spy)
+    configured_sdk.async_fetch_job_result = fetch_spy
     configured_sdk.async_get_job = AsyncMock(
         side_effect=[
             JobStatus(
@@ -3944,3 +3965,79 @@ async def test_app_env_subtitle_resolution_simulation_client_and_default_fallbac
         assert bare_app.sub_title == f"Env: {DEFAULT_BASE_URL}"
         assert "None" not in bare_app.sub_title
         assert "Unknown" not in bare_app.sub_title
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_facade_only_no_private_probes_and_retries_failed_html_result_url() -> (
+    None
+):
+    """AC 8 & Req 10: JobMonitor uses ImednetFacade without private probes and retries failed fetches."""
+    import re
+    from pathlib import Path
+
+    # 1. Verify zero private attribute probe tokens in imednet_tui source
+    tui_src_dir = Path(__file__).resolve().parents[1] / "src" / "imednet_tui"
+    forbidden_probes = (
+        "_fetch_result_url",
+        "_async_client",
+        "_client",
+        "_mock_children",
+        "__self__",
+    )
+    for py_file in tui_src_dir.rglob("*.py"):
+        content = py_file.read_text(encoding="utf-8")
+        for probe in forbidden_probes:
+            pattern = rf"(?<![A-Za-z0-9_]){re.escape(probe)}(?![A-Za-z0-9_])"
+            assert re.search(pattern, content) is None, (
+                f"Forbidden private probe {probe!r} found in {py_file}"
+            )
+
+    # 2. Strict custom AsyncImednetFacade that raises AssertionError on any private attribute probe
+    class _StrictAsyncFacade:
+        def __init__(self) -> None:
+            self.fetch_calls = 0
+
+        def __getattr__(self, name: str) -> Any:
+            if name.startswith("_"):
+                raise AssertionError(f"Private attribute probe {name!r} is forbidden")
+            raise AttributeError(name)
+
+        async def async_get_job(self, study_key: str, batch_id: str) -> JobStatus:
+            assert study_key == "STUDY-STRICT"
+            return JobStatus(
+                batch_id=batch_id,
+                state=JobState.COMPLETED,
+                progress=100,
+                result_url=f"https://results.strict.example/{batch_id}",
+            )
+
+        async def async_fetch_job_result(self, result_url: str) -> Any:
+            self.fetch_calls += 1
+            if self.fetch_calls == 1:
+                return "<html><body>503 Service Unavailable</body></html>"
+            return [{"status": "SUCCESS"}, {"status": "FAILED", "error": "Bad field"}]
+
+    strict_facade: Any = _StrictAsyncFacade()
+    monitor = JobMonitor(strict_facade)
+    monitor.current_study_key = "STUDY-STRICT"
+    monitor.track_jobs(["B-STRICT"], refresh=False)
+
+    # First refresh: HTML body fails JSON decode -> result_error set, result_fetched stays False
+    await monitor.refresh_jobs()
+    assert strict_facade.fetch_calls == 1
+    entry = monitor._entries_for_study("STUDY-STRICT")["B-STRICT"]  # noqa: SLF001
+    assert entry.is_terminal is True
+    assert entry.result_fetched is False
+    assert entry.last_job.result_error is not None
+
+    # Second refresh: retries terminal job resultUrl without re-polling get_job, succeeds & freezes
+    await monitor.refresh_jobs()
+    assert strict_facade.fetch_calls == 2
+    assert entry.result_fetched is True
+    assert entry.last_job.result_error is None
+    assert entry.last_job.total_records == 2
+    assert entry.last_job.failed_records == 1
+
+    # Third refresh: already fetched -> no redundant fetch
+    await monitor.refresh_jobs()
+    assert strict_facade.fetch_calls == 2

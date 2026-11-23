@@ -11,6 +11,7 @@ from ...endpoints.records import RecordsEndpoint
 from ...errors import ValidationError
 from ...models.records import Record
 from ...sdk import ImednetSDK
+from ...utils.job_poller import JobFailedError
 from ...utils.pandas import import_records_csv
 from ...utils.tabular import ensure_no_masked_sentinel
 from ..decorators import validate_cli_path_segment, with_sdk
@@ -36,6 +37,7 @@ from ..utils.write_helpers import (
     parse_key_value_pairs,
     render_write_summary,
     resolve_cli_schema,
+    summary_from_job_failure,
     validate_write_numeric_flags,
     write_progress_context,
 )
@@ -50,10 +52,16 @@ def _assemble_create_records_payload(
     if args.input_file and args.json_payload:
         raise ValueError("Cannot combine --file and --json.")
 
-    inline_data = parse_key_value_pairs(args.data_pairs)
+    study_key: str | None = getattr(args, "study_key", None)
     records: list[dict[str, Any]]
     if args.input_file:
-        records = load_records_from_path_or_stdin(args.input_file, schema=schema)
+        records = load_records_from_path_or_stdin(
+            args.input_file,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=args.form_key,
+            default_form_id=args.form_id,
+        )
     elif args.json_payload:
         records = parse_json_records_text(args.json_payload, source_label="--json")
     else:
@@ -61,6 +69,13 @@ def _assemble_create_records_payload(
             raise ValueError(
                 "Provide --file, --json, or at least --form-key / --form-id to create a record."
             )
+        inline_data = parse_key_value_pairs(
+            args.data_pairs,
+            schema=schema,
+            study_key=study_key,
+            form_key=args.form_key,
+            form_id=args.form_id,
+        )
         single: dict[str, Any] = {"data": dict(inline_data)}
         records = [single]
 
@@ -97,7 +112,19 @@ def _assemble_create_records_payload(
         ):
             rec["intervalId"] = args.interval_id
 
-        if inline_data and (args.input_file or args.json_payload):
+        if args.data_pairs and (args.input_file or args.json_payload):
+            rec_fk = rec.get("formKey") or rec.get("form_key")
+            raw_fid = rec.get("formId") if rec.get("formId") is not None else rec.get("form_id")
+            rec_fid = (
+                raw_fid if isinstance(raw_fid, int) and not isinstance(raw_fid, bool) else None
+            )
+            inline_data = parse_key_value_pairs(
+                args.data_pairs,
+                schema=schema,
+                study_key=study_key,
+                form_key=str(rec_fk) if rec_fk else None,
+                form_id=rec_fid,
+            )
             existing_data = dict(rec.get("data") or {})
             existing_data.update(inline_data)
             rec["data"] = existing_data
@@ -300,6 +327,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     @with_sdk
     def create_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
+        payload: list[dict[str, Any]] = []
         try:
             resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
             payload = _assemble_create_records_payload(args, schema=resolved_schema)
@@ -323,8 +351,25 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     dry_run=args.dry_run,
                     collect_errors=True,
                 )
+        except JobFailedError as exc:
+            failed_summary = summary_from_job_failure(
+                exc,
+                study_key=args.study_key,
+                total_records=len(payload),
+            )
+            render_write_summary(
+                failed_summary,
+                resource="records_create",
+                output_format=args.output_format,
+            )
+            return
         except (ValidationError, ValueError) as exc:
-            exit_cli_validation_error(exc)
+            exit_cli_validation_error(
+                exc,
+                resource="records_create",
+                study_key=args.study_key,
+                output_format=args.output_format,
+            )
 
         summary = coerce_batch_summary(
             raw_summary,
@@ -375,6 +420,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     def import_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
         input_path = Path(args.file)
+        total_count = 0
         try:
             resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
             email_notify = parse_email_notify(args.email_notify)
@@ -385,7 +431,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 output_format=args.output_format,
             ) as on_progress:
                 if input_path.suffix.lower() == ".json":
-                    payload = load_records_from_path_or_stdin(args.file, schema=resolved_schema)
+                    payload = load_records_from_path_or_stdin(
+                        args.file,
+                        schema=resolved_schema,
+                        study_key=args.study_key,
+                    )
+                    total_count = len(payload)
                     raw_summary = sdk.records.create_batch(
                         args.study_key,
                         payload,
@@ -399,7 +450,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                         dry_run=args.dry_run,
                         collect_errors=True,
                     )
-                    total_count = len(payload)
                 else:
                     raw_summary = import_records_csv(
                         sdk,
@@ -416,8 +466,25 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                         collect_errors=True,
                     )
                     total_count = getattr(raw_summary, "total_records", 0)
+        except JobFailedError as exc:
+            failed_summary = summary_from_job_failure(
+                exc,
+                study_key=args.study_key,
+                total_records=total_count,
+            )
+            render_write_summary(
+                failed_summary,
+                resource="records_import",
+                output_format=args.output_format,
+            )
+            return
         except (ValidationError, ValueError) as exc:
-            exit_cli_validation_error(exc)
+            exit_cli_validation_error(
+                exc,
+                resource="records_import",
+                study_key=args.study_key,
+                output_format=args.output_format,
+            )
 
         summary = coerce_batch_summary(
             raw_summary,

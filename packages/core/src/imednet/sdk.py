@@ -432,6 +432,20 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
 
         if client is not None:
             self._client = client
+            injected_url = getattr(client, "base_url", None)
+            injected_sim = getattr(client, "simulation_mode", False) is True
+            if (
+                self.config.base_url is None
+                and isinstance(injected_url, str)
+                and injected_url.strip()
+            ) or (injected_sim and not self.config.simulation_mode):
+                from dataclasses import replace
+
+                self.config = replace(
+                    self.config,
+                    base_url=self.config.base_url or injected_url,
+                    simulation_mode=self.config.simulation_mode or injected_sim,
+                )
         else:
             retry_config = self._resolve_retry_config(
                 retry_config=retry_config,
@@ -598,6 +612,20 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
 
         if async_client is not None:
             self._async_client = async_client
+            injected_url = getattr(async_client, "base_url", None)
+            injected_sim = getattr(async_client, "simulation_mode", False) is True
+            if (
+                self.config.base_url is None
+                and isinstance(injected_url, str)
+                and injected_url.strip()
+            ) or (injected_sim and not self.config.simulation_mode):
+                from dataclasses import replace
+
+                self.config = replace(
+                    self.config,
+                    base_url=self.config.base_url or injected_url,
+                    simulation_mode=self.config.simulation_mode or injected_sim,
+                )
         else:
             retry_config = self._resolve_retry_config(
                 retry_config=retry_config,

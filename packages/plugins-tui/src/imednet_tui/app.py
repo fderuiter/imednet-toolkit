@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import copy
 import inspect
+import json
 import logging
 import os
 import re
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, ClassVar, cast
+from unittest.mock import NonCallableMock
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -100,17 +102,8 @@ def _get_configured_attr(obj: object, name: str) -> Any:
     """Read ``name`` from ``obj`` without auto-creating unconfigured mock attributes."""
     if obj is None:
         return None
-    if type(obj).__module__.startswith("unittest.mock"):
-        instance_dict = getattr(obj, "__dict__", {})
-        if name in instance_dict:
-            return instance_dict[name]
-        children = instance_dict.get("_mock_children")
-        if isinstance(children, dict) and name in children:
-            return children[name]
-        wrapped = instance_dict.get("_mock_wraps")
-        if wrapped is not None:
-            return getattr(wrapped, name, None)
-        return None
+    if isinstance(obj, NonCallableMock):
+        return vars(obj).get(name)
     return getattr(obj, name, None)
 
 
@@ -125,10 +118,7 @@ def _is_usable_result_url(url: object) -> bool:
 def _resolve_env_subtitle(sdk: object) -> str:
     """Resolve the active environment subtitle from simulation mode, base_url, or default."""
     config = _get_configured_attr(sdk, "config")
-    clients = [
-        _get_configured_attr(sdk, attr)
-        for attr in ("_client", "_async_client", "client", "async_client")
-    ]
+    clients = [_get_configured_attr(sdk, attr) for attr in ("client", "async_client")]
     if (
         _get_configured_attr(config, "simulation_mode") is True
         or _get_configured_attr(sdk, "simulation_mode") is True
@@ -1284,62 +1274,55 @@ class JobMonitor(Container):
         sync_fn = cast(ImednetFacade, self.sdk).get_job
         return await asyncio.to_thread(sync_fn, study_key, jid)
 
-    def _resolve_result_fetcher(self, url: str) -> Callable[[str], Any] | None:
-        """Resolve an async or sync callable for fetching ``resultUrl`` when configured."""
-        candidate_endpoints: list[Any] = [_get_configured_attr(self.sdk, "jobs")]
-        for method_name in ("async_get_job", "get_job"):
-            method_obj = _get_configured_attr(self.sdk, method_name)
-            bound_self = getattr(method_obj, "__self__", None)
-            if bound_self is not None and not type(bound_self).__module__.startswith(
-                "unittest.mock"
-            ):
-                candidate_endpoints.append(bound_self)
-
-        for endpoint in candidate_endpoints:
-            fetch_fn = _get_configured_attr(endpoint, "_fetch_result_url")
+    def _resolve_result_fetcher(self) -> Callable[[str], Any] | None:
+        """Resolve an async or sync SPI facade callable for fetching ``resultUrl``."""
+        for method_name in ("async_fetch_job_result", "fetch_job_result"):
+            fetch_fn = _get_configured_attr(self.sdk, method_name)
             if callable(fetch_fn):
                 return cast(Callable[[str], Any], fetch_fn)
 
-        is_relative = url.startswith("/") and not url.startswith("//")
-        for attr_name in ("_async_client", "async_client", "_client", "client"):
-            client = _get_configured_attr(self.sdk, attr_name)
-            if client is None:
-                continue
-            if not is_relative:
-                ext_fn = _get_configured_attr(client, "fetch_external_url")
-                if callable(ext_fn):
-                    return cast(Callable[[str], Any], ext_fn)
-            get_fn = _get_configured_attr(client, "get")
-            if callable(get_fn):
-                return cast(Callable[[str], Any], get_fn)
+        jobs_endpoint = _get_configured_attr(self.sdk, "jobs")
+        endpoint_fn = _get_configured_attr(jobs_endpoint, "fetch_result")
+        if callable(endpoint_fn):
+            return cast(Callable[[str], Any], endpoint_fn)
         return None
 
-    async def _populate_terminal_job_results(self, entry: _TrackedJobEntry, job: Any) -> None:
-        """Fetch ``job.result_url`` once for terminal ``JobStatus`` items lacking inline results."""
+    async def _populate_terminal_job_results(
+        self,
+        entry: _TrackedJobEntry,
+        job: Any,
+        *,
+        is_retry: bool = False,
+    ) -> None:
+        """Fetch ``job.result_url`` for terminal ``JobStatus`` items lacking inline results."""
         if (
             not isinstance(job, JobStatus)
             or not getattr(job, "is_terminal", False)
             or entry.result_fetched
-            or bool(getattr(job, "results", None))
         ):
             return
 
-        prev_state = entry.last_state
-        if prev_state is not None and prev_state != "NOT_FOUND":
-            curr_state = getattr(job, "state", None)
-            if curr_state is None or not is_valid_job_transition(prev_state, curr_state):
-                return
+        if getattr(job, "results", None) is not None:
+            entry.result_fetched = True
+            return
+
+        if not is_retry:
+            prev_state = entry.last_state
+            if prev_state is not None and prev_state != "NOT_FOUND":
+                curr_state = getattr(job, "state", None)
+                if curr_state is None or not is_valid_job_transition(prev_state, curr_state):
+                    return
 
         raw_url = getattr(job, "result_url", None)
         if not _is_usable_result_url(raw_url):
+            entry.result_fetched = True
             return
 
         url = str(raw_url).strip()
-        fetch_fn = self._resolve_result_fetcher(url)
+        fetch_fn = self._resolve_result_fetcher()
         if fetch_fn is None:
             return
 
-        entry.result_fetched = True
         try:
             if inspect.iscoroutinefunction(fetch_fn):
                 response = await fetch_fn(url)
@@ -1348,22 +1331,58 @@ class JobMonitor(Container):
                 if inspect.isawaitable(response):
                     response = await response
 
-            json_fn = _get_configured_attr(response, "json")
-            if callable(json_fn):
-                try:
-                    job.results = json_fn()
-                except Exception:
-                    job.results = getattr(response, "text", str(response))
+            parsed: Any
+            if isinstance(response, (dict, list)):
+                parsed = response
             else:
-                job.results = response
+                json_fn = _get_configured_attr(response, "json")
+                if callable(json_fn):
+                    parsed = json_fn()
+                elif isinstance(response, (str, bytes)):
+                    parsed = json.loads(response)
+                else:
+                    raise ValueError(
+                        f"Unsupported resultUrl response type: {type(response).__name__}"
+                    )
+                if not isinstance(parsed, (dict, list)):
+                    raise ValueError(
+                        f"Expected JSON object or array from resultUrl, got {type(parsed).__name__}"
+                    )
+
+            job.results = parsed
+            job.result_error = None
+            entry.result_fetched = True
         except Exception as exc:
             redacted_err = _sanitize_text(exc)
+            job.results = None
             job.result_error = redacted_err
+            entry.result_fetched = False
             logging.getLogger("imednet_tui").warning(
                 "Failed to fetch resultUrl for job %s: %s",
                 entry.job_id,
                 redacted_err,
             )
+
+    def _needs_terminal_result_retry(self, entry: _TrackedJobEntry) -> bool:
+        """Return True when a terminal ``JobStatus`` entry has a failed/unfetched ``resultUrl``."""
+        job = entry.last_job
+        return (
+            entry.is_terminal
+            and not entry.result_fetched
+            and isinstance(job, JobStatus)
+            and getattr(job, "results", None) is None
+            and _is_usable_result_url(getattr(job, "result_url", None))
+            and self._resolve_result_fetcher() is not None
+        )
+
+    async def _retry_terminal_result_fetch(self, entry: _TrackedJobEntry) -> None:
+        """Retry fetching ``resultUrl`` for an already-terminal job under the semaphore."""
+        if not self._needs_terminal_result_retry(entry):
+            return
+        async with self.semaphore:
+            if not self._needs_terminal_result_retry(entry):
+                return
+            await self._populate_terminal_job_results(entry, entry.last_job, is_retry=True)
 
     def _apply_job_evaluation(self, entry: _TrackedJobEntry, job: Any) -> None:
         """Evaluate ``job`` monotonically via ``evaluate_job_state`` and update ``entry``."""
@@ -1632,9 +1651,13 @@ class JobMonitor(Container):
                             entry.last_state = None
 
             active_entries = [entry for entry in entries.values() if not entry.is_terminal]
-            if active_entries:
+            retry_result_entries = [
+                entry for entry in entries.values() if self._needs_terminal_result_retry(entry)
+            ]
+            if active_entries or retry_result_entries:
                 await asyncio.gather(
-                    *(self._poll_tracked_entry(study_key, entry) for entry in active_entries)
+                    *(self._poll_tracked_entry(study_key, entry) for entry in active_entries),
+                    *(self._retry_terminal_result_fetch(entry) for entry in retry_result_entries),
                 )
 
             if self.current_study_key != study_key:

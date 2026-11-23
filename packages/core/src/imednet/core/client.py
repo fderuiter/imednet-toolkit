@@ -120,7 +120,7 @@ class Client(HTTPClientBase[httpx.Client, SyncRequestExecutor]):
                 infos = socket.getaddrinfo(host_to_resolve, port, type=socket.SOCK_STREAM)
                 _validate_addrinfo_results(infos, host_to_resolve)
             req_kwargs = self._prepare_external_kwargs(validated_url, kwargs)
-            response = self._request("GET", validated_url, **req_kwargs)
+            response = self._external_executor("GET", validated_url, **req_kwargs)
             next_url = self._resolve_same_origin_redirect(validated_url, response, hop)
             if next_url is None:
                 return response

@@ -183,7 +183,9 @@ class RegisterSubjectsWorkflow:
         self._ensure_sync_mode("register_subjects_batch", "async_register_subjects_batch")
         sdk = cast("ImednetFacade", self._sdk)
         sites = sdk.get_sites(study_key=study_key)
-        normalized_pairs = normalize_subject_registration_inputs(subjects, schema=schema)
+        normalized_pairs = normalize_subject_registration_inputs(
+            subjects, schema=schema, study_key=study_key
+        )
         validate_subject_registration_sites(normalized_pairs, sites)
 
         should_filter = (
@@ -318,7 +320,9 @@ class RegisterSubjectsWorkflow:
 
         sdk = cast("AsyncImednetFacade", self._sdk)
         sites = await sdk.async_get_sites(study_key=study_key)
-        normalized_pairs = normalize_subject_registration_inputs(subjects, schema=schema)
+        normalized_pairs = normalize_subject_registration_inputs(
+            subjects, schema=schema, study_key=study_key
+        )
         validate_subject_registration_sites(normalized_pairs, sites)
 
         should_filter = (

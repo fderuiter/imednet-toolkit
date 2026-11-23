@@ -140,6 +140,8 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.get_variables('S'), list[Variable])
     assert_type(sdk.get_visits('S'), list[Visit])
     assert_type(sdk.get_job('S', 'B'), JobStatus)
+    assert sdk.fetch_job_result('https://example.com/res.json') is not None or True
+    assert facade.fetch_job_result('https://example.com/res.json') is not None or True
     assert_type(sdk.create_record('S', [{'formKey': 'DEMOG'}]), Job)
     assert_type(sdk.create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(sdk.poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
@@ -357,6 +359,8 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.async_get_variables('S'), list[Variable])
     assert_type(await sdk.async_get_visits('S'), list[Visit])
     assert_type(await sdk.async_get_job('S', 'B'), JobStatus)
+    assert (await sdk.async_fetch_job_result('https://example.com/res.json')) is not None or True
+    assert (await facade.async_fetch_job_result('https://example.com/res.json')) is not None or True
     assert_type(await sdk.async_create_record('S', [{'formKey': 'DEMOG'}]), Job)
     assert_type(await sdk.async_create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(await sdk.async_poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
@@ -552,11 +556,23 @@ def aliased_model_constructor_contracts() -> None:
     assert_type(BaseRecordRequest(form_key='DM', data=payload), BaseRecordRequest)
     assert_type(BaseRecordRequest(formKey='DM', data=payload), BaseRecordRequest)
     assert_type(
-        RegisterSubjectRequest(form_key='DM', site_name='SITE-01', data=payload),
+        RegisterSubjectRequest(
+            form_key='DM',
+            site_name='SITE-01',
+            subject_key='SUBJ-01',
+            subject_oid='OID-01',
+            data=payload,
+        ),
         RegisterSubjectRequest,
     )
     assert_type(
-        RegisterSubjectRequest(formKey='DM', siteName='SITE-01', data=payload),
+        RegisterSubjectRequest(
+            formKey='DM',
+            siteName='SITE-01',
+            subjectKey='SUBJ-01',
+            subjectOid='OID-01',
+            data=payload,
+        ),
         RegisterSubjectRequest,
     )
     assert_type(

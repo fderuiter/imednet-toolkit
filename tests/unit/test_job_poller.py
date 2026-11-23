@@ -334,23 +334,27 @@ def test_job_poller_fetch_result(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exc_info.value.status.result_error == "fetch fail"
     assert exc_info.value.result_error == "fetch fail"
 
-    # Text fallback
+    # Non-JSON HTTP response body (e.g., HTML error page) fails rather than masking as text
     class MockTextResponse:
         def json(self):
-            raise ValueError()
+            raise ValueError("Expecting value: line 1 column 1")
 
         @property
         def text(self):
-            return "text data"
+            return "<html>502 Bad Gateway</html>"
 
     poller_text = JobPoller(get_job, fetch_result=lambda url: MockTextResponse())
-    st3 = poller_text.run("ST", "1", interval=0)
-    assert st3.results == "text data"
+    with pytest.raises(JobFailedError, match="Non-JSON resultUrl response") as exc_text:
+        poller_text.run("ST", "1", interval=0)
+    assert exc_text.value.status.results is None
+    assert exc_text.value.status.result_error is not None
 
-    # Raw string
-    poller_str = JobPoller(get_job, fetch_result=lambda url: "raw string")
-    st4 = poller_str.run("ST", "1", interval=0)
-    assert st4.results == "raw string"
+    # Raw non-JSON string body also fails
+    poller_str = JobPoller(get_job, fetch_result=lambda url: "<html>error</html>")
+    with pytest.raises(JobFailedError, match="Non-JSON resultUrl response") as exc_str:
+        poller_str.run("ST", "1", interval=0)
+    assert exc_str.value.status.results is None
+    assert exc_str.value.status.result_error is not None
 
 
 @pytest.mark.asyncio
@@ -552,3 +556,82 @@ async def test_poll_many_records_result_url_errors(monkeypatch: pytest.MonkeyPat
     async_err = async_summary.failures["B_ASYNC_ERR"]
     assert isinstance(async_err, JobFailedError)
     assert async_err.result_error == "Connection reset fetching resultUrl"
+
+
+@pytest.mark.asyncio
+async def test_job_status_errors_dict_empty_results_list_and_html_result_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 6 & Req 7: Count {'errors': [...]}, preserve failedRecords on [], and fail on HTML resultUrl."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    # 1. {"errors": [...]} without explicit failed key still counts failures and fails polling
+    errors_only_status = JobStatus(
+        batchId="B-ERR-DICT",
+        state="COMPLETED",
+        progress=100,
+        results={"errors": [{"message": "Missing site"}, {"message": "Invalid subject"}]},
+    )
+    assert errors_only_status.failed_records == 2
+    assert errors_only_status.total_records == 2
+    assert errors_only_status.is_failed is True
+    assert errors_only_status.is_successful is False
+
+    # 2. Empty results=[] preserves wire failedRecords / totalRecords / successfulRecords
+    empty_results_with_wire_counts = JobStatus.model_validate(
+        {
+            "batchId": "B-EMPTY-LIST",
+            "state": "COMPLETED",
+            "progress": 100,
+            "totalRecords": 5,
+            "successfulRecords": 3,
+            "failedRecords": 2,
+            "results": [],
+        }
+    )
+    assert empty_results_with_wire_counts.total_records == 5
+    assert empty_results_with_wire_counts.successful_records == 3
+    assert empty_results_with_wire_counts.failed_records == 2
+    assert empty_results_with_wire_counts.is_failed is True
+    assert empty_results_with_wire_counts.is_successful is False
+
+    # 3. Polling COMPLETED job whose resultUrl returns {"errors": [...]} or HTML raises JobFailedError
+    class _ErrorsJsonResp:
+        def json(self) -> dict[str, object]:
+            return {"errors": [{"error": "Duplicate subjectKey"}]}
+
+    class _HtmlResp:
+        text = "<!DOCTYPE html><html><body>Gateway Error</body></html>"
+
+        def json(self) -> object:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    def _completed_job(_study: str, batch_id: str) -> JobStatus:
+        return JobStatus(
+            batchId=batch_id,
+            state="COMPLETED",
+            progress=100,
+            resultUrl=f"https://results.example.test/{batch_id}",
+        )
+
+    with pytest.raises(JobFailedError, match="Duplicate subjectKey"):
+        JobPoller(_completed_job, fetch_result=lambda _u: _ErrorsJsonResp()).run(
+            "ST", "B-JSON-ERR", interval=0
+        )
+
+    with pytest.raises(JobFailedError, match="Non-JSON resultUrl response"):
+        JobPoller(_completed_job, fetch_result=lambda _u: _HtmlResp()).run(
+            "ST", "B-HTML-ERR", interval=0
+        )
+
+    async def _async_completed_job(_study: str, batch_id: str) -> JobStatus:
+        return _completed_job(_study, batch_id)
+
+    async def _async_html_fetch(_u: str) -> object:
+        return _HtmlResp()
+
+    with pytest.raises(JobFailedError, match="Non-JSON resultUrl response"):
+        await AsyncJobPoller(_async_completed_job, fetch_result=_async_html_fetch).run(
+            "ST", "B-ASYNC-HTML", interval=0
+        )
