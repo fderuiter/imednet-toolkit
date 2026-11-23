@@ -13,9 +13,9 @@ from imednet.models.jobs import Job
 from imednet.models.records import Record
 from imednet.utils.batch_coordinator import (
     DEFAULT_BATCH_CHUNK_SIZE,
-    AsyncBatchCoordinator,
-    BatchCoordinator,
     BatchSubmissionSummary,
+    _submit_records_batch_async,
+    _submit_records_batch_sync,
 )
 from imednet.utils.job_poller import JobProgressHandler
 from imednet.utils.tabular import normalize_records_input
@@ -116,55 +116,25 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and optionally poll jobs."""
-        self._validate_study_key(study_key)
-        normalized = normalize_records_input(records_data, schema=schema)
-        coordinator = BatchCoordinator(chunk_size=chunk_size)
-
-        def _poll_single(
-            batch_id: str,
-            *,
-            on_progress: JobProgressHandler | None = None,
-        ) -> Any:
-            jobs_ep = JobsEndpoint(client=self._require_sync_client())
-            return jobs_ep.poll(
-                study_key,
-                batch_id,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-            )
-
-        def _poll_many(
-            batch_ids: list[str],
-            *,
-            on_progress: JobProgressHandler | None = None,
-        ) -> Any:
-            jobs_ep = JobsEndpoint(client=self._require_sync_client())
-            return jobs_ep.poll_many(
-                study_key,
-                batch_ids,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-            )
-
-        return coordinator.submit(
+        return _submit_records_batch_sync(
             study_key,
-            normalized,
-            lambda chunk: self.create(
-                study_key,
-                chunk,
-                email_notify=email_notify,
-                schema=schema,
-                skip_validation=True,
-            ),
+            records_data,
+            email_notify,
+            validate_study_key_fn=self._validate_study_key,
+            create_records_fn=self.create,
+            poll_single_fn=lambda sk, bid, **kw: JobsEndpoint(
+                client=self._require_sync_client()
+            ).poll(sk, bid, **kw),
+            poll_many_fn=lambda sk, bids, **kw: JobsEndpoint(
+                client=self._require_sync_client()
+            ).poll_many(sk, bids, **kw),
             schema=schema,
+            chunk_size=chunk_size,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
-            poll_single=_poll_single if wait_for_completion else None,
-            poll_many=_poll_many if wait_for_completion else None,
+            timeout=timeout,
+            interval=interval,
             on_progress=on_progress,
-            require_batch_id=wait_for_completion,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -218,55 +188,25 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit records in bounded chunks, and optionally poll."""
-        self._validate_study_key(study_key)
-        normalized = normalize_records_input(records_data, schema=schema)
-        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
-
-        async def _poll_single(
-            batch_id: str,
-            *,
-            on_progress: JobProgressHandler | None = None,
-        ) -> Any:
-            jobs_ep = AsyncJobsEndpoint(async_client=self._require_async_client())
-            return await jobs_ep.poll(
-                study_key,
-                batch_id,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-            )
-
-        async def _poll_many(
-            batch_ids: list[str],
-            *,
-            on_progress: JobProgressHandler | None = None,
-        ) -> Any:
-            jobs_ep = AsyncJobsEndpoint(async_client=self._require_async_client())
-            return await jobs_ep.poll_many(
-                study_key,
-                batch_ids,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-            )
-
-        return await coordinator.submit(
+        return await _submit_records_batch_async(
             study_key,
-            normalized,
-            lambda chunk: self.create(
-                study_key,
-                chunk,
-                email_notify=email_notify,
-                schema=schema,
-                skip_validation=True,
-            ),
+            records_data,
+            email_notify,
+            validate_study_key_fn=self._validate_study_key,
+            create_records_fn=self.create,
+            poll_single_fn=lambda sk, bid, **kw: AsyncJobsEndpoint(
+                async_client=self._require_async_client()
+            ).poll(sk, bid, **kw),
+            poll_many_fn=lambda sk, bids, **kw: AsyncJobsEndpoint(
+                async_client=self._require_async_client()
+            ).poll_many(sk, bids, **kw),
             schema=schema,
+            chunk_size=chunk_size,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
-            poll_single=_poll_single if wait_for_completion else None,
-            poll_many=_poll_many if wait_for_completion else None,
+            timeout=timeout,
+            interval=interval,
             on_progress=on_progress,
-            require_batch_id=wait_for_completion,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
