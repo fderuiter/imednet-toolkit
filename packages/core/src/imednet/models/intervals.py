@@ -16,6 +16,9 @@ class FormSummary(ImednetBaseModel):
     form_name: str = Field("", alias="formName")
 
 
+FormSummary = ModelEngine.get_model('FormSummary', FormSummary)
+
+
 class Interval(ImednetBaseModel):
     """Represents a visit interval or event within the study timeline."""
 

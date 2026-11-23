@@ -193,9 +193,9 @@ def sync_contract(sdk: ImednetSDK) -> None:
         ),
         JobStatus,
     )
-    assert_type(job_status.total_records, int)
-    assert_type(job_status.successful_records, int)
-    assert_type(job_status.failed_records, int)
+    assert_type(job_status.total_records, int | None)
+    assert_type(job_status.successful_records, int | None)
+    assert_type(job_status.failed_records, int | None)
     assert_type(Query(study_key='S', description='Open query'), Query)
     assert_type(Query(studyKey='S', description='Open query'), Query)
     assert_type(Record(record_id=1), Record)

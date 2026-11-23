@@ -40,7 +40,7 @@ from textual.widgets import (
 from imednet.spi.constants import DEFAULT_BASE_URL, MAX_PAGE_SIZE
 from imednet.spi.errors import NotFoundError
 from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
-from imednet.spi.models import Job, JobState, JobStatus, Subject, is_valid_job_transition
+from imednet.spi.models import JobState, Subject, is_valid_job_transition
 from imednet.spi.utils import (
     InvalidJobStateError,
     InvalidJobTransitionError,
@@ -112,14 +112,6 @@ def _get_configured_attr(obj: object, name: str) -> Any:
             return getattr(wrapped, name, None)
         return None
     return getattr(obj, name, None)
-
-
-def _is_usable_result_url(url: object) -> bool:
-    """Return True when ``url`` is a non-empty string and not a ``<...>`` placeholder."""
-    if not isinstance(url, str):
-        return False
-    cleaned = url.strip()
-    return bool(cleaned) and not (cleaned.startswith("<") and cleaned.endswith(">"))
 
 
 def _resolve_env_subtitle(sdk: object) -> str:
@@ -743,7 +735,6 @@ class _TrackedJobEntry:
     last_state: JobState | str | None = None
     is_terminal: bool = False
     warning: str | None = None
-    result_fetched: bool = False
 
 
 def _extract_entry_row(entry: _TrackedJobEntry) -> tuple[str, str, str, str, str, str]:
@@ -787,8 +778,6 @@ def _extract_entry_row(entry: _TrackedJobEntry) -> tuple[str, str, str, str, str
         progress_str = cleaned_prog if cleaned_prog.endswith("%") else f"{cleaned_prog}%"
     elif state_upper in _SUCCESS_STATE_NAMES:
         progress_str = "100%"
-    elif isinstance(job, (Job, JobStatus)) and not isinstance(job, _TrackedJobPlaceholder):
-        progress_str = "0%"
     else:
         progress_str = "-"
 
@@ -1284,87 +1273,6 @@ class JobMonitor(Container):
         sync_fn = cast(ImednetFacade, self.sdk).get_job
         return await asyncio.to_thread(sync_fn, study_key, jid)
 
-    def _resolve_result_fetcher(self, url: str) -> Callable[[str], Any] | None:
-        """Resolve an async or sync callable for fetching ``resultUrl`` when configured."""
-        candidate_endpoints: list[Any] = [_get_configured_attr(self.sdk, "jobs")]
-        for method_name in ("async_get_job", "get_job"):
-            method_obj = _get_configured_attr(self.sdk, method_name)
-            bound_self = getattr(method_obj, "__self__", None)
-            if bound_self is not None and not type(bound_self).__module__.startswith(
-                "unittest.mock"
-            ):
-                candidate_endpoints.append(bound_self)
-
-        for endpoint in candidate_endpoints:
-            fetch_fn = _get_configured_attr(endpoint, "_fetch_result_url")
-            if callable(fetch_fn):
-                return cast(Callable[[str], Any], fetch_fn)
-
-        is_relative = url.startswith("/") and not url.startswith("//")
-        for attr_name in ("_async_client", "async_client", "_client", "client"):
-            client = _get_configured_attr(self.sdk, attr_name)
-            if client is None:
-                continue
-            if not is_relative:
-                ext_fn = _get_configured_attr(client, "fetch_external_url")
-                if callable(ext_fn):
-                    return cast(Callable[[str], Any], ext_fn)
-            get_fn = _get_configured_attr(client, "get")
-            if callable(get_fn):
-                return cast(Callable[[str], Any], get_fn)
-        return None
-
-    async def _populate_terminal_job_results(self, entry: _TrackedJobEntry, job: Any) -> None:
-        """Fetch ``job.result_url`` once for terminal ``JobStatus`` items lacking inline results."""
-        if (
-            not isinstance(job, JobStatus)
-            or not getattr(job, "is_terminal", False)
-            or entry.result_fetched
-            or bool(getattr(job, "results", None))
-        ):
-            return
-
-        prev_state = entry.last_state
-        if prev_state is not None and prev_state != "NOT_FOUND":
-            curr_state = getattr(job, "state", None)
-            if curr_state is None or not is_valid_job_transition(prev_state, curr_state):
-                return
-
-        raw_url = getattr(job, "result_url", None)
-        if not _is_usable_result_url(raw_url):
-            return
-
-        url = str(raw_url).strip()
-        fetch_fn = self._resolve_result_fetcher(url)
-        if fetch_fn is None:
-            return
-
-        entry.result_fetched = True
-        try:
-            if inspect.iscoroutinefunction(fetch_fn):
-                response = await fetch_fn(url)
-            else:
-                response = await asyncio.to_thread(fetch_fn, url)
-                if inspect.isawaitable(response):
-                    response = await response
-
-            json_fn = _get_configured_attr(response, "json")
-            if callable(json_fn):
-                try:
-                    job.results = json_fn()
-                except Exception:
-                    job.results = getattr(response, "text", str(response))
-            else:
-                job.results = response
-        except Exception as exc:
-            redacted_err = _sanitize_text(exc)
-            job.result_error = redacted_err
-            logging.getLogger("imednet_tui").warning(
-                "Failed to fetch resultUrl for job %s: %s",
-                entry.job_id,
-                redacted_err,
-            )
-
     def _apply_job_evaluation(self, entry: _TrackedJobEntry, job: Any) -> None:
         """Evaluate ``job`` monotonically via ``evaluate_job_state`` and update ``entry``."""
         if entry.is_terminal:
@@ -1510,7 +1418,6 @@ class JobMonitor(Container):
                     entry.warning = f"Poll error: {sanitized_err}"
                 return
 
-            await self._populate_terminal_job_results(entry, job)
             self._apply_job_evaluation(entry, job)
 
     @staticmethod

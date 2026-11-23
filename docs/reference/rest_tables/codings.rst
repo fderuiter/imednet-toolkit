@@ -70,7 +70,7 @@ List codings
      - Maximum number of records to return per page.
    * - ``sort``
      - String
-     - None
+     - ``formId,asc``
      - Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String

@@ -3396,17 +3396,16 @@ async def test_not_found_placeholder_pauses_timer_retries_on_r_and_untracks_via_
 
 
 @pytest.mark.asyncio
-async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_red() -> None:
-    """Verify AsyncImednetSDK and ImednetSDK fetch resultUrl once and style partial failures red."""
+async def test_terminal_job_skips_result_url_fetches_and_renders_dash_for_unknown_counts() -> None:
+    """Verify AsyncImednetSDK and ImednetSDK never fetch resultUrl and render '-' for unknown counts."""
     base_url = "https://edc.result-test.imednetapi.com"
-    marker_val = "sec-result-marker-999"  # pragma: allowlist secret
 
     with respx.mock(base_url=base_url, assert_all_called=False) as router:
         router.get("/api/v1/edc/studies").mock(
             return_value=httpx.Response(
                 200,
                 json={
-                    "data": [{"studyKey": "ST_RES", "studyName": "Result URL Study"}],
+                    "data": [{"studyKey": "ST_RES", "studyName": "Six-Field Job Study"}],
                     "pagination": {"page": 0, "size": 100, "totalPages": 1, "totalItems": 1},
                 },
             )
@@ -3429,23 +3428,33 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
                 },
             )
         )
-        router.get("/api/v1/edc/studies/ST_RES/jobs/B_CLEAN").mock(
+        router.get("/api/v1/edc/studies/ST_RES/jobs/B_SIX_FIELD").mock(
             return_value=httpx.Response(
                 200,
                 json={
-                    "batchId": "B_CLEAN",
+                    "jobId": "J_SIX",
+                    "batchId": "B_SIX_FIELD",
                     "state": "COMPLETED",
-                    "progress": 100,
-                    "resultUrl": f"{base_url}/api/v1/edc/studies/ST_RES/jobs/B_CLEAN/results",
                     "dateCreated": "2026-07-01T10:00:00Z",
+                    "dateStarted": "2026-07-01T10:00:02Z",
+                    "dateFinished": "2026-07-01T10:00:09Z",
                 },
             )
         )
-        clean_res_route = router.get("/api/v1/edc/studies/ST_RES/jobs/B_CLEAN/results").mock(
+        router.get("/api/v1/edc/studies/ST_RES/jobs/B_WITH_URL").mock(
             return_value=httpx.Response(
                 200,
-                json=[{"status": "SUCCESS"}, {"status": "SUCCESS"}],
+                json={
+                    "jobId": "J_URL",
+                    "batchId": "B_WITH_URL",
+                    "state": "COMPLETED",
+                    "resultUrl": f"{base_url}/api/v1/edc/studies/ST_RES/jobs/B_WITH_URL/results",
+                    "dateCreated": "2026-07-01T10:05:00Z",
+                },
             )
+        )
+        unbacked_res_route = router.get("/api/v1/edc/studies/ST_RES/jobs/B_WITH_URL/results").mock(
+            return_value=httpx.Response(500, json={"message": "Should never be called"})
         )
 
         router.get("/api/v1/edc/studies/ST_RES/jobs/B_PARTIAL").mock(
@@ -3454,42 +3463,10 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
                 json={
                     "batchId": "B_PARTIAL",
                     "state": "COMPLETED",
-                    "progress": 100,
-                    "resultUrl": "/api/v1/edc/studies/ST_RES/jobs/B_PARTIAL/results",
-                    "dateCreated": "2026-07-01T10:05:00Z",
-                },
-            )
-        )
-        partial_res_route = router.get("/api/v1/edc/studies/ST_RES/jobs/B_PARTIAL/results").mock(
-            return_value=httpx.Response(
-                200,
-                json=[
-                    {"status": "SUCCESS"},
-                    {"status": "FAILED", "error": "Invalid visit date"},
-                    {"error": "Missing subject key"},
-                ],
-            )
-        )
-
-        router.get("/api/v1/edc/studies/ST_RES/jobs/B_RES_ERR").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "batchId": "B_RES_ERR",
-                    "state": "COMPLETED",
-                    "progress": 100,
-                    "resultUrl": (
-                        f"{base_url}/api/v1/edc/studies/ST_RES/jobs/B_RES_ERR/results"
-                        f"?apiKey={marker_val}"
-                    ),
+                    "totalRecords": 3,
+                    "failedRecords": 2,
                     "dateCreated": "2026-07-01T10:10:00Z",
                 },
-            )
-        )
-        err_res_route = router.get("/api/v1/edc/studies/ST_RES/jobs/B_RES_ERR/results").mock(
-            return_value=httpx.Response(
-                500,
-                json={"message": f"Upstream error for token={marker_val}"},
             )
         )
 
@@ -3503,32 +3480,40 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
                 app = ImednetTuiApp(
                     async_sdk,
                     study_key="ST_RES",
-                    batch_ids=["B_CLEAN", "B_PARTIAL", "B_RES_ERR"],
+                    batch_ids=["B_SIX_FIELD", "B_WITH_URL", "B_PARTIAL"],
                 )
                 async with app.run_test(size=(110, 32)) as pilot:
                     await _settle(pilot)
                     job_monitor = app.screen.query_one(JobMonitor)
                     job_table = app.screen.query_one("#job_table", JobTable)
-                    log_viewer = app.screen.query_one(LogViewer)
 
                     assert spy_to_thread.call_count == 0
-                    assert clean_res_route.call_count == 1
-                    assert partial_res_route.call_count == 1
-                    assert err_res_route.call_count == 1
+                    assert unbacked_res_route.call_count == 0
 
-                    # Row 0: B_CLEAN -> Total=2, Failed=0, styled green
-                    row_clean = job_table.get_row_at(0)
-                    assert [str(c) for c in row_clean[:5]] == [
-                        "B_CLEAN",
+                    # Row 0: Six-field upstream COMPLETED payload -> Total='-', Failed='-', styled green
+                    row_six = job_table.get_row_at(0)
+                    assert [str(c) for c in row_six[:5]] == [
+                        "B_SIX_FIELD",
                         "COMPLETED",
                         "100%",
-                        "2",
-                        "0",
+                        "-",
+                        "-",
                     ]
-                    assert row_clean[1].style == "green"
+                    assert row_six[1].style == "green"
 
-                    # Row 1: B_PARTIAL -> Total=3, Failed=2, styled red despite COMPLETED state
-                    row_partial = job_table.get_row_at(1)
+                    # Row 1: Payload with resultUrl is NOT fetched -> Total='-', Failed='-', styled green
+                    row_url = job_table.get_row_at(1)
+                    assert [str(c) for c in row_url[:5]] == [
+                        "B_WITH_URL",
+                        "COMPLETED",
+                        "100%",
+                        "-",
+                        "-",
+                    ]
+                    assert row_url[1].style == "green"
+
+                    # Row 2: Explicit failedRecords > 0 still styles red
+                    row_partial = job_table.get_row_at(2)
                     assert [str(c) for c in row_partial[:5]] == [
                         "B_PARTIAL",
                         "COMPLETED",
@@ -3538,38 +3523,13 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
                     ]
                     assert row_partial[1].style == "red"
 
-                    # Row 2: B_RES_ERR -> result_error populated & redacted, styled red
-                    row_err = job_table.get_row_at(2)
-                    assert str(row_err[0]) == "B_RES_ERR"
-                    assert str(row_err[1]) == "COMPLETED"
-                    assert row_err[1].style == "red"
-
                     summary_renderable = job_monitor.render()
-                    spans_text = [
-                        (
-                            summary_renderable.plain[span.start : span.end],
-                            str(span.style),
-                        )
-                        for span in summary_renderable.spans
-                    ]
-                    completed_styles = [
-                        style for label, style in spans_text if label == "COMPLETED"
-                    ]
-                    assert completed_styles == ["green", "red", "red"]
+                    summary_plain = summary_renderable.plain
+                    assert "total=-, failed=-" in summary_plain
+                    assert "total=0, failed=0" not in summary_plain
+                    assert "[0%," not in summary_plain
 
-                    log_dump = "\n".join(log_viewer.lines)
-                    assert "B_RES_ERR" in log_dump
-                    assert marker_val not in log_dump
-                    assert "***" in log_dump
-
-                    # Manual refresh must NOT re-fetch resultUrl for already-fetched terminal jobs
-                    await pilot.press("r")
-                    await _settle(pilot)
-                    assert clean_res_route.call_count == 1
-                    assert partial_res_route.call_count == 1
-                    assert err_res_route.call_count == 1
-
-        # Verify synchronous ImednetSDK also populates resultUrl counts off the main thread
+        # Verify synchronous ImednetSDK also renders '-' for unknown counts and never fetches resultUrl
         with ImednetSDK(
             api_key="test-key",  # pragma: allowlist secret
             security_key="test-sec",  # pragma: allowlist secret
@@ -3579,21 +3539,21 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
             sync_app = ImednetTuiApp(
                 sync_sdk,
                 study_key="ST_RES",
-                batch_ids=["B_PARTIAL"],
+                batch_ids=["B_SIX_FIELD", "B_WITH_URL"],
             )
             async with sync_app.run_test(size=(100, 30)) as pilot:
                 await _settle(pilot)
                 sync_table = sync_app.screen.query_one("#job_table", JobTable)
                 sync_row = sync_table.get_row_at(0)
                 assert [str(c) for c in sync_row[:5]] == [
-                    "B_PARTIAL",
+                    "B_SIX_FIELD",
                     "COMPLETED",
                     "100%",
-                    "3",
-                    "2",
+                    "-",
+                    "-",
                 ]
-                assert sync_row[1].style == "red"
-                assert partial_res_route.call_count == 2
+                assert sync_row[1].style == "green"
+                assert unbacked_res_route.call_count == 0
 
 
 @pytest.mark.asyncio

@@ -104,7 +104,7 @@ class JobPollSummary:
         """Return True if all jobs were successful with zero failed records."""
         return not self.failures and all(
             cast(Any, s).is_successful
-            and getattr(s, "failed_records", 0) == 0
+            and (getattr(s, "failed_records", None) or 0) == 0
             and not getattr(s, "result_error", None)
             for s in self.results.values()
         )
@@ -114,7 +114,7 @@ class JobPollSummary:
         """Return True if any job failed, timed out, or reported failed records."""
         return bool(self.failures) or any(
             cast(Any, s).is_failed
-            or getattr(s, "failed_records", 0) > 0
+            or (getattr(s, "failed_records", None) or 0) > 0
             or bool(getattr(s, "result_error", None))
             for s in self.results.values()
         )

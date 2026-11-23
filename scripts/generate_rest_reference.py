@@ -77,14 +77,26 @@ PATH_VAR_DESCRIPTIONS: dict[str, str] = {
     "batchId": "Unique batch tracking identifier for asynchronous record creation job.",
 }
 
-BODY_FIELD_DESCRIPTIONS: dict[str, tuple[str, bool, str]] = {
-    "formKey": ("String", True, "Clinical Case Report Form (CRF) unique key identifier."),
-    "subjectKey": ("String", True, "Target study participant unique key identifier."),
-    "siteName": ("String", True, "Name of the clinical research site where data was collected."),
-    "intervalName": ("String", True, "Study visit or interval event name."),
+BODY_FIELD_DESCRIPTIONS: dict[str, tuple[str, str, str]] = {
+    "formKey": ("String", "Required", "Clinical Case Report Form (CRF) unique key identifier."),
+    "subjectKey": (
+        "String",
+        "Conditional",
+        "Target study participant key (required when updating scheduled records or creating unscheduled records; omit when registering a new subject).",
+    ),
+    "siteName": (
+        "String",
+        "Conditional",
+        "Clinical research site name (required when registering a new subject).",
+    ),
+    "intervalName": (
+        "String",
+        "Conditional",
+        "Study visit or interval event name (required when updating an existing scheduled record).",
+    ),
     "data": (
         "Object",
-        True,
+        "Required",
         "Clinical data dictionary mapping item/question variable names to recorded values.",
     ),
 }
@@ -286,8 +298,7 @@ def _generate_endpoint_rst(operation: dict[str, Any]) -> list[str]:
                 "     - Description",
             ]
         )
-        for field, (f_type, f_req, f_desc) in BODY_FIELD_DESCRIPTIONS.items():
-            req_str = "Required" if f_req else "Optional"
+        for field, (f_type, req_str, f_desc) in BODY_FIELD_DESCRIPTIONS.items():
             lines.extend(
                 [
                     f"   * - ``{field}``",

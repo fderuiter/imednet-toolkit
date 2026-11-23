@@ -1092,13 +1092,13 @@ def test_record_revisions_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
 
 
 def test_jobs_status_success(runner: CliRunner, sdk: MagicMock) -> None:
-    """Test that jobs status outputs formatted table headers and fields."""
+    """Test that jobs status outputs formatted table headers and six upstream fields."""
     job = JobStatus(
         batchId="BATCH123",
         jobId="JOB456",
         state="RUNNING",
-        progress=45,
         dateCreated="2026-11-17 10:00",
+        dateStarted="2026-11-17 10:01",
         dateFinished=None,
     )
     sdk.get_job.return_value = job
@@ -1109,27 +1109,28 @@ def test_jobs_status_success(runner: CliRunner, sdk: MagicMock) -> None:
     assert "Batch Id" in result.stdout
     assert "Job Id" in result.stdout
     assert "State" in result.stdout
-    assert "Progress" in result.stdout
     assert "Date Created" in result.stdout
+    assert "Date Started" in result.stdout
     assert "Date Finished" in result.stdout
+    assert "Progress" not in result.stdout
     assert "BATCH123" in result.stdout
     assert "JOB456" in result.stdout
     assert "RUNNING" in result.stdout
-    assert "45" in result.stdout
     assert "2026-11-17 10:00" in result.stdout
+    assert "2026-11-17 10:01" in result.stdout
     assert "-" in result.stdout
     # ANSI escape sequences stripped on non-tty
     assert "\x1b[" not in result.stdout
 
 
 def test_jobs_wait_success(runner: CliRunner, sdk: MagicMock) -> None:
-    """Test that jobs wait outputs formatted table headers and fields."""
+    """Test that jobs wait outputs formatted table headers and six upstream fields."""
     job = JobStatus(
         batchId="BATCH123",
         jobId="JOB456",
         state="COMPLETE",
-        progress=100,
         dateCreated="2026-11-17 10:00",
+        dateStarted="2026-11-17 10:01",
         dateFinished="2026-11-17 10:05",
     )
     sdk.poll_job.return_value = job
@@ -1142,12 +1143,13 @@ def test_jobs_wait_success(runner: CliRunner, sdk: MagicMock) -> None:
     assert "Batch Id" in result.stdout
     assert "Job Id" in result.stdout
     assert "State" in result.stdout
-    assert "Progress" in result.stdout
     assert "Date Created" in result.stdout
+    assert "Date Started" in result.stdout
     assert "Date Finished" in result.stdout
+    assert "Progress" not in result.stdout
     assert "BATCH123" in result.stdout
     assert "COMPLETE" in result.stdout
-    assert "100" in result.stdout
+    assert "2026-11-17 10:01" in result.stdout
     assert "\x1b[" not in result.stdout
 
 
@@ -1842,20 +1844,6 @@ def test_jobs_json_mode_interactive_and_redirected(
         ),
         (
             [
-                "intervals",
-                "list",
-                "STUDY",
-                "-f",
-                "interval_name=Screening",
-                "--filter",
-                "disabled=false",
-            ],
-            "intervals",
-            ("STUDY",),
-            {"interval_name": "Screening", "disabled": False},
-        ),
-        (
-            [
                 "visits",
                 "list",
                 "STUDY",
@@ -2076,7 +2064,6 @@ def test_records_list_output_conflicts_checked_before_filters(
         ("sites", "sites"),
         ("forms", "forms"),
         ("variables", "variables"),
-        ("intervals", "intervals"),
         ("visits", "visits"),
         ("queries", "queries"),
         ("record-revisions", "record_revisions"),
@@ -2107,6 +2094,13 @@ def test_study_scoped_list_commands_reject_study_key_in_filter(
     assert "'study_key' and 'studyKey' cannot be used in --filter" in result.stderr
     assert "TypeError" not in result.stderr
     getattr(sdk, attr).list.assert_not_called()
+
+
+def test_intervals_list_omits_filter_flag(runner: CliRunner, sdk: MagicMock) -> None:
+    """Intervals list omits --filter/-f per Table 1 in the upstream Common spec."""
+    result = runner.invoke(cli.app, ["intervals", "list", "STUDY", "-f", "intervalId==1"])
+    assert result.exit_code == 2
+    sdk.intervals.list.assert_not_called()
 
 
 def test_get_model_value_and_cli_utils_export() -> None:

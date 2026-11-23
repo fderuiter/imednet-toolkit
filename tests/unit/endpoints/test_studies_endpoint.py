@@ -27,35 +27,41 @@ def test_list_builds_path_and_filters(
         ep.list(status="active")
 
 
-def test_get_single_arg_success(dummy_client, response_factory):
-    """Test single-argument study retrieval targets /api/v1/edc/studies/{studyKey}."""
+def test_get_single_arg_success(dummy_client, paginator_factory):
+    """Test single-argument study retrieval queries /api/v1/edc/studies?filter=studyKey==S1."""
     ep = studies.StudiesEndpoint(dummy_client)
-    dummy_client.get.return_value = response_factory({"studyKey": "S1", "studyName": "Demo Trial"})
+    captured = paginator_factory(
+        studies,
+        [{"studyKey": "S1", "studyName": "Demo Trial", "lastUpdated": "2026-01-15T00:00:00Z"}],
+    )
 
     res = ep.get("S1")
 
-    dummy_client.get.assert_called_once_with("/api/v1/edc/studies/S1")
+    assert captured["path"] == "/api/v1/edc/studies"
+    assert captured["params"] == {"filter": "studyKey==S1"}
     assert isinstance(res, Study)
     assert res.study_key == "S1"
     assert res.study_name == "Demo Trial"
+    assert res.last_updated == "2026-01-15T00:00:00Z"
 
 
-def test_get_legacy_two_arg_success(dummy_client, response_factory):
-    """Test legacy two-argument study retrieval (None, 'S1') targets direct route."""
+def test_get_legacy_two_arg_success(dummy_client, paginator_factory):
+    """Test legacy two-argument study retrieval (None, 'S1') uses studyKey filter."""
     ep = studies.StudiesEndpoint(dummy_client)
-    dummy_client.get.return_value = response_factory({"studyKey": "S1"})
+    captured = paginator_factory(studies, [{"studyKey": "S1"}])
 
     res = ep.get(None, "S1")
 
-    dummy_client.get.assert_called_once_with("/api/v1/edc/studies/S1")
+    assert captured["path"] == "/api/v1/edc/studies"
+    assert captured["params"] == {"filter": "studyKey==S1"}
     assert isinstance(res, Study)
     assert res.study_key == "S1"
 
 
-def test_get_keyword_arguments_success(dummy_client, response_factory):
+def test_get_keyword_arguments_success(dummy_client, paginator_factory):
     """Test keyword argument forms for backward compatibility."""
     ep = studies.StudiesEndpoint(dummy_client)
-    dummy_client.get.return_value = response_factory({"studyKey": "S1"})
+    paginator_factory(studies, [{"studyKey": "S1"}])
 
     res1 = ep.get(study_key="S1")
     assert res1.study_key == "S1"
@@ -73,10 +79,10 @@ def test_get_keyword_arguments_success(dummy_client, response_factory):
     assert res5.study_key == "S1"
 
 
-def test_get_empty_payload_raises_not_found(dummy_client, response_factory):
-    """Test that an empty response payload raises NotFoundError."""
+def test_get_empty_payload_raises_not_found(dummy_client, paginator_factory):
+    """Test that an empty list response raises NotFoundError."""
     ep = studies.StudiesEndpoint(dummy_client)
-    dummy_client.get.return_value = response_factory({})
+    paginator_factory(studies, [])
 
     with pytest.raises(NotFoundError):
         ep.get("missing")

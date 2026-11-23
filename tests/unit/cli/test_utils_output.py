@@ -372,6 +372,32 @@ def test_format_job_progress_bounds_and_arguments() -> None:
     assert "(3.0s)" in formatted_direct
 
 
+def test_format_job_progress_omits_zero_percent_on_six_field_payloads() -> None:
+    """Six-field upstream JobStatus payloads without progress render state bars and omit 0%."""
+    done_status = JobStatus(
+        jobId="J-1",
+        batchId="B-DONE",
+        state="COMPLETED",
+        dateCreated="2026-07-01T10:00:00Z",
+        dateStarted="2026-07-01T10:00:01Z",
+        dateFinished="2026-07-01T10:00:05Z",
+    )
+    done_fmt = format_job_progress("B-DONE", status=done_status, elapsed=4.0)
+    assert done_fmt == "Job B-DONE: [====================] COMPLETED (4.0s)"
+    assert "0%" not in done_fmt
+    assert "%" not in done_fmt
+
+    proc_status = JobStatus(batchId="B-PROC", state="PROCESSING")
+    proc_fmt = format_job_progress("B-PROC", status=proc_status, elapsed=1.5)
+    assert proc_fmt == "Job B-PROC: [==========----------] PROCESSING (1.5s)"
+    assert "0%" not in proc_fmt
+
+    open_status = JobStatus(batchId="B-OPEN", state="OPEN")
+    open_fmt = format_job_progress("B-OPEN", status=open_status, elapsed=0.2)
+    assert open_fmt == "Job B-OPEN: [--------------------] OPEN (0.2s)"
+    assert "0%" not in open_fmt
+
+
 def test_job_wait_progress_callback_and_clean_stdout_json() -> None:
     """job_wait connects on_progress to sdk.poll_job and keeps JSON stdout clean."""
     import json

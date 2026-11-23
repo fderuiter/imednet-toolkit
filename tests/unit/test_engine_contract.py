@@ -979,9 +979,9 @@ def test_all_39_aliased_models_emit_dual_constructor_overloads_and_field_aliases
         and stmt.returns is not None
         and any(isinstance(d, ast.Name) and d.id == "property" for d in stmt.decorator_list)
     }
-    assert job_status_props["total_records"] == "int"
-    assert job_status_props["successful_records"] == "int"
-    assert job_status_props["failed_records"] == "int"
+    assert job_status_props["total_records"] == "int | None"
+    assert job_status_props["successful_records"] == "int | None"
+    assert job_status_props["failed_records"] == "int | None"
 
 
 def test_stub_formatting_helpers_cover_wrapping_and_defaults():
@@ -1032,6 +1032,40 @@ def test_stub_formatting_helpers_cover_wrapping_and_defaults():
         "    ", "plain_opt", "int | None", unaliased_finfo
     )
     assert unaliased_dyn == ["    plain_opt: int | None = None"]
+
+
+def test_contract_builder_extracts_study_from_list_and_all_nested_array_models():
+    """Verify ContractBuilder.ingest_postman populates Study from List studies and nested models."""
+    contract = get_contract()
+    assert "Study" in contract.models
+    assert "last_updated" in contract.models["Study"].fields
+    assert len(contract.models["Study"].fields) == 9
+
+    assert set(contract.models["FormSummary"].fields) == {"form_id", "form_key", "form_name"}
+    assert {
+        "sequence",
+        "annotation_status",
+        "user",
+        "comment",
+        "closed",
+        "date",
+    }.issubset(contract.models["QueryComment"].fields)
+    assert {"keyword_name", "keyword_key", "keyword_id", "date_added"}.issubset(
+        contract.models["Keyword"].fields
+    )
+    assert {"keyword_name", "keyword_key", "keyword_id", "date_added"}.issubset(
+        contract.models["SubjectKeyword"].fields
+    )
+    assert {
+        "role_id",
+        "name",
+        "community_id",
+        "inactive",
+        "date_created",
+        "date_modified",
+    }.issubset(contract.models["Role"].fields)
+    assert "progress" not in contract.models["JobStatus"].fields
+    assert "result_url" not in contract.models["JobStatus"].fields
 
 
 def test_mypy_strict_accepts_aliased_models_and_rejects_missing_required_fields(tmp_path):

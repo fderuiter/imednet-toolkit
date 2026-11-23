@@ -95,7 +95,5 @@ Retrieve job status
      "state": "COMPLETED",
      "dateCreated": "<string>",
      "dateStarted": "<string>",
-     "dateFinished": "<string>",
-     "progress": 100,
-     "resultUrl": "<string>"
+     "dateFinished": "<string>"
    }

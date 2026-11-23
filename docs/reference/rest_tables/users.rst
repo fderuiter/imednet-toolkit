@@ -70,7 +70,7 @@ List users
      - Maximum number of records to return per page.
    * - ``sort``
      - String
-     - None
+     - ``login,asc``
      - Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).
    * - ``includeInactive``
      - Boolean

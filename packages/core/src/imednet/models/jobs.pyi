@@ -95,6 +95,8 @@ class Job(ImednetBaseModel):
 class JobStatus(Job):
     """Extended job information returned when polling."""
 
+    progress: int | None = Field(default=None, alias="progress")
+    result_url: str | None = Field(default=None, alias="resultUrl")
     results: Any = Field(default=None)
     record_total_count: int | None = Field(default=None, alias="totalRecords")
     record_success_count: int | None = Field(default=None, alias="successfulRecords")
@@ -106,8 +108,6 @@ class JobStatus(Job):
     date_created: str | None = Field(default=None, alias="dateCreated")
     date_finished: str | None = Field(default=None, alias="dateFinished")
     date_started: str | None = Field(default=None, alias="dateStarted")
-    progress: int | None = Field(default=None, alias="progress")
-    result_url: str | None = Field(default=None, alias="resultUrl")
 
     @overload
     def __init__(
@@ -119,13 +119,13 @@ class JobStatus(Job):
         date_created: str | None = None,
         date_finished: str | None = None,
         date_started: str | None = None,
+        progress: int | None = None,
+        result_url: str | None = None,
         results: Any = None,
         record_total_count: int | None = None,
         record_success_count: int | None = None,
         record_failure_count: int | None = None,
         result_error: str | None = None,
-        progress: int | None = None,
-        result_url: str | None = None,
         total_records: int | None = None,
         successful_records: int | None = None,
         failed_records: int | None = None,
@@ -140,13 +140,13 @@ class JobStatus(Job):
         dateCreated: str | None = None,
         dateFinished: str | None = None,
         dateStarted: str | None = None,
+        progress: int | None = None,
+        resultUrl: str | None = None,
         results: Any = None,
         totalRecords: int | None = None,
         successfulRecords: int | None = None,
         failedRecords: int | None = None,
         resultError: str | None = None,
-        progress: int | None = None,
-        resultUrl: str | None = None,
     ) -> None: ...
     @model_validator(mode="before")
     @classmethod
@@ -154,11 +154,11 @@ class JobStatus(Job):
     @field_validator("progress", mode="before", check_fields=False)
     def _parse_progress(cls, v: Any) -> int | None: ...
     @property
-    def total_records(self) -> int: ...
+    def total_records(self) -> int | None: ...
     @property
-    def successful_records(self) -> int: ...
+    def successful_records(self) -> int | None: ...
     @property
-    def failed_records(self) -> int: ...
+    def failed_records(self) -> int | None: ...
     @property
     def is_successful(self) -> bool: ...
     @property

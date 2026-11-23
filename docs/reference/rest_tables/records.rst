@@ -70,7 +70,7 @@ List records
      - Maximum number of records to return per page.
    * - ``sort``
      - String
-     - None
+     - ``recordId,asc``
      - Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String
@@ -258,16 +258,16 @@ Create records
      - Clinical Case Report Form (CRF) unique key identifier.
    * - ``subjectKey``
      - String
-     - Required
-     - Target study participant unique key identifier.
+     - Conditional
+     - Target study participant key (required when updating scheduled records or creating unscheduled records; omit when registering a new subject).
    * - ``siteName``
      - String
-     - Required
-     - Name of the clinical research site where data was collected.
+     - Conditional
+     - Clinical research site name (required when registering a new subject).
    * - ``intervalName``
      - String
-     - Required
-     - Study visit or interval event name.
+     - Conditional
+     - Study visit or interval event name (required when updating an existing scheduled record).
    * - ``data``
      - Object
      - Required

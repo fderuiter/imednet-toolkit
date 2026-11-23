@@ -283,6 +283,8 @@ Job = ModelEngine.get_model('Job', Job)
 class JobStatus(Job):
     """Extended job information returned when polling."""
 
+    progress: int | None = Field(default=None, alias="progress")
+    result_url: str | None = Field(default=None, alias="resultUrl")
     results: Any = Field(default=None)
     record_total_count: int | None = Field(default=None, alias="totalRecords")
     record_success_count: int | None = Field(default=None, alias="successfulRecords")
@@ -322,25 +324,25 @@ class JobStatus(Job):
             return 0
 
     @property
-    def total_records(self) -> int:
-        """Return the total number of records processed."""
+    def total_records(self) -> int | None:
+        """Return the total number of records processed, or None when unknown."""
         if isinstance(self.results, list):
             return len(self.results)
         if isinstance(self.results, dict):
-            if "total" in self.results:
-                return int(self.results.get("total", 0))
+            if "total" in self.results and self.results.get("total") is not None:
+                return int(self.results["total"])
             if self.record_total_count is not None:
                 return int(self.record_total_count)
-            return 0
+            return None
         if self.record_total_count is not None:
             return int(self.record_total_count)
         if self.results:
             return 1
-        return 0
+        return None
 
     @property
-    def successful_records(self) -> int:
-        """Return the total number of successful records processed."""
+    def successful_records(self) -> int | None:
+        """Return the total number of successful records processed, or None when unknown."""
         if isinstance(self.results, list):
             return sum(
                 1
@@ -349,20 +351,20 @@ class JobStatus(Job):
                 and (r.get("status") or "").upper() in {"PASS", "SUCCESS", "COMPLETED"}
             )
         if isinstance(self.results, dict):
-            if "success" in self.results:
-                return int(self.results.get("success", 0))
+            if "success" in self.results and self.results.get("success") is not None:
+                return int(self.results["success"])
             if self.record_success_count is not None:
                 return int(self.record_success_count)
-            return 0
+            return None
         if self.record_success_count is not None:
             return int(self.record_success_count)
-        if super().is_successful and self.results:
-            return 1
-        return 0
+        if self.results:
+            return 1 if super().is_successful else 0
+        return None
 
     @property
-    def failed_records(self) -> int:
-        """Return the total number of failed records processed."""
+    def failed_records(self) -> int | None:
+        """Return the total number of failed records processed, or None when unknown."""
         if isinstance(self.results, list):
             return sum(
                 1
@@ -374,27 +376,29 @@ class JobStatus(Job):
                 )
             )
         if isinstance(self.results, dict):
-            if "failed" in self.results:
-                return int(self.results.get("failed", 0))
+            if "failed" in self.results and self.results.get("failed") is not None:
+                return int(self.results["failed"])
             if self.record_failure_count is not None:
                 return int(self.record_failure_count)
-            return 0
+            return None
         if self.record_failure_count is not None:
             return int(self.record_failure_count)
-        if super().is_failed and self.results:
-            return 1
-        return 0
+        if self.results:
+            return 1 if super().is_failed else 0
+        return None
 
     @property
     def is_successful(self) -> bool:
         """Checks if the job completed in a success state with zero failed records."""
-        return super().is_successful and self.failed_records == 0 and not self.result_error
+        failed = self.failed_records
+        return super().is_successful and (failed is None or failed == 0) and not self.result_error
 
     @property
     def is_failed(self) -> bool:
         """Checks if the job failed, was cancelled, or finished with record/result errors."""
+        failed = self.failed_records
         return super().is_failed or (
-            self.is_terminal and (self.failed_records > 0 or bool(self.result_error))
+            self.is_terminal and ((failed is not None and failed > 0) or bool(self.result_error))
         )
 
 

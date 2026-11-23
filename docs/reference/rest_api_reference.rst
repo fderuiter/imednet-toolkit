@@ -58,6 +58,9 @@ Status codes
 ``200``
   Request succeeded.
 
+``202``
+  Accepted — Asynchronous batch job created.
+
 ``400``
   Malformed request.
 

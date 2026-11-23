@@ -70,7 +70,7 @@ List queries
      - Maximum number of records to return per page.
    * - ``sort``
      - String
-     - None
+     - ``annotationId,asc``
      - Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String
@@ -151,7 +151,16 @@ List queries
                "subjectOid": "",
                "type": "",
                "lastUpdated": "<string>",
-               "queryComments": []
+               "queryComments": [
+                   {
+                       "sequence": "<integer>",
+                       "annotationStatus": "<string>",
+                       "user": "<string>",
+                       "comment": "<string>",
+                       "closed": "<boolean>",
+                       "date": "<string>"
+                   }
+               ]
            },
            {
                "studyKey": "<string>",

@@ -270,7 +270,7 @@ class ImednetFacade(Protocol):
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
-        """Wait for multiple background jobs concurrently and fetch resultUrl payloads."""
+        """Wait for multiple background jobs concurrently until terminal states."""
         ...
 
     @property
@@ -514,7 +514,7 @@ class AsyncImednetFacade(Protocol):
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
-        """Asynchronously wait for multiple background jobs and fetch resultUrl payloads."""
+        """Asynchronously wait for multiple background jobs until terminal states."""
         ...
 
     @property
