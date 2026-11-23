@@ -299,3 +299,161 @@ def test_ingest_revisions_bigint_aware_timestamps_and_pandas_fallback(
         datetime(2024, 3, 15, 12, 30, 0),
         None,
     )
+
+
+def test_ingest_revisions_cst_timestamps_and_inclusive_boundary_deduplication() -> None:
+    """Test RecordRevision -06:00 timestamps and deduplication across inclusive extract_audit_trail bounds."""
+    pytest.importorskip("duckdb")
+
+    sdk = MagicMock()
+    boundary_rev = RecordRevision(
+        studyKey="STUDY",
+        recordRevisionId=901,
+        recordId=42,
+        recordOid="REC-42",
+        formKey="VITALS",
+        recordRevision=1,
+        dataRevision=1,
+        user="crc_user",
+        reasonForChange="Initial entry in CST",
+        deleted=False,
+        dateCreated="2026-01-31T18:00:00-06:00",
+        lastUpdated="2026-01-31T18:05:00-06:00",
+    )
+    feb_rev = RecordRevision(
+        studyKey="STUDY",
+        recordRevisionId=902,
+        recordId=42,
+        recordOid="REC-42",
+        formKey="VITALS",
+        recordRevision=2,
+        dataRevision=1,
+        user="pi_user",
+        reasonForChange="Investigator sign-off",
+        deleted=False,
+        dateCreated="2026-02-01T09:30:00-06:00",
+        lastUpdated="2026-02-01T09:30:00-06:00",
+    )
+    sdk.get_record_revisions.side_effect = [
+        [boundary_rev],
+        [boundary_rev, feb_rev],
+    ]
+
+    with DuckDBIngestionWorkflow(sdk, ":memory:") as workflow:
+        assert (
+            workflow.ingest_revisions(
+                "STUDY",
+                start_date="2026-01-01",
+                end_date="2026-02-01",
+                mode="append",
+            )
+            == 1
+        )
+        assert (
+            workflow.ingest_revisions(
+                "STUDY",
+                start_date="2026-02-01",
+                end_date="2026-02-28",
+                mode="append",
+            )
+            == 2
+        )
+
+        bronze_rows = workflow._connection.execute(
+            "SELECT record_revision_id, date_created, last_updated "
+            "FROM bronze_revisions ORDER BY record_revision_id"
+        ).fetchall()
+        assert bronze_rows == [
+            (901, datetime(2026, 2, 1, 0, 0, 0), datetime(2026, 2, 1, 0, 5, 0)),
+            (902, datetime(2026, 2, 1, 15, 30, 0), datetime(2026, 2, 1, 15, 30, 0)),
+        ]
+
+
+def test_silver_view_deleted_oid_multi_study_and_close_on_exception(tmp_path) -> None:
+    """Test voided record exclusion, record_oid fallback, multi-Study views, and context manager exception exit."""
+    duckdb = pytest.importorskip("duckdb")
+    db_path = str(tmp_path / "workflow_test.duckdb")
+
+    revisions_s1 = [
+        RecordRevision(
+            study_key="S1",
+            record_revision_id=10,
+            record_id=1,
+            record_oid="OID-1",
+            form_key="F1",
+            record_revision=1,
+            deleted=False,
+            date_created="2026-01-01T00:00:00Z",
+        ),
+        RecordRevision(
+            study_key="S1",
+            record_revision_id=11,
+            record_id=1,
+            record_oid="OID-1",
+            form_key="F1",
+            record_revision=2,
+            deleted=True,
+            date_created="2026-01-02T00:00:00Z",
+        ),
+        RecordRevision(
+            study_key="S1",
+            record_revision_id=12,
+            record_id=None,
+            record_oid="OID-NULL-ID",
+            form_key="F2",
+            record_revision=1,
+            deleted=False,
+            date_created="2026-01-03T00:00:00Z",
+        ),
+        RecordRevision(
+            study_key="S1",
+            record_revision_id=13,
+            record_id=None,
+            record_oid="OID-NULL-ID",
+            form_key="F2",
+            record_revision=2,
+            deleted=False,
+            date_created="2026-01-04T00:00:00Z",
+        ),
+    ]
+    revisions_s2 = [
+        RecordRevision(
+            study_key="S2",
+            record_revision_id=20,
+            record_id=1,
+            record_oid="OID-1",
+            form_key="F1",
+            record_revision=1,
+            deleted=False,
+            date_created="2026-01-05T00:00:00Z",
+        )
+    ]
+
+    with (
+        patch.object(
+            DataExtractionWorkflow,
+            "extract_audit_trail",
+            side_effect=[revisions_s1, revisions_s2],
+        ),
+        pytest.raises(RuntimeError, match="caller failure"),
+    ):
+        with DuckDBIngestionWorkflow(MagicMock(), db_path) as workflow:
+            workflow.ingest_revisions("S1", mode="replace")
+            workflow.ingest_revisions("S2", mode="append")
+            workflow.build_silver_view("S1")
+            workflow.build_silver_view("S2")
+            raise RuntimeError("caller failure")
+
+    # Connection must be closed despite exception inside with-block
+    conn = duckdb.connect(db_path, read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT study_key, record_revision_id, record_oid "
+            "FROM silver_current_state ORDER BY study_key, record_revision_id"
+        ).fetchall()
+        assert rows == [
+            ("S1", 13, "OID-NULL-ID"),
+            ("S2", 20, "OID-1"),
+        ]
+    finally:
+        conn.close()

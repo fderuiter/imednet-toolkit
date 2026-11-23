@@ -9,7 +9,7 @@ verify monotonic 21 CFR Part 11 audit chains, enforce secure-by-default PHI
 WCAG 2.1 Level AA conformance disclosures.
 
 .. seealso::
-   * :doc:`duckdb_integration` — Ingest ``RecordRevision`` logs and build SCD Type 2 ``valid_from`` / ``valid_to`` analytical views in DuckDB.
+   * :doc:`duckdb_integration` — Ingest ``RecordRevision`` logs into ``bronze_revisions`` and build deduplicated ``silver_current_state`` analytical views in DuckDB.
    * :doc:`export_destinations` — Enforce default ``mask_phi=True`` redaction and explicit ``StudyConfiguration`` PHI policies across CSV, Parquet, SQL, and Snowflake sinks.
    * :doc:`/reference/governance` — Track immutable SHA-256 configuration snapshots with ``ConfigVersionStore``.
    * :doc:`/reference/VPAT` — Review Voluntary Product Accessibility Template (WCAG 2.1 Level AA) conformance statements.
@@ -174,10 +174,10 @@ Analytical Lineage, PHI Controls & Governance
 Combine ``RecordRevision`` verification with downstream compliance controls
 across the toolkit:
 
-1. **DuckDB Lakehouse Lineage** (:doc:`duckdb_integration`): Load immutable
-   ``record_revisions`` tables with ``DuckDBIngestionWorkflow.ingest_revisions``
-   and materialize Slowly Changing Dimension (SCD Type 2) ``silver_records_history``
-   views via ``build_silver_view``.
+1. **DuckDB Lakehouse Lineage** (:doc:`duckdb_integration`): Load ``RecordRevision``
+   audit history into ``bronze_revisions`` with ``DuckDBIngestionWorkflow.ingest_revisions``
+   and materialize deduplicated ``silver_current_state`` (and per-Study
+   ``"silver_current_state_{study_key}"``) current-state views via ``build_silver_view``.
 2. **PHI Masking & Redaction** (:doc:`export_destinations`): All sink plugins
    default to ``mask_phi=True`` and support explicit ``StudyConfiguration`` PHI
    ``Variable`` declarations so unredacted identifiers cannot leak accidentally.

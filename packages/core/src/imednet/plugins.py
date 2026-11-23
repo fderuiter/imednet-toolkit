@@ -47,7 +47,8 @@ import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, overload, runtime_checkable
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, Self, overload, runtime_checkable
 
 from typing_extensions import deprecated
 
@@ -158,8 +159,25 @@ class DuckDBIngestionWorkflowProtocol(Protocol):
         """Ingest study record revisions into the DuckDB bronze table."""
         ...
 
-    def build_silver_view(self, study_key: str) -> None:
+    def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
         """Create or replace the deduplicated DuckDB silver view for a study."""
+        ...
+
+    def close(self) -> None:
+        """Close the underlying DuckDB connection."""
+        ...
+
+    def __enter__(self) -> Self:
+        """Enter the context manager and return the workflow instance."""
+        ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the context manager and close the DuckDB connection."""
         ...
 
 
