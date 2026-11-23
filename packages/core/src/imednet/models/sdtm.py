@@ -8,7 +8,7 @@ import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any
+from typing import Any, overload
 
 from pydantic import BaseModel
 
@@ -24,6 +24,7 @@ except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
 
 _MASKED_SENTINEL = "***MASKED***"
+SDTM_PROVENANCE_RECORD_ID_KEY = "__sdtm_record_id__"
 _SDTM_RECORDS_SORT = "subjectKey,asc;recordId,asc"
 _ISO_YEAR_RE = re.compile(r"^\d{4}$")
 _ISO_YEAR_MONTH_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
@@ -200,6 +201,41 @@ def _collapse_alnum_key(key: str) -> str:
 def _is_birth_dtc_key(key: str) -> bool:
     """Return True when *key* represents a CDISC birth-date DTC variable."""
     return _collapse_alnum_key(key).endswith("brthdtc")
+
+
+def _is_birth_date_alias_key(key: str) -> bool:
+    """Return True when *key* represents BRTHDTC or a raw birth-date variable."""
+    collapsed = _collapse_alnum_key(key)
+    if (
+        collapsed.startswith("v")
+        and len(collapsed) > 1
+        and collapsed[1:]
+        in {
+            "brthdtc",
+            "brthdat",
+            "birthdate",
+            "dateofbirth",
+            "dob",
+        }
+    ):
+        return True
+    return collapsed in {
+        "brthdtc",
+        "brthdat",
+        "birthdate",
+        "dateofbirth",
+        "dob",
+    } or collapsed.endswith(("brthdtc", "brthdat"))
+
+
+def _canonical_sdtm_record_id(raw_id: Any) -> str | None:
+    """Normalize a Record identifier to a canonical non-empty string."""
+    if raw_id is None or isinstance(raw_id, bool):
+        return None
+    if isinstance(raw_id, int):
+        return str(raw_id)
+    text = str(raw_id).strip()
+    return text or None
 
 
 SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
@@ -598,7 +634,11 @@ _METADATA_SDTM_KEYS: dict[str, str] = {
 }
 
 _GLOBAL_UNAMBIGUOUS_SDTM_ALIASES: dict[str, str] = {}
+_DOMAIN_SIGNAL_ALIASES: dict[str, str] = {}
 for _dom_code, _dom_spec in SDTM_DOMAIN_SPECS.items():
+    for _std_var in _dom_spec["variables"]:
+        if _std_var not in {"STUDYID", "DOMAIN", "USUBJID", "SUBJID"}:
+            _DOMAIN_SIGNAL_ALIASES.setdefault(_collapse_alnum_key(_std_var), _dom_code)
     for _sdtm_var, _aliases in _dom_spec["aliases"].items():
         if _dom_code == "DM" and _sdtm_var == "SUBJID":
             continue
@@ -610,6 +650,105 @@ for _dom_code, _dom_spec in SDTM_DOMAIN_SPECS.items():
                 and _alias.lower() not in _GENERIC_ALIASES_EXCLUDED_FROM_GLOBAL_SDTM
             ):
                 _GLOBAL_UNAMBIGUOUS_SDTM_ALIASES.setdefault(_norm_alias, _sdtm_var)
+                _DOMAIN_SIGNAL_ALIASES.setdefault(_collapse_alnum_key(_alias), _dom_code)
+
+for _extra_dom, _extra_vars in (
+    (
+        "DM",
+        (
+            "dmdtc",
+            "rfstdtc",
+            "rfendtc",
+            "actarm",
+            "actarmcd",
+            "armcd",
+            "subjinit",
+        ),
+    ),
+    (
+        "VS",
+        (
+            "sysbp",
+            "diabp",
+            "pulse",
+            "hr",
+            "heartrate",
+            "temp",
+            "temperature",
+            "resp",
+            "resprate",
+            "respiratoryrate",
+            "weight",
+            "height",
+            "bmi",
+            "vsstresc",
+            "vsstresn",
+            "vsstresu",
+            "vspos",
+            "vsloc",
+        ),
+    ),
+    (
+        "AE",
+        (
+            "aesdth",
+            "aeshosp",
+            "aeslife",
+            "aesdisab",
+            "aescong",
+            "aesmie",
+        ),
+    ),
+    (
+        "DV",
+        (
+            "pdterm",
+            "pdcat",
+            "pdsev",
+            "pdstdtc",
+            "pdstat",
+        ),
+    ),
+):
+    for _extra_var in _extra_vars:
+        _DOMAIN_SIGNAL_ALIASES.setdefault(_extra_var, _extra_dom)
+
+_IGNORED_FORM_TOKENS: frozenset[str] = frozenset(
+    {"F", "FRM", "FORM", "FORMS", "CRF", "ECRF", "PAGE", "LOG", "SUB", "DATA"}
+)
+_RECORD_META_KEYS_COLLAPSED: frozenset[str] = frozenset(
+    {
+        "studykey",
+        "studyid",
+        "domain",
+        "usubjid",
+        "subjectkey",
+        "subjectid",
+        "subjectoid",
+        "sitekey",
+        "siteid",
+        "sitename",
+        "visitid",
+        "visitkey",
+        "visitnum",
+        "visit",
+        "intervalid",
+        "intervalname",
+        "formid",
+        "formkey",
+        "formname",
+        "recordid",
+        "recordoid",
+        "recordtype",
+        "recordstatus",
+        "deleted",
+        "datecreated",
+        "datemodified",
+        "lastupdated",
+        "revision",
+        "parentrecordid",
+    }
+)
 
 VALID_NAMING_CONVENTIONS: frozenset[str] = frozenset({"snake_case", "camelCase", "sdtm"})
 
@@ -651,21 +790,286 @@ def normalize_naming_convention(convention: str | None) -> str | None:
     )
 
 
+def infer_sdtm_domain_from_form(
+    form_key: str | None = None,
+    form_name: str | None = None,
+    *,
+    variable_names: Iterable[str] | None = None,
+    pipeline: Any | None = None,
+) -> str | None:
+    """Infer a canonical SDTM domain code from Form key, Form name, or Variable signals."""
+    rules = _iter_pipeline_mapping_rules(pipeline)
+    if rules and form_key:
+        fk_collapsed = _collapse_alnum_key(form_key)
+        if fk_collapsed:
+            for rule in rules:
+                rule_dom = getattr(rule, "domain", None)
+                src_fk = getattr(rule, "source_form_key", None)
+                if rule_dom and src_fk and _collapse_alnum_key(str(src_fk)) == fk_collapsed:
+                    return resolve_sdtm_domain(str(rule_dom))
+
+    for candidate in (form_key, form_name):
+        if not candidate or not isinstance(candidate, str) or not candidate.strip():
+            continue
+        cleaned = candidate.strip().upper()
+        compact = "".join(ch for ch in cleaned if ch.isalnum())
+        if compact in _DOMAIN_NAME_ALIASES:
+            return _DOMAIN_NAME_ALIASES[compact]
+        stripped_compact = re.sub(r"\d+$", "", compact)
+        if stripped_compact and stripped_compact in _DOMAIN_NAME_ALIASES:
+            return _DOMAIN_NAME_ALIASES[stripped_compact]
+
+        tokens = [
+            tok
+            for tok in re.split(r"[^A-Z0-9]+", cleaned)
+            if tok and tok not in _IGNORED_FORM_TOKENS and not tok.isdigit()
+        ]
+        if not tokens:
+            continue
+        joined = "".join(tokens)
+        if joined in _DOMAIN_NAME_ALIASES:
+            return _DOMAIN_NAME_ALIASES[joined]
+        stripped_joined = re.sub(r"\d+$", "", joined)
+        if stripped_joined and stripped_joined in _DOMAIN_NAME_ALIASES:
+            return _DOMAIN_NAME_ALIASES[stripped_joined]
+
+        for tok in tokens:
+            if tok in _DOMAIN_NAME_ALIASES:
+                return _DOMAIN_NAME_ALIASES[tok]
+            stripped_tok = re.sub(r"\d+$", "", tok)
+            if stripped_tok and stripped_tok in _DOMAIN_NAME_ALIASES:
+                return _DOMAIN_NAME_ALIASES[stripped_tok]
+
+    if variable_names is not None:
+        var_list = [str(v) for v in variable_names if v]
+        if rules and var_list:
+            collapsed_vars = {_collapse_alnum_key(v) for v in var_list if v}
+            for rule in rules:
+                rule_dom = getattr(rule, "domain", None)
+                src_var = getattr(rule, "source_variable_name", None)
+                if rule_dom and src_var and _collapse_alnum_key(str(src_var)) in collapsed_vars:
+                    return resolve_sdtm_domain(str(rule_dom))
+        var_domains = [
+            inferred for v in var_list if (inferred := _infer_variable_sdtm_domain(v)) is not None
+        ]
+        if var_domains:
+            counts: dict[str, int] = {}
+            for vd in var_domains:
+                counts[vd] = counts.get(vd, 0) + 1
+            return max(counts.items(), key=lambda kv: kv[1])[0]
+    return None
+
+
+def _infer_variable_sdtm_domain(var_name: str) -> str | None:
+    """Return the SDTM domain associated with an unambiguous clinical variable alias."""
+    if not var_name or not isinstance(var_name, str):
+        return None
+    collapsed = _collapse_alnum_key(var_name)
+    if not collapsed or collapsed in _RECORD_META_KEYS_COLLAPSED:
+        return None
+    matched = _DOMAIN_SIGNAL_ALIASES.get(collapsed)
+    if matched is not None:
+        return matched
+    if len(var_name) > 2 and var_name[:2].lower() in {"v_", "f_"}:
+        sub_collapsed = _collapse_alnum_key(var_name[2:])
+        if sub_collapsed and sub_collapsed not in _RECORD_META_KEYS_COLLAPSED:
+            return _DOMAIN_SIGNAL_ALIASES.get(sub_collapsed)
+    return None
+
+
+def _iter_pipeline_mapping_rules(pipeline: Any | None) -> list[Any]:
+    """Extract StudyConfiguration MappingRule objects from an EnrichmentPipeline if present."""
+    if pipeline is None:
+        return []
+    cfg = getattr(pipeline, "config", None)
+    cfg_mappings = getattr(cfg, "mappings", None) if cfg is not None else None
+    if isinstance(cfg_mappings, (list, tuple)):
+        return list(cfg_mappings)
+    pipe_mappings = getattr(pipeline, "mappings", None)
+    if isinstance(pipe_mappings, Mapping):
+        return list(pipe_mappings.values())
+    return []
+
+
+def form_matches_sdtm_domain(
+    target_domain: str,
+    *,
+    form_key: str | None = None,
+    form_name: str | None = None,
+    variable_names: Iterable[str] | None = None,
+    pipeline: Any | None = None,
+) -> bool:
+    """Return True when a Form's key, name, mappings, or variables match ``target_domain``."""
+    dom = resolve_sdtm_domain(target_domain)
+    var_list = [str(v) for v in variable_names if v] if variable_names is not None else []
+    collapsed_vars = {_collapse_alnum_key(v) for v in var_list if v}
+
+    rules = _iter_pipeline_mapping_rules(pipeline)
+    if rules:
+        form_key_collapsed = _collapse_alnum_key(form_key) if form_key else ""
+        for rule in rules:
+            rule_dom_raw = getattr(rule, "domain", None)
+            if not rule_dom_raw or resolve_sdtm_domain(str(rule_dom_raw)) != dom:
+                continue
+            src_fk = getattr(rule, "source_form_key", None)
+            if (
+                form_key_collapsed
+                and src_fk
+                and _collapse_alnum_key(str(src_fk)) == form_key_collapsed
+            ):
+                return True
+            src_var = getattr(rule, "source_variable_name", None)
+            if collapsed_vars and src_var and _collapse_alnum_key(str(src_var)) in collapsed_vars:
+                return True
+
+    inferred_form_dom = infer_sdtm_domain_from_form(form_key, form_name)
+    if inferred_form_dom is not None:
+        return inferred_form_dom == dom
+
+    if var_list:
+        var_domains = {
+            inferred for v in var_list if (inferred := _infer_variable_sdtm_domain(v)) is not None
+        }
+        if dom in var_domains:
+            return True
+        if var_domains:
+            return False
+
+    return True
+
+
+def _extract_record_domain_signals(
+    rec: Any,
+) -> tuple[str | None, str | None, str | None, list[str]]:
+    """Extract (explicit_domain, form_key, form_name, variable_names) from a Record or dict."""
+    explicit_domain: Any = None
+    form_key: Any = None
+    form_name: Any = None
+    var_names: list[str] = []
+
+    if isinstance(rec, Mapping):
+        explicit_domain = rec.get("DOMAIN") if "DOMAIN" in rec else rec.get("domain")
+        form_key = rec.get("form_key") or rec.get("formKey")
+        form_name = rec.get("form_name") or rec.get("formName")
+        rd = rec.get("record_data") if "record_data" in rec else rec.get("recordData")
+        if isinstance(rd, Mapping):
+            if not explicit_domain:
+                explicit_domain = rd.get("DOMAIN") if "DOMAIN" in rd else rd.get("domain")
+            var_names.extend(str(k) for k in rd if k not in {"DOMAIN", "domain"})
+        else:
+            for k in rec:
+                ks = str(k)
+                if _collapse_alnum_key(ks) not in _RECORD_META_KEYS_COLLAPSED:
+                    var_names.append(ks)
+    else:
+        explicit_domain = getattr(rec, "DOMAIN", None) or getattr(rec, "domain", None)
+        form_key = getattr(rec, "form_key", None) or getattr(rec, "formKey", None)
+        form_name = getattr(rec, "form_name", None) or getattr(rec, "formName", None)
+        rd = getattr(rec, "record_data", None)
+        if isinstance(rd, Mapping):
+            if not explicit_domain:
+                explicit_domain = rd.get("DOMAIN") if "DOMAIN" in rd else rd.get("domain")
+            var_names.extend(str(k) for k in rd if k not in {"DOMAIN", "domain"})
+        elif isinstance(rec, BaseModel):
+            for fname, finfo in type(rec).model_fields.items():
+                if _collapse_alnum_key(fname) not in _RECORD_META_KEYS_COLLAPSED:
+                    var_names.append(fname)
+                alias = getattr(finfo, "alias", None)
+                if (
+                    isinstance(alias, str)
+                    and _collapse_alnum_key(alias) not in _RECORD_META_KEYS_COLLAPSED
+                ):
+                    var_names.append(alias)
+        else:
+            obj_dict = getattr(rec, "__dict__", None)
+            if isinstance(obj_dict, Mapping):
+                for k in obj_dict:
+                    ks = str(k)
+                    if _collapse_alnum_key(ks) not in _RECORD_META_KEYS_COLLAPSED:
+                        var_names.append(ks)
+
+    clean_explicit = (
+        str(explicit_domain).strip()
+        if explicit_domain is not None and str(explicit_domain).strip()
+        else None
+    )
+    clean_fk = str(form_key).strip() if form_key is not None and str(form_key).strip() else None
+    clean_fn = str(form_name).strip() if form_name is not None and str(form_name).strip() else None
+    return clean_explicit, clean_fk, clean_fn, var_names
+
+
+@overload
+def infer_record_sdtm_domain(
+    rec: Any,
+    *,
+    pipeline: Any | None = None,
+    fallback: str = "AE",
+) -> str: ...
+
+
+@overload
+def infer_record_sdtm_domain(
+    rec: Any,
+    *,
+    pipeline: Any | None = None,
+    fallback: None,
+) -> str | None: ...
+
+
+def infer_record_sdtm_domain(
+    rec: Any,
+    *,
+    pipeline: Any | None = None,
+    fallback: str | None = "AE",
+) -> str | None:
+    """Infer the target SDTM domain for a single Record when no explicit domain is configured."""
+    explicit_dom, form_key, form_name, var_names = _extract_record_domain_signals(rec)
+    if explicit_dom:
+        return resolve_sdtm_domain(explicit_dom, fallback=fallback or "AE")
+
+    inferred = infer_sdtm_domain_from_form(
+        form_key,
+        form_name,
+        variable_names=var_names,
+        pipeline=pipeline,
+    )
+    if inferred is not None:
+        return inferred
+
+    if fallback is None:
+        return None
+    return resolve_sdtm_domain(form_key or form_name, fallback=fallback)
+
+
+def record_matches_sdtm_domain(
+    rec: Any,
+    target_domain: str,
+    *,
+    pipeline: Any | None = None,
+) -> bool:
+    """Return True when ``rec`` belongs to ``target_domain`` based on Form and Variable signals."""
+    dom = resolve_sdtm_domain(target_domain)
+    explicit_dom, form_key, form_name, var_names = _extract_record_domain_signals(rec)
+    if explicit_dom is not None:
+        return resolve_sdtm_domain(explicit_dom) == dom
+    return form_matches_sdtm_domain(
+        dom,
+        form_key=form_key,
+        form_name=form_name,
+        variable_names=var_names,
+        pipeline=pipeline,
+    )
+
+
 def resolve_sdtm_domain(domain: str | None, *, fallback: str = "AE") -> str:
     """Canonicalize an SDTM domain code or form/domain alias (e.g. 'PD' -> 'DV')."""
     if not domain or not isinstance(domain, str) or not domain.strip():
         return fallback
     cleaned = domain.strip()
-    compact = "".join(ch for ch in cleaned.upper() if ch.isalnum())
-    if compact in _DOMAIN_NAME_ALIASES:
-        return _DOMAIN_NAME_ALIASES[compact]
-    # Prefix heuristics for common EDC form keys (e.g. 'F_AE', 'AE_FORM', 'VS_VITALS')
-    upper = cleaned.upper()
-    tokens = [tok for tok in upper.replace("-", "_").split("_") if tok and tok != "F"]
-    for tok in tokens:
-        if tok in _DOMAIN_NAME_ALIASES:
-            return _DOMAIN_NAME_ALIASES[tok]
-    return upper
+    inferred = infer_sdtm_domain_from_form(cleaned)
+    if inferred is not None:
+        return inferred
+    return cleaned.upper()
 
 
 def format_variable_name(
@@ -911,6 +1315,7 @@ class _PreparedSdtmRow:
     usubjid: str
     sort_key: tuple[tuple[int, str], tuple[tuple[int, str], ...], tuple[int, int, str], int]
     row: dict[str, Any]
+    record_id: str | None = None
 
 
 class _SdtmNormalizer:
@@ -926,6 +1331,9 @@ class _SdtmNormalizer:
         pipeline: Any | None = None,
         phi_keys: Iterable[str] | None = None,
         registry: SensitivityRegistry | None = None,
+        filter_by_domain: bool = True,
+        include_record_id_provenance: bool = False,
+        provenance: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         domain_clean = resolve_sdtm_domain(domain)
         self.domain_clean = domain_clean
@@ -933,6 +1341,9 @@ class _SdtmNormalizer:
         self.include_deleted = include_deleted
         self.mask_phi = mask_phi
         self.pipeline = pipeline
+        self.filter_by_domain = filter_by_domain
+        self.include_record_id_provenance = include_record_id_provenance
+        self.provenance = provenance
         self.registry: SensitivityRegistry = (
             global_sensitivity_registry if registry is None else registry
         )
@@ -1078,6 +1489,12 @@ class _SdtmNormalizer:
     def prepare_record(self, rec: Any, orig_idx: int) -> _PreparedSdtmRow | None:
         """Normalize a single clinical record and compute its Subject-group sort key."""
         if not self.include_deleted and _is_deleted_record(rec):
+            return None
+        if self.filter_by_domain and not record_matches_sdtm_domain(
+            rec,
+            self.domain_clean,
+            pipeline=self.pipeline,
+        ):
             return None
 
         model_field_to_serialized: dict[str, str] = {}
@@ -1325,7 +1742,12 @@ class _SdtmNormalizer:
             _record_id_sort_key(raw_record_id),
             orig_idx,
         )
-        return _PreparedSdtmRow(usubjid=usubjid, sort_key=sort_key, row=row)
+        return _PreparedSdtmRow(
+            usubjid=usubjid,
+            sort_key=sort_key,
+            row=row,
+            record_id=_canonical_sdtm_record_id(raw_record_id),
+        )
 
     def finalize_subject_group(
         self,
@@ -1337,9 +1759,28 @@ class _SdtmNormalizer:
         rows: list[dict[str, Any]] = []
         for item in group:
             if self.include_seq:
-                next_seq = seq_counters.get(item.usubjid, 0) + 1
-                seq_counters[item.usubjid] = next_seq
-                item.row[self.seq_var] = next_seq
+                reused_seq: int | None = None
+                if self.provenance is not None and item.record_id is not None:
+                    prev_entry = self.provenance.get(item.record_id)
+                    if (
+                        isinstance(prev_entry, Mapping)
+                        and prev_entry.get("STUDYID") == item.row.get("STUDYID")
+                        and prev_entry.get("DOMAIN") == self.domain_clean
+                        and prev_entry.get("USUBJID") == item.usubjid
+                    ):
+                        raw_prev_seq = prev_entry.get(self.seq_var)
+                        if isinstance(raw_prev_seq, int) and not isinstance(raw_prev_seq, bool):
+                            reused_seq = raw_prev_seq
+                if reused_seq is not None:
+                    item.row[self.seq_var] = reused_seq
+                    if reused_seq > seq_counters.get(item.usubjid, 0):
+                        seq_counters[item.usubjid] = reused_seq
+                else:
+                    next_seq = seq_counters.get(item.usubjid, 0) + 1
+                    seq_counters[item.usubjid] = next_seq
+                    item.row[self.seq_var] = next_seq
+            if self.include_record_id_provenance and item.record_id is not None:
+                item.row[SDTM_PROVENANCE_RECORD_ID_KEY] = item.record_id
             rows.append(item.row)
         return rows
 
@@ -1348,6 +1789,8 @@ class _SdtmNormalizer:
         if not rows:
             return pd.DataFrame(columns=self.std_vars)
         df = pd.DataFrame(rows)
+        if not self.include_record_id_provenance and SDTM_PROVENANCE_RECORD_ID_KEY in df.columns:
+            df = df.drop(columns=[SDTM_PROVENANCE_RECORD_ID_KEY])
         cols = [c for c in self.std_vars if c in df.columns]
         extra_cols = [c for c in df.columns if c not in self.std_vars]
         return df[cols + extra_cols]
@@ -1504,6 +1947,9 @@ def transform_records_to_sdtm_rows(
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
     enrichment_pipeline: Any = _UNSET_PIPELINE,
+    filter_by_domain: bool = True,
+    include_record_id_provenance: bool = False,
+    provenance: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Transform clinical records into normalized CDISC SDTM row dictionaries.
 
@@ -1523,6 +1969,9 @@ def transform_records_to_sdtm_rows(
         pipeline=resolved_pipeline,
         phi_keys=phi_keys,
         registry=registry,
+        filter_by_domain=filter_by_domain,
+        include_record_id_provenance=include_record_id_provenance,
+        provenance=provenance,
     )
     counters = seq_counters if seq_counters is not None else {}
 
@@ -1592,22 +2041,29 @@ def transform_records_to_sdtm(
 
 __all__ = [
     "SDTM_DOMAIN_SPECS",
+    "SDTM_PROVENANCE_RECORD_ID_KEY",
     "VALID_NAMING_CONVENTIONS",
     "_SDTM_RECORDS_SORT",
     "_UNSET_PIPELINE",
     "_PreparedSdtmRow",
     "_SdtmNormalizer",
+    "_canonical_sdtm_record_id",
     "_collapse_alnum_key",
     "_extract_stream_usubjid_and_id",
     "_format_sdtm_flag",
     "_get_model_consumed_keys",
     "_get_model_field_aliases",
+    "_is_birth_date_alias_key",
     "_iter_sorted_sdtm_frames",
     "_normalize_key",
+    "form_matches_sdtm_domain",
     "format_iso8601_dtc",
     "format_variable_name",
     "get_sdtm_domain_variables",
+    "infer_record_sdtm_domain",
+    "infer_sdtm_domain_from_form",
     "normalize_naming_convention",
+    "record_matches_sdtm_domain",
     "resolve_sdtm_domain",
     "transform_records_to_sdtm",
     "transform_records_to_sdtm_rows",

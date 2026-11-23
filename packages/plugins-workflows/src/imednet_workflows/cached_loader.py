@@ -16,7 +16,15 @@ from filelock import FileLock
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from imednet.spi.models import Record
-from imednet.spi.utils import build_filter_string, redact_sensitive_text
+from imednet.spi.utils import (
+    MASKED_SENTINEL,
+    build_filter_string,
+    global_sensitivity_registry,
+    mask_clinical_phi,
+    mask_custom_phi_recursive,
+    redact_sensitive_text,
+    resolve_enrichment_pipeline,
+)
 
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE
 
@@ -25,6 +33,7 @@ if TYPE_CHECKING:
 
 DEFAULT_CACHE_DIR = Path.home() / ".imednet" / "cache"
 _MISSING_ID_BATCH_SIZE = 100
+_UNMASKED_CACHE_KEY_SUFFIX = "::unmasked"
 
 
 class StudySyncStatus(StrEnum):
@@ -121,6 +130,7 @@ class CachedRecordsLoader:
         retry_attempts: int = 3,
         lock_timeout_seconds: int = 30,
         lock: FileLock | None = None,
+        mask_phi: bool = True,
     ) -> None:
         """Initialize the cached records loader.
 
@@ -131,16 +141,61 @@ class CachedRecordsLoader:
             retry_attempts: Number of API retry attempts.
             lock_timeout_seconds: Number of seconds to wait when acquiring the cache file lock.
             lock: Optional FileLock instance for synchronizing write transactions.
+            mask_phi: Redact PHI before persisting record payloads into SQLite.
         """
         self._sdk = sdk
         base_dir = DEFAULT_CACHE_DIR if cache_dir is None else Path(cache_dir).expanduser()
         self.db_path = base_dir / database_name
         self._retry_attempts = retry_attempts
+        self._mask_phi = bool(mask_phi)
         lock_path = Path(f"{self.db_path}.lock")
         self._lock = (
             lock if lock is not None else FileLock(str(lock_path), timeout=lock_timeout_seconds)
         )
         self._initialise_cache()
+
+    @property
+    def mask_phi(self) -> bool:
+        """Return whether cached record payloads have PHI redacted prior to SQLite storage."""
+        return self._mask_phi
+
+    def _cache_study_key(self, study_key: str) -> str:
+        """Return the isolated SQLite partition key for masked vs unmasked caches."""
+        if self._mask_phi:
+            return study_key
+        return f"{study_key}{_UNMASKED_CACHE_KEY_SUFFIX}"
+
+    def _redact_record_payload(self, serialized: dict[str, Any], study_key: str) -> dict[str, Any]:
+        """Redact clinical and study-specific PHI from a serialized Record dict before SQLite writes."""
+        if not self._mask_phi:
+            return serialized
+
+        redacted = dict(serialized)
+        pipeline = resolve_enrichment_pipeline(study_key)
+        phi_keys: set[str] = (
+            set(getattr(pipeline, "phi_keys", set())) if pipeline is not None else set()
+        )
+
+        for data_key in ("recordData", "record_data"):
+            raw_data = redacted.get(data_key)
+            if isinstance(raw_data, dict) and raw_data:
+                masked_data = mask_clinical_phi(raw_data)
+                if phi_keys:
+                    masked_data = mask_custom_phi_recursive(masked_data, phi_keys)
+                redacted[data_key] = masked_data
+
+        for meta_key, meta_val in list(redacted.items()):
+            if meta_key in ("recordData", "record_data") or meta_val is None:
+                continue
+            if global_sensitivity_registry.is_exempt(meta_key):
+                continue
+            if global_sensitivity_registry.is_sensitive(meta_key):
+                redacted[meta_key] = MASKED_SENTINEL
+            elif phi_keys and isinstance(meta_val, (str, int, float, dict, list)):
+                masked_meta = mask_custom_phi_recursive({meta_key: meta_val}, phi_keys)
+                redacted[meta_key] = masked_meta[meta_key]
+
+        return redacted
 
     @property
     def lock(self) -> FileLock:
@@ -154,10 +209,11 @@ class CachedRecordsLoader:
 
     def sync_records(self, study_key: str, *, reconcile: bool = True) -> None:
         """Synchronise the cache for ``study_key`` without materialising cached rows."""
+        cache_key = self._cache_study_key(study_key)
         conn = get_sqlite_connection(self.db_path)
         try:
             sync_state = self.get_study_sync_state(study_key, conn=conn)
-            self._mark_study_syncing(conn, study_key)
+            self._mark_study_syncing(conn, cache_key)
             cycle_timestamps: list[str | None] = [sync_state.high_water_mark]
 
             try:
@@ -176,9 +232,9 @@ class CachedRecordsLoader:
                     self._upsert_records(conn, delta_records)
 
                 if reconcile:
-                    pre_reconcile_epoch = self._get_sync_epoch(conn, study_key)
+                    pre_reconcile_epoch = self._get_sync_epoch(conn, cache_key)
                     active_record_ids = self._fetch_active_record_ids(study_key)
-                    missing_ids = active_record_ids - self._get_local_record_ids(conn, study_key)
+                    missing_ids = active_record_ids - self._get_local_record_ids(conn, cache_key)
                     if missing_ids:
                         missing_records = self._fetch_missing_records(study_key, missing_ids)
                         cycle_timestamps.extend(
@@ -193,9 +249,9 @@ class CachedRecordsLoader:
                         max_epoch=pre_reconcile_epoch,
                     )
 
-                self._complete_study_sync(conn, study_key, cycle_timestamps)
+                self._complete_study_sync(conn, cache_key, cycle_timestamps)
             except Exception as exc:
-                self._fail_study_sync(conn, study_key, exc)
+                self._fail_study_sync(conn, cache_key, exc)
                 raise
         finally:
             conn.close()
@@ -204,6 +260,7 @@ class CachedRecordsLoader:
         self, study_key: str, *, conn: sqlite3.Connection | None = None
     ) -> StudySyncState:
         """Return the stored sync epoch, watermark, and status metadata for ``study_key``."""
+        cache_key = self._cache_study_key(study_key)
         close_conn = False
         if conn is None:
             conn = get_sqlite_connection(self.db_path)
@@ -222,7 +279,7 @@ class CachedRecordsLoader:
                 FROM study_sync_state
                 WHERE study_key = ?
                 """,
-                (study_key,),
+                (cache_key,),
             ).fetchone()
             if row is None:
                 return StudySyncState(study_key=study_key)
@@ -232,7 +289,7 @@ class CachedRecordsLoader:
             except ValueError:
                 parsed_status = StudySyncStatus.IDLE
             return StudySyncState(
-                study_key=cast(str, row["study_key"]),
+                study_key=study_key,
                 sync_epoch=int(row["sync_epoch"]),
                 high_water_mark=cast(str | None, row["high_water_mark"]),
                 initial_sync_complete=bool(row["initial_sync_complete"]),
@@ -248,6 +305,7 @@ class CachedRecordsLoader:
         self, study_key: str, *, conn: sqlite3.Connection | None = None
     ) -> int:
         """Return the count of cached records for ``study_key`` without materialising rows."""
+        cache_key = self._cache_study_key(study_key)
         close_conn = False
         if conn is None:
             conn = get_sqlite_connection(self.db_path)
@@ -259,7 +317,7 @@ class CachedRecordsLoader:
                 FROM record_cache
                 WHERE study_key = ?
                 """,
-                (study_key,),
+                (cache_key,),
             ).fetchone()
             if row is None:
                 return 0
@@ -313,8 +371,9 @@ class CachedRecordsLoader:
             ORDER BY record_id
             """
         )
+        cache_key = self._cache_study_key(study_key)
         try:
-            cursor = conn.execute(query, (study_key,))
+            cursor = conn.execute(query, (cache_key,))
             while True:
                 rows = cursor.fetchmany(chunk_size)
                 if not rows:
@@ -334,9 +393,10 @@ class CachedRecordsLoader:
         max_epoch: int | None = None,
     ) -> None:
         """Prune records removed from the upstream EDC backend up to ``max_epoch``."""
+        cache_key = self._cache_study_key(study_key)
         with self._lock, conn:
             effective_epoch = (
-                max_epoch if max_epoch is not None else self._get_sync_epoch(conn, study_key)
+                max_epoch if max_epoch is not None else self._get_sync_epoch(conn, cache_key)
             )
             local_rows = conn.execute(
                 """
@@ -344,7 +404,7 @@ class CachedRecordsLoader:
                 FROM record_cache
                 WHERE study_key = ? AND upserted_epoch <= ?
                 """,
-                (study_key, effective_epoch),
+                (cache_key, effective_epoch),
             ).fetchall()
             local_ids = {cast(int, row["record_id"]) for row in local_rows}
             orphaned_ids = local_ids - active_record_ids
@@ -354,7 +414,7 @@ class CachedRecordsLoader:
                     DELETE FROM record_cache
                     WHERE study_key = ? AND record_id = ? AND upserted_epoch <= ?
                     """,
-                    [(study_key, orphaned_id, effective_epoch) for orphaned_id in orphaned_ids],
+                    [(cache_key, orphaned_id, effective_epoch) for orphaned_id in orphaned_ids],
                 )
 
     def _initialise_cache(self) -> None:
@@ -673,17 +733,23 @@ class CachedRecordsLoader:
 
     def _upsert_records(self, conn: sqlite3.Connection, records: Iterable[Record]) -> None:
         """Insert or update records in the local SQLite cache stamped with a new sync epoch."""
-        prepared = [
-            (
-                cast(str, record.study_key),
-                cast(int, record.record_id),
-                cast(str, record.form_key or ""),
-                _serialize_date_modified(record.date_modified),
-                json.dumps(record.model_dump(mode="json", by_alias=True), sort_keys=True),
+        prepared: list[tuple[str, int, str, str | None, str]] = []
+        for record in records:
+            if record.study_key is None or record.record_id is None:
+                continue
+            raw_study_key = cast(str, record.study_key)
+            cache_key = self._cache_study_key(raw_study_key)
+            serialized = record.model_dump(mode="json", by_alias=True)
+            redacted = self._redact_record_payload(serialized, raw_study_key)
+            prepared.append(
+                (
+                    cache_key,
+                    cast(int, record.record_id),
+                    cast(str, record.form_key or ""),
+                    _serialize_date_modified(record.date_modified),
+                    json.dumps(redacted, sort_keys=True),
+                )
             )
-            for record in records
-            if record.study_key is not None and record.record_id is not None
-        ]
         if not prepared:
             return
 

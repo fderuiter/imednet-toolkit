@@ -100,7 +100,13 @@ from imednet.spi.sinks import (
     build_sink_mapper,
     extract_record_id,
     format_variable_name,
+    hydrate_sdtm_checkpoint_state,
     normalize_sink_value,
+    persist_sdtm_checkpoint_state,
+    pop_deleted_sdtm_provenance_keys,
+    reconcile_sdtm_provenance_rows,
+    redact_batch_records,
+    resolve_sdtm_domain,
     run_streaming_export,
 )
 from imednet.spi.utils import flatten, global_sensitivity_registry, mask_clinical_phi
@@ -615,7 +621,7 @@ def _post_process_warehouse_sdtm(
     """Normalize and validate an SDTM domain row for Snowflake Parquet staging."""
     normalized = _normalize_warehouse_value(row)
     if mask_phi and not _already_masked:
-        normalized = mask_clinical_phi(normalized)
+        normalized = redact_batch_records([normalized], mask_phi=True, as_sdtm=True)[0]
     cleaned: dict[str, Any] = {}
     for col, val in normalized.items():
         if not isinstance(col, str) or not _IDENTIFIER_PATTERN.match(col):
@@ -882,6 +888,7 @@ def _records_to_arrow_table(
     as_sdtm: bool = False,
     sdtm_domain: str | None = None,
     naming_convention: str | None = None,
+    sdtm_row_reconciler: Any | None = None,
 ) -> Any:
     """Convert *records* to a flattened tabular ``pyarrow.Table``."""
     pa = _require_optional_dep("pyarrow", "snowflake")
@@ -940,6 +947,9 @@ def _records_to_arrow_table(
                 as_sdtm=True,
                 sdtm_domain=sdtm_domain,
             )
+            raw_rows = mapper.map_records(records, study_key=study_key)
+            if callable(sdtm_row_reconciler):
+                raw_rows = sdtm_row_reconciler(raw_rows)
         else:
             post_proc = (
                 _make_mapped_post_proc(False, mapper_convention)
@@ -952,9 +962,15 @@ def _records_to_arrow_table(
                 mask_phi=mask_phi,
                 naming_convention=None if is_default_conv else mapper_convention,
             )
-        raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+            raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
     elif mapper_as_sdtm:
-        mapped_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+        map_records_fn = getattr(mapper, "map_records", None)
+        if callable(map_records_fn):
+            mapped_rows = map_records_fn(records, study_key=study_key)
+        else:
+            mapped_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+        if callable(sdtm_row_reconciler):
+            mapped_rows = sdtm_row_reconciler(mapped_rows)
         orig_post_proc = getattr(mapper, "post_processor", None)
         if getattr(orig_post_proc, "func", orig_post_proc) is _post_process_warehouse_sdtm:
             raw_rows = mapped_rows
@@ -1051,9 +1067,46 @@ class SnowflakeExportSink(ExportSink):
         super().__init__(config)
         self._cfg: SnowflakeSinkConfig = config
         self._seq_counters: dict[str, int] = {}
+        self._seq_counters_by_domain: dict[str, dict[str, int]] = {}
+        self._sdtm_provenance: dict[str, dict[str, Any]] = {}
         self._conn: Any = None
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
+
+    def bind_checkpoint_metadata(self, metadata: dict[str, Any] | None) -> None:
+        """Bind mutable checkpoint metadata to persist SDTM sequence and provenance state."""
+        super().bind_checkpoint_metadata(metadata)
+        self._seq_counters_by_domain, self._sdtm_provenance = hydrate_sdtm_checkpoint_state(
+            metadata
+        )
+        if self._cfg.sdtm_domain:
+            dom = resolve_sdtm_domain(self._cfg.sdtm_domain)
+            self._seq_counters = self._seq_counters_by_domain.setdefault(dom, {})
+
+    def _delete_sdtm_natural_keys(
+        self,
+        cur: Any,
+        target_table: str,
+        key_dicts: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Delete superseded or voided SDTM rows from *target_table* by CDISC natural key."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        for kd in key_dicts:
+            predicates: list[str] = []
+            for col, val in kd.items():
+                if val is None or not _IDENTIFIER_PATTERN.match(col):
+                    continue
+                predicates.append(f"{_quote_identifier(col.upper())} = %s")
+                params.append(val)
+            if predicates:
+                clauses.append(f"({' AND '.join(predicates)})")
+        if clauses:
+            where_sql = " OR ".join(clauses)
+            cur.execute(
+                f"DELETE FROM {target_table} WHERE {where_sql}",  # noqa: S608
+                params,
+            )  # nosem
 
     # ------------------------------------------------------------------
     # Connection management
@@ -1194,7 +1247,21 @@ class SnowflakeExportSink(ExportSink):
             mode="tabular",
             post_processor=post_proc,
             seq_counters=self._seq_counters,
+            seq_counters_by_domain=self._seq_counters_by_domain,
+            include_sdtm_provenance=cfg.as_sdtm,
+            sdtm_provenance=self._sdtm_provenance,
         )
+        changed_old_keys: list[dict[str, Any]] = []
+
+        def _reconcile_sdtm_rows(rows_in: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            nonlocal changed_old_keys
+            cleaned, _all_prev, changed_prev = reconcile_sdtm_provenance_rows(
+                rows_in,
+                self._sdtm_provenance,
+                default_domain=cfg.sdtm_domain,
+            )
+            changed_old_keys = changed_prev
+            return cleaned
 
         arrow_table = _records_to_arrow_table(
             records,
@@ -1204,7 +1271,34 @@ class SnowflakeExportSink(ExportSink):
             as_sdtm=cfg.as_sdtm,
             sdtm_domain=cfg.sdtm_domain,
             naming_convention=cfg.naming_convention,
+            sdtm_row_reconciler=_reconcile_sdtm_rows if cfg.as_sdtm else None,
         )
+        if cfg.as_sdtm:
+            persist_sdtm_checkpoint_state(
+                self._checkpoint_metadata,
+                self._seq_counters_by_domain,
+                self._sdtm_provenance,
+            )
+            if int(getattr(arrow_table, "num_rows", 0)) == 0:
+                if self.config.idempotent and changed_old_keys:
+                    target_table_empty = (
+                        f"{_quote_identifier(cfg.database)}."
+                        f"{_quote_identifier(cfg.schema)}."
+                        f"{_quote_identifier(cfg.table)}"
+                    )
+
+                    def _prune_only() -> int:
+                        cur = self._conn.cursor()
+                        try:
+                            self._delete_sdtm_natural_keys(
+                                cur, target_table_empty, changed_old_keys
+                            )
+                            return 0
+                        finally:
+                            cur.close()
+
+                    self._execute_with_retry("export_warehouse", batch_id, _prune_only)
+                return 0
         merge_columns = _resolve_merge_columns(arrow_table)
         local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
         pq = _require_optional_dep("pyarrow.parquet", "snowflake")
@@ -1228,6 +1322,8 @@ class SnowflakeExportSink(ExportSink):
                 self._ensure_table_schema(cur, target_table, arrow_table, merge_columns)
 
                 if self.config.idempotent:
+                    if cfg.as_sdtm and changed_old_keys:
+                        self._delete_sdtm_natural_keys(cur, target_table, changed_old_keys)
                     staging_table = (
                         f"{_quote_identifier(cfg.database)}."
                         f"{_quote_identifier(cfg.schema)}."
@@ -1328,7 +1424,11 @@ class SnowflakeExportSink(ExportSink):
                         f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
                         f"FORCE = TRUE"
                     )  # nosem
-                rows_loaded = len(records)
+                rows_loaded = (
+                    int(getattr(arrow_table, "num_rows", len(records)))
+                    if cfg.as_sdtm
+                    else len(records)
+                )
                 logger.debug(
                     "Loaded batch %s (%d rows) via stage %s",
                     batch_id,
@@ -1349,16 +1449,43 @@ class SnowflakeExportSink(ExportSink):
         """Delete newly voided rows from Snowflake when running idempotently."""
         if not self.config.idempotent or not records:
             return 0
-        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
-        if not record_ids:
-            return 0
-
         cfg = self._cfg
         target_table = (
             f"{_quote_identifier(cfg.database)}."
             f"{_quote_identifier(cfg.schema)}."
             f"{_quote_identifier(cfg.table)}"
         )
+
+        if cfg.as_sdtm:
+            deleted_keys = pop_deleted_sdtm_provenance_keys(records, self._sdtm_provenance)
+            persist_sdtm_checkpoint_state(
+                self._checkpoint_metadata,
+                self._seq_counters_by_domain,
+                self._sdtm_provenance,
+            )
+            if not deleted_keys:
+                return 0
+
+            def execute_sdtm_reconcile() -> int:
+                cur = self._conn.cursor()
+                try:
+                    self._delete_sdtm_natural_keys(cur, target_table, deleted_keys)
+                    logger.debug(
+                        "Reconciled %d voided SDTM records in batch %s",
+                        len(deleted_keys),
+                        batch_id,
+                    )
+                    return len(deleted_keys)
+                finally:
+                    cur.close()
+
+            return self._execute_with_retry(
+                "reconcile_warehouse_deleted", batch_id, execute_sdtm_reconcile
+            )
+
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if not record_ids:
+            return 0
         placeholders = ", ".join(["%s"] * len(record_ids))
 
         if cfg.naming_convention == "camelCase":
@@ -1440,7 +1567,7 @@ def export_to_snowflake(
         study_key,
         lambda: SnowflakeExportSink(config=resolved_cfg),
         stream_cfg,
-        stream_name=f"snowflake_{resolved_cfg.table}",
+        stream_name=resolved_cfg.stream_name or f"snowflake_{resolved_cfg.table}",
         batch_id_prefix=f"{study_key}/records/{run_id}",
         quality_gate_fn=apply_quality_gate,
     )

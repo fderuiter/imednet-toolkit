@@ -64,7 +64,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -86,7 +86,12 @@ from imednet.spi.sinks import (
     apply_quality_gate,
     build_sink_mapper,
     extract_record_id,
+    hydrate_sdtm_checkpoint_state,
     normalize_sink_value,
+    persist_sdtm_checkpoint_state,
+    pop_deleted_sdtm_provenance_keys,
+    reconcile_sdtm_provenance_rows,
+    resolve_sdtm_domain,
     run_streaming_export,
 )
 
@@ -372,8 +377,56 @@ class Neo4jExportSink(ExportSink):
         self._auth = self.config.auth
         self._study_key = self.config.study_key
         self._seq_counters: dict[str, int] = {}
+        self._seq_counters_by_domain: dict[str, dict[str, int]] = {}
+        self._sdtm_provenance: dict[str, dict[str, Any]] = {}
         self._driver: Any = None
         self._connect()
+
+    def bind_checkpoint_metadata(self, metadata: dict[str, Any] | None) -> None:
+        """Bind mutable checkpoint metadata to persist SDTM sequence and provenance state."""
+        super().bind_checkpoint_metadata(metadata)
+        self._seq_counters_by_domain, self._sdtm_provenance = hydrate_sdtm_checkpoint_state(
+            metadata
+        )
+        if self.config.sdtm_domain:
+            dom = resolve_sdtm_domain(self.config.sdtm_domain)
+            self._seq_counters = self._seq_counters_by_domain.setdefault(dom, {})
+
+    @staticmethod
+    def _delete_sdtm_keys_in_session(
+        session: Any,
+        key_dicts: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Delete superseded or voided SDTM Record nodes in Neo4j by CDISC natural key."""
+        grouped: dict[str | None, list[dict[str, Any]]] = {}
+        for kd in key_dicts:
+            seq_col = next(
+                (
+                    k
+                    for k in kd
+                    if k.endswith("SEQ")
+                    and k not in ("STUDYID", "DOMAIN", "USUBJID")
+                    and k.isalnum()
+                ),
+                None,
+            )
+            grouped.setdefault(seq_col, []).append(dict(kd))
+        for seq_col, group_keys in grouped.items():
+            if seq_col:
+                cypher_del = (
+                    "UNWIND $keys AS k\n"
+                    "MATCH (r:Record {"
+                    f"STUDYID: k.STUDYID, DOMAIN: k.DOMAIN, USUBJID: k.USUBJID, {seq_col}: k.{seq_col}"
+                    "})\n"
+                    "DETACH DELETE r\n"
+                )
+            else:
+                cypher_del = (
+                    "UNWIND $keys AS k\n"
+                    "MATCH (r:Record {STUDYID: k.STUDYID, DOMAIN: k.DOMAIN, USUBJID: k.USUBJID})\n"
+                    "DETACH DELETE r\n"
+                )
+            session.run(cypher_del, keys=group_keys)
 
     # ------------------------------------------------------------------
     # Connection management
@@ -405,39 +458,68 @@ class Neo4jExportSink(ExportSink):
             mode="document",
             post_processor=post_proc,
             seq_counters=self._seq_counters,
+            seq_counters_by_domain=self._seq_counters_by_domain,
+            include_sdtm_provenance=self.config.as_sdtm,
+            sdtm_provenance=self._sdtm_provenance,
         )
         database = getattr(self.config, "database", "neo4j")
         mapped_rows: list[dict[str, Any]] | None = None
+        changed_old_keys: list[dict[str, Any]] = []
         cypher: str | None = None
 
         def execute_export() -> int:
             """Execute Cypher transaction to write or merge records in Neo4j."""
-            nonlocal mapped_rows, cypher
+            nonlocal mapped_rows, changed_old_keys, cypher
             if mapped_rows is None:
                 try:
-                    mapped_rows = [
-                        _record_to_row(r, self._study_key, mapper=mapper) for r in records
-                    ]
+                    if self.config.as_sdtm:
+                        raw_mapped = mapper.map_records(records, study_key=self._study_key)
+                        mapped_rows, _all_prev, changed_old_keys = reconcile_sdtm_provenance_rows(
+                            raw_mapped,
+                            self._sdtm_provenance,
+                            default_domain=self.config.sdtm_domain,
+                        )
+                        persist_sdtm_checkpoint_state(
+                            self._checkpoint_metadata,
+                            self._seq_counters_by_domain,
+                            self._sdtm_provenance,
+                        )
+                    else:
+                        mapped_rows = [
+                            _record_to_row(r, self._study_key, mapper=mapper) for r in records
+                        ]
                 except ExportConfigurationError:
                     raise
                 except Exception:
                     raise TypeError("Malformed Neo4j record batch payload.") from None
             if not mapped_rows:
+                if self.config.as_sdtm and self.config.idempotent and changed_old_keys:
+                    with self._driver.session(database=database) as session:
+                        self._delete_sdtm_keys_in_session(session, changed_old_keys)
                 return 0
-            if cypher is None:
-                if self.config.as_sdtm:
-                    sample_row = mapped_rows[0]
+            if self.config.as_sdtm:
+                sdtm_groups: dict[tuple[str | None, bool], list[dict[str, Any]]] = {}
+                for r_item in mapped_rows:
                     seq_prop = next(
                         (
                             k
-                            for k in sample_row
+                            for k in r_item
                             if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
                         ),
                         None,
                     )
-                    has_visit = any("VISITNUM" in r for r in mapped_rows)
-                    merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
-                elif self.config.naming_convention == "camelCase":
+                    sdtm_groups.setdefault((seq_prop, "VISITNUM" in r_item), []).append(r_item)
+                with self._driver.session(database=database) as session:
+                    if self.config.idempotent and changed_old_keys:
+                        self._delete_sdtm_keys_in_session(session, changed_old_keys)
+                    for (seq_prop, has_visit), group_rows in sdtm_groups.items():
+                        merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
+                        group_cypher = merge_cypher if self.config.idempotent else create_cypher
+                        session.run(group_cypher, rows=group_rows)
+                logger.debug("Wrote batch %s (%d records)", batch_id, len(mapped_rows))
+                return len(mapped_rows)
+            if cypher is None:
+                if self.config.naming_convention == "camelCase":
                     merge_cypher, create_cypher = _build_convention_cypher(
                         "studyKey", "subjectKey", "recordId", "visitId"
                     )
@@ -462,15 +544,39 @@ class Neo4jExportSink(ExportSink):
         """Delete newly voided Record nodes from Neo4j when running idempotently."""
         if not self.config.idempotent or not records:
             return 0
-        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
-        if not record_ids:
-            return 0
-
         cfg = (
             self.config
             if isinstance(self.config, Neo4jSinkConfig)
             else Neo4jSinkConfig(study_key=self._study_key, uri=self._uri, auth=self._auth)
         )
+
+        if cfg.as_sdtm:
+            deleted_keys = pop_deleted_sdtm_provenance_keys(records, self._sdtm_provenance)
+            persist_sdtm_checkpoint_state(
+                self._checkpoint_metadata,
+                self._seq_counters_by_domain,
+                self._sdtm_provenance,
+            )
+            if not deleted_keys:
+                return 0
+
+            def execute_sdtm_reconcile() -> int:
+                with self._driver.session(database=cfg.database) as session:
+                    self._delete_sdtm_keys_in_session(session, deleted_keys)
+                logger.debug(
+                    "Reconciled %d voided SDTM records in batch %s",
+                    len(deleted_keys),
+                    batch_id,
+                )
+                return len(deleted_keys)
+
+            return self._execute_with_retry(
+                "reconcile_graph_deleted", batch_id, execute_sdtm_reconcile
+            )
+
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if not record_ids:
+            return 0
 
         delete_cypher = _DELETE_RECORD_CYPHER
         if cfg.naming_convention == "camelCase":
@@ -534,7 +640,7 @@ def export_to_neo4j(
         study_key,
         lambda: Neo4jExportSink(config=resolved_cfg),
         resolved_cfg,
-        stream_name=f"neo4j_{resolved_cfg.database}",
+        stream_name=resolved_cfg.stream_name or f"neo4j_{resolved_cfg.database}",
         quality_gate_fn=apply_quality_gate,
     )
 

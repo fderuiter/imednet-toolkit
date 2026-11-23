@@ -97,6 +97,12 @@ from tenacity import wait_exponential
 from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
+from imednet.models.sdtm import (
+    SDTM_PROVENANCE_RECORD_ID_KEY,
+    _canonical_sdtm_record_id,
+    _is_birth_date_alias_key,
+    format_iso8601_dtc,
+)
 from imednet.models.standards import (
     SDTM_DOMAIN_SPECS,
     StandardsProfile,
@@ -408,7 +414,42 @@ class SinkConfig:
 # ---------------------------------------------------------------------------
 
 
-def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
+def _mask_phi_mapping_for_sdtm(mapping_obj: Mapping[Any, Any]) -> dict[Any, Any]:
+    """Redact PHI in a mapping while truncating birth-date keys to 4-digit ISO years for SDTM."""
+    result: dict[Any, Any] = {}
+    for k, v in mapping_obj.items():
+        key_str = str(k)
+        if global_sensitivity_registry.is_exempt(key_str):
+            result[k] = v
+            continue
+        if _is_birth_date_alias_key(key_str):
+            result[k] = format_iso8601_dtc(v, redact_to_year=True)
+            continue
+        if global_sensitivity_registry.is_sensitive(key_str):
+            result[k] = MASKED_SENTINEL if v is not None else None
+            continue
+        if isinstance(v, Mapping):
+            result[k] = _mask_phi_mapping_for_sdtm(v)
+        elif isinstance(v, list):
+            result[k] = [
+                _mask_phi_mapping_for_sdtm(elem)
+                if isinstance(elem, Mapping)
+                else mask_clinical_phi(elem)
+                for elem in v
+            ]
+        elif isinstance(v, tuple):
+            result[k] = tuple(
+                _mask_phi_mapping_for_sdtm(elem)
+                if isinstance(elem, Mapping)
+                else mask_clinical_phi(elem)
+                for elem in v
+            )
+        else:
+            result[k] = mask_clinical_phi(v)
+    return result
+
+
+def _redact_dataframe_batch(df: Any, pd_mod: Any, *, as_sdtm: bool = False) -> Any:
     """Return a PHI-redacted copy of a pandas DataFrame without mutating caller state."""
     masked = df.copy()
     sensitive_cols = list(
@@ -418,7 +459,16 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
     )
     for col in sensitive_cols:
         if len(masked) > 0:
-            masked[col] = MASKED_SENTINEL
+            if as_sdtm and _is_birth_date_alias_key(str(col)):
+                target = masked[col]
+                if hasattr(target, "columns"):
+                    masked[col] = target.apply(
+                        lambda s: s.apply(lambda v: format_iso8601_dtc(v, redact_to_year=True))
+                    )
+                else:
+                    masked[col] = target.apply(lambda v: format_iso8601_dtc(v, redact_to_year=True))
+            else:
+                masked[col] = MASKED_SENTINEL
 
     if len(masked) == 0:
         return masked
@@ -439,10 +489,10 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
     return masked
 
 
-def _redact_single_record(item: Any) -> Any:
+def _redact_single_record(item: Any, *, as_sdtm: bool = False) -> Any:
     """Redact PHI on a single Mapping, Pydantic model, or record-like object."""
     if isinstance(item, Mapping):
-        return mask_clinical_phi(dict(item))
+        return _mask_phi_mapping_for_sdtm(item) if as_sdtm else mask_clinical_phi(dict(item))
     if isinstance(item, NonCallableMock):
         return item
 
@@ -452,11 +502,26 @@ def _redact_single_record(item: Any) -> Any:
         updates: dict[str, Any] = {}
         record_data = getattr(item, "record_data", None)
         if isinstance(record_data, dict):
-            masked_rd = mask_clinical_phi(record_data)
+            masked_rd = (
+                _mask_phi_mapping_for_sdtm(record_data)
+                if as_sdtm
+                else mask_clinical_phi(record_data)
+            )
             if masked_rd != record_data:
                 updates["record_data"] = masked_rd
-        for field_name in model_fields:
+        for field_name, finfo in model_fields.items():
             if field_name == "record_data" or global_sensitivity_registry.is_exempt(field_name):
+                continue
+            alias_name = getattr(finfo, "alias", None)
+            is_birth_field = _is_birth_date_alias_key(field_name) or (
+                isinstance(alias_name, str) and _is_birth_date_alias_key(alias_name)
+            )
+            if as_sdtm and is_birth_field:
+                val = getattr(item, field_name, None)
+                if val is not None:
+                    year_val = format_iso8601_dtc(val, redact_to_year=True)
+                    if year_val != val:
+                        updates[field_name] = year_val
                 continue
             if global_sensitivity_registry.is_sensitive(field_name):
                 val = getattr(item, field_name, None)
@@ -466,7 +531,9 @@ def _redact_single_record(item: Any) -> Any:
 
     record_data = getattr(item, "record_data", None)
     if isinstance(record_data, dict):
-        masked_rd = mask_clinical_phi(record_data)
+        masked_rd = (
+            _mask_phi_mapping_for_sdtm(record_data) if as_sdtm else mask_clinical_phi(record_data)
+        )
         if masked_rd != record_data:
             copied = copy.copy(item)
             copied.record_data = masked_rd
@@ -474,23 +541,28 @@ def _redact_single_record(item: Any) -> Any:
     return item
 
 
-def redact_batch_records(records: Any, *, mask_phi: bool = True) -> Any:
+def redact_batch_records(
+    records: Any,
+    *,
+    mask_phi: bool = True,
+    as_sdtm: bool = False,
+) -> Any:
     """Apply default SensitivityRegistry PHI redaction across a batch of records or DataFrame."""
     if not mask_phi or records is None:
         return records
 
     pd_mod = sys.modules.get("pandas")
     if pd_mod is not None and isinstance(records, pd_mod.DataFrame):
-        return _redact_dataframe_batch(records, pd_mod)
+        return _redact_dataframe_batch(records, pd_mod, as_sdtm=as_sdtm)
 
     if isinstance(records, Mapping):
-        return mask_clinical_phi(dict(records))
+        return _mask_phi_mapping_for_sdtm(records) if as_sdtm else mask_clinical_phi(dict(records))
     if isinstance(records, (str, bytes)):
         return records
     if isinstance(records, tuple):
-        return tuple(_redact_single_record(item) for item in records)
+        return tuple(_redact_single_record(item, as_sdtm=as_sdtm) for item in records)
     if isinstance(records, Iterable):
-        return [_redact_single_record(item) for item in records]
+        return [_redact_single_record(item, as_sdtm=as_sdtm) for item in records]
     return records
 
 
@@ -537,6 +609,11 @@ class ExportSink(ABC):
         """Initialize the export sink with a configuration."""
         self.config: SinkConfig = config
         self._circuit_breaker: CircuitBreaker = CircuitBreaker()
+        self._checkpoint_metadata: dict[str, Any] | None = None
+
+    def bind_checkpoint_metadata(self, metadata: dict[str, Any] | None) -> None:
+        """Bind a mutable checkpoint transaction metadata dictionary to this sink."""
+        self._checkpoint_metadata = metadata
 
     def _get_circuit_breaker(self) -> CircuitBreaker:
         """Return this sink's isolated circuit breaker, initializing lazily if needed."""
@@ -549,7 +626,8 @@ class ExportSink(ABC):
     def redact_batch(self, records: Sequence[Any]) -> Any:
         """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
         should_mask = getattr(self.config, "mask_phi", True) is not False
-        return redact_batch_records(records, mask_phi=should_mask)
+        as_sdtm = bool(getattr(self.config, "as_sdtm", False))
+        return redact_batch_records(records, mask_phi=should_mask, as_sdtm=as_sdtm)
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -2144,6 +2222,12 @@ def run_streaming_export(
         else:
             sink_obj = sink()
         stack.enter_context(sink_obj)
+        if tx is not None and callable(getattr(sink_obj, "bind_checkpoint_metadata", None)):
+            tx_meta = tx.get("metadata")
+            if not isinstance(tx_meta, dict):
+                tx_meta = {}
+                tx["metadata"] = tx_meta
+            sink_obj.bind_checkpoint_metadata(tx_meta)
 
         reconcile_voided = (
             (not opts["include_deleted"])
@@ -2263,6 +2347,213 @@ def run_streaming_export(
     return total_written
 
 
+def pop_sdtm_record_id_provenance(row: dict[str, Any]) -> str | None:
+    """Remove and return the transient SDTM ``recordId`` provenance marker from ``row``."""
+    raw = row.pop(SDTM_PROVENANCE_RECORD_ID_KEY, None)
+    return _canonical_sdtm_record_id(raw)
+
+
+def strip_sdtm_provenance(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return copies of ``rows`` with transient SDTM provenance keys removed."""
+    cleaned: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item.pop(SDTM_PROVENANCE_RECORD_ID_KEY, None)
+        cleaned.append(item)
+    return cleaned
+
+
+def _coerce_sdtm_seq_value(raw_seq: Any) -> Any | None:
+    """Normalize an SDTM ``<DOM>SEQ`` scalar across Python, CSV string, and pandas float representations."""
+    if raw_seq is None or isinstance(raw_seq, bool):
+        return None
+    if isinstance(raw_seq, int):
+        return raw_seq
+    if isinstance(raw_seq, float):
+        if math.isnan(raw_seq) or math.isinf(raw_seq):
+            return None
+        return int(raw_seq) if raw_seq.is_integer() else raw_seq
+    if isinstance(raw_seq, str):
+        stripped = raw_seq.strip()
+        if not stripped:
+            return None
+        try:
+            return int(stripped)
+        except ValueError:
+            try:
+                as_float = float(stripped)
+            except ValueError:
+                return stripped
+            if math.isnan(as_float) or math.isinf(as_float):
+                return None
+            return int(as_float) if as_float.is_integer() else stripped
+    try:
+        return int(raw_seq)
+    except (TypeError, ValueError):
+        text = str(raw_seq).strip()
+        return text if text and text not in ("<NA>", "nan", "NaN", "None") else None
+
+
+def extract_sdtm_natural_key(
+    row: Mapping[str, Any],
+    *,
+    default_domain: str | None = None,
+) -> dict[str, Any]:
+    """Extract the CDISC SDTM natural key ``(STUDYID, DOMAIN, USUBJID[, <DOM>SEQ])`` from ``row``."""
+    raw_dom = row.get("DOMAIN") or default_domain
+    dom = resolve_sdtm_domain(str(raw_dom)) if raw_dom else "AE"
+    key: dict[str, Any] = {
+        "STUDYID": str(row.get("STUDYID") or ""),
+        "DOMAIN": dom,
+        "USUBJID": str(row.get("USUBJID") or ""),
+    }
+    if dom != "DM":
+        seq_col = f"{dom}SEQ"
+        coerced_seq = _coerce_sdtm_seq_value(row.get(seq_col))
+        if coerced_seq is not None:
+            key[seq_col] = coerced_seq
+    return key
+
+
+def sdtm_natural_key_tuple(key_map: Mapping[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """Build a hashable tuple representation of an SDTM natural key dictionary."""
+    dom = str(key_map.get("DOMAIN") or "")
+    items: list[tuple[str, Any]] = [
+        ("STUDYID", str(key_map.get("STUDYID") or "")),
+        ("DOMAIN", dom),
+        ("USUBJID", str(key_map.get("USUBJID") or "")),
+    ]
+    if dom and dom != "DM":
+        seq_col = f"{dom}SEQ"
+        coerced_seq = _coerce_sdtm_seq_value(key_map.get(seq_col))
+        if coerced_seq is not None:
+            items.append((seq_col, coerced_seq))
+    return tuple(items)
+
+
+def hydrate_sdtm_checkpoint_state(
+    metadata: dict[str, Any] | None,
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, Any]]]:
+    """Hydrate mutable ``(seq_counters_by_domain, sdtm_provenance)`` from checkpoint metadata."""
+    seq_by_dom: dict[str, dict[str, int]] = {}
+    provenance: dict[str, dict[str, Any]] = {}
+    if not isinstance(metadata, Mapping):
+        return seq_by_dom, provenance
+
+    raw_seq = metadata.get("sdtm_seq_counters")
+    if isinstance(raw_seq, Mapping):
+        for dom, subj_map in raw_seq.items():
+            if not isinstance(subj_map, Mapping):
+                continue
+            dom_clean = resolve_sdtm_domain(str(dom))
+            parsed_subj: dict[str, int] = {}
+            for usubjid, val in subj_map.items():
+                if isinstance(val, int) and not isinstance(val, bool):
+                    parsed_subj[str(usubjid)] = val
+                else:
+                    try:
+                        parsed_subj[str(usubjid)] = int(val)
+                    except (TypeError, ValueError):
+                        continue
+            seq_by_dom[dom_clean] = parsed_subj
+
+    raw_prov = metadata.get("sdtm_provenance")
+    if isinstance(raw_prov, Mapping):
+        for rid, key_dict in raw_prov.items():
+            cid = _canonical_sdtm_record_id(rid)
+            if cid is not None and isinstance(key_dict, Mapping):
+                provenance[cid] = extract_sdtm_natural_key(key_dict)
+    return seq_by_dom, provenance
+
+
+def persist_sdtm_checkpoint_state(
+    metadata: dict[str, Any] | None,
+    seq_counters_by_domain: Mapping[str, Mapping[str, int]],
+    provenance: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Persist ``sdtm_seq_counters`` and ``sdtm_provenance`` back into checkpoint ``metadata``."""
+    if not isinstance(metadata, dict):
+        return
+    metadata["sdtm_seq_counters"] = {
+        str(dom): {str(subj): int(seq) for subj, seq in subj_map.items()}
+        for dom, subj_map in seq_counters_by_domain.items()
+        if subj_map
+    }
+    metadata["sdtm_provenance"] = {
+        str(rid): dict(key_dict) for rid, key_dict in provenance.items() if key_dict
+    }
+
+
+def reconcile_sdtm_provenance_rows(
+    rows: Iterable[dict[str, Any]],
+    provenance: dict[str, dict[str, Any]],
+    *,
+    default_domain: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Strip transient ``recordId`` provenance, update ``provenance``, and deduplicate SDTM rows.
+
+    Returns ``(cleaned_rows, all_replaced_keys, changed_old_keys)``:
+    - ``cleaned_rows``: pure CDISC SDTM dicts with transient provenance removed and duplicates merged.
+    - ``all_replaced_keys``: prior SDTM keys for any updated ``recordId`` (for rewrite/prune sinks).
+    - ``changed_old_keys``: prior SDTM keys where ``old_key != new_key`` (for MERGE/upsert sinks).
+    """
+    staged: list[tuple[dict[str, Any], tuple[tuple[str, Any], ...] | None]] = []
+    all_replaced: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
+    changed_old: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
+
+    for raw_row in rows:
+        row = dict(raw_row)
+        rid = pop_sdtm_record_id_provenance(row)
+        nat_key = extract_sdtm_natural_key(row, default_domain=default_domain)
+        nat_tuple = sdtm_natural_key_tuple(nat_key) if nat_key.get("USUBJID") else None
+
+        if rid is not None and nat_key.get("STUDYID") and nat_key.get("DOMAIN"):
+            prev = provenance.get(rid)
+            if isinstance(prev, Mapping) and prev:
+                prev_dict = extract_sdtm_natural_key(prev, default_domain=default_domain)
+                prev_tuple = sdtm_natural_key_tuple(prev_dict)
+                all_replaced[prev_tuple] = prev_dict
+                if nat_tuple is None or prev_tuple != nat_tuple:
+                    changed_old[prev_tuple] = prev_dict
+            provenance[rid] = dict(nat_key)
+
+        staged.append((row, nat_tuple))
+
+    dedup_index: dict[tuple[tuple[str, Any], ...], int] = {}
+    cleaned: list[dict[str, Any]] = []
+    for row, nat_tuple in staged:
+        if nat_tuple is not None:
+            if nat_tuple in dedup_index:
+                cleaned[dedup_index[nat_tuple]] = row
+            else:
+                dedup_index[nat_tuple] = len(cleaned)
+                cleaned.append(row)
+        else:
+            cleaned.append(row)
+
+    for active_tuple in dedup_index:
+        changed_old.pop(active_tuple, None)
+
+    return cleaned, list(all_replaced.values()), list(changed_old.values())
+
+
+def pop_deleted_sdtm_provenance_keys(
+    deleted_records: Iterable[Any],
+    provenance: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Pop voided ``recordId`` entries from ``provenance`` and return their SDTM natural keys."""
+    removed: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
+    for rec in deleted_records:
+        cid = _canonical_sdtm_record_id(extract_record_id(rec))
+        if cid is None:
+            continue
+        prev = provenance.pop(cid, None)
+        if isinstance(prev, Mapping) and prev:
+            prev_dict = extract_sdtm_natural_key(prev)
+            removed[sdtm_natural_key_tuple(prev_dict)] = prev_dict
+    return list(removed.values())
+
+
 __all__ = [
     "DEFAULT_MAX_BUFFERED_RECORDS",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
@@ -2278,14 +2569,22 @@ __all__ = [
     "extract_record_form_ref",
     "extract_record_id",
     "extract_record_timestamp",
+    "extract_sdtm_natural_key",
     "get_state_provider",
+    "hydrate_sdtm_checkpoint_state",
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
     "normalize_sink_value",
     "normalize_watermark_datetime",
+    "persist_sdtm_checkpoint_state",
+    "pop_deleted_sdtm_provenance_keys",
+    "pop_sdtm_record_id_provenance",
+    "reconcile_sdtm_provenance_rows",
     "redact_batch_records",
     "resolve_max_buffered_records",
     "run_streaming_export",
+    "sdtm_natural_key_tuple",
+    "strip_sdtm_provenance",
     "validate_max_buffered_records",
 ]

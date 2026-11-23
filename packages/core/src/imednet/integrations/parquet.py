@@ -5,21 +5,27 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+from collections.abc import Mapping, Sequence
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 from unittest.mock import NonCallableMock
 
+from ..errors import ExportBatchError, ImednetError
+from ..models.sdtm import resolve_sdtm_domain, transform_records_to_sdtm_rows
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
 from .enrichment import resolve_enrichment_pipeline
 from .export import (
+    _apply_naming_convention_to_df,
     _build_form_export_contexts,
     _build_tabular_sink_config,
     _canonical_record_id,
     _config_has_streaming_options,
+    _df_sdtm_key_tuples,
     _filter_df_excluding_record_ids,
+    _filter_df_excluding_sdtm_keys,
     _FormExportContext,
     _is_incremental_config,
     _mask_df,
@@ -31,6 +37,11 @@ from .sink_base import (
     BoundedFormBufferRouter,
     extract_record_form_ref,
     extract_record_id,
+    hydrate_sdtm_checkpoint_state,
+    persist_sdtm_checkpoint_state,
+    pop_deleted_sdtm_provenance_keys,
+    reconcile_sdtm_provenance_rows,
+    sdtm_natural_key_tuple,
     validate_max_buffered_records,
 )
 
@@ -96,6 +107,7 @@ def _build_record_mapper(
     *,
     chunk_size: int,
     mask_phi: bool = True,
+    use_cache: bool = True,
 ) -> Any:
     """Build a workflows ``RecordMapper`` without importing the plugin at module import time."""
     mapper_cls = _record_mapper()
@@ -103,11 +115,56 @@ def _build_record_mapper(
     kwargs: dict[str, Any] = {}
     if "chunk_size" in parameters:
         kwargs["chunk_size"] = chunk_size
-    if "loader" in parameters:
-        kwargs["loader"] = _cached_records_loader()(sdk)
+    if use_cache and "loader" in parameters:
+        loader_cls = _cached_records_loader()
+        loader_params: Mapping[str, inspect.Parameter] = {}
+        with contextlib.suppress(TypeError, ValueError):
+            loader_params = inspect.signature(loader_cls).parameters
+        if "mask_phi" in loader_params:
+            kwargs["loader"] = loader_cls(sdk, mask_phi=mask_phi)
+        else:
+            kwargs["loader"] = loader_cls(sdk)
     if "mask_phi" in parameters:
         kwargs["mask_phi"] = mask_phi
     return mapper_cls(sdk, **kwargs)
+
+
+def _commit_hive_df(
+    df: Any,
+    *,
+    pyarrow_module: ModuleType,
+    storage_engine: PyArrowDatasetPartitionedStorageEngine,
+    base_dir: str,
+    study_key: str,
+    form_key: str,
+    batch_id: str,
+) -> int:
+    """Drop conflicting Hive partition columns and commit ``df`` as a partitioned Arrow table."""
+    for part_col in ("study_key", "form_key"):
+        if part_col in df.columns:
+            df = df.drop(columns=[part_col])
+    pa_err_cls = getattr(pyarrow_module, "ArrowException", None)
+    driver_errs: tuple[type[BaseException], ...] = (
+        (OSError, pa_err_cls)
+        if isinstance(pa_err_cls, type) and issubclass(pa_err_cls, BaseException)
+        else (OSError,)
+    )
+    try:
+        table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
+        storage_engine.write_form_table(
+            table,
+            base_dir=base_dir,
+            study_key=study_key,
+            form_key=form_key,
+        )
+    except ImednetError:
+        raise
+    except driver_errs as exc:
+        raise ExportBatchError(
+            f"Hive Parquet batch {batch_id!r} failed: {exc}",
+            batch_id=batch_id,
+        ) from exc
+    return len(df)
 
 
 def _write_hive_form_rows(
@@ -125,6 +182,9 @@ def _write_hive_form_rows(
     study_key: str,
     form_key: str,
     skip_empty: bool,
+    naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
+    batch_id: str = "",
 ) -> int:
     """Convert parsed form rows into an Arrow table and commit to the Hive partition."""
     df = mapper._build_dataframe(
@@ -138,15 +198,95 @@ def _write_hive_form_rows(
     df.columns = df.columns.astype(str)
     df = df.loc[:, ~df.columns.str.lower().duplicated()]
     if mask_phi and not df.empty:
-        df = _mask_df(df, phi_keys=phi_keys)
-    table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
-    storage_engine.write_form_table(
-        table,
+        df = _mask_df(df, phi_keys=phi_keys, as_sdtm=False)
+    if not use_labels_as_columns and naming_convention is not None:
+        df = _apply_naming_convention_to_df(
+            df,
+            naming_convention,
+            domain=sdtm_domain,
+            study_key=study_key,
+        )
+    return _commit_hive_df(
+        df,
+        pyarrow_module=pyarrow_module,
+        storage_engine=storage_engine,
         base_dir=base_dir,
         study_key=study_key,
         form_key=form_key,
+        batch_id=batch_id or f"{study_key}/{form_key}/0",
     )
-    return len(df)
+
+
+def _prune_hive_partition_files(
+    files: list[Path],
+    *,
+    excluded_ids: set[str] | None = None,
+    excluded_sdtm_keys: set[tuple[tuple[str, Any], ...]] | None = None,
+    sdtm_domain: str | None = None,
+    pyarrow_module: ModuleType,
+    storage_engine: PyArrowDatasetPartitionedStorageEngine,
+    base_dir: str,
+    study_key: str,
+    form_key: str,
+) -> None:
+    """Prune superseded or voided rows from pre-existing Hive partition Parquet files."""
+    if not files or (not excluded_ids and not excluded_sdtm_keys):
+        return
+    pandas_module = _ensure_pandas()
+    partition_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={form_key}"
+    pa_err_cls = getattr(pyarrow_module, "ArrowException", None)
+    driver_errs: tuple[type[BaseException], ...] = (
+        (OSError, pa_err_cls)
+        if isinstance(pa_err_cls, type) and issubclass(pa_err_cls, BaseException)
+        else (OSError,)
+    )
+    try:
+        for pf in files:
+            if not pf.exists():
+                continue
+            existing_df = pandas_module.read_parquet(pf, engine="pyarrow")
+            if excluded_sdtm_keys is not None:
+                filtered_df = _filter_df_excluding_sdtm_keys(
+                    existing_df,
+                    excluded_sdtm_keys,
+                    default_domain=sdtm_domain,
+                )
+            else:
+                filtered_df = _filter_df_excluding_record_ids(existing_df, excluded_ids or set())
+            if len(filtered_df) == len(existing_df):
+                continue
+            if not filtered_df.empty:
+                for part_col in ("study_key", "form_key"):
+                    if part_col in filtered_df.columns:
+                        filtered_df = filtered_df.drop(columns=[part_col])
+                replacement_table = pyarrow_module.Table.from_pandas(
+                    filtered_df.reset_index(drop=True),
+                    preserve_index=False,
+                )
+                storage_engine.write_form_table(
+                    replacement_table,
+                    base_dir=base_dir,
+                    study_key=study_key,
+                    form_key=form_key,
+                )
+            pf.unlink(missing_ok=True)
+            if pf.parent != partition_dir and pf.parent.exists() and not any(pf.parent.iterdir()):
+                with contextlib.suppress(OSError):
+                    pf.parent.rmdir()
+        if partition_dir.exists() and not any(partition_dir.rglob("*.parquet")):
+            for child in sorted(partition_dir.rglob("*"), reverse=True):
+                if child.is_dir():
+                    with contextlib.suppress(OSError):
+                        child.rmdir()
+            with contextlib.suppress(OSError):
+                partition_dir.rmdir()
+    except ImednetError:
+        raise
+    except driver_errs as exc:
+        raise ExportBatchError(
+            f"Hive Parquet prune for '{study_key}/{form_key}' failed: {exc}",
+            batch_id=f"{study_key}/{form_key}/reconcile",
+        ) from exc
 
 
 def _prune_hive_partition_record_ids(
@@ -159,43 +299,16 @@ def _prune_hive_partition_record_ids(
     study_key: str,
     form_key: str,
 ) -> None:
-    """Prune superseded or voided record IDs from pre-existing Hive partition Parquet files."""
-    if not files or not excluded_ids:
-        return
-    pandas_module = _ensure_pandas()
-    partition_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={form_key}"
-    for pf in files:
-        if not pf.exists():
-            continue
-        existing_df = pandas_module.read_parquet(pf, engine="pyarrow")
-        filtered_df = _filter_df_excluding_record_ids(existing_df, excluded_ids)
-        if len(filtered_df) == len(existing_df):
-            continue
-        if not filtered_df.empty:
-            for part_col in ("study_key", "form_key"):
-                if part_col in filtered_df.columns:
-                    filtered_df = filtered_df.drop(columns=[part_col])
-            replacement_table = pyarrow_module.Table.from_pandas(
-                filtered_df.reset_index(drop=True),
-                preserve_index=False,
-            )
-            storage_engine.write_form_table(
-                replacement_table,
-                base_dir=base_dir,
-                study_key=study_key,
-                form_key=form_key,
-            )
-        pf.unlink(missing_ok=True)
-        if pf.parent != partition_dir and pf.parent.exists() and not any(pf.parent.iterdir()):
-            with contextlib.suppress(OSError):
-                pf.parent.rmdir()
-    if partition_dir.exists() and not any(partition_dir.rglob("*.parquet")):
-        for child in sorted(partition_dir.rglob("*"), reverse=True):
-            if child.is_dir():
-                with contextlib.suppress(OSError):
-                    child.rmdir()
-        with contextlib.suppress(OSError):
-            partition_dir.rmdir()
+    """Backward-compatible wrapper pruning superseded/voided ``recordId`` rows from Hive partitions."""
+    _prune_hive_partition_files(
+        files,
+        excluded_ids=excluded_ids,
+        pyarrow_module=pyarrow_module,
+        storage_engine=storage_engine,
+        base_dir=base_dir,
+        study_key=study_key,
+        form_key=form_key,
+    )
 
 
 def export_to_hive_parquet(
@@ -239,7 +352,13 @@ def export_to_hive_parquet(
         )
 
     effective_mask_phi = config.mask_phi
-    mapper = _build_record_mapper(sdk, chunk_size=config.batch_size, mask_phi=effective_mask_phi)
+    is_streaming_mode = _config_has_streaming_options(config) or config.quality_gate_enabled
+    mapper = _build_record_mapper(
+        sdk,
+        chunk_size=config.batch_size,
+        mask_phi=effective_mask_phi,
+        use_cache=not is_streaming_mode,
+    )
     if hasattr(mapper, "_active_study_key"):
         mapper._active_study_key = study_key
     pipeline = resolve_enrichment_pipeline(study_key)
@@ -247,7 +366,7 @@ def export_to_hive_parquet(
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
 
-    if _config_has_streaming_options(config) or config.quality_gate_enabled:
+    if is_streaming_mode:
         contexts, all_variables = _build_form_export_contexts(
             sdk,
             study_key,
@@ -270,6 +389,12 @@ def export_to_hive_parquet(
         is_incremental = _is_incremental_config(config)
         preexisting_files: dict[str, list[Path]] = {}
         superseded_ids: dict[str, set[str]] = {ctx.form_key: set() for ctx in contexts}
+        superseded_sdtm_keys: dict[str, set[tuple[tuple[str, Any], ...]]] = {
+            ctx.form_key: set() for ctx in contexts
+        }
+        sdtm_state_by_form: dict[
+            str, tuple[dict[str, dict[str, int]], dict[str, dict[str, Any]]]
+        ] = {}
         if is_incremental and config.idempotent:
             for ctx in contexts:
                 part_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={ctx.form_key}"
@@ -277,7 +402,106 @@ def export_to_hive_parquet(
                     sorted(part_dir.rglob("*.parquet")) if part_dir.exists() else []
                 )
 
-        def _on_hive_active(ctx: _FormExportContext, batch: list[Any], _batch_idx: int) -> int:
+        def _get_form_sdtm_state(
+            ctx: _FormExportContext,
+        ) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, Any]]]:
+            if ctx.form_key not in sdtm_state_by_form:
+                raw_meta = ctx.tx.get("metadata") if isinstance(ctx.tx, dict) else None
+                sdtm_state_by_form[ctx.form_key] = hydrate_sdtm_checkpoint_state(
+                    raw_meta if isinstance(raw_meta, dict) else None
+                )
+            return sdtm_state_by_form[ctx.form_key]
+
+        def _persist_form_sdtm_state(ctx: _FormExportContext) -> None:
+            if ctx.form_key not in sdtm_state_by_form:
+                return
+            seq_by_dom, prov = sdtm_state_by_form[ctx.form_key]
+            raw_meta = ctx.tx.get("metadata") if isinstance(ctx.tx, dict) else None
+            if isinstance(raw_meta, dict):
+                persist_sdtm_checkpoint_state(raw_meta, seq_by_dom, prov)
+
+        def _on_hive_active(ctx: _FormExportContext, batch: list[Any], batch_idx: int) -> int:
+            batch_id_str = f"{study_key}/{ctx.form_key}/{batch_idx}"
+            if config.as_sdtm:
+                pandas_mod = _ensure_pandas()
+                seq_by_dom, prov = _get_form_sdtm_state(ctx)
+                target_domain = resolve_sdtm_domain(ctx.sdtm_domain, fallback="AE")
+                domain_seq = seq_by_dom.setdefault(target_domain, {})
+                batch_records: Sequence[Any] = batch
+                if variable_whitelist is not None:
+                    allowed = set(variable_whitelist)
+                    if pipeline is not None and pipeline.mappings:
+                        for src_var, rule in pipeline.mappings.items():
+                            if rule.target_field in allowed:
+                                allowed.add(src_var)
+                    projected: list[Any] = []
+                    for rec in batch:
+                        rec_data = getattr(rec, "record_data", None)
+                        if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
+                            projected.append(
+                                rec.model_copy(
+                                    update={
+                                        "record_data": {
+                                            k: v for k, v in rec_data.items() if k in allowed
+                                        }
+                                    }
+                                )
+                            )
+                        elif isinstance(rec, Mapping) and isinstance(
+                            rec.get("record_data"), Mapping
+                        ):
+                            cloned = dict(rec)
+                            cloned["record_data"] = {
+                                k: v for k, v in rec["record_data"].items() if k in allowed
+                            }
+                            projected.append(cloned)
+                        else:
+                            projected.append(rec)
+                    batch_records = projected
+
+                raw_sdtm_rows = transform_records_to_sdtm_rows(
+                    batch_records,
+                    domain=target_domain,
+                    study_key=study_key,
+                    include_deleted=config.include_deleted,
+                    mask_phi=effective_mask_phi,
+                    seq_counters=domain_seq,
+                    phi_keys=phi_keys,
+                    pipeline=pipeline,
+                    filter_by_domain=bool(config.sdtm_domain),
+                    include_record_id_provenance=True,
+                    provenance=prov,
+                )
+                cleaned_rows, all_replaced_keys, _ = reconcile_sdtm_provenance_rows(
+                    raw_sdtm_rows,
+                    prov,
+                    default_domain=target_domain,
+                )
+                _persist_form_sdtm_state(ctx)
+                if is_incremental and config.idempotent:
+                    for kd in all_replaced_keys:
+                        superseded_sdtm_keys[ctx.form_key].add(sdtm_natural_key_tuple(kd))
+                if not cleaned_rows:
+                    return 0
+                df = pandas_mod.DataFrame(cleaned_rows)
+                if df.empty:
+                    return 0
+                if effective_mask_phi:
+                    df = _mask_df(df, phi_keys=phi_keys, as_sdtm=True)
+                if is_incremental and config.idempotent:
+                    for kt in _df_sdtm_key_tuples(df, default_domain=target_domain):
+                        if kt is not None:
+                            superseded_sdtm_keys[ctx.form_key].add(kt)
+                return _commit_hive_df(
+                    df,
+                    pyarrow_module=pyarrow_module,
+                    storage_engine=storage_engine,
+                    base_dir=base_dir,
+                    study_key=study_key,
+                    form_key=ctx.form_key,
+                    batch_id=batch_id_str,
+                )
+
             parsed_rows, _ = mapper._parse_records(batch, ctx.record_model)
             rows = (
                 [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
@@ -298,6 +522,9 @@ def export_to_hive_parquet(
                 study_key=study_key,
                 form_key=ctx.form_key,
                 skip_empty=True,
+                naming_convention=config.naming_convention,
+                sdtm_domain=config.sdtm_domain,
+                batch_id=batch_id_str,
             )
             if is_incremental and config.idempotent and written > 0:
                 for rec in batch:
@@ -309,6 +536,13 @@ def export_to_hive_parquet(
         def _on_hive_voided(ctx: _FormExportContext, batch: list[Any], _batch_idx: int) -> int:
             if not (is_incremental and config.idempotent):
                 return 0
+            if config.as_sdtm:
+                _seq_by_dom, prov = _get_form_sdtm_state(ctx)
+                deleted_keys = pop_deleted_sdtm_provenance_keys(batch, prov)
+                _persist_form_sdtm_state(ctx)
+                for kd in deleted_keys:
+                    superseded_sdtm_keys[ctx.form_key].add(sdtm_natural_key_tuple(kd))
+                return len(deleted_keys)
             cids = [
                 cid
                 for rec in batch
@@ -321,15 +555,27 @@ def export_to_hive_parquet(
             if not (is_incremental and config.idempotent):
                 return
             for ctx in contexts:
-                _prune_hive_partition_record_ids(
-                    preexisting_files.get(ctx.form_key, []),
-                    superseded_ids[ctx.form_key],
-                    pyarrow_module=pyarrow_module,
-                    storage_engine=storage_engine,
-                    base_dir=base_dir,
-                    study_key=study_key,
-                    form_key=ctx.form_key,
-                )
+                if config.as_sdtm:
+                    _prune_hive_partition_files(
+                        preexisting_files.get(ctx.form_key, []),
+                        excluded_sdtm_keys=superseded_sdtm_keys[ctx.form_key],
+                        sdtm_domain=ctx.sdtm_domain,
+                        pyarrow_module=pyarrow_module,
+                        storage_engine=storage_engine,
+                        base_dir=base_dir,
+                        study_key=study_key,
+                        form_key=ctx.form_key,
+                    )
+                else:
+                    _prune_hive_partition_files(
+                        preexisting_files.get(ctx.form_key, []),
+                        excluded_ids=superseded_ids[ctx.form_key],
+                        pyarrow_module=pyarrow_module,
+                        storage_engine=storage_engine,
+                        base_dir=base_dir,
+                        study_key=study_key,
+                        form_key=ctx.form_key,
+                    )
 
         _stream_records_across_forms(
             sdk,

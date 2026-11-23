@@ -94,8 +94,14 @@ from imednet.spi.sinks import (
     apply_quality_gate,
     build_sink_mapper,
     extract_record_id,
+    extract_sdtm_natural_key,
+    hydrate_sdtm_checkpoint_state,
     normalize_sink_value,
+    persist_sdtm_checkpoint_state,
+    pop_deleted_sdtm_provenance_keys,
+    pop_sdtm_record_id_provenance,
     require_optional_dep,
+    resolve_sdtm_domain,
     run_streaming_export,
 )
 
@@ -169,14 +175,23 @@ def _post_process_document(doc: dict[str, Any]) -> dict[str, Any]:
 
 def _attach_sdtm_document_id(doc: dict[str, Any], record: Any, study_key: str) -> dict[str, Any]:
     """Attach a deterministic MongoDB ``_id`` to a flat SDTM domain document."""
-    rid = extract_record_id(record)
+    rid = pop_sdtm_record_id_provenance(doc)
+    if rid is None:
+        rid = extract_record_id(record)
     resolved_study = str(doc.get("STUDYID") or study_key)
     if rid is not None:
         doc["_id"] = _make_document_id(resolved_study, rid)
     else:
         domain = str(doc.get("DOMAIN") or "DM")
         usubjid = str(doc.get("USUBJID") or "")
-        seq_val = next((doc[k] for k in doc if k.endswith("SEQ")), 1)
+        seq_val = next(
+            (
+                doc[k]
+                for k in doc
+                if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
+            ),
+            1,
+        )
         doc["_id"] = f"{resolved_study}/{domain}/{usubjid}/{seq_val}"
     normalized: dict[str, Any] = normalize_sink_value(doc)
     return _encode_bson_scalars(normalized)  # type: ignore[no-any-return]
@@ -228,9 +243,21 @@ class MongoDbExportSink(ExportSink):
         self._collection_name = self.config.collection
         self._study_key = self.config.study_key
         self._seq_counters: dict[str, int] = {}
+        self._seq_counters_by_domain: dict[str, dict[str, int]] = {}
+        self._sdtm_provenance: dict[str, dict[str, Any]] = {}
         self._client: Any = None
         self._collection: Any = None
         self._connect()
+
+    def bind_checkpoint_metadata(self, metadata: dict[str, Any] | None) -> None:
+        """Bind mutable checkpoint metadata to persist SDTM sequence and provenance state."""
+        super().bind_checkpoint_metadata(metadata)
+        self._seq_counters_by_domain, self._sdtm_provenance = hydrate_sdtm_checkpoint_state(
+            metadata
+        )
+        if self.config.sdtm_domain:
+            dom = resolve_sdtm_domain(self.config.sdtm_domain)
+            self._seq_counters = self._seq_counters_by_domain.setdefault(dom, {})
 
     # ------------------------------------------------------------------
     # Connection management
@@ -267,6 +294,9 @@ class MongoDbExportSink(ExportSink):
             mode="document",
             post_processor=post_proc,
             seq_counters=self._seq_counters,
+            seq_counters_by_domain=self._seq_counters_by_domain,
+            include_sdtm_provenance=self.config.as_sdtm,
+            sdtm_provenance=self._sdtm_provenance,
         )
         mapped_docs: list[dict[str, Any]] | None = None
 
@@ -275,9 +305,46 @@ class MongoDbExportSink(ExportSink):
             nonlocal mapped_docs
             if mapped_docs is None:
                 try:
-                    mapped_docs = [
-                        _record_to_document(r, self._study_key, mapper=mapper) for r in records
-                    ]
+                    if self.config.as_sdtm:
+                        raw_rows = mapper.map_records(records, study_key=self._study_key)
+                        dedup_docs: dict[str, dict[str, Any]] = {}
+                        for raw_row in raw_rows:
+                            doc = dict(raw_row)
+                            rid = pop_sdtm_record_id_provenance(doc)
+                            nat_key = extract_sdtm_natural_key(
+                                doc, default_domain=self.config.sdtm_domain
+                            )
+                            resolved_study = str(doc.get("STUDYID") or self._study_key)
+                            if rid is not None:
+                                doc["_id"] = _make_document_id(resolved_study, rid)
+                                self._sdtm_provenance[rid] = dict(nat_key)
+                            else:
+                                domain = str(doc.get("DOMAIN") or "DM")
+                                usubjid = str(doc.get("USUBJID") or "")
+                                seq_val = next(
+                                    (
+                                        doc[k]
+                                        for k in doc
+                                        if k.endswith("SEQ")
+                                        and k not in ("STUDYID", "DOMAIN", "USUBJID")
+                                    ),
+                                    1,
+                                )
+                                doc["_id"] = f"{resolved_study}/{domain}/{usubjid}/{seq_val}"
+                            encoded_doc: dict[str, Any] = _encode_bson_scalars(
+                                normalize_sink_value(doc)
+                            )
+                            dedup_docs[str(encoded_doc["_id"])] = encoded_doc
+                        mapped_docs = list(dedup_docs.values())
+                        persist_sdtm_checkpoint_state(
+                            self._checkpoint_metadata,
+                            self._seq_counters_by_domain,
+                            self._sdtm_provenance,
+                        )
+                    else:
+                        mapped_docs = [
+                            _record_to_document(r, self._study_key, mapper=mapper) for r in records
+                        ]
                 except ExportConfigurationError:
                     raise
                 except Exception:
@@ -312,11 +379,32 @@ class MongoDbExportSink(ExportSink):
         """Delete newly voided documents from MongoDB when running idempotently."""
         if not self.config.idempotent or not records:
             return 0
-        doc_ids = [
-            _make_document_id(self._study_key, rid)
-            for r in records
-            if (rid := extract_record_id(r)) is not None
-        ]
+        deleted_sdtm_keys: list[dict[str, Any]] = []
+        if self.config.as_sdtm:
+            deleted_sdtm_keys = pop_deleted_sdtm_provenance_keys(records, self._sdtm_provenance)
+            persist_sdtm_checkpoint_state(
+                self._checkpoint_metadata,
+                self._seq_counters_by_domain,
+                self._sdtm_provenance,
+            )
+        doc_ids_ordered: list[str] = []
+        seen_ids: set[str] = set()
+        for r in records:
+            rid = extract_record_id(r)
+            if rid is None:
+                continue
+            primary_id = _make_document_id(self._study_key, rid)
+            if primary_id not in seen_ids:
+                seen_ids.add(primary_id)
+                doc_ids_ordered.append(primary_id)
+            for kd in deleted_sdtm_keys:
+                prev_study = str(kd.get("STUDYID") or "")
+                if prev_study and prev_study != self._study_key:
+                    alt_id = _make_document_id(prev_study, rid)
+                    if alt_id not in seen_ids:
+                        seen_ids.add(alt_id)
+                        doc_ids_ordered.append(alt_id)
+        doc_ids = doc_ids_ordered
         if not doc_ids:
             return 0
 
@@ -367,7 +455,7 @@ def export_to_mongodb(
         study_key,
         lambda: MongoDbExportSink(config=resolved_cfg),
         resolved_cfg,
-        stream_name=f"mongodb_{resolved_cfg.collection}",
+        stream_name=resolved_cfg.stream_name or f"mongodb_{resolved_cfg.collection}",
         quality_gate_fn=apply_quality_gate,
     )
 

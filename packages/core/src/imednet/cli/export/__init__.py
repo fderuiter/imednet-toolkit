@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 from ...endpoints.records import RecordsEndpoint
+from ...errors import ValidationError
 from ...integrations.sink_base import normalize_watermark_datetime
 from ...models.records import Record
 from ...sdk import ImednetSDK
@@ -30,6 +33,139 @@ def _add_export_study_args(parser: argparse.ArgumentParser) -> None:
     """Attach hybrid study key and simulation flags to an export subcommand."""
     add_study_key_args(parser)
     add_simulation_arg(parser)
+
+
+def _add_filter_whitelist_args(parser: argparse.ArgumentParser) -> None:
+    """Attach ``--vars`` and ``--forms`` whitelist options to an export subcommand."""
+    parser.add_argument(
+        "--vars",
+        dest="vars_",
+        default=None,
+        help="Comma-separated list of variable names to include.",
+    )
+    parser.add_argument(
+        "--forms",
+        default=None,
+        help="Comma-separated list of form IDs or form keys to include.",
+    )
+
+
+def _parse_var_whitelist(vars_: str | None) -> list[str] | None:
+    """Parse comma-separated ``--vars`` values into a clean list of variable names."""
+    if not vars_:
+        return None
+    parsed = [v.strip() for v in vars_.split(",") if v.strip()]
+    return parsed or None
+
+
+def _resolve_form_whitelist(
+    sdk: ImednetSDK,
+    study_key: str,
+    forms: str | None,
+) -> list[int] | None:
+    """Resolve comma-separated ``--forms`` values containing ``formId`` integers or ``formKey`` names."""
+    if not forms:
+        return None
+    tokens = [tok.strip() for tok in forms.split(",") if tok.strip()]
+    if not tokens:
+        return None
+
+    parsed_ints: list[int] = []
+    needs_lookup = False
+    for tok in tokens:
+        try:
+            parsed_ints.append(int(tok))
+        except ValueError:
+            needs_lookup = True
+            break
+
+    if not needs_lookup:
+        return parsed_ints
+
+    raw_forms: Iterable[Any] = ()
+    forms_endpoint = getattr(sdk, "forms", None)
+    if forms_endpoint is not None and callable(getattr(forms_endpoint, "list", None)):
+        candidate = forms_endpoint.list(study_key=study_key)
+        if isinstance(candidate, Iterable):
+            raw_forms = list(candidate)
+    if not raw_forms and callable(getattr(sdk, "get_forms", None)):
+        fallback = sdk.get_forms(study_key)
+        if isinstance(fallback, Iterable):
+            raw_forms = list(fallback)
+
+    exact_key_map: dict[str, int] = {}
+    lower_key_map: dict[str, int] = {}
+    for form_obj in raw_forms:
+        if isinstance(form_obj, dict):
+            fid = form_obj.get("formId", form_obj.get("form_id"))
+            fkey = form_obj.get("formKey", form_obj.get("form_key"))
+        else:
+            fid = getattr(form_obj, "form_id", getattr(form_obj, "formId", None))
+            fkey = getattr(form_obj, "form_key", getattr(form_obj, "formKey", None))
+        if fid is None:
+            continue
+        try:
+            fid_int = int(fid)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(fkey, str) and fkey.strip():
+            clean_key = fkey.strip()
+            exact_key_map[clean_key] = fid_int
+            lower_key_map.setdefault(clean_key.lower(), fid_int)
+
+    resolved: list[int] = []
+    for tok in tokens:
+        try:
+            resolved.append(int(tok))
+            continue
+        except ValueError:
+            pass
+        if tok in exact_key_map:
+            resolved.append(exact_key_map[tok])
+            continue
+        lowered = tok.lower()
+        if lowered in lower_key_map:
+            resolved.append(lower_key_map[lowered])
+            continue
+        raise ValidationError(
+            f"Unknown form '{tok}' in study '{study_key}'. Expected a valid formKey or integer formId."
+        )
+
+    return resolved
+
+
+def _is_sqlite_connection_string(connection_string: str | None) -> bool:
+    """Return True when *connection_string* targets a SQLite database."""
+    if not connection_string:
+        return False
+    return connection_string.strip().lower().startswith("sqlite:")
+
+
+def _validate_export_flag_conflicts(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    """Validate cross-flag CLI export invariants and exit with status 2 on conflict."""
+    if (
+        getattr(args, "quality_gate_enabled", None) is False
+        and getattr(args, "min_schema_readiness_score", None) is not None
+    ):
+        parser.error("--min-readiness-score cannot be combined with --no-quality-gate")
+
+    effective_sdtm = bool(
+        getattr(args, "as_sdtm", False) or getattr(args, "sdtm_domain", None) is not None
+    )
+    naming_convention = getattr(args, "naming_convention", None)
+    use_labels = bool(getattr(args, "use_labels", False))
+
+    if effective_sdtm and naming_convention in {"snake_case", "camelCase"}:
+        parser.error(
+            f"--naming-convention {naming_convention} cannot be combined with --as-sdtm or --sdtm-domain"
+        )
+    if use_labels and effective_sdtm:
+        parser.error("--use-labels cannot be combined with --as-sdtm or --sdtm-domain")
+    if use_labels and naming_convention is not None:
+        parser.error("--use-labels cannot be combined with --naming-convention")
 
 
 def _resolve_export_study(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str:
@@ -92,30 +228,33 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Optional file path for file-backed checkpoint state ledger.",
     )
-    parser.add_argument(
+    mask_group = parser.add_mutually_exclusive_group()
+    mask_group.add_argument(
         "--mask-phi",
         dest="mask_phi",
         action="store_true",
         default=True,
         help="Mask sensitive Subject PHI fields with ***MASKED*** (enabled by default).",
     )
-    parser.add_argument(
+    mask_group.add_argument(
         "--no-mask-phi",
         dest="mask_phi",
         action="store_false",
         help="Disable default PHI masking for authorized raw exports.",
     )
-    parser.add_argument(
+    qg_group = parser.add_mutually_exclusive_group()
+    qg_group.add_argument(
         "--quality-gate",
         dest="quality_gate_enabled",
         action="store_true",
         default=None,
         help="Enable pre-write record schema readiness quality gate filtering.",
     )
-    parser.add_argument(
+    qg_group.add_argument(
         "--no-quality-gate",
         dest="quality_gate_enabled",
         action="store_false",
+        default=None,
         help="Disable pre-write record schema readiness quality gate filtering.",
     )
     parser.add_argument(
@@ -254,6 +393,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     pq_parser = sub.add_parser("parquet", help="Export study records to a Parquet file.")
     _add_export_study_args(pq_parser)
     pq_parser.add_argument("path", type=Path, help="Destination Parquet file.")
+    _add_filter_whitelist_args(pq_parser)
     pq_parser.add_argument(
         "--use-labels",
         action="store_true",
@@ -267,33 +407,49 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         /,
         study_key: str,
         path: Path,
+        vars_: str | None = None,
+        forms: str | None = None,
         use_labels: bool = False,
         **stream_kwargs: Any,
     ) -> None:
         if importlib.util.find_spec("pyarrow") is None:
             print_error(
-                "Error: pyarrow is required for Parquet export. Install with \"pip install 'imednet[export]'\"."
+                "Error: pyarrow is required for Parquet export. Install with \"pip install 'imednet[export]'\""
             )
             sys.exit(1)
         from .. import export_to_parquet
 
+        var_list = _parse_var_whitelist(vars_)
+        form_list = _resolve_form_whitelist(sdk, study_key, forms)
+        call_kwargs: dict[str, Any] = dict(stream_kwargs)
+        if var_list is not None:
+            call_kwargs["variable_whitelist"] = var_list
+        if form_list is not None:
+            call_kwargs["form_whitelist"] = form_list
         with fetching_status("records for Parquet export", study_key):
             export_to_parquet(
                 sdk,
                 study_key,
                 str(path),
                 use_labels_as_columns=use_labels,
-                **stream_kwargs,
+                **call_kwargs,
             )
 
     def _dispatch_pq(args: argparse.Namespace) -> None:
         study_key = _resolve_export_study(pq_parser, args)
+        _validate_export_flag_conflicts(pq_parser, args)
         stream_kwargs = _extract_streaming_kwargs(args)
+        extra_opts: dict[str, Any] = {}
+        if args.vars_ is not None:
+            extra_opts["vars_"] = args.vars_
+        if args.forms is not None:
+            extra_opts["forms"] = args.forms
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_parquet(
                 study_key=study_key,
                 path=args.path,
                 use_labels=args.use_labels,
+                **extra_opts,
                 **stream_kwargs,
             )
 
@@ -303,6 +459,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     csv_parser = sub.add_parser("csv", help="Export study records to a CSV file.")
     _add_export_study_args(csv_parser)
     csv_parser.add_argument("path", type=Path, help="Destination CSV file.")
+    _add_filter_whitelist_args(csv_parser)
     csv_parser.add_argument(
         "--use-labels",
         action="store_true",
@@ -316,6 +473,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         /,
         study_key: str,
         path: Path,
+        vars_: str | None = None,
+        forms: str | None = None,
         use_labels: bool = False,
         **stream_kwargs: Any,
     ) -> None:
@@ -324,23 +483,37 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             sys.exit(1)
         from .. import export_to_csv
 
+        var_list = _parse_var_whitelist(vars_)
+        form_list = _resolve_form_whitelist(sdk, study_key, forms)
+        call_kwargs: dict[str, Any] = dict(stream_kwargs)
+        if var_list is not None:
+            call_kwargs["variable_whitelist"] = var_list
+        if form_list is not None:
+            call_kwargs["form_whitelist"] = form_list
         with fetching_status("records for CSV export", study_key):
             export_to_csv(
                 sdk,
                 study_key,
                 str(path),
                 use_labels_as_columns=use_labels,
-                **stream_kwargs,
+                **call_kwargs,
             )
 
     def _dispatch_csv(args: argparse.Namespace) -> None:
         study_key = _resolve_export_study(csv_parser, args)
+        _validate_export_flag_conflicts(csv_parser, args)
         stream_kwargs = _extract_streaming_kwargs(args)
+        extra_opts: dict[str, Any] = {}
+        if args.vars_ is not None:
+            extra_opts["vars_"] = args.vars_
+        if args.forms is not None:
+            extra_opts["forms"] = args.forms
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_csv(
                 study_key=study_key,
                 path=args.path,
                 use_labels=args.use_labels,
+                **extra_opts,
                 **stream_kwargs,
             )
 
@@ -350,6 +523,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     xl_parser = sub.add_parser("excel", help="Export study records to an Excel workbook.")
     _add_export_study_args(xl_parser)
     xl_parser.add_argument("path", type=Path, help="Destination Excel workbook.")
+    _add_filter_whitelist_args(xl_parser)
     xl_parser.add_argument(
         "--use-labels",
         action="store_true",
@@ -363,6 +537,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         /,
         study_key: str,
         path: Path,
+        vars_: str | None = None,
+        forms: str | None = None,
         use_labels: bool = False,
         **stream_kwargs: Any,
     ) -> None:
@@ -374,23 +550,37 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             sys.exit(1)
         from .. import export_to_excel
 
+        var_list = _parse_var_whitelist(vars_)
+        form_list = _resolve_form_whitelist(sdk, study_key, forms)
+        call_kwargs: dict[str, Any] = dict(stream_kwargs)
+        if var_list is not None:
+            call_kwargs["variable_whitelist"] = var_list
+        if form_list is not None:
+            call_kwargs["form_whitelist"] = form_list
         with fetching_status("records for Excel export", study_key):
             export_to_excel(
                 sdk,
                 study_key,
                 str(path),
                 use_labels_as_columns=use_labels,
-                **stream_kwargs,
+                **call_kwargs,
             )
 
     def _dispatch_xl(args: argparse.Namespace) -> None:
         study_key = _resolve_export_study(xl_parser, args)
+        _validate_export_flag_conflicts(xl_parser, args)
         stream_kwargs = _extract_streaming_kwargs(args)
+        extra_opts: dict[str, Any] = {}
+        if args.vars_ is not None:
+            extra_opts["vars_"] = args.vars_
+        if args.forms is not None:
+            extra_opts["forms"] = args.forms
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_excel(
                 study_key=study_key,
                 path=args.path,
                 use_labels=args.use_labels,
+                **extra_opts,
                 **stream_kwargs,
             )
 
@@ -400,6 +590,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     json_parser = sub.add_parser("json", help="Export study records to a JSON file.")
     _add_export_study_args(json_parser)
     json_parser.add_argument("path", type=Path, help="Destination JSON file.")
+    _add_filter_whitelist_args(json_parser)
     json_parser.add_argument(
         "--use-labels",
         action="store_true",
@@ -418,12 +609,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         /,
         study_key: str,
         path: Path,
+        vars_: str | None = None,
+        forms: str | None = None,
         use_labels: bool = False,
         hierarchical: bool = False,
         **stream_kwargs: Any,
     ) -> None:
         from .. import export_to_json
 
+        var_list = _parse_var_whitelist(vars_)
+        form_list = _resolve_form_whitelist(sdk, study_key, forms)
+        call_kwargs: dict[str, Any] = dict(stream_kwargs)
+        if var_list is not None:
+            call_kwargs["variable_whitelist"] = var_list
+        if form_list is not None:
+            call_kwargs["form_whitelist"] = form_list
         with fetching_status("records for JSON export", study_key):
             export_to_json(
                 sdk,
@@ -431,18 +631,25 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 str(path),
                 use_labels_as_columns=use_labels,
                 hierarchical=hierarchical,
-                **stream_kwargs,
+                **call_kwargs,
             )
 
     def _dispatch_json(args: argparse.Namespace) -> None:
         study_key = _resolve_export_study(json_parser, args)
+        _validate_export_flag_conflicts(json_parser, args)
         stream_kwargs = _extract_streaming_kwargs(args)
+        extra_opts: dict[str, Any] = {}
+        if args.vars_ is not None:
+            extra_opts["vars_"] = args.vars_
+        if args.forms is not None:
+            extra_opts["forms"] = args.forms
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_json_cmd(
                 study_key=study_key,
                 path=args.path,
                 use_labels=args.use_labels,
                 hierarchical=args.hierarchical,
+                **extra_opts,
                 **stream_kwargs,
             )
 
@@ -453,10 +660,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     _add_export_study_args(ddb_parser)
     ddb_parser.add_argument("table_name", help="Destination DuckDB table name.")
     ddb_parser.add_argument("db_path", type=Path, help="Path to DuckDB database file.")
-    ddb_parser.add_argument(
-        "--vars", dest="vars_", help="Comma-separated list of variable names to include."
-    )
-    ddb_parser.add_argument("--forms", help="Comma-separated list of form IDs to include.")
+    _add_filter_whitelist_args(ddb_parser)
     ddb_parser.add_argument(
         "--use-labels",
         action="store_true",
@@ -483,16 +687,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             sys.exit(1)
         from ...integrations.export import _validate_duckdb_identifier
 
-        try:
-            _validate_duckdb_identifier(table_name)
-        except ValueError as exc:
-            print_error(f"Error: {exc}")
-            sys.exit(1)
+        _validate_duckdb_identifier(table_name)
 
         from .. import export_to_duckdb
 
-        var_list = [v.strip() for v in vars_.split(",")] if vars_ else None
-        form_list = [int(f.strip()) for f in forms.split(",")] if forms else None
+        var_list = _parse_var_whitelist(vars_)
+        form_list = _resolve_form_whitelist(sdk, study_key, forms)
         with fetching_status("records for DuckDB export", study_key):
             export_to_duckdb(
                 sdk,
@@ -507,6 +707,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     def _dispatch_ddb(args: argparse.Namespace) -> None:
         study_key = _resolve_export_study(ddb_parser, args)
+        _validate_export_flag_conflicts(ddb_parser, args)
         stream_kwargs = _extract_streaming_kwargs(args)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_duckdb(
@@ -524,7 +725,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     # sql
     sql_parser = sub.add_parser("sql", help="Export study records to a SQL table.")
     _add_export_study_args(sql_parser)
-    sql_parser.add_argument("table", help="Destination table name.")
+    sql_parser.add_argument(
+        "table",
+        nargs="?",
+        default=None,
+        help="Destination table name (optional for per-form SQLite exports).",
+    )
     sql_parser.add_argument("connection_string", help="Database connection string.")
     sql_parser.add_argument(
         "--single-table",
@@ -534,10 +740,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     sql_parser.add_argument(
         "--long-format", action="store_true", help="Export normalized long-format table."
     )
-    sql_parser.add_argument(
-        "--vars", dest="vars_", help="Comma-separated list of variable names to include."
-    )
-    sql_parser.add_argument("--forms", help="Comma-separated list of form IDs to include.")
+    _add_filter_whitelist_args(sql_parser)
     _add_streaming_export_args(sql_parser)
 
     @with_sdk
@@ -545,7 +748,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         sdk: ImednetSDK,
         /,
         study_key: str,
-        table: str,
+        table: str | None,
         connection_string: str,
         single_table: bool = False,
         long_format: bool = False,
@@ -561,13 +764,34 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         from .. import export_to_long_sql, export_to_sql, export_to_sql_by_form
 
         engine = create_engine(connection_string)
-        var_list = [v.strip() for v in vars_.split(",")] if vars_ else None
-        form_list = [int(f.strip()) for f in forms.split(",")] if forms else None
+        is_sqlite = engine.dialect.name == "sqlite"
+        if (single_table or long_format or not is_sqlite) and not table:
+            sql_parser.error("the following arguments are required: table")
+
+        var_list = _parse_var_whitelist(vars_)
+        form_list = _resolve_form_whitelist(sdk, study_key, forms)
         with fetching_status("records for SQL export", study_key):
             if long_format:
-                export_to_long_sql(sdk, study_key, table, connection_string, **stream_kwargs)
+                assert table is not None
+                long_kwargs: dict[str, Any] = dict(stream_kwargs)
+                if var_list is not None:
+                    long_kwargs["variable_whitelist"] = var_list
+                if form_list is not None:
+                    long_kwargs["form_whitelist"] = form_list
+                export_to_long_sql(
+                    sdk,
+                    study_key,
+                    table,
+                    connection_string,
+                    **long_kwargs,
+                )
                 return
-            if not single_table and engine.dialect.name == "sqlite":
+            if not single_table and is_sqlite:
+                if table is not None:
+                    print_error(
+                        f"Warning: positional table argument '{table}' is ignored for per-form "
+                        "SQLite exports (pass --single-table or --long-format to target a single table)."
+                    )
                 export_to_sql_by_form(
                     sdk,
                     study_key,
@@ -577,6 +801,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     **stream_kwargs,
                 )
             else:
+                assert table is not None
                 export_to_sql(
                     sdk,
                     study_key,
@@ -588,7 +813,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 )
 
     def _dispatch_sql(args: argparse.Namespace) -> None:
+        is_sqlite_conn = _is_sqlite_connection_string(args.connection_string)
+        if (
+            getattr(args, "study_key_flag", None) is not None
+            and getattr(args, "study_key", None) is not None
+            and getattr(args, "table", None) is None
+            and (args.single_table or args.long_format or not is_sqlite_conn)
+        ):
+            args.table = args.study_key
+            args.study_key = None
+
         study_key = _resolve_export_study(sql_parser, args)
+        _validate_export_flag_conflicts(sql_parser, args)
+        if (args.single_table or args.long_format or not is_sqlite_conn) and not args.table:
+            sql_parser.error("the following arguments are required: table")
+
         stream_kwargs = _extract_streaming_kwargs(args)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_sql(
@@ -651,6 +890,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     def _dispatch_mongodb(args: argparse.Namespace) -> None:
         study_key = _resolve_export_study(m_parser, args)
+        _validate_export_flag_conflicts(m_parser, args)
         stream_kwargs = _extract_streaming_kwargs(args)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_mongodb(
@@ -672,7 +912,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     _add_export_study_args(n_parser)
     n_parser.add_argument("uri", help="Neo4j URI.")
     n_parser.add_argument("username", help="Neo4j username.")
-    n_parser.add_argument("password", help="Neo4j password.")
+    n_parser.add_argument(
+        "password",
+        nargs="?",
+        default=None,
+        help="Optional Neo4j password (prefer --password or NEO4J_PASSWORD).",
+    )
+    n_parser.add_argument(
+        "--password",
+        dest="password_opt",
+        default=None,
+        help="Neo4j password (defaults to NEO4J_PASSWORD environment variable).",
+    )
     n_parser.add_argument("--database", default="neo4j", help="Neo4j database name.")
     n_parser.add_argument("--batch-size", type=int, default=500, help="Records per batch.")
     n_parser.add_argument(
@@ -715,14 +966,37 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             sdk.sinks.export_to_neo4j(study_key, config=cfg)
 
     def _dispatch_neo4j(args: argparse.Namespace) -> None:
+        if (
+            getattr(args, "study_key_flag", None) is not None
+            and getattr(args, "study_key", None) is not None
+            and getattr(args, "password", None) is None
+            and "://" in str(args.study_key)
+        ):
+            args.uri, args.username, args.password = args.study_key, args.uri, args.username
+            args.study_key = None
+
         study_key = _resolve_export_study(n_parser, args)
+        _validate_export_flag_conflicts(n_parser, args)
+        if args.password is not None and args.password_opt is not None:
+            n_parser.error(
+                "conflicting password arguments: provide --password or positional password, not both"
+            )
+        resolved_password = (
+            args.password_opt
+            if args.password_opt is not None
+            else (args.password if args.password is not None else os.environ.get("NEO4J_PASSWORD"))
+        )
+        if not isinstance(resolved_password, str) or not resolved_password:
+            n_parser.error("Neo4j password is required via --password or NEO4J_PASSWORD.")
+        assert isinstance(resolved_password, str)
+
         stream_kwargs = _extract_streaming_kwargs(args)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_neo4j(
                 study_key=study_key,
                 uri=args.uri,
                 username=args.username,
-                password=args.password,
+                password=resolved_password,
                 database=args.database,
                 batch_size=args.batch_size,
                 merge=args.merge,
@@ -738,12 +1012,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     _add_export_study_args(s_parser)
     s_parser.add_argument("account", help="Snowflake account identifier.")
     s_parser.add_argument("user", help="Snowflake username.")
-    s_parser.add_argument("password", help="Snowflake password.")
     s_parser.add_argument("database", help="Target Snowflake database.")
     s_parser.add_argument("schema", help="Target Snowflake schema.")
     s_parser.add_argument("warehouse", help="Snowflake warehouse.")
     s_parser.add_argument("stage", help="Internal stage name.")
     s_parser.add_argument("table", help="Target table name.")
+    s_parser.add_argument("extra_arg", nargs="?", default=None, help=argparse.SUPPRESS)
+    s_parser.add_argument(
+        "--password",
+        dest="password_opt",
+        default=None,
+        help="Snowflake password (defaults to SNOWFLAKE_PASSWORD environment variable).",
+    )
     s_parser.add_argument("--stage-prefix", default="imednet", help="Path prefix in stage.")
     s_parser.add_argument(
         "--local-staging-dir",
@@ -813,19 +1093,49 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             sdk.sinks.export_to_snowflake(study_key, config=cfg)
 
     def _dispatch_snowflake(args: argparse.Namespace) -> None:
+        pos_password: str | None = None
+        database = args.database
+        schema = args.schema
+        warehouse = args.warehouse
+        stage = args.stage
+        table = args.table
+        if args.extra_arg is not None:
+            pos_password = args.database
+            database = args.schema
+            schema = args.warehouse
+            warehouse = args.stage
+            stage = args.table
+            table = args.extra_arg
+
         study_key = _resolve_export_study(s_parser, args)
+        _validate_export_flag_conflicts(s_parser, args)
+        if pos_password is not None and args.password_opt is not None:
+            s_parser.error(
+                "conflicting password arguments: provide --password or positional password, not both"
+            )
+        resolved_password = (
+            args.password_opt
+            if args.password_opt is not None
+            else (
+                pos_password if pos_password is not None else os.environ.get("SNOWFLAKE_PASSWORD")
+            )
+        )
+        if not isinstance(resolved_password, str) or not resolved_password:
+            s_parser.error("Snowflake password is required via --password or SNOWFLAKE_PASSWORD.")
+        assert isinstance(resolved_password, str)
+
         stream_kwargs = _extract_streaming_kwargs(args)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_snowflake(
                 study_key=study_key,
                 account=args.account,
                 user=args.user,
-                password=args.password,
-                database=args.database,
-                schema=args.schema,
-                warehouse=args.warehouse,
-                stage=args.stage,
-                table=args.table,
+                password=resolved_password,
+                database=database,
+                schema=schema,
+                warehouse=warehouse,
+                stage=stage,
+                table=table,
                 stage_prefix=args.stage_prefix,
                 local_staging_dir=args.local_staging_dir,
                 manifest_path=args.manifest_path,

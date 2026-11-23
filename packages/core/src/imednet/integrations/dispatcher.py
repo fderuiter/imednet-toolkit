@@ -5,6 +5,7 @@ supporting both tabular procedural functions and object-oriented sink classes.
 """
 
 import dataclasses
+import sys
 import threading
 from collections.abc import Callable
 from importlib.metadata import entry_points
@@ -141,11 +142,23 @@ def export(
     if sink_class is not None:
         if config is not None:
             cfg = config
+            if kwargs:
+                valid_fields = {f.name for f in dataclasses.fields(type(cfg))}
+                override_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+                if override_kwargs:
+                    cfg = dataclasses.replace(cfg, **override_kwargs)
         else:
             config_class = _registry.get_config_class(target)
             valid_fields = {f.name for f in dataclasses.fields(config_class)}
             config_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
             cfg = config_class(study_key=study_key, **config_kwargs)
+
+        sink_module = sys.modules.get(sink_class.__module__)
+        helper_fn = (
+            getattr(sink_module, f"export_to_{target}", None) if sink_module is not None else None
+        )
+        if callable(helper_fn):
+            return helper_fn(sdk, study_key, config=cfg)
 
         return run_streaming_export(
             sdk,

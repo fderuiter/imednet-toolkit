@@ -15,11 +15,13 @@ from imednet.errors import (
     AuthenticationError,
     AuthorizationError,
     ForbiddenError,
+    ImednetError,
     NotFoundError,
     PathTraversalValidationError,
     RateLimitError,
     UnauthorizedError,
 )
+from imednet.utils.job_poller import JobFailedError
 from imednet.utils.secrets import redact_sensitive_payload
 from imednet.utils.url import validate_path_segment
 
@@ -33,7 +35,13 @@ R = TypeVar("R")
 def redact_cli_secrets(msg: str) -> str:
     """Redact environment secrets and sensitive tokens from CLI error messages."""
     redacted = msg
-    for env_var in ("IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_OIDC_TOKEN"):
+    for env_var in (
+        "IMEDNET_API_KEY",
+        "IMEDNET_SECURITY_KEY",
+        "IMEDNET_OIDC_TOKEN",
+        "NEO4J_PASSWORD",
+        "SNOWFLAKE_PASSWORD",
+    ):
         val = os.environ.get(env_var)
         if val:
             if val in redacted:
@@ -130,6 +138,14 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
         except ApiError as exc:
             msg = _redact_secrets(str(exc))
             print_error(f"API Error: {msg}")
+            sys.exit(1)
+        except JobFailedError as exc:
+            msg = _redact_secrets(str(exc))
+            print_error(f"Unexpected error: {msg}")
+            sys.exit(1)
+        except ImednetError as exc:
+            msg = _redact_secrets(str(exc))
+            print_error(f"Error: {msg}")
             sys.exit(1)
         except KeyboardInterrupt:
             clear_line()

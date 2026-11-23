@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from unittest.mock import NonCallableMock
 
+from imednet.errors import ExportBatchError, ExportConfigurationError, ImednetError
 from imednet.integrations.enrichment import (
     EnrichmentPipeline,
     _matches_custom_phi_key,
@@ -39,19 +40,33 @@ from imednet.integrations.sink_base import (
     extract_record_form_ref,
     extract_record_id,
     extract_record_timestamp,
+    extract_sdtm_natural_key,
     get_state_provider,
+    hydrate_sdtm_checkpoint_state,
     is_record_deleted,
     iter_batches,
     iter_filtered_sdk_records,
     normalize_watermark_datetime,
+    persist_sdtm_checkpoint_state,
+    pop_deleted_sdtm_provenance_keys,
+    reconcile_sdtm_provenance_rows,
+    redact_batch_records,
     run_streaming_export,
+    sdtm_natural_key_tuple,
+)
+from imednet.models.sdtm import (
+    _is_birth_date_alias_key,
+    form_matches_sdtm_domain,
+    format_iso8601_dtc,
+    infer_record_sdtm_domain,
+    infer_sdtm_domain_from_form,
+    transform_records_to_sdtm_rows,
 )
 from imednet.models.standards import (
     format_variable_name,
     get_sdtm_domain_variables,
     normalize_naming_convention,
     resolve_sdtm_domain,
-    transform_records_to_sdtm,
 )
 
 try:
@@ -69,11 +84,45 @@ from ..sdk import ImednetSDK
 _SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 
+class InvalidDuckDBIdentifierError(ExportConfigurationError, ValueError):
+    """Raised when a DuckDB table or column identifier fails validation."""
+
+
 def _validate_duckdb_identifier(name: str) -> None:
     if not isinstance(name, str) or not _SAFE_IDENTIFIER_PATTERN.fullmatch(name):
-        raise ValueError(
+        raise InvalidDuckDBIdentifierError(
             f"Invalid identifier {name!r}. Only alphanumeric characters and underscores are allowed."
         )
+
+
+def _create_sqlalchemy_engine(conn_str: str) -> Any:
+    """Create a SQLAlchemy engine, wrapping invalid connection URLs in ``ExportConfigurationError``."""
+    from sqlalchemy import create_engine
+
+    try:
+        return create_engine(conn_str)
+    except ImednetError:
+        raise
+    except Exception as exc:
+        raise ExportConfigurationError(f"Invalid SQL connection configuration: {exc}") from exc
+
+
+def _connect_duckdb(duckdb_mod: Any, db_path: str, *, threads_one: bool = False) -> Any:
+    """Open a DuckDB connection, wrapping driver/filesystem errors in ``ExportConfigurationError``."""
+    ddb_err_cls = getattr(duckdb_mod, "Error", None)
+    driver_errs: tuple[type[BaseException], ...] = (
+        (OSError, ddb_err_cls)
+        if isinstance(ddb_err_cls, type) and issubclass(ddb_err_cls, BaseException)
+        else (OSError,)
+    )
+    try:
+        if threads_one:
+            return duckdb_mod.connect(db_path, config={"threads": "1"})
+        return duckdb_mod.connect(db_path)
+    except ImednetError:
+        raise
+    except driver_errs as exc:
+        raise ExportConfigurationError(f"Cannot connect to DuckDB at {db_path!r}: {exc}") from exc
 
 
 def _quote_duckdb_identifier(name: str) -> str:
@@ -123,16 +172,38 @@ def _is_custom_phi_key(key: str, phi_keys: set[str] | None) -> bool:
     return _matches_custom_phi_key(key, phi_keys)
 
 
-def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFrame:
+def _redact_sdtm_birth_cell(val: Any) -> Any:
+    """Redact a birth-date scalar to a 4-digit ISO year on SDTM exports."""
+    if _is_missing_scalar(val):
+        return val
+    return format_iso8601_dtc(val, redact_to_year=True)
+
+
+def _mask_df(
+    df: pd.DataFrame,
+    *,
+    phi_keys: set[str] | None = None,
+    as_sdtm: bool = False,
+) -> pd.DataFrame:
     """Mask sensitive fields in the DataFrame based on global and study rules."""
-    sensitive_cols = list(
-        dict.fromkeys(
-            col
-            for col in df.columns
-            if global_sensitivity_registry.is_sensitive(str(col))
-            or _is_custom_phi_key(str(col), phi_keys)
-        )
-    )
+    birth_cols: list[Any] = []
+    sensitive_cols: list[Any] = []
+    seen_cols: set[Any] = set()
+    for col in df.columns:
+        if col in seen_cols:
+            continue
+        seen_cols.add(col)
+        col_str = str(col)
+        is_custom = _is_custom_phi_key(col_str, phi_keys)
+        if as_sdtm and not is_custom and _is_birth_date_alias_key(col_str):
+            birth_cols.append(col)
+        elif global_sensitivity_registry.is_sensitive(col_str) or is_custom:
+            sensitive_cols.append(col)
+
+    for col in birth_cols:
+        if len(df) > 0:
+            df[col] = df[col].apply(_redact_sdtm_birth_cell)
+
     for col in sensitive_cols:
         if len(df) > 0:
             df[col] = MASKED_SENTINEL
@@ -140,21 +211,32 @@ def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFr
     if len(df) == 0:
         return df
 
-    remaining = df.drop(columns=sensitive_cols)
+    remaining = df.drop(columns=[*sensitive_cols, *birth_cols])
     try:
         object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object, "str"]).columns))
     except TypeError:
         object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object]).columns))
 
     custom_mask_fn = (lambda val: mask_custom_phi_recursive(val, phi_keys)) if phi_keys else None
+    cell_mask_fn = (
+        (
+            lambda val: (
+                redact_batch_records([{"v": val}], mask_phi=True, as_sdtm=True)[0]["v"]
+                if isinstance(val, (dict, list, str))
+                else val
+            )
+        )
+        if as_sdtm
+        else mask_clinical_phi
+    )
     for col in object_cols:
         target = df[col]
         if isinstance(target, pd.DataFrame):
-            df[col] = target.apply(lambda s: s.apply(mask_clinical_phi))
+            df[col] = target.apply(lambda s: s.apply(cell_mask_fn))
             if custom_mask_fn is not None:
                 df[col] = df[col].apply(lambda s: s.apply(custom_mask_fn))
         else:
-            df[col] = target.apply(mask_clinical_phi)
+            df[col] = target.apply(cell_mask_fn)
             if custom_mask_fn is not None:
                 df[col] = df[col].apply(custom_mask_fn)
 
@@ -372,6 +454,7 @@ def _prepare_tabular_batch_df(
     *,
     mask_phi: bool,
     sanitize: bool,
+    as_sdtm: bool = False,
 ) -> pd.DataFrame:
     """Convert ``records`` into a DataFrame with standardized PHI masking and CSV sanitization."""
     if isinstance(records, pd.DataFrame):
@@ -394,7 +477,7 @@ def _prepare_tabular_batch_df(
             df = df.loc[:, ~dup_mask]
 
     if mask_phi:
-        df = _mask_df(df)
+        df = _mask_df(df, as_sdtm=as_sdtm)
     if sanitize:
         df = _sanitize_df(df)
     return df
@@ -501,6 +584,66 @@ def _filter_df_excluding_record_ids(df: pd.DataFrame, exclude_ids: set[str]) -> 
     if id_col is None:
         return df
     mask = [_canonical_record_id(val) not in exclude_ids for val in df[id_col].tolist()]
+    return df.loc[mask].reset_index(drop=True)
+
+
+def _df_sdtm_key_tuples(
+    df: pd.DataFrame,
+    *,
+    default_domain: str | None = None,
+) -> list[tuple[tuple[str, Any], ...] | None]:
+    """Compute hashable SDTM natural key tuples for each row of ``df``."""
+    if df.empty or "USUBJID" not in df.columns:
+        return [None] * len(df)
+    records = df.to_dict(orient="records")
+    out: list[tuple[tuple[str, Any], ...] | None] = []
+    for row in records:
+        if _is_missing_scalar(row.get("USUBJID")):
+            out.append(None)
+            continue
+        cleaned_row = {k: (None if _is_missing_scalar(v) else v) for k, v in row.items()}
+        nat_key = extract_sdtm_natural_key(cleaned_row, default_domain=default_domain)
+        out.append(sdtm_natural_key_tuple(nat_key) if nat_key.get("USUBJID") else None)
+    return out
+
+
+def _dedupe_df_by_sdtm_key(
+    df: pd.DataFrame,
+    *,
+    exclude_keys: set[tuple[tuple[str, Any], ...]] | None = None,
+    default_domain: str | None = None,
+) -> tuple[pd.DataFrame, set[tuple[tuple[str, Any], ...]]]:
+    """Keep the latest row per SDTM natural key and drop ``exclude_keys``."""
+    if df.empty:
+        return df, set()
+    key_tuples = _df_sdtm_key_tuples(df, default_domain=default_domain)
+    excluded = exclude_keys or set()
+    seen: set[tuple[tuple[str, Any], ...]] = set()
+    kept_rev: list[int] = []
+    for idx in range(len(key_tuples) - 1, -1, -1):
+        kt = key_tuples[idx]
+        if kt is None:
+            kept_rev.append(idx)
+            continue
+        if kt in excluded or kt in seen:
+            continue
+        seen.add(kt)
+        kept_rev.append(idx)
+    kept_rev.reverse()
+    return df.iloc[kept_rev].reset_index(drop=True), seen
+
+
+def _filter_df_excluding_sdtm_keys(
+    df: pd.DataFrame,
+    exclude_keys: set[tuple[tuple[str, Any], ...]],
+    *,
+    default_domain: str | None = None,
+) -> pd.DataFrame:
+    """Drop rows from ``df`` whose SDTM natural key appears in ``exclude_keys``."""
+    if df.empty or not exclude_keys or "USUBJID" not in df.columns:
+        return df
+    key_tuples = _df_sdtm_key_tuples(df, default_domain=default_domain)
+    mask = [kt is None or kt not in exclude_keys for kt in key_tuples]
     return df.loc[mask].reset_index(drop=True)
 
 
@@ -628,6 +771,23 @@ class TabularCSVSink(ExportSink):
         self._is_incremental_sync = _is_incremental_config(config)
         self._staged_frames: list[pd.DataFrame] = []
         self._voided_ids: set[str] = set()
+        self._excluded_sdtm_keys: set[tuple[tuple[str, Any], ...]] = set()
+
+    def stage_sdtm_excluded_keys(self, key_dicts: Sequence[Mapping[str, Any]]) -> None:
+        """Stage superseded SDTM natural keys for pruning during CSV reconciliation."""
+        for kd in key_dicts:
+            self._excluded_sdtm_keys.add(sdtm_natural_key_tuple(kd))
+
+    def reconcile_sdtm_deleted(
+        self, key_dicts: Sequence[Mapping[str, Any]], *, batch_id: str
+    ) -> int:
+        """Stage voided SDTM natural keys for deletion on CSV flush."""
+        _ = batch_id
+        if not self._cfg.idempotent or not key_dicts:
+            return 0
+        for kd in key_dicts:
+            self._excluded_sdtm_keys.add(sdtm_natural_key_tuple(kd))
+        return len(key_dicts)
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -635,6 +795,7 @@ class TabularCSVSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            as_sdtm=self._cfg.as_sdtm,
         )
         if len(df) == 0:
             return 0
@@ -650,12 +811,17 @@ class TabularCSVSink(ExportSink):
                 checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
                 rows_loaded = len(df)
                 self._append_manifest(batch_id, rows_loaded, checksum)
-                id_col = _find_df_record_id_col(df)
-                if id_col is not None:
-                    for raw_id in df[id_col].tolist():
-                        cid = _canonical_record_id(raw_id)
-                        if cid is not None:
-                            self._voided_ids.discard(cid)
+                if self._cfg.as_sdtm:
+                    for kt in _df_sdtm_key_tuples(df, default_domain=self._cfg.sdtm_domain):
+                        if kt is not None:
+                            self._excluded_sdtm_keys.discard(kt)
+                else:
+                    id_col = _find_df_record_id_col(df)
+                    if id_col is not None:
+                        for raw_id in df[id_col].tolist():
+                            cid = _canonical_record_id(raw_id)
+                            if cid is not None:
+                                self._voided_ids.discard(cid)
                 self._staged_frames.append(df)
                 return rows_loaded
 
@@ -706,10 +872,19 @@ class TabularCSVSink(ExportSink):
         combined_delta = (
             _concat_tabular_frames(self._staged_frames) if self._staged_frames else pd.DataFrame()
         )
-        dedup_delta, delta_ids = _dedupe_df_by_record_id(
-            combined_delta,
-            exclude_ids=self._voided_ids,
-        )
+        delta_sdtm_keys: set[tuple[tuple[str, Any], ...]] = set()
+        delta_ids: set[str] = set()
+        if self._cfg.as_sdtm:
+            dedup_delta, delta_sdtm_keys = _dedupe_df_by_sdtm_key(
+                combined_delta,
+                exclude_keys=self._excluded_sdtm_keys,
+                default_domain=self._cfg.sdtm_domain,
+            )
+        else:
+            dedup_delta, delta_ids = _dedupe_df_by_record_id(
+                combined_delta,
+                exclude_ids=self._voided_ids,
+            )
         dest_exists = Path(self.path).exists() and Path(self.path).stat().st_size > 0
         sep = str(self._cfg.pandas_kwargs.get("sep", ","))
 
@@ -735,6 +910,7 @@ class TabularCSVSink(ExportSink):
             delta_rows = list(csv.DictReader(io.StringIO(rendered_delta), delimiter=sep))
 
         exclude_ids = delta_ids | self._voided_ids
+        exclude_sdtm = delta_sdtm_keys | self._excluded_sdtm_keys
 
         def _stream_merge(tmp_path: str) -> None:
             with (
@@ -757,9 +933,19 @@ class TabularCSVSink(ExportSink):
                 )
                 writer.writeheader()
                 for row in reader:
-                    row_cid = _extract_row_canonical_id(row)
-                    if row_cid is not None and row_cid in exclude_ids:
-                        continue
+                    if self._cfg.as_sdtm:
+                        nat_key = extract_sdtm_natural_key(
+                            row, default_domain=self._cfg.sdtm_domain
+                        )
+                        if (
+                            nat_key.get("USUBJID")
+                            and sdtm_natural_key_tuple(nat_key) in exclude_sdtm
+                        ):
+                            continue
+                    else:
+                        row_cid = _extract_row_canonical_id(row)
+                        if row_cid is not None and row_cid in exclude_ids:
+                            continue
                     writer.writerow({k: (row.get(k) or "") for k in unified_fields})
                 for d_row in delta_rows:
                     writer.writerow({k: (d_row.get(k) or "") for k in unified_fields})
@@ -782,12 +968,13 @@ class TabularCSVSink(ExportSink):
 
     def flush(self) -> None:
         """Finalize staged incremental CSV updates and voided deletions atomically."""
+        has_voided = bool(self._voided_ids or self._excluded_sdtm_keys)
         should_reconcile = False
         if self._is_incremental_sync and self._cfg.idempotent:
-            should_reconcile = bool(self._staged_frames or self._voided_ids)
+            should_reconcile = bool(self._staged_frames or has_voided)
         elif (
             self._cfg.idempotent
-            and self._voided_ids
+            and has_voided
             and Path(self.path).exists()
             and Path(self.path).stat().st_size > 0
         ):
@@ -798,14 +985,20 @@ class TabularCSVSink(ExportSink):
 
         try:
             self._reconcile_csv_to_disk()
+        except ExportBatchError:
+            raise
+        except OSError as exc:
+            raise _wrap_flush_os_error(exc, f"{self._cfg.study_key}/csv/flush") from exc
         finally:
             self._staged_frames.clear()
             self._voided_ids.clear()
+            self._excluded_sdtm_keys.clear()
 
     def close(self) -> None:
         """Clear any staged state."""
         self._staged_frames.clear()
         self._voided_ids.clear()
+        self._excluded_sdtm_keys.clear()
 
 
 _RECORD_META_CONTRACT_TYPES: tuple[tuple[str, str], ...] = (
@@ -832,10 +1025,21 @@ _LOGICAL_TO_DUCKDB_SQL: dict[str, str] = {
 }
 
 
+class _ExportFlushOSError(ExportBatchError, OSError):
+    """Filesystem error during tabular flush preserving both ExportBatchError and OSError MRO."""
+
+
+def _wrap_flush_os_error(exc: OSError, batch_id: str) -> _ExportFlushOSError:
+    """Wrap a flush OSError in an exception satisfying both ExportBatchError and OSError."""
+    from imednet.utils.url import redact_sensitive_text
+
+    return _ExportFlushOSError(redact_sensitive_text(str(exc)), batch_id=batch_id)
+
+
 def _quote_duckdb_column(name: str) -> str:
     """Safely double-quote an arbitrary DataFrame column identifier for DuckDB DDL."""
     if not isinstance(name, str) or not name or "\x00" in name:
-        raise ValueError(f"Invalid DuckDB column name {name!r}.")
+        raise InvalidDuckDBIdentifierError(f"Invalid DuckDB column name {name!r}.")
     return '"' + name.replace('"', '""') + '"'
 
 
@@ -1407,6 +1611,27 @@ def _filter_arrow_table_excluding_ids(pa: Any, tbl: Any, exclude_ids: set[str]) 
     return tbl.filter(pa.array(mask, type=pa.bool_()))
 
 
+def _filter_arrow_table_excluding_sdtm_keys(
+    pa: Any,
+    tbl: Any,
+    exclude_keys: set[tuple[tuple[str, Any], ...]],
+    *,
+    default_domain: str | None = None,
+) -> Any:
+    """Filter out rows from ``tbl`` whose SDTM natural key appears in ``exclude_keys``."""
+    if tbl.num_rows == 0 or not exclude_keys or "USUBJID" not in tbl.column_names:
+        return tbl
+    rows = tbl.to_pylist()
+    mask: list[bool] = []
+    for row in rows:
+        nat_key = extract_sdtm_natural_key(row, default_domain=default_domain)
+        kt = sdtm_natural_key_tuple(nat_key) if nat_key.get("USUBJID") else None
+        mask.append(kt is None or kt not in exclude_keys)
+    if all(mask):
+        return tbl
+    return tbl.filter(pa.array(mask, type=pa.bool_()))
+
+
 class TabularParquetSink(ExportSink):
     """Streaming Parquet sink backed by ``pyarrow.parquet.ParquetWriter``."""
 
@@ -1430,7 +1655,25 @@ class TabularParquetSink(ExportSink):
         self._compression = self._parquet_kwargs.pop("compression", "snappy")
         self._voided_ids: set[str] = set()
         self._delta_id_counts: dict[str, int] = {}
+        self._excluded_sdtm_keys: set[tuple[tuple[str, Any], ...]] = set()
+        self._delta_sdtm_key_counts: dict[tuple[tuple[str, Any], ...], int] = {}
         self._delta_path: str | None = None
+
+    def stage_sdtm_excluded_keys(self, key_dicts: Sequence[Mapping[str, Any]]) -> None:
+        """Stage superseded SDTM natural keys for pruning during Parquet reconciliation."""
+        for kd in key_dicts:
+            self._excluded_sdtm_keys.add(sdtm_natural_key_tuple(kd))
+
+    def reconcile_sdtm_deleted(
+        self, key_dicts: Sequence[Mapping[str, Any]], *, batch_id: str
+    ) -> int:
+        """Stage voided SDTM natural keys for deletion on Parquet flush."""
+        _ = batch_id
+        if not self._cfg.idempotent or not key_dicts:
+            return 0
+        for kd in key_dicts:
+            self._excluded_sdtm_keys.add(sdtm_natural_key_tuple(kd))
+        return len(key_dicts)
 
     def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
         """Configure contract-derived column types prior to streaming batches."""
@@ -1537,6 +1780,7 @@ class TabularParquetSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            as_sdtm=self._cfg.as_sdtm,
         )
         if len(df) == 0:
             return 0
@@ -1559,13 +1803,21 @@ class TabularParquetSink(ExportSink):
                 self._evolve_writer_schema(pa, pq, table.schema)
             self._writer.write_table(table)
             if self._use_staged_delta():
-                id_col = _find_df_record_id_col(df)
-                if id_col is not None:
-                    for raw_id in df[id_col].tolist():
-                        cid = _canonical_record_id(raw_id)
-                        if cid is not None:
-                            self._delta_id_counts[cid] = self._delta_id_counts.get(cid, 0) + 1
-                            self._voided_ids.discard(cid)
+                if self._cfg.as_sdtm:
+                    for kt in _df_sdtm_key_tuples(df, default_domain=self._cfg.sdtm_domain):
+                        if kt is not None:
+                            self._delta_sdtm_key_counts[kt] = (
+                                self._delta_sdtm_key_counts.get(kt, 0) + 1
+                            )
+                            self._excluded_sdtm_keys.discard(kt)
+                else:
+                    id_col = _find_df_record_id_col(df)
+                    if id_col is not None:
+                        for raw_id in df[id_col].tolist():
+                            cid = _canonical_record_id(raw_id)
+                            if cid is not None:
+                                self._delta_id_counts[cid] = self._delta_id_counts.get(cid, 0) + 1
+                                self._voided_ids.discard(cid)
             return len(df)
 
         return self._execute_with_retry("export_parquet", batch_id, execute_export)
@@ -1617,6 +1869,30 @@ class TabularParquetSink(ExportSink):
         out_writer: Any,
         target_schema: Any,
     ) -> None:
+        if self._cfg.as_sdtm:
+            remaining_sdtm = dict(self._delta_sdtm_key_counts)
+            for record_batch in delta_pf.iter_batches(batch_size=max(1, self._cfg.batch_size)):
+                tbl = pa.Table.from_batches([record_batch])
+                if tbl.num_rows > 0 and "USUBJID" in tbl.column_names:
+                    mask_sdtm: list[bool] = []
+                    for row in tbl.to_pylist():
+                        nat_key = extract_sdtm_natural_key(
+                            row, default_domain=self._cfg.sdtm_domain
+                        )
+                        kt = sdtm_natural_key_tuple(nat_key) if nat_key.get("USUBJID") else None
+                        if kt is None:
+                            mask_sdtm.append(True)
+                        else:
+                            remaining_sdtm[kt] = remaining_sdtm.get(kt, 1) - 1
+                            mask_sdtm.append(
+                                kt not in self._excluded_sdtm_keys and remaining_sdtm[kt] == 0
+                            )
+                    if not all(mask_sdtm):
+                        tbl = tbl.filter(pa.array(mask_sdtm, type=pa.bool_()))
+                if tbl.num_rows > 0:
+                    out_writer.write_table(_cast_arrow_table_to_schema(pa, tbl, target_schema))
+            return
+
         remaining = dict(self._delta_id_counts)
         for record_batch in delta_pf.iter_batches(batch_size=max(1, self._cfg.batch_size)):
             tbl = pa.Table.from_batches([record_batch])
@@ -1645,8 +1921,9 @@ class TabularParquetSink(ExportSink):
             and Path(self._delta_path).exists()
             and Path(self._delta_path).stat().st_size > 0
         )
+        has_voided = bool(self._voided_ids or self._excluded_sdtm_keys)
 
-        if not has_delta and not self._voided_ids:
+        if not has_delta and not has_voided:
             if not dest_exists:
                 self._write_empty_parquet()
             return 0
@@ -1656,9 +1933,16 @@ class TabularParquetSink(ExportSink):
 
         pq_any: Any = pq
 
-        needs_delta_filter = any(cnt > 1 for cnt in self._delta_id_counts.values()) or bool(
-            self._voided_ids & set(self._delta_id_counts)
-        )
+        if self._cfg.as_sdtm:
+            needs_delta_filter = any(
+                cnt > 1 for cnt in self._delta_sdtm_key_counts.values()
+            ) or bool(self._excluded_sdtm_keys & set(self._delta_sdtm_key_counts))
+            delta_count = len(self._delta_sdtm_key_counts)
+        else:
+            needs_delta_filter = any(cnt > 1 for cnt in self._delta_id_counts.values()) or bool(
+                self._voided_ids & set(self._delta_id_counts)
+            )
+            delta_count = len(self._delta_id_counts)
 
         if not dest_exists:
             if not has_delta:
@@ -1667,7 +1951,7 @@ class TabularParquetSink(ExportSink):
             if not needs_delta_filter:
                 Path(self.path).parent.mkdir(parents=True, exist_ok=True)
                 os.replace(delta_file, self.path)
-                return len(self._delta_id_counts)
+                return delta_count
 
             delta_schema = pq_any.read_schema(delta_file)
 
@@ -1684,7 +1968,7 @@ class TabularParquetSink(ExportSink):
                     self._stream_delta_batches_filtered(pa, delta_pf, out_writer, delta_schema)
 
             _atomic_replace_file(self.path, _write_dedup_delta, suffix=".parquet.tmp")
-            return len(self._delta_id_counts)
+            return delta_count
 
         prev_schema = pq_any.read_schema(self.path)
         if has_delta:
@@ -1694,6 +1978,7 @@ class TabularParquetSink(ExportSink):
             unified_schema = prev_schema
 
         exclude_prev_ids = set(self._delta_id_counts) | self._voided_ids
+        exclude_prev_sdtm = set(self._delta_sdtm_key_counts) | self._excluded_sdtm_keys
 
         def _stream_merge(tmp_path: str) -> None:
             with pq_any.ParquetWriter(
@@ -1707,7 +1992,17 @@ class TabularParquetSink(ExportSink):
                         batch_size=max(1, self._cfg.batch_size)
                     ):
                         prev_tbl = pa.Table.from_batches([record_batch])
-                        kept_tbl = _filter_arrow_table_excluding_ids(pa, prev_tbl, exclude_prev_ids)
+                        if self._cfg.as_sdtm:
+                            kept_tbl = _filter_arrow_table_excluding_sdtm_keys(
+                                pa,
+                                prev_tbl,
+                                exclude_prev_sdtm,
+                                default_domain=self._cfg.sdtm_domain,
+                            )
+                        else:
+                            kept_tbl = _filter_arrow_table_excluding_ids(
+                                pa, prev_tbl, exclude_prev_ids
+                            )
                         if kept_tbl.num_rows > 0:
                             out_writer.write_table(
                                 _cast_arrow_table_to_schema(pa, kept_tbl, unified_schema)
@@ -1719,7 +2014,7 @@ class TabularParquetSink(ExportSink):
                         )
 
         _atomic_replace_file(self.path, _stream_merge, suffix=".parquet.tmp")
-        return len(self._delta_id_counts)
+        return delta_count
 
     def flush(self) -> None:
         """Flush and finalize Parquet footer or reconcile incremental deltas before checkpoint commit."""
@@ -1728,19 +2023,31 @@ class TabularParquetSink(ExportSink):
             self._writer.close()
             self._writer = None
 
-        if self._use_staged_delta() or (self._cfg.idempotent and self._voided_ids):
+        has_voided = bool(self._voided_ids or self._excluded_sdtm_keys)
+        if self._use_staged_delta() or (self._cfg.idempotent and has_voided):
             try:
                 self._reconcile_parquet_to_disk()
+            except ExportBatchError:
+                raise
+            except OSError as exc:
+                raise _wrap_flush_os_error(exc, f"{self._cfg.study_key}/parquet/flush") from exc
             finally:
                 if self._delta_path is not None:
                     Path(self._delta_path).unlink(missing_ok=True)
                     self._delta_path = None
                 self._delta_id_counts.clear()
                 self._voided_ids.clear()
+                self._delta_sdtm_key_counts.clear()
+                self._excluded_sdtm_keys.clear()
             return
 
         if not wrote_batches:
-            self._write_empty_parquet()
+            try:
+                self._write_empty_parquet()
+            except ExportBatchError:
+                raise
+            except OSError as exc:
+                raise _wrap_flush_os_error(exc, f"{self._cfg.study_key}/parquet/empty") from exc
 
     def close(self) -> None:
         """Ensure underlying ParquetWriter is closed and any staging file is removed."""
@@ -1754,7 +2061,103 @@ class TabularParquetSink(ExportSink):
             self._delta_path = None
         self._delta_id_counts.clear()
         self._voided_ids.clear()
+        self._delta_sdtm_key_counts.clear()
+        self._excluded_sdtm_keys.clear()
         self._schema = None
+
+
+def _ensure_sql_columns_exist(engine: Any, table_name: str, df: pd.DataFrame) -> None:
+    """Add any newly introduced DataFrame columns to an existing SQL table before append."""
+    if df.empty or isinstance(engine, NonCallableMock):
+        return
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import text as sa_text
+
+    inspector = sa_inspect(engine)
+    if not inspector.has_table(table_name):
+        return
+    existing_lower = {c["name"].lower() for c in inspector.get_columns(table_name)}
+    missing_cols = [col for col in df.columns if str(col).lower() not in existing_lower]
+    if not missing_cols:
+        return
+    preparer = engine.dialect.identifier_preparer
+    quoted_table = preparer.quote(table_name)
+    with engine.begin() as conn:
+        for col in missing_cols:
+            ltype = _infer_series_logical_type(df[col])
+            sql_type = (
+                "BIGINT"
+                if ltype == "int64"
+                else ("DOUBLE PRECISION" if ltype == "float64" else "TEXT")
+            )
+            quoted_col = preparer.quote(str(col))
+            conn.execute(sa_text(f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_col} {sql_type}"))
+
+
+def _execute_sql_sdtm_key_delete(
+    engine: Any,
+    table_name: str,
+    key_dicts: Sequence[Mapping[str, Any]],
+) -> int:
+    """Delete rows matching SDTM natural key dictionaries when ``table_name`` exists."""
+    if not key_dicts or isinstance(engine, NonCallableMock):
+        return 0
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import text as sa_text
+
+    inspector = sa_inspect(engine)
+    if not inspector.has_table(table_name):
+        return 0
+    existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
+    preparer = engine.dialect.identifier_preparer
+    quoted_table = preparer.quote(table_name)
+    deleted = 0
+    with engine.begin() as conn:
+        for idx, kd in enumerate(key_dicts):
+            preds: list[str] = []
+            params: dict[str, Any] = {}
+            for col, val in kd.items():
+                if val is None or col not in existing_cols:
+                    continue
+                pname = f"p_{idx}_{col}"
+                preds.append(f"{preparer.quote(col)} = :{pname}")
+                params[pname] = val
+            if preds:
+                stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {' AND '.join(preds)}")
+                conn.execute(stmt, params)
+                deleted += 1
+    return deleted
+
+
+def _delete_duckdb_sdtm_keys(
+    conn: Any,
+    table_name: str,
+    key_dicts: Sequence[Mapping[str, Any]],
+) -> int:
+    """Delete rows matching SDTM natural key dictionaries from a DuckDB table."""
+    if (
+        not key_dicts
+        or isinstance(conn, NonCallableMock)
+        or not _duckdb_table_exists(conn, table_name)
+    ):
+        return 0
+    existing_cols = {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    }
+    quoted_tbl = _quote_duckdb_identifier(table_name)
+    deleted = 0
+    for kd in key_dicts:
+        preds: list[str] = []
+        params: list[Any] = []
+        for col, val in kd.items():
+            if val is None or col not in existing_cols:
+                continue
+            preds.append(f"{_quote_duckdb_column(col)} = ?")
+            params.append(val)
+        if preds:
+            conn.execute(f"DELETE FROM {quoted_tbl} WHERE {' AND '.join(preds)}", params)
+            deleted += 1
+    return deleted
 
 
 def _execute_chunked_sql_id_delete(
@@ -1812,6 +2215,24 @@ class TabularSQLSink(ExportSink):
             self._initial_if_exists = "append"
         else:
             self._initial_if_exists = "append" if self._is_incremental_sync else "replace"
+        self._pending_sdtm_delete_keys: list[dict[str, Any]] = []
+
+    def stage_sdtm_excluded_keys(self, key_dicts: Sequence[Mapping[str, Any]]) -> None:
+        """Stage superseded SDTM natural keys for SQL deletion prior to append."""
+        self._pending_sdtm_delete_keys.extend(dict(kd) for kd in key_dicts)
+
+    def reconcile_sdtm_deleted(
+        self, key_dicts: Sequence[Mapping[str, Any]], *, batch_id: str
+    ) -> int:
+        """Delete voided SDTM rows from the SQL table when running idempotently."""
+        if not self._cfg.idempotent or not key_dicts or isinstance(self.engine, NonCallableMock):
+            return 0
+        copied = [dict(kd) for kd in key_dicts]
+        return self._execute_with_retry(
+            "reconcile_sql_deleted",
+            batch_id,
+            lambda: _execute_sql_sdtm_key_delete(self.engine, self.table, copied),
+        )
 
     def _delete_existing_record_ids(self, record_ids: Sequence[Any]) -> int:
         """Delete existing rows matching ``recordId`` when the destination table exists."""
@@ -1828,9 +2249,13 @@ class TabularSQLSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            as_sdtm=self._cfg.as_sdtm,
         )
         if len(df) == 0:
             return 0
+
+        pending_sdtm = list(self._pending_sdtm_delete_keys)
+        self._pending_sdtm_delete_keys.clear()
 
         def execute_export() -> int:
             if_exists = self._initial_if_exists if self._is_first_batch else "append"
@@ -1840,11 +2265,28 @@ class TabularSQLSink(ExportSink):
                 and if_exists == "append"
                 and not isinstance(self.engine, NonCallableMock)
             ):
-                for candidate_col in ("recordId", "record_id", "RECORD_ID"):
-                    if candidate_col in df.columns:
-                        ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
-                        self._delete_existing_record_ids(ids)
-                        break
+                if self._cfg.as_sdtm:
+                    incoming_keys = [
+                        extract_sdtm_natural_key(
+                            {k: (None if _is_missing_scalar(v) else v) for k, v in r.items()},
+                            default_domain=self._cfg.sdtm_domain,
+                        )
+                        for r in df.to_dict(orient="records")
+                    ]
+                    _execute_sql_sdtm_key_delete(
+                        self.engine,
+                        self.table,
+                        [*pending_sdtm, *(k for k in incoming_keys if k.get("USUBJID"))],
+                    )
+                else:
+                    for candidate_col in ("recordId", "record_id", "RECORD_ID"):
+                        if candidate_col in df.columns:
+                            ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
+                            self._delete_existing_record_ids(ids)
+                            break
+
+            if if_exists == "append" and not isinstance(self.engine, NonCallableMock):
+                _ensure_sql_columns_exist(self.engine, self.table, df)
 
             df_str = df.to_csv(index=False)
             checksum = hashlib.sha256(df_str.encode('utf-8')).hexdigest()
@@ -1922,12 +2364,30 @@ class TabularDuckDBSink(ExportSink):
         self._is_first_batch = True
         self._is_incremental_sync = _is_incremental_config(config)
         self._owns_conn = conn is None
+        self._pending_sdtm_delete_keys: list[dict[str, Any]] = []
         if conn is not None:
             self._conn: Any = conn
         else:
             import duckdb
 
-            self._conn = duckdb.connect(resolved_db_path, config={"threads": "1"})
+            self._conn = _connect_duckdb(duckdb, resolved_db_path, threads_one=True)
+
+    def stage_sdtm_excluded_keys(self, key_dicts: Sequence[Mapping[str, Any]]) -> None:
+        """Stage superseded SDTM natural keys for DuckDB deletion prior to insert."""
+        self._pending_sdtm_delete_keys.extend(dict(kd) for kd in key_dicts)
+
+    def reconcile_sdtm_deleted(
+        self, key_dicts: Sequence[Mapping[str, Any]], *, batch_id: str
+    ) -> int:
+        """Delete voided SDTM rows from DuckDB when running idempotently."""
+        if not self._cfg.idempotent or not key_dicts:
+            return 0
+        copied = [dict(kd) for kd in key_dicts]
+        return self._execute_with_retry(
+            "reconcile_duckdb_deleted",
+            batch_id,
+            lambda: _delete_duckdb_sdtm_keys(self._conn, self.table_name, copied),
+        )
 
     def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
         """Configure contract-derived column types prior to streaming batches."""
@@ -1966,9 +2426,13 @@ class TabularDuckDBSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            as_sdtm=self._cfg.as_sdtm,
         )
         if len(df) == 0:
             return 0
+
+        pending_sdtm = list(self._pending_sdtm_delete_keys)
+        self._pending_sdtm_delete_keys.clear()
 
         def execute_export() -> int:
             quoted_tbl = _quote_duckdb_identifier(self.table_name)
@@ -2000,11 +2464,30 @@ class TabularDuckDBSink(ExportSink):
                     self._conn.execute(f"CREATE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}")
                 else:
                     if self._is_incremental_sync and self._cfg.idempotent:
-                        for candidate_col in ("recordId", "record_id", "RECORD_ID"):
-                            if candidate_col in df.columns:
-                                ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
-                                self._delete_record_ids(ids)
-                                break
+                        if self._cfg.as_sdtm:
+                            incoming_keys = [
+                                extract_sdtm_natural_key(
+                                    {
+                                        k: (None if _is_missing_scalar(v) else v)
+                                        for k, v in r.items()
+                                    },
+                                    default_domain=self._cfg.sdtm_domain,
+                                )
+                                for r in df.to_dict(orient="records")
+                            ]
+                            _delete_duckdb_sdtm_keys(
+                                self._conn,
+                                self.table_name,
+                                [*pending_sdtm, *(k for k in incoming_keys if k.get("USUBJID"))],
+                            )
+                        else:
+                            for candidate_col in ("recordId", "record_id", "RECORD_ID"):
+                                if candidate_col in df.columns:
+                                    ids = [
+                                        rid for rid in df[candidate_col].tolist() if pd.notna(rid)
+                                    ]
+                                    self._delete_record_ids(ids)
+                                    break
                     self._conn.execute(
                         f"INSERT INTO {quoted_tbl} BY NAME SELECT * FROM {quoted_alias}"
                     )
@@ -2038,7 +2521,16 @@ class TabularDuckDBSink(ExportSink):
             and self._conn is not None
             and not isinstance(self._conn, NonCallableMock)
         ):
-            _replace_duckdb_with_empty_table(self._conn, self.table_name, self._contract_types)
+
+            def _write_empty_duckdb() -> int:
+                _replace_duckdb_with_empty_table(self._conn, self.table_name, self._contract_types)
+                return 0
+
+            self._execute_with_retry(
+                "export_duckdb",
+                f"{self._cfg.study_key}/duckdb/{self.table_name}/empty",
+                _write_empty_duckdb,
+            )
 
     def close(self) -> None:
         """Close the DuckDB connection when owned by this sink."""
@@ -2061,24 +2553,50 @@ class _TabularCollectingSink(ExportSink):
         on_flush: Any,
         *,
         pass_voided_ids: bool = False,
+        pass_sdtm_keys: bool = False,
+        operation_name: str = "export_tabular",
     ) -> None:
         super().__init__(config)
         self._frames: list[pd.DataFrame] = []
         self._voided_ids: set[str] = set()
+        self._excluded_sdtm_keys: set[tuple[tuple[str, Any], ...]] = set()
         self._on_flush = on_flush
         self._pass_voided_ids = pass_voided_ids
+        self._pass_sdtm_keys = pass_sdtm_keys
+        self._operation_name = operation_name
+
+    def stage_sdtm_excluded_keys(self, key_dicts: Sequence[Mapping[str, Any]]) -> None:
+        for kd in key_dicts:
+            self._excluded_sdtm_keys.add(sdtm_natural_key_tuple(kd))
+
+    def reconcile_sdtm_deleted(
+        self, key_dicts: Sequence[Mapping[str, Any]], *, batch_id: str
+    ) -> int:
+        _ = batch_id
+        if not self.config.idempotent or not key_dicts:
+            return 0
+        for kd in key_dicts:
+            self._excluded_sdtm_keys.add(sdtm_natural_key_tuple(kd))
+        return len(key_dicts)
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         _ = batch_id
         df = records if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
         if len(df) == 0:
             return 0
-        id_col = _find_df_record_id_col(df)
-        if id_col is not None:
-            for raw_id in df[id_col].tolist():
-                cid = _canonical_record_id(raw_id)
-                if cid is not None:
-                    self._voided_ids.discard(cid)
+        if getattr(self.config, "as_sdtm", False):
+            for kt in _df_sdtm_key_tuples(
+                df, default_domain=getattr(self.config, "sdtm_domain", None)
+            ):
+                if kt is not None:
+                    self._excluded_sdtm_keys.discard(kt)
+        else:
+            id_col = _find_df_record_id_col(df)
+            if id_col is not None:
+                for raw_id in df[id_col].tolist():
+                    cid = _canonical_record_id(raw_id)
+                    if cid is not None:
+                        self._voided_ids.discard(cid)
         self._frames.append(df)
         return len(df)
 
@@ -2096,14 +2614,34 @@ class _TabularCollectingSink(ExportSink):
 
     def flush(self) -> None:
         combined = _concat_tabular_frames(self._frames) if self._frames else pd.DataFrame()
-        if self._pass_voided_ids:
-            self._on_flush(combined, set(self._voided_ids))
-        else:
-            self._on_flush(combined)
+        voided_copy = set(self._voided_ids)
+        sdtm_copy = set(self._excluded_sdtm_keys)
+        flush_batch_id = f"{self.config.study_key}/{self._operation_name}/flush"
+        try:
+            if self._pass_sdtm_keys:
+                self._on_flush(combined, voided_copy, sdtm_copy)
+            elif self._pass_voided_ids:
+                self._on_flush(combined, voided_copy)
+            else:
+                self._on_flush(combined)
+        except ExportBatchError:
+            raise
+        except OSError as exc:
+            raise _wrap_flush_os_error(exc, flush_batch_id) from exc
+        except Exception as exc:
+            raise ExportBatchError(
+                f"Batch {flush_batch_id!r} failed during flush.",
+                batch_id=flush_batch_id,
+            ) from exc
+        finally:
+            self._frames.clear()
+            self._voided_ids.clear()
+            self._excluded_sdtm_keys.clear()
 
     def close(self) -> None:
         self._frames.clear()
         self._voided_ids.clear()
+        self._excluded_sdtm_keys.clear()
 
 
 class _TabularTransformSink(ExportSink):
@@ -2135,27 +2673,31 @@ class _TabularTransformSink(ExportSink):
         self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
         self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
         self._seq_counters: dict[str, int] = {}
+        self._seq_counters_by_domain: dict[str, dict[str, int]] = {}
+        self._sdtm_provenance: dict[str, dict[str, Any]] = {}
         self._meta_cols = {name for name, _ in _RECORD_META_CONTRACT_TYPES}
+
+    def bind_checkpoint_metadata(self, metadata: dict[str, Any] | None) -> None:
+        super().bind_checkpoint_metadata(metadata)
+        self._inner.bind_checkpoint_metadata(metadata)
+        self._seq_counters_by_domain, self._sdtm_provenance = hydrate_sdtm_checkpoint_state(
+            metadata
+        )
+        if self._cfg.sdtm_domain:
+            dom = resolve_sdtm_domain(self._cfg.sdtm_domain)
+            self._seq_counters = self._seq_counters_by_domain.setdefault(dom, {})
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         if self._cfg.as_sdtm:
             if not records:
                 return 0
-            raw_domain = self._cfg.sdtm_domain
-            if not raw_domain:
-                first_rec = records[0]
-                raw_domain = (
-                    first_rec.get("DOMAIN")
-                    or first_rec.get("domain")
-                    or first_rec.get("form_key")
-                    or first_rec.get("formKey")
-                    if isinstance(first_rec, Mapping)
-                    else getattr(first_rec, "form_key", None)
-                )
-            target_domain = resolve_sdtm_domain(raw_domain, fallback="AE")
             batch_records: Sequence[Any] = records
             if self._cfg.variable_whitelist is not None:
                 allowed = set(self._cfg.variable_whitelist)
+                if self._pipeline is not None and self._pipeline.mappings:
+                    for src_var, rule in self._pipeline.mappings.items():
+                        if rule.target_field in allowed:
+                            allowed.add(src_var)
                 projected: list[Any] = []
                 for rec in records:
                     rec_data = getattr(rec, "record_data", None)
@@ -2179,16 +2721,72 @@ class _TabularTransformSink(ExportSink):
                         projected.append(rec)
                 batch_records = projected
 
-            df = transform_records_to_sdtm(
-                batch_records,
-                domain=target_domain,
-                study_key=self._cfg.study_key,
-                include_deleted=self._cfg.include_deleted,
-                mask_phi=self._cfg.mask_phi,
-                seq_counters=self._seq_counters,
-                phi_keys=self._phi_keys,
-                pipeline=self._pipeline,
+            raw_sdtm_rows: list[dict[str, Any]] = []
+            if self._cfg.sdtm_domain:
+                target_domain = resolve_sdtm_domain(self._cfg.sdtm_domain, fallback="AE")
+                domain_seq = self._seq_counters_by_domain.setdefault(
+                    target_domain, self._seq_counters
+                )
+                raw_sdtm_rows = transform_records_to_sdtm_rows(
+                    batch_records,
+                    domain=target_domain,
+                    study_key=self._cfg.study_key,
+                    include_deleted=self._cfg.include_deleted,
+                    mask_phi=self._cfg.mask_phi,
+                    seq_counters=domain_seq,
+                    phi_keys=self._phi_keys,
+                    pipeline=self._pipeline,
+                    filter_by_domain=True,
+                    include_record_id_provenance=True,
+                    provenance=self._sdtm_provenance,
+                )
+            else:
+                grouped_by_dom: dict[str, list[Any]] = {}
+                unmatched_records: list[Any] = []
+                for rec in batch_records:
+                    inferred = infer_record_sdtm_domain(rec, pipeline=self._pipeline, fallback=None)
+                    if inferred is not None:
+                        grouped_by_dom.setdefault(inferred, []).append(rec)
+                    else:
+                        fid, fk = extract_record_form_ref(rec)
+                        if fid is None and not fk:
+                            unmatched_records.append(rec)
+                if not grouped_by_dom and unmatched_records:
+                    grouped_by_dom["AE"] = unmatched_records
+                for dom_code, dom_recs in grouped_by_dom.items():
+                    domain_seq = self._seq_counters_by_domain.setdefault(dom_code, {})
+                    raw_sdtm_rows.extend(
+                        transform_records_to_sdtm_rows(
+                            dom_recs,
+                            domain=dom_code,
+                            study_key=self._cfg.study_key,
+                            include_deleted=self._cfg.include_deleted,
+                            mask_phi=self._cfg.mask_phi,
+                            seq_counters=domain_seq,
+                            phi_keys=self._phi_keys,
+                            pipeline=self._pipeline,
+                            filter_by_domain=False,
+                            include_record_id_provenance=True,
+                            provenance=self._sdtm_provenance,
+                        )
+                    )
+
+            cleaned_rows, all_replaced_keys, _ = reconcile_sdtm_provenance_rows(
+                raw_sdtm_rows,
+                self._sdtm_provenance,
+                default_domain=self._cfg.sdtm_domain,
             )
+            persist_sdtm_checkpoint_state(
+                self._checkpoint_metadata,
+                self._seq_counters_by_domain,
+                self._sdtm_provenance,
+            )
+            stage_fn = getattr(self._inner, "stage_sdtm_excluded_keys", None)
+            if callable(stage_fn) and all_replaced_keys:
+                stage_fn(all_replaced_keys)
+            if not cleaned_rows:
+                return 0
+            df = pd.DataFrame(cleaned_rows)
             if df.empty:
                 return 0
             if self._sanitize:
@@ -2226,6 +2824,21 @@ class _TabularTransformSink(ExportSink):
         return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
 
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        if self._cfg.as_sdtm:
+            if not self._cfg.idempotent or not records:
+                return 0
+            deleted_keys = pop_deleted_sdtm_provenance_keys(records, self._sdtm_provenance)
+            persist_sdtm_checkpoint_state(
+                self._checkpoint_metadata,
+                self._seq_counters_by_domain,
+                self._sdtm_provenance,
+            )
+            if not deleted_keys:
+                return 0
+            sdtm_del_fn = getattr(self._inner, "reconcile_sdtm_deleted", None)
+            if callable(sdtm_del_fn):
+                return int(sdtm_del_fn(deleted_keys, batch_id=batch_id))
+            return 0
         return self._inner.reconcile_deleted(records, batch_id=batch_id)
 
     def flush(self) -> None:
@@ -2376,10 +2989,19 @@ def _tabular_export(
         config.as_sdtm
         and written == 0
         and isinstance(sink, TabularCSVSink)
-        and not Path(sink.path).exists()
+        and (not Path(sink.path).exists() or Path(sink.path).is_dir())
     ):
         empty_sdtm_df = _build_empty_contract_df(contract_types)
-        empty_sdtm_df.to_csv(sink.path, index=False, **config.pandas_kwargs)
+
+        def _write_empty_csv() -> int:
+            empty_sdtm_df.to_csv(sink.path, index=False, **config.pandas_kwargs)
+            return 0
+
+        sink._execute_with_retry(
+            "export_csv",
+            f"{study_key}/csv/empty",
+            _write_empty_csv,
+        )
 
 
 class _TabularCallableSink(ExportSink):
@@ -2618,7 +3240,7 @@ def export_to_csv(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
-    quality_gate_enabled: bool = True,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
@@ -2635,21 +3257,7 @@ def export_to_csv(
         When ``True`` (default), sensitive PHI values are replaced with
         ``***MASKED***``.
     """
-    has_sdtm_or_standards_opts = bool(
-        kwargs.get("as_sdtm")
-        or kwargs.get("sdtm_domain") is not None
-        or kwargs.get("domain") is not None
-        or kwargs.get("standards_profile") is not None
-        or kwargs.get("min_standards_score") is not None
-    )
-    effective_default_gate = (
-        False
-        if has_sdtm_or_standards_opts
-        and "quality_gate_enabled" not in kwargs
-        and quality_gate_enabled is True
-        else quality_gate_enabled
-    )
-    kwargs.setdefault("quality_gate_enabled", effective_default_gate)
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     kwargs.setdefault("sanitize", True)
     config = _build_tabular_sink_config(
         study_key,
@@ -2657,8 +3265,8 @@ def export_to_csv(
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
-        manifest_path=manifest_path or str(Path(path).with_suffix(".manifest.jsonl")),
-        default_quality_gate=effective_default_gate,
+        manifest_path=manifest_path,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
 
@@ -2754,7 +3362,11 @@ def export_to_excel(
     )
     is_incremental_excel = _is_incremental_config(config)
 
-    def _write_or_reconcile_excel(combined: pd.DataFrame, voided_ids: set[str]) -> None:
+    def _write_or_reconcile_excel(
+        combined: pd.DataFrame,
+        voided_ids: set[str],
+        excluded_sdtm_keys: set[tuple[tuple[str, Any], ...]],
+    ) -> None:
         if not (is_incremental_excel and config.idempotent):
             target = (
                 _build_empty_contract_df(sdtm_contract)
@@ -2765,7 +3377,8 @@ def export_to_excel(
             return
 
         dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
-        if combined.empty and not voided_ids:
+        has_voided = bool(voided_ids or excluded_sdtm_keys)
+        if combined.empty and not has_voided:
             if dest_exists:
                 return
             empty_target = (
@@ -2778,15 +3391,30 @@ def export_to_excel(
             )
             return
 
-        dedup_delta, delta_ids = _dedupe_df_by_record_id(combined, exclude_ids=voided_ids)
+        if config.as_sdtm:
+            dedup_delta, delta_sdtm_keys = _dedupe_df_by_sdtm_key(
+                combined,
+                exclude_keys=excluded_sdtm_keys,
+                default_domain=config.sdtm_domain,
+            )
+        else:
+            dedup_delta, delta_ids = _dedupe_df_by_record_id(combined, exclude_ids=voided_ids)
+
         if dest_exists:
             prev_df = pd.read_excel(path)
-            prev_kept = _filter_df_excluding_record_ids(prev_df, delta_ids | voided_ids)
+            if config.as_sdtm:
+                prev_kept = _filter_df_excluding_sdtm_keys(
+                    prev_df,
+                    delta_sdtm_keys | excluded_sdtm_keys,
+                    default_domain=config.sdtm_domain,
+                )
+            else:
+                prev_kept = _filter_df_excluding_record_ids(prev_df, delta_ids | voided_ids)
             if not prev_kept.empty:
                 if config.mask_phi:
                     pipeline = resolve_enrichment_pipeline(study_key)
                     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-                    prev_kept = _mask_df(prev_kept, phi_keys=phi_keys)
+                    prev_kept = _mask_df(prev_kept, phi_keys=phi_keys, as_sdtm=config.as_sdtm)
                 if config.sanitize:
                     prev_kept = _sanitize_df(prev_kept)
             if prev_kept.empty:
@@ -2804,7 +3432,12 @@ def export_to_excel(
             suffix=".xlsx",
         )
 
-    sink = _TabularCollectingSink(config, _write_or_reconcile_excel, pass_voided_ids=True)
+    sink = _TabularCollectingSink(
+        config,
+        _write_or_reconcile_excel,
+        pass_sdtm_keys=True,
+        operation_name="export_excel",
+    )
     _tabular_export(sdk, study_key, sink, config, sanitize=True, stream_name="excel")
 
 
@@ -2851,6 +3484,134 @@ def _dump_json_payload(path: str | os.PathLike[str], data: Any, config: TabularS
 
     _atomic_replace_file(resolved_path, _write_tmp_json, suffix=".json.tmp")
     return len(sanitized_data) if isinstance(sanitized_data, list) else 1
+
+
+def _merge_flat_sdtm_json_records(
+    existing_records: list[Any],
+    delta_records: list[dict[str, Any]],
+    excluded_sdtm_keys: set[tuple[tuple[str, Any], ...]],
+    *,
+    default_domain: str | None = None,
+) -> list[Any]:
+    """Upsert ``delta_records`` by SDTM natural key and drop superseded/voided SDTM keys."""
+    delta_by_key: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
+    unkeyed_delta: list[dict[str, Any]] = []
+    for drec in delta_records:
+        nat = extract_sdtm_natural_key(drec, default_domain=default_domain)
+        if nat.get("USUBJID"):
+            delta_by_key[sdtm_natural_key_tuple(nat)] = drec
+        else:
+            unkeyed_delta.append(drec)
+
+    merged: list[Any] = []
+    placed_keys: set[tuple[tuple[str, Any], ...]] = set()
+    for erec in existing_records:
+        if isinstance(erec, Mapping):
+            nat = extract_sdtm_natural_key(erec, default_domain=default_domain)
+            kt = sdtm_natural_key_tuple(nat) if nat.get("USUBJID") else None
+            if kt is not None and kt in excluded_sdtm_keys and kt not in delta_by_key:
+                continue
+            if kt is not None and kt in delta_by_key:
+                if kt not in placed_keys:
+                    merged.append(delta_by_key[kt])
+                    placed_keys.add(kt)
+                continue
+        merged.append(erec)
+
+    for kt, drec in delta_by_key.items():
+        if kt not in placed_keys and kt not in excluded_sdtm_keys:
+            merged.append(drec)
+    merged.extend(unkeyed_delta)
+    return merged
+
+
+def _build_hierarchical_sdtm_tree(
+    existing_tree: list[Any],
+    delta_rows: list[dict[str, Any]],
+    excluded_sdtm_keys: set[tuple[tuple[str, Any], ...]],
+    *,
+    study_key: str,
+    default_domain: str | None = None,
+) -> list[dict[str, Any]]:
+    """Build and reconcile a nested Subject -> Domain -> records SDTM JSON hierarchy."""
+    delta_by_key: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
+    for row in delta_rows:
+        nat = extract_sdtm_natural_key(row, default_domain=default_domain)
+        if nat.get("USUBJID"):
+            delta_by_key[sdtm_natural_key_tuple(nat)] = row
+
+    subjects: dict[str, dict[str, Any]] = {}
+    placed_keys: set[tuple[tuple[str, Any], ...]] = set()
+
+    for subj in existing_tree:
+        if not isinstance(subj, Mapping):
+            continue
+        usubjid = str(subj.get("USUBJID") or subj.get("subject_key") or "")
+        study_id = str(subj.get("STUDYID") or study_key)
+        if not usubjid:
+            continue
+        subj_entry = subjects.setdefault(
+            usubjid,
+            {"STUDYID": study_id, "USUBJID": usubjid, "domains": {}},
+        )
+        for dnode in subj.get("domains") or []:
+            if not isinstance(dnode, Mapping):
+                continue
+            dom_code = str(dnode.get("DOMAIN") or default_domain or "AE")
+            for rec in dnode.get("records") or []:
+                if not isinstance(rec, Mapping):
+                    continue
+                nat = extract_sdtm_natural_key(rec, default_domain=dom_code)
+                kt = sdtm_natural_key_tuple(nat) if nat.get("USUBJID") else None
+                if kt is not None and kt in excluded_sdtm_keys and kt not in delta_by_key:
+                    continue
+                if kt is not None and kt in delta_by_key:
+                    if kt not in placed_keys:
+                        updated = delta_by_key[kt]
+                        upd_dom = str(updated.get("DOMAIN") or dom_code)
+                        upd_subj = str(updated.get("USUBJID") or usubjid)
+                        upd_study = str(updated.get("STUDYID") or study_id)
+                        upd_entry = subjects.setdefault(
+                            upd_subj,
+                            {"STUDYID": upd_study, "USUBJID": upd_subj, "domains": {}},
+                        )
+                        upd_entry["domains"].setdefault(upd_dom, []).append(updated)
+                        placed_keys.add(kt)
+                    continue
+                subj_entry["domains"].setdefault(dom_code, []).append(dict(rec))
+
+    for row in delta_rows:
+        nat = extract_sdtm_natural_key(row, default_domain=default_domain)
+        kt = sdtm_natural_key_tuple(nat) if nat.get("USUBJID") else None
+        if kt is not None and (kt in placed_keys or kt in excluded_sdtm_keys):
+            continue
+        if kt is not None:
+            placed_keys.add(kt)
+        usubjid = str(row.get("USUBJID") or "")
+        study_id = str(row.get("STUDYID") or study_key)
+        dom_code = str(row.get("DOMAIN") or default_domain or "AE")
+        subj_entry = subjects.setdefault(
+            usubjid,
+            {"STUDYID": study_id, "USUBJID": usubjid, "domains": {}},
+        )
+        subj_entry["domains"].setdefault(dom_code, []).append(dict(row))
+
+    tree_out: list[dict[str, Any]] = []
+    for usubjid, subj_entry in subjects.items():
+        dom_list = [
+            {"DOMAIN": dom_code, "records": recs}
+            for dom_code, recs in subj_entry["domains"].items()
+            if recs
+        ]
+        if dom_list:
+            tree_out.append(
+                {
+                    "STUDYID": subj_entry["STUDYID"],
+                    "USUBJID": usubjid,
+                    "domains": dom_list,
+                }
+            )
+    return tree_out
 
 
 def _merge_flat_json_records(
@@ -3155,7 +3916,83 @@ def export_to_json(
         mask_phi=mask_phi,
     )
 
-    if hierarchical and not config.as_sdtm:
+    if hierarchical:
+        if config.as_sdtm:
+            is_inc_hier_sdtm = _is_incremental_config(config)
+
+            def _write_or_reconcile_sdtm_hier(
+                combined: pd.DataFrame,
+                _voided_ids: set[str],
+                excluded_sdtm_keys: set[tuple[tuple[str, Any], ...]],
+            ) -> None:
+                if not (is_inc_hier_sdtm and config.idempotent):
+                    delta_rows = _dataframe_to_json_records(combined)
+                    if config.mask_phi:
+                        delta_rows = redact_batch_records(delta_rows, mask_phi=True, as_sdtm=True)
+                    tree = _build_hierarchical_sdtm_tree(
+                        [],
+                        delta_rows,
+                        set(),
+                        study_key=study_key,
+                        default_domain=config.sdtm_domain,
+                    )
+                    _dump_json_payload(path, tree, config)
+                    return
+
+                dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
+                if combined.empty and not excluded_sdtm_keys:
+                    if dest_exists:
+                        return
+                    _dump_json_payload(path, [], config)
+                    return
+
+                dedup_delta, _ = _dedupe_df_by_sdtm_key(
+                    combined,
+                    exclude_keys=excluded_sdtm_keys,
+                    default_domain=config.sdtm_domain,
+                )
+                delta_rows = _dataframe_to_json_records(dedup_delta)
+                existing_tree: list[Any] = []
+                if dest_exists:
+                    try:
+                        with open(path, encoding="utf-8") as existing_f:
+                            loaded = json.load(existing_f)
+                        if isinstance(loaded, list):
+                            existing_tree = loaded
+                    except Exception:
+                        existing_tree = []
+
+                merged_tree: Any = _build_hierarchical_sdtm_tree(
+                    existing_tree,
+                    delta_rows,
+                    excluded_sdtm_keys,
+                    study_key=study_key,
+                    default_domain=config.sdtm_domain,
+                )
+                if config.mask_phi:
+                    pipeline = resolve_enrichment_pipeline(study_key)
+                    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+                    merged_tree = redact_batch_records(merged_tree, mask_phi=True, as_sdtm=True)
+                    if phi_keys:
+                        merged_tree = mask_custom_phi_recursive(merged_tree, phi_keys)
+                _dump_json_payload(path, merged_tree, config)
+
+            sdtm_hier_sink = _TabularCollectingSink(
+                config,
+                _write_or_reconcile_sdtm_hier,
+                pass_sdtm_keys=True,
+                operation_name="export_json",
+            )
+            _tabular_export(
+                sdk,
+                study_key,
+                sdtm_hier_sink,
+                config,
+                sanitize=False,
+                stream_name="json_hierarchical",
+            )
+            return
+
         mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
         is_mock_hier_mapper = _is_mock_mapper(mapper) or not callable(
             getattr(mapper, "_get_enrichment_pipeline", None)
@@ -3248,22 +4085,38 @@ def export_to_json(
 
     is_incremental_json = _is_incremental_config(config)
 
-    def _write_or_reconcile_json(combined: pd.DataFrame, voided_ids: set[str]) -> None:
+    def _write_or_reconcile_json(
+        combined: pd.DataFrame,
+        voided_ids: set[str],
+        excluded_sdtm_keys: set[tuple[tuple[str, Any], ...]],
+    ) -> None:
         if not (is_incremental_json and config.idempotent):
-            records_out = _dataframe_to_json_records(combined)
+            records_out: Any = _dataframe_to_json_records(combined)
             if config.mask_phi:
-                records_out = mask_clinical_phi(records_out)
+                records_out = (
+                    redact_batch_records(records_out, mask_phi=True, as_sdtm=True)
+                    if config.as_sdtm
+                    else mask_clinical_phi(records_out)
+                )
             _dump_json_payload(path, records_out, config)
             return
 
         dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
-        if combined.empty and not voided_ids:
+        has_voided = bool(voided_ids or excluded_sdtm_keys)
+        if combined.empty and not has_voided:
             if dest_exists:
                 return
             _dump_json_payload(path, [], config)
             return
 
-        dedup_delta, _ = _dedupe_df_by_record_id(combined, exclude_ids=voided_ids)
+        if config.as_sdtm:
+            dedup_delta, _ = _dedupe_df_by_sdtm_key(
+                combined,
+                exclude_keys=excluded_sdtm_keys,
+                default_domain=config.sdtm_domain,
+            )
+        else:
+            dedup_delta, _ = _dedupe_df_by_record_id(combined, exclude_ids=voided_ids)
         delta_records = _dataframe_to_json_records(dedup_delta)
         existing_records: list[Any] = []
         if dest_exists:
@@ -3275,20 +4128,37 @@ def export_to_json(
             except Exception:
                 existing_records = []
 
-        merged_records: Any = _merge_flat_json_records(
-            existing_records,
-            delta_records,
-            voided_ids,
-        )
+        if config.as_sdtm:
+            merged_records: Any = _merge_flat_sdtm_json_records(
+                existing_records,
+                delta_records,
+                excluded_sdtm_keys,
+                default_domain=config.sdtm_domain,
+            )
+        else:
+            merged_records = _merge_flat_json_records(
+                existing_records,
+                delta_records,
+                voided_ids,
+            )
         if config.mask_phi:
             pipeline = resolve_enrichment_pipeline(study_key)
             phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-            merged_records = mask_clinical_phi(merged_records)
+            merged_records = (
+                redact_batch_records(merged_records, mask_phi=True, as_sdtm=True)
+                if config.as_sdtm
+                else mask_clinical_phi(merged_records)
+            )
             if phi_keys:
                 merged_records = mask_custom_phi_recursive(merged_records, phi_keys)
         _dump_json_payload(path, merged_records, config)
 
-    sink = _TabularCollectingSink(config, _write_or_reconcile_json, pass_voided_ids=True)
+    sink = _TabularCollectingSink(
+        config,
+        _write_or_reconcile_json,
+        pass_sdtm_keys=True,
+        operation_name="export_json",
+    )
     _tabular_export(sdk, study_key, sink, config, sanitize=False, stream_name="json")
 
 
@@ -3303,7 +4173,7 @@ def export_to_sql(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
-    quality_gate_enabled: bool = True,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
@@ -3323,8 +4193,6 @@ def export_to_sql(
         When ``True`` (default), sensitive PHI values are replaced with
         ``***MASKED***``.
     """
-    from sqlalchemy import create_engine
-
     manifest_path = kwargs.pop("manifest_path", manifest_path)
     if if_exists is not None:
         kwargs["if_exists"] = if_exists
@@ -3340,7 +4208,7 @@ def export_to_sql(
         mask_phi=mask_phi,
     )
 
-    engine = create_engine(conn_str)
+    engine = _create_sqlalchemy_engine(conn_str)
     sink = TabularSQLSink(table, engine, config)
     _tabular_export(sdk, study_key, sink, config, sanitize=False, stream_name=f"sql_{table}")
 
@@ -3443,7 +4311,13 @@ def export_to_duckdb(
         if df_legacy is not None:
 
             def _write_duckdb() -> int:
-                conn: Any = duckdb.connect(_coerce_path_str(db_path))
+                conn: Any = _connect_duckdb(duckdb, _coerce_path_str(db_path))
+                ddb_err_cls = getattr(duckdb, "Error", None)
+                driver_errs: tuple[type[BaseException], ...] = (
+                    (OSError, ddb_err_cls)
+                    if isinstance(ddb_err_cls, type) and issubclass(ddb_err_cls, BaseException)
+                    else (OSError,)
+                )
                 try:
                     quoted_tbl = _quote_duckdb_identifier(table_name)
                     quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
@@ -3466,6 +4340,13 @@ def export_to_duckdb(
                     finally:
                         conn.unregister(_DUCKDB_DF_ALIAS)
                     return len(df_legacy)
+                except ImednetError:
+                    raise
+                except driver_errs as exc:
+                    raise ExportBatchError(
+                        f"DuckDB batch {f'{study_key}/duckdb/0'!r} failed: {exc}",
+                        batch_id=f"{study_key}/duckdb/0",
+                    ) from exc
                 finally:
                     conn.close()
 
@@ -3542,16 +4423,55 @@ def _build_form_export_contexts(
         if var.form_id is not None:
             variables_by_form.setdefault(var.form_id, []).append(var)
 
+    inferred_by_form_id: dict[int, str | None] = {}
+    if as_sdtm and sdtm_domain is None:
+        for f_cand in forms:
+            if f_cand.form_id is None or f_cand.form_key is None:
+                continue
+            if form_whitelist is not None and f_cand.form_id not in form_whitelist:
+                continue
+            cand_vars = [
+                v.variable_name
+                for v in variables_by_form.get(f_cand.form_id, [])
+                if v.variable_name
+            ]
+            inferred_by_form_id[f_cand.form_id] = infer_sdtm_domain_from_form(
+                f_cand.form_key,
+                getattr(f_cand, "form_name", None),
+                variable_names=cand_vars,
+                pipeline=pipeline,
+            )
+    has_any_inferred_domain = any(v is not None for v in inferred_by_form_id.values())
+
     contexts: list[_FormExportContext] = []
     for form in forms:
         if form.form_id is None or form.form_key is None:
             continue
         if form_whitelist is not None and form.form_id not in form_whitelist:
             continue
+        variables = variables_by_form.get(form.form_id, [])
+        if as_sdtm:
+            if sdtm_domain is not None:
+                form_var_names = [v.variable_name for v in variables if v.variable_name]
+                if not form_matches_sdtm_domain(
+                    sdtm_domain,
+                    form_key=form.form_key,
+                    form_name=getattr(form, "form_name", None),
+                    variable_names=form_var_names,
+                    pipeline=pipeline,
+                ):
+                    continue
+                form_domain: str | None = resolve_sdtm_domain(sdtm_domain, fallback="AE")
+            else:
+                inferred_dom = inferred_by_form_id.get(form.form_id)
+                if has_any_inferred_domain and inferred_dom is None:
+                    continue
+                form_domain = inferred_dom or resolve_sdtm_domain(form.form_key, fallback="AE")
+        else:
+            form_domain = sdtm_domain
         if validate_form_key_fn is not None:
             validate_form_key_fn(form.form_key)
 
-        variables = variables_by_form.get(form.form_id, [])
         variable_keys = [
             v.variable_name
             for v in variables
@@ -3561,11 +4481,6 @@ def _build_form_export_contexts(
         label_map = {
             v.variable_name: v.label for v in variables if v.variable_name in variable_keys
         }
-        form_domain = (
-            resolve_sdtm_domain(sdtm_domain or form.form_key, fallback="AE")
-            if as_sdtm
-            else sdtm_domain
-        )
         record_model = None if as_sdtm else mapper._build_record_model(variable_keys, label_map)
         contract_types = (
             _build_sdtm_contract_types(form_domain, variable_whitelist=variable_whitelist)
@@ -3640,6 +4555,13 @@ def _stream_records_across_forms(
                         fallback_timestamp=opts["modified_since"],
                     )
                 )
+                if ctx.sink is not None and callable(
+                    getattr(ctx.sink, "bind_checkpoint_metadata", None)
+                ):
+                    raw_meta = ctx.tx.get("metadata")
+                    ctx.sink.bind_checkpoint_metadata(
+                        raw_meta if isinstance(raw_meta, dict) else None
+                    )
                 raw_last = ctx.tx.get("last_timestamp")
                 ctx.watermark = (
                     normalize_watermark_datetime(raw_last)
@@ -3943,7 +4865,7 @@ def export_to_duckdb_by_form(
     )
 
     resolved_db_path = _coerce_path_str(db_path)
-    conn: Any = duckdb.connect(resolved_db_path, config={"threads": "1"})
+    conn: Any = _connect_duckdb(duckdb, resolved_db_path, threads_one=True)
     try:
         if use_mock_fetch:
             for ctx in contexts:
@@ -4056,8 +4978,6 @@ def export_to_sql_by_form(
     **kwargs: Any,
 ) -> None:
     """Export records to separate SQL tables for each form."""
-    from sqlalchemy import create_engine
-
     manifest_path = kwargs.pop("manifest_path", None)
     config = _build_tabular_sink_config(
         study_key,
@@ -4078,7 +4998,7 @@ def export_to_sql_by_form(
     pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
-    engine = create_engine(conn_str)
+    engine = _create_sqlalchemy_engine(conn_str)
 
     contexts, all_variables = _build_form_export_contexts(
         sdk,
@@ -4234,8 +5154,18 @@ def _unpack_long_sql_rows(
     phi_keys: set[str] | None,
     naming_convention: str | None = None,
     sdtm_domain: str | None = None,
+    variable_whitelist: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Unpack ``Record`` envelopes into normalized long-format variable rows with PHI masking."""
+    allowed_vars: set[str] | None = None
+    mapped_allowed_sources: set[str] = set()
+    if variable_whitelist is not None:
+        allowed_vars = set(variable_whitelist)
+        if pipeline is not None and pipeline.mappings:
+            for src_var, rule in pipeline.mappings.items():
+                if rule.target_field in allowed_vars:
+                    mapped_allowed_sources.add(src_var)
+
     long_rows: list[dict[str, Any]] = []
     for rec in records:
         rec_id = extract_record_id(rec)
@@ -4250,9 +5180,17 @@ def _unpack_long_sql_rows(
             timestamp = getattr(rec, "date_modified", getattr(rec, "dateModified", None))
             raw_payload = getattr(rec, "record_data", getattr(rec, "recordData", None))
         rec_payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
+        if allowed_vars is not None and rec_payload:
+            rec_payload = {
+                k: v
+                for k, v in rec_payload.items()
+                if k in allowed_vars or k in mapped_allowed_sources
+            }
         if pipeline is not None and rec_payload:
             rec_payload = pipeline.process(rec_payload, mask_phi=mask_phi)
         for name, value in rec_payload.items():
+            if allowed_vars is not None and name not in allowed_vars:
+                continue
             if not mask_phi:
                 masked_value = value
             elif global_sensitivity_registry.is_sensitive(name) or _is_custom_phi_key(
@@ -4306,6 +5244,18 @@ class _LongSQLSink(ExportSink):
         self._initial_if_exists: Literal["replace", "append"] = (
             "append" if (self._is_incremental_sync or not config.idempotent) else "replace"
         )
+        self._seq_counters: dict[str, int] = {}
+        self._seq_counters_by_domain: dict[str, dict[str, int]] = {}
+        self._sdtm_provenance: dict[str, dict[str, Any]] = {}
+
+    def bind_checkpoint_metadata(self, metadata: dict[str, Any] | None) -> None:
+        super().bind_checkpoint_metadata(metadata)
+        self._seq_counters_by_domain, self._sdtm_provenance = hydrate_sdtm_checkpoint_state(
+            metadata
+        )
+        if self._cfg.sdtm_domain:
+            dom = resolve_sdtm_domain(self._cfg.sdtm_domain)
+            self._seq_counters = self._seq_counters_by_domain.setdefault(dom, {})
 
     def _delete_record_ids(self, record_ids: Sequence[Any]) -> int:
         return _execute_chunked_sql_id_delete(
@@ -4321,7 +5271,10 @@ class _LongSQLSink(ExportSink):
             if_exists: Literal["replace", "append"] = (
                 self._initial_if_exists if self._is_first_write else "append"
             )
-            pd.DataFrame(chunk).to_sql(
+            chunk_df = pd.DataFrame(chunk)
+            if if_exists == "append" and not isinstance(self.engine, NonCallableMock):
+                _ensure_sql_columns_exist(self.engine, self.table, chunk_df)
+            chunk_df.to_sql(
                 self.table,
                 self.engine,
                 if_exists=if_exists,
@@ -4329,9 +5282,138 @@ class _LongSQLSink(ExportSink):
             )
             self._is_first_write = False
 
+    def _build_sdtm_long_rows(
+        self, records: Sequence[Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        batch_records: Sequence[Any] = records
+        if self._cfg.variable_whitelist is not None:
+            allowed = set(self._cfg.variable_whitelist)
+            if self._pipeline is not None and self._pipeline.mappings:
+                for src_var, rule in self._pipeline.mappings.items():
+                    if rule.target_field in allowed:
+                        allowed.add(src_var)
+            projected: list[Any] = []
+            for rec in records:
+                rec_data = getattr(rec, "record_data", None)
+                if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
+                    projected.append(
+                        rec.model_copy(
+                            update={
+                                "record_data": {k: v for k, v in rec_data.items() if k in allowed}
+                            }
+                        )
+                    )
+                elif isinstance(rec, Mapping) and isinstance(rec.get("record_data"), Mapping):
+                    cloned = dict(rec)
+                    cloned["record_data"] = {
+                        k: v for k, v in rec["record_data"].items() if k in allowed
+                    }
+                    projected.append(cloned)
+                else:
+                    projected.append(rec)
+            batch_records = projected
+
+        raw_sdtm_rows: list[dict[str, Any]] = []
+        if self._cfg.sdtm_domain:
+            target_dom = resolve_sdtm_domain(self._cfg.sdtm_domain, fallback="AE")
+            dom_seq = self._seq_counters_by_domain.setdefault(target_dom, self._seq_counters)
+            raw_sdtm_rows = transform_records_to_sdtm_rows(
+                batch_records,
+                domain=target_dom,
+                study_key=self._cfg.study_key,
+                include_deleted=self._cfg.include_deleted,
+                mask_phi=self._cfg.mask_phi,
+                seq_counters=dom_seq,
+                phi_keys=self._phi_keys,
+                pipeline=self._pipeline,
+                filter_by_domain=True,
+                include_record_id_provenance=True,
+                provenance=self._sdtm_provenance,
+            )
+        else:
+            grouped: dict[str, list[Any]] = {}
+            unmatched: list[Any] = []
+            for rec in batch_records:
+                inferred = infer_record_sdtm_domain(rec, pipeline=self._pipeline, fallback=None)
+                if inferred is not None:
+                    grouped.setdefault(inferred, []).append(rec)
+                else:
+                    fid, fk = extract_record_form_ref(rec)
+                    if fid is None and not fk:
+                        unmatched.append(rec)
+            if not grouped and unmatched:
+                grouped["AE"] = unmatched
+            for dom_code, dom_recs in grouped.items():
+                dom_seq = self._seq_counters_by_domain.setdefault(dom_code, {})
+                raw_sdtm_rows.extend(
+                    transform_records_to_sdtm_rows(
+                        dom_recs,
+                        domain=dom_code,
+                        study_key=self._cfg.study_key,
+                        include_deleted=self._cfg.include_deleted,
+                        mask_phi=self._cfg.mask_phi,
+                        seq_counters=dom_seq,
+                        phi_keys=self._phi_keys,
+                        pipeline=self._pipeline,
+                        filter_by_domain=False,
+                        include_record_id_provenance=True,
+                        provenance=self._sdtm_provenance,
+                    )
+                )
+
+        cleaned_rows, all_replaced_keys, _ = reconcile_sdtm_provenance_rows(
+            raw_sdtm_rows,
+            self._sdtm_provenance,
+            default_domain=self._cfg.sdtm_domain,
+        )
+        persist_sdtm_checkpoint_state(
+            self._checkpoint_metadata,
+            self._seq_counters_by_domain,
+            self._sdtm_provenance,
+        )
+        keys_to_delete = list(all_replaced_keys)
+        long_rows: list[dict[str, Any]] = []
+        for srow in cleaned_rows:
+            nat = extract_sdtm_natural_key(srow, default_domain=self._cfg.sdtm_domain)
+            if nat.get("USUBJID"):
+                keys_to_delete.append(nat)
+            key_cols = set(nat.keys())
+            emitted_for_row = False
+            for col_name, val in srow.items():
+                if col_name in key_cols or _is_missing_scalar(val):
+                    continue
+                emitted_for_row = True
+                long_entry = dict(nat)
+                long_entry["variable_name"] = col_name
+                long_entry["value"] = str(val) if not isinstance(val, str) else val
+                long_rows.append(long_entry)
+            if not emitted_for_row and nat.get("USUBJID"):
+                long_entry = dict(nat)
+                long_entry["variable_name"] = "DOMAIN"
+                long_entry["value"] = str(nat.get("DOMAIN") or "")
+                long_rows.append(long_entry)
+        return long_rows, keys_to_delete
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         if not records:
             return 0
+        if self._cfg.as_sdtm:
+            long_rows, sdtm_delete_keys = self._build_sdtm_long_rows(records)
+
+            def execute_sdtm_export() -> int:
+                if (
+                    self._is_incremental_sync
+                    and self._cfg.idempotent
+                    and self._initial_if_exists == "append"
+                    and sdtm_delete_keys
+                ):
+                    _execute_sql_sdtm_key_delete(self.engine, self.table, sdtm_delete_keys)
+                if long_rows:
+                    self._write_long_chunks(long_rows)
+                return len(long_rows)
+
+            return self._execute_with_retry("export_long_sql", batch_id, execute_sdtm_export)
+
         incoming_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
         long_rows = _unpack_long_sql_rows(
             records,
@@ -4340,6 +5422,7 @@ class _LongSQLSink(ExportSink):
             phi_keys=self._phi_keys,
             naming_convention=self._cfg.naming_convention,
             sdtm_domain=self._cfg.sdtm_domain,
+            variable_whitelist=self._cfg.variable_whitelist,
         )
 
         def execute_export() -> int:
@@ -4359,6 +5442,20 @@ class _LongSQLSink(ExportSink):
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
         if not self._cfg.idempotent or not records or isinstance(self.engine, NonCallableMock):
             return 0
+        if self._cfg.as_sdtm:
+            deleted_keys = pop_deleted_sdtm_provenance_keys(records, self._sdtm_provenance)
+            persist_sdtm_checkpoint_state(
+                self._checkpoint_metadata,
+                self._seq_counters_by_domain,
+                self._sdtm_provenance,
+            )
+            if not deleted_keys:
+                return 0
+            return self._execute_with_retry(
+                "reconcile_long_sql_deleted",
+                batch_id,
+                lambda: _execute_sql_sdtm_key_delete(self.engine, self.table, deleted_keys),
+            )
         record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
         if not record_ids:
             return 0
@@ -4375,10 +5472,24 @@ class _LongSQLSink(ExportSink):
             and not self._is_incremental_sync
             and not isinstance(self.engine, NonCallableMock)
         ):
-            empty_df = pd.DataFrame(
-                columns=["record_id", "form_id", "variable_name", "value", "timestamp"]
+            if self._cfg.as_sdtm:
+                dom = resolve_sdtm_domain(self._cfg.sdtm_domain, fallback="AE")
+                cols = (
+                    ["STUDYID", "DOMAIN", "USUBJID", "variable_name", "value"]
+                    if dom == "DM"
+                    else ["STUDYID", "DOMAIN", "USUBJID", f"{dom}SEQ", "variable_name", "value"]
+                )
+            else:
+                cols = ["record_id", "form_id", "variable_name", "value", "timestamp"]
+            empty_df = pd.DataFrame(columns=cols)
+            self._execute_with_retry(
+                "export_long_sql",
+                f"{self._cfg.study_key}/long_sql/{self.table}/empty",
+                lambda: (
+                    empty_df.to_sql(self.table, self.engine, if_exists="replace", index=False),
+                    0,
+                )[1],
             )
-            empty_df.to_sql(self.table, self.engine, if_exists="replace", index=False)
             self._is_first_write = False
 
     def close(self) -> None:
@@ -4399,6 +5510,8 @@ def export_to_long_sql(
     conn_str: str,
     *,
     chunk_size: int = 1000,
+    variable_whitelist: list[str] | None = None,
+    form_whitelist: list[int] | None = None,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
@@ -4408,16 +5521,20 @@ def export_to_long_sql(
             "pandas is required for export_to_long_sql. Install with "
             "\"pip install 'imednet[export]'\"."
         )
-    from sqlalchemy import create_engine
-
     manifest_path = kwargs.pop("manifest_path", None)
+    if variable_whitelist is None and "variable_whitelist" in kwargs:
+        variable_whitelist = kwargs.pop("variable_whitelist")
+    if form_whitelist is None and "form_whitelist" in kwargs:
+        form_whitelist = kwargs.pop("form_whitelist")
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
         manifest_path=manifest_path,
         mask_phi=mask_phi,
     )
-    engine = create_engine(conn_str)
+    engine = _create_sqlalchemy_engine(conn_str)
     mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
     pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
@@ -4427,24 +5544,35 @@ def export_to_long_sql(
             legacy_records = (
                 rec
                 for rec in mapper._fetch_records(study_key)
-                if config.include_deleted or not is_record_deleted(rec)
+                if (config.include_deleted or not is_record_deleted(rec))
+                and (
+                    config.form_whitelist is None
+                    or extract_record_form_ref(rec)[0] in set(config.form_whitelist)
+                )
             )
             long_rows = _unpack_long_sql_rows(
                 legacy_records,
                 mask_phi=config.mask_phi,
                 pipeline=pipeline,
                 phi_keys=phi_keys,
+                variable_whitelist=config.variable_whitelist,
             )
-            first = True
-            for start in range(0, len(long_rows), max(1, chunk_size)):
-                df = pd.DataFrame(long_rows[start : start + max(1, chunk_size)])
-                df.to_sql(
-                    table_name,
-                    engine,
-                    if_exists="replace" if first else "append",
-                    index=False,
-                )
-                first = False
+
+            def _write_legacy_long() -> int:
+                first = True
+                for start in range(0, len(long_rows), max(1, chunk_size)):
+                    df = pd.DataFrame(long_rows[start : start + max(1, chunk_size)])
+                    df.to_sql(
+                        table_name,
+                        engine,
+                        if_exists="replace" if first else "append",
+                        index=False,
+                    )
+                    first = False
+                return len(long_rows)
+
+            with _TabularCallableSink(config, "export_long_sql", _write_legacy_long) as legacy_sink:
+                legacy_sink.write_batch([1], batch_id=f"{study_key}/long_sql/{table_name}/0")
         finally:
             db_name = getattr(getattr(engine, "url", None), "database", None)
             if (
@@ -4456,31 +5584,6 @@ def export_to_long_sql(
         return
 
     records_source = _make_mapper_records_source(sdk, study_key, mapper, config)
-    if config.as_sdtm:
-        sdtm_sql_sink = TabularSQLSink(table_name, engine, config)
-        sdtm_transform_sink = _TabularTransformSink(
-            sdtm_sql_sink,
-            mapper,
-            None,
-            [],
-            {},
-            config,
-            sanitize=False,
-            pipeline=pipeline,
-        )
-        run_streaming_export(
-            sdk,
-            study_key,
-            sdtm_transform_sink,
-            config,
-            stream_name=f"long_sql_{table_name}",
-            batch_id_prefix=f"{study_key}/long_sql/{table_name}",
-            records_source=records_source,
-            quality_gate_fn=apply_quality_gate,
-            iter_batches_fn=iter_batches,
-        )
-        return
-
     long_sink = _LongSQLSink(
         table_name,
         engine,
