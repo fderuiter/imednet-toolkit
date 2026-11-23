@@ -15,8 +15,17 @@ integration, endpoint wrappers, and the base CLI commands.
 pip install imednet
 ```
 
-Optional workflow commands live in the separate `imednet-workflows` package, and
-the Airflow integration lives in `apache-airflow-providers-imednet`.
+Optional core extras can be installed for CLI enhancements, analytical exports,
+warehouse sinks, and interactive views (`imednet[cli]`, `imednet[duckdb]`,
+`imednet[export]`, `imednet[mongodb]`, `imednet[neo4j]`, `imednet[snowflake]`,
+and `imednet[tui]`).
+
+Companion workspace packages provide extended Study and Record integrations:
+
+- `imednet-workflows` for higher-level Study and Record workflows and CLI subcommands
+- `imednet-plugins-sinks` for MongoDB, Neo4j, and Snowflake export sinks
+- `imednet-tui` for the interactive terminal user interface
+- `apache-airflow-providers-imednet` for Apache Airflow hooks, operators, and sensors
 
 Full project documentation is available at
 <https://fderuiter.github.io/imednet-toolkit/>.

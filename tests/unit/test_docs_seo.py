@@ -53,8 +53,17 @@ def test_sphinx_seo_hooks_emit_meta_tags_sitemap_robots_and_404(tmp_path: Path) 
 
     shutil.copy2(REPO_ROOT / "docs" / "_static" / "logo.png", static_dir / "logo.png")
     (static_dir / "custom.css").write_text("body {}\n", encoding="utf-8")
+    (static_dir / "code_blocks.js").write_text("", encoding="utf-8")
     (static_dir / "showcase.js").write_text("", encoding="utf-8")
     (static_dir / "thebe_pyodide.js").write_text("", encoding="utf-8")
+
+    # Add a partial file under _includes/ to verify exclude_patterns omits it from HTML and sitemap.xml
+    includes_dir = src_dir / "_includes"
+    includes_dir.mkdir(parents=True)
+    (includes_dir / "install_extensions.rst").write_text(
+        "Install core SDK with ``pip install imednet``.\n",
+        encoding="utf-8",
+    )
 
     # Reuse the real docs/conf.py, docs/_ext, and docs/404.rst with a compact doc set for fast isolated build
     shutil.copytree(REPO_ROOT / "docs" / "_ext", src_dir / "_ext")
@@ -66,7 +75,8 @@ def test_sphinx_seo_hooks_emit_meta_tags_sitemap_robots_and_404(tmp_path: Path) 
         "===================================\n\n"
         ".. toctree::\n"
         "   :maxdepth: 1\n\n"
-        "   guide\n",
+        "   guide\n"
+        "   interactive\n",
         encoding="utf-8",
     )
     (src_dir / "guide.rst").write_text(
@@ -74,7 +84,15 @@ def test_sphinx_seo_hooks_emit_meta_tags_sitemap_robots_and_404(tmp_path: Path) 
         "=================\n\n"
         ".. note::\n"
         "   Disclaimer note skipped for summary extraction.\n\n"
-        "Install the SDK and query clinical study records in three lines of Python.\n",
+        "Install the SDK and query clinical study records in three lines of Python.\n\n"
+        ".. include:: /_includes/install_extensions.rst\n",
+        encoding="utf-8",
+    )
+    (src_dir / "interactive.rst").write_text(
+        "Interactive Quick Start\n"
+        "=======================\n\n"
+        ".. pyodide-button:: Activate Interactive Runtime\n\n"
+        "Run live Study queries in the browser.\n",
         encoding="utf-8",
     )
     (src_dir / "404.rst").write_text(
@@ -148,18 +166,117 @@ def test_sphinx_seo_hooks_emit_meta_tags_sitemap_robots_and_404(tmp_path: Path) 
         'content="https://fderuiter.github.io/imednet-toolkit/_static/logo.png"' in not_found_html
     )
 
-    # Verify sitemap.xml includes index and guide, and excludes 404.html
+    assert not (out_dir / "_includes" / "install_extensions.html").exists()
+
+    # Verify index.html loads showcase.js and omits Pyodide assets
+    assert "showcase.js" in index_html
+    assert "code_blocks.js" in index_html
+    assert 'id="imednet-pyodide-config"' not in index_html
+    assert "thebe_pyodide.js" not in index_html
+
+    # Verify guide.html omits both showcase.js and Pyodide assets while keeping code_blocks.js
+    assert "code_blocks.js" in guide_html
+    assert "showcase.js" not in guide_html
+    assert 'id="imednet-pyodide-config"' not in guide_html
+    assert "thebe_pyodide.js" not in guide_html
+
+    # Verify interactive.html includes both #imednet-pyodide-config and thebe_pyodide.js
+    interactive_html = (out_dir / "interactive.html").read_text(encoding="utf-8")
+    assert 'id="imednet-pyodide-config"' in interactive_html
+    assert "thebe_pyodide.js" in interactive_html
+    assert "showcase.js" not in interactive_html
+
+    # Verify 404.html omits Pyodide metadata and showcase.js while keeping rewritten _static/ paths
+    assert 'id="imednet-pyodide-config"' not in not_found_html
+    assert "showcase.js" not in not_found_html
+
+    # Verify sitemap.xml includes index, guide, and interactive, and excludes 404.html and _includes/
     sitemap_root = DefusedET.fromstring((out_dir / "sitemap.xml").read_text(encoding="utf-8"))
     ns = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
     locs = [el.text for el in sitemap_root.findall(f"{ns}url/{ns}loc")]
     assert "https://fderuiter.github.io/imednet-toolkit/" in locs
     assert "https://fderuiter.github.io/imednet-toolkit/guide.html" in locs
-    assert all(loc is not None and not loc.endswith("/404.html") for loc in locs)
+    assert "https://fderuiter.github.io/imednet-toolkit/interactive.html" in locs
+    assert all(
+        loc is not None and not loc.endswith("/404.html") and "/_includes/" not in loc
+        for loc in locs
+    )
 
     # Verify robots.txt references canonical sitemap
     robots_txt = (out_dir / "robots.txt").read_text(encoding="utf-8")
     assert "User-agent: *" in robots_txt
     assert "Sitemap: https://fderuiter.github.io/imednet-toolkit/sitemap.xml" in robots_txt
+
+
+@pytest.mark.unit
+def test_check_built_html_seo_rejects_no_title_escaped_og_and_includes(tmp_path: Path) -> None:
+    """Verify check_built_html_seo rejects <no title>, escaped OG tags, and _includes/ URLs."""
+    html_dir = tmp_path / "html"
+    html_dir.mkdir(parents=True)
+    base = "https://fderuiter.github.io/imednet-toolkit/"
+
+    valid_head = (
+        '<meta name="description" content="Valid description." />\n'
+        '<meta property="og:title" content="Valid Title" />\n'
+        '<meta property="og:description" content="Valid description." />\n'
+        f'<meta property="og:url" content="{base}" />\n'
+        f'<meta property="og:image" content="{base}_static/logo.png" />\n'
+        '<meta name="twitter:card" content="summary" />\n'
+    )
+    (html_dir / "index.html").write_text(
+        f"<html><head><title>Valid Title</title>\n{valid_head}</head><body></body></html>",
+        encoding="utf-8",
+    )
+    (html_dir / "404.html").write_text(
+        f'<html><head><title>Not Found</title>\n{valid_head}<link rel="stylesheet" href="/imednet-toolkit/_static/custom.css" /></head><body></body></html>',
+        encoding="utf-8",
+    )
+    (html_dir / "robots.txt").write_text(
+        f"User-agent: *\nAllow: /\n\nSitemap: {base}sitemap.xml\n",
+        encoding="utf-8",
+    )
+    (html_dir / "sitemap.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"  <url><loc>{base}</loc></url>\n"
+        "</urlset>\n",
+        encoding="utf-8",
+    )
+    assert check_built_html_seo(html_dir, require_exists=True) is False
+
+    # 1. <no title> in <title> must fail
+    (html_dir / "untitled.html").write_text(
+        f"<html><head><title>&lt;no title&gt; - imednet</title>\n{valid_head}</head><body></body></html>",
+        encoding="utf-8",
+    )
+    assert check_built_html_seo(html_dir, require_exists=True) is True
+    (html_dir / "untitled.html").unlink()
+
+    # 2. Escaped OpenGraph tag must fail
+    (html_dir / "escaped.html").write_text(
+        "<html><head><title>Escaped</title>\n"
+        '<meta name="description" content="Valid" />\n'
+        '&lt;meta property="og:title" content="Escaped" /&gt;\n'
+        '<meta property="og:description" content="Valid" />\n'
+        f'<meta property="og:url" content="{base}escaped.html" />\n'
+        f'<meta property="og:image" content="{base}_static/logo.png" />\n'
+        '<meta name="twitter:card" content="summary" />\n'
+        "</head><body></body></html>",
+        encoding="utf-8",
+    )
+    assert check_built_html_seo(html_dir, require_exists=True) is True
+    (html_dir / "escaped.html").unlink()
+
+    # 3. _includes/ URL in sitemap.xml must fail
+    (html_dir / "sitemap.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"  <url><loc>{base}</loc></url>\n"
+        f"  <url><loc>{base}_includes/install_extensions.html</loc></url>\n"
+        "</urlset>\n",
+        encoding="utf-8",
+    )
+    assert check_built_html_seo(html_dir, require_exists=True) is True
 
 
 @pytest.mark.unit

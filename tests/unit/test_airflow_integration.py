@@ -78,7 +78,7 @@ def test_export_operator_calls_helper(monkeypatch):
 
     result = op.execute({})
 
-    export_mock.assert_called_once_with(sdk, "S", "/tmp/out.csv")
+    export_mock.assert_called_once_with(sdk, "S", "/tmp/out.csv", quality_gate_enabled=False)
     assert result == "/tmp/out.csv"
 
 
@@ -135,7 +135,9 @@ def test_export_operator_copies_runtime_kwargs_and_resolves_sdk_at_execute(monke
 
     hook_cls.assert_called_once_with("imednet_default")
     hook_inst.get_sdk_client.assert_called_once_with()
-    export_mock.assert_called_once_with(sdk, "S", "/tmp/out.json", orient="records")
+    export_mock.assert_called_once_with(
+        sdk, "S", "/tmp/out.json", orient="records", quality_gate_enabled=False
+    )
     assert result == "/tmp/out.json"
 
 
@@ -605,7 +607,11 @@ def test_export_operator_template_field_rendering_simulation(monkeypatch):
     result = op.execute({})
 
     export_mock.assert_called_once_with(
-        sdk, "RENDERED-STUDY-001", "/data/RENDERED-STUDY-001.csv", index=False
+        sdk,
+        "RENDERED-STUDY-001",
+        "/data/RENDERED-STUDY-001.csv",
+        index=False,
+        quality_gate_enabled=False,
     )
     assert result == "/data/RENDERED-STUDY-001.csv"
 
@@ -840,7 +846,10 @@ def test_airflow_sensor_operator_and_hook_close_sdk_on_completion_and_error(monk
     )
     sensor_ok = airflow_mod.ImednetJobSensor(task_id="s1", study_key="STUDY1", batch_id="B1")
     monkeypatch.setattr(sensor_ok, "_get_sdk", lambda: sdk_poke_ok)
-    assert sensor_ok.poke({}) is True
+    poke_res = sensor_ok.poke({})
+    assert bool(poke_res) is True
+    assert isinstance(poke_res, airflow_mod._airflow_compat.PokeReturnValue)
+    assert "results" not in poke_res.xcom_value
     assert sdk_poke_ok._client._client.is_closed
 
     sdk_poke_err = _make_sdk(
@@ -962,11 +971,20 @@ def test_export_operator_rejects_secrets_in_templated_filter_fields(monkeypatch)
     from apache_airflow_providers_imednet import ImednetExportOperator
     from apache_airflow_providers_imednet._airflow_compat import AirflowException
 
+    # Mapping keys in record_filter represent clinical/record attributes (e.g. secret='no'),
+    # while embedded credential assignments or credentialed URIs in values are rejected.
+    allowed_filter_op = ImednetExportOperator(
+        task_id="allowed_secret_attr_filter",
+        study_key="STUDY-1",
+        record_filter={"secret": "no"},
+    )
+    assert allowed_filter_op.record_filter == {"secret": "no"}
+
     with pytest.raises(AirflowException, match="record_filter"):
         ImednetExportOperator(
             task_id="bad_filter",
             study_key="STUDY-1",
-            record_filter={"password": "leaked"},  # pragma: allowlist secret
+            record_filter={"filter": "password=leaked"},  # pragma: allowlist secret
         )
 
     op = ImednetExportOperator(task_id="ok", study_key="STUDY-1")

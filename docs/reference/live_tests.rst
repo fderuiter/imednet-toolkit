@@ -26,41 +26,42 @@ dependencies that control skipping.
 
 CLI Tests (``test_cli_live.py``)
 --------------------------------
-These checks invoke the CLI using ``typer.testing.CliRunner`` and expect a zero exit code:
+These checks invoke the ``argparse`` CLI entrypoint (``imednet.cli.app``) via the in-process ``CliRunner`` helper in ``tests/live/test_cli_live.py`` and expect a zero exit code:
 
-- ``imednet studies list`` — Lists available studies.
-- ``imednet sites list <STUDY_KEY>`` — Lists sites for the chosen study.
-- ``imednet subjects list <STUDY_KEY>`` — Lists subjects for the study.
-- ``imednet records list <STUDY_KEY>`` — Lists records for the study.
-- ``imednet jobs status <STUDY_KEY> <BATCH_ID>`` — Retrieves the status of a known job.
-- ``imednet jobs wait <STUDY_KEY> <BATCH_ID>`` — Waits until the specified job completes.
-- ``imednet export parquet <STUDY_KEY> file.parquet`` — Exports records to Parquet.
-- ``imednet export csv <STUDY_KEY> file.csv`` — Exports records to CSV.
-- ``imednet export excel <STUDY_KEY> file.xlsx`` — Exports records to Excel.
-- ``imednet export json <STUDY_KEY> file.json`` — Exports records to JSON.
-- ``imednet export sql <STUDY_KEY> TABLE sqlite:///file.db`` — Exports records to a SQL database.
-- ``imednet workflows extract-records <STUDY_KEY>`` — Runs the workflow to export records.
+- ``imednet studies list`` — Lists available Studies.
+- ``imednet sites list <STUDY_KEY>`` — Lists Sites for the chosen Study.
+- ``imednet subjects list <STUDY_KEY>`` — Lists Subjects for the Study.
+- ``imednet records list <STUDY_KEY>`` — Lists Records for the Study.
+- ``imednet jobs status <STUDY_KEY> <BATCH_ID>`` — Retrieves the status of a known Job.
+- ``imednet jobs wait <STUDY_KEY> <BATCH_ID> --interval 1 --timeout 60`` — Waits until the specified Job completes.
+- ``imednet export parquet <STUDY_KEY> data.parquet`` — Exports Records to Parquet.
+- ``imednet export csv <STUDY_KEY> data.csv`` — Exports Records to CSV.
+- ``imednet export excel <STUDY_KEY> data.xlsx`` — Exports Records to Excel.
+- ``imednet export json <STUDY_KEY> data.json`` — Exports Records to JSON.
+- ``imednet export sql <STUDY_KEY> table sqlite:///test.db --single-table`` — Exports Records to a SQLite database (verifying wide-table column chunking).
+- ``imednet workflows extract-records <STUDY_KEY>`` — Runs the workflow to extract Records.
 
 Each command should complete successfully and create the expected output file where applicable.
 
 Endpoint Tests
 --------------
 
-### Synchronous (``test_endpoints_sync_live.py``)
-These tests verify that every REST endpoint works as expected using ``ImednetSDK``.
-When creating records, the first available form in the study is used
-automatically so ``IMEDNET_FORM_KEY`` does not need to be set:
+Synchronous (``test_endpoints_sync_live.py``)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+These tests verify REST endpoints on ``ImednetSDK`` according to each resource's supported capability set.
+When creating Records (with ``IMEDNET_ALLOW_MUTATION=1``), discovery selects an eligible Form (``subject_record_report=true``, ``disabled=false``) along with eligible Site, Subject, and Interval fixtures when ``IMEDNET_FORM_KEY`` is unset:
 
-- Listing endpoints (``list`` methods) return a list of model objects.
-- Individual ``get`` calls return an object whose key matches the input.
-- ``RecordsEndpoint.create`` submits a new record and ``JobsEndpoint.get`` retrieves the resulting job status.
-- ``JobsEndpoint.get`` with a known batch ID returns the corresponding job.
-- All endpoints tested include studies, sites, subjects, records, intervals, visits, variables, forms, queries, record revisions, users, jobs, and codings.
+- **List-and-get endpoints** (``studies``, ``sites``, ``subjects``, ``records``, ``forms``, ``intervals``, ``variables``, and ``record_revisions``) consume ``list(...)`` iterators into model lists and verify ``get(...)`` returns the matching entity.
+- **List-only endpoints** (``visits``, ``queries``, ``users``, and ``codings``) assert that ``get`` is absent and verify ``list(...)`` yields typed models.
+- **Job status and mutation** verify ``JobsEndpoint.get`` against a known ``generated_batch_id``, and exercise ``RecordsEndpoint.create`` across ``register``, ``scheduled``, and ``new`` payloads followed by ``JobsEndpoint.get`` when a ``batch_id`` is returned.
 
-### Asynchronous (``test_endpoints_async_live.py``)
-The asynchronous tests mirror the synchronous ones using ``AsyncImednetSDK``.
-Every ``async_list`` and ``async_get`` call behaves the same as the synchronous
-version, and an additional check creates a record and polls the resulting job.
+Asynchronous (``test_endpoints_async_live.py``)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+The asynchronous suite exercises study-scoped endpoints on ``AsyncImednetSDK``:
+
+- List-and-get endpoints (``sites``, ``subjects``, ``records``, ``intervals``, ``variables``, ``forms``, and ``record_revisions``) iterate ``async_sdk.<endpoint>.list(study_key)`` via ``async for`` (``AsyncIterator``) and ``await async_sdk.<endpoint>.get(study_key, item_id)``.
+- List-only endpoints (``visits``, ``queries``, ``users``, and ``codings``) confirm ``get`` is not exposed and consume ``list(study_key)`` via ``async for``.
+- Mutation coverage awaits ``async_sdk.records.create(study_key, [record_payload])`` across ``register``, ``scheduled``, and ``new`` payloads and awaits ``async_sdk.jobs.get(study_key, job.batch_id)``.
 
 Schema Validation (``test_schema_validator_live.py``)
 -----------------------------------------------------
