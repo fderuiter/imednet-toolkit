@@ -205,6 +205,20 @@ def normalize_watermark_datetime(value: datetime | str | None) -> datetime | Non
     raise ValueError(f"Watermark must be a datetime or ISO-8601 string, got {type(value).__name__}")
 
 
+def clamp_monotonic_watermark(
+    prior_ts: datetime | str | None,
+    candidate_ts: datetime | str | None,
+) -> datetime | None:
+    """Return a monotonically non-decreasing UTC watermark across ``prior_ts`` and ``candidate_ts``."""
+    norm_prior = normalize_watermark_datetime(prior_ts)
+    norm_candidate = normalize_watermark_datetime(candidate_ts)
+    if norm_prior is None:
+        return norm_candidate
+    if norm_candidate is None:
+        return norm_prior
+    return max(norm_prior, norm_candidate)
+
+
 def get_state_provider(
     ledger_path: str | Path | None = None,
     *,
@@ -2258,7 +2272,7 @@ def run_streaming_export(
         if tx is not None:
             tx["records_processed"] = total_written + total_reconciled
             if max_ts is not None:
-                tx["new_timestamp"] = max_ts
+                tx["new_timestamp"] = clamp_monotonic_watermark(watermark, max_ts)
 
     return total_written
 
@@ -2274,6 +2288,7 @@ __all__ = [
     "_require_optional_dep",
     "apply_quality_gate",
     "build_record_query_branches",
+    "clamp_monotonic_watermark",
     "evaluate_standards_readiness",
     "extract_record_form_ref",
     "extract_record_id",

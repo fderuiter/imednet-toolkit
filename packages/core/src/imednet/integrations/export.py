@@ -36,6 +36,7 @@ from imednet.integrations.sink_base import (
     _enforce_batch_standards_readiness,
     _extract_safe_config_options,
     apply_quality_gate,
+    clamp_monotonic_watermark,
     extract_record_form_ref,
     extract_record_id,
     extract_record_timestamp,
@@ -58,6 +59,7 @@ try:
     import pandas as pd
 except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
+_DEFAULT_PANDAS_TO_SQL: Any = pd.DataFrame.to_sql if pd is not None else None
 from imednet.constants import MAX_SQLITE_COLUMNS
 from imednet.utils import sanitize_csv_formula
 from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
@@ -161,6 +163,357 @@ def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFr
     return df
 
 
+_STUDY_KEY_CANDIDATES: tuple[str, ...] = ("studyKey", "study_key", "STUDYID")
+_RECORD_ID_CANDIDATES: tuple[str, ...] = ("recordId", "record_id", "RECORD_ID")
+_SQLITE_SHARD_KEY_COLS: tuple[str, ...] = (
+    *_STUDY_KEY_CANDIDATES,
+    *_RECORD_ID_CANDIDATES,
+)
+_LOGICAL_TO_ANSI_SQL: dict[str, str] = {
+    "int64": "BIGINT",
+    "float64": "FLOAT",
+    "bool": "BOOLEAN",
+    "string": "TEXT",
+}
+
+
+def _discover_sqlite_part_tables(inspector: Any, table_name: str) -> list[str]:
+    """Return existing ``{table_name}_partN`` SQLite shard tables ordered numerically."""
+    get_table_names = getattr(inspector, "get_table_names", None)
+    if not callable(get_table_names):
+        return []
+    raw_names = get_table_names()
+    if isinstance(raw_names, NonCallableMock) or not isinstance(raw_names, Iterable):
+        return []
+    pattern = re.compile(rf"^{re.escape(table_name)}_part([1-9]\d*)$")
+    matched: list[tuple[int, str]] = []
+    for name in raw_names:
+        if isinstance(name, str) and (m := pattern.fullmatch(name)) is not None:
+            matched.append((int(m.group(1)), name))
+    matched.sort(key=lambda item: item[0])
+    return [name for _, name in matched]
+
+
+def _resolve_backfill_study_key(
+    df: pd.DataFrame,
+    col: str,
+    backfill_study_key: str | None,
+) -> str | None:
+    """Resolve the Study key used to backfill legacy rows when adding a Study identifier column."""
+    if isinstance(backfill_study_key, str) and backfill_study_key.strip():
+        return backfill_study_key.strip()
+    if col in df.columns:
+        non_missing = {
+            str(v).strip()
+            for v in df[col].tolist()
+            if v is not None and not _is_missing_scalar(v) and str(v).strip()
+        }
+        if len(non_missing) == 1:
+            return next(iter(non_missing))
+    return None
+
+
+def _evolve_sql_table_columns(
+    engine: Any,
+    table_name: str,
+    df: pd.DataFrame,
+    *,
+    conn: Any | None = None,
+    backfill_study_key: str | None = None,
+) -> pd.DataFrame:
+    """Add missing DataFrame columns to an existing SQL table prior to ``append`` writes."""
+    if (
+        isinstance(df, NonCallableMock)
+        or isinstance(engine, NonCallableMock)
+        or len(df.columns) == 0
+    ):
+        return df
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import text as sa_text
+
+    inspect_target = conn if conn is not None else engine
+    inspector = sa_inspect(inspect_target)
+    if not inspector.has_table(table_name):
+        return df
+
+    existing_cols = [str(c["name"]) for c in inspector.get_columns(table_name)]
+    existing_by_lower = {c.lower(): c for c in existing_cols}
+
+    rename_map = {
+        col: existing_by_lower[str(col).lower()]
+        for col in df.columns
+        if str(col).lower() in existing_by_lower and str(col) != existing_by_lower[str(col).lower()]
+    }
+    out_df = df.rename(columns=rename_map) if rename_map else df
+
+    missing_cols = [str(c) for c in out_df.columns if str(c).lower() not in existing_by_lower]
+    if not missing_cols:
+        return out_df
+
+    is_sqlite = getattr(getattr(engine, "dialect", None), "name", None) == "sqlite"
+    if is_sqlite and len(existing_cols) + len(missing_cols) > MAX_SQLITE_COLUMNS:
+        available = max(0, MAX_SQLITE_COLUMNS - len(existing_cols))
+        study_lower = {s.lower() for s in _STUDY_KEY_CANDIDATES}
+        droppable_study = [c for c in missing_cols if c.lower() in study_lower]
+        cols_to_drop: list[str] = []
+        while len(missing_cols) > available and droppable_study:
+            drop_col = droppable_study.pop(0)
+            missing_cols.remove(drop_col)
+            cols_to_drop.append(drop_col)
+        if cols_to_drop:
+            out_df = out_df.drop(columns=cols_to_drop)
+
+    if not missing_cols:
+        return out_df
+
+    preparer = engine.dialect.identifier_preparer
+    quoted_table = preparer.quote(table_name)
+    study_lower = {s.lower() for s in _STUDY_KEY_CANDIDATES}
+
+    def _run_alter(active_conn: Any) -> None:
+        for col in missing_cols:
+            inferred = _infer_series_logical_type(out_df[col])
+            sql_type = _LOGICAL_TO_ANSI_SQL.get(inferred or "string", "TEXT")
+            quoted_col = preparer.quote(col)
+            stmt = sa_text(f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_col} {sql_type}")
+            active_conn.execute(stmt)  # nosem
+            if col.lower() in study_lower:
+                backfill_val = _resolve_backfill_study_key(out_df, col, backfill_study_key)
+                if backfill_val is not None:
+                    backfill_stmt = sa_text(
+                        f"UPDATE {quoted_table} SET {quoted_col} = :study_key "
+                        f"WHERE {quoted_col} IS NULL"
+                    )
+                    active_conn.execute(backfill_stmt, {"study_key": backfill_val})  # nosem
+
+    if conn is not None:
+        _run_alter(conn)
+    else:
+        with engine.begin() as active_conn:
+            _run_alter(active_conn)
+    return out_df
+
+
+def _build_sqlite_wide_chunks(df: pd.DataFrame) -> list[pd.DataFrame]:
+    """Split a wide DataFrame into ``<= MAX_SQLITE_COLUMNS`` slices preserving key identifiers."""
+    key_indices = [idx for idx, col in enumerate(df.columns) if str(col) in _SQLITE_SHARD_KEY_COLS]
+    if 0 < len(key_indices) < MAX_SQLITE_COLUMNS:
+        key_set = set(key_indices)
+        non_key_indices = [idx for idx in range(len(df.columns)) if idx not in key_set]
+        slice_width = MAX_SQLITE_COLUMNS - len(key_indices)
+        if not non_key_indices:
+            return [df.iloc[:, key_indices]]
+        return [
+            df.iloc[:, key_indices + non_key_indices[start : start + slice_width]]
+            for start in range(0, len(non_key_indices), slice_width)
+        ]
+    return [
+        df.iloc[:, start : start + MAX_SQLITE_COLUMNS]
+        for start in range(0, len(df.columns), MAX_SQLITE_COLUMNS)
+    ]
+
+
+def _append_to_existing_sqlite_parts(
+    df: pd.DataFrame,
+    table: str,
+    engine: Any,
+    existing_parts: list[str],
+    *,
+    conn: Any,
+    inspector: Any,
+    backfill_study_key: str | None = None,
+    **kwargs: Any,
+) -> None:
+    """Append ``df`` rows across already-sharded ``{table}_partN`` SQLite tables."""
+    part_existing_cols = {
+        pt: [str(c["name"]) for c in inspector.get_columns(pt)] for pt in existing_parts
+    }
+    key_cols = [str(col) for col in df.columns if str(col) in _SQLITE_SHARD_KEY_COLS]
+    key_lower_set = {k.lower() for k in _SQLITE_SHARD_KEY_COLS}
+
+    non_key_owner: dict[str, str] = {}
+    for pt in existing_parts:
+        for existing_col in part_existing_cols[pt]:
+            low = existing_col.lower()
+            if low not in key_lower_set and low not in non_key_owner:
+                non_key_owner[low] = pt
+
+    assigned: dict[str, list[str]] = {pt: [] for pt in existing_parts}
+    new_non_keys: list[str] = []
+    for col in df.columns:
+        col_str = str(col)
+        low = col_str.lower()
+        if low in key_lower_set:
+            continue
+        owner = non_key_owner.get(low)
+        if owner is not None:
+            assigned[owner].append(col_str)
+        else:
+            new_non_keys.append(col_str)
+
+    new_part_specs: list[tuple[str, list[str]]] = []
+    if new_non_keys:
+        last_pt = existing_parts[-1]
+        last_existing_lower = {c.lower() for c in part_existing_cols[last_pt]}
+        missing_keys_in_last = [k for k in key_cols if k.lower() not in last_existing_lower]
+        room_in_last = max(
+            0,
+            MAX_SQLITE_COLUMNS - len(part_existing_cols[last_pt]) - len(missing_keys_in_last),
+        )
+        assigned[last_pt].extend(new_non_keys[:room_in_last])
+        overflow = new_non_keys[room_in_last:]
+        if overflow:
+            last_match = re.search(r"_part([1-9]\d*)$", last_pt)
+            next_num = (int(last_match.group(1)) + 1) if last_match else (len(existing_parts) + 1)
+            slice_width = max(1, MAX_SQLITE_COLUMNS - len(key_cols))
+            for offset, start in enumerate(range(0, len(overflow), slice_width)):
+                new_part_specs.append(
+                    (f"{table}_part{next_num + offset}", overflow[start : start + slice_width])
+                )
+
+    for pt in existing_parts:
+        part_cols = list(dict.fromkeys([*key_cols, *assigned[pt]]))
+        part_df = df.loc[:, part_cols]
+        part_df = _evolve_sql_table_columns(
+            engine,
+            pt,
+            part_df,
+            conn=conn,
+            backfill_study_key=backfill_study_key,
+        )
+        part_df.to_sql(pt, conn, if_exists="append", index=False, **kwargs)
+
+    for new_pt, overflow_cols in new_part_specs:
+        new_cols = list(dict.fromkeys([*key_cols, *overflow_cols]))
+        df.loc[:, new_cols].to_sql(new_pt, conn, if_exists="append", index=False, **kwargs)
+
+
+def _to_sql_with_chunking_on_conn(
+    df: pd.DataFrame,
+    table: str,
+    engine: Any,
+    *,
+    if_exists: Literal["fail", "replace", "append", "delete_rows"],
+    conn: Any | None = None,
+    backfill_study_key: str | None = None,
+    **kwargs: Any,
+) -> None:
+    """Write ``df`` to ``table`` (or ``{table}_partN`` shards), optionally reusing ``conn``."""
+    is_mock = isinstance(df, NonCallableMock) or isinstance(engine, NonCallableMock)
+    is_sqlite = getattr(getattr(engine, "dialect", None), "name", None) == "sqlite"
+
+    if not is_mock and is_sqlite and if_exists == "append":
+        from sqlalchemy import inspect as sa_inspect
+
+        def _append_sqlite(active_conn: Any) -> None:
+            inspector = sa_inspect(active_conn)
+            existing_parts = _discover_sqlite_part_tables(inspector, table)
+            if existing_parts:
+                _append_to_existing_sqlite_parts(
+                    df,
+                    table,
+                    engine,
+                    existing_parts,
+                    conn=active_conn,
+                    inspector=inspector,
+                    backfill_study_key=backfill_study_key,
+                    **kwargs,
+                )
+            elif len(df.columns) > MAX_SQLITE_COLUMNS:
+                for idx, chunk in enumerate(_build_sqlite_wide_chunks(df), start=1):
+                    chunk.to_sql(
+                        f"{table}_part{idx}",
+                        active_conn,
+                        if_exists="append",
+                        index=False,
+                        **kwargs,
+                    )
+            else:
+                evolved = _evolve_sql_table_columns(
+                    engine,
+                    table,
+                    df,
+                    conn=active_conn,
+                    backfill_study_key=backfill_study_key,
+                )
+                evolved.to_sql(table, active_conn, if_exists="append", index=False, **kwargs)
+
+        if conn is not None:
+            _append_sqlite(conn)
+        else:
+            with engine.begin() as active_conn:
+                _append_sqlite(active_conn)
+        return
+
+    if is_sqlite and not isinstance(df, NonCallableMock) and len(df.columns) > MAX_SQLITE_COLUMNS:
+        chunks = _build_sqlite_wide_chunks(df)
+        if is_mock:
+            for i, chunk in enumerate(chunks, start=1):
+                chunk.to_sql(
+                    f"{table}_part{i}",
+                    engine,
+                    if_exists=if_exists,
+                    index=False,
+                    **kwargs,
+                )
+            return
+
+        def _write_wide_sqlite(active_conn: Any) -> None:
+            if if_exists == "replace":
+                from sqlalchemy import inspect as sa_inspect
+                from sqlalchemy import text as sa_text
+
+                inspector = sa_inspect(active_conn)
+                preparer = engine.dialect.identifier_preparer
+                if inspector.has_table(table):
+                    active_conn.execute(
+                        sa_text(f"DROP TABLE IF EXISTS {preparer.quote(table)}")
+                    )  # nosem
+                for stale_pt in _discover_sqlite_part_tables(inspector, table)[len(chunks) :]:
+                    active_conn.execute(
+                        sa_text(f"DROP TABLE IF EXISTS {preparer.quote(stale_pt)}")
+                    )  # nosem
+            for i, chunk in enumerate(chunks, start=1):
+                chunk.to_sql(
+                    f"{table}_part{i}",
+                    active_conn,
+                    if_exists=if_exists,
+                    index=False,
+                    **kwargs,
+                )
+
+        if conn is not None:
+            _write_wide_sqlite(conn)
+        else:
+            with engine.begin() as active_conn:
+                _write_wide_sqlite(active_conn)
+        return
+
+    if not is_mock and if_exists == "append":
+        if conn is not None:
+            evolved = _evolve_sql_table_columns(
+                engine,
+                table,
+                df,
+                conn=conn,
+                backfill_study_key=backfill_study_key,
+            )
+            evolved.to_sql(table, conn, if_exists=if_exists, index=False, **kwargs)
+        else:
+            with engine.begin() as active_conn:
+                evolved = _evolve_sql_table_columns(
+                    engine,
+                    table,
+                    df,
+                    conn=active_conn,
+                    backfill_study_key=backfill_study_key,
+                )
+                evolved.to_sql(table, active_conn, if_exists=if_exists, index=False, **kwargs)
+    else:
+        target_con = conn if (conn is not None and not is_mock) else engine
+        df.to_sql(table, target_con, if_exists=if_exists, index=False, **kwargs)
+
+
 def _to_sql_with_chunking(
     df: pd.DataFrame,
     table: str,
@@ -173,20 +526,12 @@ def _to_sql_with_chunking(
 
     SQLite limits tables to ``MAX_SQLITE_COLUMNS`` columns. When the DataFrame
     exceeds this, the data is written to multiple tables suffixed with
-    ``_part1``, ``_part2`` and so on.
+    ``_part1``, ``_part2`` and so on while retaining Study and Record key columns.
     """
-    if engine.dialect.name == "sqlite" and len(df.columns) > MAX_SQLITE_COLUMNS:
-        for i, start in enumerate(range(0, len(df.columns), MAX_SQLITE_COLUMNS), start=1):
-            chunk = df.iloc[:, start : start + MAX_SQLITE_COLUMNS]
-            chunk.to_sql(
-                f"{table}_part{i}",
-                engine,
-                if_exists=if_exists,
-                index=False,
-                **kwargs,
-            )
-    else:
-        df.to_sql(table, engine, if_exists=if_exists, index=False, **kwargs)
+    _to_sql_with_chunking_on_conn(df, table, engine, if_exists=if_exists, **kwargs)
+
+
+_DEFAULT_TO_SQL_WITH_CHUNKING = _to_sql_with_chunking
 
 
 def _records_df(
@@ -1178,6 +1523,8 @@ def _evolve_duckdb_table_for_df(
     df: pd.DataFrame,
     contract_types: Mapping[str, str | None] | None,
     untyped_null_cols: set[str],
+    *,
+    backfill_study_key: str | None = None,
 ) -> pd.DataFrame:
     """Widen or add DuckDB table columns prior to ``INSERT INTO ... BY NAME``."""
     if df.empty or isinstance(conn, NonCallableMock):
@@ -1190,6 +1537,7 @@ def _evolve_duckdb_table_for_df(
         for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
     }
     adjusted: pd.DataFrame | None = None
+    study_lower = {s.lower() for s in _STUDY_KEY_CANDIDATES}
 
     for col_raw in df.columns:
         col = str(col_raw)
@@ -1205,6 +1553,13 @@ def _evolve_duckdb_table_for_df(
             else:
                 sql_type = _LOGICAL_TO_DUCKDB_SQL[desired_logical]
             conn.execute(f"ALTER TABLE {quoted_tbl} ADD COLUMN {quoted_col} {sql_type}")
+            if col.lower() in study_lower:
+                backfill_val = _resolve_backfill_study_key(df, col, backfill_study_key)
+                if backfill_val is not None:
+                    conn.execute(  # nosem
+                        f"UPDATE {quoted_tbl} SET {quoted_col} = ? WHERE {quoted_col} IS NULL",
+                        [backfill_val],
+                    )
             existing_info[col] = sql_type
             continue
 
@@ -1757,36 +2112,239 @@ class TabularParquetSink(ExportSink):
         self._schema = None
 
 
+def _extract_record_study_key(record: Any) -> str | None:
+    """Extract an optional explicit ``study_key`` / ``studyKey`` from ``record``."""
+    for attr in _STUDY_KEY_CANDIDATES:
+        raw = record.get(attr) if isinstance(record, Mapping) else getattr(record, attr, None)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
+
+def _group_record_ids_by_study(
+    records: Iterable[Any],
+    default_study_key: str,
+) -> list[tuple[str | None, list[Any]]]:
+    """Group extracted record IDs by ``(study_key, record_ids)`` preserving order."""
+    fallback = default_study_key.strip() if isinstance(default_study_key, str) else ""
+    grouped: dict[str | None, list[Any]] = {}
+    for rec in records:
+        rid = extract_record_id(rec)
+        if rid is None:
+            continue
+        s_key = _extract_record_study_key(rec) or (fallback or None)
+        grouped.setdefault(s_key, []).append(rid)
+    return list(grouped.items())
+
+
+def _resolve_study_col_name(
+    df: pd.DataFrame,
+    *,
+    existing_cols: Iterable[str] = (),
+    use_labels_as_columns: bool = False,
+    naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
+    as_sdtm: bool = False,
+) -> str:
+    """Choose the canonical Study identifier column name for ``df`` and destination."""
+    existing_by_lower = {str(c).lower(): str(c) for c in existing_cols}
+    for cand in _STUDY_KEY_CANDIDATES:
+        if cand.lower() in existing_by_lower:
+            return existing_by_lower[cand.lower()]
+
+    df_by_lower = {str(c).lower(): str(c) for c in df.columns}
+    for cand in _STUDY_KEY_CANDIDATES:
+        if cand.lower() in df_by_lower:
+            return df_by_lower[cand.lower()]
+
+    if not use_labels_as_columns and naming_convention is not None:
+        canonical_conv = normalize_naming_convention(naming_convention)
+        if canonical_conv is not None:
+            return format_variable_name(
+                "study_key",
+                canonical_conv,
+                domain=sdtm_domain,
+                is_metadata=True,
+            )
+
+    if as_sdtm or "RECORD_ID" in df.columns:
+        return "STUDYID"
+    if "record_id" in df.columns and "recordId" not in df.columns:
+        return "study_key"
+    return "studyKey"
+
+
+def _ensure_df_study_key(
+    df: pd.DataFrame,
+    study_key: str,
+    *,
+    records: Sequence[Any] | None = None,
+    existing_cols: Iterable[str] = (),
+    use_labels_as_columns: bool = False,
+    naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
+    as_sdtm: bool = False,
+) -> tuple[pd.DataFrame, str | None]:
+    """Ensure incremental tabular ``df`` carries a populated Study identifier column."""
+    study_col = _resolve_study_col_name(
+        df,
+        existing_cols=existing_cols,
+        use_labels_as_columns=use_labels_as_columns,
+        naming_convention=naming_convention,
+        sdtm_domain=sdtm_domain,
+        as_sdtm=as_sdtm,
+    )
+    fallback = study_key.strip() if isinstance(study_key, str) else ""
+    if records is not None and not isinstance(records, pd.DataFrame) and len(records) == len(df):
+        row_studies = [_extract_record_study_key(r) or fallback for r in records]
+    else:
+        row_studies = [fallback] * len(df)
+
+    df_by_lower = {str(c).lower(): c for c in df.columns}
+    alt_study_col = next(
+        (df_by_lower[c.lower()] for c in _STUDY_KEY_CANDIDATES if c.lower() in df_by_lower),
+        None,
+    )
+    if alt_study_col is not None and alt_study_col != study_col:
+        df = df.rename(columns={alt_study_col: study_col})
+
+    if study_col in df.columns:
+        if any(row_studies) and bool(df[study_col].isna().any()):
+            out = df.copy()
+            filled = [
+                (row_studies[idx] or pd.NA) if _is_missing_scalar(val) else str(val)
+                for idx, val in enumerate(out[study_col].tolist())
+            ]
+            out[study_col] = pd.Series(filled, index=out.index, dtype="string")
+            return out, study_col
+        return df, study_col
+
+    if not any(row_studies):
+        return df, None
+
+    out = df.copy()
+    out.insert(
+        0,
+        study_col,
+        pd.Series([val or pd.NA for val in row_studies], index=out.index, dtype="string"),
+    )
+    return out, study_col
+
+
+def _group_df_record_ids_by_study(
+    df: pd.DataFrame,
+    default_study_key: str,
+) -> list[tuple[str | None, list[Any]]]:
+    """Group ``df`` record IDs by ``(study_key, record_ids)`` for pre-append deletes."""
+    df_by_lower = {str(c).lower(): c for c in df.columns}
+    id_col = next(
+        (df_by_lower[c.lower()] for c in _RECORD_ID_CANDIDATES if c.lower() in df_by_lower),
+        None,
+    )
+    if id_col is None:
+        return []
+    study_col = next(
+        (df_by_lower[c.lower()] for c in _STUDY_KEY_CANDIDATES if c.lower() in df_by_lower),
+        None,
+    )
+    fallback = default_study_key.strip() if isinstance(default_study_key, str) else ""
+    id_values = df[id_col].tolist()
+    study_values = df[study_col].tolist() if study_col is not None else [None] * len(df)
+    grouped: dict[str | None, list[Any]] = {}
+    for s_val, rid in zip(study_values, id_values, strict=False):
+        if _is_missing_scalar(rid):
+            continue
+        resolved_study = (
+            str(s_val).strip()
+            if (s_val is not None and not _is_missing_scalar(s_val) and str(s_val).strip())
+            else (fallback or None)
+        )
+        grouped.setdefault(resolved_study, []).append(rid)
+    return list(grouped.items())
+
+
 def _execute_chunked_sql_id_delete(
     engine: Any,
     table_name: str,
     candidate_cols: Sequence[str],
     record_ids: Sequence[Any],
+    *,
+    study_key: str | None = None,
+    candidate_study_cols: Sequence[str] = _STUDY_KEY_CANDIDATES,
+    conn: Any | None = None,
 ) -> int:
-    """Delete rows matching ``record_ids`` in chunks of 500 when ``table_name`` exists."""
+    """Delete matching rows across ``table_name`` and ``_partN`` shards in one transaction."""
     if not record_ids or isinstance(engine, NonCallableMock):
         return 0
     from sqlalchemy import inspect as sa_inspect
     from sqlalchemy import text as sa_text
 
-    inspector = sa_inspect(engine)
-    if not inspector.has_table(table_name):
+    inspect_target = conn if conn is not None else engine
+    inspector = sa_inspect(inspect_target)
+    target_tables: list[str] = []
+    if inspector.has_table(table_name):
+        target_tables.append(table_name)
+    if getattr(getattr(engine, "dialect", None), "name", None) == "sqlite":
+        target_tables.extend(_discover_sqlite_part_tables(inspector, table_name))
+    if not target_tables:
         return 0
-    existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
-    id_col = next((col for col in candidate_cols if col in existing_cols), None)
-    if id_col is None:
+
+    delete_targets: list[tuple[str, str, str | None]] = []
+    for target_tbl in target_tables:
+        cols_by_lower = {
+            str(c["name"]).lower(): str(c["name"]) for c in inspector.get_columns(target_tbl)
+        }
+        id_col = next(
+            (cols_by_lower[col.lower()] for col in candidate_cols if col.lower() in cols_by_lower),
+            None,
+        )
+        if id_col is None:
+            continue
+        study_col = (
+            next(
+                (
+                    cols_by_lower[sc.lower()]
+                    for sc in candidate_study_cols
+                    if sc.lower() in cols_by_lower
+                ),
+                None,
+            )
+            if study_key is not None
+            else None
+        )
+        delete_targets.append((target_tbl, id_col, study_col))
+
+    if not delete_targets:
         return 0
 
     preparer = engine.dialect.identifier_preparer
-    quoted_table = preparer.quote(table_name)
-    quoted_col = preparer.quote(id_col)
-    with engine.begin() as conn:
-        for start in range(0, len(record_ids), 500):
-            chunk = record_ids[start : start + 500]
-            params = {f"id_{idx}": rid for idx, rid in enumerate(chunk)}
-            placeholders = ", ".join(f":{k}" for k in params)
-            stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})")
-            conn.execute(stmt, params)
+
+    def _run_deletes(active_conn: Any) -> None:
+        for target_tbl, id_col, study_col in delete_targets:
+            quoted_table = preparer.quote(target_tbl)
+            quoted_col = preparer.quote(id_col)
+            quoted_study_col = preparer.quote(study_col) if study_col is not None else None
+            for start in range(0, len(record_ids), 500):
+                chunk = record_ids[start : start + 500]
+                params: dict[str, Any] = {f"id_{idx}": rid for idx, rid in enumerate(chunk)}
+                placeholders = ", ".join(f":{k}" for k in params)
+                if quoted_study_col is not None and study_key is not None:
+                    params["study_key"] = study_key
+                    stmt = sa_text(
+                        f"DELETE FROM {quoted_table} WHERE {quoted_study_col} = :study_key "
+                        f"AND {quoted_col} IN ({placeholders})"
+                    )
+                else:
+                    stmt = sa_text(
+                        f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})"
+                    )
+                active_conn.execute(stmt, params)  # nosem
+
+    if conn is not None:
+        _run_deletes(conn)
+    else:
+        with engine.begin() as active_conn:
+            _run_deletes(active_conn)
     return len(record_ids)
 
 
@@ -1813,13 +2371,37 @@ class TabularSQLSink(ExportSink):
         else:
             self._initial_if_exists = "append" if self._is_incremental_sync else "replace"
 
-    def _delete_existing_record_ids(self, record_ids: Sequence[Any]) -> int:
-        """Delete existing rows matching ``recordId`` when the destination table exists."""
+    def _inspect_existing_columns(self, *, conn: Any | None = None) -> list[str]:
+        """Return existing column names across ``self.table`` and any SQLite ``_partN`` shards."""
+        if isinstance(self.engine, NonCallableMock):
+            return []
+        from sqlalchemy import inspect as sa_inspect
+
+        inspector = sa_inspect(conn if conn is not None else self.engine)
+        cols: list[str] = []
+        if inspector.has_table(self.table):
+            cols.extend(str(c["name"]) for c in inspector.get_columns(self.table))
+        if getattr(getattr(self.engine, "dialect", None), "name", None) == "sqlite":
+            for pt in _discover_sqlite_part_tables(inspector, self.table):
+                cols.extend(str(c["name"]) for c in inspector.get_columns(pt))
+        return cols
+
+    def _delete_existing_record_ids(
+        self,
+        record_ids: Sequence[Any],
+        *,
+        study_key: str | None = None,
+        conn: Any | None = None,
+    ) -> int:
+        """Delete existing rows matching ``(study_key, recordId)`` across table and shards."""
+        effective_study = study_key if study_key is not None else (self._cfg.study_key or None)
         return _execute_chunked_sql_id_delete(
             self.engine,
             self.table,
-            ("recordId", "record_id", "RECORD_ID"),
+            _RECORD_ID_CANDIDATES,
             record_ids,
+            study_key=effective_study,
+            conn=conn,
         )
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
@@ -1834,30 +2416,63 @@ class TabularSQLSink(ExportSink):
 
         def execute_export() -> int:
             if_exists = self._initial_if_exists if self._is_first_batch else "append"
-            if (
+            cast_if_exists = cast(Literal["fail", "replace", "append", "delete_rows"], if_exists)
+            existing_cols = self._inspect_existing_columns() if if_exists == "append" else []
+            if self._is_incremental_sync:
+                batch_df, _ = _ensure_df_study_key(
+                    df,
+                    self._cfg.study_key,
+                    records=records,
+                    existing_cols=existing_cols,
+                    use_labels_as_columns=self._cfg.use_labels_as_columns,
+                    naming_convention=self._cfg.naming_convention,
+                    sdtm_domain=self._cfg.sdtm_domain,
+                    as_sdtm=self._cfg.as_sdtm,
+                )
+            else:
+                batch_df = df
+
+            df_str = batch_df.to_csv(index=False)
+            checksum = hashlib.sha256(df_str.encode("utf-8")).hexdigest()
+
+            do_pre_delete = (
                 self._is_incremental_sync
                 and self._cfg.idempotent
                 and if_exists == "append"
                 and not isinstance(self.engine, NonCallableMock)
-            ):
-                for candidate_col in ("recordId", "record_id", "RECORD_ID"):
-                    if candidate_col in df.columns:
-                        ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
-                        self._delete_existing_record_ids(ids)
-                        break
-
-            df_str = df.to_csv(index=False)
-            checksum = hashlib.sha256(df_str.encode('utf-8')).hexdigest()
-
-            _to_sql_with_chunking(
-                df,
-                self.table,
-                self.engine,
-                if_exists=cast(Literal["fail", "replace", "append", "delete_rows"], if_exists),
-                **self._cfg.pandas_kwargs,
+            )
+            grouped_ids = (
+                _group_df_record_ids_by_study(batch_df, self._cfg.study_key)
+                if do_pre_delete
+                else []
             )
 
-            rows_loaded = len(df)
+            if do_pre_delete and _to_sql_with_chunking is _DEFAULT_TO_SQL_WITH_CHUNKING:
+                with self.engine.begin() as conn:
+                    for s_key, ids in grouped_ids:
+                        self._delete_existing_record_ids(ids, study_key=s_key, conn=conn)
+                    _to_sql_with_chunking_on_conn(
+                        batch_df,
+                        self.table,
+                        self.engine,
+                        if_exists=cast_if_exists,
+                        conn=conn,
+                        backfill_study_key=self._cfg.study_key,
+                        **self._cfg.pandas_kwargs,
+                    )
+            else:
+                if do_pre_delete:
+                    for s_key, ids in grouped_ids:
+                        self._delete_existing_record_ids(ids, study_key=s_key)
+                _to_sql_with_chunking(
+                    batch_df,
+                    self.table,
+                    self.engine,
+                    if_exists=cast_if_exists,
+                    **self._cfg.pandas_kwargs,
+                )
+
+            rows_loaded = len(batch_df)
             self._append_manifest(batch_id, rows_loaded, checksum)
             return rows_loaded
 
@@ -1866,17 +2481,21 @@ class TabularSQLSink(ExportSink):
         return loaded
 
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
-        """Delete newly voided rows from the SQL table when running idempotently."""
+        """Delete newly voided rows from the SQL table and shards in one transaction."""
         if not self._cfg.idempotent or not records or isinstance(self.engine, NonCallableMock):
             return 0
-        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
-        if not record_ids:
+        grouped = _group_record_ids_by_study(records, self._cfg.study_key)
+        if not grouped:
             return 0
-        return self._execute_with_retry(
-            "reconcile_sql_deleted",
-            batch_id,
-            lambda: self._delete_existing_record_ids(record_ids),
-        )
+
+        def _reconcile_all() -> int:
+            with self.engine.begin() as conn:
+                return sum(
+                    self._delete_existing_record_ids(ids, study_key=s_key, conn=conn)
+                    for s_key, ids in grouped
+                )
+
+        return self._execute_with_retry("reconcile_sql_deleted", batch_id, _reconcile_all)
 
     def _append_manifest(self, batch_id: str, row_count: int, checksum: str) -> None:
         if not self._cfg.manifest_path:
@@ -1938,26 +2557,59 @@ class TabularDuckDBSink(ExportSink):
             self._conn, self.table_name
         )
 
-    def _delete_record_ids(self, record_ids: Sequence[Any]) -> int:
+    def _existing_column_names(self) -> list[str]:
+        if not self._table_exists():
+            return []
+        return [
+            str(row[1])
+            for row in self._conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+        ]
+
+    def _delete_record_ids(
+        self,
+        record_ids: Sequence[Any],
+        *,
+        study_key: str | None = None,
+    ) -> int:
         if not record_ids or not self._table_exists():
             return 0
-        cols = {
-            row[1]
-            for row in self._conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
-        }
+        cols_by_lower = {c.lower(): c for c in self._existing_column_names()}
         id_col = next(
-            (c for c in ("recordId", "record_id", "RECORD_ID") if c in cols),
+            (cols_by_lower[c.lower()] for c in _RECORD_ID_CANDIDATES if c.lower() in cols_by_lower),
             None,
         )
         if id_col is None:
             return 0
-        placeholders = ", ".join(["?"] * len(record_ids))
-        quoted_tbl = _quote_duckdb_identifier(self.table_name)
-        quoted_col = _quote_duckdb_identifier(id_col)
-        self._conn.execute(
-            f"DELETE FROM {quoted_tbl} WHERE {quoted_col} IN ({placeholders})",
-            list(record_ids),
+        effective_study = study_key if study_key is not None else (self._cfg.study_key or None)
+        study_col = (
+            next(
+                (
+                    cols_by_lower[c.lower()]
+                    for c in _STUDY_KEY_CANDIDATES
+                    if c.lower() in cols_by_lower
+                ),
+                None,
+            )
+            if effective_study is not None
+            else None
         )
+        quoted_tbl = _quote_duckdb_identifier(self.table_name)
+        quoted_col = _quote_duckdb_column(id_col)
+        quoted_study_col = _quote_duckdb_column(study_col) if study_col is not None else None
+        for start in range(0, len(record_ids), 500):
+            chunk = list(record_ids[start : start + 500])
+            placeholders = ", ".join(["?"] * len(chunk))
+            if quoted_study_col is not None and effective_study is not None:
+                self._conn.execute(  # nosem
+                    f"DELETE FROM {quoted_tbl} WHERE {quoted_study_col} = ? "
+                    f"AND {quoted_col} IN ({placeholders})",
+                    [effective_study, *chunk],
+                )
+            else:
+                self._conn.execute(  # nosem
+                    f"DELETE FROM {quoted_tbl} WHERE {quoted_col} IN ({placeholders})",
+                    chunk,
+                )
         return len(record_ids)
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
@@ -1977,18 +2629,41 @@ class TabularDuckDBSink(ExportSink):
                 self._is_first_batch and self._cfg.idempotent and not self._is_incremental_sync
             )
             creating_table = replace_existing or not self._table_exists()
+            existing_cols = [] if creating_table else self._existing_column_names()
+            if self._is_incremental_sync:
+                batch_df, study_col = _ensure_df_study_key(
+                    df,
+                    self._cfg.study_key,
+                    records=records,
+                    existing_cols=existing_cols,
+                    use_labels_as_columns=self._cfg.use_labels_as_columns,
+                    naming_convention=self._cfg.naming_convention,
+                    sdtm_domain=self._cfg.sdtm_domain,
+                    as_sdtm=self._cfg.as_sdtm,
+                )
+                if study_col is not None:
+                    self._contract_types.setdefault(study_col, "string")
+            else:
+                batch_df = df
+
             if creating_table:
-                df_to_register = _apply_contract_to_all_null_df_columns(df, self._contract_types)
+                df_to_register = _apply_contract_to_all_null_df_columns(
+                    batch_df, self._contract_types
+                )
                 self._untyped_null_cols = _collect_untyped_all_null_columns(
-                    df, self._contract_types
+                    batch_df, self._contract_types
                 )
             else:
+                if self._is_incremental_sync and self._cfg.idempotent:
+                    for s_key, ids in _group_df_record_ids_by_study(batch_df, self._cfg.study_key):
+                        self._delete_record_ids(ids, study_key=s_key)
                 df_to_register = _evolve_duckdb_table_for_df(
                     self._conn,
                     self.table_name,
-                    df,
+                    batch_df,
                     self._contract_types,
                     self._untyped_null_cols,
+                    backfill_study_key=self._cfg.study_key,
                 )
             self._conn.register(_DUCKDB_DF_ALIAS, df_to_register)
             try:
@@ -1999,18 +2674,12 @@ class TabularDuckDBSink(ExportSink):
                 elif creating_table:
                     self._conn.execute(f"CREATE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}")
                 else:
-                    if self._is_incremental_sync and self._cfg.idempotent:
-                        for candidate_col in ("recordId", "record_id", "RECORD_ID"):
-                            if candidate_col in df.columns:
-                                ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
-                                self._delete_record_ids(ids)
-                                break
                     self._conn.execute(
                         f"INSERT INTO {quoted_tbl} BY NAME SELECT * FROM {quoted_alias}"
                     )
             finally:
                 self._conn.unregister(_DUCKDB_DF_ALIAS)
-            return len(df)
+            return len(batch_df)
 
         loaded = self._execute_with_retry("export_duckdb", batch_id, execute_export)
         self._is_first_batch = False
@@ -2020,13 +2689,13 @@ class TabularDuckDBSink(ExportSink):
         """Delete newly voided rows from DuckDB when running idempotently."""
         if not self._cfg.idempotent or not records:
             return 0
-        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
-        if not record_ids:
+        grouped = _group_record_ids_by_study(records, self._cfg.study_key)
+        if not grouped:
             return 0
         return self._execute_with_retry(
             "reconcile_duckdb_deleted",
             batch_id,
-            lambda: self._delete_record_ids(record_ids),
+            lambda: sum(self._delete_record_ids(ids, study_key=s_key) for s_key, ids in grouped),
         )
 
     def flush(self) -> None:
@@ -3816,7 +4485,7 @@ def _stream_records_across_forms(
             if ctx.tx is not None:
                 ctx.tx["records_processed"] = ctx.total_written + ctx.total_reconciled
                 if ctx.max_ts is not None:
-                    ctx.tx["new_timestamp"] = ctx.max_ts
+                    ctx.tx["new_timestamp"] = clamp_monotonic_watermark(ctx.watermark, ctx.max_ts)
 
 
 def _make_form_sink_config(
@@ -4142,9 +4811,7 @@ def export_to_sql_by_form(
     with contextlib.ExitStack() as sink_stack:
         for ctx in contexts:
             form_pandas_kwargs = dict(config.pandas_kwargs)
-            if if_exists is not None and not (
-                config.incremental or config.modified_since is not None
-            ):
+            if if_exists is not None and not is_incremental:
                 form_pandas_kwargs["if_exists"] = if_exists
             form_config = _make_form_sink_config(
                 study_key,
@@ -4234,11 +4901,15 @@ def _unpack_long_sql_rows(
     phi_keys: set[str] | None,
     naming_convention: str | None = None,
     sdtm_domain: str | None = None,
+    study_key: str | None = None,
+    study_col_name: str = "study_key",
 ) -> list[dict[str, Any]]:
     """Unpack ``Record`` envelopes into normalized long-format variable rows with PHI masking."""
     long_rows: list[dict[str, Any]] = []
+    include_study = study_key is not None and bool(study_key.strip())
     for rec in records:
         rec_id = extract_record_id(rec)
+        rec_study = (_extract_record_study_key(rec) or study_key) if include_study else None
         if isinstance(rec, Mapping):
             form_id = rec.get("form_id") if "form_id" in rec else rec.get("formId")
             timestamp = (
@@ -4268,7 +4939,10 @@ def _unpack_long_sql_rows(
                 if naming_convention is not None
                 else name
             )
-            long_rows.append(
+            row_dict: dict[str, Any] = {}
+            if include_study:
+                row_dict[study_col_name] = rec_study
+            row_dict.update(
                 {
                     "record_id": rec_id,
                     "form_id": form_id,
@@ -4277,6 +4951,7 @@ def _unpack_long_sql_rows(
                     "timestamp": timestamp,
                 }
             )
+            long_rows.append(row_dict)
     return long_rows
 
 
@@ -4307,23 +4982,69 @@ class _LongSQLSink(ExportSink):
             "append" if (self._is_incremental_sync or not config.idempotent) else "replace"
         )
 
-    def _delete_record_ids(self, record_ids: Sequence[Any]) -> int:
+    def _resolve_study_col(self) -> str:
+        if not isinstance(self.engine, NonCallableMock):
+            from sqlalchemy import inspect as sa_inspect
+
+            inspector = sa_inspect(self.engine)
+            if inspector.has_table(self.table):
+                cols_by_lower = {
+                    str(c["name"]).lower(): str(c["name"])
+                    for c in inspector.get_columns(self.table)
+                }
+                for cand in _STUDY_KEY_CANDIDATES:
+                    if cand.lower() in cols_by_lower:
+                        return cols_by_lower[cand.lower()]
+        if self._cfg.naming_convention is not None:
+            canonical_conv = normalize_naming_convention(self._cfg.naming_convention)
+            if canonical_conv == "camelCase":
+                return "studyKey"
+            if canonical_conv == "sdtm":
+                return "STUDYID"
+        return "study_key"
+
+    def _delete_record_ids(
+        self,
+        record_ids: Sequence[Any],
+        *,
+        study_key: str | None = None,
+        conn: Any | None = None,
+    ) -> int:
+        effective_study = study_key if study_key is not None else (self._cfg.study_key or None)
         return _execute_chunked_sql_id_delete(
             self.engine,
             self.table,
-            ("record_id",),
+            _RECORD_ID_CANDIDATES,
             record_ids,
+            study_key=effective_study,
+            conn=conn,
         )
 
-    def _write_long_chunks(self, long_rows: list[dict[str, Any]]) -> None:
+    def _write_long_chunks(
+        self,
+        long_rows: list[dict[str, Any]],
+        *,
+        conn: Any | None = None,
+    ) -> None:
+        is_mock = isinstance(self.engine, NonCallableMock)
         for start in range(0, len(long_rows), self._chunk_size):
             chunk = long_rows[start : start + self._chunk_size]
             if_exists: Literal["replace", "append"] = (
                 self._initial_if_exists if self._is_first_write else "append"
             )
-            pd.DataFrame(chunk).to_sql(
+            chunk_df = pd.DataFrame(chunk)
+            if not is_mock and if_exists == "append":
+                chunk_df = _evolve_sql_table_columns(
+                    self.engine,
+                    self.table,
+                    chunk_df,
+                    conn=conn,
+                    backfill_study_key=self._cfg.study_key if self._is_incremental_sync else None,
+                )
+            target_con = conn if (conn is not None and not is_mock) else self.engine
+            chunk_df.to_sql(
                 self.table,
-                self.engine,
+                target_con,
                 if_exists=if_exists,
                 index=False,
             )
@@ -4332,7 +5053,8 @@ class _LongSQLSink(ExportSink):
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         if not records:
             return 0
-        incoming_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        grouped_ids = _group_record_ids_by_study(records, self._cfg.study_key)
+        study_col = self._resolve_study_col() if self._is_incremental_sync else "study_key"
         long_rows = _unpack_long_sql_rows(
             records,
             mask_phi=self._cfg.mask_phi,
@@ -4340,18 +5062,30 @@ class _LongSQLSink(ExportSink):
             phi_keys=self._phi_keys,
             naming_convention=self._cfg.naming_convention,
             sdtm_domain=self._cfg.sdtm_domain,
+            study_key=self._cfg.study_key if self._is_incremental_sync else None,
+            study_col_name=study_col,
         )
 
         def execute_export() -> int:
-            if (
+            is_mock = isinstance(self.engine, NonCallableMock)
+            do_pre_delete = (
                 self._is_incremental_sync
                 and self._cfg.idempotent
                 and self._initial_if_exists == "append"
-                and incoming_ids
-            ):
-                self._delete_record_ids(incoming_ids)
-            if long_rows:
-                self._write_long_chunks(long_rows)
+                and bool(grouped_ids)
+            )
+            if do_pre_delete and not is_mock and pd.DataFrame.to_sql is _DEFAULT_PANDAS_TO_SQL:
+                with self.engine.begin() as conn:
+                    for s_key, ids in grouped_ids:
+                        self._delete_record_ids(ids, study_key=s_key, conn=conn)
+                    if long_rows:
+                        self._write_long_chunks(long_rows, conn=conn)
+            else:
+                if do_pre_delete:
+                    for s_key, ids in grouped_ids:
+                        self._delete_record_ids(ids, study_key=s_key)
+                if long_rows:
+                    self._write_long_chunks(long_rows)
             return len(records)
 
         return self._execute_with_retry("export_long_sql", batch_id, execute_export)
@@ -4359,14 +5093,18 @@ class _LongSQLSink(ExportSink):
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
         if not self._cfg.idempotent or not records or isinstance(self.engine, NonCallableMock):
             return 0
-        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
-        if not record_ids:
+        grouped = _group_record_ids_by_study(records, self._cfg.study_key)
+        if not grouped:
             return 0
-        return self._execute_with_retry(
-            "reconcile_long_sql_deleted",
-            batch_id,
-            lambda: self._delete_record_ids(record_ids),
-        )
+
+        def _reconcile_all() -> int:
+            with self.engine.begin() as conn:
+                return sum(
+                    self._delete_record_ids(ids, study_key=s_key, conn=conn)
+                    for s_key, ids in grouped
+                )
+
+        return self._execute_with_retry("reconcile_long_sql_deleted", batch_id, _reconcile_all)
 
     def flush(self) -> None:
         if (

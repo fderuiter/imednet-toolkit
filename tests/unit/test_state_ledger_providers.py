@@ -313,3 +313,181 @@ def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
 
     assert pushed_statuses == ["failed", "running", "success"]
     assert provider.get_last_timestamp("ST1", "recs") == committed
+
+
+def test_monotonic_watermark_clamping_across_providers_and_streaming(
+    tmp_path: Path,
+    sdk_variable_store: dict[str, Any],
+) -> None:
+    """Transactions and streaming helpers retain 2026-06-20T12:00:00+00:00 when given 2026-06-01T08:00:00+00:00."""
+    from unittest.mock import MagicMock
+
+    from imednet.integrations.export import export_to_sql_by_form
+    from imednet.integrations.sink_base import (
+        ExportSink,
+        SinkConfig,
+        clamp_monotonic_watermark,
+        run_streaming_export,
+    )
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet.spi.sink_base import clamp_monotonic_watermark as spi_clamp_monotonic_watermark
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    _ = sdk_variable_store
+    assert clamp_monotonic_watermark is spi_clamp_monotonic_watermark
+
+    high_wm = datetime.fromisoformat("2026-06-20T12:00:00+00:00")
+    older_wm = datetime.fromisoformat("2026-06-01T08:00:00+00:00")
+    newer_wm = datetime.fromisoformat("2026-06-25T09:30:00+00:00")
+
+    assert clamp_monotonic_watermark(None, None) is None
+    assert clamp_monotonic_watermark(None, "2026-06-01T08:00:00+00:00") == older_wm
+    assert clamp_monotonic_watermark(high_wm, None) == high_wm
+    assert clamp_monotonic_watermark(high_wm, "2026-06-01T08:00:00+00:00") == high_wm
+    assert clamp_monotonic_watermark(older_wm, newer_wm) == newer_wm
+
+    # 1. FileStateProvider.transaction clamps regressing commit_ts
+    file_provider = FileStateProvider(tmp_path / "monotonic_file_ledger.json")
+    file_provider.set_last_timestamp("STUDY_WM", "records", high_wm)
+    with file_provider.transaction("STUDY_WM", "records") as tx:
+        assert tx["last_timestamp"] == high_wm
+        tx["new_timestamp"] = older_wm
+        tx["records_processed"] = 2
+    assert file_provider.get_last_timestamp("STUDY_WM", "records") == high_wm
+
+    # 2. AirflowStateProvider.transaction clamps regressing commit_ts
+    airflow_provider = AirflowStateProvider()
+    airflow_provider.set_last_timestamp("STUDY_WM", "records", high_wm)
+    with airflow_provider.transaction("STUDY_WM", "records") as tx:
+        assert tx["last_timestamp"] == high_wm
+        tx["new_timestamp"] = older_wm
+        tx["records_processed"] = 2
+    assert airflow_provider.get_last_timestamp("STUDY_WM", "records") == high_wm
+
+    # 3. run_streaming_export clamps tx["new_timestamp"] and committed watermark
+    class _NoopSink(ExportSink):
+        def write_batch(self, records: Any, *, batch_id: str) -> int:
+            _ = batch_id
+            return len(records)
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    stale_record = Record(
+        record_id=1,
+        study_key="STUDY_WM",
+        subject_key="S-1",
+        form_id=101,
+        form_key="F_DM",
+        deleted=False,
+        date_modified=older_wm,
+        record_data={"AGE": 40},
+    )
+    run_streaming_export(
+        MagicMock(),
+        "STUDY_WM",
+        _NoopSink(SinkConfig(study_key="STUDY_WM")),
+        SinkConfig(
+            study_key="STUDY_WM",
+            incremental=True,
+            state_provider=file_provider,
+            stream_name="records",
+        ),
+        records_source=lambda _wm, _excl: [stale_record],
+    )
+    assert file_provider.get_last_timestamp("STUDY_WM", "records") == high_wm
+
+    # 4. _stream_records_across_forms clamps per-form watermarks when given older records
+    form_stream = "sql:F_DM"
+    airflow_provider.set_last_timestamp("STUDY_WM", form_stream, high_wm)
+    sdk = MagicMock()
+    forms = [
+        Form(
+            form_id=101,
+            form_key="F_DM",
+            form_name="Demographics",
+            form_type="Standard",
+            date_created="2026-01-01T00:00:00Z",
+            date_modified="2026-01-01T00:00:00Z",
+        )
+    ]
+    variables = [
+        Variable(
+            variable_id=1,
+            variable_name="AGE",
+            label="Age",
+            variable_type="int",
+            form_id=101,
+            form_key="F_DM",
+        )
+    ]
+    sdk.get_forms.return_value = forms
+    sdk.forms.list.return_value = forms
+    sdk.get_variables.return_value = variables
+    sdk.variables.list.return_value = variables
+    # Return older_wm record even when queried with high_wm to simulate out-of-order upstream payload
+    sdk.records.list.side_effect = lambda **_kw: iter([stale_record])
+
+    form_db = tmp_path / "monotonic_forms.sqlite"
+    export_to_sql_by_form(
+        sdk,
+        "STUDY_WM",
+        f"sqlite:///{form_db}",
+        incremental=True,
+        state_provider=airflow_provider,
+    )
+    assert airflow_provider.get_last_timestamp("STUDY_WM", form_stream) == high_wm
+
+
+def test_administrative_set_last_timestamp_force_and_delete_entry_override_watermarks(
+    tmp_path: Path,
+    sdk_variable_store: dict[str, Any],
+) -> None:
+    """Administrative set_last_timestamp(..., force=True) and delete_entry reset or remove checkpoints cleanly."""
+    from imednet_workflows.state_ledger import FileStateProvider, StreamExecutionStatus
+
+    _ = sdk_variable_store
+    high_wm = datetime.fromisoformat("2026-06-20T12:00:00+00:00")
+    reset_wm = datetime.fromisoformat("2026-06-01T08:00:00+00:00")
+
+    file_provider = FileStateProvider(tmp_path / "admin_override.json")
+    airflow_provider = AirflowStateProvider()
+
+    for provider in (file_provider, airflow_provider):
+        provider.set_last_timestamp("STUDY_ADM", "s1", high_wm)
+        provider.set_last_timestamp("STUDY_ADM", "s2", high_wm)
+        assert provider.get_last_timestamp("STUDY_ADM", "s1") == high_wm
+
+        # Put s1 into RUNNING state, then administratively rewind watermark with force=True
+        provider.set_last_timestamp(
+            "STUDY_ADM",
+            "s1",
+            high_wm,
+            status=StreamExecutionStatus.RUNNING,
+            force=True,
+        )
+        provider.set_last_timestamp(
+            "STUDY_ADM",
+            "s1",
+            reset_wm,
+            status=StreamExecutionStatus.PENDING,
+            force=True,
+        )
+        assert provider.get_last_timestamp("STUDY_ADM", "s1") == reset_wm
+        assert provider.get_last_status("STUDY_ADM", "s1") == StreamExecutionStatus.PENDING
+
+        # Administratively clear timestamp to None with force=True
+        provider.set_last_timestamp("STUDY_ADM", "s1", None, force=True)
+        assert provider.get_last_timestamp("STUDY_ADM", "s1") is None
+
+        # Remove single stream checkpoint, then entire study checkpoint without transition errors
+        assert provider.delete_entry("STUDY_ADM", "s1") is True
+        assert provider.get_last_status("STUDY_ADM", "s1") is None
+        assert provider.get_last_timestamp("STUDY_ADM", "s2") == high_wm
+        assert provider.delete_entry("STUDY_ADM") is True
+        assert provider.get_last_timestamp("STUDY_ADM", "s2") is None

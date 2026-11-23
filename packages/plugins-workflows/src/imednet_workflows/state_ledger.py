@@ -18,6 +18,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from imednet.spi.sink_base import clamp_monotonic_watermark
 from imednet.spi.sinks import redact_uri
 from imednet.spi.utils import redact_sensitive_payload, redact_sensitive_text
 
@@ -534,9 +535,7 @@ class FileStateProvider(BaseStateProvider):
                 state = self.read_state()
                 validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
                 raw_new_ts = tx_data.get("new_timestamp")
-                commit_ts = (
-                    _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
-                )
+                commit_ts = clamp_monotonic_watermark(prior_ts, raw_new_ts)
                 study_entry = state.studies.setdefault(study_key, StudyState())
                 study_entry.streams[stream_name] = StreamState(
                     last_timestamp=commit_ts,
@@ -944,7 +943,7 @@ class AirflowStateProvider(BaseStateProvider):
         else:
             validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
             raw_new_ts = tx_data.get("new_timestamp")
-            commit_ts = _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
+            commit_ts = clamp_monotonic_watermark(prior_ts, raw_new_ts)
             self.set_last_timestamp(
                 study_key=study_key,
                 stream_name=stream_name,

@@ -360,8 +360,9 @@ Incremental exports decouple destination sinks from checkpoint persistence throu
      when ``include_deleted=False``.
   4. Applies :func:`~imednet.spi.sink_base.apply_quality_gate` and streams fixed-size chunks
      into ``sink.write_batch(...)``.
-  5. Flushes and closes the sink before exiting ``provider.transaction(...)``, ensuring the
-     high-water mark advances **only** after every batch and ``sink.flush()`` succeed.
+  5. Flushes and closes the sink before exiting ``provider.transaction(...)``, clamping committed
+     watermarks via :func:`~imednet.spi.sink_base.clamp_monotonic_watermark` so the high-water
+     mark never regresses and advances **only** after every batch and ``sink.flush()`` succeed.
 
 Error propagation
 ~~~~~~~~~~~~~~~~~

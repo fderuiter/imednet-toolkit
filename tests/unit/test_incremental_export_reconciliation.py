@@ -817,3 +817,709 @@ def test_incremental_reconciliation_edge_cases(tmp_path: Path) -> None:
         ledger_path=str(ledger),
     )
     assert json.loads(hier_path.read_text(encoding="utf-8")) == []
+
+
+def _build_wide_study_sdk(
+    upstream_records: dict[int, Record],
+    *,
+    num_clinical_vars: int = 2005,
+    extra_vars: list[str] | None = None,
+) -> MagicMock:
+    """Build a stateful mock SDK with >2000 clinical variables on a single form."""
+    forms = [
+        Form(
+            form_id=501,
+            form_key="F_WIDE",
+            form_name="Wide Clinical Form",
+            form_type="Standard",
+            date_created="2026-01-01T00:00:00Z",
+            date_modified="2026-01-01T00:00:00Z",
+        )
+    ]
+    var_names = ["patientName", *[f"V_{idx:04d}" for idx in range(1, num_clinical_vars)]]
+    if extra_vars:
+        var_names.extend(extra_vars)
+    variables = [
+        Variable(
+            variable_id=idx,
+            variable_name=vname,
+            label=vname,
+            variable_type="text" if vname == "patientName" else "int",
+            form_id=501,
+            form_key="F_WIDE",
+        )
+        for idx, vname in enumerate(var_names, start=1)
+    ]
+    base_sdk = _build_study_sdk(upstream_records, study_key="STUDY_WIDE")
+    base_sdk.get_forms.return_value = forms
+    base_sdk.forms.list.return_value = forms
+    base_sdk.get_variables.return_value = variables
+    base_sdk.variables.list.side_effect = None
+    base_sdk.variables.list.return_value = variables
+    return base_sdk
+
+
+def test_wide_sqlite_incremental_reconciles_updates_and_voids_across_shards(
+    tmp_path: Path,
+) -> None:
+    """Wide (>2000 vars) SQLite incremental runs update recordId=1 and delete voided recordId=2 across all shards."""
+    from sqlalchemy import create_engine, text
+
+    from imednet.constants import MAX_SQLITE_COLUMNS
+    from imednet.integrations.export import TabularSQLSink
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    def _wide_payload(
+        patient_name: str,
+        v1: int,
+        v2004: int,
+        extra: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {f"V_{idx:04d}": idx for idx in range(1, 2005)}
+        payload["patientName"] = patient_name
+        payload["V_0001"] = v1
+        payload["V_2004"] = v2004
+        if extra:
+            payload.update(extra)
+        return payload
+
+    records: dict[int, Record] = {
+        1: Record(
+            record_id=1,
+            study_key="STUDY_WIDE",
+            subject_key="SUBJ-1",
+            visit_id=401,
+            form_id=501,
+            form_key="F_WIDE",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data=_wide_payload("Alice", 10, 2004),
+        ),
+        2: Record(
+            record_id=2,
+            study_key="STUDY_WIDE",
+            subject_key="SUBJ-2",
+            visit_id=401,
+            form_id=501,
+            form_key="F_WIDE",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data=_wide_payload("Bob", 20, 4008),
+        ),
+        3: Record(
+            record_id=3,
+            study_key="STUDY_WIDE",
+            subject_key="SUBJ-3",
+            visit_id=401,
+            form_id=501,
+            form_key="F_WIDE",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data=_wide_payload("Carol", 30, 6012),
+        ),
+    }
+    sdk = _build_wide_study_sdk(records, num_clinical_vars=2005)
+
+    single_db = tmp_path / "wide_single.sqlite"
+    by_form_db = tmp_path / "wide_by_form.sqlite"
+    ledger = tmp_path / "wide_ledger.json"
+
+    export_to_sql(
+        sdk,
+        "STUDY_WIDE",
+        "wide_records",
+        f"sqlite:///{single_db}",
+        incremental=True,
+        ledger_path=str(ledger),
+        stream_name="wide_sql",
+    )
+    export_to_sql_by_form(
+        sdk,
+        "STUDY_WIDE",
+        f"sqlite:///{by_form_db}",
+        incremental=True,
+        ledger_path=str(ledger),
+        stream_name="wide_sql_form",
+    )
+
+    for db_path, prefix in ((single_db, "wide_records"), (by_form_db, "F_WIDE")):
+        with sqlite3.connect(db_path) as conn:
+            p1_cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{prefix}_part1")')]
+            p2_cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{prefix}_part2")')]
+            assert len(p1_cols) == MAX_SQLITE_COLUMNS
+            assert len(p2_cols) <= MAX_SQLITE_COLUMNS
+            assert {"studyKey", "recordId"} <= set(p1_cols)
+            assert {"studyKey", "recordId"} <= set(p2_cols)
+            masked_vals = [
+                r[0]
+                for r in conn.execute(
+                    f'SELECT "patientName" FROM "{prefix}_part1" ORDER BY "recordId"'
+                )
+            ]
+            assert masked_vals == [MASKED_SENTINEL, MASKED_SENTINEL, MASKED_SENTINEL]
+
+    # Run 2: update recordId=1 across both shards and void recordId=2
+    records[1] = records[1].model_copy(
+        update={
+            "date_modified": "2026-06-02T12:00:00Z",
+            "record_data": _wide_payload("Alice Updated", 111, 9999),
+        }
+    )
+    records[2] = records[2].model_copy(
+        update={"deleted": True, "date_modified": "2026-06-02T12:00:00Z"}
+    )
+
+    export_to_sql(
+        sdk,
+        "STUDY_WIDE",
+        "wide_records",
+        f"sqlite:///{single_db}",
+        incremental=True,
+        ledger_path=str(ledger),
+        stream_name="wide_sql",
+    )
+    export_to_sql_by_form(
+        sdk,
+        "STUDY_WIDE",
+        f"sqlite:///{by_form_db}",
+        incremental=True,
+        ledger_path=str(ledger),
+        stream_name="wide_sql_form",
+    )
+
+    for db_path, prefix in ((single_db, "wide_records"), (by_form_db, "F_WIDE")):
+        with sqlite3.connect(db_path) as conn:
+            p1_rows = conn.execute(
+                f'SELECT "studyKey", "recordId", "V_0001" FROM "{prefix}_part1" ORDER BY "recordId"'
+            ).fetchall()
+            p2_rows = conn.execute(
+                f'SELECT "studyKey", "recordId", "V_2004" FROM "{prefix}_part2" ORDER BY "recordId"'
+            ).fetchall()
+            assert p1_rows == [("STUDY_WIDE", 1, 111), ("STUDY_WIDE", 3, 30)]
+            assert p2_rows == [("STUDY_WIDE", 1, 9999), ("STUDY_WIDE", 3, 6012)]
+
+    # Verify multi-shard delete executes atomically inside a single SQLite transaction
+    engine = create_engine(f"sqlite:///{single_db}")
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    'CREATE TRIGGER fail_part2_del BEFORE DELETE ON "wide_records_part2" '
+                    "BEGIN SELECT RAISE(ABORT, 'simulated shard2 failure'); END;"
+                )
+            )
+        sink_cfg = TabularSinkConfig(
+            study_key="STUDY_WIDE",
+            incremental=True,
+            max_retries=0,
+        )
+        sql_sink = TabularSQLSink("wide_records", engine, sink_cfg)
+        with pytest.raises(Exception, match="Batch 'tx_check' failed") as exc_info:
+            sql_sink.reconcile_deleted([{"recordId": 3, "deleted": True}], batch_id="tx_check")
+        assert "simulated shard2 failure" in str(exc_info.value.__cause__)
+
+        with sqlite3.connect(single_db) as conn:
+            p1_ids = [
+                r[0]
+                for r in conn.execute(
+                    'SELECT "recordId" FROM "wide_records_part1" ORDER BY "recordId"'
+                )
+            ]
+            p2_ids = [
+                r[0]
+                for r in conn.execute(
+                    'SELECT "recordId" FROM "wide_records_part2" ORDER BY "recordId"'
+                )
+            ]
+            assert p1_ids == [1, 3]
+            assert p2_ids == [1, 3]
+    finally:
+        engine.dispose()
+
+    # Also verify full non-incremental wide export followed by modified_since incremental sync
+    legacy_wide_db = tmp_path / "legacy_wide.sqlite"
+    records[2] = records[2].model_copy(
+        update={
+            "deleted": False,
+            "date_modified": "2026-06-01T10:00:00Z",
+            "record_data": _wide_payload("Bob", 20, 4008),
+        }
+    )
+    export_to_sql(
+        sdk,
+        "STUDY_WIDE",
+        "wide_legacy",
+        f"sqlite:///{legacy_wide_db}",
+    )
+
+    records[1] = records[1].model_copy(
+        update={
+            "date_modified": "2026-06-03T09:00:00Z",
+            "record_data": _wide_payload("Alice3", 222, 8888, extra={"V_2005": 77}),
+        }
+    )
+    records[2] = records[2].model_copy(
+        update={"deleted": True, "date_modified": "2026-06-03T09:00:00Z"}
+    )
+    sdk_widened = _build_wide_study_sdk(records, num_clinical_vars=2005, extra_vars=["V_2005"])
+    export_to_sql(
+        sdk_widened,
+        "STUDY_WIDE",
+        "wide_legacy",
+        f"sqlite:///{legacy_wide_db}",
+        modified_since="2026-06-03T00:00:00Z",
+    )
+    with sqlite3.connect(legacy_wide_db) as conn:
+        assert (
+            len(list(conn.execute('PRAGMA table_info("wide_legacy_part1")'))) <= MAX_SQLITE_COLUMNS
+        )
+        assert (
+            len(list(conn.execute('PRAGMA table_info("wide_legacy_part2")'))) <= MAX_SQLITE_COLUMNS
+        )
+        assert conn.execute(
+            'SELECT "recordId", "V_0001" FROM "wide_legacy_part1" ORDER BY "recordId"'
+        ).fetchall() == [(1, 222), (3, 30)]
+        assert conn.execute(
+            'SELECT "recordId", "V_2004", "V_2005" FROM "wide_legacy_part2" ORDER BY "recordId"'
+        ).fetchall() == [(1, 8888, 77), (3, 6012, None)]
+
+
+def test_shared_multi_study_composite_deletes_sql_duckdb_and_long_sql(
+    tmp_path: Path,
+) -> None:
+    """Incremental updates and voided deletes in STUDY_B preserve STUDY_A rows with matching record_id."""
+    duckdb = pytest.importorskip("duckdb")
+
+    records_a = {
+        1: Record(
+            record_id=1,
+            study_key="STUDY_A",
+            subject_key="A-1",
+            visit_id=401,
+            form_id=301,
+            form_key="F_DM",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data={"AGE": 41, "patientName": "Alice A"},
+        ),
+        2: Record(
+            record_id=2,
+            study_key="STUDY_A",
+            subject_key="A-2",
+            visit_id=401,
+            form_id=301,
+            form_key="F_DM",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data={"AGE": 42, "patientName": "Bob A"},
+        ),
+    }
+    records_b = {
+        1: Record(
+            record_id=1,
+            study_key="STUDY_B",
+            subject_key="B-1",
+            visit_id=401,
+            form_id=301,
+            form_key="F_DM",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data={"AGE": 51, "patientName": "Alice B"},
+        ),
+        2: Record(
+            record_id=2,
+            study_key="STUDY_B",
+            subject_key="B-2",
+            visit_id=401,
+            form_id=301,
+            form_key="F_DM",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data={"AGE": 52, "patientName": "Bob B"},
+        ),
+    }
+
+    sdk_a = _build_study_sdk(records_a, study_key="STUDY_A")
+    sdk_b = _build_study_sdk(records_b, study_key="STUDY_B")
+
+    shared_sql = tmp_path / "shared_multi.sqlite"
+    shared_ddb = tmp_path / "shared_multi.duckdb"
+    shared_long = tmp_path / "shared_long.sqlite"
+    non_inc_long = tmp_path / "non_inc_long.sqlite"
+    ledger = tmp_path / "multi_ledger.json"
+
+    # Non-incremental export_to_long_sql preserves its 5-column layout
+    export_to_long_sql(sdk_a, "STUDY_A", "long_obs", f"sqlite:///{non_inc_long}")
+    with sqlite3.connect(non_inc_long) as conn:
+        non_inc_cols = [r[1] for r in conn.execute('PRAGMA table_info("long_obs")')]
+    assert non_inc_cols == ["record_id", "form_id", "variable_name", "value", "timestamp"]
+
+    # Initial incremental loads for STUDY_A and STUDY_B into shared destinations
+    for s_key, s_sdk in (("STUDY_A", sdk_a), ("STUDY_B", sdk_b)):
+        export_to_sql(
+            s_sdk,
+            s_key,
+            "shared_tab",
+            f"sqlite:///{shared_sql}",
+            incremental=True,
+            ledger_path=str(ledger),
+            stream_name="shared_sql",
+        )
+        export_to_duckdb(
+            s_sdk,
+            s_key,
+            str(shared_ddb),
+            "shared_tab",
+            incremental=True,
+            ledger_path=str(ledger),
+            stream_name="shared_ddb",
+        )
+        export_to_long_sql(
+            s_sdk,
+            s_key,
+            "shared_long",
+            f"sqlite:///{shared_long}",
+            incremental=True,
+            ledger_path=str(ledger),
+            stream_name="shared_long",
+        )
+
+    # Mutate STUDY_B: update record_id=1 and void record_id=2
+    records_b[1] = records_b[1].model_copy(
+        update={
+            "date_modified": "2026-06-02T15:00:00Z",
+            "record_data": {"AGE": 99, "patientName": "Alice B2"},
+        }
+    )
+    records_b[2] = records_b[2].model_copy(
+        update={"deleted": True, "date_modified": "2026-06-02T15:00:00Z"}
+    )
+
+    export_to_sql(
+        sdk_b,
+        "STUDY_B",
+        "shared_tab",
+        f"sqlite:///{shared_sql}",
+        incremental=True,
+        ledger_path=str(ledger),
+        stream_name="shared_sql",
+    )
+    export_to_duckdb(
+        sdk_b,
+        "STUDY_B",
+        str(shared_ddb),
+        "shared_tab",
+        incremental=True,
+        ledger_path=str(ledger),
+        stream_name="shared_ddb",
+    )
+    export_to_long_sql(
+        sdk_b,
+        "STUDY_B",
+        "shared_long",
+        f"sqlite:///{shared_long}",
+        incremental=True,
+        ledger_path=str(ledger),
+        stream_name="shared_long",
+    )
+
+    expected_tabular = [
+        ("STUDY_A", 1, 41),
+        ("STUDY_A", 2, 42),
+        ("STUDY_B", 1, 99),
+    ]
+    with sqlite3.connect(shared_sql) as conn:
+        sql_rows = conn.execute(
+            'SELECT "studyKey", "recordId", "AGE" FROM "shared_tab" ORDER BY "studyKey", "recordId"'
+        ).fetchall()
+    assert sql_rows == expected_tabular
+
+    with duckdb.connect(str(shared_ddb)) as dcon:
+        ddb_rows = dcon.execute(
+            'SELECT "studyKey", "recordId", "AGE" FROM "shared_tab" ORDER BY "studyKey", "recordId"'
+        ).fetchall()
+    assert ddb_rows == expected_tabular
+
+    with sqlite3.connect(shared_long) as conn:
+        long_age_rows = conn.execute(
+            'SELECT "study_key", "record_id", CAST("value" AS INTEGER) FROM "shared_long" '
+            'WHERE "variable_name" = \'AGE\' ORDER BY "study_key", "record_id"'
+        ).fetchall()
+        b2_remaining = conn.execute(
+            'SELECT COUNT(*) FROM "shared_long" WHERE "study_key" = \'STUDY_B\' AND "record_id" = 2'
+        ).fetchone()[0]
+    assert long_age_rows == expected_tabular
+    assert b2_remaining == 0
+
+    # Also verify direct TabularSQLSink and TabularDuckDBSink multi-Study usage (including mixed study_key/studyKey)
+    from sqlalchemy import create_engine
+
+    from imednet.integrations.export import TabularDuckDBSink, TabularSQLSink
+
+    direct_sql = tmp_path / "direct_shared.sqlite"
+    direct_ddb = tmp_path / "direct_shared.duckdb"
+    eng_direct = create_engine(f"sqlite:///{direct_sql}")
+    try:
+        sql_a = TabularSQLSink(
+            "direct_tab",
+            eng_direct,
+            TabularSinkConfig(study_key="STUDY_A", incremental=True),
+        )
+        sql_a.write_batch(
+            [{"recordId": 1, "AGE": 41}, {"recordId": 2, "AGE": 42}],
+            batch_id="a1",
+        )
+        sql_b = TabularSQLSink(
+            "direct_tab",
+            eng_direct,
+            TabularSinkConfig(study_key="STUDY_B", incremental=True),
+        )
+        # Pass snake_case study_key on an existing studyKey table to verify destination column alignment
+        sql_b.write_batch(
+            [
+                {"study_key": "STUDY_B", "recordId": 1, "AGE": 51},
+                {"study_key": "STUDY_B", "recordId": 2, "AGE": 52},
+            ],
+            batch_id="b1",
+        )
+        sql_b.write_batch([{"recordId": 1, "AGE": 99}], batch_id="b2")
+        sql_b.reconcile_deleted([{"recordId": 2, "deleted": True}], batch_id="b3")
+    finally:
+        eng_direct.dispose()
+
+    with TabularDuckDBSink(
+        str(direct_ddb),
+        "direct_tab",
+        TabularSinkConfig(study_key="STUDY_A", incremental=True),
+    ) as ddb_a:
+        ddb_a.write_batch(
+            [{"recordId": 1, "AGE": 41}, {"recordId": 2, "AGE": 42}],
+            batch_id="a1",
+        )
+    with TabularDuckDBSink(
+        str(direct_ddb),
+        "direct_tab",
+        TabularSinkConfig(study_key="STUDY_B", incremental=True),
+    ) as ddb_b:
+        ddb_b.write_batch(
+            [
+                {"study_key": "STUDY_B", "recordId": 1, "AGE": 51},
+                {"study_key": "STUDY_B", "recordId": 2, "AGE": 52},
+            ],
+            batch_id="b1",
+        )
+        ddb_b.write_batch([{"recordId": 1, "AGE": 99}], batch_id="b2")
+        ddb_b.reconcile_deleted([{"recordId": 2, "deleted": True}], batch_id="b3")
+
+    with sqlite3.connect(direct_sql) as conn:
+        direct_sql_cols = [r[1] for r in conn.execute('PRAGMA table_info("direct_tab")')]
+        assert "study_key" not in direct_sql_cols
+        assert (
+            conn.execute(
+                'SELECT "studyKey", "recordId", "AGE" FROM "direct_tab" ORDER BY "studyKey", "recordId"'
+            ).fetchall()
+            == expected_tabular
+        )
+    with duckdb.connect(str(direct_ddb)) as dcon:
+        direct_ddb_cols = [r[1] for r in dcon.execute("PRAGMA table_info('direct_tab')").fetchall()]
+        assert "study_key" not in direct_ddb_cols
+        assert (
+            dcon.execute(
+                'SELECT "studyKey", "recordId", "AGE" FROM "direct_tab" ORDER BY "studyKey", "recordId"'
+            ).fetchall()
+            == expected_tabular
+        )
+
+
+def test_legacy_single_study_schema_evolution_and_delete_fallback(
+    tmp_path: Path,
+) -> None:
+    """Legacy tables without study_key/studyKey evolve on incremental writes and fall back to recordId deletes."""
+    duckdb = pytest.importorskip("duckdb")
+    from sqlalchemy import create_engine
+
+    from imednet.integrations.export import (
+        TabularDuckDBSink,
+        TabularSQLSink,
+        _execute_chunked_sql_id_delete,
+    )
+
+    records = {
+        1: Record(
+            record_id=1,
+            study_key="STUDY_LEG",
+            subject_key="L-1",
+            visit_id=401,
+            form_id=301,
+            form_key="F_DM",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data={"AGE": 31, "patientName": "Legacy 1"},
+        ),
+        2: Record(
+            record_id=2,
+            study_key="STUDY_LEG",
+            subject_key="L-2",
+            visit_id=401,
+            form_id=301,
+            form_key="F_DM",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data={"AGE": 32, "patientName": "Legacy 2"},
+        ),
+        3: Record(
+            record_id=3,
+            study_key="STUDY_LEG",
+            subject_key="L-3",
+            visit_id=401,
+            form_id=301,
+            form_key="F_DM",
+            record_status="Complete",
+            deleted=False,
+            date_created="2026-06-01T00:00:00Z",
+            date_modified="2026-06-01T10:00:00Z",
+            record_data={"AGE": 33, "patientName": "Legacy 3"},
+        ),
+    }
+    sdk = _build_study_sdk(records, study_key="STUDY_LEG")
+
+    leg_sql = tmp_path / "legacy_single.sqlite"
+    leg_ddb = tmp_path / "legacy_single.duckdb"
+    leg_long = tmp_path / "legacy_long.sqlite"
+
+    # Create legacy single-study tables via non-incremental full exports (no studyKey / study_key column)
+    export_to_sql(sdk, "STUDY_LEG", "leg_tab", f"sqlite:///{leg_sql}")
+    export_to_duckdb(sdk, "STUDY_LEG", str(leg_ddb), "leg_tab")
+    export_to_long_sql(sdk, "STUDY_LEG", "leg_long", f"sqlite:///{leg_long}")
+
+    with sqlite3.connect(leg_sql) as conn:
+        assert "studyKey" not in {r[1] for r in conn.execute('PRAGMA table_info("leg_tab")')}
+    with duckdb.connect(str(leg_ddb)) as dcon:
+        assert "studyKey" not in {
+            r[1] for r in dcon.execute("PRAGMA table_info('leg_tab')").fetchall()
+        }
+    with sqlite3.connect(leg_long) as conn:
+        assert "study_key" not in {r[1] for r in conn.execute('PRAGMA table_info("leg_long")')}
+
+    # Direct delete fallback on legacy tables before schema evolution
+    eng = create_engine(f"sqlite:///{leg_sql}")
+    try:
+        _execute_chunked_sql_id_delete(
+            eng, "leg_tab", ("recordId", "record_id"), [999], study_key="STUDY_LEG"
+        )
+    finally:
+        eng.dispose()
+    with TabularDuckDBSink(
+        str(leg_ddb), "leg_tab", TabularSinkConfig(study_key="STUDY_LEG", incremental=True)
+    ) as dsink:
+        dsink._delete_record_ids([999], study_key="STUDY_LEG")
+
+    # Incremental update of record 1 and voided delete of record 2 on legacy tables
+    records[1] = records[1].model_copy(
+        update={
+            "date_modified": "2026-06-02T12:00:00Z",
+            "record_data": {"AGE": 81, "patientName": "Legacy 1 Updated"},
+        }
+    )
+    records[2] = records[2].model_copy(
+        update={"deleted": True, "date_modified": "2026-06-02T12:00:00Z"}
+    )
+
+    export_to_sql(
+        sdk,
+        "STUDY_LEG",
+        "leg_tab",
+        f"sqlite:///{leg_sql}",
+        modified_since="2026-06-02T00:00:00Z",
+    )
+    export_to_duckdb(
+        sdk,
+        "STUDY_LEG",
+        str(leg_ddb),
+        "leg_tab",
+        modified_since="2026-06-02T00:00:00Z",
+    )
+    export_to_long_sql(
+        sdk,
+        "STUDY_LEG",
+        "leg_long",
+        f"sqlite:///{leg_long}",
+        modified_since="2026-06-02T00:00:00Z",
+    )
+
+    expected_evolved = [("STUDY_LEG", 1, 81), ("STUDY_LEG", 3, 33)]
+    with sqlite3.connect(leg_sql) as conn:
+        cols = {r[1] for r in conn.execute('PRAGMA table_info("leg_tab")')}
+        assert "studyKey" in cols
+        rows = conn.execute(
+            'SELECT "studyKey", "recordId", "AGE" FROM "leg_tab" ORDER BY "recordId"'
+        ).fetchall()
+    assert rows == expected_evolved
+
+    with duckdb.connect(str(leg_ddb)) as dcon:
+        dcols = {r[1] for r in dcon.execute("PRAGMA table_info('leg_tab')").fetchall()}
+        assert "studyKey" in dcols
+        drows = dcon.execute(
+            'SELECT "studyKey", "recordId", "AGE" FROM "leg_tab" ORDER BY "recordId"'
+        ).fetchall()
+    assert drows == expected_evolved
+
+    with sqlite3.connect(leg_long) as conn:
+        lcols = {r[1] for r in conn.execute('PRAGMA table_info("leg_long")')}
+        assert "study_key" in lcols
+        lrows = conn.execute(
+            'SELECT "study_key", "record_id", CAST("value" AS INTEGER) FROM "leg_long" '
+            'WHERE "variable_name" = \'AGE\' ORDER BY "record_id"'
+        ).fetchall()
+    assert lrows == expected_evolved
+
+    # Subsequent cross-Study voided delete for STUDY_B on evolved table preserves historical STUDY_LEG record 3
+    eng_post = create_engine(f"sqlite:///{leg_sql}")
+    try:
+        sql_b = TabularSQLSink(
+            "leg_tab",
+            eng_post,
+            TabularSinkConfig(study_key="STUDY_B", incremental=True),
+        )
+        sql_b.reconcile_deleted([{"recordId": 3, "deleted": True}], batch_id="b_post")
+    finally:
+        eng_post.dispose()
+    with TabularDuckDBSink(
+        str(leg_ddb),
+        "leg_tab",
+        TabularSinkConfig(study_key="STUDY_B", incremental=True),
+    ) as ddb_b:
+        ddb_b.reconcile_deleted([{"recordId": 3, "deleted": True}], batch_id="b_post")
+
+    with sqlite3.connect(leg_sql) as conn:
+        assert (
+            conn.execute(
+                'SELECT "studyKey", "recordId", "AGE" FROM "leg_tab" ORDER BY "recordId"'
+            ).fetchall()
+            == expected_evolved
+        )
+    with duckdb.connect(str(leg_ddb)) as dcon:
+        assert (
+            dcon.execute(
+                'SELECT "studyKey", "recordId", "AGE" FROM "leg_tab" ORDER BY "recordId"'
+            ).fetchall()
+            == expected_evolved
+        )
