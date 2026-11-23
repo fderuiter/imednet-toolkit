@@ -5,11 +5,18 @@ import re
 from typing import Any
 
 from imednet.errors import ClientError, PathTraversalValidationError
+from imednet.utils.secrets import redact_sensitive_payload
 
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
 _CAMEL_TO_SNAKE_RE1 = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_TO_SNAKE_RE2 = re.compile(r"([a-z\d])([A-Z])")
 _DELIMITER_RE = re.compile(r"[^a-zA-Z0-9]+")
+_INLINE_QUOTED_KV_RE = re.compile(
+    r"([\"']?)([A-Za-z][A-Za-z0-9_-]{1,63})\1(\s*[:=]\s*)([\"'])([^\"'\r\n]*)\4"
+)
+_INLINE_EQUALS_KV_RE = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{1,63})(\s*=\s*)([^\s,;\"')\]}]+)"
+)
 
 
 def _normalize_key_uncached(key: Any) -> str:
@@ -183,6 +190,60 @@ def mask_clinical_phi(
     if isinstance(value, tuple):
         return tuple(mask_clinical_phi(v, registry=active_registry) for v in value)
     return value
+
+
+def sanitize_diagnostic_text(
+    value: str,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> str:
+    """Redact credentials and mask inline clinical PHI key-value pairs in text."""
+    active_registry = global_sensitivity_registry if registry is None else registry
+    redacted = str(redact_sensitive_payload(value))
+
+    def _mask_quoted(match: re.Match[str]) -> str:
+        key = match.group(2)
+        if active_registry.is_sensitive(key):
+            quote_key = match.group(1)
+            sep = match.group(3)
+            quote_val = match.group(4)
+            return f"{quote_key}{key}{quote_key}{sep}{quote_val}***MASKED***{quote_val}"
+        return match.group(0)
+
+    def _mask_equals(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if active_registry.is_sensitive(key):
+            return f"{key}{match.group(2)}***MASKED***"
+        return match.group(0)
+
+    masked = _INLINE_QUOTED_KV_RE.sub(_mask_quoted, redacted)
+    return _INLINE_EQUALS_KV_RE.sub(_mask_equals, masked)
+
+
+def _scrub_diagnostic_leaves(value: Any, *, registry: SensitivityRegistry) -> Any:
+    if isinstance(value, str):
+        if value in {"[REDACTED]", "***MASKED***"}:
+            return value
+        return sanitize_diagnostic_text(value, registry=registry)
+    if isinstance(value, dict):
+        return {k: _scrub_diagnostic_leaves(v, registry=registry) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_diagnostic_leaves(v, registry=registry) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_diagnostic_leaves(v, registry=registry) for v in value)
+    return value
+
+
+def sanitize_diagnostic_payload(
+    value: Any,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> Any:
+    """Deep-sanitize structured payloads by redacting credentials and masking clinical PHI."""
+    active_registry = global_sensitivity_registry if registry is None else registry
+    redacted = redact_sensitive_payload(value)
+    masked = mask_clinical_phi(redacted, registry=active_registry)
+    return _scrub_diagnostic_leaves(masked, registry=active_registry)
 
 
 def sanitize_csv_formula(value: Any) -> Any:

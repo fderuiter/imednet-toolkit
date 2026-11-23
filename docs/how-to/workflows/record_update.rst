@@ -71,6 +71,14 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
 Single-Record Convenience Helpers
 ---------------------------------
 
+:meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.create_or_update_records`
+(and ``async_create_or_update_records``) enforces a strict single-``Job`` contract:
+passing multi-chunk payloads, ``dry_run=True``, empty ``Record`` lists, or invalid
+``DataDictionary`` inputs raises :class:`~imednet.errors.ValidationError` instead of
+truncating outcomes or fabricating synthetic ``COMPLETED`` states. Use
+:meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.create_or_update_records_batch`
+for multi-chunk writes or dry-run validation reports.
+
 For targeted operational scripts, ``RecordUpdateWorkflow`` also provides typed
 builders that construct properly aliased ``Record`` dictionaries and return the
 submitted ``Job`` (along with ``async_*`` counterparts for ``AsyncImednetSDK``):

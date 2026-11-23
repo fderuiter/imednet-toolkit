@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from imednet import AsyncImednetSDK, ImednetSDK
+from imednet.errors import ValidationError
 from imednet.models.records import RegisterSubjectRequest
 from imednet.simulation import SimulationState, create_simulation_transport
 from imednet.validation import cache as validation_cache_mod
@@ -87,12 +88,23 @@ def test_record_update_550_records_sends_six_chunks_and_validates_once() -> None
         wf = RecordUpdateWorkflow(sdk)
         records = [{"formKey": "F1", "data": {"age": i % 90}} for i in range(550)]
 
+        # Single-Job helper rejects multi-chunk payloads without sending POSTs
+        with pytest.raises(ValidationError, match="create_or_update_records_batch"):
+            wf.create_or_update_records(
+                "STUDY",
+                records,
+                wait_for_completion=True,
+                poll_interval=0,
+                timeout=10,
+            )
+        assert posted_chunks == []
+
         with patch.object(
             validation_cache_mod,
             "validate_record_data",
             wraps=validation_cache_mod.validate_record_data,
         ) as spy_validate:
-            job = wf.create_or_update_records(
+            summary = wf.create_or_update_records_batch(
                 "STUDY",
                 records,
                 wait_for_completion=True,
@@ -103,17 +115,6 @@ def test_record_update_550_records_sends_six_chunks_and_validates_once() -> None
         assert len(posted_chunks) == 6
         assert [len(c) for c in posted_chunks] == [100, 100, 100, 100, 100, 50]
         assert spy_validate.call_count == 550
-        assert job.state == "COMPLETED"
-
-        # Verify batch summary helper as well
-        posted_chunks.clear()
-        summary = wf.create_or_update_records_batch(
-            "STUDY",
-            records,
-            wait_for_completion=True,
-            poll_interval=0,
-            timeout=10,
-        )
         assert isinstance(summary, BatchSubmissionSummary)
         assert summary.chunk_count == 6
         assert summary.total_records == 550
@@ -262,8 +263,19 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
             for i in range(550)
         ]
 
-        # Default path (no explicit schema passed): get_sites called once and 6 chunked POSTs sent
-        default_job = wf.register_subjects(
+        # Single-Job helper rejects multi-chunk payloads before sending POSTs
+        with pytest.raises(ValidationError, match="register_subjects_batch"):
+            wf.register_subjects(
+                "STUDY",
+                requests,
+                wait_for_completion=True,
+                poll_interval=0,
+                timeout=10,
+            )
+        assert posted_chunks == []
+
+        # Default batch path (no explicit schema passed): get_sites called once and 6 chunked POSTs sent
+        default_summary = wf.register_subjects_batch(
             "STUDY",
             requests,
             wait_for_completion=True,
@@ -272,7 +284,7 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
         )
         assert len(posted_chunks) == 6
         assert [len(c) for c in posted_chunks] == [100, 100, 100, 100, 100, 50]
-        assert default_job.state == "COMPLETED"
+        assert default_summary.all_successful is True
 
         # Explicit schema path: BatchCoordinator validates 550 items once and skips duplicate endpoint validation
         posted_chunks.clear()
@@ -284,7 +296,7 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
             "validate_record_data",
             wraps=validation_cache_mod.validate_record_data,
         ) as spy_validate:
-            job = wf.register_subjects(
+            schema_summary = wf.register_subjects_batch(
                 "STUDY",
                 requests,
                 schema=validator.schema,
@@ -296,7 +308,7 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
         assert len(posted_chunks) == 6
         assert [len(c) for c in posted_chunks] == [100, 100, 100, 100, 100, 50]
         assert spy_validate.call_count == 550
-        assert job.state == "COMPLETED"
+        assert schema_summary.all_successful is True
 
         # Optional filtering of already enrolled Subjects and duplicate candidate keys
         posted_chunks.clear()
@@ -326,15 +338,23 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
         assert len(posted_chunks) == 1
         assert posted_chunks[0][0]["data"]["SUBJ_ID"] == "NEW-002"
 
-        # When every requested Subject is already enrolled, no POST is issued
+        # When every requested Subject is already enrolled, single-Job helper rejects zero-Job outcome
+        # while register_subjects_batch returns an empty summary with skipped_count=1
         posted_chunks.clear()
-        noop_job = wf.register_subjects(
+        with pytest.raises(ValidationError, match="register_subjects_batch"):
+            wf.register_subjects(
+                "STUDY",
+                [{"formKey": "ENROLL", "siteName": "SITE-1", "subjectKey": "EXISTING-001"}],
+                skip_existing=True,
+            )
+        noop_summary = wf.register_subjects_batch(
             "STUDY",
             [{"formKey": "ENROLL", "siteName": "SITE-1", "subjectKey": "EXISTING-001"}],
             skip_existing=True,
         )
         assert posted_chunks == []
-        assert noop_job.state == "COMPLETED"
+        assert noop_summary.jobs == []
+        assert noop_summary.skipped_count == 1
     finally:
         sdk.close()
 
@@ -660,7 +680,7 @@ async def test_record_update_workflow_concurrent_submissions_sharing_cache_valid
         pause_on_post = True
 
         task1 = asyncio.create_task(
-            wf.async_create_or_update_records(
+            wf.async_create_or_update_records_batch(
                 "STUDY",
                 [
                     {"formKey": "F1", "data": {"age": 30}},
@@ -687,8 +707,9 @@ async def test_record_update_workflow_concurrent_submissions_sharing_cache_valid
             )
 
         allow_first_post.set()
-        job = await task1
-        assert job.state == "COMPLETED"
+        summary = await task1
+        assert summary.all_successful is True
+        assert [j.state for j in summary.jobs] == ["COMPLETED", "COMPLETED"]
         assert [[r["data"]["age"] for r in b] for b in posted_batches] == [[30, 31], [32]]
 
 

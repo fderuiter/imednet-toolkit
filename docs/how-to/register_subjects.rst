@@ -9,8 +9,16 @@ target ``Site`` names exist and are open for enrollment before submitting
 Single-Submission Example
 -------------------------
 
-For small cohorts, :meth:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow.register_subjects`
-submits registration payloads and returns the final ``Job``:
+For small cohorts that fit within a single chunk,
+:meth:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow.register_subjects`
+(and ``async_register_subjects``) submits registration payloads and returns the single
+submitted ``Job``. Passing multi-chunk inputs, ``dry_run=True``, or empty/all-skipped
+cohorts that produce zero ``Job`` objects raises :class:`~imednet.errors.ValidationError`
+rather than returning synthetic ``COMPLETED`` states; use
+:meth:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow.register_subjects_batch`
+whenever chunking, dry-run validation, or zero-``Job`` filtering is expected. When
+``wait_for_completion=True``, the submitted ``Job`` must also carry a non-empty
+``batchId`` so terminal status can be polled:
 
 .. testcode::
 
