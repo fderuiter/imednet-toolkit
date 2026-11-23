@@ -1060,6 +1060,61 @@ def _before_process_endpoint_signature(app: Any, obj: Any, bound_method: bool) -
             target.__signature__ = sig.replace(return_annotation=normalized)
 
 
+def _process_shadowed_method_signature(
+    app: Any,
+    what: str,
+    name: str,
+    obj: Any,
+    options: Any,
+    signature: str | None,
+    return_annotation: str | None,
+) -> tuple[str | None, str | None] | None:
+    """Format signatures cleanly when ModelEngine subclasses shadow base class methods."""
+    import sphinx_autodoc_typehints
+    from sphinx.util.inspect import signature as sphinx_signature
+    from sphinx.util.inspect import stringify_signature
+
+    try:
+        return sphinx_autodoc_typehints.process_signature(
+            app,
+            what,
+            name,
+            obj,
+            options,
+            signature or "",
+            return_annotation or "",
+        )
+    except KeyError:
+        if what != "method" or not callable(obj):
+            return None
+        target = inspect.unwrap(obj)
+        if not getattr(target, "__annotations__", None):
+            return None
+        sph_signature = sphinx_signature(target)
+        if getattr(app.config, "typehints_use_signature", False):
+            parameters = list(sph_signature.parameters.values())
+        else:
+            parameters = [
+                param.replace(annotation=inspect.Parameter.empty)
+                for param in sph_signature.parameters.values()
+            ]
+        start = 0
+        if parameters:
+            owner_cls = _resolve_owner_class(app, name)
+            method_name = getattr(target, "__name__", name.rsplit(".", 1)[-1])
+            raw_descriptor = (
+                inspect.getattr_static(owner_cls, method_name, target)
+                if owner_cls is not None
+                else target
+            )
+            if not isinstance(raw_descriptor, (classmethod, staticmethod)):
+                start = 1
+        sph_signature = sph_signature.replace(parameters=parameters[start:])
+        if not getattr(app.config, "typehints_use_signature_return", False):
+            sph_signature = sph_signature.replace(return_annotation=inspect.Signature.empty)
+        return stringify_signature(sph_signature).replace("\\", "\\\\"), None
+
+
 def _process_endpoint_signature(
     app: Any,
     what: str,
@@ -1232,6 +1287,7 @@ _FIRST_PARTY_DIRECT_REWRITES: dict[str, str] = {
     "imednet.core.endpoint.base.GenericListGetEndpoint": "imednet.core.EdcSyncListGetEndpoint",
     "imednet.core.protocols.RequesterProtocol": "imednet.core.Client",
     "imednet.core.protocols.AsyncRequesterProtocol": "imednet.core.AsyncClient",
+    "write_batch": "imednet.integrations.sink_base.ExportSink.write_batch",
     "EdcGenericListGetEndpoint": "EdcSyncListGetEndpoint",
     "EdcGenericGetEndpoint": "EdcSyncGetEndpoint",
     "EdcGenericListEndpoint": "EdcSyncListEndpoint",
@@ -1614,6 +1670,26 @@ def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: An
                             f"imednet.pagination.{canon_sym}{tail_suffix}",
                         ]
                     )
+
+                try:
+                    mod_obj: Any = sys.modules.get(mod_part) or importlib.import_module(mod_part)
+                except Exception:
+                    mod_obj = None
+                if mod_obj is not None:
+                    sym_obj = getattr(mod_obj, sym_part, None)
+                    if sym_obj is not None and not isinstance(sym_obj, types.ModuleType):
+                        obj_mod = getattr(sym_obj, "__module__", None)
+                        obj_qual = getattr(
+                            sym_obj, "__qualname__", getattr(sym_obj, "__name__", sym_part)
+                        )
+                        if isinstance(obj_mod, str) and obj_mod:
+                            candidates.append(".".join([obj_mod, obj_qual, *member_tail]))
+                            runtime_home = _find_canonical_documented_module(
+                                obj_mod, obj_qual.split(".")[0], documented_modules
+                            )
+                            if runtime_home is not None:
+                                candidates.append(".".join([runtime_home, obj_qual, *member_tail]))
+
                 suffix_key = ".".join([canon_sym, *member_tail])
                 if suffix_key in suffix_index:
                     candidates.append(_select_best_py_candidate(suffix_index[suffix_key], node))
@@ -1627,6 +1703,9 @@ def _resolve_reexported_py_reference(app: Any, env: Any, node: Any, contnode: An
                 "imednet.pagination",
                 "imednet.sdk",
                 "imednet.endpoints",
+                "imednet.auth",
+                "imednet.models",
+                "imednet.integrations.sink_base",
             ):
                 candidates.append(f"{prefix}.{norm_target}")
             if norm_target in suffix_index:
@@ -2088,6 +2167,8 @@ def setup(app: Any) -> None:  # pragma: no cover
     _get_documented_modules.cache_clear()
     _analyze_module_symbols.cache_clear()
 
+    import sphinx_autodoc_typehints
+
     app.set_translator("html", _AccessibleHTML5Translator)
     app.set_translator("dirhtml", _AccessibleHTML5Translator)
     app.add_autodocumenter(_AsyncAwareMethodDocumenter, override=True)
@@ -2095,6 +2176,12 @@ def setup(app: Any) -> None:  # pragma: no cover
     app.connect(
         "autodoc-before-process-signature", _before_process_endpoint_signature, priority=400
     )
+    events = getattr(app, "events", None)
+    if events is not None:
+        for listener in list(events.listeners.get("autodoc-process-signature", [])):
+            if listener.handler is sphinx_autodoc_typehints.process_signature:
+                app.disconnect(listener.id)
+    app.connect("autodoc-process-signature", _process_shadowed_method_signature, priority=500)
     app.connect("autodoc-process-signature", _process_endpoint_signature, priority=600)
     app.connect("autodoc-process-docstring", _emit_barrel_export_table, priority=550)
     app.connect("autodoc-process-docstring", _emit_pydantic_model_fields, priority=600)
@@ -2155,10 +2242,6 @@ from unittest.mock import MagicMock, patch
 for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")]:
     del sys.modules[_mod]
 
-with contextlib.suppress(ImportError, AttributeError):
-    from airflow.sdk.bases.operator import ExecutorSafeguard
-    ExecutorSafeguard.test_mode = True
-
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
 logging.getLogger("py.warnings").setLevel(logging.ERROR)
@@ -2170,6 +2253,11 @@ os.environ["IMEDNET_SECURITY_KEY"] = "dummy_security_key"  # pragma: allowlist s
 os.environ["SNOWFLAKE_PASSWORD"] = "dummy_password"  # pragma: allowlist secret
 os.environ["IMEDNET_STUDY_KEY"] = "STUDY"
 os.environ["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
+os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
+
+with contextlib.suppress(Exception):
+    from airflow.sdk.bases.operator import ExecutorSafeguard
+    ExecutorSafeguard.test_mode = True
 
 _doctest_orig_cwd = os.getcwd()
 _doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")

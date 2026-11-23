@@ -32,6 +32,12 @@ def pytest_addoption(parser):
     parser.addoption(
         "--run-performance", action="store_true", default=False, help="run performance tests"
     )
+    parser.addoption(
+        "--update-perf-baseline",
+        action="store_true",
+        default=False,
+        help="recompute and overwrite committed performance baseline ratios",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -48,7 +54,11 @@ def pytest_collection_modifyitems(config, items):
             if not config.getoption("--run-fuzzing") and "fuzzing" not in marker_expr:
                 item.add_marker(skip_fuzzing)
         if "performance" in item.keywords:
-            if not config.getoption("--run-performance") and "performance" not in marker_expr:
+            if (
+                not config.getoption("--run-performance")
+                and not config.getoption("--update-perf-baseline")
+                and "performance" not in marker_expr
+            ):
                 item.add_marker(skip_performance)
 
 

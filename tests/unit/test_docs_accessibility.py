@@ -1685,16 +1685,24 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
     idx_wrapper_levels = [
         lvl for zone, lvl in page_headings.get("index.html", []) if zone == "toctree-wrapper"
     ]
-    assert idx_wrapper_levels == ["3", "3", "3", "3"], (
-        f"Expected four aria-level='3' toctree captions under <h2> on index.html, got {idx_wrapper_levels}"
+    assert idx_wrapper_levels == ["3", "3", "3", "3", "3"], (
+        f"Expected five aria-level='3' toctree captions under <h2> on index.html, got {idx_wrapper_levels}"
     )
     contrib_wrapper_levels = [
         lvl
         for zone, lvl in page_headings.get("reference/contributing.html", [])
         if zone == "toctree-wrapper"
     ]
-    assert contrib_wrapper_levels == ["2"], (
-        f"Expected aria-level='2' toctree caption under <h1> on reference/contributing.html, got {contrib_wrapper_levels}"
+    assert contrib_wrapper_levels == [], (
+        f"Expected no duplicate nested toctree-wrapper on reference/contributing.html, got {contrib_wrapper_levels}"
+    )
+    contrib_sidebar_levels = [
+        lvl
+        for zone, lvl in page_headings.get("reference/contributing.html", [])
+        if zone == "sidebar-tree"
+    ]
+    assert contrib_sidebar_levels == ["2", "2", "2", "2", "2"], (
+        f"Expected five aria-level='2' sidebar captions on reference/contributing.html, got {contrib_sidebar_levels}"
     )
 
     class _QuietHandler(SimpleHTTPRequestHandler):
@@ -2141,14 +2149,15 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     }"""
                 )
                 contrib_wrapper = [h for h in contrib_heading_audit if h["inToctreeWrapper"]]
-                assert len(contrib_wrapper) == 1
-                assert contrib_wrapper[0]["text"] == "Contributor Guides"
-                assert contrib_wrapper[0]["ariaLevel"] == "2"
-                assert contrib_wrapper[0]["borderBottomWidth"] == 0.0
+                assert contrib_wrapper == []
+                contrib_sidebar = [h for h in contrib_heading_audit if h["inSidebar"]]
+                assert len(contrib_sidebar) == 5
+                assert any(h["text"] == "Maintainer & Contributor:" for h in contrib_sidebar)
                 for h_item in contrib_heading_audit:
                     assert h_item["ariaLevel"] in {"1", "2", "3", "4", "5", "6"}
                     if h_item["inSidebar"]:
                         assert h_item["ariaLevel"] == "2"
+                        assert h_item["borderBottomWidth"] == 0.0
                 contrib_page.close()
 
                 sc_253_checks = idx_page.evaluate(
