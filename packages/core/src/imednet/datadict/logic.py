@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import re
-from collections.abc import Iterable, Mapping
+import re._constants as _re_constants  # type: ignore[import-not-found]
+import re._parser as _re_parser  # type: ignore[import-not-found]
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -547,6 +550,571 @@ def _normalize_operator(raw_op: str) -> str:
     return mapping.get(cleaned, cleaned or "==")
 
 
+_MAX_REGEX_PATTERN_LENGTH = 512
+_MAX_REGEX_INPUT_LENGTH = 1024
+_MAX_REGEX_REPEAT_COUNT = 256
+
+_REPEAT_OPCODES = frozenset(
+    op
+    for op in (
+        _re_constants.MAX_REPEAT,
+        _re_constants.MIN_REPEAT,
+        getattr(_re_constants, "POSSESSIVE_REPEAT", None),
+    )
+    if op is not None
+)
+_BACKREF_OPCODES = frozenset(
+    op
+    for op in (
+        _re_constants.GROUPREF,
+        _re_constants.GROUPREF_EXISTS,
+        getattr(_re_constants, "GROUPREF_IGNORE", None),
+        getattr(_re_constants, "GROUPREF_LOC_IGNORE", None),
+        getattr(_re_constants, "GROUPREF_UNI_IGNORE", None),
+    )
+    if op is not None
+)
+_LOOKAROUND_OPCODES = frozenset({_re_constants.ASSERT, _re_constants.ASSERT_NOT})
+_ATOMIC_GROUP_OPCODE = getattr(_re_constants, "ATOMIC_GROUP", None)
+
+_DIGIT_ASCII_MASK = sum(1 << c for c in range(48, 58))
+_UPPER_ASCII_MASK = sum(1 << c for c in range(65, 91))
+_LOWER_ASCII_MASK = sum(1 << c for c in range(97, 123))
+_WORD_ASCII_MASK = _DIGIT_ASCII_MASK | _UPPER_ASCII_MASK | _LOWER_ASCII_MASK | (1 << 95)
+_SPACE_ASCII_MASK = sum(1 << c for c in (9, 10, 11, 12, 13, 32))
+_LINEBREAK_ASCII_MASK = (1 << 10) | (1 << 13)
+
+_DIGIT_CATEGORIES = frozenset(
+    cat
+    for cat in (
+        _re_constants.CATEGORY_DIGIT,
+        getattr(_re_constants, "CATEGORY_UNI_DIGIT", None),
+    )
+    if cat is not None
+)
+_NOT_DIGIT_CATEGORIES = frozenset(
+    cat
+    for cat in (
+        _re_constants.CATEGORY_NOT_DIGIT,
+        getattr(_re_constants, "CATEGORY_UNI_NOT_DIGIT", None),
+    )
+    if cat is not None
+)
+_WORD_CATEGORIES = frozenset(
+    cat
+    for cat in (
+        _re_constants.CATEGORY_WORD,
+        getattr(_re_constants, "CATEGORY_UNI_WORD", None),
+        getattr(_re_constants, "CATEGORY_LOC_WORD", None),
+    )
+    if cat is not None
+)
+_NOT_WORD_CATEGORIES = frozenset(
+    cat
+    for cat in (
+        _re_constants.CATEGORY_NOT_WORD,
+        getattr(_re_constants, "CATEGORY_UNI_NOT_WORD", None),
+        getattr(_re_constants, "CATEGORY_LOC_NOT_WORD", None),
+    )
+    if cat is not None
+)
+_SPACE_CATEGORIES = frozenset(
+    cat
+    for cat in (
+        _re_constants.CATEGORY_SPACE,
+        getattr(_re_constants, "CATEGORY_UNI_SPACE", None),
+    )
+    if cat is not None
+)
+_NOT_SPACE_CATEGORIES = frozenset(
+    cat
+    for cat in (
+        _re_constants.CATEGORY_NOT_SPACE,
+        getattr(_re_constants, "CATEGORY_UNI_NOT_SPACE", None),
+    )
+    if cat is not None
+)
+_LINEBREAK_CATEGORIES = frozenset(
+    cat
+    for cat in (
+        getattr(_re_constants, "CATEGORY_LINEBREAK", None),
+        getattr(_re_constants, "CATEGORY_UNI_LINEBREAK", None),
+    )
+    if cat is not None
+)
+_NOT_LINEBREAK_CATEGORIES = frozenset(
+    cat
+    for cat in (
+        getattr(_re_constants, "CATEGORY_NOT_LINEBREAK", None),
+        getattr(_re_constants, "CATEGORY_UNI_NOT_LINEBREAK", None),
+    )
+    if cat is not None
+)
+
+
+def _has_quantified_pipe_group(pattern: str) -> bool:
+    """Return True if ``pattern`` has a parenthesized ``|`` group with a repeating quantifier."""
+    group_has_pipe: list[bool] = []
+    escaped = False
+    in_char_class = False
+    class_initial = False
+    length = len(pattern)
+
+    for idx, ch in enumerate(pattern):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if in_char_class:
+            if class_initial:
+                if ch == "^":
+                    continue
+                class_initial = False
+                if ch == "]":
+                    continue
+            if ch == "]":
+                in_char_class = False
+            continue
+        if ch == "[":
+            in_char_class = True
+            class_initial = True
+            continue
+        if ch == "(":
+            group_has_pipe.append(False)
+            continue
+        if ch == "|":
+            if group_has_pipe:
+                group_has_pipe[-1] = True
+            continue
+        if ch == ")" and group_has_pipe:
+            had_pipe = group_has_pipe.pop()
+            if had_pipe:
+                if idx + 1 < length and pattern[idx + 1] in {"*", "+", "{"}:
+                    return True
+                if group_has_pipe:
+                    group_has_pipe[-1] = True
+    return False
+
+
+class _RegexCharsetBuilder:
+    """Bitmask representation of character sets across ASCII and Unicode intervals."""
+
+    def __init__(self, items: Sequence[Any]) -> None:
+        boundaries: set[int] = {128, 0x110000}
+        self._collect_boundaries(items, boundaries)
+        pts = sorted(boundaries)
+        self._segments: list[tuple[int, int, int]] = []
+        self.all_mask = (1 << 128) - 1
+        bit_cursor = 128
+        for idx in range(len(pts) - 1):
+            seg_lo = pts[idx]
+            seg_hi = pts[idx + 1] - 1
+            self._segments.append((seg_lo, seg_hi, bit_cursor))
+            self.all_mask |= self._present_subclasses(seg_lo, seg_hi) << bit_cursor
+            bit_cursor += 4
+
+    @staticmethod
+    def _codepoint_subclass(cp: int) -> int:
+        ch = chr(cp)
+        if ch.isdigit():
+            return 0
+        if ch.isalnum() or cp == 95:
+            return 1
+        if ch.isspace():
+            return 2
+        return 3
+
+    @classmethod
+    def _present_subclasses(cls, seg_lo: int, seg_hi: int) -> int:
+        if seg_hi - seg_lo > 256:
+            return 0b1111
+        present = 0
+        for cp in range(seg_lo, seg_hi + 1):
+            present |= 1 << cls._codepoint_subclass(cp)
+            if present == 0b1111:
+                break
+        return present
+
+    def _register_span(self, lo: int, hi: int, boundaries: set[int]) -> None:
+        if hi >= 128:
+            clamped_lo = max(128, lo)
+            clamped_hi = min(0x10FFFF, hi)
+            if clamped_lo <= clamped_hi:
+                boundaries.add(clamped_lo)
+                boundaries.add(clamped_hi + 1)
+        if hi - lo <= 256:
+            for cp in range(max(0, lo), min(0x10FFFF, hi) + 1):
+                ch = chr(cp)
+                for folded in (ch.lower(), ch.upper()):
+                    if len(folded) == 1 and ord(folded) >= 128:
+                        fcp = ord(folded)
+                        boundaries.add(fcp)
+                        boundaries.add(fcp + 1)
+
+    def _collect_boundaries(self, items: Sequence[Any], boundaries: set[int]) -> None:
+        for op, av in items:
+            if op in {_re_constants.LITERAL, _re_constants.NOT_LITERAL}:
+                cp = int(av)
+                self._register_span(cp, cp, boundaries)
+            elif op == _re_constants.IN:
+                for sub_op, sub_av in av:
+                    if sub_op == _re_constants.LITERAL:
+                        cp = int(sub_av)
+                        self._register_span(cp, cp, boundaries)
+                    elif sub_op == _re_constants.RANGE:
+                        self._register_span(int(sub_av[0]), int(sub_av[1]), boundaries)
+            elif op in _REPEAT_OPCODES:
+                self._collect_boundaries(av[2], boundaries)
+            elif op == _re_constants.SUBPATTERN:
+                self._collect_boundaries(av[3], boundaries)
+            elif _ATOMIC_GROUP_OPCODE is not None and op == _ATOMIC_GROUP_OPCODE:
+                self._collect_boundaries(av, boundaries)
+            elif op == _re_constants.BRANCH:
+                for branch in av[1]:
+                    self._collect_boundaries(branch, boundaries)
+            elif op in _LOOKAROUND_OPCODES:
+                self._collect_boundaries(av[1], boundaries)
+
+    def _non_ascii_span_mask(self, lo: int, hi: int) -> int:
+        mask = 0
+        for seg_lo, seg_hi, offset in self._segments:
+            if seg_lo <= hi and seg_hi >= lo:
+                mask |= self._present_subclasses(seg_lo, seg_hi) << offset
+        return mask
+
+    def _non_ascii_subclass_mask(self, subclass_bits: int) -> int:
+        mask = 0
+        for seg_lo, seg_hi, offset in self._segments:
+            mask |= (self._present_subclasses(seg_lo, seg_hi) & subclass_bits) << offset
+        return mask
+
+    def literal_mask(self, code: int, flags: int) -> int:
+        codes = {code}
+        if flags & int(_re_constants.SRE_FLAG_IGNORECASE):
+            ch = chr(code)
+            for folded in (ch.lower(), ch.upper()):
+                if len(folded) == 1:
+                    codes.add(ord(folded))
+        mask = 0
+        for cp in codes:
+            if cp < 128:
+                mask |= 1 << cp
+            else:
+                mask |= self._non_ascii_span_mask(cp, cp)
+        return mask
+
+    def range_mask(self, lo: int, hi: int, flags: int) -> int:
+        if hi < lo:
+            return 0
+        ignore_case = bool(flags & int(_re_constants.SRE_FLAG_IGNORECASE))
+        if ignore_case and hi - lo <= 256:
+            mask = 0
+            for cp in range(lo, hi + 1):
+                mask |= self.literal_mask(cp, flags)
+            return mask
+        mask = 0
+        lo_ascii = max(0, lo)
+        hi_ascii = min(127, hi)
+        if lo_ascii <= hi_ascii:
+            if ignore_case:
+                for cp in range(lo_ascii, hi_ascii + 1):
+                    mask |= self.literal_mask(cp, flags)
+            else:
+                mask |= ((1 << (hi_ascii - lo_ascii + 1)) - 1) << lo_ascii
+        if hi >= 128:
+            mask |= self._non_ascii_span_mask(max(128, lo), hi)
+        return mask
+
+    def category_mask(self, cat: Any, flags: int) -> int:
+        ascii_only = bool(flags & int(_re_constants.SRE_FLAG_ASCII))
+        if cat in _DIGIT_CATEGORIES:
+            mask = _DIGIT_ASCII_MASK
+            if not ascii_only:
+                mask |= self._non_ascii_subclass_mask(0b0001)
+            return mask
+        if cat in _NOT_DIGIT_CATEGORIES:
+            return self.all_mask ^ self.category_mask(_re_constants.CATEGORY_DIGIT, flags)
+        if cat in _WORD_CATEGORIES:
+            mask = _WORD_ASCII_MASK
+            if not ascii_only:
+                mask |= self._non_ascii_subclass_mask(0b0011)
+            return mask
+        if cat in _NOT_WORD_CATEGORIES:
+            return self.all_mask ^ self.category_mask(_re_constants.CATEGORY_WORD, flags)
+        if cat in _SPACE_CATEGORIES:
+            mask = _SPACE_ASCII_MASK
+            if not ascii_only:
+                mask |= self._non_ascii_subclass_mask(0b0100)
+            return mask
+        if cat in _NOT_SPACE_CATEGORIES:
+            return self.all_mask ^ self.category_mask(_re_constants.CATEGORY_SPACE, flags)
+        if cat in _LINEBREAK_CATEGORIES:
+            return _LINEBREAK_ASCII_MASK
+        if cat in _NOT_LINEBREAK_CATEGORIES:
+            return self.all_mask ^ _LINEBREAK_ASCII_MASK
+        return self.all_mask
+
+    def in_item_mask(self, sub_op: Any, sub_av: Any, flags: int) -> int:
+        if sub_op == _re_constants.LITERAL:
+            return self.literal_mask(int(sub_av), flags)
+        if sub_op == _re_constants.RANGE:
+            return self.range_mask(int(sub_av[0]), int(sub_av[1]), flags)
+        if sub_op == _re_constants.CATEGORY:
+            return self.category_mask(sub_av, flags)
+        return 0
+
+    def in_mask(self, in_items: Sequence[Any], flags: int) -> int:
+        if not in_items:
+            return 0
+        negated = in_items[0][0] == _re_constants.NEGATE
+        entries = in_items[1:] if negated else in_items
+        union_mask = 0
+        for sub_op, sub_av in entries:
+            union_mask |= self.in_item_mask(sub_op, sub_av, flags)
+        return (self.all_mask ^ union_mask) if negated else union_mask
+
+    def first_mask_and_nullable(self, items: Sequence[Any], flags: int) -> tuple[int, bool]:
+        """Return ``(first_char_mask, can_match_empty)`` for ``items``."""
+        mask = 0
+        for op, av in items:
+            if op == _re_constants.AT or op in _LOOKAROUND_OPCODES:
+                continue
+            if op == _re_constants.LITERAL:
+                mask |= self.literal_mask(int(av), flags)
+                return mask, False
+            if op == _re_constants.NOT_LITERAL:
+                mask |= self.all_mask ^ self.literal_mask(int(av), flags)
+                return mask, False
+            if op == _re_constants.ANY:
+                dotall = bool(flags & int(_re_constants.SRE_FLAG_DOTALL))
+                mask |= self.all_mask if dotall else (self.all_mask ^ (1 << 10))
+                return mask, False
+            if op == _re_constants.IN:
+                mask |= self.in_mask(av, flags)
+                return mask, False
+            if op == _re_constants.SUBPATTERN:
+                sub_flags = (flags | int(av[1])) & ~int(av[2])
+                sub_mask, sub_null = self.first_mask_and_nullable(av[3], sub_flags)
+                mask |= sub_mask
+                if not sub_null:
+                    return mask, False
+                continue
+            if _ATOMIC_GROUP_OPCODE is not None and op == _ATOMIC_GROUP_OPCODE:
+                sub_mask, sub_null = self.first_mask_and_nullable(av, flags)
+                mask |= sub_mask
+                if not sub_null:
+                    return mask, False
+                continue
+            if op == _re_constants.BRANCH:
+                branch_null = False
+                for branch in av[1]:
+                    b_mask, b_null = self.first_mask_and_nullable(branch, flags)
+                    mask |= b_mask
+                    branch_null = branch_null or b_null
+                if not branch_null:
+                    return mask, False
+                continue
+            if op in _REPEAT_OPCODES:
+                min_rep, max_rep, sub_items = int(av[0]), av[1], av[2]
+                if max_rep == 0:
+                    continue
+                sub_mask, sub_null = self.first_mask_and_nullable(sub_items, flags)
+                mask |= sub_mask
+                if min_rep > 0 and not sub_null:
+                    return mask, False
+                continue
+        return mask, True
+
+
+def _strip_common_literal_prefix(
+    branch_a: Sequence[Any],
+    branch_b: Sequence[Any],
+    builder: _RegexCharsetBuilder,
+    flags: int,
+) -> tuple[Sequence[Any], Sequence[Any]]:
+    idx = 0
+    limit = min(len(branch_a), len(branch_b))
+    while idx < limit:
+        op_a, av_a = branch_a[idx]
+        op_b, av_b = branch_b[idx]
+        if op_a != _re_constants.LITERAL or op_b != _re_constants.LITERAL:
+            break
+        if builder.literal_mask(int(av_a), flags) != builder.literal_mask(int(av_b), flags):
+            break
+        idx += 1
+    return branch_a[idx:], branch_b[idx:]
+
+
+def _validate_regex_subpattern(
+    items: Sequence[Any],
+    *,
+    builder: _RegexCharsetBuilder,
+    flags: int,
+    in_any_quantifier: bool,
+    in_repeating_quantifier: bool,
+    has_quantified_pipe: bool,
+) -> None:
+    for op, av in items:
+        if op in _BACKREF_OPCODES:
+            raise ValueError("Regex backreferences are not permitted")
+
+        if op in _LOOKAROUND_OPCODES:
+            if in_any_quantifier:
+                raise ValueError("Quantified lookaround assertions are not permitted")
+            _validate_regex_subpattern(
+                av[1],
+                builder=builder,
+                flags=flags,
+                in_any_quantifier=False,
+                in_repeating_quantifier=False,
+                has_quantified_pipe=has_quantified_pipe,
+            )
+            continue
+
+        if op in _REPEAT_OPCODES:
+            min_rep = int(av[0])
+            max_rep = av[1]
+            sub_items = av[2]
+            if min_rep > _MAX_REGEX_REPEAT_COUNT or (
+                max_rep != _re_constants.MAXREPEAT and int(max_rep) > _MAX_REGEX_REPEAT_COUNT
+            ):
+                raise ValueError(f"Regex repeat count exceeds maximum of {_MAX_REGEX_REPEAT_COUNT}")
+            if in_repeating_quantifier:
+                raise ValueError("Nested quantifiers are not permitted in regex pattern")
+            is_repeating = max_rep == _re_constants.MAXREPEAT or int(max_rep) > 1
+            if is_repeating:
+                first_mask, is_null = builder.first_mask_and_nullable(sub_items, flags)
+                if is_null and first_mask == 0:
+                    raise ValueError("Zero-width quantified subpatterns are not permitted")
+            _validate_regex_subpattern(
+                sub_items,
+                builder=builder,
+                flags=flags,
+                in_any_quantifier=True,
+                in_repeating_quantifier=in_repeating_quantifier or is_repeating,
+                has_quantified_pipe=has_quantified_pipe,
+            )
+            continue
+
+        if op == _re_constants.SUBPATTERN:
+            sub_flags = (flags | int(av[1])) & ~int(av[2])
+            _validate_regex_subpattern(
+                av[3],
+                builder=builder,
+                flags=sub_flags,
+                in_any_quantifier=in_any_quantifier,
+                in_repeating_quantifier=in_repeating_quantifier,
+                has_quantified_pipe=has_quantified_pipe,
+            )
+            continue
+
+        if _ATOMIC_GROUP_OPCODE is not None and op == _ATOMIC_GROUP_OPCODE:
+            _validate_regex_subpattern(
+                av,
+                builder=builder,
+                flags=flags,
+                in_any_quantifier=in_any_quantifier,
+                in_repeating_quantifier=in_repeating_quantifier,
+                has_quantified_pipe=has_quantified_pipe,
+            )
+            continue
+
+        if op == _re_constants.BRANCH:
+            branches: Sequence[Sequence[Any]] = av[1]
+            for branch in branches:
+                _validate_regex_subpattern(
+                    branch,
+                    builder=builder,
+                    flags=flags,
+                    in_any_quantifier=in_any_quantifier,
+                    in_repeating_quantifier=in_repeating_quantifier,
+                    has_quantified_pipe=has_quantified_pipe,
+                )
+            if in_repeating_quantifier:
+                for branch in branches:
+                    _, b_null = builder.first_mask_and_nullable(branch, flags)
+                    if b_null:
+                        raise ValueError("Overlapping quantified alternations are not permitted")
+                num_branches = len(branches)
+                for i in range(num_branches):
+                    for j in range(i + 1, num_branches):
+                        rem_a, rem_b = _strip_common_literal_prefix(
+                            branches[i], branches[j], builder, flags
+                        )
+                        mask_a, null_a = builder.first_mask_and_nullable(rem_a, flags)
+                        mask_b, null_b = builder.first_mask_and_nullable(rem_b, flags)
+                        if null_a or null_b or (mask_a & mask_b) != 0:
+                            raise ValueError(
+                                "Overlapping quantified alternations are not permitted"
+                            )
+            continue
+
+        if (
+            op == _re_constants.IN
+            and in_repeating_quantifier
+            and has_quantified_pipe
+            and len(av) > 1
+            and av[0][0] != _re_constants.NEGATE
+        ):
+            seen_mask = 0
+            for sub_op, sub_av in av:
+                item_mask = builder.in_item_mask(sub_op, sub_av, flags)
+                if seen_mask & item_mask:
+                    raise ValueError("Overlapping quantified alternations are not permitted")
+                seen_mask |= item_mask
+
+
+def validate_regex_pattern(pattern: str) -> None:
+    """Validate that ``pattern`` is syntactically valid and safe against ReDoS.
+
+    Args:
+        pattern: Regular expression string to inspect.
+
+    Raises:
+        ValueError: If ``pattern`` exceeds length limits, fails syntax parsing,
+            or contains backtracking-prone constructs.
+    """
+    if len(pattern) > _MAX_REGEX_PATTERN_LENGTH:
+        raise ValueError(
+            f"Regex pattern length {len(pattern)} exceeds maximum of {_MAX_REGEX_PATTERN_LENGTH}"
+        )
+    try:
+        parsed = _re_parser.parse(pattern)
+    except re.error as exc:
+        raise ValueError(f"Invalid regex syntax: {exc}") from exc
+
+    items = list(parsed)
+    flags = int(parsed.state.flags)
+    builder = _RegexCharsetBuilder(items)
+    _validate_regex_subpattern(
+        items,
+        builder=builder,
+        flags=flags,
+        in_any_quantifier=False,
+        in_repeating_quantifier=False,
+        has_quantified_pipe=_has_quantified_pipe_group(pattern),
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_safe_regex(pattern: str) -> re.Pattern[str]:
+    """Validate ``pattern`` AST and compile it with bounded LRU caching."""
+    validate_regex_pattern(pattern)
+    return re.compile(pattern)
+
+
+def _get_compiled_safe_regex(pattern: str) -> re.Pattern[str] | None:
+    """Return a compiled safe regex ``Pattern``, or ``None`` if invalid or unsafe."""
+    if len(pattern) > _MAX_REGEX_PATTERN_LENGTH:
+        return None
+    try:
+        return _compile_safe_regex(pattern)
+    except ValueError:
+        return None
+
+
 class LogicTreeEvaluator:
     """Deterministic, non-``eval`` evaluator for parsed BusinessLogicRule XML ASTs."""
 
@@ -698,6 +1266,9 @@ class LogicTreeEvaluator:
         if not conditions:
             return False, False, "no_conditions"
 
+        if self._has_unsafe_regex_condition(conditions, data):
+            return False, False, "unsafe_regex"
+
         triggered = self._eval_node(
             cond_root,
             data,
@@ -706,6 +1277,50 @@ class LogicTreeEvaluator:
             group_combinator=root_combinator,
         )
         return triggered, False, None
+
+    @staticmethod
+    def _has_unsafe_regex_condition(
+        conditions: Iterable[ExtractedCondition],
+        data: Mapping[str, Any],
+    ) -> bool:
+        for cond in conditions:
+            if cond.operator != "regex":
+                continue
+            if cond.compare_variable is not None:
+                rhs = data.get(cond.compare_variable)
+                if _is_empty_record_value(rhs):
+                    continue
+                pattern_str = str(rhs)
+            else:
+                pattern_str = "" if cond.value is None or cond.value is True else str(cond.value)
+            if _get_compiled_safe_regex(pattern_str) is None:
+                return True
+        return False
+
+    def validate_rule_regex_patterns(self, rule: Any) -> list[str]:
+        """Return validation error descriptions for invalid or unsafe static regex conditions."""
+        logic_ast, _xml_err = self._resolve_logic_ast(rule)
+        if not isinstance(logic_ast, Mapping):
+            return []
+        unwrapped = self._unwrap_root(logic_ast)
+        cond_root = unwrapped.get("conditions", unwrapped.get("if", unwrapped))
+        if not isinstance(cond_root, (Mapping, list)):
+            return []
+        conditions, _ = self._collect_leaf_conditions(
+            cond_root,
+            None,
+            allow_cross_scope=True,
+        )
+        issues: list[str] = []
+        for cond in conditions:
+            if cond.operator != "regex" or cond.compare_variable is not None:
+                continue
+            pattern_str = "" if cond.value is None or cond.value is True else str(cond.value)
+            try:
+                validate_regex_pattern(pattern_str)
+            except ValueError as exc:
+                issues.append(f"variable '{cond.variable}' has unsafe or invalid regex: {exc}")
+        return issues
 
     def extract_rule_metadata(
         self,
@@ -1000,6 +1615,7 @@ class LogicTreeEvaluator:
         *,
         negated: bool = False,
         default_operator: str | None = None,
+        allow_cross_scope: bool = False,
     ) -> tuple[list[ExtractedCondition], bool]:
         if isinstance(node, list):
             out: list[ExtractedCondition] = []
@@ -1010,6 +1626,7 @@ class LogicTreeEvaluator:
                     form_key,
                     negated=negated,
                     default_operator=default_operator,
+                    allow_cross_scope=allow_cross_scope,
                 )
                 out.extend(sub_conds)
                 cross = cross or sub_cross
@@ -1018,9 +1635,10 @@ class LogicTreeEvaluator:
         if not isinstance(node, Mapping):
             return [], False
 
-        for ckey in _CROSS_SCOPE_KEYS:
-            if node.get(ckey):
-                return [], True
+        if not allow_cross_scope:
+            for ckey in _CROSS_SCOPE_KEYS:
+                if node.get(ckey):
+                    return [], True
 
         if self._is_leaf_condition(node):
             leaf, is_cross = self._parse_leaf_condition(
@@ -1028,6 +1646,7 @@ class LogicTreeEvaluator:
                 form_key,
                 negated=negated,
                 default_operator=default_operator,
+                allow_cross_scope=allow_cross_scope,
             )
             return ([leaf] if leaf is not None else []), is_cross
 
@@ -1040,6 +1659,7 @@ class LogicTreeEvaluator:
                     form_key,
                     negated=negated,
                     default_operator=default_operator,
+                    allow_cross_scope=allow_cross_scope,
                 )
                 out_conds.extend(sub_c)
                 is_cross_any = is_cross_any or sub_x
@@ -1051,6 +1671,7 @@ class LogicTreeEvaluator:
                     form_key,
                     negated=negated,
                     default_operator=op_mapped,
+                    allow_cross_scope=allow_cross_scope,
                 )
                 out_conds.extend(sub_c)
                 is_cross_any = is_cross_any or sub_x
@@ -1061,6 +1682,7 @@ class LogicTreeEvaluator:
                     form_key,
                     negated=not negated,
                     default_operator=default_operator,
+                    allow_cross_scope=allow_cross_scope,
                 )
                 out_conds.extend(sub_c)
                 is_cross_any = is_cross_any or sub_x
@@ -1096,10 +1718,12 @@ class LogicTreeEvaluator:
         *,
         negated: bool = False,
         default_operator: str | None = None,
+        allow_cross_scope: bool = False,
     ) -> tuple[ExtractedCondition | None, bool]:
-        for ckey in _CROSS_SCOPE_KEYS:
-            if cond.get(ckey):
-                return None, True
+        if not allow_cross_scope:
+            for ckey in _CROSS_SCOPE_KEYS:
+                if cond.get(ckey):
+                    return None, True
 
         raw_var = str(
             cond.get("variable")
@@ -1119,7 +1743,7 @@ class LogicTreeEvaluator:
         var_name, resolved_form, is_cross = self._resolve_scoped_variable(
             raw_var, cond_form, form_key
         )
-        if is_cross:
+        if is_cross and not allow_cross_scope:
             return None, True
 
         compare_var: str | None = None
@@ -1127,7 +1751,7 @@ class LogicTreeEvaluator:
             cv_raw = cond.get(cv_key)
             if isinstance(cv_raw, str) and cv_raw.strip():
                 cv_name, _, cv_cross = self._resolve_scoped_variable(cv_raw, cond_form, form_key)
-                if cv_cross:
+                if cv_cross and not allow_cross_scope:
                     return None, True
                 compare_var = cv_name
                 break
@@ -1360,11 +1984,17 @@ class LogicTreeEvaluator:
             rhs = data.get(cond.compare_variable)
             if _is_empty_record_value(actual) or _is_empty_record_value(rhs):
                 return False
+            if op == "regex" and _get_compiled_safe_regex(str(rhs)) is None:
+                return False
         else:
             rhs = cond.value
             # Empty XML tag <value/> parses to True via _parse_xml_element
             if rhs is True and not isinstance(actual, bool):
                 rhs = ""
+            if op == "regex":
+                pattern_str = "" if rhs is None or rhs is True else str(rhs)
+                if _get_compiled_safe_regex(pattern_str) is None:
+                    return False
 
             if _is_empty_record_value(actual):
                 # Explicit comparison to empty string (e.g. VAR == "" or VAR != "")
@@ -1419,10 +2049,16 @@ class LogicTreeEvaluator:
             return str(actual).endswith(str(expected))
 
         if op == "regex":
-            try:
-                return re.search(str(expected), str(actual)) is not None
-            except re.error:
+            if isinstance(actual, str) and len(actual) > _MAX_REGEX_INPUT_LENGTH:
                 return False
+            actual_str = actual if isinstance(actual, str) else str(actual)
+            if len(actual_str) > _MAX_REGEX_INPUT_LENGTH:
+                return False
+            expected_str = "" if expected is None or expected is True else str(expected)
+            compiled = _get_compiled_safe_regex(expected_str)
+            if compiled is None:
+                return False
+            return compiled.search(actual_str) is not None
 
         # Boolean comparison when actual is a Python bool
         if isinstance(actual, bool):

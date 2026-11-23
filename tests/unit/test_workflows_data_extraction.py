@@ -183,10 +183,17 @@ def test_extract_records_by_criteria_scaling_benchmark() -> None:
 
 
 def test_extract_audit_trail_builds_filters_and_dates() -> None:
-    """Test that extract audit trail normalizes UTC bounds and builds dateCreated range filters."""
+    """Test extract_audit_trail sends one dateCreated bound upstream and filters end_date locally."""
     sdk = MagicMock()
-    revisions = [RecordRevision(record_revision_id=1)]
-    sdk.get_record_revisions.return_value = revisions
+    in_window = RecordRevision(
+        record_revision_id=1,
+        date_created="2026-01-15T12:00:00Z",
+    )
+    after_window = RecordRevision(
+        record_revision_id=2,
+        date_created="2026-02-05T00:00:00Z",
+    )
+    sdk.get_record_revisions.return_value = [in_window, after_window]
 
     wf = DataExtractionWorkflow(sdk)
     result = wf.extract_audit_trail(
@@ -201,24 +208,37 @@ def test_extract_audit_trail_builds_filters_and_dates() -> None:
         "STUDY",
         role="data",
         status="open",
-        dateCreated=[
-            (">=", "2026-01-01T00:00:00Z"),
-            ("<=", "2026-02-01T23:59:59Z"),
-        ],
+        dateCreated=(">=", "2026-01-01T00:00:00Z"),
     )
-    assert result == revisions
+    assert result == [in_window]
 
 
-def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -> None:
-    """Test that extract_audit_trail sends dateCreated>=...;dateCreated<=... over HTTP."""
+def test_extract_audit_trail_emits_single_date_created_http_filter_and_filters_locally() -> None:
+    """Test extract_audit_trail sends a valid single-bound filter over HTTP and filters end_date locally."""
     import respx
 
     from imednet.sdk import ImednetSDK
+    from imednet.utils.filters import validate_filter_syntax
 
     with respx.mock(assert_all_called=True) as router:
         route = router.get("https://api.test/api/v1/edc/studies/STUDY/recordRevisions").respond(
             200,
-            json={"data": [{"recordRevisionId": 5, "recordId": 10, "recordRevision": 1}]},
+            json={
+                "data": [
+                    {
+                        "recordRevisionId": 5,
+                        "recordId": 10,
+                        "recordRevision": 1,
+                        "dateCreated": "2026-01-20 09:30:00",
+                    },
+                    {
+                        "recordRevisionId": 6,
+                        "recordId": 10,
+                        "recordRevision": 2,
+                        "dateCreated": "2026-02-03 10:00:00",
+                    },
+                ]
+            },
         )
         sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
         wf = DataExtractionWorkflow(sdk)
@@ -230,9 +250,9 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
         )
 
         sent_filter = route.calls.last.request.url.params["filter"]
-        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z"
+        validate_filter_syntax(sent_filter)
+        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z"
         assert "studyKey" not in sent_filter
         assert "startDate" not in sent_filter
         assert "endDate" not in sent_filter
-        assert len(revisions) == 1
-        assert revisions[0].record_revision_id == 5
+        assert [r.record_revision_id for r in revisions] == [5]
