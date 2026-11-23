@@ -1538,6 +1538,7 @@ html_js_files: list[str] = ["code_blocks.js"]
 
 doctest_global_setup = """
 import builtins
+import contextlib
 import logging
 import os
 import sys
@@ -1547,6 +1548,10 @@ from unittest.mock import MagicMock, patch
 
 for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")]:
     del sys.modules[_mod]
+
+with contextlib.suppress(ImportError):
+    from airflow.sdk.bases.operator import ExecutorSafeguard
+    ExecutorSafeguard.test_mode = True
 
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
