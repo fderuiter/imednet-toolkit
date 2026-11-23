@@ -872,6 +872,21 @@ def _before_process_endpoint_signature(app: Any, obj: Any, bound_method: bool) -
             pass
 
 
+def _suppress_module_signature(
+    app: Any,  # noqa: ARG001
+    what: str,
+    name: str,  # noqa: ARG001
+    obj: Any,  # noqa: ARG001
+    options: Any,  # noqa: ARG001
+    signature: str | None,  # noqa: ARG001
+    return_annotation: str | None,  # noqa: ARG001
+) -> tuple[str | None, str | None] | None:
+    """Prevent callable module instances from emitting invalid py:module call signatures."""
+    if what == "module":
+        return (None, None)
+    return None
+
+
 def _process_endpoint_signature(
     app: Any,
     what: str,
@@ -1462,6 +1477,7 @@ def setup(app: Any) -> None:  # pragma: no cover
     app.connect(
         "autodoc-before-process-signature", _before_process_endpoint_signature, priority=400
     )
+    app.connect("autodoc-process-signature", _suppress_module_signature, priority=400)
     app.connect("autodoc-process-signature", _process_endpoint_signature, priority=600)
     app.connect("autodoc-process-docstring", _emit_pydantic_model_fields, priority=600)
     app.connect("autodoc-skip-member", _skip_non_canonical_or_internal)
@@ -1509,6 +1525,7 @@ html_js_files: list[str] = ["code_blocks.js"]
 
 doctest_global_setup = """
 import builtins
+import contextlib
 import logging
 import os
 import sys
@@ -1518,6 +1535,10 @@ from unittest.mock import MagicMock, patch
 
 for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")]:
     del sys.modules[_mod]
+
+with contextlib.suppress(ImportError):
+    from airflow.sdk.bases.operator import ExecutorSafeguard
+    ExecutorSafeguard.test_mode = True
 
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")

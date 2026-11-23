@@ -206,6 +206,31 @@ def test_conf_autodoc_operation_signature_hooks() -> None:
     assert "FilterGetOperation" not in (rewritten[1] or "")
     assert "Record" in (rewritten[1] or "")
 
+    import imednet.integrations.export as export_mod
+
+    assert callable(export_mod)
+    assert conf._suppress_module_signature(
+        fake_app,
+        "module",
+        "imednet.integrations.export",
+        export_mod,
+        {},
+        None,
+        None,
+    ) == (None, None)
+    assert (
+        conf._suppress_module_signature(
+            fake_app,
+            "function",
+            "imednet.integrations.export.export_to_parquet",
+            export_mod.export_to_parquet,
+            {},
+            None,
+            None,
+        )
+        is None
+    )
+
 
 def test_check_no_duplicate_suppression_detects_forbidden_patterns(tmp_path: Path) -> None:
     """check_no_duplicate_suppression flags _SuppressDuplicateDescriptions and duplicate filters."""
