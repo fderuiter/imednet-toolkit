@@ -42,7 +42,9 @@ from imednet.spi.models import (
 )
 from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import (
+    CompiledRecordPredicate,
     EnrichmentPipeline,
+    compile_record_predicate,
     global_sensitivity_registry,
     mask_clinical_phi,
     mask_custom_phi_recursive,
@@ -504,14 +506,37 @@ class RecordMapper:
             self._include_deleted if include_deleted is None else include_deleted
         )
         raw_filters = dict(extra_filters) if extra_filters else {}
-        form_id_list, _ = self._extract_form_ids(raw_filters)
-        form_ids: set[Any] | None = set(form_id_list) if form_id_list is not None else None
+        explicit_sort = sort if sort is not None else raw_filters.get("sort")
+        has_pagination_override = (
+            raw_filters.get("page") is not None or raw_filters.get("size") is not None
+        )
 
         loader = self._loader
-        if loader is not None:
+        if loader is not None and not effective_include_deleted and not has_pagination_override:
             sync_method = getattr(loader, "sync_records", None)
             bound_iter, supports_subject_order = self._resolve_loader_iter_callable(loader)
-            if callable(sync_method) and callable(bound_iter):
+            is_custom_sort = False
+            if explicit_sort is not None and str(explicit_sort).strip():
+                is_sdtm_subject_sort = explicit_sort == _SDTM_RECORDS_SORT and group_by_subject
+                is_custom_sort = not is_sdtm_subject_sort
+
+            if callable(sync_method) and callable(bound_iter) and not is_custom_sort:
+                form_id_list, remaining_filters = self._extract_form_ids(raw_filters)
+                if form_id_list is not None and len(form_id_list) == 0:
+                    return iter(())
+                form_ids: set[Any] | None = set(form_id_list) if form_id_list is not None else None
+                if form_id_list is not None and remaining_filters:
+                    compile_record_predicate(
+                        extra_filters={**remaining_filters, "formId": form_id_list[0]},
+                        record_data_filter=record_data_filter,
+                    )
+                predicate = compile_record_predicate(
+                    extra_filters=remaining_filters,
+                    record_data_filter=record_data_filter,
+                )
+                if predicate.always_empty:
+                    return iter(())
+
                 sync_method(study_key)
                 iter_kwargs: dict[str, Any] = {"chunk_size": self._pipeline.chunk_size}
                 if group_by_subject and supports_subject_order:
@@ -521,6 +546,7 @@ class RecordMapper:
                     visit_key=visit_key,
                     form_ids=form_ids,
                     include_deleted=effective_include_deleted,
+                    predicate=predicate,
                 )
 
         return self._stream_sdk_records(
@@ -540,8 +566,9 @@ class RecordMapper:
         visit_key: str | None,
         form_ids: set[Any] | None,
         include_deleted: bool | None = None,
+        predicate: CompiledRecordPredicate | None = None,
     ) -> Iterator[RecordModel]:
-        """Apply visit, form, and deleted filters to an iterable of records."""
+        """Apply visit, form, metadata, recordData, and deleted filters to cached records."""
         effective_include_deleted = (
             self._include_deleted if include_deleted is None else include_deleted
         )
@@ -562,7 +589,13 @@ class RecordMapper:
                 continue
             if form_ids is not None and record.form_id not in form_ids:
                 continue
-            yield record
+            emitted: RecordModel = record
+            if predicate is not None:
+                matched = predicate.apply(record)
+                if matched is None:
+                    continue
+                emitted = matched
+            yield emitted
 
     def _parse_record(
         self,
@@ -1111,7 +1144,7 @@ class RecordMapper:
 
         source_is_ordered = False
         force_drain_ungrouped_loader = False
-        if self._loader is not None:
+        if self._loader is not None and not effective_include_deleted:
             bound_iter, supports_subject_order = self._resolve_loader_iter_callable(self._loader)
             from unittest.mock import NonCallableMock
 
