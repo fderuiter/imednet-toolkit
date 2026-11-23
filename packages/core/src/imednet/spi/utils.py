@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from imednet.utils.tabular import (
         MASKED_SENTINEL,
         ensure_no_masked_sentinel,
+        extract_input_form_refs,
         normalize_records_input,
         normalize_tabular_row,
     )
@@ -136,6 +137,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "csv_to_records": ("imednet.utils.pandas", "csv_to_records"),
     "dataframe_to_records": ("imednet.utils.pandas", "dataframe_to_records"),
     "ensure_no_masked_sentinel": ("imednet.utils.tabular", "ensure_no_masked_sentinel"),
+    "extract_input_form_refs": ("imednet.utils.tabular", "extract_input_form_refs"),
     "evaluate_expression": ("imednet.utils.evaluator", "evaluate_expression"),
     "evaluate_job_state": ("imednet.utils.job_poller", "evaluate_job_state"),
     "extract_candidate_subject_key": (
@@ -261,6 +263,7 @@ __all__ = [
     "evaluate_expression",
     "evaluate_job_state",
     "extract_candidate_subject_key",
+    "extract_input_form_refs",
     "fetch_terminal_job_result",
     "filter_existing_subject_registrations",
     "flatten",

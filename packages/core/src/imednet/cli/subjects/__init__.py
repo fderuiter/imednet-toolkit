@@ -14,6 +14,7 @@ from ...utils.enrollment import (
     normalize_subject_registration_inputs,
     validate_subject_registration_sites,
 )
+from ...utils.job_poller import JobFailedError
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import print_error, register_list_command, simulation_mode_context
 from ..utils.args import (
@@ -24,6 +25,7 @@ from ..utils.write_helpers import (
     add_write_common_args,
     coerce_batch_summary,
     exit_cli_validation_error,
+    handle_job_failed_error,
     parse_email_notify,
     parse_json_records_text,
     parse_key_value_pairs,
@@ -43,13 +45,31 @@ def _load_cli_subject_inputs(
     if args.input_file and args.json_payload:
         raise ValueError("Cannot combine --file and --json.")
 
-    inline_data = parse_key_value_pairs(args.data_pairs)
+    inline_data = parse_key_value_pairs(
+        args.data_pairs,
+        schema=schema,
+        form_key=args.form_key,
+        study_key=getattr(args, "study_key", None),
+    )
     if args.input_file:
         if args.input_file == "-":
-            return parse_json_records_text(sys.stdin.read(), source_label="stdin")
+            return parse_json_records_text(
+                sys.stdin.read(),
+                source_label="stdin",
+                schema=schema,
+                create_only=True,
+                study_key=getattr(args, "study_key", None),
+                allow_jsonl_fallback=True,
+            )
         return Path(args.input_file)
     if args.json_payload:
-        return parse_json_records_text(args.json_payload, source_label="--json")
+        return parse_json_records_text(
+            args.json_payload,
+            source_label="--json",
+            schema=schema,
+            create_only=True,
+            study_key=getattr(args, "study_key", None),
+        )
 
     if not args.form_key or not args.site_name:
         raise ValueError(
@@ -198,7 +218,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     on_progress=on_progress,
                     dry_run=args.dry_run,
                     collect_errors=True,
+                    create_only=True,
                 )
+        except JobFailedError as exc:
+            handle_job_failed_error(
+                exc,
+                study_key=args.study_key,
+                total_records=len(subjects_data),
+                skipped_count=skipped_count,
+                resource="subjects_register",
+                output_format=args.output_format,
+            )
+            return
         except (ValidationError, ValueError) as exc:
             exit_cli_validation_error(exc)
 

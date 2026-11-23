@@ -17,7 +17,7 @@ from imednet.utils.job_poller import (
     JobProgressHandler,
     JobStatusEvent,
 )
-from imednet.utils.tabular import ensure_no_masked_sentinel
+from imednet.utils.tabular import ensure_finite_numbers, ensure_no_masked_sentinel
 from imednet.validation.cache import (
     BatchValidationReport,
     RecordValidationIssue,
@@ -117,6 +117,7 @@ def _validate_records_with_schema(
 ) -> None:
     """Validate records not already marked prevalidated in the active task scope."""
     ensure_no_masked_sentinel(records_data)
+    ensure_finite_numbers(records_data)
     is_rec_prevalidated = getattr(schema, "is_record_prevalidated", None)
     if callable(is_rec_prevalidated):
         for rec in records_data:
@@ -153,6 +154,7 @@ def _masked_only_report(records_data: list[dict[str, Any]]) -> BatchValidationRe
     for idx, rec in enumerate(records_data):
         try:
             ensure_no_masked_sentinel([rec])
+            ensure_finite_numbers([rec])
             report.valid_records += 1
         except ValidationError as exc:
             report.invalid_records += 1

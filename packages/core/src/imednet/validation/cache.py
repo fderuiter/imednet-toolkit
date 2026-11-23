@@ -29,7 +29,15 @@ from imednet.datadict.logic import LogicTreeEvaluator, extract_variable_constrai
 from imednet.datadict.models import DataDictionary
 from imednet.errors import UnknownVariableTypeError, ValidationError
 from imednet.utils.security import global_sensitivity_registry
-from imednet.utils.tabular import MASKED_SENTINEL, _contains_masked_sentinel
+from imednet.utils.tabular import (
+    _IDENTIFIER_COLUMNS,
+    _NESTED_DATA_COLUMNS,
+    _READ_ONLY_RECORD_COLUMNS,
+    _SIMULATION_PASSTHROUGH_KEYS,
+    MASKED_SENTINEL,
+    _contains_masked_sentinel,
+    _contains_nonfinite_number,
+)
 
 from ..models.variables import Variable
 from ._base import _extract_form_ref, _ValidatorMixin
@@ -444,16 +452,18 @@ def _validate_int(value: Any) -> None:
 
 
 def _validate_float(value: Any) -> None:
-    """Validate that the value is numeric (int or float, excluding booleans).
+    """Validate that the value is a finite number (int or float, excluding booleans).
 
     Args:
         value: The value to validate.
 
     Raises:
-        ValidationError: If the value is not numeric or is a boolean.
+        ValidationError: If the value is not finite numeric or is a boolean.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError("Value must be numeric")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValidationError("Value must be numeric (NaN and Infinity are not allowed)")
 
 
 def _validate_bool(value: Any) -> None:
@@ -509,10 +519,30 @@ def _validate_multi_choice(value: Any) -> None:
     )
 
 
+def _validate_true_false(value: Any) -> None:
+    """Validate that a true/false variable value is a boolean, string, or integer."""
+    if not isinstance(value, (bool, str, int)):
+        raise ValidationError("Value must be a boolean, string, or integer code")
+
+
 def _validate_calculation(value: Any) -> None:
-    """Validate that a computed or range value is non-boolean numeric or text."""
+    """Validate that a computed or range value is non-boolean finite numeric or text."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ValidationError("Value must be numeric or a string")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValidationError("Value must be numeric (NaN and Infinity are not allowed)")
+    if isinstance(value, str) and value.strip().lower() in {
+        "nan",
+        "+nan",
+        "-nan",
+        "inf",
+        "+inf",
+        "-inf",
+        "infinity",
+        "+infinity",
+        "-infinity",
+    }:
+        raise ValidationError("Value must be numeric (NaN and Infinity are not allowed)")
 
 
 _TYPE_SEP_RE = re.compile(r"[\s_-]+")
@@ -560,9 +590,9 @@ _CANONICAL_VARIABLE_TAXONOMY: dict[str, tuple[str, Any, Callable[[Any], None]]] 
     "yes/no": ("yes/no", "1", _validate_single_choice),
     "yesno": ("yes/no", "1", _validate_single_choice),
     "yes no": ("yes/no", "1", _validate_single_choice),
-    "true/false": ("yes/no", "1", _validate_single_choice),
-    "truefalse": ("yes/no", "1", _validate_single_choice),
-    "true false": ("yes/no", "1", _validate_single_choice),
+    "true/false": ("yes/no", "1", _validate_true_false),
+    "truefalse": ("yes/no", "1", _validate_true_false),
+    "true false": ("yes/no", "1", _validate_true_false),
     # Multi-choice categorical types
     "checkbox": ("checkbox", True, _validate_multi_choice),
     "check box": ("checkbox", True, _validate_multi_choice),
@@ -619,6 +649,10 @@ _MULTI_CHOICE_TYPE_KEYS: frozenset[str] = frozenset(
     key for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items() if spec[2] is _validate_multi_choice
 )
 
+_TRUE_FALSE_TYPE_KEYS: frozenset[str] = frozenset(
+    key for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items() if spec[2] is _validate_true_false
+)
+
 # Pre-index common casings and word-separator forms to avoid per-Record string
 # allocations during hot-path batch validation.
 _TYPE_VALIDATORS: dict[str, Callable[[Any], None]] = dict(_NORMALIZED_TYPE_VALIDATORS)
@@ -653,7 +687,7 @@ _TYPE_VALIDATORS.update(
         "SingleSelect": _validate_single_choice,
         "MultiSelect": _validate_multi_choice,
         "YesNo": _validate_single_choice,
-        "TrueFalse": _validate_single_choice,
+        "TrueFalse": _validate_true_false,
         "FileUpload": _validate_text,
     }
 )
@@ -827,6 +861,11 @@ def _validate_choice_membership(
             )
         return
 
+    if vtype_norm in _TRUE_FALSE_TYPE_KEYS and isinstance(value, bool):
+        equiv = ("1", "true", "True") if value else ("0", "false", "False")
+        if any(candidate in allowed for candidate in equiv):
+            return
+
     str_val = str(value)
     if str_val not in allowed:
         shown_val = _display_constraint_value(name, value)
@@ -853,8 +892,13 @@ def _validate_numeric_bounds(
             num = float(value.strip())
         except ValueError:
             return
-    if num is None or not math.isfinite(num):
+    if num is None:
         return
+    if not math.isfinite(num):
+        raise ValidationError(
+            f"Value for variable '{name}' on form '{form_key}' must be finite "
+            "(NaN and Infinity are not allowed)"
+        )
 
     shown_val = _display_constraint_value(name, value)
     if min_value is not None and num < min_value:
@@ -1051,6 +1095,14 @@ def validate_record_data(
                 f"Variable '{name}' on form '{form_key}' contains masked PHI sentinel '{MASKED_SENTINEL}'",
                 variable_name=name,
                 rule_id="masked_phi",
+            )
+            continue
+        if _contains_nonfinite_number(value):
+            type_failed_vars.add(name)
+            _record_error(
+                f"Variable '{name}' on form '{form_key}' contains non-finite number (NaN or Infinity)",
+                variable_name=name,
+                rule_id="type",
             )
             continue
         if name not in variables:
@@ -1260,6 +1312,27 @@ def calculate_readiness_score(
     return score, reasons
 
 
+_FLATTENED_EXCLUDED_RECORD_KEYS: frozenset[str] = (
+    _IDENTIFIER_COLUMNS
+    | _READ_ONLY_RECORD_COLUMNS
+    | _NESTED_DATA_COLUMNS
+    | _SIMULATION_PASSTHROUGH_KEYS
+)
+
+
+def _extract_record_clinical_data(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract clinical variable mapping from nested or flattened Record dicts."""
+    for nested_key in ("recordData", "record_data", "data"):
+        if nested_key in record:
+            nested_val = record[nested_key]
+            if isinstance(nested_val, dict):
+                return nested_val
+            if isinstance(nested_val, Mapping):
+                return dict(nested_val)
+            return {}
+    return {k: v for k, v in record.items() if k not in _FLATTENED_EXCLUDED_RECORD_KEYS}
+
+
 @overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
@@ -1354,7 +1427,7 @@ def validate_record_entry(
         return validate_record_data(
             schema,
             fk,
-            record.get("recordData", record.get("data", {})),
+            _extract_record_clinical_data(record),
             study_key=eff_study_key,
             collect_errors=collect_errors,
             record_index=record_index,
@@ -1480,7 +1553,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
                 raise ValidationError(f"Unknown form ID {fid}")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            _extract_record_clinical_data(record),
             study_key=study_key,
         )
 
@@ -1569,7 +1642,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
                 raise ValidationError(f"Unknown form ID {fid}")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            _extract_record_clinical_data(record),
             study_key=study_key,
         )
 

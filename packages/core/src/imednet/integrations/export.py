@@ -813,6 +813,8 @@ _RECORD_META_CONTRACT_TYPES: tuple[tuple[str, str], ...] = (
     ("subjectKey", "string"),
     ("visitId", "int64"),
     ("formId", "int64"),
+    ("formKey", "string"),
+    ("intervalId", "int64"),
     ("recordStatus", "string"),
     ("dateCreated", "string"),
 )
@@ -2106,6 +2108,98 @@ class _TabularCollectingSink(ExportSink):
         self._voided_ids.clear()
 
 
+def _attach_record_export_meta_columns(
+    df: pd.DataFrame,
+    records: Sequence[Any],
+) -> pd.DataFrame:
+    """Attach ``formKey`` and ``intervalId`` columns from source *records* onto *df*."""
+    if df.empty or "recordId" not in df.columns or not records:
+        return df
+
+    by_rid: dict[int, tuple[str | None, int | None]] = {}
+    positional: list[tuple[str | None, int | None]] = []
+    has_source_meta = False
+    for rec in records:
+        if isinstance(rec, Mapping):
+            raw_rid = (
+                rec.get("recordId") if rec.get("recordId") is not None else rec.get("record_id")
+            )
+            raw_fk = rec.get("formKey") if rec.get("formKey") is not None else rec.get("form_key")
+            raw_iid = (
+                rec.get("intervalId")
+                if rec.get("intervalId") is not None
+                else rec.get("interval_id")
+            )
+            if any(k in rec for k in ("formKey", "form_key", "intervalId", "interval_id")):
+                has_source_meta = True
+        else:
+            raw_rid = getattr(rec, "record_id", None)
+            raw_fk = getattr(rec, "form_key", None)
+            raw_iid = getattr(rec, "interval_id", None)
+            if hasattr(rec, "form_key") or hasattr(rec, "interval_id"):
+                has_source_meta = True
+
+        fk_val = str(raw_fk).strip() if raw_fk is not None and str(raw_fk).strip() else None
+        iid_val: int | None = None
+        if (
+            raw_iid is not None
+            and not isinstance(raw_iid, bool)
+            and not _is_missing_scalar(raw_iid)
+        ):
+            try:
+                iid_val = int(raw_iid)
+            except (TypeError, ValueError):
+                iid_val = None
+        positional.append((fk_val, iid_val))
+        if (
+            raw_rid is not None
+            and not isinstance(raw_rid, bool)
+            and not _is_missing_scalar(raw_rid)
+        ):
+            with contextlib.suppress(TypeError, ValueError):
+                by_rid[int(raw_rid)] = (fk_val, iid_val)
+
+    if not has_source_meta:
+        return df
+
+    form_keys: list[Any] = []
+    interval_ids: list[Any] = []
+    for pos_idx, rid_cell in enumerate(df["recordId"]):
+        pair: tuple[str | None, int | None] | None = None
+        if (
+            rid_cell is not None
+            and not isinstance(rid_cell, bool)
+            and not _is_missing_scalar(rid_cell)
+        ):
+            try:
+                pair = by_rid.get(int(rid_cell))
+            except (TypeError, ValueError):
+                pair = None
+        if pair is None and pos_idx < len(positional):
+            pair = positional[pos_idx]
+        fk_item, iid_item = pair if pair is not None else (None, None)
+        form_keys.append(fk_item)
+        interval_ids.append(iid_item if iid_item is not None else pd.NA)
+
+    out = df.copy()
+    existing_cols = list(out.columns)
+    insert_pos = (
+        existing_cols.index("formId") + 1
+        if "formId" in existing_cols
+        else existing_cols.index("recordId") + 1
+    )
+    if "formKey" not in out.columns:
+        out.insert(insert_pos, "formKey", pd.Series(form_keys, index=out.index, dtype="object"))
+        insert_pos += 1
+    if "intervalId" not in out.columns:
+        out.insert(
+            insert_pos,
+            "intervalId",
+            pd.Series(interval_ids, index=out.index, dtype="Int64"),
+        )
+    return out
+
+
 class _TabularTransformSink(ExportSink):
     """Adapts record batches into masked/sanitized DataFrames before delegating to ``inner``."""
 
@@ -2206,6 +2300,8 @@ class _TabularTransformSink(ExportSink):
         )
         if df.empty:
             return 0
+        if not _is_mock_mapper(self._mapper):
+            df = _attach_record_export_meta_columns(df, records)
         df.columns = df.columns.astype(str)
         dup_mask = df.columns.str.lower().duplicated()
         df = df.loc[:, ~dup_mask]

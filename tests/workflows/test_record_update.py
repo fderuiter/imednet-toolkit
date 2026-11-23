@@ -37,7 +37,9 @@ def _build_schema() -> tuple[SchemaCache, Variable]:
 
 @pytest.mark.parametrize("async_mode", [False, True])
 def test_create_or_update_records_no_wait(schema: SchemaCache, async_mode: bool) -> None:
-    """Test that create or update records no wait."""
+    """Test that create or update records normalizes recordData dicts before SDK submission."""
+    from imednet.utils.tabular import normalize_records_input
+
     sdk = MagicMock()
     job = Job(batch_id="1", state="PROCESSING")
     if not async_mode:
@@ -52,14 +54,76 @@ def test_create_or_update_records_no_wait(schema: SchemaCache, async_mode: bool)
     wf._validator.schema = schema
     wf._schema = schema
     record = fake_data.fake_record(schema)
+    expected = normalize_records_input([record], schema=schema, study_key="S")
 
     if async_mode:
         result = asyncio.run(wf.async_create_or_update_records("S", [record]))
-        sdk.async_create_record.assert_awaited_once_with("S", [record], schema=schema)
+        sdk.async_create_record.assert_awaited_once_with("S", expected, schema=schema)
     else:
         result = wf.create_or_update_records("S", [record])
-        sdk.create_record.assert_called_once_with("S", [record], schema=schema)
+        sdk.create_record.assert_called_once_with("S", expected, schema=schema)
     assert result == job
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_first_call_workflow_refreshes_schema_before_tabular_coercion(
+    tmp_path, async_mode: bool
+) -> None:
+    """AC 6: First call on a fresh sync/async SDK refreshes schema before coercing CSV/DataFrame."""
+    csv_path = tmp_path / "first_call.csv"
+    csv_path.write_text(
+        "form_key,subject_key,site_name,V_CODE,V_FLAG,V_TF\nF_FIRST,SUB-1,SITE-1,007,true,false\n",
+        encoding="utf-8",
+    )
+    vars_payload = [
+        Variable(
+            variable_name="V_CODE",
+            variable_type="text",
+            form_id=11,
+            form_key="F_FIRST",
+        ),
+        Variable(
+            variable_name="V_FLAG",
+            variable_type="checkbox",
+            form_id=11,
+            form_key="F_FIRST",
+        ),
+        Variable(
+            variable_name="V_TF",
+            variable_type="true/false",
+            form_id=11,
+            form_key="F_FIRST",
+        ),
+    ]
+    job = Job(batch_id="B-FIRST", state="PROCESSING")
+    sdk = MagicMock()
+    if async_mode:
+        sdk._async_client = object()
+        sdk.async_get_variables = AsyncMock(return_value=vars_payload)
+        sdk.async_create_record = AsyncMock(return_value=job)
+        wf = RecordUpdateWorkflow(sdk)
+        summary = asyncio.run(wf.async_create_or_update_records_batch("S_FRESH", csv_path))
+        sdk.async_get_variables.assert_awaited_once_with(study_key="S_FRESH")
+        sent_chunk = sdk.async_create_record.await_args.args[1]
+    else:
+        del sdk.async_create_record
+        sdk._async_client = None
+        sdk.get_variables = MagicMock(return_value=vars_payload)
+        sdk.create_record = MagicMock(return_value=job)
+        wf = RecordUpdateWorkflow(sdk)
+        summary = wf.create_or_update_records_batch("S_FRESH", csv_path)
+        sdk.get_variables.assert_called_once_with(study_key="S_FRESH")
+        sent_chunk = sdk.create_record.call_args.args[1]
+
+    assert summary.all_successful is True
+    assert sent_chunk == [
+        {
+            "formKey": "F_FIRST",
+            "subjectKey": "SUB-1",
+            "siteName": "SITE-1",
+            "data": {"V_CODE": "007", "V_FLAG": True, "V_TF": False},
+        }
+    ]
 
 
 @pytest.mark.parametrize("async_mode", [False, True])

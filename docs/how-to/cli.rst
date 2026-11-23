@@ -98,8 +98,8 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
 Supported core list resources are studies, queries, variables, record-revisions,
 sites, forms, records, subjects, intervals, visits, codings, and users, alongside
 ``workflows extract-records``, ``workflows state show`` (resource ``ledger_state``),
-and ``subject-data`` (plus write batch summaries for ``records create``, ``records import``,
-and ``subjects register``). JSON reads emit one envelope
+and ``subject-data`` (plus write batch summaries for ``records create``, ``records update``,
+``records import``, and ``subjects register``). JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
 and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it). Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
@@ -107,6 +107,23 @@ JSON aliases; the JSON view includes model fields beyond the human summary table
 Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
 Usage failures exit 2, SDK-command interruption exits 130, and success/help exits 0.
+
+Record write and tabular import commands
+----------------------------------------
+
+Use ``records create``, ``records update``, and ``records import`` to validate and submit
+Study Records from inline ``-d KEY=VALUE`` pairs, piped ``records list --format json``
+envelopes, or ``.csv``, ``.json``, ``.jsonl``, ``.ndjson``, ``.parquet``, and ``.xlsx``
+datasets (install ``imednet[export]`` for Parquet and Excel readers):
+
+.. code-block:: bash
+
+   imednet records create STUDY --form-key F_DM --subject-key SUB1 -d V_AGE=45 -d V_CODE=007 --schema study_dd.json --wait
+   imednet records update STUDY --record-id 601 -d V_AGE=46 --wait --format json
+   imednet records update STUDY --record-oid REC-OID-601 -d V_AGE=47 --schema api --dry-run
+   imednet records import STUDY ./records.csv --schema study_dd.json --wait --format json
+   imednet records import STUDY ./records.parquet --create-only --wait
+   imednet records list STUDY --all --format json | imednet records import STUDY - --wait --format json
 
 Legacy ``records list -o/--output json|csv`` still writes ``records.json`` or ``records.csv``
 and emits a ``stderr`` deprecation warning (prefer ``--format json`` for stdout or

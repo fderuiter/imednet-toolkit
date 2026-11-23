@@ -109,13 +109,12 @@ def test_flattened_dataframe_roundtrip_succeeds_in_simulation_transport() -> Non
     for item in sent_payload:
         assert "data" in item
         assert isinstance(item["data"], dict)
+        assert isinstance(item.get("recordId"), int)
         for forbidden_key in (
             "study_key",
             "studyKey",
             "record_id",
-            "recordId",
             "record_oid",
-            "recordOid",
             "record_type",
             "recordType",
             "record_status",
@@ -140,6 +139,13 @@ def test_flattened_dataframe_roundtrip_succeeds_in_simulation_transport() -> Non
     updated_revisions = state.get_record_revisions("STUDY")
     assert len(updated_records) == len(initial_records)
     assert len(updated_revisions) == len(initial_revisions) + len(df)
+
+    create_only_summary = sdk.records.create_batch("STUDY", df, create_only=True)
+    assert create_only_summary.total_records == len(df)
+    last_post = json.loads([r for r in captured_requests if r.method == "POST"][-1].content)
+    for item in last_post:
+        assert "recordId" not in item
+        assert "recordOid" not in item
 
 
 def test_csv_with_masked_sentinel_raises_validation_error_before_any_http_request(
@@ -238,6 +244,8 @@ def test_dataframe_to_records_identifier_mapping_nan_drop_and_float_coercion() -
     assert len(records) == 1
     rec = records[0]
     assert rec == {
+        "recordId": 900,
+        "recordOid": "OID-900",
         "formId": 301,
         "subjectOid": "SUBJ-OID-1",
         "siteId": 101,
@@ -246,6 +254,17 @@ def test_dataframe_to_records_identifier_mapping_nan_drop_and_float_coercion() -
     }
     assert isinstance(rec["data"]["AGE"], int)
     assert isinstance(rec["data"]["TEMP"], float)
+
+    create_only_records = dataframe_to_records(df, create_only=True)
+    assert create_only_records == [
+        {
+            "formId": 301,
+            "subjectOid": "SUBJ-OID-1",
+            "siteId": 101,
+            "intervalId": 501,
+            "data": {"AGE": 45, "TEMP": 98.6},
+        }
+    ]
 
 
 def test_csv_to_records_and_import_records_csv_work_without_pandas(
@@ -277,6 +296,16 @@ def test_csv_to_records_and_import_records_csv_work_without_pandas(
 
     parsed = csv_to_records(csv_path, schema=schema)
     assert parsed == [
+        {
+            "recordId": 999,
+            "formKey": "F_DM",
+            "subjectKey": "SUB-10",
+            "siteName": "SITE",
+            "intervalName": "Baseline",
+            "data": {"CODE": "007", "AGE": 45},
+        }
+    ]
+    assert csv_to_records(csv_path, schema=schema, create_only=True) == [
         {
             "formKey": "F_DM",
             "subjectKey": "SUB-10",
@@ -350,6 +379,7 @@ def test_spi_reexports_all_tabular_enrollment_and_validation_helpers() -> None:
         "dataframe_to_records",
         "import_records_csv",
         "ensure_no_masked_sentinel",
+        "extract_input_form_refs",
         "normalize_records_input",
         "normalize_tabular_row",
         "ELIGIBLE_SITE_ENROLLMENT_STATUSES",
@@ -369,3 +399,239 @@ def test_spi_reexports_all_tabular_enrollment_and_validation_helpers() -> None:
     }
     for name in expected_validation:
         assert hasattr(spi_validation, name), f"Missing {name} in imednet.spi.validation"
+
+
+def test_scheduled_and_unscheduled_dataframe_roundtrip_and_record_oid_matching() -> None:
+    """AC 2 & Req 2: Scheduled + unscheduled to_dataframe roundtrip updates in place; recordOid matches."""
+    sdk, state, _captured = _make_sim_sdk()
+
+    # Seed an unscheduled record (intervalId=None) alongside scheduled records
+    sdk.records.create_batch(
+        "STUDY",
+        [
+            {
+                "recordOid": "REC-OID-UNSCHED-1",
+                "formKey": "F_VS",
+                "subjectKey": "SUB1",
+                "siteName": "SITE",
+                "data": {"V_WEIGHT": 71.5},
+            }
+        ],
+    )
+    baseline_count = len(state.get_records("STUDY"))
+    assert any(r.get("intervalId") is None for r in state.get_records("STUDY"))
+
+    for flatten in (True, False):
+        df = sdk.records.to_dataframe("STUDY", flatten=flatten, mask_phi=False)
+        summary = sdk.records.create_batch("STUDY", df)
+        assert summary.all_successful is True
+        assert len(state.get_records("STUDY")) == baseline_count
+
+    # Match existing unscheduled record strictly via recordOid (without recordId)
+    sdk.records.create_batch(
+        "STUDY",
+        [
+            {
+                "recordOid": "REC-OID-UNSCHED-1",
+                "formKey": "F_VS",
+                "subjectKey": "SUB1",
+                "data": {"V_WEIGHT": 74.0},
+            }
+        ],
+    )
+    assert len(state.get_records("STUDY")) == baseline_count
+    unsched = next(
+        r for r in state.get_records("STUDY") if r.get("recordOid") == "REC-OID-UNSCHED-1"
+    )
+    assert unsched["recordData"]["V_WEIGHT"] == 74.0
+
+    # With create_only=True, recordId/recordOid are stripped so unscheduled row creates a new record
+    df_all = sdk.records.to_dataframe("STUDY", flatten=True, mask_phi=False)
+    sdk.records.create_batch("STUDY", df_all, create_only=True)
+    assert len(state.get_records("STUDY")) == baseline_count + 1
+
+
+def test_sdtm_headers_and_subject_registration_record_identifier_exclusion(
+    tmp_path: Path,
+) -> None:
+    """Req 1: SDTM headers normalize cleanly while Subject registration excludes recordId/recordOid."""
+    from imednet.utils.enrollment import normalize_subject_registration_inputs
+    from imednet.utils.tabular import normalize_tabular_row
+
+    sdtm_row = {
+        "STUDYID": "STUDY",
+        "RECORD_ID": "601",
+        "RECORD_OID": "REC-OID-601",
+        "FORM_KEY": "F_DM",
+        "USUBJID": "SUB1",
+        "SITEID": "101",
+        "INTERVAL_ID": "501",
+        "VISITNUM": "1",
+        "SUBJID": "LOCAL-01",
+        "V_AGE": "46",
+    }
+    normalized = normalize_tabular_row(sdtm_row, row_index=0, from_csv_str=True)
+    assert normalized == {
+        "recordId": 601,
+        "recordOid": "REC-OID-601",
+        "formKey": "F_DM",
+        "subjectKey": "SUB1",
+        "siteId": 101,
+        "intervalId": 501,
+        "data": {"SUBJID": "LOCAL-01", "V_AGE": 46},
+    }
+
+    # When USUBJID is a defined clinical variable on the form, keep it in data
+    schema_with_usubjid = DataDictionary.model_validate(
+        {
+            "forms": [
+                {
+                    "formKey": "F_DM",
+                    "variables": [{"variableName": "USUBJID", "variableType": "text"}],
+                }
+            ]
+        }
+    )
+    norm_var = normalize_tabular_row(
+        {"FORM_KEY": "F_DM", "USUBJID": "STUDY-001"},
+        row_index=0,
+        from_csv_str=True,
+        schema=schema_with_usubjid,
+    )
+    assert norm_var == {"formKey": "F_DM", "data": {"USUBJID": "STUDY-001"}}
+
+    # Subject registration strips recordId and recordOid across CSV, DataFrame, JSON, and dicts
+    subj_csv = tmp_path / "subj.csv"
+    subj_csv.write_text(
+        "record_id,record_oid,form_key,site_name,subject_key,V_AGE\n"
+        "601,REC-OID-601,F_DM,SITE,SUB-NEW,33\n",
+        encoding="utf-8",
+    )
+    subj_json = tmp_path / "subj.json"
+    subj_json.write_text(
+        json.dumps(
+            [
+                {
+                    "recordId": 601,
+                    "recordOid": "REC-OID-601",
+                    "formKey": "F_DM",
+                    "siteName": "SITE",
+                    "subjectKey": "SUB-NEW",
+                    "data": {"V_AGE": 33},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    subj_df = pd.DataFrame(
+        [
+            {
+                "recordId": 601,
+                "recordOid": "REC-OID-601",
+                "formKey": "F_DM",
+                "siteName": "SITE",
+                "subjectKey": "SUB-NEW",
+                "V_AGE": 33,
+            }
+        ]
+    )
+    for raw_subj in (subj_csv, subj_json, subj_df, json.loads(subj_json.read_text())):
+        pairs = normalize_subject_registration_inputs(raw_subj)
+        assert len(pairs) == 1
+        raw_payload, req_model = pairs[0]
+        dumped = req_model.model_dump(by_alias=True, exclude_none=True)
+        assert "recordId" not in dumped
+        assert "recordOid" not in dumped
+        assert isinstance(raw_payload, dict)
+        assert "recordId" not in raw_payload
+        assert "recordOid" not in raw_payload
+
+
+@pytest.mark.asyncio
+async def test_nonfinite_floats_truefalse_bool_and_flattened_record_validation() -> None:
+    """Req 6: Reject NaN/Infinity, accept bool on true/false, and validate flattened Record dicts."""
+    from imednet.validation.cache import (
+        AsyncSchemaValidator,
+        SchemaCache,
+        SchemaValidator,
+        validate_record_entry,
+    )
+
+    dd = DataDictionary.model_validate(
+        {
+            "forms": [
+                {
+                    "formKey": "F_VAL",
+                    "variables": [
+                        {
+                            "variableName": "V_FLT",
+                            "variableType": "float",
+                            "extraAttributes": {"minValue": 0.0, "maxValue": 200.0},
+                        },
+                        {"variableName": "V_CALC", "variableType": "calculation"},
+                        {"variableName": "V_TF", "variableType": "true/false"},
+                        {"variableName": "V_TXT", "variableType": "text"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    for bad_num in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError, match="NaN|Infinity|finite"):
+            validate_record_entry(dd, {"formKey": "F_VAL", "data": {"V_FLT": bad_num}})
+        with pytest.raises(ValidationError, match="NaN|Infinity|finite"):
+            validate_record_entry(dd, {"formKey": "F_VAL", "data": {"V_CALC": bad_num}})
+
+    # Even without a schema, RecordCreateOperation blocks NaN/Infinity before HTTP POST
+    sdk, _state, captured = _make_sim_sdk()
+    with pytest.raises(ValidationError, match="NaN|Infinity|non-finite"):
+        sdk.records.create(
+            "STUDY",
+            [{"formKey": "F_DM", "subjectKey": "SUB1", "data": {"V_AGE": float("nan")}}],
+            skip_validation=True,
+        )
+    assert captured == []
+
+    # true/false accepts True and False booleans
+    validate_record_entry(dd, {"formKey": "F_VAL", "data": {"V_TF": True}})
+    validate_record_entry(dd, {"formKey": "F_VAL", "data": {"V_TF": False}})
+
+    # Flattened Record dicts validate clinical variables directly
+    with pytest.raises(ValidationError):
+        validate_record_entry(dd, {"formKey": "F_VAL", "V_TXT": 12345})
+
+    cache = SchemaCache()
+    from imednet.models.variables import Variable
+
+    cache.populate(
+        [
+            Variable(
+                variable_name="V_TXT",
+                variable_type="text",
+                form_id=99,
+                form_key="F_VAL",
+                study_key="STUDY",
+            ),
+            Variable(
+                variable_name="V_TF",
+                variable_type="true/false",
+                form_id=99,
+                form_key="F_VAL",
+                study_key="STUDY",
+            ),
+        ],
+        study_key="STUDY",
+    )
+    sync_val = SchemaValidator(sdk)
+    sync_val.schema = cache
+    sync_val.validate_record("STUDY", {"formKey": "F_VAL", "V_TXT": "ok", "V_TF": True})
+    with pytest.raises(ValidationError):
+        sync_val.validate_record("STUDY", {"formKey": "F_VAL", "V_TXT": 999})
+
+    async_sdk, _astate, _acaptured = _make_async_sim_sdk()
+    async_val = AsyncSchemaValidator(async_sdk)
+    async_val.schema = cache
+    await async_val.validate_record("STUDY", {"formKey": "F_VAL", "V_TXT": "ok", "V_TF": False})
+    with pytest.raises(ValidationError):
+        await async_val.validate_record("STUDY", {"formKey": "F_VAL", "V_TXT": 999})

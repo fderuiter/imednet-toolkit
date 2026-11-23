@@ -13,7 +13,7 @@ from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.security import validate_header_value
-from imednet.utils.tabular import ensure_no_masked_sentinel
+from imednet.utils.tabular import ensure_finite_numbers, ensure_no_masked_sentinel
 from imednet.validation.cache import (
     ValidationSchemaProtocol,
     is_schema_record_prevalidated,
@@ -71,6 +71,7 @@ class RecordCreateOperation(Operation[T]):
 
         ensure_no_masked_sentinel(self.records_data)
         self._validate()
+        ensure_finite_numbers(self.records_data)
         self.headers = self._build_headers()
 
     def _validate(self) -> None:

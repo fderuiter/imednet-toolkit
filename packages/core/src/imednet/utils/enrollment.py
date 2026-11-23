@@ -20,6 +20,7 @@ from imednet.utils.tabular import (
     csv_to_records,
     dataframe_rows_to_records,
     ensure_no_masked_sentinel,
+    reject_nonfinite_json_constant,
 )
 from imednet.utils.typing import JsonDict
 
@@ -75,6 +76,11 @@ def _apply_registration_defaults(
     return resolved
 
 
+_SUBJECT_EXCLUDED_RECORD_ID_KEYS: frozenset[str] = frozenset(
+    {"record_id", "recordId", "RECORD_ID", "record_oid", "recordOid", "RECORD_OID"}
+)
+
+
 def normalize_subject_registration_inputs(
     subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | Any,
     *,
@@ -87,19 +93,25 @@ def normalize_subject_registration_inputs(
     if isinstance(subjects, (str, os.PathLike)):
         file_path = Path(subjects)
         if file_path.suffix.lower() == ".json":
-            raw_json = json.loads(file_path.read_text(encoding="utf-8"))
+            raw_json = json.loads(
+                file_path.read_text(encoding="utf-8"),
+                parse_constant=reject_nonfinite_json_constant,
+            )
             items = raw_json if isinstance(raw_json, list) else [raw_json]
-            records = [dict(x) for x in items]
+            records = [
+                {k: v for k, v in dict(x).items() if k not in _SUBJECT_EXCLUDED_RECORD_ID_KEYS}
+                for x in items
+            ]
             ensure_no_masked_sentinel(records)
         else:
-            records = csv_to_records(file_path, schema=schema)
+            records = csv_to_records(file_path, schema=schema, create_only=True)
         raw_items = _apply_registration_defaults(
             records,
             default_form_key=default_form_key,
             default_site_name=default_site_name,
         )
     elif _is_dataframe_instance(subjects):
-        records = dataframe_rows_to_records(subjects, schema=schema)
+        records = dataframe_rows_to_records(subjects, schema=schema, create_only=True)
         raw_items = _apply_registration_defaults(
             records,
             default_form_key=default_form_key,
@@ -125,7 +137,9 @@ def normalize_subject_registration_inputs(
                 model_subj = RegisterSubjectRequest.model_validate(patched)
             normalized_raw = model_subj
         elif isinstance(raw_subj, Mapping):
-            raw_dict = dict(raw_subj)
+            raw_dict = {
+                k: v for k, v in raw_subj.items() if k not in _SUBJECT_EXCLUDED_RECORD_ID_KEYS
+            }
             if default_form_key and not (raw_dict.get("formKey") or raw_dict.get("form_key")):
                 raw_dict["formKey"] = default_form_key
             if default_site_name and not (raw_dict.get("siteName") or raw_dict.get("site_name")):

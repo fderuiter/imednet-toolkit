@@ -70,6 +70,7 @@ class RecordsOperationDef:
         *,
         schema: ValidationSchemaProtocol | None = None,
         skip_validation: bool = False,
+        create_only: bool = False,
     ) -> RecordCreateOperation[Job]:
         """Create one or more records in a study.
 
@@ -79,12 +80,18 @@ class RecordsOperationDef:
             email_notify: Whether to send email notifications.
             schema: Optional validation schema (SchemaCache or DataDictionary).
             skip_validation: Whether to skip schema validation if already validated.
+            create_only: When True, omit recordId and recordOid so records are inserted anew.
 
         Returns:
             The background job for the creation operation.
         """
         self._validate_study_key(study_key)  # type: ignore
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(
+            records_data,
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
         path = self._get_endpoint_path(study_key)  # type: ignore
         return RecordCreateOperation[Job](
             path=path,
@@ -114,10 +121,16 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        create_only: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and optionally poll jobs."""
         self._validate_study_key(study_key)
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(
+            records_data,
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
         coordinator = BatchCoordinator(chunk_size=chunk_size)
 
         def _poll_single(
@@ -216,10 +229,16 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        create_only: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit records in bounded chunks, and optionally poll."""
         self._validate_study_key(study_key)
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(
+            records_data,
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
 
         async def _poll_single(

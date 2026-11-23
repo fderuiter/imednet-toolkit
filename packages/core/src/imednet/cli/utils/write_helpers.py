@@ -12,24 +12,49 @@ from typing import Any
 
 from imednet.datadict import load_from_cdisc_odm, load_from_csv, load_from_redcap
 from imednet.datadict.models import DataDictionary
-from imednet.models.jobs import Job
+from imednet.errors import ValidationError
+from imednet.models.jobs import Job, JobStatus
 from imednet.sdk import ImednetSDK
 from imednet.utils.batch_coordinator import DEFAULT_BATCH_CHUNK_SIZE, BatchSubmissionSummary
-from imednet.utils.job_poller import JobProgressHandler
+from imednet.utils.job_poller import JobFailedError, JobPollSummary, JobProgressHandler
 from imednet.utils.tabular import (
+    _BOOL_LIKE_TYPES,
+    _TEXT_LIKE_TYPES,
     MASKED_SENTINEL,
     _coerce_clinical_value,
     _contains_masked_sentinel,
+    _resolve_expected_var_type,
     csv_to_records,
+    dataframe_rows_to_records,
     ensure_no_masked_sentinel,
+    normalize_records_input,
+    reject_nonfinite_json_constant,
 )
-from imednet.validation.cache import SchemaCache, ValidationSchemaProtocol
+from imednet.validation.cache import (
+    BatchValidationReport,
+    RecordValidationIssue,
+    SchemaCache,
+    ValidationSchemaProtocol,
+)
 
 from ..decorators import _redact_secrets
 from .args import add_output_format, add_simulation_arg, resolve_output_format
 from .context import fetching_status
 from .output import display_list, emit_json, format_job_progress, print_error
 from .terminal import is_json_output_mode, is_non_interactive, supports_live_status
+
+SUPPORTED_RECORD_EXTENSIONS: tuple[str, ...] = (
+    ".csv",
+    ".json",
+    ".jsonl",
+    ".ndjson",
+    ".parquet",
+    ".xlsx",
+)
+
+_NONFINITE_TOKENS: frozenset[str] = frozenset(
+    {"nan", "+nan", "-nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}
+)
 
 
 def add_write_common_args(
@@ -150,7 +175,30 @@ def resolve_cli_schema(
     return load_offline_schema(schema_source, study_key=study_key)
 
 
-def parse_key_value_pairs(pairs: Sequence[str] | None) -> dict[str, Any]:
+def validate_record_file_arg(file_arg: str) -> None:
+    """Validate that *file_arg* is ``'-'`` or an existing file with a supported record extension."""
+    if file_arg == "-":
+        return
+    file_path = Path(file_arg)
+    if not file_path.exists():
+        raise ValueError(f"Input file not found: '{file_arg}'")
+    suffix = file_path.suffix.lower()
+    if suffix not in SUPPORTED_RECORD_EXTENSIONS:
+        supported = ", ".join(SUPPORTED_RECORD_EXTENSIONS)
+        raise ValueError(
+            f"Unsupported file format '{file_path.suffix or '<none>'}' for '{file_arg}'. "
+            f"Supported extensions: {supported}."
+        )
+
+
+def parse_key_value_pairs(
+    pairs: Sequence[str] | None,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+    form_key: str | None = None,
+    form_id: int | None = None,
+    study_key: str | None = None,
+) -> dict[str, Any]:
     """Parse repeatable ``KEY=VALUE`` pairs from ``-d/--data`` flags."""
     if not pairs:
         return {}
@@ -166,23 +214,50 @@ def parse_key_value_pairs(pairs: Sequence[str] | None) -> dict[str, Any]:
             raise ValueError(
                 f"Variable '{key}' contains masked PHI sentinel '{MASKED_SENTINEL}' and cannot be submitted."
             )
+        expected_vtype = _resolve_expected_var_type(
+            schema,
+            form_key,
+            form_id,
+            key,
+            study_key=study_key,
+        )
         val_stripped = raw_val.strip()
-        if val_stripped.lower() in {"true", "false"}:
-            parsed[key] = val_stripped.lower() == "true"
+        val_low = val_stripped.lower()
+        if expected_vtype in _TEXT_LIKE_TYPES:
+            parsed[key] = raw_val
+            continue
+        if val_low in _NONFINITE_TOKENS:
+            raise ValidationError(
+                f"Variable '{key}' contains invalid numeric constant '{val_stripped}': "
+                "NaN and Infinity are not allowed."
+            )
+        if (expected_vtype in _BOOL_LIKE_TYPES or expected_vtype is None) and val_low in {
+            "true",
+            "false",
+        }:
+            parsed[key] = val_low == "true"
         else:
-            parsed[key] = _coerce_clinical_value(raw_val, from_csv_str=True)
+            parsed[key] = _coerce_clinical_value(
+                raw_val,
+                from_csv_str=True,
+                expected_var_type=expected_vtype,
+            )
     return parsed
 
 
-def parse_json_records_text(raw_text: str, *, source_label: str) -> list[dict[str, Any]]:
-    """Parse a JSON object or JSON array of record payload dicts."""
-    try:
-        loaded = json.loads(raw_text)
-    except ValueError as exc:
-        raise ValueError(f"Invalid JSON in {source_label}: {exc}") from exc
-
+def _unwrap_json_records_payload(loaded: Any, *, source_label: str) -> list[dict[str, Any]]:
+    """Unwrap v1 CLI ``items`` envelopes, REST API ``data`` list envelopes, or record objects."""
     if isinstance(loaded, dict):
-        items = [loaded]
+        if isinstance(loaded.get("items"), list) and all(
+            isinstance(x, dict) for x in loaded["items"]
+        ):
+            items = list(loaded["items"])
+        elif isinstance(loaded.get("data"), list) and all(
+            isinstance(x, dict) for x in loaded["data"]
+        ):
+            items = list(loaded["data"])
+        else:
+            items = [loaded]
     elif isinstance(loaded, list) and all(isinstance(x, dict) for x in loaded):
         items = list(loaded)
     else:
@@ -193,22 +268,198 @@ def parse_json_records_text(raw_text: str, *, source_label: str) -> list[dict[st
     return items
 
 
+def parse_jsonl_records_text(
+    raw_text: str,
+    *,
+    source_label: str,
+    schema: ValidationSchemaProtocol | None = None,
+    create_only: bool = False,
+    study_key: str | None = None,
+) -> list[dict[str, Any]]:
+    """Parse newline-delimited JSON (``.jsonl`` / ``.ndjson``) record objects."""
+    items: list[dict[str, Any]] = []
+    for line_no, raw_line in enumerate(raw_text.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped, parse_constant=reject_nonfinite_json_constant)
+        except ValidationError:
+            raise
+        except ValueError as exc:
+            raise ValueError(f"Invalid JSON on line {line_no} of {source_label}: {exc}") from exc
+        if not isinstance(obj, dict):
+            raise ValueError(f"JSONL line {line_no} in {source_label} must be a JSON object.")
+        items.append(obj)
+    ensure_no_masked_sentinel(items)
+    return normalize_records_input(
+        items,
+        schema=schema,
+        create_only=create_only,
+        study_key=study_key,
+    )
+
+
+def parse_json_records_text(
+    raw_text: str,
+    *,
+    source_label: str,
+    schema: ValidationSchemaProtocol | None = None,
+    create_only: bool = False,
+    study_key: str | None = None,
+    allow_jsonl_fallback: bool = False,
+) -> list[dict[str, Any]]:
+    """Parse a JSON object, envelope, or JSON array of record payload dicts."""
+    try:
+        loaded = json.loads(raw_text, parse_constant=reject_nonfinite_json_constant)
+    except ValidationError:
+        raise
+    except ValueError as exc:
+        if allow_jsonl_fallback:
+            non_empty_lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+            if len(non_empty_lines) > 1:
+                return parse_jsonl_records_text(
+                    raw_text,
+                    source_label=source_label,
+                    schema=schema,
+                    create_only=create_only,
+                    study_key=study_key,
+                )
+        raise ValueError(f"Invalid JSON in {source_label}: {exc}") from exc
+
+    items = _unwrap_json_records_payload(loaded, source_label=source_label)
+    return normalize_records_input(
+        items,
+        schema=schema,
+        create_only=create_only,
+        study_key=study_key,
+    )
+
+
+def _load_parquet_records(
+    file_path: Path,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+    create_only: bool = False,
+    study_key: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load records from a Parquet file, hinting ``imednet[export]`` when missing."""
+    try:
+        import pandas as pd
+        import pyarrow as _pa  # noqa: F401
+    except ImportError as exc:
+        raise ValueError(
+            f"Reading Parquet file '{file_path}' requires optional dependencies "
+            "(pandas and pyarrow). Install them with: pip install 'imednet[export]'"
+        ) from exc
+    try:
+        df = pd.read_parquet(file_path)
+    except ImportError as exc:
+        raise ValueError(
+            f"Reading Parquet file '{file_path}' requires pyarrow. "
+            "Install it with: pip install 'imednet[export]'"
+        ) from exc
+    return dataframe_rows_to_records(
+        df,
+        schema=schema,
+        create_only=create_only,
+        study_key=study_key,
+    )
+
+
+def _load_excel_records(
+    file_path: Path,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+    create_only: bool = False,
+    study_key: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load records from an Excel ``.xlsx`` workbook, hinting ``imednet[export]`` when missing."""
+    try:
+        import openpyxl as _oxl  # noqa: F401
+        import pandas as pd
+    except ImportError as exc:
+        raise ValueError(
+            f"Reading Excel file '{file_path}' requires optional dependencies "
+            "(pandas and openpyxl). Install them with: pip install 'imednet[export]'"
+        ) from exc
+    try:
+        df = pd.read_excel(file_path, engine="openpyxl")
+    except ImportError as exc:
+        raise ValueError(
+            f"Reading Excel file '{file_path}' requires openpyxl. "
+            "Install it with: pip install 'imednet[export]'"
+        ) from exc
+    return dataframe_rows_to_records(
+        df,
+        schema=schema,
+        create_only=create_only,
+        study_key=study_key,
+    )
+
+
 def load_records_from_path_or_stdin(
     file_arg: str,
     *,
     schema: ValidationSchemaProtocol | None = None,
+    create_only: bool = False,
+    study_key: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Load record payloads from ``'-'`` (stdin JSON), ``.json``, or ``.csv``."""
+    """Load record payloads from ``'-'`` (stdin) or supported tabular/JSON files."""
     if file_arg == "-":
-        return parse_json_records_text(sys.stdin.read(), source_label="stdin")
-    file_path = Path(file_arg)
-    if not file_path.exists():
-        raise ValueError(f"Input file not found: '{file_arg}'")
-    if file_path.suffix.lower() == ".json":
         return parse_json_records_text(
-            file_path.read_text(encoding="utf-8"), source_label=str(file_path)
+            sys.stdin.read(),
+            source_label="stdin",
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+            allow_jsonl_fallback=True,
         )
-    return csv_to_records(file_path, schema=schema)
+    validate_record_file_arg(file_arg)
+    file_path = Path(file_arg)
+    suffix = file_path.suffix.lower()
+    if suffix == ".csv":
+        return csv_to_records(
+            file_path,
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
+    if suffix == ".json":
+        return parse_json_records_text(
+            file_path.read_text(encoding="utf-8-sig"),
+            source_label=str(file_path),
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
+    if suffix in {".jsonl", ".ndjson"}:
+        return parse_jsonl_records_text(
+            file_path.read_text(encoding="utf-8-sig"),
+            source_label=str(file_path),
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
+    if suffix == ".parquet":
+        return _load_parquet_records(
+            file_path,
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
+    if suffix == ".xlsx":
+        return _load_excel_records(
+            file_path,
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
+    supported = ", ".join(SUPPORTED_RECORD_EXTENSIONS)
+    raise ValueError(
+        f"Unsupported file format '{file_path.suffix or '<none>'}' for '{file_arg}'. "
+        f"Supported extensions: {supported}."
+    )
 
 
 @contextmanager
@@ -295,8 +546,9 @@ def render_write_summary(
     *,
     resource: str,
     output_format: str | None = None,
+    failure_message: str | None = None,
 ) -> None:
-    """Render a :class:`BatchSubmissionSummary` in human table or JSON mode and exit 1 if invalid."""
+    """Render a :class:`BatchSubmissionSummary` in human table or JSON mode and exit 1 on failure."""
     resolved_format = resolve_output_format(output_format)
     if summary.validation_report is not None and not summary.validation_report.is_valid:
         if resolved_format == "json":
@@ -307,6 +559,8 @@ def render_write_summary(
 
     if resolved_format == "json":
         emit_json([_summary_to_json_item(summary)], resource)
+        if not summary.all_successful:
+            sys.exit(1)
         return
 
     if summary.dry_run:
@@ -324,6 +578,10 @@ def render_write_summary(
         return
 
     if not summary.jobs:
+        if not summary.all_successful:
+            err_msg = failure_message or "Background job(s) ended in a failed state."
+            print_error(f"Error: {_redact_secrets(err_msg)}")
+            sys.exit(1)
         msg = f"No records submitted for study '{summary.study_key}'"
         if summary.skipped_count:
             msg += f" ({summary.skipped_count} already-enrolled skipped)"
@@ -347,6 +605,96 @@ def render_write_summary(
         details=summary.jobs,
         interactive=False,
     )
+    if not summary.all_successful:
+        if failure_message:
+            print_error(f"Error: {_redact_secrets(failure_message)}")
+        else:
+            failed_ids = [
+                str(j.batch_id or j.job_id or "<unknown>")
+                for j in summary.jobs
+                if getattr(j, "is_failed", False)
+            ]
+            suffix = f" ({', '.join(failed_ids)})" if failed_ids else ""
+            print_error(f"Error: Background job(s) ended in a failed state{suffix}.")
+        sys.exit(1)
+
+
+def handle_job_failed_error(
+    exc: JobFailedError,
+    *,
+    study_key: str,
+    total_records: int,
+    resource: str,
+    output_format: str | None = None,
+    skipped_count: int = 0,
+) -> None:
+    """Render a failed polled job summary in JSON or table mode and exit 1."""
+    status = getattr(exc, "status", None)
+    jobs = [status] if isinstance(status, Job) else []
+    batch_key = str(getattr(status, "batch_id", None) or "failed")
+    poll_summary = JobPollSummary(
+        study_key=study_key,
+        results={batch_key: status} if isinstance(status, JobStatus) else {},
+        failures={batch_key: exc},
+        elapsed_total=0.0,
+    )
+    summary = BatchSubmissionSummary(
+        study_key=study_key,
+        jobs=jobs,
+        chunk_sizes=[total_records] if total_records else [],
+        total_records=total_records,
+        skipped_count=skipped_count,
+        poll_summary=poll_summary,
+        dry_run=False,
+    )
+    render_write_summary(
+        summary,
+        resource=resource,
+        output_format=output_format,
+        failure_message=str(exc),
+    )
+
+
+def handle_cli_write_validation_error(
+    exc: Exception,
+    *,
+    study_key: str,
+    resource: str,
+    dry_run: bool = False,
+    output_format: str | None = None,
+) -> None:
+    """Emit structured ``isValid: false`` report on dry-run payload errors or exit 1 on stderr."""
+    if dry_run and isinstance(exc, ValidationError) and MASKED_SENTINEL not in str(exc):
+        report = getattr(exc, "validation_report", None)
+        if not isinstance(report, BatchValidationReport):
+            report = BatchValidationReport(
+                total_records=1,
+                valid_records=0,
+                invalid_records=1,
+                errors=[
+                    RecordValidationIssue(
+                        record_index=0,
+                        form_key=None,
+                        variable_name=None,
+                        message=_redact_secrets(str(exc)),
+                        rule_id="invalid_payload",
+                    )
+                ],
+            )
+        summary = BatchSubmissionSummary(
+            study_key=study_key,
+            jobs=[],
+            chunk_sizes=[],
+            total_records=report.total_records,
+            dry_run=True,
+            validation_report=report,
+        )
+        render_write_summary(
+            summary,
+            resource=resource,
+            output_format=output_format,
+        )
+    exit_cli_validation_error(exc)
 
 
 def exit_cli_validation_error(exc: Exception) -> None:

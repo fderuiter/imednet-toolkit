@@ -262,6 +262,7 @@ class SimulationState:
             self.records: list[dict[str, Any]] = [
                 {
                     "recordId": 601,
+                    "recordOid": "REC-OID-601",
                     "studyKey": "STUDY",
                     "subjectKey": "SUB1",
                     "subjectId": 201,
@@ -280,6 +281,7 @@ class SimulationState:
                 },
                 {
                     "recordId": 602,
+                    "recordOid": "REC-OID-602",
                     "studyKey": "STUDY",
                     "subjectKey": "SUB1",
                     "subjectId": 201,
@@ -888,6 +890,9 @@ class SimulationState:
                     else dict(raw_item)
                 )
                 rec_data = self._extract_record_data(item)
+                has_explicit_form = any(
+                    item.get(k) is not None for k in ("formKey", "form_key", "formId", "form_id")
+                )
                 form_id, form_key = self._resolve_form_identifiers(study_key, item)
                 raw_subj_key = str(item.get("subjectKey") or item.get("subject_key") or "").strip()
                 requested_rec_id = (
@@ -895,6 +900,7 @@ class SimulationState:
                     if item.get("recordId") is not None
                     else item.get("record_id")
                 )
+                raw_rec_oid = str(item.get("recordOid") or item.get("record_oid") or "").strip()
                 resolved_interval_id, resolved_visit_id = self._resolve_interval_and_visit(
                     study_key, raw_subj_key, item
                 )
@@ -907,6 +913,17 @@ class SimulationState:
                             r
                             for r in self.records
                             if r.get("studyKey") == study_key and r.get("recordId") == target_rec_id
+                        ),
+                        None,
+                    )
+                elif raw_rec_oid:
+                    existing_record = next(
+                        (
+                            r
+                            for r in self.records
+                            if r.get("studyKey") == study_key
+                            and str(r.get("recordOid") or "").strip() == raw_rec_oid
+                            and not r.get("deleted", False)
                         ),
                         None,
                     )
@@ -930,13 +947,23 @@ class SimulationState:
                 updated_ts = str(item.get("lastUpdated") or item.get("last_updated") or modified_ts)
                 user_str = str(item.get("user") or "sim_user")
                 role_str = str(item.get("role") or "Investigator")
-                record_oid = item.get("recordOid") or item.get("record_oid")
+                record_oid = raw_rec_oid or None
                 subject_oid = item.get("subjectOid") or item.get("subject_oid")
 
                 if existing_record is not None:
                     rec_id = int(existing_record["recordId"])
                     subj_id = int(existing_record.get("subjectId", 201))
                     subj_key = raw_subj_key or str(existing_record.get("subjectKey", "SUB1"))
+                    eff_form_key = (
+                        form_key
+                        if has_explicit_form
+                        else str(existing_record.get("formKey") or form_key)
+                    )
+                    eff_form_id = (
+                        form_id
+                        if has_explicit_form and existing_record.get("formId") is None
+                        else existing_record.get("formId", form_id)
+                    )
                     prev_data = copy.deepcopy(existing_record.get("recordData") or {})
                     merged_data = copy.deepcopy(prev_data)
                     merged_data.update(rec_data)
@@ -967,9 +994,13 @@ class SimulationState:
 
                     data_changed = merged_data != prev_data
                     existing_record["recordData"] = merged_data
-                    existing_record["formKey"] = form_key
+                    existing_record["formKey"] = eff_form_key
                     if existing_record.get("formId") is None:
-                        existing_record["formId"] = form_id
+                        existing_record["formId"] = eff_form_id
+                    if record_oid:
+                        existing_record["recordOid"] = record_oid
+                    elif not existing_record.get("recordOid"):
+                        existing_record["recordOid"] = f"REC-OID-{rec_id}"
                     existing_record["dateModified"] = modified_ts
                     existing_record["lastUpdated"] = updated_ts
 
@@ -990,7 +1021,7 @@ class SimulationState:
                             "recordId": rec_id,
                             "subjectId": subj_id,
                             "subjectKey": subj_key,
-                            "formKey": form_key,
+                            "formKey": eff_form_key,
                             "status": "SUCCESS",
                         }
                     )
@@ -1005,7 +1036,7 @@ class SimulationState:
                             or item.get("reason_for_change")
                             or "Record updated"
                         ),
-                        record_oid=record_oid,
+                        record_oid=record_oid or str(existing_record.get("recordOid") or ""),
                         subject_oid=subject_oid,
                         date_created=updated_ts,
                     )
@@ -1087,8 +1118,10 @@ class SimulationState:
                 )
                 record_status_str = str(norm_status) if norm_status is not None else "Complete"
 
+                resolved_rec_oid = record_oid or f"REC-OID-{rec_id}"
                 record_entry = {
                     "recordId": rec_id,
+                    "recordOid": resolved_rec_oid,
                     "studyKey": study_key,
                     "subjectKey": subj_key,
                     "subjectId": subj_id,

@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 from typing import Any
 
 from ...endpoints.records import RecordsEndpoint
 from ...errors import ValidationError
 from ...models.records import Record
 from ...sdk import ImednetSDK
-from ...utils.pandas import import_records_csv
+from ...utils.job_poller import JobFailedError
 from ...utils.tabular import ensure_no_masked_sentinel
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import display_list, fetching_status, print_error, simulation_mode_context
@@ -29,13 +28,15 @@ from ..utils.export import export_list_to_file
 from ..utils.write_helpers import (
     add_write_common_args,
     coerce_batch_summary,
-    exit_cli_validation_error,
+    handle_cli_write_validation_error,
+    handle_job_failed_error,
     load_records_from_path_or_stdin,
     parse_email_notify,
     parse_json_records_text,
     parse_key_value_pairs,
     render_write_summary,
     resolve_cli_schema,
+    validate_record_file_arg,
     validate_write_numeric_flags,
     write_progress_context,
 )
@@ -45,28 +46,74 @@ def _assemble_create_records_payload(
     args: argparse.Namespace,
     *,
     schema: Any = None,
+    is_update: bool = False,
 ) -> list[dict[str, Any]]:
-    """Build record creation payload(s) from ``--file``, ``--json``, or inline flags."""
+    """Build record creation/update payload(s) from ``--file``, ``--json``, or inline flags."""
     if args.input_file and args.json_payload:
         raise ValueError("Cannot combine --file and --json.")
 
-    inline_data = parse_key_value_pairs(args.data_pairs)
+    create_only = bool(getattr(args, "create_only", False))
+    record_id = getattr(args, "record_id", None)
+    record_oid = getattr(args, "record_oid", None)
+    if create_only and (record_id is not None or record_oid):
+        raise ValueError("Cannot combine --create-only with --record-id or --record-oid.")
+
+    study_key = getattr(args, "study_key", None)
     records: list[dict[str, Any]]
     if args.input_file:
-        records = load_records_from_path_or_stdin(args.input_file, schema=schema)
+        records = load_records_from_path_or_stdin(
+            args.input_file,
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
     elif args.json_payload:
-        records = parse_json_records_text(args.json_payload, source_label="--json")
+        records = parse_json_records_text(
+            args.json_payload,
+            source_label="--json",
+            schema=schema,
+            create_only=create_only,
+            study_key=study_key,
+        )
     else:
-        if not args.form_key and args.form_id is None:
+        has_target = bool(
+            args.form_key or args.form_id is not None or record_id is not None or record_oid
+        )
+        if not has_target:
+            if is_update:
+                raise ValueError(
+                    "Provide --file, --json, --record-id, --record-oid, or --form-key / --form-id to update a record."
+                )
             raise ValueError(
-                "Provide --file, --json, or at least --form-key / --form-id to create a record."
+                "Provide --file, --json, or at least --form-key / --form-id / --record-id / --record-oid to create a record."
             )
-        single: dict[str, Any] = {"data": dict(inline_data)}
-        records = [single]
+        inline_data = parse_key_value_pairs(
+            args.data_pairs,
+            schema=schema,
+            form_key=args.form_key,
+            form_id=args.form_id,
+            study_key=study_key,
+        )
+        records = [{"data": dict(inline_data)}]
 
     resolved: list[dict[str, Any]] = []
     for item in records:
         rec = dict(item)
+        if not create_only:
+            if (
+                record_id is not None
+                and rec.get("recordId") is None
+                and rec.get("record_id") is None
+            ):
+                rec["recordId"] = record_id
+            if record_oid and not (rec.get("recordOid") or rec.get("record_oid")):
+                rec["recordOid"] = record_oid
+        else:
+            rec.pop("recordId", None)
+            rec.pop("record_id", None)
+            rec.pop("recordOid", None)
+            rec.pop("record_oid", None)
+
         if args.form_key and not (rec.get("formKey") or rec.get("form_key")):
             rec["formKey"] = args.form_key
         elif args.form_id is not None and rec.get("formId") is None and rec.get("form_id") is None:
@@ -97,9 +144,19 @@ def _assemble_create_records_payload(
         ):
             rec["intervalId"] = args.interval_id
 
-        if inline_data and (args.input_file or args.json_payload):
+        if args.data_pairs and (args.input_file or args.json_payload):
+            rec_fk = str(rec.get("formKey") or rec.get("form_key") or "") or args.form_key
+            raw_rec_fid = rec.get("formId") if rec.get("formId") is not None else rec.get("form_id")
+            rec_fid = int(raw_rec_fid) if isinstance(raw_rec_fid, int) else args.form_id
+            row_inline_data = parse_key_value_pairs(
+                args.data_pairs,
+                schema=schema,
+                form_key=rec_fk,
+                form_id=rec_fid,
+                study_key=study_key,
+            )
             existing_data = dict(rec.get("data") or {})
-            existing_data.update(inline_data)
+            existing_data.update(row_inline_data)
             rec["data"] = existing_data
 
         resolved.append(rec)
@@ -249,63 +306,253 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     list_parser.set_defaults(func=_dispatch_list_records)
 
+    def _add_record_target_args(
+        target_parser: argparse.ArgumentParser,
+        *,
+        allow_create_only: bool,
+    ) -> None:
+        add_study_key_args(target_parser)
+        target_parser.add_argument(
+            "-f",
+            "--file",
+            dest="input_file",
+            default=None,
+            help=(
+                "Path to .csv, .json, .jsonl, .ndjson, .parquet, or .xlsx file "
+                "('-' for stdin JSON)."
+            ),
+        )
+        target_parser.add_argument(
+            "--json",
+            dest="json_payload",
+            default=None,
+            help="Inline JSON object or array of record payloads.",
+        )
+        target_parser.add_argument(
+            "--record-id",
+            type=int,
+            default=None,
+            help="Target record ID (recordId) to update.",
+        )
+        target_parser.add_argument(
+            "--record-oid",
+            default=None,
+            help="Target record OID (recordOid) to update.",
+        )
+        target_parser.add_argument("--form-key", default=None, help="Target form key (formKey).")
+        target_parser.add_argument(
+            "--form-id", type=int, default=None, help="Target form ID (formId)."
+        )
+        target_parser.add_argument(
+            "--subject-key", default=None, help="Target subject key (subjectKey)."
+        )
+        target_parser.add_argument(
+            "--subject-oid", default=None, help="Target subject OID (subjectOid)."
+        )
+        target_parser.add_argument(
+            "--subject-id", type=int, default=None, help="Target subject ID (subjectId)."
+        )
+        target_parser.add_argument("--site-name", default=None, help="Target site name (siteName).")
+        target_parser.add_argument(
+            "--site-id", type=int, default=None, help="Target site ID (siteId)."
+        )
+        target_parser.add_argument(
+            "--interval-name", default=None, help="Target interval name (intervalName)."
+        )
+        target_parser.add_argument(
+            "--interval-id", type=int, default=None, help="Target interval ID (intervalId)."
+        )
+        target_parser.add_argument(
+            "-d",
+            "--data",
+            action="append",
+            dest="data_pairs",
+            default=None,
+            help="Clinical variable assignment in KEY=VALUE form. Repeat for multiple variables.",
+        )
+        if allow_create_only:
+            target_parser.add_argument(
+                "--create-only",
+                action="store_true",
+                default=False,
+                help="Strip recordId/recordOid and force creation of new records.",
+            )
+        add_write_common_args(target_parser)
+
+    def _register_records_write_subcommand(
+        target_parser: argparse.ArgumentParser,
+        *,
+        is_update: bool,
+        resource: str,
+        progress_label: str,
+    ) -> None:
+        @with_sdk
+        def _records_write_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
+            no_interactive = getattr(args, "no_interactive", False)
+            create_only = bool(getattr(args, "create_only", False))
+            payload: list[dict[str, Any]] = []
+            try:
+                resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
+                payload = _assemble_create_records_payload(
+                    args,
+                    schema=resolved_schema,
+                    is_update=is_update,
+                )
+                email_notify = parse_email_notify(args.email_notify)
+                with write_progress_context(
+                    progress_label,
+                    args.study_key,
+                    no_interactive=no_interactive,
+                    output_format=args.output_format,
+                ) as on_progress:
+                    raw_summary = sdk.records.create_batch(
+                        args.study_key,
+                        payload,
+                        email_notify=email_notify,
+                        schema=resolved_schema,
+                        create_only=create_only,
+                        chunk_size=args.chunk_size,
+                        wait_for_completion=args.wait,
+                        timeout=args.timeout,
+                        interval=args.interval,
+                        on_progress=on_progress,
+                        dry_run=args.dry_run,
+                        collect_errors=True,
+                    )
+            except JobFailedError as exc:
+                handle_job_failed_error(
+                    exc,
+                    study_key=args.study_key,
+                    total_records=len(payload),
+                    resource=resource,
+                    output_format=args.output_format,
+                )
+                return
+            except (ValidationError, ValueError) as exc:
+                handle_cli_write_validation_error(
+                    exc,
+                    study_key=args.study_key,
+                    resource=resource,
+                    dry_run=args.dry_run,
+                    output_format=args.output_format,
+                )
+                return
+
+            summary = coerce_batch_summary(
+                raw_summary,
+                study_key=args.study_key,
+                total_records=len(payload),
+                dry_run=args.dry_run,
+            )
+            render_write_summary(
+                summary,
+                resource=resource,
+                output_format=args.output_format,
+            )
+
+        def _dispatch(args: argparse.Namespace) -> None:
+            study_key = resolve_study_key(target_parser, args, required=True)
+            assert study_key is not None
+            validate_cli_path_segment(study_key, name="study_key")
+            validate_write_numeric_flags(
+                chunk_size=args.chunk_size,
+                timeout=args.timeout,
+                interval=args.interval,
+            )
+            if getattr(args, "create_only", False) and (
+                args.record_id is not None or args.record_oid
+            ):
+                print_error("Error: Cannot combine --create-only with --record-id or --record-oid.")
+                sys.exit(1)
+            if args.input_file:
+                try:
+                    validate_record_file_arg(args.input_file)
+                except ValueError as exc:
+                    print_error(f"Error: {exc}")
+                    sys.exit(1)
+            if (
+                not args.input_file
+                and not args.json_payload
+                and not args.form_key
+                and args.form_id is None
+                and args.record_id is None
+                and not args.record_oid
+            ):
+                if is_update:
+                    print_error(
+                        "Error: Provide --file, --json, --record-id, --record-oid, "
+                        "or --form-key / --form-id to update records."
+                    )
+                else:
+                    print_error(
+                        "Error: Provide --file, --json, or at least --form-key / --form-id "
+                        "/ --record-id / --record-oid to create records."
+                    )
+                sys.exit(1)
+            with simulation_mode_context(bool(getattr(args, "simulation", False))):
+                _records_write_cmd(args)
+
+        target_parser.set_defaults(func=_dispatch)
+
     # 2. records create
     create_parser = sub.add_parser(
         "create",
         help="Create or update one or more records in a study.",
     )
-    add_study_key_args(create_parser)
-    create_parser.add_argument(
-        "-f",
-        "--file",
-        dest="input_file",
-        default=None,
-        help="Path to JSON or CSV file of record payloads ('-' for stdin JSON).",
+    _add_record_target_args(create_parser, allow_create_only=True)
+    _register_records_write_subcommand(
+        create_parser,
+        is_update=False,
+        resource="records_create",
+        progress_label="record submission",
     )
-    create_parser.add_argument(
-        "--json",
-        dest="json_payload",
-        default=None,
-        help="Inline JSON object or array of record payloads.",
+
+    # 3. records update
+    update_parser = sub.add_parser(
+        "update",
+        help="Update one or more existing records in a study.",
     )
-    create_parser.add_argument("--form-key", default=None, help="Target form key (formKey).")
-    create_parser.add_argument("--form-id", type=int, default=None, help="Target form ID (formId).")
-    create_parser.add_argument(
-        "--subject-key", default=None, help="Target subject key (subjectKey)."
+    _add_record_target_args(update_parser, allow_create_only=False)
+    _register_records_write_subcommand(
+        update_parser,
+        is_update=True,
+        resource="records_update",
+        progress_label="record update",
     )
-    create_parser.add_argument(
-        "--subject-oid", default=None, help="Target subject OID (subjectOid)."
+
+    # 4. records import
+    import_parser = sub.add_parser(
+        "import",
+        help="Import study records from a CSV, JSON, JSONL/NDJSON, Parquet, or Excel file.",
     )
-    create_parser.add_argument(
-        "--subject-id", type=int, default=None, help="Target subject ID (subjectId)."
+    add_study_key_args(import_parser)
+    import_parser.add_argument(
+        "file",
+        help="Path to .csv, .json, .jsonl, .ndjson, .parquet, .xlsx file, or '-' for stdin.",
     )
-    create_parser.add_argument("--site-name", default=None, help="Target site name (siteName).")
-    create_parser.add_argument("--site-id", type=int, default=None, help="Target site ID (siteId).")
-    create_parser.add_argument(
-        "--interval-name", default=None, help="Target interval name (intervalName)."
+    import_parser.add_argument(
+        "--create-only",
+        action="store_true",
+        default=False,
+        help="Strip recordId/recordOid and force creation of new records.",
     )
-    create_parser.add_argument(
-        "--interval-id", type=int, default=None, help="Target interval ID (intervalId)."
-    )
-    create_parser.add_argument(
-        "-d",
-        "--data",
-        action="append",
-        dest="data_pairs",
-        default=None,
-        help="Clinical variable assignment in KEY=VALUE form. Repeat for multiple variables.",
-    )
-    add_write_common_args(create_parser)
+    add_write_common_args(import_parser)
 
     @with_sdk
-    def create_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
+    def import_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
+        payload: list[dict[str, Any]] = []
         try:
             resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
-            payload = _assemble_create_records_payload(args, schema=resolved_schema)
             email_notify = parse_email_notify(args.email_notify)
+            payload = load_records_from_path_or_stdin(
+                args.file,
+                schema=resolved_schema,
+                create_only=args.create_only,
+                study_key=args.study_key,
+            )
             with write_progress_context(
-                "record submission",
+                "record import",
                 args.study_key,
                 no_interactive=no_interactive,
                 output_format=args.output_format,
@@ -315,6 +562,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     payload,
                     email_notify=email_notify,
                     schema=resolved_schema,
+                    create_only=args.create_only,
                     chunk_size=args.chunk_size,
                     wait_for_completion=args.wait,
                     timeout=args.timeout,
@@ -323,106 +571,29 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     dry_run=args.dry_run,
                     collect_errors=True,
                 )
+        except JobFailedError as exc:
+            handle_job_failed_error(
+                exc,
+                study_key=args.study_key,
+                total_records=len(payload),
+                resource="records_import",
+                output_format=args.output_format,
+            )
+            return
         except (ValidationError, ValueError) as exc:
-            exit_cli_validation_error(exc)
+            handle_cli_write_validation_error(
+                exc,
+                study_key=args.study_key,
+                resource="records_import",
+                dry_run=args.dry_run,
+                output_format=args.output_format,
+            )
+            return
 
         summary = coerce_batch_summary(
             raw_summary,
             study_key=args.study_key,
             total_records=len(payload),
-            dry_run=args.dry_run,
-        )
-        render_write_summary(
-            summary,
-            resource="records_create",
-            output_format=args.output_format,
-        )
-
-    def _dispatch_create_records(args: argparse.Namespace) -> None:
-        study_key = resolve_study_key(create_parser, args, required=True)
-        assert study_key is not None
-        validate_cli_path_segment(study_key, name="study_key")
-        validate_write_numeric_flags(
-            chunk_size=args.chunk_size,
-            timeout=args.timeout,
-            interval=args.interval,
-        )
-        if (
-            not args.input_file
-            and not args.json_payload
-            and not args.form_key
-            and args.form_id is None
-        ):
-            print_error(
-                "Error: Provide --file, --json, or at least --form-key / --form-id to create records."
-            )
-            sys.exit(1)
-        with simulation_mode_context(bool(getattr(args, "simulation", False))):
-            create_records_cmd(args)
-
-    create_parser.set_defaults(func=_dispatch_create_records)
-
-    # 3. records import
-    import_parser = sub.add_parser(
-        "import",
-        help="Import study records from a CSV or JSON file.",
-    )
-    add_study_key_args(import_parser)
-    import_parser.add_argument("file", help="Path to CSV or JSON file to import.")
-    add_write_common_args(import_parser)
-
-    @with_sdk
-    def import_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
-        no_interactive = getattr(args, "no_interactive", False)
-        input_path = Path(args.file)
-        try:
-            resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
-            email_notify = parse_email_notify(args.email_notify)
-            with write_progress_context(
-                "record import",
-                args.study_key,
-                no_interactive=no_interactive,
-                output_format=args.output_format,
-            ) as on_progress:
-                if input_path.suffix.lower() == ".json":
-                    payload = load_records_from_path_or_stdin(args.file, schema=resolved_schema)
-                    raw_summary = sdk.records.create_batch(
-                        args.study_key,
-                        payload,
-                        email_notify=email_notify,
-                        schema=resolved_schema,
-                        chunk_size=args.chunk_size,
-                        wait_for_completion=args.wait,
-                        timeout=args.timeout,
-                        interval=args.interval,
-                        on_progress=on_progress,
-                        dry_run=args.dry_run,
-                        collect_errors=True,
-                    )
-                    total_count = len(payload)
-                else:
-                    raw_summary = import_records_csv(
-                        sdk,
-                        args.study_key,
-                        input_path,
-                        email_notify=email_notify,
-                        schema=resolved_schema,
-                        chunk_size=args.chunk_size,
-                        wait_for_completion=args.wait,
-                        timeout=args.timeout,
-                        interval=args.interval,
-                        on_progress=on_progress,
-                        dry_run=args.dry_run,
-                        collect_errors=True,
-                    )
-                    total_count = getattr(raw_summary, "total_records", 0)
-        except (ValidationError, ValueError) as exc:
-            exit_cli_validation_error(exc)
-
-        summary = coerce_batch_summary(
-            raw_summary,
-            study_key=args.study_key,
-            total_records=total_count,
             dry_run=args.dry_run,
         )
         render_write_summary(
@@ -440,8 +611,10 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             timeout=args.timeout,
             interval=args.interval,
         )
-        if not Path(args.file).exists():
-            print_error(f"Error: Input file not found: '{args.file}'")
+        try:
+            validate_record_file_arg(args.file)
+        except ValueError as exc:
+            print_error(f"Error: {exc}")
             sys.exit(1)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             import_records_cmd(args)

@@ -818,10 +818,25 @@ def display_list(
             return
 
     # Non-interactive / piped fallback: emit standard ASCII table
-    print(f"Found {len(items)} {label}:")
+    print(f"Found {len(items)} {_humanize_display_label(label)}:")
     _print_table(items if fields else data_list, field_keys)
     if effective_notice:
         print(f"Notice: {effective_notice}")
+
+
+_HUMAN_RESOURCE_LABELS: dict[str, str] = {
+    "records_create": "record creation jobs",
+    "records_update": "record update jobs",
+    "records_import": "record import jobs",
+    "subjects_register": "subject registration jobs",
+}
+
+
+def _humanize_display_label(label: str) -> str:
+    """Return a human-readable table header label while avoiding raw snake_case."""
+    if label in _HUMAN_RESOURCE_LABELS:
+        return _HUMAN_RESOURCE_LABELS[label]
+    return label.replace("_", " ")
 
 
 def print_error(

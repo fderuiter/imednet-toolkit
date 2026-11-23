@@ -11,6 +11,7 @@ from imednet.spi.utils import (
     BatchSubmissionSummary,
     JobProgressHandler,
     RecordsInput,
+    extract_input_form_refs,
     normalize_records_input,
     poll_facade_many_async,
     poll_facade_many_sync,
@@ -161,26 +162,40 @@ class RecordUpdateWorkflow:
             if not resolved or resolved not in study_forms:
                 raise ValidationError(f"Unknown form ID {fid}")
 
-    def _validate_form_key(self, study_key: str, records_data: list[dict[str, Any]]) -> None:
+    def _validate_form_key(
+        self,
+        study_key: str,
+        records_data: list[dict[str, Any]],
+        *,
+        already_refreshed: bool = False,
+    ) -> None:
         """Refresh schema once if any distinct form key or form ID in the batch is uncached."""
         self._ensure_sync_mode("_validate_form_key", "_async_validate_form_key")
         if not records_data or not isinstance(self._schema, BaseSchemaCache):
             return
         cache = self._schema
         explicit_form_keys, form_ids = self._collect_distinct_form_refs(records_data, cache)
-        if self._check_form_refs_need_refresh(cache, study_key, explicit_form_keys, form_ids):
+        if not already_refreshed and self._check_form_refs_need_refresh(
+            cache, study_key, explicit_form_keys, form_ids
+        ):
             cast(SchemaValidator, self._validator).refresh(study_key)
         self._verify_cached_form_refs(cache, study_key, explicit_form_keys, form_ids)
 
     async def _async_validate_form_key(
-        self, study_key: str, records_data: list[dict[str, Any]]
+        self,
+        study_key: str,
+        records_data: list[dict[str, Any]],
+        *,
+        already_refreshed: bool = False,
     ) -> None:
         """Asynchronous variant of :meth:`_validate_form_key`."""
         if not records_data or not isinstance(self._schema, BaseSchemaCache):
             return
         cache = self._schema
         explicit_form_keys, form_ids = self._collect_distinct_form_refs(records_data, cache)
-        if self._check_form_refs_need_refresh(cache, study_key, explicit_form_keys, form_ids):
+        if not already_refreshed and self._check_form_refs_need_refresh(
+            cache, study_key, explicit_form_keys, form_ids
+        ):
             await cast(AsyncSchemaValidator, self._validator).refresh(study_key)
         self._verify_cached_form_refs(cache, study_key, explicit_form_keys, form_ids)
 
@@ -203,9 +218,19 @@ class RecordUpdateWorkflow:
             "create_or_update_records_batch", "async_create_or_update_records_batch"
         )
         active_schema, is_offline = self._resolve_active_schema(schema)
-        normalized = normalize_records_input(records_data, schema=active_schema)
+        pre_refreshed = False
+        if not is_offline and isinstance(self._schema, BaseSchemaCache):
+            raw_fks, raw_fids = extract_input_form_refs(records_data)
+            if self._check_form_refs_need_refresh(self._schema, study_key, raw_fks, raw_fids):
+                cast(SchemaValidator, self._validator).refresh(study_key)
+                pre_refreshed = True
+        normalized = normalize_records_input(
+            records_data,
+            schema=active_schema,
+            study_key=study_key,
+        )
         if not is_offline:
-            self._validate_form_key(study_key, normalized)
+            self._validate_form_key(study_key, normalized, already_refreshed=pre_refreshed)
         sdk = cast("ImednetFacade", self._sdk)
         coordinator = BatchCoordinator(chunk_size=chunk_size or self._batch_size)
         return coordinator.submit(
@@ -285,9 +310,23 @@ class RecordUpdateWorkflow:
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once, submit chunks, and return a batch summary."""
         active_schema, is_offline = self._resolve_active_schema(schema)
-        normalized = normalize_records_input(records_data, schema=active_schema)
+        pre_refreshed = False
+        if not is_offline and isinstance(self._schema, BaseSchemaCache):
+            raw_fks, raw_fids = extract_input_form_refs(records_data)
+            if self._check_form_refs_need_refresh(self._schema, study_key, raw_fks, raw_fids):
+                await cast(AsyncSchemaValidator, self._validator).refresh(study_key)
+                pre_refreshed = True
+        normalized = normalize_records_input(
+            records_data,
+            schema=active_schema,
+            study_key=study_key,
+        )
         if not is_offline:
-            await self._async_validate_form_key(study_key, normalized)
+            await self._async_validate_form_key(
+                study_key,
+                normalized,
+                already_refreshed=pre_refreshed,
+            )
         sdk = cast("AsyncImednetFacade", self._sdk)
         coordinator = AsyncBatchCoordinator(chunk_size=chunk_size or self._batch_size)
         return await coordinator.submit(
