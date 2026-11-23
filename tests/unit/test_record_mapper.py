@@ -16,11 +16,10 @@ from imednet.models.reporting import (
     ProtocolDeviation,
     VitalSigns,
 )
+from imednet.models.sdtm import _get_model_field_aliases, _normalize_key
 from imednet.models.variables import Variable
 from imednet_workflows.record_mapper import (
     RecordMapper,
-    _get_model_field_aliases,
-    _normalize_key,
     format_iso8601_dtc,
     transform_records_to_sdtm,
 )
