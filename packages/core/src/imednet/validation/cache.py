@@ -18,12 +18,12 @@ from typing import (
     Any,
     Generic,
     Literal,
+    Protocol,
     TypeVar,
     cast,
     overload,
+    runtime_checkable,
 )
-
-from typing_extensions import Protocol, runtime_checkable
 
 from imednet.core.context import get_study_context
 from imednet.datadict.logic import (
