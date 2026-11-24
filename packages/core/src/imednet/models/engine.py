@@ -32,6 +32,33 @@ _FIRST_PARTY_ROOTS = frozenset(
         "imednet_tui",
     }
 )
+_CANONICAL_MODEL_MODULES: dict[str, str] = {
+    "Pagination": "imednet.models.base",
+    "Coding": "imednet.models.codings",
+    "Form": "imednet.models.forms",
+    "FormSummary": "imednet.models.intervals",
+    "Interval": "imednet.models.intervals",
+    "Job": "imednet.models.jobs",
+    "JobStatus": "imednet.models.jobs",
+    "Query": "imednet.models.queries",
+    "QueryComment": "imednet.models.queries",
+    "RecordRevision": "imednet.models.record_revisions",
+    "BaseRecordRequest": "imednet.models.records",
+    "CreateNewRecordRequest": "imednet.models.records",
+    "Keyword": "imednet.models.records",
+    "Record": "imednet.models.records",
+    "RecordJobResponse": "imednet.models.records",
+    "RegisterSubjectRequest": "imednet.models.records",
+    "UpdateScheduledRecordRequest": "imednet.models.records",
+    "Site": "imednet.models.sites",
+    "Study": "imednet.models.studies",
+    "Subject": "imednet.models.subjects",
+    "SubjectKeyword": "imednet.models.subjects",
+    "Role": "imednet.models.users",
+    "User": "imednet.models.users",
+    "Variable": "imednet.models.variables",
+    "Visit": "imednet.models.visits",
+}
 
 
 def _format_runtime_annotation(annotation: Any) -> str:
@@ -253,14 +280,28 @@ def _format_from_import(from_prefix: str, names: list[str]) -> str:
     return f"{from_prefix} import (\n{joined}\n)"
 
 
+def _is_computed_field_decorator(dec: ast.expr) -> bool:
+    """Return True if decorator AST node represents `@computed_field` or `@computed_field(...)`."""
+    target = dec.func if isinstance(dec, ast.Call) else dec
+    return (isinstance(target, ast.Name) and target.id == "computed_field") or (
+        isinstance(target, ast.Attribute) and target.attr == "computed_field"
+    )
+
+
 def _format_function_stub(
     fn: ast.FunctionDef | ast.AsyncFunctionDef,
     indent: str = "",
 ) -> list[str]:
     """Format a function or method with body stripped to `...`."""
     lines: list[str] = []
+    emitted_property = False
     for dec in fn.decorator_list:
-        lines.append(f"{indent}@{_format_expr(dec)}")
+        dec_name = "property" if _is_computed_field_decorator(dec) else _format_expr(dec)
+        if dec_name == "property":
+            if emitted_property:
+                continue
+            emitted_property = True
+        lines.append(f"{indent}@{dec_name}")
 
     args = fn.args
     params: list[str] = []
@@ -354,72 +395,128 @@ def _extract_validator_key_aliases(cls_node: ast.ClassDef) -> list[tuple[str, st
     return pairs
 
 
-def _format_overload_init(params: list[str], indent: str = "    ") -> list[str]:
-    """Format a keyword-only `@overload def __init__` stub wrapped at <= 100 characters."""
-    lines = [f"{indent}@overload"]
+def _get_init_param_annotation(
+    runtime_cls: type[Any],
+    field_name: str,
+    ann_str: str,
+) -> str:
+    """Resolve constructor parameter annotation, widening accepted runtime input types."""
+    if ann_str == "RecordData" and any(
+        base.__name__ == "BaseRecordRequest" for base in runtime_cls.__mro__
+    ):
+        return "RecordData | dict[str, Any]"
+    if runtime_cls.__name__ == "Role" and field_name in {"date_created", "date_modified"}:
+        return "datetime | str | Sequence[int] | None"
+    return ann_str
+
+
+def _wrap_init_param(indent: str, param: str) -> list[str]:
+    """Format a single `__init__` parameter line wrapped at <= 100 characters."""
+    single = f"{indent}{param},"
+    if len(single) <= 100 or ": " not in param:
+        return [single]
+    name_part, rest = param.split(": ", maxsplit=1)
+    if " = " in rest:
+        ann_str, default_str = rest.rsplit(" = ", maxsplit=1)
+        suffix = f" = {default_str},"
+    else:
+        ann_str = rest
+        suffix = ","
+    inner = f"{indent}    {ann_str}"
+    if len(inner) <= 100:
+        return [
+            f"{indent}{name_part}: (",
+            inner,
+            f"{indent}){suffix}",
+        ]
+    union_parts = [part.strip() for part in ann_str.split(" | ")]
+    if len(union_parts) > 1:
+        wrapped = [f"{indent}{name_part}: ("]
+        for idx, part in enumerate(union_parts):
+            prefix = "" if idx == 0 else "| "
+            wrapped.append(f"{indent}    {prefix}{part}")
+        wrapped.append(f"{indent}){suffix}")
+        return wrapped
+    return [single]
+
+
+def _format_init_stub(params: list[str], indent: str = "    ") -> list[str]:
+    """Format a unified keyword-only `def __init__` stub wrapped at <= 100 characters."""
     all_params = ["self", "*", *params] if params else ["self"]
     joined = ", ".join(all_params)
     single = f"{indent}def __init__({joined}) -> None: ..."
     if len(single) <= 100:
-        lines.append(single)
-        return lines
+        return [single]
     indented = f"{indent}    {joined}"
     if len(indented) <= 100:
-        lines.append(f"{indent}def __init__(")
-        lines.append(indented)
-        lines.append(f"{indent}) -> None: ...")
-        return lines
-    lines.append(f"{indent}def __init__(")
+        return [
+            f"{indent}def __init__(",
+            indented,
+            f"{indent}) -> None: ...",
+        ]
+    lines = [f"{indent}def __init__("]
     for param in all_params:
-        lines.append(f"{indent}    {param},")
+        lines.extend(_wrap_init_param(f"{indent}    ", param))
     lines.append(f"{indent}) -> None: ...")
     return lines
 
 
-def _build_init_overloads(
+def _build_unified_init(
     cls_node: ast.ClassDef,
     runtime_cls: type[Any],
     declared_annotations: dict[str, str],
     indent: str = "    ",
 ) -> list[str]:
-    """Build `snake_case` and `camelCase` `@overload def __init__` stubs for an aliased model."""
-    snake_params: list[str] = []
-    alias_params: list[str] = []
-    alias_meta: dict[str, tuple[str, str]] = {}
-    existing_snake_names: set[str] = set()
+    """Build a unified `def __init__` stub accepting mixed `snake_case` and `camelCase` kwargs."""
+    params: list[str] = []
+    emitted_names: set[str] = set()
+    validator_aliases = _extract_validator_key_aliases(cls_node)
 
     for field_name, field_info in runtime_cls.model_fields.items():
-        ann_str = declared_annotations.get(field_name) or _format_runtime_annotation(
+        raw_ann_str = declared_annotations.get(field_name) or _format_runtime_annotation(
             field_info.annotation
         )
-        if field_info.is_required():
-            default_suffix = ""
-        elif field_info.default_factory is not None:
+        ann_str = _get_init_param_annotation(runtime_cls, field_name, raw_ann_str)
+        alias_name = field_info.alias
+        has_distinct_alias = bool(alias_name and alias_name != field_name)
+        extra_alt_keys = [
+            alt_key
+            for alt_key, target_alias in validator_aliases
+            if target_alias in {field_name, alias_name} and alt_key not in {field_name, alias_name}
+        ]
+
+        if not has_distinct_alias and not extra_alt_keys:
+            if field_info.is_required():
+                default_suffix = ""
+            elif field_info.default_factory is not None:
+                default_suffix = " = ..."
+            else:
+                default_suffix = f" = {_format_runtime_default(field_info.default)}"
+            params.append(f"{field_name}: {ann_str}{default_suffix}")
+            emitted_names.add(field_name)
+            continue
+
+        if field_info.is_required() or field_info.default_factory is not None:
             default_suffix = " = ..."
         else:
             default_suffix = f" = {_format_runtime_default(field_info.default)}"
 
-        snake_params.append(f"{field_name}: {ann_str}{default_suffix}")
-        existing_snake_names.add(field_name)
+        params.append(f"{field_name}: {ann_str}{default_suffix}")
+        emitted_names.add(field_name)
 
-        alias_name = field_info.alias or field_name
-        alias_params.append(f"{alias_name}: {ann_str}{default_suffix}")
-        alias_meta[alias_name] = (ann_str, default_suffix)
+        if has_distinct_alias and alias_name is not None and alias_name not in emitted_names:
+            params.append(f"{alias_name}: {ann_str}{default_suffix}")
+            emitted_names.add(alias_name)
 
-    for alt_key, target_alias in _extract_validator_key_aliases(cls_node):
-        if alt_key not in existing_snake_names and target_alias in alias_meta:
-            ann_str, default_suffix = alias_meta[target_alias]
-            snake_params.append(f"{alt_key}: {ann_str}{default_suffix}")
-            existing_snake_names.add(alt_key)
+        for alt_key in extra_alt_keys:
+            if alt_key not in emitted_names:
+                params.append(f"{alt_key}: {ann_str}{default_suffix}")
+                emitted_names.add(alt_key)
 
     if runtime_cls.model_config.get("extra") == "allow":
-        snake_params.append("**extra_data: Any")
-        alias_params.append("**extra_data: Any")
+        params.append("**extra_data: Any")
 
-    return [
-        *_format_overload_init(snake_params, indent=indent),
-        *_format_overload_init(alias_params, indent=indent),
-    ]
+    return _format_init_stub(params, indent=indent)
 
 
 def _wrap_dynamic_field_stub(
@@ -560,6 +657,7 @@ def _build_pruned_imports(
     has_future_annotations = False
     any_imported = False
     overload_imported = False
+    sequence_imported = False
     field_imported = False
 
     for node in import_nodes:
@@ -579,6 +677,8 @@ def _build_pruned_imports(
                         any_imported = True
                     if bound == "overload":
                         overload_imported = True
+                    if bound == "Sequence":
+                        sequence_imported = True
             continue
 
         if isinstance(node, ast.ImportFrom) and node.module == "pydantic" and node.level == 0:
@@ -613,6 +713,10 @@ def _build_pruned_imports(
                 and (alias.asname or alias.name) not in pruned_forbidden
             ]
             if kept:
+                if mod == "collections.abc" and any(
+                    (a.asname or a.name) == "Sequence" for a in kept
+                ):
+                    sequence_imported = True
                 grp = 4 if node.level > 0 else _classify_import_group(mod)
                 sorted_kept = sorted(
                     kept,
@@ -635,6 +739,13 @@ def _build_pruned_imports(
         typing_aliases.append(ast.alias(name="Any"))
     if "overload" in used_names and not overload_imported:
         typing_aliases.append(ast.alias(name="overload"))
+    if "Sequence" in used_names and not sequence_imported:
+        grouped[1].append(
+            (
+                (1, "collections.abc", "Sequence"),
+                "from collections.abc import Sequence",
+            )
+        )
     if "Field" in used_names and not field_imported:
         pydantic_aliases.append(ast.alias(name="Field"))
 
@@ -786,28 +897,58 @@ class ModelEngine:
     """Engine for dynamically creating Pydantic models from schemas."""
 
     _model_cache: ClassVar[dict[tuple[str, type[Any]], type[Any]]] = {}
+    _canonical_bases: ClassVar[dict[str, type[Any]]] = {}
+    _resolving_canonical: ClassVar[set[str]] = set()
 
     @classmethod
-    def get_model(cls, model_name: str, base_cls: type[Any] = ImednetBaseModel) -> type[Any]:
+    def _resolve_canonical_base(cls, model_name: str) -> type[Any]:
+        """Resolve the canonical static base subclass for *model_name* when available."""
+        if model_name in cls._canonical_bases:
+            return cls._canonical_bases[model_name]
+
+        mod_name = _CANONICAL_MODEL_MODULES.get(model_name)
+        if mod_name and model_name not in cls._resolving_canonical:
+            cls._resolving_canonical.add(model_name)
+            try:
+                mod = importlib.import_module(mod_name)
+                if model_name in cls._canonical_bases:
+                    return cls._canonical_bases[model_name]
+                candidate = getattr(mod, model_name, None)
+                if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                    cls._canonical_bases.setdefault(model_name, candidate)
+                    return candidate
+            finally:
+                cls._resolving_canonical.discard(model_name)
+
+        return ImednetBaseModel
+
+    @classmethod
+    def get_model(
+        cls,
+        model_name: str,
+        base_cls: type[Any] | None = None,
+    ) -> type[Any]:
         """Get or create a dynamic Pydantic model for the given name.
 
         Args:
             model_name: The name of the model (e.g., 'Subject', 'Record').
-            base_cls: The base class to inherit from.
+            base_cls: Optional base class override; defaults to the canonical model subclass.
 
         Returns:
             A Pydantic model class.
         """
-        cache_key = (model_name, base_cls)
+        resolved_base = cls._resolve_canonical_base(model_name) if base_cls is None else base_cls
+
+        cache_key = (model_name, resolved_base)
         if cache_key in cls._model_cache:
             return cls._model_cache[cache_key]
 
         if tracer:
             with tracer.start_as_current_span("ModelEngine.get_model") as span:
                 span.set_attribute("model_name", model_name)
-                model = cls._get_model(model_name, base_cls)
+                model = cls._get_model(model_name, resolved_base)
         else:
-            model = cls._get_model(model_name, base_cls)
+            model = cls._get_model(model_name, resolved_base)
 
         cls._model_cache[cache_key] = model
         return model
@@ -852,6 +993,9 @@ class ModelEngine:
         """Internal implementation for dynamic model creation."""
         contract = get_contract()
         if model_name not in contract.models:
+            if base_cls is not ImednetBaseModel and base_cls.__name__ == model_name:
+                cls._forward_domain_methods(base_cls, base_cls)
+                return base_cls
             fallback_model = create_model(
                 model_name,
                 __base__=base_cls,
@@ -874,6 +1018,8 @@ class ModelEngine:
                 py_type: Any = str | None
             elif field_def.type_name == "integer":
                 py_type = int | None
+            elif field_def.type_name == "float":
+                py_type = float | None
             elif field_def.type_name == "boolean":
                 py_type = bool | None
             elif field_def.type_name == "dict":
@@ -1004,7 +1150,7 @@ class ModelEngine:
             and not has_explicit_init
             and _is_aliased_imednet_model(effective_cls)
         ):
-            init_lines = _build_init_overloads(
+            init_lines = _build_unified_init(
                 cls_node,
                 effective_cls,
                 declared_annotations,

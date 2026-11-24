@@ -104,7 +104,9 @@ def _format_config_error(exc: ValueError) -> str:
 def get_sdk() -> ImednetSDK:
     """Initialize and return the SDK instance using :func:`load_config`."""
     sdk_cls: type[ImednetSDK]
-    if _OFFLINE_DRY_RUN_CTX.get() and not parse_bool(os.getenv(SIMULATION_MODE_ENV, "false")):
+    if _OFFLINE_DRY_RUN_CTX.get() and not parse_bool(
+        os.getenv(SIMULATION_MODE_ENV, "false"), strict=False
+    ):
         try:
             sdk_cls = globals()["ImednetSDK"] if "ImednetSDK" in globals() else _load_sdk_cls()
             return sdk_cls(
@@ -120,7 +122,7 @@ def get_sdk() -> ImednetSDK:
 
     if not (
         os.getenv("IMEDNET_OIDC_TOKEN", "").strip()
-        or parse_bool(os.getenv(SIMULATION_MODE_ENV, "false"))
+        or parse_bool(os.getenv(SIMULATION_MODE_ENV, "false"), strict=False)
         or (
             os.getenv("IMEDNET_API_KEY", "").strip()
             and os.getenv("IMEDNET_SECURITY_KEY", "").strip()

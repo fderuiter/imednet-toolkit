@@ -37,7 +37,7 @@ class MappingRule(ImednetBaseModel):
             self.strict
             or self.strict_mode
             or self.strict_cdash
-            or parse_bool(os.getenv("IMEDNET_STRICT_CDASH", "false"))
+            or parse_bool(os.getenv("IMEDNET_STRICT_CDASH", "false"), strict=False)
         )
         if is_strict:
             valid, err_msg = validate_cdash_variable(self.target_field, self.domain)
@@ -95,7 +95,7 @@ class StudyConfiguration(ImednetBaseModel):
             self.strict
             or self.strict_mode
             or self.strict_cdash
-            or parse_bool(os.getenv("IMEDNET_STRICT_CDASH", "false"))
+            or parse_bool(os.getenv("IMEDNET_STRICT_CDASH", "false"), strict=False)
         )
         if is_strict:
             for rule in self.mappings:

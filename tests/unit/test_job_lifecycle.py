@@ -298,12 +298,13 @@ def test_airflow_job_sensor_stale_response_protection(monkeypatch: pytest.Monkey
         sdk.jobs.get.return_value = running_job
         assert sensor.poke({}) is False
 
-        # 2. Terminal completion poke -> returns PokeReturnValue(is_done=True, ...)
+        # 2. Terminal completion poke -> returns truthy PokeReturnValue(is_done=True, ...)
         completed_job = JobStatus(batchId="B", state="COMPLETED")
         sdk.jobs.get.return_value = completed_job
         terminal_res = sensor.poke({})
         assert isinstance(terminal_res, _airflow_compat.PokeReturnValue)
         assert bool(terminal_res) is True
+        assert getattr(terminal_res, "is_done", terminal_res) is True
         assert terminal_res.xcom_value["batch_id"] == "B"
         assert terminal_res.xcom_value["state"] == "COMPLETED"
         assert "results" not in terminal_res.xcom_value
@@ -314,6 +315,7 @@ def test_airflow_job_sensor_stale_response_protection(monkeypatch: pytest.Monkey
         stale_res = sensor.poke({})
         assert isinstance(stale_res, _airflow_compat.PokeReturnValue)
         assert bool(stale_res) is True
+        assert getattr(stale_res, "is_done", stale_res) is True
         assert stale_res.xcom_value == terminal_res.xcom_value
     finally:
         for mod in list(sys.modules):

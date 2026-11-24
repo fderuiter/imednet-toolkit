@@ -120,17 +120,20 @@ def test_parse_datetime_numeric():
 
 
 def test_parse_bool_string_float():
-    """Test that parse bool string float."""
+    """Test that parse bool string float rejects non-finite floats."""
     assert validators.parse_bool("1.0") is True
     assert validators.parse_bool("0.0") is False
     assert validators.parse_bool("-1") is True
     assert validators.parse_bool("+1") is True
     assert validators.parse_bool(".5") is True
-    assert validators.parse_bool("nan") is True  # bool(float("nan")) is True
-    assert validators.parse_bool("inf") is True
-    assert validators.parse_bool("-inf") is True
+    assert validators.parse_bool("nan") is False
+    assert validators.parse_bool("inf") is False
+    assert validators.parse_bool("-inf") is False
     assert validators.parse_bool("nope") is False
     assert validators.parse_bool("invalid") is False
+    for non_finite in ("nan", "inf", "-inf", float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="non-finite"):
+            validators.parse_bool(non_finite, strict=True)
 
 
 def test_parse_dict_or_default_structural_shift(caplog):

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import overload
-
 from pydantic import Field
 
 from imednet.models.base import ImednetBaseModel
@@ -15,10 +13,16 @@ class FormSummary(ImednetBaseModel):
     form_key: str = Field("", alias="formKey")
     form_name: str = Field("", alias="formName")
 
-    @overload
-    def __init__(self, *, form_id: int = 0, form_key: str = "", form_name: str = "") -> None: ...
-    @overload
-    def __init__(self, *, formId: int = 0, formKey: str = "", formName: str = "") -> None: ...
+    def __init__(
+        self,
+        *,
+        form_id: int = 0,
+        formId: int = 0,
+        form_key: str = "",
+        formKey: str = "",
+        form_name: str = "",
+        formName: str = "",
+    ) -> None: ...
 
 class Interval(ImednetBaseModel):
     """Represents a visit interval or event within the study timeline."""
@@ -46,58 +50,49 @@ class Interval(ImednetBaseModel):
     window_calculation_form: str | None = Field(default=None, alias="windowCalculationForm")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         forms: list[FormSummary] | None = None,
         study_key: str | None = None,
-        interval_id: int | None = None,
-        interval_name: str | None = None,
-        interval_description: str | None = None,
-        interval_sequence: int | None = None,
-        interval_group_id: int | None = None,
-        interval_group_name: str | None = None,
-        disabled: bool | None = None,
-        date_created: str | None = None,
-        date_modified: str | None = None,
-        actual_date: str | None = None,
-        actual_date_form: str | None = None,
-        defined_using_interval: str | None = None,
-        due_date_will_be_in: int | None = None,
-        epro_grace_period: int | None = None,
-        negative_slack: int | None = None,
-        positive_slack: int | None = None,
-        timeline: str | None = None,
-        window_calculation_date: str | None = None,
-        window_calculation_form: str | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        forms: list[FormSummary] | None = None,
         studyKey: str | None = None,
+        interval_id: int | None = None,
         intervalId: int | None = None,
+        interval_name: str | None = None,
         intervalName: str | None = None,
+        interval_description: str | None = None,
         intervalDescription: str | None = None,
+        interval_sequence: int | None = None,
         intervalSequence: int | None = None,
+        interval_group_id: int | None = None,
         intervalGroupId: int | None = None,
+        interval_group_name: str | None = None,
         intervalGroupName: str | None = None,
         disabled: bool | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_modified: str | None = None,
         dateModified: str | None = None,
+        actual_date: str | None = None,
         actualDate: str | None = None,
+        actual_date_form: str | None = None,
         actualDateForm: str | None = None,
+        defined_using_interval: str | None = None,
         definedUsingInterval: str | None = None,
+        due_date_will_be_in: int | None = None,
         dueDateWillBeIn: int | None = None,
+        epro_grace_period: int | None = None,
         eproGracePeriod: int | None = None,
+        negative_slack: int | None = None,
         negativeSlack: int | None = None,
+        positive_slack: int | None = None,
         positiveSlack: int | None = None,
         timeline: str | None = None,
+        window_calculation_date: str | None = None,
         windowCalculationDate: str | None = None,
+        window_calculation_form: str | None = None,
         windowCalculationForm: str | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
 
