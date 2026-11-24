@@ -37,8 +37,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Workspace Dependencies
+        id: cache-uv
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
@@ -51,7 +52,16 @@ jobs:
         run: |
           python -m pip install uv hatch
           uv sync --locked --all-packages --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Save Workspace Dependencies
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache-uv.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
 
       - name: Run Performance Suite
         env:
@@ -59,9 +69,14 @@ jobs:
         run: |
           pytest tests/core/test_performance.py -m performance -v
 
+      - name: Aggregate Verification Report
+        if: always()
+        run: python scripts/aggregate_verification.py --report-dir reports/verification --expect-track performance
+
       - name: Save Verification Artifact
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: performance-report
-          path: performance_report.json
-          if-no-files-found: ignore
+          path: reports/verification/performance_report.json
+          if-no-files-found: error

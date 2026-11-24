@@ -67,11 +67,11 @@ List users
    * - ``size``
      - Integer
      - ``25``
-     - Maximum number of records to return per page.
+     - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
      - ``login,asc``
-     - Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).
+     - Sorting expression (e.g. ``login,asc`` or ``lastName,desc``; valid fields: ``userId``, ``login``, ``firstName``, ``lastName``, ``email``, ``userActiveInStudy``).
    * - ``includeInactive``
      - Boolean
      - ``false``

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, overload
+from typing import Any
 
 from pydantic import Field, field_validator, model_validator
 
@@ -59,26 +59,19 @@ class Job(ImednetBaseModel):
     date_finished: str | None = Field(default=None, alias="dateFinished")
     date_started: str | None = Field(default=None, alias="dateStarted")
 
-    @overload
     def __init__(
         self,
         *,
         state: JobState | str | None = None,
         job_id: str | None = None,
-        batch_id: str | None = None,
-        date_created: str | None = None,
-        date_finished: str | None = None,
-        date_started: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        state: JobState | str | None = None,
         jobId: str | None = None,
+        batch_id: str | None = None,
         batchId: str | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_finished: str | None = None,
         dateFinished: str | None = None,
+        date_started: str | None = None,
         dateStarted: str | None = None,
     ) -> None: ...
     @field_validator("state", mode="before")
@@ -109,43 +102,34 @@ class JobStatus(Job):
     date_finished: str | None = Field(default=None, alias="dateFinished")
     date_started: str | None = Field(default=None, alias="dateStarted")
 
-    @overload
     def __init__(
         self,
         *,
         state: JobState | str | None = None,
         job_id: str | None = None,
-        batch_id: str | None = None,
-        date_created: str | None = None,
-        date_finished: str | None = None,
-        date_started: str | None = None,
-        progress: int | None = None,
-        result_url: str | None = None,
-        results: Any = None,
-        record_total_count: int | None = None,
-        record_success_count: int | None = None,
-        record_failure_count: int | None = None,
-        result_error: str | None = None,
-        total_records: int | None = None,
-        successful_records: int | None = None,
-        failed_records: int | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        state: JobState | str | None = None,
         jobId: str | None = None,
+        batch_id: str | None = None,
         batchId: str | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_finished: str | None = None,
         dateFinished: str | None = None,
+        date_started: str | None = None,
         dateStarted: str | None = None,
         progress: int | None = None,
+        result_url: str | None = None,
         resultUrl: str | None = None,
         results: Any = None,
+        record_total_count: int | None = None,
         totalRecords: int | None = None,
+        total_records: int | None = None,
+        record_success_count: int | None = None,
         successfulRecords: int | None = None,
+        successful_records: int | None = None,
+        record_failure_count: int | None = None,
         failedRecords: int | None = None,
+        failed_records: int | None = None,
+        result_error: str | None = None,
         resultError: str | None = None,
     ) -> None: ...
     @model_validator(mode="before")

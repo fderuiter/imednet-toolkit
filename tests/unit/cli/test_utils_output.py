@@ -7,9 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from imednet.cli.utils import (
+    _HC_STATUS_COLOR_MAP,
     _STATUS_COLOR_MAP,
     Console,
     _format_cell_value,
+    _format_header_label,
     clear_line,
     display_list,
     fetching_status,
@@ -143,21 +145,44 @@ def test_display_list_with_fields(capfd: pytest.CaptureFixture[str]) -> None:
     obj = MagicMock()
     # Mock attribute access for optimized path
     obj.id = 123
+    obj.subject_oid = "SOID-1"
+    obj.result_url = "https://example.test/r"
+    obj.created_utc = "2026-01-01T00:00:00Z"
     obj.name = "Test Item"
     # Ensure model_dump is NOT called
     obj.model_dump = MagicMock()
 
-    display_list([obj], "items", fields=["id", "name"])
+    display_list(
+        [obj],
+        "items",
+        fields=["id", "subject_oid", "result_url", "created_utc", "name"],
+    )
     captured = capfd.readouterr()
 
     assert "Found 1 items:" in captured.out
-    assert "Id" in captured.out
+    assert "ID " in captured.out or "ID |" in captured.out
+    assert "Subject OID" in captured.out
+    assert "Result URL" in captured.out
+    assert "Created UTC" in captured.out
     assert "Name" in captured.out
     assert "123" in captured.out
+    assert "SOID-1" in captured.out
     assert "Test Item" in captured.out
 
     # Verify optimization: model_dump should not be called
     obj.model_dump.assert_not_called()
+
+
+def test_format_header_label_preserves_acronyms_without_mangling_words() -> None:
+    """_format_header_label preserves ID, OID, URL, and UTC tokens without altering normal words."""
+    assert _format_header_label("id") == "ID"
+    assert _format_header_label("ID") == "ID"
+    assert _format_header_label("record_revision_id") == "Record Revision ID"
+    assert _format_header_label("annotation_id") == "Annotation ID"
+    assert _format_header_label("subject_oid") == "Subject OID"
+    assert _format_header_label("result_url") == "Result URL"
+    assert _format_header_label("timestamp_utc") == "Timestamp UTC"
+    assert _format_header_label("valid_avoid_curl_clutch") == "Valid Avoid Curl Clutch"
 
 
 def test_format_cell_value_status_colors() -> None:
@@ -504,9 +529,11 @@ def test_format_cell_value_empty_string_hyphen() -> None:
 
 
 def test_job_state_color_mappings() -> None:
-    """Verify job states are registered in _STATUS_COLOR_MAP."""
+    """Verify job and query states are registered in _STATUS_COLOR_MAP and _HC_STATUS_COLOR_MAP."""
     assert _STATUS_COLOR_MAP["running"] == "yellow"
     assert _STATUS_COLOR_MAP["queued"] == "yellow"
+    assert _STATUS_COLOR_MAP["answered"] == "yellow"
+    assert _HC_STATUS_COLOR_MAP["answered"] == "hc_warning"
     assert _STATUS_COLOR_MAP["complete"] == "green"
     assert _STATUS_COLOR_MAP["cancelled"] == "red"
     assert _STATUS_COLOR_MAP["timeout"] == "red"

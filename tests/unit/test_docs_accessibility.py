@@ -159,23 +159,72 @@ def test_code_block_keyboard_accessibility() -> None:
     """Ensure preformatted code blocks receive keyboard accessibility attributes and focus styles."""
     css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
     js_content = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
+    code_blocks_js = (REPO_ROOT / "docs/_static/code_blocks.js").read_text(encoding="utf-8")
 
     # Verify CSS focus-visible rule for preformatted code blocks
     assert "pre:focus-visible" in css_content
     assert "outline: 2px solid var(--color-brand-primary)" in css_content
 
-    # Verify script logic detects pre elements and tests horizontal overflow
-    assert "querySelectorAll" in js_content and "pre" in js_content
-    assert "scrollWidth >" in js_content and "clientWidth" in js_content
+    # Verify script logic detects pre elements and tests horizontal overflow in both global and showcase scripts
+    for script_src in (js_content, code_blocks_js):
+        assert "querySelectorAll" in script_src and "pre" in script_src
+        assert "scrollWidth >" in script_src and "clientWidth" in script_src
+        assert "tabindex" in script_src and '"0"' in script_src
+        assert "role" in script_src and '"region"' in script_src
+        assert "aria-label" in script_src and '"Code snippet"' in script_src
+        assert "resize" in script_src
+        assert "removeAttribute" in script_src and "tabindex" in script_src
 
-    # Verify accessible region and tabindex attributes are assigned to overflowing containers
-    assert 'tabindex' in js_content and '"0"' in js_content
-    assert 'role' in js_content and '"region"' in js_content
-    assert 'aria-label' in js_content and '"Code snippet"' in js_content
 
-    # Verify dynamic updates on window resize and removal when not overflowing
-    assert "resize" in js_content
-    assert "removeAttribute" in js_content and "tabindex" in js_content
+@pytest.mark.unit
+def test_navigation_keyboard_css_and_controller_contracts() -> None:
+    """Verify conf.py, custom.css, and navigation.js contracts for switches, drawers, and modindex."""
+    from docs import conf as docs_conf
+
+    assert "navigation.js" in docs_conf.html_js_files
+
+    css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
+    nav_js = (REPO_ROOT / "docs/_static/navigation.js").read_text(encoding="utf-8")
+
+    # 1. .toctree-checkbox transparent 32px switch override & Enter key handler
+    assert "input.toctree-checkbox" in css_content
+    assert "appearance: none" in css_content
+    assert "32px" in css_content
+    assert ".toctree-checkbox:focus-visible" in css_content
+    assert "input.toctree-checkbox" in nav_js
+    assert '"Enter"' in nav_js
+    assert '"switch"' in nav_js
+
+    # 2. Responsive drawer visibility guards (<= 82em TOC, <= 63em sidebar) & inert syncing
+    assert "@media (max-width: 82em)" in css_content
+    assert "#__toc:not(:checked) ~ .page .toc-drawer" in css_content
+    assert "@media (max-width: 63em)" in css_content
+    assert "#__navigation:not(:checked) ~ .page .sidebar-drawer" in css_content
+    assert "visibility: hidden" in css_content
+    assert "(max-width: 63em)" in nav_js
+    assert "(max-width: 82em)" in nav_js
+    assert ".inert" in nav_js
+    assert ".nav-overlay-icon" in nav_js
+    assert ".toc-header-icon:not(.no-toc)" in nav_js
+    assert ".toc-content-icon:not(.no-toc)" in nav_js
+    assert "aria-controls" in nav_js
+    assert "aria-expanded" in nav_js
+    assert '"Escape"' in nav_js
+
+    # 3. py-modindex img.toggler upgrade & focus-visible / forced-colors rules
+    assert "img.toggler" in nav_js
+    assert "plus.png" in nav_js
+    assert "img.toggler:focus-visible" in css_content
+    assert ".nav-overlay-icon:focus-visible" in css_content
+    assert ".toc-header-icon:focus-visible" in css_content
+    assert ".toc-content-icon:focus-visible" in css_content
+
+    # 4. Global #furo-main-content tabindex='-1' & a.back-to-top focus transfer across non-index pages
+    assert "code_blocks.js" in docs_conf.html_js_files
+    assert "furo-main-content" in nav_js
+    assert "a.back-to-top" in nav_js
+    assert "data-btt-bound" in nav_js
+    assert "preventScroll: true" in nav_js
 
 
 @pytest.mark.unit
@@ -769,6 +818,170 @@ __result__ = {
 
 
 @pytest.mark.unit
+def test_accessible_html5_translator_toctree_caption_aria_levels(tmp_path: Path) -> None:
+    """Verify _AccessibleHTML5Translator emits contextual aria-level on toctree captions (WCAG 4.1.2, 1.3.1, ARIA12, G141)."""
+    from docs import conf as docs_conf
+    from docutils import nodes
+    from docutils.utils import new_document
+    from furo.navigation import get_navigation_tree
+    from sphinx import addnodes
+    from sphinx.application import Sphinx
+    from sphinx.util.docutils import docutils_namespace
+
+    # 1. Verify setup(app) registers _AccessibleHTML5Translator for both html and dirhtml
+    class _TranslatorAppStub:
+        def __init__(self) -> None:
+            self.translators: dict[str, object] = {}
+
+        def set_translator(self, name: str, translator_class: object, **_kwargs: object) -> None:
+            self.translators[name] = translator_class
+
+        def add_autodocumenter(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def connect(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    stub_app = _TranslatorAppStub()
+    docs_conf.setup(stub_app)
+    assert stub_app.translators["html"] is docs_conf._AccessibleHTML5Translator
+    assert stub_app.translators["dirhtml"] is docs_conf._AccessibleHTML5Translator
+
+    # 2. Spin up minimal Sphinx html and dirhtml apps wired with docs/conf.py translator
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "conf.py").write_text(
+        'project = "test"\nhtml_theme = "furo"\nmaster_doc = "index"\n',
+        encoding="utf-8",
+    )
+    (src_dir / "index.rst").write_text("Root\n====\n", encoding="utf-8")
+
+    def _make_toctree_caption(text: str) -> addnodes.compact_paragraph:
+        cp = addnodes.compact_paragraph(toctree=True)
+        cp += nodes.title("", text)
+        return cp
+
+    with docutils_namespace():
+        dirhtml_app = Sphinx(
+            srcdir=str(src_dir),
+            confdir=str(src_dir),
+            outdir=str(tmp_path / "out_dirhtml"),
+            doctreedir=str(tmp_path / "doctrees_dirhtml"),
+            buildername="dirhtml",
+        )
+        dirhtml_app.set_translator("dirhtml", docs_conf._AccessibleHTML5Translator)
+        assert dirhtml_app.builder.get_translator_class() is docs_conf._AccessibleHTML5Translator
+        dirhtml_partial = dirhtml_app.builder.render_partial(_make_toctree_caption("Reference:"))[
+            "fragment"
+        ]
+        assert 'aria-level="2"' in dirhtml_partial
+
+    with docutils_namespace():
+        app = Sphinx(
+            srcdir=str(src_dir),
+            confdir=str(src_dir),
+            outdir=str(tmp_path / "out_html"),
+            doctreedir=str(tmp_path / "doctrees_html"),
+            buildername="html",
+        )
+        app.set_translator("html", docs_conf._AccessibleHTML5Translator)
+        assert app.builder.get_translator_class() is docs_conf._AccessibleHTML5Translator
+
+        # 3. Partial sidebar rendering (section_level == 0 -> aria-level="2") + Furo sidebar tree
+        sidebar_partial = app.builder.render_partial(_make_toctree_caption("Tutorials:"))[
+            "fragment"
+        ]
+        assert (
+            '<p aria-level="2" class="caption" role="heading"><span class="caption-text">Tutorials:</span></p>'
+            in sidebar_partial
+        )
+        furo_sidebar_html = get_navigation_tree(sidebar_partial)
+        assert 'role="heading"' in furo_sidebar_html
+        assert 'aria-level="2"' in furo_sidebar_html
+
+        # 4. Full document hierarchy: h1 section -> 2, h2 section -> 3, deep sections -> clamped to 6,
+        #    plus topic/admonition and table captions delegated cleanly to super().visit_title
+        app.builder.prepare_writing({"index"})
+        app.builder.current_docname = "index"
+        app.builder.secnumbers = {"#h2-sec": (1, 1)}
+        app.builder.fignumbers = {"table": {"tbl-1": (1, 1)}}
+
+        doc = new_document("index", app.builder.docsettings)
+
+        sec_h1 = nodes.section(ids=["h1-sec"])
+        sec_h1 += nodes.title("", "Contributing")
+        sec_h1 += _make_toctree_caption("Contributor Guides")
+
+        sec_h2 = nodes.section(ids=["h2-sec"])
+        sec_h2 += nodes.title("", "Documentation Overview")
+        sec_h2 += _make_toctree_caption("How-to Guides:")
+
+        # Nest down to depth 7 (section_level 7 + initial_header_level 1 = 8 -> clamped to 6)
+        parent_sec = sec_h2
+        for depth in range(3, 8):
+            nested = nodes.section(ids=[f"sec-{depth}"])
+            nested += nodes.title("", f"Heading {depth}")
+            if depth in (5, 6, 7):
+                nested += _make_toctree_caption(f"Deep Caption {depth}")
+            parent_sec += nested
+            parent_sec = nested
+
+        # Non-toctree topic title must not get role="heading" or aria-level
+        topic_node = nodes.topic()
+        topic_node += nodes.title("", "Topic Summary")
+        sec_h1 += topic_node
+
+        # Table with title must preserve caption-text wrapper and fignumber without aria-level
+        table = nodes.table(ids=["tbl-1"])
+        table += nodes.title("", "API Stability Matrix")
+        tgroup = nodes.tgroup(cols=1)
+        tgroup += nodes.colspec(colwidth=1)
+        tbody = nodes.tbody()
+        row = nodes.row()
+        entry = nodes.entry()
+        entry += nodes.paragraph(text="Stable")
+        row += entry
+        tbody += row
+        tgroup += tbody
+        table += tgroup
+        sec_h1 += table
+
+        sec_h1 += sec_h2
+        doc += sec_h1
+
+        translator = docs_conf._AccessibleHTML5Translator(doc, app.builder)
+        doc.walkabout(translator)
+        rendered = "".join(translator.body)
+
+    assert (
+        '<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributor Guides</span></p>'
+        in rendered
+    )
+    assert (
+        '<p aria-level="3" class="caption" role="heading"><span class="caption-text">How-to Guides:</span></p>'
+        in rendered
+    )
+    for depth in (5, 6, 7):
+        assert (
+            f'<p aria-level="6" class="caption" role="heading"><span class="caption-text">Deep Caption {depth}</span></p>'
+            in rendered
+        )
+
+    assert '<p class="topic-title">Topic Summary</p>' in rendered
+    # Section numbering and figure numbering stay intact without duplication
+    assert rendered.count('<span class="section-number">1.1. </span>') == 1
+    assert rendered.count('<span class="caption-number">Table 1.1 </span>') == 1
+    assert (
+        '<caption><span class="caption-number">Table 1.1 </span><span class="caption-text">API Stability Matrix</span>'
+        in rendered
+    )
+    assert (
+        "<caption>" in rendered
+        and "aria-level" not in rendered.split("<caption>", 1)[1].split("</caption>", 1)[0]
+    )
+
+
+@pytest.mark.unit
 def test_pyodide_cells_sphinx_extension_and_conf() -> None:
     """Verify native Sphinx Pyodide extension directives, HTML context hooks, and conf.py config."""
     from docs import conf as docs_conf
@@ -821,10 +1034,13 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
     assert _compute_content_root("tutorials/quick_start") == "../"
     assert _compute_content_root("tutorials/examples/quick_start") == "../../"
 
-    # Verify page context hook injects #imednet-pyodide-config and backports content_root
+    # Verify page context hook scopes #imednet-pyodide-config and thebe_pyodide.js to PyodideButtonNode pages
+    from docutils.utils import new_document
+
     class _DummyApp:
         def __init__(self) -> None:
             self.directives: list[str] = []
+            self.js_files: list[str] = []
             self.config = type("Cfg", (), {"pyodide_config": pyodide_cfg})()
 
         def add_config_value(self, *_args: object, **_kwargs: object) -> None:
@@ -836,6 +1052,9 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
         def add_directive(self, name: str, *_args: object, **_kwargs: object) -> None:
             self.directives.append(name)
 
+        def add_js_file(self, filename: str, **_kwargs: object) -> None:
+            self.js_files.append(filename)
+
         def connect(self, *_args: object, **_kwargs: object) -> None:
             pass
 
@@ -845,10 +1064,21 @@ def test_pyodide_cells_sphinx_extension_and_conf() -> None:
     assert "pyodide-button" in dummy_app.directives
     assert "thebe-button" in dummy_app.directives
 
+    non_interactive_ctx: dict[str, str] = {"metatags": ""}
+    _inject_pyodide_page_context(dummy_app, "404", "page.html", non_interactive_ctx, None)
+    assert non_interactive_ctx["content_root"] == "./"
+    assert 'id="imednet-pyodide-config"' not in non_interactive_ctx["metatags"]
+    assert dummy_app.js_files == []
+
+    interactive_doc = new_document("tutorials/quick_start")
+    interactive_doc += PyodideButtonNode()
     ctx: dict[str, str] = {"metatags": ""}
-    _inject_pyodide_page_context(dummy_app, "tutorials/quick_start", "page.html", ctx, None)
+    _inject_pyodide_page_context(
+        dummy_app, "tutorials/quick_start", "page.html", ctx, interactive_doc
+    )
     assert ctx["content_root"] == "../"
     assert '<script id="imednet-pyodide-config" type="application/json">' in ctx["metatags"]
+    assert dummy_app.js_files == ["thebe_pyodide.js"]
 
 
 @pytest.mark.unit
@@ -1213,6 +1443,153 @@ def test_diagram_validator_skips_acc_directives_and_verifies_all_15_diagrams() -
         )
 
 
+@pytest.mark.unit
+def test_scroll_padding_reduced_motion_and_back_to_top_focus_transfer() -> None:
+    """Verify CSS C43 scroll-padding-top, reduced-motion rules, C45 focus ring, and JS focus transfer."""
+    css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
+    showcase_js = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
+
+    # Requirement 1: Root scroll-padding-top (3.5rem default, 6rem at <= 63em)
+    assert re.search(r"html\s*\{\s*scroll-padding-top:\s*3\.5rem;", css_content) is not None
+    assert (
+        re.search(
+            r"@media\s*\(\s*max-width:\s*63em\s*\)\s*\{\s*html\s*\{\s*scroll-padding-top:\s*6rem;",
+            css_content,
+        )
+        is not None
+    )
+
+    # Requirement 2: #furo-main-content:focus-visible 2px solid outline in default and forced-colors
+    main_focus_block = re.search(
+        r"#furo-main-content:focus-visible\s*\{([^}]*)\}",
+        css_content,
+    )
+    assert main_focus_block is not None
+    assert "outline: 2px solid var(--color-brand-primary)" in main_focus_block.group(1)
+    assert "outline-offset: 2px" in main_focus_block.group(1)
+
+    fc_pos = css_content.index("@media (forced-colors: active)")
+    fc_section = css_content[fc_pos:]
+    assert "#furo-main-content:focus-visible" in fc_section
+    assert "outline: 2px solid Highlight !important" in fc_section
+
+    # Requirement 3: @media (prefers-reduced-motion: reduce) sets scroll-behavior: auto
+    rm_match = re.search(
+        r"@media\s*\(\s*prefers-reduced-motion:\s*reduce\s*\)\s*\{([^}]*\{[^}]*\})\s*\}",
+        css_content,
+    )
+    assert rm_match is not None
+    rm_body = rm_match.group(1)
+    for required_sel in ("html", ".sidebar-scroll", ".toc-scroll"):
+        assert required_sel in rm_body
+    assert "scroll-behavior: auto" in rm_body
+
+    # Requirements 4 & 5 + terminology guardrail in showcase.js
+    assert "furo-main-content" in showcase_js
+    assert "a.back-to-top" in showcase_js
+    assert "globalThis.scrollTo" in showcase_js
+    assert "globalThis.matchMedia" in showcase_js
+    assert "preventScroll: true" in showcase_js
+
+    node_bin = shutil.which("node")
+    if node_bin:
+        js_probe = f"""
+        const fs = require("fs");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(REPO_ROOT / "docs/_static/showcase.js"))}, "utf8");
+
+        function runCase(reducedMotion, presetTabindex) {{
+            const attrs = presetTabindex !== null ? {{ tabindex: presetTabindex }} : {{}};
+            const focusCalls = [];
+            const scrollCalls = [];
+            const linkAttrs = {{}};
+            const clickHandlers = [];
+            let prevented = false;
+
+            const mainEl = {{
+                id: "furo-main-content",
+                hasAttribute: (k) => Object.prototype.hasOwnProperty.call(attrs, k),
+                getAttribute: (k) => (Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null),
+                setAttribute: (k, v) => {{ attrs[k] = String(v); }},
+                focus: (opts) => {{ focusCalls.push(opts || {{}}); }}
+            }};
+
+            const bttLink = {{
+                hasAttribute: (k) => Object.prototype.hasOwnProperty.call(linkAttrs, k),
+                setAttribute: (k, v) => {{ linkAttrs[k] = String(v); }},
+                addEventListener: (ev, cb) => {{
+                    if (ev === "click") clickHandlers.push(cb);
+                }}
+            }};
+
+            const win = {{
+                location: {{ hash: "#panel-auditor" }},
+                history: {{ replaceState: () => {{}} }},
+                addEventListener: () => {{}},
+                scrollTo: (opts) => {{ scrollCalls.push(opts); }},
+                matchMedia: (q) => ({{
+                    matches: q === "(prefers-reduced-motion: reduce)" ? reducedMotion : false
+                }})
+            }};
+
+            const doc = {{
+                readyState: "complete",
+                getElementById: (id) => (id === "furo-main-content" ? mainEl : null),
+                querySelectorAll: (sel) => (sel === "a.back-to-top" ? [bttLink] : []),
+                addEventListener: () => {{}},
+                body: {{}}
+            }};
+
+            const sandbox = {{
+                window: win,
+                document: doc,
+                console
+            }};
+            sandbox.globalThis = sandbox;
+            sandbox.scrollTo = win.scrollTo;
+            sandbox.matchMedia = win.matchMedia;
+
+            vm.runInNewContext(source, sandbox);
+
+            const startupTabindex = mainEl.getAttribute("tabindex");
+            clickHandlers.forEach((cb) => cb({{ preventDefault: () => {{ prevented = true; }} }}));
+
+            return {{
+                startupTabindex,
+                prevented,
+                hashAfter: win.location.hash,
+                scrollCalls,
+                focusCalls
+            }};
+        }}
+
+        const smoothRes = runCase(false, null);
+        const reducedRes = runCase(true, null);
+        const presetRes = runCase(false, "0");
+        console.log(JSON.stringify({{ smoothRes, reducedRes, presetRes }}));
+        """
+        proc = subprocess.run(
+            [node_bin, "-e", js_probe], capture_output=True, text=True, check=True
+        )
+        payload = json.loads(proc.stdout)
+
+        assert payload["smoothRes"] == {
+            "startupTabindex": "-1",
+            "prevented": True,
+            "hashAfter": "#panel-auditor",
+            "scrollCalls": [{"top": 0, "behavior": "smooth"}],
+            "focusCalls": [{"preventScroll": True}],
+        }
+        assert payload["reducedRes"] == {
+            "startupTabindex": "-1",
+            "prevented": True,
+            "hashAfter": "#panel-auditor",
+            "scrollCalls": [{"top": 0, "behavior": "auto"}],
+            "focusCalls": [{"preventScroll": True}],
+        }
+        assert payload["presetRes"]["startupTabindex"] == "0"
+
+
 def _launch_chromium_for_accessibility(playwright_instance: object) -> object:
     """Launch headless Chromium with CI-safe flags and local binary fallbacks."""
     launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
@@ -1288,6 +1665,88 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
             check=True,
             cwd=str(REPO_ROOT),
         )
+
+    class _HeadingRoleAuditParser:
+        """Scan built HTML files for [role='heading'] elements and validate aria-level."""
+
+        @staticmethod
+        def audit_directory(
+            root_dir: Path,
+        ) -> tuple[int, list[str], dict[str, list[tuple[str, str | None]]]]:
+            from html.parser import HTMLParser
+
+            class _Parser(HTMLParser):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.headings: list[tuple[str, str | None, str]] = []
+                    self._stack: list[tuple[str, set[str]]] = []
+
+                def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                    attr_map = dict(attrs)
+                    classes = set((attr_map.get("class") or "").split())
+                    if attr_map.get("role") == "heading":
+                        in_sidebar = any("sidebar-tree" in c for _, c in self._stack)
+                        in_toctree = any("toctree-wrapper" in c for _, c in self._stack)
+                        zone = (
+                            "sidebar-tree"
+                            if in_sidebar
+                            else ("toctree-wrapper" if in_toctree else "other")
+                        )
+                        self.headings.append((zone, attr_map.get("aria-level"), tag))
+                    self._stack.append((tag, classes))
+
+                def handle_endtag(self, tag: str) -> None:
+                    for idx in range(len(self._stack) - 1, -1, -1):
+                        if self._stack[idx][0] == tag:
+                            del self._stack[idx:]
+                            break
+
+            total_headings = 0
+            violations: list[str] = []
+            by_page: dict[str, list[tuple[str, str | None]]] = {}
+            valid_levels = {"1", "2", "3", "4", "5", "6"}
+
+            for html_file in sorted(root_dir.rglob("*.html")):
+                rel = html_file.relative_to(root_dir).as_posix()
+                parser = _Parser()
+                parser.feed(html_file.read_text(encoding="utf-8", errors="ignore"))
+                by_page[rel] = [(zone, lvl) for zone, lvl, _tag in parser.headings]
+                for zone, lvl, tag in parser.headings:
+                    total_headings += 1
+                    if lvl not in valid_levels:
+                        violations.append(
+                            f"{rel}: <{tag} role='heading'> in {zone} has invalid aria-level={lvl!r}"
+                        )
+                    elif zone == "sidebar-tree" and lvl != "2":
+                        violations.append(
+                            f"{rel}: .sidebar-tree heading expected aria-level='2', got {lvl!r}"
+                        )
+            return total_headings, violations, by_page
+
+    total_role_headings, heading_violations, page_headings = (
+        _HeadingRoleAuditParser.audit_directory(html_dir)
+    )
+    assert total_role_headings > 0, (
+        "Expected captioned toctree [role='heading'] nodes in built HTML"
+    )
+    assert heading_violations == [], (
+        "Invalid or missing aria-level on [role='heading'] elements:\n"
+        + "\n".join(heading_violations[:25])
+    )
+    idx_wrapper_levels = [
+        lvl for zone, lvl in page_headings.get("index.html", []) if zone == "toctree-wrapper"
+    ]
+    assert idx_wrapper_levels == ["3", "3", "3", "3", "3"], (
+        f"Expected five aria-level='3' toctree captions under <h2> on index.html, got {idx_wrapper_levels}"
+    )
+    contrib_sidebar_levels = [
+        lvl
+        for zone, lvl in page_headings.get("reference/contributing.html", [])
+        if zone == "sidebar-tree"
+    ]
+    assert contrib_sidebar_levels == ["2", "2", "2", "2", "2"], (
+        f"Expected five aria-level='2' sidebar toctree captions on reference/contributing.html, got {contrib_sidebar_levels}"
+    )
 
     class _QuietHandler(SimpleHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
@@ -1682,6 +2141,65 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     f"http://127.0.0.1:{port}/index.html",
                     wait_until="load",
                 )
+
+                # Verify [role="heading"] aria-level hierarchy & caption styling in Chromium
+                idx_heading_audit = idx_page.evaluate(
+                    """() => {
+                        return Array.from(document.querySelectorAll('[role="heading"]')).map((el) => {
+                            const cs = getComputedStyle(el);
+                            return {
+                                text: (el.textContent || '').trim(),
+                                tag: el.tagName,
+                                ariaLevel: el.getAttribute('aria-level'),
+                                inSidebar: !!el.closest('.sidebar-tree'),
+                                inToctreeWrapper: !!el.closest('.toctree-wrapper'),
+                                borderBottomStyle: cs.borderBottomStyle,
+                                borderBottomWidth: parseFloat(cs.borderBottomWidth)
+                            };
+                        });
+                    }"""
+                )
+                assert len(idx_heading_audit) >= 8
+                for h_item in idx_heading_audit:
+                    assert h_item["ariaLevel"] in {"1", "2", "3", "4", "5", "6"}, (
+                        f"index.html [role='heading'] ({h_item['text']!r}) has invalid aria-level={h_item['ariaLevel']!r}"
+                    )
+                    if h_item["inSidebar"]:
+                        assert h_item["ariaLevel"] == "2"
+                    if h_item["inToctreeWrapper"]:
+                        assert h_item["ariaLevel"] == "3"
+                        assert h_item["borderBottomWidth"] == 0.0, (
+                            f"index.html caption {h_item['text']!r} unexpectedly picked up h2 bottom border"
+                        )
+
+                contrib_page = context.new_page()
+                contrib_page.goto(
+                    f"http://127.0.0.1:{port}/reference/contributing.html",
+                    wait_until="load",
+                )
+                contrib_heading_audit = contrib_page.evaluate(
+                    """() => {
+                        return Array.from(document.querySelectorAll('[role="heading"]')).map((el) => {
+                            const cs = getComputedStyle(el);
+                            return {
+                                text: (el.textContent || '').trim(),
+                                ariaLevel: el.getAttribute('aria-level'),
+                                inSidebar: !!el.closest('.sidebar-tree'),
+                                inToctreeWrapper: !!el.closest('.toctree-wrapper'),
+                                borderBottomWidth: parseFloat(cs.borderBottomWidth)
+                            };
+                        });
+                    }"""
+                )
+                contrib_sidebar = [h for h in contrib_heading_audit if h["inSidebar"]]
+                assert len(contrib_sidebar) == 5
+                assert any("Maintainer & Contributor" in h["text"] for h in contrib_sidebar)
+                for h_item in contrib_heading_audit:
+                    assert h_item["ariaLevel"] in {"1", "2", "3", "4", "5", "6"}
+                    assert h_item["borderBottomWidth"] == 0.0
+                    if h_item["inSidebar"]:
+                        assert h_item["ariaLevel"] == "2"
+                contrib_page.close()
 
                 sc_253_checks = idx_page.evaluate(
                     """() => {
@@ -2375,6 +2893,927 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     assert hash_state["integrationHidden"] is True
 
                 idx_page.close()
+
+                # --------------------------------------------------------------
+                # 5. Keyboard navigation: .toctree-checkbox switches, responsive
+                #    drawers (1280x900, 375x812, 320x640, >82em), py-modindex
+                #    img.toggler controls, and 4-mode :focus-visible outlines
+                # --------------------------------------------------------------
+                nav_page = context.new_page()
+                nav_page.set_viewport_size({"width": 1280, "height": 900})
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/index.html",
+                    wait_until="load",
+                )
+                nav_page.add_script_tag(content=contrast_helper_js)
+
+                # 5a. Sequential Tab order & .toctree-checkbox switches on index.html
+                first_tab_stop = None
+                index_tabbed_switches: list[str] = []
+                index_toc_drawer_stops = 0
+                for step_idx in range(90):
+                    nav_page.keyboard.press("Tab")
+                    stop = nav_page.evaluate(
+                        """() => {
+                            const el = document.activeElement;
+                            if (!el || el === document.body) return null;
+                            return {
+                                id: el.id || '',
+                                cls: String(el.className || ''),
+                                inToc: !!el.closest('.toc-drawer')
+                            };
+                        }"""
+                    )
+                    if step_idx == 0:
+                        first_tab_stop = stop
+                    if stop:
+                        if stop["inToc"]:
+                            index_toc_drawer_stops += 1
+                        if (
+                            "toctree-checkbox" in stop["cls"]
+                            and stop["id"] not in index_tabbed_switches
+                        ):
+                            index_tabbed_switches.append(stop["id"])
+
+                assert first_tab_stop is not None and "skip-to-content" in first_tab_stop["cls"], (
+                    f"Expected .skip-to-content as first Tab stop, got {first_tab_stop}"
+                )
+                assert index_toc_drawer_stops == 0, (
+                    f"Closed .toc-drawer at 1280x900 trapped {index_toc_drawer_stops} Tab stops"
+                )
+
+                expected_index_switches = nav_page.evaluate(
+                    """() => Array.from(document.querySelectorAll('.toctree-checkbox'))
+                        .filter((el) => el.getClientRects().length > 0)
+                        .map((el) => ({
+                            id: el.id,
+                            role: el.getAttribute('role'),
+                            label: el.getAttribute('aria-label') || '',
+                            w: el.getBoundingClientRect().width,
+                            h: el.getBoundingClientRect().height
+                        }))"""
+                )
+                assert len(expected_index_switches) >= 9
+                for sw_meta in expected_index_switches:
+                    assert sw_meta["role"] == "switch"
+                    assert sw_meta["label"]
+                    assert sw_meta["w"] >= 32.0 and sw_meta["h"] >= 32.0
+                assert index_tabbed_switches == [s["id"] for s in expected_index_switches]
+
+                # Space and Enter toggle child <ul> and expose/hide nested switches in Tab order
+                nested_parent = nav_page.locator("#toctree-checkbox-5")
+                nested_parent.focus()
+                assert (
+                    nav_page.evaluate("document.getElementById('toctree-checkbox-5').checked")
+                    is False
+                )
+                assert (
+                    nav_page.evaluate(
+                        "getComputedStyle(document.querySelector('#toctree-checkbox-5 ~ ul')).display"
+                    )
+                    == "none"
+                )
+                nav_page.keyboard.press("Enter")
+                assert (
+                    nav_page.evaluate("document.getElementById('toctree-checkbox-5').checked")
+                    is True
+                )
+                assert (
+                    nav_page.evaluate(
+                        "getComputedStyle(document.querySelector('#toctree-checkbox-5 ~ ul')).display"
+                    )
+                    == "block"
+                )
+                assert (
+                    nav_page.evaluate(
+                        "document.querySelector('#toctree-checkbox-5 ~ ul .toctree-checkbox').getClientRects().length > 0"
+                    )
+                    is True
+                )
+                nav_page.keyboard.press("Space")
+                assert (
+                    nav_page.evaluate("document.getElementById('toctree-checkbox-5').checked")
+                    is False
+                )
+                assert (
+                    nav_page.evaluate(
+                        "getComputedStyle(document.querySelector('#toctree-checkbox-5 ~ ul')).display"
+                    )
+                    == "none"
+                )
+
+                # Verify sequential Tab reaches every visible .toctree-checkbox on reference/api/imednet.html
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/reference/api/imednet.html",
+                    wait_until="load",
+                )
+                api_visible_switches = nav_page.evaluate(
+                    """() => Array.from(document.querySelectorAll('.toctree-checkbox'))
+                        .filter((el) => el.getClientRects().length > 0)
+                        .map((el) => el.id)"""
+                )
+                assert len(api_visible_switches) >= 10
+                api_tabbed_switches: list[str] = []
+                for _ in range(130):
+                    nav_page.keyboard.press("Tab")
+                    sw_id = nav_page.evaluate(
+                        """() => {
+                            const el = document.activeElement;
+                            return el && el.classList.contains('toctree-checkbox') ? el.id : '';
+                        }"""
+                    )
+                    if sw_id and sw_id not in api_tabbed_switches:
+                        api_tabbed_switches.append(sw_id)
+                assert api_tabbed_switches == api_visible_switches
+
+                # 5b. Responsive drawers & triggers across 1280x900, 375x812, 320x640, and 1400x900
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/index.html",
+                    wait_until="load",
+                )
+                nav_page.add_script_tag(content=contrast_helper_js)
+
+                drawer_1280 = nav_page.evaluate(
+                    """() => {
+                        const sd = document.querySelector('.sidebar-drawer');
+                        const td = document.querySelector('.toc-drawer');
+                        const tocTrigger = document.querySelector('.toc-content-icon');
+                        return {
+                            sdVis: getComputedStyle(sd).visibility,
+                            sdInert: sd.inert,
+                            tdVis: getComputedStyle(td).visibility,
+                            tdInert: td.inert,
+                            tocRole: tocTrigger.getAttribute('role'),
+                            tocTabIndex: tocTrigger.tabIndex,
+                            tocControls: tocTrigger.getAttribute('aria-controls'),
+                            tocExpanded: tocTrigger.getAttribute('aria-expanded'),
+                            tocLabel: tocTrigger.getAttribute('aria-label') || ''
+                        };
+                    }"""
+                )
+                assert drawer_1280["sdVis"] == "visible" and drawer_1280["sdInert"] is False
+                assert drawer_1280["tdVis"] == "hidden" and drawer_1280["tdInert"] is True
+                assert drawer_1280["tocRole"] == "button"
+                assert drawer_1280["tocTabIndex"] == 0
+                assert drawer_1280["tocControls"] == "furo-toc-drawer"
+                assert drawer_1280["tocExpanded"] == "false"
+                assert drawer_1280["tocLabel"]
+
+                # Open .toc-drawer via Enter, verify focus moves inside, close via Escape -> focus returns
+                nav_page.locator(".toc-content-icon").focus()
+                nav_page.keyboard.press("Enter")
+                toc_open_state = nav_page.evaluate(
+                    """() => {
+                        const td = document.querySelector('.toc-drawer');
+                        const trigger = document.querySelector('.toc-content-icon');
+                        return {
+                            checked: document.getElementById('__toc').checked,
+                            vis: getComputedStyle(td).visibility,
+                            inert: td.inert,
+                            expanded: trigger.getAttribute('aria-expanded'),
+                            focusInside: td.contains(document.activeElement)
+                        };
+                    }"""
+                )
+                assert toc_open_state == {
+                    "checked": True,
+                    "vis": "visible",
+                    "inert": False,
+                    "expanded": "true",
+                    "focusInside": True,
+                }
+                nav_page.keyboard.press("Escape")
+                nav_page.wait_for_timeout(280)
+                toc_closed_state = nav_page.evaluate(
+                    """() => {
+                        const td = document.querySelector('.toc-drawer');
+                        const trigger = document.querySelector('.toc-content-icon');
+                        return {
+                            checked: document.getElementById('__toc').checked,
+                            vis: getComputedStyle(td).visibility,
+                            inert: td.inert,
+                            expanded: trigger.getAttribute('aria-expanded'),
+                            focusRestored: document.activeElement === trigger
+                        };
+                    }"""
+                )
+                assert toc_closed_state == {
+                    "checked": False,
+                    "vis": "hidden",
+                    "inert": True,
+                    "expanded": "false",
+                    "focusRestored": True,
+                }
+
+                # Reopen via Space and verify TOC link click closes drawer & restores trigger focus
+                nav_page.keyboard.press("Space")
+                assert nav_page.evaluate("document.getElementById('__toc').checked") is True
+                nav_page.locator(".toc-drawer .toc-tree a").nth(1).click()
+                nav_page.wait_for_timeout(30)
+                assert nav_page.evaluate("document.getElementById('__toc').checked") is False
+                assert nav_page.evaluate("document.querySelector('.toc-drawer').inert") is True
+                assert (
+                    nav_page.evaluate(
+                        "document.activeElement === document.querySelector('.toc-content-icon')"
+                    )
+                    is True
+                )
+
+                # Mobile viewports (375x812 and 320x640): both drawers closed, 0 off-screen Tab stops
+                for vp_w, vp_h in ((375, 812), (320, 640)):
+                    nav_page.set_viewport_size({"width": vp_w, "height": vp_h})
+                    nav_page.wait_for_timeout(280)
+                    closed_mobile = nav_page.evaluate(
+                        """() => {
+                            const sd = document.querySelector('.sidebar-drawer');
+                            const td = document.querySelector('.toc-drawer');
+                            return {
+                                sdVis: getComputedStyle(sd).visibility,
+                                sdInert: sd.inert,
+                                tdVis: getComputedStyle(td).visibility,
+                                tdInert: td.inert
+                            };
+                        }"""
+                    )
+                    assert closed_mobile == {
+                        "sdVis": "hidden",
+                        "sdInert": True,
+                        "tdVis": "hidden",
+                        "tdInert": True,
+                    }, f"{vp_w}x{vp_h} closed drawers mismatch: {closed_mobile}"
+
+                    # Press Tab 15 times and confirm 0 stops land inside closed drawers
+                    nav_page.evaluate("document.activeElement && document.activeElement.blur()")
+                    for _ in range(15):
+                        nav_page.keyboard.press("Tab")
+                        in_closed = nav_page.evaluate(
+                            """() => {
+                                const el = document.activeElement;
+                                return !!(
+                                    el && (el.closest('.sidebar-drawer') || el.closest('.toc-drawer'))
+                                );
+                            }"""
+                        )
+                        assert in_closed is False, (
+                            f"Closed drawer trapped Tab stop at {vp_w}x{vp_h}"
+                        )
+
+                    # Keyboard toggle #__navigation and #__toc and restore on Escape
+                    for trig_sel, input_id, drawer_sel in (
+                        (".nav-overlay-icon", "__navigation", ".sidebar-drawer"),
+                        (".toc-header-icon", "__toc", ".toc-drawer"),
+                    ):
+                        nav_page.locator(trig_sel).focus()
+                        nav_page.keyboard.press("Space")
+                        opened = nav_page.evaluate(
+                            f"""() => {{
+                                const dr = document.querySelector('{drawer_sel}');
+                                const tr = document.querySelector('{trig_sel}');
+                                return {{
+                                    checked: document.getElementById('{input_id}').checked,
+                                    vis: getComputedStyle(dr).visibility,
+                                    inert: dr.inert,
+                                    expanded: tr.getAttribute('aria-expanded'),
+                                    focusInside: dr.contains(document.activeElement)
+                                }};
+                            }}"""
+                        )
+                        assert opened == {
+                            "checked": True,
+                            "vis": "visible",
+                            "inert": False,
+                            "expanded": "true",
+                            "focusInside": True,
+                        }
+                        nav_page.keyboard.press("Escape")
+                        assert (
+                            nav_page.evaluate(f"document.getElementById('{input_id}').checked")
+                            is False
+                        )
+                        assert (
+                            nav_page.evaluate(f"document.querySelector('{drawer_sel}').inert")
+                            is True
+                        )
+                        assert (
+                            nav_page.evaluate(
+                                f"document.activeElement === document.querySelector('{trig_sel}')"
+                            )
+                            is True
+                        )
+
+                # Wide desktop (> 82em = 1400x900) leaves both drawers visible and non-inert
+                nav_page.set_viewport_size({"width": 1400, "height": 900})
+                nav_page.wait_for_timeout(50)
+                wide_drawers = nav_page.evaluate(
+                    """() => {
+                        const sd = document.querySelector('.sidebar-drawer');
+                        const td = document.querySelector('.toc-drawer');
+                        return {
+                            sdVis: getComputedStyle(sd).visibility,
+                            sdInert: sd.inert,
+                            tdVis: getComputedStyle(td).visibility,
+                            tdInert: td.inert
+                        };
+                    }"""
+                )
+                assert wide_drawers == {
+                    "sdVis": "visible",
+                    "sdInert": False,
+                    "tdVis": "visible",
+                    "tdInert": False,
+                }
+
+                # 5c. py-modindex.html: .no-toc triggers skipped & 5 img.toggler controls
+                nav_page.set_viewport_size({"width": 1280, "height": 900})
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/py-modindex.html",
+                    wait_until="load",
+                )
+                nav_page.add_script_tag(content=contrast_helper_js)
+
+                no_toc_audit = nav_page.evaluate(
+                    """() => {
+                        const hdr = document.querySelector('.toc-header-icon');
+                        const cnt = document.querySelector('.toc-content-icon');
+                        return {
+                            hdrNoToc: hdr.classList.contains('no-toc'),
+                            cntNoToc: cnt.classList.contains('no-toc'),
+                            hdrDisplay: getComputedStyle(hdr).display,
+                            cntDisplay: getComputedStyle(cnt).display,
+                            hdrHasTabindex: hdr.hasAttribute('tabindex'),
+                            cntHasTabindex: cnt.hasAttribute('tabindex')
+                        };
+                    }"""
+                )
+                assert no_toc_audit == {
+                    "hdrNoToc": True,
+                    "cntNoToc": True,
+                    "hdrDisplay": "none",
+                    "cntDisplay": "none",
+                    "hdrHasTabindex": False,
+                    "cntHasTabindex": False,
+                }
+
+                togglers_meta = nav_page.evaluate(
+                    """() => Array.from(document.querySelectorAll('img.toggler')).map((img) => {
+                        const num = img.id.replace(/^toggle-/, '');
+                        return {
+                            id: img.id,
+                            tabIndex: img.tabIndex,
+                            role: img.getAttribute('role'),
+                            expanded: img.getAttribute('aria-expanded'),
+                            label: img.getAttribute('aria-label') || '',
+                            alt: img.getAttribute('alt'),
+                            rowCount: document.querySelectorAll('tr.cg-' + num).length
+                        };
+                    })"""
+                )
+                assert len(togglers_meta) == 5
+                total_toggled_rows = sum(item["rowCount"] for item in togglers_meta)
+                assert total_toggled_rows >= 191, (
+                    f"Expected >= 191 module rows across 5 img.toggler groups, got {total_toggled_rows}"
+                )
+                expected_pkgs = {
+                    "apache_airflow_providers_imednet",
+                    "imednet",
+                    "imednet_sinks",
+                    "imednet_tui",
+                    "imednet_workflows",
+                }
+                assert {item["label"] for item in togglers_meta} == {
+                    f"Toggle {pkg} submodules" for pkg in expected_pkgs
+                }
+
+                for item in togglers_meta:
+                    tid = item["id"]
+                    num = tid.replace("toggle-", "")
+                    assert item["tabIndex"] == 0
+                    assert item["role"] == "button"
+                    assert item["expanded"] == "true"
+                    assert item["alt"] == "-"
+
+                    loc = nav_page.locator(f"#{tid}")
+                    loc.focus()
+                    nav_page.keyboard.press("Enter")
+                    collapsed_check = nav_page.evaluate(
+                        f"""() => {{
+                            const img = document.getElementById('{tid}');
+                            const rows = Array.from(document.querySelectorAll('tr.cg-{num}'));
+                            return {{
+                                expanded: img.getAttribute('aria-expanded'),
+                                alt: img.getAttribute('alt'),
+                                allHidden: rows.length > 0 && rows.every((r) => getComputedStyle(r).display === 'none')
+                            }};
+                        }}"""
+                    )
+                    assert collapsed_check == {
+                        "expanded": "false",
+                        "alt": "+",
+                        "allHidden": True,
+                    }
+
+                    nav_page.keyboard.press("Space")
+                    expanded_check = nav_page.evaluate(
+                        f"""() => {{
+                            const img = document.getElementById('{tid}');
+                            const rows = Array.from(document.querySelectorAll('tr.cg-{num}'));
+                            return {{
+                                expanded: img.getAttribute('aria-expanded'),
+                                alt: img.getAttribute('alt'),
+                                allVisible: rows.length > 0 && rows.every((r) => getComputedStyle(r).display !== 'none')
+                            }};
+                        }}"""
+                    )
+                    assert expanded_check == {
+                        "expanded": "true",
+                        "alt": "-",
+                        "allVisible": True,
+                    }
+
+                # 5d. 4-mode :focus-visible outlines (light, dark, prefers-contrast: more, forced-colors)
+                outline_helper_js = """
+                window.__checkToggleOutline = (sel) => {
+                    const h = window.__wcagHelpers;
+                    const el = document.querySelector(sel);
+                    const cs = getComputedStyle(el);
+                    const oc = h.parseRgb(cs.outlineColor);
+                    const bg = h.effectiveBg(el);
+                    return {
+                        matches: el.matches(':focus-visible'),
+                        style: cs.outlineStyle,
+                        width: cs.outlineWidth,
+                        color: cs.outlineColor,
+                        contrast: oc ? h.ratio(oc, bg) : 0
+                    };
+                };
+                """
+                nav_page.add_script_tag(content=outline_helper_js)
+                for theme in ("light", "dark"):
+                    nav_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    nav_page.locator("#toggle-1").focus()
+                    nav_page.keyboard.press("Shift")
+                    mod_out = nav_page.evaluate("window.__checkToggleOutline('#toggle-1')")
+                    assert mod_out["matches"] is True
+                    assert mod_out["style"] == "solid" and mod_out["width"] == "2px"
+                    assert mod_out["contrast"] >= 4.5
+
+                nav_page.emulate_media(contrast="more")
+                for theme in ("light", "dark"):
+                    nav_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    nav_page.locator("#toggle-1").focus()
+                    nav_page.keyboard.press("Shift")
+                    mod_hc = nav_page.evaluate("window.__checkToggleOutline('#toggle-1')")
+                    assert mod_hc["matches"] is True
+                    assert mod_hc["style"] == "solid" and mod_hc["width"] == "2px"
+                    assert mod_hc["contrast"] >= 7.0
+                nav_page.emulate_media(contrast="no-preference")
+
+                nav_page.emulate_media(forced_colors="active")
+                sys_hl_mod = nav_page.evaluate(
+                    """() => {
+                        const p = document.createElement('span');
+                        p.style.cssText = 'forced-color-adjust: none !important; outline: 2px solid Highlight !important; display: none;';
+                        document.body.appendChild(p);
+                        const c = getComputedStyle(p).outlineColor;
+                        p.remove();
+                        return c;
+                    }"""
+                )
+                nav_page.locator("#toggle-1").focus()
+                nav_page.keyboard.press("Shift")
+                mod_fc = nav_page.evaluate("window.__checkToggleOutline('#toggle-1')")
+                assert mod_fc["matches"] is True
+                assert mod_fc["style"] == "solid" and mod_fc["width"] == "2px"
+                assert mod_fc["color"] == sys_hl_mod
+                nav_page.emulate_media(forced_colors="none")
+
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/index.html",
+                    wait_until="load",
+                )
+                nav_page.add_script_tag(content=contrast_helper_js)
+                nav_page.add_script_tag(content=outline_helper_js)
+
+                for theme in ("light", "dark"):
+                    nav_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    nav_page.set_viewport_size({"width": 1280, "height": 900})
+                    for sel in ("#toctree-checkbox-1", ".toc-content-icon"):
+                        nav_page.locator(sel).focus()
+                        nav_page.keyboard.press("Shift")
+                        res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                        assert res["matches"] is True
+                        assert res["style"] == "solid" and res["width"] == "2px"
+                        assert res["contrast"] >= 4.5
+                    nav_page.set_viewport_size({"width": 375, "height": 812})
+                    for sel in (".nav-overlay-icon", ".toc-header-icon"):
+                        nav_page.locator(sel).focus()
+                        nav_page.keyboard.press("Shift")
+                        res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                        assert res["matches"] is True
+                        assert res["style"] == "solid" and res["width"] == "2px"
+                        assert res["contrast"] >= 4.5
+
+                nav_page.emulate_media(contrast="more")
+                for theme in ("light", "dark"):
+                    nav_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                    nav_page.set_viewport_size({"width": 1280, "height": 900})
+                    for sel in ("#toctree-checkbox-1", ".toc-content-icon"):
+                        nav_page.locator(sel).focus()
+                        nav_page.keyboard.press("Shift")
+                        res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                        assert res["matches"] is True
+                        assert res["style"] == "solid" and res["width"] == "2px"
+                        assert res["contrast"] >= 7.0
+                    nav_page.set_viewport_size({"width": 375, "height": 812})
+                    for sel in (".nav-overlay-icon", ".toc-header-icon"):
+                        nav_page.locator(sel).focus()
+                        nav_page.keyboard.press("Shift")
+                        res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                        assert res["matches"] is True
+                        assert res["style"] == "solid" and res["width"] == "2px"
+                        assert res["contrast"] >= 7.0
+                nav_page.emulate_media(contrast="no-preference")
+
+                nav_page.emulate_media(forced_colors="active")
+                sys_hl_idx = nav_page.evaluate(
+                    """() => {
+                        const p = document.createElement('span');
+                        p.style.cssText = 'forced-color-adjust: none !important; outline: 2px solid Highlight !important; display: none;';
+                        document.body.appendChild(p);
+                        const c = getComputedStyle(p).outlineColor;
+                        p.remove();
+                        return c;
+                    }"""
+                )
+                nav_page.set_viewport_size({"width": 1280, "height": 900})
+                for sel in ("#toctree-checkbox-1", ".toc-content-icon"):
+                    nav_page.locator(sel).focus()
+                    nav_page.keyboard.press("Shift")
+                    res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                    assert res["matches"] is True
+                    assert res["style"] == "solid" and res["width"] == "2px"
+                    assert res["color"] == sys_hl_idx
+                nav_page.set_viewport_size({"width": 375, "height": 812})
+                for sel in (".nav-overlay-icon", ".toc-header-icon"):
+                    nav_page.locator(sel).focus()
+                    nav_page.keyboard.press("Shift")
+                    res = nav_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                    assert res["matches"] is True
+                    assert res["style"] == "solid" and res["width"] == "2px"
+                    assert res["color"] == sys_hl_idx
+                nav_page.emulate_media(forced_colors="none")
+
+                nav_page.close()
+
+                # --------------------------------------------------------------
+                # 6. Scroll-padding-top (C43), Shift+Tab SC 2.4.11 visibility &
+                #    a.back-to-top SC 2.4.7 focus transfer across 5 viewports
+                # --------------------------------------------------------------
+                nav_page = context.new_page()
+                cdp_session = context.new_cdp_session(nav_page)
+                cdp_session.send("Page.enable")
+                try:
+                    # 5a. Reduced-motion scroll-behavior & smooth back-to-top check at 1280x900
+                    nav_page.set_viewport_size({"width": 1280, "height": 900})
+                    nav_page.emulate_media(reduced_motion="no-preference")
+                    nav_page.goto(
+                        f"http://127.0.0.1:{port}/index.html",
+                        wait_until="load",
+                    )
+                    default_scroll_styles = nav_page.evaluate(
+                        """() => ({
+                            html: getComputedStyle(document.documentElement).scrollBehavior,
+                            sidebar: getComputedStyle(document.querySelector('.sidebar-scroll')).scrollBehavior,
+                            toc: getComputedStyle(document.querySelector('.toc-scroll')).scrollBehavior
+                        })"""
+                    )
+                    assert default_scroll_styles == {
+                        "html": "smooth",
+                        "sidebar": "smooth",
+                        "toc": "smooth",
+                    }
+
+                    # Smooth scroll + focus transfer on index.html with #panel-auditor active
+                    nav_page.locator("#tab-auditor").click()
+                    nav_page.evaluate("globalThis.scrollTo({ top: 900, behavior: 'auto' })")
+                    nav_page.wait_for_timeout(40)
+                    nav_page.evaluate("globalThis.scrollTo({ top: 550, behavior: 'auto' })")
+                    nav_page.wait_for_function(
+                        "() => getComputedStyle(document.querySelector('a.back-to-top')).display === 'flex'"
+                    )
+                    nav_page.locator("a.back-to-top").focus()
+                    nav_page.keyboard.press("Enter")
+                    nav_page.wait_for_function("() => window.scrollY === 0", timeout=4000)
+                    smooth_btt = nav_page.evaluate(
+                        """() => {
+                            const mc = document.getElementById('furo-main-content');
+                            const cs = getComputedStyle(mc);
+                            return {
+                                hash: window.location.hash,
+                                activeId: document.activeElement && document.activeElement.id,
+                                focusVisible: mc.matches(':focus-visible'),
+                                outlineStyle: cs.outlineStyle,
+                                outlineWidth: cs.outlineWidth,
+                                outlineOffset: cs.outlineOffset,
+                                auditorSelected: document.getElementById('tab-auditor').getAttribute('aria-selected'),
+                                auditorHidden: document.getElementById('panel-auditor').hasAttribute('hidden')
+                            };
+                        }"""
+                    )
+                    assert smooth_btt == {
+                        "hash": "#panel-auditor",
+                        "activeId": "furo-main-content",
+                        "focusVisible": True,
+                        "outlineStyle": "solid",
+                        "outlineWidth": "2px",
+                        "outlineOffset": "2px",
+                        "auditorSelected": "true",
+                        "auditorHidden": False,
+                    }
+
+                    # Forced-colors focus ring on #furo-main-content:focus-visible (2px solid Highlight)
+                    nav_page.emulate_media(forced_colors="active")
+                    fc_main_ring = nav_page.evaluate(
+                        """() => {
+                            const probe = document.createElement('span');
+                            probe.style.cssText =
+                                'forced-color-adjust: none !important; outline: 2px solid Highlight !important; display: none;';
+                            document.body.appendChild(probe);
+                            const sysHighlight = getComputedStyle(probe).outlineColor;
+                            probe.remove();
+
+                            const mc = document.getElementById('furo-main-content');
+                            const cs = getComputedStyle(mc);
+                            return {
+                                matches: mc.matches(':focus-visible'),
+                                style: cs.outlineStyle,
+                                width: cs.outlineWidth,
+                                offset: cs.outlineOffset,
+                                color: cs.outlineColor,
+                                sysHighlight
+                            };
+                        }"""
+                    )
+                    assert fc_main_ring["matches"] is True
+                    assert fc_main_ring["style"] == "solid"
+                    assert fc_main_ring["width"] == "2px"
+                    assert fc_main_ring["offset"] == "2px"
+                    assert fc_main_ring["color"] == fc_main_ring["sysHighlight"]
+                    nav_page.emulate_media(forced_colors="none")
+
+                    # Reduced-motion scroll-behavior: auto & .skip-to-content preservation of #panel-auditor
+                    nav_page.emulate_media(reduced_motion="reduce")
+                    reduced_scroll_styles = nav_page.evaluate(
+                        """() => ({
+                            html: getComputedStyle(document.documentElement).scrollBehavior,
+                            sidebar: getComputedStyle(document.querySelector('.sidebar-scroll')).scrollBehavior,
+                            toc: getComputedStyle(document.querySelector('.toc-scroll')).scrollBehavior
+                        })"""
+                    )
+                    assert reduced_scroll_styles == {
+                        "html": "auto",
+                        "sidebar": "auto",
+                        "toc": "auto",
+                    }
+
+                    nav_page.locator("#tab-auditor").click()
+                    nav_page.evaluate("globalThis.scrollTo({ top: 700, behavior: 'auto' })")
+                    nav_page.locator("a.skip-to-content").focus()
+                    nav_page.keyboard.press("Enter")
+                    skip_state = nav_page.evaluate(
+                        """() => {
+                            const mc = document.getElementById('furo-main-content');
+                            const cs = getComputedStyle(mc);
+                            return {
+                                scrollY: window.scrollY,
+                                activeId: document.activeElement && document.activeElement.id,
+                                focusVisible: mc.matches(':focus-visible'),
+                                outlineStyle: cs.outlineStyle,
+                                outlineWidth: cs.outlineWidth,
+                                auditorSelected: document.getElementById('tab-auditor').getAttribute('aria-selected'),
+                                auditorHidden: document.getElementById('panel-auditor').hasAttribute('hidden')
+                            };
+                        }"""
+                    )
+                    assert skip_state["scrollY"] == 0
+                    assert skip_state["activeId"] == "furo-main-content"
+                    assert skip_state["focusVisible"] is True
+                    assert skip_state["outlineStyle"] == "solid"
+                    assert skip_state["outlineWidth"] == "2px"
+                    assert skip_state["auditorSelected"] == "true"
+                    assert skip_state["auditorHidden"] is False
+
+                    # 5b. Exhaustive 5-viewport audit: scroll-padding-top, Shift+Tab SC 2.4.11,
+                    #     and a.back-to-top SC 2.4.7 + SC 2.4.3 Tab order
+                    viewport_matrix = [
+                        ("320x640@16px", 320, 640, 16, "96px"),
+                        ("640x450@16px", 640, 450, 16, "96px"),
+                        ("768x600@16px", 768, 600, 16, "96px"),
+                        ("1280x900@16px", 1280, 900, 16, "56px"),
+                        ("1280x900@32px", 1280, 900, 32, "192px"),
+                    ]
+                    audit_pages = [
+                        "index.html",
+                        "how-to/cli.html",
+                        "tutorials/quick_start.html",
+                        "reference/VPAT.html",
+                    ]
+                    traversed_pre_regions = 0
+
+                    for vp_label, vp_w, vp_h, std_fs, expected_padding in viewport_matrix:
+                        nav_page.set_viewport_size({"width": vp_w, "height": vp_h})
+                        cdp_session.send(
+                            "Page.setFontSizes",
+                            {"fontSizes": {"standard": std_fs, "fixed": std_fs}},
+                        )
+
+                        for rel_page in audit_pages:
+                            nav_page.goto(
+                                f"http://127.0.0.1:{port}/{rel_page}",
+                                wait_until="load",
+                            )
+                            page_meta = nav_page.evaluate(
+                                """() => {
+                                    const mc = document.getElementById('furo-main-content');
+                                    return {
+                                        scrollPaddingTop: getComputedStyle(document.documentElement).scrollPaddingTop,
+                                        mainTabindex: mc ? mc.getAttribute('tabindex') : null
+                                    };
+                                }"""
+                            )
+                            assert page_meta["scrollPaddingTop"] == expected_padding, (
+                                f"{vp_label} {rel_page} scroll-padding-top={page_meta['scrollPaddingTop']!r} "
+                                f"!= {expected_padding!r}"
+                            )
+                            assert page_meta["mainTabindex"] == "-1", (
+                                f"{vp_label} {rel_page} #furo-main-content missing tabindex='-1'"
+                            )
+
+                            # Reverse Shift+Tab traversal on representative long pages
+                            if rel_page in ("index.html", "how-to/cli.html"):
+                                nav_page.evaluate(
+                                    "globalThis.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' })"
+                                )
+                                nav_page.locator("footer a").last.focus()
+                                checked_stops = 0
+                                obscured_stops: list[dict[str, object]] = []
+
+                                for _ in range(55):
+                                    nav_page.keyboard.press("Shift+Tab")
+                                    stop_info = nav_page.evaluate(
+                                        """() => {
+                                            const el = document.activeElement;
+                                            if (!el || el === document.body) return { done: true };
+                                            if (el.classList.contains('skip-to-content')) return { done: true };
+                                            if (!el.closest('.content')) return { skip: true };
+                                            const r = el.getBoundingClientRect();
+                                            if (r.width <= 0 || r.height <= 0) return { skip: true };
+
+                                            const mh = document.querySelector('header.mobile-header');
+                                            const mhR = mh && getComputedStyle(mh).display !== 'none'
+                                                ? mh.getBoundingClientRect()
+                                                : null;
+                                            const btt = document.querySelector('a.back-to-top');
+                                            const bttR = btt && getComputedStyle(btt).display !== 'none'
+                                                ? btt.getBoundingClientRect()
+                                                : null;
+
+                                            const completelyUnderMh = !!(
+                                                mhR && r.bottom <= mhR.bottom + 0.5 && r.top < mhR.bottom
+                                            );
+                                            const completelyUnderBtt = !!(
+                                                bttR &&
+                                                r.left >= bttR.left - 0.5 &&
+                                                r.right <= bttR.right + 0.5 &&
+                                                r.top >= bttR.top - 0.5 &&
+                                                r.bottom <= bttR.bottom + 0.5
+                                            );
+
+                                            // Multi-point hit-test across visible box intersection
+                                            const vx0 = Math.max(1, r.left + 1);
+                                            const vx1 = Math.min(window.innerWidth - 2, r.right - 1);
+                                            const vy0 = Math.max(1, r.top + 1);
+                                            const vy1 = Math.min(window.innerHeight - 2, r.bottom - 1);
+                                            let anyUncoveredPoint = false;
+                                            if (vx1 >= vx0 && vy1 >= vy0) {
+                                                for (const fx of [0.2, 0.5, 0.8]) {
+                                                    for (const fy of [0.2, 0.5, 0.8]) {
+                                                        const px = vx0 + (vx1 - vx0) * fx;
+                                                        const py = vy0 + (vy1 - vy0) * fy;
+                                                        const hit = document.elementFromPoint(px, py);
+                                                        if (
+                                                            hit &&
+                                                            !hit.closest('header.mobile-header') &&
+                                                            !hit.closest('a.back-to-top')
+                                                        ) {
+                                                            anyUncoveredPoint = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            return {
+                                                tag: el.tagName,
+                                                id: el.id,
+                                                cls: el.className,
+                                                top: Math.round(r.top),
+                                                bottom: Math.round(r.bottom),
+                                                mhBottom: mhR ? Math.round(mhR.bottom) : 0,
+                                                completelyObscured:
+                                                    completelyUnderMh || completelyUnderBtt || !anyUncoveredPoint
+                                            };
+                                        }"""
+                                    )
+                                    if stop_info.get("done"):
+                                        break
+                                    if stop_info.get("skip"):
+                                        continue
+                                    checked_stops += 1
+                                    if stop_info.get("tag") == "PRE":
+                                        traversed_pre_regions += 1
+                                    if stop_info.get("completelyObscured"):
+                                        obscured_stops.append(stop_info)
+
+                                assert checked_stops >= 8, (
+                                    f"Expected >= 8 Shift+Tab stops inside .content on {vp_label} {rel_page}, "
+                                    f"got {checked_stops}"
+                                )
+                                assert obscured_stops == [], (
+                                    f"SC 2.4.11 obscured Shift+Tab stops on {vp_label} {rel_page}: {obscured_stops}"
+                                )
+
+                            # Back-to-top Enter activation & subsequent Tab focus order (SC 2.4.7 & SC 2.4.3)
+                            if rel_page == "index.html":
+                                nav_page.locator("#tab-auditor").click()
+                            nav_page.evaluate(
+                                "globalThis.scrollTo({ top: Math.min(900, document.documentElement.scrollHeight), behavior: 'auto' })"
+                            )
+                            nav_page.wait_for_timeout(30)
+                            nav_page.evaluate("globalThis.scrollTo({ top: 300, behavior: 'auto' })")
+                            nav_page.wait_for_function(
+                                "() => getComputedStyle(document.querySelector('a.back-to-top')).display === 'flex'"
+                            )
+                            hash_before = nav_page.evaluate("window.location.hash")
+                            nav_page.locator("a.back-to-top").focus()
+                            nav_page.keyboard.press("Enter")
+
+                            btt_check = nav_page.evaluate(
+                                """() => {
+                                    const mc = document.getElementById('furo-main-content');
+                                    const cs = getComputedStyle(mc);
+                                    return {
+                                        scrollY: window.scrollY,
+                                        hash: window.location.hash,
+                                        activeId: document.activeElement && document.activeElement.id,
+                                        focusVisible: mc.matches(':focus-visible'),
+                                        outlineStyle: cs.outlineStyle,
+                                        outlineWidth: cs.outlineWidth,
+                                        outlineOffset: cs.outlineOffset
+                                    };
+                                }"""
+                            )
+                            assert btt_check == {
+                                "scrollY": 0,
+                                "hash": hash_before,
+                                "activeId": "furo-main-content",
+                                "focusVisible": True,
+                                "outlineStyle": "solid",
+                                "outlineWidth": "2px",
+                                "outlineOffset": "2px",
+                            }, f"{vp_label} {rel_page} back-to-top failed: {btt_check}"
+
+                            if rel_page == "index.html":
+                                auditor_preserved = nav_page.evaluate(
+                                    """() => ({
+                                        selected: document.getElementById('tab-auditor').getAttribute('aria-selected'),
+                                        hidden: document.getElementById('panel-auditor').hasAttribute('hidden')
+                                    })"""
+                                )
+                                assert auditor_preserved == {"selected": "true", "hidden": False}
+
+                            nav_page.keyboard.press("Tab")
+                            next_tab_inside_main = nav_page.evaluate(
+                                """() => {
+                                    const mc = document.getElementById('furo-main-content');
+                                    const ae = document.activeElement;
+                                    return Boolean(mc && ae && ae !== mc && mc.contains(ae));
+                                }"""
+                            )
+                            assert next_tab_inside_main is True, (
+                                f"{vp_label} {rel_page} Tab after back-to-top did not focus first control inside #furo-main-content"
+                            )
+
+                    assert traversed_pre_regions >= 1, (
+                        "Expected Shift+Tab audit to traverse overflowing pre[tabindex='0'] code regions"
+                    )
+                finally:
+                    cdp_session.send(
+                        "Page.setFontSizes",
+                        {"fontSizes": {"standard": 16, "fixed": 16}},
+                    )
+                    cdp_session.detach()
+                    nav_page.close()
+
                 context.close()
             finally:
                 browser.close()

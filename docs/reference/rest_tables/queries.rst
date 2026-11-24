@@ -67,11 +67,11 @@ List queries
    * - ``size``
      - Integer
      - ``25``
-     - Maximum number of records to return per page.
+     - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
      - ``annotationId,asc``
-     - Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).
+     - Sorting expression (e.g. ``annotationId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String
      - None

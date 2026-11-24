@@ -67,11 +67,11 @@ List records
    * - ``size``
      - Integer
      - ``25``
-     - Maximum number of records to return per page.
+     - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
      - ``recordId,asc``
-     - Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).
+     - Sorting expression (e.g. ``recordId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String
      - None
@@ -226,6 +226,10 @@ Create records
      - String
      - Required
      - Request media type. Must be ``application/json``.
+   * - ``x-email-notify``
+     - Boolean / String
+     - Optional
+     - Enable email notification on record submission (``true``, ``false``, or recipient email address).
 
 .. rubric:: Path Variables
 
@@ -244,6 +248,8 @@ Create records
 
 .. rubric:: Request Body Schema
 
+The request body must be a JSON array of record objects (``[{...}, ...]``). Each record object in the array supports the following fields:
+
 .. list-table::
    :widths: 25 15 15 45
    :header-rows: 1
@@ -254,20 +260,44 @@ Create records
      - Description
    * - ``formKey``
      - String
-     - Required
-     - Clinical Case Report Form (CRF) unique key identifier.
-   * - ``subjectKey``
-     - String
      - Conditional
-     - Target study participant key (required when updating scheduled records or creating unscheduled records; omit when registering a new subject).
+     - Case Report Form (CRF) unique key identifier. Either ``formKey`` or ``formId`` is required.
+   * - ``formId``
+     - Integer
+     - Conditional
+     - Numeric CRF identifier accepted in place of ``formKey`` (either ``formKey`` or ``formId`` is required).
    * - ``siteName``
      - String
      - Conditional
-     - Clinical research site name (required when registering a new subject).
+     - Clinical research site name. Either ``siteName`` or ``siteId`` is required when registering a new subject.
+   * - ``siteId``
+     - Integer
+     - Conditional
+     - Numeric site identifier accepted in place of ``siteName`` when registering a new subject.
+   * - ``subjectKey``
+     - String
+     - Conditional
+     - Participant subject key. One of ``subjectKey``, ``subjectId``, or ``subjectOid`` is required when creating or updating records for an existing subject (omit when registering a new subject).
+   * - ``subjectId``
+     - Integer
+     - Conditional
+     - Numeric participant subject identifier accepted in place of ``subjectKey``.
+   * - ``subjectOid``
+     - String
+     - Conditional
+     - System-assigned participant subject OID accepted in place of ``subjectKey``.
    * - ``intervalName``
      - String
      - Conditional
-     - Study visit or interval event name (required when updating an existing scheduled record).
+     - Scheduled study visit or interval name. Either ``intervalName`` or ``intervalId`` is required when updating a scheduled visit record.
+   * - ``intervalId``
+     - Integer
+     - Conditional
+     - Numeric study visit or interval identifier accepted in place of ``intervalName`` for scheduled visit records.
+   * - ``recordId``
+     - Integer
+     - Conditional
+     - Existing numeric record identifier used when updating a specific unscheduled record.
    * - ``data``
      - Object
      - Required

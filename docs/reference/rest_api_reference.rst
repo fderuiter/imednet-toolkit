@@ -59,10 +59,10 @@ Status codes
   Request succeeded.
 
 ``202``
-  Accepted — Asynchronous batch job created.
+  Accepted for asynchronous batch processing (such as ``POST /api/v1/edc/studies/{studyKey}/records``).
 
 ``400``
-  Malformed request.
+  Malformed request or validation failure.
 
 ``401``
   Authentication failed.
@@ -73,19 +73,64 @@ Status codes
 ``404``
   Resource not found.
 
+``409``
+  Conflict with the current resource state (mapped to :class:`~imednet.errors.ConflictError`).
+
 ``429``
   Too many requests.
 
 ``500``
   Unknown server error.
 
+Pagination and sorting
+----------------------
+
+Collection ``GET`` endpoints accept standard paging and sorting query parameters:
+
+``page``
+  Zero-based page index (default ``0``).
+
+``size``
+  Maximum number of items returned per page (default ``25``, maximum ``500``).
+
+``sort``
+  Comma-separated property and direction expression ``<property>,<asc|desc>``
+  (for example, ``studyKey,asc`` on ``/studies`` or ``login,asc`` on ``/users``).
+  Valid sort properties depend on the target resource.
+
+Response envelopes
+------------------
+
+Collection list endpoints return a JSON object containing ``metadata``,
+``pagination``, and ``data`` (an array of resource objects):
+
+.. code-block:: json
+
+   {
+     "metadata": { "status": "OK", "method": "GET", "path": "/api/v1/edc/studies", "timestamp": "...", "error": {} },
+     "pagination": { "currentPage": 0, "size": 25, "totalPages": 1, "totalElements": 1, "sort": [] },
+     "data": []
+   }
+
+Batch job endpoints—specifically
+``POST /api/v1/edc/studies/{studyKey}/records`` and
+``GET /api/v1/edc/studies/{studyKey}/jobs/{batchId}``—return flat JSON objects
+directly without ``metadata``, ``pagination``, or ``data`` wrappers.
+
 .. _filter_syntax:
 
 Filtering
 ---------
 
-Endpoints accept a ``filter`` query string composed of key, operator and value
-segments. ``recordDataFilter`` targets dynamic question data within a record.
+Supported list endpoints accept a ``filter`` query string composed of key,
+operator, and value segments. ``recordDataFilter`` targets dynamic question data
+within a record on ``GET /api/v1/edc/studies/{studyKey}/records``.
+
+Not all endpoints support query filtering:
+``GET /api/v1/edc/studies/{studyKey}/intervals`` (``/intervals``),
+``GET /api/v1/edc/studies/{studyKey}/users`` (``/users``), and
+``GET /api/v1/edc/studies/{studyKey}/jobs/{batchId}`` (``/jobs/{batchId}``)—as
+well as ``POST`` endpoints—do not accept ``filter`` or ``recordDataFilter``.
 
 Attributes
 ~~~~~~~~~~
@@ -114,9 +159,14 @@ Operators
 Connectors
 ~~~~~~~~~~
 
-``and`` or ``;``  logical AND
+``;`` (or ``and``)  logical AND
 
-``or``  or `,`     logical OR
+``,`` (or ``or``)   logical OR
+
+Semicolon (``;``) and comma (``,``) connectors cannot be mixed within a single
+``filter`` or ``recordDataFilter`` expression. Combining ``;`` and ``,`` outside
+double quotes fails :func:`~imednet.utils.filters.validate_connector_exclusivity`
+in the SDK and returns HTTP ``400 Bad Request`` from the API.
 
 Dates
 ~~~~~
@@ -127,14 +177,17 @@ Dates are UTC timestamps. When filtering visits by ``startDate``,
 Filter examples
 ~~~~~~~~~~~~~~~
 
-``formId > 10``
+``formId>10``
   Forms with an ID greater than 10.
 
-``formType == "SUBJECT"``
+``formType=="SUBJECT"``
   Subject related forms.
 
-``formId > 10;formType == "SUBJECT"``
+``formId>10;formType=="SUBJECT"``
   Subject related forms with ID greater than 10.
+
+``siteName=="Bright Test Site"``
+  Sites matching a quoted name containing spaces.
 
 ``dateCreated>2000-11-05T14:00:00Z``
   Entities created after 5 November 2000 14:00 UTC.
@@ -151,14 +204,17 @@ recordDataFilter examples
 ``AESER==Serious;GENDER==Male``
   Serious adverse events for male subjects.
 
-``AESER==bronch``
+``AESER=~bronch``
   Adverse events containing ``bronch``.
 
 Notes
 ~~~~~
 
-White space is not allowed between attribute, operator and value. Both ``filter``
-and ``recordDataFilter`` require unique attributes and are case sensitive.
+White space is not allowed outside double quotes (including between attribute,
+operator, and value); wrap string values containing spaces in double quotes.
+Mixing ``;`` (AND) and ``,`` (OR) connectors in the same expression is invalid
+and returns HTTP ``400 Bad Request``. Both ``filter`` and ``recordDataFilter``
+require unique attributes in AND clauses and are case sensitive.
 
 Error responses
 ---------------

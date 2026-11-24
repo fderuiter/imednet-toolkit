@@ -502,3 +502,335 @@ def test_sdk_create_records_batch_with_data_dictionary_prevalidates_once() -> No
         assert post_chunks == [100, 5]
     finally:
         sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_sdk_convenience_batch_preserves_nested_spans_and_partial_mocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Convenience batch methods emit nested poll_jobs spans and preserve partial mock seams."""
+    from contextlib import contextmanager
+    from unittest.mock import AsyncMock
+
+    import imednet.sdk_convenience as sdk_conv_mod
+
+    span_events: list[tuple[str, tuple[str, ...]]] = []
+    active_stack: list[str] = []
+
+    class FakeTracer:
+        @contextmanager
+        def start_as_current_span(self, name: str) -> Any:
+            active_stack.append(name)
+            span_events.append((name, tuple(active_stack)))
+            try:
+                yield
+            finally:
+                active_stack.pop()
+
+    monkeypatch.setattr(sdk_conv_mod, "tracer", FakeTracer())
+
+    sdk = ImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    )
+    try:
+        mock_create = MagicMock(
+            return_value=Job(jobId="J-1", batchId="B-1", state="QUEUED"),
+        )
+        mock_poll_jobs = MagicMock(
+            side_effect=lambda study_key, batch_ids, **_kw: JobPollSummary(
+                study_key=study_key,
+                results={
+                    bid: JobStatus(jobId="J-1", batchId=bid, state="COMPLETED") for bid in batch_ids
+                },
+                failures={},
+                elapsed_total=1.25,
+            )
+        )
+        monkeypatch.setattr(sdk.records, "create", mock_create)
+        monkeypatch.setattr(sdk, "poll_jobs", mock_poll_jobs)
+        partial_summary = sdk.create_records_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 29}}],
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert partial_summary.poll_summary is not None
+        assert partial_summary.poll_summary.elapsed_total == 1.25
+        mock_create.assert_called_once()
+        mock_poll_jobs.assert_called_once()
+    finally:
+        sdk.close()
+
+    # Exercise tracedbound SDK methods directly with jobs.poll_many mocked
+    span_events.clear()
+    sdk2 = ImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    )
+    try:
+        create_spy = MagicMock(return_value=Job(jobId="J-1", batchId="B-1", state="QUEUED"))
+        poll_many_spy = MagicMock(
+            return_value=JobPollSummary(
+                study_key="STUDY",
+                results={"B-1": JobStatus(jobId="J-1", batchId="B-1", state="COMPLETED")},
+                failures={},
+                elapsed_total=2.5,
+            )
+        )
+        monkeypatch.setattr(sdk2.records, "create", create_spy)
+        monkeypatch.setattr(sdk2.jobs, "poll_many", poll_many_spy)
+
+        summary = sdk2.create_records_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 30}}],
+            email_notify="ops@example.test",
+            skip_validation=True,
+            wait_for_completion=True,
+            timeout=15.0,
+            interval=0.5,
+        )
+        assert summary.poll_summary is not None
+        assert summary.poll_summary.elapsed_total == 2.5
+        assert summary.last_job is not None and summary.last_job.state == "COMPLETED"
+        create_spy.assert_called_once_with(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 30}}],
+            email_notify="ops@example.test",
+            schema=None,
+            skip_validation=True,
+        )
+        poll_many_spy.assert_called_once_with(
+            "STUDY",
+            ["B-1"],
+            interval=0.5,
+            timeout=15.0,
+            on_progress=None,
+            fail_fast=False,
+        )
+        assert span_events == [
+            ("create_records_batch", ("create_records_batch",)),
+            ("poll_jobs", ("create_records_batch", "poll_jobs")),
+        ]
+    finally:
+        sdk2.close()
+
+    span_events.clear()
+    async with AsyncImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    ) as async_sdk:
+        acreate_spy = AsyncMock(return_value=Job(jobId="AJ-1", batchId="AB-1", state="QUEUED"))
+        apoll_many_spy = AsyncMock(
+            return_value=JobPollSummary(
+                study_key="STUDY",
+                results={"AB-1": JobStatus(jobId="AJ-1", batchId="AB-1", state="COMPLETED")},
+                failures={},
+                elapsed_total=3.75,
+            )
+        )
+        monkeypatch.setattr(async_sdk.records, "create", acreate_spy)
+        monkeypatch.setattr(async_sdk.jobs, "poll_many", apoll_many_spy)
+
+        asummary = await async_sdk.async_create_records_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 31}}],
+            skip_validation=True,
+            wait_for_completion=True,
+            timeout=20.0,
+            interval=1.0,
+        )
+        assert asummary.poll_summary is not None
+        assert asummary.poll_summary.elapsed_total == 3.75
+        acreate_spy.assert_awaited_once()
+        apoll_many_spy.assert_awaited_once_with(
+            "STUDY",
+            ["AB-1"],
+            interval=1.0,
+            timeout=20.0,
+            on_progress=None,
+            fail_fast=False,
+        )
+        assert span_events == [
+            ("async_create_records_batch", ("async_create_records_batch",)),
+            ("async_poll_jobs", ("async_create_records_batch", "async_poll_jobs")),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_records_endpoint_create_batch_dispatches_poll_single_and_poll_many(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Endpoint create_batch uses JobsEndpoint.poll for 1 chunk and poll_many for >1 chunks."""
+    from unittest.mock import AsyncMock
+
+    from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
+    from imednet.errors.validation import PathTraversalValidationError
+
+    sdk = ImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    )
+    try:
+        seq = 0
+
+        def _fake_sync_create(study_key: str, chunk: list[dict[str, Any]], **_kw: Any) -> Job:
+            nonlocal seq
+            seq += 1
+            return Job(jobId=f"J-{seq}", batchId=f"B-{seq}", state="QUEUED")
+
+        with pytest.raises(PathTraversalValidationError):
+            sdk.records.create_batch("   ", [{"formKey": "F1", "data": {"age": 1}}])
+
+        poll_single_spy = MagicMock(
+            side_effect=lambda _sk, bid, **_kw: JobStatus(
+                jobId=f"J-{bid}", batchId=bid, state="COMPLETED"
+            )
+        )
+        poll_many_spy = MagicMock(
+            side_effect=lambda sk, bids, **_kw: JobPollSummary(
+                study_key=sk,
+                results={
+                    bid: JobStatus(jobId=f"J-{bid}", batchId=bid, state="COMPLETED") for bid in bids
+                },
+                failures={},
+                elapsed_total=1.5,
+            )
+        )
+        monkeypatch.setattr(sdk.records, "create", _fake_sync_create)
+        monkeypatch.setattr(JobsEndpoint, "poll", poll_single_spy)
+        monkeypatch.setattr(JobsEndpoint, "poll_many", poll_many_spy)
+
+        single = sdk.records.create_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 1}}],
+            chunk_size=2,
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert single.batch_ids == ["B-1"]
+        assert poll_single_spy.call_count == 1
+        assert poll_many_spy.call_count == 0
+
+        multi = sdk.records.create_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": i}} for i in range(3)],
+            chunk_size=2,
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert multi.batch_ids == ["B-2", "B-3"]
+        assert poll_single_spy.call_count == 1
+        assert poll_many_spy.call_count == 1
+    finally:
+        sdk.close()
+
+    async with AsyncImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    ) as async_sdk:
+        aseq = 0
+
+        async def _fake_async_create(
+            study_key: str, chunk: list[dict[str, Any]], **_kw: Any
+        ) -> Job:
+            nonlocal aseq
+            aseq += 1
+            return Job(jobId=f"AJ-{aseq}", batchId=f"AB-{aseq}", state="QUEUED")
+
+        with pytest.raises(PathTraversalValidationError):
+            await async_sdk.records.create_batch("   ", [{"formKey": "F1", "data": {"age": 1}}])
+
+        apoll_single_spy = AsyncMock(
+            side_effect=lambda _sk, bid, **_kw: JobStatus(
+                jobId=f"AJ-{bid}", batchId=bid, state="COMPLETED"
+            )
+        )
+        apoll_many_spy = AsyncMock(
+            side_effect=lambda sk, bids, **_kw: JobPollSummary(
+                study_key=sk,
+                results={
+                    bid: JobStatus(jobId=f"AJ-{bid}", batchId=bid, state="COMPLETED")
+                    for bid in bids
+                },
+                failures={},
+                elapsed_total=1.5,
+            )
+        )
+        monkeypatch.setattr(async_sdk.records, "create", _fake_async_create)
+        monkeypatch.setattr(AsyncJobsEndpoint, "poll", apoll_single_spy)
+        monkeypatch.setattr(AsyncJobsEndpoint, "poll_many", apoll_many_spy)
+
+        asingle = await async_sdk.records.create_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 1}}],
+            chunk_size=2,
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert asingle.batch_ids == ["AB-1"]
+        assert apoll_single_spy.await_count == 1
+        assert apoll_many_spy.await_count == 0
+
+        amulti = await async_sdk.records.create_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": i}} for i in range(3)],
+            chunk_size=2,
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert amulti.batch_ids == ["AB-2", "AB-3"]
+        assert apoll_single_spy.await_count == 1
+        assert apoll_many_spy.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_facade_helpers_argument_preparation_and_fallback() -> None:
+    """poll_facade_* helpers omit None on_progress and fall back sequentially when needed."""
+    from unittest.mock import AsyncMock
+
+    from imednet.utils.batch_coordinator import (
+        poll_facade_many_async,
+        poll_facade_many_sync,
+        poll_facade_single_async,
+        poll_facade_single_sync,
+    )
+
+    sync_facade = MagicMock(spec=["poll_job"])
+    sync_facade.poll_job.side_effect = lambda _sk, bid, **_kw: JobStatus(
+        jobId=f"J-{bid}", batchId=bid, state="COMPLETED"
+    )
+    single_res = poll_facade_single_sync(
+        sync_facade, "STUDY", "B1", timeout=10, poll_interval=2, on_progress=None
+    )
+    assert single_res.batch_id == "B1"
+    sync_facade.poll_job.assert_called_once_with("STUDY", "B1", timeout=10, interval=2)
+
+    fallback_summary = poll_facade_many_sync(
+        sync_facade, "STUDY", ["B1", "B2"], timeout=10, poll_interval=2
+    )
+    assert set(fallback_summary.results) == {"B1", "B2"}
+    assert fallback_summary.elapsed_total == 0.0
+
+    async_facade = MagicMock(spec=["async_poll_job"])
+    async_facade.async_poll_job = AsyncMock(
+        side_effect=lambda _sk, bid, **_kw: JobStatus(
+            jobId=f"AJ-{bid}", batchId=bid, state="COMPLETED"
+        )
+    )
+    asingle_res = await poll_facade_single_async(
+        async_facade, "STUDY", "AB1", timeout=12, poll_interval=3, on_progress=None
+    )
+    assert asingle_res.batch_id == "AB1"
+    async_facade.async_poll_job.assert_awaited_once_with("STUDY", "AB1", timeout=12, interval=3)
+
+    afallback_summary = await poll_facade_many_async(
+        async_facade, "STUDY", ["AB1", "AB2"], timeout=12, poll_interval=3
+    )
+    assert set(afallback_summary.results) == {"AB1", "AB2"}
+    assert afallback_summary.elapsed_total == 0.0

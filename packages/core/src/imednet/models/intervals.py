@@ -11,9 +11,9 @@ from imednet.models.engine import ModelEngine
 class FormSummary(ImednetBaseModel):
     """Minimal form details embedded within an interval definition."""
 
-    form_id: int = Field(0, alias="formId")
-    form_key: str = Field("", alias="formKey")
-    form_name: str = Field("", alias="formName")
+    form_id: int | None = Field(default=None, alias="formId")
+    form_key: str | None = Field(default=None, alias="formKey")
+    form_name: str | None = Field(default=None, alias="formName")
 
 
 FormSummary = ModelEngine.get_model('FormSummary', FormSummary)

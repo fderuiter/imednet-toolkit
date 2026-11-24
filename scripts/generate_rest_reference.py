@@ -65,12 +65,40 @@ RESOURCE_METADATA: dict[str, dict[str, str]] = {
 
 QUERY_PARAM_DESCRIPTIONS: dict[str, str] = {
     "page": "Zero-based page index for paged results.",
-    "size": "Maximum number of records to return per page.",
-    "sort": "Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).",
+    "size": "Maximum number of records to return per page (maximum ``500``).",
+    "sort": "Sorting expression in ``<property>,<asc|desc>`` format.",
     "filter": "Attribute query filter expression (see :ref:`filter_syntax`).",
     "recordDataFilter": "Dynamic question data filter expression (see :ref:`filter_syntax`).",
     "includeInactive": "Whether to include inactive users in the returned result set.",
 }
+
+RESOURCE_SORT_DEFAULTS: dict[str, str] = {
+    "studies": "studyKey,asc",
+    "users": "login,asc",
+}
+
+PREFERRED_SORT_FIELDS: dict[str, str] = {
+    "studies": "studyKey",
+    "forms": "formKey",
+    "variables": "variableName",
+    "intervals": "intervalId",
+    "sites": "siteName",
+    "subjects": "subjectKey",
+    "records": "recordId",
+    "record_revisions": "recordRevisionId",
+    "codings": "codingId",
+    "queries": "annotationId",
+    "visits": "visitId",
+    "users": "login",
+}
+
+SECONDARY_SORT_CANDIDATES: tuple[str, ...] = (
+    "dateCreated",
+    "dateModified",
+    "dateCoded",
+    "lastUpdated",
+    "lastName",
+)
 
 PATH_VAR_DESCRIPTIONS: dict[str, str] = {
     "studyKey": "Unique key identifying the clinical study protocol.",
@@ -78,21 +106,55 @@ PATH_VAR_DESCRIPTIONS: dict[str, str] = {
 }
 
 BODY_FIELD_DESCRIPTIONS: dict[str, tuple[str, str, str]] = {
-    "formKey": ("String", "Required", "Clinical Case Report Form (CRF) unique key identifier."),
-    "subjectKey": (
+    "formKey": (
         "String",
         "Conditional",
-        "Target study participant key (required when updating scheduled records or creating unscheduled records; omit when registering a new subject).",
+        "Case Report Form (CRF) unique key identifier. Either ``formKey`` or ``formId`` is required.",
+    ),
+    "formId": (
+        "Integer",
+        "Conditional",
+        "Numeric CRF identifier accepted in place of ``formKey`` (either ``formKey`` or ``formId`` is required).",
     ),
     "siteName": (
         "String",
         "Conditional",
-        "Clinical research site name (required when registering a new subject).",
+        "Clinical research site name. Either ``siteName`` or ``siteId`` is required when registering a new subject.",
+    ),
+    "siteId": (
+        "Integer",
+        "Conditional",
+        "Numeric site identifier accepted in place of ``siteName`` when registering a new subject.",
+    ),
+    "subjectKey": (
+        "String",
+        "Conditional",
+        "Participant subject key. One of ``subjectKey``, ``subjectId``, or ``subjectOid`` is required when creating or updating records for an existing subject (omit when registering a new subject).",
+    ),
+    "subjectId": (
+        "Integer",
+        "Conditional",
+        "Numeric participant subject identifier accepted in place of ``subjectKey``.",
+    ),
+    "subjectOid": (
+        "String",
+        "Conditional",
+        "System-assigned participant subject OID accepted in place of ``subjectKey``.",
     ),
     "intervalName": (
         "String",
         "Conditional",
-        "Study visit or interval event name (required when updating an existing scheduled record).",
+        "Scheduled study visit or interval name. Either ``intervalName`` or ``intervalId`` is required when updating a scheduled visit record.",
+    ),
+    "intervalId": (
+        "Integer",
+        "Conditional",
+        "Numeric study visit or interval identifier accepted in place of ``intervalName`` for scheduled visit records.",
+    ),
+    "recordId": (
+        "Integer",
+        "Conditional",
+        "Existing numeric record identifier used when updating a specific unscheduled record.",
     ),
     "data": (
         "Object",
@@ -155,13 +217,114 @@ def _format_route_path(url_obj: dict[str, Any]) -> str:
     return path_str
 
 
-def _generate_endpoint_rst(operation: dict[str, Any]) -> list[str]:
+def _infer_resource_key(url_obj: dict[str, Any]) -> str:
+    """Infer canonical resource key from URL path segments."""
+    for seg in reversed(url_obj.get("path", [])):
+        norm = _normalize_resource_name(seg)
+        if norm in RESOURCE_METADATA:
+            return norm
+    return "studies"
+
+
+def _extract_sortable_fields(operation: dict[str, Any]) -> list[str]:
+    """Extract scalar top-level item keys from sample ``data`` list response, if present."""
+    responses = operation.get("response", [])
+    if not responses:
+        return []
+    resp_body = responses[0].get("body")
+    if not isinstance(resp_body, str) or not resp_body.strip():
+        return []
+    try:
+        parsed = json.loads(resp_body)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    data_list = parsed.get("data")
+    if not isinstance(data_list, list) or not data_list:
+        return []
+    first_item = data_list[0]
+    if not isinstance(first_item, dict):
+        return []
+    return [
+        key
+        for key, val in first_item.items()
+        if isinstance(key, str) and not isinstance(val, (dict, list))
+    ]
+
+
+def _resolve_sort_param(
+    operation: dict[str, Any],
+    res_key: str,
+    raw_val: str,
+) -> tuple[str, str]:
+    """Derive ``(default_cell, description)`` for ``sort`` from Postman response fields."""
+    default_sort = (
+        raw_val if (raw_val and raw_val != "<string>") else RESOURCE_SORT_DEFAULTS.get(res_key)
+    )
+    default_cell = f"``{default_sort}``" if default_sort else "None"
+    sortable_fields = _extract_sortable_fields(operation)
+
+    if not sortable_fields:
+        if default_sort:
+            return default_cell, f"Sorting expression (e.g. ``{default_sort}``)."
+        return default_cell, QUERY_PARAM_DESCRIPTIONS["sort"]
+
+    asc_field: str | None = None
+    if default_sort:
+        default_prop = default_sort.split(",")[0].strip()
+        if default_prop in sortable_fields:
+            asc_field = default_prop
+    if asc_field is None:
+        preferred = PREFERRED_SORT_FIELDS.get(res_key)
+        if preferred and preferred in sortable_fields:
+            asc_field = preferred
+        else:
+            asc_field = next(
+                (field for field in sortable_fields if field != "studyKey"),
+                sortable_fields[0],
+            )
+
+    desc_field = next(
+        (
+            cand
+            for cand in SECONDARY_SORT_CANDIDATES
+            if cand in sortable_fields and cand != asc_field
+        ),
+        None,
+    )
+    if desc_field is None and len(sortable_fields) > 1:
+        desc_field = next((field for field in sortable_fields if field != asc_field), None)
+
+    if res_key == "users":
+        valid_fields_str = ", ".join(f"``{field}``" for field in sortable_fields)
+        if desc_field:
+            return (
+                default_cell,
+                f"Sorting expression (e.g. ``{asc_field},asc`` or ``{desc_field},desc``; "
+                f"valid fields: {valid_fields_str}).",
+            )
+        return (
+            default_cell,
+            f"Sorting expression (e.g. ``{asc_field},asc``; valid fields: {valid_fields_str}).",
+        )
+
+    if desc_field:
+        return (
+            default_cell,
+            f"Sorting expression (e.g. ``{asc_field},asc`` or ``{desc_field},desc``).",
+        )
+    return default_cell, f"Sorting expression (e.g. ``{asc_field},asc``)."
+
+
+def _generate_endpoint_rst(operation: dict[str, Any], res_key: str = "") -> list[str]:
     """Generate reStructuredText for a single API endpoint operation."""
     op_name = operation.get("name", "Endpoint")
     req = operation.get("request", {})
     method = req.get("method", "GET").upper()
     url_obj = req.get("url", {})
     route_path = _format_route_path(url_obj)
+    effective_res_key = res_key or _infer_resource_key(url_obj)
 
     lines: list[str] = [
         f"{op_name}",
@@ -207,6 +370,15 @@ def _generate_endpoint_rst(operation: dict[str, Any]) -> list[str]:
                 "     - String",
                 "     - Required",
                 "     - Request media type. Must be ``application/json``.",
+            ]
+        )
+    if method == "POST" and route_path == "/api/v1/edc/studies/{studyKey}/records":
+        lines.extend(
+            [
+                "   * - ``x-email-notify``",
+                "     - Boolean / String",
+                "     - Optional",
+                "     - Enable email notification on record submission (``true``, ``false``, or recipient email address).",
             ]
         )
     lines.append("")
@@ -263,13 +435,16 @@ def _generate_endpoint_rst(operation: dict[str, Any]) -> list[str]:
         for q in query_params:
             key = q.get("key", "")
             raw_val = q.get("value", "")
-            default_val = f"``{raw_val}``" if raw_val and raw_val != "<string>" else "None"
             type_str = (
                 "Integer"
                 if key in ("page", "size")
                 else ("Boolean" if key == "includeInactive" else "String")
             )
-            desc = QUERY_PARAM_DESCRIPTIONS.get(key, f"Optional filter attribute for {key}.")
+            if key == "sort":
+                default_val, desc = _resolve_sort_param(operation, effective_res_key, raw_val)
+            else:
+                default_val = f"``{raw_val}``" if raw_val and raw_val != "<string>" else "None"
+                desc = QUERY_PARAM_DESCRIPTIONS.get(key, f"Optional filter attribute for {key}.")
             lines.extend(
                 [
                     f"   * - ``{key}``",
@@ -288,6 +463,18 @@ def _generate_endpoint_rst(operation: dict[str, Any]) -> list[str]:
             [
                 ".. rubric:: Request Body Schema",
                 "",
+            ]
+        )
+        if body_raw.lstrip().startswith("["):
+            lines.extend(
+                [
+                    "The request body must be a JSON array of record objects (``[{...}, ...]``). "
+                    "Each record object in the array supports the following fields:",
+                    "",
+                ]
+            )
+        lines.extend(
+            [
                 ".. list-table::",
                 "   :widths: 25 15 15 45",
                 "   :header-rows: 1",
@@ -298,7 +485,8 @@ def _generate_endpoint_rst(operation: dict[str, Any]) -> list[str]:
                 "     - Description",
             ]
         )
-        for field, (f_type, req_str, f_desc) in BODY_FIELD_DESCRIPTIONS.items():
+        for field, (f_type, f_req, f_desc) in BODY_FIELD_DESCRIPTIONS.items():
+            req_str = f_req if isinstance(f_req, str) else ("Required" if f_req else "Optional")
             lines.extend(
                 [
                     f"   * - ``{field}``",
@@ -464,7 +652,7 @@ def generate_rest_reference(
             )
         else:
             for op in ops:
-                rst_lines.extend(_generate_endpoint_rst(op))
+                rst_lines.extend(_generate_endpoint_rst(op, res_key=res_key))
 
         content = "\n".join(rst_lines).rstrip() + "\n"
         file_path.write_text(content, encoding="utf-8")

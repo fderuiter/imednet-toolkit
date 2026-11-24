@@ -45,9 +45,13 @@ from imednet.spi.utils import (
     InvalidJobStateError,
     InvalidJobTransitionError,
     JobFailedError,
+    PathTraversalValidationError,
     evaluate_job_state,
+    global_sensitivity_registry,
+    mask_clinical_phi,
     redact_sensitive_payload,
     redact_sensitive_text,
+    validate_path_segment,
 )
 
 from .terminal import is_interactive_terminal
@@ -80,10 +84,55 @@ _QUOTED_SENSITIVE_KEY_RE = re.compile(
     r"""authorization|client[_-]?secret|private[_-]?key|access[_-]?key|auth[_-]?key|"""
     r"""credential|token|password|secret)\1(\s*:\s*)(['"])[^'"]*\4"""
 )
+_PHI_MASKED_SENTINEL = "***MASKED***"
+_PHI_QUOTED_KV_RE = re.compile(
+    r"""(?<![A-Za-z0-9_-])(?P<q1>['"]?)(?P<key>[A-Za-z][A-Za-z0-9_-]*)(?P=q1)"""
+    r"""(?P<sep>\s*[:=]\s*)(?P<q2>['"])(?P<val>(?:\\.|(?!(?P=q2))[^\r\n])*)(?P=q2)"""
+)
+_PHI_UNQUOTED_KV_RE = re.compile(
+    r"""(?<![A-Za-z0-9_-])(?P<q1>['"]?)(?P<key>[A-Za-z][A-Za-z0-9_-]*)(?P=q1)"""
+    r"""(?P<sep>\s*[:=]\s*)"""
+    r"""(?P<val>[^'"\s,;&\)\]\}\r\n](?:[^\r\n,;&\)\]\}]*?(?=(?:\s+[A-Za-z][A-Za-z0-9_-]*\s*[:=])|[,;&\)\]\}\r\n]|$))?)"""
+)
+
+
+def _sanitize_structured_payload(value: Any) -> Any:
+    """Apply clinical PHI masking and credential redaction to structured payloads."""
+    masked = mask_clinical_phi(value, registry=global_sensitivity_registry)
+    return redact_sensitive_payload(masked)
+
+
+def _mask_phi_key_value_text(text: str) -> str:
+    """Mask formatted key-value clinical PHI substrings matched by ``global_sensitivity_registry``."""
+
+    def _replace_quoted(match: re.Match[str]) -> str:
+        key = match.group("key")
+        if not global_sensitivity_registry.is_sensitive(key):
+            return match.group(0)
+        q1 = match.group("q1")
+        sep = match.group("sep")
+        q2 = match.group("q2")
+        return f"{q1}{key}{q1}{sep}{q2}{_PHI_MASKED_SENTINEL}{q2}"
+
+    def _replace_unquoted(match: re.Match[str]) -> str:
+        key = match.group("key")
+        if not global_sensitivity_registry.is_sensitive(key):
+            return match.group(0)
+        raw_val = match.group("val")
+        stripped = raw_val.rstrip()
+        if not stripped or stripped in {_PHI_MASKED_SENTINEL, "***"}:
+            return match.group(0)
+        trailing = raw_val[len(stripped) :]
+        q1 = match.group("q1")
+        sep = match.group("sep")
+        return f"{q1}{key}{q1}{sep}{_PHI_MASKED_SENTINEL}{trailing}"
+
+    masked = _PHI_QUOTED_KV_RE.sub(_replace_quoted, text)
+    return _PHI_UNQUOTED_KV_RE.sub(_replace_unquoted, masked)
 
 
 def _sanitize_text(value: Any) -> str:
-    """Redact sensitive credentials, headers, and URL query parameters from text or errors."""
+    """Redact sensitive credentials, clinical PHI, headers, and URL query parameters from text."""
     if isinstance(value, BaseException):
         if len(value.args) == 1 and isinstance(value.args[0], (dict, list, tuple)):
             payload_source: Any = value.args[0]
@@ -91,9 +140,10 @@ def _sanitize_text(value: Any) -> str:
             payload_source = str(value)
     else:
         payload_source = value
-    redacted_payload = redact_sensitive_payload(payload_source)
+    redacted_payload = _sanitize_structured_payload(payload_source)
     sanitized = redact_sensitive_text(str(redacted_payload))
-    return _QUOTED_SENSITIVE_KEY_RE.sub(r"\1\2\1\3\4***\4", sanitized)
+    sanitized = _QUOTED_SENSITIVE_KEY_RE.sub(r"\1\2\1\3\4***\4", sanitized)
+    return _mask_phi_key_value_text(sanitized)
 
 
 def _get_configured_attr(obj: object, name: str) -> Any:
@@ -297,7 +347,7 @@ class TextualLogHandler(logging.Handler):
         self.log_widget = log_widget
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Format, redact, and write log record to widget.
+        """Format, redact, mask clinical PHI, and write log record to widget.
 
         Args:
             record: The logging LogRecord to emit.
@@ -305,12 +355,14 @@ class TextualLogHandler(logging.Handler):
         try:
             sanitized_record = copy.copy(record)
             if isinstance(record.msg, (dict, list, tuple)):
-                sanitized_record.msg = redact_sensitive_payload(record.msg)
+                sanitized_record.msg = _sanitize_structured_payload(record.msg)
             if isinstance(record.args, dict):
-                sanitized_record.args = redact_sensitive_payload(record.args)
+                sanitized_record.args = _sanitize_structured_payload(record.args)
             elif isinstance(record.args, tuple):
                 sanitized_record.args = tuple(
-                    redact_sensitive_payload(arg) if isinstance(arg, (dict, list, tuple)) else arg
+                    _sanitize_structured_payload(arg)
+                    if isinstance(arg, (dict, list, tuple))
+                    else arg
                     for arg in record.args
                 )
             msg = _sanitize_text(self.format(sanitized_record))
@@ -708,13 +760,15 @@ class _TrackedJobPlaceholder:
         status: str = "FAILED",
         *,
         is_terminal: bool = False,
+        non_retryable: bool = False,
     ) -> None:
         """Initialize placeholder with job ID, status, and terminal flag.
 
         Args:
             job_id: Identifier of the tracked job.
-            status: Status display string, such as FAILED, NOT_FOUND, or UNKNOWN.
+            status: Status display string, such as FAILED, NOT_FOUND, INVALID, or UNKNOWN.
             is_terminal: Whether background polling should treat this placeholder as terminal.
+            non_retryable: Whether manual refreshes should skip re-polling this placeholder.
         """
         self.job_id = job_id
         self.batch_id = job_id
@@ -724,6 +778,7 @@ class _TrackedJobPlaceholder:
         self.job_status = status
         self.date_created = ""
         self.is_terminal = is_terminal
+        self.non_retryable = non_retryable
 
 
 @dataclass
@@ -735,6 +790,7 @@ class _TrackedJobEntry:
     last_state: JobState | str | None = None
     is_terminal: bool = False
     warning: str | None = None
+    record_errors: list[dict[str, Any]] | None = None
 
 
 def _extract_entry_row(entry: _TrackedJobEntry) -> tuple[str, str, str, str, str, str]:
@@ -832,10 +888,62 @@ def _resolve_entry_state_color(entry: _TrackedJobEntry, state_str: str) -> str:
     return "red"
 
 
+def _extract_job_record_error_lines(entry: _TrackedJobEntry) -> list[str]:
+    """Extract sanitized per-Record error lines from ``entry.last_job.results`` or ``record_errors``."""
+    job = entry.last_job
+    results = getattr(job, "results", None) if job is not None else None
+    raw_items: list[Any] = []
+    if isinstance(results, list):
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            item_status = str(item.get("status") or "").upper()
+            has_err = bool(item.get("error") or item.get("errors"))
+            if item_status in {"FAIL", "FAILED", "ERROR"} or (not item_status and has_err):
+                raw_items.append(item)
+    elif isinstance(results, dict):
+        nested = results.get("errors")
+        if isinstance(nested, list):
+            raw_items.extend(nested)
+        elif results.get("error"):
+            raw_items.append(results)
+    if not raw_items and entry.record_errors:
+        raw_items.extend(entry.record_errors)
+
+    lines: list[str] = []
+    for idx, item in enumerate(raw_items, start=1):
+        if isinstance(item, dict):
+            sanitized_item = cast(dict[str, Any], _sanitize_structured_payload(item))
+            ident_parts: list[str] = []
+            for id_key, label in (
+                ("recordId", "recordId"),
+                ("record_id", "record_id"),
+                ("subjectKey", "subjectKey"),
+                ("subject_key", "subject_key"),
+                ("formKey", "formKey"),
+                ("form_key", "form_key"),
+            ):
+                if id_key in sanitized_item and sanitized_item[id_key] not in (None, ""):
+                    ident_parts.append(f"{label}={_sanitize_text(sanitized_item[id_key])}")
+            detail_val = (
+                sanitized_item.get("error")
+                or sanitized_item.get("errors")
+                or sanitized_item.get("message")
+                or sanitized_item.get("description")
+                or sanitized_item
+            )
+            prefix = f"Record ({', '.join(ident_parts)})" if ident_parts else f"Record #{idx}"
+            lines.append(f"- {prefix}: {_sanitize_text(detail_val)}")
+        elif item is not None:
+            lines.append(f"- Record #{idx}: {_sanitize_text(item)}")
+    return lines
+
+
 class JobTable(DataTable[Text]):
     """Keyboard-scrollable table displaying tracked background study jobs."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
+        ("enter,space", "toggle_job_detail", "Inspect Job"),
         ("delete,backspace", "untrack_selected_job", "Untrack Job"),
     ]
 
@@ -882,14 +990,36 @@ class JobTable(DataTable[Text]):
             if preserve_cursor and prev_row > 0:
                 self.move_cursor(row=min(prev_row, len(rows) - 1))
 
-    def action_untrack_selected_job(self) -> None:
-        """Remove the currently highlighted job row from the enclosing JobMonitor."""
+    def _selected_batch_id(self) -> tuple[int, str] | None:
+        """Return ``(row_idx, batch_id)`` for the currently highlighted job row, if any."""
         if not self.is_mounted or self.row_count <= 0:
-            return
+            return None
         row_idx = self.cursor_row
         if row_idx < 0 or row_idx >= self.row_count:
-            return
+            return None
         batch_id = str(self.get_row_at(row_idx)[0]).strip()
+        return row_idx, batch_id
+
+    def action_toggle_job_detail(self) -> None:
+        """Toggle the inline ``#job_detail_panel`` for the currently highlighted job row."""
+        selected = self._selected_batch_id()
+        if selected is None:
+            return
+        row_idx, batch_id = selected
+        for ancestor in self.ancestors:
+            if isinstance(ancestor, JobMonitor):
+                if batch_id and batch_id != "-":
+                    ancestor.toggle_job_detail(batch_id)
+                elif 0 <= row_idx < len(ancestor.tracked_job_ids):
+                    ancestor.toggle_job_detail(ancestor.tracked_job_ids[row_idx])
+                break
+
+    def action_untrack_selected_job(self) -> None:
+        """Remove the currently highlighted job row from the enclosing JobMonitor."""
+        selected = self._selected_batch_id()
+        if selected is None:
+            return
+        row_idx, batch_id = selected
         for ancestor in self.ancestors:
             if isinstance(ancestor, JobMonitor):
                 if batch_id and batch_id != "-":
@@ -936,6 +1066,21 @@ class JobMonitor(Container):
     JobMonitor #job_table {
         height: 1fr;
     }
+
+    JobMonitor #job_detail_panel {
+        display: none;
+        height: auto;
+        max-height: 6;
+        overflow-y: auto;
+        padding: 0 1;
+        background: $panel;
+        color: $text;
+        border-top: solid $primary;
+    }
+
+    JobMonitor #job_detail_panel.visible {
+        display: block;
+    }
     """
 
     MAX_CONCURRENT_POLLS: ClassVar[int] = 5
@@ -965,6 +1110,8 @@ class JobMonitor(Container):
         self._study_jobs: dict[str, dict[str, _TrackedJobEntry]] = {}
         self._unassigned_job_ids: list[str] = []
         self._rendered_study_key: str | None = None
+        self._inspected_job_id: str | None = None
+        self._detail_text: str = ""
         self._summary_renderable = Text("Job Monitor: Select a study to view background jobs.")
         self._summary_text = self._summary_renderable.markup
 
@@ -1040,13 +1187,109 @@ class JobMonitor(Container):
             self._pause_timer()
 
     def compose(self) -> ComposeResult:
-        """Compose inline batch input, status notice, and scrollable jobs table."""
+        """Compose inline batch input, status notice, jobs table, and inline detail panel."""
         yield Input(
             placeholder="Enter batch ID(s) to track (e.g. BATCH-001) and press Enter...",
             id="batch_id_input",
         )
         yield Static(self._summary_renderable.plain, id="job_monitor_notice", markup=False)
         yield JobTable(id="job_table")
+        yield Static("", id="job_detail_panel", markup=False)
+
+    def _resolve_entry_for_detail(self, job_id: str) -> _TrackedJobEntry | None:
+        """Resolve a ``_TrackedJobEntry`` for ``job_id`` in the active study."""
+        if self.current_study_key is None:
+            return None
+        entries = self._study_jobs.get(self.current_study_key, {})
+        if job_id in entries:
+            return entries[job_id]
+        for entry in entries.values():
+            if _extract_entry_row(entry)[0] == job_id:
+                return entry
+        return None
+
+    def _format_job_detail_text(self, job_id: str) -> str | None:
+        """Build sanitized inline detail text for ``job_id``, or None if untracked."""
+        if self.current_study_key is None:
+            if job_id not in self._unassigned_job_ids:
+                return None
+            return (
+                f"Job Details: {_sanitize_text(job_id)} [QUEUED]\n"
+                "Status: Queued — select a study to bind and poll this batch."
+            )
+
+        entry = self._resolve_entry_for_detail(job_id)
+        if entry is None:
+            return None
+
+        batch_id, state_str, progress_str, total_str, failed_str, _ = _extract_entry_row(entry)
+        lines = [
+            f"Job Details: {_sanitize_text(batch_id)} [{_sanitize_text(state_str)}] "
+            f"(progress={progress_str}, total={total_str}, failed={failed_str})"
+        ]
+        job = entry.last_job
+        raw_res_err = getattr(job, "result_error", None) if job is not None else None
+        sanitized_res_err = (
+            _sanitize_text(raw_res_err.strip())
+            if isinstance(raw_res_err, str) and raw_res_err.strip()
+            else None
+        )
+        if sanitized_res_err:
+            lines.append(f"Result Error: {sanitized_res_err}")
+
+        record_error_lines = _extract_job_record_error_lines(entry)
+        if record_error_lines:
+            lines.append(f"Record Errors ({len(record_error_lines)}):")
+            lines.extend(record_error_lines)
+
+        if entry.warning:
+            sanitized_warn = _sanitize_text(entry.warning)
+            if sanitized_warn != sanitized_res_err:
+                lines.append(f"Diagnostic: {sanitized_warn}")
+
+        if len(lines) == 1:
+            lines.append("No errors reported.")
+        return "\n".join(lines)
+
+    def _sync_job_detail_panel(self) -> None:
+        """Synchronize ``#job_detail_panel`` content and visibility with ``_inspected_job_id``."""
+        if self._inspected_job_id is None:
+            self._detail_text = ""
+        else:
+            rendered = self._format_job_detail_text(self._inspected_job_id)
+            if rendered is None:
+                self._inspected_job_id = None
+                self._detail_text = ""
+            else:
+                self._detail_text = rendered
+
+        if not self.is_mounted:
+            return
+        with contextlib.suppress(Exception):
+            panel = self.query_one("#job_detail_panel", Static)
+            panel.update(self._detail_text)
+            panel.set_class(bool(self._inspected_job_id), "visible")
+
+    def toggle_job_detail(self, job_id: str) -> bool:
+        """Toggle inline ``#job_detail_panel`` for ``job_id``; return True when open."""
+        cleaned = job_id.strip()
+        if not cleaned:
+            return False
+        if self._inspected_job_id == cleaned:
+            self._inspected_job_id = None
+            self._sync_job_detail_panel()
+            return False
+        self._inspected_job_id = cleaned
+        self._sync_job_detail_panel()
+        return self._inspected_job_id is not None
+
+    def close_job_detail(self) -> bool:
+        """Close ``#job_detail_panel`` if open; return True when a panel was closed."""
+        if self._inspected_job_id is None:
+            return False
+        self._inspected_job_id = None
+        self._sync_job_detail_panel()
+        return True
 
     def update(self, content: str | Text = "") -> None:
         """Store summary text or renderable for non-composited inspection and testing."""
@@ -1081,6 +1324,53 @@ class JobMonitor(Container):
         with contextlib.suppress(Exception):
             table = self.query_one("#job_table", JobTable)
             table.set_job_rows(rows, preserve_cursor=preserve_cursor)
+        self._sync_job_detail_panel()
+
+    def _render_unassigned_jobs(self) -> None:
+        """Render queued CLI batch IDs prior to study selection without starting polling."""
+        self._pause_timer()
+        self._rendered_study_key = None
+        if not self._unassigned_job_ids:
+            self._update_ui(
+                summary=Text("Job Monitor: Select a study to view background jobs."),
+                notice_text=(
+                    "Select a study to monitor jobs. Upstream iMednet APIs require batch IDs; "
+                    "enter batch ID(s) above once a study is active."
+                ),
+                rows=(),
+                preserve_cursor=False,
+            )
+            return
+
+        rows: list[tuple[Text, Text, Text, Text, Text, Text]] = []
+        summary_parts: list[str | Text | tuple[str, str]] = [
+            (f"Queued Jobs ({len(self._unassigned_job_ids)})", "bold")
+        ]
+        sanitized_ids: list[str] = []
+        for jid in self._unassigned_job_ids:
+            safe_id = _sanitize_text(jid)
+            sanitized_ids.append(safe_id)
+            rows.append(
+                (
+                    Text(safe_id),
+                    Text("QUEUED", style="yellow"),
+                    Text("-"),
+                    Text("-"),
+                    Text("-"),
+                    Text("-"),
+                )
+            )
+            summary_parts.extend(["\n", ("QUEUED", "yellow"), f" - Job ({safe_id})"])
+        notice_text = (
+            f"Queued Jobs ({len(rows)}) — select a study to start polling: "
+            f"{', '.join(sanitized_ids)}"
+        )
+        self._update_ui(
+            summary=Text.assemble(*summary_parts),
+            notice_text=notice_text,
+            rows=rows,
+            preserve_cursor=True,
+        )
 
     def _render_empty_study_jobs(self, study_key: str) -> None:
         """Pause background polling and display the empty-study batch prompt."""
@@ -1124,13 +1414,7 @@ class JobMonitor(Container):
             self._sync_timer_for_study(self.current_study_key)
             self.schedule_refresh()
         else:
-            self._update_ui(
-                summary=Text("Job Monitor: Select a study to view background jobs."),
-                notice_text=(
-                    "Select a study to monitor jobs. Upstream iMednet APIs require batch IDs; "
-                    "enter batch ID(s) above once a study is active."
-                ),
-            )
+            self._render_unassigned_jobs()
 
     def track_jobs(
         self,
@@ -1160,7 +1444,10 @@ class JobMonitor(Container):
                 existing = entries.get(jid)
                 if existing is None:
                     entries[jid] = _TrackedJobEntry(job_id=jid)
-                elif isinstance(existing.last_job, _TrackedJobPlaceholder):
+                elif (
+                    isinstance(existing.last_job, _TrackedJobPlaceholder)
+                    and not existing.last_job.non_retryable
+                ):
                     existing.last_job = None
                     existing.is_terminal = False
                     existing.warning = None
@@ -1170,6 +1457,8 @@ class JobMonitor(Container):
             for jid in parsed_ids:
                 if jid not in self._unassigned_job_ids:
                     self._unassigned_job_ids.append(jid)
+            if self.current_study_key is None:
+                self._render_unassigned_jobs()
 
         if refresh and target_study and target_study == self.current_study_key:
             self._sync_timer_for_study(target_study)
@@ -1211,6 +1500,8 @@ class JobMonitor(Container):
             if removed_key is None:
                 return False
             del entries[removed_key]
+            if self._inspected_job_id in {cleaned, removed_key}:
+                self._inspected_job_id = None
             if target_study == self.current_study_key:
                 self._sync_timer_for_study(target_study)
                 if entries:
@@ -1221,16 +1512,41 @@ class JobMonitor(Container):
 
         if cleaned in self._unassigned_job_ids:
             self._unassigned_job_ids.remove(cleaned)
+            if self._inspected_job_id == cleaned:
+                self._inspected_job_id = None
+            if self.current_study_key is None:
+                self._render_unassigned_jobs()
             return True
         return False
 
+    def _show_validation_warning(self, warning_message: str) -> None:
+        """Display an immediate sanitized validation warning without starting background polls."""
+        sanitized = _sanitize_text(warning_message)
+        logging.getLogger("imednet_tui").warning("Invalid batch ID input: %s", sanitized)
+        notice_msg = f"Validation Warning: {sanitized}"
+        self.update(Text.assemble((notice_msg, "yellow")))
+        if self.is_mounted:
+            with contextlib.suppress(Exception):
+                self.query_one("#job_monitor_notice", Static).update(notice_msg)
+            if hasattr(self.app, "notify"):
+                self.app.notify(sanitized, severity="warning", markup=False)
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Register batch IDs submitted from the inline input control."""
+        """Validate and register batch IDs submitted from the inline input control."""
         if event.input.id != "batch_id_input":
             return
         batch_ids = _normalize_batch_ids(event.value)
         event.input.value = ""
         if not batch_ids:
+            return
+        invalid_messages: list[str] = []
+        for token in batch_ids:
+            try:
+                validate_path_segment(token, name="batch_id")
+            except PathTraversalValidationError as err:
+                invalid_messages.append(_sanitize_text(err))
+        if invalid_messages:
+            self._show_validation_warning("; ".join(invalid_messages))
             return
         if not self.current_study_key:
             if hasattr(self.app, "notify"):
@@ -1316,7 +1632,7 @@ class JobMonitor(Container):
 
         try:
             is_done = evaluate_job_state(job, previous_state=prev_state)
-        except JobFailedError:
+        except JobFailedError as err:
             if prev_state is not None and (
                 raw_state is None or not is_valid_job_transition(prev_state, raw_state)
             ):
@@ -1332,7 +1648,8 @@ class JobMonitor(Container):
             if raw_state is not None:
                 entry.last_state = raw_state
             entry.is_terminal = True
-            entry.warning = None
+            entry.record_errors = list(err.record_errors) if err.record_errors else None
+            entry.warning = _sanitize_text(err)
         except (InvalidJobStateError, InvalidJobTransitionError) as err:
             sanitized_err = _sanitize_text(err)
             logging.getLogger("imednet_tui").warning(
@@ -1356,6 +1673,7 @@ class JobMonitor(Container):
             entry.last_job = job
             if raw_state is not None:
                 entry.last_state = raw_state
+            entry.record_errors = None
             entry.warning = None
             if is_done:
                 entry.is_terminal = True
@@ -1381,6 +1699,22 @@ class JobMonitor(Container):
                         entry.job_id,
                         sanitized_err,
                     )
+                    return
+                if isinstance(err, PathTraversalValidationError):
+                    logging.getLogger("imednet_tui").warning(
+                        "Invalid batch ID segment for %s: %s",
+                        _sanitize_text(entry.job_id),
+                        sanitized_err,
+                    )
+                    entry.last_job = _TrackedJobPlaceholder(
+                        entry.job_id,
+                        "INVALID",
+                        is_terminal=True,
+                        non_retryable=True,
+                    )
+                    entry.last_state = "INVALID"
+                    entry.is_terminal = True
+                    entry.warning = sanitized_err
                     return
                 if isinstance(err, NotFoundError):
                     logging.getLogger("imednet_tui").warning(
@@ -1510,17 +1844,7 @@ class JobMonitor(Container):
         """
         study_key = self.current_study_key
         if not study_key:
-            self._pause_timer()
-            self._rendered_study_key = None
-            self._update_ui(
-                summary=Text("Job Monitor: Select a study to view background jobs."),
-                notice_text=(
-                    "Select a study to monitor jobs. Upstream iMednet APIs require batch IDs; "
-                    "enter batch ID(s) above once a study is active."
-                ),
-                rows=(),
-                preserve_cursor=False,
-            )
+            self._render_unassigned_jobs()
             return
 
         try:
@@ -1533,7 +1857,10 @@ class JobMonitor(Container):
 
             if retry_placeholders:
                 for entry in entries.values():
-                    if isinstance(entry.last_job, _TrackedJobPlaceholder):
+                    if (
+                        isinstance(entry.last_job, _TrackedJobPlaceholder)
+                        and not entry.last_job.non_retryable
+                    ):
                         entry.is_terminal = False
                         if not isinstance(entry.last_state, JobState):
                             entry.last_state = None
@@ -1777,6 +2104,12 @@ class DashboardScreen(Screen[None]):
         color: white;
     }
 
+    DashboardScreen.high-contrast JobMonitor #job_detail_panel {
+        background: #000000;
+        color: #FFFFFF;
+        border-top: heavy white;
+    }
+
     DashboardScreen.high-contrast Tabs {
         background: black;
         color: white;
@@ -1930,6 +2263,14 @@ class DashboardScreen(Screen[None]):
                     refresh=False,
                 )
             self._activate_study(self.initial_study_key, self.initial_study_key)
+        elif self._pending_batch_ids:
+            job_monitor = self.query_one(JobMonitor)
+            job_monitor.track_jobs(
+                self._pending_batch_ids,
+                study_key=None,
+                refresh=False,
+            )
+            self._pending_batch_ids.clear()
 
     def on_unmount(self) -> None:
         """Detach the SDK/TUI log handler and restore original logger settings on unmount."""
@@ -2073,6 +2414,12 @@ class ImednetTuiApp(App[None]):
         text-opacity: 100%;
         background-tint: #000000 0%;
     }
+
+    .high-contrast #job_detail_panel {
+        background: #000000;
+        color: #FFFFFF;
+        border-top: heavy white;
+    }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -2160,7 +2507,7 @@ class ImednetTuiApp(App[None]):
         self._sync_high_contrast_classes()
 
     def action_handle_escape(self) -> None:
-        """Move focus from the batch input to the jobs table, or clear an active site filter."""
+        """Exit batch input, close the job detail panel, or clear an active site filter."""
         screen = self._get_dashboard()
         if screen is None:
             return
@@ -2168,6 +2515,9 @@ class ImednetTuiApp(App[None]):
             with contextlib.suppress(Exception):
                 screen.query_one("#job_table", JobTable).focus()
             return
+        with contextlib.suppress(Exception):
+            if screen.query_one(JobMonitor).close_job_detail():
+                return
         screen.clear_site_filter()
 
     def action_refresh_data(self) -> None:

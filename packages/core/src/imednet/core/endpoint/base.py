@@ -393,7 +393,7 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
 
     _lookup_key_hint: str | None = None
 
-    def _validate_item_id(self, item_id: ItemId) -> ItemId:
+    def _validate_item_id(self, item_id: object) -> int:
         """Validate a single-item identifier before constructing the lookup filter."""
         if isinstance(item_id, str):
             validate_path_segment(item_id, name="item_id")
@@ -429,7 +429,7 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
         return items[0]
 
     @execute_get
-    def get(self, study_key: str | None, item_id: ItemId) -> FilterGetOperation[T]:
+    def get(self, study_key: str | None, item_id: int) -> FilterGetOperation[T]:
         """Retrieve a single resource by its ID.
 
         Args:

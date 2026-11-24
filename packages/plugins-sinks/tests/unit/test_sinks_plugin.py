@@ -28,6 +28,15 @@ class _AsyncFacadeStub:
         return []
 
 
+def test_package_root_reexports_sinks_namespace() -> None:
+    """Verify imednet_sinks re-exports SinksNamespace lazily and lists it in __all__."""
+    import imednet_sinks
+
+    assert "SinksNamespace" in imednet_sinks.__all__
+    assert "SinksNamespace" in dir(imednet_sinks)
+    assert imednet_sinks.SinksNamespace is SinksNamespace
+
+
 def test_create_sinks_exposes_classes_and_supports_async() -> None:
     """Verify create_sinks returns a SinksNamespace with concrete sink/config classes."""
     sdk = _SyncFacadeStub()

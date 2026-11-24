@@ -138,15 +138,24 @@ def test_openapi_ingestion_containers_literals_and_none_defaults(tmp_path, monke
     for fdef in rec_fields.values():
         assert fdef.default_value is None
 
+    from imednet.models.base import ImednetBaseModel
+    from imednet.models.records import Record
+
     dyn_record = ModelEngine.get_model("Record")
+    assert issubclass(dyn_record, Record)
     inst = dyn_record.from_json({})
     assert inst.record_id is None
     assert inst.deleted is None
-    assert inst.record_data is None
-    assert inst.keywords is None
+    assert inst.record_data == {}
+    assert inst.keywords == []
     assert inst.literal_flag is None
     assert inst.literal_count is None
     assert inst.literal_note is None
+
+    raw_dyn_record = ModelEngine.get_model("Record", ImednetBaseModel)
+    raw_inst = raw_dyn_record.from_json({})
+    assert raw_inst.record_data is None
+    assert raw_inst.keywords is None
 
 
 def test_contract_builder_defensive_branches_and_nested_openapi_refs(tmp_path):

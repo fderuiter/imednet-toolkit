@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .document import MongoDbExportSink, MongoDbSinkConfig, export_to_mongodb
     from .graph import Neo4jExportSink, Neo4jSinkConfig, export_to_neo4j
+    from .plugin import SinksNamespace
     from .warehouse import SnowflakeExportSink, SnowflakeSinkConfig, export_to_snowflake
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
@@ -16,6 +17,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "MongoDbSinkConfig": ("imednet_sinks.document", "MongoDbSinkConfig"),
     "Neo4jExportSink": ("imednet_sinks.graph", "Neo4jExportSink"),
     "Neo4jSinkConfig": ("imednet_sinks.graph", "Neo4jSinkConfig"),
+    "SinksNamespace": ("imednet_sinks.plugin", "SinksNamespace"),
     "SnowflakeExportSink": ("imednet_sinks.warehouse", "SnowflakeExportSink"),
     "SnowflakeSinkConfig": ("imednet_sinks.warehouse", "SnowflakeSinkConfig"),
     "export_to_mongodb": ("imednet_sinks.document", "export_to_mongodb"),
@@ -48,6 +50,7 @@ __all__ = [
     "MongoDbSinkConfig",
     "Neo4jExportSink",
     "Neo4jSinkConfig",
+    "SinksNamespace",
     "SnowflakeExportSink",
     "SnowflakeSinkConfig",
     "export_to_mongodb",
