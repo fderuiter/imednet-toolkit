@@ -12,7 +12,7 @@ declaration did not justify that cost. Revisit only for a measured user-facing r
 
 Add opt-in `--format json` to core list reads, core write commands (`records create`,
 `records update`, `records import`, `subjects register`), job status/wait, and workflow commands
-(`extract-records`, `subject-data`, `state show`, `validate-standards`). Explicit
+(`extract-records`, `subject-data`, `state show`, `uat run`, `validate-standards`). Explicit
 `--format` flags always take precedence; otherwise setting `IMEDNET_CLI_OUTPUT_FORMAT=json`
 defaults `--format`-capable commands (and `datadict diff`) to JSON output while suppressing
 full-screen `InteractiveDataGrid` UIs, `stdout` ANSI color sequences, and live `stderr`
@@ -24,22 +24,25 @@ file export flags remain. Study-scoped commands across core, workflows, and TUI 
 `imednet.spi.cli` hybrid `study_key` parsing (accepting positional `STUDY` or
 `-s`/`--study-key` and rejecting conflicting values with exit code `2`) and offline
 `--simulation` mode (`SimulationTransport` via `IMEDNET_SIMULATION_MODE=1`). Datadict JSON
-uses its own versioned Data Dictionary/schema/diff contracts and is deliberately not
-wrapped in the list envelope. TUI and non-JSON workflow commands (`sync-worker`,
-`state set`, `state reset`, `uat run`) own their own documented outputs and interactive
-sessions; this change does not claim a global machine-output mode for arbitrary
-third-party commands.
+and `workflows uat build-spec` use their own versioned Data Dictionary/schema/diff and
+`UATSpecification` contracts and are deliberately not wrapped in the list envelope. TUI and
+non-JSON workflow commands (`sync-worker`, `state set`, `state reset`) own their own
+documented outputs and interactive sessions; this change does not claim a global
+machine-output mode for arbitrary third-party commands.
 
 ## Output and exits
 
 Human progress and diagnostics go to stderr; stdout carries the selected result.
-Core list, job, and write machine responses contain schemaVersion `1.0`, resource, status
-`complete`, count and items. Empty read results are successful count=0/items=[]. Write
-commands (`records_create`, `records_update`, `records_import`, `subjects_register`) emit `count: 1` with a
-single `BatchSubmissionSummary` item containing `studyKey`, `dryRun`, `totalRecords`,
+Core list, job, write, and `workflows uat run` (`resource: "uat_run"`) machine responses
+contain schemaVersion `1.0`, resource, status `complete`, count and items. Empty read
+results are successful count=0/items=[]. Write commands (`records_create`, `records_update`,
+`records_import`, `subjects_register`) emit `count: 1` with a single
+`BatchSubmissionSummary` item containing `studyKey`, `dryRun`, `totalRecords`,
 `skippedCount`, `chunkCount`, `batchIds`, `allSuccessful`, `jobs` (alias-serialized `Job`
 models), and `validationReport`; when `validationReport.is_valid` is `false`, JSON mode
-still emits the summary envelope to `stdout` and exits `1`. By contrast,
+still emits the summary envelope to `stdout` and exits `1` (matching `workflows uat run --format json`,
+which emits its structured `uat_run` summary envelope and exits `1` when validation,
+submission, or job polling fails). By contrast,
 `imednet workflows validate-standards --format json` emits a standalone readiness report
 JSON object (`study_key`, `profile`, `domain`, `score`, `is_ready`, `passed`,
 `checked_records`, `checked_fields`, `successfully_validated_fields`, `domain_scores`,
