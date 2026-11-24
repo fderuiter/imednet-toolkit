@@ -73,6 +73,8 @@ def is_unconfigured_mock_method(fn: Any) -> bool:
         return False
     if getattr(fn, "side_effect", None) is not None:
         return False
+    if getattr(fn, "_mock_wraps", None) is not None:
+        return False
     ret = getattr(fn, "return_value", None)
     return type(ret).__module__.startswith("unittest.mock")
 

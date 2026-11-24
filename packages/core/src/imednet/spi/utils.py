@@ -27,6 +27,13 @@ if TYPE_CHECKING:
         resolve_enrichment_pipeline,
         resolve_study_configuration,
     )
+    from imednet.integrations.sink_base import (
+        TabularBatchStamp,
+        get_tabular_batch_stamp,
+        has_valid_tabular_batch_stamp,
+        normalize_phi_keys_snapshot,
+        stamp_tabular_batch,
+    )
     from imednet.utils.batch_coordinator import (
         DEFAULT_BATCH_CHUNK_SIZE,
         AsyncBatchCoordinator,
@@ -162,6 +169,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "RecordsInput": ("imednet.utils.typing", "RecordsInput"),
     "RestrictedAstEvaluator": ("imednet.utils.evaluator", "RestrictedAstEvaluator"),
     "SensitivityRegistry": ("imednet.utils.security", "SensitivityRegistry"),
+    "TabularBatchStamp": ("imednet.integrations.sink_base", "TabularBatchStamp"),
     "build_filter_string": ("imednet.utils.filters", "build_filter_string"),
     "chunk_records": ("imednet.utils.batch_coordinator", "chunk_records"),
     "compile_record_predicate": (
@@ -197,7 +205,12 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "get_security_key_context": ("imednet.core.context", "get_security_key_context"),
     "get_sqlite_connection": ("imednet.utils.db", "get_sqlite_connection"),
     "get_study_context": ("imednet.core.context", "get_study_context"),
+    "get_tabular_batch_stamp": ("imednet.integrations.sink_base", "get_tabular_batch_stamp"),
     "global_sensitivity_registry": ("imednet.utils.security", "global_sensitivity_registry"),
+    "has_valid_tabular_batch_stamp": (
+        "imednet.integrations.sink_base",
+        "has_valid_tabular_batch_stamp",
+    ),
     "import_records_csv": ("imednet.utils.pandas", "import_records_csv"),
     "is_boolean_token": ("imednet.utils.validators", "is_boolean_token"),
     "is_missing_value": ("imednet.utils.validators", "is_missing_value"),
@@ -209,6 +222,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     ),
     "normalize_cache_origin": ("imednet.utils.url", "normalize_cache_origin"),
     "normalize_iso_date": ("imednet.utils.dates", "normalize_iso_date"),
+    "normalize_phi_keys_snapshot": (
+        "imednet.integrations.sink_base",
+        "normalize_phi_keys_snapshot",
+    ),
     "normalize_records_input": ("imednet.utils.tabular", "normalize_records_input"),
     "normalize_subject_registration_inputs": (
         "imednet.utils.enrollment",
@@ -248,6 +265,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "set_base_url_context": ("imednet.core.context", "set_base_url_context"),
     "set_security_key_context": ("imednet.core.context", "set_security_key_context"),
     "sqlite_connection": ("imednet.utils.db", "sqlite_connection"),
+    "stamp_tabular_batch": ("imednet.integrations.sink_base", "stamp_tabular_batch"),
     "validate_filter_key": ("imednet.utils.filters", "validate_filter_key"),
     "validate_partition_key": ("imednet.utils.security", "validate_partition_key"),
     "validate_path_segment": ("imednet.utils.url", "validate_path_segment"),
@@ -313,6 +331,7 @@ __all__ = [
     "RecordsInput",
     "RestrictedAstEvaluator",
     "SensitivityRegistry",
+    "TabularBatchStamp",
     "build_filter_string",
     "chunk_records",
     "compile_record_predicate",
@@ -333,7 +352,9 @@ __all__ = [
     "get_security_key_context",
     "get_sqlite_connection",
     "get_study_context",
+    "get_tabular_batch_stamp",
     "global_sensitivity_registry",
+    "has_valid_tabular_batch_stamp",
     "import_records_csv",
     "is_boolean_token",
     "is_missing_value",
@@ -342,6 +363,7 @@ __all__ = [
     "mask_custom_phi_recursive",
     "normalize_cache_origin",
     "normalize_iso_date",
+    "normalize_phi_keys_snapshot",
     "normalize_records_input",
     "normalize_subject_registration_inputs",
     "normalize_tabular_row",
@@ -372,6 +394,7 @@ __all__ = [
     "set_base_url_context",
     "set_security_key_context",
     "sqlite_connection",
+    "stamp_tabular_batch",
     "validate_filter_key",
     "validate_partition_key",
     "validate_path_segment",

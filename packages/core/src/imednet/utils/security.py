@@ -89,15 +89,18 @@ class SensitivityRegistry:
         self._exempt_snapshot = frozenset(self._exempt_keys)
         self._collapsed_sensitive = {k.replace("_", "") for k in self._sensitive_keys}
         self._collapsed_exempt = {k.replace("_", "") for k in self._exempt_keys}
+        self._key_cache: dict[str, bool] = {}
 
     def _sync_collapsed_sets(self) -> None:
         """Resynchronize collapsed key sets if underlying sets were mutated directly."""
         if self._sensitive_keys != self._sens_snapshot:
             self._sens_snapshot = frozenset(self._sensitive_keys)
             self._collapsed_sensitive = {k.replace("_", "") for k in self._sensitive_keys}
+            self._key_cache.clear()
         if self._exempt_keys != self._exempt_snapshot:
             self._exempt_snapshot = frozenset(self._exempt_keys)
             self._collapsed_exempt = {k.replace("_", "") for k in self._exempt_keys}
+            self._key_cache.clear()
 
     def add_sensitive_key(self, key: Any) -> None:
         """Add a key to the sensitive list if it is not exempted."""
@@ -110,6 +113,7 @@ class SensitivityRegistry:
             self._sensitive_keys.add(norm_key)
             self._collapsed_sensitive.add(collapsed)
             self._sens_snapshot = frozenset(self._sensitive_keys)
+            self._key_cache.clear()
 
     def remove_sensitive_key(self, key: Any) -> None:
         """Remove a key from the sensitive list."""
@@ -123,6 +127,7 @@ class SensitivityRegistry:
                 self._sensitive_keys.discard(existing)
         self._collapsed_sensitive.discard(collapsed)
         self._sens_snapshot = frozenset(self._sensitive_keys)
+        self._key_cache.clear()
 
     def add_exempt_key(self, key: Any) -> None:
         """Add a key to the exemption list."""
@@ -132,6 +137,7 @@ class SensitivityRegistry:
             self._exempt_keys.add(norm_key)
             self._collapsed_exempt.add(norm_key.replace("_", ""))
             self._exempt_snapshot = frozenset(self._exempt_keys)
+            self._key_cache.clear()
 
     def remove_exempt_key(self, key: Any) -> None:
         """Remove a key from the exemption list."""
@@ -145,6 +151,7 @@ class SensitivityRegistry:
                 self._exempt_keys.discard(existing)
         self._collapsed_exempt.discard(collapsed)
         self._exempt_snapshot = frozenset(self._exempt_keys)
+        self._key_cache.clear()
 
     def is_exempt(self, key: Any) -> bool:
         """Check if a key is explicitly exempted from PHI masking."""
@@ -157,16 +164,76 @@ class SensitivityRegistry:
     def is_sensitive(self, key: Any) -> bool:
         """Check if a key is considered sensitive and not exempted."""
         self._sync_collapsed_sets()
+        if key.__class__ is str:
+            cached = self._key_cache.get(key)
+            if cached is not None:
+                return cached
         norm_key = _normalize_key(key)
         if not norm_key:
-            return False
-        collapsed = norm_key.replace("_", "")
-        if norm_key in self._exempt_keys or collapsed in self._collapsed_exempt:
-            return False
-        return norm_key in self._sensitive_keys or collapsed in self._collapsed_sensitive
+            res = False
+        else:
+            collapsed = norm_key.replace("_", "")
+            if norm_key in self._exempt_keys or collapsed in self._collapsed_exempt:
+                res = False
+            else:
+                res = norm_key in self._sensitive_keys or collapsed in self._collapsed_sensitive
+        if key.__class__ is str:
+            if len(self._key_cache) >= 8192:
+                self._key_cache.clear()
+            self._key_cache[key] = res
+        return res
+
+    def snapshot(self) -> tuple[frozenset[str], frozenset[str]]:
+        """Return an immutable snapshot of active sensitive and exempt key sets."""
+        self._sync_collapsed_sets()
+        return (self._sens_snapshot, self._exempt_snapshot)
 
 
 global_sensitivity_registry = SensitivityRegistry()
+
+
+_FORMULA_PREFIX_CHARS = frozenset("=+-@")
+_CONTAINER_TYPES = (dict, list, tuple)
+
+
+def _mask_clinical_phi_synced(
+    value: Any,
+    active_registry: SensitivityRegistry,
+    cache_get: Any,
+) -> Any:
+    """Recursively mask sensitive keys after syncing ``active_registry`` once."""
+    vc = value.__class__
+    if vc is dict or isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        for k, v in value.items():
+            if k.__class__ is str:
+                is_sens = cache_get(k)
+                if is_sens is None:
+                    is_sens = active_registry.is_sensitive(k)
+            else:
+                is_sens = active_registry.is_sensitive(k)
+            if is_sens:
+                out[k] = "***MASKED***"
+            elif isinstance(v, _CONTAINER_TYPES):
+                out[k] = _mask_clinical_phi_synced(v, active_registry, cache_get)
+            else:
+                out[k] = v
+        return out
+    if vc is list or isinstance(value, list):
+        return [
+            _mask_clinical_phi_synced(v, active_registry, cache_get)
+            if isinstance(v, _CONTAINER_TYPES)
+            else v
+            for v in value
+        ]
+    if vc is tuple or isinstance(value, tuple):
+        return tuple(
+            _mask_clinical_phi_synced(v, active_registry, cache_get)
+            if isinstance(v, _CONTAINER_TYPES)
+            else v
+            for v in value
+        )
+    return value
 
 
 def mask_clinical_phi(
@@ -175,21 +242,11 @@ def mask_clinical_phi(
     registry: SensitivityRegistry | None = None,
 ) -> Any:
     """Recursively mask sensitive keys in unstructured data."""
+    if not isinstance(value, _CONTAINER_TYPES):
+        return value
     active_registry = global_sensitivity_registry if registry is None else registry
-    if isinstance(value, dict):
-        return {
-            k: (
-                "***MASKED***"
-                if active_registry.is_sensitive(k)
-                else mask_clinical_phi(v, registry=active_registry)
-            )
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [mask_clinical_phi(v, registry=active_registry) for v in value]
-    if isinstance(value, tuple):
-        return tuple(mask_clinical_phi(v, registry=active_registry) for v in value)
-    return value
+    active_registry._sync_collapsed_sets()
+    return _mask_clinical_phi_synced(value, active_registry, active_registry._key_cache.get)
 
 
 def sanitize_diagnostic_text(
@@ -252,6 +309,18 @@ def sanitize_csv_formula(value: Any) -> Any:
     Prefixes strings starting with =, +, -, or @ (even after whitespace) with a single quote.
     Lists and tuples are recursively sanitized.
     """
+    if value.__class__ is str:
+        if not value:
+            return value
+        ch0 = value[0]
+        if ch0 in _FORMULA_PREFIX_CHARS:
+            return f"'{value}"
+        if not ch0.isspace():
+            return value
+        stripped = value.lstrip()
+        if stripped and stripped[0] in _FORMULA_PREFIX_CHARS:
+            return f"'{value}"
+        return value
     if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
         return f"'{value}"
     if isinstance(value, list):

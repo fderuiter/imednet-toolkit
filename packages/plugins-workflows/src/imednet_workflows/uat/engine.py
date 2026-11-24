@@ -798,16 +798,19 @@ class UATExecutionEngine:
         }
         if not any(configured.values()):
             return None
-        if all(configured.values()):
-            return StudySchemaInspector(self._sdk).inspect(study_key)
+        try:
+            if all(configured.values()):
+                return StudySchemaInspector(self._sdk).inspect(study_key)
 
-        return StudySnapshot(
-            study_key=study_key,
-            forms=self._sdk.get_forms(study_key) if configured["get_forms"] else [],
-            variables=self._sdk.get_variables(study_key) if configured["get_variables"] else [],
-            intervals=self._sdk.get_intervals(study_key) if configured["get_intervals"] else [],
-            sites=self._sdk.get_sites(study_key) if configured["get_sites"] else [],
-        )
+            return StudySnapshot(
+                study_key=study_key,
+                forms=self._sdk.get_forms(study_key) if configured["get_forms"] else [],
+                variables=self._sdk.get_variables(study_key) if configured["get_variables"] else [],
+                intervals=self._sdk.get_intervals(study_key) if configured["get_intervals"] else [],
+                sites=self._sdk.get_sites(study_key) if configured["get_sites"] else [],
+            )
+        except NotFoundError:
+            return None
 
     @staticmethod
     def _resolve_verification_site(
@@ -864,7 +867,12 @@ class UATExecutionEngine:
         try:
             return list(self._sdk.get_subjects(study_key, deleted=False))
         except TypeError:
-            return list(self._sdk.get_subjects(study_key))
+            try:
+                return list(self._sdk.get_subjects(study_key))
+            except NotFoundError:
+                return []
+        except NotFoundError:
+            return []
 
     @staticmethod
     def _find_uat_subject_at_site(

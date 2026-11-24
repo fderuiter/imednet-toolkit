@@ -33,6 +33,7 @@ from imednet.integrations.sink_base import (
     ExportSink,
     SinkConfig,
     StateProviderProtocol,
+    TabularBatchStamp,
     _enforce_batch_standards_readiness,
     _extract_safe_config_options,
     apply_quality_gate,
@@ -41,11 +42,14 @@ from imednet.integrations.sink_base import (
     extract_record_id,
     extract_record_timestamp,
     get_state_provider,
+    get_tabular_batch_stamp,
+    has_valid_tabular_batch_stamp,
     is_record_deleted,
     iter_batches,
     iter_filtered_sdk_records,
     normalize_watermark_datetime,
     run_streaming_export,
+    stamp_tabular_batch,
 )
 from imednet.models.standards import (
     format_variable_name,
@@ -118,6 +122,9 @@ def _create_record_mapper(sdk: Any, *, mask_phi: bool = True) -> Any:
     return mapper
 
 
+_CONTAINER_CELL_TYPES = (dict, list, tuple)
+
+
 def _is_custom_phi_key(key: str, phi_keys: set[str] | None) -> bool:
     """Return True when *key* matches a custom StudyConfiguration PHI field."""
     if not phi_keys or not key:
@@ -125,8 +132,99 @@ def _is_custom_phi_key(key: str, phi_keys: set[str] | None) -> bool:
     return _matches_custom_phi_key(key, phi_keys)
 
 
+def _is_active_phi_key(key: Any, phi_keys: set[str] | None) -> bool:
+    """Return True when *key* matches active global or study-specific PHI rules."""
+    if not isinstance(key, str) or not key:
+        return False
+    return global_sensitivity_registry.is_sensitive(key) or _is_custom_phi_key(key, phi_keys)
+
+
+def _mask_series_containers(
+    series: pd.Series,
+    phi_keys: set[str] | None = None,
+) -> pd.Series:
+    """Mask nested container cells in ``series`` without scalar mask_clinical_phi scans."""
+    values = series.tolist()
+    if not any(isinstance(v, _CONTAINER_CELL_TYPES) for v in values):
+        return series
+    new_vals: list[Any] = []
+    for val in values:
+        if isinstance(val, _CONTAINER_CELL_TYPES):
+            masked_val = mask_clinical_phi(val)
+            if phi_keys:
+                masked_val = mask_custom_phi_recursive(masked_val, phi_keys)
+            new_vals.append(masked_val)
+        else:
+            new_vals.append(val)
+    return pd.Series(new_vals, index=series.index, dtype=object)
+
+
+def _dedup_case_insensitive_columns(
+    df: pd.DataFrame,
+    *,
+    ensure_str_columns: bool = False,
+    in_place_allowed: bool = True,
+) -> pd.DataFrame:
+    """Drop case-insensitive duplicate columns without copying clean DataFrames."""
+    if not isinstance(df, pd.DataFrame):
+        return df
+    prior_stamp = get_tabular_batch_stamp(df)
+    all_str = all(isinstance(c, str) for c in df.columns)
+    has_any_str = all_str or any(isinstance(c, str) for c in df.columns)
+
+    dup_mask = None
+    has_dups = False
+    if ensure_str_columns:
+        str_cols = list(df.columns) if all_str else [str(c) for c in df.columns]
+        lower_cols = [c.lower() for c in str_cols]
+        dup_mask = pd.Index(lower_cols).duplicated()
+        has_dups = bool(dup_mask.any())
+    elif has_any_str:
+        lower_mixed = [c.lower() if isinstance(c, str) else c for c in df.columns]
+        dup_mask = pd.Index(lower_mixed).duplicated()
+        has_dups = bool(dup_mask.any())
+
+    if (not ensure_str_columns or all_str) and not has_dups:
+        return df
+
+    out = df if in_place_allowed else df.copy()
+    if ensure_str_columns and not all_str:
+        if not in_place_allowed:
+            out.columns = out.columns.astype(str)
+        else:
+            out = out.copy()
+            out.columns = out.columns.astype(str)
+        prior_stamp = None
+    if has_dups and dup_mask is not None:
+        out = out.loc[:, ~dup_mask]
+
+    if (
+        prior_stamp is not None
+        and get_tabular_batch_stamp(out) is None
+        and (
+            not prior_stamp.mask_phi
+            or prior_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
+        )
+    ):
+        stamp_tabular_batch(
+            out,
+            mask_phi=prior_stamp.mask_phi,
+            phi_keys=prior_stamp.phi_keys,
+            sanitized=prior_stamp.sanitized,
+        )
+    return out
+
+
 def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFrame:
     """Mask sensitive fields in the DataFrame based on global and study rules."""
+    if isinstance(df, pd.DataFrame) and has_valid_tabular_batch_stamp(
+        df, mask_phi=True, phi_keys=phi_keys
+    ):
+        return df
+
+    prior_stamp = get_tabular_batch_stamp(df)
+    was_sanitized = bool(prior_stamp.sanitized) if prior_stamp is not None else False
+
     sensitive_cols = list(
         dict.fromkeys(
             col
@@ -140,6 +238,7 @@ def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFr
             df[col] = MASKED_SENTINEL
 
     if len(df) == 0:
+        stamp_tabular_batch(df, mask_phi=True, phi_keys=phi_keys, sanitized=was_sanitized)
         return df
 
     remaining = df.drop(columns=sensitive_cols)
@@ -148,18 +247,14 @@ def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFr
     except TypeError:
         object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object]).columns))
 
-    custom_mask_fn = (lambda val: mask_custom_phi_recursive(val, phi_keys)) if phi_keys else None
     for col in object_cols:
         target = df[col]
         if isinstance(target, pd.DataFrame):
-            df[col] = target.apply(lambda s: s.apply(mask_clinical_phi))
-            if custom_mask_fn is not None:
-                df[col] = df[col].apply(lambda s: s.apply(custom_mask_fn))
+            df[col] = target.apply(lambda s: _mask_series_containers(s, phi_keys))
         else:
-            df[col] = target.apply(mask_clinical_phi)
-            if custom_mask_fn is not None:
-                df[col] = df[col].apply(custom_mask_fn)
+            df[col] = _mask_series_containers(target, phi_keys)
 
+    stamp_tabular_batch(df, mask_phi=True, phi_keys=phi_keys, sanitized=was_sanitized)
     return df
 
 
@@ -214,8 +309,7 @@ def _records_df(
         form_whitelist=form_whitelist,
     )
     if isinstance(df, pd.DataFrame):
-        df.columns = df.columns.astype(str)
-        df = df.loc[:, ~df.columns.str.lower().duplicated()]
+        df = _dedup_case_insensitive_columns(df, ensure_str_columns=True)
     return df
 
 
@@ -289,16 +383,55 @@ def _uses_mock_fetch_records(mapper: Any) -> bool:
 
 def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
     """Sanitize DataFrame string columns to prevent CSV injection."""
+    if isinstance(df, pd.DataFrame) and has_valid_tabular_batch_stamp(
+        df, mask_phi=False, require_sanitized=True
+    ):
+        return df
+
+    prior_stamp = get_tabular_batch_stamp(df)
+
     # Explicitly include "str" to avoid Pandas 3.0 warning about object dtype
     # including strings implicitly. Use a try/except block to handle older Pandas versions
     # (e.g. 2.3.3) where "str" raises a TypeError.
     try:
-        cols = df.select_dtypes(include=[object, "str"])
+        cols = list(dict.fromkeys(df.select_dtypes(include=[object, "str"]).columns))
     except TypeError:
-        cols = df.select_dtypes(include=[object])
+        cols = list(dict.fromkeys(df.select_dtypes(include=[object]).columns))
+
+    def _sanitize_series_once(series: pd.Series) -> tuple[pd.Series, bool]:
+        vals = series.tolist()
+        mutated = False
+        sanitized_vals: list[Any] = []
+        for v in vals:
+            nv = sanitize_csv_formula(v)
+            if nv is not v:
+                mutated = True
+            sanitized_vals.append(nv)
+        if not mutated:
+            return series, False
+        return pd.Series(sanitized_vals, index=series.index, dtype=series.dtype), True
 
     for col in cols:
-        df[col] = df[col].apply(sanitize_csv_formula)
+        target = df[col]
+        if isinstance(target, pd.DataFrame):
+            df[col] = target.apply(lambda s: _sanitize_series_once(s)[0])
+        else:
+            new_series, changed = _sanitize_series_once(target)
+            if changed:
+                df[col] = new_series
+
+    if prior_stamp is not None and (
+        not prior_stamp.mask_phi
+        or prior_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
+    ):
+        stamp_tabular_batch(
+            df,
+            mask_phi=prior_stamp.mask_phi,
+            phi_keys=prior_stamp.phi_keys,
+            sanitized=True,
+        )
+    else:
+        stamp_tabular_batch(df, mask_phi=False, sanitized=True)
     return df
 
 
@@ -370,34 +503,87 @@ def _normalize_tabular_batch_item(item: Any) -> Any:
     return item
 
 
+def _resolve_study_phi_keys(study_key: str | None) -> set[str] | None:
+    """Resolve custom normalized PHI keys from committed StudyConfiguration when present."""
+    if not study_key:
+        return None
+    pipeline = resolve_enrichment_pipeline(study_key)
+    if pipeline is None or not pipeline.phi_keys:
+        return None
+    return set(pipeline.phi_keys)
+
+
 def _prepare_tabular_batch_df(
     records: Any,
     *,
     mask_phi: bool,
     sanitize: bool,
+    study_key: str | None = None,
 ) -> pd.DataFrame:
-    """Convert ``records`` into a DataFrame with standardized PHI masking and CSV sanitization."""
+    """Convert ``records`` into a DataFrame with single-pass PHI masking and CSV sanitization."""
+    phi_keys = _resolve_study_phi_keys(study_key) if mask_phi else None
+
     if isinstance(records, pd.DataFrame):
         if len(records) == 0:
             return records
+        has_dup_cols = False
+        if any(isinstance(c, str) for c in records.columns):
+            lower_cols = [c.lower() if isinstance(c, str) else c for c in records.columns]
+            has_dup_cols = bool(pd.Index(lower_cols).duplicated().any())
+        already_masked = (not mask_phi) or has_valid_tabular_batch_stamp(
+            records,
+            mask_phi=True,
+            phi_keys=phi_keys,
+        )
+        already_sanitized = (not sanitize) or has_valid_tabular_batch_stamp(
+            records,
+            mask_phi=False,
+            require_sanitized=True,
+        )
+        if not has_dup_cols and already_masked and already_sanitized:
+            return records
+
+        prior_stamp = get_tabular_batch_stamp(records)
         df = records.copy()
-    else:
-        items = list(records) if not isinstance(records, Sequence) else records
-        if not items:
-            return pd.DataFrame()
-        normalized = [_normalize_tabular_batch_item(item) for item in items]
-        df = pd.DataFrame(normalized)
-        if len(df) == 0:
-            return df
+        if prior_stamp is not None and (
+            not prior_stamp.mask_phi
+            or prior_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
+        ):
+            stamp_tabular_batch(
+                df,
+                mask_phi=prior_stamp.mask_phi,
+                phi_keys=prior_stamp.phi_keys,
+                sanitized=prior_stamp.sanitized,
+            )
+        if has_dup_cols:
+            df = _dedup_case_insensitive_columns(df, ensure_str_columns=False)
+            already_masked = (not mask_phi) or has_valid_tabular_batch_stamp(
+                df,
+                mask_phi=True,
+                phi_keys=phi_keys,
+            )
+            already_sanitized = (not sanitize) or has_valid_tabular_batch_stamp(
+                df,
+                mask_phi=False,
+                require_sanitized=True,
+            )
+        if mask_phi and not already_masked:
+            df = _mask_df(df, phi_keys=phi_keys)
+        if sanitize and not already_sanitized:
+            df = _sanitize_df(df)
+        return df
 
-    if any(isinstance(c, str) for c in df.columns):
-        lower_cols = [c.lower() if isinstance(c, str) else c for c in df.columns]
-        dup_mask = pd.Index(lower_cols).duplicated()
-        if bool(dup_mask.any()):
-            df = df.loc[:, ~dup_mask]
+    items = list(records) if not isinstance(records, Sequence) else records
+    if not items:
+        return pd.DataFrame()
+    normalized = [_normalize_tabular_batch_item(item) for item in items]
+    df = pd.DataFrame(normalized)
+    if len(df) == 0:
+        return df
 
+    df = _dedup_case_insensitive_columns(df, ensure_str_columns=False)
     if mask_phi:
-        df = _mask_df(df)
+        df = _mask_df(df, phi_keys=phi_keys)
     if sanitize:
         df = _sanitize_df(df)
     return df
@@ -503,7 +689,19 @@ def _dedupe_df_by_record_id(
         return df, set()
     id_col = _find_df_record_id_col(df)
     if id_col is None:
-        return df.reset_index(drop=True), set()
+        deduped_unkeyed = df.reset_index(drop=True)
+        prior_stamp = get_tabular_batch_stamp(df)
+        if prior_stamp is not None and (
+            not prior_stamp.mask_phi
+            or prior_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
+        ):
+            stamp_tabular_batch(
+                deduped_unkeyed,
+                mask_phi=prior_stamp.mask_phi,
+                phi_keys=prior_stamp.phi_keys,
+                sanitized=prior_stamp.sanitized,
+            )
+        return deduped_unkeyed, set()
 
     excluded = exclude_ids or set()
     study_col = _find_df_study_col(df)
@@ -534,7 +732,19 @@ def _dedupe_df_by_record_id(
         kept_rev.append(idx)
 
     kept_rev.reverse()
-    return df.iloc[kept_rev].reset_index(drop=True), seen_cids_for_study
+    deduped = df.iloc[kept_rev].reset_index(drop=True)
+    prior_stamp = get_tabular_batch_stamp(df)
+    if prior_stamp is not None and (
+        not prior_stamp.mask_phi
+        or prior_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
+    ):
+        stamp_tabular_batch(
+            deduped,
+            mask_phi=prior_stamp.mask_phi,
+            phi_keys=prior_stamp.phi_keys,
+            sanitized=prior_stamp.sanitized,
+        )
+    return deduped, seen_cids_for_study
 
 
 def _filter_df_excluding_record_ids(
@@ -593,8 +803,21 @@ def _concat_tabular_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
     if not non_empty:
         return frames[0].copy() if frames else pd.DataFrame()
     if len(non_empty) == 1:
-        return non_empty[0].reset_index(drop=True)
+        single = non_empty[0].reset_index(drop=True)
+        single_stamp = get_tabular_batch_stamp(non_empty[0])
+        if single_stamp is not None and (
+            not single_stamp.mask_phi
+            or single_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
+        ):
+            stamp_tabular_batch(
+                single,
+                mask_phi=single_stamp.mask_phi,
+                phi_keys=single_stamp.phi_keys,
+                sanitized=single_stamp.sanitized,
+            )
+        return single
 
+    stamps: list[TabularBatchStamp | None] = [get_tabular_batch_stamp(f) for f in non_empty]
     unified_cols: list[Any] = []
     seen_cols: set[Any] = set()
     for frame in non_empty:
@@ -628,13 +851,85 @@ def _concat_tabular_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
             prepared.append(stub)
 
     merged = pd.concat(prepared, ignore_index=True)
-    return merged.reindex(columns=unified_cols)
+    reindexed = merged.reindex(columns=unified_cols)
+    first_stamp = stamps[0] if stamps else None
+    if (
+        first_stamp is not None
+        and all(
+            st is not None
+            and st.mask_phi == first_stamp.mask_phi
+            and st.registry_snapshot == first_stamp.registry_snapshot
+            for st in stamps[1:]
+        )
+        and (
+            not first_stamp.mask_phi
+            or first_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
+        )
+    ):
+        common_phi = first_stamp.phi_keys.intersection(
+            *(st.phi_keys for st in stamps[1:] if st is not None)
+        )
+        stamp_tabular_batch(
+            reindexed,
+            mask_phi=first_stamp.mask_phi,
+            phi_keys=common_phi,
+            sanitized=all(bool(st.sanitized) for st in stamps if st is not None),
+        )
+    return reindexed
+
+
+_PURE_JSON_NON_FLOAT_SCALARS = frozenset({str, int, bool, type(None)})
 
 
 def _sanitize_json_value(value: Any) -> Any:
     """Recursively convert missing sentinels and nonfinite floats to ``None`` for RFC 8259 JSON."""
-    if value is None or value is pd.NA:
+    vc = value.__class__
+    if vc in _PURE_JSON_NON_FLOAT_SCALARS:
+        return value
+    if value is pd.NA:
         return None
+    if vc is float:
+        return value if math.isfinite(value) else None
+    if vc is dict:
+        mutated_dict: dict[Any, Any] | None = None
+        pure_scalars = _PURE_JSON_NON_FLOAT_SCALARS
+        isfinite = math.isfinite
+        for k, v in value.items():
+            v_cls = v.__class__
+            if v_cls in pure_scalars:
+                continue
+            if v_cls is float:
+                if isfinite(v):
+                    continue
+                new_v: Any = None
+            else:
+                new_v = _sanitize_json_value(v)
+                if new_v is v and new_v.__class__ is v_cls:
+                    continue
+            if mutated_dict is None:
+                mutated_dict = dict(value)
+            mutated_dict[k] = new_v
+        return mutated_dict if mutated_dict is not None else value
+    if vc is list:
+        mutated_list: list[Any] | None = None
+        pure_scalars = _PURE_JSON_NON_FLOAT_SCALARS
+        isfinite = math.isfinite
+        for idx, item in enumerate(value):
+            i_cls = item.__class__
+            if i_cls in pure_scalars:
+                continue
+            if i_cls is float:
+                if isfinite(item):
+                    continue
+                new_item: Any = None
+            else:
+                new_item = _sanitize_json_value(item)
+                if new_item is item and new_item.__class__ is i_cls:
+                    continue
+            if mutated_list is None:
+                mutated_list = list(value)
+            mutated_list[idx] = new_item
+        return mutated_list if mutated_list is not None else value
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -678,6 +973,8 @@ def _dataframe_to_json_records(df: Any) -> list[dict[str, Any]]:
 class TabularCSVSink(ExportSink):
     """Sink for exporting data to CSV format."""
 
+    _skip_auto_redact_batch = True
+
     def __init__(self, path: str | os.PathLike[str], config: TabularSinkConfig):
         """Initialize the CSV sink."""
         super().__init__(config)
@@ -694,6 +991,7 @@ class TabularCSVSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            study_key=self._cfg.study_key,
         )
         if len(df) == 0:
             return 0
@@ -1516,6 +1814,8 @@ def _filter_arrow_table_excluding_ids(
 class TabularParquetSink(ExportSink):
     """Streaming Parquet sink backed by ``pyarrow.parquet.ParquetWriter``."""
 
+    _skip_auto_redact_batch = True
+
     def __init__(
         self,
         path: str | os.PathLike[str],
@@ -1643,6 +1943,7 @@ class TabularParquetSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            study_key=self._cfg.study_key,
         )
         if len(df) == 0:
             return 0
@@ -1944,6 +2245,8 @@ def _execute_chunked_sql_id_delete(
 class TabularSQLSink(ExportSink):
     """Sink for exporting data to SQL databases."""
 
+    _skip_auto_redact_batch = True
+
     def __init__(self, table: str, engine: Any, config: TabularSinkConfig):
         """Initialize the SQL sink."""
         super().__init__(config)
@@ -1980,6 +2283,7 @@ class TabularSQLSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            study_key=self._cfg.study_key,
         )
         if len(df) == 0:
             return 0
@@ -2057,6 +2361,8 @@ class TabularSQLSink(ExportSink):
 class TabularDuckDBSink(ExportSink):
     """Streaming sink for exporting DataFrame batches into a DuckDB table."""
 
+    _skip_auto_redact_batch = True
+
     def __init__(
         self,
         db_path: str | os.PathLike[str],
@@ -2133,6 +2439,7 @@ class TabularDuckDBSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            study_key=self._cfg.study_key,
         )
         if len(df) == 0:
             return 0
@@ -2301,7 +2608,7 @@ class _TabularTransformSink(ExportSink):
         self._variable_keys = variable_keys
         self._label_map = label_map
         self._cfg = config
-        self._sanitize = sanitize
+        self._sanitize = bool(sanitize or config.sanitize)
         self._pipeline = pipeline
         self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
         self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
@@ -2370,6 +2677,14 @@ class _TabularTransformSink(ExportSink):
             )
             if df.empty:
                 return 0
+            has_brthdtc_col = any(str(c).upper() == "BRTHDTC" for c in df.columns)
+            if not self._cfg.mask_phi or not has_brthdtc_col:
+                stamp_tabular_batch(
+                    df,
+                    mask_phi=self._cfg.mask_phi,
+                    phi_keys=self._phi_keys,
+                    sanitized=False,
+                )
             if self._sanitize:
                 df = _sanitize_df(df)
             return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
@@ -2385,9 +2700,7 @@ class _TabularTransformSink(ExportSink):
         )
         if df.empty:
             return 0
-        df.columns = df.columns.astype(str)
-        dup_mask = df.columns.str.lower().duplicated()
-        df = df.loc[:, ~dup_mask]
+        df = _dedup_case_insensitive_columns(df, ensure_str_columns=True)
 
         if self._cfg.mask_phi:
             df = _mask_df(df, phi_keys=self._phi_keys)
@@ -2399,8 +2712,14 @@ class _TabularTransformSink(ExportSink):
                 meta_cols=self._meta_cols,
                 study_key=self._cfg.study_key,
             )
+            if self._cfg.mask_phi:
+                df = _mask_df(df, phi_keys=self._phi_keys)
+            else:
+                stamp_tabular_batch(df, mask_phi=False, sanitized=False)
         if self._sanitize:
             df = _sanitize_df(df)
+        elif not self._cfg.mask_phi:
+            stamp_tabular_batch(df, mask_phi=False, sanitized=False)
 
         return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
 
@@ -2624,6 +2943,8 @@ def _collect_tabular_df(
     frames: list[pd.DataFrame] = []
 
     class _FrameCollectorSink(ExportSink):
+        _skip_auto_redact_batch = True
+
         def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
             if isinstance(records, pd.DataFrame):
                 frames.append(records)
@@ -2864,7 +3185,7 @@ def export_to_csv(
     )
 
     sink = TabularCSVSink(path, config)
-    _tabular_export(sdk, study_key, sink, config, sanitize=True, stream_name="csv")
+    _tabular_export(sdk, study_key, sink, config, sanitize=config.sanitize, stream_name="csv")
 
 
 def export_to_excel(
@@ -2909,7 +3230,7 @@ def export_to_excel(
         df_mock: pd.DataFrame | None = None
         if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
             df_mock = (
-                _collect_tabular_df(sdk, study_key, config, sanitize=True)
+                _collect_tabular_df(sdk, study_key, config, sanitize=config.sanitize)
                 if config.quality_gate_enabled
                 else _prepare_export_df(
                     sdk,
@@ -2917,14 +3238,14 @@ def export_to_excel(
                     use_labels_as_columns=config.use_labels_as_columns,
                     variable_whitelist=config.variable_whitelist,
                     form_whitelist=config.form_whitelist,
-                    sanitize=True,
+                    sanitize=config.sanitize,
                 )
             )
         else:
             pre_mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
             if _is_mock_mapper(pre_mapper):
                 df_mock = (
-                    _collect_tabular_df(sdk, study_key, config, sanitize=True)
+                    _collect_tabular_df(sdk, study_key, config, sanitize=config.sanitize)
                     if config.quality_gate_enabled
                     else _prepare_export_df(
                         sdk,
@@ -2932,7 +3253,7 @@ def export_to_excel(
                         use_labels_as_columns=config.use_labels_as_columns,
                         variable_whitelist=config.variable_whitelist,
                         form_whitelist=config.form_whitelist,
-                        sanitize=True,
+                        sanitize=config.sanitize,
                         mask_phi=config.mask_phi,
                         _mapper=pre_mapper,
                     )
@@ -2995,13 +3316,24 @@ def export_to_excel(
                 delta_ids | voided_ids,
                 study_key=study_key,
             )
-            if not prev_kept.empty:
-                if config.mask_phi:
-                    pipeline = resolve_enrichment_pipeline(study_key)
-                    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-                    prev_kept = _mask_df(prev_kept, phi_keys=phi_keys)
-                if config.sanitize:
-                    prev_kept = _sanitize_df(prev_kept)
+            if not prev_kept.empty and config.mask_phi:
+                phi_keys = _resolve_study_phi_keys(study_key)
+                matching_phi_cols = list(
+                    dict.fromkeys(
+                        col for col in prev_kept.columns if _is_active_phi_key(str(col), phi_keys)
+                    )
+                )
+                cols_needing_mask = [
+                    col
+                    for col in matching_phi_cols
+                    if bool(
+                        prev_kept[col].isna().any() or (prev_kept[col] != MASKED_SENTINEL).any()
+                    )
+                ]
+                if cols_needing_mask:
+                    prev_kept = prev_kept.copy()
+                    for col in cols_needing_mask:
+                        prev_kept[col] = MASKED_SENTINEL
             if prev_kept.empty:
                 merged_df = dedup_delta
             elif dedup_delta.empty:
@@ -3018,7 +3350,7 @@ def export_to_excel(
         )
 
     sink = _TabularCollectingSink(config, _write_or_reconcile_excel, pass_voided_ids=True)
-    _tabular_export(sdk, study_key, sink, config, sanitize=True, stream_name="excel")
+    _tabular_export(sdk, study_key, sink, config, sanitize=config.sanitize, stream_name="excel")
 
 
 def _apply_json_enrichment(study_key: str, data: Any, *, mask_phi: bool = True) -> Any:
@@ -3041,29 +3373,100 @@ def _apply_json_enrichment(study_key: str, data: Any, *, mask_phi: bool = True) 
     return data
 
 
-def _dump_json_payload(path: str | os.PathLike[str], data: Any, config: TabularSinkConfig) -> int:
+def _dump_json_payload(
+    path: str | os.PathLike[str],
+    data: Any,
+    config: TabularSinkConfig,
+    *,
+    skip_sanitize: bool = False,
+) -> int:
     """Persist strict RFC 8259 JSON export payload atomically, appending when ``idempotent=False``."""
     resolved_path: str = _coerce_path_str(path)
-    sanitized_data = _sanitize_json_value(data)
-    payload = sanitized_data
-    if not config.idempotent and isinstance(sanitized_data, list) and Path(resolved_path).exists():
-        try:
-            with open(resolved_path, encoding="utf-8") as existing_file:
-                existing_data = json.load(existing_file)
-            if isinstance(existing_data, list):
-                payload = _sanitize_json_value(existing_data) + sanitized_data
-        except Exception:
-            payload = sanitized_data
-
     dump_kwargs = dict(config.pandas_kwargs)
     dump_kwargs["allow_nan"] = False
 
+    if skip_sanitize and config.idempotent:
+        try:
+            serialized = json.dumps(data, **dump_kwargs)
+            payload_len = len(data) if isinstance(data, list) else 1
+        except (TypeError, ValueError):
+            sanitized_fallback = _sanitize_json_value(data)
+            serialized = json.dumps(sanitized_fallback, **dump_kwargs)
+            payload_len = len(sanitized_fallback) if isinstance(sanitized_fallback, list) else 1
+    else:
+        sanitized_data = _sanitize_json_value(data)
+        payload = sanitized_data
+        if (
+            not config.idempotent
+            and isinstance(sanitized_data, list)
+            and Path(resolved_path).exists()
+        ):
+            try:
+                with open(resolved_path, encoding="utf-8") as existing_file:
+                    existing_data = json.load(existing_file)
+                if isinstance(existing_data, list):
+                    payload = _sanitize_json_value(existing_data) + sanitized_data
+            except Exception:
+                payload = sanitized_data
+        serialized = json.dumps(payload, **dump_kwargs)
+        payload_len = len(sanitized_data) if isinstance(sanitized_data, list) else 1
+
     def _write_tmp_json(tmp_path: str) -> None:
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, **dump_kwargs)
+            f.write(serialized)
 
     _atomic_replace_file(resolved_path, _write_tmp_json, suffix=".json.tmp")
-    return len(sanitized_data) if isinstance(sanitized_data, list) else 1
+    return payload_len
+
+
+_JSON_SCALAR_CLASSES = frozenset({str, int, float, bool, type(None)})
+
+
+def _remask_historical_item_if_needed(
+    value: Any,
+    phi_keys: set[str] | None,
+    key_cache: dict[str, bool],
+) -> Any:
+    """Re-mask historical JSON items in place only when active PHI rules match existing keys."""
+    vc = value.__class__
+    if vc is dict or isinstance(value, dict):
+        cache_get = key_cache.get
+        scalar_classes = _JSON_SCALAR_CLASSES
+        for k, v in value.items():
+            if k.__class__ is str or isinstance(k, str):
+                is_phi = cache_get(k)
+                if is_phi is None:
+                    is_phi = _is_active_phi_key(k, phi_keys)
+                    key_cache[k] = is_phi
+                if is_phi:
+                    if v != MASKED_SENTINEL:
+                        value[k] = MASKED_SENTINEL
+                    continue
+            if v.__class__ not in scalar_classes and isinstance(v, _CONTAINER_CELL_TYPES):
+                new_v = _remask_historical_item_if_needed(v, phi_keys, key_cache)
+                if new_v is not v:
+                    value[k] = new_v
+        return value
+    if vc is list or isinstance(value, list):
+        scalar_classes = _JSON_SCALAR_CLASSES
+        for idx, item in enumerate(value):
+            if item.__class__ not in scalar_classes and isinstance(item, _CONTAINER_CELL_TYPES):
+                new_item = _remask_historical_item_if_needed(item, phi_keys, key_cache)
+                if new_item is not item:
+                    value[idx] = new_item
+        return value
+    if vc is tuple or isinstance(value, tuple):
+        mutated: list[Any] | None = None
+        scalar_classes = _JSON_SCALAR_CLASSES
+        for idx, item in enumerate(value):
+            if item.__class__ not in scalar_classes and isinstance(item, _CONTAINER_CELL_TYPES):
+                new_item = _remask_historical_item_if_needed(item, phi_keys, key_cache)
+                if new_item is not item:
+                    if mutated is None:
+                        mutated = list(value)
+                    mutated[idx] = new_item
+        return tuple(mutated) if mutated is not None else value
+    return value
 
 
 def _merge_flat_json_records(
@@ -3071,6 +3474,8 @@ def _merge_flat_json_records(
     delta_records: list[dict[str, Any]],
     voided_ids: set[str],
     *,
+    mask_historical_phi: bool = False,
+    phi_keys: set[str] | None = None,
     study_key: str | None = None,
 ) -> list[Any]:
     """Upsert ``delta_records`` by canonical ``(STUDYID, RECORD_ID)`` and drop ``voided_ids``."""
@@ -3084,6 +3489,7 @@ def _merge_flat_json_records(
         else:
             unkeyed_delta.append(drec)
 
+    key_cache: dict[str, bool] = {}
     merged: list[Any] = []
     placed_keys: set[tuple[str, str]] = set()
     for erec in existing_records:
@@ -3102,6 +3508,14 @@ def _merge_flat_json_records(
                     merged.append(delta_by_key[comp_key])
                     placed_keys.add(comp_key)
                 continue
+            if mask_historical_phi:
+                erec_dict = erec if isinstance(erec, dict) else dict(erec)
+                _remask_historical_item_if_needed(erec_dict, phi_keys, key_cache)
+                merged.append(erec_dict)
+                continue
+        elif mask_historical_phi and isinstance(erec, _CONTAINER_CELL_TYPES):
+            merged.append(_remask_historical_item_if_needed(erec, phi_keys, key_cache))
+            continue
         merged.append(erec)
 
     for comp_key, drec in delta_by_key.items():
@@ -3117,9 +3531,26 @@ def _merge_hierarchical_archives(
     existing_tree: list[Any],
     delta_tree: list[dict[str, Any]],
     exclude_ids: set[str],
+    *,
+    mask_historical_phi: bool = False,
+    phi_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Merge hierarchical Subject->Visit->Form trees by ``recordId`` and prune voided records."""
     subjects: dict[Any, dict[str, Any]] = {}
+    key_cache: dict[str, bool] = {}
+
+    def _keep_hist_records(raw_records: Any) -> list[dict[str, Any]]:
+        kept_list: list[dict[str, Any]] = []
+        for rec in raw_records or []:
+            if not isinstance(rec, Mapping):
+                continue
+            if _extract_row_canonical_id(rec) in exclude_ids:
+                continue
+            rec_dict = dict(rec)
+            if mask_historical_phi:
+                _remask_historical_item_if_needed(rec_dict, phi_keys, key_cache)
+            kept_list.append(rec_dict)
+        return kept_list
 
     for subj in existing_tree:
         if not isinstance(subj, Mapping):
@@ -3134,12 +3565,7 @@ def _merge_hierarchical_archives(
                 if not isinstance(fnode, Mapping):
                     continue
                 fid = fnode.get("form_id")
-                kept = [
-                    dict(rec)
-                    for rec in (fnode.get("records") or [])
-                    if isinstance(rec, Mapping)
-                    and _extract_row_canonical_id(rec) not in exclude_ids
-                ]
+                kept = _keep_hist_records(fnode.get("records"))
                 if kept:
                     visits_map.setdefault(vid, {}).setdefault(fid, []).extend(kept)
 
@@ -3148,11 +3574,7 @@ def _merge_hierarchical_archives(
             if not isinstance(fnode, Mapping):
                 continue
             fid = fnode.get("form_id")
-            kept = [
-                dict(rec)
-                for rec in (fnode.get("records") or [])
-                if isinstance(rec, Mapping) and _extract_row_canonical_id(rec) not in exclude_ids
-            ]
+            kept = _keep_hist_records(fnode.get("records"))
             if kept:
                 unsched_map.setdefault(fid, []).extend(kept)
 
@@ -3286,9 +3708,9 @@ class _HierarchicalJSONSink(ExportSink):
         else:
             delta_data = []
 
-        if self._cfg.mask_phi:
-            delta_data = mask_clinical_phi(delta_data)
         if self._is_mock_hier_mapper:
+            if self._cfg.mask_phi:
+                delta_data = mask_clinical_phi(delta_data)
             delta_data = _apply_json_enrichment(
                 self._study_key,
                 delta_data,
@@ -3296,6 +3718,7 @@ class _HierarchicalJSONSink(ExportSink):
             )
 
         if self._is_incremental_sync and self._cfg.idempotent and dest_exists:
+            delta_sanitized = _sanitize_json_value(delta_data)
             existing_tree: list[Any] = []
             try:
                 with open(self.path, encoding="utf-8") as existing_f:
@@ -3306,21 +3729,17 @@ class _HierarchicalJSONSink(ExportSink):
                 existing_tree = []
 
             exclude_ids = set(self._records_by_cid) | self._voided_ids
+            phi_keys = _resolve_study_phi_keys(self._study_key) if self._cfg.mask_phi else None
             final_data: Any = _merge_hierarchical_archives(
                 existing_tree,
-                delta_data if isinstance(delta_data, list) else [],
+                delta_sanitized if isinstance(delta_sanitized, list) else [],
                 exclude_ids,
+                mask_historical_phi=self._cfg.mask_phi,
+                phi_keys=phi_keys,
             )
-            if self._cfg.mask_phi:
-                pipeline = resolve_enrichment_pipeline(self._study_key)
-                phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-                final_data = mask_clinical_phi(final_data)
-                if phi_keys:
-                    final_data = mask_custom_phi_recursive(final_data, phi_keys)
-        else:
-            final_data = delta_data
+            return _dump_json_payload(self.path, final_data, self._cfg, skip_sanitize=True)
 
-        return _dump_json_payload(self.path, final_data, self._cfg)
+        return _dump_json_payload(self.path, delta_data, self._cfg)
 
     def flush(self) -> None:
         batch_id = f"{self._study_key}/json_hierarchical/flush"
@@ -3475,10 +3894,18 @@ def export_to_json(
     is_incremental_json = _is_incremental_config(config)
 
     def _write_or_reconcile_json(combined: pd.DataFrame, voided_ids: set[str]) -> None:
+        phi_keys = _resolve_study_phi_keys(study_key) if config.mask_phi else None
         if not (is_incremental_json and config.idempotent):
-            records_out = _dataframe_to_json_records(combined)
-            if config.mask_phi:
+            combined_stamped = (not config.mask_phi) or has_valid_tabular_batch_stamp(
+                combined,
+                mask_phi=True,
+                phi_keys=phi_keys,
+            )
+            records_out: Any = _dataframe_to_json_records(combined)
+            if config.mask_phi and not combined_stamped:
                 records_out = mask_clinical_phi(records_out)
+                if phi_keys:
+                    records_out = mask_custom_phi_recursive(records_out, phi_keys)
             _dump_json_payload(path, records_out, config)
             return
 
@@ -3494,7 +3921,22 @@ def export_to_json(
             exclude_ids=voided_ids,
             study_key=study_key,
         )
+        delta_stamped = (not config.mask_phi) or has_valid_tabular_batch_stamp(
+            dedup_delta,
+            mask_phi=True,
+            phi_keys=phi_keys,
+        )
         delta_records = _dataframe_to_json_records(dedup_delta)
+        if config.mask_phi and not delta_stamped:
+            delta_records = cast(list[dict[str, Any]], mask_clinical_phi(delta_records))
+            if phi_keys:
+                delta_records = cast(
+                    list[dict[str, Any]],
+                    mask_custom_phi_recursive(delta_records, phi_keys),
+                )
+
+        delta_records = cast(list[dict[str, Any]], _sanitize_json_value(delta_records))
+
         existing_records: list[Any] = []
         if dest_exists:
             try:
@@ -3509,15 +3951,11 @@ def export_to_json(
             existing_records,
             delta_records,
             voided_ids,
+            mask_historical_phi=config.mask_phi,
+            phi_keys=phi_keys,
             study_key=study_key,
         )
-        if config.mask_phi:
-            pipeline = resolve_enrichment_pipeline(study_key)
-            phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-            merged_records = mask_clinical_phi(merged_records)
-            if phi_keys:
-                merged_records = mask_custom_phi_recursive(merged_records, phi_keys)
-        _dump_json_payload(path, merged_records, config)
+        _dump_json_payload(path, merged_records, config, skip_sanitize=True)
 
     sink = _TabularCollectingSink(config, _write_or_reconcile_json, pass_voided_ids=True)
     _tabular_export(sdk, study_key, sink, config, sanitize=False, stream_name="json")
@@ -4236,9 +4674,7 @@ def export_to_duckdb_by_form(
                     use_labels_as_columns,
                 )
                 if isinstance(df, pd.DataFrame):
-                    df.columns = df.columns.astype(str)
-                    dup_mask = df.columns.str.lower().duplicated()
-                    df = df.loc[:, ~dup_mask]
+                    df = _dedup_case_insensitive_columns(df, ensure_str_columns=True)
                     if config.mask_phi:
                         df = _mask_df(df, phi_keys=phi_keys)
 
@@ -4393,8 +4829,7 @@ def export_to_sql_by_form(
                 use_labels_as_columns,
             )
             if isinstance(df, pd.DataFrame):
-                dup_mask = df.columns.str.lower().duplicated()
-                df = df.loc[:, ~dup_mask]
+                df = _dedup_case_insensitive_columns(df, ensure_str_columns=False)
                 if config.mask_phi:
                     df = _mask_df(df, phi_keys=phi_keys)
 

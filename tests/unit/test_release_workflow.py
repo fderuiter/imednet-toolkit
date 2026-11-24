@@ -468,8 +468,8 @@ def _assert_manifest_matches_git_tags(
         )
 
 
-def test_release_please_manifest_and_config_parity() -> None:
-    """Verify manifest lists only tagged packages, sets initial-version for TUI, and preserves wheel tightening."""
+def test_release_please_manifest_and_config_parity(tmp_path: Path) -> None:
+    """Verify manifest/config/pyproject parity after release bumps and wheel tightening behavior."""
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     config = json.loads(RELEASE_PLEASE_CONFIG_PATH.read_text(encoding="utf-8"))
     packages_cfg = config["packages"]
@@ -482,19 +482,14 @@ def test_release_please_manifest_and_config_parity() -> None:
         "packages/plugins-tui",
     }
     assert set(packages_cfg) == expected_all_packages
-    assert set(manifest) == {
-        "packages/core",
-        "packages/providers-airflow",
-        "packages/plugins-workflows",
-        "packages/plugins-sinks",
-    }
-    assert "packages/plugins-tui" not in manifest
+    assert set(manifest) == expected_all_packages
     assert packages_cfg["packages/plugins-tui"].get("initial-version") == "1.0.0"
 
-    tui_pyproject = tomllib.loads(
-        (ROOT / "packages" / "plugins-tui" / "pyproject.toml").read_text(encoding="utf-8")
-    )
-    assert tui_pyproject["project"]["version"] == "1.0.0"
+    for pkg_path, manifest_ver in manifest.items():
+        pkg_pyproject = tomllib.loads(
+            (ROOT / pkg_path / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        assert pkg_pyproject["project"]["version"] == manifest_ver
 
     internal_pkgs = td.get_internal_packages(MANIFEST_PATH)
     assert set(internal_pkgs) == {
@@ -502,17 +497,43 @@ def test_release_please_manifest_and_config_parity() -> None:
         "apache-airflow-providers-imednet",
         "imednet-workflows",
         "imednet-plugins-sinks",
+        "imednet-tui",
     }
-    assert "imednet-tui" not in internal_pkgs
-    assert td.process_dependency("imednet-tui", internal_pkgs) == "imednet-tui"
+    tui_ver = manifest["packages/plugins-tui"]
+    assert (
+        td.process_dependency("imednet-tui", internal_pkgs)
+        == f"imednet-tui>={tui_ver},{td.compute_upper_bound(tui_ver)}"
+    )
+
+    # Verify unreleased packages omitted from a manifest remain unconstrained during wheel tightening
+    partial_manifest_dir = tmp_path / "repo"
+    for pkg_rel in ("packages/core", "packages/plugins-tui"):
+        target_toml = partial_manifest_dir / pkg_rel / "pyproject.toml"
+        target_toml.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / pkg_rel / "pyproject.toml", target_toml)
+    partial_manifest_path = partial_manifest_dir / ".release-please-manifest.json"
+    partial_manifest = {"packages/core": manifest["packages/core"]}
+    partial_manifest_path.write_text(json.dumps(partial_manifest), encoding="utf-8")
+    partial_internal = td.get_internal_packages(partial_manifest_path)
+    assert "imednet-tui" not in partial_internal
+    assert td.process_dependency("imednet-tui", partial_internal) == "imednet-tui"
 
     sample_tags = {
-        "imednet-v1.1.0",
-        "apache-airflow-providers-imednet-v1.1.0",
-        "imednet-workflows-v1.1.0",
-        "imednet-plugins-sinks-v1.0.1",
+        f"{packages_cfg[pkg_path]['package-name']}-v{ver}" for pkg_path, ver in manifest.items()
     }
     _assert_manifest_matches_git_tags(manifest, config, sample_tags)
+
+    unreleased_sub_cfg = {
+        "packages": {
+            "packages/core": packages_cfg["packages/core"],
+            "packages/plugins-tui": packages_cfg["packages/plugins-tui"],
+        }
+    }
+    _assert_manifest_matches_git_tags(
+        partial_manifest,
+        unreleased_sub_cfg,
+        {f"imednet-v{manifest['packages/core']}"},
+    )
 
     git_bin = shutil.which("git")
     if git_bin and (ROOT / ".git").exists():
@@ -524,7 +545,7 @@ def test_release_please_manifest_and_config_parity() -> None:
             check=False,
         )
         live_tags = {line.strip() for line in tag_proc.stdout.splitlines() if line.strip()}
-        if live_tags:
+        if live_tags and sample_tags.issubset(live_tags):
             _assert_manifest_matches_git_tags(manifest, config, live_tags)
 
 

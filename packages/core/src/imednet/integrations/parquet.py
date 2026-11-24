@@ -23,6 +23,7 @@ from .export import (
     _canonical_record_id,
     _concat_tabular_frames,
     _config_has_streaming_options,
+    _dedup_case_insensitive_columns,
     _dedupe_df_by_record_id,
     _filter_df_excluding_record_ids,
     _FormExportContext,
@@ -143,8 +144,7 @@ def _write_hive_form_rows(
     )
     if skip_empty and df.empty:
         return 0
-    df.columns = df.columns.astype(str)
-    df = df.loc[:, ~df.columns.str.lower().duplicated()]
+    df = _dedup_case_insensitive_columns(df, ensure_str_columns=True)
     if mask_phi and not df.empty:
         df = _mask_df(df, phi_keys=phi_keys)
     if not use_labels_as_columns and naming_convention is not None and not df.empty:
@@ -154,6 +154,8 @@ def _write_hive_form_rows(
             domain=sdtm_domain,
             study_key=study_key,
         )
+        if mask_phi:
+            df = _mask_df(df, phi_keys=phi_keys)
     if dedupe_incremental and not df.empty:
         df, _ = _dedupe_df_by_record_id(df, study_key=study_key)
         if skip_empty and df.empty:
