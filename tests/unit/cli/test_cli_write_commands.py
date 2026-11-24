@@ -1075,7 +1075,7 @@ def test_cli_human_write_tables_headers_and_clinical_labels(
     env_overrides: dict[str, str],
     extra_flags: list[str],
 ) -> None:
-    """AC 5: Human write tables show Batch Id, Job Id, State, Progress, Total Records, Failed Records under clinical labels."""
+    """AC 5: Human write tables show Batch ID, Job ID, State, Progress, Total Records, Failed Records under clinical labels."""
     _install_reusable_sim_sdk(monkeypatch)
     for k, v in env_overrides.items():
         monkeypatch.setenv(k, v)
@@ -1166,8 +1166,8 @@ def test_cli_human_write_tables_headers_and_clinical_labels(
         assert expected_label in res.stdout
         assert forbidden_snake not in res.stdout
         for col_header in (
-            "Batch Id",
-            "Job Id",
+            "Batch ID",
+            "Job ID",
             "State",
             "Progress",
             "Total Records",

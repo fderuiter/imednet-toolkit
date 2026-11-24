@@ -1666,11 +1666,12 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["code_blocks.js"]
+html_js_files: list[str] = ["code_blocks.js", "navigation.js"]
 
 doctest_global_setup = """
 import builtins
 import contextlib
+import io
 import logging
 import os
 import sys
@@ -1681,14 +1682,10 @@ from unittest.mock import MagicMock, patch
 for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")]:
     del sys.modules[_mod]
 
-with contextlib.suppress(ImportError):
-    from airflow.sdk.bases.operator import ExecutorSafeguard
-    ExecutorSafeguard.test_mode = True
-
-logging.basicConfig(level=logging.WARNING, stream=sys.stderr, force=True)
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
 logging.getLogger("py.warnings").setLevel(logging.ERROR)
+logging.getLogger("snowflake").setLevel(logging.WARNING)
 logging.captureWarnings(True)
 
 os.environ["IMEDNET_SIMULATION_MODE"] = "true"
@@ -1699,24 +1696,32 @@ os.environ["IMEDNET_STUDY_KEY"] = "STUDY"
 os.environ["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
 os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
 
-_doctest_orig_cwd = os.getcwd()
-_doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
-os.chdir(_doctest_tmpdir.name)
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        from airflow.sdk.bases.operator import ExecutorSafeguard
+        ExecutorSafeguard.test_mode = True
+    except Exception:
+        pass
 
-from imednet.simulation.state import get_default_simulation_state
-get_default_simulation_state().reset()
+    logging.basicConfig(level=logging.WARNING, stream=sys.stderr, force=True)
 
-__file__ = "/a/b/c/d/e/dummy.py"
+    _doctest_orig_cwd = os.getcwd()
+    _doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
+    os.chdir(_doctest_tmpdir.name)
 
-_mongo_client_patcher = patch("pymongo.MongoClient", return_value=MagicMock())
-_mongo_client_patcher.start()
+    from imednet.simulation.state import get_default_simulation_state
+    get_default_simulation_state().reset()
 
-_neo4j_driver_patcher = patch("neo4j.GraphDatabase.driver", return_value=MagicMock())
-_neo4j_driver_patcher.start()
+    __file__ = "/a/b/c/d/e/dummy.py"
 
-logging.getLogger("snowflake").setLevel(logging.WARNING)
-_snowflake_connect_patcher = patch("snowflake.connector.connect", return_value=MagicMock())
-_snowflake_connect_patcher.start()
+    _mongo_client_patcher = patch("pymongo.MongoClient", return_value=MagicMock())
+    _mongo_client_patcher.start()
+
+    _neo4j_driver_patcher = patch("neo4j.GraphDatabase.driver", return_value=MagicMock())
+    _neo4j_driver_patcher.start()
+
+    _snowflake_connect_patcher = patch("snowflake.connector.connect", return_value=MagicMock())
+    _snowflake_connect_patcher.start()
 
 _original_print = builtins.print
 

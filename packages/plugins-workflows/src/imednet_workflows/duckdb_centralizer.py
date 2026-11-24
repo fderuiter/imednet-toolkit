@@ -7,10 +7,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
+from contextlib import suppress
+from datetime import UTC, date, datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Literal, Self
 from uuid import uuid4
+
+from imednet.spi.utils import parse_iso_datetime
 
 from .data_extraction import DataExtractionWorkflow
 
@@ -61,6 +65,53 @@ class DuckDBIngestionWorkflow:
 
         self._connection: Any = duckdb.connect(db_path)
         self._extractor = DataExtractionWorkflow(sdk)
+        self._closed = False
+
+    def close(self) -> None:
+        """Close the underlying DuckDB connection idempotently."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._connection is not None:
+            self._connection.close()
+
+    def __enter__(self) -> Self:
+        """Enter the context manager and return the workflow instance."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the context manager and close the DuckDB connection."""
+        self.close()
+
+    @staticmethod
+    def _validate_study_key(study_key: Any) -> str:
+        """Validate that a study key matches the safe identifier pattern."""
+        if not isinstance(study_key, str) or not _SAFE_STUDY_KEY_PATTERN.fullmatch(study_key):
+            raise ValueError(
+                f"Invalid study key: {study_key!r}. "
+                "Only alphanumeric characters and ._:- are allowed."
+            )
+        return study_key
+
+    @staticmethod
+    def _deduplicate_rows(rows: Iterable[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+        """Deduplicate staged rows on non-null (study_key, record_revision_id) keeping last."""
+        materialized = list(rows)
+        last_index_by_key: dict[tuple[str, int], int] = {}
+        for idx, row in enumerate(materialized):
+            rev_id = row[1]
+            if rev_id is not None:
+                last_index_by_key[(row[0], rev_id)] = idx
+        return [
+            row
+            for idx, row in enumerate(materialized)
+            if row[1] is None or last_index_by_key[(row[0], row[1])] == idx
+        ]
 
     def ingest_revisions(
         self,
@@ -71,6 +122,7 @@ class DuckDBIngestionWorkflow:
         mode: Literal["append", "replace"] = "append",
     ) -> int:
         """Fetch RecordRevisions and write to the bronze_revisions table."""
+        self._validate_study_key(study_key)
         if mode not in {"append", "replace"}:
             raise ValueError("mode must be one of: 'append', 'replace'")
 
@@ -79,99 +131,173 @@ class DuckDBIngestionWorkflow:
             start_date=start_date,
             end_date=end_date,
         )
-
-        if mode == "replace":
-            self._connection.execute("DROP VIEW IF EXISTS record_revisions")
-            self._connection.execute("DROP TABLE IF EXISTS bronze_revisions")
+        rows = self._deduplicate_rows(self._to_rows(study_key, revisions))
+        staging_relation = self._build_staging_relation(rows) if rows else None
 
         self._ensure_bronze_table()
-        raw_rows = list(self._to_rows(study_key, revisions))
-        if not raw_rows:
+        if not rows:
+            if mode == "replace":
+                self._connection.execute("BEGIN TRANSACTION")
+                try:
+                    self._connection.execute(
+                        "DELETE FROM bronze_revisions WHERE study_key = ?",
+                        [study_key],
+                    )
+                    self._connection.execute("COMMIT")
+                except BaseException:
+                    with suppress(Exception):
+                        self._connection.execute("ROLLBACK")
+                    raise
             return 0
 
-        deduped_rows: list[tuple[Any, ...]] = []
-        seen_keys: set[tuple[str, int]] = set()
-        for row in raw_rows:
-            rev_id = row[1]
-            if rev_id is not None:
-                dedup_key = (str(row[0]), int(rev_id))
-                if dedup_key in seen_keys:
-                    continue
-                seen_keys.add(dedup_key)
-            deduped_rows.append(row)
-
-        before_row = self._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()
-        before_count = int(before_row[0]) if before_row is not None else 0
-
-        staging_relation = self._build_staging_relation(deduped_rows)
+        existing_overlap_count = 0
         view_name = f"_staging_bronze_revisions_{uuid4().hex}"
         self._connection.register(view_name, staging_relation)
         try:
-            insert_query = f"""
-                INSERT INTO bronze_revisions (
-                    study_key,
-                    record_revision_id,
-                    record_id,
-                    record_oid,
-                    form_key,
-                    subject_key,
-                    site_id,
-                    interval_id,
-                    record_status,
-                    record_revision,
-                    data_revision,
-                    "user",
-                    role,
-                    reason_for_change,
-                    deleted,
-                    date_created,
-                    last_updated
-                )
-                SELECT
-                    CAST(staging.study_key AS VARCHAR),
-                    CAST(staging.record_revision_id AS BIGINT),
-                    CAST(staging.record_id AS BIGINT),
-                    CAST(staging.record_oid AS VARCHAR),
-                    CAST(staging.form_key AS VARCHAR),
-                    CAST(staging.subject_key AS VARCHAR),
-                    CAST(staging.site_id AS BIGINT),
-                    CAST(staging.interval_id AS BIGINT),
-                    CAST(staging.record_status AS VARCHAR),
-                    CAST(staging.record_revision AS INTEGER),
-                    CAST(staging.data_revision AS INTEGER),
-                    CAST(staging."user" AS VARCHAR),
-                    CAST(staging.role AS VARCHAR),
-                    CAST(staging.reason_for_change AS VARCHAR),
-                    CAST(staging.deleted AS BOOLEAN),
-                    CAST(CAST(staging.date_created AS VARCHAR) AS TIMESTAMP),
-                    CAST(CAST(staging.last_updated AS VARCHAR) AS TIMESTAMP)
-                FROM "{view_name}" AS staging
-                WHERE staging.record_revision_id IS NULL
-                   OR NOT EXISTS (
-                       SELECT 1
-                       FROM bronze_revisions AS existing
-                       WHERE existing.study_key = CAST(staging.study_key AS VARCHAR)
-                         AND existing.record_revision_id = CAST(staging.record_revision_id AS BIGINT)
-                   )
-                """
-            self._connection.execute(insert_query)  # nosem
+            self._connection.execute("BEGIN TRANSACTION")
+            try:
+                if mode == "replace":
+                    self._connection.execute(
+                        "DELETE FROM bronze_revisions WHERE study_key = ?",
+                        [study_key],
+                    )
+                has_keyed_rows = any(row[1] is not None for row in rows)
+                if has_keyed_rows and (
+                    mode == "append" or any(row[0] != study_key for row in rows)
+                ):
+                    overlap_query = f"""
+                        SELECT COUNT(*)
+                        FROM "{view_name}" AS staged
+                        WHERE staged.record_revision_id IS NOT NULL
+                          AND EXISTS (
+                              SELECT 1
+                              FROM bronze_revisions AS existing
+                              WHERE existing.study_key = CAST(staged.study_key AS VARCHAR)
+                                AND existing.record_revision_id = CAST(
+                                    staged.record_revision_id AS BIGINT
+                                )
+                          )
+                        """
+                    overlap_row = self._connection.execute(overlap_query).fetchone()  # nosem
+                    existing_overlap_count = int(overlap_row[0]) if overlap_row is not None else 0
+
+                    delete_query = f"""
+                        DELETE FROM bronze_revisions
+                        WHERE record_revision_id IS NOT NULL
+                          AND EXISTS (
+                              SELECT 1
+                              FROM "{view_name}" AS staged
+                              WHERE staged.record_revision_id IS NOT NULL
+                                AND bronze_revisions.study_key = CAST(staged.study_key AS VARCHAR)
+                                AND bronze_revisions.record_revision_id = CAST(
+                                    staged.record_revision_id AS BIGINT
+                                )
+                          )
+                        """
+                    self._connection.execute(delete_query)  # nosem
+
+                insert_query = f"""
+                    INSERT INTO bronze_revisions (
+                        study_key,
+                        record_revision_id,
+                        record_id,
+                        record_oid,
+                        form_key,
+                        subject_key,
+                        site_id,
+                        interval_id,
+                        record_status,
+                        record_revision,
+                        data_revision,
+                        "user",
+                        role,
+                        reason_for_change,
+                        deleted,
+                        date_created,
+                        last_updated
+                    )
+                    SELECT
+                        CAST(study_key AS VARCHAR),
+                        CAST(record_revision_id AS BIGINT),
+                        CAST(record_id AS BIGINT),
+                        CAST(record_oid AS VARCHAR),
+                        CAST(form_key AS VARCHAR),
+                        CAST(subject_key AS VARCHAR),
+                        CAST(site_id AS BIGINT),
+                        CAST(interval_id AS BIGINT),
+                        CAST(record_status AS VARCHAR),
+                        CAST(record_revision AS INTEGER),
+                        CAST(data_revision AS INTEGER),
+                        CAST("user" AS VARCHAR),
+                        CAST(role AS VARCHAR),
+                        CAST(reason_for_change AS VARCHAR),
+                        CAST(deleted AS BOOLEAN),
+                        CAST(CAST(date_created AS VARCHAR) AS TIMESTAMP),
+                        CAST(CAST(last_updated AS VARCHAR) AS TIMESTAMP)
+                    FROM "{view_name}"
+                    """
+                self._connection.execute(insert_query)  # nosem
+                self._connection.execute("COMMIT")
+            except BaseException:
+                with suppress(Exception):
+                    self._connection.execute("ROLLBACK")
+                raise
         finally:
             self._connection.unregister(view_name)
 
-        after_row = self._connection.execute("SELECT COUNT(*) FROM bronze_revisions").fetchone()
-        after_count = int(after_row[0]) if after_row is not None else before_count
-        return max(0, after_count - before_count)
+        return max(0, len(rows) - existing_overlap_count)
 
-    def build_silver_view(self, study_key: str) -> None:
-        """Create or replace record_revisions, silver_current_state, and silver_records_history views."""
-        if not isinstance(study_key, str) or not _SAFE_STUDY_KEY_PATTERN.fullmatch(study_key):
-            raise ValueError(
-                f"Invalid study key: {study_key!r}. Only alphanumeric characters and ._:- are allowed."
-            )
+    def _build_combined_silver_union_sql(self, prefix: str, study_key: str) -> str:
+        """Build UNION ALL SQL across all per-Study views matching prefix."""
+        catalog_rows = self._connection.execute(
+            """
+            SELECT view_name
+            FROM duckdb_views()
+            WHERE database_name = current_database()
+              AND schema_name = current_schema()
+              AND NOT internal
+              AND NOT temporary
+              AND starts_with(view_name, ?)
+            ORDER BY view_name
+            """,
+            [prefix],
+        ).fetchall()
+        built_study_keys = sorted(
+            {
+                study_key,
+                *(
+                    row[0].removeprefix(prefix)
+                    for row in catalog_rows
+                    if isinstance(row[0], str)
+                    and row[0].startswith(prefix)
+                    and _SAFE_STUDY_KEY_PATTERN.fullmatch(row[0].removeprefix(prefix))
+                ),
+            }
+        )
+        return "\n            UNION ALL\n            ".join(
+            f'SELECT * FROM "{prefix}{key}"' for key in built_study_keys
+        )
+
+    def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
+        """Create or replace per-Study and combined silver current-state and history views.
+
+        Args:
+            study_key: Study key identifier to materialize.
+            include_deleted: When True, retain records whose latest revision has deleted=True.
+        """
+        self._validate_study_key(study_key)
         self._ensure_bronze_table()
         escaped_study_key = study_key.replace("'", "''")
-        current_state_query = f"""
-            CREATE OR REPLACE VIEW silver_current_state AS
+        record_partition_expr = (
+            "study_key, COALESCE(CAST(record_id AS VARCHAR), "
+            "NULLIF(record_oid, ''), CAST(record_revision_id AS VARCHAR))"
+        )
+        per_study_view = f"silver_current_state_{study_key}"
+        deleted_clause = (
+            "" if include_deleted else "\n            WHERE NOT COALESCE(deleted, FALSE)"
+        )
+        per_study_query = f"""
+            CREATE OR REPLACE VIEW "{per_study_view}" AS
             SELECT
                 study_key,
                 record_revision_id,
@@ -190,21 +316,50 @@ class DuckDBIngestionWorkflow:
                 deleted,
                 date_created,
                 last_updated
-            FROM bronze_revisions
-            WHERE study_key = '{escaped_study_key}'
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY COALESCE(CAST(record_id AS VARCHAR), record_oid)
-                ORDER BY
-                    record_revision DESC NULLS LAST,
-                    data_revision DESC NULLS LAST,
-                    date_created DESC NULLS LAST,
-                    record_revision_id DESC NULLS LAST
-            ) = 1
+            FROM (
+                SELECT
+                    study_key,
+                    record_revision_id,
+                    record_id,
+                    record_oid,
+                    form_key,
+                    subject_key,
+                    site_id,
+                    interval_id,
+                    record_status,
+                    record_revision,
+                    data_revision,
+                    "user",
+                    role,
+                    reason_for_change,
+                    deleted,
+                    date_created,
+                    last_updated
+                FROM bronze_revisions
+                WHERE study_key = '{escaped_study_key}'
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY {record_partition_expr}
+                    ORDER BY
+                        record_revision DESC NULLS LAST,
+                        data_revision DESC NULLS LAST,
+                        date_created DESC NULLS LAST,
+                        record_revision_id DESC NULLS LAST
+                ) = 1
+            ) AS latest_revisions{deleted_clause}
             """
-        self._connection.execute(current_state_query)  # nosem
+        self._connection.execute(per_study_query)  # nosem
+        current_union_sql = self._build_combined_silver_union_sql(
+            "silver_current_state_", study_key
+        )
+        combined_current_query = f"""
+            CREATE OR REPLACE VIEW silver_current_state AS
+            {current_union_sql}
+            """
+        self._connection.execute(combined_current_query)  # nosem
 
-        history_query = f"""
-            CREATE OR REPLACE VIEW silver_records_history AS
+        per_study_history_view = f"silver_records_history_{study_key}"
+        per_study_history_query = f"""
+            CREATE OR REPLACE VIEW "{per_study_history_view}" AS
             SELECT
                 study_key,
                 record_revision_id,
@@ -225,7 +380,7 @@ class DuckDBIngestionWorkflow:
                 last_updated,
                 COALESCE(date_created, last_updated) AS valid_from,
                 LEAD(COALESCE(date_created, last_updated)) OVER (
-                    PARTITION BY COALESCE(CAST(record_id AS VARCHAR), record_oid)
+                    PARTITION BY {record_partition_expr}
                     ORDER BY
                         record_revision ASC NULLS LAST,
                         data_revision ASC NULLS LAST,
@@ -233,7 +388,7 @@ class DuckDBIngestionWorkflow:
                         record_revision_id ASC NULLS LAST
                 ) AS valid_to,
                 LEAD(1) OVER (
-                    PARTITION BY COALESCE(CAST(record_id AS VARCHAR), record_oid)
+                    PARTITION BY {record_partition_expr}
                     ORDER BY
                         record_revision ASC NULLS LAST,
                         data_revision ASC NULLS LAST,
@@ -243,7 +398,15 @@ class DuckDBIngestionWorkflow:
             FROM bronze_revisions
             WHERE study_key = '{escaped_study_key}'
             """
-        self._connection.execute(history_query)  # nosem
+        self._connection.execute(per_study_history_query)  # nosem
+        history_union_sql = self._build_combined_silver_union_sql(
+            "silver_records_history_", study_key
+        )
+        combined_history_query = f"""
+            CREATE OR REPLACE VIEW silver_records_history AS
+            {history_union_sql}
+            """
+        self._connection.execute(combined_history_query)  # nosem
 
     def _ensure_bronze_table(self) -> None:
         """Ensure the bronze_revisions table and record_revisions view exist in DuckDB."""
@@ -265,7 +428,8 @@ class DuckDBIngestionWorkflow:
                 reason_for_change VARCHAR,
                 deleted BOOLEAN,
                 date_created TIMESTAMP,
-                last_updated TIMESTAMP
+                last_updated TIMESTAMP,
+                UNIQUE (study_key, record_revision_id)
             )
             """)
         self._connection.execute("""
@@ -314,19 +478,27 @@ class DuckDBIngestionWorkflow:
             return None
         if isinstance(value, datetime):
             dt = value
-            if dt.tzinfo is not None and dt.utcoffset() is not None:
-                dt = dt.astimezone(UTC).replace(tzinfo=None)
-            return dt.isoformat()
-        if isinstance(value, str):
-            return value if value.strip() else None
-        return str(value)
+        elif isinstance(value, date):
+            return value.isoformat()
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            dt = parse_iso_datetime(stripped)
+        else:
+            return str(value)
+        if dt.tzinfo is not None and dt.utcoffset() is not None:
+            dt = dt.astimezone(UTC).replace(tzinfo=None)
+        return dt.isoformat()
 
     def _to_rows(
         self, study_key: str, revisions: Iterable[RecordRevision]
     ) -> Iterable[tuple[Any, ...]]:
         """Internal helper to convert RecordRevision models into database rows."""
+        self._validate_study_key(study_key)
         for revision in revisions:
-            rev_study_key = getattr(revision, "study_key", None) or study_key
+            raw_study_key = getattr(revision, "study_key", None)
+            rev_study_key = self._validate_study_key(raw_study_key) if raw_study_key else study_key
             deleted_val = getattr(revision, "deleted", False)
             yield (
                 str(rev_study_key),
