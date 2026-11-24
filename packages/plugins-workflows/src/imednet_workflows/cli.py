@@ -45,15 +45,13 @@ from imednet.spi.cli import (
     resolve_hybrid_study_and_key,
     resolve_output_format,
     resolve_study_key,
+    sanitize_cli_phi,
     simulation_mode_context,
     validate_cli_path_segment,
     with_sdk,
 )
 from imednet.spi.models import PROFILE_REGISTRY
 from imednet.spi.utils import (
-    global_sensitivity_registry,
-    mask_clinical_phi,
-    mask_custom_phi_recursive,
     redact_sensitive_text,
     resolve_study_configuration,
     validate_path_segment,
@@ -225,7 +223,12 @@ def _serialize_uat_run_result(
         "validationReport": val_rep_dict,
         "phaseDurations": phase_durations,
     }
-    masked = _mask_workflow_value(item, custom_phi_fields=custom_phi_fields)
+    masked = sanitize_cli_phi(
+        item,
+        study_key=study_key,
+        mask_phi=True,
+        custom_phi_fields=custom_phi_fields,
+    )
     return masked if isinstance(masked, dict) else item
 
 
@@ -239,114 +242,22 @@ def _resolve_custom_phi_fields(study_key: str | None) -> set[str]:
     return set()
 
 
-def _is_key_phi_sensitive(key: str, custom_phi_fields: set[str]) -> bool:
-    """Return True if *key* matches global or study-configured PHI sensitivity rules."""
-    if global_sensitivity_registry.is_sensitive(key):
-        return True
-    if custom_phi_fields:
-        probe = mask_custom_phi_recursive({key: "probe"}, custom_phi_fields)
-        return bool(isinstance(probe, Mapping) and probe.get(key) == "***MASKED***")
-    return False
-
-
-def _mask_workflow_value(value: Any, *, custom_phi_fields: set[str]) -> Any:
-    """Recursively mask clinical PHI across Pydantic models, mappings, and sequences.
-
-    Preserves object identity when no field values require masking so downstream
-    interactive views and SDK model serializers receive unmodified model instances.
-    """
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-
-    if isinstance(value, Mapping):
-        changed = False
-        rebuilt: dict[Any, Any] = {}
-        for k, v in value.items():
-            if _is_key_phi_sensitive(str(k), custom_phi_fields):
-                rebuilt[k] = "***MASKED***"
-                if v != "***MASKED***":
-                    changed = True
-            else:
-                masked_v = _mask_workflow_value(v, custom_phi_fields=custom_phi_fields)
-                rebuilt[k] = masked_v
-                if masked_v is not v and masked_v != v:
-                    changed = True
-        if not changed and isinstance(value, dict):
-            return value
-        return rebuilt
-
-    if isinstance(value, list):
-        masked_list = [
-            _mask_workflow_value(item, custom_phi_fields=custom_phi_fields) for item in value
-        ]
-        if all(
-            new_item is old_item for new_item, old_item in zip(masked_list, value, strict=False)
-        ):
-            return value
-        return masked_list
-
-    if isinstance(value, tuple):
-        masked_tuple = tuple(
-            _mask_workflow_value(item, custom_phi_fields=custom_phi_fields) for item in value
-        )
-        if all(
-            new_item is old_item for new_item, old_item in zip(masked_tuple, value, strict=False)
-        ):
-            return value
-        return masked_tuple
-
-    model_fields = getattr(type(value), "model_fields", None)
-    model_copy = getattr(value, "model_copy", None)
-    if isinstance(model_fields, Mapping) and callable(model_copy):
-        updates: dict[str, Any] = {}
-        for fname, finfo in model_fields.items():
-            raw_val = getattr(value, fname, None)
-            if raw_val is None:
-                continue
-            alias = getattr(finfo, "alias", None)
-            if _is_key_phi_sensitive(fname, custom_phi_fields) or (
-                isinstance(alias, str) and _is_key_phi_sensitive(alias, custom_phi_fields)
-            ):
-                if isinstance(raw_val, str) and raw_val != "***MASKED***":
-                    updates[fname] = "***MASKED***"
-                continue
-            masked_val = _mask_workflow_value(raw_val, custom_phi_fields=custom_phi_fields)
-            if masked_val is not raw_val and masked_val != raw_val:
-                updates[fname] = masked_val
-
-        extra = getattr(value, "__pydantic_extra__", None)
-        masked_extra: dict[str, Any] | None = None
-        if isinstance(extra, dict) and extra:
-            candidate_extra = _mask_workflow_value(extra, custom_phi_fields=custom_phi_fields)
-            if candidate_extra is not extra and candidate_extra != extra:
-                masked_extra = dict(candidate_extra)
-
-        if not updates and masked_extra is None:
-            return value
-
-        copied = model_copy(update=updates)
-        if masked_extra is not None:
-            copied_extra = getattr(copied, "__pydantic_extra__", None)
-            if isinstance(copied_extra, dict):
-                copied_extra = dict(copied_extra)
-                copied_extra.update(masked_extra)
-                object.__setattr__(copied, "__pydantic_extra__", copied_extra)
-        return copied
-
-    return value
-
-
 def _mask_workflow_item(
     payload: Any,
     *,
     study_key: str | None = None,
     mask_phi: bool = True,
 ) -> Any:
-    """Apply default and study-configured PHI masking to *payload* when enabled."""
+    """Apply default and study-configured PHI masking to *payload* via the shared SPI sanitizer."""
     if not mask_phi:
         return payload
     custom_phi_fields = _resolve_custom_phi_fields(study_key)
-    return _mask_workflow_value(payload, custom_phi_fields=custom_phi_fields)
+    return sanitize_cli_phi(
+        payload,
+        study_key=study_key,
+        mask_phi=True,
+        custom_phi_fields=custom_phi_fields,
+    )
 
 
 def _to_serializable(value: Any) -> Any:
@@ -384,11 +295,13 @@ def _sanitize_workflow_payload(
     serialized = _to_serializable(payload)
     if not mask_phi:
         return serialized
-    masked = mask_clinical_phi(serialized)
     custom_phi = _resolve_custom_phi_fields(study_key)
-    if custom_phi:
-        masked = mask_custom_phi_recursive(masked, custom_phi)
-    return masked
+    return sanitize_cli_phi(
+        serialized,
+        study_key=study_key,
+        mask_phi=True,
+        custom_phi_fields=custom_phi,
+    )
 
 
 def _execute_set_state(
@@ -1644,7 +1557,12 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             )
             custom_phi = _resolve_custom_phi_fields(study_key)
             if custom_phi:
-                sanitized_records = mask_custom_phi_recursive(sanitized_records, custom_phi)
+                sanitized_records = sanitize_cli_phi(
+                    sanitized_records,
+                    study_key=study_key,
+                    mask_phi=True,
+                    custom_phi_fields=custom_phi,
+                )
         else:
             sanitized_records = serialized_records
 

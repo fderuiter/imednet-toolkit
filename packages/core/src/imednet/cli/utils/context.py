@@ -67,6 +67,37 @@ if not TYPE_CHECKING:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def bootstrap_cli_dotenv() -> set[str]:
+    """Load working-directory ``.env`` defaults without overriding shell environment variables.
+
+    Returns the set of environment variable names newly added to ``os.environ``.
+    """
+    before_keys = set(os.environ)
+    try:
+        import dotenv
+
+        load_fn = getattr(dotenv, "load_dotenv", None)
+        if not callable(load_fn):
+            return set()
+        find_fn = getattr(dotenv, "find_dotenv", None)
+        if callable(find_fn):
+            dotenv_path = find_fn(usecwd=True)
+            if not dotenv_path:
+                return set()
+            try:
+                load_fn(dotenv_path, override=False)
+            except TypeError:
+                load_fn()
+        else:
+            try:
+                load_fn(override=False)
+            except TypeError:
+                load_fn()
+    except Exception:
+        return set(os.environ) - before_keys
+    return set(os.environ) - before_keys
+
+
 @contextmanager
 def simulation_mode_context(enabled: bool = False) -> Iterator[None]:
     """Temporarily enable ``IMEDNET_SIMULATION_MODE`` and restore prior environment on exit."""
@@ -128,12 +159,7 @@ def get_sdk() -> ImednetSDK:
             and os.getenv("IMEDNET_SECURITY_KEY", "").strip()
         )
     ):
-        try:
-            from dotenv import load_dotenv
-
-            load_dotenv()
-        except Exception:  # noqa: S110
-            pass
+        bootstrap_cli_dotenv()
 
     try:
         config = load_config()

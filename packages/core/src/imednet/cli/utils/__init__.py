@@ -20,7 +20,7 @@ from .args import (
     resolve_study_key,
 )
 from .commands import get_model_value, register_list_command
-from .context import fetching_status, get_sdk, simulation_mode_context
+from .context import bootstrap_cli_dotenv, fetching_status, get_sdk, simulation_mode_context
 from .output import (
     _HC_STATUS_COLOR_MAP,
     _STATUS_COLOR_MAP,
@@ -53,6 +53,7 @@ from .terminal import (
 from .write_helpers import load_offline_schema, parse_email_notify, resolve_cli_schema
 
 if TYPE_CHECKING:
+    from .export import sanitize_cli_phi, sanitize_cli_records
     from .grid import InteractiveDataGrid, is_interactive_terminal, run_interactive_grid
 
 __all__ = [
@@ -74,6 +75,7 @@ __all__ = [
     "add_output_format",
     "add_simulation_arg",
     "add_study_key_args",
+    "bootstrap_cli_dotenv",
     "clear_line",
     "console",
     "display_list",
@@ -100,6 +102,8 @@ __all__ = [
     "resolve_output_format",
     "resolve_study_key",
     "run_interactive_grid",
+    "sanitize_cli_phi",
+    "sanitize_cli_records",
     "simulation_mode_context",
     "supports_ansi_color",
     "supports_fullscreen_ui",
@@ -132,6 +136,12 @@ def __getattr__(name: str) -> Any:
             if name == "run_interactive_grid":
                 return lambda *args, **kwargs: False
             raise
+    if name in ("sanitize_cli_phi", "sanitize_cli_records"):
+        from . import export as _export_mod
+
+        val = getattr(_export_mod, name)
+        globals()[name] = val
+        return val
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

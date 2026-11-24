@@ -76,5 +76,5 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         include_filter=False,
         extra_args_fn=_add_users_list_args,
         extra_kwargs_fn=lambda args: {"include_inactive": args.include_inactive},
-        preflight_query=False,
+        preflight_query=True,
     )

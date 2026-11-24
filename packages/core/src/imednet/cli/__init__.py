@@ -329,58 +329,66 @@ def app(args: list[str] | None = None) -> None:
     if args is None:
         args = sys.argv[1:]
 
-    parser = _build_scoped_parser(args)
+    from .utils.context import bootstrap_cli_dotenv
 
-    parsed = parser.parse_args(args)
+    dotenv_added_keys = bootstrap_cli_dotenv()
 
-    old_high_contrast = os.environ.get("IMEDNET_HIGH_CONTRAST")
-    old_output_format = os.environ.get(OUTPUT_FORMAT_ENV)
-    old_non_interactive = os.environ.get(NON_INTERACTIVE_ENV)
-    old_simulation_mode = os.environ.get(SIMULATION_MODE_ENV)
     try:
-        if parsed.high_contrast and getattr(parsed, "command", None) != "tui":
-            os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
+        parser = _build_scoped_parser(args)
 
-        if getattr(parsed, "no_interactive", False):
-            os.environ[NON_INTERACTIVE_ENV] = "1"
+        parsed = parser.parse_args(args)
 
-        if getattr(parsed, "simulation", False):
-            os.environ[SIMULATION_MODE_ENV] = "1"
+        old_high_contrast = os.environ.get("IMEDNET_HIGH_CONTRAST")
+        old_output_format = os.environ.get(OUTPUT_FORMAT_ENV)
+        old_non_interactive = os.environ.get(NON_INTERACTIVE_ENV)
+        old_simulation_mode = os.environ.get(SIMULATION_MODE_ENV)
+        try:
+            if parsed.high_contrast and getattr(parsed, "command", None) != "tui":
+                os.environ["IMEDNET_HIGH_CONTRAST"] = "1"
 
-        explicit_format = getattr(parsed, "output_format", None)
-        if explicit_format is None:
-            explicit_format = getattr(parsed, "format", None)
+            if getattr(parsed, "no_interactive", False):
+                os.environ[NON_INTERACTIVE_ENV] = "1"
 
-        if explicit_format == "json":
-            os.environ[OUTPUT_FORMAT_ENV] = "json"
-        elif explicit_format in {"table", "text", "md"}:
-            os.environ.pop(OUTPUT_FORMAT_ENV, None)
-        elif old_output_format is not None and old_output_format.strip().lower() == "json":
-            os.environ[OUTPUT_FORMAT_ENV] = "json"
+            if getattr(parsed, "simulation", False):
+                os.environ[SIMULATION_MODE_ENV] = "1"
 
-        with cli_execution_guard():
-            if hasattr(parsed, "func"):
-                parsed.func(parsed)
+            explicit_format = getattr(parsed, "output_format", None)
+            if explicit_format is None:
+                explicit_format = getattr(parsed, "format", None)
+
+            if explicit_format == "json":
+                os.environ[OUTPUT_FORMAT_ENV] = "json"
+            elif explicit_format in {"table", "text", "md"}:
+                os.environ.pop(OUTPUT_FORMAT_ENV, None)
+            elif old_output_format is not None and old_output_format.strip().lower() == "json":
+                os.environ[OUTPUT_FORMAT_ENV] = "json"
+
+            with cli_execution_guard():
+                if hasattr(parsed, "func"):
+                    parsed.func(parsed)
+                else:
+                    active_parser = _find_active_subparser(parser, args)
+                    active_parser.print_help()
+        finally:
+            if old_high_contrast is not None:
+                os.environ["IMEDNET_HIGH_CONTRAST"] = old_high_contrast
             else:
-                active_parser = _find_active_subparser(parser, args)
-                active_parser.print_help()
+                os.environ.pop("IMEDNET_HIGH_CONTRAST", None)
+            if old_output_format is not None:
+                os.environ[OUTPUT_FORMAT_ENV] = old_output_format
+            else:
+                os.environ.pop(OUTPUT_FORMAT_ENV, None)
+            if old_non_interactive is not None:
+                os.environ[NON_INTERACTIVE_ENV] = old_non_interactive
+            else:
+                os.environ.pop(NON_INTERACTIVE_ENV, None)
+            if old_simulation_mode is not None:
+                os.environ[SIMULATION_MODE_ENV] = old_simulation_mode
+            else:
+                os.environ.pop(SIMULATION_MODE_ENV, None)
     finally:
-        if old_high_contrast is not None:
-            os.environ["IMEDNET_HIGH_CONTRAST"] = old_high_contrast
-        else:
-            os.environ.pop("IMEDNET_HIGH_CONTRAST", None)
-        if old_output_format is not None:
-            os.environ[OUTPUT_FORMAT_ENV] = old_output_format
-        else:
-            os.environ.pop(OUTPUT_FORMAT_ENV, None)
-        if old_non_interactive is not None:
-            os.environ[NON_INTERACTIVE_ENV] = old_non_interactive
-        else:
-            os.environ.pop(NON_INTERACTIVE_ENV, None)
-        if old_simulation_mode is not None:
-            os.environ[SIMULATION_MODE_ENV] = old_simulation_mode
-        else:
-            os.environ.pop(SIMULATION_MODE_ENV, None)
+        for key in dotenv_added_keys:
+            os.environ.pop(key, None)
 
 
 if __name__ == "__main__":

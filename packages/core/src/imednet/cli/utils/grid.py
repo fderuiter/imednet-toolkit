@@ -20,6 +20,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from imednet.utils.validators import parse_bool
+
 from ..decorators import _redact_secrets
 from .output import (
     _HC_STATUS_COLOR_MAP,
@@ -247,7 +249,7 @@ class InteractiveDataGrid:
         self.is_high_contrast = (
             is_high_contrast
             if is_high_contrast is not None
-            else (os.environ.get("IMEDNET_HIGH_CONTRAST") == "1")
+            else parse_bool(os.environ.get("IMEDNET_HIGH_CONTRAST"), strict=False)
         )
 
         detail_list = list(details) if details is not None else list(items)

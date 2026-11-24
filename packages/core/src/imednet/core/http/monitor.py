@@ -19,6 +19,7 @@ else:
     Tracer = Any
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 class RequestMonitor(_BaseMonitor):

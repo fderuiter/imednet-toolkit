@@ -30,6 +30,7 @@ from imednet.utils.security import (
 from imednet.utils.url import validate_path_segment
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 _ORIGINAL_TIME_SLEEP = time.sleep
 
 

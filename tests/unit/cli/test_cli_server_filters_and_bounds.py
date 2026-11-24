@@ -269,7 +269,7 @@ def test_users_list_supports_sort_limit_all_and_omits_filter(
         "page": "0",
     }
 
-    # Passing --filter to users or intervals list must be rejected by argparse with exit code 2
+    # Passing --filter to users list must be rejected by argparse with exit code 2
     with pytest.raises(SystemExit) as exc_info:
         cli.app(["users", "list", "S1", "--filter", "login==alice"])
     assert exc_info.value.code == 2
@@ -278,7 +278,12 @@ def test_users_list_supports_sort_limit_all_and_omits_filter(
         return_value=httpx.Response(
             200,
             json=_paginated_payload(
-                [{"intervalId": 1, "intervalName": "Baseline"}], page=0, size=5
+                [
+                    {"intervalId": 1, "intervalName": "Baseline"},
+                    {"intervalId": 2, "intervalName": "Screening"},
+                ],
+                page=0,
+                size=5,
             ),
         )
     )
@@ -286,15 +291,28 @@ def test_users_list_supports_sort_limit_all_and_omits_filter(
         ["intervals", "list", "S1", "--sort", "intervalId,asc", "--limit", "5", "--format", "json"]
     )
     int_out = json.loads(capfd.readouterr().out)
-    assert int_out["count"] == 1
+    assert int_out["count"] == 2
     assert dict(intervals_route.calls[0].request.url.params) == {
         "sort": "intervalId,asc",
         "size": "5",
         "page": "0",
     }
-    with pytest.raises(SystemExit) as int_exc_info:
-        cli.app(["intervals", "list", "S1", "--filter", "intervalId==1"])
-    assert int_exc_info.value.code == 2
+
+    cli.app(
+        [
+            "intervals",
+            "list",
+            "S1",
+            "--filter",
+            "intervalId==1",
+            "--format",
+            "json",
+        ]
+    )
+    filtered_int_out = json.loads(capfd.readouterr().out)
+    assert filtered_int_out["count"] == 1
+    assert filtered_int_out["items"][0]["intervalId"] == 1
+    assert "filter" not in dict(intervals_route.calls[-1].request.url.params)
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 from imednet.cli.decorators import (
     cli_execution_guard,
+    format_cli_diagnostic_error,
     redact_cli_secrets,
     validate_cli_path_segment,
     with_sdk,
@@ -21,6 +22,7 @@ from imednet.cli.utils import (
     add_output_format,
     add_simulation_arg,
     add_study_key_args,
+    bootstrap_cli_dotenv,
     clear_line,
     console,
     display_list,
@@ -50,7 +52,11 @@ from imednet.cli.utils import (
 )
 
 if TYPE_CHECKING:
-    from imednet.cli.utils import is_interactive_terminal
+    from imednet.cli.utils import (
+        is_interactive_terminal,
+        sanitize_cli_phi,
+        sanitize_cli_records,
+    )
 
 __all__ = [
     "NON_INTERACTIVE_ENV",
@@ -65,12 +71,14 @@ __all__ = [
     "add_output_format",
     "add_simulation_arg",
     "add_study_key_args",
+    "bootstrap_cli_dotenv",
     "clear_line",
     "cli_execution_guard",
     "console",
     "display_list",
     "emit_json",
     "fetching_status",
+    "format_cli_diagnostic_error",
     "format_job_progress",
     "is_dumb_terminal",
     "is_interactive_terminal",
@@ -89,6 +97,8 @@ __all__ = [
     "resolve_hybrid_study_and_key",
     "resolve_output_format",
     "resolve_study_key",
+    "sanitize_cli_phi",
+    "sanitize_cli_records",
     "simulation_mode_context",
     "supports_ansi_color",
     "supports_fullscreen_ui",
@@ -100,11 +110,12 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    """Lazily resolve interactive terminal helpers from ``imednet.cli.utils``."""
-    if name == "is_interactive_terminal":
-        from imednet.cli.utils import is_interactive_terminal
+    """Lazily resolve interactive terminal and PHI sanitizer helpers from ``imednet.cli.utils``."""
+    if name in ("is_interactive_terminal", "sanitize_cli_phi", "sanitize_cli_records"):
+        from imednet import cli as _cli_pkg  # noqa: F401
+        from imednet.cli import utils as _cli_utils
 
-        return is_interactive_terminal
+        return getattr(_cli_utils, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

@@ -50,6 +50,7 @@ from imednet.spi.utils import (
     evaluate_job_state,
     global_sensitivity_registry,
     mask_clinical_phi,
+    parse_bool,
     redact_sensitive_payload,
     redact_sensitive_text,
     validate_path_segment,
@@ -2450,7 +2451,7 @@ class ImednetTuiApp(App[None]):
         self.high_contrast_enabled = (
             bool(high_contrast)
             if high_contrast is not None
-            else os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+            else parse_bool(os.environ.get("IMEDNET_HIGH_CONTRAST"), strict=False)
         )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:

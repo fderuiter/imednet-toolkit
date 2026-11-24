@@ -12,6 +12,7 @@ from typing import TypeVar
 from imednet.errors.network import CircuitBreakerError
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 T = TypeVar("T")
 

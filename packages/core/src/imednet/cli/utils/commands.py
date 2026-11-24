@@ -153,9 +153,36 @@ def register_list_command(
         resolved_format: str,
         no_interactive: bool,
         disallow_study_key: bool,
-    ) -> tuple[dict[str, Any], int | None]:
+    ) -> tuple[dict[str, Any], int | None, Any]:
         target_model, target_allowed_attrs = _ensure_query_metadata()
-        return prepare_list_query(
+        is_client_side_filter = (
+            include_filter and target_allowed_attrs is not None and len(target_allowed_attrs) == 0
+        )
+        if not is_client_side_filter:
+            req_kwargs, eff_limit = prepare_list_query(
+                filter_args=filter_values,
+                sort=sort,
+                limit=limit,
+                fetch_all=fetch_all,
+                output_format=resolved_format,
+                no_interactive=no_interactive,
+                model=target_model,
+                allowed_attributes=target_allowed_attrs,
+                disallow_study_key=disallow_study_key,
+            )
+            return req_kwargs, eff_limit, None
+
+        from imednet.utils.filters import _get_model_field_types
+        from imednet.utils.record_filter_eval import compile_model_predicate
+
+        client_allowed_attrs: frozenset[str] | None = None
+        if target_model is not None:
+            field_types = _get_model_field_types(target_model)
+            scalar_keys = frozenset(k for k, kind in field_types.items() if kind != "other")
+            if scalar_keys:
+                client_allowed_attrs = scalar_keys
+
+        validated_kwargs, eff_limit = prepare_list_query(
             filter_args=filter_values,
             sort=sort,
             limit=limit,
@@ -163,9 +190,20 @@ def register_list_command(
             output_format=resolved_format,
             no_interactive=no_interactive,
             model=target_model,
-            allowed_attributes=target_allowed_attrs,
+            allowed_attributes=client_allowed_attrs,
             disallow_study_key=disallow_study_key,
         )
+        if not filter_values:
+            return validated_kwargs, eff_limit, None
+
+        upstream_kwargs: dict[str, Any] = {}
+        if "sort" in validated_kwargs:
+            upstream_kwargs["sort"] = validated_kwargs["sort"]
+        filter_only_kwargs = {
+            k: v for k, v in validated_kwargs.items() if k not in ("sort", "size")
+        }
+        predicate = compile_model_predicate(filter_only_kwargs)
+        return upstream_kwargs, eff_limit, predicate
 
     if requires_study_key:
         add_study_key_args(list_parser)
@@ -188,11 +226,11 @@ def register_list_command(
             limit: int | None = None,
             fetch_all: bool = False,
             no_interactive: bool = False,
-            _prepared_query: tuple[dict[str, Any], int | None] | None = None,
+            _prepared_query: tuple[dict[str, Any], int | None, Any] | None = None,
             _extra_kwargs: Mapping[str, Any] | None = None,
         ) -> None:
             resolved_format = resolve_output_format(output_format)
-            req_kwargs, effective_limit = (
+            req_kwargs, effective_limit, client_predicate = (
                 _prepared_query
                 if _prepared_query is not None
                 else _prepare_query(
@@ -207,8 +245,14 @@ def register_list_command(
             )
             call_kwargs = {**_extra_kwargs, **req_kwargs} if _extra_kwargs else req_kwargs
             with fetching_status(name, study_key):
+                raw_stream = getattr(sdk, attr).list(study_key, **call_kwargs)
+                filtered_stream = (
+                    (item for item in raw_stream if client_predicate.matches(item))
+                    if client_predicate is not None
+                    else raw_stream
+                )
                 items, truncated, load_remaining = collect_list_items_with_remainder(
-                    getattr(sdk, attr).list(study_key, **call_kwargs),
+                    filtered_stream,
                     effective_limit,
                 )
             _render_list_results(
@@ -278,11 +322,11 @@ def register_list_command(
             limit: int | None = None,
             fetch_all: bool = False,
             no_interactive: bool = False,
-            _prepared_query: tuple[dict[str, Any], int | None] | None = None,
+            _prepared_query: tuple[dict[str, Any], int | None, Any] | None = None,
             _extra_kwargs: Mapping[str, Any] | None = None,
         ) -> None:
             resolved_format = resolve_output_format(output_format)
-            req_kwargs, effective_limit = (
+            req_kwargs, effective_limit, client_predicate = (
                 _prepared_query
                 if _prepared_query is not None
                 else _prepare_query(
@@ -297,8 +341,14 @@ def register_list_command(
             )
             call_kwargs = {**_extra_kwargs, **req_kwargs} if _extra_kwargs else req_kwargs
             with fetching_status(name):
+                raw_stream = getattr(sdk, attr).list(**call_kwargs)
+                filtered_stream = (
+                    (item for item in raw_stream if client_predicate.matches(item))
+                    if client_predicate is not None
+                    else raw_stream
+                )
                 items, truncated, load_remaining = collect_list_items_with_remainder(
-                    getattr(sdk, attr).list(**call_kwargs),
+                    filtered_stream,
                     effective_limit,
                 )
             _render_list_results(

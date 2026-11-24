@@ -202,6 +202,15 @@ def add_study_key_args(
             parser.add_argument("study_key", nargs="?", default=None, help=positional_help)
 
 
+def _resolve_env_study_key() -> str | None:
+    """Return stripped ``IMEDNET_STUDY_KEY`` from ``os.environ`` when non-blank."""
+    raw = os.environ.get("IMEDNET_STUDY_KEY")
+    if _is_blank_arg(raw):
+        return None
+    assert raw is not None
+    return raw.strip()
+
+
 def resolve_study_key(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
@@ -209,7 +218,7 @@ def resolve_study_key(
     required: bool = True,
     missing_error: str = "the following arguments are required: study_key",
 ) -> str | None:
-    """Resolve hybrid positional ``study_key`` and ``--study-key`` flag, exiting 2 on conflict."""
+    """Resolve hybrid positional ``study_key``, ``--study-key`` flag, or ``IMEDNET_STUDY_KEY``."""
     flag_val: str | None = getattr(args, "study_key_flag", None)
     pos_val: str | None = getattr(args, "study_key", None)
 
@@ -227,7 +236,7 @@ def resolve_study_key(
     elif pos_present:
         resolved = pos_val
     else:
-        resolved = None
+        resolved = _resolve_env_study_key()
 
     if resolved is None and required:
         parser.error(missing_error)
@@ -244,11 +253,12 @@ def resolve_hybrid_study_and_key(
     secondary_dest: str = "subject_key",
     secondary_flag_dest: str = "subject_key_flag",
 ) -> tuple[str, str]:
-    """Resolve hybrid positional and flag pairs for ``study_key`` and a secondary key."""
+    """Resolve hybrid positional/flag pairs for ``study_key`` and a secondary key."""
     flag_study: str | None = getattr(args, "study_key_flag", None)
     flag_secondary: str | None = getattr(args, secondary_flag_dest, None)
     pos_study: str | None = getattr(args, "study_key", None)
     pos_secondary: str | None = getattr(args, secondary_dest, None)
+    env_study = _resolve_env_study_key()
 
     if flag_study is not None and flag_secondary is not None:
         study_key: str | None = flag_study
@@ -284,7 +294,17 @@ def resolve_hybrid_study_and_key(
         elif pos_study is not None:
             study_key = pos_study
         else:
-            study_key = None
+            study_key = env_study
+    elif pos_study is not None and pos_secondary is None and env_study is not None:
+        if not _is_blank_arg(pos_study):
+            study_key = env_study
+            secondary_key = pos_study
+        else:
+            study_key = env_study
+            secondary_key = None
+    elif pos_study is None and pos_secondary is None:
+        study_key = env_study
+        secondary_key = None
     else:
         study_key = pos_study
         secondary_key = pos_secondary
