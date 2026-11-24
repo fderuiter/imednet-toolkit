@@ -16,26 +16,6 @@ Role-Based Pathways & Interactive Showcase
 
    .. container:: role-card role-pathway-section
 
-      .. rubric:: Clinical Data Managers
-         :class: role-card-title
-
-      Curated workflows for Study Data Dictionary schemas, pre-live UAT validation, Subject registration, and bulk Record creation using ``imednet datadict`` (``from-csv``, ``from-odm``, ``to-odm``, ``from-redcap``, ``from-api``, ``validate``, ``diff``, and ``schema``).
-
-      .. raw:: html
-
-         <div class="role-card-action">
-            <button type="button" class="role-card-launch-btn" data-persona-target="panel-datamanager" aria-label="Inspect Form Schemas - Open Clinical Data Manager Live Explorer">
-               <span>📋 Inspect Form Schemas</span>
-            </button>
-         </div>
-
-      * :doc:`how-to/data_dictionary`
-      * :doc:`how-to/workflows/uat_workflow`
-      * :doc:`how-to/register_subjects`
-      * :doc:`how-to/workflows/bulk_submission`
-
-   .. container:: role-card role-pathway-section
-
       .. rubric:: Integration Engineers
          :class: role-card-title
 
@@ -54,6 +34,26 @@ Role-Based Pathways & Interactive Showcase
       * :doc:`how-to/airflow`
       * :doc:`reference/rest_api_reference`
       * :doc:`reference/api/core`
+
+   .. container:: role-card role-pathway-section
+
+      .. rubric:: Clinical Data Managers
+         :class: role-card-title
+
+      Curated workflows for Study Data Dictionary schemas, pre-live UAT validation, Subject registration, and bulk Record creation using ``imednet datadict`` (``from-csv``, ``from-odm``, ``to-odm``, ``from-redcap``, ``from-api``, ``validate``, ``diff``, and ``schema``).
+
+      .. raw:: html
+
+         <div class="role-card-action">
+            <button type="button" class="role-card-launch-btn" data-persona-target="panel-datamanager" aria-label="Inspect Form Schemas - Open Clinical Data Manager Live Explorer">
+               <span>📋 Inspect Form Schemas</span>
+            </button>
+         </div>
+
+      * :doc:`how-to/data_dictionary`
+      * :doc:`how-to/workflows/uat_workflow`
+      * :doc:`how-to/register_subjects`
+      * :doc:`how-to/workflows/bulk_submission`
 
    .. container:: role-card role-pathway-section
 
@@ -216,7 +216,7 @@ Role-Based Pathways & Interactive Showcase
             <div class="explorer-controls-left">
                <div class="explorer-control-group">
                   <label for="aud-scenario-select" class="explorer-control-label">Audit Scope:</label>
-                  <select id="aud-scenario-select" class="explorer-select" aria-label="Select audit scope">
+                  <select id="aud-scenario-select" class="explorer-select" aria-label="Audit Scope: Select audit scope">
                      <option value="part11">21 CFR Part 11 Electronic Signature &amp; Audit Trail</option>
                      <option value="vpat">WCAG 2.1 AA Accessibility Conformance Verification</option>
                   </select>
