@@ -4,46 +4,24 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 from typing import Any
 
 from ...sdk import ImednetSDK
-from ...utils.batch_coordinator import BatchSubmissionSummary
 from ...utils.enrollment import (
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
     validate_subject_registration_sites,
 )
-from ..decorators import validate_cli_path_segment, with_sdk
+from ..decorators import with_sdk
 from ..utils import print_error, register_list_command, simulation_mode_context
-from ..utils.args import (
-    add_study_key_args,
-    resolve_study_key,
-)
+from ..utils.args import add_study_key_args
 from ..utils.context import is_offline_schema_dry_run
 from ..utils.write_helpers import (
     add_write_common_args,
     assemble_cli_write_records,
-    execute_cli_write,
-    guard_stdin_dash_tty,
-    resolve_cli_schema,
-    submit_cli_records_batch,
-    validate_write_numeric_flags,
+    prepare_write_cli_preflight,
+    run_cli_batch_write,
 )
-
-
-def _load_cli_subject_inputs(
-    args: argparse.Namespace,
-    *,
-    schema: Any = None,
-) -> list[dict[str, Any]]:
-    """Resolve CLI subject registration inputs from ``--file``, ``--json``, or inline flags."""
-    return assemble_cli_write_records(
-        args,
-        schema=schema,
-        study_key=getattr(args, "study_key", None),
-        is_subject_registration=True,
-    )
 
 
 def _subject_view_model(s: Any) -> dict[str, Any]:
@@ -153,14 +131,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             schema_source=args.schema_source,
         )
 
-        def _run() -> BatchSubmissionSummary:
-            resolved_schema = resolve_cli_schema(
-                sdk,
-                args.study_key,
-                args.schema_source,
-                dry_run=args.dry_run,
+        def _prepare_subjects(resolved_schema: Any) -> tuple[list[dict[str, Any]], int]:
+            raw_inputs = assemble_cli_write_records(
+                args,
+                schema=resolved_schema,
+                study_key=args.study_key,
+                is_subject_registration=True,
             )
-            raw_inputs = _load_cli_subject_inputs(args, schema=resolved_schema)
             normalized_pairs = normalize_subject_registration_inputs(
                 raw_inputs,
                 default_form_key=args.form_key,
@@ -177,42 +154,23 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 if (args.skip_existing and not offline_dry_run)
                 else None
             )
-            subjects_data, skipped_count = filter_existing_subject_registrations(
+            return filter_existing_subject_registrations(
                 normalized_pairs,
                 existing_subjects,
                 should_filter=args.skip_existing,
                 subject_key_field=args.subject_key_field,
             )
-            return submit_cli_records_batch(
-                sdk,
-                args,
-                subjects_data,
-                action_label="subject registration",
-                schema=resolved_schema,
-                skipped_count=skipped_count,
-            )
 
-        execute_cli_write(
-            _run,
-            study_key=args.study_key,
+        run_cli_batch_write(
+            sdk,
+            args,
             resource="subjects_register",
-            output_format=args.output_format,
-            dry_run=args.dry_run,
+            action_label="subject registration",
+            prepare_batch=_prepare_subjects,
         )
 
     def _dispatch_register_subjects(args: argparse.Namespace) -> None:
-        study_key = resolve_study_key(register_parser, args, required=True)
-        assert study_key is not None
-        validate_cli_path_segment(study_key, name="study_key")
-        validate_write_numeric_flags(
-            chunk_size=args.chunk_size,
-            timeout=args.timeout,
-            interval=args.interval,
-        )
-        guard_stdin_dash_tty(args.input_file)
-        if args.input_file and args.input_file != "-" and not Path(args.input_file).exists():
-            print_error(f"Error: Input file not found: '{args.input_file}'")
-            sys.exit(1)
+        prepare_write_cli_preflight(register_parser, args)
         if (
             not args.input_file
             and not args.json_payload

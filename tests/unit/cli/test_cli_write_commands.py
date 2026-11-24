@@ -2285,3 +2285,313 @@ def test_cli_write_wait_exits_1_and_emits_json_counts_on_result_url_errors_or_ht
     assert job_entry["batchId"] == "B-FAIL-1"
     assert (job_entry["failedRecords"] or 0) >= 1 or bool(job_entry.get("resultError"))
     assert "Error:" in res.stderr
+
+
+def test_merge_inline_data_overrides_preserves_original_and_coerces_per_form() -> None:
+    """merge_inline_data_overrides copies payloads, merges recordData/data, and coerces per form."""
+    from imednet.cli.utils.write_helpers import merge_inline_data_overrides
+    from imednet.datadict.models import DataDictionary, Form, Variable
+
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formId=77,
+                formKey="F_COERCE",
+                formName="Coerce Form",
+                variables=[
+                    Variable(variableName="V_ZIP", variableType="text"),
+                    Variable(variableName="V_COUNT", variableType="integer"),
+                ],
+            )
+        ]
+    )
+
+    original = {"recordId": 101, "recordData": {"V_EXISTING": "keep", "V_COUNT": 1}}
+    noop_copy = merge_inline_data_overrides(original, None, schema=dd)
+    assert noop_copy == original
+    assert noop_copy is not original
+
+    merged = merge_inline_data_overrides(
+        original,
+        ["V_ZIP=02138", "V_COUNT=9"],
+        schema=dd,
+        default_form_id=77,
+    )
+    assert original["recordData"] == {"V_EXISTING": "keep", "V_COUNT": 1}
+    assert "data" not in original
+    assert merged["data"] == {"V_EXISTING": "keep", "V_ZIP": "02138", "V_COUNT": 9}
+
+
+def test_subjects_register_skip_existing_sets_skipped_count_on_returned_batch_summary(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """subjects register --skip-existing sets summary.skipped_count when create_batch returns BatchSubmissionSummary."""
+    from imednet.models.jobs import Job
+    from imednet.utils.batch_coordinator import BatchSubmissionSummary
+
+    sdk, _state, _requests = sim_sdk_and_requests
+    monkeypatch.setattr(sdk, "close", lambda: None)
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda **_kwargs: sdk)
+
+    csv_path = tmp_path / "skip_check.csv"
+    csv_path.write_text(
+        "formKey,siteName,subjectKey,V_AGE\nF_DM,SITE,SUB1,30\nF_DM,SITE,SUB-BRAND-NEW,44\n",
+        encoding="utf-8",
+    )
+
+    def _fake_create_batch(*_args: object, **_kwargs: object) -> BatchSubmissionSummary:
+        return BatchSubmissionSummary(
+            study_key="STUDY",
+            jobs=[Job(jobId="J-SKIP-1", batchId="B-SKIP-1", state="QUEUED")],
+            chunk_sizes=[1],
+            total_records=1,
+            skipped_count=0,
+        )
+
+    monkeypatch.setattr(sdk.records, "create_batch", _fake_create_batch)
+
+    res = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--file",
+            str(csv_path),
+            "--skip-existing",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res.exit_code == 0, res.stderr
+    item = json.loads(res.stdout)["items"][0]
+    assert item["totalRecords"] == 1
+    assert item["skippedCount"] == 1
+    assert item["batchIds"] == ["B-SKIP-1"]
+
+
+def test_prepare_write_cli_preflight_and_import_progress_context_ordering(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """prepare_write_cli_preflight validates paths and import_records_cmd loads inside write_progress_context."""
+    from contextlib import contextmanager
+
+    import imednet.cli.records as records_cli_mod
+    from imednet.cli.utils import write_helpers
+    from imednet.spi import cli as spi_cli
+
+    # 1. spi.cli exports remain unchanged and do not leak internal batch helpers
+    for internal_name in (
+        "make_job_progress_callback",
+        "prepare_write_cli_preflight",
+        "merge_inline_data_overrides",
+        "run_cli_batch_write",
+    ):
+        assert internal_name not in spi_cli.__all__
+        assert not hasattr(spi_cli, internal_name)
+
+    # 2. prepare_write_cli_preflight rejects "-" when allow_stdin_dash=False
+    parser = cli.get_parser()
+    ns_dash = parser.parse_args(["records", "import", "STUDY", "-"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc_info:
+        write_helpers.prepare_write_cli_preflight(
+            parser,
+            ns_dash,
+            file_arg=ns_dash.file,
+            allow_stdin_dash=False,
+        )
+    assert exc_info.value.code == 1
+    assert "Input file not found: '-'" in capsys.readouterr().err
+
+    # 3. import_records_cmd loads CSV and JSON files while inside write_progress_context
+    in_progress = False
+    observed_in_progress: list[bool] = []
+    orig_progress_ctx = write_helpers.write_progress_context
+
+    @contextmanager
+    def _spy_progress_ctx(*p_args: object, **p_kwargs: object):
+        nonlocal in_progress
+        with orig_progress_ctx(*p_args, **p_kwargs) as cb:  # type: ignore[arg-type]
+            in_progress = True
+            try:
+                yield cb
+            finally:
+                in_progress = False
+
+    orig_csv = records_cli_mod.import_records_csv
+    orig_json_loader = records_cli_mod.load_records_from_path_or_stdin
+
+    def _spy_csv(*c_args: object, **c_kwargs: object):
+        observed_in_progress.append(in_progress)
+        return orig_csv(*c_args, **c_kwargs)  # type: ignore[arg-type]
+
+    def _spy_json_loader(*l_args: object, **l_kwargs: object):
+        observed_in_progress.append(in_progress)
+        return orig_json_loader(*l_args, **l_kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(write_helpers, "write_progress_context", _spy_progress_ctx)
+    monkeypatch.setattr(records_cli_mod, "import_records_csv", _spy_csv)
+    monkeypatch.setattr(records_cli_mod, "load_records_from_path_or_stdin", _spy_json_loader)
+
+    csv_file = tmp_path / "order.csv"
+    csv_file.write_text("formKey,subjectKey,siteName,V_AGE\nF_DM,SUB1,SITE,40\n", encoding="utf-8")
+    json_file = tmp_path / "order.json"
+    json_file.write_text(
+        json.dumps(
+            [{"formKey": "F_DM", "subjectKey": "SUB1", "siteName": "SITE", "data": {"V_AGE": 41}}]
+        ),
+        encoding="utf-8",
+    )
+
+    for target in (csv_file, json_file):
+        res = _invoke_cli(
+            capsys,
+            ["records", "import", "STUDY", str(target), "--no-interactive", "--format", "json"],
+        )
+        assert res.exit_code == 0, res.stderr
+
+    assert observed_in_progress == [True, True]
+
+    # 4. Offline --dry-run on records update also runs without credentials or HTTP requests
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    dd_file = tmp_path / "upd_dd.json"
+    dd_file.write_text(
+        json.dumps(
+            {
+                "forms": [
+                    {
+                        "formKey": "F_DM",
+                        "variables": [{"variableName": "V_AGE", "variableType": "integer"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    res_upd_dry = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--record-id",
+            "601",
+            "--form-key",
+            "F_DM",
+            "-d",
+            "V_AGE=50",
+            "--schema",
+            str(dd_file),
+            "--dry-run",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_upd_dry.exit_code == 0, res_upd_dry.stderr
+    assert json.loads(res_upd_dry.stdout)["items"][0]["dryRun"] is True
+
+
+def test_cli_package_has_zero_pylint_r0801_duplicate_code() -> None:
+    """CLI package has zero duplicate-code blocks at min-similarity-lines=12 and 8."""
+    import ast
+    import importlib.util
+    import shutil
+    import subprocess
+    import sys
+
+    cli_dir = Path(cli.__file__).resolve().parent
+    py_files = sorted(cli_dir.rglob("*.py"))
+    assert py_files
+
+    # Always verify via AST-aware normalized line windows (works in wheel/CI test envs without pylint)
+    normalized_by_file: dict[Path, list[str]] = {}
+    for path in py_files:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        skip_lines: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and node.end_lineno:
+                skip_lines.update(range(node.lineno, node.end_lineno + 1))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Skip signature lines and leading docstring, matching pyproject.toml SIMILARITIES
+                if node.body:
+                    sig_end = node.body[0].lineno - 1
+                    skip_lines.update(range(node.lineno, sig_end + 1))
+                    first_stmt = node.body[0]
+                    if (
+                        isinstance(first_stmt, ast.Expr)
+                        and isinstance(first_stmt.value, ast.Constant)
+                        and isinstance(first_stmt.value.value, str)
+                        and first_stmt.end_lineno
+                    ):
+                        skip_lines.update(range(first_stmt.lineno, first_stmt.end_lineno + 1))
+            elif isinstance(node, (ast.Module, ast.ClassDef)) and node.body:
+                first_stmt = node.body[0]
+                if (
+                    isinstance(first_stmt, ast.Expr)
+                    and isinstance(first_stmt.value, ast.Constant)
+                    and isinstance(first_stmt.value.value, str)
+                    and first_stmt.end_lineno
+                ):
+                    skip_lines.update(range(first_stmt.lineno, first_stmt.end_lineno + 1))
+
+        kept: list[str] = []
+        for idx, raw_line in enumerate(source.splitlines(), start=1):
+            if idx in skip_lines:
+                continue
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            kept.append(stripped)
+        normalized_by_file[path] = kept
+
+    window = 8
+    seen_windows: dict[tuple[str, ...], Path] = {}
+    for path, lines in normalized_by_file.items():
+        for i in range(len(lines) - window + 1):
+            chunk = tuple(lines[i : i + window])
+            prev_path = seen_windows.get(chunk)
+            if prev_path is not None and prev_path != path:
+                pytest.fail(
+                    f"Duplicate 8-line CLI block between {prev_path.relative_to(cli_dir)} "
+                    f"and {path.relative_to(cli_dir)}: {chunk}"
+                )
+            seen_windows.setdefault(chunk, path)
+
+    # Also run Pylint R0801 directly when pylint is installed in the environment
+    pylint_cmd: list[str] | None = None
+    if importlib.util.find_spec("pylint") is not None:
+        pylint_cmd = [sys.executable, "-m", "pylint"]
+    elif shutil.which("pylint"):
+        pylint_cmd = [shutil.which("pylint") or "pylint"]
+
+    if pylint_cmd is not None:
+        for threshold in ("12", "8"):
+            proc = subprocess.run(
+                [
+                    *pylint_cmd,
+                    "--disable=all",
+                    "--enable=duplicate-code",
+                    "--ignore-comments=yes",
+                    "--ignore-docstrings=yes",
+                    "--ignore-imports=yes",
+                    "--ignore-signatures=yes",
+                    f"--min-similarity-lines={threshold}",
+                    str(cli_dir),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert "R0801" not in proc.stdout

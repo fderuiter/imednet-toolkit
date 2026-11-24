@@ -912,3 +912,78 @@ def test_sync_worker_cli_interval_bounds_and_non_interactive_telemetry_and_fatal
             assert leaked not in res_err.stderr
             assert leaked not in res_err.stdout
         sdk_inst.close.assert_called_once()
+
+
+def test_make_job_progress_callback_updates_status_ctrl_and_live_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """make_job_progress_callback updates status_ctrl or live stderr and backs job_wait."""
+    import io
+    import json
+
+    from tests.unit.cli.test_cli import CliRunner
+
+    from imednet import cli
+    from imednet.cli.utils import write_helpers
+    from imednet.cli.utils.write_helpers import make_job_progress_callback
+
+    event = JobStatusEvent(
+        batch_id="B-CB-1",
+        status=JobStatus(batch_id="B-CB-1", state=JobState.PROCESSING, progress=50),
+        poll_number=1,
+        elapsed=1.2,
+        is_terminal=False,
+    )
+    expected_msg = format_job_progress(event)
+
+    # 1. Updates status_ctrl when .update is available
+    ctrl = MagicMock()
+    cb_with_ctrl = make_job_progress_callback(ctrl)
+    cb_with_ctrl(event)
+    ctrl.update.assert_called_once_with(expected_msg)
+
+    # 2. Writes carriage-return ANSI clear line to live stderr when status_ctrl is None
+    buf = io.StringIO()
+    monkeypatch.setattr(write_helpers, "supports_live_status", lambda _stream: True)
+    monkeypatch.setattr(write_helpers.sys, "stderr", buf)
+    cb_live = make_job_progress_callback(None)
+    cb_live(event)
+    assert buf.getvalue() == f"\r\033[K{expected_msg}"
+
+    # 3. Swallows BrokenPipeError cleanly on closed stderr pipe
+    class _BrokenStderr:
+        def write(self, _s: str) -> int:
+            raise BrokenPipeError("pipe closed")
+
+        def flush(self) -> None:
+            pass
+
+    monkeypatch.setattr(write_helpers.sys, "stderr", _BrokenStderr())
+    cb_live(event)
+
+    # 4. job_wait passes make_job_progress_callback(status_ctrl) inside fetching_status under --format json
+    runner = CliRunner()
+    completed = JobStatus(batch_id="B-CB-JSON", state="COMPLETED", progress=100)
+    seen_ctrls: list[object] = []
+
+    orig_factory = write_helpers.make_job_progress_callback
+
+    def _spy_factory(status_ctrl: object = None):
+        seen_ctrls.append(status_ctrl)
+        return orig_factory(status_ctrl)
+
+    mock_sdk = MagicMock()
+    mock_sdk.poll_job.return_value = completed
+    with (
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        patch("imednet.cli.jobs.make_job_progress_callback", side_effect=_spy_factory),
+    ):
+        res = runner.invoke(
+            cli.app, ["jobs", "wait", "STUDY-TEST", "B-CB-JSON", "--format", "json"]
+        )
+
+    assert res.exit_code == 0
+    assert len(seen_ctrls) == 1
+    assert hasattr(seen_ctrls[0], "update")
+    parsed = json.loads(res.stdout)
+    assert parsed["items"][0]["batchId"] == "B-CB-JSON"
