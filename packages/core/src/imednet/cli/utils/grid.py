@@ -28,6 +28,7 @@ from .output import (
     _display_width,
     _fit_display_width,
     _format_cell_value,
+    _format_header_label,
     _is_16_color_terminal,
     _iter_graphemes,
     _sanitize_cell_text,
@@ -445,7 +446,7 @@ class InteractiveDataGrid:
 
     def _compute_col_widths(self, grid_limit: int) -> tuple[list[str], list[int]]:
         """Compute formatted headers and readable column widths without crushing headers."""
-        headers = [_sanitize_cell_text(str(f).replace("_", " ").title()) for f in self.fields]
+        headers = [_format_header_label(f) for f in self.fields]
         num_cols = len(self.fields)
         if num_cols == 0:
             return headers, []
@@ -848,36 +849,9 @@ class InteractiveDataGrid:
             )
         )
 
-    def _draw_side_panel(self, panel_x: int, panel_width: int, max_y: int) -> None:
-        """Render the side inspection panel displaying variables and metadata."""
-        viewport_lines = max_y - 3  # Lines from 1 to max_y - 2
-
-        # Blank the entire panel area across title and viewport rows and draw divider
-        safe_addstr(self.stdscr, 0, panel_x, " " * panel_width)
-        blank_row = "│" + (" " * max(0, panel_width - 1))
-        for y in range(1, max_y - 1):
-            safe_addstr(self.stdscr, y, panel_x, blank_row)
-
-        content_x = panel_x + 2
-        content_w = max(10, panel_width - 3)
-
+    def _build_side_panel_lines(self, content_w: int) -> list[tuple[str, int]]:
+        """Build wrapped metadata and variable lines for the selected side-panel entry."""
         is_records = self.label == "records"
-        panel_title = _sanitize_cell_text(
-            " RECORD INSPECTION " if is_records else f" {self.label.upper()} DETAILS "
-        )
-        safe_addstr(
-            self.stdscr,
-            1,
-            content_x,
-            _center_display_width(panel_title, content_w, "─"),
-            curses.A_BOLD,
-        )
-
-        if not self.filtered_entries:
-            empty_sel = "No record selected." if is_records else f"No {self.label} selected."
-            safe_addstr(self.stdscr, 3, content_x, _slice_display_width(empty_sel, content_w))
-            return
-
         _, detail_obj = self.filtered_entries[self.selected_idx]
         meta, variables = extract_item_details(detail_obj)
 
@@ -911,7 +885,7 @@ class InteractiveDataGrid:
             if k in meta and meta[k] is not None and meta[k] != "":
                 self._append_panel_value(
                     lines,
-                    k.replace("_", " ").title(),
+                    _format_header_label(k),
                     meta[k],
                     k,
                     content_w,
@@ -927,7 +901,7 @@ class InteractiveDataGrid:
             for k, v in other_meta:
                 self._append_panel_value(
                     lines,
-                    k.replace("_", " ").title(),
+                    _format_header_label(k),
                     v,
                     k,
                     content_w,
@@ -953,11 +927,68 @@ class InteractiveDataGrid:
             for k, v in other_meta:
                 self._append_panel_value(
                     lines,
-                    k.replace("_", " ").title(),
+                    _format_header_label(k),
                     v,
                     k,
                     content_w,
                 )
+
+        return lines
+
+    def _resolve_side_panel_max_scroll(self, max_y: int, max_x: int) -> int:
+        """Return cached or freshly computed maximum side-panel scroll offset."""
+        if self._side_panel_max_scroll is not None:
+            return self._side_panel_max_scroll
+        _, _, _, panel_width = self._layout_bounds(max_x)
+        if (
+            max_y < 5
+            or max_x < 24
+            or panel_width <= 0
+            or not self.filtered_entries
+            or not (0 <= self.selected_idx < len(self.filtered_entries))
+        ):
+            self._side_panel_max_scroll = 0
+            return 0
+        content_w = max(10, panel_width - 3)
+        visible_slots = max(1, max_y - 5)
+        lines = self._build_side_panel_lines(content_w)
+        max_scroll = max(0, len(lines) - visible_slots)
+        self._side_panel_max_scroll = max_scroll
+        return max_scroll
+
+    def _draw_side_panel(self, panel_x: int, panel_width: int, max_y: int) -> None:
+        """Render the side inspection panel displaying variables and metadata."""
+        viewport_lines = max_y - 3  # Lines from 1 to max_y - 2
+
+        # Blank the entire panel area across title and viewport rows and draw divider
+        safe_addstr(self.stdscr, 0, panel_x, " " * panel_width)
+        blank_row = "│" + (" " * max(0, panel_width - 1))
+        for y in range(1, max_y - 1):
+            safe_addstr(self.stdscr, y, panel_x, blank_row)
+
+        content_x = panel_x + 2
+        content_w = max(10, panel_width - 3)
+
+        is_records = self.label == "records"
+        panel_title = _sanitize_cell_text(
+            " RECORD INSPECTION " if is_records else f" {self.label.upper()} DETAILS "
+        )
+        safe_addstr(
+            self.stdscr,
+            1,
+            content_x,
+            _center_display_width(panel_title, content_w, "─"),
+            curses.A_BOLD,
+        )
+
+        if not self.filtered_entries:
+            empty_sel = "No record selected." if is_records else f"No {self.label} selected."
+            safe_addstr(self.stdscr, 3, content_x, _slice_display_width(empty_sel, content_w))
+            self._side_panel_max_scroll = 0
+            self.side_panel_scroll = 0
+            return
+
+        lines = self._build_side_panel_lines(content_w)
 
         # Render lines with scroll offset
         visible_slots = max(1, viewport_lines - 2)
@@ -1194,7 +1225,7 @@ class InteractiveDataGrid:
         Returns:
             True if loop should exit, False otherwise.
         """
-        max_y, _ = self.stdscr.getmaxyx()
+        max_y, max_x = self.stdscr.getmaxyx()
         viewport_height = max(1, max_y - 4)
         total = len(self.filtered_entries)
 
@@ -1277,19 +1308,17 @@ class InteractiveDataGrid:
                 self.side_panel_scroll = 0
                 self._side_panel_max_scroll = None
 
-        elif ch in (ord("["), ord("{"), "[", "{"):  # Scroll side panel up
-            if self.side_panel_open and self.side_panel_scroll > 0:
-                self.side_panel_scroll -= 1
-
         elif (
-            ch in (ord("]"), ord("}"), "]", "}")
+            ch in (ord("["), ord("]"), ord("{"), ord("}"), "[", "]", "{", "}")
             and self.side_panel_open
-            and (
-                self._side_panel_max_scroll is None
-                or self.side_panel_scroll < self._side_panel_max_scroll
-            )
-        ):  # Scroll panel down
-            self.side_panel_scroll += 1
+        ):
+            max_scroll = self._resolve_side_panel_max_scroll(max_y, max_x)
+            clamped = max(0, min(self.side_panel_scroll, max_scroll))
+            step = max(1, max_y - 5) if ch in (ord("{"), ord("}"), "{", "}") else 1
+            if ch in (ord("["), ord("{"), "[", "{"):
+                self.side_panel_scroll = max(0, clamped - step)
+            else:
+                self.side_panel_scroll = min(max_scroll, clamped + step)
 
         return False
 
