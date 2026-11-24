@@ -37,14 +37,15 @@ if not hasattr(_pydantic_internal_utils, "AbstractSetIntStr"):
 # Add package source roots and local Sphinx extensions so API modules and directives resolve.
 _DOCS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_DOCS_DIR, ".."))
-sys.path[:0] = [
-    os.path.join(_DOCS_DIR, "_ext"),
-    os.path.abspath("../packages/core/src"),
-    os.path.abspath("../packages/providers-airflow/src"),
-    os.path.abspath("../packages/plugins-workflows/src"),
-    os.path.abspath("../packages/plugins-sinks/src"),
-    os.path.abspath("../packages/plugins-tui/src"),
-]
+sys.path.insert(0, os.path.join(_DOCS_DIR, "_ext"))
+if os.environ.get("IMEDNET_TEST_WHEELS") != "1":
+    sys.path[:0] = [
+        os.path.abspath("../packages/core/src"),
+        os.path.abspath("../packages/providers-airflow/src"),
+        os.path.abspath("../packages/plugins-workflows/src"),
+        os.path.abspath("../packages/plugins-sinks/src"),
+        os.path.abspath("../packages/plugins-tui/src"),
+    ]
 
 from api_reference import (
     build_pydantic_field_specs,

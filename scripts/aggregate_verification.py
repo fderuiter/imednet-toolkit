@@ -78,13 +78,19 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     has_drift = False
     drift_violations: list[str] = []
+    failed_summaries: list[str] = []
     seen_tracks = {r.track for r in all_reports}
 
     for r in all_reports:
         if r.status == "failed":
             has_drift = True
-            for v in r.violations:
-                drift_violations.append(f"- {v.violation_type} in track `{r.track}`: {v.message}")
+            if r.violations:
+                for v in r.violations:
+                    drift_violations.append(
+                        f"- {v.violation_type} in track `{r.track}`: {v.message}"
+                    )
+            else:
+                failed_summaries.append(f"- failed in track `{r.track}`: {r.summary}")
 
     drift_count = len(drift_violations)
     missing_tracks = [track for track in expected_tracks if track not in seen_tracks]
@@ -93,8 +99,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if has_drift:
         report_dir.mkdir(parents=True, exist_ok=True)
+        report_lines = drift_violations or failed_summaries
         with open(report_dir / "drift_report.txt", "w", encoding="utf-8") as f:
-            f.writelines(f"{dv}\n" for dv in drift_violations)
+            f.writelines(f"{line}\n" for line in report_lines)
         print(f"::error::Detected {drift_count} verification violations.")
 
     if missing_tracks:

@@ -66,8 +66,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/imednet"]
+artifacts = ["src/imednet/py.typed"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/src/imednet"
+    "/src/imednet",
+    "/src/imednet/py.typed",
 ]

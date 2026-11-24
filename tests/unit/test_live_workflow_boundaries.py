@@ -84,6 +84,13 @@ def test_live_workflow_propagates_test_and_aggregation_failures(
         env["DRIFT_DETECTED"] = drift_detected
     else:
         env.pop("DRIFT_DETECTED", None)
+    if drift_detected == "true":
+        drift_dir = tmp_path / "reports" / "verification"
+        drift_dir.mkdir(parents=True, exist_ok=True)
+        (drift_dir / "drift_report.txt").write_text(
+            "- additive in track `drift`: Unexpected Study field\n",
+            encoding="utf-8",
+        )
     result = subprocess.run(
         [shutil.which("bash"), "-e", "-c", step["run"]],
         cwd=tmp_path,
@@ -94,3 +101,5 @@ def test_live_workflow_propagates_test_and_aggregation_failures(
         timeout=10,
     )
     assert result.returncode == expected, result.stderr
+    if drift_detected == "true":
+        assert "additive in track `drift`: Unexpected Study field" in result.stdout

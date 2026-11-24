@@ -18,12 +18,13 @@ os.environ.setdefault("IMEDNET_SECURITY_KEY", "test_sec_key")
 
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_TESTS_DIR = (ROOT / "tests" / "live").resolve()
-for source_root in (
-    ROOT / "packages" / "core" / "src",
-    ROOT / "packages" / "plugins-workflows" / "src",
-    ROOT / "packages" / "providers-airflow" / "src",
-):
-    sys.path.insert(0, str(source_root))
+if os.environ.get("IMEDNET_TEST_WHEELS") != "1":
+    for source_root in (
+        ROOT / "packages" / "core" / "src",
+        ROOT / "packages" / "plugins-workflows" / "src",
+        ROOT / "packages" / "providers-airflow" / "src",
+    ):
+        sys.path.insert(0, str(source_root))
 
 
 def pytest_addoption(parser):
