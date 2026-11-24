@@ -805,7 +805,7 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
             return httpx.Response(503, json={"error": "Service Unavailable"})
         return httpx.Response(404)
 
-    # Sync SDK: 5 external resultUrl 503s via SPI fetch_job_result + 5 local NaN serialization errors
+    # Sync SDK: 5 external resultUrl 503s via jobs.fetch_result + 5 local NaN serialization errors
     with ImednetSDK(
         api_key="k",
         security_key="s",
@@ -813,7 +813,7 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
         retries=0,
         transport=httpx.MockTransport(handler),
     ) as sync_sdk:
-        sync_poller = JobPoller(sync_sdk.jobs.get, fetch_result=sync_sdk.fetch_job_result)
+        sync_poller = JobPoller(sync_sdk.jobs.get, fetch_result=sync_sdk.jobs.fetch_result)
         for i in range(5):
             with pytest.raises(JobFailedError, match="failed to fetch resultUrl"):
                 sync_poller.run("STUDY1", f"B-503-{i}", interval=0, timeout=5)
@@ -834,7 +834,7 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
         assert len(studies) == 1
         assert studies[0].study_key == "STUDY1"
 
-    # Async SDK: 5 external resultUrl 503s via SPI async_fetch_job_result + 5 local NaN serialization errors
+    # Async SDK: 5 external resultUrl 503s via jobs.fetch_result + 5 local NaN serialization errors
     async with AsyncImednetSDK(
         api_key="k",
         security_key="s",
@@ -842,9 +842,7 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
         retries=0,
         transport=httpx.MockTransport(handler),
     ) as async_sdk:
-        async_poller = AsyncJobPoller(
-            async_sdk.jobs.get, fetch_result=async_sdk.async_fetch_job_result
-        )
+        async_poller = AsyncJobPoller(async_sdk.jobs.get, fetch_result=async_sdk.jobs.fetch_result)
         for i in range(5):
             with pytest.raises(JobFailedError, match="failed to fetch resultUrl"):
                 await async_poller.run("STUDY1", f"AB-503-{i}", interval=0, timeout=5)

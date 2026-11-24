@@ -160,6 +160,33 @@ def _assert_guardrail_contract(
     )
     assert not any("typos" in r and "--diff" in r for r in quality_runs)
 
+    filter_step = next(s for s in jobs["plan"]["steps"] if s.get("id") == "filter")
+    export_patterns = yaml.safe_load(filter_step["with"]["filters"])["export_logic"]
+    assert "packages/plugins-sinks/**" in export_patterns
+
+    build_steps = jobs["build"]["steps"]
+    build_step = next(s for s in build_steps if s.get("name") == "Build Workspace Packages")
+    assert "Skipping" not in build_step["run"]
+    upload_steps = [
+        s for s in build_steps if str(s.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert {s["with"]["name"] for s in upload_steps} == {
+        "dist-core",
+        "dist-workflows",
+        "dist-providers",
+        "dist-sinks",
+        "dist-tui",
+    }
+    for up in upload_steps:
+        assert up.get("if") == "needs.plan.outputs.build_matrix != '[]'"
+
+    run_tests_step = next(s for s in jobs["test"]["steps"] if s.get("name") == "Run Tests")
+    assert ".venv/bin/pytest" in run_tests_step["run"]
+    assert "IMEDNET_TEST_WHEELS=1" in run_tests_step["run"]
+    assert "hatch run" not in run_tests_step["run"]
+    assert "Passing gracefully" not in run_tests_step["run"]
+    assert "-eq 5" not in run_tests_step["run"]
+
 
 def test_ci_uses_canonical_full_verification():
     project, hooks, typos_cfg, pipeline = _load_guardrail_manifests()
@@ -550,6 +577,36 @@ def _mutate_quality_missing_typos(
             step["run"] = step["run"].replace("uv run typos --force-exclude .\n", "")
 
 
+def _mutate_missing_sinks_export_filter(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    filter_step = next(s for s in pipeline["jobs"]["plan"]["steps"] if s.get("id") == "filter")
+    filter_step["with"]["filters"] = filter_step["with"]["filters"].replace(
+        "  - 'packages/plugins-sinks/**'\n", ""
+    )
+
+
+def _mutate_build_selective_upload(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    upload_step = next(
+        s for s in pipeline["jobs"]["build"]["steps"] if s.get("name") == "Upload Core Artifact"
+    )
+    upload_step["if"] = "contains(fromJSON(needs.plan.outputs.build_matrix), 'core')"
+
+
+def _mutate_test_hatch_run(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    run_step = next(s for s in pipeline["jobs"]["test"]["steps"] if s.get("name") == "Run Tests")
+    run_step["run"] = run_step["run"].replace(".venv/bin/pytest", "hatch run test")
+
+
+def _mutate_test_exit_code_5_bypass(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    run_step = next(s for s in pipeline["jobs"]["test"]["steps"] if s.get("name") == "Run Tests")
+    run_step["run"] += '\n|| { RET=$?; if [ $RET -eq 5 ]; then exit 0; fi; exit $RET; }'
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -572,6 +629,10 @@ def _mutate_quality_missing_typos(
         _mutate_pre_commit_unpinned_uvx,
         _mutate_quality_missing_needs,
         _mutate_quality_missing_typos,
+        _mutate_missing_sinks_export_filter,
+        _mutate_build_selective_upload,
+        _mutate_test_hatch_run,
+        _mutate_test_exit_code_5_bypass,
     ],
 )
 def test_guardrail_manifest_contract_rejects_simulated_drift(mutator) -> None:

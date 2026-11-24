@@ -339,19 +339,20 @@ def resolve_sdk_result_fetcher(sdk: Any) -> Callable[[str], Any] | None:
 
     from imednet.endpoints.jobs import JobsEndpoint
 
-    if not isinstance(sdk, NonCallableMock) or "fetch_job_result" in vars(sdk):
-        facade_fn = getattr(sdk, "fetch_job_result", None)
-        if callable(facade_fn):
-            return cast(Callable[[str], Any], facade_fn)
-
     jobs = (
         getattr(sdk, "jobs", None)
-        if not isinstance(sdk, NonCallableMock) or "jobs" in vars(sdk)
+        if not isinstance(sdk, NonCallableMock)
+        or "jobs" in vars(sdk)
+        or "jobs" in getattr(sdk, "_mock_children", {})
         else None
     )
     if isinstance(jobs, JobsEndpoint):
         return jobs.fetch_result
-    if jobs is not None and not isinstance(jobs, NonCallableMock):
+    if jobs is not None and (
+        not isinstance(jobs, NonCallableMock)
+        or "fetch_result" in vars(jobs)
+        or "fetch_result" in getattr(jobs, "_mock_children", {})
+    ):
         fetch_fn = getattr(jobs, "fetch_result", None)
         if callable(fetch_fn):
             return cast(Callable[[str], Any], fetch_fn)

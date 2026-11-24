@@ -9,17 +9,17 @@ import inspect
 import logging
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Self, cast
 from unittest.mock import NonCallableMock
 
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import BindingType
-from textual.containers import Container
+from textual.containers import Container, VerticalScroll
 from textual.events import Resize
 from textual.message import Message
 from textual.screen import Screen
@@ -47,11 +47,13 @@ from imednet.spi.utils import (
     InvalidJobTransitionError,
     JobFailedError,
     PathTraversalValidationError,
+    SensitivityRegistry,
     evaluate_job_state,
     global_sensitivity_registry,
-    mask_clinical_phi,
-    redact_sensitive_payload,
-    redact_sensitive_text,
+    resolve_study_configuration,
+    sanitize_diagnostic_payload,
+    sanitize_diagnostic_text,
+    sdk_governance_context,
     validate_path_segment,
 )
 
@@ -61,8 +63,10 @@ __all__ = [
     "DEFAULT_FETCH_LIMIT",
     "DashboardScreen",
     "ImednetTuiApp",
+    "JobDetailPanel",
     "JobMonitor",
     "JobTable",
+    "LogViewer",
     "SiteList",
     "StudyList",
     "SubjectTable",
@@ -80,71 +84,88 @@ _SUCCESS_STATE_NAMES: frozenset[str] = frozenset({"COMPLETED", "COMPLETE", "SUCC
 _ACTIVE_STATE_NAMES: frozenset[str] = frozenset(
     {"PROCESSING", "PENDING", "RUNNING", "QUEUED", "OPEN", "ACTIVE"}
 )
-_QUOTED_SENSITIVE_KEY_RE = re.compile(
-    r"""(?i)(['"])(x-imn-security-key|x-api-key|api[_-]?key|security[_-]?key|"""
-    r"""authorization|client[_-]?secret|private[_-]?key|access[_-]?key|auth[_-]?key|"""
-    r"""credential|token|password|secret)\1(\s*:\s*)(['"])[^'"]*\4"""
-)
-_PHI_MASKED_SENTINEL = "***MASKED***"
-_PHI_QUOTED_KV_RE = re.compile(
-    r"""(?<![A-Za-z0-9_-])(?P<q1>['"]?)(?P<key>[A-Za-z][A-Za-z0-9_-]*)(?P=q1)"""
-    r"""(?P<sep>\s*[:=]\s*)(?P<q2>['"])(?P<val>(?:\\.|(?!(?P=q2))[^\r\n])*)(?P=q2)"""
-)
-_PHI_UNQUOTED_KV_RE = re.compile(
-    r"""(?<![A-Za-z0-9_-])(?P<q1>['"]?)(?P<key>[A-Za-z][A-Za-z0-9_-]*)(?P=q1)"""
-    r"""(?P<sep>\s*[:=]\s*)"""
-    r"""(?P<val>[^'"\s,;&\)\]\}\r\n](?:[^\r\n,;&\)\]\}]*?(?=(?:\s+[A-Za-z][A-Za-z0-9_-]*\s*[:=])|[,;&\)\]\}\r\n]|$))?)"""
-)
 
 
-def _sanitize_structured_payload(value: Any) -> Any:
-    """Apply clinical PHI masking and credential redaction to structured payloads."""
-    masked = mask_clinical_phi(value, registry=global_sensitivity_registry)
-    return redact_sensitive_payload(masked)
+class _StudyPhiRegistryCache:
+    """Session-scoped cache resolving ``StudyConfiguration.phi_fields`` per study."""
+
+    def __init__(self, sdk: object | None = None) -> None:
+        """Initialize the per-study sensitivity registry cache."""
+        self.sdk = sdk
+        self._phi_fields_by_study: dict[str, tuple[str, ...]] = {}
+        self._registry_cache: dict[
+            tuple[str, frozenset[str], frozenset[str]],
+            SensitivityRegistry,
+        ] = {}
+
+    def clear(self) -> None:
+        """Invalidate cached per-study ``phi_fields`` and isolated registries."""
+        self._phi_fields_by_study.clear()
+        self._registry_cache.clear()
+
+    def _resolve_phi_fields(self, study_key: str) -> tuple[str, ...]:
+        """Resolve committed ``StudyConfiguration.phi_fields`` once per study key."""
+        cached = self._phi_fields_by_study.get(study_key)
+        if cached is not None:
+            return cached
+        fields: tuple[str, ...] = ()
+        try:
+            if self.sdk is not None:
+                with sdk_governance_context(self.sdk):
+                    cfg = resolve_study_configuration(study_key)
+            else:
+                cfg = resolve_study_configuration(study_key)
+            raw_fields = getattr(cfg, "phi_fields", None) if cfg is not None else None
+            if raw_fields:
+                fields = tuple(str(field_name) for field_name in raw_fields if field_name)
+        except Exception:
+            fields = ()
+        self._phi_fields_by_study[study_key] = fields
+        return fields
+
+    def registry_for(self, study_key: str | None) -> SensitivityRegistry:
+        """Return an isolated ``SensitivityRegistry`` for ``study_key`` without global mutation."""
+        cleaned_study = (
+            study_key.strip() if isinstance(study_key, str) and study_key.strip() else None
+        )
+        if cleaned_study is None:
+            return global_sensitivity_registry
+        phi_fields = self._resolve_phi_fields(cleaned_study)
+        if not phi_fields:
+            return global_sensitivity_registry
+        sens_snap, exempt_snap = global_sensitivity_registry.snapshot()
+        cache_key = (cleaned_study, sens_snap, exempt_snap)
+        existing = self._registry_cache.get(cache_key)
+        if existing is not None:
+            return existing
+        reg = SensitivityRegistry()
+        for key in sens_snap:
+            reg.add_sensitive_key(key)
+        for key in exempt_snap:
+            reg.add_exempt_key(key)
+        for custom_key in phi_fields:
+            if not reg.is_exempt(custom_key):
+                reg.add_sensitive_key(custom_key)
+        self._registry_cache[cache_key] = reg
+        return reg
 
 
-def _mask_phi_key_value_text(text: str) -> str:
-    """Mask formatted key-value clinical PHI substrings matched by ``global_sensitivity_registry``."""
-
-    def _replace_quoted(match: re.Match[str]) -> str:
-        key = match.group("key")
-        if not global_sensitivity_registry.is_sensitive(key):
-            return match.group(0)
-        q1 = match.group("q1")
-        sep = match.group("sep")
-        q2 = match.group("q2")
-        return f"{q1}{key}{q1}{sep}{q2}{_PHI_MASKED_SENTINEL}{q2}"
-
-    def _replace_unquoted(match: re.Match[str]) -> str:
-        key = match.group("key")
-        if not global_sensitivity_registry.is_sensitive(key):
-            return match.group(0)
-        raw_val = match.group("val")
-        stripped = raw_val.rstrip()
-        if not stripped or stripped in {_PHI_MASKED_SENTINEL, "***"}:
-            return match.group(0)
-        trailing = raw_val[len(stripped) :]
-        q1 = match.group("q1")
-        sep = match.group("sep")
-        return f"{q1}{key}{q1}{sep}{_PHI_MASKED_SENTINEL}{trailing}"
-
-    masked = _PHI_QUOTED_KV_RE.sub(_replace_quoted, text)
-    return _PHI_UNQUOTED_KV_RE.sub(_replace_unquoted, masked)
+def _sanitize_structured_payload(
+    value: Any,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> Any:
+    """Apply clinical PHI masking and credential redaction via core diagnostic sanitizer."""
+    return sanitize_diagnostic_payload(value, registry=registry)
 
 
-def _sanitize_text(value: Any) -> str:
-    """Redact sensitive credentials, clinical PHI, headers, and URL query parameters from text."""
-    if isinstance(value, BaseException):
-        if len(value.args) == 1 and isinstance(value.args[0], (dict, list, tuple)):
-            payload_source: Any = value.args[0]
-        else:
-            payload_source = str(value)
-    else:
-        payload_source = value
-    redacted_payload = _sanitize_structured_payload(payload_source)
-    sanitized = redact_sensitive_text(str(redacted_payload))
-    sanitized = _QUOTED_SENSITIVE_KEY_RE.sub(r"\1\2\1\3\4***\4", sanitized)
-    return _mask_phi_key_value_text(sanitized)
+def _sanitize_text(
+    value: Any,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> str:
+    """Redact credentials, URL query filters, JSON, and clinical PHI via core sanitizer."""
+    return sanitize_diagnostic_text(value, registry=registry)
 
 
 def _get_configured_attr(obj: object, name: str) -> Any:
@@ -326,14 +347,30 @@ def _fallback_item_label(item: ListItem, default: str) -> str:
 class TextualLogHandler(logging.Handler):
     """Logging handler routing records to a Textual Log widget."""
 
-    def __init__(self, log_widget: Log) -> None:
+    def __init__(
+        self,
+        log_widget: Log,
+        *,
+        registry_resolver: Callable[[], SensitivityRegistry | None] | None = None,
+    ) -> None:
         """Initialize handler with target Log widget.
 
         Args:
             log_widget: The Textual Log widget to write to.
+            registry_resolver: Optional callable returning the active study registry.
         """
         super().__init__()
         self.log_widget = log_widget
+        self._registry_resolver = registry_resolver
+
+    def _active_registry(self) -> SensitivityRegistry | None:
+        """Resolve the active SensitivityRegistry for the target log widget."""
+        if self._registry_resolver is not None:
+            return self._registry_resolver()
+        resolver = getattr(self.log_widget, "active_registry", None)
+        if callable(resolver):
+            return cast("SensitivityRegistry | None", resolver())
+        return None
 
     def emit(self, record: logging.LogRecord) -> None:
         """Format, redact, mask clinical PHI, and write log record to widget.
@@ -342,20 +379,24 @@ class TextualLogHandler(logging.Handler):
             record: The logging LogRecord to emit.
         """
         try:
+            reg = self._active_registry()
             sanitized_record = copy.copy(record)
             if isinstance(record.msg, (dict, list, tuple)):
-                sanitized_record.msg = _sanitize_structured_payload(record.msg)
+                sanitized_record.msg = _sanitize_structured_payload(record.msg, registry=reg)
             if isinstance(record.args, dict):
-                sanitized_record.args = _sanitize_structured_payload(record.args)
+                sanitized_record.args = _sanitize_structured_payload(record.args, registry=reg)
             elif isinstance(record.args, tuple):
                 sanitized_record.args = tuple(
-                    _sanitize_structured_payload(arg)
+                    _sanitize_structured_payload(arg, registry=reg)
                     if isinstance(arg, (dict, list, tuple))
                     else arg
                     for arg in record.args
                 )
-            msg = _sanitize_text(self.format(sanitized_record))
-            self.log_widget.write_line(msg)
+            msg = _sanitize_text(self.format(sanitized_record), registry=reg)
+            if isinstance(self.log_widget, LogViewer):
+                Log.write_lines(self.log_widget, [msg])
+            else:
+                self.log_widget.write_line(msg)
         except Exception:
             self.handleError(record)
 
@@ -877,7 +918,11 @@ def _resolve_entry_state_color(entry: _TrackedJobEntry, state_str: str) -> str:
     return "red"
 
 
-def _extract_job_record_error_lines(entry: _TrackedJobEntry) -> list[str]:
+def _extract_job_record_error_lines(
+    entry: _TrackedJobEntry,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> list[str]:
     """Extract sanitized per-Record error lines from ``entry.last_job.results`` or ``record_errors``."""
     job = entry.last_job
     results = getattr(job, "results", None) if job is not None else None
@@ -902,7 +947,10 @@ def _extract_job_record_error_lines(entry: _TrackedJobEntry) -> list[str]:
     lines: list[str] = []
     for idx, item in enumerate(raw_items, start=1):
         if isinstance(item, dict):
-            sanitized_item = cast(dict[str, Any], _sanitize_structured_payload(item))
+            sanitized_item = cast(
+                dict[str, Any],
+                _sanitize_structured_payload(item, registry=registry),
+            )
             ident_parts: list[str] = []
             for id_key, label in (
                 ("recordId", "recordId"),
@@ -913,7 +961,9 @@ def _extract_job_record_error_lines(entry: _TrackedJobEntry) -> list[str]:
                 ("form_key", "form_key"),
             ):
                 if id_key in sanitized_item and sanitized_item[id_key] not in (None, ""):
-                    ident_parts.append(f"{label}={_sanitize_text(sanitized_item[id_key])}")
+                    ident_parts.append(
+                        f"{label}={_sanitize_text(sanitized_item[id_key], registry=registry)}"
+                    )
             detail_val = (
                 sanitized_item.get("error")
                 or sanitized_item.get("errors")
@@ -922,10 +972,23 @@ def _extract_job_record_error_lines(entry: _TrackedJobEntry) -> list[str]:
                 or sanitized_item
             )
             prefix = f"Record ({', '.join(ident_parts)})" if ident_parts else f"Record #{idx}"
-            lines.append(f"- {prefix}: {_sanitize_text(detail_val)}")
+            lines.append(f"- {prefix}: {_sanitize_text(detail_val, registry=registry)}")
         elif item is not None:
-            lines.append(f"- Record #{idx}: {_sanitize_text(item)}")
+            lines.append(f"- Record #{idx}: {_sanitize_text(item, registry=registry)}")
     return lines
+
+
+def _read_job_metadata_field(
+    job: object,
+    *names: str,
+    registry: SensitivityRegistry | None = None,
+) -> str | None:
+    """Read and sanitize the first non-empty scalar field from ``job``."""
+    for name in names:
+        cleaned = _clean_scalar(_get_configured_attr(job, name))
+        if cleaned is not None:
+            return _sanitize_text(cleaned, registry=registry)
+    return None
 
 
 class JobTable(DataTable[Text]):
@@ -949,6 +1012,10 @@ class JobTable(DataTable[Text]):
         """Initialize the JobTable widget."""
         super().__init__(**kwargs)
         self.cursor_type = "row"
+
+    def allow_focus(self) -> bool:
+        """Allow focus only while all ancestor containers and tab panes are displayed."""
+        return self.can_focus and all(ancestor.display for ancestor in self.ancestors_with_self)
 
     def on_mount(self) -> None:
         """Initialize job table columns on mount."""
@@ -1018,6 +1085,48 @@ class JobTable(DataTable[Text]):
                 break
 
 
+class JobDetailPanel(VerticalScroll):
+    """Focusable, keyboard-scrollable split pane displaying sanitized job metadata and errors."""
+
+    can_focus = True
+    can_focus_children = False
+
+    def __init__(
+        self,
+        content: str = "",
+        *,
+        markup: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the scrollable job detail pane."""
+        super().__init__(**kwargs)
+        self._content_text = content
+        self._markup = markup
+
+    def allow_focus(self) -> bool:
+        """Allow keyboard focus only when visible inside an active displayed tab pane."""
+        return (
+            self.can_focus
+            and self.has_class("visible")
+            and all(ancestor.display for ancestor in self.ancestors_with_self)
+        )
+
+    def compose(self) -> ComposeResult:
+        """Compose inner Static body inside the scrollable viewport."""
+        yield Static(self._content_text, id="job_detail_body", markup=self._markup)
+
+    def update(self, content: str = "") -> None:
+        """Update rendered detail text inside the scrollable viewport."""
+        self._content_text = content
+        if self.is_mounted:
+            with contextlib.suppress(Exception):
+                self.query_one("#job_detail_body", Static).update(content)
+
+    def render(self) -> Text:
+        """Return Rich Text snapshot of detail content for inspection."""
+        return Text(self._content_text)
+
+
 class JobMonitor(Container):
     """Widget registering, polling, and displaying study background jobs."""
 
@@ -1052,19 +1161,37 @@ class JobMonitor(Container):
         color: $text;
     }
 
+    JobMonitor #job_split_pane {
+        layout: horizontal;
+        width: 1fr;
+        height: 1fr;
+    }
+
     JobMonitor #job_table {
+        width: 1fr;
         height: 1fr;
     }
 
     JobMonitor #job_detail_panel {
         display: none;
-        height: auto;
-        max-height: 6;
+        width: 1fr;
+        height: 1fr;
+        overflow-x: auto;
         overflow-y: auto;
         padding: 0 1;
         background: $panel;
         color: $text;
-        border-top: solid $primary;
+        border-left: solid $primary;
+    }
+
+    JobMonitor #job_detail_panel:focus {
+        border-left: double $accent;
+    }
+
+    JobMonitor #job_detail_panel > #job_detail_body {
+        width: 1fr;
+        height: auto;
+        min-height: 100%;
     }
 
     JobMonitor #job_detail_panel.visible {
@@ -1080,6 +1207,7 @@ class JobMonitor(Container):
         sdk: ImednetFacade | AsyncImednetFacade,
         *,
         max_concurrency: int = MAX_CONCURRENT_POLLS,
+        phi_cache: _StudyPhiRegistryCache | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the JobMonitor widget.
@@ -1087,11 +1215,13 @@ class JobMonitor(Container):
         Args:
             sdk: Active iMednet SDK facade instance.
             max_concurrency: Maximum number of concurrent status polling requests.
+            phi_cache: Optional shared per-study ``SensitivityRegistry`` cache.
             **kwargs: Additional widget arguments.
         """
         super().__init__(**kwargs)
         self.sdk = sdk
         self.max_concurrency = max_concurrency
+        self._phi_cache = phi_cache if phi_cache is not None else _StudyPhiRegistryCache(sdk)
         self._semaphore: asyncio.Semaphore | None = None
         self.timer: Timer | None = None
         self._polling_active = False
@@ -1103,6 +1233,11 @@ class JobMonitor(Container):
         self._detail_text: str = ""
         self._summary_renderable = Text("Job Monitor: Select a study to view background jobs.")
         self._summary_text = self._summary_renderable.markup
+
+    def _active_registry(self, study_key: str | None = None) -> SensitivityRegistry:
+        """Return the isolated ``SensitivityRegistry`` for ``study_key`` or active study."""
+        target = study_key if study_key is not None else self.current_study_key
+        return self._phi_cache.registry_for(target)
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
@@ -1176,14 +1311,15 @@ class JobMonitor(Container):
             self._pause_timer()
 
     def compose(self) -> ComposeResult:
-        """Compose inline batch input, status notice, jobs table, and inline detail panel."""
+        """Compose inline batch input, status notice, and bounded horizontal split pane."""
         yield Input(
             placeholder="Enter batch ID(s) to track (e.g. BATCH-001) and press Enter...",
             id="batch_id_input",
         )
         yield Static(self._summary_renderable.plain, id="job_monitor_notice", markup=False)
-        yield JobTable(id="job_table")
-        yield Static("", id="job_detail_panel", markup=False)
+        with Container(id="job_split_pane"):
+            yield JobTable(id="job_table")
+            yield JobDetailPanel("", id="job_detail_panel", markup=False)
 
     def _resolve_entry_for_detail(self, job_id: str) -> _TrackedJobEntry | None:
         """Resolve a ``_TrackedJobEntry`` for ``job_id`` in the active study."""
@@ -1199,12 +1335,22 @@ class JobMonitor(Container):
 
     def _format_job_detail_text(self, job_id: str) -> str | None:
         """Build sanitized inline detail text for ``job_id``, or None if untracked."""
+        reg = self._active_registry()
         if self.current_study_key is None:
             if job_id not in self._unassigned_job_ids:
                 return None
-            return (
-                f"Job Details: {_sanitize_text(job_id)} [QUEUED]\n"
-                "Status: Queued — select a study to bind and poll this batch."
+            safe_id = _sanitize_text(job_id, registry=reg)
+            return "\n".join(
+                [
+                    f"Job Details: {safe_id} [QUEUED]",
+                    "jobId: -",
+                    f"batchId: {safe_id}",
+                    "state: QUEUED",
+                    "dateCreated: -",
+                    "dateStarted: -",
+                    "dateFinished: -",
+                    "Status: Queued — select a study to bind and poll this batch.",
+                ]
             )
 
         entry = self._resolve_entry_for_detail(job_id)
@@ -1212,35 +1358,97 @@ class JobMonitor(Container):
             return None
 
         batch_id, state_str, progress_str, total_str, failed_str, _ = _extract_entry_row(entry)
-        lines = [
-            f"Job Details: {_sanitize_text(batch_id)} [{_sanitize_text(state_str)}] "
-            f"(progress={progress_str}, total={total_str}, failed={failed_str})"
-        ]
+        safe_batch_id = _sanitize_text(batch_id, registry=reg)
+        safe_state = _sanitize_text(state_str, registry=reg)
         job = entry.last_job
+        is_placeholder = job is None or isinstance(job, _TrackedJobPlaceholder)
+        resolved_job_id = (
+            "-"
+            if is_placeholder
+            else (_read_job_metadata_field(job, "job_id", "jobId", registry=reg) or "-")
+        )
+        resolved_batch_id = (
+            safe_batch_id
+            if is_placeholder
+            else (
+                _read_job_metadata_field(job, "batch_id", "batchId", registry=reg) or safe_batch_id
+            )
+        )
+        resolved_created = (
+            "-"
+            if is_placeholder
+            else (_read_job_metadata_field(job, "date_created", "dateCreated", registry=reg) or "-")
+        )
+        resolved_started = (
+            "-"
+            if is_placeholder
+            else (_read_job_metadata_field(job, "date_started", "dateStarted", registry=reg) or "-")
+        )
+        resolved_finished = (
+            "-"
+            if is_placeholder
+            else (
+                _read_job_metadata_field(job, "date_finished", "dateFinished", registry=reg) or "-"
+            )
+        )
+        resolved_result_url = (
+            None
+            if is_placeholder
+            else _read_job_metadata_field(job, "result_url", "resultUrl", registry=reg)
+        )
+
+        lines = [
+            f"Job Details: {safe_batch_id} [{safe_state}] "
+            f"(progress={progress_str}, total={total_str}, failed={failed_str})",
+            f"jobId: {resolved_job_id}",
+            f"batchId: {resolved_batch_id}",
+            f"state: {safe_state}",
+            f"dateCreated: {resolved_created}",
+            f"dateStarted: {resolved_started}",
+            f"dateFinished: {resolved_finished}",
+        ]
+        if resolved_result_url:
+            lines.append(f"resultUrl: {resolved_result_url}")
+
+        has_diagnostic = False
         raw_res_err = getattr(job, "result_error", None) if job is not None else None
         sanitized_res_err = (
-            _sanitize_text(raw_res_err.strip())
+            _sanitize_text(raw_res_err.strip(), registry=reg)
             if isinstance(raw_res_err, str) and raw_res_err.strip()
             else None
         )
         if sanitized_res_err:
             lines.append(f"Result Error: {sanitized_res_err}")
+            has_diagnostic = True
 
-        record_error_lines = _extract_job_record_error_lines(entry)
+        record_error_lines = _extract_job_record_error_lines(entry, registry=reg)
         if record_error_lines:
             lines.append(f"Record Errors ({len(record_error_lines)}):")
             lines.extend(record_error_lines)
+            has_diagnostic = True
 
         if entry.warning:
-            sanitized_warn = _sanitize_text(entry.warning)
+            sanitized_warn = _sanitize_text(entry.warning, registry=reg)
             if sanitized_warn != sanitized_res_err:
                 lines.append(f"Diagnostic: {sanitized_warn}")
+                has_diagnostic = True
 
-        if len(lines) == 1:
-            lines.append("No errors reported.")
+        if not has_diagnostic:
+            upper_state = state_str.upper()
+            if upper_state == "NOT_FOUND" or entry.last_state == "NOT_FOUND":
+                safe_study = _sanitize_text(self.current_study_key, registry=reg)
+                lines.append(
+                    f"Diagnostic: Batch '{resolved_batch_id}' was not found in study '{safe_study}'."
+                )
+            elif upper_state in {"INVALID", "FAILED", "CANCELLED", "TIMEOUT"} or bool(
+                getattr(job, "is_failed", False)
+            ):
+                lines.append(f"Diagnostic: Job entered terminal state {safe_state}.")
+            else:
+                lines.append("No errors reported.")
         return "\n".join(lines)
 
-    def _sync_job_detail_panel(self) -> None:
+    def _sync_job_detail_panel(self, *, reset_scroll: bool = False) -> None:
         """Synchronize ``#job_detail_panel`` content and visibility with ``_inspected_job_id``."""
         if self._inspected_job_id is None:
             self._detail_text = ""
@@ -1255,9 +1463,11 @@ class JobMonitor(Container):
         if not self.is_mounted:
             return
         with contextlib.suppress(Exception):
-            panel = self.query_one("#job_detail_panel", Static)
+            panel = self.query_one("#job_detail_panel", JobDetailPanel)
             panel.update(self._detail_text)
             panel.set_class(bool(self._inspected_job_id), "visible")
+            if reset_scroll:
+                panel.scroll_home(animate=False)
 
     def toggle_job_detail(self, job_id: str) -> bool:
         """Toggle inline ``#job_detail_panel`` for ``job_id``; return True when open."""
@@ -1266,10 +1476,10 @@ class JobMonitor(Container):
             return False
         if self._inspected_job_id == cleaned:
             self._inspected_job_id = None
-            self._sync_job_detail_panel()
+            self._sync_job_detail_panel(reset_scroll=True)
             return False
         self._inspected_job_id = cleaned
-        self._sync_job_detail_panel()
+        self._sync_job_detail_panel(reset_scroll=True)
         return self._inspected_job_id is not None
 
     def close_job_detail(self) -> bool:
@@ -1277,7 +1487,7 @@ class JobMonitor(Container):
         if self._inspected_job_id is None:
             return False
         self._inspected_job_id = None
-        self._sync_job_detail_panel()
+        self._sync_job_detail_panel(reset_scroll=True)
         return True
 
     def update(self, content: str | Text = "") -> None:
@@ -1510,7 +1720,8 @@ class JobMonitor(Container):
 
     def _show_validation_warning(self, warning_message: str) -> None:
         """Display an immediate sanitized validation warning without starting background polls."""
-        sanitized = _sanitize_text(warning_message)
+        reg = self._active_registry()
+        sanitized = _sanitize_text(warning_message, registry=reg)
         logging.getLogger("imednet_tui").warning("Invalid batch ID input: %s", sanitized)
         notice_msg = f"Validation Warning: {sanitized}"
         self.update(Text.assemble((notice_msg, "yellow")))
@@ -1521,30 +1732,24 @@ class JobMonitor(Container):
                 self.app.notify(sanitized, severity="warning", markup=False)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Validate and register batch IDs submitted from the inline input control."""
+        """Validate and stage/register batch IDs submitted from ``#batch_id_input``."""
         if event.input.id != "batch_id_input":
             return
         batch_ids = _normalize_batch_ids(event.value)
-        event.input.value = ""
         if not batch_ids:
+            event.input.value = ""
             return
+        reg = self._active_registry()
         invalid_messages: list[str] = []
         for token in batch_ids:
             try:
                 validate_path_segment(token, name="batch_id")
             except PathTraversalValidationError as err:
-                invalid_messages.append(_sanitize_text(err))
+                invalid_messages.append(_sanitize_text(err, registry=reg))
         if invalid_messages:
             self._show_validation_warning("; ".join(invalid_messages))
             return
-        if not self.current_study_key:
-            if hasattr(self.app, "notify"):
-                self.app.notify(
-                    "Select a study before adding batch IDs.",
-                    severity="warning",
-                    markup=False,
-                )
-            return
+        event.input.value = ""
         self.track_jobs(batch_ids, study_key=self.current_study_key, refresh=True)
 
     def set_study(self, study_key: str) -> None:
@@ -1580,6 +1785,7 @@ class JobMonitor(Container):
 
     def _apply_job_evaluation(self, entry: _TrackedJobEntry, job: Any) -> None:
         """Evaluate ``job`` monotonically via ``evaluate_job_state`` and update ``entry``."""
+        reg = self._active_registry()
         if entry.is_terminal:
             curr_state = getattr(job, "state", None)
             if (
@@ -1592,8 +1798,8 @@ class JobMonitor(Container):
                 logging.getLogger("imednet_tui").warning(
                     "Ignoring stale response for job %s (state=%s); terminal state %s preserved",
                     entry.job_id,
-                    _sanitize_text(repr(curr_state)),
-                    _sanitize_text(entry.last_state),
+                    _sanitize_text(repr(curr_state), registry=reg),
+                    _sanitize_text(entry.last_state, registry=reg),
                 )
             return
 
@@ -1610,7 +1816,7 @@ class JobMonitor(Container):
             entry.last_state if entry.last_state != "NOT_FOUND" else None
         )
         if prev_state is not None and raw_state is None:
-            missing_msg = f"Ignoring missing job state update after {_sanitize_text(prev_state)}"
+            missing_msg = f"Ignoring missing job state update after {_sanitize_text(prev_state, registry=reg)}"
             logging.getLogger("imednet_tui").warning(
                 "Invalid job state update for %s: %s",
                 entry.job_id,
@@ -1626,7 +1832,8 @@ class JobMonitor(Container):
                 raw_state is None or not is_valid_job_transition(prev_state, raw_state)
             ):
                 trans_msg = _sanitize_text(
-                    f"Invalid job state transition from {prev_state} to {raw_state}"
+                    f"Invalid job state transition from {prev_state} to {raw_state}",
+                    registry=reg,
                 )
                 logging.getLogger("imednet_tui").warning(
                     "Invalid job state update for %s: %s", entry.job_id, trans_msg
@@ -1638,9 +1845,9 @@ class JobMonitor(Container):
                 entry.last_state = raw_state
             entry.is_terminal = True
             entry.record_errors = list(err.record_errors) if err.record_errors else None
-            entry.warning = _sanitize_text(err)
+            entry.warning = _sanitize_text(err, registry=reg)
         except (InvalidJobStateError, InvalidJobTransitionError) as err:
-            sanitized_err = _sanitize_text(err)
+            sanitized_err = _sanitize_text(err, registry=reg)
             logging.getLogger("imednet_tui").warning(
                 "Invalid job state update for %s: %s", entry.job_id, sanitized_err
             )
@@ -1652,7 +1859,8 @@ class JobMonitor(Container):
                 and not is_valid_job_transition(prev_state, raw_state)
             ):
                 trans_msg = _sanitize_text(
-                    f"Invalid job state transition from {prev_state} to {raw_state}"
+                    f"Invalid job state transition from {prev_state} to {raw_state}",
+                    registry=reg,
                 )
                 logging.getLogger("imednet_tui").warning(
                     "Invalid job state update for %s: %s", entry.job_id, trans_msg
@@ -1675,13 +1883,14 @@ class JobMonitor(Container):
         """Poll status for a single non-terminal tracked job under the concurrency semaphore."""
         if entry.is_terminal:
             return
+        reg = self._active_registry(study_key)
         async with self.semaphore:
             if entry.is_terminal:
                 return
             try:
                 job = await self._fetch_job_status(study_key, entry.job_id)
             except Exception as err:
-                sanitized_err = _sanitize_text(err)
+                sanitized_err = _sanitize_text(err, registry=reg)
                 if entry.is_terminal:
                     logging.getLogger("imednet_tui").warning(
                         "Ignoring transient error for terminal job %s: %s",
@@ -1692,7 +1901,7 @@ class JobMonitor(Container):
                 if isinstance(err, PathTraversalValidationError):
                     logging.getLogger("imednet_tui").warning(
                         "Invalid batch ID segment for %s: %s",
-                        _sanitize_text(entry.job_id),
+                        _sanitize_text(entry.job_id, registry=reg),
                         sanitized_err,
                     )
                     entry.last_job = _TrackedJobPlaceholder(
@@ -1706,17 +1915,25 @@ class JobMonitor(Container):
                     entry.warning = sanitized_err
                     return
                 if isinstance(err, NotFoundError):
+                    not_found_msg = (
+                        sanitized_err
+                        if sanitized_err.strip()
+                        else (
+                            f"Batch '{_sanitize_text(entry.job_id, registry=reg)}' was not found "
+                            f"in study '{_sanitize_text(study_key, registry=reg)}'."
+                        )
+                    )
                     logging.getLogger("imednet_tui").warning(
                         "Job %s not found: %s",
                         entry.job_id,
-                        sanitized_err,
+                        not_found_msg,
                     )
                     entry.last_job = _TrackedJobPlaceholder(
                         entry.job_id, "NOT_FOUND", is_terminal=True
                     )
                     entry.last_state = "NOT_FOUND"
                     entry.is_terminal = True
-                    entry.warning = None
+                    entry.warning = not_found_msg
                     return
                 if (
                     isinstance(err, (InvalidJobStateError, InvalidJobTransitionError))
@@ -1744,14 +1961,18 @@ class JobMonitor(Container):
             self._apply_job_evaluation(entry, job)
 
     @staticmethod
-    def _format_entry_line(entry: _TrackedJobEntry) -> Text:
+    def _format_entry_line(
+        entry: _TrackedJobEntry,
+        *,
+        registry: SensitivityRegistry | None = None,
+    ) -> Text:
         """Format a single tracked job entry into a styled Rich ``Text`` line."""
         job = entry.last_job
         if job is None:
             if entry.warning:
                 return Text.assemble(
                     ("WARNING", "yellow"),
-                    f" - Job ({entry.job_id}) (Warning: {_sanitize_text(entry.warning)})",
+                    f" - Job ({entry.job_id}) (Warning: {_sanitize_text(entry.warning, registry=registry)})",
                 )
             return Text.assemble(("ACTIVE", "yellow"), f" - Job ({entry.job_id})")
 
@@ -1774,7 +1995,9 @@ class JobMonitor(Container):
             f" - {label}{metrics_suffix}{created_suffix}",
         ]
         if entry.warning:
-            parts.extend([" ", (f"(Warning: {_sanitize_text(entry.warning)})", "yellow")])
+            parts.extend(
+                [" ", (f"(Warning: {_sanitize_text(entry.warning, registry=registry)})", "yellow")]
+            )
         return Text.assemble(*parts)
 
     def _render_study_entries(
@@ -1783,6 +2006,7 @@ class JobMonitor(Container):
         entries: dict[str, _TrackedJobEntry],
     ) -> None:
         """Render styled summary, notice banner, and table rows for ``entries``."""
+        reg = self._active_registry(study_key)
         entry_list = list(entries.values())
         rows: list[tuple[Text, Text, Text, Text, Text, Text]] = []
         summary_parts: list[str | Text | tuple[str, str]] = [
@@ -1805,11 +2029,11 @@ class JobMonitor(Container):
                     Text(created_str),
                 )
             )
-            summary_parts.extend(["\n", self._format_entry_line(entry)])
+            summary_parts.extend(["\n", self._format_entry_line(entry, registry=reg)])
             if not entry.is_terminal:
                 active_count += 1
             if entry.warning:
-                warnings.append(f"{entry.job_id}: {_sanitize_text(entry.warning)}")
+                warnings.append(f"{entry.job_id}: {_sanitize_text(entry.warning, registry=reg)}")
 
         same_study = self._rendered_study_key == study_key
         self._rendered_study_key = study_key
@@ -1851,6 +2075,7 @@ class JobMonitor(Container):
                         and not entry.last_job.non_retryable
                     ):
                         entry.is_terminal = False
+                        entry.warning = None
                         if not isinstance(entry.last_state, JobState):
                             entry.last_state = None
 
@@ -1876,7 +2101,7 @@ class JobMonitor(Container):
             self._render_study_entries(study_key, current_entries)
         except Exception as e:
             if self.current_study_key == study_key or not self.is_mounted:
-                err_msg = f"Error fetching jobs: {_sanitize_text(e)}"
+                err_msg = f"Error fetching jobs: {_sanitize_text(e, registry=self._active_registry(study_key))}"
                 self._update_ui(
                     summary=Text.assemble((err_msg, "red")),
                     notice_text=err_msg,
@@ -1896,14 +2121,45 @@ class LogViewer(Log):
     }
     """
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        registry_resolver: Callable[[], SensitivityRegistry | None] | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Initialize the LogViewer widget.
 
         Args:
+            registry_resolver: Optional callable resolving the active study registry.
             **kwargs: Additional widget arguments.
         """
         super().__init__(**kwargs)
         self.border_title = "Logs"
+        self._registry_resolver = registry_resolver
+
+    def active_registry(self) -> SensitivityRegistry | None:
+        """Resolve active study ``SensitivityRegistry`` when attached to a dashboard."""
+        if self._registry_resolver is not None:
+            return self._registry_resolver()
+        with contextlib.suppress(Exception):
+            screen_obj: Any = self.screen
+            if isinstance(screen_obj, DashboardScreen):
+                return screen_obj.active_phi_registry()
+        return None
+
+    def write(self, data: str, scroll_end: bool | None = None) -> Self:
+        """Sanitize and write raw text to the log widget."""
+        sanitized = _sanitize_text(data, registry=self.active_registry()) if data else data
+        return super().write(sanitized, scroll_end=scroll_end)
+
+    def write_lines(self, lines: Iterable[str], scroll_end: bool | None = None) -> Self:
+        """Sanitize and write an iterable of lines to the log widget."""
+        raw_list = list(lines)
+        if not raw_list:
+            return super().write_lines(raw_list, scroll_end=scroll_end)
+        combined = "\n".join(str(line) for line in raw_list)
+        sanitized = _sanitize_text(combined, registry=self.active_registry())
+        return super().write_lines([sanitized], scroll_end=scroll_end)
 
 
 class DashboardScreen(Screen[None]):
@@ -2093,10 +2349,19 @@ class DashboardScreen(Screen[None]):
         color: white;
     }
 
-    DashboardScreen.high-contrast JobMonitor #job_detail_panel {
+    DashboardScreen.high-contrast JobMonitor #job_detail_panel,
+    DashboardScreen.high-contrast JobMonitor #job_detail_panel:focus,
+    DashboardScreen.high-contrast JobMonitor #job_detail_panel > #job_detail_body {
         background: #000000;
         color: #FFFFFF;
-        border-top: heavy white;
+    }
+
+    DashboardScreen.high-contrast JobMonitor #job_detail_panel {
+        border-left: heavy white;
+    }
+
+    DashboardScreen.high-contrast JobMonitor #job_detail_panel:focus {
+        border-left: double white;
     }
 
     DashboardScreen.high-contrast Tabs {
@@ -2133,7 +2398,8 @@ class DashboardScreen(Screen[None]):
         """
         super().__init__(**kwargs)
         self.sdk = sdk
-        self.log_viewer = LogViewer()
+        self._phi_cache = _StudyPhiRegistryCache(sdk)
+        self.log_viewer = LogViewer(registry_resolver=self.active_phi_registry)
         self.initial_study_key = (
             initial_study_key.strip() if initial_study_key and initial_study_key.strip() else None
         )
@@ -2143,6 +2409,20 @@ class DashboardScreen(Screen[None]):
         self.selected_site_id: str | None = None
         self._log_handler: TextualLogHandler | None = None
         self._previous_logger_settings: dict[str, tuple[int, bool]] = {}
+
+    def active_phi_registry(self) -> SensitivityRegistry:
+        """Resolve the isolated ``SensitivityRegistry`` for the active study."""
+        study_key = self.selected_study_key
+        if not study_key:
+            with contextlib.suppress(Exception):
+                study_key = self.query_one(JobMonitor).current_study_key
+        if not study_key:
+            study_key = self.initial_study_key
+        return self._phi_cache.registry_for(study_key)
+
+    def invalidate_phi_cache(self) -> None:
+        """Clear cached per-study ``phi_fields`` registries on explicit refresh."""
+        self._phi_cache.clear()
 
     def compose(self) -> ComposeResult:
         """Compose children widgets for the dashboard screen.
@@ -2169,7 +2449,7 @@ class DashboardScreen(Screen[None]):
 
             with TabbedContent(id="bottom-pane"):
                 with TabPane("Jobs", id="jobs-tab"):
-                    yield JobMonitor(self.sdk, id="job_monitor")
+                    yield JobMonitor(self.sdk, phi_cache=self._phi_cache, id="job_monitor")
                 with TabPane("Logs", id="logs-tab"):
                     yield self.log_viewer
         yield Footer()
@@ -2222,7 +2502,10 @@ class DashboardScreen(Screen[None]):
         if getattr(self.app, "high_contrast_enabled", False) or "high-contrast" in self.app.classes:
             self.add_class("high-contrast")
 
-        handler = TextualLogHandler(self.log_viewer)
+        handler = TextualLogHandler(
+            self.log_viewer,
+            registry_resolver=self.active_phi_registry,
+        )
         formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         handler.setFormatter(formatter)
         self._previous_logger_settings.clear()
@@ -2404,10 +2687,19 @@ class ImednetTuiApp(App[None]):
         background-tint: #000000 0%;
     }
 
-    .high-contrast #job_detail_panel {
+    .high-contrast #job_detail_panel,
+    .high-contrast #job_detail_panel:focus,
+    .high-contrast #job_detail_panel > #job_detail_body {
         background: #000000;
         color: #FFFFFF;
-        border-top: heavy white;
+    }
+
+    .high-contrast #job_detail_panel {
+        border-left: heavy white;
+    }
+
+    .high-contrast #job_detail_panel:focus {
+        border-left: double white;
     }
     """
 
@@ -2496,17 +2788,25 @@ class ImednetTuiApp(App[None]):
         self._sync_high_contrast_classes()
 
     def action_handle_escape(self) -> None:
-        """Exit batch input, close the job detail panel, or clear an active site filter."""
+        """Exit batch input, close the job detail panel on the Jobs tab, or clear site filter."""
         screen = self._get_dashboard()
         if screen is None:
             return
-        if isinstance(self.focused, Input) and self.focused.id == "batch_id_input":
-            with contextlib.suppress(Exception):
-                screen.query_one("#job_table", JobTable).focus()
-            return
+        jobs_tab_active = False
         with contextlib.suppress(Exception):
-            if screen.query_one(JobMonitor).close_job_detail():
+            jobs_tab_active = screen.query_one("#bottom-pane", TabbedContent).active == "jobs-tab"
+        if jobs_tab_active:
+            if isinstance(self.focused, Input) and self.focused.id == "batch_id_input":
+                with contextlib.suppress(Exception):
+                    screen.query_one("#job_table", JobTable).focus()
                 return
+            with contextlib.suppress(Exception):
+                detail_was_focused = isinstance(self.focused, JobDetailPanel)
+                if screen.query_one(JobMonitor).close_job_detail():
+                    if detail_was_focused:
+                        with contextlib.suppress(Exception):
+                            screen.query_one("#job_table", JobTable).focus()
+                    return
         screen.clear_site_filter()
 
     def action_refresh_data(self) -> None:
@@ -2514,6 +2814,9 @@ class ImednetTuiApp(App[None]):
         screen = self._get_dashboard()
         if screen is None:
             return
+
+        screen.invalidate_phi_cache()
+        screen.active_phi_registry()
 
         with contextlib.suppress(Exception):
             screen.workers.cancel_group(screen, "load-all")

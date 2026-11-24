@@ -32,18 +32,26 @@ dashboard for browsing studies, sites, subjects, and background jobs:
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
 ``Enter`` to select a study or site (re-selecting the active site clears the site filter)
-or to register validated batch IDs in the Jobs tab input, ``Enter`` or ``Space`` on the
-Jobs table to toggle the inline ``#job_detail_panel`` (displaying sanitized ``resultUrl``
-and per-``Record`` diagnostics), ``Esc`` to move focus from the Jobs batch input to the
-Jobs table, close an open ``#job_detail_panel``, or clear an active site filter, ``q`` to
-quit, ``d`` to toggle dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh
-active study data, and ``a`` to load all pages when a panel is truncated. Single-key
-shortcuts are suppressed automatically while typing batch IDs in the Jobs tab input, and
-``LogViewer`` masks ``Subject`` PHI fields to ``***MASKED***`` by default. Pass ``--study``
-and repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
-immediately (or pass ``--batch`` without ``--study`` to stage ``QUEUED`` batches until a
-``Study`` is selected), and pass ``--force`` only when intentionally bypassing TTY stream
-checks.
+or to validate and stage/register batch IDs in ``#batch_id_input`` (staging ``QUEUED``
+entries when no ``Study`` is selected yet and preserving draft text if validation fails),
+``Enter`` or ``Space`` on ``#job_table`` to toggle the focusable split
+``#job_detail_panel`` alongside ``#job_table`` (displaying the six-field ``Job`` metadata
+``jobId``, ``batchId``, ``state``, ``dateCreated``, ``dateStarted``, and ``dateFinished``,
+plus sanitized ``resultUrl``, ``Record`` errors, and explicit ``NOT_FOUND`` or failure
+diagnostics, scrollable via ``Tab`` and ``Up`` / ``Down`` / ``PageUp`` / ``PageDown`` /
+``Home`` / ``End`` while keeping ``#job_table`` rows visible on ``80x24`` consoles),
+``Esc`` on the Jobs tab to exit ``#batch_id_input`` or close ``#job_detail_panel`` (and
+``Esc`` on the Logs tab or once ``#job_detail_panel`` is closed to clear an active site
+filter immediately), ``q`` to quit, ``d`` to toggle dark mode, ``h`` to toggle
+high-contrast mode, ``r`` to refresh active study data, and ``a`` to load all pages when a
+panel is truncated. Single-key shortcuts are suppressed automatically while typing batch
+IDs in ``#batch_id_input``, and ``LogViewer`` and ``#job_detail_panel`` mask default
+``Subject`` PHI and committed ``StudyConfiguration`` ``phiFields`` across URL filters,
+plain filter expressions, and multiline JSON to ``***MASKED***`` without masking exempt
+study/subject/record identifiers. Pass ``--study`` and repeatable ``--batch`` flags at
+launch to open a study and monitor specific batch jobs immediately (or pass ``--batch``
+without ``--study`` to stage ``QUEUED`` batches until a ``Study`` is selected), and pass
+``--force`` only when intentionally bypassing TTY stream checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
 ``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
