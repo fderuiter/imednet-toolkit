@@ -61,6 +61,33 @@ def test_parse_iso_datetime_micro_padding() -> None:
     assert dt.microsecond == 982680
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected_microsecond", "expected_offset"),
+    [
+        ("2024-01-01T12:00:00.1", 100000, None),
+        ("2024-01-01T12:00:00.12+02:00", 120000, timedelta(hours=2)),
+        ("2024-01-01T12:00:00.123456", 123456, None),
+        ("2024-01-01T12:00:00.1234567", 123456, None),
+        ("2024-01-01T12:00:00.123456789Z", 123456, timedelta(0)),
+    ],
+)
+def test_parse_iso_datetime_fractional_boundaries_and_offsets(
+    raw: str,
+    expected_microsecond: int,
+    expected_offset: timedelta | None,
+) -> None:
+    """Test fractional-second padding, microsecond truncation, and timezone offsets."""
+    dt = parse_iso_datetime(raw)
+    assert dt.microsecond == expected_microsecond
+    if expected_offset is None:
+        assert dt.tzinfo is None
+    elif expected_offset == timedelta(0):
+        assert dt.tzinfo == timezone.utc
+    else:
+        assert dt.tzinfo is not None
+        assert dt.tzinfo.utcoffset(dt) == expected_offset
+
+
 def test_parse_iso_datetime_invalid() -> None:
     """Test that parse iso datetime invalid."""
     with pytest.raises(ValueError):
