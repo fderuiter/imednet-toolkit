@@ -1,7 +1,7 @@
-"""Example DAG showing :class:`ImednetExportOperator` to write records to a file.
+"""Apache Airflow DAG exporting Study Records to CSV via ``ImednetExportOperator``.
 
-Update ``STUDY_KEY`` and ``output_path`` before running. Credentials are read from
-an Airflow connection ``imednet_default`` (or override ``imednet_conn_id``).
+Update ``STUDY_KEY`` and ``output_path`` before running. Credentials are read
+from the ``imednet_default`` Airflow connection (or override ``imednet_conn_id``).
 """
 
 from datetime import datetime

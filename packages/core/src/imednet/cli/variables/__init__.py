@@ -15,5 +15,5 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "variables",
         "variables",
         requires_study_key=True,
-        summary_fields=["variable_name", "label", "variable_type", "form_name", "disabled"],
+        summary_fields=["variable_name", "label", "variable_type", "form_key", "disabled"],
     )

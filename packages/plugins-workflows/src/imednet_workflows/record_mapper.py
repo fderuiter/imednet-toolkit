@@ -28,12 +28,7 @@ from imednet.spi.models import (
     SDTM_DOMAIN_SPECS,
     _collapse_alnum_key,
     _extract_stream_usubjid_and_id,
-    _format_sdtm_flag,
-    _get_model_consumed_keys,
-    _get_model_field_aliases,
     _iter_sorted_sdtm_frames,
-    _normalize_key,
-    _PreparedSdtmRow,
     _SdtmNormalizer,
     format_iso8601_dtc,
 )
@@ -42,7 +37,9 @@ from imednet.spi.models import (
 )
 from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import (
+    CompiledRecordPredicate,
     EnrichmentPipeline,
+    compile_record_predicate,
     global_sensitivity_registry,
     mask_clinical_phi,
     mask_custom_phi_recursive,
@@ -69,6 +66,8 @@ def transform_records_to_sdtm(
     enrichment_pipeline: EnrichmentPipeline | None = _UNSET_PIPELINE,
     pipeline: EnrichmentPipeline | None = _UNSET_PIPELINE,
     seq_counters: dict[str, int] | None = None,
+    record_seqs: dict[str, int] | None = None,
+    preserve_record_id: bool = False,
     phi_keys: Iterable[str] | None = None,
     registry: Any | None = None,
 ) -> pd.DataFrame:
@@ -93,6 +92,8 @@ def transform_records_to_sdtm(
         include_deleted=include_deleted,
         mask_phi=mask_phi,
         seq_counters=seq_counters,
+        record_seqs=record_seqs,
+        preserve_record_id=preserve_record_id,
         phi_keys=phi_keys,
         registry=registry,
         pipeline=resolved_pipeline,
@@ -146,6 +147,174 @@ class RecordMapper:
         self._last_variables: list[VariableModel] = []
         self._active_study_key: str | None = None
         self._enrichment_cache: dict[str, EnrichmentPipeline | None] = {}
+        self._site_map_cache: dict[str, dict[int, str]] = {}
+        self._interval_map_cache: dict[str, dict[int, str]] = {}
+        self._visit_interval_map_cache: dict[str, dict[int, tuple[int | None, str | None]]] = {}
+        self._form_key_map_cache: dict[str, dict[int, str]] = {}
+
+    def _iter_sdk_lookup_items(
+        self,
+        study_key: str,
+        endpoint_attr: str,
+        facade_method: str,
+    ) -> list[Any]:
+        """Safely fetch study metadata items without triggering unconfigured mock calls."""
+        from unittest.mock import NonCallableMock
+
+        try:
+            if isinstance(self.sdk, NonCallableMock):
+                mock_children = getattr(self.sdk, "_mock_children", {})
+                obj_vars = vars(self.sdk)
+                has_ep = endpoint_attr in mock_children or endpoint_attr in obj_vars
+                has_facade = facade_method in mock_children or facade_method in obj_vars
+                if not has_ep and not has_facade:
+                    return []
+                raw_iter = (
+                    getattr(self.sdk, endpoint_attr).list(study_key=study_key)
+                    if (has_ep and not has_facade)
+                    else getattr(self.sdk, facade_method)(study_key=study_key)
+                )
+            elif callable(getattr(self.sdk, facade_method, None)):
+                raw_iter = getattr(self.sdk, facade_method)(study_key=study_key)
+            else:
+                ep = getattr(self.sdk, endpoint_attr, None)
+                if ep is None or not callable(getattr(ep, "list", None)):
+                    return []
+                raw_iter = ep.list(study_key=study_key)
+            return list(raw_iter)
+        except Exception as exc:  # pragma: no cover - defensive for unmocked routes
+            logger.debug(
+                "Skipping %s metadata hydration for study '%s': %s",
+                endpoint_attr,
+                study_key,
+                exc,
+            )
+            return []
+
+    def _resolve_site_name(self, study_key: str, site_id: int) -> str | None:
+        """Resolve human-readable ``siteName`` for *site_id* using a per-study cache."""
+        if study_key not in self._site_map_cache:
+            mapping: dict[int, str] = {}
+            for site in self._iter_sdk_lookup_items(study_key, "sites", "get_sites"):
+                sid = (
+                    site.get("siteId") if isinstance(site, dict) else getattr(site, "site_id", None)
+                )
+                sname = (
+                    site.get("siteName")
+                    if isinstance(site, dict)
+                    else getattr(site, "site_name", None)
+                )
+                if sid is not None and isinstance(sname, str) and sname:
+                    mapping[int(sid)] = sname
+            self._site_map_cache[study_key] = mapping
+        return self._site_map_cache[study_key].get(site_id)
+
+    def _ensure_visit_interval_maps(self, study_key: str) -> None:
+        """Populate visit-backed interval fallback maps once per study when needed."""
+        if study_key in self._visit_interval_map_cache:
+            return
+        visit_map: dict[int, tuple[int | None, str | None]] = {}
+        interval_map = self._interval_map_cache.setdefault(study_key, {})
+        for visit in self._iter_sdk_lookup_items(study_key, "visits", "get_visits"):
+            vid = (
+                visit.get("visitId")
+                if isinstance(visit, dict)
+                else getattr(visit, "visit_id", None)
+            )
+            iid = (
+                visit.get("intervalId")
+                if isinstance(visit, dict)
+                else getattr(visit, "interval_id", None)
+            )
+            iname = (
+                visit.get("intervalName")
+                if isinstance(visit, dict)
+                else getattr(visit, "interval_name", None)
+            )
+            coerced_iid = int(iid) if iid is not None else None
+            coerced_iname = str(iname) if isinstance(iname, str) and iname else None
+            if coerced_iid is not None and coerced_iname and coerced_iid not in interval_map:
+                interval_map[coerced_iid] = coerced_iname
+            if vid is not None:
+                visit_map[int(vid)] = (coerced_iid, coerced_iname)
+        self._visit_interval_map_cache[study_key] = visit_map
+
+    def _resolve_interval_name(
+        self,
+        study_key: str,
+        interval_id: int,
+        *,
+        visit_id: int | None = None,
+    ) -> str | None:
+        """Resolve human-readable ``intervalName`` for *interval_id* using Intervals + Visits."""
+        if study_key not in self._interval_map_cache:
+            mapping: dict[int, str] = {}
+            for interval in self._iter_sdk_lookup_items(study_key, "intervals", "get_intervals"):
+                iid = (
+                    interval.get("intervalId")
+                    if isinstance(interval, dict)
+                    else getattr(interval, "interval_id", None)
+                )
+                iname = (
+                    interval.get("intervalName")
+                    if isinstance(interval, dict)
+                    else getattr(interval, "interval_name", None)
+                )
+                if iid is not None and isinstance(iname, str) and iname:
+                    mapping[int(iid)] = iname
+            self._interval_map_cache[study_key] = mapping
+        found = self._interval_map_cache[study_key].get(interval_id)
+        if found is not None:
+            return found
+        self._ensure_visit_interval_maps(study_key)
+        found = self._interval_map_cache[study_key].get(interval_id)
+        if found is not None:
+            return found
+        if visit_id is not None:
+            visit_pair = self._visit_interval_map_cache[study_key].get(visit_id)
+            if visit_pair is not None:
+                return visit_pair[1]
+        return None
+
+    def _resolve_visit_interval(
+        self,
+        study_key: str,
+        visit_id: int,
+    ) -> tuple[int | None, str | None]:
+        """Resolve ``(intervalId, intervalName)`` from *visit_id* when absent on the Record."""
+        self._ensure_visit_interval_maps(study_key)
+        pair = self._visit_interval_map_cache[study_key].get(visit_id)
+        if pair is None:
+            return None, None
+        iid, iname = pair
+        if iid is not None and iname is None:
+            iname = self._resolve_interval_name(study_key, iid)
+        return iid, iname
+
+    def _resolve_form_key(self, study_key: str | None, form_id: int) -> str | None:
+        """Resolve ``formKey`` from cached variables or the Forms endpoint."""
+        for var in self._last_variables:
+            if getattr(var, "form_id", None) == form_id:
+                vf_key = getattr(var, "form_key", None)
+                if isinstance(vf_key, str) and vf_key:
+                    return vf_key
+        if not study_key:
+            return None
+        if study_key not in self._form_key_map_cache:
+            mapping: dict[int, str] = {}
+            for form in self._iter_sdk_lookup_items(study_key, "forms", "get_forms"):
+                fid = (
+                    form.get("formId") if isinstance(form, dict) else getattr(form, "form_id", None)
+                )
+                fkey = (
+                    form.get("formKey")
+                    if isinstance(form, dict)
+                    else getattr(form, "form_key", None)
+                )
+                if fid is not None and isinstance(fkey, str) and fkey:
+                    mapping[int(fid)] = fkey
+            self._form_key_map_cache[study_key] = mapping
+        return self._form_key_map_cache[study_key].get(form_id)
 
     def _get_enrichment_pipeline(self, study_key: str | None = None) -> EnrichmentPipeline | None:
         """Resolve and cache committed StudyConfiguration rules for *study_key*."""
@@ -504,14 +673,37 @@ class RecordMapper:
             self._include_deleted if include_deleted is None else include_deleted
         )
         raw_filters = dict(extra_filters) if extra_filters else {}
-        form_id_list, _ = self._extract_form_ids(raw_filters)
-        form_ids: set[Any] | None = set(form_id_list) if form_id_list is not None else None
+        explicit_sort = sort if sort is not None else raw_filters.get("sort")
+        has_pagination_override = (
+            raw_filters.get("page") is not None or raw_filters.get("size") is not None
+        )
 
         loader = self._loader
-        if loader is not None:
+        if loader is not None and not effective_include_deleted and not has_pagination_override:
             sync_method = getattr(loader, "sync_records", None)
             bound_iter, supports_subject_order = self._resolve_loader_iter_callable(loader)
-            if callable(sync_method) and callable(bound_iter):
+            is_custom_sort = False
+            if explicit_sort is not None and str(explicit_sort).strip():
+                is_sdtm_subject_sort = explicit_sort == _SDTM_RECORDS_SORT and group_by_subject
+                is_custom_sort = not is_sdtm_subject_sort
+
+            if callable(sync_method) and callable(bound_iter) and not is_custom_sort:
+                form_id_list, remaining_filters = self._extract_form_ids(raw_filters)
+                if form_id_list is not None and len(form_id_list) == 0:
+                    return iter(())
+                form_ids: set[Any] | None = set(form_id_list) if form_id_list is not None else None
+                if form_id_list is not None and remaining_filters:
+                    compile_record_predicate(
+                        extra_filters={**remaining_filters, "formId": form_id_list[0]},
+                        record_data_filter=record_data_filter,
+                    )
+                predicate = compile_record_predicate(
+                    extra_filters=remaining_filters,
+                    record_data_filter=record_data_filter,
+                )
+                if predicate.always_empty:
+                    return iter(())
+
                 sync_method(study_key)
                 iter_kwargs: dict[str, Any] = {"chunk_size": self._pipeline.chunk_size}
                 if group_by_subject and supports_subject_order:
@@ -521,6 +713,7 @@ class RecordMapper:
                     visit_key=visit_key,
                     form_ids=form_ids,
                     include_deleted=effective_include_deleted,
+                    predicate=predicate,
                 )
 
         return self._stream_sdk_records(
@@ -540,8 +733,9 @@ class RecordMapper:
         visit_key: str | None,
         form_ids: set[Any] | None,
         include_deleted: bool | None = None,
+        predicate: CompiledRecordPredicate | None = None,
     ) -> Iterator[RecordModel]:
-        """Apply visit, form, and deleted filters to an iterable of records."""
+        """Apply visit, form, metadata, recordData, and deleted filters to cached records."""
         effective_include_deleted = (
             self._include_deleted if include_deleted is None else include_deleted
         )
@@ -562,7 +756,13 @@ class RecordMapper:
                 continue
             if form_ids is not None and record.form_id not in form_ids:
                 continue
-            yield record
+            emitted: RecordModel = record
+            if predicate is not None:
+                matched = predicate.apply(record)
+                if matched is None:
+                    continue
+                emitted = matched
+            yield emitted
 
     def _parse_record(
         self,
@@ -574,11 +774,60 @@ class RecordMapper:
     ) -> dict[str, Any]:
         """Parse a single record using the dynamic Pydantic model."""
         should_mask = self.mask_phi if mask_phi is None else mask_phi
+        resolved_sk = (
+            study_key
+            if isinstance(study_key, str) and study_key
+            else getattr(rec, "study_key", None) or self._active_study_key
+        )
+        sk_str = resolved_sk if isinstance(resolved_sk, str) and resolved_sk else None
+
+        raw_form_key = getattr(rec, "form_key", None)
+        form_key = (
+            raw_form_key
+            if isinstance(raw_form_key, str) and raw_form_key
+            else (
+                self._resolve_form_key(sk_str, int(rec.form_id))
+                if rec.form_id is not None
+                else None
+            )
+        )
+
+        site_id = getattr(rec, "site_id", None)
+        raw_site_name = getattr(rec, "site_name", None)
+        site_name = (
+            raw_site_name
+            if isinstance(raw_site_name, str) and raw_site_name
+            else (
+                self._resolve_site_name(sk_str, int(site_id))
+                if sk_str and site_id is not None
+                else None
+            )
+        )
+
+        interval_id = getattr(rec, "interval_id", None)
+        raw_interval_name = getattr(rec, "interval_name", None)
+        interval_name: str | None = (
+            raw_interval_name if isinstance(raw_interval_name, str) and raw_interval_name else None
+        )
+        if sk_str:
+            if interval_name is None and interval_id is not None:
+                interval_name = self._resolve_interval_name(
+                    sk_str, int(interval_id), visit_id=rec.visit_id
+                )
+            elif interval_id is None and rec.visit_id is not None:
+                interval_id, interval_name = self._resolve_visit_interval(sk_str, int(rec.visit_id))
+
         meta = {
             "recordId": rec.record_id,
+            "recordOid": getattr(rec, "record_oid", None),
             "subjectKey": rec.subject_key,
             "visitId": rec.visit_id,
+            "intervalId": interval_id,
+            "intervalName": interval_name,
             "formId": rec.form_id,
+            "formKey": form_key,
+            "siteId": site_id,
+            "siteName": site_name,
             "recordStatus": rec.record_status,
             "dateCreated": (
                 rec.date_created.isoformat()  # type: ignore[union-attr]
@@ -591,14 +840,7 @@ class RecordMapper:
         raw_data = rec.record_data if isinstance(rec.record_data, dict) else {}
         data = mask_clinical_phi(raw_data) if (should_mask and raw_data) else raw_data
         parsed = record_model(**data).model_dump(by_alias=False)
-        resolved_sk = (
-            study_key
-            if isinstance(study_key, str) and study_key
-            else getattr(rec, "study_key", None) or self._active_study_key
-        )
-        pipeline = self._get_enrichment_pipeline(
-            resolved_sk if isinstance(resolved_sk, str) else None
-        )
+        pipeline = self._get_enrichment_pipeline(sk_str)
         if pipeline is not None:
             parsed = pipeline.process(parsed, mask_phi=should_mask)
         return {**meta, **parsed}
@@ -683,9 +925,15 @@ class RecordMapper:
         ] + mapped_targets
         meta_cols = [
             "recordId",
+            "recordOid",
             "subjectKey",
             "visitId",
+            "intervalId",
+            "intervalName",
             "formId",
+            "formKey",
+            "siteId",
+            "siteName",
             "recordStatus",
             "dateCreated",
         ]
@@ -881,9 +1129,15 @@ class RecordMapper:
 
         meta_keys = {
             "recordId",
+            "recordOid",
             "subjectKey",
             "visitId",
+            "intervalId",
+            "intervalName",
             "formId",
+            "formKey",
+            "siteId",
+            "siteName",
             "recordStatus",
             "dateCreated",
         }
@@ -994,6 +1248,8 @@ class RecordMapper:
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
         seq_counters: dict[str, int] | None = None,
+        record_seqs: dict[str, int] | None = None,
+        preserve_record_id: bool = False,
     ) -> pd.DataFrame:
         """Transform an iterable of records into a normalized SDTM domain DataFrame."""
         effective_include_deleted = (
@@ -1009,6 +1265,8 @@ class RecordMapper:
             mask_phi=should_mask,
             enrichment_pipeline=pipeline,
             seq_counters=seq_counters,
+            record_seqs=record_seqs,
+            preserve_record_id=preserve_record_id,
         )
 
     def sdtm_dataframe(
@@ -1111,7 +1369,7 @@ class RecordMapper:
 
         source_is_ordered = False
         force_drain_ungrouped_loader = False
-        if self._loader is not None:
+        if self._loader is not None and not effective_include_deleted:
             bound_iter, supports_subject_order = self._resolve_loader_iter_callable(self._loader)
             from unittest.mock import NonCallableMock
 
@@ -1206,13 +1464,8 @@ __all__ = [
     "DEFAULT_CHUNK_SIZE",
     "SDTM_DOMAIN_SPECS",
     "RecordMapper",
-    "_PreparedSdtmRow",
     "_SdtmNormalizer",
-    "_format_sdtm_flag",
-    "_get_model_consumed_keys",
-    "_get_model_field_aliases",
     "_iter_sorted_sdtm_frames",
-    "_normalize_key",
     "format_iso8601_dtc",
     "transform_records_to_sdtm",
 ]

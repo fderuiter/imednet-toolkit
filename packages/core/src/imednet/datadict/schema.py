@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from .models import BusinessLogicRule, DataDictionary, Form
 from .normalize import _is_file_target, _safe_is_file, normalize_form_id
 
 SCHEMA_PATH = Path(__file__).parent / "resources" / "data-dictionary-1.0.0.schema.json"
+_RULE_VALIDATOR = LogicTreeEvaluator()
 
 __all__ = [
     "SCHEMA_PATH",
@@ -21,6 +23,26 @@ __all__ = [
     "get_schema",
     "validate",
 ]
+
+
+def _validate_rule_list(
+    rules: list[BusinessLogicRule],
+    loc_prefix: str,
+) -> list[str]:
+    errors: list[str] = []
+    for idx, rule in enumerate(rules):
+        rule_label = str(rule.name or rule.id or f"index {idx}")
+        for issue in _RULE_VALIDATOR.validate_rule_regex_patterns(rule):
+            errors.append(f"[{loc_prefix}.{idx}.logic] Rule '{rule_label}': {issue}")
+    return errors
+
+
+def _validate_business_logic_regexes(dd: DataDictionary) -> list[str]:
+    errors: list[str] = []
+    for form_idx, form in enumerate(dd.forms):
+        errors.extend(_validate_rule_list(form.businessLogic, f"forms.{form_idx}.businessLogic"))
+    errors.extend(_validate_rule_list(dd.unassignedBusinessLogic, "unassignedBusinessLogic"))
+    return errors
 
 
 def get_schema() -> dict[str, Any]:
@@ -367,8 +389,12 @@ def validate(
                 loc = ".".join(str(p) for p in err.absolute_path)
                 prefix = f"[{loc}] " if loc else ""
                 errors.append(f"{prefix}{err.message}")
-            if errors:
-                return errors
+            if not errors:
+                with contextlib.suppress(ValidationError):
+                    dd_checked = DataDictionary.model_validate(data)
+                    errors.extend(_validate_business_logic_regexes(dd_checked))
+                    errors.extend(_validate_semantics(dd_checked))
+            return errors
         except ImportError:
             errors.append(
                 "jsonschema library is not installed; falling back to Pydantic model validation."
@@ -384,6 +410,7 @@ def validate(
             errors.append(f"[{loc}] {msg}")
         return errors
 
-    # 4. Semantic validation (duplicate keys, broken references, inverted bounds)
+    # 4. Regex safety and semantic validation (duplicate keys, broken references, inverted bounds)
+    errors.extend(_validate_business_logic_regexes(dd))
     errors.extend(_validate_semantics(dd))
     return errors

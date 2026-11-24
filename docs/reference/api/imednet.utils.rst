@@ -97,6 +97,14 @@ imednet.utils.pandas module
    :members:
    :show-inheritance:
 
+imednet.utils.record\_filter\_eval module
+-----------------------------------------
+
+.. automodule:: imednet.utils.record_filter_eval
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 imednet.utils.secrets module
 ----------------------------
 

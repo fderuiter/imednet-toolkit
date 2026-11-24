@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, overload
+from typing import Any
 
 from pydantic import Field, field_validator
 
@@ -61,22 +61,16 @@ class SubjectKeyword(ImednetBaseModel):
     keyword_id: int = Field(0, alias="keywordId")
     date_added: datetime = Field(default_factory=datetime.now, alias="dateAdded")
 
-    @overload
     def __init__(
         self,
         *,
         keyword_name: str = "",
-        keyword_key: str = "",
-        keyword_id: int = 0,
-        date_added: datetime = ...,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         keywordName: str = "",
+        keyword_key: str = "",
         keywordKey: str = "",
+        keyword_id: int = 0,
         keywordId: int = 0,
+        date_added: datetime = ...,
         dateAdded: datetime = ...,
     ) -> None: ...
 
@@ -97,40 +91,32 @@ class Subject(ImednetBaseModel):
     subject_oid: str | None = Field(default=None, alias="subjectOid")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         keywords: list[SubjectKeyword] = ...,
         subject_status: SubjectStatus | str | None = None,
-        deleted: bool | None = None,
-        study_key: str | None = None,
-        subject_id: int | None = None,
-        subject_key: str | None = None,
-        site_id: int | None = None,
-        site_name: str | None = None,
-        date_created: str | None = None,
-        date_modified: str | None = None,
-        enrollment_start_date: str | None = None,
-        subject_oid: str | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        keywords: list[SubjectKeyword] = ...,
         subjectStatus: SubjectStatus | str | None = None,
         deleted: bool | None = None,
+        study_key: str | None = None,
         studyKey: str | None = None,
+        subject_id: int | None = None,
         subjectId: int | None = None,
+        subject_key: str | None = None,
         subjectKey: str | None = None,
+        site_id: int | None = None,
         siteId: int | None = None,
+        site_name: str | None = None,
         siteName: str | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_modified: str | None = None,
         dateModified: str | None = None,
+        enrollment_start_date: str | None = None,
         enrollmentStartDate: str | None = None,
+        subject_oid: str | None = None,
         subjectOid: str | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
     @field_validator("subject_status", mode="before")
