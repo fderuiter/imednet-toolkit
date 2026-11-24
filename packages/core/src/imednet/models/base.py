@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import types
 from collections.abc import Callable
 from datetime import datetime
@@ -30,6 +31,8 @@ from imednet.utils.validators import (
 )
 
 _NORMALIZERS: dict[type, dict[str, Callable[[Any], Any]]] = {}
+_logger: logging.Logger = logging.getLogger(__name__)
+_drift_logger: logging.Logger = logging.getLogger("imednet.drift")
 
 
 def _identity(v: Any) -> Any:
@@ -39,8 +42,12 @@ def _identity(v: Any) -> Any:
 
 def _optional_str(v: Any) -> Any:
     """Convert value to string, returning None if missing."""
-    if is_missing_value(v):
+    if type(v) is str:
+        return None if not v or v.isspace() else v
+    if v is None:
         return None
+    if isinstance(v, str):
+        return None if not v or v.isspace() else str(v)
     if isinstance(v, (list, dict)):
         _guard_str_container(v)
         return None
@@ -49,6 +56,8 @@ def _optional_str(v: Any) -> Any:
 
 def _required_int(v: Any) -> int:
     """Convert value to int, converting OverflowError to ValueError for Pydantic validation."""
+    if type(v) is int:
+        return v
     try:
         return parse_int_or_default(v)
     except OverflowError as exc:
@@ -57,54 +66,70 @@ def _required_int(v: Any) -> int:
 
 def _optional_int(v: Any) -> Any:
     """Convert value to int, returning None if missing."""
-    if v is None or (not is_strict_mode() and is_missing_value(v)):
+    if type(v) is int or v is None:
+        return v
+    strict = is_strict_mode()
+    if not strict and is_missing_value(v):
         return None
     try:
-        return parse_int_or_default(v)
+        return parse_int_or_default(v, strict=strict)
     except OverflowError as exc:
         raise ValueError(str(exc)) from exc
 
 
 def _optional_bool(v: Any) -> Any:
     """Convert value to bool, returning None if missing."""
-    if v is None or (not is_strict_mode() and is_missing_value(v)):
+    if type(v) is bool or v is None:
+        return v
+    strict = is_strict_mode()
+    if not strict and is_missing_value(v):
         return None
-    return parse_bool(v)
+    return parse_bool(v, strict=strict)
 
 
 def _optional_datetime(v: Any) -> Any:
     """Convert value to datetime, returning None if missing."""
-    if v is None or (not is_strict_mode() and is_missing_value(v)):
+    if type(v) is datetime or v is None or isinstance(v, datetime):
+        return v
+    if type(v) is str and v and not v.isspace():
+        return parse_datetime(v)
+    strict = is_strict_mode()
+    if not strict and is_missing_value(v):
         return None
-    return parse_datetime(v)
+    return parse_datetime(v, strict=strict)
 
 
 def _optional_list(v: Any) -> Any:
     """Convert value to list, returning None if missing."""
-    if v is None or (not is_strict_mode() and is_missing_value(v)):
+    if type(v) is list or v is None or isinstance(v, list):
+        return v
+    strict = is_strict_mode()
+    if not strict and is_missing_value(v):
         return None
-    return parse_list_or_default(v)
+    return parse_list_or_default(v, strict=strict)
 
 
 def _optional_dict(v: Any) -> Any:
     """Convert value to dict, returning None if missing."""
-    if v is None or (not is_strict_mode() and is_missing_value(v)):
+    if type(v) is dict or v is None or isinstance(v, dict):
+        return v
+    strict = is_strict_mode()
+    if not strict and is_missing_value(v):
         return None
-    return parse_dict_or_default(v)
+    return parse_dict_or_default(v, strict=strict)
 
 
 def _extract_single_item(v: Any) -> Any:
     """Extract the first item if a list is provided where an object was expected."""
-    if isinstance(v, list):
-        if is_strict_mode():
-            raise ValueError("Expected object, got list")
-        if len(v) > 0 and isinstance(v[0], dict):
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "Structural shift detected: API returned a list where an object was expected. Coercing by extracting the first item."
-            )
-            return v[0]
+    if type(v) is not list and not isinstance(v, list):
+        return v
+    if is_strict_mode():
+        raise ValueError("Expected object, got list")
+    if len(v) > 0 and isinstance(v[0], dict):
+        _logger.warning(
+            "Structural shift detected: API returned a list where an object was expected. Coercing by extracting the first item."
+        )
+        return v[0]
     return v
 
 
@@ -196,20 +221,26 @@ class ImednetBaseModel(BaseModel):
     )
 
     @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        """Precompile per-field normalizers when model annotations are resolved."""
+        super().__pydantic_init_subclass__(**kwargs)
+        _NORMALIZERS.pop(cls, None)
+        if getattr(cls, "__pydantic_complete__", False):
+            _NORMALIZERS[cls] = {
+                field_name: _get_normalizer(cls, field_name) for field_name in cls.model_fields
+            }
+
+    @classmethod
     def from_json(cls, data: Any) -> Self:
         """Validate data coming from JSON APIs."""
         if isinstance(data, list) and not is_strict_mode():
             if len(data) > 0 and isinstance(data[0], dict):
-                import logging
-
-                logging.getLogger(__name__).warning(
+                _logger.warning(
                     f"Structural shift detected: API returned a list where an object ({cls.__name__}) was expected. Coercing by extracting the first item."
                 )
                 data = data[0]
             elif len(data) == 0:
-                import logging
-
-                logging.getLogger(__name__).warning(
+                _logger.warning(
                     f"Structural shift detected: API returned an empty list where an object ({cls.__name__}) was expected. Coercing to empty dict."
                 )
                 data = {}
@@ -217,65 +248,66 @@ class ImednetBaseModel(BaseModel):
         try:
             return cls.model_validate(data)
         except Exception as e:
-            import logging
-
             msg = f"Drift detected (destructive): {cls.__name__} validation failed: {e}"
             if msg not in _drift_reported:
                 _drift_reported.add(msg)
-                logging.getLogger("imednet.drift").warning(msg)
+                _drift_logger.warning(msg)
             raise
 
     @model_validator(mode="before")
     @classmethod
     def _detect_drift(cls, data: Any) -> Any:
         """Compare incoming JSON data against the model definition to detect API drift."""
-        if not isinstance(data, dict):
+        if type(data) is not dict and not isinstance(data, dict):
             return data
-
-        import logging
-
-        logger = logging.getLogger("imednet.drift")
 
         try:
             defined_fields, required_fields = _FIELD_METADATA_CACHE[cls]
         except KeyError:
             defined_fields, required_fields = _get_field_metadata(cls)
 
-        incoming_keys = set(data.keys())
+        is_strict = is_strict_mode()
+        warn_extra = cls.model_config.get("extra") != "ignore"
+        debug_drift = _drift_logger.isEnabledFor(logging.DEBUG)
 
-        unexpected_fields = incoming_keys - defined_fields
-        if unexpected_fields:
-            is_strict = is_strict_mode()
-            msg = f"Drift detected (additive): {cls.__name__} received unexpected fields: {', '.join(sorted(unexpected_fields))}"
-            if is_strict:
-                raise ValueError(msg)
-            if cls.model_config.get("extra") != "ignore":  # noqa: SIM102
+        if is_strict or warn_extra or debug_drift:
+            unexpected_fields = data.keys() - defined_fields
+            if unexpected_fields:
+                msg = f"Drift detected (additive): {cls.__name__} received unexpected fields: {', '.join(sorted(unexpected_fields))}"
+                if is_strict:
+                    raise ValueError(msg)
+                if warn_extra:
+                    if msg not in _drift_reported:
+                        _drift_reported.add(msg)
+                        _drift_logger.warning(msg)
+                elif debug_drift and msg not in _drift_reported:
+                    _drift_reported.add(msg)
+                    _drift_logger.debug(msg)
+
+        if required_fields:
+            missing_fields: list[str] | None = None
+            for name, alias in required_fields:
+                if name not in data and (not alias or alias not in data):
+                    if missing_fields is None:
+                        missing_fields = [name]
+                    else:
+                        missing_fields.append(name)
+            if missing_fields:
+                msg = f"Drift detected (destructive): {cls.__name__} missing required fields: {', '.join(sorted(missing_fields))}"
                 if msg not in _drift_reported:
                     _drift_reported.add(msg)
-                    logger.warning(msg)
-
-        missing_fields = []
-        for name, alias in required_fields:
-            if name not in incoming_keys and (not alias or alias not in incoming_keys):
-                missing_fields.append(name)
-        if missing_fields:
-            msg = f"Drift detected (destructive): {cls.__name__} missing required fields: {', '.join(sorted(missing_fields))}"
-            if msg not in _drift_reported:
-                _drift_reported.add(msg)
-                logger.warning(msg)
+                    _drift_logger.warning(msg)
 
         return data
 
     @field_validator("*", check_fields=False, mode="before")
     def _normalise(cls, v: Any, info: Any) -> Any:
         """Normalize common primitive types before validation."""
-        if not info.field_name:
-            return v
-
-        # Bolt Optimization: Avoid function call overhead in hot path
         try:
             return _NORMALIZERS[cls][info.field_name](v)  # type: ignore[index]
         except KeyError:
+            if not info.field_name:
+                return v
             return _get_normalizer(cls, info.field_name)(v)  # type: ignore[arg-type]
 
 

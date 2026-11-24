@@ -254,3 +254,262 @@ def test_str_normalizers_guard_against_containers_without_leaking_values(
             assert marker not in exc_text
     for marker in sensitive_markers:
         assert marker not in caplog.text
+
+
+def test_fast_path_normalizers_skip_strict_lookup_on_none_and_canonical_types(monkeypatch):
+    """Verify canonical primitives and None return before resolving strict mode."""
+    import enum
+
+    import imednet.core.context as ctx_mod
+    import imednet.models.base as base_mod
+    from imednet.models.base import (
+        _extract_single_item,
+        _optional_bool,
+        _optional_datetime,
+        _optional_dict,
+        _optional_int,
+        _optional_list,
+        _optional_str,
+        _required_int,
+    )
+
+    class _SampleIntEnum(enum.IntEnum):
+        FIVE = 5
+
+    class _SampleStrEnum(enum.StrEnum):
+        ALPHA = "alpha"
+        BLANK = "   "
+
+    def _forbid_strict_lookup() -> bool:
+        raise AssertionError("is_strict_mode() should not be called on canonical fast paths")
+
+    monkeypatch.setattr(base_mod, "is_strict_mode", _forbid_strict_lookup)
+    monkeypatch.setattr(ctx_mod, "is_strict_mode", _forbid_strict_lookup)
+    monkeypatch.setattr(validators, "_is_strict_mode_fn", _forbid_strict_lookup)
+
+    now = datetime.datetime(2026, 5, 13, 12, 0, tzinfo=datetime.UTC)
+
+    # _optional_* on None and canonical values
+    assert _optional_str(None) is None
+    assert _optional_str("") is None
+    assert _optional_str("   \t\n") is None
+    assert _optional_str("clean") == "clean"
+    assert _optional_str(_SampleStrEnum.ALPHA) == "alpha"
+    assert _optional_str(_SampleStrEnum.BLANK) is None
+    assert _required_int(42) == 42
+    assert _optional_int(None) is None
+    assert _optional_int(42) == 42
+    assert _optional_bool(None) is None
+    assert _optional_bool(True) is True
+    assert _optional_bool(False) is False
+    assert _optional_datetime(None) is None
+    assert _optional_datetime(now) is now
+    assert _optional_datetime("2026-05-13T12:00:00Z") == now
+    assert _optional_list(None) is None
+    assert _optional_list([1, 2]) == [1, 2]
+    assert _optional_dict(None) is None
+    assert _optional_dict({"k": 1}) == {"k": 1}
+    assert _extract_single_item({"id": 1}) == {"id": 1}
+
+    # parse_* on canonical values
+    assert validators.is_missing_value(None) is True
+    assert validators.is_missing_value("") is True
+    assert validators.is_missing_value(" \n\t ") is True
+    assert validators.is_missing_value("x") is False
+    assert validators.parse_str_or_default("abc") == "abc"
+    assert validators.parse_str_or_default(None, default="fallback") == "fallback"
+    assert validators.parse_int_or_default(7) == 7
+    assert validators.parse_int_or_default(_SampleIntEnum.FIVE) == 5
+    assert validators.parse_int_or_default(" 42 ") == 42
+    assert validators.parse_bool(True) is True
+    assert validators.parse_bool(False) is False
+    assert validators.parse_bool("true") is True
+    assert validators.parse_bool(" False ") is False
+    assert validators.parse_datetime(now) is now
+    assert validators.parse_datetime("2026-05-13T12:00:00Z") == now
+    assert validators.parse_list_or_default(["a"]) == ["a"]
+    assert validators.parse_dict_or_default({"a": 1}) == {"a": 1}
+
+
+def test_strict_mode_env_cache_tracks_dynamic_mutations_and_context(monkeypatch):
+    """Verify IMEDNET_STRICT_MODE caching updates immediately across setenv, delenv, context, and custom mappings."""
+    import os
+
+    from pydantic import ValidationError
+
+    import imednet.core.context as ctx_mod
+    from imednet.core.context import is_strict_mode, strict_mode_context
+    from imednet.models.subjects import Subject
+
+    monkeypatch.delenv("IMEDNET_STRICT_MODE", raising=False)
+    assert is_strict_mode() is False
+    assert Subject.from_json({"subjectId": "42.9"}).subject_id == 42
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "1")
+    assert is_strict_mode() is True
+    with pytest.raises(ValidationError):
+        Subject.from_json({"subjectId": "42.9"})
+
+    with strict_mode_context(False):
+        assert is_strict_mode() is False
+        assert Subject.from_json({"subjectId": "42.9"}).subject_id == 42
+
+    assert is_strict_mode() is True
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "false")
+    assert is_strict_mode() is False
+    with strict_mode_context(True):
+        assert is_strict_mode() is True
+        with pytest.raises(ValidationError):
+            Subject.from_json({"subjectId": "42.9"})
+
+    monkeypatch.delenv("IMEDNET_STRICT_MODE")
+    assert is_strict_mode() is False
+
+    # Verify fallback when os.environ itself is replaced with a custom mapping
+    for idx in range(36):
+        monkeypatch.setenv("IMEDNET_STRICT_MODE", f"env_unknown_{idx}")
+        assert is_strict_mode() is False
+    assert len(ctx_mod._STRICT_ENV_CACHE) <= 33
+
+    monkeypatch.setattr(os, "environ", {"IMEDNET_STRICT_MODE": "yes"})
+    assert is_strict_mode() is True
+    os.environ["IMEDNET_STRICT_MODE"] = "no"
+    assert is_strict_mode() is False
+    del os.environ["IMEDNET_STRICT_MODE"]
+    assert is_strict_mode() is False
+
+    # Verify cache bounding stays functional when >32 distinct raw values are seen
+    for idx in range(40):
+        os.environ["IMEDNET_STRICT_MODE"] = f"unknown_{idx}"
+        assert is_strict_mode() is False
+    assert len(ctx_mod._STRICT_ENV_CACHE) <= 33
+
+
+def test_optional_and_primitive_normalizer_edge_branches(monkeypatch):
+    """Cover permissive missing-string, non-finite numeric, and multi-field drift branches."""
+    from types import SimpleNamespace
+
+    from pydantic import Field, ValidationError
+
+    from imednet.models.base import (
+        ImednetBaseModel,
+        _optional_bool,
+        _optional_datetime,
+        _optional_dict,
+        _optional_int,
+        _optional_list,
+        _optional_str,
+    )
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "0")
+    assert _optional_str(123) == "123"
+    assert _optional_int("") is None
+    assert _optional_bool("") is None
+    assert _optional_datetime("") is None
+    assert _optional_list("") is None
+    assert _optional_list("item") == ["item"]
+    assert _optional_dict("") is None
+    assert _optional_dict("not-a-dict") == {}
+
+    assert validators.parse_datetime(True) == datetime.datetime(1969, 4, 20, 16, 20)
+    with pytest.raises(ValueError, match="Expected datetime, got bool"):
+        validators.parse_datetime(True, strict=True)
+    assert validators.parse_int_or_default("nan", default=3) == 3
+    with pytest.raises(ValueError, match="NaN"):
+        validators.parse_int_or_default("nan", strict=True)
+    with pytest.raises(ValueError, match="NoneType"):
+        validators.parse_int_or_default(None, strict=True)
+    assert validators.parse_int_or_default(float("inf"), default=4) == 4
+
+    class _TwoReqModel(ImednetBaseModel):
+        first_req: str = Field(..., alias="firstReq")
+        second_req: int = Field(..., alias="secondReq")
+
+    assert _TwoReqModel._normalise("raw", SimpleNamespace(field_name=None)) == "raw"
+    with pytest.raises(ValidationError):
+        _TwoReqModel.model_validate({})
+
+
+def test_record_batch_validation_call_counts_and_subclass_validator_order(monkeypatch):
+    """Verify 10,000 Record validations execute <= 10,000 strict checks and zero os.getenv/parse_bool calls, while preserving subclass validator order."""
+    import os
+
+    import imednet.core.context as ctx_mod
+    import imednet.models.base as base_mod
+    from imednet.core.context import strict_mode_context
+    from imednet.models.jobs import JobStatus
+    from imednet.models.records import Record, RecordStatus
+    from imednet.models.standards import StandardsReadinessReport
+    from imednet.models.users import Role
+    from imednet.testing.fake_data import fake_record
+    from imednet.validation.cache import SchemaCache
+
+    cache = SchemaCache()
+    payloads = [fake_record(cache) for _ in range(10000)]
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "false")
+    # Prime initial env cache once before steady-state measurement
+    assert ctx_mod.is_strict_mode() is False
+
+    counts = {"strict": 0, "getenv": 0, "parse_bool": 0}
+    orig_strict = ctx_mod.is_strict_mode
+    orig_getenv = os.getenv
+    orig_parse_bool = validators.parse_bool
+
+    def _counted_strict() -> bool:
+        counts["strict"] += 1
+        return orig_strict()
+
+    def _counted_getenv(*args, **kwargs):
+        counts["getenv"] += 1
+        return orig_getenv(*args, **kwargs)
+
+    def _counted_parse_bool(*args, **kwargs):
+        counts["parse_bool"] += 1
+        return orig_parse_bool(*args, **kwargs)
+
+    monkeypatch.setattr(ctx_mod, "is_strict_mode", _counted_strict)
+    monkeypatch.setattr(base_mod, "is_strict_mode", _counted_strict)
+    monkeypatch.setattr(validators, "_is_strict_mode_fn", _counted_strict)
+    monkeypatch.setattr(os, "getenv", _counted_getenv)
+    monkeypatch.setattr(ctx_mod, "parse_bool", _counted_parse_bool)
+    monkeypatch.setattr(base_mod, "parse_bool", _counted_parse_bool)
+
+    for payload in payloads:
+        Record.model_validate(payload)
+
+    assert counts["strict"] <= 10000
+    assert counts["getenv"] == 0
+    assert counts["parse_bool"] == 0
+
+    # Verify subclass validator execution order across Role, Record, JobStatus, StandardsReadinessReport
+    with strict_mode_context(True):
+        role = Role.from_json(
+            {
+                "roleId": "R-1",
+                "dateCreated": [2026, 5, 13, 14, 6, 50, 612000000],
+                "dateModified": [2026, 5, 14, 9, 30, 0, 0],
+            }
+        )
+        assert role.date_created == datetime.datetime(
+            2026, 5, 13, 14, 6, 50, 612000, tzinfo=datetime.UTC
+        )
+        rec = Record.from_json({"recordId": 1, "recordStatus": "record_complete", "deleted": False})
+        assert rec.record_status == RecordStatus.RECORD_COMPLETE
+        job = JobStatus.from_json(
+            {"batchId": "B-1", "progress": "80", "total_records": 10, "successful_records": 8}
+        )
+        assert job.progress == 80
+        assert job.total_records == 10
+
+    report = StandardsReadinessReport.model_validate(
+        {
+            "score": "not-a-float",
+            "successfully_validated_fields": 4,
+            "total_expected_fields": 5,
+            "domain_scores": {"DM": "95.5", "AE": "bad"},
+        }
+    )
+    assert report.score == 0.0
+    assert report.domain_scores == {"DM": 95.5, "AE": 0.0}

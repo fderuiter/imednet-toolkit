@@ -108,3 +108,133 @@ def test_dynamic_runtime_model_metadata_caching():
     assert "dynamicId" in defined
     assert "tag" in defined
     assert ("dynamic_id", "dynamicId") in required
+
+
+def test_precompiled_normalizers_and_forward_ref_rebuild():
+    """Verify __pydantic_init_subclass__ precompiles _NORMALIZERS while keeping _FIELD_METADATA_CACHE lazy and resolving forward refs."""
+    from pydantic import create_model
+
+    from imednet.models.base import (
+        _FIELD_METADATA_CACHE,
+        _NORMALIZERS,
+        ImednetBaseModel,
+        _extract_single_item,
+        _optional_int,
+        _optional_str,
+    )
+
+    class PrecompiledSubModel(ImednetBaseModel):
+        item_id: int | None = Field(default=None, alias="itemId")
+        label: str | None = Field(default=None, alias="label")
+
+    # _NORMALIZERS is precompiled immediately on subclass creation; _FIELD_METADATA_CACHE stays lazy
+    assert PrecompiledSubModel in _NORMALIZERS
+    assert _NORMALIZERS[PrecompiledSubModel]["item_id"] is _optional_int
+    assert _NORMALIZERS[PrecompiledSubModel]["label"] is _optional_str
+    assert PrecompiledSubModel not in _FIELD_METADATA_CACHE
+
+    dyn_cls = create_model(
+        "PrecompiledDynamicModel",
+        code=(str | None, Field(default=None, alias="code")),
+        __base__=ImednetBaseModel,
+    )
+    assert dyn_cls in _NORMALIZERS
+    assert _NORMALIZERS[dyn_cls]["code"] is _optional_str
+    assert dyn_cls not in _FIELD_METADATA_CACHE
+
+    # Forward-ref model resolves nested BaseModel normalizer after model_rebuild
+    ns: dict[str, object] = {"ImednetBaseModel": ImednetBaseModel}
+    exec(
+        "from __future__ import annotations\n"
+        "class ForwardParent(ImednetBaseModel):\n"
+        "    child: ForwardChild\n"
+        "class ForwardChild(ImednetBaseModel):\n"
+        "    val: int\n",
+        ns,
+    )
+    forward_parent = ns["ForwardParent"]
+    assert isinstance(forward_parent, type) and issubclass(forward_parent, ImednetBaseModel)
+    assert forward_parent not in _NORMALIZERS
+    forward_parent.model_rebuild(_types_namespace=ns)
+    parsed = forward_parent.from_json({"child": [{"val": 7}]})
+    assert parsed.child.val == 7
+    assert _NORMALIZERS[forward_parent]["child"] is _extract_single_item
+
+
+def test_detect_drift_gates_additive_checks_by_debug_extra_and_strict(caplog, monkeypatch):
+    """Verify additive drift checks skip at default log levels on extra='ignore', log deduplicated DEBUG notices when enabled, and warn on extra!='ignore'."""
+    import logging
+
+    from pydantic import ConfigDict
+
+    from imednet.models.base import ImednetBaseModel, _drift_reported
+
+    class IgnoredExtraModel(ImednetBaseModel):
+        req_id: int = Field(..., alias="reqId")
+
+    class AllowedExtraModel(ImednetBaseModel):
+        model_config = ConfigDict(extra="allow")
+        req_id: int = Field(default=1, alias="reqId")
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "0")
+    drift_logger = logging.getLogger("imednet.drift")
+    orig_level = drift_logger.level
+
+    try:
+        # 1. Default WARNING level on extra='ignore' skips additive drift notice
+        _drift_reported.clear()
+        caplog.clear()
+        drift_logger.setLevel(logging.WARNING)
+        with caplog.at_level(logging.WARNING, logger="imednet.drift"):
+            inst = IgnoredExtraModel.model_validate({"reqId": 1, "newApiField": "x"})
+            assert inst.req_id == 1
+        assert "newApiField" not in caplog.text
+
+        # 2. Enabling DEBUG on imednet.drift logs deduplicated DEBUG additive drift notice
+        _drift_reported.clear()
+        caplog.clear()
+        drift_logger.setLevel(logging.DEBUG)
+        with caplog.at_level(logging.DEBUG, logger="imednet.drift"):
+            IgnoredExtraModel.model_validate({"reqId": 1, "newApiField": "x"})
+            IgnoredExtraModel.model_validate({"reqId": 2, "newApiField": "y"})
+
+        debug_records = [
+            r
+            for r in caplog.records
+            if r.name == "imednet.drift"
+            and r.levelno == logging.DEBUG
+            and "Drift detected (additive): IgnoredExtraModel received unexpected fields: newApiField"
+            in r.message
+        ]
+        assert len(debug_records) == 1
+
+        # 3. extra != 'ignore' logs deduplicated WARNING even when DEBUG is enabled or disabled
+        _drift_reported.clear()
+        caplog.clear()
+        drift_logger.setLevel(logging.WARNING)
+        with caplog.at_level(logging.WARNING, logger="imednet.drift"):
+            AllowedExtraModel.model_validate({"reqId": 1, "extraAllowedField": "v1"})
+            AllowedExtraModel.model_validate({"reqId": 2, "extraAllowedField": "v2"})
+
+        warn_records = [
+            r
+            for r in caplog.records
+            if r.name == "imednet.drift"
+            and r.levelno == logging.WARNING
+            and "Drift detected (additive): AllowedExtraModel received unexpected fields: extraAllowedField"
+            in r.message
+        ]
+        assert len(warn_records) == 1
+
+        # 4. Destructive drift still warns when required field/alias is missing from data
+        _drift_reported.clear()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="imednet.drift"):
+            with pytest.raises(ValidationError):
+                IgnoredExtraModel.model_validate({})
+        assert (
+            "Drift detected (destructive): IgnoredExtraModel missing required fields: req_id"
+            in caplog.text
+        )
+    finally:
+        drift_logger.setLevel(orig_level)
