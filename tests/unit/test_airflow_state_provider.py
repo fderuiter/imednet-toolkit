@@ -582,3 +582,323 @@ def test_airflow_state_provider_redacts_sensitive_error_and_metadata(
     assert "RAW_API_SECRET" not in stream_state.error_message
     assert "RAW_META_SECRET" not in json.dumps(stream_state.metadata)
     assert stream_state.metadata["target"] == "edc"
+
+
+def test_50_form_export_runtime_comms_orm_sql_budgets_and_legacy_migration(
+    airflow_runtime_env: Path,
+    tmp_path: Path,
+) -> None:
+    """Verify 50-form export_to_sql_by_form RPC/SQL budgets, 250-stream read_state, 1-DELETE reset, and legacy migration."""
+    from airflow import settings
+    from airflow.models.variable import Variable as ModelVariable
+    from sqlalchemy import event
+
+    from imednet.integrations.export import export_to_sql_by_form
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    # 1. RuntimeTaskInstance: 50-form export_to_sql_by_form executes 1 GetVariable and 2 PutVariable calls
+    comms_report = tmp_path / "comms_50_forms.json"
+    rt_sqlite = tmp_path / "rt_50_forms.sqlite"
+    provider_rt = AirflowStateProvider(variable_prefix="imednet_50f_rt")
+    seed_ts = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
+    with provider_rt.batch_transaction(
+        "STUDY_50_RT", [f"sql_F{i:02d}" for i in range(1, 51)]
+    ) as seed_tx:
+        for i in range(1, 51):
+            seed_tx[f"sql_F{i:02d}"]["new_timestamp"] = seed_ts
+
+    dag_file = airflow_runtime_env / "dag_50_form_comms.py"
+    dag_file.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import traceback
+            from pathlib import Path
+            import httpx
+            import airflow.utils.session as af_session
+            from airflow.sdk import DAG, task
+            from airflow.sdk.execution_time import task_runner
+            from imednet import ImednetSDK
+            from imednet.integrations.export import export_to_sql_by_form
+            from imednet_workflows.state_ledger import AirflowStateProvider
+            from datetime import datetime, timezone
+
+            with DAG("dag_50_form_comms", start_date=datetime(2026, 1, 1, tzinfo=timezone.utc)) as dag:
+                @task
+                def run_50_form_export() -> None:
+                    forms_payload = [
+                        {{"studyKey": "STUDY_50_RT", "formId": i, "formKey": f"F{{i:02d}}", "formName": f"Form {{i}}"}}
+                        for i in range(1, 51)
+                    ]
+                    vars_payload = [
+                        {{
+                            "studyKey": "STUDY_50_RT",
+                            "variableId": i,
+                            "variableName": f"V_{{i:02d}}",
+                            "variableType": "integer",
+                            "label": f"Var {{i}}",
+                            "formId": i,
+                            "formKey": f"F{{i:02d}}",
+                            "formName": f"Form {{i}}",
+                        }}
+                        for i in range(1, 51)
+                    ]
+                    recs_payload = [
+                        {{
+                            "studyKey": "STUDY_50_RT",
+                            "recordId": 1000 + i,
+                            "subjectId": 1,
+                            "subjectKey": "SUBJ-1",
+                            "formId": i,
+                            "formKey": f"F{{i:02d}}",
+                            "dateCreated": "2026-09-05 10:00:00",
+                            "dateModified": "2026-09-05 12:00:00",
+                            "recordData": {{f"V_{{i:02d}}": i}},
+                        }}
+                        for i in range(1, 51)
+                    ]
+
+                    def handler(request: httpx.Request) -> httpx.Response:
+                        if request.url.path.endswith("/forms"):
+                            return httpx.Response(200, json={{"data": forms_payload, "pagination": {{"totalPages": 1}}}})
+                        if request.url.path.endswith("/variables"):
+                            return httpx.Response(200, json={{"data": vars_payload, "pagination": {{"totalPages": 1}}}})
+                        if request.url.path.endswith("/records"):
+                            return httpx.Response(200, json={{"data": recs_payload, "pagination": {{"totalPages": 1}}}})
+                        return httpx.Response(200, json={{"data": [], "pagination": {{"totalPages": 1}}}})
+
+                    sdk = ImednetSDK(
+                        api_key="k",
+                        security_key="s",
+                        base_url="https://edc.trn.imednetapi.com",
+                        transport=httpx.MockTransport(handler),
+                    )
+
+                    seen_msgs: list[str] = []
+                    orig_comms = task_runner.SUPERVISOR_COMMS
+
+                    class _CommsSpy:
+                        def __init__(self, inner):
+                            self._inner = inner
+
+                        def send(self, msg, *args, **kwargs):
+                            msg_name = type(msg).__name__
+                            if "Variable" in msg_name:
+                                seen_msgs.append(msg_name)
+                            return self._inner.send(msg, *args, **kwargs)
+
+                        def __getattr__(self, name):
+                            return getattr(self._inner, name)
+
+                    orig_create_session = af_session.create_session
+                    def _forbid_direct_orm(*args, **kwargs):
+                        stack_files = [frame.filename for frame in traceback.extract_stack()]
+                        if any("/packages/" in fn for fn in stack_files) and not any(
+                            "execution_api" in fn for fn in stack_files
+                        ):
+                            raise AssertionError("Direct ORM forbidden inside RuntimeTaskInstance")
+                        return orig_create_session(*args, **kwargs)
+
+                    task_runner.SUPERVISOR_COMMS = _CommsSpy(orig_comms)
+                    af_session.create_session = _forbid_direct_orm
+                    try:
+                        export_to_sql_by_form(
+                            sdk,
+                            "STUDY_50_RT",
+                            f"sqlite:///{str(rt_sqlite)}",
+                            incremental=True,
+                            quality_gate_enabled=False,
+                            mask_phi=False,
+                            state_provider=AirflowStateProvider(variable_prefix="imednet_50f_rt"),
+                        )
+                    finally:
+                        task_runner.SUPERVISOR_COMMS = orig_comms
+                        af_session.create_session = orig_create_session
+
+                    Path({str(comms_report)!r}).write_text(json.dumps(seen_msgs), encoding="utf-8")
+
+                run_50_form_export()
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    dag_run = _load_dag_from_file(dag_file, "dag").test(
+        logical_date=datetime(2026, 9, 5, tzinfo=timezone.utc)
+    )
+    assert str(dag_run.state) == "success"
+    seen_rt_msgs = json.loads(comms_report.read_text(encoding="utf-8"))
+    assert seen_rt_msgs == ["GetVariable", "PutVariable", "PutVariable"]
+    rt_state = provider_rt.read_state()
+    assert len(rt_state.studies["STUDY_50_RT"].streams) == 50
+    assert provider_rt.get_last_timestamp("STUDY_50_RT", "sql_F50") == datetime(
+        2026, 9, 5, 12, 0, tzinfo=timezone.utc
+    )
+
+    # 2. ORM mode: 50-form export_to_sql_by_form executes <= 3 SQL statements and <= 2 session commits
+    import httpx
+
+    from imednet import ImednetSDK
+
+    forms_orm = [
+        {"studyKey": "STUDY_50_ORM", "formId": i, "formKey": f"F{i:02d}", "formName": f"Form {i}"}
+        for i in range(1, 51)
+    ]
+    vars_orm = [
+        {
+            "studyKey": "STUDY_50_ORM",
+            "variableId": i,
+            "variableName": f"V_{i:02d}",
+            "variableType": "integer",
+            "label": f"Var {i}",
+            "formId": i,
+            "formKey": f"F{i:02d}",
+            "formName": f"Form {i}",
+        }
+        for i in range(1, 51)
+    ]
+    recs_orm = [
+        {
+            "studyKey": "STUDY_50_ORM",
+            "recordId": 2000 + i,
+            "subjectId": 1,
+            "subjectKey": "SUBJ-1",
+            "formId": i,
+            "formKey": f"F{i:02d}",
+            "dateCreated": "2026-09-06 10:00:00",
+            "dateModified": "2026-09-06 14:00:00",
+            "recordData": {f"V_{i:02d}": i},
+        }
+        for i in range(1, 51)
+    ]
+
+    def _orm_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/forms"):
+            return httpx.Response(200, json={"data": forms_orm, "pagination": {"totalPages": 1}})
+        if request.url.path.endswith("/variables"):
+            return httpx.Response(200, json={"data": vars_orm, "pagination": {"totalPages": 1}})
+        if request.url.path.endswith("/records"):
+            return httpx.Response(200, json={"data": recs_orm, "pagination": {"totalPages": 1}})
+        return httpx.Response(200, json={"data": [], "pagination": {"totalPages": 1}})
+
+    orm_sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://edc.trn.imednetapi.com",
+        transport=httpx.MockTransport(_orm_handler),
+    )
+    provider_orm = AirflowStateProvider(variable_prefix="imednet_orm_bench")
+    orm_sqlite = tmp_path / "orm_50_forms.sqlite"
+
+    airflow_sql_statements: list[str] = []
+    airflow_commits: list[int] = []
+
+    def _on_before_cursor(conn, cursor, statement, parameters, context, executemany) -> None:  # type: ignore[no-untyped-def]
+        _ = (conn, cursor, parameters, context, executemany)
+        airflow_sql_statements.append(str(statement).strip())
+
+    def _on_after_commit(session: Any) -> None:
+        _ = session
+        airflow_commits.append(1)
+
+    assert settings.engine is not None
+    event.listen(settings.engine, "before_cursor_execute", _on_before_cursor)
+    event.listen(settings.Session, "after_commit", _on_after_commit)
+    try:
+        export_to_sql_by_form(
+            orm_sdk,
+            "STUDY_50_ORM",
+            f"sqlite:///{orm_sqlite}",
+            incremental=True,
+            quality_gate_enabled=False,
+            mask_phi=False,
+            state_provider=provider_orm,
+        )
+        assert len(airflow_sql_statements) <= 3
+        assert len(airflow_commits) <= 2
+
+        # 3. 250 streams across 5 studies in ORM read_state -> 1 SQL SELECT, 0 commits, autoescape=True
+        for s_idx in range(2, 6):
+            with provider_orm.batch_transaction(
+                f"STUDY_50_ORM_{s_idx}", [f"sql_F{i:02d}" for i in range(1, 51)]
+            ) as btx:
+                for i in range(1, 51):
+                    btx[f"sql_F{i:02d}"]["new_timestamp"] = seed_ts
+        # Decoy matching wildcard '_' if autoescape=True were missing on 'imednet_orm_bench:'
+        ModelVariable.set(
+            "imednetXormXbench:DECOY",
+            {"study_key": "DECOY", "streams": {"s": {"status": "success"}}},
+            serialize_json=True,
+        )
+
+        airflow_sql_statements.clear()
+        airflow_commits.clear()
+        orm_ledger = provider_orm.read_state()
+        select_stmts = [s for s in airflow_sql_statements if s.upper().startswith("SELECT")]
+        assert len(select_stmts) == 1
+        assert len(airflow_sql_statements) == 1
+        assert len(airflow_commits) == 0
+        assert len(orm_ledger.studies) == 5
+        assert "DECOY" not in orm_ledger.studies
+        assert sum(len(s.streams) for s in orm_ledger.studies.values()) == 250
+
+        # 4. ORM delete_entry(study_key) -> 1 SQL DELETE statement while preserving sibling studies
+        ModelVariable.set(
+            "imednet_orm_bench:STUDY_50XORM:decoy_stream",
+            {"study_key": "STUDY_50XORM", "stream_name": "decoy_stream", "status": "success"},
+            serialize_json=True,
+        )
+        airflow_sql_statements.clear()
+        assert provider_orm.delete_entry("STUDY_50_ORM") is True
+        delete_stmts = [s for s in airflow_sql_statements if s.upper().startswith("DELETE")]
+        assert len(delete_stmts) == 1
+        assert len(airflow_sql_statements) == 1
+        assert "STUDY_50_ORM_2" in provider_orm.read_state().studies
+        assert (
+            ModelVariable.get("imednet_orm_bench:STUDY_50XORM:decoy_stream", default_var=None)
+            is not None
+        )
+
+        # 5. ORM legacy per-stream keys load on read and consolidate + delete legacy rows on next write
+        legacy_provider = AirflowStateProvider(variable_prefix="imednet_legacy_orm")
+        ModelVariable.set(
+            "imednet_legacy_orm:ST_UPG:sql_DM",
+            {
+                "study_key": "ST_UPG",
+                "stream_name": "sql_DM",
+                "last_timestamp": "2026-08-01T00:00:00+00:00",
+                "records_processed": 9,
+                "status": "success",
+            },
+            serialize_json=True,
+        )
+        ModelVariable.set(
+            "imednet_legacy_orm:ST_UPG:sql_AE",
+            {
+                "study_key": "ST_UPG",
+                "stream_name": "sql_AE",
+                "last_timestamp": "2026-08-02T00:00:00+00:00",
+                "records_processed": 4,
+                "status": "success",
+            },
+            serialize_json=True,
+        )
+        assert legacy_provider.get_last_timestamp("ST_UPG", "sql_AE") == datetime(
+            2026, 8, 2, 0, 0, tzinfo=timezone.utc
+        )
+        with legacy_provider.batch_transaction("ST_UPG", ["sql_DM", "sql_AE"]) as upg_tx:
+            assert upg_tx["sql_DM"]["last_timestamp"] == datetime(
+                2026, 8, 1, 0, 0, tzinfo=timezone.utc
+            )
+            upg_tx["sql_DM"]["new_timestamp"] = datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc)
+
+        assert ModelVariable.get("imednet_legacy_orm:ST_UPG:sql_DM", default_var=None) is None
+        assert ModelVariable.get("imednet_legacy_orm:ST_UPG:sql_AE", default_var=None) is None
+        consolidated_upg = ModelVariable.get(
+            "imednet_legacy_orm:ST_UPG", default_var=None, deserialize_json=True
+        )
+        assert set(consolidated_upg["streams"]) == {"sql_DM", "sql_AE"}
+        assert legacy_provider.get_last_status("ST_UPG", "sql_DM") == StreamExecutionStatus.SUCCESS
+    finally:
+        event.remove(settings.engine, "before_cursor_execute", _on_before_cursor)
+        event.remove(settings.Session, "after_commit", _on_after_commit)
