@@ -231,3 +231,20 @@ def test_neo4j_showcase_executes_batch_writes(
     assert "Loaded 2 Records from Study 'STUDY_ALPHA' into Neo4j." in out
     assert "env-neo4j-pass" not in out
     assert TEST_API_VAL not in out
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["mongodb_export.py", "neo4j_export.py", "snowflake_export.py"],
+)
+def test_sink_showcases_require_security_key_outside_simulation_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    script_name: str,
+) -> None:
+    """Verify sink export examples fail fast with KeyError when IMEDNET_SECURITY_KEY is missing outside simulation."""
+    monkeypatch.delenv("IMEDNET_SIMULATION_MODE", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.setenv("IMEDNET_API_KEY", TEST_API_VAL)
+
+    with pytest.raises(KeyError, match="IMEDNET_SECURITY_KEY"):
+        runpy.run_path(str(EXAMPLES_DIR / script_name))

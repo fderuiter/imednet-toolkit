@@ -51,7 +51,12 @@ def _normalize_wheel_prefix(pkg_name: str) -> str:
     return re.sub(r"[-_.]+", "_", pkg_name).lower()
 
 
-def verify_wheel_metadata(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
+def verify_wheel_metadata(
+    dist_dir: Path,
+    packages_dir: Path = PACKAGES_DIR,
+    *,
+    require_classifiers: bool = True,
+) -> None:
     """Verify built workspace wheels expose Markdown descriptions, MIT license, and Python 3.11-3.13 classifiers."""
     for _, pkg_name in discover_workspace_packages(packages_dir):
         wheel_path = _find_wheel_for_package(dist_dir, pkg_name)
@@ -62,8 +67,10 @@ def verify_wheel_metadata(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> 
 
         with zipfile.ZipFile(wheel_path) as zf:
             meta_entries = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
-            if not meta_entries:
-                raise ValueError(f"Wheel '{wheel_path.name}' is missing .dist-info/METADATA")
+            if len(meta_entries) != 1:
+                raise ValueError(
+                    f"Wheel '{wheel_path.name}' is missing .dist-info/METADATA (found {meta_entries})"
+                )
             msg = email.message_from_bytes(zf.read(meta_entries[0]))
 
         content_type = (msg.get("Description-Content-Type") or "").split(";")[0].strip().lower()
@@ -77,18 +84,30 @@ def verify_wheel_metadata(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> 
         if not isinstance(payload, str) or not payload.strip():
             raise ValueError(f"Wheel '{wheel_path.name}' has an empty METADATA description body")
 
-        license_expr = (msg.get("License-Expression") or "").strip()
-        if license_expr != "MIT":
+        license_val = (msg.get("License-Expression") or msg.get("License") or "").strip()
+        if license_val != "MIT":
             raise ValueError(
-                f"Wheel '{wheel_path.name}' expected License-Expression 'MIT', got {license_expr!r}"
+                f"Wheel '{wheel_path.name}' expected License-Expression 'MIT', got {license_val!r}"
             )
 
-        classifiers = set(msg.get_all("Classifier", []))
-        missing_classifiers = [c for c in REQUIRED_PYTHON_CLASSIFIERS if c not in classifiers]
-        if missing_classifiers:
-            raise ValueError(
-                f"Wheel '{wheel_path.name}' is missing classifiers: {missing_classifiers}"
-            )
+        if require_classifiers:
+            classifiers = set(msg.get_all("Classifier", []))
+            missing_classifiers = [c for c in REQUIRED_PYTHON_CLASSIFIERS if c not in classifiers]
+            if missing_classifiers:
+                raise ValueError(
+                    f"Wheel '{wheel_path.name}' is missing classifiers: {missing_classifiers}"
+                )
+        print(
+            f"Verified wheel METADATA for {wheel_path.name} "
+            f"(license={license_val}, content_type={content_type}, body_chars={len(payload.strip())})."
+        )
+
+
+def validate_wheel_metadata(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
+    """Verify every built wheel in dist_dir declares License/License-Expression, text/markdown, and a non-empty body."""
+    if not any(dist_dir.glob("*.whl")):
+        raise ValueError(f"No built wheels (.whl) found in {dist_dir}")
+    verify_wheel_metadata(dist_dir, packages_dir=packages_dir, require_classifiers=False)
 
 
 def build_wheels(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
@@ -272,6 +291,13 @@ def prepare_wheels(
     finally:
         if internal_packages:
             tighten_dependencies.restore_files(internal_packages)
+        for pkg_path, _ in missing_packages:
+            pyproject_path = pkg_path / "pyproject.toml"
+            backup_path = pyproject_path.with_suffix(".toml.bak")
+            if backup_path.exists():
+                shutil.copy2(backup_path, pyproject_path)
+                backup_path.unlink()
+                print(f"Restored {pyproject_path} from backup")
 
     return built_names
 

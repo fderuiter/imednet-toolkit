@@ -39,6 +39,8 @@ from scripts.validate_docs import (
     check_no_duplicate_suppression,
     check_package_docs,
     check_packages_registered,
+    check_pypi_install_tags,
+    check_readme_github_pages_routes,
     check_release_please_parity,
     check_rendered_api_reference,
     check_sdtm_and_phi_parity,
@@ -789,6 +791,67 @@ def test_check_package_docs_detects_manifest_and_changelog_drift(tmp_path: Path)
     assert check_package_docs(tmp_path) is True
 
 
+def test_check_package_docs_enforces_wheel_metadata_and_absolute_links(tmp_path: Path) -> None:
+    """check_package_docs requires readme/license/classifiers in pyproject.toml and rejects relative links in package READMEs."""
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n- [demo](packages/demo-pkg/CHANGELOG.md)\n",
+        encoding="utf-8",
+    )
+    changelogs_dir = tmp_path / "docs" / "reference" / "changelogs"
+    changelogs_dir.mkdir(parents=True)
+    (changelogs_dir / "index.rst").write_text(
+        "Changelogs\n==========\n\n.. toctree::\n\n   demo-pkg\n",
+        encoding="utf-8",
+    )
+    (changelogs_dir / "demo-pkg.md").write_text(
+        "# demo-pkg\n\n```{include} ../../../packages/demo-pkg/CHANGELOG.md\n```\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs" / "reference" / "compatibility.rst").write_text(
+        "Compatibility\n=============\n\nSee :doc:`changelogs/index`.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs" / "reference" / "contributing.rst").write_text(
+        "Contributing\n============\n\nSee :doc:`changelogs/index`.\n",
+        encoding="utf-8",
+    )
+    pkg_dir = tmp_path / "packages" / "demo-pkg"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "CHANGELOG.md").write_text("# Demo Changelog\n", encoding="utf-8")
+    (pkg_dir / "README.md").write_text(
+        "# demo-pkg\n\nSee [Docs](https://fderuiter.github.io/imednet-toolkit/).\n",
+        encoding="utf-8",
+    )
+    valid_manifest = (
+        '[project]\nname = "demo"\nreadme = "README.md"\nlicense = "MIT"\n'
+        "classifiers = [\n"
+        '  "Programming Language :: Python :: 3.11",\n'
+        '  "Programming Language :: Python :: 3.12",\n'
+        '  "Programming Language :: Python :: 3.13",\n'
+        "]\n"
+    )
+    (pkg_dir / "pyproject.toml").write_text(valid_manifest, encoding="utf-8")
+    assert check_package_docs(tmp_path) is False
+
+    # Relative link in package README fails
+    (pkg_dir / "README.md").write_text(
+        "# demo-pkg\n\nSee [Example](../../examples/quick_start.py).\n",
+        encoding="utf-8",
+    )
+    assert check_package_docs(tmp_path) is True
+
+    # Restore valid README, remove license -> fails
+    (pkg_dir / "README.md").write_text(
+        "# demo-pkg\n\nSee [Docs](https://fderuiter.github.io/imednet-toolkit/).\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nreadme = "README.md"\n',
+        encoding="utf-8",
+    )
+    assert check_package_docs(tmp_path) is True
+
+
 def test_check_governance_and_issue_templates_detects_retired_urls_labels_and_dropdowns(
     tmp_path: Path,
 ) -> None:
@@ -858,6 +921,118 @@ def test_check_governance_and_issue_templates_detects_retired_urls_labels_and_dr
     assert check_governance_and_issue_templates(tmp_path) is True
 
 
+def test_check_readme_github_pages_routes_resolves_pages_and_fragments(tmp_path: Path) -> None:
+    """check_readme_github_pages_routes rejects raw .rst links and verifies HTML files and #fragments."""
+    repo = tmp_path / "repo"
+    pkg_dir = repo / "packages" / "core"
+    html_dir = tmp_path / "html"
+    (html_dir / "tutorials").mkdir(parents=True)
+    pkg_dir.mkdir(parents=True)
+
+    (html_dir / "index.html").write_text(
+        '<html><body><section id="interactive-showcase"></section>'
+        '<div id="documentation-overview"></div></body></html>',
+        encoding="utf-8",
+    )
+    (html_dir / "tutorials" / "quick_start.html").write_text(
+        '<html><body><h1 id="quick-start">Quick Start</h1></body></html>',
+        encoding="utf-8",
+    )
+
+    (repo / "README.md").write_text(
+        "# Root\n\n"
+        "- [Showcase](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)\n"
+        "- [Tutorials](https://fderuiter.github.io/imednet-toolkit/#documentation-overview)\n"
+        "- [Quick Start](https://fderuiter.github.io/imednet-toolkit/tutorials/quick_start.html#quick-start)\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "README.md").write_text(
+        "# Core\n\nFull docs: <https://fderuiter.github.io/imednet-toolkit/>\n",
+        encoding="utf-8",
+    )
+
+    assert check_readme_github_pages_routes(html_dir, require_exists=True, repo_root=repo) is False
+
+    # Broken #fragment fails
+    (pkg_dir / "README.md").write_text(
+        "# Core\n\n[Missing Anchor](https://fderuiter.github.io/imednet-toolkit/#nonexistent)\n",
+        encoding="utf-8",
+    )
+    assert check_readme_github_pages_routes(html_dir, require_exists=True, repo_root=repo) is True
+
+    # Raw .rst link fails even without HTML dir
+    (pkg_dir / "README.md").write_text(
+        "# Core\n\n[Raw RST](docs/tutorials/quick_start.rst)\n",
+        encoding="utf-8",
+    )
+    assert check_readme_github_pages_routes(None, repo_root=repo) is True
+
+
+def test_check_pypi_install_tags_enforces_git_release_tags(tmp_path: Path) -> None:
+    """check_pypi_install_tags allows published packages/extras in PyPI blocks and requires source checkout for untagged ones."""
+    repo = tmp_path / "git_repo"
+    core_dir = repo / "packages" / "core"
+    tui_dir = repo / "packages" / "plugins-tui"
+    core_dir.mkdir(parents=True)
+    tui_dir.mkdir(parents=True)
+
+    (core_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet"\nversion = "1.1.0"\n'
+        "[project.optional-dependencies]\nexport = []\n",
+        encoding="utf-8",
+    )
+    (tui_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet-tui"\nversion = "1.0.0"\n',
+        encoding="utf-8",
+    )
+
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "tag", "imednet-v1.1.0"], cwd=repo, check=True, capture_output=True)
+
+    # Add unreleased extra 'tui' on HEAD after imednet-v1.1.0 tag
+    (core_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet"\nversion = "1.1.0"\n'
+        "[project.optional-dependencies]\nexport = []\ntui = []\n",
+        encoding="utf-8",
+    )
+    (repo / "README.md").write_text(
+        "## Installation\n\n### Published PyPI Releases\n\n"
+        '```bash\npip install imednet\npip install "imednet[export]"\n```\n\n'
+        "### Source Checkouts\n\n"
+        '```bash\npip install -e ./packages/plugins-tui -e "./packages/core[tui]"\n```\n',
+        encoding="utf-8",
+    )
+    assert check_pypi_install_tags(repo) is False
+
+    # Advertising unreleased imednet[tui] in PyPI block fails
+    (repo / "README.md").write_text(
+        '## Installation\n\n```bash\npip install "imednet[tui]"\n```\n',
+        encoding="utf-8",
+    )
+    assert check_pypi_install_tags(repo) is True
+
+    # Advertising untagged imednet-tui in PyPI block fails
+    (repo / "README.md").write_text(
+        "## Installation\n\n```bash\npip install imednet-tui\n```\n",
+        encoding="utf-8",
+    )
+    assert check_pypi_install_tags(repo) is True
+
+
 def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_dirs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -869,6 +1044,8 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_packages_registered() is False
     assert check_package_docs() is False
     assert check_governance_and_issue_templates() is False
+    assert check_pypi_install_tags() is False
+    assert check_readme_github_pages_routes(None) is False
     assert check_release_please_parity() is False
     assert check_examples_index_parity() is False
     assert check_diataxis_sidebar_isolation() is False
@@ -885,6 +1062,8 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_packages_registered(empty_root) is True
     assert check_package_docs(empty_root) is True
     assert check_governance_and_issue_templates(empty_root) is True
+    assert check_pypi_install_tags(empty_root) is True
+    assert check_readme_github_pages_routes(None, repo_root=empty_root) is True
     assert check_release_please_parity(empty_root) is True
     assert check_examples_index_parity(empty_root) is True
     assert check_diataxis_sidebar_isolation(empty_root) is True

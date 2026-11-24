@@ -1562,9 +1562,12 @@ os.environ["IMEDNET_STUDY_KEY"] = "STUDY"
 os.environ["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
 os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
 
+_executor_safeguard_prev = None
 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
     try:
         from airflow.sdk.bases.operator import ExecutorSafeguard
+
+        _executor_safeguard_prev = ExecutorSafeguard.test_mode
         ExecutorSafeguard.test_mode = True
     except Exception:
         pass
@@ -1607,6 +1610,10 @@ _mongo_client_patcher.stop()
 _neo4j_driver_patcher.stop()
 _snowflake_connect_patcher.stop()
 _print_patcher.stop()
+if _executor_safeguard_prev is not None:
+    with contextlib.suppress(ImportError):
+        from airflow.sdk.bases.operator import ExecutorSafeguard
+        ExecutorSafeguard.test_mode = _executor_safeguard_prev
 get_default_simulation_state().reset()
 os.chdir(_doctest_orig_cwd)
 _doctest_tmpdir.cleanup()
