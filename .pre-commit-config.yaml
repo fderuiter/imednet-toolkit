@@ -22,8 +22,8 @@ repos:
     rev: v0.15.22
     hooks:
       # Run linter with safe auto-fix enabled
-      - id: ruff
-        args: [--fix, --exit-non-zero-on-fix, --ignore=UP038]
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
         exclude: ^sandbox/
       # Run formatter
       - id: ruff-format
@@ -34,6 +34,7 @@ repos:
     rev: v1.30.0
     hooks:
       - id: typos
+        args: [--force-exclude]
 
   # Credential leak prevention honoring .secrets.baseline
   - repo: https://github.com/Yelp/detect-secrets

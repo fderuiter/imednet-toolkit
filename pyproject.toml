@@ -17,6 +17,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ruff==0.15.22",
+    "typos==1.30.0",
     "pyyaml>=6.0.3,<7.0.0",
     "httpx[socks]>=0.28.1,<0.29.0",
     "pandas>=2.2.3,<3.0.0",
@@ -160,6 +161,7 @@ ignore_missing_imports = true
 "scripts/**/*.py" = ["SLF001", "S", "D", "RUF", "RET"]
 "examples/**/*.py" = ["SLF001", "S", "D", "RUF"]
 "packages/plugins-sinks/tests/**/*.py" = ["SLF001", "S", "D", "PT", "SIM", "RUF", "B", "RET", "UP", "C", "F821"]
+"packages/plugins-tui/tests/**/*.py" = ["SLF001", "S", "D", "PT", "SIM", "RUF", "B", "RET", "UP", "C", "F821"]
 
 [tool.ruff.format]
 quote-style = "preserve"
@@ -203,6 +205,7 @@ dependencies = [
 verify-static = [
     "ruff format --check .",
     "ruff check .",
+    "typos --force-exclude .",
     "mypy packages/core/src/imednet",
     "mypy packages/plugins-workflows/src/imednet_workflows",
     "mypy packages/providers-airflow/src/apache_airflow_providers_imednet",
@@ -245,7 +248,7 @@ dependencies = [
     "vulture>=2.11",
     "ruff==0.15.22",
     "mypy>=1.15.0,<2.5.0",
-    "typos",
+    "typos==1.30.0",
     "semgrep==1.185.0",
     "pip-audit",
     "detect-secrets",
@@ -264,10 +267,10 @@ dependencies = [
 ]
 
 [tool.hatch.envs.lint.scripts]
-fmt = "ruff format --check {args:packages}"
-ruff-check = "ruff check {args:packages}"
+fmt = "ruff format --check {args:.}"
+ruff-check = "ruff check {args:.}"
 mypy-check = "mypy {args:packages}"
-typos-check = "typos {args:packages}"
+typos-check = "typos --force-exclude {args:.}"
 semgrep-check = "semgrep scan --config p/security-audit --metrics off --error {args:packages}"
 # Scanner-only upstream exceptions: docs/reference/security_exceptions.rst
 audit = "pip-audit -s osv --timeout 60 --ignore-vuln CVE-2026-116685 --ignore-vuln CVE-2026-59951 --ignore-vuln CVE-2026-116686 --ignore-vuln CVE-2026-116684 --ignore-vuln CVE-2026-126360 --ignore-vuln CVE-2026-114603"
@@ -305,7 +308,7 @@ detached = true
 
 [tool.hatch.envs.quality.scripts]
 all = [
-    "hatch run lint:all {args:packages}",
+    "hatch run lint:all",
     "hatch run duplication:check {args:packages}"
 ]
 
