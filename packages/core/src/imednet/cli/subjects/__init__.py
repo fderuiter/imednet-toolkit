@@ -7,14 +7,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ...errors import ApiError, ValidationError
 from ...sdk import ImednetSDK
+from ...utils.batch_coordinator import BatchSubmissionSummary
 from ...utils.enrollment import (
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
     validate_subject_registration_sites,
 )
-from ...utils.job_poller import JobFailedError, JobTimeoutError
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import print_error, register_list_command, simulation_mode_context
 from ..utils.args import (
@@ -24,12 +23,9 @@ from ..utils.args import (
 from ..utils.context import is_offline_schema_dry_run
 from ..utils.write_helpers import (
     add_write_common_args,
-    exit_cli_validation_error,
-    exit_cli_write_error,
-    load_records_from_path_or_stdin,
-    parse_json_records_text,
-    parse_key_value_pairs,
-    render_write_summary,
+    assemble_cli_write_records,
+    execute_cli_write,
+    guard_stdin_dash_tty,
     resolve_cli_schema,
     submit_cli_records_batch,
     validate_write_numeric_flags,
@@ -40,79 +36,14 @@ def _load_cli_subject_inputs(
     args: argparse.Namespace,
     *,
     schema: Any = None,
-) -> Any:
-    """Resolve CLI subject registration inputs from ``--file``, ``--json``, or inline flags."""
-    if args.input_file and args.json_payload:
-        raise ValueError("Cannot combine --file and --json.")
-
-    study_key = getattr(args, "study_key", None)
-    if args.input_file:
-        if args.input_file == "-":
-            items = parse_json_records_text(sys.stdin.read(), source_label="stdin")
-            if args.data_pairs:
-                return _merge_subject_inline_overrides(items, args=args, schema=schema)
-            return items
-        if args.data_pairs:
-            items = load_records_from_path_or_stdin(
-                args.input_file,
-                schema=schema,
-                study_key=study_key,
-                default_form_key=args.form_key,
-            )
-            return _merge_subject_inline_overrides(items, args=args, schema=schema)
-        return Path(args.input_file)
-    if args.json_payload:
-        items = parse_json_records_text(args.json_payload, source_label="--json")
-        if args.data_pairs:
-            return _merge_subject_inline_overrides(items, args=args, schema=schema)
-        return items
-
-    if not args.form_key or (not args.site_name and getattr(args, "site_id", None) is None):
-        raise ValueError(
-            "Provide --file, --json, or both --form-key and --site-name to register a subject."
-        )
-    inline_data = parse_key_value_pairs(
-        args.data_pairs,
-        schema=schema,
-        form_key=args.form_key,
-        study_key=study_key,
-    )
-    single: dict[str, Any] = {
-        "formKey": args.form_key,
-        "data": inline_data,
-    }
-    if args.site_name:
-        single["siteName"] = args.site_name
-    if getattr(args, "site_id", None) is not None:
-        single["siteId"] = args.site_id
-    if args.subject_key:
-        single["subjectKey"] = args.subject_key
-    if getattr(args, "subject_oid", None):
-        single["subjectOid"] = args.subject_oid
-    return [single]
-
-
-def _merge_subject_inline_overrides(
-    items: list[dict[str, Any]],
-    *,
-    args: argparse.Namespace,
-    schema: Any = None,
 ) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    for item in items:
-        rec = dict(item)
-        eff_fk = args.form_key or rec.get("formKey") or rec.get("form_key")
-        row_inline = parse_key_value_pairs(
-            args.data_pairs,
-            schema=schema,
-            form_key=str(eff_fk) if eff_fk else None,
-            study_key=getattr(args, "study_key", None),
-        )
-        existing_data = dict(rec.get("data") or rec.get("recordData") or {})
-        existing_data.update(row_inline)
-        rec["data"] = existing_data
-        merged.append(rec)
-    return merged
+    """Resolve CLI subject registration inputs from ``--file``, ``--json``, or inline flags."""
+    return assemble_cli_write_records(
+        args,
+        schema=schema,
+        study_key=getattr(args, "study_key", None),
+        is_subject_registration=True,
+    )
 
 
 def _subject_view_model(s: Any) -> dict[str, Any]:
@@ -158,7 +89,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "--file",
         dest="input_file",
         default=None,
-        help="Path to CSV or JSON file of subject registration requests ('-' for stdin JSON).",
+        help="Path to CSV or JSON file of subject registration requests ('-' for stdin JSON or CSV).",
     )
     register_parser.add_argument(
         "--json",
@@ -221,9 +152,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             dry_run=args.dry_run,
             schema_source=args.schema_source,
         )
-        subjects_data: list[dict[str, Any]] = []
-        skipped_count = 0
-        try:
+
+        def _run() -> BatchSubmissionSummary:
             resolved_schema = resolve_cli_schema(
                 sdk,
                 args.study_key,
@@ -239,32 +169,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 schema=resolved_schema,
                 study_key=args.study_key,
             )
-            if (
-                (args.subject_key or getattr(args, "subject_oid", None))
-                and (args.input_file or args.json_payload)
-                and len(normalized_pairs) == 1
-            ):
-                dumped_only = normalized_pairs[0][1].model_dump(by_alias=True, exclude_none=True)
-                if args.subject_key and not normalized_pairs[0][1].subject_key:
-                    dumped_only["subjectKey"] = args.subject_key
-                if getattr(args, "subject_oid", None) and not normalized_pairs[0][1].subject_oid:
-                    dumped_only["subjectOid"] = args.subject_oid
-                normalized_pairs = [
-                    (dumped_only, normalized_pairs[0][1].model_validate(dumped_only))
-                ]
-
             sites = None if offline_dry_run else list(sdk.sites.list(args.study_key))
             validate_subject_registration_sites(normalized_pairs, sites)
 
-            should_filter = args.skip_existing and not offline_dry_run
-            existing_subjects = list(sdk.subjects.list(args.study_key)) if should_filter else None
+            existing_subjects = (
+                list(sdk.subjects.list(args.study_key))
+                if (args.skip_existing and not offline_dry_run)
+                else None
+            )
             subjects_data, skipped_count = filter_existing_subject_registrations(
                 normalized_pairs,
                 existing_subjects,
-                should_filter=should_filter,
+                should_filter=args.skip_existing,
                 subject_key_field=args.subject_key_field,
             )
-            summary = submit_cli_records_batch(
+            return submit_cli_records_batch(
                 sdk,
                 args,
                 subjects_data,
@@ -272,27 +191,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 schema=resolved_schema,
                 skipped_count=skipped_count,
             )
-        except (ValidationError, ValueError) as exc:
-            exit_cli_validation_error(
-                exc,
-                resource="subjects_register",
-                study_key=args.study_key,
-                output_format=args.output_format,
-            )
-        except (JobFailedError, JobTimeoutError, ApiError) as exc:
-            exit_cli_write_error(
-                exc,
-                resource="subjects_register",
-                study_key=args.study_key,
-                total_records=len(subjects_data),
-                skipped_count=skipped_count,
-                output_format=args.output_format,
-            )
 
-        render_write_summary(
-            summary,
+        execute_cli_write(
+            _run,
+            study_key=args.study_key,
             resource="subjects_register",
             output_format=args.output_format,
+            dry_run=args.dry_run,
         )
 
     def _dispatch_register_subjects(args: argparse.Namespace) -> None:
@@ -304,6 +209,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             timeout=args.timeout,
             interval=args.interval,
         )
+        guard_stdin_dash_tty(args.input_file)
         if args.input_file and args.input_file != "-" and not Path(args.input_file).exists():
             print_error(f"Error: Input file not found: '{args.input_file}'")
             sys.exit(1)

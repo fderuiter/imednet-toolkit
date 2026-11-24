@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import csv
 import datetime
+import io
 import json
 import math
 import os
@@ -566,6 +567,52 @@ def normalize_tabular_row(
     return envelope
 
 
+def _read_csv_stream_records(
+    stream: Any,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+) -> list[JsonDict]:
+    records: list[JsonDict] = []
+    reader = csv.DictReader(stream)
+    if not reader.fieldnames:
+        return []
+    for idx, raw_row in enumerate(reader):
+        normalized = normalize_tabular_row(
+            raw_row,
+            row_index=idx,
+            from_csv_str=True,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
+        if normalized is not None:
+            records.append(normalized)
+    return records
+
+
+def csv_text_to_records(
+    raw_csv: str,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+) -> list[JsonDict]:
+    """Parse CSV text into REST create-records payload dicts."""
+    cleaned = raw_csv.lstrip("\ufeff")
+    return _read_csv_stream_records(
+        io.StringIO(cleaned),
+        schema=schema,
+        study_key=study_key,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+    )
+
+
 def csv_to_records(
     path: str | os.PathLike[str],
     *,
@@ -580,24 +627,14 @@ def csv_to_records(
     Works in ``packages/core`` even when ``pandas`` is not installed.
     """
     csv_path = Path(path)
-    records: list[JsonDict] = []
     with csv_path.open("r", encoding=encoding, newline="") as handle:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames:
-            return []
-        for idx, raw_row in enumerate(reader):
-            normalized = normalize_tabular_row(
-                raw_row,
-                row_index=idx,
-                from_csv_str=True,
-                schema=schema,
-                study_key=study_key,
-                default_form_key=default_form_key,
-                default_form_id=default_form_id,
-            )
-            if normalized is not None:
-                records.append(normalized)
-    return records
+        return _read_csv_stream_records(
+            handle,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
 
 
 def _is_dataframe_instance(obj: object) -> bool:
@@ -677,6 +714,7 @@ def normalize_records_input(
 
 __all__ = [
     "MASKED_SENTINEL",
+    "csv_text_to_records",
     "csv_to_records",
     "dataframe_rows_to_records",
     "ensure_no_masked_sentinel",

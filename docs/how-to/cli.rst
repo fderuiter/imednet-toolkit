@@ -104,15 +104,45 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
 Supported core list resources are studies, queries, variables, record-revisions,
 sites, forms, records, subjects, intervals, visits, codings, and users, alongside
 ``workflows extract-records``, ``workflows state show`` (resource ``ledger_state``),
-``workflows uat run`` (resource ``uat_run``), and ``subject-data`` (plus write batch summaries for ``records create``, ``records import``,
-and ``subjects register``). JSON reads emit one envelope
+``workflows uat run`` (resource ``uat_run``), and ``subject-data`` (plus write batch
+summaries for ``records create``, ``records update``, ``records import``, and
+``subjects register``). JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
-and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it). Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
+and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it), while
+write commands emit ``status: "failed"`` with exit code ``1`` when pre-write validation,
+a mid-batch chunk ``POST``, or ``--wait`` polling fails after validating or committing
+earlier chunks. Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
 JSON aliases; the JSON view includes model fields beyond the human summary table.
 Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
 Usage failures exit 2, SDK-command interruption exits 130, and success/help exits 0.
+
+Batch writes, schema-aware coercion, and dry runs
+-------------------------------------------------
+
+``imednet records create``, ``imednet records update``, ``imednet records import``, and
+``imednet subjects register`` share a unified write pipeline across inline flags, ``--json``,
+``-f`` / ``--file`` (or positional ``FILE`` on ``records import``), and piped ``-`` ``stdin``
+(auto-detecting JSON or CSV while rejecting interactive TTY ``stdin`` before opening SDK
+connections):
+
+.. code-block:: bash
+
+   imednet records create STUDY --form-key F_DM --subject-key SUB-001 \
+       -d ZIP_CODE=90210 -d 'NOTE="0042"' --schema ./study_dd.json --dry-run
+   imednet records update STUDY --record-id 601 -d V_AGE=51 \
+       --reason-for-change "Chart correction" --wait --format json
+   cat batch.csv | imednet records import STUDY - --schema api --wait --format json
+   imednet subjects register STUDY --file subjects.csv --skip-existing --wait
+
+Passing ``--schema`` (``api``, canonical ``DataDictionary`` JSON, CDISC ODM XML, REDCap
+CSV, or a 4-file CSV directory/ZIP) preserves string values on ``text``, ``string``, and
+``memo`` Variables for both CSV cells and ``-d KEY=VALUE`` overrides, while double-quoted
+``-d 'KEY="90210"'`` values always remain strings even without ``--schema``. Offline
+``--dry-run`` runs with an offline ``--schema`` perform local validation only without
+issuing HTTP requests, whereas ``--dry-run`` without ``--schema`` loads the live Study
+``DataDictionary`` to validate Form and Variable keys before reporting results.
 
 Legacy ``records list -o/--output`` accepts ``json``, ``csv``, or an explicit ``.json`` /
 ``.csv`` destination path (preserving ``./records.json`` and ``./records.csv`` for

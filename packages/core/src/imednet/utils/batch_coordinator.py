@@ -138,6 +138,7 @@ class BatchSubmissionSummary:
     validation_report: BatchValidationReport | None = None
     unsubmitted_chunks: list[list[dict[str, Any]]] = field(default_factory=list)
     wait_for_completion: bool = False
+    has_error: bool = False
 
     @property
     def batch_ids(self) -> list[str]:
@@ -167,7 +168,7 @@ class BatchSubmissionSummary:
     @property
     def all_successful(self) -> bool:
         """Return True if validation and all chunks succeeded without failed or unpolled jobs."""
-        if self.unsubmitted_chunks:
+        if self.has_error or self.unsubmitted_chunks:
             return False
         if self.validation_report is not None and not self.validation_report.is_valid:
             return False
@@ -418,6 +419,31 @@ def _attach_committed_jobs_context(
         pass
 
 
+def _attach_validation_error_summary(
+    exc: ValidationError,
+    *,
+    study_key: str,
+    total_records: int,
+    skipped_count: int,
+    dry_run: bool,
+    report: BatchValidationReport | None = None,
+) -> None:
+    """Attach an errored :class:`BatchSubmissionSummary` onto validation exceptions."""
+    resolved_report = report or getattr(exc, "validation_report", None)
+    summary = BatchSubmissionSummary(
+        study_key=study_key,
+        jobs=[],
+        chunk_sizes=[],
+        total_records=total_records,
+        skipped_count=skipped_count,
+        dry_run=dry_run,
+        validation_report=resolved_report,
+        has_error=True,
+    )
+    exc.partial_summary = summary  # type: ignore[attr-defined]
+    exc.batch_summary = summary  # type: ignore[attr-defined]
+
+
 def _attach_mid_batch_error(
     exc: Exception,
     *,
@@ -448,8 +474,10 @@ def _attach_mid_batch_error(
         validation_report=report,
         unsubmitted_chunks=sanitized_chunks,
         wait_for_completion=wait_for_completion,
+        has_error=True,
     )
     exc.partial_summary = partial_summary  # type: ignore[attr-defined]
+    exc.batch_summary = partial_summary  # type: ignore[attr-defined]
     exc.unsubmitted_chunks = sanitized_chunks  # type: ignore[attr-defined]
     exc.unsubmitted_records = partial_summary.unsubmitted_records  # type: ignore[attr-defined]
     exc.submitted_jobs = list(sanitized_jobs)  # type: ignore[attr-defined]
@@ -484,6 +512,7 @@ def _raise_from_poll_summary(
         validation_report=partial_summary.validation_report,
         unsubmitted_chunks=list(partial_summary.unsubmitted_chunks),
         wait_for_completion=partial_summary.wait_for_completion,
+        has_error=True,
     )
 
     target_exc: Exception | None = None
@@ -507,6 +536,7 @@ def _raise_from_poll_summary(
     if target_exc is not None:
         target_exc.poll_summary = sanitized_poll  # type: ignore[attr-defined]
         target_exc.partial_summary = attached_summary  # type: ignore[attr-defined]
+        target_exc.batch_summary = attached_summary  # type: ignore[attr-defined]
         target_exc.submitted_jobs = list(sanitized_jobs)  # type: ignore[attr-defined]
         _attach_committed_jobs_context(target_exc, sanitized_jobs, partial_summary.chunk_sizes)
         raise target_exc
@@ -848,37 +878,49 @@ class BatchCoordinator:
     ) -> BatchSubmissionSummary:
         """Validate once, submit in bounded chunks, and optionally poll to completion."""
         effective_sdk = sdk if sdk is not None else self._sdk
-        report, call_kwargs, needs_api_schema = _plan_validation(
-            study_key,
-            records_data,
-            schema=schema,
-            validate_batch_fn=validate_batch_fn,
-            skip_validation=skip_validation,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-            sdk=effective_sdk,
-            reject_async=True,
-        )
-        if call_kwargs is not None and validate_batch_fn is not None:
-            raw_result = self._call_sync_validate_batch(
-                validate_batch_fn, study_key, records_data, **call_kwargs
-            )
-            report = _complete_custom_validation(
-                raw_result,
+        report: BatchValidationReport | None = None
+        try:
+            report, call_kwargs, needs_api_schema = _plan_validation(
+                study_key,
                 records_data,
-                used_collect_errors=bool(call_kwargs),
+                schema=schema,
+                validate_batch_fn=validate_batch_fn,
+                skip_validation=skip_validation,
                 dry_run=dry_run,
                 collect_errors=collect_errors,
+                sdk=effective_sdk,
+                reject_async=True,
             )
-        elif needs_api_schema:
-            from imednet.datadict.loaders.api import load_from_api
+            if call_kwargs is not None and validate_batch_fn is not None:
+                raw_result = self._call_sync_validate_batch(
+                    validate_batch_fn, study_key, records_data, **call_kwargs
+                )
+                report = _complete_custom_validation(
+                    raw_result,
+                    records_data,
+                    used_collect_errors=bool(call_kwargs),
+                    dry_run=dry_run,
+                    collect_errors=collect_errors,
+                )
+            elif needs_api_schema:
+                from imednet.datadict.loaders.api import load_from_api
 
-            report = _validate_loaded_api_schema(
-                load_from_api(effective_sdk, study_key),
-                records_data,
+                report = _validate_loaded_api_schema(
+                    load_from_api(effective_sdk, study_key),
+                    records_data,
+                    study_key=study_key,
+                    dry_run=dry_run,
+                )
+        except ValidationError as exc:
+            _attach_validation_error_summary(
+                exc,
                 study_key=study_key,
+                total_records=len(records_data),
+                skipped_count=skipped_count,
                 dry_run=dry_run,
+                report=report,
             )
+            raise
 
         chunks, early_summary = _prepare_submission_chunks(
             study_key,
@@ -928,7 +970,22 @@ class BatchCoordinator:
 
         poll_summary: JobPollSummary | None = None
         if wait_for_completion:
-            batch_ids = _extract_batch_ids(jobs, require_batch_id=require_batch_id)
+            try:
+                batch_ids = _extract_batch_ids(jobs, require_batch_id=require_batch_id)
+            except Exception as exc:
+                _attach_mid_batch_error(
+                    exc,
+                    study_key=study_key,
+                    jobs=jobs,
+                    chunk_sizes=chunk_sizes,
+                    total_records=len(records_data),
+                    skipped_count=skipped_count,
+                    poll_summary=None,
+                    report=report,
+                    remaining_chunks=[],
+                    wait_for_completion=wait_for_completion,
+                )
+                raise
             poll_summary = _settle_batches_sync(
                 study_key,
                 batch_ids,
@@ -985,34 +1042,46 @@ class AsyncBatchCoordinator:
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit bounded chunks, and optionally poll."""
         effective_sdk = sdk if sdk is not None else self._sdk
-        report, call_kwargs, needs_api_schema = _plan_validation(
-            study_key,
-            records_data,
-            schema=schema,
-            validate_batch_fn=validate_batch_fn,
-            skip_validation=skip_validation,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-            sdk=effective_sdk,
-        )
-        if call_kwargs is not None and validate_batch_fn is not None:
-            raw_result = await validate_batch_fn(study_key, records_data, **call_kwargs)
-            report = _complete_custom_validation(
-                raw_result,
+        report: BatchValidationReport | None = None
+        try:
+            report, call_kwargs, needs_api_schema = _plan_validation(
+                study_key,
                 records_data,
-                used_collect_errors=bool(call_kwargs),
+                schema=schema,
+                validate_batch_fn=validate_batch_fn,
+                skip_validation=skip_validation,
                 dry_run=dry_run,
                 collect_errors=collect_errors,
+                sdk=effective_sdk,
             )
-        elif needs_api_schema:
-            from imednet.datadict.loaders.api import async_load_from_api
+            if call_kwargs is not None and validate_batch_fn is not None:
+                raw_result = await validate_batch_fn(study_key, records_data, **call_kwargs)
+                report = _complete_custom_validation(
+                    raw_result,
+                    records_data,
+                    used_collect_errors=bool(call_kwargs),
+                    dry_run=dry_run,
+                    collect_errors=collect_errors,
+                )
+            elif needs_api_schema:
+                from imednet.datadict.loaders.api import async_load_from_api
 
-            report = _validate_loaded_api_schema(
-                await async_load_from_api(effective_sdk, study_key),
-                records_data,
+                report = _validate_loaded_api_schema(
+                    await async_load_from_api(effective_sdk, study_key),
+                    records_data,
+                    study_key=study_key,
+                    dry_run=dry_run,
+                )
+        except ValidationError as exc:
+            _attach_validation_error_summary(
+                exc,
                 study_key=study_key,
+                total_records=len(records_data),
+                skipped_count=skipped_count,
                 dry_run=dry_run,
+                report=report,
             )
+            raise
 
         chunks, early_summary = _prepare_submission_chunks(
             study_key,
@@ -1062,7 +1131,22 @@ class AsyncBatchCoordinator:
 
         poll_summary: JobPollSummary | None = None
         if wait_for_completion:
-            batch_ids = _extract_batch_ids(jobs, require_batch_id=require_batch_id)
+            try:
+                batch_ids = _extract_batch_ids(jobs, require_batch_id=require_batch_id)
+            except Exception as exc:
+                _attach_mid_batch_error(
+                    exc,
+                    study_key=study_key,
+                    jobs=jobs,
+                    chunk_sizes=chunk_sizes,
+                    total_records=len(records_data),
+                    skipped_count=skipped_count,
+                    poll_summary=None,
+                    report=report,
+                    remaining_chunks=[],
+                    wait_for_completion=wait_for_completion,
+                )
+                raise
             poll_summary = await _settle_batches_async(
                 study_key,
                 batch_ids,

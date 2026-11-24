@@ -496,12 +496,234 @@ def test_sdk_create_records_batch_with_data_dictionary_prevalidates_once() -> No
             {"formKey": "F1", "data": {"age": 20}},
             {"formKey": "F1", "data": {"age": "bad"}},
         ]
-        with pytest.raises(ValidationError, match="integer"):
+        with pytest.raises(ValidationError, match="integer") as val_exc:
             sdk.create_records_batch("STUDY", invalid_records, schema=dd)
+        assert getattr(val_exc.value, "batch_summary", None) is not None
+        assert val_exc.value.batch_summary.jobs == []
+        assert val_exc.value.batch_summary.all_successful is False
         # Invalid chunk rejected before POST
         assert post_chunks == [100, 5]
     finally:
         sdk.close()
+
+
+def test_batch_coordinator_attaches_partial_summary_on_post_and_poll_failures() -> None:
+    """Sync BatchCoordinator attaches partial batch_summary on chunk POST and poll errors."""
+    from imednet.errors import ApiError, ServerError
+    from imednet.utils.job_poller import JobTimeoutError
+
+    coordinator = BatchCoordinator(chunk_size=2)
+
+    # 1. Chunk 1 commits B-1, Chunk 2 fails POST with ServerError (ApiError subclass)
+    calls = 0
+
+    def fail_second_post(chunk: list[dict[str, Any]]) -> Job:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return Job(jobId="J-1", batchId="B-1", state="QUEUED")
+        raise ServerError("Upstream 502 on chunk 2", status_code=502)
+
+    with pytest.raises(ApiError, match="Upstream 502") as post_exc:
+        coordinator.submit(
+            "STUDY",
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            fail_second_post,
+            skipped_count=1,
+        )
+    partial_post = getattr(post_exc.value, "batch_summary", None)
+    assert partial_post is not None
+    assert partial_post.batch_ids == ["B-1"]
+    assert partial_post.chunk_sizes == [2]
+    assert partial_post.total_records == 3
+    assert partial_post.skipped_count == 1
+    assert partial_post.all_successful is False
+
+    # 2. Single-chunk poll failure attaches committed job and terminal failed status
+    failed_status = JobStatus(
+        jobId="J-1",
+        batchId="B-1",
+        state="FAILED",
+        recordTotalCount=2,
+        failedRecords=2,
+    )
+    with pytest.raises(JobFailedError) as single_poll_exc:
+        coordinator.submit(
+            "STUDY",
+            [{"a": 1}, {"a": 2}],
+            lambda _chunk: Job(jobId="J-1", batchId="B-1", state="QUEUED"),
+            wait_for_completion=True,
+            poll_single=lambda _bid: (_ for _ in ()).throw(
+                JobFailedError("B-1 failed", failed_status)
+            ),
+        )
+    single_summary = getattr(single_poll_exc.value, "batch_summary", None)
+    assert single_summary is not None
+    assert single_summary.batch_ids == ["B-1"]
+    assert single_summary.jobs[0].state == "FAILED"
+    assert single_summary.all_successful is False
+
+    # 3. Multi-chunk poll_single fallback retains completed siblings B-1 and B-3 when B-2 times out
+    post_idx = 0
+
+    def submit_three_chunks(_chunk: list[dict[str, Any]]) -> Job:
+        nonlocal post_idx
+        post_idx += 1
+        return Job(jobId=f"J-{post_idx}", batchId=f"B-{post_idx}", state="QUEUED")
+
+    def poll_sibling_failure(bid: str) -> JobStatus:
+        if bid == "B-2":
+            raise JobTimeoutError(f"Timed out waiting for {bid}")
+        return JobStatus(
+            jobId=f"J-{bid[-1]}",
+            batchId=bid,
+            state="COMPLETED",
+            recordTotalCount=2,
+            failedRecords=0,
+        )
+
+    with pytest.raises(JobTimeoutError, match="B-2") as multi_poll_exc:
+        coordinator.submit(
+            "STUDY",
+            [{"a": i} for i in range(5)],
+            submit_three_chunks,
+            wait_for_completion=True,
+            poll_single=poll_sibling_failure,
+        )
+    multi_summary = getattr(multi_poll_exc.value, "batch_summary", None)
+    assert multi_summary is not None
+    assert multi_summary.batch_ids == ["B-1", "B-2", "B-3"]
+    assert multi_summary.poll_summary is not None
+    assert set(multi_summary.poll_summary.results) == {"B-1", "B-3"}
+    assert "B-2" in multi_summary.poll_summary.failures
+    assert multi_summary.jobs[0].state == "COMPLETED"
+    assert multi_summary.jobs[1].state == "QUEUED"
+    assert multi_summary.jobs[2].state == "COMPLETED"
+    assert multi_summary.all_successful is False
+
+
+@pytest.mark.asyncio
+async def test_async_batch_coordinator_and_poll_facade_retain_partial_summaries() -> None:
+    """AsyncBatchCoordinator and poll_facade_many_sync/async retain completed sibling JobStatus items."""
+    from imednet.errors import ApiError, ServerError
+    from imednet.utils.batch_coordinator import poll_facade_many_async, poll_facade_many_sync
+
+    coordinator = AsyncBatchCoordinator(chunk_size=2)
+    calls = 0
+
+    async def fail_second_async_post(_chunk: list[dict[str, Any]]) -> Job:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return Job(jobId="AJ-1", batchId="AB-1", state="QUEUED")
+        raise ServerError("Async 503 on chunk 2", status_code=503)
+
+    with pytest.raises(ApiError, match="Async 503") as async_post_exc:
+        await coordinator.submit(
+            "STUDY",
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            fail_second_async_post,
+        )
+    async_post_summary = getattr(async_post_exc.value, "batch_summary", None)
+    assert async_post_summary is not None
+    assert async_post_summary.batch_ids == ["AB-1"]
+    assert async_post_summary.all_successful is False
+
+    # Verify poll_facade_many_sync fallback retains B-1 and B-3 when B-2 raises JobFailedError
+    class SyncFacadeStub:
+        def poll_job(self, _study_key: str, batch_id: str, **_kwargs: Any) -> JobStatus:
+            if batch_id == "B-2":
+                raise JobFailedError(
+                    "B-2 failed",
+                    JobStatus(
+                        jobId="J-2",
+                        batchId="B-2",
+                        state="FAILED",
+                        recordTotalCount=2,
+                        failedRecords=1,
+                    ),
+                )
+            return JobStatus(
+                jobId=f"J-{batch_id[-1]}",
+                batchId=batch_id,
+                state="COMPLETED",
+                recordTotalCount=2,
+                failedRecords=0,
+            )
+
+    sync_poll_summary = poll_facade_many_sync(
+        SyncFacadeStub(),
+        "STUDY",
+        ["B-1", "B-2", "B-3"],
+        timeout=5.0,
+        poll_interval=0.0,
+    )
+    assert set(sync_poll_summary.results) == {"B-1", "B-3"}
+    assert "B-2" in sync_poll_summary.failures
+
+    # Verify poll_facade_many_async fallback retains AB-1 and AB-3 when AB-2 fails, and
+    # AsyncBatchCoordinator attaches all three jobs onto JobFailedError.batch_summary
+    class AsyncFacadeStub:
+        async def async_poll_job(self, _study_key: str, batch_id: str, **_kwargs: Any) -> JobStatus:
+            if batch_id == "AB-2":
+                raise JobFailedError(
+                    "AB-2 failed",
+                    JobStatus(
+                        jobId="AJ-2",
+                        batchId="AB-2",
+                        state="FAILED",
+                        recordTotalCount=2,
+                        failedRecords=2,
+                    ),
+                )
+            return JobStatus(
+                jobId=f"AJ-{batch_id[-1]}",
+                batchId=batch_id,
+                state="COMPLETED",
+                recordTotalCount=2,
+                failedRecords=0,
+            )
+
+    stub = AsyncFacadeStub()
+    async_poll_summary = await poll_facade_many_async(
+        stub,
+        "STUDY",
+        ["AB-1", "AB-2", "AB-3"],
+        timeout=5.0,
+        poll_interval=0.0,
+    )
+    assert set(async_poll_summary.results) == {"AB-1", "AB-3"}
+    assert "AB-2" in async_poll_summary.failures
+
+    chunk_counter = 0
+
+    async def submit_three_async(_chunk: list[dict[str, Any]]) -> Job:
+        nonlocal chunk_counter
+        chunk_counter += 1
+        return Job(jobId=f"AJ-{chunk_counter}", batchId=f"AB-{chunk_counter}", state="QUEUED")
+
+    with pytest.raises(JobFailedError, match="AB-2") as async_poll_exc:
+        await coordinator.submit(
+            "STUDY",
+            [{"a": i} for i in range(5)],
+            submit_three_async,
+            wait_for_completion=True,
+            poll_many=lambda bids, on_progress=None: poll_facade_many_async(
+                stub,
+                "STUDY",
+                bids,
+                timeout=5.0,
+                poll_interval=0.0,
+                on_progress=on_progress,
+            ),
+        )
+    attached = getattr(async_poll_exc.value, "batch_summary", None)
+    assert attached is not None
+    assert attached.batch_ids == ["AB-1", "AB-2", "AB-3"]
+    assert [j.state for j in attached.jobs] == ["COMPLETED", "FAILED", "COMPLETED"]
+    assert attached.poll_summary is not None
+    assert set(attached.poll_summary.results) == {"AB-1", "AB-3"}
+    assert attached.all_successful is False
 
 
 @pytest.mark.asyncio

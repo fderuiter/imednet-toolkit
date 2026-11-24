@@ -17,6 +17,7 @@ from imednet.models.sites import (
 from imednet.models.subjects import Subject, SubjectStatus, normalize_subject_status
 from imednet.utils.tabular import (
     _is_dataframe_instance,
+    _lookup_form_key_from_id,
     csv_to_records,
     dataframe_rows_to_records,
     ensure_no_masked_sentinel,
@@ -161,6 +162,16 @@ def normalize_subject_registration_inputs(
             normalized_raw = model_subj
         elif isinstance(raw_subj, Mapping):
             raw_dict = dict(raw_subj)
+            if not (raw_dict.get("formKey") or raw_dict.get("form_key")):
+                raw_fid = raw_dict.get("formId")
+                if raw_fid is None:
+                    raw_fid = raw_dict.get("form_id")
+                if raw_fid is not None and schema is not None:
+                    resolved_fk = _lookup_form_key_from_id(
+                        schema, int(raw_fid), study_key=study_key
+                    )
+                    if resolved_fk:
+                        raw_dict["formKey"] = resolved_fk
             if default_form_key and not (raw_dict.get("formKey") or raw_dict.get("form_key")):
                 raw_dict["formKey"] = default_form_key
             has_site_name = bool(raw_dict.get("siteName") or raw_dict.get("site_name"))
@@ -181,6 +192,15 @@ def normalize_subject_registration_inputs(
 
     ensure_no_masked_sentinel(dumped_for_check)
     return pairs
+
+
+def validate_local_subject_registration_sites(
+    normalized_pairs: Sequence[
+        tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]
+    ],
+) -> None:
+    """Validate local ``siteName`` or ``siteId`` presence without issuing remote site queries."""
+    validate_subject_registration_sites(normalized_pairs, None)
 
 
 def validate_subject_registration_sites(
@@ -273,6 +293,21 @@ def filter_existing_subject_registrations(
     seen_in_batch: set[str] = set()
     for raw_subj, subj in normalized_pairs:
         dumped = subj.model_dump(by_alias=True, exclude_none=True)
+        for key_alias in ("subjectKey", "subjectOid"):
+            val = dumped.get(key_alias)
+            if isinstance(val, str):
+                stripped = val.strip()
+                if stripped:
+                    dumped[key_alias] = stripped
+                else:
+                    dumped.pop(key_alias, None)
+        if isinstance(raw_subj, Mapping):
+            raw_sk = raw_subj.get("subjectKey") or raw_subj.get("subject_key")
+            if isinstance(raw_sk, str) and raw_sk.strip():
+                dumped["subjectKey"] = raw_sk.strip()
+            raw_oid = raw_subj.get("subjectOid") or raw_subj.get("subject_oid")
+            if isinstance(raw_oid, str) and raw_oid.strip():
+                dumped["subjectOid"] = raw_oid.strip()
         if should_filter:
             cand_id = extract_candidate_subject_key(
                 raw_subj, payload=dumped, subject_key_field=subject_key_field
@@ -292,5 +327,6 @@ __all__ = [
     "filter_existing_subject_registrations",
     "is_site_enrollment_eligible",
     "normalize_subject_registration_inputs",
+    "validate_local_subject_registration_sites",
     "validate_subject_registration_sites",
 ]

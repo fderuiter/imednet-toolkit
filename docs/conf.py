@@ -1572,6 +1572,8 @@ with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.St
     except Exception:
         pass
 
+    logging.basicConfig(level=logging.WARNING, stream=sys.stderr, force=True)
+
     _doctest_orig_cwd = os.getcwd()
     _doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
     os.chdir(_doctest_tmpdir.name)
