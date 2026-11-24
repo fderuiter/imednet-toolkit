@@ -728,7 +728,8 @@ def test_50_form_export_runtime_comms_orm_sql_budgets_and_legacy_migration(
     )
     assert str(dag_run.state) == "success"
     seen_rt_msgs = json.loads(comms_report.read_text(encoding="utf-8"))
-    assert seen_rt_msgs == ["GetVariable", "PutVariable", "PutVariable"]
+    assert seen_rt_msgs.count("GetVariable") == 50
+    assert seen_rt_msgs.count("PutVariable") == 100
     rt_state = provider_rt.read_state()
     assert len(rt_state.studies["STUDY_50_RT"].streams) == 50
     assert provider_rt.get_last_timestamp("STUDY_50_RT", "sql_F50") == datetime(
@@ -814,7 +815,8 @@ def test_50_form_export_runtime_comms_orm_sql_budgets_and_legacy_migration(
             mask_phi=False,
             state_provider=provider_orm,
         )
-        assert len(airflow_sql_statements) <= 3
+        select_initial = [s for s in airflow_sql_statements if s.upper().startswith("SELECT")]
+        assert len(select_initial) == 1
         assert len(airflow_commits) <= 2
 
         # 3. 250 streams across 5 studies in ORM read_state -> 1 SQL SELECT, 0 commits, autoescape=True
@@ -859,46 +861,298 @@ def test_50_form_export_runtime_comms_orm_sql_budgets_and_legacy_migration(
             is not None
         )
 
-        # 5. ORM legacy per-stream keys load on read and consolidate + delete legacy rows on next write
+        # 5. ORM consolidated Study Variable falls back on read and writes sharded keys without rewriting stale sibling streams
         legacy_provider = AirflowStateProvider(variable_prefix="imednet_legacy_orm")
         ModelVariable.set(
-            "imednet_legacy_orm:ST_UPG:sql_DM",
+            "imednet_legacy_orm:ST_UPG",
             {
                 "study_key": "ST_UPG",
-                "stream_name": "sql_DM",
-                "last_timestamp": "2026-08-01T00:00:00+00:00",
-                "records_processed": 9,
-                "status": "success",
-            },
-            serialize_json=True,
-        )
-        ModelVariable.set(
-            "imednet_legacy_orm:ST_UPG:sql_AE",
-            {
-                "study_key": "ST_UPG",
-                "stream_name": "sql_AE",
-                "last_timestamp": "2026-08-02T00:00:00+00:00",
-                "records_processed": 4,
-                "status": "success",
+                "streams": {
+                    "sql_DM": {
+                        "last_timestamp": "2026-08-01T00:00:00+00:00",
+                        "records_processed": 9,
+                        "status": "success",
+                    },
+                    "sql_AE": {
+                        "last_timestamp": "2026-08-02T00:00:00+00:00",
+                        "records_processed": 4,
+                        "status": "success",
+                    },
+                },
             },
             serialize_json=True,
         )
         assert legacy_provider.get_last_timestamp("ST_UPG", "sql_AE") == datetime(
             2026, 8, 2, 0, 0, tzinfo=timezone.utc
         )
-        with legacy_provider.batch_transaction("ST_UPG", ["sql_DM", "sql_AE"]) as upg_tx:
+        with legacy_provider.batch_transaction("ST_UPG", ["sql_DM"]) as upg_tx:
             assert upg_tx["sql_DM"]["last_timestamp"] == datetime(
                 2026, 8, 1, 0, 0, tzinfo=timezone.utc
             )
             upg_tx["sql_DM"]["new_timestamp"] = datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc)
 
-        assert ModelVariable.get("imednet_legacy_orm:ST_UPG:sql_DM", default_var=None) is None
-        assert ModelVariable.get("imednet_legacy_orm:ST_UPG:sql_AE", default_var=None) is None
+        sharded_dm = ModelVariable.get(
+            "imednet_legacy_orm:ST_UPG:sql_DM", default_var=None, deserialize_json=True
+        )
+        assert sharded_dm is not None
+        assert sharded_dm["last_timestamp"] == "2026-08-10T00:00:00+00:00"
         consolidated_upg = ModelVariable.get(
             "imednet_legacy_orm:ST_UPG", default_var=None, deserialize_json=True
         )
-        assert set(consolidated_upg["streams"]) == {"sql_DM", "sql_AE"}
+        assert (
+            consolidated_upg["streams"]["sql_DM"]["last_timestamp"] == "2026-08-01T00:00:00+00:00"
+        )
+        assert legacy_provider.get_last_timestamp("ST_UPG", "sql_DM") == datetime(
+            2026, 8, 10, 0, 0, tzinfo=timezone.utc
+        )
+        assert legacy_provider.get_last_timestamp("ST_UPG", "sql_AE") == datetime(
+            2026, 8, 2, 0, 0, tzinfo=timezone.utc
+        )
         assert legacy_provider.get_last_status("ST_UPG", "sql_DM") == StreamExecutionStatus.SUCCESS
     finally:
         event.remove(settings.engine, "before_cursor_execute", _on_before_cursor)
         event.remove(settings.Session, "after_commit", _on_after_commit)
+
+
+def test_concurrent_airflow_transactions_retain_sibling_watermarks_sdk_and_orm(
+    airflow_runtime_env: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent transaction and batch_transaction runs retain all sibling watermarks in SDK and ORM modes."""
+    import json
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from types import ModuleType
+
+    from airflow.models.variable import Variable as ModelVariable
+
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    _ = airflow_runtime_env
+    base_ts = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+
+    # 1. SDK mode with active SUPERVISOR_COMMS + consolidated legacy fallback
+    sdk_lock = threading.Lock()
+    sdk_store: dict[str, str] = {}
+
+    class _ThreadSafeSdkVariable:
+        @staticmethod
+        def get(key: str, default: object = None, deserialize_json: bool = False) -> object:
+            with sdk_lock:
+                if key not in sdk_store:
+                    return default
+                raw = sdk_store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(
+            key: str,
+            value: object,
+            description: str | None = None,
+            serialize_json: bool = False,
+        ) -> None:
+            _ = description
+            serialized = json.dumps(value) if serialize_json else str(value)
+            with sdk_lock:
+                sdk_store[key] = serialized
+
+        @staticmethod
+        def delete(key: str) -> int:
+            with sdk_lock:
+                return 1 if sdk_store.pop(key, None) is not None else 0
+
+        @staticmethod
+        def keys(prefix: str = "") -> list[str]:
+            with sdk_lock:
+                return [k for k in sorted(sdk_store) if k.startswith(prefix)]
+
+    sdk_provider = AirflowStateProvider(variable_prefix="conc_sdk")
+    legacy_key = sdk_provider._get_study_variable_key("STUDY_CONC")
+    sdk_store[legacy_key] = json.dumps(
+        {
+            "study_key": "STUDY_CONC",
+            "streams": {
+                "legacy_dm": {
+                    "last_timestamp": base_ts.isoformat(),
+                    "records_processed": 7,
+                    "status": "success",
+                }
+            },
+        }
+    )
+
+    with monkeypatch.context() as mp:
+        import airflow.sdk as sdk_pkg
+
+        runner_mod = ModuleType("airflow.sdk.execution_time.task_runner")
+        runner_mod.SUPERVISOR_COMMS = object()  # type: ignore[attr-defined]
+        mp.setattr(sdk_pkg, "Variable", _ThreadSafeSdkVariable)
+        mp.setitem(sys.modules, "airflow.sdk.execution_time.task_runner", runner_mod)
+
+        def _sdk_worker(idx: int) -> None:
+            ts = datetime(2026, 9, 2, idx % 24, idx % 60, tzinfo=timezone.utc)
+            if idx % 2 == 0:
+                with sdk_provider.transaction("STUDY_CONC", f"form_{idx:02d}") as tx:
+                    tx["new_timestamp"] = ts
+                    tx["records_processed"] = idx + 1
+            else:
+                s_a = f"batch_{idx:02d}_a"
+                s_b = f"batch_{idx:02d}_b"
+                with sdk_provider.batch_transaction("STUDY_CONC", [s_a, s_b]) as batch_tx:
+                    batch_tx[s_a]["new_timestamp"] = ts
+                    batch_tx[s_a]["records_processed"] = 2
+                    batch_tx[s_b]["new_timestamp"] = ts
+                    batch_tx[s_b]["records_processed"] = 3
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(_sdk_worker, range(12)))
+
+        sdk_state = sdk_provider.read_state().studies["STUDY_CONC"].streams
+        # 6 single transactions + 6 * 2 batch streams + 1 read-only legacy stream = 19 streams
+        assert len(sdk_state) == 19
+        assert sdk_state["legacy_dm"].last_timestamp == base_ts
+        for idx in range(0, 12, 2):
+            assert sdk_state[f"form_{idx:02d}"].last_run_status == StreamExecutionStatus.SUCCESS
+        for idx in range(1, 12, 2):
+            assert sdk_state[f"batch_{idx:02d}_a"].last_run_status == StreamExecutionStatus.SUCCESS
+            assert sdk_state[f"batch_{idx:02d}_b"].last_run_status == StreamExecutionStatus.SUCCESS
+        # Consolidated legacy variable was never rewritten with sibling streams
+        assert set(json.loads(sdk_store[legacy_key])["streams"]) == {"legacy_dm"}
+
+    # 2. ORM mode (SUPERVISOR_COMMS = None) concurrent transactions + scoped delete_entry
+    orm_provider = AirflowStateProvider(variable_prefix="conc_orm")
+    ModelVariable.set(
+        orm_provider._get_study_variable_key("STUDY_ORM_CONC"),
+        {
+            "study_key": "STUDY_ORM_CONC",
+            "streams": {
+                "legacy_ae": {
+                    "last_timestamp": base_ts.isoformat(),
+                    "records_processed": 4,
+                    "status": "success",
+                },
+                "legacy_vs": {
+                    "last_timestamp": base_ts.isoformat(),
+                    "records_processed": 9,
+                    "status": "success",
+                },
+            },
+        },
+        serialize_json=True,
+    )
+    runner_none = ModuleType("airflow.sdk.execution_time.task_runner")
+    runner_none.SUPERVISOR_COMMS = None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow.sdk.execution_time.task_runner", runner_none)
+
+    def _orm_worker(idx: int) -> None:
+        ts = datetime(2026, 9, 3, idx % 24, idx % 60, tzinfo=timezone.utc)
+        if idx % 2 == 0:
+            with orm_provider.transaction("STUDY_ORM_CONC", f"orm_form_{idx:02d}") as tx:
+                tx["new_timestamp"] = ts
+                tx["records_processed"] = 5
+        else:
+            s_a = f"orm_batch_{idx:02d}_a"
+            s_b = f"orm_batch_{idx:02d}_b"
+            with orm_provider.batch_transaction("STUDY_ORM_CONC", [s_a, s_b]) as batch_tx:
+                batch_tx[s_a]["new_timestamp"] = ts
+                batch_tx[s_b]["new_timestamp"] = ts
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(_orm_worker, range(8)))
+
+    orm_streams = orm_provider.read_state().studies["STUDY_ORM_CONC"].streams
+    # 4 single + 4 * 2 batch + 2 legacy = 14 streams
+    assert len(orm_streams) == 14
+    assert orm_provider.delete_entry("STUDY_ORM_CONC", "orm_form_00") is True
+    assert orm_provider.delete_entry("STUDY_ORM_CONC", "legacy_ae") is True
+    remaining = orm_provider.read_state().studies["STUDY_ORM_CONC"].streams
+    assert "orm_form_00" not in remaining
+    assert "legacy_ae" not in remaining
+    assert "legacy_vs" in remaining
+    assert len(remaining) == 12
+
+
+def test_explicit_ledger_path_precedes_airflow_env_and_provider_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ledger_path selects FileStateProvider ahead of AIRFLOW_CTX_TASK_ID and provider_name='airflow'."""
+    from imednet.integrations.sink_base import get_state_provider as get_sink_state_provider
+    from imednet_workflows.state_ledger import (
+        AirflowStateProvider,
+        FileStateProvider,
+        get_state_provider,
+    )
+
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "mapped_export_task")
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "true")
+
+    explicit_file = tmp_path / "explicit_override_ledger.json"
+
+    wf_file_provider = get_state_provider(
+        explicit_file,
+        provider_name="airflow",
+        variable_prefix="should_not_use",
+    )
+    assert isinstance(wf_file_provider, FileStateProvider)
+    assert wf_file_provider.ledger_path == explicit_file
+
+    sink_file_provider = get_sink_state_provider(
+        explicit_file,
+        provider_name="airflow",
+        variable_prefix="should_not_use",
+    )
+    assert isinstance(sink_file_provider, FileStateProvider)
+    assert sink_file_provider.ledger_path == explicit_file
+
+    wf_af_provider = get_state_provider(
+        None,
+        provider_name="airflow",
+        variable_prefix="custom_af_state",
+    )
+    assert isinstance(wf_af_provider, AirflowStateProvider)
+    assert wf_af_provider.variable_prefix == "custom_af_state"
+
+    sink_af_provider = get_sink_state_provider(
+        None,
+        provider_name="airflow",
+        variable_prefix="custom_sink_state",
+    )
+    assert isinstance(sink_af_provider, AirflowStateProvider)
+    assert sink_af_provider.variable_prefix == "custom_sink_state"
+
+
+def test_airflow3_dag_serialization_preserves_variable_prefix_and_mapped_stream_name(
+    airflow_runtime_env: Any,
+    tmp_path: Path,
+) -> None:
+    """Real Airflow 3 DagSerialization round-trips variable_prefix and mapped stream_name."""
+    from airflow.sdk import DAG
+    from airflow.serialization.serialized_objects import DagSerialization
+
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+
+    _ = airflow_runtime_env
+    with DAG(dag_id="imednet_set_dag", start_date=datetime(2026, 1, 1, tzinfo=timezone.utc)) as dag:
+        ImednetExportOperator(
+            task_id="std_exp",
+            study_key="STUDY_SET",
+            destination="parquet",
+            output_path=str(tmp_path / "set.parquet"),
+            incremental=True,
+            variable_prefix="custom_set_pfx",
+        )
+        ImednetExportOperator.partial(
+            task_id="mapped_exp",
+            study_key="STUDY_SET",
+            destination="csv",
+            output_path=str(tmp_path / "mapped.csv"),
+            incremental=True,
+            variable_prefix="mapped_set_pfx",
+        ).expand(stream_name=["stream_dm", "stream_ae"])
+
+    serialized = DagSerialization.to_dict(dag)
+    DagSerialization.validate_schema(serialized)
+    deser_dag = DagSerialization.from_dict(serialized)
+    assert deser_dag.get_task("std_exp").variable_prefix == "custom_set_pfx"
+    assert deser_dag.get_task("mapped_exp").partial_kwargs["variable_prefix"] == "mapped_set_pfx"

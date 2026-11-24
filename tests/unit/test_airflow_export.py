@@ -20,7 +20,9 @@ def _setup_airflow(monkeypatch):
 EXPORT_FUNCTIONS = [
     "export_to_csv",
     "export_to_duckdb",
+    "export_to_duckdb_by_form",
     "export_to_parquet",
+    "export_to_hive_parquet",
     "export_to_excel",
     "export_to_json",
     "export_to_sql",
@@ -1886,3 +1888,301 @@ def test_operator_sdtm_phi_redaction_and_incremental_reconciliation(
     json_rows2 = json.loads(json_path.read_text(encoding="utf-8"))
     assert len(json_rows2) == 1 and json_rows2[0]["USUBJID"] == "S01"
     assert json_rows2[0]["BRTHDTC"] == "1981"
+
+
+def test_export_operator_variable_prefix_ledger_path_mapped_streams_and_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ImednetExportOperator validates variable_prefix/stream_name/output_path guards, mapped streams, and explicit ledger_path."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from apache_airflow_providers_imednet._airflow_compat import AirflowException
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    # 1. Serialized fields & template_fields contract for variable_prefix and stream_name
+    op_set = ImednetExportOperator(
+        task_id="std_exp",
+        study_key="STUDY_SET",
+        destination="parquet",
+        output_path=str(tmp_path / "set.parquet"),
+        incremental=True,
+        variable_prefix="custom_set_pfx",
+    )
+    assert op_set.variable_prefix == "custom_set_pfx"
+    assert "variable_prefix" in op_set.template_fields
+    assert "stream_name" in op_set.mapped_runtime_fields
+
+    # 2. Credential & blank guards on variable_prefix, stream_name, and output_path
+    for bad_prefix in (
+        "postgresql://user:secret_pw@db.internal:5432/clinical",  # pragma: allowlist secret
+        "pfx?X-Amz-Signature=raw_sig_secret",  # pragma: allowlist secret
+        "   ",
+    ):
+        with pytest.raises(AirflowException, match="variable_prefix"):
+            ImednetExportOperator(
+                task_id="bad_pfx",
+                study_key="S1",
+                variable_prefix=bad_prefix,
+            )
+
+    with pytest.raises(AirflowException, match="stream_name"):
+        ImednetExportOperator(
+            task_id="bad_stream",
+            study_key="S1",
+            stream_name="stream?token=raw_secret_token",  # pragma: allowlist secret
+        )
+
+    with pytest.raises(AirflowException, match="output_path"):
+        ImednetExportOperator(
+            task_id="bad_out",
+            study_key="S1",
+            output_path="https://user:secret_pw@storage.internal/out.parquet",  # pragma: allowlist secret
+        )
+
+    # 3. Mapped stream isolation: sdtm_domain + map_index + negative sentinel fallthrough
+    op_map = ImednetExportOperator(
+        task_id="mapped_domain_export",
+        study_key="S_MAP",
+        destination="parquet",
+        output_path=str(tmp_path / "dm.parquet"),
+        as_sdtm=True,
+        domain="AE",
+    )
+    assert (
+        op_map._default_airflow_stream_name(
+            "parquet",
+            context={"ti": SimpleNamespace(map_index=0)},
+        )
+        == "parquet_mapped_domain_export_AE_0"
+    )
+    assert (
+        op_map._default_airflow_stream_name(
+            "parquet",
+            sdtm_domain="DM",
+            context={"ti": SimpleNamespace(map_index=1)},
+        )
+        == "parquet_mapped_domain_export_DM_1"
+    )
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_MAP_INDEX", "3")
+    assert (
+        op_map._default_airflow_stream_name(
+            "parquet",
+            context={"ti": SimpleNamespace(map_index=-1)},
+        )
+        == "parquet_mapped_domain_export_AE_3"
+    )
+    monkeypatch.delenv("AIRFLOW_CTX_TASK_MAP_INDEX", raising=False)
+
+    # 4. Explicit ledger_path overrides AIRFLOW_CTX_TASK_ID and variable_prefix
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "explicit_ledger_task")
+    sdk = MagicMock(sinks=None)
+    sdk.forms.list.return_value = []
+    sdk.variables.list.return_value = [
+        Variable(
+            variable_id=1,
+            variable_name="AGE",
+            variable_type="int",
+            form_id=1,
+            form_key="DM",
+        )
+    ]
+    sdk.records.list.side_effect = lambda **_kw: iter(
+        [
+            Record(
+                record_id=1,
+                study_key="STUDY_EXPLICIT",
+                form_id=1,
+                form_key="DM",
+                subject_key="S1",
+                date_modified=datetime(2026, 7, 1, 9, 30, tzinfo=UTC),
+                record_data={"AGE": 39},
+            )
+        ]
+    )
+    explicit_ledger = tmp_path / "explicit_af_ledger.json"
+    csv_target = tmp_path / "explicit_af.csv"
+    op_explicit = ImednetExportOperator(
+        task_id="explicit_ledger_task",
+        study_key="STUDY_EXPLICIT",
+        destination="csv",
+        output_path=str(csv_target),
+        incremental=True,
+        stream_name="mapped_runtime_stream",
+        ledger_path=str(explicit_ledger),
+        variable_prefix="ignored_af_prefix",
+    )
+    monkeypatch.setattr(op_explicit, "_get_sdk", lambda: sdk)
+    op_explicit.execute({})
+    assert explicit_ledger.exists()
+    assert FileStateProvider(explicit_ledger).get_last_timestamp(
+        "STUDY_EXPLICIT", "mapped_runtime_stream"
+    ) == datetime(2026, 7, 1, 9, 30, tzinfo=UTC)
+
+
+def test_export_operator_duckdb_by_form_and_hive_parquet_incremental_checkpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ImednetExportOperator executes duckdb_by_form and hive_parquet with sharded checkpoints and PHI masking."""
+    import json
+    import sys
+    from datetime import UTC, datetime
+    from types import ModuleType
+
+    import duckdb
+    import pyarrow.dataset as ds
+
+    from apache_airflow_providers_imednet.operators.export import (
+        _TABULAR_EXPORTS,
+        ImednetExportOperator,
+    )
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    assert "duckdb_by_form" in _TABULAR_EXPORTS
+    assert "hive_parquet" in _TABULAR_EXPORTS
+
+    var_store: dict[str, str] = {}
+
+    class _FakeSdkVariable:
+        @staticmethod
+        def get(key: str, default: object = None, deserialize_json: bool = False) -> object:
+            if key not in var_store:
+                return default
+            raw = var_store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(key: str, value: object, serialize_json: bool = False) -> None:
+            var_store[key] = json.dumps(value) if serialize_json else str(value)
+
+        @staticmethod
+        def delete(key: str) -> int:
+            return 1 if var_store.pop(key, None) is not None else 0
+
+        @staticmethod
+        def keys(prefix: str = "") -> list[str]:
+            return [k for k in sorted(var_store) if k.startswith(prefix)]
+
+    import airflow.sdk as sdk_pkg
+
+    runner_mod = ModuleType("airflow.sdk.execution_time.task_runner")
+    runner_mod.SUPERVISOR_COMMS = object()  # type: ignore[attr-defined]
+    monkeypatch.setattr(sdk_pkg, "Variable", _FakeSdkVariable, raising=False)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.execution_time.task_runner", runner_mod)
+
+    records = [
+        Record(
+            record_id=1,
+            study_key="STUDY_MF",
+            form_id=10,
+            form_key="DEMO",
+            subject_key="S01",
+            date_modified=datetime(2026, 8, 1, 10, 0, tzinfo=UTC),
+            record_data={"AGE": 42, "PATIENT_NAME": "Alice Secret"},
+        ),
+        Record(
+            record_id=2,
+            study_key="STUDY_MF",
+            form_id=20,
+            form_key="VITALS",
+            subject_key="S01",
+            date_modified=datetime(2026, 8, 1, 11, 0, tzinfo=UTC),
+            record_data={"SYSBP": 120, "PATIENT_NAME": "Alice Secret"},
+        ),
+    ]
+    variables = [
+        Variable(
+            variable_id=1,
+            variable_name="AGE",
+            variable_type="int",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_id=2,
+            variable_name="PATIENT_NAME",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_id=3,
+            variable_name="SYSBP",
+            variable_type="int",
+            form_id=20,
+            form_key="VITALS",
+        ),
+        Variable(
+            variable_id=4,
+            variable_name="PATIENT_NAME",
+            variable_type="text",
+            form_id=20,
+            form_key="VITALS",
+        ),
+    ]
+    forms = [
+        Form(form_id=10, form_key="DEMO", form_name="Demographics"),
+        Form(form_id=20, form_key="VITALS", form_name="Vitals"),
+    ]
+    sdk = MagicMock(sinks=None)
+    sdk.forms.list.return_value = forms
+    sdk.get_forms.return_value = forms
+    sdk.variables.list.return_value = variables
+    sdk.get_variables.return_value = variables
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+
+    duck_path = tmp_path / "mf_study.duckdb"
+    op_duck = ImednetExportOperator(
+        task_id="exp_duck_by_form",
+        study_key="STUDY_MF",
+        destination="duckdb_by_form",
+        output_path=str(duck_path),
+        incremental=True,
+        variable_prefix="af_mf_pfx",
+    )
+    monkeypatch.setattr(op_duck, "_get_sdk", lambda: sdk)
+    assert op_duck.execute({}) == str(duck_path)
+
+    with duckdb.connect(str(duck_path), read_only=True) as con:
+        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        assert {"DEMO", "VITALS"}.issubset(tables)
+        demo_row = con.execute("SELECT AGE, PATIENT_NAME FROM DEMO").fetchone()
+        assert demo_row == (42, "***MASKED***")
+
+    hive_dir = tmp_path / "hive_out"
+    op_hive = ImednetExportOperator(
+        task_id="exp_hive_pq",
+        study_key="STUDY_MF",
+        destination="hive_parquet",
+        output_path=str(hive_dir),
+        incremental=True,
+        variable_prefix="af_mf_pfx",
+    )
+    monkeypatch.setattr(op_hive, "_get_sdk", lambda: sdk)
+    assert op_hive.execute({}) == str(hive_dir)
+
+    hive_table = ds.dataset(
+        str(hive_dir),
+        format="parquet",
+        partitioning="hive",
+        ignore_prefixes=["."],
+    ).to_table()
+    hive_rows = hive_table.to_pylist()
+    assert {r["form_key"] for r in hive_rows} == {"DEMO", "VITALS"}
+    assert all(r["PATIENT_NAME"] == "***MASKED***" for r in hive_rows)
+
+    # Verify sharded Airflow Variable checkpoints written under custom variable_prefix
+    assert {
+        "af_mf_pfx:STUDY_MF:duckdb_by_form_exp_duck_by_form_DEMO",
+        "af_mf_pfx:STUDY_MF:duckdb_by_form_exp_duck_by_form_VITALS",
+        "af_mf_pfx:STUDY_MF:hive_parquet_exp_hive_pq_DEMO",
+        "af_mf_pfx:STUDY_MF:hive_parquet_exp_hive_pq_VITALS",
+    }.issubset(set(var_store))
+    assert "af_mf_pfx:STUDY_MF" not in var_store

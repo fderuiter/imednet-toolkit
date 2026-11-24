@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import closing
@@ -20,7 +21,11 @@ from imednet.spi.utils import (
 
 from .. import export
 from .._airflow_compat import AirflowException, BaseOperator, Context
-from .._guards import has_embedded_uri_credentials, has_inline_secret_tokens
+from .._guards import (
+    has_embedded_uri_credentials,
+    has_inline_secret_tokens,
+    validate_non_secret_identifier,
+)
 from ..hooks import ImednetHook
 
 logger = logging.getLogger(__name__)
@@ -230,13 +235,18 @@ class ImednetExportOperator(BaseOperator):
     """Unified Airflow operator for exporting study records to any destination."""
 
     # Fields intended for Airflow `.partial().expand()` runtime mapping.
-    mapped_runtime_fields: Sequence[str] = ("study_key", "output_path", "export_kwargs")
+    mapped_runtime_fields: Sequence[str] = (
+        "study_key",
+        "output_path",
+        "export_kwargs",
+        "stream_name",
+    )
     template_fields: Sequence[str] = (
         *mapped_runtime_fields,
         "modified_since",
         "record_filter",
         "record_data_filter",
-        "stream_name",
+        "variable_prefix",
     )
     template_fields_renderers = {"export_kwargs": "json"}  # noqa: RUF012
     _explicit_tabular_options: frozenset[str] = frozenset()
@@ -279,6 +289,7 @@ class ImednetExportOperator(BaseOperator):
         include_deleted: bool = False,
         incremental: bool = False,
         stream_name: str | None = None,
+        variable_prefix: str | None = None,
         ledger_path: Any = None,
         state_provider: Any = None,
         **kwargs: Any,
@@ -301,6 +312,8 @@ class ImednetExportOperator(BaseOperator):
         :param kwargs: Additional Airflow BaseOperator arguments.
         """
         super().__init__(**kwargs)
+        if "task_id" in kwargs and getattr(self, "task_id", None) is None:
+            self.task_id = kwargs["task_id"]
         self.study_key = study_key
         self.destination = destination
         self.output_path = output_path
@@ -328,6 +341,7 @@ class ImednetExportOperator(BaseOperator):
         self.include_deleted = include_deleted
         self.incremental = incremental
         self.stream_name = stream_name
+        self.variable_prefix = variable_prefix
         self.ledger_path = ledger_path
         self.state_provider = state_provider
 
@@ -404,6 +418,22 @@ class ImednetExportOperator(BaseOperator):
         self._stream_name = value
 
     @property
+    def variable_prefix(self) -> str | None:
+        """Return the configured Airflow Variable checkpoint prefix."""
+        return getattr(self, "_variable_prefix", None)
+
+    @variable_prefix.setter
+    def variable_prefix(self, value: str | None) -> None:
+        """Validate and set variable_prefix, rejecting blank or credential-bearing strings."""
+        if value is not None:
+            validate_non_secret_identifier(
+                value,
+                field_name="variable_prefix",
+                parameter_kind="operator parameter",
+            )
+        self._variable_prefix = value
+
+    @property
     def export_kwargs(self) -> dict[str, Any]:
         """Return validated non-secret export keyword arguments."""
         current = getattr(self, "_export_kwargs", None)
@@ -430,6 +460,12 @@ class ImednetExportOperator(BaseOperator):
             val = getattr(self, field_name, None)
             if val is not None:
                 _validate_no_secrets_in_value(val, field_name=field_name)
+        if self.variable_prefix is not None:
+            validate_non_secret_identifier(
+                self.variable_prefix,
+                field_name="variable_prefix",
+                parameter_kind="operator parameter",
+            )
         _validate_no_secrets_in_value(self.export_kwargs, field_name="export_kwargs")
 
     def _effective_destination(self) -> str:
@@ -439,7 +475,9 @@ class ImednetExportOperator(BaseOperator):
             dest = self.export_func.replace("export_to_", "")
         elif not dest:
             dest = "csv"
-        return dest.lower().strip()
+        normalized = dest.lower().strip()
+        underscore_alias = normalized.replace("-", "_")
+        return underscore_alias if underscore_alias in _TABULAR_EXPORTS else normalized
 
     def _get_sdk(self) -> ImednetSDK:
         """Resolve the SDK client from the configured Airflow connection at execute time."""
@@ -529,22 +567,95 @@ class ImednetExportOperator(BaseOperator):
             opts["naming_convention"] = str(resolved_convention)
         return opts
 
-    def _default_airflow_stream_name(self, dest: str, *, sink_prefix: bool = False) -> str:
-        """Return a task-scoped default stream name invariant across mapped task indexes."""
-        base = f"airflow_{dest}" if sink_prefix else dest
+    def _resolve_variable_prefix(self, runtime_kwargs: Mapping[str, Any]) -> str | None:
+        """Resolve and validate ``variable_prefix`` from operator attributes or export_kwargs."""
+        raw_prefix: Any = self.variable_prefix
+        if raw_prefix is None and "variable_prefix" in runtime_kwargs:
+            raw_prefix = runtime_kwargs["variable_prefix"]
+        if raw_prefix is None:
+            return None
+        validated = validate_non_secret_identifier(
+            raw_prefix,
+            field_name="variable_prefix",
+            parameter_kind="operator parameter",
+        )
+        return validated.strip()
+
+    def _extract_map_index(
+        self,
+        context: Mapping[str, Any] | None = None,
+        *,
+        map_index: int | None = None,
+    ) -> int | None:
+        """Return non-negative ``map_index`` when running inside a mapped task instance."""
+        candidates: list[Any] = [map_index]
+        if isinstance(context, Mapping):
+            candidates.append(context.get("map_index"))
+            ti = context.get("ti") or context.get("task_instance")
+            if ti is not None:
+                candidates.append(getattr(ti, "map_index", None))
+        candidates.append(getattr(self, "map_index", None))
+        self_ti = getattr(self, "ti", None)
+        if self_ti is not None:
+            candidates.append(getattr(self_ti, "map_index", None))
+        candidates.append(os.environ.get("AIRFLOW_CTX_TASK_MAP_INDEX"))
+
+        for candidate in candidates:
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+                return candidate
+            if isinstance(candidate, str):
+                stripped = candidate.strip()
+                if stripped.lstrip("-").isdigit():
+                    parsed = int(stripped)
+                    if parsed >= 0:
+                        return parsed
+        return None
+
+    def _default_airflow_stream_name(
+        self,
+        dest: str,
+        *,
+        sink_prefix: bool = False,
+        sdtm_domain: str | None = None,
+        map_index: int | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Return a task-scoped default stream name isolated per ``sdtm_domain`` and ``map_index``."""
+        parts = [f"airflow_{dest}" if sink_prefix else dest]
         task_id = getattr(self, "task_id", None)
         if isinstance(task_id, str) and task_id.strip():
-            return f"{base}_{task_id.strip()}"
-        return base
+            parts.append(task_id.strip())
+
+        raw_kwargs = getattr(self, "_export_kwargs", None)
+        resolved_domain = (
+            sdtm_domain
+            or getattr(self, "sdtm_domain", None)
+            or getattr(self, "domain", None)
+            or (
+                (raw_kwargs.get("sdtm_domain") or raw_kwargs.get("domain"))
+                if isinstance(raw_kwargs, Mapping)
+                else None
+            )
+        )
+        if isinstance(resolved_domain, str) and resolved_domain.strip():
+            parts.append(resolved_domain.strip())
+
+        resolved_map_index = self._extract_map_index(context, map_index=map_index)
+        if resolved_map_index is not None:
+            parts.append(str(resolved_map_index))
+        return "_".join(parts)
 
     def _build_tabular_kwargs(
         self,
         runtime_kwargs: dict[str, Any],
         *,
         dest: str = "records",
+        context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Merge operational parameters and deterministic quality-gate state into tabular kwargs."""
+        effective_var_prefix = self._resolve_variable_prefix(runtime_kwargs)
         merged = dict(runtime_kwargs)
+        merged.pop("variable_prefix", None)
         if "domain" in merged and "sdtm_domain" not in merged:
             merged["sdtm_domain"] = merged.pop("domain")
         else:
@@ -560,14 +671,35 @@ class ImednetExportOperator(BaseOperator):
             merged["quality_gate_enabled"] = bool(getattr(self, "quality_gate_enabled", False))
         for key, val in self._collect_streaming_options(runtime_kwargs).items():
             merged.setdefault(key, val)
+        resolved_domain = merged.get("sdtm_domain")
+        resolved_map_index = self._extract_map_index(context)
         if (
             merged.get("incremental")
             and "state_provider" not in merged
             and "ledger_path" not in merged
         ):
-            merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
+            merged["state_provider"] = sink_base.get_state_provider(
+                provider_name="airflow",
+                variable_prefix=effective_var_prefix,
+            )
             if "stream_name" not in merged:
-                merged["stream_name"] = self._default_airflow_stream_name(dest)
+                merged["stream_name"] = self._default_airflow_stream_name(
+                    dest,
+                    sdtm_domain=str(resolved_domain) if resolved_domain is not None else None,
+                    map_index=resolved_map_index,
+                    context=context,
+                )
+        elif (
+            merged.get("incremental")
+            and "stream_name" not in merged
+            and (resolved_domain is not None or resolved_map_index is not None)
+        ):
+            merged["stream_name"] = self._default_airflow_stream_name(
+                dest,
+                sdtm_domain=str(resolved_domain) if resolved_domain is not None else None,
+                map_index=resolved_map_index,
+                context=context,
+            )
         return merged
 
     @staticmethod
@@ -615,6 +747,8 @@ class ImednetExportOperator(BaseOperator):
         runtime_kwargs = self._get_runtime_export_kwargs()
         conn_settings = self._resolve_destination_connection(dest)
         stream_opts = self._collect_streaming_options(runtime_kwargs)
+        if config.state_provider is not None and "state_provider" not in stream_opts:
+            stream_opts["state_provider"] = config.state_provider
         if not config.mask_phi and "mask_phi" not in stream_opts:
             stream_opts["mask_phi"] = False
         if config.max_buffered_records is not None:
@@ -887,11 +1021,12 @@ class ImednetExportOperator(BaseOperator):
         validate_path_segment(self.study_key, name="study_key")
         runtime_kwargs = self._get_runtime_export_kwargs()
         # Resolve destination early to fail fast on invalid configs (like legacy _get_export_callable)
-        dest = self.destination
-        if not dest and self.export_func:
-            dest = self.export_func.replace("export_to_", "")
-        elif not dest:
-            dest = "csv"
+        raw_dest = self.destination
+        if not raw_dest and self.export_func:
+            raw_dest = self.export_func.replace("export_to_", "")
+        elif not raw_dest:
+            raw_dest = "csv"
+        dest = self._effective_destination()
 
         export_callable = None
         if dest in _TABULAR_EXPORTS:
@@ -901,26 +1036,40 @@ class ImednetExportOperator(BaseOperator):
 
         if not export_callable and dest not in ("snowflake", "neo4j", "mongodb"):
             raise AirflowException(
-                f"Unsupported export_func '{self.export_func or dest}'. Expected a valid destination or tabular function."
+                f"Unsupported export_func '{self.export_func or raw_dest}'. Expected a valid destination or tabular function."
             )
 
-        stream_opts = self._collect_streaming_options(runtime_kwargs)
+        effective_var_prefix = self._resolve_variable_prefix(runtime_kwargs)
+        clean_runtime_kwargs = {k: v for k, v in runtime_kwargs.items() if k != "variable_prefix"}
+        stream_opts = self._collect_streaming_options(clean_runtime_kwargs)
+        user_supplied_state_provider = stream_opts.get("state_provider") is not None
         sink_stream_opts = {k: v for k, v in stream_opts.items() if k != "mask_phi"}
+        if (
+            not export_callable
+            and sink_stream_opts.get("incremental")
+            and not user_supplied_state_provider
+            and sink_stream_opts.get("ledger_path") is None
+            and effective_var_prefix is not None
+        ):
+            sink_stream_opts["state_provider"] = sink_base.get_state_provider(
+                provider_name="airflow",
+                variable_prefix=effective_var_prefix,
+            )
 
         config = sink_base.SinkConfig(
             study_key=self.study_key,
-            batch_size=int(runtime_kwargs.get("batch_size", self.batch_size)),
-            max_buffered_records=runtime_kwargs.get("max_buffered_records"),
-            max_retries=int(runtime_kwargs.get("max_retries", self.max_retries)),
-            retry_backoff=float(runtime_kwargs.get("retry_backoff", 1.0)),
-            idempotent=bool(runtime_kwargs.get("idempotent", self.idempotent)),
-            mask_phi=bool(runtime_kwargs.get("mask_phi", self.mask_phi)),
-            extra=runtime_kwargs,
+            batch_size=int(clean_runtime_kwargs.get("batch_size", self.batch_size)),
+            max_buffered_records=clean_runtime_kwargs.get("max_buffered_records"),
+            max_retries=int(clean_runtime_kwargs.get("max_retries", self.max_retries)),
+            retry_backoff=float(clean_runtime_kwargs.get("retry_backoff", 1.0)),
+            idempotent=bool(clean_runtime_kwargs.get("idempotent", self.idempotent)),
+            mask_phi=bool(clean_runtime_kwargs.get("mask_phi", self.mask_phi)),
+            extra=clean_runtime_kwargs,
             quality_gate_enabled=bool(
-                runtime_kwargs.get("quality_gate_enabled", self.quality_gate_enabled)
+                clean_runtime_kwargs.get("quality_gate_enabled", self.quality_gate_enabled)
             ),
             min_schema_readiness_score=float(
-                runtime_kwargs.get(
+                clean_runtime_kwargs.get(
                     "min_schema_readiness_score",
                     self.min_schema_readiness_score,
                 )
@@ -928,6 +1077,7 @@ class ImednetExportOperator(BaseOperator):
             **sink_stream_opts,
         )
 
+        ctx_map = context if isinstance(context, Mapping) else None
         with closing(self._get_sdk()) as sdk:
             sink = None
             if not export_callable:
@@ -939,13 +1089,22 @@ class ImednetExportOperator(BaseOperator):
 
             if sink:
                 run_token = uuid.uuid4().hex[:12]
-                if isinstance(context, Mapping):
-                    raw_run_id = context.get("run_id") or context.get("ts_nodash")
+                if ctx_map is not None:
+                    raw_run_id = ctx_map.get("run_id") or ctx_map.get("ts_nodash")
                     if isinstance(raw_run_id, str) and raw_run_id.strip():
                         run_token = f"{raw_run_id.strip()}/{uuid.uuid4().hex[:8]}"
+                has_mapped_suffix = (
+                    config.sdtm_domain is not None or self._extract_map_index(ctx_map) is not None
+                )
                 default_sink_stream = (
-                    self._default_airflow_stream_name(dest, sink_prefix=True)
-                    if config.ledger_path is None and config.state_provider is None
+                    self._default_airflow_stream_name(
+                        dest,
+                        sink_prefix=True,
+                        sdtm_domain=config.sdtm_domain,
+                        context=ctx_map,
+                    )
+                    if (config.ledger_path is None and not user_supplied_state_provider)
+                    or has_mapped_suffix
                     else f"airflow_{dest}"
                 )
                 sink_base.run_streaming_export(
@@ -973,7 +1132,11 @@ class ImednetExportOperator(BaseOperator):
                 )
                 tabular_kwargs = self._filter_callable_kwargs(
                     export_callable,
-                    self._build_tabular_kwargs(runtime_kwargs, dest=dest),
+                    self._build_tabular_kwargs(
+                        runtime_kwargs,
+                        dest=dest,
+                        context=ctx_map,
+                    ),
                     implicit_quality_gate=implicit_gate,
                 )
                 if dest == "duckdb_by_form":

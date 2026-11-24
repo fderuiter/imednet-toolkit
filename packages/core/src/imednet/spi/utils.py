@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     from imednet.utils.url import (
         normalize_cache_origin,
         redact_sensitive_text,
+        redact_url_query,
         resolve_sdk_base_url,
         sanitize_base_url,
         validate_path_segment,
@@ -244,6 +245,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "poll_facade_single_sync": ("imednet.utils.batch_coordinator", "poll_facade_single_sync"),
     "redact_sensitive_payload": ("imednet.utils.secrets", "redact_sensitive_payload"),
     "redact_sensitive_text": ("imednet.utils.url", "redact_sensitive_text"),
+    "redact_url_query": ("imednet.utils.url", "redact_url_query"),
     "reset_base_url_context": ("imednet.core.context", "reset_base_url_context"),
     "reset_security_key_context": ("imednet.core.context", "reset_security_key_context"),
     "resolve_enrichment_pipeline": (
@@ -379,6 +381,7 @@ __all__ = [
     "poll_facade_single_sync",
     "redact_sensitive_payload",
     "redact_sensitive_text",
+    "redact_url_query",
     "reset_base_url_context",
     "reset_security_key_context",
     "resolve_enrichment_pipeline",

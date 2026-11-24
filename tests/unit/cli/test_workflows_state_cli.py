@@ -1016,3 +1016,161 @@ def test_interactive_state_set_reads_ledger_once_and_reuses_wizard_state(
     assert mock_ledger.return_value.read_state.call_count == 1
     assert "Current Status:    success (timestamp: 2026-05-22T12:00:00+00:00)" in res.stderr
     mock_ledger.return_value.set_last_timestamp.assert_called_once()
+
+
+def test_workflows_state_cli_airflow_provider_and_variable_prefix_show_set_reset(
+    runner: CliRunner,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """workflows state show, set, and reset honor --provider airflow, --variable-prefix, and explicit --ledger-path."""
+    import json
+    import sys
+    from types import ModuleType
+
+    from imednet.cli import app as main_app
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    var_store: dict[str, str] = {}
+
+    class _FakeSdkVariable:
+        @staticmethod
+        def get(key: str, default: object = None, deserialize_json: bool = False) -> object:
+            if key not in var_store:
+                return default
+            raw = var_store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(key: str, value: object, serialize_json: bool = False) -> None:
+            var_store[key] = json.dumps(value) if serialize_json else str(value)
+
+        @staticmethod
+        def delete(key: str) -> int:
+            return 1 if var_store.pop(key, None) is not None else 0
+
+        @staticmethod
+        def keys(prefix: str = "") -> list[str]:
+            return [k for k in sorted(var_store) if k.startswith(prefix)]
+
+    airflow_mod = ModuleType("airflow")
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.Variable = _FakeSdkVariable  # type: ignore[attr-defined]
+    exec_mod = ModuleType("airflow.sdk.execution_time")
+    runner_mod = ModuleType("airflow.sdk.execution_time.task_runner")
+    runner_mod.SUPERVISOR_COMMS = object()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.execution_time", exec_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.execution_time.task_runner", runner_mod)
+    monkeypatch.delenv("USE_AIRFLOW_STATE_PROVIDER", raising=False)
+    monkeypatch.delenv("AIRFLOW_CTX_TASK_ID", raising=False)
+
+    # 1. Set two sharded checkpoints under custom --variable-prefix
+    for stream_name, ts in (
+        ("ae_stream", "2026-06-01T10:00:00Z"),
+        ("dm_stream", "2026-06-01T11:00:00Z"),
+    ):
+        res_set = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--provider",
+                "airflow",
+                "--variable-prefix",
+                "custom_cli_pfx",
+                "--study-key",
+                "STUDY-CLI",
+                "--stream",
+                stream_name,
+                "--timestamp",
+                ts,
+                "--records-processed",
+                "9",
+            ],
+        )
+        assert res_set.exit_code == 0, res_set.output
+
+    assert set(var_store) == {
+        "custom_cli_pfx:STUDY-CLI:ae_stream",
+        "custom_cli_pfx:STUDY-CLI:dm_stream",
+    }
+
+    # 2. Show under custom prefix returns both sharded streams; default prefix sees none
+    res_show_custom = runner.invoke(
+        main_app,
+        [
+            "workflows",
+            "state",
+            "show",
+            "--provider",
+            "airflow",
+            "--variable-prefix",
+            "custom_cli_pfx",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_show_custom.exit_code == 0, res_show_custom.output
+    shown_payload = json.loads(res_show_custom.stdout)
+    shown_rows = shown_payload["items"] if isinstance(shown_payload, dict) else shown_payload
+    assert {r["streamName"] for r in shown_rows} == {"ae_stream", "dm_stream"}
+
+    res_show_default = runner.invoke(
+        main_app,
+        ["workflows", "state", "show", "--provider", "airflow"],
+    )
+    assert res_show_default.exit_code == 0
+    assert "No ledger entries" in res_show_default.output
+
+    # 3. Scoped stream reset deletes only target stream
+    res_reset_one = runner.invoke(
+        main_app,
+        [
+            "workflows",
+            "state",
+            "reset",
+            "--provider",
+            "airflow",
+            "--variable-prefix",
+            "custom_cli_pfx",
+            "--study-key",
+            "STUDY-CLI",
+            "--stream",
+            "ae_stream",
+        ],
+    )
+    assert res_reset_one.exit_code == 0, res_reset_one.output
+    assert set(var_store) == {"custom_cli_pfx:STUDY-CLI:dm_stream"}
+
+    # 4. Explicit --ledger-path overrides AIRFLOW_CTX_TASK_ID and --provider airflow
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "cli_inside_airflow")
+    explicit_ledger = tmp_path / "cli_explicit_ledger.json"
+    res_explicit = runner.invoke(
+        main_app,
+        [
+            "workflows",
+            "state",
+            "set",
+            "--provider",
+            "airflow",
+            "--variable-prefix",
+            "custom_cli_pfx",
+            "--ledger-path",
+            str(explicit_ledger),
+            "--study-key",
+            "STUDY-FILE",
+            "--stream",
+            "csv_stream",
+            "--timestamp",
+            "2026-06-02T00:00:00Z",
+        ],
+    )
+    assert res_explicit.exit_code == 0, res_explicit.output
+    assert explicit_ledger.exists()
+    assert FileStateProvider(explicit_ledger).get_last_timestamp("STUDY-FILE", "csv_stream") == (
+        datetime(2026, 6, 2, 0, 0, tzinfo=timezone.utc)
+    )
+    assert "custom_cli_pfx:STUDY-FILE:csv_stream" not in var_store

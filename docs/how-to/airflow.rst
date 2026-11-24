@@ -77,8 +77,8 @@ rather than embedding secrets in DAG definitions.
 
 To prevent credential leakage in Airflow rendered task metadata and XComs,
 templated fields (``study_key``, ``output_path``, ``export_kwargs``,
-``modified_since``, ``record_filter``, ``record_data_filter``, and
-``stream_name``) reject embedded URI userinfo, secrets in query strings,
+``stream_name``, ``modified_since``, ``record_filter``, ``record_data_filter``,
+and ``variable_prefix``) reject embedded URI userinfo, secrets in query strings,
 single-delimiter credential assignments (such as ``api_key=leak``), and bearer
 JWTs while permitting clinical ``Variable`` filter expressions (for example
 ``TOKEN==1`` or ``NOTES=="bearer of card"``) and explicit ``export_kwargs={"auth": "none"}``.
@@ -120,8 +120,9 @@ The Airflow integration organizes hooks, operators, and sensors in dedicated
 subpackages for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, DuckDB, SQL / ``sql_by_form``
-/ ``long_sql``, Snowflake, Neo4j, MongoDB, etc.)
+records to any supported destination (CSV, Parquet, ``hive_parquet``, DuckDB /
+``duckdb_by_form``, SQL / ``sql_by_form`` / ``long_sql``, Excel, JSON, Snowflake,
+Neo4j, MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled`` — ``False`` by default and deterministically forwarded
@@ -142,8 +143,10 @@ templated ``study_key``, ``batch_id``, and ``imednet_conn_id`` fields and polls
 an asynchronous iMednet ``Job`` until it reaches a terminal state (see
 :ref:`rest_resource_jobs`). On completion, both synchronous (``deferrable=False``)
 and deferrable (``deferrable=True``) runs emit an identical, compact ``Job``
-summary XCom with raw ``results`` stripped and ``Subject`` PHI masked via
-:func:`~imednet.utils.security.mask_clinical_phi`. Terminal ``resultUrl``
+summary XCom with raw ``results`` stripped, ``Subject`` PHI masked via
+:func:`~imednet.utils.security.mask_clinical_phi`, and pre-signed ``resultUrl``
+(``result_url``) credentials and signatures (such as ``X-Amz-Credential``,
+``X-Amz-Signature``, ``sig``, and ``token``) redacted to ``***``. Terminal ``resultUrl``
 payloads are verified so batch-level or per-``Record`` failures scrub ``Subject``
 PHI and raise a redacted ``AirflowException``. When ``soft_fail=True``, polling
 timeouts are converted to ``AirflowSkipException`` in both modes, whereas
@@ -153,7 +156,8 @@ All operators use ``ImednetHook`` to obtain an :class:`~imednet.ImednetSDK` inst
 from an Airflow connection. The production reference DAG above shows the recommended
 dynamic-mapping pattern: keep static settings (for example ``destination``,
 ``imednet_conn_id``, and ``destination_conn_id``) in ``.partial(...)`` and map
-only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs``).
+only non-secret runtime fields (``study_key``, ``output_path``, ``export_kwargs``,
+``stream_name``).
 
 .. testcode::
 
@@ -220,29 +224,35 @@ resolved only inside ``execute()``:
 Incremental Checkpoints with ``AirflowStateProvider`` and ``ExtractionStateLedger``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``ImednetExportOperator`` forwards all eight streaming checkpoint and ``Record``
+``ImednetExportOperator`` forwards streaming checkpoint and ``Record``
 filter parameters directly to :func:`~imednet.spi.sink_base.run_streaming_export`
 and tabular export helpers while maintaining ``mask_phi=True`` by default:
 
 - ``incremental``: Enable transactional high-water mark reads and commits.
-- ``stream_name``: Stream key used to isolate checkpoints per destination or ``Form``.
-- ``state_provider``: Explicit checkpoint provider such as
-  :class:`~imednet_workflows.state_ledger.AirflowStateProvider` (persisting all
-  stream JSON watermarks for a ``Study`` inside one Airflow ``Variable`` map under
-  ``imednet_state:<study_key>`` via ``airflow.sdk.Variable``, transparently reading
-  and consolidating legacy ``imednet_state:<study_key>:<stream_name>`` keys on the
-  next study write, preserving per-``Study`` state across dynamic task mapping order
-  changes, and rolling ``RUNNING`` checkpoints back to ``FAILED`` on
-  ``BaseException`` interrupts such as ``AirflowTaskTimeout``)
-  or :class:`~imednet_workflows.ExtractionStateLedger`
+- ``stream_name``: Stream key used to isolate checkpoints per destination, domain,
+  or ``Form`` (included in ``mapped_runtime_fields`` for ``.partial().expand()``;
+  when omitted, default stream keys automatically append ``sdtm_domain`` and
+  non-negative mapped ``map_index`` values).
+- ``variable_prefix``: JSON-serializable Airflow ``Variable`` prefix preserved
+  across Airflow 3 DAG serialization (``DagSerialization.to_dict`` /
+  ``from_dict``). Defaults to ``"imednet_state"`` when omitted. Prefer
+  ``variable_prefix`` on ``ImednetExportOperator`` in serialized Airflow 3 DAGs
+  rather than passing a live Python ``state_provider`` object.
+- ``state_provider``: Optional in-process checkpoint provider such as
+  :class:`~imednet_workflows.state_ledger.AirflowStateProvider` (sharding each
+  stream watermark under ``<variable_prefix>:<study_key>:<stream_name>`` via
+  ``airflow.sdk.Variable`` so concurrent ``Study`` streams never overwrite
+  sibling watermarks, falling back read-only to legacy consolidated
+  ``<variable_prefix>:<study_key>`` maps without writing stale streams back, and
+  rolling ``RUNNING`` checkpoints back to ``FAILED`` on ``BaseException``
+  interrupts such as ``AirflowTaskTimeout``) or
+  :class:`~imednet_workflows.ExtractionStateLedger`
   (:class:`~imednet_workflows.state_ledger.FileStateProvider`). When omitted on an
-  ``incremental=True`` run, ``ImednetExportOperator`` defaults to the ``airflow``
-  provider entry point automatically unless ``ledger_path`` is specified. Because
-  ``Variable.set`` performs last-writer-wins upserts on the consolidated study key,
-  configure distinct ``AirflowStateProvider(variable_prefix=...)`` values when
-  concurrent operators export the same ``Study`` in parallel.
-- ``ledger_path``: Shared filesystem path used when persisting checkpoints with
-  ``ExtractionStateLedger`` instead of Airflow ``Variable`` storage.
+  ``incremental=True`` run, ``ImednetExportOperator`` resolves ``airflow`` (with
+  ``variable_prefix``) automatically unless ``ledger_path`` is specified.
+- ``ledger_path``: Explicit filesystem path that selects ``FileStateProvider``
+  (``ExtractionStateLedger``) ahead of ``AIRFLOW_CTX_TASK_ID`` and Airflow
+  ``Variable`` storage.
 - ``modified_since``: Initial UTC lower-bound watermark when no prior checkpoint exists.
 - ``record_filter``: ``Record`` metadata filter dictionary or expression string.
 - ``record_data_filter``: ``Variable`` payload filter expression (``recordDataFilter``).
@@ -252,9 +262,8 @@ and tabular export helpers while maintaining ``mask_phi=True`` by default:
 .. testcode::
 
    from apache_airflow_providers_imednet import ImednetExportOperator
-   from imednet_workflows.state_ledger import AirflowStateProvider, ExtractionStateLedger
+   from imednet_workflows.state_ledger import ExtractionStateLedger
 
-   airflow_state = AirflowStateProvider()
    shared_file_ledger = ExtractionStateLedger("/tmp/airflow_shared_ledger.json")
 
    incremental_export_task = ImednetExportOperator(
@@ -266,8 +275,8 @@ and tabular export helpers while maintaining ``mask_phi=True`` by default:
        mask_phi=True,
        incremental=True,
        stream_name="snowflake_vital_signs",
+       variable_prefix="imednet_state",
        ledger_path=None,
-       state_provider=airflow_state,
        modified_since="2026-01-01T00:00:00Z",
        record_filter={"form_key": "F_VS"},
        record_data_filter="V_WEIGHT>0",
@@ -291,9 +300,10 @@ which polls iMednet asynchronously inside the Airflow triggerer using
 ``ImednetJobTrigger.serialize()`` persists only non-secret identifiers
 (``study_key``, ``batch_id``, ``imednet_conn_id``, ``poke_interval``, and
 ``timeout``) to the Airflow metadata database. ``ImednetJobTrigger.run()``
-excludes ``results`` and applies :func:`~imednet.utils.security.mask_clinical_phi`
+excludes ``results``, applies :func:`~imednet.utils.security.mask_clinical_phi`,
+and redacts ``resultUrl`` (``result_url``) URL signatures and query tokens
 before emitting a ``TriggerEvent`` so ``execute_complete()`` writes the exact
-same PHI-free ``Job`` summary XCom as synchronous ``poke()``. Polling timeouts
+same PHI- and credential-free ``Job`` summary XCom as synchronous ``poke()``. Polling timeouts
 emit ``{"status": "timeout"}`` (raising ``AirflowSensorTimeout``, which
 ``soft_fail=True`` skips via ``AirflowSkipException``), while terminal ``Job``
 or ``Record`` failures emit ``{"status": "error"}`` with ``Subject`` PHI and

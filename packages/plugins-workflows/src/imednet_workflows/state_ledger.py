@@ -11,6 +11,7 @@ import re
 import socket
 import sys
 import tempfile
+import threading
 from collections.abc import Generator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -863,6 +864,9 @@ class FileStateProvider(BaseStateProvider):
 # Backward compatibility alias
 ExtractionStateLedger = FileStateProvider
 
+_SUPPRESS_SUPERVISOR_LOCK = threading.Lock()
+_SUPPRESS_SUPERVISOR_DEPTH = 0
+
 
 class AirflowStateProvider(BaseStateProvider):
     """Manage transactional stream checkpoints using Airflow Variables."""
@@ -882,6 +886,14 @@ class AirflowStateProvider(BaseStateProvider):
             lease_ttl_seconds: Duration in seconds before an active ``RUNNING`` lease expires.
         """
         cleaned_prefix = variable_prefix.strip().rstrip(":")
+        if (
+            "://" in cleaned_prefix
+            and "://***@" not in cleaned_prefix
+            and redact_uri(cleaned_prefix) != cleaned_prefix
+        ) or redact_sensitive_text(cleaned_prefix) != cleaned_prefix:
+            raise ValueError(
+                "Sensitive credentials or tokens are not allowed in 'variable_prefix'."
+            )
         self.variable_prefix = cleaned_prefix or self.DEFAULT_VARIABLE_PREFIX
         self.lease_ttl_seconds = lease_ttl_seconds
 
@@ -904,15 +916,15 @@ class AirflowStateProvider(BaseStateProvider):
         )
 
     def _get_study_variable_key(self, study_key: str) -> str:
-        """Return the deterministic consolidated Airflow Variable key bound to a Study."""
+        """Return the legacy consolidated Airflow Variable key bound to a Study."""
         return f"{self.variable_prefix}:{self._encode_key_part(study_key)}"
 
     def _study_prefix(self, study_key: str) -> str:
-        """Return the legacy per-stream Airflow Variable key prefix for a specific Study."""
+        """Return the sharded per-stream Airflow Variable key prefix for a specific Study."""
         return f"{self._get_study_variable_key(study_key)}:"
 
     def _get_variable_key(self, study_key: str, stream_name: str | None = None) -> str:
-        """Return the consolidated Study Variable key or legacy per-stream Variable key."""
+        """Return the sharded ``<prefix>:<study>:<stream>`` key or Study key when stream omitted."""
         if stream_name is None:
             return self._get_study_variable_key(study_key)
         return f"{self._study_prefix(study_key)}{self._encode_key_part(stream_name)}"
@@ -928,7 +940,7 @@ class AirflowStateProvider(BaseStateProvider):
         return self._decode_key_part(remainder)
 
     def _parse_variable_key(self, key: str) -> tuple[str, str] | None:
-        """Decode ``(study_key, stream_name)`` from a legacy per-stream Airflow Variable key."""
+        """Decode ``(study_key, stream_name)`` from a sharded per-stream Airflow Variable key."""
         root_prefix = f"{self.variable_prefix}:"
         if not key.startswith(root_prefix):
             return None
@@ -960,11 +972,41 @@ class AirflowStateProvider(BaseStateProvider):
             return False
         if SdkVariable is None:
             return False
-        try:
-            from airflow.sdk.execution_time import task_runner
-        except ImportError:
-            return True
+        task_runner = sys.modules.get("airflow.sdk.execution_time.task_runner")
+        if task_runner is None:
+            try:
+                from airflow.sdk.execution_time import task_runner  # type: ignore[assignment]
+            except ImportError:
+                return True
         return getattr(task_runner, "SUPERVISOR_COMMS", None) is not None
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _suppress_inactive_supervisor_comms() -> Generator[None, None, None]:
+        """Prevent Airflow 3 ORM Variable helpers from redirecting when SUPERVISOR_COMMS is None."""
+        global _SUPPRESS_SUPERVISOR_DEPTH
+        with _SUPPRESS_SUPERVISOR_LOCK:
+            runner_mod = sys.modules.get("airflow.sdk.execution_time.task_runner")
+            suppressed = False
+            if _SUPPRESS_SUPERVISOR_DEPTH > 0:
+                _SUPPRESS_SUPERVISOR_DEPTH += 1
+                suppressed = True
+            elif (
+                runner_mod is not None
+                and "SUPERVISOR_COMMS" in vars(runner_mod)
+                and getattr(runner_mod, "SUPERVISOR_COMMS", None) is None
+            ):
+                delattr(runner_mod, "SUPERVISOR_COMMS")
+                _SUPPRESS_SUPERVISOR_DEPTH = 1
+                suppressed = True
+        try:
+            yield
+        finally:
+            if suppressed:
+                with _SUPPRESS_SUPERVISOR_LOCK:
+                    _SUPPRESS_SUPERVISOR_DEPTH -= 1
+                    if _SUPPRESS_SUPERVISOR_DEPTH == 0 and runner_mod is not None:
+                        runner_mod.SUPERVISOR_COMMS = None  # type: ignore[attr-defined]
 
     @staticmethod
     def _ensure_orm_session() -> None:
@@ -1026,7 +1068,8 @@ class AirflowStateProvider(BaseStateProvider):
                 return None
             self._ensure_orm_session()
             try:
-                raw_val = ModelVariable.get(key, default_var=None, deserialize_json=True)
+                with self._suppress_inactive_supervisor_comms():
+                    raw_val = ModelVariable.get(key, default_var=None, deserialize_json=True)
             except (json.JSONDecodeError, ValueError):
                 return None
 
@@ -1048,7 +1091,48 @@ class AirflowStateProvider(BaseStateProvider):
         except ImportError:
             return
         self._ensure_orm_session()
-        ModelVariable.set(key, payload, serialize_json=True)
+        with self._suppress_inactive_supervisor_comms():
+            ModelVariable.set(key, payload, serialize_json=True)
+
+    def _write_stream_entry(
+        self, study_key: str, stream_name: str, payload: dict[str, Any]
+    ) -> None:
+        """Persist a single sharded stream checkpoint key without touching sibling streams."""
+        self._write_variable(self._get_variable_key(study_key, stream_name), payload)
+
+    def _write_stream_entries_batch(
+        self,
+        study_key: str,
+        payloads_by_stream: Mapping[str, dict[str, Any]],
+    ) -> None:
+        """Persist target sharded stream checkpoints using one ORM session when available."""
+        if not payloads_by_stream or not self._airflow_available():
+            return
+
+        keyed_payloads = [
+            (self._get_variable_key(study_key, s_name), payload)
+            for s_name, payload in payloads_by_stream.items()
+        ]
+        if self._has_active_task_sdk_comms():
+            for var_key, payload in keyed_payloads:
+                self._write_variable(var_key, payload)
+            return
+
+        try:
+            from airflow.models.variable import Variable as ModelVariable
+            from airflow.utils.session import create_session
+        except ImportError:
+            return
+
+        self._ensure_orm_session()
+        with self._suppress_inactive_supervisor_comms(), create_session() as session:
+            for var_key, payload in keyed_payloads:
+                ModelVariable.set(var_key, payload, serialize_json=True, session=session)
+        with contextlib.suppress(Exception):
+            from airflow.sdk import SecretCache
+
+            for var_key, _ in keyed_payloads:
+                SecretCache.invalidate_variable(var_key)
 
     def _list_variable_keys(self, prefix: str) -> list[str]:
         """List Airflow Variable keys matching ``prefix``."""
@@ -1090,7 +1174,8 @@ class AirflowStateProvider(BaseStateProvider):
         except ImportError:
             return
         self._ensure_orm_session()
-        ModelVariable.delete(key)
+        with self._suppress_inactive_supervisor_comms():
+            ModelVariable.delete(key)
 
     @staticmethod
     def _parse_timestamp(payload: dict[str, Any] | None) -> datetime | None:
@@ -1228,19 +1313,22 @@ class AirflowStateProvider(BaseStateProvider):
         }
 
     def _read_stream_entry(self, study_key: str, stream_name: str) -> dict[str, Any] | None:
-        """Read a single stream checkpoint from consolidated Study key or legacy fallback."""
+        """Read a single stream checkpoint from its sharded key or consolidated Study fallback."""
         if not self._airflow_available():
             return None
 
+        stream_var_key = self._get_variable_key(study_key, stream_name)
         study_var_key = self._get_study_variable_key(study_key)
-        legacy_var_key = self._get_variable_key(study_key, stream_name)
 
         if self._has_active_task_sdk_comms():
+            sharded = self._read_variable(stream_var_key)
+            if sharded is not None:
+                return sharded
             consolidated = self._read_variable(study_var_key)
             if consolidated is not None:
                 _, streams = self._extract_study_streams(consolidated, study_key)
                 return streams.get(stream_name)
-            return self._read_variable(legacy_var_key)
+            return None
 
         try:
             from airflow.models.variable import Variable as ModelVariable
@@ -1251,152 +1339,84 @@ class AirflowStateProvider(BaseStateProvider):
         found: dict[str, dict[str, Any] | None] = {}
         with self._open_orm_read_session() as session:
             rows = session.scalars(
-                select(ModelVariable).where(ModelVariable.key.in_([study_var_key, legacy_var_key]))
+                select(ModelVariable).where(ModelVariable.key.in_([stream_var_key, study_var_key]))
             ).all()
             for row in rows:
                 found[str(row.key)] = self._deserialize_json_dict(row.val)
 
+        if stream_var_key in found:
+            return found[stream_var_key]
         if study_var_key in found:
             consolidated = found[study_var_key]
             if consolidated is None:
                 return None
             _, streams = self._extract_study_streams(consolidated, study_key)
             return streams.get(stream_name)
-        return found.get(legacy_var_key)
+        return None
 
-    def _load_study_state(
+    def _read_target_stream_entries(
         self,
         study_key: str,
-    ) -> tuple[str, dict[str, dict[str, Any]], list[str]]:
-        """Load consolidated Study checkpoints, falling back to legacy per-stream keys."""
-        if not self._airflow_available():
-            return study_key, {}, []
+        stream_names: Sequence[str],
+    ) -> dict[str, dict[str, Any] | None]:
+        """Read checkpoints strictly for ``stream_names`` with consolidated read-only fallback."""
+        unique_streams = list(dict.fromkeys(stream_names))
+        if not unique_streams or not self._airflow_available():
+            return {}
 
+        target_keys = {
+            s_name: self._get_variable_key(study_key, s_name) for s_name in unique_streams
+        }
         study_var_key = self._get_study_variable_key(study_key)
-        legacy_prefix = self._study_prefix(study_key)
+        entries: dict[str, dict[str, Any] | None] = {}
 
         if self._has_active_task_sdk_comms():
-            consolidated = self._read_variable(study_var_key)
-            if consolidated is not None:
-                resolved_study, streams = self._extract_study_streams(consolidated, study_key)
-                return resolved_study, streams, []
-
-            legacy_keys = sorted(self._list_variable_keys(legacy_prefix))
-            if not legacy_keys:
-                return study_key, {}, []
-
-            streams = {}
-            resolved_study = study_key
-            for legacy_key in legacy_keys:
-                entry = self._read_variable(legacy_key)
-                if not entry:
-                    continue
-                parsed = self._parse_variable_key(legacy_key)
-                entry_study = entry.get("study_key")
-                if isinstance(entry_study, str) and entry_study:
-                    resolved_study = entry_study
-                s_name = entry.get("stream_name") or (parsed[1] if parsed else None)
-                if isinstance(s_name, str) and s_name:
-                    streams[s_name] = dict(entry)
-            return resolved_study, streams, legacy_keys
+            missing_streams: list[str] = []
+            for s_name in unique_streams:
+                sharded = self._read_variable(target_keys[s_name])
+                if sharded is not None:
+                    entries[s_name] = sharded
+                else:
+                    missing_streams.append(s_name)
+            if missing_streams:
+                consolidated = self._read_variable(study_var_key)
+                if consolidated is not None:
+                    _, fallback_streams = self._extract_study_streams(consolidated, study_key)
+                    for s_name in missing_streams:
+                        if s_name in fallback_streams:
+                            entries[s_name] = fallback_streams[s_name]
+            return entries
 
         try:
             from airflow.models.variable import Variable as ModelVariable
-            from sqlalchemy import or_, select
+            from sqlalchemy import select
         except ImportError:
-            return study_key, {}, []
+            return {}
 
-        raw_rows: list[tuple[str, dict[str, Any] | None]] = []
+        found: dict[str, dict[str, Any] | None] = {}
         with self._open_orm_read_session() as session:
             rows = session.scalars(
-                select(ModelVariable)
-                .where(
-                    or_(
-                        ModelVariable.key == study_var_key,
-                        ModelVariable.key.startswith(legacy_prefix, autoescape=True),
-                    )
+                select(ModelVariable).where(
+                    ModelVariable.key.in_([*target_keys.values(), study_var_key])
                 )
-                .order_by(ModelVariable.key)
             ).all()
             for row in rows:
-                raw_rows.append((str(row.key), self._deserialize_json_dict(row.val)))
+                found[str(row.key)] = self._deserialize_json_dict(row.val)
 
-        has_study_row = False
-        consolidated_payload: dict[str, Any] | None = None
-        legacy_keys = []
-        legacy_entries: list[tuple[str, dict[str, Any]]] = []
-        for row_key, decoded in raw_rows:
-            if row_key == study_var_key:
-                has_study_row = True
-                consolidated_payload = decoded
-            else:
-                legacy_keys.append(row_key)
-                if decoded is not None:
-                    legacy_entries.append((row_key, decoded))
-
-        if has_study_row:
-            if consolidated_payload is None:
-                return study_key, {}, legacy_keys
-            resolved_study, streams = self._extract_study_streams(consolidated_payload, study_key)
-            return resolved_study, streams, legacy_keys
-
-        streams = {}
-        resolved_study = study_key
-        for legacy_key, entry in legacy_entries:
-            parsed = self._parse_variable_key(legacy_key)
-            entry_study = entry.get("study_key")
-            if isinstance(entry_study, str) and entry_study:
-                resolved_study = entry_study
-            s_name = entry.get("stream_name") or (parsed[1] if parsed else None)
-            if isinstance(s_name, str) and s_name:
-                streams[s_name] = dict(entry)
-        return resolved_study, streams, legacy_keys
-
-    def _save_study_state(
-        self,
-        study_key: str,
-        streams: dict[str, dict[str, Any]],
-        *,
-        legacy_keys_to_delete: Sequence[str] = (),
-    ) -> None:
-        """Persist consolidated Study checkpoints and delete superseded legacy keys."""
-        if not self._airflow_available():
-            return
-
-        study_var_key = self._get_study_variable_key(study_key)
-        payload: dict[str, Any] = {
-            "study_key": study_key,
-            "streams": streams,
-        }
-
-        if self._has_active_task_sdk_comms():
-            self._write_variable(study_var_key, payload)
-            for legacy_key in legacy_keys_to_delete:
-                self._delete_listed_variable_key(legacy_key)
-            return
-
-        if not legacy_keys_to_delete:
-            self._write_variable(study_var_key, payload)
-            return
-
-        try:
-            from airflow.models.variable import Variable as ModelVariable
-            from airflow.utils.session import create_session
-            from sqlalchemy import delete
-        except ImportError:
-            return
-
-        self._ensure_orm_session()
-        with create_session() as session:
-            ModelVariable.set(study_var_key, payload, serialize_json=True, session=session)
-            session.execute(
-                delete(ModelVariable).where(ModelVariable.key.in_(list(legacy_keys_to_delete)))
+        fallback_streams_orm: dict[str, dict[str, Any]] = {}
+        if study_var_key in found and found[study_var_key] is not None:
+            _, fallback_streams_orm = self._extract_study_streams(
+                found[study_var_key],  # type: ignore[arg-type]
+                study_key,
             )
-        with contextlib.suppress(Exception):
-            from airflow.sdk import SecretCache
 
-            for legacy_key in legacy_keys_to_delete:
-                SecretCache.invalidate_variable(legacy_key)
+        for s_name in unique_streams:
+            var_key = target_keys[s_name]
+            if var_key in found:
+                entries[s_name] = found[var_key]
+            elif s_name in fallback_streams_orm:
+                entries[s_name] = fallback_streams_orm[s_name]
+        return entries
 
     def get_last_timestamp(self, study_key: str, stream_name: str) -> datetime | None:
         """Return the high-water mark timestamp for a Study and stream from Airflow Variables."""
@@ -1431,8 +1451,7 @@ class AirflowStateProvider(BaseStateProvider):
         """Persist SDTM sidecar lineage and monotonic sequence watermarks in Airflow Variables."""
         if not lineage_updates and not seq_watermarks:
             return
-        resolved_study, streams, legacy_keys = self._load_study_state(study_key)
-        existing = streams.get(stream_name)
+        existing = self._read_stream_entry(study_key, stream_name)
         prior_meta = existing.get("metadata") if isinstance(existing, dict) else {}
         incoming: dict[str, Any] = {}
         if lineage_updates:
@@ -1445,22 +1464,19 @@ class AirflowStateProvider(BaseStateProvider):
         )
         if isinstance(existing, dict):
             updated = dict(existing)
+            updated["study_key"] = study_key
+            updated["stream_name"] = stream_name
             updated["metadata"] = _sanitize_metadata(merged_meta)
-            streams[stream_name] = updated
         else:
-            streams[stream_name] = self._build_stream_payload(
-                study_key=resolved_study,
+            updated = self._build_stream_payload(
+                study_key=study_key,
                 stream_name=stream_name,
                 timestamp=None,
                 records_processed=0,
                 status=StreamExecutionStatus.SUCCESS,
                 metadata=merged_meta,
             )
-        self._save_study_state(
-            resolved_study,
-            streams,
-            legacy_keys_to_delete=legacy_keys,
-        )
+        self._write_stream_entry(study_key, stream_name, updated)
 
     def set_last_timestamp(
         self,
@@ -1478,10 +1494,9 @@ class AirflowStateProvider(BaseStateProvider):
         lease_expires_at: datetime | None = None,
         _preserve_existing_lineage: bool = True,
     ) -> None:
-        """Persist the high-water mark checkpoint for a Study and stream in Airflow Variables."""
+        """Persist the sharded checkpoint for a Study and stream in Airflow Variables."""
         validated_status = _coerce_and_validate_status(status)
-        resolved_study, streams, legacy_keys = self._load_study_state(study_key)
-        existing_payload = streams.get(stream_name)
+        existing_payload = self._read_stream_entry(study_key, stream_name)
 
         if not force:
             current_status = self._parse_status(existing_payload)
@@ -1496,8 +1511,8 @@ class AirflowStateProvider(BaseStateProvider):
             prior_meta if isinstance(prior_meta, Mapping) else None,
             metadata,
         )
-        streams[stream_name] = self._build_stream_payload(
-            study_key=resolved_study,
+        payload = self._build_stream_payload(
+            study_key=study_key,
             stream_name=stream_name,
             timestamp=timestamp,
             records_processed=records_processed,
@@ -1508,11 +1523,7 @@ class AirflowStateProvider(BaseStateProvider):
             owner_host=owner_host,
             lease_expires_at=lease_expires_at,
         )
-        self._save_study_state(
-            resolved_study,
-            streams,
-            legacy_keys_to_delete=legacy_keys,
-        )
+        self._write_stream_entry(study_key, stream_name, payload)
 
     @staticmethod
     def _extract_lease_fields(
@@ -1539,9 +1550,8 @@ class AirflowStateProvider(BaseStateProvider):
         *,
         lease_ttl_seconds: float | None = None,
     ) -> Generator[dict[str, Any], None, None]:
-        """Context manager for transactional state tracking backed by Airflow Variables."""
-        resolved_study, streams, legacy_keys = self._load_study_state(study_key)
-        raw_entry = streams.get(stream_name)
+        """Context manager for sharded transactional state tracking backed by Airflow Variables."""
+        raw_entry = self._read_stream_entry(study_key, stream_name)
         prior_ts = _normalize_optional_utc(self._parse_timestamp(raw_entry))
         raw_prior_meta = raw_entry.get("metadata") if isinstance(raw_entry, dict) else None
         prior_metadata: dict[str, Any] = (
@@ -1564,8 +1574,8 @@ class AirflowStateProvider(BaseStateProvider):
             if stale_reason is not None:
                 validate_transition(current_status, StreamExecutionStatus.FAILED)
                 raw_processed = raw_entry.get("records_processed", 0)
-                streams[stream_name] = self._build_stream_payload(
-                    study_key=resolved_study,
+                recovered_payload = self._build_stream_payload(
+                    study_key=study_key,
                     stream_name=stream_name,
                     timestamp=prior_ts,
                     records_processed=(
@@ -1577,19 +1587,14 @@ class AirflowStateProvider(BaseStateProvider):
                     error_message=f"Recovered stale running stream: {stale_reason}",
                     metadata=copy.deepcopy(prior_metadata),
                 )
-                self._save_study_state(
-                    resolved_study,
-                    streams,
-                    legacy_keys_to_delete=legacy_keys,
-                )
-                legacy_keys = []
+                self._write_stream_entry(study_key, stream_name, recovered_payload)
                 current_status = StreamExecutionStatus.FAILED
 
         validate_transition(current_status, StreamExecutionStatus.RUNNING)
 
         ttl = self.lease_ttl_seconds if lease_ttl_seconds is None else lease_ttl_seconds
-        streams[stream_name] = self._build_stream_payload(
-            study_key=resolved_study,
+        running_payload = self._build_stream_payload(
+            study_key=study_key,
             stream_name=stream_name,
             timestamp=prior_ts,
             records_processed=0,
@@ -1599,11 +1604,7 @@ class AirflowStateProvider(BaseStateProvider):
             owner_host=socket.gethostname(),
             lease_expires_at=now + timedelta(seconds=ttl),
         )
-        self._save_study_state(
-            resolved_study,
-            streams,
-            legacy_keys_to_delete=legacy_keys,
-        )
+        self._write_stream_entry(study_key, stream_name, running_payload)
 
         tx_data: dict[str, Any] = {
             "last_timestamp": effective_ts,
@@ -1618,8 +1619,8 @@ class AirflowStateProvider(BaseStateProvider):
             if isinstance(err, GeneratorExit):
                 raise
             validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
-            streams[stream_name] = self._build_stream_payload(
-                study_key=resolved_study,
+            failed_payload = self._build_stream_payload(
+                study_key=study_key,
                 stream_name=stream_name,
                 timestamp=prior_ts,
                 records_processed=tx_data.get("records_processed", 0),
@@ -1627,26 +1628,32 @@ class AirflowStateProvider(BaseStateProvider):
                 error_message=str(err),
                 metadata=copy.deepcopy(prior_metadata),
             )
-            self._save_study_state(resolved_study, streams)
+            self._write_stream_entry(study_key, stream_name, failed_payload)
             raise
         else:
             validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
             raw_new_ts = tx_data.get("new_timestamp")
             commit_ts = _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
             raw_commit_meta = tx_data.get("metadata")
-            merged_commit_meta = _merge_preserved_lineage_metadata(
+            latest_entry = self._read_stream_entry(study_key, stream_name)
+            latest_meta = latest_entry.get("metadata") if isinstance(latest_entry, dict) else None
+            base_meta = _merge_preserved_lineage_metadata(
                 prior_metadata,
+                latest_meta if isinstance(latest_meta, Mapping) else None,
+            )
+            merged_commit_meta = _merge_preserved_lineage_metadata(
+                base_meta,
                 raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
             )
-            streams[stream_name] = self._build_stream_payload(
-                study_key=resolved_study,
+            success_payload = self._build_stream_payload(
+                study_key=study_key,
                 stream_name=stream_name,
                 timestamp=commit_ts,
                 records_processed=tx_data.get("records_processed", 0),
                 status=StreamExecutionStatus.SUCCESS,
                 metadata=merged_commit_meta,
             )
-            self._save_study_state(resolved_study, streams)
+            self._write_stream_entry(study_key, stream_name, success_payload)
 
     @contextlib.contextmanager
     def batch_transaction(
@@ -1657,13 +1664,13 @@ class AirflowStateProvider(BaseStateProvider):
         *,
         lease_ttl_seconds: float | None = None,
     ) -> Generator[dict[str, dict[str, Any]], None, None]:
-        """Context manager for batched transactional tracking across multiple Study streams."""
+        """Context manager for batched transactional tracking scoped to target Study streams."""
         unique_streams = list(dict.fromkeys(stream_names))
         if not unique_streams:
             yield {}
             return
 
-        resolved_study, streams, legacy_keys = self._load_study_state(study_key)
+        target_entries = self._read_target_stream_entries(study_key, unique_streams)
         fallback_utc = _normalize_optional_utc(fallback_timestamp)
         now = datetime.now(UTC)
         prior_ts_map: dict[str, datetime | None] = {}
@@ -1671,7 +1678,7 @@ class AirflowStateProvider(BaseStateProvider):
         tx_map: dict[str, dict[str, Any]] = {}
 
         for stream_name in unique_streams:
-            raw_entry = streams.get(stream_name)
+            raw_entry = target_entries.get(stream_name)
             prior_ts = _normalize_optional_utc(self._parse_timestamp(raw_entry))
             raw_prior_meta = raw_entry.get("metadata") if isinstance(raw_entry, dict) else None
             prior_meta: dict[str, Any] = (
@@ -1706,9 +1713,9 @@ class AirflowStateProvider(BaseStateProvider):
         lease_exp = now + timedelta(seconds=ttl)
         owner_pid = os.getpid()
         owner_host = socket.gethostname()
-        for stream_name in unique_streams:
-            streams[stream_name] = self._build_stream_payload(
-                study_key=resolved_study,
+        running_payloads = {
+            stream_name: self._build_stream_payload(
+                study_key=study_key,
                 stream_name=stream_name,
                 timestamp=prior_ts_map[stream_name],
                 records_processed=0,
@@ -1718,22 +1725,21 @@ class AirflowStateProvider(BaseStateProvider):
                 owner_host=owner_host,
                 lease_expires_at=lease_exp,
             )
-        self._save_study_state(
-            resolved_study,
-            streams,
-            legacy_keys_to_delete=legacy_keys,
-        )
+            for stream_name in unique_streams
+        }
+        self._write_stream_entries_batch(study_key, running_payloads)
 
         try:
             yield tx_map
         except BaseException as err:
             if isinstance(err, GeneratorExit):
                 raise
+            failed_payloads: dict[str, dict[str, Any]] = {}
             for stream_name in unique_streams:
                 validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
                 tx_data = tx_map[stream_name]
-                streams[stream_name] = self._build_stream_payload(
-                    study_key=resolved_study,
+                failed_payloads[stream_name] = self._build_stream_payload(
+                    study_key=study_key,
                     stream_name=stream_name,
                     timestamp=prior_ts_map[stream_name],
                     records_processed=tx_data.get("records_processed", 0),
@@ -1741,9 +1747,10 @@ class AirflowStateProvider(BaseStateProvider):
                     error_message=str(err),
                     metadata=copy.deepcopy(prior_meta_map[stream_name]),
                 )
-            self._save_study_state(resolved_study, streams)
+            self._write_stream_entries_batch(study_key, failed_payloads)
             raise
         else:
+            success_payloads: dict[str, dict[str, Any]] = {}
             for stream_name in unique_streams:
                 validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
                 tx_data = tx_map[stream_name]
@@ -1758,27 +1765,27 @@ class AirflowStateProvider(BaseStateProvider):
                     prior_meta_map[stream_name],
                     raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
                 )
-                streams[stream_name] = self._build_stream_payload(
-                    study_key=resolved_study,
+                success_payloads[stream_name] = self._build_stream_payload(
+                    study_key=study_key,
                     stream_name=stream_name,
                     timestamp=commit_ts,
                     records_processed=tx_data.get("records_processed", 0),
                     status=StreamExecutionStatus.SUCCESS,
                     metadata=merged_commit_meta,
                 )
-            self._save_study_state(resolved_study, streams)
+            self._write_stream_entries_batch(study_key, success_payloads)
 
     def _delete_study_variables(self, study_key: str) -> bool:
-        """Delete the consolidated Study Variable and any legacy per-stream Variables."""
+        """Delete all sharded stream Variables and any consolidated Study Variable."""
         if not self._airflow_available():
             return False
 
         study_var_key = self._get_study_variable_key(study_key)
-        legacy_prefix = self._study_prefix(study_key)
+        stream_prefix = self._study_prefix(study_key)
 
         if self._has_active_task_sdk_comms():
             candidates = self._list_variable_keys(study_var_key)
-            matched = [k for k in candidates if k == study_var_key or k.startswith(legacy_prefix)]
+            matched = [k for k in candidates if k == study_var_key or k.startswith(stream_prefix)]
             if not matched:
                 return False
             for key in matched:
@@ -1793,87 +1800,154 @@ class AirflowStateProvider(BaseStateProvider):
             return False
 
         self._ensure_orm_session()
-        with create_session() as session:
-            result = session.execute(
-                delete(ModelVariable).where(
-                    or_(
-                        ModelVariable.key == study_var_key,
-                        ModelVariable.key.startswith(legacy_prefix, autoescape=True),
+        with self._suppress_inactive_supervisor_comms(), create_session() as session:
+            matched_keys = [
+                str(k)
+                for k in session.scalars(
+                    delete(ModelVariable)
+                    .where(
+                        or_(
+                            ModelVariable.key == study_var_key,
+                            ModelVariable.key.startswith(stream_prefix, autoescape=True),
+                        )
                     )
-                )
-            )
-            deleted_rows = int(getattr(result, "rowcount", 0) or 0)
-        if deleted_rows > 0:
-            with contextlib.suppress(Exception):
-                from airflow.sdk import SecretCache
+                    .returning(ModelVariable.key)
+                ).all()
+            ]
+            if not matched_keys:
+                return False
+        with contextlib.suppress(Exception):
+            from airflow.sdk import SecretCache
 
-                SecretCache.invalidate_variable(study_var_key)
-        return deleted_rows > 0
+            for key in matched_keys:
+                SecretCache.invalidate_variable(key)
+        return True
 
     def delete_entry(self, study_key: str, stream_name: str | None = None) -> bool:
-        """Delete a Study or specific stream checkpoint from Airflow Variables."""
+        """Delete a Study or target stream checkpoint from Airflow Variables."""
         if stream_name is None:
             return self._delete_study_variables(study_key)
 
-        resolved_study, streams, legacy_keys = self._load_study_state(study_key)
-        if stream_name not in streams:
+        if not self._airflow_available():
             return False
 
-        del streams[stream_name]
-        if streams:
-            self._save_study_state(
-                resolved_study,
-                streams,
-                legacy_keys_to_delete=legacy_keys,
-            )
-            return True
+        stream_var_key = self._get_variable_key(study_key, stream_name)
+        study_var_key = self._get_study_variable_key(study_key)
+        stream_prefix = self._study_prefix(study_key)
 
         if self._has_active_task_sdk_comms():
-            if legacy_keys:
-                for key in legacy_keys:
-                    self._delete_listed_variable_key(key)
-            else:
-                self._delete_listed_variable_key(self._get_study_variable_key(study_key))
-            return True
+            candidates = set(self._list_variable_keys(study_var_key))
+            removed = False
+            if stream_var_key in candidates:
+                self._delete_listed_variable_key(stream_var_key)
+                removed = True
+            if study_var_key in candidates:
+                consolidated = self._read_variable(study_var_key)
+                if consolidated is not None:
+                    resolved_study, streams = self._extract_study_streams(consolidated, study_key)
+                    if stream_name in streams:
+                        unsharded_streams = {
+                            s_name: payload
+                            for s_name, payload in streams.items()
+                            if s_name != stream_name
+                            and self._get_variable_key(study_key, s_name) not in candidates
+                        }
+                        removed = True
+                        if unsharded_streams:
+                            self._write_variable(
+                                study_var_key,
+                                {"study_key": resolved_study, "streams": unsharded_streams},
+                            )
+                        else:
+                            self._delete_listed_variable_key(study_var_key)
+            return removed
 
-        return self._delete_study_variables(study_key)
+        try:
+            from airflow.models.variable import Variable as ModelVariable
+            from airflow.utils.session import create_session
+            from sqlalchemy import delete, select
+        except ImportError:
+            return False
+
+        self._ensure_orm_session()
+        removed = False
+        modified_study_var = False
+        with self._suppress_inactive_supervisor_comms(), create_session() as session:
+            del_res = session.execute(
+                delete(ModelVariable).where(ModelVariable.key == stream_var_key)
+            )
+            if int(getattr(del_res, "rowcount", 0) or 0) > 0:
+                removed = True
+
+            study_row = session.scalars(
+                select(ModelVariable).where(ModelVariable.key == study_var_key)
+            ).first()
+            if study_row is not None:
+                consolidated = self._deserialize_json_dict(study_row.val)
+                if consolidated is not None:
+                    resolved_study, streams = self._extract_study_streams(consolidated, study_key)
+                    if stream_name in streams:
+                        existing_sharded = {
+                            str(k)
+                            for k in session.scalars(
+                                select(ModelVariable.key).where(
+                                    ModelVariable.key.startswith(stream_prefix, autoescape=True)
+                                )
+                            ).all()
+                        }
+                        unsharded_streams = {
+                            s_name: payload
+                            for s_name, payload in streams.items()
+                            if s_name != stream_name
+                            and self._get_variable_key(study_key, s_name) not in existing_sharded
+                        }
+                        removed = True
+                        modified_study_var = True
+                        if unsharded_streams:
+                            ModelVariable.set(
+                                study_var_key,
+                                {"study_key": resolved_study, "streams": unsharded_streams},
+                                serialize_json=True,
+                                session=session,
+                            )
+                        else:
+                            session.execute(
+                                delete(ModelVariable).where(ModelVariable.key == study_var_key)
+                            )
+
+        if removed:
+            with contextlib.suppress(Exception):
+                from airflow.sdk import SecretCache
+
+                SecretCache.invalidate_variable(stream_var_key)
+                if modified_study_var:
+                    SecretCache.invalidate_variable(study_var_key)
+        return removed
 
     def read_state(self) -> LedgerState:
-        """Read and validate the full ledger state across all Study checkpoints."""
+        """Read and validate the full ledger state across sharded and consolidated checkpoints."""
         state = LedgerState()
         if not self._airflow_available():
             return state
 
         root_prefix = f"{self.variable_prefix}:"
         consolidated_rows: list[tuple[str, dict[str, Any]]] = []
-        legacy_rows: list[tuple[str, dict[str, Any]]] = []
-        consolidated_encoded_studies: set[str] = set()
+        sharded_rows: list[tuple[str, dict[str, Any]]] = []
 
         if self._has_active_task_sdk_comms():
             keys = sorted(self._list_variable_keys(root_prefix))
-            study_keys_list: list[str] = []
-            legacy_keys_list: list[tuple[str, str]] = []
             for key in keys:
                 remainder = key[len(root_prefix) :]
                 encoded_study, sep, encoded_stream = remainder.partition(":")
                 if not sep:
                     if encoded_study:
-                        study_keys_list.append(key)
-                        consolidated_encoded_studies.add(encoded_study)
+                        payload = self._read_variable(key)
+                        if payload:
+                            consolidated_rows.append((key, payload))
                 elif encoded_study and encoded_stream:
-                    legacy_keys_list.append((encoded_study, key))
-
-            for key in study_keys_list:
-                payload = self._read_variable(key)
-                if payload:
-                    consolidated_rows.append((key, payload))
-
-            for encoded_study, key in legacy_keys_list:
-                if encoded_study in consolidated_encoded_studies:
-                    continue
-                payload = self._read_variable(key)
-                if payload:
-                    legacy_rows.append((key, payload))
+                    payload = self._read_variable(key)
+                    if payload:
+                        sharded_rows.append((key, payload))
         else:
             try:
                 from airflow.models.variable import Variable as ModelVariable
@@ -1895,12 +1969,10 @@ class AirflowStateProvider(BaseStateProvider):
                 remainder = key[len(root_prefix) :]
                 encoded_study, sep, encoded_stream = remainder.partition(":")
                 if not sep:
-                    if encoded_study:
-                        consolidated_encoded_studies.add(encoded_study)
-                        if payload:
-                            consolidated_rows.append((key, payload))
+                    if encoded_study and payload:
+                        consolidated_rows.append((key, payload))
                 elif encoded_study and encoded_stream and payload:
-                    legacy_rows.append((key, payload))
+                    sharded_rows.append((key, payload))
 
         for key, payload in consolidated_rows:
             decoded_study = self._parse_study_variable_key(key)
@@ -1913,11 +1985,7 @@ class AirflowStateProvider(BaseStateProvider):
                     study = state.studies.setdefault(s_key, StudyState())
                     study.streams[s_name] = stream_state
 
-        for key, payload in legacy_rows:
-            remainder = key[len(root_prefix) :]
-            encoded_study, _, _ = remainder.partition(":")
-            if encoded_study in consolidated_encoded_studies:
-                continue
+        for key, payload in sharded_rows:
             parsed_key = self._parse_variable_key(key)
             raw_s_key = payload.get("study_key") or (parsed_key[0] if parsed_key else None)
             raw_s_name = payload.get("stream_name") or (parsed_key[1] if parsed_key else None)
@@ -1932,11 +2000,46 @@ class AirflowStateProvider(BaseStateProvider):
 
 
 def get_state_provider(
-    ledger_path: str = DEFAULT_LEDGER_PATH,
+    ledger_path: str | Path | None = DEFAULT_LEDGER_PATH,
+    *,
+    provider_name: str | None = None,
+    variable_prefix: str | None = None,
 ) -> BaseStateProvider:
-    """Factory to get the appropriate state provider based on environment."""
-    if "AIRFLOW_CTX_TASK_ID" in os.environ or os.environ.get("USE_AIRFLOW_STATE_PROVIDER") == "1":
+    """Factory to get the appropriate state provider based on arguments and environment."""
+    normalized_provider = provider_name.strip().lower() if isinstance(provider_name, str) else None
+    if normalized_provider not in (None, "default", "file", "airflow"):
+        raise ValueError(
+            f"Unsupported state provider '{provider_name}'. Expected 'default', 'file', or 'airflow'."
+        )
+
+    explicit_ledger = ledger_path is not None and str(ledger_path) != DEFAULT_LEDGER_PATH
+    if explicit_ledger or normalized_provider == "file":
+        resolved_path: str | Path = DEFAULT_LEDGER_PATH if ledger_path is None else ledger_path
+        if (
+            not explicit_ledger
+            and str(resolved_path) == DEFAULT_LEDGER_PATH
+            and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ
+        ):
+            resolved_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
+        return FileStateProvider(resolved_path)
+
+    use_airflow = normalized_provider == "airflow" or (
+        normalized_provider in (None, "default")
+        and (
+            variable_prefix is not None
+            or "AIRFLOW_CTX_TASK_ID" in os.environ
+            or os.environ.get("USE_AIRFLOW_STATE_PROVIDER") == "1"
+        )
+    )
+    if use_airflow:
+        if variable_prefix is not None:
+            return AirflowStateProvider(variable_prefix=variable_prefix)
         return AirflowStateProvider()
-    if ledger_path == DEFAULT_LEDGER_PATH and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
-        ledger_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
-    return FileStateProvider(ledger_path)
+
+    resolved_default_path: str | Path = DEFAULT_LEDGER_PATH if ledger_path is None else ledger_path
+    if (
+        str(resolved_default_path) == DEFAULT_LEDGER_PATH
+        and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ
+    ):
+        resolved_default_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
+    return FileStateProvider(resolved_default_path)

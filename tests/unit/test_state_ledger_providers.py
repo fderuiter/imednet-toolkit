@@ -114,8 +114,10 @@ def test_airflow_variable_roundtrip_and_read_state(sdk_variable_store: dict[str,
     assert state.studies["STUDY:01_A"].streams["records_main"].records_processed == 12
     assert state.studies["STUDY:01_A"].streams["records_main"].metadata == {"batch": 1}
     assert state.studies["STUDY:01_A"].streams["queries"].records_processed == 3
-    assert len(sdk_variable_store) == 1
-    assert provider._get_variable_key("STUDY:01_A") in sdk_variable_store
+    assert len(sdk_variable_store) == 2
+    assert provider._get_variable_key("STUDY:01_A", "records_main") in sdk_variable_store
+    assert provider._get_variable_key("STUDY:01_A", "queries") in sdk_variable_store
+    assert provider._get_study_variable_key("STUDY:01_A") not in sdk_variable_store
 
 
 def test_airflow_delete_entry_stream_and_study(sdk_variable_store: dict[str, Any]) -> None:
@@ -243,17 +245,17 @@ def test_airflow_initial_failure_and_empty_run_keep_none_watermark(
 ) -> None:
     """Airflow provider keeps last_timestamp as None on failed or zero-record initial syncs."""
     provider = AirflowStateProvider()
-    var_key = provider._get_variable_key("ST-INIT")
+    var_key = provider._get_variable_key("ST-INIT", "recs")
 
     with pytest.raises(RuntimeError, match="initial airflow failure"):
         with provider.transaction("ST-INIT", "recs") as tx:
             assert tx["last_timestamp"] is None
-            running_payload = json.loads(sdk_variable_store[var_key])["streams"]["recs"]
+            running_payload = json.loads(sdk_variable_store[var_key])
             assert running_payload["status"] == "running"
             assert running_payload["last_timestamp"] is None
             raise RuntimeError("initial airflow failure")
 
-    failed_payload = json.loads(sdk_variable_store[var_key])["streams"]["recs"]
+    failed_payload = json.loads(sdk_variable_store[var_key])
     assert failed_payload["status"] == "failed"
     assert failed_payload["last_timestamp"] is None
     assert provider.get_last_timestamp("ST-INIT", "recs") is None
@@ -263,7 +265,7 @@ def test_airflow_initial_failure_and_empty_run_keep_none_watermark(
         assert retry_tx["last_timestamp"] is None
         retry_tx["records_processed"] = 0
 
-    ok_payload = json.loads(sdk_variable_store[var_key])["streams"]["recs"]
+    ok_payload = json.loads(sdk_variable_store[var_key])
     assert ok_payload["status"] == "success"
     assert ok_payload["last_timestamp"] is None
     assert provider.get_last_timestamp("ST-INIT", "recs") is None
@@ -274,19 +276,19 @@ def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
 ) -> None:
     """Airflow provider recovers expired/dead-PID RUNNING Variable leases via FAILED -> RUNNING."""
     provider = AirflowStateProvider()
-    legacy_var_key = provider._get_variable_key("ST1", "recs")
+    sharded_var_key = provider._get_variable_key("ST1", "recs")
     pushed_statuses: list[str] = []
 
     orig_write = provider._write_variable
 
     def _tracking_write(key: str, payload: dict[str, Any]) -> None:
-        pushed_statuses.append(str(payload["streams"]["recs"]["status"]))
+        pushed_statuses.append(str(payload["status"]))
         orig_write(key, payload)
 
     provider._write_variable = _tracking_write  # type: ignore[method-assign]
 
     # Active lease on current PID blocks concurrent transaction
-    sdk_variable_store[legacy_var_key] = json.dumps(
+    sdk_variable_store[sharded_var_key] = json.dumps(
         {
             "last_timestamp": None,
             "status": "running",
@@ -299,8 +301,8 @@ def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
         with provider.transaction("ST1", "recs"):
             pass
 
-    # Expired remote lease transitions RUNNING -> FAILED -> RUNNING -> SUCCESS and deletes legacy key
-    sdk_variable_store[legacy_var_key] = json.dumps(
+    # Expired remote lease transitions RUNNING -> FAILED -> RUNNING -> SUCCESS on sharded stream key
+    sdk_variable_store[sharded_var_key] = json.dumps(
         {
             "last_timestamp": None,
             "status": "running",
@@ -316,8 +318,8 @@ def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
         tx["records_processed"] = 4
 
     assert pushed_statuses == ["failed", "running", "success"]
-    assert legacy_var_key not in sdk_variable_store
-    assert provider._get_variable_key("ST1") in sdk_variable_store
+    assert sharded_var_key in sdk_variable_store
+    assert provider._get_study_variable_key("ST1") not in sdk_variable_store
     assert provider.get_last_timestamp("ST1", "recs") == committed
 
 
@@ -338,10 +340,10 @@ def test_batch_transaction_single_write_per_phase_and_rollback(
     )[1]
 
     af_writes: list[str] = []
-    orig_af_write = airflow_provider._write_variable
-    airflow_provider._write_variable = lambda k, v: (  # type: ignore[method-assign]
-        af_writes.append(k),
-        orig_af_write(k, v),
+    orig_af_batch = airflow_provider._write_stream_entries_batch
+    airflow_provider._write_stream_entries_batch = lambda sk, payloads: (  # type: ignore[method-assign]
+        af_writes.append(sk),
+        orig_af_batch(sk, payloads),
     )[1]
 
     for prov, counter in ((file_provider, file_writes), (airflow_provider, af_writes)):
@@ -538,29 +540,27 @@ def test_airflow_legacy_keys_migrate_cleanly_and_sdk_rpc_budgets(
     t1 = datetime(2026, 3, 1, 9, 0, tzinfo=timezone.utc)
     t2 = datetime(2026, 3, 2, 9, 0, tzinfo=timezone.utc)
 
-    # 1. Seed two legacy per-stream keys for LEGACY_ST and one sibling study
-    legacy_k1 = provider._get_variable_key("LEGACY_ST", "sql_DM")
-    legacy_k2 = provider._get_variable_key("LEGACY_ST", "sql_VS")
-    sibling_legacy = provider._get_variable_key("LEGACY_ST_SIBLING", "sql_DM")
-    store[legacy_k1] = json.dumps(
+    # 1. Seed a consolidated Study Variable for LEGACY_ST and one sibling sharded key
+    consolidated_key = provider._get_study_variable_key("LEGACY_ST")
+    sibling_sharded = provider._get_variable_key("LEGACY_ST_SIBLING", "sql_DM")
+    store[consolidated_key] = json.dumps(
         {
             "study_key": "LEGACY_ST",
-            "stream_name": "sql_DM",
-            "last_timestamp": t1.isoformat(),
-            "records_processed": 11,
-            "status": "success",
+            "streams": {
+                "sql_DM": {
+                    "last_timestamp": t1.isoformat(),
+                    "records_processed": 11,
+                    "status": "success",
+                },
+                "sql_VS": {
+                    "last_timestamp": t2.isoformat(),
+                    "records_processed": 22,
+                    "status": "success",
+                },
+            },
         }
     )
-    store[legacy_k2] = json.dumps(
-        {
-            "study_key": "LEGACY_ST",
-            "stream_name": "sql_VS",
-            "last_timestamp": t2.isoformat(),
-            "records_processed": 22,
-            "status": "success",
-        }
-    )
-    store[sibling_legacy] = json.dumps(
+    store[sibling_sharded] = json.dumps(
         {
             "study_key": "LEGACY_ST_SIBLING",
             "stream_name": "sql_DM",
@@ -575,17 +575,19 @@ def test_airflow_legacy_keys_migrate_cleanly_and_sdk_rpc_budgets(
     pre_state = provider.read_state()
     assert set(pre_state.studies["LEGACY_ST"].streams) == {"sql_DM", "sql_VS"}
 
-    # Next study write consolidates BOTH streams into imednet_state:LEGACY_ST and deletes legacy keys
+    # Writing sql_DM shards ONLY imednet_state:LEGACY_ST:sql_DM without writing consolidated map
     t3 = datetime(2026, 3, 5, 12, 0, tzinfo=timezone.utc)
+    ops.clear()
     provider.set_last_timestamp("LEGACY_ST", "sql_DM", t3, records_processed=30)
-    assert provider._get_variable_key("LEGACY_ST") in store
-    assert legacy_k1 not in store
-    assert legacy_k2 not in store
-    assert sibling_legacy in store
+    sharded_dm_key = provider._get_variable_key("LEGACY_ST", "sql_DM")
+    assert sharded_dm_key in store
+    assert ("set", consolidated_key) not in ops
+    assert sibling_sharded in store
     assert provider.get_last_timestamp("LEGACY_ST", "sql_DM") == t3
+    # Untouched sibling stream still falls back read-only to consolidated map
     assert provider.get_last_timestamp("LEGACY_ST", "sql_VS") == t2
 
-    # 2. Seed 5 studies x 50 form streams (= 250 streams) and verify 6 RPCs in read_state
+    # 2. Seed 5 studies x 50 sharded form streams (= 250 streams) and verify read_state
     store.clear()
     for s_idx in range(1, 6):
         study_name = f"STUDY_{s_idx}"
@@ -600,29 +602,33 @@ def test_airflow_legacy_keys_migrate_cleanly_and_sdk_rpc_budgets(
     full_state = provider.read_state()
     assert len(full_state.studies) == 5
     assert sum(len(s.streams) for s in full_state.studies.values()) == 250
-    assert [op for op, _ in ops] == ["keys", "get", "get", "get", "get", "get"]
-    assert len(ops) == 6
+    assert ops[0] == ("keys", f"{provider.variable_prefix}:")
+    assert len(ops) == 251
 
-    # 3. Verify delete_entry(study_key) executes 2 RPCs (keys + delete, 0 get) & preserves sibling
+    # 3. Verify delete_entry(study_key) deletes only STUDY_1 sharded keys (0 get) & preserves sibling
     provider.set_last_timestamp("STUDY_1_OTHER", "sql_FORM_01", t3)
     ops.clear()
     assert provider.delete_entry("STUDY_1") is True
-    assert ops == [
-        ("keys", provider._get_variable_key("STUDY_1")),
-        ("delete", provider._get_variable_key("STUDY_1")),
-    ]
+    assert ops[0] == ("keys", provider._get_study_variable_key("STUDY_1"))
+    assert all(op == "delete" for op, _ in ops[1:])
+    assert len(ops) == 51
     assert provider.get_last_timestamp("STUDY_1_OTHER", "sql_FORM_01") == t3
     assert provider.delete_entry("STUDY_1") is False
 
-    # Single-stream delete removing one stream, then the final stream
+    # Single-stream delete removing one sharded stream (keys + delete, 0 get), then the final stream
     provider.set_last_timestamp("SINGLE_DEL", "s1", t1)
     provider.set_last_timestamp("SINGLE_DEL", "s2", t2)
     assert provider.delete_entry("SINGLE_DEL", "missing") is False
+    ops.clear()
     assert provider.delete_entry("SINGLE_DEL", "s1") is True
+    assert ops == [
+        ("keys", provider._get_study_variable_key("SINGLE_DEL")),
+        ("delete", provider._get_variable_key("SINGLE_DEL", "s1")),
+    ]
     assert provider.get_last_timestamp("SINGLE_DEL", "s1") is None
     assert provider.get_last_timestamp("SINGLE_DEL", "s2") == t2
     assert provider.delete_entry("SINGLE_DEL", "s2") is True
-    assert provider._get_variable_key("SINGLE_DEL") not in store
+    assert provider._get_variable_key("SINGLE_DEL", "s2") not in store
 
 
 def test_airflow_orm_mode_consolidated_migration_and_fallbacks(
@@ -740,39 +746,34 @@ def test_airflow_orm_mode_consolidated_migration_and_fallbacks(
     t1 = datetime(2026, 4, 1, 8, 0, tzinfo=timezone.utc)
     t2 = datetime(2026, 4, 2, 8, 0, tzinfo=timezone.utc)
 
-    # Seed legacy per-stream ORM rows and verify fallback read + migration on write
-    leg_1 = provider._get_variable_key("ORM_ST", "sql_DM")
-    leg_2 = provider._get_variable_key("ORM_ST", "sql_VS")
+    # Seed consolidated ORM row and verify fallback read + sharded write without overwriting consolidated row
+    consolidated_orm_key = provider._get_study_variable_key("ORM_ST")
     FakeModelVariable.set(
-        leg_1,
+        consolidated_orm_key,
         {
             "study_key": "ORM_ST",
-            "stream_name": "sql_DM",
-            "last_timestamp": t1.isoformat(),
-            "records_processed": 4,
-            "status": "success",
+            "streams": {
+                "sql_DM": {
+                    "last_timestamp": t1.isoformat(),
+                    "records_processed": 4,
+                    "status": "success",
+                },
+                "sql_VS": {
+                    "last_timestamp": t2.isoformat(),
+                    "records_processed": 8,
+                    "status": "failed",
+                },
+            },
         },
         serialize_json=True,
     )
-    FakeModelVariable.set(
-        leg_2,
-        {
-            "study_key": "ORM_ST",
-            "stream_name": "sql_VS",
-            "last_timestamp": t2.isoformat(),
-            "records_processed": 8,
-            "status": "failed",
-        },
-        serialize_json=True,
-    )
-    assert provider._list_variable_keys("imednet_state:ORM_ST:") == [leg_1, leg_2]
     assert provider.get_last_timestamp("ORM_ST", "sql_DM") == t1
     assert str(provider.get_last_status("ORM_ST", "sql_VS")).lower().endswith("failed")
 
     orm_initial = provider.read_state()
     assert set(orm_initial.studies["ORM_ST"].streams) == {"sql_DM", "sql_VS"}
 
-    # Migrate legacy rows to consolidated study row via batch_transaction
+    # batch_transaction writes sharded target stream keys in one ORM session without rewriting consolidated row
     t3 = datetime(2026, 4, 3, 10, 0, tzinfo=timezone.utc)
     with provider.batch_transaction("ORM_ST", ["sql_DM", "sql_AE"]) as tx_map:
         assert tx_map["sql_DM"]["last_timestamp"] == t1
@@ -782,11 +783,14 @@ def test_airflow_orm_mode_consolidated_migration_and_fallbacks(
         tx_map["sql_AE"]["new_timestamp"] = t3
         tx_map["sql_AE"]["records_processed"] = 3
 
-    assert set(invalidated) >= {leg_1, leg_2}
+    sharded_dm = provider._get_variable_key("ORM_ST", "sql_DM")
+    sharded_ae = provider._get_variable_key("ORM_ST", "sql_AE")
+    assert set(invalidated) >= {sharded_dm, sharded_ae}
+    assert consolidated_orm_key not in invalidated
     with session_factory() as check_sess:
         remaining_keys = sorted(check_sess.scalars(select(FakeModelVariable.key)).all())
-    assert remaining_keys == [provider._get_variable_key("ORM_ST")]
-    assert provider._read_variable(provider._get_variable_key("ORM_ST")) is not None
+    assert remaining_keys == sorted([consolidated_orm_key, sharded_dm, sharded_ae])
+    assert provider.get_last_timestamp("ORM_ST", "sql_DM") == t3
     assert provider.get_last_timestamp("ORM_ST", "sql_VS") == t2
     assert provider.get_last_timestamp("ORM_ST", "sql_AE") == t3
 
@@ -824,8 +828,8 @@ def test_airflow_orm_mode_consolidated_migration_and_fallbacks(
     assert provider._list_variable_keys("p") == []
     provider._delete_listed_variable_key("k")
     assert provider._read_stream_entry("S", "f") is None
-    assert provider._load_study_state("S") == ("S", {}, [])
-    provider._save_study_state("S", {})
+    assert provider._read_target_stream_entries("S", ["f"]) == {}
+    provider._write_stream_entries_batch("S", {"f": {}})
     assert provider.delete_entry("S") is False
     assert provider.read_state().studies == {}
     engine.dispose()

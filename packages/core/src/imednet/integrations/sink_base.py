@@ -235,13 +235,20 @@ def get_state_provider(
     ledger_path: str | Path | None = None,
     *,
     provider_name: str | None = None,
+    variable_prefix: str | None = None,
 ) -> StateProviderProtocol:
     """Discover and instantiate a pluggable checkpoint state provider at runtime."""
     from importlib.metadata import entry_points
 
-    target_name = provider_name or "default"
+    if ledger_path is not None:
+        target_name = "file" if provider_name in ("airflow", "file") else "default"
+    else:
+        target_name = provider_name or "default"
+
     eps = list(entry_points(group=STATE_PROVIDER_ENTRY_POINT_GROUP))
     matched = [ep for ep in eps if ep.name == target_name]
+    if not matched and ledger_path is not None:
+        matched = [ep for ep in eps if ep.name in ("file", "default")]
     if not matched and provider_name is None and eps:
         matched = [eps[0]]
     if not matched:
@@ -250,12 +257,21 @@ def get_state_provider(
             "Install 'imednet-workflows' or 'imednet[export]'."
         )
 
-    factory = matched[0].load()
-    if target_name == "airflow":
-        provider = factory()
-    elif ledger_path is not None:
+    ep = matched[0]
+    factory = ep.load()
+    if ledger_path is not None:
+        if ep.name == "default":
+            provider = factory(ledger_path=ledger_path, provider_name="file")
+        else:
+            provider = factory(ledger_path)
+    elif ep.name == "airflow":
         provider = (
-            factory(ledger_path=ledger_path) if target_name == "default" else factory(ledger_path)
+            factory(variable_prefix=variable_prefix) if variable_prefix is not None else factory()
+        )
+    elif ep.name == "default" and (provider_name is not None or variable_prefix is not None):
+        provider = factory(
+            provider_name=provider_name,
+            variable_prefix=variable_prefix,
         )
     else:
         provider = factory()

@@ -13,6 +13,7 @@ from imednet.spi.utils import (
     mask_clinical_phi,
     redact_sensitive_payload,
     redact_sensitive_text,
+    redact_url_query,
     validate_path_segment,
 )
 
@@ -20,14 +21,17 @@ from ._airflow_compat import AirflowException
 
 _CREDENTIAL_KEY_EXPR = (
     r"x-imn-security-key|x-api-key|"
+    r"x[-_]amz[-_](?:signature|credential|security[-_]token)|"
+    r"x[-_]goog[-_](?:signature|credential)|"
+    r"aws[_-]?access[_-]?key[_-]?id|"
     r"(?:[a-z0-9]+[_-]+)*(?:api[_-]?key|security[_-]?key|auth[_-]?key|access[_-]?key|"
     r"private[_-]?key(?:[_-]?passphrase)?|secret[_-]?key|csrf[_-]?key|client[_-]?secret|"
     r"oidc[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?token|"
     r"auth[_-]?token|bearer[_-]?token|session[_-]?token|csrf[_-]?token)|"
     r"(?:[a-z0-9]+[_-]+)+(?:token|tokens|secret|secrets|password|passwords|passwd|"
-    r"passphrase|credential|credentials)|"
+    r"passphrase|credential|credentials|signature|signatures)|"
     r"authorization|token|tokens|password|passwords|passwd|pwd|passphrase|"
-    r"secret|secrets|credential|credentials"
+    r"secret|secrets|credential|credentials|signature|signatures|sig"
 )
 
 _SINGLE_ASSIGNMENT_SECRET_RE = re.compile(
@@ -83,8 +87,31 @@ def validate_non_secret_identifier(
     return value
 
 
+def _redact_summary_urls_and_secrets(value: Any, *, key_name: str | None = None) -> Any:
+    """Recursively redact URL signatures, query tokens, URI credentials, and secret payloads."""
+    if isinstance(value, Mapping):
+        sanitized_map: dict[str, Any] = {}
+        for k, v in value.items():
+            k_str = str(k)
+            if k_str == "results":
+                continue
+            sanitized_map[k_str] = _redact_summary_urls_and_secrets(v, key_name=k_str)
+        return redact_sensitive_payload(sanitized_map)
+    if isinstance(value, list):
+        return [_redact_summary_urls_and_secrets(item, key_name=key_name) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_summary_urls_and_secrets(item, key_name=key_name) for item in value)
+    if isinstance(value, str):
+        redacted = redact_uri(redact_sensitive_text(value))
+        is_url_field = key_name is not None and key_name.lower() in {"result_url", "resulturl"}
+        if "?" in redacted and ("://" in redacted or redacted.startswith("/") or is_url_field):
+            redacted = redact_url_query(redacted)
+        return redact_sensitive_payload(redacted)
+    return value
+
+
 def build_job_summary(status: Any, *, study_key: str, batch_id: str) -> dict[str, Any]:
-    """Project a compact, ``results``-free, PHI-masked ``Job`` summary dictionary."""
+    """Project a compact, ``results``-free, PHI-masked, and credential-redacted ``Job`` summary."""
     model_dump = getattr(status, "model_dump", None)
     if callable(model_dump):
         try:
@@ -93,7 +120,7 @@ def build_job_summary(status: Any, *, study_key: str, batch_id: str) -> dict[str
             dumped = model_dump(mode="json")
         if isinstance(dumped, Mapping):
             summary = {str(k): v for k, v in dumped.items() if str(k) != "results"}
-            return cast(dict[str, Any], mask_clinical_phi(summary))
+            return cast(dict[str, Any], sanitize_job_summary(summary))
 
     raw_state = getattr(status, "state", None)
     state_val = getattr(raw_state, "value", raw_state)
@@ -103,15 +130,22 @@ def build_job_summary(status: Any, *, study_key: str, batch_id: str) -> dict[str
         "batch_id": raw_batch if isinstance(raw_batch, str) and raw_batch else batch_id,
         "state": str(state_val) if state_val is not None else None,
     }
-    return cast(dict[str, Any], mask_clinical_phi(fallback_summary))
+    raw_result_url = getattr(status, "result_url", None)
+    if raw_result_url is None:
+        raw_result_url = getattr(status, "resultUrl", None)
+    if isinstance(raw_result_url, str) and raw_result_url:
+        fallback_summary["result_url"] = raw_result_url
+    return cast(dict[str, Any], sanitize_job_summary(fallback_summary))
 
 
 def sanitize_job_summary(summary: Any) -> Any:
-    """Strip any ``results`` payload and apply ``mask_clinical_phi`` to a Job summary."""
+    """Strip ``results``, mask clinical PHI, and redact URL signatures/tokens on a Job summary."""
     if isinstance(summary, Mapping):
         cleaned = {str(k): v for k, v in summary.items() if str(k) != "results"}
-        return mask_clinical_phi(cleaned)
-    return mask_clinical_phi(summary)
+        phi_masked = mask_clinical_phi(cleaned)
+        return _redact_summary_urls_and_secrets(phi_masked)
+    phi_masked = mask_clinical_phi(summary)
+    return _redact_summary_urls_and_secrets(phi_masked)
 
 
 def _collect_phi_values(value: Any, out: set[str]) -> None:

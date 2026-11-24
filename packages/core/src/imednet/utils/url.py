@@ -129,7 +129,22 @@ def redact_url_query(url: str, sensitive_params: set[str] | None = None) -> str:
     """Return URL with sensitive query parameters redacted."""
     from imednet.utils.secrets import is_sensitive_key
 
-    default_params = {"api_key", "security_key", "token", "secret", "password"}
+    default_params = {
+        "api_key",
+        "security_key",
+        "token",
+        "secret",
+        "password",
+        "sig",
+        "signature",
+        "x-amz-credential",
+        "x-amz-signature",
+        "x-amz-security-token",
+        "x-goog-credential",
+        "x-goog-signature",
+        "awsaccesskeyid",
+        "aws_access_key_id",
+    }
 
     parsed = urlparse(url)
     query_params = parse_qsl(parsed.query, keep_blank_values=True)

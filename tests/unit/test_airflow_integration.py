@@ -92,8 +92,11 @@ def test_export_operator_exposes_mapped_runtime_fields(monkeypatch):
         "study_key",
         "output_path",
         "export_kwargs",
+        "stream_name",
     )
     assert "study_key" in ImednetExportOperator.template_fields
+    assert "stream_name" in ImednetExportOperator.template_fields
+    assert "variable_prefix" in ImednetExportOperator.template_fields
     assert ImednetExportOperator.template_fields_renderers == {"export_kwargs": "json"}
 
 
@@ -499,7 +502,7 @@ def _setup_airflow_for_dag(monkeypatch):
         # Mirrors ImednetExportOperator.mapped_runtime_fields: these are the fields
         # that Airflow sets at runtime (via template rendering / expand_kwargs) and
         # that the operator must read from self at execute time, not from __init__.
-        mapped_runtime_fields = ("study_key", "output_path", "export_kwargs")
+        mapped_runtime_fields = ("study_key", "output_path", "export_kwargs", "stream_name")
 
         def __init__(self, **kwargs):
             """Initialize the test object."""
@@ -951,14 +954,21 @@ def test_export_operator_full_template_fields_contract(monkeypatch):
     _setup_airflow(monkeypatch)
     from apache_airflow_providers_imednet import ImednetExportOperator
 
+    assert ImednetExportOperator.mapped_runtime_fields == (
+        "study_key",
+        "output_path",
+        "export_kwargs",
+        "stream_name",
+    )
     assert ImednetExportOperator.template_fields == (
         "study_key",
         "output_path",
         "export_kwargs",
+        "stream_name",
         "modified_since",
         "record_filter",
         "record_data_filter",
-        "stream_name",
+        "variable_prefix",
     )
 
 

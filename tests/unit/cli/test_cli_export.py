@@ -969,3 +969,190 @@ def test_cli_export_json_hierarchical_honors_incremental_filters_ledger_and_qual
     data2 = json.loads(out_file.read_text(encoding="utf-8"))
     assert len(data2) == 1
     assert data2[0]["visits"][0]["forms"][0]["records"][0]["recordId"] == 1
+
+
+def test_cli_export_duckdb_by_form_and_hive_parquet_end_to_end_with_checkpoints(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify duckdb-by-form and hive-parquet CLI subcommands, lazy exports, and incremental checkpoints."""
+    from datetime import UTC, datetime
+
+    import duckdb
+    import pyarrow.dataset as ds
+
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    # 1. Lazy exports in imednet.cli
+    assert "export_to_duckdb_by_form" in cli.__all__
+    assert "export_to_hive_parquet" in cli.__all__
+    assert callable(cli.export_to_duckdb_by_form)
+    assert callable(cli.export_to_hive_parquet)
+
+    # 2. Help & checkpoint options on both subcommands
+    for subcmd in ("duckdb-by-form", "hive-parquet"):
+        help_res = runner.invoke(cli.app, ["export", subcmd, "--help"])
+        assert help_res.exit_code == 0
+        for flag in (
+            "--incremental",
+            "--stream-name",
+            "--ledger-path",
+            "--since",
+            "--filter",
+            "--record-data-filter",
+            "--include-deleted",
+            "--use-labels",
+            "--no-mask-phi",
+            "--quality-gate",
+            "--no-interactive",
+        ):
+            assert flag in help_res.stdout
+
+    # 3. Missing optional dependency checks exit 1 cleanly
+    with monkeypatch.context() as mp:
+        mp.setattr(importlib.util, "find_spec", lambda _name: None)
+        assert (
+            runner.invoke(
+                cli.app, ["export", "duckdb-by-form", "S", str(tmp_path / "x.duckdb")]
+            ).exit_code
+            == 1
+        )
+        assert (
+            runner.invoke(
+                cli.app, ["export", "hive-parquet", "S", str(tmp_path / "x_hive")]
+            ).exit_code
+            == 1
+        )
+
+    # 4. Real end-to-end execution with multi-Form data and FileStateProvider checkpoints
+    records = [
+        Record(
+            record_id=1,
+            study_key="S_MF_CLI",
+            form_id=10,
+            form_key="DEMO",
+            subject_key="SUBJ-1",
+            date_modified=datetime(2026, 8, 10, 9, 0, tzinfo=UTC),
+            record_data={"AGE": 50, "PATIENT_NAME": "Bob Hidden"},
+        ),
+        Record(
+            record_id=2,
+            study_key="S_MF_CLI",
+            form_id=20,
+            form_key="VITALS",
+            subject_key="SUBJ-1",
+            date_modified=datetime(2026, 8, 10, 9, 30, tzinfo=UTC),
+            record_data={"HR": 72, "PATIENT_NAME": "Bob Hidden"},
+        ),
+    ]
+    variables = [
+        Variable(
+            variable_id=1,
+            variable_name="AGE",
+            variable_type="int",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_id=2,
+            variable_name="PATIENT_NAME",
+            variable_type="text",
+            form_id=10,
+            form_key="DEMO",
+        ),
+        Variable(
+            variable_id=3,
+            variable_name="HR",
+            variable_type="int",
+            form_id=20,
+            form_key="VITALS",
+        ),
+        Variable(
+            variable_id=4,
+            variable_name="PATIENT_NAME",
+            variable_type="text",
+            form_id=20,
+            form_key="VITALS",
+        ),
+    ]
+    forms = [
+        Form(form_id=10, form_key="DEMO", form_name="Demographics"),
+        Form(form_id=20, form_key="VITALS", form_name="Vitals"),
+    ]
+    sdk.forms.list.return_value = forms
+    sdk.get_forms.return_value = forms
+    sdk.variables.list.return_value = variables
+    sdk.get_variables.return_value = variables
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+
+    ledger_path = tmp_path / "cli_mf_ledger.json"
+    duck_db = tmp_path / "cli_mf.duckdb"
+    hive_root = tmp_path / "cli_hive"
+
+    res_duck = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "duckdb-by-form",
+            "S_MF_CLI",
+            str(duck_db),
+            "--incremental",
+            "--ledger-path",
+            str(ledger_path),
+        ],
+    )
+    assert res_duck.exit_code == 0, res_duck.output
+
+    with duckdb.connect(str(duck_db), read_only=True) as con:
+        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        assert {"DEMO", "VITALS"}.issubset(tables)
+        assert con.execute("SELECT AGE, PATIENT_NAME FROM DEMO").fetchone() == (
+            50,
+            "***MASKED***",
+        )
+
+    res_hive = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "hive-parquet",
+            "S_MF_CLI",
+            str(hive_root),
+            "--incremental",
+            "--ledger-path",
+            str(ledger_path),
+        ],
+    )
+    assert res_hive.exit_code == 0, res_hive.output
+
+    hive_rows = (
+        ds.dataset(
+            str(hive_root),
+            format="parquet",
+            partitioning="hive",
+            ignore_prefixes=["."],
+        )
+        .to_table()
+        .to_pylist()
+    )
+    assert {r["form_key"] for r in hive_rows} == {"DEMO", "VITALS"}
+    assert all(r["PATIENT_NAME"] == "***MASKED***" for r in hive_rows)
+
+    ledger = FileStateProvider(ledger_path)
+    assert ledger.get_last_timestamp("S_MF_CLI", "duckdb_DEMO") == datetime(
+        2026, 8, 10, 9, 0, tzinfo=UTC
+    )
+    assert ledger.get_last_timestamp("S_MF_CLI", "duckdb_VITALS") == datetime(
+        2026, 8, 10, 9, 30, tzinfo=UTC
+    )
+    assert ledger.get_last_timestamp("S_MF_CLI", "hive_parquet_DEMO") == datetime(
+        2026, 8, 10, 9, 0, tzinfo=UTC
+    )
+    assert ledger.get_last_timestamp("S_MF_CLI", "hive_parquet_VITALS") == datetime(
+        2026, 8, 10, 9, 30, tzinfo=UTC
+    )

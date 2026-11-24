@@ -391,6 +391,45 @@ def _sanitize_workflow_payload(
     return masked
 
 
+class _ExplicitLedgerPathAction(argparse.Action):
+    """Record an explicit -l/--ledger-path flag while preserving DEFAULT_LEDGER_PATH."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        namespace.explicit_ledger_path = True
+
+
+def _get_cli_state_provider(
+    ledger_path: str,
+    *,
+    provider: str | None = None,
+    variable_prefix: str | None = None,
+    explicit_ledger_path: bool = False,
+) -> Any:
+    """Resolve the state provider for CLI commands while honoring explicit --ledger-path."""
+    factory = _resolve_attr("get_state_provider")
+    if provider is None and variable_prefix is None and not explicit_ledger_path:
+        return factory(ledger_path)
+    if provider is None and variable_prefix is None and ledger_path != DEFAULT_LEDGER_PATH:
+        return factory(ledger_path)
+    effective_provider = "file" if explicit_ledger_path else provider
+    effective_ledger: str | None = ledger_path if explicit_ledger_path else None
+    try:
+        return factory(
+            effective_ledger,
+            provider_name=effective_provider,
+            variable_prefix=variable_prefix,
+        )
+    except TypeError:
+        return factory(ledger_path)
+
+
 def _execute_set_state(
     study_key: str | None,
     stream: str | None,
@@ -401,6 +440,10 @@ def _execute_set_state(
     parser: argparse.ArgumentParser | None = None,
     no_interactive: bool = False,
     force: bool = False,
+    *,
+    provider: str | None = None,
+    variable_prefix: str | None = None,
+    explicit_ledger_path: bool = False,
 ) -> None:
     """Execute high-water mark timestamp update for a study/stream in the ledger."""
     if not interactive:
@@ -428,8 +471,13 @@ def _execute_set_state(
             _emit_line(f"Invalid ISO timestamp format: {err}", err=True)
             sys.exit(1)
 
-        ledger = _resolve_attr("get_state_provider")(ledger_path)
         try:
+            ledger = _get_cli_state_provider(
+                ledger_path,
+                provider=provider,
+                variable_prefix=variable_prefix,
+                explicit_ledger_path=explicit_ledger_path,
+            )
             ledger.set_last_timestamp(
                 study_key=study_key,  # type: ignore[arg-type]
                 stream_name=stream,  # type: ignore[arg-type]
@@ -459,7 +507,16 @@ def _execute_set_state(
     )
 
     ensure_interactive_stdin(force_non_interactive=no_interactive)
-    ledger = _resolve_attr("get_state_provider")(ledger_path)
+    try:
+        ledger = _get_cli_state_provider(
+            ledger_path,
+            provider=provider,
+            variable_prefix=variable_prefix,
+            explicit_ledger_path=explicit_ledger_path,
+        )
+    except Exception as err:
+        _emit_line(f"Failed to initialize state provider: {err}", err=True)
+        sys.exit(1)
     current_state = display_ledger_streams(
         ledger_path=ledger_path,
         study_key=study_key,
@@ -536,6 +593,10 @@ def _execute_reset_state(
     interactive: bool = False,
     parser: argparse.ArgumentParser | None = None,
     no_interactive: bool = False,
+    *,
+    provider: str | None = None,
+    variable_prefix: str | None = None,
+    explicit_ledger_path: bool = False,
 ) -> None:
     """Execute high-water mark state deletion for a study/stream."""
     if interactive:
@@ -564,8 +625,13 @@ def _execute_reset_state(
         _emit_line(f"Error: {msg}", err=True)
         sys.exit(2)
 
-    ledger = _resolve_attr("get_state_provider")(ledger_path)
     try:
+        ledger = _get_cli_state_provider(
+            ledger_path,
+            provider=provider,
+            variable_prefix=variable_prefix,
+            explicit_ledger_path=explicit_ledger_path,
+        )
         if stream:
             removed = ledger.delete_entry(study_key, stream)
             if removed:
@@ -592,6 +658,9 @@ def _execute_show_state(
     interactive: bool = False,
     no_interactive: bool = False,
     output_format: str | None = None,
+    provider: str | None = None,
+    variable_prefix: str | None = None,
+    explicit_ledger_path: bool = False,
 ) -> None:
     """Display current high-water mark records and stream metadata from the ledger."""
     resolved_format = resolve_output_format(output_format)
@@ -609,8 +678,15 @@ def _execute_show_state(
         )
         study_key = study_input if study_input else None
 
-    ledger = _resolve_attr("get_state_provider")(ledger_path)
     try:
+        ledger = _get_cli_state_provider(
+            ledger_path,
+            provider=provider,
+            variable_prefix=variable_prefix,
+            explicit_ledger_path=explicit_ledger_path,
+        )
+        raw_prefix = getattr(ledger, "variable_prefix", None)
+        ledger_source = f"airflow:{raw_prefix}" if isinstance(raw_prefix, str) else ledger_path
         state = ledger.read_state()
     except Exception as err:
         _emit_line(f"Failed to read ledger from {ledger_path}: {err}", err=True)
@@ -641,7 +717,7 @@ def _execute_show_state(
         emit_json(entries, "ledger_state")
         return
 
-    _emit_line(f"iMednet Extraction Ledger ({ledger_path})")
+    _emit_line(f"iMednet Extraction Ledger ({ledger_source})")
     _emit_line(
         "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
     )
@@ -655,6 +731,22 @@ def _execute_show_state(
         _emit_line("No ledger entries found matching filters.")
 
 
+def _add_state_provider_args(parser: argparse.ArgumentParser) -> None:
+    """Attach --provider and --variable-prefix options to a workflows state subcommand."""
+    parser.add_argument(
+        "--provider",
+        choices=("default", "file", "airflow"),
+        default=None,
+        help="Checkpoint state provider ('default', 'file', or 'airflow').",
+    )
+    parser.add_argument(
+        "--variable-prefix",
+        dest="variable_prefix",
+        default=None,
+        help="Airflow Variable key prefix when using the 'airflow' state provider.",
+    )
+
+
 def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     """Attach show, set, and reset subparsers to a state ArgumentParser."""
     state_sub = state_parser.add_subparsers(dest="state_command")
@@ -665,9 +757,11 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     show_parser.add_argument(
         "-l",
         "--ledger-path",
+        action=_ExplicitLedgerPathAction,
         default=DEFAULT_LEDGER_PATH,
         help="Path to the pipeline ledger JSON file.",
     )
+    _add_state_provider_args(show_parser)
     add_study_key_args(show_parser, flag_help="Filter the ledger by a specific study key.")
     show_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
@@ -682,6 +776,9 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
             interactive=args.interactive,
             no_interactive=getattr(args, "no_interactive", False),
             output_format=getattr(args, "output_format", None),
+            provider=getattr(args, "provider", None),
+            variable_prefix=getattr(args, "variable_prefix", None),
+            explicit_ledger_path=bool(getattr(args, "explicit_ledger_path", False)),
         )
 
     show_parser.set_defaults(func=_dispatch_show_state)
@@ -698,9 +795,11 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     set_parser.add_argument(
         "-l",
         "--ledger-path",
+        action=_ExplicitLedgerPathAction,
         default=DEFAULT_LEDGER_PATH,
         help="Path to the pipeline ledger JSON file.",
     )
+    _add_state_provider_args(set_parser)
     set_parser.add_argument(
         "-f",
         "--force",
@@ -724,6 +823,9 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
             parser=set_parser,
             no_interactive=getattr(args, "no_interactive", False),
             force=getattr(args, "force", False),
+            provider=getattr(args, "provider", None),
+            variable_prefix=getattr(args, "variable_prefix", None),
+            explicit_ledger_path=bool(getattr(args, "explicit_ledger_path", False)),
         )
 
     set_parser.set_defaults(func=_dispatch_set_state)
@@ -740,9 +842,11 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     reset_parser.add_argument(
         "-l",
         "--ledger-path",
+        action=_ExplicitLedgerPathAction,
         default=DEFAULT_LEDGER_PATH,
         help="Path to the pipeline ledger JSON file.",
     )
+    _add_state_provider_args(reset_parser)
     reset_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
@@ -757,6 +861,9 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
             interactive=args.interactive,
             parser=reset_parser,
             no_interactive=getattr(args, "no_interactive", False),
+            provider=getattr(args, "provider", None),
+            variable_prefix=getattr(args, "variable_prefix", None),
+            explicit_ledger_path=bool(getattr(args, "explicit_ledger_path", False)),
         )
 
     reset_parser.set_defaults(func=_dispatch_reset_state)

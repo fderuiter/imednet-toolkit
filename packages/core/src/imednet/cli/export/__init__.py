@@ -300,6 +300,101 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     pq_parser.set_defaults(func=_dispatch_pq)
 
+    # hive-parquet
+    hive_pq_parser = sub.add_parser(
+        "hive-parquet",
+        help="Export study records to a Hive-partitioned Parquet directory.",
+    )
+    _add_export_study_args(hive_pq_parser)
+    hive_pq_parser.add_argument(
+        "path",
+        type=Path,
+        help="Destination Hive-partitioned Parquet directory.",
+    )
+    hive_pq_parser.add_argument(
+        "--vars",
+        dest="vars_",
+        help="Comma-separated list of variable names to include.",
+    )
+    hive_pq_parser.add_argument("--forms", help="Comma-separated list of form IDs to include.")
+    hive_pq_parser.add_argument(
+        "--use-labels",
+        action="store_true",
+        help="Use variable labels instead of names as column headers.",
+    )
+    hive_pq_parser.add_argument(
+        "--chunk-size",
+        dest="chunk_size",
+        type=int,
+        default=5000,
+        help="Number of records processed per partition chunk (default: 5000).",
+    )
+    hive_pq_parser.add_argument(
+        "--manifest-path",
+        dest="manifest_path",
+        type=Path,
+        default=None,
+        help="Optional output path for the JSON export manifest.",
+    )
+    _add_streaming_export_args(hive_pq_parser)
+
+    @with_sdk
+    def export_hive_parquet(
+        sdk: ImednetSDK,
+        /,
+        study_key: str,
+        path: Path,
+        vars_: str | None = None,
+        forms: str | None = None,
+        use_labels: bool = False,
+        chunk_size: int = 5000,
+        manifest_path: Path | None = None,
+        **stream_kwargs: Any,
+    ) -> None:
+        if importlib.util.find_spec("pyarrow") is None:
+            print_error(
+                "Error: pyarrow is required for Hive Parquet export. Install with \"pip install 'imednet[export]'\"."
+            )
+            sys.exit(1)
+        if chunk_size <= 0:
+            print_error("Error: --chunk-size must be greater than 0.")
+            sys.exit(1)
+        from .. import export_to_hive_parquet
+
+        var_list = [v.strip() for v in vars_.split(",") if v.strip()] if vars_ else None
+        form_list = [int(f.strip()) for f in forms.split(",") if f.strip()] if forms else None
+        extra_opts = dict(stream_kwargs)
+        if manifest_path is not None:
+            extra_opts["manifest_path"] = manifest_path
+        with fetching_status("records for Hive Parquet export", study_key):
+            export_to_hive_parquet(
+                sdk,
+                study_key,
+                str(path),
+                use_labels_as_columns=use_labels,
+                variable_whitelist=var_list,
+                form_whitelist=form_list,
+                chunk_size=chunk_size,
+                **extra_opts,
+            )
+
+    def _dispatch_hive_pq(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(hive_pq_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_hive_parquet(
+                study_key=study_key,
+                path=args.path,
+                vars_=args.vars_,
+                forms=args.forms,
+                use_labels=args.use_labels,
+                chunk_size=args.chunk_size,
+                manifest_path=args.manifest_path,
+                **stream_kwargs,
+            )
+
+    hive_pq_parser.set_defaults(func=_dispatch_hive_pq)
+
     # csv
     csv_parser = sub.add_parser("csv", help="Export study records to a CSV file.")
     _add_export_study_args(csv_parser)
@@ -521,6 +616,84 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             )
 
     ddb_parser.set_defaults(func=_dispatch_ddb)
+
+    # duckdb-by-form
+    ddb_form_parser = sub.add_parser(
+        "duckdb-by-form",
+        help="Export study records to separate DuckDB tables for each Form.",
+    )
+    _add_export_study_args(ddb_form_parser)
+    ddb_form_parser.add_argument("db_path", type=Path, help="Path to DuckDB database file.")
+    ddb_form_parser.add_argument(
+        "--vars",
+        dest="vars_",
+        help="Comma-separated list of variable names to include.",
+    )
+    ddb_form_parser.add_argument("--forms", help="Comma-separated list of form IDs to include.")
+    ddb_form_parser.add_argument(
+        "--use-labels",
+        action="store_true",
+        help="Use variable labels instead of names as column headers.",
+    )
+    ddb_form_parser.add_argument(
+        "--manifest-path",
+        dest="manifest_path",
+        type=Path,
+        default=None,
+        help="Optional output path for the JSON export manifest.",
+    )
+    _add_streaming_export_args(ddb_form_parser)
+
+    @with_sdk
+    def export_duckdb_by_form(
+        sdk: ImednetSDK,
+        /,
+        study_key: str,
+        db_path: Path,
+        vars_: str | None = None,
+        forms: str | None = None,
+        use_labels: bool = False,
+        manifest_path: Path | None = None,
+        **stream_kwargs: Any,
+    ) -> None:
+        if importlib.util.find_spec("duckdb") is None:
+            print_error(
+                "Error: duckdb is required for DuckDB export. Install with \"pip install 'imednet[duckdb]'\""
+            )
+            sys.exit(1)
+        from .. import export_to_duckdb_by_form
+
+        var_list = [v.strip() for v in vars_.split(",") if v.strip()] if vars_ else None
+        form_list = [int(f.strip()) for f in forms.split(",") if f.strip()] if forms else None
+        extra_opts = dict(stream_kwargs)
+        if manifest_path is not None:
+            extra_opts["manifest_path"] = manifest_path
+        with fetching_status("records for DuckDB-by-form export", study_key):
+            export_to_duckdb_by_form(
+                sdk,
+                study_key,
+                str(db_path),
+                use_labels_as_columns=use_labels,
+                variable_whitelist=var_list,
+                form_whitelist=form_list,
+                **extra_opts,
+            )
+
+    def _dispatch_ddb_form(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(ddb_form_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_duckdb_by_form(
+                study_key=study_key,
+                db_path=args.db_path,
+                vars_=args.vars_,
+                forms=args.forms,
+                use_labels=args.use_labels,
+                manifest_path=args.manifest_path,
+                **stream_kwargs,
+            )
+
+    ddb_form_parser.set_defaults(func=_dispatch_ddb_form)
 
     # sql
     sql_parser = sub.add_parser("sql", help="Export study records to a SQL table.")
