@@ -699,6 +699,28 @@ class TabularSinkConfig(SinkConfig):
     pandas_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
+def _append_jsonl_manifest(
+    manifest_path: str | None,
+    *,
+    batch_id: str,
+    destination: str,
+    row_count: int,
+    checksum: str,
+) -> None:
+    """Append a JSONL batch manifest entry when ``manifest_path`` is configured."""
+    if not manifest_path:
+        return
+    entry = {
+        "batch_id": batch_id,
+        "destination": destination,
+        "row_count": row_count,
+        "checksum": checksum,
+        "loaded_at": datetime.now(tz=UTC).isoformat(),
+    }
+    with open(manifest_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + os.linesep)
+
+
 def _is_incremental_config(config: SinkConfig) -> bool:
     """Return True when ``config`` activates incremental, watermark, or stateful sync."""
     return bool(
@@ -1218,7 +1240,13 @@ class TabularCSVSink(ExportSink):
                 )
                 checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
                 rows_loaded = len(df)
-                self._append_manifest(batch_id, rows_loaded, checksum)
+                _append_jsonl_manifest(
+                    self._cfg.manifest_path,
+                    batch_id=batch_id,
+                    destination=self.path,
+                    row_count=rows_loaded,
+                    checksum=checksum,
+                )
                 id_col = _find_df_record_id_col(df)
                 study_col = _find_df_study_col(df)
                 if id_col is not None:
@@ -1262,7 +1290,13 @@ class TabularCSVSink(ExportSink):
                 f.write(csv_str)
 
             rows_loaded = len(df)
-            self._append_manifest(batch_id, rows_loaded, checksum)
+            _append_jsonl_manifest(
+                self._cfg.manifest_path,
+                batch_id=batch_id,
+                destination=self.path,
+                row_count=rows_loaded,
+                checksum=checksum,
+            )
             return rows_loaded
 
         loaded = self._execute_with_retry("export_csv", batch_id, execute_export)
@@ -1372,19 +1406,6 @@ class TabularCSVSink(ExportSink):
 
         _atomic_replace_file(self.path, _stream_merge, suffix=".csv.tmp")
         return len(delta_rows)
-
-    def _append_manifest(self, batch_id: str, row_count: int, checksum: str) -> None:
-        if not self._cfg.manifest_path:
-            return
-        entry = {
-            "batch_id": batch_id,
-            "destination": self.path,
-            "row_count": row_count,
-            "checksum": checksum,
-            "loaded_at": datetime.now(tz=UTC).isoformat(),
-        }
-        with open(self._cfg.manifest_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + os.linesep)
 
     def flush(self) -> None:
         """Finalize staged incremental CSV updates and voided deletions atomically."""
@@ -2759,7 +2780,13 @@ class TabularSQLSink(ExportSink):
             )
 
             rows_loaded = len(df)
-            self._append_manifest(batch_id, rows_loaded, checksum)
+            _append_jsonl_manifest(
+                self._cfg.manifest_path,
+                batch_id=batch_id,
+                destination=self.table,
+                row_count=rows_loaded,
+                checksum=checksum,
+            )
             return rows_loaded
 
         loaded = self._execute_with_retry("export_sql", batch_id, execute_export)
@@ -2786,19 +2813,6 @@ class TabularSQLSink(ExportSink):
             batch_id,
             _do_delete,
         )
-
-    def _append_manifest(self, batch_id: str, row_count: int, checksum: str) -> None:
-        if not self._cfg.manifest_path:
-            return
-        entry = {
-            "batch_id": batch_id,
-            "destination": self.table,
-            "row_count": row_count,
-            "checksum": checksum,
-            "loaded_at": datetime.now(tz=UTC).isoformat(),
-        }
-        with open(self._cfg.manifest_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + os.linesep)
 
     def flush(self) -> None:
         """Flush the sink, writing an empty SDTM schema snapshot on full zero-row export."""
@@ -3781,6 +3795,45 @@ def _build_tabular_sink_config(
     )
 
 
+def _resolve_non_streaming_export_df(
+    sdk: ImednetSDK,
+    study_key: str,
+    config: TabularSinkConfig,
+    *,
+    sanitize: bool = False,
+) -> pd.DataFrame | None:
+    """Resolve a preflight DataFrame when monkeypatched or mock-mapper non-streaming paths apply."""
+    if _config_has_streaming_options(config):
+        return None
+    if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
+        if config.quality_gate_enabled:
+            return _collect_tabular_df(sdk, study_key, config, sanitize=sanitize)
+        prepare_kwargs: dict[str, Any] = {
+            "use_labels_as_columns": config.use_labels_as_columns,
+            "variable_whitelist": config.variable_whitelist,
+            "form_whitelist": config.form_whitelist,
+        }
+        if sanitize:
+            prepare_kwargs["sanitize"] = True
+        return _prepare_export_df(sdk, study_key, **prepare_kwargs)
+
+    pre_mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+    if not _is_mock_mapper(pre_mapper):
+        return None
+    if config.quality_gate_enabled:
+        return _collect_tabular_df(sdk, study_key, config, sanitize=sanitize)
+    return _prepare_export_df(
+        sdk,
+        study_key,
+        use_labels_as_columns=config.use_labels_as_columns,
+        variable_whitelist=config.variable_whitelist,
+        form_whitelist=config.form_whitelist,
+        sanitize=sanitize,
+        mask_phi=config.mask_phi,
+        _mapper=pre_mapper,
+    )
+
+
 def export_to_parquet(
     sdk: ImednetSDK,
     study_key: str,
@@ -3818,45 +3871,16 @@ def export_to_parquet(
         default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
-    if not _config_has_streaming_options(config):
-        df_mock: pd.DataFrame | None = None
-        if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
-            df_mock = (
-                _collect_tabular_df(sdk, study_key, config, sanitize=False)
-                if config.quality_gate_enabled
-                else _prepare_export_df(
-                    sdk,
-                    study_key,
-                    use_labels_as_columns=config.use_labels_as_columns,
-                    variable_whitelist=config.variable_whitelist,
-                    form_whitelist=config.form_whitelist,
-                )
-            )
-        else:
-            pre_mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-            if _is_mock_mapper(pre_mapper):
-                df_mock = (
-                    _collect_tabular_df(sdk, study_key, config, sanitize=False)
-                    if config.quality_gate_enabled
-                    else _prepare_export_df(
-                        sdk,
-                        study_key,
-                        use_labels_as_columns=config.use_labels_as_columns,
-                        variable_whitelist=config.variable_whitelist,
-                        form_whitelist=config.form_whitelist,
-                        mask_phi=config.mask_phi,
-                        _mapper=pre_mapper,
-                    )
-                )
-        if df_mock is not None:
+    df_mock = _resolve_non_streaming_export_df(sdk, study_key, config)
+    if df_mock is not None:
 
-            def _write_parquet() -> int:
-                df_mock.to_parquet(path, index=False, **config.pandas_kwargs)
-                return len(df_mock)
+        def _write_parquet() -> int:
+            df_mock.to_parquet(path, index=False, **config.pandas_kwargs)
+            return len(df_mock)
 
-            with _TabularCallableSink(config, "export_parquet", _write_parquet) as legacy_sink:
-                legacy_sink.write_batch([1], batch_id=f"{study_key}/parquet/0")
-            return
+        with _TabularCallableSink(config, "export_parquet", _write_parquet) as legacy_sink:
+            legacy_sink.write_batch([1], batch_id=f"{study_key}/parquet/0")
+        return
 
     sink = TabularParquetSink(path, config)
     _tabular_export(sdk, study_key, sink, config, sanitize=False, stream_name="parquet")
@@ -3946,47 +3970,16 @@ def export_to_excel(
         default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
-    if not _config_has_streaming_options(config):
-        df_mock: pd.DataFrame | None = None
-        if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
-            df_mock = (
-                _collect_tabular_df(sdk, study_key, config, sanitize=config.sanitize)
-                if config.quality_gate_enabled
-                else _prepare_export_df(
-                    sdk,
-                    study_key,
-                    use_labels_as_columns=config.use_labels_as_columns,
-                    variable_whitelist=config.variable_whitelist,
-                    form_whitelist=config.form_whitelist,
-                    sanitize=config.sanitize,
-                )
-            )
-        else:
-            pre_mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-            if _is_mock_mapper(pre_mapper):
-                df_mock = (
-                    _collect_tabular_df(sdk, study_key, config, sanitize=config.sanitize)
-                    if config.quality_gate_enabled
-                    else _prepare_export_df(
-                        sdk,
-                        study_key,
-                        use_labels_as_columns=config.use_labels_as_columns,
-                        variable_whitelist=config.variable_whitelist,
-                        form_whitelist=config.form_whitelist,
-                        sanitize=config.sanitize,
-                        mask_phi=config.mask_phi,
-                        _mapper=pre_mapper,
-                    )
-                )
-        if df_mock is not None:
+    df_mock = _resolve_non_streaming_export_df(sdk, study_key, config, sanitize=config.sanitize)
+    if df_mock is not None:
 
-            def _write_excel() -> int:
-                df_mock.to_excel(path, index=False, **config.pandas_kwargs)
-                return len(df_mock)
+        def _write_excel() -> int:
+            df_mock.to_excel(path, index=False, **config.pandas_kwargs)
+            return len(df_mock)
 
-            with _TabularCallableSink(config, "export_excel", _write_excel) as legacy_sink:
-                legacy_sink.write_batch([1], batch_id=f"{study_key}/excel/0")
-            return
+        with _TabularCallableSink(config, "export_excel", _write_excel) as legacy_sink:
+            legacy_sink.write_batch([1], batch_id=f"{study_key}/excel/0")
+        return
 
     excel_kwargs = dict(config.pandas_kwargs)
     excel_study_forms = _try_fetch_study_forms(sdk, study_key) if config.as_sdtm else []
@@ -4705,47 +4698,18 @@ def export_to_json(
         )
         return
 
-    if not _config_has_streaming_options(config):
-        df_mock: pd.DataFrame | None = None
-        if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
-            df_mock = (
-                _collect_tabular_df(sdk, study_key, config, sanitize=False)
-                if config.quality_gate_enabled
-                else _prepare_export_df(
-                    sdk,
-                    study_key,
-                    use_labels_as_columns=config.use_labels_as_columns,
-                    variable_whitelist=config.variable_whitelist,
-                    form_whitelist=config.form_whitelist,
-                )
-            )
-        else:
-            pre_mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-            if _is_mock_mapper(pre_mapper):
-                df_mock = (
-                    _collect_tabular_df(sdk, study_key, config, sanitize=False)
-                    if config.quality_gate_enabled
-                    else _prepare_export_df(
-                        sdk,
-                        study_key,
-                        use_labels_as_columns=config.use_labels_as_columns,
-                        variable_whitelist=config.variable_whitelist,
-                        form_whitelist=config.form_whitelist,
-                        mask_phi=config.mask_phi,
-                        _mapper=pre_mapper,
-                    )
-                )
-        if df_mock is not None:
-            mock_data = _dataframe_to_json_records(df_mock)
-            with sdk_governance_context(sdk):
-                mock_data = _apply_json_enrichment(study_key, mock_data, mask_phi=config.mask_phi)
-            with _TabularCallableSink(
-                config,
-                "export_json",
-                lambda: _dump_json_payload(path, mock_data, config),
-            ) as legacy_sink:
-                legacy_sink.write_batch([1], batch_id=f"{study_key}/json/0")
-            return
+    df_mock = _resolve_non_streaming_export_df(sdk, study_key, config)
+    if df_mock is not None:
+        mock_data = _dataframe_to_json_records(df_mock)
+        with sdk_governance_context(sdk):
+            mock_data = _apply_json_enrichment(study_key, mock_data, mask_phi=config.mask_phi)
+        with _TabularCallableSink(
+            config,
+            "export_json",
+            lambda: _dump_json_payload(path, mock_data, config),
+        ) as legacy_sink:
+            legacy_sink.write_batch([1], batch_id=f"{study_key}/json/0")
+        return
 
     is_incremental_json = _is_incremental_config(config)
 
@@ -4967,71 +4931,42 @@ def export_to_duckdb(
         mask_phi=mask_phi,
     )
 
-    if not _config_has_streaming_options(config):
-        df_legacy: pd.DataFrame | None = None
-        if _prepare_export_df is not _DEFAULT_PREPARE_EXPORT_DF:
-            df_legacy = (
-                _collect_tabular_df(sdk, study_key, config, sanitize=False)
-                if config.quality_gate_enabled
-                else _prepare_export_df(
-                    sdk,
-                    study_key,
-                    use_labels_as_columns=config.use_labels_as_columns,
-                    variable_whitelist=config.variable_whitelist,
-                    form_whitelist=config.form_whitelist,
-                )
-            )
-        else:
-            pre_mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-            if _is_mock_mapper(pre_mapper):
-                df_legacy = (
-                    _collect_tabular_df(sdk, study_key, config, sanitize=False)
-                    if config.quality_gate_enabled
-                    else _prepare_export_df(
-                        sdk,
-                        study_key,
-                        use_labels_as_columns=config.use_labels_as_columns,
-                        variable_whitelist=config.variable_whitelist,
-                        form_whitelist=config.form_whitelist,
-                        mask_phi=config.mask_phi,
-                        _mapper=pre_mapper,
-                    )
-                )
-        if df_legacy is not None:
+    df_legacy = _resolve_non_streaming_export_df(sdk, study_key, config)
+    if df_legacy is not None:
 
-            def _write_duckdb() -> int:
-                conn: Any = duckdb.connect(_coerce_path_str(db_path))
+        def _write_duckdb() -> int:
+            conn: Any = duckdb.connect(_coerce_path_str(db_path))
+            try:
+                quoted_tbl = _quote_duckdb_identifier(table_name)
+                quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
+                if len(df_legacy.columns) == 0 and not isinstance(conn, NonCallableMock):
+                    if config.idempotent:
+                        _replace_duckdb_with_empty_table(conn, table_name, None)
+                    return 0
+                conn.register(_DUCKDB_DF_ALIAS, df_legacy)
                 try:
-                    quoted_tbl = _quote_duckdb_identifier(table_name)
-                    quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
-                    if len(df_legacy.columns) == 0 and not isinstance(conn, NonCallableMock):
-                        if config.idempotent:
-                            _replace_duckdb_with_empty_table(conn, table_name, None)
-                        return 0
-                    conn.register(_DUCKDB_DF_ALIAS, df_legacy)
-                    try:
-                        if config.idempotent:
-                            conn.execute(
-                                f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
-                            )
-                        else:
-                            conn.execute(
-                                f"CREATE TABLE IF NOT EXISTS {quoted_tbl} "
-                                f"AS SELECT * FROM {quoted_alias} WHERE 1=0"
-                            )
-                            conn.execute(f"INSERT INTO {quoted_tbl} SELECT * FROM {quoted_alias}")
-                    finally:
-                        conn.unregister(_DUCKDB_DF_ALIAS)
-                    return len(df_legacy)
+                    if config.idempotent:
+                        conn.execute(
+                            f"CREATE OR REPLACE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}"
+                        )
+                    else:
+                        conn.execute(
+                            f"CREATE TABLE IF NOT EXISTS {quoted_tbl} "
+                            f"AS SELECT * FROM {quoted_alias} WHERE 1=0"
+                        )
+                        conn.execute(f"INSERT INTO {quoted_tbl} SELECT * FROM {quoted_alias}")
                 finally:
-                    conn.close()
+                    conn.unregister(_DUCKDB_DF_ALIAS)
+                return len(df_legacy)
+            finally:
+                conn.close()
 
-            if has_explicit_retry:
-                with _TabularCallableSink(config, "export_duckdb", _write_duckdb) as legacy_sink:
-                    legacy_sink.write_batch([1], batch_id=f"{study_key}/duckdb/0")
-            else:
-                _write_duckdb()
-            return
+        if has_explicit_retry:
+            with _TabularCallableSink(config, "export_duckdb", _write_duckdb) as legacy_sink:
+                legacy_sink.write_batch([1], batch_id=f"{study_key}/duckdb/0")
+        else:
+            _write_duckdb()
+        return
 
     sink = TabularDuckDBSink(db_path, table_name, config)
     _tabular_export(
@@ -5478,6 +5413,115 @@ def _make_form_sink_config(
     )
 
 
+@dataclass(frozen=True)
+class _FormExportState:
+    """Shared mapper, enrichment, and mock-dispatch state for per-form exports."""
+
+    mapper: Any
+    pipeline: EnrichmentPipeline | None
+    phi_keys: set[str] | None
+    has_native_enrichment: bool
+    use_mock_fetch: bool
+
+
+def _prepare_form_export_state(
+    sdk: Any,
+    study_key: str,
+    config: TabularSinkConfig,
+) -> _FormExportState:
+    """Initialize the RecordMapper, enrichment pipeline, and mock-fetch flag for per-form exports."""
+    with sdk_governance_context(sdk):
+        mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+        if hasattr(mapper, "_active_study_key"):
+            mapper._active_study_key = study_key
+        pipeline = resolve_enrichment_pipeline(study_key)
+    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+    has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
+    use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
+    return _FormExportState(
+        mapper=mapper,
+        pipeline=pipeline,
+        phi_keys=phi_keys,
+        has_native_enrichment=has_native_enrichment,
+        use_mock_fetch=use_mock_fetch,
+    )
+
+
+def _build_mock_form_df(
+    study_key: str,
+    ctx: _FormExportContext,
+    state: _FormExportState,
+    config: TabularSinkConfig,
+    *,
+    use_labels_as_columns: bool,
+    coerce_columns_to_str: bool,
+) -> pd.DataFrame:
+    """Fetch, parse, enrich, deduplicate, and mask a mock per-form DataFrame."""
+    records = state.mapper._fetch_records(
+        study_key,
+        extra_filters={"formId": ctx.form_id},
+    )
+    rows, _ = state.mapper._parse_records(records, ctx.record_model)
+    if state.pipeline is not None and not state.has_native_enrichment:
+        rows = [state.pipeline.process(r, mask_phi=config.mask_phi) for r in rows]
+    df = state.mapper._build_dataframe(
+        rows,
+        ctx.variable_keys,
+        ctx.label_map,
+        use_labels_as_columns,
+    )
+    if isinstance(df, pd.DataFrame):
+        df = _dedup_case_insensitive_columns(df, ensure_str_columns=coerce_columns_to_str)
+        if config.mask_phi:
+            df = _mask_df(df, phi_keys=state.phi_keys)
+    return cast(pd.DataFrame, df)
+
+
+def _enter_form_transform_sink(
+    sink_stack: contextlib.ExitStack,
+    ctx: _FormExportContext,
+    inner_sink: ExportSink,
+    form_config: TabularSinkConfig,
+    state: _FormExportState,
+) -> None:
+    """Wrap ``inner_sink`` in ``_TabularTransformSink`` and register it on ``sink_stack``."""
+    transform_sink = _TabularTransformSink(
+        inner_sink,
+        state.mapper,
+        ctx.record_model,
+        ctx.variable_keys,
+        ctx.label_map,
+        form_config,
+        sanitize=False,
+        pipeline=state.pipeline,
+    )
+    ctx.sink = sink_stack.enter_context(transform_sink)
+
+
+def _make_form_stream_callbacks(
+    study_key: str,
+) -> tuple[
+    Callable[[_FormExportContext, list[Any], int], int],
+    Callable[[_FormExportContext, list[Any], int], int],
+]:
+    """Create active-batch write and voided-batch reconciliation callbacks for per-form streaming."""
+
+    def _write_form_batch(ctx: _FormExportContext, batch: list[Any], batch_idx: int) -> int:
+        return int(ctx.sink.write_batch(batch, batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}"))
+
+    def _reconcile_form_voided(
+        ctx: _FormExportContext, voided_batch: list[Any], batch_idx: int
+    ) -> int:
+        return int(
+            ctx.sink.reconcile_deleted(
+                voided_batch,
+                batch_id=f"{study_key}/{ctx.form_key}/voided/{batch_idx}",
+            )
+        )
+
+    return _write_form_batch, _reconcile_form_voided
+
+
 def export_to_duckdb_by_form(
     sdk: ImednetSDK,
     study_key: str,
@@ -5540,24 +5584,17 @@ def export_to_duckdb_by_form(
         default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
-    with sdk_governance_context(sdk):
-        mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-        if hasattr(mapper, "_active_study_key"):
-            mapper._active_study_key = study_key
-        pipeline = resolve_enrichment_pipeline(study_key)
-    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-    has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
-    use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
+    state = _prepare_form_export_state(sdk, study_key, config)
 
     contexts, all_variables = _build_form_export_contexts(
         sdk,
         study_key,
-        mapper,
+        state.mapper,
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         mask_phi=config.mask_phi,
-        pipeline=pipeline,
+        pipeline=state.pipeline,
         stream_prefix="duckdb",
         custom_stream_prefix=config.stream_name,
         validate_form_key_fn=_validate_duckdb_identifier,
@@ -5570,26 +5607,16 @@ def export_to_duckdb_by_form(
     resolved_db_path = _coerce_path_str(db_path)
     conn: Any = duckdb.connect(resolved_db_path, config={"threads": "1"})
     try:
-        if use_mock_fetch:
+        if state.use_mock_fetch:
             for ctx in contexts:
-                records = mapper._fetch_records(
+                df = _build_mock_form_df(
                     study_key,
-                    extra_filters={"formId": ctx.form_id},
+                    ctx,
+                    state,
+                    config,
+                    use_labels_as_columns=use_labels_as_columns,
+                    coerce_columns_to_str=True,
                 )
-                rows, _ = mapper._parse_records(records, ctx.record_model)
-                if pipeline is not None and not has_native_enrichment:
-                    rows = [pipeline.process(r, mask_phi=config.mask_phi) for r in rows]
-                df = mapper._build_dataframe(
-                    rows,
-                    ctx.variable_keys,
-                    ctx.label_map,
-                    use_labels_as_columns,
-                )
-                if isinstance(df, pd.DataFrame):
-                    df = _dedup_case_insensitive_columns(df, ensure_str_columns=True)
-                    if config.mask_phi:
-                        df = _mask_df(df, phi_keys=phi_keys)
-
                 if (
                     isinstance(df, pd.DataFrame)
                     and len(df.columns) == 0
@@ -5623,34 +5650,9 @@ def export_to_duckdb_by_form(
                     contract_types=ctx.contract_types,
                     conn=conn,
                 )
-                transform_sink = _TabularTransformSink(
-                    inner_ddb_sink,
-                    mapper,
-                    ctx.record_model,
-                    ctx.variable_keys,
-                    ctx.label_map,
-                    form_config,
-                    sanitize=False,
-                    pipeline=pipeline,
-                )
-                ctx.sink = sink_stack.enter_context(transform_sink)
+                _enter_form_transform_sink(sink_stack, ctx, inner_ddb_sink, form_config, state)
 
-            def _write_duckdb_batch(
-                ctx: _FormExportContext, batch: list[Any], batch_idx: int
-            ) -> int:
-                return int(
-                    ctx.sink.write_batch(batch, batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}")
-                )
-
-            def _reconcile_duckdb_voided(
-                ctx: _FormExportContext, voided_batch: list[Any], batch_idx: int
-            ) -> int:
-                return int(
-                    ctx.sink.reconcile_deleted(
-                        voided_batch,
-                        batch_id=f"{study_key}/{ctx.form_key}/voided/{batch_idx}",
-                    )
-                )
+            on_active_batch, on_voided_batch = _make_form_stream_callbacks(study_key)
 
             _stream_records_across_forms(
                 sdk,
@@ -5658,8 +5660,8 @@ def export_to_duckdb_by_form(
                 config,
                 contexts,
                 all_variables,
-                on_active_batch=_write_duckdb_batch,
-                on_voided_batch=_reconcile_duckdb_voided,
+                on_active_batch=on_active_batch,
+                on_voided_batch=on_voided_batch,
                 on_before_checkpoints=sink_stack.close,
             )
     finally:
@@ -5698,24 +5700,18 @@ def export_to_sql_by_form(
         if_exists if if_exists is not None else ("replace" if config.idempotent else "append")
     )
 
-    with sdk_governance_context(sdk):
-        mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-        if hasattr(mapper, "_active_study_key"):
-            mapper._active_study_key = study_key
-        pipeline = resolve_enrichment_pipeline(study_key)
-    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-    has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
+    state = _prepare_form_export_state(sdk, study_key, config)
     engine = create_engine(conn_str)
 
     contexts, all_variables = _build_form_export_contexts(
         sdk,
         study_key,
-        mapper,
+        state.mapper,
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         mask_phi=config.mask_phi,
-        pipeline=pipeline,
+        pipeline=state.pipeline,
         stream_prefix="sql",
         custom_stream_prefix=config.stream_name,
         as_sdtm=config.as_sdtm,
@@ -5724,27 +5720,16 @@ def export_to_sql_by_form(
         preserve_record_id=_is_incremental_config(config),
     )
 
-    use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
-    if use_mock_fetch:
+    if state.use_mock_fetch:
         for ctx in contexts:
-            records = mapper._fetch_records(
+            df = _build_mock_form_df(
                 study_key,
-                extra_filters={"formId": ctx.form_id},
+                ctx,
+                state,
+                config,
+                use_labels_as_columns=use_labels_as_columns,
+                coerce_columns_to_str=False,
             )
-            rows, _ = mapper._parse_records(records, ctx.record_model)
-            if pipeline is not None and not has_native_enrichment:
-                rows = [pipeline.process(r, mask_phi=config.mask_phi) for r in rows]
-            df = mapper._build_dataframe(
-                rows,
-                ctx.variable_keys,
-                ctx.label_map,
-                use_labels_as_columns,
-            )
-            if isinstance(df, pd.DataFrame):
-                df = _dedup_case_insensitive_columns(df, ensure_str_columns=False)
-                if config.mask_phi:
-                    df = _mask_df(df, phi_keys=phi_keys)
-
             form_table = ctx.form_key
 
             def _write_form_sql(
@@ -5781,32 +5766,9 @@ def export_to_sql_by_form(
                 pandas_kwargs=form_pandas_kwargs,
             )
             inner_sql_sink = TabularSQLSink(ctx.form_key, engine, form_config)
-            transform_sink = _TabularTransformSink(
-                inner_sql_sink,
-                mapper,
-                ctx.record_model,
-                ctx.variable_keys,
-                ctx.label_map,
-                form_config,
-                sanitize=False,
-                pipeline=pipeline,
-            )
-            ctx.sink = sink_stack.enter_context(transform_sink)
+            _enter_form_transform_sink(sink_stack, ctx, inner_sql_sink, form_config, state)
 
-        def _write_sql_batch(ctx: _FormExportContext, batch: list[Any], batch_idx: int) -> int:
-            return int(
-                ctx.sink.write_batch(batch, batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}")
-            )
-
-        def _reconcile_sql_voided(
-            ctx: _FormExportContext, voided_batch: list[Any], batch_idx: int
-        ) -> int:
-            return int(
-                ctx.sink.reconcile_deleted(
-                    voided_batch,
-                    batch_id=f"{study_key}/{ctx.form_key}/voided/{batch_idx}",
-                )
-            )
+        on_active_batch, on_voided_batch = _make_form_stream_callbacks(study_key)
 
         def _finalize_and_flush_sql_sinks() -> None:
             if (
@@ -5847,8 +5809,8 @@ def export_to_sql_by_form(
             config,
             contexts,
             all_variables,
-            on_active_batch=_write_sql_batch,
-            on_voided_batch=_reconcile_sql_voided,
+            on_active_batch=on_active_batch,
+            on_voided_batch=on_voided_batch,
             on_before_checkpoints=_finalize_and_flush_sql_sinks,
         )
 
