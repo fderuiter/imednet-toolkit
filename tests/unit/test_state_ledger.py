@@ -257,16 +257,32 @@ def test_delete_entry_returns_false_when_stream_not_found(tmp_path) -> None:
 
 
 def test_corrupted_ledger_recovery(tmp_path) -> None:
-    """Test that corrupted ledger recovery."""
-    ledger_file = tmp_path / "ledger.json"
-    # Write garbage content to file
-    with open(ledger_file, "w") as f:
-        f.write("corrupted JSON data {")
+    """Corrupt non-empty ledger raises JSONDecodeError instead of erasing sibling studies; empty file returns empty state."""
+    import json
 
+    ledger_file = tmp_path / "ledger.json"
+    # Empty/whitespace file returns empty state
+    ledger_file.write_text("   \n", encoding="utf-8")
     ledger = ExtractionStateLedger(str(ledger_file))
-    state = ledger.read_state()
-    # Should recover gracefully with empty state
-    assert len(state.studies) == 0
+    assert len(ledger.read_state().studies) == 0
+
+    # Non-empty corrupt JSON raises instead of silently resetting to empty state
+    ledger_file.write_text("corrupted JSON data {", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        ledger.read_state()
+
+    # Write/delete operations also refuse to overwrite the corrupt file
+    with pytest.raises(json.JSONDecodeError):
+        ledger.set_last_timestamp("STUDY-NEW", "records", datetime(2026, 6, 1, tzinfo=timezone.utc))
+    assert ledger_file.read_text(encoding="utf-8") == "corrupted JSON data {"
+    with pytest.raises(json.JSONDecodeError):
+        ledger.delete_entry("STUDY-NEW")
+    assert ledger_file.read_text(encoding="utf-8") == "corrupted JSON data {"
+
+    # Non-mapping JSON root raises ValueError
+    ledger_file.write_text("[1, 2, 3]", encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        ledger.read_state()
 
 
 def test_get_state_provider_airflow(monkeypatch):
@@ -1111,3 +1127,263 @@ def test_get_state_provider_accepts_path_and_cli_renders_none_watermark(
     state_app(["show", "--ledger-path", str(ledger_file)])
     captured = capsys.readouterr()
     assert "STUDY-NONE" in captured.out
+
+
+def test_sanitize_metadata_preserves_integer_sdtm_maps_across_phi_and_secret_keys(
+    tmp_path: Path,
+) -> None:
+    """_sanitize_metadata preserves integer values in SDTM maps across PHI and secret-like keys while delegating residuals to sanitize_diagnostic_payload."""
+    from imednet.integrations.sink_base import bind_sdtm_stream_metadata
+    from imednet_workflows.state_ledger import _sanitize_metadata
+
+    raw_meta = {
+        "sdtm_seq_counters": {
+            "DOB": 4,
+            "SSN": 7,
+            "patient_name": 2,
+            "API_TOKEN": 9,
+            "SECRET_SUBJ": 11,
+            "PASSWORD_1": 3,
+            "BOOL_BAD": True,
+            "birth_date": "1980-04-12",
+            "NESTED_DOMAIN": {
+                "DOB": 6,
+                "API_KEY": 8,
+                "birth_date": "1980-04-12",
+            },
+        },
+        "sdtm_record_seqs": {
+            "DOB::REC_1": 1,
+            "SSN::API_KEY_99": 2,
+            "AUTH_TOKEN::42": 5,
+            "SECRET_KEY": "sk-live-secret",  # pragma: allowlist secret
+        },
+        "sdtm_seq_watermarks": {
+            "DOB": 4,
+            "TOKEN_SUBJ": 9,
+        },
+        "DOB": "1985-07-19",
+        "api_token": "plain-secret-value",  # pragma: allowlist secret
+        "indirect_phi": {
+            "variable": "DOB",
+            "value": "1985-07-19",
+        },
+        "inline_phi_note": 'Validation failed for patientName="Alice Smith" at https://edc.example/api?ssn=123-45-6789',
+        "nested": {
+            "patientName": "Alice Smith",
+            "client_secret": "s3cr3t",  # pragma: allowlist secret
+        },
+    }
+
+    sanitized = _sanitize_metadata(raw_meta)
+    assert sanitized["sdtm_seq_counters"]["DOB"] == 4
+    assert sanitized["sdtm_seq_counters"]["SSN"] == 7
+    assert sanitized["sdtm_seq_counters"]["patient_name"] == 2
+    assert sanitized["sdtm_seq_counters"]["API_TOKEN"] == 9
+    assert sanitized["sdtm_seq_counters"]["SECRET_SUBJ"] == 11
+    assert sanitized["sdtm_seq_counters"]["PASSWORD_1"] == 3
+    assert sanitized["sdtm_seq_counters"]["NESTED_DOMAIN"]["DOB"] == 6
+    assert sanitized["sdtm_seq_counters"]["NESTED_DOMAIN"]["API_KEY"] == 8
+    # Non-integer entries inside SDTM maps do not bypass sanitization
+    assert sanitized["sdtm_seq_counters"]["birth_date"] == "***MASKED***"
+    assert sanitized["sdtm_seq_counters"]["NESTED_DOMAIN"]["birth_date"] == "***MASKED***"
+
+    assert sanitized["sdtm_record_seqs"]["DOB::REC_1"] == 1
+    assert sanitized["sdtm_record_seqs"]["SSN::API_KEY_99"] == 2
+    assert sanitized["sdtm_record_seqs"]["AUTH_TOKEN::42"] == 5
+    assert sanitized["sdtm_record_seqs"]["SECRET_KEY"] == "***"
+
+    assert sanitized["sdtm_seq_watermarks"] == {"DOB": 4, "TOKEN_SUBJ": 9}
+
+    # Outside integer SDTM maps, direct/indirect/inline PHI and secret keys remain masked/redacted
+    assert sanitized["DOB"] == "***MASKED***"
+    assert sanitized["api_token"] == "***"
+    assert sanitized["indirect_phi"]["value"] == "***MASKED***"
+    assert "Alice Smith" not in sanitized["inline_phi_note"]
+    assert "123-45-6789" not in sanitized["inline_phi_note"]
+    assert sanitized["nested"]["patientName"] != "Alice Smith"
+    assert sanitized["nested"]["client_secret"] == "***"
+
+    # Persisted FileStateProvider round-trip binds all integer SDTM sequences cleanly
+    provider = FileStateProvider(tmp_path / "sdtm_phi_ledger.json")
+    provider.set_last_timestamp(
+        "STUDY-SDTM",
+        "ae_sdtm",
+        datetime(2026, 6, 1, tzinfo=timezone.utc),
+        metadata=raw_meta,
+    )
+    persisted = provider.read_state().studies["STUDY-SDTM"].streams["ae_sdtm"].metadata
+    seq_counters: dict[str, int] = {}
+    record_seqs: dict[str, int] = {}
+    bind_sdtm_stream_metadata(persisted, seq_counters, record_seqs)
+    assert seq_counters["DOB"] == 4
+    assert seq_counters["API_TOKEN"] == 9
+    assert record_seqs["SSN::API_KEY_99"] == 2
+
+
+def test_file_state_provider_set_last_timestamp_none_metadata_retains_prior_metadata(
+    tmp_path: Path,
+) -> None:
+    """FileStateProvider.set_last_timestamp(..., metadata=None) retains all prior stream metadata."""
+    provider = FileStateProvider(tmp_path / "retain_meta.json")
+    initial_meta = {
+        "sdtm_seq_counters": {"SUBJ-01": 3},
+        "sdtm_record_seqs": {"101": 1, "102": 2, "103": 3},
+        "sdtm_lineage": {"domain": "AE", "spec_hash": "abc123"},
+        "custom_checkpoint_tag": "release-v1",
+    }
+    provider.set_last_timestamp(
+        "STUDY-META",
+        "ae_stream",
+        datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+        records_processed=3,
+        metadata=initial_meta,
+    )
+
+    provider.set_last_timestamp(
+        "STUDY-META",
+        "ae_stream",
+        datetime(2026, 6, 2, 10, 0, tzinfo=timezone.utc),
+        records_processed=5,
+        metadata=None,
+    )
+
+    stream = provider.read_state().studies["STUDY-META"].streams["ae_stream"]
+    assert stream.last_timestamp == datetime(2026, 6, 2, 10, 0, tzinfo=timezone.utc)
+    assert stream.records_processed == 5
+    assert stream.metadata == initial_meta
+
+
+def test_get_state_provider_explicit_ledger_path_bypasses_airflow_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit ledger_path (or IMEDNET_WORKFLOW_LEDGER_PATH) uses FileStateProvider even under Airflow env."""
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_records")
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+
+    explicit_file = tmp_path / "custom_ledger.json"
+    provider = get_state_provider(explicit_file)
+    assert isinstance(provider, FileStateProvider)
+    assert provider.ledger_path == explicit_file
+
+    provider_str = get_state_provider(str(explicit_file))
+    assert isinstance(provider_str, FileStateProvider)
+
+    # Implicit default without env override still uses AirflowStateProvider inside Airflow
+    monkeypatch.delenv("IMEDNET_WORKFLOW_LEDGER_PATH", raising=False)
+    assert isinstance(get_state_provider(), AirflowStateProvider)
+
+    # Explicit IMEDNET_WORKFLOW_LEDGER_PATH env override routes to FileStateProvider
+    monkeypatch.setenv("IMEDNET_WORKFLOW_LEDGER_PATH", str(explicit_file))
+    env_provider = get_state_provider()
+    assert isinstance(env_provider, FileStateProvider)
+    assert env_provider.ledger_path == explicit_file
+
+
+def test_cross_host_retry_reclaims_running_lease_without_waiting_one_hour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Crashed cross-host RUNNING lease is reclaimed immediately on task retry without waiting 3600s."""
+    import socket
+
+    ledger_file = tmp_path / "retry_lease.json"
+    ledger = FileStateProvider(ledger_file)
+    ledger.set_last_timestamp(
+        "STUDY-RETRY",
+        "records",
+        datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc),
+        records_processed=10,
+    )
+
+    # Simulate Worker Pod A entering transaction on try_number=1, recording mid-run SDTM lineage, and crashing
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "clinical_dag")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_records")
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled__2026-06-02")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_MAP_INDEX", "0")
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
+    with monkeypatch.context() as worker_a:
+        worker_a.setattr(socket, "gethostname", lambda: "k8s-worker-pod-crashed")
+        worker_a.setattr("os.getpid", lambda: 88888)
+        tx_cm = ledger.transaction("STUDY-RETRY", "records")
+        tx_cm.__enter__()
+        ledger.record_sdtm_lineage(
+            "STUDY-RETRY",
+            "records",
+            {"domain": "AE", "spec_hash": "hash1"},
+        )
+        # Simulate SIGKILL: close underlying generator without normal __exit__ rollback
+        tx_cm.gen.close()
+
+    assert ledger.get_last_status("STUDY-RETRY", "records") == StreamExecutionStatus.RUNNING
+
+    # 1. Different task (concurrent worker, NOT a retry of the crashed task) is still blocked!
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "different_task")
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "2")
+    with pytest.raises(
+        InvalidStateTransitionError,
+        match="Cannot transition stream state from 'running' to 'running'",
+    ):
+        with ledger.transaction("STUDY-RETRY", "records"):
+            pass
+
+    # 2. Same task but different mapped task index is also blocked!
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_records")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_MAP_INDEX", "1")
+    with pytest.raises(
+        InvalidStateTransitionError,
+        match="Cannot transition stream state from 'running' to 'running'",
+    ):
+        with ledger.transaction("STUDY-RETRY", "records"):
+            pass
+
+    # 3. Same task + map_index at same try_number=1 on another host is also blocked (duplicate dispatch guard)
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_MAP_INDEX", "0")
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
+    with pytest.raises(
+        InvalidStateTransitionError,
+        match="Cannot transition stream state from 'running' to 'running'",
+    ):
+        with ledger.transaction("STUDY-RETRY", "records"):
+            pass
+
+    # 4. Retry attempt (try_number=2 > 1) for the exact same task instance reclaims immediately!
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "2")
+    new_ts = datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)
+    with ledger.transaction("STUDY-RETRY", "records") as tx:
+        assert tx["last_timestamp"] == datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc)
+        tx["new_timestamp"] = new_ts
+        tx["records_processed"] = 25
+
+    committed = ledger.read_state().studies["STUDY-RETRY"].streams["records"]
+    assert committed.last_run_status == StreamExecutionStatus.SUCCESS
+    assert committed.last_timestamp == new_ts
+    assert "_lease_attempt" not in committed.metadata
+
+    # 5. Forced set_last_timestamp(metadata=None) on a crashed RUNNING stream preserves user metadata
+    #    while stripping transient _lease_attempt metadata.
+    ledger.set_last_timestamp(
+        "STUDY-RETRY",
+        "sdtm_ae",
+        datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc),
+        metadata={"sdtm_seq_counters": {"DOB": 3}},
+    )
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
+    with monkeypatch.context() as worker_b:
+        worker_b.setattr(socket, "gethostname", lambda: "k8s-worker-pod-2")
+        worker_b.setattr("os.getpid", lambda: 99999)
+        tx_cm2 = ledger.transaction("STUDY-RETRY", "sdtm_ae")
+        tx_cm2.__enter__()
+        tx_cm2.gen.close()
+
+    ledger.set_last_timestamp(
+        "STUDY-RETRY",
+        "sdtm_ae",
+        datetime(2026, 6, 1, 6, 0, tzinfo=timezone.utc),
+        metadata=None,
+        force=True,
+    )
+    rewound = ledger.read_state().studies["STUDY-RETRY"].streams["sdtm_ae"]
+    assert rewound.metadata == {"sdtm_seq_counters": {"DOB": 3}}
+    assert "_lease_attempt" not in rewound.metadata

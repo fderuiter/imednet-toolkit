@@ -50,7 +50,7 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
         first_batch,
         [first_batch[1], second_batch[0]],
     ]
-    sdk.records.list.side_effect = [second_batch]
+    sdk.records.list.side_effect = [second_batch, []]
 
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "custom-cache")
 
@@ -63,6 +63,7 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
 
     first_delta_call = sdk.get_records.call_args_list[0]
     second_delta_call = sdk.records.list.call_args_list[0]
+    third_delta_call = sdk.records.list.call_args_list[1]
     assert first_delta_call.kwargs == {
         "study_key": "STUDY",
         "record_data_filter": None,
@@ -71,6 +72,11 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
     assert second_delta_call.kwargs == {
         "study_key": "STUDY",
         "filter": 'dateModified>="2024-01-02 00:00:00+00:00"',
+        "record_data_filter": None,
+    }
+    assert third_delta_call.kwargs == {
+        "study_key": "STUDY",
+        "filter": 'lastUpdated>="2024-01-02 00:00:00+00:00"',
         "record_data_filter": None,
     }
     assert sdk.get_records.call_args_list[2].kwargs == {
@@ -144,17 +150,22 @@ def test_sync_records_handles_empty_delta_without_reconciliation(tmp_path: Path)
     sdk.get_records.side_effect = [
         [_record(1, "2024-01-01 00:00:00+00:00")],
     ]
-    sdk.records.list.side_effect = [[]]
+    sdk.records.list.side_effect = [[], []]
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
 
     loader.sync_records("STUDY", reconcile=False)
     loader.sync_records("STUDY", reconcile=False)
 
     assert sdk.get_records.call_count == 1
-    assert sdk.records.list.call_count == 1
+    assert sdk.records.list.call_count == 2
     assert sdk.records.list.call_args_list[0].kwargs == {
         "study_key": "STUDY",
         "filter": 'dateModified>="2024-01-01 00:00:00+00:00"',
+        "record_data_filter": None,
+    }
+    assert sdk.records.list.call_args_list[1].kwargs == {
+        "study_key": "STUDY",
+        "filter": 'lastUpdated>="2024-01-01 00:00:00+00:00"',
         "record_data_filter": None,
     }
 
@@ -475,6 +486,7 @@ def test_cached_loader_http_contract_iso_timestamp_and_lowercase_bool(tmp_path: 
         assert calls[1]["filter"] == "deleted==false"
         assert calls[1]["recordDataFilter"] == "none"
         assert calls[2]["filter"] == "dateModified>=2024-01-02T00:00:00Z"
+        assert calls[3]["filter"] == "lastUpdated>=2024-01-02T00:00:00Z"
 
 
 def test_cached_loader_incremental_sync_with_simulation_transport(tmp_path: Path) -> None:
@@ -525,11 +537,13 @@ def test_cached_loader_incremental_sync_with_simulation_transport(tmp_path: Path
     recorded_get_params.clear()
     refreshed_records = loader.load_records("STUDY")
 
-    # Delta request must send top-level timestamp filter without studyKey
+    # Delta requests must send separate AND-only dateModified and lastUpdated filters without studyKey
     assert recorded_get_params[0]["filter"] == "dateModified>=2026-01-10T09:35:00Z"
     assert "studyKey" not in recorded_get_params[0]["filter"]
-    assert recorded_get_params[1]["filter"] == "deleted==false"
-    assert recorded_get_params[1]["recordDataFilter"] == "none"
+    assert recorded_get_params[1]["filter"] == "lastUpdated>=2026-01-10T09:35:00Z"
+    assert "studyKey" not in recorded_get_params[1]["filter"]
+    assert recorded_get_params[2]["filter"] == "deleted==false"
+    assert recorded_get_params[2]["recordDataFilter"] == "none"
 
     by_id = {r.record_id: r for r in refreshed_records}
     assert sorted(k for k in by_id if k is not None) == [600, 601, 602, 1001]
@@ -684,8 +698,8 @@ def test_timestamped_study_backfills_new_null_timestamp_record_during_reconcilia
         ],  # Cycle 2 active IDs include untimestamped record 3
         [r3_draft],  # Cycle 2 backfill for missing record 3
     ]
-    # Delta query with dateModified >= 2024-01-02 returns only timestamped r4_stamped, omitting r3_draft
-    sdk.records.list.side_effect = [[r4_stamped]]
+    # Delta queries with dateModified/lastUpdated >= 2024-01-02 return only timestamped r4_stamped, omitting r3_draft
+    sdk.records.list.side_effect = [[r4_stamped], []]
 
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
     loader.sync_records("STUDY", reconcile=True)
@@ -727,7 +741,7 @@ def test_sync_records_preserves_high_water_mark_when_any_step_fails(tmp_path: Pa
     assert state.error_message == "delta network error"
 
     # 2. Backfill failure after delta upsert of newer r2_newer still preserves previous high_water_mark
-    sdk.records.list.side_effect = [[r2_newer]]
+    sdk.records.list.side_effect = [[r2_newer], []]
     sdk.get_records.side_effect = [
         [
             Record(study_key="STUDY", record_id=1, form_key="FORM", record_data=None),
@@ -744,7 +758,7 @@ def test_sync_records_preserves_high_water_mark_when_any_step_fails(tmp_path: Pa
     assert state.error_message == "backfill timeout"
 
     # 3. Reconciliation failure preserves previous high_water_mark
-    sdk.records.list.side_effect = [[r2_newer]]
+    sdk.records.list.side_effect = [[r2_newer], []]
     sdk.get_records.side_effect = [
         [
             Record(study_key="STUDY", record_id=1, form_key="FORM", record_data=None),
@@ -934,3 +948,70 @@ def test_iter_cached_records_order_by_subject_groups_subjects_cleanly(tmp_path: 
 
     subject_grouped = list(loader.iter_cached_records("STUDY", chunk_size=2, order_by_subject=True))
     assert [r.record_id for r in subject_grouped] == [40, 20, 50, 10, 30]
+
+
+def test_sync_records_without_reconcile_captures_signed_records_via_last_updated(
+    tmp_path: Path,
+) -> None:
+    """sync_records(reconcile=False) captures 21 CFR 11.10(e) signed records via lastUpdated branch."""
+    from datetime import datetime, timezone
+
+    sdk = MagicMock()
+    initial_rec = Record(
+        study_key="STUDY_SIG",
+        record_id=101,
+        form_id=10,
+        form_key="AE",
+        subject_key="SUBJ-01",
+        record_status="Complete",
+        date_modified="2026-02-01T10:00:00Z",
+        last_updated="2026-02-01T10:00:00Z",
+        record_data={"AETERM": "Headache"},
+    )
+    signed_rec = Record(
+        study_key="STUDY_SIG",
+        record_id=101,
+        form_id=10,
+        form_key="AE",
+        subject_key="SUBJ-01",
+        record_status="Signed",
+        date_modified="2026-02-01T09:00:00Z",
+        last_updated="2026-02-05T16:45:00Z",
+        record_data={"AETERM": "Headache"},
+    )
+    edited_rec = Record(
+        study_key="STUDY_SIG",
+        record_id=102,
+        form_id=10,
+        form_key="AE",
+        subject_key="SUBJ-02",
+        record_status="Complete",
+        date_modified="2026-02-03T12:00:00Z",
+        last_updated="2026-02-03T12:00:00Z",
+        record_data={"AETERM": "Nausea"},
+    )
+
+    sdk.get_records.side_effect = [[initial_rec]]
+    sdk.records.list.side_effect = [[edited_rec], [signed_rec, edited_rec]]
+
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "sig-cache")
+    loader.sync_records("STUDY_SIG", reconcile=False)
+    hwm1 = loader.get_study_sync_state("STUDY_SIG").high_water_mark
+    assert hwm1 is not None
+    assert datetime.fromisoformat(hwm1) == datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc)
+
+    loader.sync_records("STUDY_SIG", reconcile=False)
+
+    assert sdk.records.list.call_count == 2
+    flt0 = sdk.records.list.call_args_list[0].kwargs["filter"]
+    flt1 = sdk.records.list.call_args_list[1].kwargs["filter"]
+    assert flt0.startswith("dateModified>=") and "," not in flt0
+    assert flt1.startswith("lastUpdated>=") and "," not in flt1
+
+    cached = {r.record_id: r for r in loader.get_cached_records("STUDY_SIG")}
+    assert sorted(k for k in cached if k is not None) == [101, 102]
+    assert cached[101].record_status == "Signed"
+
+    hwm2 = loader.get_study_sync_state("STUDY_SIG").high_water_mark
+    assert hwm2 is not None
+    assert datetime.fromisoformat(hwm2) == datetime(2026, 2, 5, 16, 45, tzinfo=timezone.utc)

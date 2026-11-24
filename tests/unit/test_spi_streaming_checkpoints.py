@@ -1159,7 +1159,7 @@ def test_or_filter_with_watermark_never_mixes_and_or_connectors(tmp_path: Path) 
         watermark="2026-06-01T00:00:00Z",
         exclude_deleted_upstream=True,
     )
-    assert len(branches) == 2
+    assert len(branches) == 4
 
     with pytest.raises(ValueError, match="cannot combine both"):
         SinkConfig(study_key="S1", record_filter="subjectKey==SUBJ-01;visitId==1,visitId==2")
@@ -1220,10 +1220,12 @@ def test_or_filter_with_watermark_never_mixes_and_or_connectors(tmp_path: Path) 
                 modified_since="2026-06-01T00:00:00Z",
             )
             df = pd.read_csv(out_csv)
-            # Duplicate recordId 501 returned across both OR branches is deduplicated!
+            # Duplicate recordId 501 returned across OR + dual-watermark branches is deduplicated!
             assert list(df["recordId"]) == [501]
-            assert len(seen_http_filters) == 2
-            assert all("dateModified>=2026-06-01T00:00:00Z" in f for f in seen_http_filters)
+            assert len(seen_http_filters) == 4
+            assert all(not (";" in f and "," in f) for f in seen_http_filters)
+            assert sum("dateModified>=2026-06-01T00:00:00Z" in f for f in seen_http_filters) == 2
+            assert sum("lastUpdated>=2026-06-01T00:00:00Z" in f for f in seen_http_filters) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1879,24 +1881,44 @@ def test_incremental_watermark_combines_date_modified_without_duplicate_attribut
     assert b_gt[0]["dateModified"] == (">", "2026-06-05T00:00:00Z")
 
     # 2. Lower bound superseded by newer watermark: user >= 2026-05-01, watermark 2026-06-01
+    #    emits separate AND-only branches for dateModified >= wm and lastUpdated >= wm.
     b_wm = build_record_query_branches(
         record_filter="dateModified>=2026-05-01T00:00:00Z;formKey==AE",
         watermark="2026-06-01T00:00:00Z",
     )
-    assert len(b_wm) == 1
+    assert len(b_wm) == 2
     assert b_wm[0]["dateModified"] == (">=", "2026-06-01T00:00:00Z")
+    assert "lastUpdated" not in b_wm[0]
+    assert b_wm[1] == {
+        "dateModified": (">=", "2026-05-01T00:00:00Z"),
+        "formKey": ("==", "AE"),
+        "deleted": False,
+        "lastUpdated": (">=", "2026-06-01T00:00:00Z"),
+    }
 
-    # 3. Unsatisfiable upper bound (< watermark) and equality (< watermark) prune branch completely
+    # 3. Unsatisfiable dateModified upper bound (< watermark) prunes the dateModified branch
+    #    while keeping lastUpdated >= watermark for post-edit signatures; when both timestamp
+    #    fields are bounded < watermark, all branches are pruned.
+    assert build_record_query_branches(
+        record_filter="dateModified<2026-05-01T00:00:00Z",
+        watermark="2026-06-01T00:00:00Z",
+    ) == [
+        {
+            "dateModified": ("<", "2026-05-01T00:00:00Z"),
+            "deleted": False,
+            "lastUpdated": (">=", "2026-06-01T00:00:00Z"),
+        }
+    ]
     assert (
         build_record_query_branches(
-            record_filter="dateModified<2026-05-01T00:00:00Z",
+            record_filter="dateModified<2026-05-01T00:00:00Z;lastUpdated<2026-05-01T00:00:00Z",
             watermark="2026-06-01T00:00:00Z",
         )
         == []
     )
     assert (
         build_record_query_branches(
-            record_filter="dateModified==2026-05-01T00:00:00Z",
+            record_filter="dateModified==2026-05-01T00:00:00Z;lastUpdated==2026-05-01T00:00:00Z",
             watermark="2026-06-01T00:00:00Z",
         )
         == []
@@ -1910,7 +1932,7 @@ def test_incremental_watermark_combines_date_modified_without_duplicate_attribut
     assert b_eq == [{"dateModified": ("==", "2026-06-10T00:00:00Z"), "deleted": False}]
 
     # 5. End-to-end HTTP check: upper bound `dateModified<=2026-06-10T00:00:00Z` + `--since 2026-06-01T00:00:00Z`
-    #    sends a SINGLE `dateModified>=2026-06-01T00:00:00Z` in HTTP filter and locally filters <= 2026-06-10!
+    #    sends single-attribute-safe AND-only branches without duplicate attributes and locally filters <= 2026-06-10!
     seen_filters: list[str] = []
     with respx.mock(assert_all_called=True) as router:
 
@@ -1918,6 +1940,8 @@ def test_incremental_watermark_combines_date_modified_without_duplicate_attribut
             flt = request.url.params.get("filter", "")
             seen_filters.append(flt)
             assert flt.count("dateModified") == 1
+            assert flt.count("lastUpdated") <= 1
+            assert not (";" in flt and "," in flt)
             return httpx.Response(
                 200,
                 json={
@@ -1975,6 +1999,7 @@ def test_incremental_watermark_combines_date_modified_without_duplicate_attribut
             )
             exported_rows = json.loads(out_json.read_text(encoding="utf-8"))
             assert [row["recordId"] for row in exported_rows] == [1]
-            assert len(seen_filters) == 1
-            assert seen_filters[0].count("dateModified") == 1
+            assert len(seen_filters) == 2
             assert "dateModified>=2026-06-01T00:00:00Z" in seen_filters[0]
+            assert "dateModified<=2026-06-10T00:00:00Z" in seen_filters[1]
+            assert "lastUpdated>=2026-06-01T00:00:00Z" in seen_filters[1]

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import logging
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import closing
+from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote_plus, urlsplit
 
@@ -529,13 +533,185 @@ class ImednetExportOperator(BaseOperator):
             opts["naming_convention"] = str(resolved_convention)
         return opts
 
-    def _default_airflow_stream_name(self, dest: str, *, sink_prefix: bool = False) -> str:
-        """Return a task-scoped default stream name invariant across mapped task indexes."""
+    @staticmethod
+    def _sanitize_stream_token(raw: str, *, max_len: int = 32) -> tuple[str, bool]:
+        """Normalize a stream qualifier token into ``[A-Za-z0-9._-]`` and flag lossy edits."""
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("_")
+        truncated = cleaned[:max_len].strip("_")
+        return truncated, (truncated != raw or not truncated)
+
+    @classmethod
+    def _canonicalize_qualifier_value(cls, value: Any) -> Any:
+        """Convert arbitrary filter/target values into deterministic JSON-serializable structures."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return (
+                _sanitize_lineage_text(value)
+                if isinstance(value, str) and "://" in value
+                else value
+            )
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, Mapping):
+            return {
+                str(k): cls._canonicalize_qualifier_value(v)
+                for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+            }
+        if isinstance(value, (set, frozenset)):
+            items = [cls._canonicalize_qualifier_value(v) for v in value]
+            return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return [cls._canonicalize_qualifier_value(v) for v in value]
+        return str(value)
+
+    def _default_airflow_stream_name(
+        self,
+        dest: str,
+        runtime_kwargs: Mapping[str, Any] | None = None,
+        *,
+        sink_prefix: bool = False,
+    ) -> str:
+        """Return a deterministic stream name scoped by task, destination target, and Form filters."""
         base = f"airflow_{dest}" if sink_prefix else dest
         task_id = getattr(self, "task_id", None)
         if isinstance(task_id, str) and task_id.strip():
-            return f"{base}_{task_id.strip()}"
-        return base
+            base = f"{base}_{task_id.strip()}"
+
+        kw: dict[str, Any] = (
+            dict(runtime_kwargs)
+            if isinstance(runtime_kwargs, Mapping)
+            else dict(getattr(self, "export_kwargs", None) or {})
+        )
+
+        canonical_qualifiers: dict[str, Any] = {}
+        readable_parts: list[str] = []
+        needs_digest = False
+
+        # 1. Destination target qualifiers (output_path, table, collection, stage prefix, db/dir/conn)
+        target_entries: list[tuple[str, str]] = []
+        raw_out = getattr(self, "output_path", None)
+        if raw_out is None:
+            raw_out = kw.get("output_path")
+        if raw_out is not None and str(raw_out).strip():
+            safe_out = _sanitize_lineage_text(str(raw_out).strip())
+            target_entries.append(("output_path", safe_out))
+
+        for target_key in (
+            "output_dir",
+            "table",
+            "table_name",
+            "collection",
+            "stage_prefix",
+            "prefix",
+            "base_dir",
+            "db_path",
+            "path",
+            "database",
+            "conn_str",
+        ):
+            raw_val = kw.get(target_key)
+            if raw_val is not None and str(raw_val).strip():
+                safe_val = _sanitize_lineage_text(str(raw_val).strip())
+                if not target_entries or target_entries[0][1] != safe_val:
+                    target_entries.append((target_key, safe_val))
+
+        raw_dest_conn = kw.get("destination_conn_id", getattr(self, "destination_conn_id", None))
+        if isinstance(raw_dest_conn, str) and raw_dest_conn.strip():
+            target_entries.append(("destination_conn_id", raw_dest_conn.strip()))
+
+        if target_entries:
+            canonical_qualifiers["targets"] = target_entries
+            primary_target = target_entries[0][1]
+            if "/" in primary_target or "\\" in primary_target or "://" in primary_target:
+                needs_digest = True
+                leaf = Path(primary_target.rstrip("/\\")).name or primary_target
+                slug, _ = self._sanitize_stream_token(leaf)
+            else:
+                slug, lossy = self._sanitize_stream_token(primary_target)
+                if lossy:
+                    needs_digest = True
+            if len(target_entries) > 1:
+                needs_digest = True
+            if slug:
+                readable_parts.append(slug)
+
+        # 2. Form / SDTM domain / record_filter qualifiers
+        raw_whitelist = kw.get("form_whitelist", getattr(self, "form_whitelist", None))
+        if (
+            raw_whitelist is not None
+            and isinstance(raw_whitelist, Sequence)
+            and not isinstance(raw_whitelist, (str, bytes, bytearray))
+        ):
+            sorted_forms = sorted(
+                {str(item).strip() for item in raw_whitelist if str(item).strip()}
+            )
+            canonical_qualifiers["form_whitelist"] = sorted_forms
+            if not sorted_forms:
+                readable_parts.append("forms_empty")
+                needs_digest = True
+            else:
+                form_slugs: list[str] = []
+                for token in sorted_forms[:4]:
+                    f_slug, f_lossy = self._sanitize_stream_token(token, max_len=20)
+                    if f_lossy:
+                        needs_digest = True
+                    if f_slug:
+                        form_slugs.append(f_slug)
+                if len(sorted_forms) > 4:
+                    needs_digest = True
+                if form_slugs:
+                    readable_parts.append("forms_" + "_".join(form_slugs))
+
+        raw_domain = (
+            kw.get("sdtm_domain")
+            if kw.get("sdtm_domain") is not None
+            else kw.get("domain", getattr(self, "sdtm_domain", None))
+        )
+        if isinstance(raw_domain, str) and raw_domain.strip():
+            norm_dom = raw_domain.strip().upper()
+            canonical_qualifiers["sdtm_domain"] = norm_dom
+            dom_slug, dom_lossy = self._sanitize_stream_token(norm_dom, max_len=16)
+            if dom_lossy:
+                needs_digest = True
+            if dom_slug:
+                readable_parts.append(f"domain_{dom_slug}")
+
+        raw_rf = kw.get("record_filter", getattr(self, "record_filter", None))
+        has_rf = (
+            (isinstance(raw_rf, str) and bool(raw_rf.strip()) and raw_rf.strip().lower() != "none")
+            or (isinstance(raw_rf, Mapping) and bool(raw_rf))
+            or (
+                isinstance(raw_rf, Sequence)
+                and not isinstance(raw_rf, (str, bytes, bytearray))
+                and bool(raw_rf)
+            )
+        )
+        if has_rf:
+            canonical_qualifiers["record_filter"] = self._canonicalize_qualifier_value(raw_rf)
+            needs_digest = True
+            rf_hint = "filter"
+            if isinstance(raw_rf, Mapping):
+                for fk in ("formKey", "form_key", "formId", "form_id"):
+                    if fk in raw_rf and raw_rf[fk] is not None:
+                        fk_slug, _ = self._sanitize_stream_token(str(raw_rf[fk]), max_len=20)
+                        if fk_slug:
+                            rf_hint = f"form_{fk_slug}"
+                        break
+            readable_parts.append(rf_hint)
+
+        if not canonical_qualifiers:
+            return base
+
+        suffix_parts = list(readable_parts)
+        if needs_digest or not suffix_parts:
+            serialized = json.dumps(
+                canonical_qualifiers,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:8]
+            suffix_parts.append(digest)
+
+        return "_".join([base, *suffix_parts])
 
     def _build_tabular_kwargs(
         self,
@@ -560,14 +736,16 @@ class ImednetExportOperator(BaseOperator):
             merged["quality_gate_enabled"] = bool(getattr(self, "quality_gate_enabled", False))
         for key, val in self._collect_streaming_options(runtime_kwargs).items():
             merged.setdefault(key, val)
-        if (
-            merged.get("incremental")
-            and "state_provider" not in merged
-            and "ledger_path" not in merged
-        ):
-            merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
-            if "stream_name" not in merged:
-                merged["stream_name"] = self._default_airflow_stream_name(dest)
+        if merged.get("incremental"):
+            has_explicit_ledger = merged.get("ledger_path") is not None
+            if "state_provider" not in merged and not has_explicit_ledger:
+                merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
+            elif "state_provider" not in merged and has_explicit_ledger:
+                merged["state_provider"] = sink_base.get_state_provider(
+                    ledger_path=merged["ledger_path"]
+                )
+            if not merged.get("stream_name"):
+                merged["stream_name"] = self._default_airflow_stream_name(dest, merged)
         return merged
 
     @staticmethod
@@ -943,10 +1121,10 @@ class ImednetExportOperator(BaseOperator):
                     raw_run_id = context.get("run_id") or context.get("ts_nodash")
                     if isinstance(raw_run_id, str) and raw_run_id.strip():
                         run_token = f"{raw_run_id.strip()}/{uuid.uuid4().hex[:8]}"
-                default_sink_stream = (
-                    self._default_airflow_stream_name(dest, sink_prefix=True)
-                    if config.ledger_path is None and config.state_provider is None
-                    else f"airflow_{dest}"
+                default_sink_stream = self._default_airflow_stream_name(
+                    dest,
+                    runtime_kwargs,
+                    sink_prefix=True,
                 )
                 sink_base.run_streaming_export(
                     sdk,
@@ -956,7 +1134,7 @@ class ImednetExportOperator(BaseOperator):
                     stream_name=default_sink_stream,
                     batch_id_prefix=f"{self.study_key}/batch/{run_token}",
                     quality_gate_fn=sink_base.apply_quality_gate,
-                    default_provider_name="airflow",
+                    default_provider_name=None if config.ledger_path is not None else "airflow",
                 )
             else:
                 # Execution path for tabular functions (dispatch via getattr so test mocks are preserved)

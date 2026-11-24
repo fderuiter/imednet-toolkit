@@ -436,6 +436,7 @@ def _execute_set_state(
                 timestamp=dt,
                 records_processed=records_processed,
                 status="success",
+                metadata=None,
                 force=force,
             )
             _emit_line(
@@ -519,6 +520,7 @@ def _execute_set_state(
             timestamp=dt,
             records_processed=records_processed,
             status="success",
+            metadata=None,
             force=True,
         )
         _emit_line(

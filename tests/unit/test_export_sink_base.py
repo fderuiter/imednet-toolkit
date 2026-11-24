@@ -1237,3 +1237,193 @@ class TestQualityGatePrefetchedVariablesAndBufferRouter:
         router.flush_all()
         assert active_flushes == [("F1", [101, 102], 0), ("F2", [201], 0)]
         assert router.total_buffered == 0
+
+
+class TestDualWatermarkAndLedgerRouting:
+    """Verify max(dateModified, lastUpdated) watermarks, dual-branch signed record exports, and ledger_path routing."""
+
+    def test_extract_record_timestamp_returns_max_of_date_modified_and_last_updated(self):
+        """extract_record_timestamp returns max(dateModified, lastUpdated) in UTC across models and dicts."""
+        from datetime import UTC, datetime
+
+        from imednet.models.records import Record
+
+        signed_model = Record(
+            record_id=1,
+            date_modified="2026-06-01T10:00:00Z",
+            last_updated="2026-06-04T15:30:00Z",
+        )
+        assert sink_base_mod.extract_record_timestamp(signed_model) == datetime(
+            2026, 6, 4, 15, 30, tzinfo=UTC
+        )
+
+        edited_model = Record(
+            record_id=2,
+            date_modified="2026-06-05T08:00:00Z",
+            last_updated="2026-06-04T15:30:00Z",
+        )
+        assert sink_base_mod.extract_record_timestamp(edited_model) == datetime(
+            2026, 6, 5, 8, 0, tzinfo=UTC
+        )
+
+        assert sink_base_mod.extract_record_timestamp(
+            {
+                "dateModified": "2026-06-01T09:00:00Z",
+                "lastUpdated": datetime(2026, 6, 3, 12, 0),
+            }
+        ) == datetime(2026, 6, 3, 12, 0, tzinfo=UTC)
+        assert sink_base_mod.extract_record_timestamp(
+            {"last_updated": "2026-06-02T07:15:00+02:00"}
+        ) == datetime(2026, 6, 2, 5, 15, tzinfo=UTC)
+        assert sink_base_mod.extract_record_timestamp({"recordId": 99}) is None
+
+    def test_iter_filtered_sdk_records_and_streaming_export_capture_signed_records_and_advance_watermark(
+        self, tmp_path
+    ):
+        """iter_filtered_sdk_records issues separate AND-only branches, captures signed records, deduplicates, and advances checkpoints."""
+        from datetime import UTC, datetime
+
+        from imednet.models.records import Record
+        from imednet_workflows.state_ledger import FileStateProvider
+
+        upstream = {
+            101: Record(
+                record_id=101,
+                study_key="S_SIG",
+                subject_key="SUBJ-01",
+                form_id=10,
+                form_key="AE",
+                record_status="Complete",
+                deleted=False,
+                date_modified=datetime(2026, 6, 1, 10, 0, tzinfo=UTC),
+                last_updated=datetime(2026, 6, 1, 10, 0, tzinfo=UTC),
+                record_data={"AETERM": "Headache"},
+            ),
+            102: Record(
+                record_id=102,
+                study_key="S_SIG",
+                subject_key="SUBJ-02",
+                form_id=10,
+                form_key="AE",
+                record_status="Complete",
+                deleted=False,
+                date_modified=datetime(2026, 6, 1, 9, 0, tzinfo=UTC),
+                last_updated=datetime(2026, 6, 1, 9, 0, tzinfo=UTC),
+                record_data={"AETERM": "Fatigue"},
+            ),
+        }
+        seen_calls: list[dict] = []
+
+        def _strict_list(**kw):
+            seen_calls.append(dict(kw))
+            flt = str(kw.get("filter", "") or "")
+            assert not (";" in flt and "," in flt)
+            rows = list(upstream.values())
+            if kw.get("deleted") is False:
+                rows = [r for r in rows if not r.deleted]
+            if "dateModified" in kw:
+                op_str, bound = kw["dateModified"]
+                dt_bound = sink_base_mod.normalize_watermark_datetime(bound)
+                assert op_str == ">=" and dt_bound is not None
+                rows = [
+                    r for r in rows if r.date_modified is not None and r.date_modified >= dt_bound
+                ]
+            if "lastUpdated" in kw:
+                op_str, bound = kw["lastUpdated"]
+                dt_bound = sink_base_mod.normalize_watermark_datetime(bound)
+                assert op_str == ">=" and dt_bound is not None
+                rows = [
+                    r for r in rows if r.last_updated is not None and r.last_updated >= dt_bound
+                ]
+            return iter([r.model_copy(deep=True) for r in rows])
+
+        sdk = MagicMock()
+        sdk.records.list.side_effect = _strict_list
+
+        ledger_file = tmp_path / "sig_stream_ledger.json"
+        written_batches: list[list[dict]] = []
+
+        class _CaptureSink(sink_base_mod.ExportSink):
+            def write_batch(self, records, *, batch_id=None):
+                _ = batch_id
+                batch = list(records)
+                written_batches.append(batch)
+                return len(batch)
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        cfg1 = SinkConfig(
+            study_key="S_SIG",
+            incremental=True,
+            stream_name="ae_stream",
+            ledger_path=str(ledger_file),
+        )
+        sink_base_mod.run_streaming_export(
+            sdk,
+            "S_SIG",
+            _CaptureSink(cfg1),
+            cfg1,
+            stream_name="ae_stream",
+            default_provider_name="airflow",
+        )
+        provider = FileStateProvider(ledger_file)
+        assert provider.get_last_timestamp("S_SIG", "ae_stream") == datetime(
+            2026, 6, 1, 10, 0, tzinfo=UTC
+        )
+
+        upstream[101] = upstream[101].model_copy(
+            update={
+                "record_status": "Signed",
+                "date_modified": datetime(2026, 6, 1, 8, 30, tzinfo=UTC),
+                "last_updated": datetime(2026, 6, 3, 14, 15, tzinfo=UTC),
+            }
+        )
+        upstream[102] = upstream[102].model_copy(
+            update={
+                "date_modified": datetime(2026, 6, 2, 11, 0, tzinfo=UTC),
+                "last_updated": datetime(2026, 6, 2, 11, 0, tzinfo=UTC),
+            }
+        )
+        seen_calls.clear()
+        written_batches.clear()
+
+        cfg2 = SinkConfig(
+            study_key="S_SIG",
+            incremental=True,
+            stream_name="ae_stream",
+            ledger_path=str(ledger_file),
+        )
+        total = sink_base_mod.run_streaming_export(
+            sdk,
+            "S_SIG",
+            _CaptureSink(cfg2),
+            cfg2,
+            stream_name="ae_stream",
+            default_provider_name="airflow",
+        )
+        assert total == 2
+        assert len(seen_calls) == 2
+        assert "dateModified" in seen_calls[0] and "lastUpdated" not in seen_calls[0]
+        assert "lastUpdated" in seen_calls[1] and "dateModified" not in seen_calls[1]
+
+        flat_written = [row for b in written_batches for row in b]
+        assert sorted(
+            (r["record_id"] if isinstance(r, dict) else r.record_id) for r in flat_written
+        ) == [101, 102]
+        signed_out = next(
+            r
+            for r in flat_written
+            if (r["record_id"] if isinstance(r, dict) else r.record_id) == 101
+        )
+        assert (
+            signed_out["record_status"]
+            if isinstance(signed_out, dict)
+            else signed_out.record_status
+        ) == "Signed"
+        assert provider.get_last_timestamp("S_SIG", "ae_stream") == datetime(
+            2026, 6, 3, 14, 15, tzinfo=UTC
+        )

@@ -1175,7 +1175,9 @@ def test_sink_base_sdtm_lineage_quality_gate_and_filter_branch_helpers(tmp_path:
         record_filter={"formKey": ["F_DM", "F_AE"], "filter": "subjectKey==S01"},
         watermark=t1,
     )
-    assert len(branches) == 2
+    assert len(branches) == 4
+    assert sum("dateModified" in kw for kw, _ in branches) == 2
+    assert sum("lastUpdated" in kw for kw, _ in branches) == 2
     seq_branches = _resolve_record_query_branches(
         record_filter=["formKey==F_AE;subjectKey==S01"],
         watermark=None,

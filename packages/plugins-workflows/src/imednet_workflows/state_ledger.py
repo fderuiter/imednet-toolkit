@@ -20,16 +20,95 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from imednet.spi.sinks import redact_uri
-from imednet.spi.utils import mask_clinical_phi, redact_sensitive_payload, redact_sensitive_text
+from imednet.spi.utils import (
+    redact_sensitive_payload,
+    redact_sensitive_text,
+    sanitize_diagnostic_payload,
+)
+
+_PRESERVED_SDTM_INT_MAPS: frozenset[str] = frozenset(
+    {"sdtm_seq_counters", "sdtm_record_seqs", "sdtm_seq_watermarks"}
+)
+
+
+def _extract_preserved_sdtm_ints(
+    raw_map: Mapping[Any, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split an SDTM sequence mapping into preserved integer entries and non-integer residuals."""
+    preserved: dict[str, Any] = {}
+    residual: dict[str, Any] = {}
+    for sub_key, sub_val in raw_map.items():
+        sub_key_str = str(sub_key)
+        if isinstance(sub_val, int) and not isinstance(sub_val, bool):
+            preserved[sub_key_str] = sub_val
+        elif isinstance(sub_val, Mapping) and sub_val:
+            nested_ints: dict[str, int] = {}
+            nested_other: dict[str, Any] = {}
+            for inner_k, inner_v in sub_val.items():
+                inner_k_str = str(inner_k)
+                if isinstance(inner_v, int) and not isinstance(inner_v, bool):
+                    nested_ints[inner_k_str] = inner_v
+                else:
+                    nested_other[inner_k_str] = inner_v
+            if nested_ints:
+                if nested_other:
+                    scrubbed_other = sanitize_diagnostic_payload(nested_other)
+                    merged_nested = dict(scrubbed_other) if isinstance(scrubbed_other, dict) else {}
+                    merged_nested.update(nested_ints)
+                    preserved[sub_key_str] = merged_nested
+                else:
+                    preserved[sub_key_str] = nested_ints
+            else:
+                residual[sub_key_str] = nested_other
+        else:
+            residual[sub_key_str] = sub_val
+    return preserved, residual
+
+
+def _merge_sdtm_int_entries(target: dict[str, Any], preserved: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge preserved flat and 2-level integer SDTM sequence entries over sanitized residuals."""
+    merged = dict(target)
+    for k, v in preserved.items():
+        existing = merged.get(k)
+        if isinstance(v, dict) and isinstance(existing, dict):
+            combined_inner = dict(existing)
+            combined_inner.update(v)
+            merged[k] = combined_inner
+        else:
+            merged[k] = copy.deepcopy(v)
+    return merged
 
 
 def _sanitize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
-    """Redact credentials and mask clinical PHI keys in stream checkpoint metadata."""
+    """Redact credentials and mask clinical PHI while preserving integer SDTM counters."""
     if not isinstance(metadata, dict) or not metadata:
         return {}
-    masked = mask_clinical_phi(metadata)
-    redacted = redact_sensitive_payload(masked)
-    return redacted if isinstance(redacted, dict) else {}
+
+    preserved_int_maps: dict[str, dict[str, Any]] = {}
+    residual_payload: dict[str, Any] = {}
+    for key, value in metadata.items():
+        key_str = str(key)
+        if key_str in _PRESERVED_SDTM_INT_MAPS and isinstance(value, Mapping):
+            int_entries, non_int_entries = _extract_preserved_sdtm_ints(value)
+            preserved_int_maps[key_str] = int_entries
+            if non_int_entries:
+                residual_payload[key_str] = non_int_entries
+        else:
+            residual_payload[key_str] = value
+
+    sanitized: dict[str, Any] = {}
+    if residual_payload:
+        scrubbed = sanitize_diagnostic_payload(residual_payload)
+        if isinstance(scrubbed, dict):
+            sanitized = dict(scrubbed)
+
+    for map_key, int_entries in preserved_int_maps.items():
+        existing_sanitized = sanitized.get(map_key)
+        if isinstance(existing_sanitized, dict):
+            sanitized[map_key] = _merge_sdtm_int_entries(existing_sanitized, int_entries)
+        else:
+            sanitized[map_key] = copy.deepcopy(int_entries)
+    return sanitized
 
 
 # Graceful fallback if fcntl is not available (e.g. non-UNIX environments)
@@ -295,7 +374,9 @@ def _merge_preserved_lineage_metadata(
     existing_meta: Mapping[str, Any] | None,
     incoming_meta: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Merge incoming checkpoint metadata while preserving SDTM sidecar lineage and watermarks."""
+    """Merge incoming checkpoint metadata while retaining prior metadata when omitted."""
+    if incoming_meta is None:
+        return copy.deepcopy(dict(existing_meta)) if isinstance(existing_meta, Mapping) else {}
     merged: dict[str, Any] = dict(incoming_meta) if isinstance(incoming_meta, Mapping) else {}
     if not isinstance(existing_meta, Mapping):
         return merged
@@ -390,12 +471,73 @@ def _is_pid_alive(pid: int) -> bool:
     return True
 
 
+def _escape_sql_like(prefix: str, escape_char: str = "\\") -> str:
+    """Escape SQL ``LIKE`` wildcard characters (``%`` and ``_``) in ``prefix``."""
+    return (
+        prefix.replace(escape_char, escape_char + escape_char)
+        .replace("%", escape_char + "%")
+        .replace("_", escape_char + "_")
+    )
+
+
+def _resolve_airflow_task_lease_context() -> tuple[str | None, int | None]:
+    """Resolve ``(task_key, try_number)`` from Airflow runtime context or ``AIRFLOW_CTX_*`` env."""
+    dag_id = os.environ.get("AIRFLOW_CTX_DAG_ID")
+    task_id = os.environ.get("AIRFLOW_CTX_TASK_ID")
+    run_id = (
+        os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
+        or os.environ.get("AIRFLOW_CTX_EXECUTION_DATE")
+        or os.environ.get("AIRFLOW_CTX_LOGICAL_DATE")
+    )
+    map_index = os.environ.get("AIRFLOW_CTX_MAP_INDEX") or os.environ.get(
+        "AIRFLOW_CTX_TASK_MAP_INDEX"
+    )
+    raw_try: Any = os.environ.get("AIRFLOW_CTX_TRY_NUMBER")
+
+    if not task_id or raw_try is None or map_index is None:
+        with contextlib.suppress(Exception):
+            from airflow.sdk import get_current_context
+
+            ctx = get_current_context()
+            ti = ctx.get("ti") or ctx.get("task_instance")
+            if ti is not None:
+                dag_id = dag_id or getattr(ti, "dag_id", None)
+                task_id = task_id or getattr(ti, "task_id", None)
+                run_id = run_id or getattr(ti, "run_id", None) or getattr(ti, "dag_run_id", None)
+                if map_index is None:
+                    ti_map = getattr(ti, "map_index", None)
+                    if ti_map is not None:
+                        map_index = str(ti_map)
+                if raw_try is None:
+                    raw_try = getattr(ti, "try_number", None)
+
+    try_number: int | None = None
+    if isinstance(raw_try, int) and not isinstance(raw_try, bool):
+        try_number = raw_try
+    elif isinstance(raw_try, str) and raw_try.strip():
+        with contextlib.suppress(ValueError):
+            try_number = int(raw_try.strip())
+
+    task_key: str | None = None
+    if isinstance(task_id, str) and task_id.strip():
+        norm_dag = dag_id.strip() if isinstance(dag_id, str) else ""
+        norm_run = run_id.strip() if isinstance(run_id, str) else ""
+        norm_map = map_index.strip() if isinstance(map_index, str) and map_index.strip() else "-1"
+        task_key = f"{norm_dag}:{task_id.strip()}:{norm_run}:{norm_map}"
+
+    return task_key, try_number
+
+
 def _check_stale_running(
     owner_pid: int | None,
     owner_host: str | None,
     lease_expires_at: datetime | None,
     *,
     now: datetime | None = None,
+    owner_task_key: str | None = None,
+    owner_try_number: int | None = None,
+    current_task_key: str | None = None,
+    current_try_number: int | None = None,
 ) -> str | None:
     """Return a recovery reason if a RUNNING stream lease is stale, or None if still active."""
     current_time = now if now is not None else datetime.now(UTC)
@@ -412,7 +554,84 @@ def _check_stale_running(
         host_label = owner_host or current_host
         return f"owner process {owner_pid} on {host_label} is no longer running"
 
+    env_task_key, env_try_number = _resolve_airflow_task_lease_context()
+    resolved_task_key = current_task_key if current_task_key is not None else env_task_key
+    resolved_try_number = current_try_number if current_try_number is not None else env_try_number
+    current_pid = os.getpid()
+    is_different_worker = (owner_host is not None and owner_host != current_host) or (
+        owner_pid is not None and owner_pid != current_pid
+    )
+    if is_different_worker:
+        host_label = owner_host or current_host
+        if (
+            owner_task_key is not None
+            and resolved_task_key is not None
+            and owner_task_key == resolved_task_key
+            and (
+                owner_try_number is None
+                or resolved_try_number is None
+                or resolved_try_number > owner_try_number
+            )
+        ):
+            return (
+                f"reclaimed crashed lease for task {resolved_task_key} "
+                f"from {host_label} (pid={owner_pid})"
+            )
+        if (
+            owner_task_key is None
+            and resolved_try_number is not None
+            and resolved_try_number > 1
+            and (owner_pid is not None or owner_host is not None)
+        ):
+            return (
+                f"reclaimed crashed lease on retry attempt {resolved_try_number} "
+                f"from {host_label} (pid={owner_pid})"
+            )
+
     return None
+
+
+_LEASE_ATTEMPT_META_KEY = "_lease_attempt"
+
+
+def _attach_lease_attempt(
+    metadata: Mapping[str, Any] | None,
+    task_key: str | None,
+    try_number: int | None,
+) -> dict[str, Any]:
+    """Attach transient task retry lease context to RUNNING stream metadata."""
+    cleaned = _strip_lease_attempt(metadata)
+    if task_key is not None or try_number is not None:
+        cleaned[_LEASE_ATTEMPT_META_KEY] = {
+            "task_key": task_key,
+            "try_number": try_number,
+        }
+    return cleaned
+
+
+def _extract_lease_attempt(
+    metadata: Mapping[str, Any] | None,
+) -> tuple[str | None, int | None]:
+    """Extract transient task retry lease context from RUNNING stream metadata."""
+    if not isinstance(metadata, Mapping):
+        return None, None
+    raw = metadata.get(_LEASE_ATTEMPT_META_KEY)
+    if not isinstance(raw, Mapping):
+        return None, None
+    raw_task = raw.get("task_key")
+    task_key = raw_task if isinstance(raw_task, str) and raw_task else None
+    raw_try = raw.get("try_number")
+    try_num = raw_try if isinstance(raw_try, int) and not isinstance(raw_try, bool) else None
+    return task_key, try_num
+
+
+def _strip_lease_attempt(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return a deep copy of stream metadata without transient lease attempt keys."""
+    if not isinstance(metadata, Mapping):
+        return {}
+    out = copy.deepcopy(dict(metadata))
+    out.pop(_LEASE_ATTEMPT_META_KEY, None)
+    return out
 
 
 class FileStateProvider(BaseStateProvider):
@@ -463,11 +682,15 @@ class FileStateProvider(BaseStateProvider):
         """Reads and validates the current ledger state."""
         self._ensure_ledger_exists()
         with open(self.ledger_path, encoding="utf-8") as f:
-            try:
-                data = json.load(f)
-            except json.JSONDecodeError:
-                # If file is empty or corrupted, fallback to empty ledger
-                return LedgerState(studies={})
+            raw_content = f.read()
+        if not raw_content.strip():
+            return LedgerState(studies={})
+        data = json.loads(raw_content)
+        if not isinstance(data, Mapping):
+            raise ValueError(
+                f"Corrupted ledger state in {self.ledger_path}: expected JSON object, "
+                f"got {type(data).__name__}"
+            )
         return LedgerState.model_validate(data)
 
     def write_state(self, state: LedgerState) -> None:
@@ -538,7 +761,7 @@ class FileStateProvider(BaseStateProvider):
                 validate_transition(current_status, validated_status)
 
             normalized_ts = _normalize_optional_utc(timestamp)
-            prior_meta = current_stream.metadata if current_stream else None
+            prior_meta = _strip_lease_attempt(current_stream.metadata) if current_stream else None
             merged_meta = _merge_preserved_lineage_metadata(prior_meta, metadata)
             redacted_meta = _sanitize_metadata(merged_meta)
 
@@ -570,7 +793,13 @@ class FileStateProvider(BaseStateProvider):
             state = self.read_state()
             study = state.studies.setdefault(study_key, StudyState())
             current_stream = study.streams.get(stream_name)
-            prior_meta = current_stream.metadata if current_stream else {}
+            lease_task_k, lease_try_n = (
+                _extract_lease_attempt(current_stream.metadata)
+                if current_stream is not None
+                and current_stream.last_run_status == StreamExecutionStatus.RUNNING
+                else (None, None)
+            )
+            prior_meta = _strip_lease_attempt(current_stream.metadata) if current_stream else {}
             incoming: dict[str, Any] = {}
             if lineage_updates:
                 incoming["sdtm_lineage"] = dict(lineage_updates)
@@ -580,6 +809,8 @@ class FileStateProvider(BaseStateProvider):
                 _merge_preserved_lineage_metadata(prior_meta, incoming)
             )
             if current_stream is not None:
+                if current_stream.last_run_status == StreamExecutionStatus.RUNNING:
+                    merged_meta = _attach_lease_attempt(merged_meta, lease_task_k, lease_try_n)
                 current_stream.metadata = merged_meta
             else:
                 study.streams[stream_name] = StreamState(
@@ -613,22 +844,29 @@ class FileStateProvider(BaseStateProvider):
             prior_ts = (
                 _normalize_optional_utc(current_stream.last_timestamp) if current_stream else None
             )
-            prior_metadata: dict[str, Any] = (
-                copy.deepcopy(dict(current_stream.metadata))
+            raw_stream_meta = (
+                current_stream.metadata
                 if current_stream is not None and isinstance(current_stream.metadata, dict)
-                else {}
+                else None
             )
+            owner_task_val, owner_try_val = _extract_lease_attempt(raw_stream_meta)
+            prior_metadata: dict[str, Any] = _strip_lease_attempt(raw_stream_meta)
             effective_ts = (
                 prior_ts if prior_ts is not None else _normalize_optional_utc(fallback_timestamp)
             )
 
             now = datetime.now(UTC)
+            active_task_key, active_try_number = _resolve_airflow_task_lease_context()
             if current_stream is not None and current_status == StreamExecutionStatus.RUNNING:
                 stale_reason = _check_stale_running(
                     current_stream.owner_pid,
                     current_stream.owner_host,
                     current_stream.lease_expires_at,
                     now=now,
+                    owner_task_key=owner_task_val,
+                    owner_try_number=owner_try_val,
+                    current_task_key=active_task_key,
+                    current_try_number=active_try_number,
                 )
                 if stale_reason is not None:
                     validate_transition(current_status, StreamExecutionStatus.FAILED)
@@ -650,7 +888,7 @@ class FileStateProvider(BaseStateProvider):
                 last_timestamp=prior_ts,
                 records_processed=0,
                 last_run_status=StreamExecutionStatus.RUNNING,
-                metadata=copy.deepcopy(prior_metadata),
+                metadata=_attach_lease_attempt(prior_metadata, active_task_key, active_try_number),
                 owner_pid=os.getpid(),
                 owner_host=socket.gethostname(),
                 lease_expires_at=now + timedelta(seconds=ttl),
@@ -695,11 +933,11 @@ class FileStateProvider(BaseStateProvider):
                 running_stream = study_entry.streams.get(stream_name)
                 base_meta = _merge_preserved_lineage_metadata(
                     prior_metadata,
-                    running_stream.metadata if running_stream else None,
+                    _strip_lease_attempt(running_stream.metadata) if running_stream else None,
                 )
                 commit_meta = _merge_preserved_lineage_metadata(
                     base_meta,
-                    raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
+                    raw_commit_meta if isinstance(raw_commit_meta, Mapping) else None,
                 )
                 redacted_commit_meta = _sanitize_metadata(commit_meta)
                 study_entry.streams[stream_name] = StreamState(
@@ -734,6 +972,7 @@ class FileStateProvider(BaseStateProvider):
             state = self.read_state()
             study = state.studies.setdefault(study_key, StudyState())
             now = datetime.now(UTC)
+            active_task_key, active_try_number = _resolve_airflow_task_lease_context()
 
             for stream_name in unique_streams:
                 current_stream = study.streams.get(stream_name)
@@ -743,11 +982,13 @@ class FileStateProvider(BaseStateProvider):
                     if current_stream
                     else None
                 )
-                prior_meta: dict[str, Any] = (
-                    copy.deepcopy(dict(current_stream.metadata))
+                raw_stream_meta = (
+                    current_stream.metadata
                     if current_stream is not None and isinstance(current_stream.metadata, dict)
-                    else {}
+                    else None
                 )
+                owner_task_val, owner_try_val = _extract_lease_attempt(raw_stream_meta)
+                prior_meta: dict[str, Any] = _strip_lease_attempt(raw_stream_meta)
                 prior_ts_map[stream_name] = prior_ts
                 prior_meta_map[stream_name] = prior_meta
                 effective_ts = prior_ts if prior_ts is not None else fallback_utc
@@ -758,6 +999,10 @@ class FileStateProvider(BaseStateProvider):
                         current_stream.owner_host,
                         current_stream.lease_expires_at,
                         now=now,
+                        owner_task_key=owner_task_val,
+                        owner_try_number=owner_try_val,
+                        current_task_key=active_task_key,
+                        current_try_number=active_try_number,
                     )
                     if stale_reason is not None:
                         validate_transition(current_status, StreamExecutionStatus.FAILED)
@@ -780,7 +1025,9 @@ class FileStateProvider(BaseStateProvider):
                     last_timestamp=prior_ts_map[stream_name],
                     records_processed=0,
                     last_run_status=StreamExecutionStatus.RUNNING,
-                    metadata=copy.deepcopy(prior_meta_map[stream_name]),
+                    metadata=_attach_lease_attempt(
+                        prior_meta_map[stream_name], active_task_key, active_try_number
+                    ),
                     owner_pid=owner_pid,
                     owner_host=owner_host,
                     lease_expires_at=lease_exp,
@@ -826,11 +1073,11 @@ class FileStateProvider(BaseStateProvider):
                     running_stream = study_entry.streams.get(stream_name)
                     base_meta = _merge_preserved_lineage_metadata(
                         prior_meta_map[stream_name],
-                        running_stream.metadata if running_stream else None,
+                        _strip_lease_attempt(running_stream.metadata) if running_stream else None,
                     )
                     commit_meta = _merge_preserved_lineage_metadata(
                         base_meta,
-                        raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
+                        raw_commit_meta if isinstance(raw_commit_meta, Mapping) else None,
                     )
                     redacted_commit_meta = _sanitize_metadata(commit_meta)
                     study_entry.streams[stream_name] = StreamState(
@@ -1051,14 +1298,14 @@ class AirflowStateProvider(BaseStateProvider):
         ModelVariable.set(key, payload, serialize_json=True)
 
     def _list_variable_keys(self, prefix: str) -> list[str]:
-        """List Airflow Variable keys matching ``prefix``."""
+        """List Airflow Variable keys matching exact ``prefix`` (escaping SQL LIKE wildcards)."""
         if not self._airflow_available():
             return []
 
         if self._has_active_task_sdk_comms():
             from airflow.sdk import Variable as SdkVariable
 
-            return [str(k) for k in SdkVariable.keys(prefix=prefix)]
+            return [str(k) for k in SdkVariable.keys(prefix=prefix) if str(k).startswith(prefix)]
 
         try:
             from airflow.models.variable import Variable as ModelVariable
@@ -1066,13 +1313,14 @@ class AirflowStateProvider(BaseStateProvider):
         except ImportError:
             return []
 
+        escaped_prefix = _escape_sql_like(prefix)
         with self._open_orm_read_session() as session:
             rows = session.scalars(
                 select(ModelVariable.key)
-                .where(ModelVariable.key.startswith(prefix, autoescape=True))
+                .where(ModelVariable.key.like(f"{escaped_prefix}%", escape="\\"))
                 .order_by(ModelVariable.key)
             ).all()
-            return [str(k) for k in rows]
+            return [str(k) for k in rows if str(k).startswith(prefix)]
 
     def _delete_listed_variable_key(self, key: str) -> None:
         """Delete a listed Airflow Variable key without issuing a pre-delete GetVariable read."""
@@ -1183,7 +1431,7 @@ class AirflowStateProvider(BaseStateProvider):
             records_processed=records_processed,
             last_run_status=status,
             error_message=raw_error if isinstance(raw_error, str) else None,
-            metadata=raw_meta if isinstance(raw_meta, dict) else {},
+            metadata=_strip_lease_attempt(raw_meta) if isinstance(raw_meta, dict) else {},
             owner_pid=owner_pid_val,
             owner_host=owner_host_val,
             lease_expires_at=lease_exp_val,
@@ -1202,6 +1450,8 @@ class AirflowStateProvider(BaseStateProvider):
         owner_pid: int | None = None,
         owner_host: str | None = None,
         lease_expires_at: datetime | None = None,
+        owner_task_key: str | None = None,
+        owner_try_number: int | None = None,
     ) -> dict[str, Any]:
         """Build a secret-redacted checkpoint payload for a single stream."""
         normalized_ts = _normalize_optional_utc(timestamp)
@@ -1211,8 +1461,10 @@ class AirflowStateProvider(BaseStateProvider):
             if error_message is not None
             else None
         )
-        redacted_meta = _sanitize_metadata(metadata)
-        return {
+        redacted_meta = _sanitize_metadata(_strip_lease_attempt(metadata))
+        if status == StreamExecutionStatus.RUNNING:
+            redacted_meta = _attach_lease_attempt(redacted_meta, owner_task_key, owner_try_number)
+        payload: dict[str, Any] = {
             "study_key": study_key,
             "stream_name": stream_name,
             "last_timestamp": normalized_ts.isoformat() if normalized_ts is not None else None,
@@ -1226,6 +1478,11 @@ class AirflowStateProvider(BaseStateProvider):
                 normalized_lease.isoformat() if normalized_lease is not None else None
             ),
         }
+        if owner_task_key is not None:
+            payload["owner_task_key"] = owner_task_key
+        if owner_try_number is not None:
+            payload["owner_try_number"] = owner_try_number
+        return payload
 
     def _read_stream_entry(self, study_key: str, stream_name: str) -> dict[str, Any] | None:
         """Read a single stream checkpoint from consolidated Study key or legacy fallback."""
@@ -1306,6 +1563,7 @@ class AirflowStateProvider(BaseStateProvider):
         except ImportError:
             return study_key, {}, []
 
+        escaped_legacy_prefix = _escape_sql_like(legacy_prefix)
         raw_rows: list[tuple[str, dict[str, Any] | None]] = []
         with self._open_orm_read_session() as session:
             rows = session.scalars(
@@ -1313,13 +1571,15 @@ class AirflowStateProvider(BaseStateProvider):
                 .where(
                     or_(
                         ModelVariable.key == study_var_key,
-                        ModelVariable.key.startswith(legacy_prefix, autoescape=True),
+                        ModelVariable.key.like(f"{escaped_legacy_prefix}%", escape="\\"),
                     )
                 )
                 .order_by(ModelVariable.key)
             ).all()
             for row in rows:
-                raw_rows.append((str(row.key), self._deserialize_json_dict(row.val)))
+                row_k = str(row.key)
+                if row_k == study_var_key or row_k.startswith(legacy_prefix):
+                    raw_rows.append((row_k, self._deserialize_json_dict(row.val)))
 
         has_study_row = False
         consolidated_payload: dict[str, Any] | None = None
@@ -1433,7 +1693,15 @@ class AirflowStateProvider(BaseStateProvider):
             return
         resolved_study, streams, legacy_keys = self._load_study_state(study_key)
         existing = streams.get(stream_name)
-        prior_meta = existing.get("metadata") if isinstance(existing, dict) else {}
+        lease_task_k, lease_try_n = (
+            _extract_lease_attempt(existing.get("metadata"))
+            if isinstance(existing, dict)
+            and self._parse_status(existing) == StreamExecutionStatus.RUNNING
+            else (None, None)
+        )
+        prior_meta = (
+            _strip_lease_attempt(existing.get("metadata")) if isinstance(existing, dict) else {}
+        )
         incoming: dict[str, Any] = {}
         if lineage_updates:
             incoming["sdtm_lineage"] = dict(lineage_updates)
@@ -1445,7 +1713,12 @@ class AirflowStateProvider(BaseStateProvider):
         )
         if isinstance(existing, dict):
             updated = dict(existing)
-            updated["metadata"] = _sanitize_metadata(merged_meta)
+            sanitized_existing_meta = _sanitize_metadata(merged_meta)
+            if self._parse_status(existing) == StreamExecutionStatus.RUNNING:
+                sanitized_existing_meta = _attach_lease_attempt(
+                    sanitized_existing_meta, lease_task_k, lease_try_n
+                )
+            updated["metadata"] = sanitized_existing_meta
             streams[stream_name] = updated
         else:
             streams[stream_name] = self._build_stream_payload(
@@ -1488,7 +1761,7 @@ class AirflowStateProvider(BaseStateProvider):
             validate_transition(current_status, validated_status)
 
         prior_meta = (
-            existing_payload.get("metadata")
+            _strip_lease_attempt(existing_payload.get("metadata"))
             if _preserve_existing_lineage and isinstance(existing_payload, dict)
             else None
         )
@@ -1517,8 +1790,8 @@ class AirflowStateProvider(BaseStateProvider):
     @staticmethod
     def _extract_lease_fields(
         raw_entry: dict[str, Any],
-    ) -> tuple[int | None, str | None, datetime | None]:
-        """Extract ``(owner_pid, owner_host, lease_expires_at)`` from a raw stream payload."""
+    ) -> tuple[int | None, str | None, datetime | None, str | None, int | None]:
+        """Extract lease metadata from a raw stream payload."""
         raw_pid = raw_entry.get("owner_pid")
         owner_pid_val = (
             raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
@@ -1528,7 +1801,17 @@ class AirflowStateProvider(BaseStateProvider):
         lease_exp_val: datetime | None = None
         with contextlib.suppress(ValueError):
             lease_exp_val = _parse_optional_timestamp(raw_entry.get("lease_expires_at"))
-        return owner_pid_val, owner_host_val, lease_exp_val
+        raw_task_key = raw_entry.get("owner_task_key")
+        owner_task_val = raw_task_key if isinstance(raw_task_key, str) else None
+        raw_try = raw_entry.get("owner_try_number")
+        owner_try_val = (
+            raw_try if isinstance(raw_try, int) and not isinstance(raw_try, bool) else None
+        )
+        if owner_task_val is None and owner_try_val is None:
+            meta_task, meta_try = _extract_lease_attempt(raw_entry.get("metadata"))
+            owner_task_val = meta_task
+            owner_try_val = meta_try
+        return owner_pid_val, owner_host_val, lease_exp_val, owner_task_val, owner_try_val
 
     @contextlib.contextmanager
     def transaction(
@@ -1544,22 +1827,31 @@ class AirflowStateProvider(BaseStateProvider):
         raw_entry = streams.get(stream_name)
         prior_ts = _normalize_optional_utc(self._parse_timestamp(raw_entry))
         raw_prior_meta = raw_entry.get("metadata") if isinstance(raw_entry, dict) else None
-        prior_metadata: dict[str, Any] = (
-            copy.deepcopy(raw_prior_meta) if isinstance(raw_prior_meta, dict) else {}
-        )
+        prior_metadata: dict[str, Any] = _strip_lease_attempt(raw_prior_meta)
         effective_ts = (
             prior_ts if prior_ts is not None else _normalize_optional_utc(fallback_timestamp)
         )
 
         current_status = self._parse_status(raw_entry)
         now = datetime.now(UTC)
+        active_task_key, active_try_number = _resolve_airflow_task_lease_context()
         if current_status == StreamExecutionStatus.RUNNING and raw_entry is not None:
-            owner_pid_val, owner_host_val, lease_exp_val = self._extract_lease_fields(raw_entry)
+            (
+                owner_pid_val,
+                owner_host_val,
+                lease_exp_val,
+                owner_task_val,
+                owner_try_val,
+            ) = self._extract_lease_fields(raw_entry)
             stale_reason = _check_stale_running(
                 owner_pid_val,
                 owner_host_val,
                 lease_exp_val,
                 now=now,
+                owner_task_key=owner_task_val,
+                owner_try_number=owner_try_val,
+                current_task_key=active_task_key,
+                current_try_number=active_try_number,
             )
             if stale_reason is not None:
                 validate_transition(current_status, StreamExecutionStatus.FAILED)
@@ -1598,6 +1890,8 @@ class AirflowStateProvider(BaseStateProvider):
             owner_pid=os.getpid(),
             owner_host=socket.gethostname(),
             lease_expires_at=now + timedelta(seconds=ttl),
+            owner_task_key=active_task_key,
+            owner_try_number=active_try_number,
         )
         self._save_study_state(
             resolved_study,
@@ -1636,7 +1930,7 @@ class AirflowStateProvider(BaseStateProvider):
             raw_commit_meta = tx_data.get("metadata")
             merged_commit_meta = _merge_preserved_lineage_metadata(
                 prior_metadata,
-                raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
+                raw_commit_meta if isinstance(raw_commit_meta, Mapping) else None,
             )
             streams[stream_name] = self._build_stream_payload(
                 study_key=resolved_study,
@@ -1666,6 +1960,7 @@ class AirflowStateProvider(BaseStateProvider):
         resolved_study, streams, legacy_keys = self._load_study_state(study_key)
         fallback_utc = _normalize_optional_utc(fallback_timestamp)
         now = datetime.now(UTC)
+        active_task_key, active_try_number = _resolve_airflow_task_lease_context()
         prior_ts_map: dict[str, datetime | None] = {}
         prior_meta_map: dict[str, dict[str, Any]] = {}
         tx_map: dict[str, dict[str, Any]] = {}
@@ -1674,21 +1969,29 @@ class AirflowStateProvider(BaseStateProvider):
             raw_entry = streams.get(stream_name)
             prior_ts = _normalize_optional_utc(self._parse_timestamp(raw_entry))
             raw_prior_meta = raw_entry.get("metadata") if isinstance(raw_entry, dict) else None
-            prior_meta: dict[str, Any] = (
-                copy.deepcopy(raw_prior_meta) if isinstance(raw_prior_meta, dict) else {}
-            )
+            prior_meta: dict[str, Any] = _strip_lease_attempt(raw_prior_meta)
             prior_ts_map[stream_name] = prior_ts
             prior_meta_map[stream_name] = prior_meta
             effective_ts = prior_ts if prior_ts is not None else fallback_utc
             current_status = self._parse_status(raw_entry)
 
             if current_status == StreamExecutionStatus.RUNNING and raw_entry is not None:
-                owner_pid_val, owner_host_val, lease_exp_val = self._extract_lease_fields(raw_entry)
+                (
+                    owner_pid_val,
+                    owner_host_val,
+                    lease_exp_val,
+                    owner_task_val,
+                    owner_try_val,
+                ) = self._extract_lease_fields(raw_entry)
                 stale_reason = _check_stale_running(
                     owner_pid_val,
                     owner_host_val,
                     lease_exp_val,
                     now=now,
+                    owner_task_key=owner_task_val,
+                    owner_try_number=owner_try_val,
+                    current_task_key=active_task_key,
+                    current_try_number=active_try_number,
                 )
                 if stale_reason is not None:
                     validate_transition(current_status, StreamExecutionStatus.FAILED)
@@ -1717,6 +2020,8 @@ class AirflowStateProvider(BaseStateProvider):
                 owner_pid=owner_pid,
                 owner_host=owner_host,
                 lease_expires_at=lease_exp,
+                owner_task_key=active_task_key,
+                owner_try_number=active_try_number,
             )
         self._save_study_state(
             resolved_study,
@@ -1756,7 +2061,7 @@ class AirflowStateProvider(BaseStateProvider):
                 raw_commit_meta = tx_data.get("metadata")
                 merged_commit_meta = _merge_preserved_lineage_metadata(
                     prior_meta_map[stream_name],
-                    raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
+                    raw_commit_meta if isinstance(raw_commit_meta, Mapping) else None,
                 )
                 streams[stream_name] = self._build_stream_payload(
                     study_key=resolved_study,
@@ -1792,13 +2097,14 @@ class AirflowStateProvider(BaseStateProvider):
         except ImportError:
             return False
 
+        escaped_legacy_prefix = _escape_sql_like(legacy_prefix)
         self._ensure_orm_session()
         with create_session() as session:
             result = session.execute(
                 delete(ModelVariable).where(
                     or_(
                         ModelVariable.key == study_var_key,
-                        ModelVariable.key.startswith(legacy_prefix, autoescape=True),
+                        ModelVariable.key.like(f"{escaped_legacy_prefix}%", escape="\\"),
                     )
                 )
             )
@@ -1881,15 +2187,18 @@ class AirflowStateProvider(BaseStateProvider):
             except ImportError:
                 return state
 
+            escaped_root = _escape_sql_like(root_prefix)
             fetched: list[tuple[str, dict[str, Any] | None]] = []
             with self._open_orm_read_session() as session:
                 rows = session.scalars(
                     select(ModelVariable)
-                    .where(ModelVariable.key.startswith(root_prefix, autoescape=True))
+                    .where(ModelVariable.key.like(f"{escaped_root}%", escape="\\"))
                     .order_by(ModelVariable.key)
                 ).all()
                 for row in rows:
-                    fetched.append((str(row.key), self._deserialize_json_dict(row.val)))
+                    row_k = str(row.key)
+                    if row_k.startswith(root_prefix):
+                        fetched.append((row_k, self._deserialize_json_dict(row.val)))
 
             for key, payload in fetched:
                 remainder = key[len(root_prefix) :]
@@ -1932,11 +2241,23 @@ class AirflowStateProvider(BaseStateProvider):
 
 
 def get_state_provider(
-    ledger_path: str = DEFAULT_LEDGER_PATH,
+    ledger_path: str | Path | None = None,
 ) -> BaseStateProvider:
-    """Factory to get the appropriate state provider based on environment."""
+    """Factory to get the appropriate state provider based on explicit path or environment."""
+    env_ledger = os.environ.get("IMEDNET_WORKFLOW_LEDGER_PATH")
+    has_explicit_ledger = (
+        ledger_path is not None and (str(ledger_path) != DEFAULT_LEDGER_PATH or bool(env_ledger))
+    ) or (ledger_path is None and bool(env_ledger))
+    if has_explicit_ledger:
+        resolved_path = (
+            ledger_path if ledger_path is not None else env_ledger or DEFAULT_LEDGER_PATH
+        )
+        return FileStateProvider(resolved_path)
+
     if "AIRFLOW_CTX_TASK_ID" in os.environ or os.environ.get("USE_AIRFLOW_STATE_PROVIDER") == "1":
         return AirflowStateProvider()
-    if ledger_path == DEFAULT_LEDGER_PATH and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
-        ledger_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
-    return FileStateProvider(ledger_path)
+
+    resolved_default = (
+        ledger_path if ledger_path is not None else (env_ledger or DEFAULT_LEDGER_PATH)
+    )
+    return FileStateProvider(resolved_default)

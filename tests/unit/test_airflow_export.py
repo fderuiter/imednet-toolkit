@@ -1887,3 +1887,269 @@ def test_operator_sdtm_phi_redaction_and_incremental_reconciliation(
     json_rows2 = json.loads(json_path.read_text(encoding="utf-8"))
     assert len(json_rows2) == 1 and json_rows2[0]["USUBJID"] == "S01"
     assert json_rows2[0]["BRTHDTC"] == "1981"
+
+
+def test_operator_explicit_ledger_path_uses_local_file_provider_under_airflow_ctx(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ImednetExportOperator with explicit ledger_path writes to FileStateProvider even under Airflow env."""
+    from datetime import UTC, datetime
+
+    import imednet.integrations.sink_base as sink_base_mod
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import AirflowStateProvider, FileStateProvider
+
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "airflow_export_task")
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+    monkeypatch.setenv("IMEDNET_CACHE_DIR", str(tmp_path / "op_cache"))
+
+    def _forbid_airflow_provider(*_a: object, **_kw: object) -> object:
+        raise AssertionError("AirflowStateProvider must not be used when ledger_path is explicit")
+
+    monkeypatch.setattr(AirflowStateProvider, "__init__", _forbid_airflow_provider)
+
+    rec = Record(
+        record_id=10,
+        study_key="STUDY-LEDGER",
+        subject_key="S01",
+        form_id=1,
+        form_key="DM",
+        deleted=False,
+        date_modified=datetime(2026, 6, 5, 14, 0, tzinfo=UTC),
+        last_updated=datetime(2026, 6, 5, 14, 0, tzinfo=UTC),
+        record_data={"AGE": 41},
+    )
+    sdk = MagicMock()
+    sdk.get_variables.return_value = [
+        Variable(variable_name="AGE", variable_type="int", form_id=1, form_key="DM")
+    ]
+    sdk.get_records.return_value = [rec]
+    sdk.records.list.return_value = iter([rec])
+    sdk.sinks = None
+
+    # 1. Tabular destination path
+    ledger_tab = tmp_path / "explicit_tab_ledger.json"
+    out_csv = tmp_path / "explicit.csv"
+    op_tab = ImednetExportOperator(
+        task_id="tab_explicit_ledger",
+        study_key="STUDY-LEDGER",
+        destination="csv",
+        output_path=str(out_csv),
+        incremental=True,
+        ledger_path=str(ledger_tab),
+    )
+    monkeypatch.setattr(op_tab, "_get_sdk", lambda: sdk)
+    op_tab.execute({"run_id": "r1"})
+
+    assert ledger_tab.exists()
+    tab_streams = FileStateProvider(ledger_tab).read_state().studies["STUDY-LEDGER"].streams
+    assert len(tab_streams) == 1
+    assert next(iter(tab_streams.values())).last_timestamp == datetime(
+        2026, 6, 5, 14, 0, tzinfo=UTC
+    )
+
+    # 2. Plugin sink destination path
+    ledger_plugin = tmp_path / "explicit_plugin_ledger.json"
+
+    class _DummyPluginSink(sink_base_mod.ExportSink):
+        def write_batch(self, records, *, batch_id=None):
+            _ = batch_id
+            return len(list(records))
+
+    sdk_plugin = MagicMock()
+    sdk_plugin.records.list.return_value = iter([rec])
+    sdk_plugin.sinks.create.side_effect = lambda _dest, config=None, **_kw: _DummyPluginSink(
+        config or sink_base_mod.SinkConfig(study_key="STUDY-LEDGER")
+    )
+
+    op_plugin = ImednetExportOperator(
+        task_id="plugin_explicit_ledger",
+        study_key="STUDY-LEDGER",
+        destination="snowflake",
+        export_kwargs={"table": "RAW_DM"},
+        incremental=True,
+        ledger_path=str(ledger_plugin),
+    )
+    monkeypatch.setattr(op_plugin, "_get_sdk", lambda: sdk_plugin)
+    op_plugin.execute({"run_id": "r1"})
+
+    assert ledger_plugin.exists()
+    plugin_streams = FileStateProvider(ledger_plugin).read_state().studies["STUDY-LEDGER"].streams
+    assert len(plugin_streams) == 1
+    assert next(iter(plugin_streams.values())).last_timestamp == datetime(
+        2026, 6, 5, 14, 0, tzinfo=UTC
+    )
+
+
+def test_operator_default_stream_names_isolate_targets_and_form_filters() -> None:
+    """ImednetExportOperator generates distinct default stream names per destination target and Form filter."""
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+
+    # 1. Different output_path targets under identical task_id (e.g. dynamic task mapping)
+    op_dm_file = ImednetExportOperator(
+        task_id="mapped_export",
+        study_key="S1",
+        destination="parquet",
+        output_path="/tmp/s1/dm.parquet",
+        incremental=True,
+    )
+    op_ae_file = ImednetExportOperator(
+        task_id="mapped_export",
+        study_key="S1",
+        destination="parquet",
+        output_path="/tmp/s1/ae.parquet",
+        incremental=True,
+    )
+    # Path separator vs underscore + destination_conn_id isolation
+    op_slash = ImednetExportOperator(
+        task_id="mapped_export",
+        study_key="S1",
+        destination="csv",
+        output_path="/data/a/b.csv",
+        incremental=True,
+    )
+    op_under = ImednetExportOperator(
+        task_id="mapped_export",
+        study_key="S1",
+        destination="csv",
+        output_path="/data/a_b.csv",
+        incremental=True,
+    )
+    op_conn_a = ImednetExportOperator(
+        task_id="sql_export",
+        study_key="S1",
+        destination="sql",
+        export_kwargs={"table_name": "RECORDS"},
+        destination_conn_id="pg_warehouse_a",
+        incremental=True,
+    )
+    op_conn_b = ImednetExportOperator(
+        task_id="sql_export",
+        study_key="S1",
+        destination="sql",
+        export_kwargs={"table_name": "RECORDS"},
+        destination_conn_id="pg_warehouse_b",
+        incremental=True,
+    )
+
+    # 2. Different Form filters on same destination/task_id
+    op_fw_dm = ImednetExportOperator(
+        task_id="plugin_sink",
+        study_key="S1",
+        destination="snowflake",
+        export_kwargs={"table": "CLINICAL", "form_whitelist": ["DM"]},
+        incremental=True,
+    )
+    op_fw_ae = ImednetExportOperator(
+        task_id="plugin_sink",
+        study_key="S1",
+        destination="snowflake",
+        export_kwargs={"table": "CLINICAL", "form_whitelist": ["AE"]},
+        incremental=True,
+    )
+    op_dom_dm = ImednetExportOperator(
+        task_id="sdtm_export",
+        study_key="S1",
+        destination="parquet",
+        output_path="/tmp/out",
+        as_sdtm=True,
+        sdtm_domain="DM",
+        incremental=True,
+    )
+    op_dom_ae = ImednetExportOperator(
+        task_id="sdtm_export",
+        study_key="S1",
+        destination="parquet",
+        output_path="/tmp/out",
+        as_sdtm=True,
+        sdtm_domain="AE",
+        incremental=True,
+    )
+    op_flt_dm = ImednetExportOperator(
+        task_id="filtered_export",
+        study_key="S1",
+        destination="json",
+        output_path="/tmp/records.json",
+        record_filter="formKey==DM",
+        incremental=True,
+    )
+    op_flt_ae = ImednetExportOperator(
+        task_id="filtered_export",
+        study_key="S1",
+        destination="json",
+        output_path="/tmp/records.json",
+        record_filter="formKey==AE",
+        incremental=True,
+    )
+
+    assert op_dm_file._default_airflow_stream_name(
+        "parquet"
+    ) != op_ae_file._default_airflow_stream_name("parquet")
+    assert op_slash._default_airflow_stream_name("csv") != op_under._default_airflow_stream_name(
+        "csv"
+    )
+    assert op_conn_a._default_airflow_stream_name("sql") != op_conn_b._default_airflow_stream_name(
+        "sql"
+    )
+    assert op_fw_dm._default_airflow_stream_name(
+        "snowflake"
+    ) != op_fw_ae._default_airflow_stream_name("snowflake")
+    assert op_dom_dm._default_airflow_stream_name(
+        "parquet"
+    ) != op_dom_ae._default_airflow_stream_name("parquet")
+    assert op_flt_dm._default_airflow_stream_name("json") != op_flt_ae._default_airflow_stream_name(
+        "json"
+    )
+
+    # 3. End-to-end mapped plugin sink runs with explicit state_provider isolate per-Form checkpoints
+    import tempfile
+    from datetime import UTC, datetime
+
+    import imednet.integrations.sink_base as sink_base_mod
+    from imednet.models.records import Record
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    with tempfile.TemporaryDirectory() as td:
+        mapped_provider = FileStateProvider(Path(td) / "mapped_sinks.json")
+
+        class _NoopSink(sink_base_mod.ExportSink):
+            def write_batch(self, records, *, batch_id=None):
+                _ = batch_id
+                return len(list(records))
+
+        def _make_mapped_sdk(ts_hour: int) -> MagicMock:
+            rec = Record(
+                record_id=ts_hour,
+                study_key="S1",
+                form_id=1,
+                form_key="DM",
+                deleted=False,
+                date_modified=datetime(2026, 6, 1, ts_hour, 0, tzinfo=UTC),
+            )
+            msdk = MagicMock()
+            msdk.records.list.return_value = iter([rec])
+            msdk.sinks.create.side_effect = lambda _d, config=None, **_kw: _NoopSink(
+                config or sink_base_mod.SinkConfig(study_key="S1")
+            )
+            return msdk
+
+        for idx, (form_code, hr) in enumerate((("DM", 10), ("AE", 14))):
+            mapped_op = ImednetExportOperator(
+                task_id="mapped_snowflake",
+                study_key="S1",
+                destination="snowflake",
+                export_kwargs={"table": "CLINICAL", "form_whitelist": [form_code]},
+                incremental=True,
+                state_provider=mapped_provider,
+            )
+            mapped_op._get_sdk = lambda h=hr: _make_mapped_sdk(h)  # type: ignore[method-assign]
+            mapped_op.execute({"run_id": f"r_{idx}"})
+
+        streams = mapped_provider.read_state().studies["S1"].streams
+        assert len(streams) == 2
+        assert {st.last_timestamp for st in streams.values()} == {
+            datetime(2026, 6, 1, 10, 0, tzinfo=UTC),
+            datetime(2026, 6, 1, 14, 0, tzinfo=UTC),
+        }

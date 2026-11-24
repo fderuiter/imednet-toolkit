@@ -538,18 +538,18 @@ def test_imednet_export_operator_incremental_idempotent_in_real_airflow_dag(
     seen_params = [
         json.loads(line) for line in queries_log.read_text(encoding="utf-8").strip().splitlines()
     ]
-    assert len(seen_params) == 2
+    assert len(seen_params) == 3
     assert "filter" not in seen_params[0]
     assert "dateModified>=" in seen_params[1].get("filter", "")
+    assert "lastUpdated>=" in seen_params[2].get("filter", "")
 
     provider = AirflowStateProvider()
-    assert (
-        provider.get_last_status("STUDY_EXPORT", "json_export_records")
-        == StreamExecutionStatus.SUCCESS
-    )
-    assert provider.get_last_timestamp("STUDY_EXPORT", "json_export_records") == datetime(
-        2026, 9, 10, 15, 0, 0, tzinfo=timezone.utc
-    )
+    study_streams = provider.read_state().studies["STUDY_EXPORT"].streams
+    assert len(study_streams) == 1
+    stream_key, stream_state = next(iter(study_streams.items()))
+    assert stream_key.startswith("json_export_records_")
+    assert stream_state.last_run_status == StreamExecutionStatus.SUCCESS
+    assert stream_state.last_timestamp == datetime(2026, 9, 10, 15, 0, 0, tzinfo=timezone.utc)
 
 
 def test_airflow_state_provider_redacts_sensitive_error_and_metadata(
@@ -902,3 +902,150 @@ def test_50_form_export_runtime_comms_orm_sql_budgets_and_legacy_migration(
     finally:
         event.remove(settings.engine, "before_cursor_execute", _on_before_cursor)
         event.remove(settings.Session, "after_commit", _on_after_commit)
+
+
+def test_airflow_state_provider_escapes_sql_like_wildcards_on_list_read_and_delete(
+    airflow_runtime_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AirflowStateProvider escapes _ and % SQL LIKE wildcards so delete_entry('STUDY_1') preserves 'STUDY-1' and 'STUDYX1'."""
+    _ = airflow_runtime_env
+    from airflow.models import Variable as ModelVariable
+
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    provider = AirflowStateProvider(variable_prefix="imednet_wild_1")
+    ts = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+
+    for sk in ("STUDY_1", "STUDY-1", "STUDYX1", "STUDY_10", "STUDY%1"):
+        provider.set_last_timestamp(sk, "records", ts, records_processed=5)
+
+    ModelVariable.set(
+        "imednet_wild_1:STUDY_1:legacy_ae",
+        {"study_key": "STUDY_1", "stream_name": "legacy_ae", "status": "success"},
+        serialize_json=True,
+    )
+    ModelVariable.set(
+        "imednet_wild_1:STUDYX1:legacy_ae",
+        {"study_key": "STUDYX1", "stream_name": "legacy_ae", "status": "success"},
+        serialize_json=True,
+    )
+    ModelVariable.set(
+        "imednetXwildX1:STUDY_1",
+        {"study_key": "STUDY_1", "streams": {"records": {"status": "success"}}},
+        serialize_json=True,
+    )
+
+    assert provider.delete_entry("STUDY_1") is True
+    assert provider.delete_entry("STUDY_1") is False
+
+    remaining = provider.read_state().studies
+    assert "STUDY_1" not in remaining
+    assert set(remaining) == {"STUDY-1", "STUDYX1", "STUDY_10", "STUDY%1"}
+    for preserved in ("STUDY-1", "STUDYX1", "STUDY_10", "STUDY%1"):
+        assert provider.get_last_status(preserved, "records") == StreamExecutionStatus.SUCCESS
+    assert ModelVariable.get("imednet_wild_1:STUDYX1:legacy_ae", default_var=None) is not None
+    assert ModelVariable.get("imednetXwildX1:STUDY_1", default_var=None) is not None
+
+    class _UnescapedSdkVar:
+        @staticmethod
+        def keys(prefix: str = "") -> list[str]:
+            _ = prefix
+            return [
+                "imednet_wild_1:STUDY_1:s1",
+                "imednet_wild_1:STUDY-1:s1",
+                "imednet_wild_1:STUDYX1:s1",
+            ]
+
+    monkeypatch.setattr(provider, "_has_active_task_sdk_comms", lambda: True)
+    monkeypatch.setattr("airflow.sdk.Variable", _UnescapedSdkVar)
+    assert provider._list_variable_keys("imednet_wild_1:STUDY_1:") == ["imednet_wild_1:STUDY_1:s1"]
+
+
+def test_airflow_state_provider_retains_metadata_and_reclaims_retry_lease(
+    airflow_runtime_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AirflowStateProvider retains metadata on metadata=None and reclaims crashed cross-host retry leases."""
+    _ = airflow_runtime_env
+
+    from imednet_workflows.state_ledger import (
+        AirflowStateProvider,
+        InvalidStateTransitionError,
+        StreamExecutionStatus,
+    )
+
+    provider = AirflowStateProvider(variable_prefix="imednet_meta_retry")
+    meta = {
+        "sdtm_seq_counters": {"DOB": 6, "API_TOKEN": 2},
+        "sdtm_record_seqs": {"DOB::10": 6},
+        "custom_note": "keep-me",
+    }
+    provider.set_last_timestamp(
+        "STUDY_MR",
+        "ae",
+        datetime(2026, 7, 1, tzinfo=timezone.utc),
+        records_processed=6,
+        metadata=meta,
+    )
+    provider.set_last_timestamp(
+        "STUDY_MR",
+        "ae",
+        datetime(2026, 7, 2, tzinfo=timezone.utc),
+        records_processed=8,
+        metadata=None,
+    )
+    loaded = provider.read_state().studies["STUDY_MR"].streams["ae"]
+    assert loaded.last_timestamp == datetime(2026, 7, 2, tzinfo=timezone.utc)
+    assert loaded.metadata == meta
+
+    # Simulate crashed cross-host RUNNING lease in Airflow Variable via SIGKILL on try_number=1,
+    # including mid-transaction record_sdtm_lineage preserving the active lease attempt!
+    import socket
+
+    provider.set_last_timestamp(
+        "STUDY_CRASH",
+        "records",
+        datetime(2026, 7, 1, 0, 0, tzinfo=timezone.utc),
+        records_processed=3,
+    )
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_crash")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_task")
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "run_01")
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
+    with monkeypatch.context() as worker_a:
+        worker_a.setattr(socket, "gethostname", lambda: "remote-celery-worker-1")
+        worker_a.setattr("os.getpid", lambda: 77777)
+        tx_cm = provider.transaction("STUDY_CRASH", "records")
+        tx_cm.__enter__()
+        provider.record_sdtm_lineage(
+            "STUDY_CRASH",
+            "records",
+            lineage_updates={"domain": "AE"},
+            seq_watermarks={"DOB": 4},
+        )
+        tx_cm.gen.close()
+
+    assert provider.get_last_status("STUDY_CRASH", "records") == StreamExecutionStatus.RUNNING
+
+    # Concurrent unrelated task is blocked
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "other_task")
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "2")
+    with pytest.raises(InvalidStateTransitionError):
+        with provider.transaction("STUDY_CRASH", "records"):
+            pass
+
+    # Retry attempt (try_number=2) of the same task reclaims immediately without waiting 3600s
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_task")
+    recovered_ts = datetime(2026, 7, 3, 9, 0, tzinfo=timezone.utc)
+    with provider.transaction("STUDY_CRASH", "records") as tx:
+        assert tx["last_timestamp"] == datetime(2026, 7, 1, 0, 0, tzinfo=timezone.utc)
+        tx["new_timestamp"] = recovered_ts
+        tx["records_processed"] = 11
+
+    assert provider.get_last_status("STUDY_CRASH", "records") == StreamExecutionStatus.SUCCESS
+    assert provider.get_last_timestamp("STUDY_CRASH", "records") == recovered_ts
+    assert provider.get_sdtm_lineage("STUDY_CRASH", "records") == {
+        "sdtm_lineage": {"domain": "AE"},
+        "sdtm_seq_watermarks": {"DOB": 4},
+    }

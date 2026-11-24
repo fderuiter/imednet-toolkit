@@ -116,35 +116,45 @@ def _build_study_sdk(
     ]
 
     def _list_records(**kw: Any) -> Any:
-        from imednet.integrations.sink_base import (
-            extract_record_timestamp,
-            normalize_watermark_datetime,
-        )
+        from imednet.integrations.sink_base import normalize_watermark_datetime
 
         flt = str(kw.get("filter", "") or "")
+        assert not (";" in flt and "," in flt)
         items = list(upstream_records.values())
         if kw.get("deleted") is False:
             items = [r for r in items if not r.deleted]
         elif kw.get("deleted") is True:
             items = [r for r in items if r.deleted]
-        if kw.get("dateModified") is not None:
-            dm = kw["dateModified"]
-            if isinstance(dm, tuple) and len(dm) == 2:
-                op_str, raw_ts = dm
-                wm_dt = normalize_watermark_datetime(raw_ts)
-                if wm_dt is not None:
-                    if op_str == ">=":
-                        items = [
-                            r
-                            for r in items
-                            if (ts := extract_record_timestamp(r)) is not None and ts >= wm_dt
-                        ]
-                    elif op_str == ">":
-                        items = [
-                            r
-                            for r in items
-                            if (ts := extract_record_timestamp(r)) is not None and ts > wm_dt
-                        ]
+        for attr_kw, model_attr in (
+            ("dateModified", "date_modified"),
+            ("lastUpdated", "last_updated"),
+        ):
+            if kw.get(attr_kw) is not None:
+                clause_val = kw[attr_kw]
+                if isinstance(clause_val, tuple) and len(clause_val) == 2:
+                    op_str, raw_ts = clause_val
+                    wm_dt = normalize_watermark_datetime(raw_ts)
+                    if wm_dt is not None:
+                        if op_str == ">=":
+                            items = [
+                                r
+                                for r in items
+                                if (
+                                    ts := normalize_watermark_datetime(getattr(r, model_attr, None))
+                                )
+                                is not None
+                                and ts >= wm_dt
+                            ]
+                        elif op_str == ">":
+                            items = [
+                                r
+                                for r in items
+                                if (
+                                    ts := normalize_watermark_datetime(getattr(r, model_attr, None))
+                                )
+                                is not None
+                                and ts > wm_dt
+                            ]
         if kw.get("formId") is not None:
             raw_fids = kw["formId"]
             if isinstance(raw_fids, tuple) and len(raw_fids) == 2 and raw_fids[0] in ("==", "="):
@@ -167,13 +177,24 @@ def _build_study_sdk(
             if clause == "deleted==false":
                 items = [r for r in items if not r.deleted]
             elif clause.startswith("dateModified>="):
-                wm_str = clause.split(">=", 1)[1]
+                wm_str = clause.split(">=", 1)[1].strip('"')
                 wm_dt = normalize_watermark_datetime(wm_str)
                 if wm_dt is not None:
                     items = [
                         r
                         for r in items
-                        if (ts := extract_record_timestamp(r)) is not None and ts >= wm_dt
+                        if (ts := normalize_watermark_datetime(r.date_modified)) is not None
+                        and ts >= wm_dt
+                    ]
+            elif clause.startswith("lastUpdated>="):
+                wm_str = clause.split(">=", 1)[1].strip('"')
+                wm_dt = normalize_watermark_datetime(wm_str)
+                if wm_dt is not None:
+                    items = [
+                        r
+                        for r in items
+                        if (ts := normalize_watermark_datetime(r.last_updated)) is not None
+                        and ts >= wm_dt
                     ]
             elif clause.startswith("formId=="):
                 fid = int(clause.split("==", 1)[1])
@@ -817,3 +838,139 @@ def test_incremental_reconciliation_edge_cases(tmp_path: Path) -> None:
         ledger_path=str(ledger),
     )
     assert json.loads(hier_path.read_text(encoding="utf-8")) == []
+
+
+def test_mapper_and_sql_by_form_export_signed_records_with_older_date_modified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_make_mapper_records_source and export_to_sql_by_form export 21 CFR 11.10(e) signed records whose dateModified < watermark."""
+    import imednet.integrations.export as export_mod
+
+    records = {
+        1: Record(
+            record_id=1,
+            study_key="S_CFR11",
+            subject_key="SUBJ-01",
+            visit_id=401,
+            form_id=302,
+            form_key="F_VS",
+            record_status="Complete",
+            deleted=False,
+            date_created=datetime(2026, 6, 1, 9, 0, tzinfo=UTC),
+            date_modified=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+            last_updated=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+            record_data={"SYSBP": 122.0},
+        ),
+        2: Record(
+            record_id=2,
+            study_key="S_CFR11",
+            subject_key="SUBJ-02",
+            visit_id=401,
+            form_id=302,
+            form_key="F_VS",
+            record_status="Complete",
+            deleted=False,
+            date_created=datetime(2026, 6, 1, 9, 0, tzinfo=UTC),
+            date_modified=datetime(2026, 6, 1, 11, 0, tzinfo=UTC),
+            last_updated=datetime(2026, 6, 1, 11, 0, tzinfo=UTC),
+            record_data={"SYSBP": 118.0},
+        ),
+    }
+    sdk = _build_study_sdk(records, study_key="S_CFR11")
+    monkeypatch.setenv("IMEDNET_CACHE_DIR", str(tmp_path / "cfr11_cache"))
+
+    csv_path = tmp_path / "cfr11.csv"
+    sql_by_form_db = tmp_path / "cfr11_by_form.db"
+    ledger_path = tmp_path / "cfr11_ledger.json"
+
+    # Run 1: initial incremental export
+    export_to_csv(
+        sdk,
+        "S_CFR11",
+        str(csv_path),
+        incremental=True,
+        stream_name="csv_cfr11",
+        ledger_path=str(ledger_path),
+    )
+    export_to_sql_by_form(
+        sdk,
+        "S_CFR11",
+        f"sqlite:///{sql_by_form_db}",
+        incremental=True,
+        stream_name="sql_cfr11",
+        ledger_path=str(ledger_path),
+    )
+
+    provider = FileStateProvider(ledger_path)
+    assert provider.get_last_timestamp("S_CFR11", "csv_cfr11") == datetime(
+        2026, 6, 1, 12, 0, tzinfo=UTC
+    )
+    assert provider.get_last_timestamp("S_CFR11", "sql_cfr11_F_VS") == datetime(
+        2026, 6, 1, 12, 0, tzinfo=UTC
+    )
+
+    # Upstream: Investigator e-signs Record 1 (dateModified stays < 12:00Z, lastUpdated advances to Jun 4)
+    # and edits Record 2 (both dateModified and lastUpdated advance to Jun 2 -> overlaps both branches)
+    records[1] = records[1].model_copy(
+        update={
+            "record_status": "Signed",
+            "date_modified": datetime(2026, 6, 1, 10, 0, tzinfo=UTC),
+            "last_updated": datetime(2026, 6, 4, 16, 20, tzinfo=UTC),
+        }
+    )
+    records[2] = records[2].model_copy(
+        update={
+            "date_modified": datetime(2026, 6, 2, 9, 0, tzinfo=UTC),
+            "last_updated": datetime(2026, 6, 2, 9, 0, tzinfo=UTC),
+            "record_data": {"SYSBP": 128.5},
+        }
+    )
+
+    # Run 2: incremental export updates signed status on Record 1 and advances checkpoints to Jun 4
+    export_to_csv(
+        sdk,
+        "S_CFR11",
+        str(csv_path),
+        incremental=True,
+        stream_name="csv_cfr11",
+        ledger_path=str(ledger_path),
+    )
+    export_to_sql_by_form(
+        sdk,
+        "S_CFR11",
+        f"sqlite:///{sql_by_form_db}",
+        incremental=True,
+        stream_name="sql_cfr11",
+        ledger_path=str(ledger_path),
+    )
+
+    csv_df = pd.read_csv(csv_path)
+    assert sorted(csv_df["recordId"].tolist()) == [1, 2]
+    assert csv_df.loc[csv_df["recordId"] == 1, "recordStatus"].iloc[0] == "Signed"
+    assert float(csv_df.loc[csv_df["recordId"] == 2, "SYSBP"].iloc[0]) == 128.5
+
+    with sqlite3.connect(sql_by_form_db) as sconn:
+        rows = sconn.execute(
+            'SELECT "recordId", "recordStatus", "SYSBP" FROM "F_VS" ORDER BY "recordId"'
+        ).fetchall()
+    assert rows == [(1, "Signed", 122.0), (2, "Complete", 128.5)]
+
+    assert provider.get_last_timestamp("S_CFR11", "csv_cfr11") == datetime(
+        2026, 6, 4, 16, 20, tzinfo=UTC
+    )
+    assert provider.get_last_timestamp("S_CFR11", "sql_cfr11_F_VS") == datetime(
+        2026, 6, 4, 16, 20, tzinfo=UTC
+    )
+
+    # Also verify non-loader fallback path in _make_mapper_records_source issues separate branches and deduplicates
+    real_mapper = export_mod._record_mapper()(sdk)
+    real_mapper._loader = None
+    source = export_mod._make_mapper_records_source(
+        sdk,
+        "S_CFR11",
+        real_mapper,
+        TabularSinkConfig(study_key="S_CFR11"),
+    )
+    yielded = list(source(datetime(2026, 6, 1, 12, 0, tzinfo=UTC), True))
+    assert sorted(r.record_id for r in yielded) == [1, 2]
+    assert next(r for r in yielded if r.record_id == 1).record_status == "Signed"
