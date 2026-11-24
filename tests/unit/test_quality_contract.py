@@ -1,19 +1,165 @@
 """Guard shared verification tasks and public package metadata against drift."""
 
+import copy
+import re
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+SHA_SETUP_UV_RE = re.compile(r"^astral-sh/setup-uv@[0-9a-f]{40}$")
+EXPECTED_RUFF_SELECT = {
+    "PL",
+    "PIE",
+    "FURB",
+    "E",
+    "F",
+    "I",
+    "N",
+    "SLF",
+    "D",
+    "S",
+    "B",
+    "C4",
+    "SIM",
+    "UP",
+    "PT",
+    "RET",
+    "RUF",
+}
+EXPECTED_TEST_IGNORES = ["SLF001", "S", "D", "PT", "SIM", "RUF", "B", "RET", "UP", "C", "F821"]
 
 
 def _workflow_triggers(pipeline: dict) -> dict:
     return pipeline.get("on") or pipeline.get(True) or {}
 
 
-def test_ci_uses_canonical_full_verification():
+def _load_guardrail_manifests() -> tuple[dict, dict, dict, dict]:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    hooks = yaml.safe_load((ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    typos_cfg = tomllib.loads((ROOT / "typos.toml").read_text(encoding="utf-8"))
+    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+    return project, hooks, typos_cfg, pipeline
+
+
+def _assert_guardrail_contract(
+    project: dict,
+    hooks: dict,
+    typos_cfg: dict,
+    pipeline: dict,
+) -> None:
+    dev_deps = project["dependency-groups"]["dev"]
+    lint_deps = project["tool"]["hatch"]["envs"]["lint"]["dependencies"]
+
+    ruff_pin = next((d for d in dev_deps if d.startswith("ruff==")), None)
+    assert ruff_pin is not None
+    ruff_version = ruff_pin.split("==", 1)[1]
+    assert ruff_pin in lint_deps
+
+    typos_pin = next((d for d in dev_deps if d.startswith("typos==")), None)
+    assert typos_pin is not None
+    typos_version = typos_pin.split("==", 1)[1]
+    assert typos_pin in lint_deps
+    assert "typos" not in lint_deps
+
+    extend_words = typos_cfg.get("default", {}).get("extend-words", {})
+    assert extend_words.get("VAS") == "VAS"
+    assert extend_words.get("SOID") == "SOID"
+
+    ruff_repo = next(repo for repo in hooks["repos"] if "ruff-pre-commit" in repo["repo"])
+    assert ruff_repo["rev"] == f"v{ruff_version}"
+    assert [h["id"] for h in ruff_repo["hooks"]] == ["ruff-check", "ruff-format"]
+    ruff_check_hook = ruff_repo["hooks"][0]
+    assert ruff_check_hook.get("args") == ["--fix", "--exit-non-zero-on-fix"]
+    assert not any("UP038" in str(arg) for arg in ruff_check_hook.get("args", []))
+
+    typos_repo = next(repo for repo in hooks["repos"] if "crate-ci/typos" in repo["repo"])
+    assert typos_repo["rev"] == f"v{typos_version}"
+    assert [h["id"] for h in typos_repo["hooks"]] == ["typos"]
+    typos_hook_args = typos_repo["hooks"][0].get("args")
+    assert typos_hook_args == ["--force-exclude"]
+    assert "--write-changes" not in typos_hook_args
+    assert "--diff" not in typos_hook_args
+
+    ruff_lint = project["tool"]["ruff"]["lint"]
+    assert set(ruff_lint["select"]) == EXPECTED_RUFF_SELECT
+    per_file_ignores = ruff_lint["per-file-ignores"]
+    testpaths = project["tool"]["pytest"]["ini_options"]["testpaths"]
+    assert set(testpaths) >= {"tests", "packages/plugins-sinks/tests", "packages/plugins-tui/tests"}
+    for testpath in testpaths:
+        assert per_file_ignores.get(f"{testpath}/**/*.py") == EXPECTED_TEST_IGNORES
+
+    default_scripts = project["tool"]["hatch"]["envs"]["default"]["scripts"]
+    assert "ruff format --check ." in default_scripts["verify-static"]
+    assert "ruff check ." in default_scripts["verify-static"]
+    assert "typos --force-exclude ." in default_scripts["verify-static"]
+    assert not any("typos" in cmd and "--diff" in cmd for cmd in default_scripts["verify-static"])
+
+    lint_scripts = project["tool"]["hatch"]["envs"]["lint"]["scripts"]
+    assert lint_scripts["fmt"] == "ruff format --check {args:.}"
+    assert lint_scripts["ruff-check"] == "ruff check {args:.}"
+    assert lint_scripts["typos-check"] == "typos --force-exclude {args:.}"
+    assert "--diff" not in lint_scripts["typos-check"]
+    assert lint_scripts["mypy-check"] == "mypy {args:packages}"
+    for pkg_scoped_task in ("semgrep-check", "vulture-check", "pylint-sim", "symilar-check"):
+        assert "{args:packages}" in lint_scripts[pkg_scoped_task]
+
+    dup_scripts = project["tool"]["hatch"]["envs"]["duplication"]["scripts"]
+    assert dup_scripts["check"] == "pylint --disable=all --enable=duplicate-code {args:packages}"
+
+    quality_scripts = project["tool"]["hatch"]["envs"]["quality"]["scripts"]
+    assert quality_scripts["all"] == [
+        "hatch run lint:all",
+        "hatch run duplication:check {args:packages}",
+    ]
+
+    jobs = pipeline["jobs"]
+    assert jobs["global-lint"]["name"] == "Global Code Quality Check"
+    assert jobs["pre-commit"]["name"] == "Pre-commit Quality Checks"
+    assert jobs["quality"]["name"] == "Workspace Quality & Security"
+    assert jobs["deploy-docs"]["name"] == "Deploy to GH Pages"
+
+    for job_key in ("global-lint", "pre-commit", "quality"):
+        job_steps = jobs[job_key]["steps"]
+        assert any(SHA_SETUP_UV_RE.match(str(s.get("uses", ""))) for s in job_steps)
+        job_runs = [s.get("run", "") for s in job_steps if "run" in s]
+        assert not any("pip install" in r for r in job_runs)
+
+    global_lint_runs = "\n".join(
+        s.get("run", "") for s in jobs["global-lint"]["steps"] if "run" in s
+    )
+    assert f'uvx --from "{ruff_pin}" ruff format --check .' in global_lint_runs
+    assert f'uvx --from "{ruff_pin}" ruff check .' in global_lint_runs
+    assert "--select" not in global_lint_runs
+    assert f'uvx --from "{typos_pin}" typos --force-exclude .' in global_lint_runs
+    assert "--diff" not in global_lint_runs
+    assert "--write-changes" not in global_lint_runs
+
+    pre_commit_runs = "\n".join(s.get("run", "") for s in jobs["pre-commit"]["steps"] if "run" in s)
+    assert re.search(
+        r'uvx --from "pre-commit==\d+\.\d+\.\d+" pre-commit run --all-files --show-diff-on-failure',
+        pre_commit_runs,
+    )
+
+    quality_needs = jobs["quality"].get("needs", [])
+    if isinstance(quality_needs, str):
+        quality_needs = [quality_needs]
+    assert "pre-commit" in set(quality_needs)
+
+    quality_runs = [s.get("run", "") for s in jobs["quality"]["steps"] if "run" in s]
+    assert any(
+        "uv run ruff format --check ." in r
+        and "uv run ruff check ." in r
+        and "uv run typos --force-exclude ." in r
+        for r in quality_runs
+    )
+    assert not any("typos" in r and "--diff" in r for r in quality_runs)
+
+
+def test_ci_uses_canonical_full_verification():
+    project, hooks, typos_cfg, pipeline = _load_guardrail_manifests()
     assert set(project["project"]["dependencies"]) == {
         "imednet",
         "imednet-workflows",
@@ -29,6 +175,7 @@ def test_ci_uses_canonical_full_verification():
     scripts = project["tool"]["hatch"]["envs"]["default"]["scripts"]
     assert scripts["verify"] == ["verify-static", "verify-tests"]
     assert "docs" not in scripts["verify"]
+    assert "typos --force-exclude ." in scripts["verify-static"]
     assert "mypy packages/plugins-sinks/src/imednet_sinks" in scripts["verify-static"]
     assert "mypy packages/plugins-tui/src/imednet_tui" in scripts["verify-static"]
     assert "mypy examples" in scripts["verify-static"]
@@ -42,11 +189,13 @@ def test_ci_uses_canonical_full_verification():
     ):
         assert cov_pkg in scripts["verify-tests"]
 
-    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+    _assert_guardrail_contract(project, hooks, typos_cfg, pipeline)
+
     steps = pipeline["jobs"]["quality"]["steps"]
     run_blocks = [s.get("run", "") for s in steps if "run" in s]
     assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in steps)
     assert any("uv sync --locked --all-packages --all-extras" in r for r in run_blocks)
+    assert any("uv run typos --force-exclude ." in r for r in run_blocks)
     assert any(
         "uv run mypy packages examples tests/typing/endpoint_contracts.py" in r for r in run_blocks
     )
@@ -118,13 +267,20 @@ def test_ci_deploy_docs_gates_and_manual_dispatch():
 
 
 def test_ruff_versions_and_metadata_are_consistent():
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    pinned = next(d for d in project["dependency-groups"]["dev"] if d.startswith("ruff=="))
-    version = pinned.split("==")[1]
-    hooks = yaml.safe_load((ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    project, hooks, typos_cfg, pipeline = _load_guardrail_manifests()
+    _assert_guardrail_contract(project, hooks, typos_cfg, pipeline)
+
+    pinned_ruff = next(d for d in project["dependency-groups"]["dev"] if d.startswith("ruff=="))
+    ruff_version = pinned_ruff.split("==")[1]
     ruff_repo = next(repo for repo in hooks["repos"] if "ruff-pre-commit" in repo["repo"])
-    assert ruff_repo["rev"] == "v" + version
-    assert pinned in project["tool"]["hatch"]["envs"]["lint"]["dependencies"]
+    assert ruff_repo["rev"] == "v" + ruff_version
+    assert pinned_ruff in project["tool"]["hatch"]["envs"]["lint"]["dependencies"]
+
+    pinned_typos = next(d for d in project["dependency-groups"]["dev"] if d.startswith("typos=="))
+    typos_version = pinned_typos.split("==")[1]
+    typos_repo = next(repo for repo in hooks["repos"] if "crate-ci/typos" in repo["repo"])
+    assert typos_repo["rev"] == "v" + typos_version
+    assert pinned_typos in project["tool"]["hatch"]["envs"]["lint"]["dependencies"]
 
     manifests = sorted((ROOT / "packages").glob("*/pyproject.toml"))
     assert len(manifests) == 5
@@ -195,3 +351,152 @@ def test_copilot_and_consumption_workflows_use_canonical_uv_sync():
         "scripts/validate_package_consumption.py --wheel-dir dist" in r for r in consumption_runs
     )
     assert not any("pip install" in r for r in consumption_runs)
+
+
+def _mutate_ruff_rev(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    ruff_repo = next(repo for repo in hooks["repos"] if "ruff-pre-commit" in repo["repo"])
+    ruff_repo["rev"] = "v0.14.0"
+
+
+def _mutate_typos_rev(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    typos_repo = next(repo for repo in hooks["repos"] if "crate-ci/typos" in repo["repo"])
+    typos_repo["rev"] = "v1.29.0"
+
+
+def _mutate_unpinned_lint_typos(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    deps = project["tool"]["hatch"]["envs"]["lint"]["dependencies"]
+    project["tool"]["hatch"]["envs"]["lint"]["dependencies"] = [
+        "typos" if d.startswith("typos==") else d for d in deps
+    ]
+
+
+def _mutate_legacy_ruff_hook_id(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    ruff_repo = next(repo for repo in hooks["repos"] if "ruff-pre-commit" in repo["repo"])
+    ruff_repo["hooks"][0]["id"] = "ruff"
+
+
+def _mutate_up038_ignore(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    ruff_repo = next(repo for repo in hooks["repos"] if "ruff-pre-commit" in repo["repo"])
+    ruff_repo["hooks"][0]["args"].append("--ignore=UP038")
+
+
+def _mutate_mutating_typos_hook(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    typos_repo = next(repo for repo in hooks["repos"] if "crate-ci/typos" in repo["repo"])
+    typos_repo["hooks"][0]["args"] = ["--write-changes"]
+
+
+def _mutate_typos_diff_flag(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    project["tool"]["hatch"]["envs"]["lint"]["scripts"]["typos-check"] = "typos --diff {args:.}"
+
+
+def _mutate_missing_soid(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    typos_cfg["default"]["extend-words"].pop("SOID", None)
+
+
+def _mutate_missing_vas(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    typos_cfg["default"]["extend-words"].pop("VAS", None)
+
+
+def _mutate_missing_tui_ignores(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    project["tool"]["ruff"]["lint"]["per-file-ignores"].pop(
+        "packages/plugins-tui/tests/**/*.py", None
+    )
+
+
+def _mutate_weakened_ruff_select(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    project["tool"]["ruff"]["lint"]["select"].remove("SLF")
+
+
+def _mutate_package_scoped_fmt(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    project["tool"]["hatch"]["envs"]["lint"]["scripts"]["fmt"] = (
+        "ruff format --check {args:packages}"
+    )
+
+
+def _mutate_quality_all_packages_arg(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    project["tool"]["hatch"]["envs"]["quality"]["scripts"]["all"][0] = (
+        "hatch run lint:all {args:packages}"
+    )
+
+
+def _mutate_widened_mypy_scope(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    project["tool"]["hatch"]["envs"]["lint"]["scripts"]["mypy-check"] = "mypy {args:.}"
+
+
+def _mutate_global_lint_pip_install(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["global-lint"]["steps"].append({"run": "pip install ruff"})
+
+
+def _mutate_global_lint_subset_select(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    for step in pipeline["jobs"]["global-lint"]["steps"]:
+        if "run" in step:
+            step["run"] += "\nruff check . --select F401,F841"
+
+
+def _mutate_pre_commit_unpinned_uvx(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    for step in pipeline["jobs"]["pre-commit"]["steps"]:
+        if "run" in step:
+            step["run"] = "uvx pre-commit run --all-files --show-diff-on-failure"
+
+
+def _mutate_quality_missing_needs(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["quality"]["needs"] = []
+
+
+def _mutate_quality_missing_typos(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    for step in pipeline["jobs"]["quality"]["steps"]:
+        if "run" in step:
+            step["run"] = step["run"].replace("uv run typos --force-exclude .\n", "")
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        _mutate_ruff_rev,
+        _mutate_typos_rev,
+        _mutate_unpinned_lint_typos,
+        _mutate_legacy_ruff_hook_id,
+        _mutate_up038_ignore,
+        _mutate_mutating_typos_hook,
+        _mutate_typos_diff_flag,
+        _mutate_missing_soid,
+        _mutate_missing_vas,
+        _mutate_missing_tui_ignores,
+        _mutate_weakened_ruff_select,
+        _mutate_package_scoped_fmt,
+        _mutate_quality_all_packages_arg,
+        _mutate_widened_mypy_scope,
+        _mutate_global_lint_pip_install,
+        _mutate_global_lint_subset_select,
+        _mutate_pre_commit_unpinned_uvx,
+        _mutate_quality_missing_needs,
+        _mutate_quality_missing_typos,
+    ],
+)
+def test_guardrail_manifest_contract_rejects_simulated_drift(mutator) -> None:
+    project, hooks, typos_cfg, pipeline = (copy.deepcopy(m) for m in _load_guardrail_manifests())
+    mutator(project, hooks, typos_cfg, pipeline)
+    with pytest.raises(AssertionError):
+        _assert_guardrail_contract(project, hooks, typos_cfg, pipeline)
