@@ -1050,8 +1050,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--standards-profile",
         dest="standards_profile",
         choices=("general", "drug", "biologic", "vaccine", "device"),
-        default="general",
-        help="Regulatory CDISC standards profile (default: general).",
+        default=None,
+        help="Regulatory CDISC standards profile (defaults to study configuration or general).",
     )
     validate_std_parser.add_argument(
         "--domain",
@@ -1082,7 +1082,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     def validate_standards(
         sdk: ImednetSDK,
         study_key: str,
-        standards_profile: str = "general",
+        standards_profile: str | None = None,
         sdtm_domain: str | None = None,
         min_standards_score: float | None = None,
         output_format: str | None = None,
@@ -1092,7 +1092,10 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             resolve_sdtm_domain,
             validate_cdash_variable,
         )
-        from imednet.spi.sink_base import evaluate_standards_readiness
+        from imednet.spi.sink_base import (
+            evaluate_standards_readiness,
+            filter_records_for_sdtm_domain,
+        )
 
         validate_path_segment(study_key, name="study_key")
         if min_standards_score is not None and not 0.0 <= min_standards_score <= 100.0:
@@ -1121,12 +1124,6 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             with fetching_status("standards readiness", study_key):
                 raw_forms, raw_variables, raw_records = _fetch_inputs()
 
-        sanitized_records = (
-            _sanitize_workflow_payload(raw_records, study_key=study_key, mask_phi=True)
-            if mask_phi
-            else raw_records
-        )
-
         form_id_to_key: dict[Any, str] = {}
         for f_obj in raw_forms:
             fid = (
@@ -1141,6 +1138,21 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             )
             if fid is not None and fkey:
                 form_id_to_key[fid] = str(fkey)
+
+        canonical_target_domain = resolve_sdtm_domain(sdtm_domain) if sdtm_domain else None
+        target_records = (
+            list(
+                filter_records_for_sdtm_domain(
+                    raw_records,
+                    canonical_target_domain,
+                    sdk=sdk,
+                    study_key=study_key,
+                    forms=raw_forms,
+                )
+            )
+            if canonical_target_domain is not None
+            else raw_records
+        )
 
         cdash_warnings: list[str] = []
         for var in raw_variables:
@@ -1161,31 +1173,85 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     else getattr(var, "form_id", None)
                 )
                 fkey = form_id_to_key.get(fid)
-            inferred_dom = resolve_sdtm_domain(sdtm_domain or fkey, fallback="")
+            if canonical_target_domain is not None:
+                if fkey and resolve_sdtm_domain(fkey, fallback="") != canonical_target_domain:
+                    continue
+                inferred_dom = canonical_target_domain
+            else:
+                inferred_dom = resolve_sdtm_domain(fkey, fallback="")
             if inferred_dom:
                 valid_cdash, warning = validate_cdash_variable(str(var_name), inferred_dom)
                 if not valid_cdash and warning and warning not in cdash_warnings:
                     cdash_warnings.append(warning)
 
+        # Score unmasked clinical records first so PHI date fields (e.g. birthDate -> BRTHDTC)
+        # validate accurately before redacting diagnostic output.
         report = evaluate_standards_readiness(
-            sanitized_records,
+            target_records,
             study_key=study_key,
             standards_profile=standards_profile,
-            sdtm_domain=sdtm_domain,
+            sdtm_domain=canonical_target_domain,
         )
-        all_warnings = list(dict.fromkeys([*report.warnings, *cdash_warnings]))
-        threshold = 100.0 if min_standards_score is None else float(min_standards_score)
-        passed = report.is_ready if min_standards_score is None else report.score >= threshold
-        serialized_violations = [
-            v.model_dump() if hasattr(v, "model_dump") else str(v) for v in report.violations
+
+        phi_literals: set[str] = set()
+        if mask_phi:
+            custom_phi_fields = _resolve_custom_phi_fields(study_key)
+
+            def _collect_phi_literals(obj: Any) -> None:
+                if isinstance(obj, Mapping):
+                    for k, v in obj.items():
+                        if _is_key_phi_sensitive(str(k), custom_phi_fields):
+                            if isinstance(v, str) and len(v.strip()) >= 2 and v != "***MASKED***":
+                                phi_literals.add(v)
+                                phi_literals.add(v.strip())
+                        else:
+                            _collect_phi_literals(v)
+                elif isinstance(obj, (list, tuple)):
+                    for item in obj:
+                        _collect_phi_literals(item)
+                elif hasattr(obj, "model_dump"):
+                    dumped = obj.model_dump()
+                    if isinstance(dumped, Mapping):
+                        _collect_phi_literals(dumped)
+
+            _collect_phi_literals(target_records)
+
+        def _redact_diag_text(text: str) -> str:
+            if not mask_phi:
+                return text
+            out = redact_sensitive_text(text)
+            for literal in sorted(phi_literals, key=len, reverse=True):
+                if literal and literal in out:
+                    out = out.replace(literal, "***MASKED***")
+            return out
+
+        all_warnings = [
+            _redact_diag_text(w) for w in dict.fromkeys([*report.warnings, *cdash_warnings])
         ]
+        has_errors = any(getattr(v, "severity", "").upper() == "ERROR" for v in report.violations)
+        effective_is_ready = bool(report.checked_records > 0 and report.is_ready)
+        threshold = 100.0 if min_standards_score is None else float(min_standards_score)
+        passed = (
+            effective_is_ready
+            if min_standards_score is None
+            else bool(report.checked_records > 0 and not has_errors and report.score >= threshold)
+        )
+        serialized_violations: list[Any] = []
+        for v in report.violations:
+            if hasattr(v, "model_dump"):
+                dumped_v = v.model_dump()
+                if isinstance(dumped_v.get("message"), str):
+                    dumped_v["message"] = _redact_diag_text(dumped_v["message"])
+                serialized_violations.append(dumped_v)
+            else:
+                serialized_violations.append(_redact_diag_text(str(v)))
 
         payload = {
             "study_key": study_key,
             "profile": report.profile,
-            "domain": resolve_sdtm_domain(sdtm_domain) if sdtm_domain else None,
+            "domain": canonical_target_domain,
             "score": report.score,
-            "is_ready": report.is_ready,
+            "is_ready": effective_is_ready,
             "passed": passed,
             "checked_records": report.checked_records,
             "checked_fields": report.checked_fields,
@@ -1194,40 +1260,42 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "warnings": all_warnings,
             "violations": serialized_violations,
         }
+        sanitized_payload = _sanitize_workflow_payload(
+            payload,
+            study_key=study_key,
+            mask_phi=mask_phi,
+        )
         if resolved_fmt == "json":
-            sanitized_payload = _sanitize_workflow_payload(
-                payload,
-                study_key=study_key,
-                mask_phi=mask_phi,
-            )
             _emit_line(json.dumps(sanitized_payload, indent=2, default=str))
         else:
             _emit_line(
                 f"Standards Readiness Report — Study: {study_key} (profile: {report.profile})"
             )
             _emit_line(
-                f"Score: {report.score:.2f}/100.00 | Ready: {report.is_ready} | "
+                f"Score: {report.score:.2f}/100.00 | Ready: {effective_is_ready} | "
                 f"Checked Records: {report.checked_records} | Checked Fields: {report.checked_fields}"
             )
             if report.domain_scores:
                 _emit_line("Domain Scores:")
                 for dom_code, dom_score in sorted(report.domain_scores.items()):
                     _emit_line(f"  {dom_code}: {dom_score:.2f}")
-            if all_warnings:
-                _emit_line(f"Warnings ({len(all_warnings)}):")
-                for warn_msg in all_warnings:
+            out_warnings = sanitized_payload.get("warnings", all_warnings)
+            if out_warnings:
+                _emit_line(f"Warnings ({len(out_warnings)}):")
+                for warn_msg in out_warnings:
                     _emit_line(f"  - {warn_msg}")
-            if report.violations:
-                _emit_line(f"Violations ({len(report.violations)}):")
-                for violation in report.violations:
+            out_violations = sanitized_payload.get("violations", serialized_violations)
+            if out_violations:
+                _emit_line(f"Violations ({len(out_violations)}):")
+                for violation in out_violations:
                     v_msg = (
-                        f"[{violation.severity}] {violation.field}: {violation.message}"
-                        if hasattr(violation, "message")
+                        f"[{violation['severity']}] {violation['field']}: {violation['message']}"
+                        if isinstance(violation, Mapping) and "message" in violation
                         else str(violation)
                     )
                     _emit_line(f"  - {v_msg}")
 
-        if min_standards_score is not None and report.score < min_standards_score:
+        if not passed:
             sys.exit(1)
 
     def _handle_validate_standards(args: argparse.Namespace) -> None:

@@ -1,7 +1,9 @@
 """Security utilities."""
 
 import functools
+import math
 import re
+from datetime import date, datetime
 from typing import Any
 
 from imednet.errors import ClientError, PathTraversalValidationError
@@ -10,6 +12,14 @@ _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
 _CAMEL_TO_SNAKE_RE1 = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_TO_SNAKE_RE2 = re.compile(r"([a-z\d])([A-Z])")
 _DELIMITER_RE = re.compile(r"[^a-zA-Z0-9]+")
+_BIRTH_DATE_KEYS: frozenset[str] = frozenset(
+    {"dob", "date_of_birth", "birth_date", "brthdtc", "brthdat", "brthyr"}
+)
+_BIRTH_DATE_COLLAPSED_KEYS: frozenset[str] = frozenset(k.replace("_", "") for k in _BIRTH_DATE_KEYS)
+_ISO_YEAR_ONLY_RE = re.compile(r"^(\d{4})(?:-(?:0[1-9]|1[0-2]|UN|UNK|-).*)?$", re.IGNORECASE)
+_SLASH_OR_DASH_MDY_RE = re.compile(r"^\d{1,2}[/-]\d{1,2}[/-](\d{4})(?:\D.*)?$")
+_SLASH_OR_DASH_YMD_RE = re.compile(r"^(\d{4})[/-]\d{1,2}[/-]\d{1,2}(?:\D.*)?$")
+_TEXT_MONTH_DMY_RE = re.compile(r"^\d{1,2}-[A-Za-z]{3,9}-(\d{4})$")
 
 
 def _normalize_key_uncached(key: Any) -> str:
@@ -162,26 +172,101 @@ class SensitivityRegistry:
 global_sensitivity_registry = SensitivityRegistry()
 
 
+def is_birth_date_key(key: Any) -> bool:
+    """Return True if *key* represents a clinical or CDISC birth-date field."""
+    norm_key = _normalize_key(key)
+    if not norm_key:
+        return False
+    return norm_key in _BIRTH_DATE_KEYS or norm_key.replace("_", "") in _BIRTH_DATE_COLLAPSED_KEYS
+
+
+def redact_birth_date_year(value: Any) -> str | None:
+    """Redact a birth-date value to a four-digit ISO 8601 year or None."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        return f"{value.year:04d}"
+    if isinstance(value, date):
+        return f"{value.year:04d}"
+    if isinstance(value, int):
+        return f"{value:04d}" if 1000 <= value <= 9999 else None
+    if isinstance(value, float):
+        if math.isnan(value):
+            return None
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped == "***MASKED***":
+            return None
+        if len(stripped) == 10 and stripped[4] == "-" and stripped[7] == "-":
+            try:
+                return f"{date.fromisoformat(stripped).year:04d}"
+            except ValueError:
+                return None
+        try:
+            return f"{datetime.fromisoformat(stripped).year:04d}"
+        except ValueError:
+            pass
+        for pattern in (
+            _SLASH_OR_DASH_YMD_RE,
+            _SLASH_OR_DASH_MDY_RE,
+            _TEXT_MONTH_DMY_RE,
+            _ISO_YEAR_ONLY_RE,
+        ):
+            match = pattern.match(stripped)
+            if match:
+                return f"{int(match.group(1)):04d}"
+        return None
+    return None
+
+
 def mask_clinical_phi(
     value: Any,
     *,
     registry: SensitivityRegistry | None = None,
+    preserve_sdtm_brthdtc: bool = False,
+    preserve_none: bool = False,
 ) -> Any:
     """Recursively mask sensitive keys in unstructured data."""
     active_registry = global_sensitivity_registry if registry is None else registry
     if isinstance(value, dict):
-        return {
-            k: (
-                "***MASKED***"
-                if active_registry.is_sensitive(k)
-                else mask_clinical_phi(v, registry=active_registry)
-            )
-            for k, v in value.items()
-        }
+        masked: dict[Any, Any] = {}
+        for k, v in value.items():
+            if active_registry.is_sensitive(k):
+                if preserve_sdtm_brthdtc and is_birth_date_key(k):
+                    masked[k] = redact_birth_date_year(v)
+                elif preserve_none and v is None:
+                    masked[k] = None
+                else:
+                    masked[k] = "***MASKED***"
+            else:
+                masked[k] = mask_clinical_phi(
+                    v,
+                    registry=active_registry,
+                    preserve_sdtm_brthdtc=preserve_sdtm_brthdtc,
+                    preserve_none=preserve_none,
+                )
+        return masked
     if isinstance(value, list):
-        return [mask_clinical_phi(v, registry=active_registry) for v in value]
+        return [
+            mask_clinical_phi(
+                v,
+                registry=active_registry,
+                preserve_sdtm_brthdtc=preserve_sdtm_brthdtc,
+                preserve_none=preserve_none,
+            )
+            for v in value
+        ]
     if isinstance(value, tuple):
-        return tuple(mask_clinical_phi(v, registry=active_registry) for v in value)
+        return tuple(
+            mask_clinical_phi(
+                v,
+                registry=active_registry,
+                preserve_sdtm_brthdtc=preserve_sdtm_brthdtc,
+                preserve_none=preserve_none,
+            )
+            for v in value
+        )
     return value
 
 

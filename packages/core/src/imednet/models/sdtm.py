@@ -966,12 +966,21 @@ class _SdtmNormalizer:
             )
 
         self.has_enrichment_transforms = bool(
-            pipeline is not None
-            and (getattr(pipeline, "terminology", None) or getattr(pipeline, "mappings", None))
+            pipeline is not None and getattr(pipeline, "mappings", None)
         )
         self.terminology: dict[str, dict[str, str]] = (
             getattr(pipeline, "terminology", {}) if pipeline is not None else {}
         )
+        self._snake_terminology: dict[str, dict[str, str]] = (
+            getattr(pipeline, "_snake_terminology", {}) if pipeline is not None else {}
+        )
+        if self.terminology and not self._snake_terminology:
+            snake_terms: dict[str, dict[str, str]] = {}
+            for term_key, lookup in self.terminology.items():
+                snake_k = _to_snake_identifier(str(term_key))
+                if snake_k and snake_k not in snake_terms:
+                    snake_terms[snake_k] = lookup
+            self._snake_terminology = snake_terms
         merged_phi_keys: set[str] = set()
         if pipeline is not None and getattr(pipeline, "phi_keys", None):
             merged_phi_keys.update(k for k in pipeline.phi_keys if k)
@@ -1063,16 +1072,31 @@ class _SdtmNormalizer:
         self._sens_cache[key] = False
         return False
 
-    def _apply_var_terminology(self, var_name: str, val: Any) -> Any:
-        """Apply domain-qualified or variable-keyed StudyConfiguration terminology lookups."""
+    def _apply_var_terminology(
+        self,
+        var_name: str,
+        val: Any,
+        *,
+        found_key: str | None = None,
+    ) -> Any:
+        """Apply domain-qualified, variable-keyed, or source-keyed terminology lookups once."""
         if not self.terminology or val is None or isinstance(val, (dict, list, tuple)):
             return val
         str_val = str(val)
-        domain_qual = f"{self.domain_clean}.{var_name}"
-        if domain_qual in self.terminology and str_val in self.terminology[domain_qual]:
-            return self.terminology[domain_qual][str_val]
-        if var_name in self.terminology and str_val in self.terminology[var_name]:
-            return self.terminology[var_name][str_val]
+        candidate_keys: list[str] = [f"{self.domain_clean}.{var_name}", var_name]
+        if found_key and found_key != var_name:
+            candidate_keys.append(f"{self.domain_clean}.{found_key}")
+            candidate_keys.append(found_key)
+        for cand_key in candidate_keys:
+            lookup = self.terminology.get(cand_key)
+            if lookup is not None and str_val in lookup:
+                return lookup[str_val]
+        if self._snake_terminology:
+            for raw_key in (found_key, var_name):
+                if raw_key:
+                    snake_lookup = self._snake_terminology.get(_to_snake_identifier(raw_key))
+                    if snake_lookup is not None and str_val in snake_lookup:
+                        return snake_lookup[str_val]
         return val
 
     def prepare_record(self, rec: Any, orig_idx: int) -> _PreparedSdtmRow | None:
@@ -1118,10 +1142,18 @@ class _SdtmNormalizer:
                 else rec_dict.get("record_id") or getattr(rec, "record_oid", None)
             )
 
+        translated_keys: set[str] = set()
         if self.pipeline is not None and (
             self.has_enrichment_transforms or not hasattr(self.pipeline, "terminology")
         ):
-            rec_dict = self.pipeline.process(rec_dict, mask_phi=False)
+            try:
+                rec_dict = self.pipeline.process(
+                    rec_dict,
+                    mask_phi=False,
+                    _translated_keys=translated_keys,
+                )
+            except TypeError:
+                rec_dict = self.pipeline.process(rec_dict, mask_phi=False)
 
         explicit_usubjid = rec_dict.get("USUBJID") or rec_dict.get("usubjid")
         usubjid_raw = (
@@ -1245,8 +1277,8 @@ class _SdtmNormalizer:
                         consumed_keys.update(all_field_aliases.get(cand, ()))
                         consumed_keys.update(all_field_aliases.get(cand_lower, ()))
 
-            if self.terminology:
-                val = self._apply_var_terminology(var_name, val)
+            if self.terminology and (found_key is None or found_key not in translated_keys):
+                val = self._apply_var_terminology(var_name, val, found_key=found_key)
             if is_topic:
                 unmasked_topic_map[var_name] = val
 
@@ -1286,7 +1318,11 @@ class _SdtmNormalizer:
         normalized_consumed = {_normalize_key(c) for c in consumed_keys}
         for k, raw_v in rec_dict.items():
             if k not in consumed_keys and _normalize_key(k) not in normalized_consumed:
-                extra_val = self._apply_var_terminology(k, raw_v) if self.terminology else raw_v
+                extra_val = (
+                    self._apply_var_terminology(k, raw_v, found_key=k)
+                    if (self.terminology and k not in translated_keys)
+                    else raw_v
+                )
                 if k in self._topic_set and k not in unmasked_topic_map:
                     unmasked_topic_map[k] = extra_val
                 if self.mask_phi and not self._is_exempt_key(k):

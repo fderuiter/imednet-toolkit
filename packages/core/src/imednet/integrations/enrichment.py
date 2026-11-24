@@ -273,7 +273,11 @@ class CentralizedMapper:
             else None
         )
         self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
+        self._has_explicit_seq_counters = seq_counters is not None
         self._seq_counters: dict[str, int] = seq_counters if seq_counters is not None else {}
+        self._domain_seq_counters: dict[str, dict[str, int]] = {}
+        if seq_counters is not None and self.sdtm_domain is not None:
+            self._domain_seq_counters[self.sdtm_domain] = self._seq_counters
         self._pipeline_cache: dict[str, Any] = {}
         self._sens_snapshot: frozenset[str] = frozenset()
         self._exempt_snapshot: frozenset[str] = frozenset()
@@ -293,6 +297,169 @@ class CentralizedMapper:
     def register_pipeline(self, study_key: str, pipeline: Any) -> None:
         """Register an explicit enrichment pipeline for *study_key*."""
         self._pipeline_cache[study_key] = pipeline
+
+    def _get_domain_seq_counters(self, domain: str) -> dict[str, int]:
+        """Return isolated per-USUBJID sequence counters for canonical *domain*."""
+        canonical = resolve_sdtm_domain(domain)
+        existing = self._domain_seq_counters.get(canonical)
+        if existing is not None:
+            return existing
+        if self._has_explicit_seq_counters and not self._domain_seq_counters:
+            self._domain_seq_counters[canonical] = self._seq_counters
+            return self._seq_counters
+        counters: dict[str, int] = {}
+        self._domain_seq_counters[canonical] = counters
+        return counters
+
+    def reset_sdtm_subject_counters(
+        self,
+        domain: str | None = None,
+        usubjids: list[str] | set[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        """Reset SDTM sequence counters for *domain* (or all domains) and *usubjids*."""
+        target_domains = (
+            [resolve_sdtm_domain(domain)]
+            if domain is not None
+            else list(self._domain_seq_counters.keys())
+        )
+        for dom in target_domains:
+            counters = self._domain_seq_counters.get(dom)
+            if counters is None:
+                continue
+            if usubjids is None:
+                counters.clear()
+            else:
+                for subj in usubjids:
+                    counters.pop(str(subj), None)
+        if not self._domain_seq_counters or domain is None:
+            if usubjids is None:
+                self._seq_counters.clear()
+            else:
+                for subj in usubjids:
+                    self._seq_counters.pop(str(subj), None)
+
+    def _resolve_record_study_and_pipeline(
+        self, record: Any, study_key: str | None
+    ) -> tuple[str, Any, set[str], bool]:
+        """Resolve canonical study key and active EnrichmentPipeline for *record*."""
+        is_mapping = isinstance(record, Mapping)
+        resolved_study_key = (
+            study_key
+            if study_key is not None
+            else (
+                record.get("study_key") or record.get("studyKey")
+                if is_mapping
+                else getattr(record, "study_key", None)
+            )
+        )
+        sk = resolved_study_key or "UNKNOWN"
+        if sk not in self._pipeline_cache:
+            if self._default_pipeline is not None:
+                self._pipeline_cache[sk] = self._default_pipeline
+            else:
+                resolved_cfg = resolve_study_configuration(sk)
+                self._pipeline_cache[sk] = (
+                    EnrichmentPipeline(resolved_cfg)
+                    if resolved_cfg is not None
+                    else self._DEFAULT_PIPELINE
+                )
+        active_pipeline = self._pipeline_cache[sk]
+        pipeline_phi_keys: set[str] = getattr(active_pipeline, "phi_keys", set())
+        has_active_rules = bool(
+            active_pipeline is not None
+            and not (
+                active_pipeline.__class__ is EnrichmentPipeline and not active_pipeline._has_rules
+            )
+        )
+        return sk, active_pipeline, pipeline_phi_keys, has_active_rules
+
+    def _resolve_record_target_domain(self, record: Any) -> str:
+        """Resolve target SDTM domain for *record*."""
+        if self.sdtm_domain:
+            return self.sdtm_domain
+        is_mapping = isinstance(record, Mapping)
+        raw_dom = (
+            record.get("DOMAIN")
+            or record.get("domain")
+            or record.get("form_key")
+            or record.get("formKey")
+            if is_mapping
+            else getattr(record, "form_key", None)
+        )
+        return resolve_sdtm_domain(raw_dom, fallback="AE")
+
+    def map_records_with_sources(
+        self,
+        records: list[Any] | tuple[Any, ...] | Any,
+        study_key: str | None = None,
+    ) -> list[tuple[Any, dict[str, Any]]]:
+        """Map a batch of records, grouping per domain and sorting chronologically for SDTM."""
+        rec_list = list(records)
+        if not rec_list:
+            return []
+        if not self.as_sdtm:
+            return [(rec, self.map_record(rec, study_key=study_key)) for rec in rec_list]
+
+        from imednet.models.sdtm import _PreparedSdtmRow, _SdtmNormalizer
+
+        domain_groups: dict[tuple[str, str], list[tuple[int, Any]]] = {}
+        group_order: list[tuple[str, str]] = []
+        group_pipelines: dict[tuple[str, str], tuple[Any, set[str], bool]] = {}
+
+        for idx, rec in enumerate(rec_list):
+            sk, active_pipeline, pipeline_phi_keys, has_active_rules = (
+                self._resolve_record_study_and_pipeline(rec, study_key)
+            )
+            target_domain = self._resolve_record_target_domain(rec)
+            group_key = (sk, target_domain)
+            if group_key not in domain_groups:
+                domain_groups[group_key] = []
+                group_order.append(group_key)
+                group_pipelines[group_key] = (
+                    active_pipeline,
+                    pipeline_phi_keys,
+                    has_active_rules,
+                )
+            domain_groups[group_key].append((idx, rec))
+
+        results: list[tuple[Any, dict[str, Any]]] = []
+        for sk, target_domain in group_order:
+            active_pipeline, pipeline_phi_keys, has_active_rules = group_pipelines[
+                (sk, target_domain)
+            ]
+            normalizer = _SdtmNormalizer(
+                domain=target_domain,
+                study_key=sk,
+                include_deleted=False,
+                mask_phi=self.mask_phi,
+                pipeline=active_pipeline if has_active_rules else None,
+                phi_keys=pipeline_phi_keys or None,
+            )
+            counters = self._get_domain_seq_counters(target_domain)
+            by_subject: dict[str, list[_PreparedSdtmRow]] = {}
+            source_by_local_idx: dict[int, Any] = {}
+            for local_idx, (_orig_idx, rec) in enumerate(domain_groups[(sk, target_domain)]):
+                source_by_local_idx[local_idx] = rec
+                prepared = normalizer.prepare_record(rec, local_idx)
+                if prepared is not None:
+                    by_subject.setdefault(prepared.usubjid, []).append(prepared)
+
+            for usubjid in sorted(by_subject):
+                subj_group = by_subject[usubjid]
+                finalized_rows = normalizer.finalize_subject_group(subj_group, counters)
+                for prep_item, sdtm_row in zip(subj_group, finalized_rows, strict=True):
+                    mapped_row = self.post_processor(sdtm_row) if self.post_processor else sdtm_row
+                    results.append((source_by_local_idx[prep_item.sort_key[3]], mapped_row))
+
+        return results
+
+    def map_records(
+        self,
+        records: list[Any] | tuple[Any, ...] | Any,
+        study_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Map a batch of clinical records to destination dicts."""
+        return [row for _src, row in self.map_records_with_sources(records, study_key=study_key)]
 
     def _resolve_masked_meta_fields(
         self,
@@ -366,24 +533,14 @@ class CentralizedMapper:
         )
 
         if self.as_sdtm:
-            raw_dom = self.sdtm_domain
-            if not raw_dom:
-                raw_dom = (
-                    record.get("DOMAIN")
-                    or record.get("domain")
-                    or record.get("form_key")
-                    or record.get("formKey")
-                    if is_mapping
-                    else getattr(record, "form_key", None)
-                )
-            target_domain = resolve_sdtm_domain(raw_dom, fallback="AE")
+            target_domain = self._resolve_record_target_domain(record)
             sdtm_rows = transform_records_to_sdtm_rows(
                 [record],
                 domain=target_domain,
                 study_key=sk,
                 include_deleted=True,
                 mask_phi=self.mask_phi,
-                seq_counters=self._seq_counters,
+                seq_counters=self._get_domain_seq_counters(target_domain),
                 phi_keys=pipeline_phi_keys or None,
                 pipeline=active_pipeline if has_active_rules else None,
             )
@@ -537,6 +694,7 @@ class EnrichmentPipeline:
         *,
         mask_phi: bool = True,
         _skip_default_phi: bool = False,
+        _translated_keys: set[str] | None = None,
     ) -> Any:
         """Process the input data through the enrichment pipeline.
 
@@ -568,6 +726,7 @@ class EnrichmentPipeline:
             depth=0,
             mask_phi=mask_phi,
             _skip_default_phi=_skip_default_phi,
+            _translated_keys=_translated_keys,
         )
 
     def _evaluate_business_logic(self, expr: str, value: Any) -> Any:
@@ -596,6 +755,7 @@ class EnrichmentPipeline:
         *,
         mask_phi: bool = True,
         _skip_default_phi: bool = False,
+        _translated_keys: set[str] | None = None,
     ) -> Any:
         """Recursively transform data structures.
 
@@ -638,8 +798,10 @@ class EnrichmentPipeline:
                     term_lookup = self.terminology.get(k)
                     if term_lookup is None and snake_k is not None:
                         term_lookup = self._snake_terminology.get(snake_k)
+                    was_translated = False
                     if not is_phi_key and term_lookup is not None and str(new_val) in term_lookup:
                         new_val = term_lookup[str(new_val)]
+                        was_translated = True
 
                     # Mapping rules (business logic and key renaming)
                     rule = self.mappings.get(k)
@@ -650,6 +812,8 @@ class EnrichmentPipeline:
                             new_val = self._evaluate_business_logic(rule.business_logic, new_val)
                         if rule.target_field and rule.target_field != k:
                             new_key = rule.target_field
+                    if was_translated and depth == 0 and _translated_keys is not None:
+                        _translated_keys.add(str(new_key))
 
                     # PHI Masking
                     target_is_phi = False

@@ -862,13 +862,14 @@ def test_workflows_validate_standards_reports_scores_and_enforces_min_score(
             "json",
         ],
     )
-    assert res_json.exit_code == 0
+    assert res_json.exit_code == 1
     report_payload = json.loads(res_json.stdout)
     assert report_payload["study_key"] == "STUDY_STD"
     assert report_payload["profile"] == "drug"
     assert report_payload["domain"] == "AE"
     assert report_payload["score"] < 100.0
     assert report_payload["is_ready"] is False
+    assert report_payload["passed"] is False
     assert any("unprefixedVar" in w for w in report_payload["warnings"])
     assert "Secret Patient" not in res_json.stdout
 
@@ -878,7 +879,7 @@ def test_workflows_validate_standards_reports_scores_and_enforces_min_score(
         cli.app,
         ["workflows", "validate-standards", "STUDY_STD", "--profile", "drug", "--domain", "AE"],
     )
-    assert res_env_json.exit_code == 0
+    assert res_env_json.exit_code == 1
     assert json.loads(res_env_json.stdout)["study_key"] == "STUDY_STD"
     monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
 
@@ -899,3 +900,85 @@ def test_workflows_validate_standards_reports_scores_and_enforces_min_score(
     assert res_gated.exit_code == 1
     assert "Standards Readiness Report" in res_gated.stdout
     assert "Violations" in res_gated.stdout
+
+    # Ready vaccine/biologic DM + AE Study scores unmasked birthDate before redacting PHI in output
+    sdk.forms.list.return_value = [
+        Form(form_id=1, form_key="AE", form_name="Adverse Events"),
+        Form(form_id=2, form_key="DM", form_name="Demographics"),
+    ]
+    sdk.variables.list.return_value = [
+        Variable(variable_id=1, form_id=1, form_key="AE", variable_name="AETERM"),
+        Variable(variable_id=2, form_id=2, form_key="DM", variable_name="BRTHDTC"),
+    ]
+    sdk.records.list.return_value = [
+        Record(
+            record_id=10,
+            study_key="STUDY_STD",
+            form_id=1,
+            form_key="AE",
+            subject_key="S01",
+            record_data={
+                "aeTerm": "Fever",
+                "aeDecod": "PYREXIA",
+                "aeSeverity": "MILD",
+                "aeRelationship": "RELATED",
+                "aeActionTaken": "NONE",
+                "aeOutcome": "RECOVERED",
+            },
+        ),
+        Record(
+            record_id=20,
+            study_key="STUDY_STD",
+            form_id=2,
+            form_key="DM",
+            subject_key="S01",
+            record_data={
+                "sex": "F",
+                "birthDate": "1985-07-20",
+                "age": 40,
+                "race": "WHITE",
+                "ethnicity": "NOT HISPANIC OR LATINO",
+                "patientName": "Confidential Alice",
+            },
+        ),
+    ]
+    for prof_name in ("vaccine", "biologic"):
+        res_ready = runner.invoke(
+            cli.app,
+            [
+                "workflows",
+                "validate-standards",
+                "STUDY_STD",
+                "--profile",
+                prof_name,
+                "--format",
+                "json",
+            ],
+        )
+        assert res_ready.exit_code == 0, res_ready.stdout
+        ready_payload = json.loads(res_ready.stdout)
+        assert ready_payload["profile"] == prof_name
+        assert ready_payload["score"] == 100.0
+        assert ready_payload["is_ready"] is True
+        assert ready_payload["passed"] is True
+        assert "Confidential Alice" not in res_ready.stdout
+
+    # Empty Study exits 1 even though 0 violations exist
+    sdk.records.list.return_value = []
+    res_empty = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_STD",
+            "--profile",
+            "general",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_empty.exit_code == 1
+    empty_payload = json.loads(res_empty.stdout)
+    assert empty_payload["checked_records"] == 0
+    assert empty_payload["is_ready"] is False
+    assert empty_payload["passed"] is False

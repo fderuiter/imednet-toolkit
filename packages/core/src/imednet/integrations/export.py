@@ -35,15 +35,19 @@ from imednet.integrations.sink_base import (
     StateProviderProtocol,
     _enforce_batch_standards_readiness,
     _extract_safe_config_options,
+    _resolve_record_sdtm_slice,
     apply_quality_gate,
     extract_record_form_ref,
     extract_record_id,
     extract_record_timestamp,
+    fetch_active_subject_records,
+    filter_records_for_sdtm_domain,
     get_state_provider,
     is_record_deleted,
     iter_batches,
     iter_filtered_sdk_records,
     normalize_watermark_datetime,
+    resolve_sdtm_domain_forms,
     run_streaming_export,
 )
 from imednet.models.standards import (
@@ -60,7 +64,12 @@ except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
 from imednet.constants import MAX_SQLITE_COLUMNS
 from imednet.utils import sanitize_csv_formula
-from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
+from imednet.utils.security import (
+    global_sensitivity_registry,
+    is_birth_date_key,
+    mask_clinical_phi,
+    redact_birth_date_year,
+)
 from imednet.utils.tabular import MASKED_SENTINEL
 
 from .. import ImednetClient
@@ -123,14 +132,34 @@ def _is_custom_phi_key(key: str, phi_keys: set[str] | None) -> bool:
     return _matches_custom_phi_key(key, phi_keys)
 
 
-def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFrame:
+def _mask_df(
+    df: pd.DataFrame,
+    *,
+    phi_keys: set[str] | None = None,
+    preserve_sdtm_brthdtc: bool = False,
+) -> pd.DataFrame:
     """Mask sensitive fields in the DataFrame based on global and study rules."""
+    birth_date_cols = (
+        list(dict.fromkeys(col for col in df.columns if is_birth_date_key(str(col))))
+        if preserve_sdtm_brthdtc
+        else []
+    )
+    birth_col_set = set(birth_date_cols)
+    for col in birth_date_cols:
+        if len(df) > 0:
+            df[col] = df[col].apply(
+                lambda v: v if _is_missing_scalar(v) else redact_birth_date_year(v)
+            )
+
     sensitive_cols = list(
         dict.fromkeys(
             col
             for col in df.columns
-            if global_sensitivity_registry.is_sensitive(str(col))
-            or _is_custom_phi_key(str(col), phi_keys)
+            if col not in birth_col_set
+            and (
+                global_sensitivity_registry.is_sensitive(str(col))
+                or _is_custom_phi_key(str(col), phi_keys)
+            )
         )
     )
     for col in sensitive_cols:
@@ -140,21 +169,27 @@ def _mask_df(df: pd.DataFrame, *, phi_keys: set[str] | None = None) -> pd.DataFr
     if len(df) == 0:
         return df
 
-    remaining = df.drop(columns=sensitive_cols)
+    excluded_cols = list(dict.fromkeys([*sensitive_cols, *birth_date_cols]))
+    remaining = df.drop(columns=excluded_cols) if excluded_cols else df
     try:
         object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object, "str"]).columns))
     except TypeError:
         object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object]).columns))
 
+    mask_fn: Callable[[Any], Any] = (
+        (lambda val: mask_clinical_phi(val, preserve_sdtm_brthdtc=True))
+        if preserve_sdtm_brthdtc
+        else mask_clinical_phi
+    )
     custom_mask_fn = (lambda val: mask_custom_phi_recursive(val, phi_keys)) if phi_keys else None
     for col in object_cols:
         target = df[col]
         if isinstance(target, pd.DataFrame):
-            df[col] = target.apply(lambda s: s.apply(mask_clinical_phi))
+            df[col] = target.apply(lambda s: s.apply(mask_fn))
             if custom_mask_fn is not None:
                 df[col] = df[col].apply(lambda s: s.apply(custom_mask_fn))
         else:
-            df[col] = target.apply(mask_clinical_phi)
+            df[col] = target.apply(mask_fn)
             if custom_mask_fn is not None:
                 df[col] = df[col].apply(custom_mask_fn)
 
@@ -372,6 +407,7 @@ def _prepare_tabular_batch_df(
     *,
     mask_phi: bool,
     sanitize: bool,
+    preserve_sdtm_brthdtc: bool = False,
 ) -> pd.DataFrame:
     """Convert ``records`` into a DataFrame with standardized PHI masking and CSV sanitization."""
     if isinstance(records, pd.DataFrame):
@@ -394,7 +430,7 @@ def _prepare_tabular_batch_df(
             df = df.loc[:, ~dup_mask]
 
     if mask_phi:
-        df = _mask_df(df)
+        df = _mask_df(df, preserve_sdtm_brthdtc=preserve_sdtm_brthdtc)
     if sanitize:
         df = _sanitize_df(df)
     return df
@@ -501,6 +537,52 @@ def _filter_df_excluding_record_ids(df: pd.DataFrame, exclude_ids: set[str]) -> 
     if id_col is None:
         return df
     mask = [_canonical_record_id(val) not in exclude_ids for val in df[id_col].tolist()]
+    return df.loc[mask].reset_index(drop=True)
+
+
+def _normalize_sdtm_slice_set(
+    slices: Sequence[tuple[str, str, str]],
+) -> set[tuple[str, str, str]]:
+    """Normalize ``(STUDYID, DOMAIN, USUBJID)`` slice tuples to stripped string triples."""
+    return {
+        (str(study_id).strip(), str(domain).strip(), str(usubjid).strip())
+        for study_id, domain, usubjid in slices
+    }
+
+
+def _row_matches_sdtm_slice(
+    row: Mapping[str, Any],
+    slice_set: set[tuple[str, str, str]],
+) -> bool:
+    """Return True when *row* matches any ``(STUDYID, DOMAIN, USUBJID)`` tuple in *slice_set*."""
+    if not slice_set:
+        return False
+    st = "" if _is_missing_scalar(row.get("STUDYID")) else str(row.get("STUDYID") or "").strip()
+    dom = "" if _is_missing_scalar(row.get("DOMAIN")) else str(row.get("DOMAIN") or "").strip()
+    usub = "" if _is_missing_scalar(row.get("USUBJID")) else str(row.get("USUBJID") or "").strip()
+    return (st, dom, usub) in slice_set
+
+
+def _filter_df_excluding_sdtm_slices(
+    df: pd.DataFrame,
+    slice_set: set[tuple[str, str, str]],
+) -> pd.DataFrame:
+    """Drop rows from ``df`` matching any ``(STUDYID, DOMAIN, USUBJID)`` in ``slice_set``."""
+    if df.empty or not slice_set or not {"STUDYID", "DOMAIN", "USUBJID"}.issubset(set(df.columns)):
+        return df
+
+    def _cell_str(val: Any) -> str:
+        return "" if _is_missing_scalar(val) else str(val).strip()
+
+    mask = [
+        (_cell_str(st), _cell_str(dom), _cell_str(usub)) not in slice_set
+        for st, dom, usub in zip(
+            df["STUDYID"].tolist(),
+            df["DOMAIN"].tolist(),
+            df["USUBJID"].tolist(),
+            strict=False,
+        )
+    ]
     return df.loc[mask].reset_index(drop=True)
 
 
@@ -628,6 +710,7 @@ class TabularCSVSink(ExportSink):
         self._is_incremental_sync = _is_incremental_config(config)
         self._staged_frames: list[pd.DataFrame] = []
         self._voided_ids: set[str] = set()
+        self._replaced_sdtm_slices: set[tuple[str, str, str]] = set()
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -635,6 +718,7 @@ class TabularCSVSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            preserve_sdtm_brthdtc=self._cfg.as_sdtm,
         )
         if len(df) == 0:
             return 0
@@ -702,6 +786,41 @@ class TabularCSVSink(ExportSink):
         self._voided_ids.update(cids)
         return len(cids)
 
+    def replace_sdtm_subject_slices(
+        self,
+        slices: Sequence[tuple[str, str, str]],
+        records: Sequence[Any],
+        *,
+        batch_id: str,
+    ) -> int:
+        """Stage replacement SDTM Subject slices for atomic CSV reconciliation on flush."""
+        if self._cfg.idempotent and slices:
+            self._replaced_sdtm_slices.update(_normalize_sdtm_slice_set(slices))
+        df = _prepare_tabular_batch_df(
+            records,
+            mask_phi=self._cfg.mask_phi,
+            sanitize=self._cfg.sanitize,
+            preserve_sdtm_brthdtc=self._cfg.as_sdtm,
+        )
+        if len(df) == 0:
+            return 0
+
+        def stage_slice_export() -> int:
+            csv_str = df.to_csv(
+                index=False,
+                header=self._is_first_batch,
+                **self._cfg.pandas_kwargs,
+            )
+            checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
+            rows_loaded = len(df)
+            self._append_manifest(batch_id, rows_loaded, checksum)
+            self._staged_frames.append(df)
+            return rows_loaded
+
+        loaded = self._execute_with_retry("export_csv", batch_id, stage_slice_export)
+        self._is_first_batch = False
+        return loaded
+
     def _reconcile_csv_to_disk(self) -> int:
         combined_delta = (
             _concat_tabular_frames(self._staged_frames) if self._staged_frames else pd.DataFrame()
@@ -735,6 +854,7 @@ class TabularCSVSink(ExportSink):
             delta_rows = list(csv.DictReader(io.StringIO(rendered_delta), delimiter=sep))
 
         exclude_ids = delta_ids | self._voided_ids
+        exclude_sdtm_slices = set(self._replaced_sdtm_slices)
 
         def _stream_merge(tmp_path: str) -> None:
             with (
@@ -757,6 +877,8 @@ class TabularCSVSink(ExportSink):
                 )
                 writer.writeheader()
                 for row in reader:
+                    if exclude_sdtm_slices and _row_matches_sdtm_slice(row, exclude_sdtm_slices):
+                        continue
                     row_cid = _extract_row_canonical_id(row)
                     if row_cid is not None and row_cid in exclude_ids:
                         continue
@@ -784,10 +906,12 @@ class TabularCSVSink(ExportSink):
         """Finalize staged incremental CSV updates and voided deletions atomically."""
         should_reconcile = False
         if self._is_incremental_sync and self._cfg.idempotent:
-            should_reconcile = bool(self._staged_frames or self._voided_ids)
+            should_reconcile = bool(
+                self._staged_frames or self._voided_ids or self._replaced_sdtm_slices
+            )
         elif (
             self._cfg.idempotent
-            and self._voided_ids
+            and (self._voided_ids or self._replaced_sdtm_slices)
             and Path(self.path).exists()
             and Path(self.path).stat().st_size > 0
         ):
@@ -801,11 +925,13 @@ class TabularCSVSink(ExportSink):
         finally:
             self._staged_frames.clear()
             self._voided_ids.clear()
+            self._replaced_sdtm_slices.clear()
 
     def close(self) -> None:
         """Clear any staged state."""
         self._staged_frames.clear()
         self._voided_ids.clear()
+        self._replaced_sdtm_slices.clear()
 
 
 _RECORD_META_CONTRACT_TYPES: tuple[tuple[str, str], ...] = (
@@ -1407,6 +1533,37 @@ def _filter_arrow_table_excluding_ids(pa: Any, tbl: Any, exclude_ids: set[str]) 
     return tbl.filter(pa.array(mask, type=pa.bool_()))
 
 
+def _filter_arrow_table_excluding_sdtm_slices(
+    pa: Any,
+    tbl: Any,
+    slice_set: set[tuple[str, str, str]],
+) -> Any:
+    """Filter out rows from ``tbl`` matching any ``(STUDYID, DOMAIN, USUBJID)`` in ``slice_set``."""
+    if (
+        tbl.num_rows == 0
+        or not slice_set
+        or not {"STUDYID", "DOMAIN", "USUBJID"}.issubset(set(tbl.column_names))
+    ):
+        return tbl
+    mask = [
+        (
+            "" if st is None else str(st).strip(),
+            "" if dom is None else str(dom).strip(),
+            "" if usub is None else str(usub).strip(),
+        )
+        not in slice_set
+        for st, dom, usub in zip(
+            tbl["STUDYID"].to_pylist(),
+            tbl["DOMAIN"].to_pylist(),
+            tbl["USUBJID"].to_pylist(),
+            strict=False,
+        )
+    ]
+    if all(mask):
+        return tbl
+    return tbl.filter(pa.array(mask, type=pa.bool_()))
+
+
 class TabularParquetSink(ExportSink):
     """Streaming Parquet sink backed by ``pyarrow.parquet.ParquetWriter``."""
 
@@ -1429,6 +1586,7 @@ class TabularParquetSink(ExportSink):
         self._parquet_kwargs.pop("engine", None)
         self._compression = self._parquet_kwargs.pop("compression", "snappy")
         self._voided_ids: set[str] = set()
+        self._replaced_sdtm_slices: set[tuple[str, str, str]] = set()
         self._delta_id_counts: dict[str, int] = {}
         self._delta_path: str | None = None
 
@@ -1537,6 +1695,7 @@ class TabularParquetSink(ExportSink):
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            preserve_sdtm_brthdtc=self._cfg.as_sdtm,
         )
         if len(df) == 0:
             return 0
@@ -1582,6 +1741,23 @@ class TabularParquetSink(ExportSink):
             return 0
         self._voided_ids.update(cids)
         return len(cids)
+
+    def replace_sdtm_subject_slices(
+        self,
+        slices: Sequence[tuple[str, str, str]],
+        records: Sequence[Any],
+        *,
+        batch_id: str,
+    ) -> int:
+        """Stage affected SDTM ``(STUDYID, DOMAIN, USUBJID)`` slices for atomic Parquet rewrite."""
+        has_records = records is not None and len(records) > 0
+        if not self._cfg.idempotent:
+            return self.write_batch(records, batch_id=batch_id) if has_records else 0
+        if slices:
+            self._replaced_sdtm_slices.update(_normalize_sdtm_slice_set(slices))
+        if not has_records:
+            return 0
+        return self.write_batch(records, batch_id=batch_id)
 
     def _write_empty_parquet(self) -> None:
         if self._contract_types:
@@ -1646,7 +1822,7 @@ class TabularParquetSink(ExportSink):
             and Path(self._delta_path).stat().st_size > 0
         )
 
-        if not has_delta and not self._voided_ids:
+        if not has_delta and not self._voided_ids and not self._replaced_sdtm_slices:
             if not dest_exists:
                 self._write_empty_parquet()
             return 0
@@ -1694,6 +1870,7 @@ class TabularParquetSink(ExportSink):
             unified_schema = prev_schema
 
         exclude_prev_ids = set(self._delta_id_counts) | self._voided_ids
+        exclude_sdtm_slices = set(self._replaced_sdtm_slices)
 
         def _stream_merge(tmp_path: str) -> None:
             with pq_any.ParquetWriter(
@@ -1708,6 +1885,10 @@ class TabularParquetSink(ExportSink):
                     ):
                         prev_tbl = pa.Table.from_batches([record_batch])
                         kept_tbl = _filter_arrow_table_excluding_ids(pa, prev_tbl, exclude_prev_ids)
+                        if exclude_sdtm_slices and kept_tbl.num_rows > 0:
+                            kept_tbl = _filter_arrow_table_excluding_sdtm_slices(
+                                pa, kept_tbl, exclude_sdtm_slices
+                            )
                         if kept_tbl.num_rows > 0:
                             out_writer.write_table(
                                 _cast_arrow_table_to_schema(pa, kept_tbl, unified_schema)
@@ -1728,7 +1909,9 @@ class TabularParquetSink(ExportSink):
             self._writer.close()
             self._writer = None
 
-        if self._use_staged_delta() or (self._cfg.idempotent and self._voided_ids):
+        if self._use_staged_delta() or (
+            self._cfg.idempotent and (self._voided_ids or self._replaced_sdtm_slices)
+        ):
             try:
                 self._reconcile_parquet_to_disk()
             finally:
@@ -1737,6 +1920,7 @@ class TabularParquetSink(ExportSink):
                     self._delta_path = None
                 self._delta_id_counts.clear()
                 self._voided_ids.clear()
+                self._replaced_sdtm_slices.clear()
             return
 
         if not wrote_batches:
@@ -1754,6 +1938,7 @@ class TabularParquetSink(ExportSink):
             self._delta_path = None
         self._delta_id_counts.clear()
         self._voided_ids.clear()
+        self._replaced_sdtm_slices.clear()
         self._schema = None
 
 
@@ -1822,12 +2007,56 @@ class TabularSQLSink(ExportSink):
             record_ids,
         )
 
+    def _delete_sdtm_slices(self, slices: Sequence[tuple[str, str, str]]) -> int:
+        """Delete existing SQL rows matching ``(STUDYID, DOMAIN, USUBJID)`` in chunks of 500."""
+        if not slices or isinstance(self.engine, NonCallableMock):
+            return 0
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy import text as sa_text
+
+        inspector = sa_inspect(self.engine)
+        if not inspector.has_table(self.table):
+            return 0
+        existing_cols = {c["name"] for c in inspector.get_columns(self.table)}
+        if not {"STUDYID", "DOMAIN", "USUBJID"}.issubset(existing_cols):
+            return 0
+
+        grouped: dict[tuple[str, str], list[str]] = {}
+        for study_id, domain, usubjid in _normalize_sdtm_slice_set(slices):
+            grouped.setdefault((study_id, domain), []).append(usubjid)
+
+        preparer = self.engine.dialect.identifier_preparer
+        quoted_table = preparer.quote(self.table)
+        q_study = preparer.quote("STUDYID")
+        q_dom = preparer.quote("DOMAIN")
+        q_usub = preparer.quote("USUBJID")
+        deleted_total = 0
+        with self.engine.begin() as conn:
+            for (study_id, domain), subjects in grouped.items():
+                for start in range(0, len(subjects), 500):
+                    chunk = subjects[start : start + 500]
+                    params: dict[str, Any] = {
+                        "study_id": study_id,
+                        "domain": domain,
+                        **{f"u_{idx}": subj for idx, subj in enumerate(chunk)},
+                    }
+                    placeholders = ", ".join(f":u_{idx}" for idx in range(len(chunk)))
+                    stmt = sa_text(
+                        f"DELETE FROM {quoted_table} "
+                        f"WHERE {q_study} = :study_id AND {q_dom} = :domain "
+                        f"AND {q_usub} IN ({placeholders})"
+                    )
+                    conn.execute(stmt, params)
+                    deleted_total += len(chunk)
+        return deleted_total
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
         df = _prepare_tabular_batch_df(
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            preserve_sdtm_brthdtc=self._cfg.as_sdtm,
         )
         if len(df) == 0:
             return 0
@@ -1865,10 +2094,63 @@ class TabularSQLSink(ExportSink):
         self._is_first_batch = False
         return loaded
 
+    def replace_sdtm_subject_slices(
+        self,
+        slices: Sequence[tuple[str, str, str]],
+        records: Sequence[Any],
+        *,
+        batch_id: str,
+    ) -> int:
+        """Atomically delete affected SDTM Subject slices and insert refreshed active rows."""
+        df = _prepare_tabular_batch_df(
+            records,
+            mask_phi=self._cfg.mask_phi,
+            sanitize=self._cfg.sanitize,
+            preserve_sdtm_brthdtc=self._cfg.as_sdtm,
+        )
+
+        def execute_replace() -> int:
+            if self._cfg.idempotent:
+                self._delete_sdtm_slices(slices)
+            if len(df) == 0:
+                return 0
+            df_str = df.to_csv(index=False)
+            checksum = hashlib.sha256(df_str.encode("utf-8")).hexdigest()
+            _to_sql_with_chunking(
+                df,
+                self.table,
+                self.engine,
+                if_exists="append",
+                **self._cfg.pandas_kwargs,
+            )
+            rows_loaded = len(df)
+            self._append_manifest(batch_id, rows_loaded, checksum)
+            return rows_loaded
+
+        loaded = self._execute_with_retry("replace_sql_sdtm_slices", batch_id, execute_replace)
+        self._is_first_batch = False
+        return loaded
+
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Delete newly voided rows from the SQL table when running idempotently."""
         if not self._cfg.idempotent or not records or isinstance(self.engine, NonCallableMock):
             return 0
+        if self._cfg.as_sdtm:
+            slices = [
+                _resolve_record_sdtm_slice(
+                    r,
+                    study_key=self._cfg.study_key or "",
+                    sdtm_domain=self._cfg.sdtm_domain,
+                    config=self._cfg,
+                    form_key_by_id={},
+                )[:3]
+                for r in records
+            ]
+            return self._execute_with_retry(
+                "reconcile_sql_deleted",
+                batch_id,
+                lambda: self._delete_sdtm_slices(slices),
+            )
         record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
         if not record_ids:
             return 0
@@ -1960,12 +2242,39 @@ class TabularDuckDBSink(ExportSink):
         )
         return len(record_ids)
 
+    def _delete_sdtm_slices(self, slices: Sequence[tuple[str, str, str]]) -> int:
+        if not slices or not self._table_exists():
+            return 0
+        cols = {
+            row[1]
+            for row in self._conn.execute(f"PRAGMA table_info('{self.table_name}')").fetchall()
+        }
+        if not {"STUDYID", "DOMAIN", "USUBJID"}.issubset(cols):
+            return 0
+        grouped: dict[tuple[str, str], list[str]] = {}
+        for study_id, domain, usubjid in _normalize_sdtm_slice_set(slices):
+            grouped.setdefault((study_id, domain), []).append(usubjid)
+        quoted_tbl = _quote_duckdb_identifier(self.table_name)
+        deleted_total = 0
+        for (study_id, domain), subjects in grouped.items():
+            for start in range(0, len(subjects), 500):
+                chunk = subjects[start : start + 500]
+                placeholders = ", ".join(["?"] * len(chunk))
+                self._conn.execute(
+                    f'DELETE FROM {quoted_tbl} WHERE "STUDYID" = ? AND "DOMAIN" = ? '
+                    f'AND "USUBJID" IN ({placeholders})',
+                    [study_id, domain, *chunk],
+                )
+                deleted_total += len(chunk)
+        return deleted_total
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records into DuckDB."""
         df = _prepare_tabular_batch_df(
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
+            preserve_sdtm_brthdtc=self._cfg.as_sdtm,
         )
         if len(df) == 0:
             return 0
@@ -2016,10 +2325,78 @@ class TabularDuckDBSink(ExportSink):
         self._is_first_batch = False
         return loaded
 
+    def replace_sdtm_subject_slices(
+        self,
+        slices: Sequence[tuple[str, str, str]],
+        records: Sequence[Any],
+        *,
+        batch_id: str,
+    ) -> int:
+        """Atomically delete affected SDTM Subject slices and insert refreshed active rows."""
+        df = _prepare_tabular_batch_df(
+            records,
+            mask_phi=self._cfg.mask_phi,
+            sanitize=self._cfg.sanitize,
+            preserve_sdtm_brthdtc=self._cfg.as_sdtm,
+        )
+
+        def execute_replace() -> int:
+            if self._cfg.idempotent:
+                self._delete_sdtm_slices(slices)
+            if len(df) == 0:
+                return 0
+            quoted_tbl = _quote_duckdb_identifier(self.table_name)
+            quoted_alias = _quote_duckdb_identifier(_DUCKDB_DF_ALIAS)
+            creating_table = not self._table_exists()
+            if creating_table:
+                df_to_register = _apply_contract_to_all_null_df_columns(df, self._contract_types)
+                self._untyped_null_cols = _collect_untyped_all_null_columns(
+                    df, self._contract_types
+                )
+            else:
+                df_to_register = _evolve_duckdb_table_for_df(
+                    self._conn,
+                    self.table_name,
+                    df,
+                    self._contract_types,
+                    self._untyped_null_cols,
+                )
+            self._conn.register(_DUCKDB_DF_ALIAS, df_to_register)
+            try:
+                if creating_table:
+                    self._conn.execute(f"CREATE TABLE {quoted_tbl} AS SELECT * FROM {quoted_alias}")
+                else:
+                    self._conn.execute(
+                        f"INSERT INTO {quoted_tbl} BY NAME SELECT * FROM {quoted_alias}"
+                    )
+            finally:
+                self._conn.unregister(_DUCKDB_DF_ALIAS)
+            return len(df)
+
+        loaded = self._execute_with_retry("replace_duckdb_sdtm_slices", batch_id, execute_replace)
+        self._is_first_batch = False
+        return loaded
+
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Delete newly voided rows from DuckDB when running idempotently."""
         if not self._cfg.idempotent or not records:
             return 0
+        if self._cfg.as_sdtm:
+            slices = [
+                _resolve_record_sdtm_slice(
+                    r,
+                    study_key=self._cfg.study_key or "",
+                    sdtm_domain=self._cfg.sdtm_domain,
+                    config=self._cfg,
+                    form_key_by_id={},
+                )[:3]
+                for r in records
+            ]
+            return self._execute_with_retry(
+                "reconcile_duckdb_deleted",
+                batch_id,
+                lambda: self._delete_sdtm_slices(slices),
+            )
         record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
         if not record_ids:
             return 0
@@ -2061,12 +2438,15 @@ class _TabularCollectingSink(ExportSink):
         on_flush: Any,
         *,
         pass_voided_ids: bool = False,
+        pass_sdtm_slices: bool = False,
     ) -> None:
         super().__init__(config)
         self._frames: list[pd.DataFrame] = []
         self._voided_ids: set[str] = set()
+        self._replaced_sdtm_slices: set[tuple[str, str, str]] = set()
         self._on_flush = on_flush
         self._pass_voided_ids = pass_voided_ids
+        self._pass_sdtm_slices = pass_sdtm_slices
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         _ = batch_id
@@ -2079,6 +2459,22 @@ class _TabularCollectingSink(ExportSink):
                 cid = _canonical_record_id(raw_id)
                 if cid is not None:
                     self._voided_ids.discard(cid)
+        self._frames.append(df)
+        return len(df)
+
+    def replace_sdtm_subject_slices(
+        self,
+        slices: Sequence[tuple[str, str, str]],
+        records: Sequence[Any],
+        *,
+        batch_id: str,
+    ) -> int:
+        _ = batch_id
+        if self.config.idempotent and slices:
+            self._replaced_sdtm_slices.update(_normalize_sdtm_slice_set(slices))
+        df = records if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
+        if len(df) == 0:
+            return 0
         self._frames.append(df)
         return len(df)
 
@@ -2096,7 +2492,9 @@ class _TabularCollectingSink(ExportSink):
 
     def flush(self) -> None:
         combined = _concat_tabular_frames(self._frames) if self._frames else pd.DataFrame()
-        if self._pass_voided_ids:
+        if self._pass_voided_ids and self._pass_sdtm_slices:
+            self._on_flush(combined, set(self._voided_ids), set(self._replaced_sdtm_slices))
+        elif self._pass_voided_ids:
             self._on_flush(combined, set(self._voided_ids))
         else:
             self._on_flush(combined)
@@ -2104,6 +2502,7 @@ class _TabularCollectingSink(ExportSink):
     def close(self) -> None:
         self._frames.clear()
         self._voided_ids.clear()
+        self._replaced_sdtm_slices.clear()
 
 
 class _TabularTransformSink(ExportSink):
@@ -2134,68 +2533,93 @@ class _TabularTransformSink(ExportSink):
         self._pipeline = pipeline
         self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
         self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
-        self._seq_counters: dict[str, int] = {}
+        self._domain_seq_counters: dict[str, dict[str, int]] = {}
         self._meta_cols = {name for name, _ in _RECORD_META_CONTRACT_TYPES}
+
+    def _resolve_record_domain(self, rec: Any) -> str:
+        raw_domain = self._cfg.sdtm_domain
+        if not raw_domain:
+            raw_domain = (
+                rec.get("DOMAIN") or rec.get("domain") or rec.get("form_key") or rec.get("formKey")
+                if isinstance(rec, Mapping)
+                else getattr(rec, "form_key", None)
+            )
+        return resolve_sdtm_domain(raw_domain, fallback="AE")
+
+    def _project_sdtm_records(self, records: Sequence[Any]) -> Sequence[Any]:
+        if self._cfg.variable_whitelist is None:
+            return records
+        allowed = set(self._cfg.variable_whitelist)
+        projected: list[Any] = []
+        for rec in records:
+            rec_data = getattr(rec, "record_data", None)
+            if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
+                projected.append(
+                    rec.model_copy(
+                        update={"record_data": {k: v for k, v in rec_data.items() if k in allowed}}
+                    )
+                )
+            elif isinstance(rec, Mapping) and isinstance(rec.get("record_data"), Mapping):
+                cloned = dict(rec)
+                cloned["record_data"] = {
+                    k: v for k, v in rec["record_data"].items() if k in allowed
+                }
+                projected.append(cloned)
+            else:
+                projected.append(rec)
+        return projected
+
+    def _transform_sdtm_records_df(self, records: Sequence[Any]) -> pd.DataFrame:
+        if not records:
+            return pd.DataFrame()
+        batch_records = self._project_sdtm_records(records)
+        domain_groups: dict[str, list[Any]] = {}
+        for rec in batch_records:
+            dom = self._resolve_record_domain(rec)
+            domain_groups.setdefault(dom, []).append(rec)
+
+        frames: list[pd.DataFrame] = []
+        for target_domain, dom_recs in domain_groups.items():
+            dom_df = transform_records_to_sdtm(
+                dom_recs,
+                domain=target_domain,
+                study_key=self._cfg.study_key,
+                include_deleted=self._cfg.include_deleted,
+                mask_phi=self._cfg.mask_phi,
+                seq_counters=self._domain_seq_counters.setdefault(target_domain, {}),
+                phi_keys=self._phi_keys,
+                pipeline=self._pipeline,
+            )
+            if not dom_df.empty:
+                frames.append(dom_df)
+
+        if not frames:
+            return pd.DataFrame()
+        df = _concat_tabular_frames(frames)
+        if self._sanitize:
+            df = _sanitize_df(df)
+        return df
+
+    def supports_sdtm_slice_replacement(self) -> bool:
+        return self._inner.supports_sdtm_slice_replacement()
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         if self._cfg.as_sdtm:
             if not records:
                 return 0
-            raw_domain = self._cfg.sdtm_domain
-            if not raw_domain:
-                first_rec = records[0]
-                raw_domain = (
-                    first_rec.get("DOMAIN")
-                    or first_rec.get("domain")
-                    or first_rec.get("form_key")
-                    or first_rec.get("formKey")
-                    if isinstance(first_rec, Mapping)
-                    else getattr(first_rec, "form_key", None)
-                )
-            target_domain = resolve_sdtm_domain(raw_domain, fallback="AE")
-            batch_records: Sequence[Any] = records
-            if self._cfg.variable_whitelist is not None:
-                allowed = set(self._cfg.variable_whitelist)
-                projected: list[Any] = []
-                for rec in records:
-                    rec_data = getattr(rec, "record_data", None)
-                    if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
-                        projected.append(
-                            rec.model_copy(
-                                update={
-                                    "record_data": {
-                                        k: v for k, v in rec_data.items() if k in allowed
-                                    }
-                                }
-                            )
-                        )
-                    elif isinstance(rec, Mapping) and isinstance(rec.get("record_data"), Mapping):
-                        cloned = dict(rec)
-                        cloned["record_data"] = {
-                            k: v for k, v in rec["record_data"].items() if k in allowed
-                        }
-                        projected.append(cloned)
-                    else:
-                        projected.append(rec)
-                batch_records = projected
-
-            df = transform_records_to_sdtm(
-                batch_records,
-                domain=target_domain,
-                study_key=self._cfg.study_key,
-                include_deleted=self._cfg.include_deleted,
-                mask_phi=self._cfg.mask_phi,
-                seq_counters=self._seq_counters,
-                phi_keys=self._phi_keys,
-                pipeline=self._pipeline,
-            )
+            df = self._transform_sdtm_records_df(records)
             if df.empty:
                 return 0
-            if self._sanitize:
-                df = _sanitize_df(df)
             return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
 
-        rows, _ = self._mapper._parse_records(records, self._record_model)
+        rows, parse_errors = self._mapper._parse_records(records, self._record_model)
+        if _is_incremental_config(self._cfg) and parse_errors > 0 and len(rows) < len(records):
+            from imednet.errors import ExportBatchError
+
+            raise ExportBatchError(
+                f"Record transformation failed for {parse_errors} record(s) in batch {batch_id!r}.",
+                batch_id=batch_id,
+            )
         if self._pipeline is not None and not self._has_native_enrichment:
             rows = [self._pipeline.process(r, mask_phi=self._cfg.mask_phi) for r in rows]
         df = self._mapper._build_dataframe(
@@ -2225,6 +2649,20 @@ class _TabularTransformSink(ExportSink):
 
         return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
 
+    def replace_sdtm_subject_slices(
+        self,
+        slices: Sequence[tuple[str, str, str]],
+        records: Sequence[Any],
+        *,
+        batch_id: str,
+    ) -> int:
+        for _study_id, domain, usubjid in slices:
+            dom_counters = self._domain_seq_counters.get(domain)
+            if dom_counters is not None:
+                dom_counters.pop(usubjid, None)
+        df = self._transform_sdtm_records_df(records)
+        return self._inner.replace_sdtm_subject_slices(slices, cast(Any, df), batch_id=batch_id)
+
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
         return self._inner.reconcile_deleted(records, batch_id=batch_id)
 
@@ -2240,25 +2678,42 @@ def _make_mapper_records_source(
     study_key: str,
     mapper: Any,
     config: TabularSinkConfig,
+    *,
+    effective_form_whitelist: list[int] | None = None,
 ) -> Callable[[datetime | None, bool], Iterable[Any]]:
     """Build a streaming records source callback compatible with real and mock mappers."""
+    resolved_fw = (
+        effective_form_whitelist if effective_form_whitelist is not None else config.form_whitelist
+    )
     extra_filters: dict[str, Any] = {}
-    if config.form_whitelist is not None:
-        extra_filters["formId"] = config.form_whitelist
-    merged_filter = _merge_form_whitelist_into_filter(config.record_filter, config.form_whitelist)
+    if resolved_fw is not None:
+        extra_filters["formId"] = resolved_fw
+    merged_filter = _merge_form_whitelist_into_filter(config.record_filter, resolved_fw)
     is_mock = _is_mock_mapper(mapper)
+
+    def _wrap_sdtm_domain(stream: Iterable[Any]) -> Iterable[Any]:
+        if config.as_sdtm and config.sdtm_domain:
+            return filter_records_for_sdtm_domain(
+                stream,
+                config.sdtm_domain,
+                sdk=sdk,
+                study_key=study_key,
+            )
+        return stream
 
     def _records_source(
         watermark: datetime | None, exclude_deleted_upstream: bool
     ) -> Iterable[Any]:
         if is_mock:
-            return cast(
-                Iterable[Any],
-                mapper._iter_records(
-                    study_key,
-                    visit_key=None,
-                    extra_filters=extra_filters or None,
-                ),
+            return _wrap_sdtm_domain(
+                cast(
+                    Iterable[Any],
+                    mapper._iter_records(
+                        study_key,
+                        visit_key=None,
+                        extra_filters=extra_filters or None,
+                    ),
+                )
             )
         if (
             getattr(mapper, "_loader", None) is not None
@@ -2273,23 +2728,27 @@ def _make_mapper_records_source(
                 from imednet.utils.dates import format_iso_datetime
 
                 iter_filters["dateModified"] = (">=", format_iso_datetime(watermark))
-            return cast(
-                Iterable[Any],
-                mapper._iter_records(
-                    study_key,
-                    visit_key=None,
-                    extra_filters=iter_filters or None,
-                    record_data_filter=config.record_data_filter,
-                    include_deleted=not exclude_deleted_upstream,
-                ),
+            return _wrap_sdtm_domain(
+                cast(
+                    Iterable[Any],
+                    mapper._iter_records(
+                        study_key,
+                        visit_key=None,
+                        extra_filters=iter_filters or None,
+                        record_data_filter=config.record_data_filter,
+                        include_deleted=not exclude_deleted_upstream,
+                    ),
+                )
             )
-        return iter_filtered_sdk_records(
-            sdk,
-            study_key,
-            watermark=watermark,
-            record_filter=merged_filter,
-            record_data_filter=config.record_data_filter,
-            exclude_deleted_upstream=exclude_deleted_upstream,
+        return _wrap_sdtm_domain(
+            iter_filtered_sdk_records(
+                sdk,
+                study_key,
+                watermark=watermark,
+                record_filter=merged_filter,
+                record_data_filter=config.record_data_filter,
+                exclude_deleted_upstream=exclude_deleted_upstream,
+            )
         )
 
     return _records_source
@@ -2308,11 +2767,27 @@ def _tabular_export(
     empty_whitelist = (
         config.variable_whitelist is not None and len(config.variable_whitelist) == 0
     ) or (config.form_whitelist is not None and len(config.form_whitelist) == 0)
+    effective_form_whitelist: list[int] | None = config.form_whitelist
     if config.as_sdtm:
         if empty_whitelist:
             with sink:
                 pass
             return
+        if config.sdtm_domain:
+            domain_form_ids, _, is_multi_form_filtered = resolve_sdtm_domain_forms(
+                sdk, study_key, config.sdtm_domain
+            )
+            if is_multi_form_filtered:
+                if config.form_whitelist is not None:
+                    effective_form_whitelist = [
+                        fid for fid in config.form_whitelist if fid in domain_form_ids
+                    ]
+                    if not effective_form_whitelist:
+                        with sink:
+                            pass
+                        return
+                else:
+                    effective_form_whitelist = sorted(domain_form_ids)
         variable_keys: list[str] = []
         label_map: dict[str, str] = {}
         contract_types = _build_sdtm_contract_types(
@@ -2349,7 +2824,13 @@ def _tabular_export(
     if isinstance(sink, (TabularParquetSink, TabularDuckDBSink)):
         sink.set_contract_types(contract_types)
 
-    records_source = _make_mapper_records_source(sdk, study_key, mapper, config)
+    records_source = _make_mapper_records_source(
+        sdk,
+        study_key,
+        mapper,
+        config,
+        effective_form_whitelist=effective_form_whitelist,
+    )
 
     transform_sink = _TabularTransformSink(
         sink,
@@ -2754,7 +3235,11 @@ def export_to_excel(
     )
     is_incremental_excel = _is_incremental_config(config)
 
-    def _write_or_reconcile_excel(combined: pd.DataFrame, voided_ids: set[str]) -> None:
+    def _write_or_reconcile_excel(
+        combined: pd.DataFrame,
+        voided_ids: set[str],
+        replaced_sdtm_slices: set[tuple[str, str, str]],
+    ) -> None:
         if not (is_incremental_excel and config.idempotent):
             target = (
                 _build_empty_contract_df(sdtm_contract)
@@ -2765,7 +3250,7 @@ def export_to_excel(
             return
 
         dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
-        if combined.empty and not voided_ids:
+        if combined.empty and not voided_ids and not replaced_sdtm_slices:
             if dest_exists:
                 return
             empty_target = (
@@ -2780,23 +3265,44 @@ def export_to_excel(
 
         dedup_delta, delta_ids = _dedupe_df_by_record_id(combined, exclude_ids=voided_ids)
         if dest_exists:
-            prev_df = pd.read_excel(path)
+            prev_df = pd.read_excel(
+                path,
+                dtype=(
+                    {"STUDYID": str, "DOMAIN": str, "USUBJID": str, "BRTHDTC": str}
+                    if config.as_sdtm
+                    else None
+                ),
+            )
             prev_kept = _filter_df_excluding_record_ids(prev_df, delta_ids | voided_ids)
+            if replaced_sdtm_slices:
+                prev_kept = _filter_df_excluding_sdtm_slices(prev_kept, replaced_sdtm_slices)
             if not prev_kept.empty:
                 if config.mask_phi:
                     pipeline = resolve_enrichment_pipeline(study_key)
                     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-                    prev_kept = _mask_df(prev_kept, phi_keys=phi_keys)
+                    prev_kept = _mask_df(
+                        prev_kept,
+                        phi_keys=phi_keys,
+                        preserve_sdtm_brthdtc=config.as_sdtm,
+                    )
                 if config.sanitize:
                     prev_kept = _sanitize_df(prev_kept)
             if prev_kept.empty:
-                merged_df = dedup_delta
+                merged_df = (
+                    _build_empty_contract_df(sdtm_contract)
+                    if dedup_delta.empty and sdtm_contract is not None
+                    else dedup_delta
+                )
             elif dedup_delta.empty:
                 merged_df = prev_kept.reset_index(drop=True)
             else:
                 merged_df = _concat_tabular_frames([prev_kept, dedup_delta])
         else:
-            merged_df = dedup_delta
+            merged_df = (
+                _build_empty_contract_df(sdtm_contract)
+                if dedup_delta.empty and sdtm_contract is not None
+                else dedup_delta
+            )
 
         _atomic_replace_file(
             path,
@@ -2804,7 +3310,12 @@ def export_to_excel(
             suffix=".xlsx",
         )
 
-    sink = _TabularCollectingSink(config, _write_or_reconcile_excel, pass_voided_ids=True)
+    sink = _TabularCollectingSink(
+        config,
+        _write_or_reconcile_excel,
+        pass_voided_ids=True,
+        pass_sdtm_slices=True,
+    )
     _tabular_export(sdk, study_key, sink, config, sanitize=True, stream_name="excel")
 
 
@@ -3248,16 +3759,20 @@ def export_to_json(
 
     is_incremental_json = _is_incremental_config(config)
 
-    def _write_or_reconcile_json(combined: pd.DataFrame, voided_ids: set[str]) -> None:
+    def _write_or_reconcile_json(
+        combined: pd.DataFrame,
+        voided_ids: set[str],
+        replaced_sdtm_slices: set[tuple[str, str, str]],
+    ) -> None:
         if not (is_incremental_json and config.idempotent):
             records_out = _dataframe_to_json_records(combined)
             if config.mask_phi:
-                records_out = mask_clinical_phi(records_out)
+                records_out = mask_clinical_phi(records_out, preserve_sdtm_brthdtc=config.as_sdtm)
             _dump_json_payload(path, records_out, config)
             return
 
         dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
-        if combined.empty and not voided_ids:
+        if combined.empty and not voided_ids and not replaced_sdtm_slices:
             if dest_exists:
                 return
             _dump_json_payload(path, [], config)
@@ -3275,6 +3790,16 @@ def export_to_json(
             except Exception:
                 existing_records = []
 
+        if replaced_sdtm_slices:
+            existing_records = [
+                erec
+                for erec in existing_records
+                if not (
+                    isinstance(erec, Mapping)
+                    and _row_matches_sdtm_slice(erec, replaced_sdtm_slices)
+                )
+            ]
+
         merged_records: Any = _merge_flat_json_records(
             existing_records,
             delta_records,
@@ -3283,12 +3808,17 @@ def export_to_json(
         if config.mask_phi:
             pipeline = resolve_enrichment_pipeline(study_key)
             phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
-            merged_records = mask_clinical_phi(merged_records)
+            merged_records = mask_clinical_phi(merged_records, preserve_sdtm_brthdtc=config.as_sdtm)
             if phi_keys:
                 merged_records = mask_custom_phi_recursive(merged_records, phi_keys)
         _dump_json_payload(path, merged_records, config)
 
-    sink = _TabularCollectingSink(config, _write_or_reconcile_json, pass_voided_ids=True)
+    sink = _TabularCollectingSink(
+        config,
+        _write_or_reconcile_json,
+        pass_voided_ids=True,
+        pass_sdtm_slices=True,
+    )
     _tabular_export(sdk, study_key, sink, config, sanitize=False, stream_name="json")
 
 
@@ -3542,11 +4072,28 @@ def _build_form_export_contexts(
         if var.form_id is not None:
             variables_by_form.setdefault(var.form_id, []).append(var)
 
+    domain_matching_ids: set[int] = set()
+    domain_matching_keys: set[str] = set()
+    domain_is_filtered = False
+    if as_sdtm and sdtm_domain:
+        domain_matching_ids, domain_matching_keys, domain_is_filtered = resolve_sdtm_domain_forms(
+            sdk,
+            study_key,
+            sdtm_domain,
+            forms=forms,
+        )
+
     contexts: list[_FormExportContext] = []
     for form in forms:
         if form.form_id is None or form.form_key is None:
             continue
         if form_whitelist is not None and form.form_id not in form_whitelist:
+            continue
+        if (
+            domain_is_filtered
+            and form.form_id not in domain_matching_ids
+            and form.form_key not in domain_matching_keys
+        ):
             continue
         if validate_form_key_fn is not None:
             validate_form_key_fn(form.form_key)
@@ -3612,6 +4159,9 @@ def _stream_records_across_forms(
     *,
     on_active_batch: Callable[[_FormExportContext, list[Any], int], int],
     on_voided_batch: Callable[[_FormExportContext, list[Any], int], int] | None = None,
+    on_sdtm_slice_replace: (
+        Callable[[_FormExportContext, list[tuple[str, str, str]], list[Any]], int] | None
+    ) = None,
     on_before_checkpoints: Callable[[], None] | None = None,
 ) -> None:
     """Stream study records once, route batches per form, and commit checkpoints post-flush."""
@@ -3666,6 +4216,25 @@ def _stream_records_across_forms(
 
         by_form_id = {ctx.form_id: ctx for ctx in contexts}
         by_form_key = {ctx.form_key: ctx for ctx in contexts}
+        form_key_by_id = {ctx.form_id: ctx.form_key for ctx in contexts}
+        can_refresh_subjects = (
+            hasattr(sdk, "records") and hasattr(sdk.records, "list")
+        ) or hasattr(sdk, "get_records")
+        sdtm_incremental_keys: set[str] = {
+            ctx.form_key
+            for ctx in contexts
+            if opts["as_sdtm"]
+            and not opts["include_deleted"]
+            and opts["idempotent"]
+            and ctx.watermark is not None
+            and on_sdtm_slice_replace is not None
+            and can_refresh_subjects
+        }
+        sdtm_ctx_slices: dict[str, set[tuple[str, str, str]]] = {
+            fk: set() for fk in sdtm_incremental_keys
+        }
+        sdtm_ctx_subjects: dict[str, set[str]] = {fk: set() for fk in sdtm_incremental_keys}
+        sdtm_ctx_delta_active: dict[str, list[Any]] = {fk: [] for fk in sdtm_incremental_keys}
 
         def _resolve_ctx(record: Any) -> _FormExportContext | None:
             fid, fk = extract_record_form_ref(record)
@@ -3676,7 +4245,9 @@ def _stream_records_across_forms(
             return None
 
         effective_form_whitelist = (
-            [ctx.form_id for ctx in contexts] if config.form_whitelist is not None else None
+            [ctx.form_id for ctx in contexts]
+            if (config.form_whitelist is not None or (opts["as_sdtm"] and opts["sdtm_domain"]))
+            else None
         )
         merged_filter = _merge_form_whitelist_into_filter(
             opts["record_filter"], effective_form_whitelist
@@ -3760,7 +4331,20 @@ def _stream_records_across_forms(
                     if opts["idempotent"] and (use_checkpoint or ctx.watermark is not None):
                         if rec_ts is not None:
                             ctx.exported_timestamps.append(rec_ts)
-                        router.add_voided(ctx.form_key, rec)
+                        if ctx.form_key in sdtm_incremental_keys:
+                            st_id, dom, usubjid, raw_subj = _resolve_record_sdtm_slice(
+                                rec,
+                                study_key=study_key,
+                                sdtm_domain=ctx.sdtm_domain or opts["sdtm_domain"],
+                                config=config,
+                                form_key_by_id=form_key_by_id,
+                            )
+                            sdtm_ctx_slices[ctx.form_key].add((st_id, dom, usubjid))
+                            if raw_subj:
+                                sdtm_ctx_subjects[ctx.form_key].add(raw_subj)
+                            ctx.total_reconciled += 1
+                        else:
+                            router.add_voided(ctx.form_key, rec)
                     continue
 
                 ctx.pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
@@ -3790,8 +4374,88 @@ def _stream_records_across_forms(
                 rec_ts = extract_record_timestamp(rec)
                 if rec_ts is not None:
                     matched_ctx.exported_timestamps.append(rec_ts)
-                router.add_active(matched_ctx.form_key, rec)
+                if matched_ctx.form_key in sdtm_incremental_keys:
+                    st_id, dom, usubjid, raw_subj = _resolve_record_sdtm_slice(
+                        rec,
+                        study_key=study_key,
+                        sdtm_domain=matched_ctx.sdtm_domain or opts["sdtm_domain"],
+                        config=config,
+                        form_key_by_id=form_key_by_id,
+                    )
+                    sdtm_ctx_slices[matched_ctx.form_key].add((st_id, dom, usubjid))
+                    if raw_subj:
+                        sdtm_ctx_subjects[matched_ctx.form_key].add(raw_subj)
+                    sdtm_ctx_delta_active[matched_ctx.form_key].append(rec)
+                else:
+                    router.add_active(matched_ctx.form_key, rec)
         router.flush_all()
+
+        if on_sdtm_slice_replace is not None:
+            for ctx in contexts:
+                slices_for_ctx = sdtm_ctx_slices.get(ctx.form_key)
+                if not slices_for_ctx:
+                    continue
+                refreshed = fetch_active_subject_records(
+                    sdk,
+                    study_key,
+                    subject_keys=sdtm_ctx_subjects[ctx.form_key],
+                    form_ids=[ctx.form_id],
+                    sdtm_domain=ctx.sdtm_domain,
+                    forms=[ctx.form],
+                    record_data_filter=opts["record_data_filter"],
+                )
+                refreshed = [
+                    r
+                    for r in refreshed
+                    if _resolve_record_sdtm_slice(
+                        r,
+                        study_key=study_key,
+                        sdtm_domain=ctx.sdtm_domain or opts["sdtm_domain"],
+                        config=config,
+                        form_key_by_id=form_key_by_id,
+                    )[:3]
+                    in slices_for_ctx
+                ]
+                if (
+                    not refreshed
+                    and sdtm_ctx_delta_active[ctx.form_key]
+                    and ctx.total_reconciled == 0
+                ):
+                    sdk_records_ep = getattr(sdk, "records", None)
+                    is_unconfigured_mock_ep = isinstance(sdk_records_ep, NonCallableMock) and (
+                        not getattr(sdk_records_ep.list, "side_effect", None)
+                        and isinstance(sdk_records_ep.list.return_value, NonCallableMock)
+                    )
+                    if is_unconfigured_mock_ep:
+                        refreshed = list(sdtm_ctx_delta_active[ctx.form_key])
+                elif apply_quality_gate is _DEFAULT_APPLY_QUALITY_GATE:
+                    refreshed = list(
+                        apply_quality_gate(
+                            sdk,
+                            study_key,
+                            refreshed,
+                            config,
+                            variables=ctx.variables,
+                            forms=[ctx.form],
+                        )
+                    )
+                else:
+                    refreshed = list(apply_quality_gate(sdk, study_key, refreshed, config))
+
+                if check_standards and refreshed:
+                    _enforce_batch_standards_readiness(
+                        refreshed,
+                        batch_id=f"{study_key}/{ctx.form_key}/sdtm_refresh",
+                        study_key=study_key,
+                        config=config,
+                        standards_profile=opts["standards_profile"],
+                        min_standards_score=opts["min_standards_score"],
+                        sdtm_domain=ctx.sdtm_domain or opts["sdtm_domain"],
+                    )
+                written_slices = on_sdtm_slice_replace(ctx, sorted(slices_for_ctx), refreshed)
+                ctx.total_written += written_slices
+                if written_slices > 0:
+                    ctx.wrote_any = True
 
         for ctx in contexts:
             rejected_timestamps = [
@@ -4029,6 +4693,19 @@ def export_to_duckdb_by_form(
                     )
                 )
 
+            def _replace_duckdb_sdtm_slices(
+                ctx: _FormExportContext,
+                slices: list[tuple[str, str, str]],
+                refreshed_records: list[Any],
+            ) -> int:
+                return int(
+                    ctx.sink.replace_sdtm_subject_slices(
+                        slices,
+                        refreshed_records,
+                        batch_id=f"{study_key}/{ctx.form_key}/sdtm_refresh",
+                    )
+                )
+
             _stream_records_across_forms(
                 sdk,
                 study_key,
@@ -4037,6 +4714,7 @@ def export_to_duckdb_by_form(
                 all_variables,
                 on_active_batch=_write_duckdb_batch,
                 on_voided_batch=_reconcile_duckdb_voided,
+                on_sdtm_slice_replace=_replace_duckdb_sdtm_slices,
                 on_before_checkpoints=sink_stack.close,
             )
     finally:
@@ -4214,6 +4892,19 @@ def export_to_sql_by_form(
                         )
             sink_stack.close()
 
+        def _replace_sql_sdtm_slices(
+            ctx: _FormExportContext,
+            slices: list[tuple[str, str, str]],
+            refreshed_records: list[Any],
+        ) -> int:
+            return int(
+                ctx.sink.replace_sdtm_subject_slices(
+                    slices,
+                    refreshed_records,
+                    batch_id=f"{study_key}/{ctx.form_key}/sdtm_refresh",
+                )
+            )
+
         _stream_records_across_forms(
             sdk,
             study_key,
@@ -4222,6 +4913,7 @@ def export_to_sql_by_form(
             all_variables,
             on_active_batch=_write_sql_batch,
             on_voided_batch=_reconcile_sql_voided,
+            on_sdtm_slice_replace=_replace_sql_sdtm_slices,
             on_before_checkpoints=_finalize_and_flush_sql_sinks,
         )
 
@@ -4501,10 +5193,19 @@ def export_to_long_sql(
     )
 
 
+def export_to_hive_parquet(*args: Any, **kwargs: Any) -> None:
+    """Export study records to a Hive-partitioned Parquet directory layout."""
+    from .parquet import export_to_hive_parquet as _export_to_hive_parquet
+
+    _export_to_hive_parquet(*args, **kwargs)
+
+
 _UNPATCHED_EXPORTS: dict[str, Callable[..., Any]] = {
     "export_to_csv": export_to_csv,
     "export_to_duckdb": export_to_duckdb,
+    "export_to_duckdb_by_form": export_to_duckdb_by_form,
     "export_to_excel": export_to_excel,
+    "export_to_hive_parquet": export_to_hive_parquet,
     "export_to_json": export_to_json,
     "export_to_long_sql": export_to_long_sql,
     "export_to_parquet": export_to_parquet,

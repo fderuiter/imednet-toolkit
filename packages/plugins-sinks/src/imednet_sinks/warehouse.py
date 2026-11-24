@@ -615,7 +615,7 @@ def _post_process_warehouse_sdtm(
     """Normalize and validate an SDTM domain row for Snowflake Parquet staging."""
     normalized = _normalize_warehouse_value(row)
     if mask_phi and not _already_masked:
-        normalized = mask_clinical_phi(normalized)
+        normalized = mask_clinical_phi(normalized, preserve_sdtm_brthdtc=True)
     cleaned: dict[str, Any] = {}
     for col, val in normalized.items():
         if not isinstance(col, str) or not _IDENTIFIER_PATTERN.match(col):
@@ -952,9 +952,17 @@ def _records_to_arrow_table(
                 mask_phi=mask_phi,
                 naming_convention=None if is_default_conv else mapper_convention,
             )
-        raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+        raw_rows = (
+            mapper.map_records(records, study_key=study_key)
+            if mapper_as_sdtm
+            else [mapper.map_record(r, study_key=study_key) for r in records]
+        )
     elif mapper_as_sdtm:
-        mapped_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+        mapped_rows = (
+            mapper.map_records(records, study_key=study_key)
+            if hasattr(mapper, "map_records")
+            else [mapper.map_record(r, study_key=study_key) for r in records]
+        )
         orig_post_proc = getattr(mapper, "post_processor", None)
         if getattr(orig_post_proc, "func", orig_post_proc) is _post_process_warehouse_sdtm:
             raw_rows = mapped_rows
@@ -1051,6 +1059,7 @@ class SnowflakeExportSink(ExportSink):
         super().__init__(config)
         self._cfg: SnowflakeSinkConfig = config
         self._seq_counters: dict[str, int] = {}
+        self._mapper: CentralizedMapper | None = None
         self._conn: Any = None
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
@@ -1155,21 +1164,11 @@ class SnowflakeExportSink(ExportSink):
             )
             cur.execute(f"ALTER TABLE {target_table} ADD COLUMN {add_defs}")  # nosem
 
-    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
-        """Write *records* to Snowflake via Parquet staging, DDL evolution, and MERGE INTO (or COPY INTO)."""
-        if not records:
-            return 0
-
+    def _get_mapper(self) -> CentralizedMapper:
+        """Return persistent CentralizedMapper so per-domain SDTM sequence counters span batches."""
+        if self._mapper is not None:
+            return self._mapper
         cfg = self._cfg
-        cfg.validate_identifiers(require_coordinates=True)
-
-        safe_batch = _BATCH_UNSAFE_PATTERN.sub("_", batch_id).strip("_")
-        if not safe_batch:
-            raise ExportBatchError(
-                f"Batch identifier {batch_id!r} resolved to an empty string after sanitization.",
-                batch_id=batch_id,
-            )
-
         if cfg.as_sdtm:
             post_proc: Any = functools.partial(
                 _post_process_warehouse_sdtm,
@@ -1189,12 +1188,30 @@ class SnowflakeExportSink(ExportSink):
                 if self.config.mask_phi
                 else _post_process_warehouse_unmasked
             )
-        mapper = build_sink_mapper(
+        self._mapper = build_sink_mapper(
             cfg,
             mode="tabular",
             post_processor=post_proc,
             seq_counters=self._seq_counters,
         )
+        return self._mapper
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Write *records* to Snowflake via Parquet staging, DDL evolution, and MERGE INTO (or COPY INTO)."""
+        if not records:
+            return 0
+
+        cfg = self._cfg
+        cfg.validate_identifiers(require_coordinates=True)
+
+        safe_batch = _BATCH_UNSAFE_PATTERN.sub("_", batch_id).strip("_")
+        if not safe_batch:
+            raise ExportBatchError(
+                f"Batch identifier {batch_id!r} resolved to an empty string after sanitization.",
+                batch_id=batch_id,
+            )
+
+        mapper = self._get_mapper()
 
         arrow_table = _records_to_arrow_table(
             records,
@@ -1345,15 +1362,178 @@ class SnowflakeExportSink(ExportSink):
     def flush(self) -> None:
         """No-op: each batch is committed individually."""
 
+    def replace_sdtm_subject_slices(
+        self,
+        slices: Sequence[tuple[str, str, str]],
+        records: Sequence[Any],
+        *,
+        batch_id: str,
+    ) -> int:
+        """Atomically purge and reload affected ``(STUDYID, DOMAIN, USUBJID)`` slices in Snowflake."""
+        cfg = self._cfg
+        cfg.validate_identifiers(require_coordinates=True)
+
+        safe_batch = _BATCH_UNSAFE_PATTERN.sub("_", batch_id).strip("_")
+        if not safe_batch:
+            raise ExportBatchError(
+                f"Batch identifier {batch_id!r} resolved to an empty string after sanitization.",
+                batch_id=batch_id,
+            )
+
+        slice_groups: dict[tuple[str, str], list[str]] = {}
+        for raw_study, raw_domain, raw_usubjid in slices:
+            st = str(raw_study).strip()
+            dom = str(raw_domain).strip()
+            usub = str(raw_usubjid).strip()
+            if not (st and dom and usub):
+                continue
+            bucket = slice_groups.setdefault((st, dom), [])
+            if usub not in bucket:
+                bucket.append(usub)
+
+        mapper = self._get_mapper()
+        for (_st, dom), usubjids in slice_groups.items():
+            mapper.reset_sdtm_subject_counters(domain=dom, usubjids=usubjids)
+
+        if not records and (not self.config.idempotent or not slice_groups):
+            return 0
+
+        arrow_table: Any = None
+        merge_columns: list[str] = []
+        local_path: Path | None = None
+        stage_path: str | None = None
+        if records:
+            arrow_table = _records_to_arrow_table(
+                records,
+                mask_phi=self.config.mask_phi,
+                study_key=cfg.study_key,
+                mapper=mapper,
+                as_sdtm=True,
+                sdtm_domain=cfg.sdtm_domain,
+                naming_convention=cfg.naming_convention,
+            )
+            merge_columns = _resolve_merge_columns(arrow_table)
+            local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
+            pq = _require_optional_dep("pyarrow.parquet", "snowflake")
+            pq.write_table(arrow_table, str(local_path))
+            stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{safe_batch}.parquet"
+
+        target_table = (
+            f"{_quote_identifier(cfg.database)}."
+            f"{_quote_identifier(cfg.schema)}."
+            f"{_quote_identifier(cfg.table)}"
+        )
+
+        def execute_replace() -> int:
+            cur = self._conn.cursor()
+            try:
+                if arrow_table is None:
+                    cur.execute("BEGIN")
+                    try:
+                        for (st, dom), usubjids in slice_groups.items():
+                            placeholders = ", ".join(["%s"] * len(usubjids))
+                            cur.execute(
+                                f"DELETE FROM {target_table} "  # noqa: S608
+                                f'WHERE "STUDYID" = %s AND "DOMAIN" = %s '
+                                f'AND "USUBJID" IN ({placeholders})',
+                                [st, dom, *usubjids],
+                            )  # nosem
+                        cur.execute("COMMIT")
+                    except Exception:
+                        cur.execute("ROLLBACK")
+                        raise
+                    return 0
+
+                assert local_path is not None
+                assert stage_path is not None
+                cur.execute(
+                    f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/' "
+                    f"AUTO_COMPRESS = FALSE OVERWRITE = TRUE"
+                )  # nosem
+                self._ensure_table_schema(cur, target_table, arrow_table, merge_columns)
+
+                if self.config.idempotent:
+                    staging_table = (
+                        f"{_quote_identifier(cfg.database)}."
+                        f"{_quote_identifier(cfg.schema)}."
+                        f"{_quote_identifier(f'{cfg.table}__imednet_stage')}"
+                    )
+                    cur.execute(
+                        f"CREATE OR REPLACE TEMPORARY TABLE {staging_table} LIKE {target_table}"
+                    )  # nosem
+                    cur.execute(
+                        f"COPY INTO {staging_table} "
+                        f"FROM '{stage_path}' "
+                        f"FILE_FORMAT = (TYPE = PARQUET) "
+                        f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
+                        f"FORCE = TRUE"
+                    )  # nosem
+                    insert_cols = ", ".join(_quote_identifier(col.upper()) for col in merge_columns)
+                    cur.execute("BEGIN")
+                    try:
+                        for (st, dom), usubjids in slice_groups.items():
+                            placeholders = ", ".join(["%s"] * len(usubjids))
+                            cur.execute(
+                                f"DELETE FROM {target_table} "  # noqa: S608
+                                f'WHERE "STUDYID" = %s AND "DOMAIN" = %s '
+                                f'AND "USUBJID" IN ({placeholders})',
+                                [st, dom, *usubjids],
+                            )  # nosem
+                        cur.execute(
+                            f"INSERT INTO {target_table} ({insert_cols}) "  # noqa: S608
+                            f"SELECT {insert_cols} FROM {staging_table}"
+                        )  # nosem
+                        cur.execute("COMMIT")
+                    except Exception:
+                        cur.execute("ROLLBACK")
+                        raise
+                else:
+                    cur.execute(
+                        f"COPY INTO {target_table} "
+                        f"FROM '{stage_path}' "
+                        f"FILE_FORMAT = (TYPE = PARQUET) "
+                        f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
+                        f"FORCE = TRUE"
+                    )  # nosem
+
+                rows_loaded = len(records)
+                self._append_manifest(batch_id, stage_path, rows_loaded)
+                return rows_loaded
+            finally:
+                cur.close()
+
+        return self._execute_with_retry("replace_warehouse_sdtm_slices", batch_id, execute_replace)
+
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Delete newly voided rows from Snowflake when running idempotently."""
         if not self.config.idempotent or not records:
             return 0
+
+        cfg = self._cfg
+        if cfg.as_sdtm:
+            from imednet.spi.sinks import extract_record_subject_key, resolve_sdtm_domain
+
+            sdtm_slices: list[tuple[str, str, str]] = []
+            for rec in records:
+                usub = extract_record_subject_key(rec)
+                if not usub:
+                    continue
+                raw_dom = cfg.sdtm_domain or (
+                    rec.get("DOMAIN") or rec.get("form_key") or rec.get("formKey")
+                    if isinstance(rec, Mapping)
+                    else getattr(rec, "form_key", None)
+                )
+                dom = resolve_sdtm_domain(raw_dom, fallback="AE")
+                sdtm_slices.append((cfg.study_key or "UNKNOWN", dom, usub))
+            if not sdtm_slices:
+                return 0
+            self.replace_sdtm_subject_slices(sdtm_slices, [], batch_id=batch_id)
+            return len(sdtm_slices)
+
         record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
         if not record_ids:
             return 0
 
-        cfg = self._cfg
         target_table = (
             f"{_quote_identifier(cfg.database)}."
             f"{_quote_identifier(cfg.schema)}."

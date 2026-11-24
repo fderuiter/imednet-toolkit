@@ -2,10 +2,12 @@
 
 from imednet.models.standards import (
     PROFILE_REGISTRY,
+    BiologicSafetyProfile,
     DeviceSafetyProfile,
     DrugSafetyProfile,
     GeneralClinicalProfile,
     StandardsProfile,
+    VaccineSafetyProfile,
     _canonical_domain,
     is_valid_cdash_variable,
     validate_cdash_variable,
@@ -13,8 +15,14 @@ from imednet.models.standards import (
 
 
 def test_profile_registry_contains_general_drug_and_device_profiles() -> None:
-    """Test that profile registry contains general drug and device profiles."""
-    assert PROFILE_REGISTRY.list_profiles() == ["device", "drug", "general"]
+    """Test that profile registry contains general, drug, biologic, vaccine, and device profiles."""
+    assert PROFILE_REGISTRY.list_profiles() == [
+        "biologic",
+        "device",
+        "drug",
+        "general",
+        "vaccine",
+    ]
 
 
 def test_drug_profile_enforces_ae_decod_relationship_and_ctcae_grades() -> None:
@@ -395,3 +403,32 @@ def test_core_sdtm_transform_enforces_pre_usubjid_phi_masking_and_cross_batch_se
     )
     assert ready_report.score == 100.0
     assert ready_report.is_ready is True
+
+
+def test_biologic_and_vaccine_profiles_enforce_safety_rules() -> None:
+    """BiologicSafetyProfile and VaccineSafetyProfile validate AE/DM/VS rules accurately."""
+    biologic = BiologicSafetyProfile()
+    bio_violations = biologic.validate(
+        domain="AE",
+        data={
+            "subjectKey": "S001",
+            "aeTerm": "Infusion reaction",
+            "aeSeverity": "MODERATE",
+        },
+    )
+    assert ("aeRelationship", "ERROR") in {(v.field, v.severity) for v in bio_violations}
+
+    vaccine = VaccineSafetyProfile()
+    vax_ready = vaccine.validate(
+        domain="AE",
+        data={
+            "subjectKey": "S002",
+            "aeTerm": "Injection site pain",
+            "aeSeverity": "MILD",
+            "aeRelationship": "RELATED",
+            "aeDecod": "INJECTION SITE PAIN",
+            "aeActionTaken": "NONE",
+            "aeOutcome": "RECOVERED",
+        },
+    )
+    assert vax_ready == []

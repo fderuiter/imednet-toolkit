@@ -20,7 +20,9 @@ def _setup_airflow(monkeypatch):
 EXPORT_FUNCTIONS = [
     "export_to_csv",
     "export_to_duckdb",
+    "export_to_duckdb_by_form",
     "export_to_parquet",
+    "export_to_hive_parquet",
     "export_to_excel",
     "export_to_json",
     "export_to_sql",
@@ -1714,3 +1716,124 @@ def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.Monkey
         if_exists="append",
     )
     assert res_long == "override_long_records"
+
+
+def test_operator_executes_hive_parquet_and_duckdb_by_form_with_isolated_mapped_streams(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ImednetExportOperator runs hive_parquet and duckdb_by_form and isolates stream_name per map_index."""
+    from datetime import UTC, datetime
+
+    import duckdb
+    import pandas as pd
+
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    forms = [
+        Form(form_id=1, form_key="AE", form_name="Adverse Events"),
+        Form(form_id=2, form_key="DM", form_name="Demographics"),
+    ]
+    variables = [
+        Variable(
+            variable_name="aeTerm", label="AE Term", variable_type="text", form_id=1, form_key="AE"
+        ),
+        Variable(
+            variable_name="birthDate",
+            label="Birth Date",
+            variable_type="text",
+            form_id=2,
+            form_key="DM",
+        ),
+    ]
+    records = [
+        Record(
+            record_id=1,
+            study_key="AF_MAP",
+            form_id=1,
+            form_key="AE",
+            subject_key="S01",
+            date_modified="2026-07-01T10:00:00Z",
+            record_data={"aeTerm": "Headache", "aeStartDate": "2026-07-01"},
+        ),
+        Record(
+            record_id=2,
+            study_key="AF_MAP",
+            form_id=2,
+            form_key="DM",
+            subject_key="S01",
+            date_modified="2026-07-02T12:00:00Z",
+            record_data={"sex": "F", "birthDate": "1985-07-20"},
+        ),
+    ]
+
+    sdk = MagicMock(sinks=None)
+    sdk.forms.list.side_effect = lambda **_kw: iter(forms)
+    sdk.get_forms.return_value = forms
+    sdk.variables.list.side_effect = lambda **_kw: iter(variables)
+    sdk.get_variables.return_value = variables
+    sdk.records.list.side_effect = lambda **_kw: iter(records)
+
+    ledger_path = tmp_path / "mapped_ledger.json"
+    lake_dir = tmp_path / "hive_lake"
+    ddb_path = tmp_path / "forms.duckdb"
+
+    op_hive_0 = ImednetExportOperator(
+        task_id="mapped_hive",
+        study_key="AF_MAP",
+        destination="hive_parquet",
+        output_path=str(lake_dir),
+        as_sdtm=True,
+        domain="AE",
+        incremental=True,
+        ledger_path=str(ledger_path),
+    )
+    monkeypatch.setattr(op_hive_0, "_get_sdk", lambda: sdk)
+    assert op_hive_0.execute({"map_index": 0}) == str(lake_dir)
+
+    op_hive_1 = ImednetExportOperator(
+        task_id="mapped_hive",
+        study_key="AF_MAP",
+        destination="hive_parquet",
+        output_path=str(lake_dir),
+        as_sdtm=True,
+        domain="DM",
+        incremental=True,
+        ledger_path=str(ledger_path),
+    )
+    monkeypatch.setattr(op_hive_1, "_get_sdk", lambda: sdk)
+    assert op_hive_1.execute({"ti": SimpleNamespace(map_index=1)}) == str(lake_dir)
+
+    provider = FileStateProvider(str(ledger_path))
+    assert provider.get_last_timestamp("AF_MAP", "hive_parquet_mapped_hive_map_0_AE") == datetime(
+        2026, 7, 1, 10, 0, tzinfo=UTC
+    )
+    assert provider.get_last_timestamp("AF_MAP", "hive_parquet_mapped_hive_map_1_DM") == datetime(
+        2026, 7, 2, 12, 0, tzinfo=UTC
+    )
+    dm_files = list((lake_dir / "study_key=AF_MAP" / "form_key=DM").rglob("*.parquet"))
+    assert len(dm_files) == 1
+    dm_df = pd.read_parquet(dm_files[0])
+    assert list(dm_df["BRTHDTC"]) == ["1985"]
+
+    op_ddb = ImednetExportOperator(
+        task_id="mapped_ddb_forms",
+        study_key="AF_MAP",
+        destination="duckdb_by_form",
+        output_path=str(ddb_path),
+        as_sdtm=True,
+        incremental=True,
+        ledger_path=str(ledger_path),
+    )
+    monkeypatch.setattr(op_ddb, "_get_sdk", lambda: sdk)
+    assert op_ddb.execute({"map_index": 2}) == str(ddb_path)
+
+    with duckdb.connect(str(ddb_path), read_only=True, config={"threads": "1"}) as con:
+        dm_val = con.execute('SELECT "BRTHDTC" FROM "DM"').fetchone()
+        assert dm_val == ("1985",)
+    assert provider.get_last_timestamp(
+        "AF_MAP", "duckdb_by_form_mapped_ddb_forms_map_2_DM"
+    ) == datetime(2026, 7, 2, 12, 0, tzinfo=UTC)

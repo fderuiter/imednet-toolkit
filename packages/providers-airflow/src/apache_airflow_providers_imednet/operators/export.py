@@ -29,12 +29,14 @@ logger = logging.getLogger(__name__)
 _TABULAR_EXPORTS = {
     "csv": export.export_to_csv,
     "parquet": export.export_to_parquet,
+    "hive_parquet": export.export_to_hive_parquet,
     "excel": export.export_to_excel,
     "json": export.export_to_json,
     "sql": export.export_to_sql,
     "sql_by_form": export.export_to_sql_by_form,
     "long_sql": export.export_to_long_sql,
     "duckdb": export.export_to_duckdb,
+    "duckdb_by_form": export.export_to_duckdb_by_form,
 }
 
 _SECRET_EXPORT_KEYS = frozenset(
@@ -290,7 +292,14 @@ class ImednetExportOperator(BaseOperator):
         :param min_schema_readiness_score: Minimum schema readiness score (0-100) required when the quality gate is enabled.
         :param kwargs: Additional Airflow BaseOperator arguments.
         """
+        raw_task_id = kwargs.get("task_id")
         super().__init__(**kwargs)
+        if (
+            not getattr(self, "task_id", None)
+            and isinstance(raw_task_id, str)
+            and raw_task_id.strip()
+        ):
+            self.task_id = raw_task_id
         self.study_key = study_key
         self.destination = destination
         self.output_path = output_path
@@ -519,19 +528,47 @@ class ImednetExportOperator(BaseOperator):
             opts["naming_convention"] = str(resolved_convention)
         return opts
 
-    def _default_airflow_stream_name(self, dest: str, *, sink_prefix: bool = False) -> str:
-        """Return a task-scoped default stream name invariant across mapped task indexes."""
+    def _resolve_map_index(self, context: Any = None) -> int | None:
+        """Extract non-negative Airflow ``map_index`` when running as a mapped task instance."""
+        candidates: list[Any] = []
+        if isinstance(context, Mapping):
+            candidates.append(context.get("map_index"))
+            ti = context.get("ti")
+            if ti is not None:
+                candidates.append(getattr(ti, "map_index", None))
+            task_instance = context.get("task_instance")
+            if task_instance is not None:
+                candidates.append(getattr(task_instance, "map_index", None))
+        candidates.append(getattr(self, "map_index", None))
+        for raw_idx in candidates:
+            if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) and raw_idx >= 0:
+                return raw_idx
+        return None
+
+    def _default_airflow_stream_name(
+        self,
+        dest: str,
+        *,
+        sink_prefix: bool = False,
+        context: Any = None,
+    ) -> str:
+        """Return a task-scoped default stream name isolated per mapped task index."""
         base = f"airflow_{dest}" if sink_prefix else dest
         task_id = getattr(self, "task_id", None)
-        if isinstance(task_id, str) and task_id.strip():
-            return f"{base}_{task_id.strip()}"
-        return base
+        prefix = (
+            f"{base}_{task_id.strip()}" if isinstance(task_id, str) and task_id.strip() else base
+        )
+        map_index = self._resolve_map_index(context)
+        if map_index is not None:
+            return f"{prefix}_map_{map_index}"
+        return prefix
 
     def _build_tabular_kwargs(
         self,
         runtime_kwargs: dict[str, Any],
         *,
         dest: str = "records",
+        context: Any = None,
     ) -> dict[str, Any]:
         """Merge explicitly configured operational parameters into tabular export kwargs."""
         merged = dict(runtime_kwargs)
@@ -546,14 +583,13 @@ class ImednetExportOperator(BaseOperator):
                 merged[key] = current_val
         for key, val in self._collect_streaming_options(runtime_kwargs).items():
             merged.setdefault(key, val)
-        if (
-            merged.get("incremental")
-            and "state_provider" not in merged
-            and "ledger_path" not in merged
-        ):
-            merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
-            if "stream_name" not in merged:
-                merged["stream_name"] = self._default_airflow_stream_name(dest)
+        if merged.get("incremental"):
+            if "state_provider" not in merged and "ledger_path" not in merged:
+                merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
+                if "stream_name" not in merged:
+                    merged["stream_name"] = self._default_airflow_stream_name(dest, context=context)
+            elif "stream_name" not in merged and self._resolve_map_index(context) is not None:
+                merged["stream_name"] = self._default_airflow_stream_name(dest, context=context)
         return merged
 
     def _resolve_sink(self, config: sink_base.SinkConfig, sdk: ImednetSDK | None = None) -> Any:
@@ -749,7 +785,7 @@ class ImednetExportOperator(BaseOperator):
             ).strip()
             raw_name = f"{database}.{collection}" if database else collection
             outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(raw_name)))
-        elif dest == "duckdb":
+        elif dest in {"duckdb", "duckdb_by_form"}:
             raw_db_path = str(
                 self.output_path
                 or runtime_kwargs.get("db_path")
@@ -762,7 +798,7 @@ class ImednetExportOperator(BaseOperator):
                 runtime_kwargs.get("table_name")
                 or runtime_kwargs.get("table")
                 or conn_settings.get("table_name")
-                or "records"
+                or ("forms" if dest == "duckdb_by_form" else "records")
             ).strip()
             raw_name = f"{safe_db_path}.{table_target}" if safe_db_path else table_target
             outputs.append(dataset_cls(namespace="duckdb", name=_sanitize_lineage_text(raw_name)))
@@ -806,8 +842,8 @@ class ImednetExportOperator(BaseOperator):
                 namespace = "sql"
                 raw_name = table_target
             outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(raw_name)))
-        elif self.output_path:
-            raw_target = str(self.output_path)
+        elif self.output_path or (dest == "hive_parquet" and runtime_kwargs.get("base_dir")):
+            raw_target = str(self.output_path or runtime_kwargs.get("base_dir"))
             if "://" in raw_target:
                 parsed_out = urlsplit(raw_target)
                 namespace = _lineage_authority(raw_target)
@@ -840,7 +876,6 @@ class ImednetExportOperator(BaseOperator):
 
     def execute(self, context: Context) -> str | None:
         """Execute the export task."""
-        _ = context
         # Validate templated fields at runtime prior to any export work.
         self._validate_templated_attributes()
         validate_path_segment(self.study_key, name="study_key")
@@ -914,8 +949,11 @@ class ImednetExportOperator(BaseOperator):
                 ):
                     stream_config = replace(config, include_deleted=True)
                 default_sink_stream = (
-                    self._default_airflow_stream_name(dest, sink_prefix=True)
-                    if stream_config.ledger_path is None and stream_config.state_provider is None
+                    self._default_airflow_stream_name(dest, sink_prefix=True, context=context)
+                    if (
+                        (stream_config.ledger_path is None and stream_config.state_provider is None)
+                        or self._resolve_map_index(context) is not None
+                    )
                     else f"airflow_{dest}"
                 )
                 sink_base.run_streaming_export(
@@ -933,7 +971,31 @@ class ImednetExportOperator(BaseOperator):
                 if not export_callable:
                     raise AirflowException(f"Unsupported destination or export_func '{dest}'")
 
-                tabular_kwargs = self._build_tabular_kwargs(runtime_kwargs, dest=dest)
+                tabular_kwargs = self._build_tabular_kwargs(
+                    runtime_kwargs, dest=dest, context=context
+                )
+                if dest == "hive_parquet":
+                    base_dir_arg = (
+                        self.output_path
+                        or tabular_kwargs.pop("base_dir", None)
+                        or tabular_kwargs.pop("path", None)
+                    )
+                    if base_dir_arg is not None:
+                        _validate_no_secrets_in_value(base_dir_arg, field_name="output_path")
+                    export_callable(sdk, self.study_key, base_dir_arg, **tabular_kwargs)
+                    return redact_uri(str(base_dir_arg)) if base_dir_arg is not None else None
+                if dest == "duckdb_by_form":
+                    conn_settings = self._resolve_destination_connection("duckdb")
+                    db_path_arg = (
+                        self.output_path
+                        or tabular_kwargs.pop("db_path", None)
+                        or tabular_kwargs.pop("path", None)
+                        or conn_settings.get("db_path")
+                    )
+                    if db_path_arg is not None:
+                        _validate_no_secrets_in_value(db_path_arg, field_name="output_path")
+                    export_callable(sdk, self.study_key, db_path_arg, **tabular_kwargs)
+                    return redact_uri(str(db_path_arg)) if db_path_arg is not None else None
                 if dest == "duckdb":
                     conn_settings = self._resolve_destination_connection(dest)
                     db_path_arg = (

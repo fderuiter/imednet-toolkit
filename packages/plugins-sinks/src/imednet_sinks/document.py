@@ -228,6 +228,7 @@ class MongoDbExportSink(ExportSink):
         self._collection_name = self.config.collection
         self._study_key = self.config.study_key
         self._seq_counters: dict[str, int] = {}
+        self._mapper: CentralizedMapper | None = None
         self._client: Any = None
         self._collection: Any = None
         self._connect()
@@ -256,18 +257,39 @@ class MongoDbExportSink(ExportSink):
     # ExportSink interface
     # ------------------------------------------------------------------
 
+    def _get_mapper(self) -> CentralizedMapper:
+        """Return persistent CentralizedMapper so per-domain SDTM sequence counters span batches."""
+        if self._mapper is None:
+            post_proc = None if self.config.as_sdtm else _post_process_document
+            self._mapper = build_sink_mapper(
+                self.config,
+                mode="document",
+                post_processor=post_proc,
+                seq_counters=self._seq_counters,
+            )
+        return self._mapper
+
+    def _map_batch_documents(
+        self, records: Sequence[Any], mapper: CentralizedMapper
+    ) -> list[dict[str, Any]]:
+        """Map a batch of records into MongoDB documents preserving SDTM chronological ordering."""
+        if self.config.as_sdtm:
+            pairs = mapper.map_records_with_sources(records, study_key=self._study_key)
+            docs: list[dict[str, Any]] = []
+            for src_rec, mapped in pairs:
+                doc = dict(mapped)
+                if "_id" not in doc:
+                    doc = _attach_sdtm_document_id(doc, src_rec, self._study_key)
+                docs.append(doc)
+            return docs
+        return [_record_to_document(r, self._study_key, mapper=mapper) for r in records]
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to MongoDB using upsert (idempotent) or insert."""
         if not records:
             return 0
 
-        post_proc = None if self.config.as_sdtm else _post_process_document
-        mapper = build_sink_mapper(
-            self.config,
-            mode="document",
-            post_processor=post_proc,
-            seq_counters=self._seq_counters,
-        )
+        mapper = self._get_mapper()
         mapped_docs: list[dict[str, Any]] | None = None
 
         def execute_export() -> int:
@@ -275,9 +297,7 @@ class MongoDbExportSink(ExportSink):
             nonlocal mapped_docs
             if mapped_docs is None:
                 try:
-                    mapped_docs = [
-                        _record_to_document(r, self._study_key, mapper=mapper) for r in records
-                    ]
+                    mapped_docs = self._map_batch_documents(records, mapper)
                 except ExportConfigurationError:
                     raise
                 except Exception:
@@ -308,10 +328,97 @@ class MongoDbExportSink(ExportSink):
     def flush(self) -> None:
         """No-op: MongoDB writes are committed per bulk operation."""
 
+    def replace_sdtm_subject_slices(
+        self,
+        slices: Sequence[tuple[str, str, str]],
+        records: Sequence[Any],
+        *,
+        batch_id: str,
+    ) -> int:
+        """Purge and rewrite affected SDTM ``(STUDYID, DOMAIN, USUBJID)`` slices in MongoDB."""
+        slice_groups: dict[tuple[str, str], list[str]] = {}
+        for raw_study, raw_domain, raw_usubjid in slices:
+            st = str(raw_study).strip()
+            dom = str(raw_domain).strip()
+            usub = str(raw_usubjid).strip()
+            if not (st and dom and usub):
+                continue
+            bucket = slice_groups.setdefault((st, dom), [])
+            if usub not in bucket:
+                bucket.append(usub)
+
+        mapper = self._get_mapper()
+        for (_st, dom), usubjids in slice_groups.items():
+            mapper.reset_sdtm_subject_counters(domain=dom, usubjids=usubjids)
+
+        if not records and (not self.config.idempotent or not slice_groups):
+            return 0
+
+        mapped_docs: list[dict[str, Any]] | None = None
+
+        def execute_replace() -> int:
+            nonlocal mapped_docs
+            if mapped_docs is None:
+                if records:
+                    try:
+                        mapped_docs = self._map_batch_documents(records, mapper)
+                    except ExportConfigurationError:
+                        raise
+                    except Exception:
+                        raise TypeError("Malformed MongoDB record batch payload.") from None
+                else:
+                    mapped_docs = []
+
+            if self.config.idempotent and slice_groups:
+                for (st, dom), usubjids in slice_groups.items():
+                    self._collection.delete_many(
+                        {"STUDYID": st, "DOMAIN": dom, "USUBJID": {"$in": usubjids}}
+                    )
+
+            if not mapped_docs:
+                return 0
+            if self.config.idempotent:
+                pymongo = _require_optional_dep("pymongo", "mongodb")
+                ops = [
+                    pymongo.UpdateOne(
+                        {"_id": doc["_id"]},
+                        {"$set": doc},
+                        upsert=True,
+                    )
+                    for doc in mapped_docs
+                ]
+                self._collection.bulk_write(ops, ordered=False)
+                return len(mapped_docs)
+            result = self._collection.insert_many(mapped_docs, ordered=False)
+            return len(result.inserted_ids)
+
+        return self._execute_with_retry("replace_mongodb_sdtm_slices", batch_id, execute_replace)
+
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Delete newly voided documents from MongoDB when running idempotently."""
         if not self.config.idempotent or not records:
             return 0
+        if self.config.as_sdtm:
+            from collections.abc import Mapping
+
+            from imednet.spi.sinks import extract_record_subject_key, resolve_sdtm_domain
+
+            sdtm_slices: list[tuple[str, str, str]] = []
+            for rec in records:
+                usub = extract_record_subject_key(rec)
+                if not usub:
+                    continue
+                raw_dom = self.config.sdtm_domain or (
+                    rec.get("DOMAIN") or rec.get("form_key") or rec.get("formKey")
+                    if isinstance(rec, Mapping)
+                    else getattr(rec, "form_key", None)
+                )
+                dom = resolve_sdtm_domain(raw_dom, fallback="AE")
+                sdtm_slices.append((self._study_key or "UNKNOWN", dom, usub))
+            if not sdtm_slices:
+                return 0
+            self.replace_sdtm_subject_slices(sdtm_slices, [], batch_id=batch_id)
+            return len(sdtm_slices)
         doc_ids = [
             _make_document_id(self._study_key, rid)
             for r in records

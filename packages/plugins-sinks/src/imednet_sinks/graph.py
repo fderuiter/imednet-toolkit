@@ -162,6 +162,12 @@ MATCH (r:Record {record_id: rid, study_key: $study_key})
 DETACH DELETE r
 """
 
+_DELETE_SDTM_SLICES_CYPHER = """\
+UNWIND $slices AS slice
+MATCH (r:Record {STUDYID: slice.STUDYID, DOMAIN: slice.DOMAIN, USUBJID: slice.USUBJID})
+DETACH DELETE r
+"""
+
 
 def _graph_json_default(value: Any) -> Any:
     """Encode ``date``/``datetime`` as ISO-8601 strings and ``Decimal`` as exact strings."""
@@ -372,6 +378,7 @@ class Neo4jExportSink(ExportSink):
         self._auth = self.config.auth
         self._study_key = self.config.study_key
         self._seq_counters: dict[str, int] = {}
+        self._mapper: CentralizedMapper | None = None
         self._driver: Any = None
         self._connect()
 
@@ -394,18 +401,52 @@ class Neo4jExportSink(ExportSink):
     # ExportSink interface
     # ------------------------------------------------------------------
 
+    def _get_mapper(self) -> CentralizedMapper:
+        """Return persistent CentralizedMapper so per-domain SDTM sequence counters span batches."""
+        if self._mapper is None:
+            post_proc = _post_process_graph_sdtm if self.config.as_sdtm else _post_process_graph
+            self._mapper = build_sink_mapper(
+                self.config,
+                mode="document",
+                post_processor=post_proc,
+                seq_counters=self._seq_counters,
+            )
+        return self._mapper
+
+    def _run_sdtm_cypher_groups(self, session: Any, mapped_rows: list[dict[str, Any]]) -> None:
+        """Execute domain-appropriate SDTM Cypher statements grouped by ``(<DOM>SEQ, has_visit)``."""
+        groups: dict[tuple[str | None, bool], list[dict[str, Any]]] = {}
+        group_order: list[tuple[str | None, bool]] = []
+        for row in mapped_rows:
+            seq_prop = next(
+                (k for k in row if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")),
+                None,
+            )
+            key = (seq_prop, "VISITNUM" in row)
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(row)
+
+        if len({seq for seq, _ in group_order}) == 1:
+            seq_prop = group_order[0][0]
+            has_visit = any(hv for _, hv in group_order)
+            merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
+            cypher = merge_cypher if self.config.idempotent else create_cypher
+            session.run(cypher, rows=mapped_rows)
+            return
+
+        for seq_prop, has_visit in group_order:
+            merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
+            cypher = merge_cypher if self.config.idempotent else create_cypher
+            session.run(cypher, rows=groups[(seq_prop, has_visit)])
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
         if not records:
             return 0
 
-        post_proc = _post_process_graph_sdtm if self.config.as_sdtm else _post_process_graph
-        mapper = build_sink_mapper(
-            self.config,
-            mode="document",
-            post_processor=post_proc,
-            seq_counters=self._seq_counters,
-        )
+        mapper = self._get_mapper()
         database = getattr(self.config, "database", "neo4j")
         mapped_rows: list[dict[str, Any]] | None = None
         cypher: str | None = None
@@ -415,29 +456,19 @@ class Neo4jExportSink(ExportSink):
             nonlocal mapped_rows, cypher
             if mapped_rows is None:
                 try:
-                    mapped_rows = [
-                        _record_to_row(r, self._study_key, mapper=mapper) for r in records
-                    ]
+                    mapped_rows = (
+                        mapper.map_records(records, study_key=self._study_key)
+                        if self.config.as_sdtm
+                        else [_record_to_row(r, self._study_key, mapper=mapper) for r in records]
+                    )
                 except ExportConfigurationError:
                     raise
                 except Exception:
                     raise TypeError("Malformed Neo4j record batch payload.") from None
             if not mapped_rows:
                 return 0
-            if cypher is None:
-                if self.config.as_sdtm:
-                    sample_row = mapped_rows[0]
-                    seq_prop = next(
-                        (
-                            k
-                            for k in sample_row
-                            if k.endswith("SEQ") and k not in ("STUDYID", "DOMAIN", "USUBJID")
-                        ),
-                        None,
-                    )
-                    has_visit = any("VISITNUM" in r for r in mapped_rows)
-                    merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
-                elif self.config.naming_convention == "camelCase":
+            if not self.config.as_sdtm and cypher is None:
+                if self.config.naming_convention == "camelCase":
                     merge_cypher, create_cypher = _build_convention_cypher(
                         "studyKey", "subjectKey", "recordId", "visitId"
                     )
@@ -449,7 +480,11 @@ class Neo4jExportSink(ExportSink):
                     merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
                 cypher = merge_cypher if self.config.idempotent else create_cypher
             with self._driver.session(database=database) as session:
-                session.run(cypher, rows=mapped_rows)
+                if self.config.as_sdtm:
+                    self._run_sdtm_cypher_groups(session, mapped_rows)
+                else:
+                    assert cypher is not None
+                    session.run(cypher, rows=mapped_rows)
             logger.debug("Wrote batch %s (%d records)", batch_id, len(mapped_rows))
             return len(mapped_rows)
 
@@ -458,10 +493,84 @@ class Neo4jExportSink(ExportSink):
     def flush(self) -> None:
         """No-op: Neo4j writes are committed per transaction."""
 
+    def replace_sdtm_subject_slices(
+        self,
+        slices: Sequence[tuple[str, str, str]],
+        records: Sequence[Any],
+        *,
+        batch_id: str,
+    ) -> int:
+        """Purge and rewrite affected SDTM ``(STUDYID, DOMAIN, USUBJID)`` Record nodes in Neo4j."""
+        slice_set: set[tuple[str, str, str]] = set()
+        for raw_study, raw_domain, raw_usubjid in slices:
+            st = str(raw_study).strip()
+            dom = str(raw_domain).strip()
+            usub = str(raw_usubjid).strip()
+            if st and dom and usub:
+                slice_set.add((st, dom, usub))
+        slice_rows = [
+            {"STUDYID": st, "DOMAIN": dom, "USUBJID": usub} for st, dom, usub in sorted(slice_set)
+        ]
+
+        mapper = self._get_mapper()
+        by_dom: dict[str, list[str]] = {}
+        for _st, dom, usub in slice_set:
+            by_dom.setdefault(dom, []).append(usub)
+        for dom, usubjids in by_dom.items():
+            mapper.reset_sdtm_subject_counters(domain=dom, usubjids=usubjids)
+
+        if not records and (not self.config.idempotent or not slice_rows):
+            return 0
+
+        database = getattr(self.config, "database", "neo4j")
+        mapped_rows: list[dict[str, Any]] | None = None
+
+        def execute_replace() -> int:
+            nonlocal mapped_rows
+            if mapped_rows is None:
+                if records:
+                    try:
+                        mapped_rows = mapper.map_records(records, study_key=self._study_key)
+                    except ExportConfigurationError:
+                        raise
+                    except Exception:
+                        raise TypeError("Malformed Neo4j record batch payload.") from None
+                else:
+                    mapped_rows = []
+            with self._driver.session(database=database) as session:
+                if self.config.idempotent and slice_rows:
+                    session.run(_DELETE_SDTM_SLICES_CYPHER, slices=slice_rows)
+                if mapped_rows:
+                    self._run_sdtm_cypher_groups(session, mapped_rows)
+            return len(mapped_rows)
+
+        return self._execute_with_retry("replace_graph_sdtm_slices", batch_id, execute_replace)
+
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Delete newly voided Record nodes from Neo4j when running idempotently."""
         if not self.config.idempotent or not records:
             return 0
+        if self.config.as_sdtm:
+            from collections.abc import Mapping
+
+            from imednet.spi.sinks import extract_record_subject_key, resolve_sdtm_domain
+
+            sdtm_slices: list[tuple[str, str, str]] = []
+            for rec in records:
+                usub = extract_record_subject_key(rec)
+                if not usub:
+                    continue
+                raw_dom = self.config.sdtm_domain or (
+                    rec.get("DOMAIN") or rec.get("form_key") or rec.get("formKey")
+                    if isinstance(rec, Mapping)
+                    else getattr(rec, "form_key", None)
+                )
+                dom = resolve_sdtm_domain(raw_dom, fallback="AE")
+                sdtm_slices.append((self._study_key or "UNKNOWN", dom, usub))
+            if not sdtm_slices:
+                return 0
+            self.replace_sdtm_subject_slices(sdtm_slices, [], batch_id=batch_id)
+            return len(sdtm_slices)
         record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
         if not record_ids:
             return 0
