@@ -5,7 +5,7 @@ This module exports:
 - :class:`StudyWorkerCallable` — a :class:`typing.Protocol` that pipeline
   functions must conform to in order to be accepted by
   :meth:`~imednet.orchestration.MultiStudyOrchestrator.execute_pipeline`.
-- :class:`OrchestratorResult` — a :class:`typing_extensions.TypedDict` that
+- :class:`OrchestratorResult` — a :class:`typing.TypedDict` that
   describes the per-study result entry returned by ``execute_pipeline``.
 - ``T_Output`` — a covariant :class:`~typing.TypeVar` used to parameterize
   :class:`StudyWorkerCallable`.
@@ -63,9 +63,7 @@ Example::
 
 from __future__ import annotations
 
-from typing import Any, TypeVar
-
-from typing_extensions import Protocol, TypedDict, runtime_checkable
+from typing import Any, Protocol, TypedDict, TypeVar, runtime_checkable
 
 T_Output = TypeVar("T_Output", covariant=True)
 

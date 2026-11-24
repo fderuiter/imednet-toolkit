@@ -10,14 +10,13 @@ from typing import (
     Any,
     Concatenate,
     Generic,
+    ParamSpec,
     TypeVar,
     cast,
     get_args,
     get_type_hints,
     overload,
 )
-
-from typing_extensions import ParamSpec
 
 if TYPE_CHECKING:
     from imednet.core.endpoint.operations.filter_get import FilterGetOperation
