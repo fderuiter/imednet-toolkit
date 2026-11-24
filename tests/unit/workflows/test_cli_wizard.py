@@ -48,11 +48,18 @@ class CliResult:
 
 
 def run_cli_command(
-    app_fn, args: list[str], stdin_input: str = "", *, tty_stdin: bool = True
+    app_fn,
+    args: list[str],
+    stdin_input: str = "",
+    *,
+    tty_stdin: bool = True,
+    capsys: pytest.CaptureFixture[str] | None = None,
 ) -> CliResult:
     """Invoke CLI entry point with redirected stdin, stdout, and stderr."""
     from contextlib import redirect_stderr, redirect_stdout
 
+    if capsys is not None:
+        capsys.readouterr()
     out = io.StringIO()
     err = io.StringIO()
     stdin_stream = _TTYStringIO(stdin_input) if tty_stdin else io.StringIO(stdin_input)
@@ -63,7 +70,13 @@ def run_cli_command(
         except SystemExit as exc:
             exit_code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
 
-    return CliResult(exit_code, out.getvalue(), err.getvalue())
+    extra_out = ""
+    extra_err = ""
+    if capsys is not None:
+        captured = capsys.readouterr()
+        extra_out = captured.out
+        extra_err = captured.err
+    return CliResult(exit_code, out.getvalue() + extra_out, err.getvalue() + extra_err)
 
 
 # ---------------------------------------------------------------------------
@@ -1181,3 +1194,237 @@ def test_extract_records_interactive_accepts_compound_and_or_filters(
         "filter": "subjectStatus==Screened,subjectStatus==Enrolled"
     }
     assert call_kwargs["visit_filter"] is None
+
+
+def test_uat_cli_and_wizard_preflight_rejects_invalid_bounds_and_email_before_inspect():
+    """Preflight validation rejects invalid subject counts, emails, and --interactive --format json before get_sdk()."""
+    from imednet_workflows.wizard import prompt_email_notify, prompt_subject_count
+
+    with patch("imednet.cli.utils.context.get_sdk") as mock_get_sdk:
+        res_zero = run_cli_command(
+            cli_app,
+            ["workflows", "uat", "run", "STUDY1", "--subject-count", "0"],
+        )
+        assert res_zero.exit_code == 1
+        assert "between 1 and 100" in res_zero.stderr
+        mock_get_sdk.assert_not_called()
+
+        res_high = run_cli_command(
+            cli_app,
+            ["workflows", "uat", "build-spec", "--study-key", "STUDY1", "--subject-count", "101"],
+        )
+        assert res_high.exit_code == 1
+        assert "between 1 and 100" in res_high.stderr
+        mock_get_sdk.assert_not_called()
+
+        res_bad_email = run_cli_command(
+            cli_app,
+            ["workflows", "uat", "run", "STUDY1", "--email-notify", "not-an-email"],
+        )
+        assert res_bad_email.exit_code == 1
+        assert "email-notify" in res_bad_email.stderr
+        mock_get_sdk.assert_not_called()
+
+        res_crlf = run_cli_command(
+            cli_app,
+            [
+                "workflows",
+                "uat",
+                "run",
+                "STUDY1",
+                "--email-notify",
+                "ops@example.com\r\nBcc:evil@example.com",
+            ],
+        )
+        assert res_crlf.exit_code == 1
+        assert "newlines" in res_crlf.stderr
+        mock_get_sdk.assert_not_called()
+
+        res_interactive_json = run_cli_command(
+            cli_app,
+            ["workflows", "uat", "run", "--interactive", "--format", "json"],
+        )
+        assert res_interactive_json.exit_code == 1
+        assert res_interactive_json.stdout == ""
+        assert "Cannot combine --interactive with --format json" in res_interactive_json.stderr
+        mock_get_sdk.assert_not_called()
+
+    # Wizard helper validation loops
+    tty_in = _TTYStringIO("0\n101\n5\n")
+    tty_out = io.StringIO()
+    tty_err = io.StringIO()
+    with patch("sys.stdin", tty_in), patch("sys.stdout", tty_out), patch("sys.stderr", tty_err):
+        assert prompt_subject_count(default=3) == 5
+    assert "between 1 and 100" in tty_err.getvalue()
+
+    email_in = _TTYStringIO("bad-email\ntrue\n")
+    email_out = io.StringIO()
+    email_err = io.StringIO()
+    with (
+        patch("sys.stdin", email_in),
+        patch("sys.stdout", email_out),
+        patch("sys.stderr", email_err),
+    ):
+        assert prompt_email_notify() is True
+    assert "email-notify" in email_err.getvalue()
+
+
+def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(
+    tmp_path,
+    monkeypatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    """Test uat build-spec, --spec, --seed reproducibility, --dry-run, and --format json envelope."""
+    import json
+
+    from imednet import ImednetSDK
+    from imednet.datadict import DataDictionary, Metadata
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVar
+    from imednet_workflows.uat.models import UATSpecification, VariableTestStrategy
+    from imednet_workflows.uat.orchestrator import UATWorkflow
+
+    spec_file = tmp_path / "uat_spec.json"
+
+    # 1. build-spec in simulation mode writes deterministic JSON spec with seed
+    build_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "build-spec",
+            "--study-key",
+            "SIM_STUDY",
+            "--subject-count",
+            "2",
+            "--seed",
+            "42",
+            "--simulation",
+            "-o",
+            str(spec_file),
+        ],
+        capsys=capsys,
+    )
+    assert build_res.exit_code == 0, build_res.stderr
+    assert spec_file.exists()
+    loaded_spec = UATSpecification.from_json(spec_file)
+    assert loaded_spec.seed == 42
+    assert len(loaded_spec.subject_specs) == 1
+    assert loaded_spec.subject_specs[0].subject_count == 2
+
+    # Verify deterministic payloads from loaded_spec.seed
+    with ImednetSDK(simulation_mode=True) as sim_sdk:
+        res_a = UATWorkflow(sim_sdk).run("SIM_STUDY", spec=loaded_spec, dry_run=True)
+        res_b = UATWorkflow(sim_sdk).run("SIM_STUDY", spec=loaded_spec, dry_run=True)
+    assert [rs.payloads for rs in res_a.record_sets] == [rs.payloads for rs in res_b.record_sets]
+
+    # 2. build-spec rejects unknown explicit site on stderr
+    bad_site_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "build-spec",
+            "--study-key",
+            "SIM_STUDY",
+            "--site-name",
+            "NON_EXISTENT_SITE",
+            "--simulation",
+        ],
+        capsys=capsys,
+    )
+    assert bad_site_res.exit_code == 1
+    assert "NON_EXISTENT_SITE" in bad_site_res.stderr
+
+    # 3. uat run --spec --dry-run --simulation --format json emits clean JSON envelope on stdout and silent stderr
+    run_res_1 = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "--spec",
+            str(spec_file),
+            "--dry-run",
+            "--simulation",
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert run_res_1.exit_code == 0, run_res_1.stderr
+    assert run_res_1.stderr == ""
+    envelope_1 = json.loads(run_res_1.stdout)
+    assert envelope_1["schemaVersion"] == "1.0"
+    assert envelope_1["resource"] == "uat_run"
+    assert envelope_1["count"] == 1
+    item_1 = envelope_1["items"][0]
+    assert item_1["dryRun"] is True
+    assert item_1["state"] == "COMPLETED"
+    assert item_1["overallSuccess"] is True
+    assert item_1["recordsSubmitted"] == 0
+    assert item_1["validationReport"]["isValid"] is True
+
+    # 4. Invalid fixed-value override against offline --schema fails --dry-run with exit 1 and emits FAILED JSON envelope
+    invalid_spec = loaded_spec.model_copy(deep=True)
+    target_form = invalid_spec.form_specs[0]
+    target_var = target_form.variables[0]
+    target_var.strategy = VariableTestStrategy.FIXED
+    target_var.fixed_value = "not-an-integer"
+    invalid_spec_file = tmp_path / "invalid_uat_spec.json"
+    invalid_spec_file.write_text(
+        invalid_spec.model_dump_json(indent=2, by_alias=True), encoding="utf-8"
+    )
+
+    strict_dd = DataDictionary(
+        metadata=Metadata.create(study_key="SIM_STUDY"),
+        forms=[
+            DDForm(
+                formKey=target_form.form_key,
+                formName=target_form.form_name,
+                variables=[
+                    DDVar(
+                        variableName=target_var.variable_name,
+                        variableType="Integer",
+                        required="Yes",
+                    )
+                ],
+            )
+        ],
+    )
+    dd_file = tmp_path / "strict_dd.json"
+    dd_file.write_text(strict_dd.model_dump_json(indent=2), encoding="utf-8")
+
+    fail_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "--spec",
+            str(invalid_spec_file),
+            "--schema",
+            str(dd_file),
+            "--dry-run",
+            "--simulation",
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert fail_res.exit_code == 1
+    assert fail_res.stderr == ""
+    fail_envelope = json.loads(fail_res.stdout)
+    assert fail_envelope["schemaVersion"] == "1.0"
+    assert fail_envelope["resource"] == "uat_run"
+    fail_item = fail_envelope["items"][0]
+    assert fail_item["state"] == "FAILED"
+    assert fail_item["overallSuccess"] is False
+    assert fail_item["validationReport"]["isValid"] is False
+
+    # 5. IMEDNET_CLI_OUTPUT_FORMAT=json silences print_progress directly
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    err_buf = io.StringIO()
+    with patch("sys.stderr", err_buf):
+        print_progress("Should be suppressed in JSON mode")
+    assert err_buf.getvalue() == ""

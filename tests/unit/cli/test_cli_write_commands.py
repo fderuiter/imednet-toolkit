@@ -64,15 +64,18 @@ def sim_sdk_and_requests(
             requests.append(request)
             return base_transport.handle_request(request)
 
-    sdk = ImednetSDK(
-        client=Client(
-            api_key="sim-key",  # pragma: allowlist secret
-            security_key="sim-secret",  # pragma: allowlist secret
-            base_url="https://edc.sim.imednet.com",
-            transport=SpyTransport(),
+    def _build_sdk() -> ImednetSDK:
+        return ImednetSDK(
+            client=Client(
+                api_key="sim-key",  # pragma: allowlist secret
+                security_key="sim-secret",  # pragma: allowlist secret
+                base_url="https://edc.sim.imednet.com",
+                transport=SpyTransport(),
+            )
         )
-    )
-    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda **_kwargs: sdk)
+
+    sdk = _build_sdk()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda **_kwargs: _build_sdk())
     return sdk, state, requests
 
 
@@ -433,7 +436,7 @@ def test_cli_write_commands_exit_nonzero_and_scrub_phi_and_secrets_on_job_failur
     tmp_path: Path,
     sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
 ) -> None:
-    """AC 6: records create/import and subjects register exit 1 on failed jobs and scrub PHI/secrets."""
+    """AC 6: records create/update/import and subjects register exit 1 on failed jobs and scrub PHI/secrets."""
     from imednet.errors import ServerError
     from imednet.models.jobs import JobStatus
     from imednet.utils.batch_coordinator import BatchSubmissionSummary
@@ -441,6 +444,7 @@ def test_cli_write_commands_exit_nonzero_and_scrub_phi_and_secrets_on_job_failur
 
     sdk, _state, _requests = sim_sdk_and_requests
     monkeypatch.setattr(sdk, "close", lambda: None)
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda **_kwargs: sdk)
     failed_status = JobStatus(
         jobId="JOB-FAIL",
         batchId="BATCH-FAIL",
@@ -450,7 +454,7 @@ def test_cli_write_commands_exit_nonzero_and_scrub_phi_and_secrets_on_job_failur
             {
                 "recordId": 10,
                 "status": "FAILED",
-                "error": "Constraint failure api_key=sk-secret-999 ssn=123-45-6789",
+                "error": "Constraint failure api_key=sk-secret-999 ssn=123-45-6789",  # pragma: allowlist secret
                 "patient_name": "John Doe",
                 "token": "tok-super-secret",  # pragma: allowlist secret
             }
@@ -513,7 +517,28 @@ def test_cli_write_commands_exit_nonzero_and_scrub_phi_and_secrets_on_job_failur
     assert "123-45-6789" not in res_create_table.stderr
     assert "John Doe" not in res_create_table.stderr
 
-    # 1b. records import & subjects register also exit 1 against a FAILED Job summary
+    # 1b. records update, records import, & subjects register also exit 1 against a FAILED Job summary
+    res_update_json = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--record-id",
+            "601",
+            "-d",
+            "V_AGE=40",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_update_json.exit_code == 1
+    update_parsed = json.loads(res_update_json.stdout)
+    assert update_parsed["items"][0]["allSuccessful"] is False
+    assert "sk-secret-999" not in res_update_json.stdout
+    assert "John Doe" not in res_update_json.stdout
+
     json_file = tmp_path / "records.json"
     json_file.write_text(
         json.dumps(
@@ -559,8 +584,7 @@ def test_cli_write_commands_exit_nonzero_and_scrub_phi_and_secrets_on_job_failur
     assert "sk-secret-999" not in res_subj_summary.stdout
     assert "John Doe" not in res_subj_summary.stdout
 
-    # 2. records import when --wait raises JobFailedError exits 1 with scrubbed stderr
-
+    # 2. records import & records update when --wait raises JobFailedError exit 1 with scrubbed stderr
     def raise_job_failed(*_a: object, **_kw: object) -> BatchSubmissionSummary:
         err = JobFailedError(
             "Job BATCH-FAIL ended in state FAILED",
@@ -588,6 +612,26 @@ def test_cli_write_commands_exit_nonzero_and_scrub_phi_and_secrets_on_job_failur
     assert "sk-secret-999" not in res_import.stderr
     assert "123-45-6789" not in res_import.stderr
     assert "John Doe" not in res_import.stderr
+
+    res_update_wait = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--record-id",
+            "601",
+            "-d",
+            "V_AGE=40",
+            "--wait",
+            "--no-interactive",
+        ],
+    )
+    assert res_update_wait.exit_code == 1
+    assert "Job Error:" in res_update_wait.stderr
+    assert "accepted_batches=['BATCH-FAIL']" in res_update_wait.stderr
+    assert "sk-secret-999" not in res_update_wait.stderr
+    assert "John Doe" not in res_update_wait.stderr
 
     # 3. subjects register when chunk 2 raises HTTP 503 mid-batch exits 1 with accepted batch context
     settled_b1 = JobStatus(jobId="J-1", batchId="BATCH-OK-1", state="COMPLETED", progress=100)
@@ -639,3 +683,376 @@ def test_cli_write_commands_exit_nonzero_and_scrub_phi_and_secrets_on_job_failur
     assert "unsubmitted_records=1" in res_subj.stderr
     assert "sec-tok" not in res_subj.stderr
     assert "1990-01-01" not in res_subj.stderr
+
+
+def test_cli_records_update_targets_by_id_oid_visit_and_interval_with_reason(
+    capsys: pytest.CaptureFixture[str],
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """Req 3: imednet records update updates by recordId, recordOid, visitId, or intervalName."""
+    _sdk, state, requests = sim_sdk_and_requests
+
+    # 1. Update by --record-id with --reason-for-change and --record-status
+    res_id = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--record-id",
+            "601",
+            "-d",
+            "V_AGE=51",
+            "--record-status",
+            "Record Complete",
+            "--reason-for-change",
+            "Corrected chart age",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_id.exit_code == 0, res_id.stderr
+    post_body_id = json.loads([r for r in requests if r.method == "POST"][-1].content)
+    assert post_body_id[0]["recordId"] == 601
+    assert post_body_id[0]["recordStatus"] == "Record Complete"
+    assert post_body_id[0]["reasonForChange"] == "Corrected chart age"
+    assert post_body_id[0]["data"] == {"V_AGE": 51}
+
+    # 2. Update by --record-oid
+    res_oid = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--record-oid",
+            "REC-601",
+            "-d",
+            "V_AGE=52",
+            "--reason-for-change",
+            "OID update",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_oid.exit_code == 0, res_oid.stderr
+
+    # 3. Update by --visit-id + --form-key
+    res_visit = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--visit-id",
+            "401",
+            "-d",
+            "V_AGE=53",
+            "--reason-for-change",
+            "Visit update",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_visit.exit_code == 0, res_visit.stderr
+
+    # 4. Update by --interval-name + --subject-key + --form-key
+    res_interval = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--subject-key",
+            "SUB1",
+            "--interval-name",
+            "Baseline",
+            "-d",
+            "V_AGE=54",
+            "--reason-for-change",
+            "Interval update",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_interval.exit_code == 0, res_interval.stderr
+
+    rec_601 = next(r for r in state.get_records("STUDY") if r["recordId"] == 601)
+    assert rec_601["recordData"]["V_AGE"] == 54
+    assert rec_601["recordStatus"] == "Record Complete"
+    revisions = state.get_record_revisions("STUDY")
+    assert revisions[-1]["reasonForChange"] == "Interval update"
+
+    # Missing target selector exits 1
+    res_missing = _invoke_cli(
+        capsys,
+        ["records", "update", "STUDY", "-d", "V_AGE=55", "--no-interactive"],
+    )
+    assert res_missing.exit_code == 1
+
+
+def test_cli_offline_dry_run_succeeds_without_credentials_or_http_requests(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Req 4: Offline --dry-run --schema <path> succeeds with unset credentials and zero HTTP traffic."""
+    monkeypatch.delenv("IMEDNET_API_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_OIDC_TOKEN", raising=False)
+    monkeypatch.delenv("IMEDNET_SIMULATION_MODE", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    dd_path = tmp_path / "study_dd.json"
+    dd_path.write_text(
+        json.dumps(
+            {
+                "forms": [
+                    {
+                        "formKey": "F_DM",
+                        "variables": [
+                            {"variableName": "V_AGE", "variableType": "integer"},
+                            {"variableName": "V_CODE", "variableType": "text"},
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    csv_path = tmp_path / "records.csv"
+    csv_path.write_text(
+        "formKey,subjectKey,siteName,V_AGE,V_CODE\nF_DM,SUB1,SITE,42,007\n",
+        encoding="utf-8",
+    )
+
+    res_import = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "import",
+            "STUDY",
+            str(csv_path),
+            "--schema",
+            str(dd_path),
+            "--dry-run",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_import.exit_code == 0, res_import.stderr
+    assert json.loads(res_import.stdout)["items"][0]["validationReport"]["isValid"] is True
+
+    res_reg = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--site-name",
+            "SITE",
+            "--subject-key",
+            "SUB-OFFLINE-1",
+            "--skip-existing",
+            "-d",
+            "V_AGE=42",
+            "-d",
+            "V_CODE=007",
+            "--schema",
+            str(dd_path),
+            "--dry-run",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_reg.exit_code == 0, res_reg.stderr
+    assert json.loads(res_reg.stdout)["items"][0]["validationReport"]["isValid"] is True
+
+
+def test_cli_dry_run_without_schema_loads_study_datadict_and_exits_one_on_unknown_keys(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """Req 5: --dry-run without --schema loads Study Data Dictionary and exits 1 on unknown Form/Variable."""
+    _sdk, _state, requests = sim_sdk_and_requests
+
+    # Unknown Form key
+    res_bad_form = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--form-key",
+            "UNKNOWN_FORM",
+            "--subject-key",
+            "SUB1",
+            "-d",
+            "V_AGE=40",
+            "--dry-run",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_bad_form.exit_code == 1
+    assert not any(r.method == "POST" for r in requests)
+
+    # Unknown Variable key on records import without --schema
+    bad_csv = tmp_path / "bad_import.csv"
+    bad_csv.write_text(
+        "formKey,subjectKey,siteName,BAD_VAR\nF_DM,SUB1,SITE,123\n",
+        encoding="utf-8",
+    )
+    res_bad_var = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "import",
+            "STUDY",
+            str(bad_csv),
+            "--dry-run",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_bad_var.exit_code == 1
+    assert not any(r.method == "POST" for r in requests)
+
+    # Unknown Variable key on form-less records update without --schema
+    res_bad_update = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--record-id",
+            "601",
+            "-d",
+            "NON_EXISTENT_VAR=1",
+            "--dry-run",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_bad_update.exit_code == 1
+    assert not any(r.method == "POST" for r in requests)
+
+
+def test_cli_subjects_register_preserves_subject_key_and_text_data_strings(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """Req 6 & 7: --subject-key preserves subjectKey and -d keeps numeric Text Variable strings."""
+    _sdk, state, requests = sim_sdk_and_requests
+
+    dd_path = tmp_path / "dd_text.json"
+    dd_path.write_text(
+        json.dumps(
+            {
+                "forms": [
+                    {
+                        "formKey": "F_DM",
+                        "variables": [
+                            {"variableName": "V_AGE", "variableType": "integer"},
+                            {"variableName": "V_INITIALS", "variableType": "text"},
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    res = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--site-name",
+            "SITE",
+            "--subject-key",
+            "SUB-PRESERVED-99",
+            "-d",
+            "V_AGE=35",
+            "-d",
+            "V_INITIALS=007",
+            "--schema",
+            str(dd_path),
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res.exit_code == 0, res.stderr
+    post_reqs = [r for r in requests if r.method == "POST"]
+    assert len(post_reqs) == 1
+    sent = json.loads(post_reqs[0].content)
+    assert sent[0]["subjectKey"] == "SUB-PRESERVED-99"
+    assert sent[0]["data"]["V_AGE"] == 35
+    assert sent[0]["data"]["V_INITIALS"] == "007"
+    assert isinstance(sent[0]["data"]["V_INITIALS"], str)
+    assert any(s["subjectKey"] == "SUB-PRESERVED-99" for s in state.get_subjects("STUDY"))
+
+
+def test_cli_records_update_validation_guards_and_schema_cache_text_coercion(
+    capsys: pytest.CaptureFixture[str],
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """records update enforces target/mutation guards and parse_key_value_pairs handles SchemaCache."""
+    from imednet.cli.utils.write_helpers import parse_key_value_pairs
+    from imednet.models.variables import Variable
+    from imednet.validation.cache import SchemaCache
+
+    cache = SchemaCache()
+    cache.populate(
+        [
+            Variable(
+                study_key="STUDY",
+                form_id=301,
+                form_key="F_DM",
+                variable_name="V_CHART",
+                variable_type="Text",
+            )
+        ],
+        study_key="STUDY",
+    )
+    assert parse_key_value_pairs(
+        ["V_CHART=0042"], schema=cache, form_id=301, study_key="STUDY"
+    ) == {"V_CHART": "0042"}
+    assert parse_key_value_pairs(["V_CHART=0042"], schema=cache, study_key="STUDY") == {
+        "V_CHART": "0042"
+    }
+
+    missing_target = _invoke_cli(
+        capsys,
+        ["records", "update", "STUDY", "-d", "V_AGE=50", "--no-interactive"],
+    )
+    assert missing_target.exit_code == 1
+    assert "target selector" in missing_target.stderr
+
+    missing_mutation = _invoke_cli(
+        capsys,
+        ["records", "update", "STUDY", "--record-id", "601", "--no-interactive"],
+    )
+    assert missing_mutation.exit_code == 1
+    assert "reason-for-change" in missing_mutation.stderr

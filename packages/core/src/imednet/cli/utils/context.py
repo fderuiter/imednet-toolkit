@@ -6,7 +6,10 @@ import os
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
+
+import httpx
 
 from imednet.config import load_config
 from imednet.utils.validators import parse_bool
@@ -16,6 +19,35 @@ from .terminal import SIMULATION_MODE_ENV
 
 if TYPE_CHECKING:
     from imednet.sdk import ImednetSDK
+
+_OFFLINE_DRY_RUN_CTX: ContextVar[bool] = ContextVar("imednet_offline_dry_run", default=False)
+
+
+def is_offline_schema_dry_run(*, dry_run: bool, schema_source: str | None) -> bool:
+    """Return True when ``--dry-run`` is paired with a local ``--schema`` path."""
+    if not dry_run or not schema_source:
+        return False
+    normalized = schema_source.strip()
+    return bool(normalized) and normalized.lower() != "api"
+
+
+@contextmanager
+def offline_dry_run_context(enabled: bool = False) -> Iterator[None]:
+    """Mark the active CLI invocation as an offline schema dry-run requiring zero credentials."""
+    if not enabled:
+        yield
+        return
+    token = _OFFLINE_DRY_RUN_CTX.set(True)
+    try:
+        yield
+    finally:
+        _OFFLINE_DRY_RUN_CTX.reset(token)
+
+
+def _forbid_offline_http(request: httpx.Request) -> httpx.Response:
+    raise RuntimeError(
+        f"Unexpected HTTP request during offline --dry-run: {request.method} {request.url}"
+    )
 
 
 def _load_sdk_cls() -> type[ImednetSDK]:
@@ -71,9 +103,26 @@ def _format_config_error(exc: ValueError) -> str:
 
 def get_sdk() -> ImednetSDK:
     """Initialize and return the SDK instance using :func:`load_config`."""
+    sdk_cls: type[ImednetSDK]
+    if _OFFLINE_DRY_RUN_CTX.get() and not parse_bool(
+        os.getenv(SIMULATION_MODE_ENV, "false"), strict=False
+    ):
+        try:
+            sdk_cls = globals()["ImednetSDK"] if "ImednetSDK" in globals() else _load_sdk_cls()
+            return sdk_cls(
+                api_key="offline-dry-run",  # pragma: allowlist secret
+                security_key="offline-dry-run",  # pragma: allowlist secret
+                transport=httpx.MockTransport(_forbid_offline_http),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            from ..decorators import redact_cli_secrets
+
+            print_error(f"Error initializing SDK: {redact_cli_secrets(str(exc))}")
+            sys.exit(1)
+
     if not (
         os.getenv("IMEDNET_OIDC_TOKEN", "").strip()
-        or parse_bool(os.getenv(SIMULATION_MODE_ENV, "false"))
+        or parse_bool(os.getenv(SIMULATION_MODE_ENV, "false"), strict=False)
         or (
             os.getenv("IMEDNET_API_KEY", "").strip()
             and os.getenv("IMEDNET_SECURITY_KEY", "").strip()
@@ -93,9 +142,7 @@ def get_sdk() -> ImednetSDK:
         sys.exit(1)
 
     try:
-        sdk_cls: type[ImednetSDK] = (
-            globals()["ImednetSDK"] if "ImednetSDK" in globals() else _load_sdk_cls()
-        )
+        sdk_cls = globals()["ImednetSDK"] if "ImednetSDK" in globals() else _load_sdk_cls()
         return sdk_cls(config=config)
     except Exception as exc:  # pragma: no cover - defensive
         from ..decorators import redact_cli_secrets

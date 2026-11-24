@@ -58,9 +58,9 @@ A healthy live suite run means:
 
 The live suite covers:
 
-* all ``list`` and ``get`` operations for every endpoint,
-* record creation and job polling (when mutation is enabled),
-* CLI commands via ``typer.testing.CliRunner``,
+* ``list`` and ``get`` operations on list-and-get endpoints (``studies``, ``sites``, ``subjects``, ``records``, ``forms``, ``intervals``, ``variables``, ``record_revisions``), ``list`` operations on list-only endpoints (``visits``, ``queries``, ``users``, ``codings``), and ``jobs.get`` lookup by batch ID,
+* Record creation (``records.create``) and Job status polling (``jobs.get`` / ``poll_job``) when mutation is enabled,
+* CLI commands invoked via the in-process ``argparse`` ``CliRunner`` against ``imednet.cli.app``,
 * export helpers (CSV, Excel, JSON, Parquet, SQL),
 * Airflow hook and operator integration (when Airflow is installed),
 * workflow utilities (extract, register, update) when mutation is enabled.

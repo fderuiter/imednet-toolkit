@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, overload
+from datetime import datetime
+from typing import Any
 
 from pydantic import Field, field_validator, model_validator
 
@@ -12,6 +13,7 @@ from imednet.models.base import ImednetBaseModel
 from imednet.models.records import RecordStatus
 
 def _coerce_optional_int_for_bounds(value: Any, field_name: str) -> int | None: ...
+def _parse_revision_timestamp(value: Any) -> datetime | None: ...
 def _validate_revision_bounds(record_revision: int | None, data_revision: int | None) -> None: ...
 
 class RecordRevision(ImednetBaseModel):
@@ -37,52 +39,43 @@ class RecordRevision(ImednetBaseModel):
     user: str | None = Field(default=None, alias="user")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         record_revision: int | None = None,
-        data_revision: int | None = None,
-        record_status: RecordStatus | str | None = None,
-        study_key: str | None = None,
-        record_revision_id: int | None = None,
-        record_id: int | None = None,
-        subject_id: int | None = None,
-        subject_key: str | None = None,
-        site_id: int | None = None,
-        form_key: str | None = None,
-        interval_id: int | None = None,
-        deleted: bool | None = None,
-        date_created: str | None = None,
-        reason_for_change: str | None = None,
-        record_oid: str | None = None,
-        role: str | None = None,
-        subject_oid: str | None = None,
-        user: str | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         recordRevision: int | None = None,
+        data_revision: int | None = None,
         dataRevision: int | None = None,
+        record_status: RecordStatus | str | None = None,
         recordStatus: RecordStatus | str | None = None,
+        study_key: str | None = None,
         studyKey: str | None = None,
+        record_revision_id: int | None = None,
         recordRevisionId: int | None = None,
+        record_id: int | None = None,
         recordId: int | None = None,
+        subject_id: int | None = None,
         subjectId: int | None = None,
+        subject_key: str | None = None,
         subjectKey: str | None = None,
+        site_id: int | None = None,
         siteId: int | None = None,
+        form_key: str | None = None,
         formKey: str | None = None,
+        interval_id: int | None = None,
         intervalId: int | None = None,
         deleted: bool | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        reason_for_change: str | None = None,
         reasonForChange: str | None = None,
+        record_oid: str | None = None,
         recordOid: str | None = None,
         role: str | None = None,
+        subject_oid: str | None = None,
         subjectOid: str | None = None,
         user: str | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
     @model_validator(mode="before")

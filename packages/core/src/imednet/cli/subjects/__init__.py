@@ -21,10 +21,12 @@ from ..utils.args import (
     add_study_key_args,
     resolve_study_key,
 )
+from ..utils.context import is_offline_schema_dry_run
 from ..utils.write_helpers import (
     add_write_common_args,
     exit_cli_validation_error,
     exit_cli_write_error,
+    load_records_from_path_or_stdin,
     parse_json_records_text,
     parse_key_value_pairs,
     render_write_summary,
@@ -43,26 +45,68 @@ def _load_cli_subject_inputs(
     if args.input_file and args.json_payload:
         raise ValueError("Cannot combine --file and --json.")
 
-    inline_data = parse_key_value_pairs(args.data_pairs)
+    inline_data = parse_key_value_pairs(
+        args.data_pairs,
+        schema=schema,
+        form_key=args.form_key,
+        study_key=getattr(args, "study_key", None),
+    )
     if args.input_file:
         if args.input_file == "-":
-            return parse_json_records_text(sys.stdin.read(), source_label="stdin")
+            items = parse_json_records_text(sys.stdin.read(), source_label="stdin")
+            if inline_data:
+                return _merge_subject_inline_overrides(items, args=args, schema=schema)
+            return items
+        if inline_data:
+            items = load_records_from_path_or_stdin(args.input_file, schema=schema)
+            return _merge_subject_inline_overrides(items, args=args, schema=schema)
         return Path(args.input_file)
     if args.json_payload:
-        return parse_json_records_text(args.json_payload, source_label="--json")
+        items = parse_json_records_text(args.json_payload, source_label="--json")
+        if inline_data:
+            return _merge_subject_inline_overrides(items, args=args, schema=schema)
+        return items
 
-    if not args.form_key or not args.site_name:
+    if not args.form_key or (not args.site_name and getattr(args, "site_id", None) is None):
         raise ValueError(
             "Provide --file, --json, or both --form-key and --site-name to register a subject."
         )
     single: dict[str, Any] = {
         "formKey": args.form_key,
-        "siteName": args.site_name,
         "data": inline_data,
     }
+    if args.site_name:
+        single["siteName"] = args.site_name
+    if getattr(args, "site_id", None) is not None:
+        single["siteId"] = args.site_id
     if args.subject_key:
         single["subjectKey"] = args.subject_key
+    if getattr(args, "subject_oid", None):
+        single["subjectOid"] = args.subject_oid
     return [single]
+
+
+def _merge_subject_inline_overrides(
+    items: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+    schema: Any = None,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for item in items:
+        rec = dict(item)
+        eff_fk = args.form_key or rec.get("formKey") or rec.get("form_key")
+        row_inline = parse_key_value_pairs(
+            args.data_pairs,
+            schema=schema,
+            form_key=str(eff_fk) if eff_fk else None,
+            study_key=getattr(args, "study_key", None),
+        )
+        existing_data = dict(rec.get("data") or rec.get("recordData") or {})
+        existing_data.update(row_inline)
+        rec["data"] = existing_data
+        merged.append(rec)
+    return merged
 
 
 def _subject_view_model(s: Any) -> dict[str, Any]:
@@ -127,9 +171,20 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         help="Enrollment site name (siteName) for inline registration or file default.",
     )
     register_parser.add_argument(
+        "--site-id",
+        type=int,
+        default=None,
+        help="Enrollment site ID (siteId) for inline registration or file default.",
+    )
+    register_parser.add_argument(
         "--subject-key",
         default=None,
         help="Subject key (subjectKey) for inline registration.",
+    )
+    register_parser.add_argument(
+        "--subject-oid",
+        default=None,
+        help="Subject OID (subjectOid) for inline registration.",
     )
     register_parser.add_argument(
         "-d",
@@ -156,25 +211,34 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def register_subjects_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
+        offline_dry_run = is_offline_schema_dry_run(
+            dry_run=args.dry_run,
+            schema_source=args.schema_source,
+        )
         try:
-            resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
+            resolved_schema = resolve_cli_schema(
+                sdk,
+                args.study_key,
+                args.schema_source,
+                dry_run=args.dry_run,
+            )
             raw_inputs = _load_cli_subject_inputs(args, schema=resolved_schema)
             normalized_pairs = normalize_subject_registration_inputs(
                 raw_inputs,
                 default_form_key=args.form_key,
                 default_site_name=args.site_name,
+                default_site_id=args.site_id,
                 schema=resolved_schema,
             )
-            sites = list(sdk.sites.list(args.study_key))
+            sites = None if offline_dry_run else list(sdk.sites.list(args.study_key))
             validate_subject_registration_sites(normalized_pairs, sites)
 
-            existing_subjects = (
-                list(sdk.subjects.list(args.study_key)) if args.skip_existing else None
-            )
+            should_filter = args.skip_existing and not offline_dry_run
+            existing_subjects = list(sdk.subjects.list(args.study_key)) if should_filter else None
             subjects_data, skipped_count = filter_existing_subject_registrations(
                 normalized_pairs,
                 existing_subjects,
-                should_filter=args.skip_existing,
+                should_filter=should_filter,
                 subject_key_field=args.subject_key_field,
             )
             summary = submit_cli_records_batch(
@@ -211,7 +275,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if (
             not args.input_file
             and not args.json_payload
-            and (not args.form_key or not args.site_name)
+            and (not args.form_key or (not args.site_name and args.site_id is None))
         ):
             print_error(
                 "Error: Provide --file, --json, or both --form-key and --site-name to register subjects."

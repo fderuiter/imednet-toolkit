@@ -15,4 +15,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "record_revisions",
         "record revisions",
         requires_study_key=True,
+        summary_fields=[
+            "record_revision_id",
+            "record_id",
+            "subject_key",
+            "form_key",
+            "user",
+            "reason_for_change",
+            "date_created",
+        ],
     )

@@ -8,13 +8,25 @@ from datetime import timedelta
 from typing import Any
 
 from imednet import ImednetSDK
-from imednet.spi.utils import (
-    redact_sensitive_payload,
-    redact_sensitive_text,
-    validate_path_segment,
-)
 
-from ._airflow_compat import AirflowException, BaseSensorOperator, Context, TaskDeferred
+from ._airflow_compat import (
+    AirflowException,
+    AirflowSensorTimeout,
+    AirflowSkipException,
+    BaseOperator,
+    BaseSensorOperator,
+    Context,
+    PokeReturnValue,
+    TaskDeferralError,
+    TaskDeferralTimeout,
+    TaskDeferred,
+)
+from ._guards import (
+    build_job_summary,
+    sanitize_job_summary,
+    scrub_job_error_message,
+    validate_non_secret_identifier,
+)
 from .hooks import ImednetHook
 from .triggers import ImednetJobTrigger
 
@@ -32,7 +44,7 @@ def _default_deferrable() -> bool:
 class ImednetJobSensor(BaseSensorOperator):
     """Poll iMednet for job completion synchronously or via the Airflow triggerer."""
 
-    template_fields: Sequence[str] = ("study_key", "batch_id")
+    template_fields: Sequence[str] = ("study_key", "batch_id", "imednet_conn_id")
 
     def __init__(
         self,
@@ -64,12 +76,33 @@ class ImednetJobSensor(BaseSensorOperator):
         self.deferrable: bool = _default_deferrable() if deferrable is None else bool(deferrable)
         self._last_state: Any = None
         self._terminal_reached: bool = False
+        self._terminal_summary: dict[str, Any] | None = None
+
+    def _validate_rendered_identifiers(self) -> None:
+        """Validate rendered ``study_key``, ``batch_id``, and ``imednet_conn_id`` before polling."""
+        validate_non_secret_identifier(
+            self.study_key,
+            field_name="study_key",
+            path_segment=True,
+            parameter_kind="sensor parameter",
+        )
+        validate_non_secret_identifier(
+            self.batch_id,
+            field_name="batch_id",
+            path_segment=True,
+            parameter_kind="sensor parameter",
+        )
+        validate_non_secret_identifier(
+            self.imednet_conn_id,
+            field_name="imednet_conn_id",
+            parameter_kind="sensor parameter",
+        )
 
     def _get_sdk(self) -> ImednetSDK:
         """Get the Imednet SDK client."""
         return ImednetHook(self.imednet_conn_id).get_sdk_client()
 
-    def poke(self, context: Context) -> bool:
+    def poke(self, context: Context) -> bool | PokeReturnValue:
         """Check the status of the Job and verify terminal ``resultUrl`` output."""
         _ = context
         from imednet.spi.models import JobStatus
@@ -82,8 +115,7 @@ class ImednetJobSensor(BaseSensorOperator):
             resolve_sdk_result_fetcher,
         )
 
-        validate_path_segment(self.study_key, name="study_key")
-        validate_path_segment(self.batch_id, name="batch_id")
+        self._validate_rendered_identifiers()
 
         with closing(self._get_sdk()) as sdk:
             job: JobStatus = sdk.jobs.get(self.study_key, self.batch_id)
@@ -91,7 +123,7 @@ class ImednetJobSensor(BaseSensorOperator):
             # In JobStatus instances, track state monotonically and guard against stale responses
             if isinstance(job, JobStatus):
                 if self._terminal_reached and not getattr(job, "is_terminal", False):
-                    return True
+                    return PokeReturnValue(is_done=True, xcom_value=self._terminal_summary)
 
                 try:
                     if getattr(job, "is_terminal", False):
@@ -104,10 +136,16 @@ class ImednetJobSensor(BaseSensorOperator):
                     self._last_state = getattr(job, "state", None)
                     if is_done:
                         self._terminal_reached = True
-                    return is_done
+                        self._terminal_summary = build_job_summary(
+                            job,
+                            study_key=self.study_key,
+                            batch_id=self.batch_id,
+                        )
+                        return PokeReturnValue(is_done=True, xcom_value=self._terminal_summary)
+                    return False
                 except (JobFailedError, InvalidJobTransitionError, InvalidJobStateError) as e:
                     self._last_state = getattr(job, "state", None)
-                    raise AirflowException(str(e)) from e
+                    raise AirflowException(scrub_job_error_message(e)) from e
 
             try:
                 if getattr(job, "is_terminal", False):
@@ -116,20 +154,28 @@ class ImednetJobSensor(BaseSensorOperator):
                         resolve_sdk_result_fetcher(sdk),
                         batch_id=self.batch_id,
                     )
-                return evaluate_job_state(job)
+                if evaluate_job_state(job):
+                    summary = build_job_summary(
+                        job,
+                        study_key=self.study_key,
+                        batch_id=self.batch_id,
+                    )
+                    return PokeReturnValue(is_done=True, xcom_value=summary)
+                return False
             except (JobFailedError, InvalidJobTransitionError, InvalidJobStateError) as e:
-                raise AirflowException(str(e)) from e
+                raise AirflowException(scrub_job_error_message(e)) from e
 
     def execute(self, context: Context) -> Any:
         """Execute sensor synchronously or defer polling to ``ImednetJobTrigger``."""
+        self._validate_rendered_identifiers()
         if not self.deferrable:
             super_execute = getattr(super(), "execute", None)
             if callable(super_execute):
                 return super_execute(context)
-            return self.poke(context)
-
-        validate_path_segment(self.study_key, name="study_key")
-        validate_path_segment(self.batch_id, name="batch_id")
+            poke_result = self.poke(context)
+            if isinstance(poke_result, PokeReturnValue):
+                return poke_result.xcom_value
+            return poke_result
 
         raw_timeout = getattr(self, "timeout", None)
         trigger_timeout: float | None = None
@@ -162,6 +208,31 @@ class ImednetJobSensor(BaseSensorOperator):
             timeout=defer_timeout,
         )
 
+    def resume_execution(
+        self,
+        next_method: str,
+        next_kwargs: dict[str, Any] | None,
+        context: Context,
+    ) -> Any:
+        """Resume deferred sensor execution while restricting ``soft_fail`` to timeouts."""
+        try:
+            try:
+                return BaseOperator.resume_execution(self, next_method, next_kwargs, context)
+            except TaskDeferralTimeout as exc:
+                raise AirflowSensorTimeout(*exc.args) from exc
+        except AirflowSkipException:
+            raise
+        except AirflowSensorTimeout as exc:
+            if getattr(self, "soft_fail", False):
+                raise AirflowSkipException("Skipping due to soft_fail is set to True.") from exc
+            if getattr(self, "never_fail", False):
+                raise AirflowSkipException("Skipping due to never_fail is set to True.") from exc
+            raise
+        except (AirflowException, TaskDeferralError) as exc:
+            if getattr(self, "never_fail", False):
+                raise AirflowSkipException("Skipping due to never_fail is set to True.") from exc
+            raise
+
     def execute_complete(
         self,
         context: Context,
@@ -174,15 +245,17 @@ class ImednetJobSensor(BaseSensorOperator):
                 f"Did not receive a valid trigger event for job '{self.batch_id}' in study '{self.study_key}'."
             )
         status = event.get("status")
+        if status == "timeout":
+            raw_timeout = str(event.get("message") or "Job timed out during deferred polling.")
+            raise AirflowSensorTimeout(scrub_job_error_message(raw_timeout))
         if status == "error":
             raw_message = str(event.get("message") or "Job failed during deferred polling.")
-            safe_message = str(redact_sensitive_payload(redact_sensitive_text(raw_message)))
-            raise AirflowException(safe_message)
+            raise AirflowException(scrub_job_error_message(raw_message))
         if status != "success":
             raise AirflowException(
                 f"Unexpected trigger event status '{status}' for job '{self.batch_id}'."
             )
-        return event.get("job")
+        return sanitize_job_summary(event.get("job"))
 
 
 __all__ = ["ImednetJobSensor"]

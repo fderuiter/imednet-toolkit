@@ -262,3 +262,62 @@ async def test_register_subjects_single_job_guards_and_empty_batch_id_when_waiti
             [{"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": 30}}],
             wait_for_completion=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_register_subjects_workflow_offline_dry_run_skips_sites_and_subjects_reads() -> None:
+    """Req 4: RegisterSubjectsWorkflow with dry_run=True and offline DataDictionary makes zero HTTP reads."""
+    from unittest.mock import AsyncMock
+
+    from imednet.datadict import DataDictionary
+
+    dd = DataDictionary.model_validate(
+        {
+            "forms": [
+                {
+                    "formKey": "F_ENROLL",
+                    "variables": [{"variableName": "V_AGE", "variableType": "integer"}],
+                }
+            ]
+        }
+    )
+
+    # Sync workflow
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_wf = RegisterSubjectsWorkflow(sync_sdk, filter_enrolled=True)
+    summary = sync_wf.register_subjects_batch(
+        "STUDY",
+        [{"formKey": "F_ENROLL", "siteName": "SITE", "subjectKey": "SUB-1", "data": {"V_AGE": 30}}],
+        skip_existing=True,
+        schema=dd,
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert summary.dry_run is True
+    assert summary.validation_report is not None
+    assert summary.validation_report.is_valid is True
+    sync_sdk.get_sites.assert_not_called()
+    sync_sdk.get_subjects.assert_not_called()
+    sync_sdk.create_record.assert_not_called()
+
+    # Async workflow
+    async_sdk = MagicMock()
+    async_sdk.async_create_record = AsyncMock()
+    async_sdk.async_get_sites = AsyncMock()
+    async_sdk.async_get_subjects = AsyncMock()
+    async_wf = RegisterSubjectsWorkflow(async_sdk, filter_enrolled=True)
+    async_summary = await async_wf.async_register_subjects_batch(
+        "STUDY",
+        [{"formKey": "F_ENROLL", "siteId": 101, "subjectKey": "SUB-2", "data": {"V_AGE": 44}}],
+        skip_existing=True,
+        schema=dd,
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert async_summary.dry_run is True
+    assert async_summary.validation_report is not None
+    assert async_summary.validation_report.is_valid is True
+    async_sdk.async_get_sites.assert_not_called()
+    async_sdk.async_get_subjects.assert_not_called()
+    async_sdk.async_create_record.assert_not_called()

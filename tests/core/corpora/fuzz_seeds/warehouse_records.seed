@@ -1,0 +1,26 @@
+ [
+  {
+    "id": "101",
+    "form_id": "AE",
+    "visit_id": "V1",
+    "subject_key": "SUBJ-001",
+    "data": {
+      "aeTerm": "Mild Nausea",
+      "aeSeverity": 1,
+      "isSerious": false,
+      "onsetDate": "2026-01-15"
+    }
+  },
+  {
+    "id": "102",
+    "form_id": "VS",
+    "visit_id": "V2",
+    "subject_key": "SUBJ-002",
+    "data": {
+      "sysBp": 118,
+      "diaBp": 76,
+      "heartRate": 68.5,
+      "notes": null
+    }
+  }
+]
