@@ -5,14 +5,18 @@ from __future__ import annotations
 import re
 import unicodedata
 from typing import Any
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
+from unittest.mock import NonCallableMock
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlsplit, urlunparse
 
+from imednet.constants import DEFAULT_BASE_URL
 from imednet.errors.validation import PathTraversalValidationError
 
 __all__ = [
     "build_safe_path",
+    "normalize_cache_origin",
     "redact_sensitive_text",
     "redact_url_query",
+    "resolve_sdk_base_url",
     "sanitize_base_url",
     "validate_path_segment",
 ]
@@ -50,6 +54,75 @@ def sanitize_base_url(url: str) -> str:
     """Return base URL without trailing slashes or ``/api``, ``/api/v1``, or ``/api/v1/edc`` suffix."""
     cleaned = url.rstrip("/")
     return str(re.sub(r"/api(?:/v1(?:/edc)?)?$", "", cleaned)).rstrip("/")
+
+
+def normalize_cache_origin(url: str | None) -> str:
+    """Normalize an SDK base URL into a canonical cache partition key."""
+    raw = url.strip() if isinstance(url, str) and url.strip() else DEFAULT_BASE_URL
+    sanitized = sanitize_base_url(raw)
+    if "://" not in sanitized and not sanitized.startswith("/"):
+        sanitized = f"https://{sanitized}"
+    parsed = urlsplit(sanitized)
+    if not parsed.scheme or not parsed.hostname:
+        return sanitized
+
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname.lower()
+    formatted_host = f"[{hostname}]" if ":" in hostname else hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+
+    is_default_port = (
+        port is None or (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+    )
+    netloc = formatted_host if is_default_port else f"{formatted_host}:{port}"
+    normalized_path = sanitize_base_url(parsed.path) if parsed.path else ""
+    if normalized_path and not normalized_path.startswith("/"):
+        normalized_path = f"/{normalized_path}"
+    return f"{scheme}://{netloc}{normalized_path}"
+
+
+def _safe_optional_attr(obj: Any, attr: str) -> Any:
+    """Read an attribute without spawning child mocks on NonCallableMock instances."""
+    if obj is None:
+        return None
+    if isinstance(obj, NonCallableMock):
+        obj_vars = vars(obj)
+        mock_children = getattr(obj, "_mock_children", {})
+        if attr not in obj_vars and attr not in mock_children:
+            return None
+    return getattr(obj, attr, None)
+
+
+def resolve_sdk_base_url(sdk: Any) -> str:
+    """Resolve and normalize the configured EDC origin URL for an SDK or facade instance."""
+    client = _safe_optional_attr(sdk, "_client")
+    async_client = _safe_optional_attr(sdk, "_async_client")
+    candidates = (
+        _safe_optional_attr(sdk, "base_url"),
+        _safe_optional_attr(sdk, "_base_url"),
+        _safe_optional_attr(_safe_optional_attr(sdk, "_ctx"), "base_url"),
+        _safe_optional_attr(client, "base_url"),
+        _safe_optional_attr(client, "_base_url"),
+        _safe_optional_attr(async_client, "base_url"),
+        _safe_optional_attr(async_client, "_base_url"),
+        _safe_optional_attr(_safe_optional_attr(sdk, "config"), "base_url"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return normalize_cache_origin(candidate)
+        if (
+            candidate is not None
+            and not isinstance(candidate, NonCallableMock)
+            and hasattr(candidate, "scheme")
+            and hasattr(candidate, "host")
+        ):
+            rendered = str(candidate).strip()
+            if rendered:
+                return normalize_cache_origin(rendered)
+    return normalize_cache_origin(DEFAULT_BASE_URL)
 
 
 def redact_url_query(url: str, sensitive_params: set[str] | None = None) -> str:

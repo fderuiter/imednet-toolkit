@@ -632,7 +632,7 @@ def test_airflow_orm_mode_consolidated_migration_and_fallbacks(
     import contextlib
 
     from sqlalchemy import Column, String, Text, create_engine, delete, select
-    from sqlalchemy.orm import DeclarativeBase, sessionmaker
+    from sqlalchemy.orm import DeclarativeBase, configure_mappers, sessionmaker
 
     engine = create_engine("sqlite:///:memory:")
 
@@ -682,6 +682,7 @@ def test_airflow_orm_mode_consolidated_migration_and_fallbacks(
                 return int(res.rowcount or 0)
 
     _Base.metadata.create_all(engine)
+    configure_mappers()
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     invalidated: list[str] = []
 

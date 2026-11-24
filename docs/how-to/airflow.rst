@@ -335,6 +335,8 @@ opening connections or issuing HTTP requests:
 
 .. testcode::
 
+   import contextlib
+   import io
    from typing import Any, cast
    from apache_airflow_providers_imednet import (
        ImednetExportOperator,
@@ -357,7 +359,8 @@ opening connections or issuing HTTP requests:
    )
    op_rejected = False
    try:
-       ImednetExportOperator.execute(bad_export_op, cast(Any, {}))
+       with contextlib.redirect_stdout(io.StringIO()):
+           ImednetExportOperator.execute(bad_export_op, cast(Any, {}))
    except PathTraversalValidationError as op_path_err:
        op_rejected = True
        assert op_path_err.status_code == 400
