@@ -9,12 +9,12 @@ from imednet.sdk import AsyncImednetSDK, ImednetSDK
 def sync_record_signature() -> None:
     """Helper function to sync record signature."""
     sdk = cast(ImednetSDK, object())
-    record: Record = sdk.records.get(study_key="STUDY", item_id="123")
+    record: Record = sdk.records.get(study_key="STUDY", item_id=123)
     _ = record
 
 
 async def async_record_signature() -> None:
     """Helper function to async record signature."""
     sdk = cast(AsyncImednetSDK, object())
-    record: Record = await sdk.records.get(study_key="STUDY", item_id="123")
+    record: Record = await sdk.records.get(study_key="STUDY", item_id=123)
     _ = record

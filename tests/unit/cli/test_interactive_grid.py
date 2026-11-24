@@ -511,13 +511,121 @@ def test_grid_side_panel_overflow_cues_and_esc_precedence() -> None:
     grid._handle_normal_input("[")
     assert grid.side_panel_scroll == bottom_scroll - 1
 
+    # Reset to top and verify '{' and '}' step by visible_slots (max(1, 24 - 5) == 19)
+    grid.side_panel_scroll = 0
+    grid._handle_normal_input("}")
+    assert grid.side_panel_scroll == min(bottom_scroll, 19)
+    grid.draw()
+    cue_page = [text for y, x, text, _ in win.strings if y == 22 and x == content_x][0]
+    assert f"Lines {grid.side_panel_scroll + 1}-" in cue_page
+
     # First Esc closes side panel while preserving search_query; second Esc clears search_query
     grid._handle_normal_input(27)
     assert grid.side_panel_open is False
     assert grid.search_query == "SUBJ-501"
 
+    # When side_panel_open is False, '{' and '}' are ignored
+    grid._handle_normal_input("}")
+    assert grid.side_panel_scroll == 0
+    grid._handle_normal_input("{")
+    assert grid.side_panel_scroll == 0
+
     grid._handle_normal_input(27)
     assert grid.search_query == ""
+
+
+def test_grid_side_panel_brace_paging_resize_clamping_and_acronym_labels() -> None:
+    """'{' and '}' step by visible_slots, clamp before initial draw or after KEY_RESIZE, stay literal in '/', and preserve ID/OID/URL/UTC labels."""
+    win = MockWindow(height=24, width=80)
+    many_vars = {f"VAR_{i:02d}": f"Value {i}" for i in range(1, 50)}
+    rec = Record.model_construct(
+        record_id=701,
+        record_oid="REC-OID-701",
+        subject_oid="SUBJ-OID-701",
+        subject_key="SUBJ-701",
+        form_key="VITALS",
+        record_status="Completed",
+        record_data=many_vars,
+    )
+    grid = InteractiveDataGrid(
+        win,
+        items=[
+            {
+                "record_id": 701,
+                "record_oid": "REC-OID-701",
+                "result_url": "https://example.test/701",
+                "synced_utc": "2026-01-01T00:00:00Z",
+            }
+        ],
+        fields=["record_id", "record_oid", "result_url", "synced_utc"],
+        label="records",
+        details=[rec],
+    )
+
+    # Open side panel WITHOUT calling draw() first (_side_panel_max_scroll is None)
+    grid._handle_normal_input(" ")
+    assert grid.side_panel_open is True
+    assert grid._side_panel_max_scroll is None
+
+    # On 80x24, visible_slots == max(1, 24 - 5) == 19
+    grid._handle_normal_input("}")
+    assert grid.side_panel_scroll == 19
+    assert grid._side_panel_max_scroll is not None
+    expected_max = grid._side_panel_max_scroll
+    assert expected_max > 38
+
+    grid._handle_normal_input("}")
+    assert grid.side_panel_scroll == 38
+
+    # Repeated '}' clamps cleanly at max_scroll even without draw()
+    for _ in range(5):
+        grid._handle_normal_input("}")
+    assert grid.side_panel_scroll == expected_max
+
+    # Single '{' steps back a full 19-line page from max_scroll
+    grid._handle_normal_input("{")
+    assert grid.side_panel_scroll == expected_max - 19
+
+    # Simulate KEY_RESIZE to a taller window where max_scroll shrinks below current scroll
+    win.height = 60
+    grid._side_panel_max_scroll = None
+    grid.side_panel_scroll = 99
+    grid._handle_normal_input("}")
+    tall_max = grid._side_panel_max_scroll
+    assert tall_max is not None
+    assert grid.side_panel_scroll == tall_max
+
+    # Narrow terminal (width < 50 -> panel_width == 0) resolves max_scroll to 0
+    win.width = 40
+    grid._side_panel_max_scroll = None
+    grid._handle_normal_input("}")
+    assert grid._side_panel_max_scroll == 0
+    assert grid.side_panel_scroll == 0
+
+    win.width = 80
+    win.height = 24
+    grid._side_panel_max_scroll = None
+    grid.side_panel_scroll = 0
+    grid.draw()
+
+    # Verify uppercase ID, OID, URL, and UTC labels in table headers and side panel
+    header_text = "".join(text for y, x, text, _ in win.strings if y == 1 and x < 44)
+    assert "Record ID" in header_text
+    assert "Record OID" in header_text
+
+    panel_lines = "\n".join(line for line, _ in grid._build_side_panel_lines(content_w=33))
+    assert "Record ID: 701" in panel_lines
+    assert "Record OID: REC-OID-701" in panel_lines
+    assert "Subject OID: SUBJ-OID-701" in panel_lines
+
+    # During '/' search input, '{' and '}' remain literal characters without scrolling panel
+    grid.side_panel_scroll = 19
+    grid._handle_normal_input("/")
+    for ch in "{test}":
+        grid._handle_search_input(ch)
+    assert grid.search_query == "{test}"
+    assert grid._side_panel_max_scroll is None  # filter_entries resets scroll for new match set
+    assert grid.side_panel_scroll == 0
 
 
 def test_grid_status_colors_high_contrast(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1151,7 +1259,7 @@ def test_horizontal_scrolling_and_literal_search_keys() -> None:
     # Initial offset shows full readable headers, never 4-char crushed stubs
     header_row = "".join(s[2] for s in win.strings if s[0] == 1)
     assert "Study Key" in header_row
-    assert "Record Revision Id" in header_row
+    assert "Record Revision ID" in header_row
     assert "Last Updated" not in header_row
 
     # Scroll right with KEY_RIGHT and 'l'
@@ -1251,9 +1359,10 @@ def test_record_revision_80_col_side_panel_strict_clipping_and_clamping() -> Non
     assert len(dividers) == win.height - 2
     assert all(s[2].startswith("│") for s in dividers)
 
-    # Side panel displays RecordRevision details including falsy 0 and False attributes
+    # Side panel displays RecordRevision details including falsy 0, False, and uppercase ID/OID labels
     panel_strings = " ".join(s[2] for s in win.strings if s[1] >= panel_x)
     assert "RECORD REVISIONS DETAILS" in panel_strings
+    assert "Record Revision ID: 9001" in panel_strings
     assert "Record Revision: 0" in panel_strings
     assert "Data Revision: 0" in panel_strings
     assert "Deleted: No" in panel_strings

@@ -1666,7 +1666,7 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["code_blocks.js"]
+html_js_files: list[str] = ["code_blocks.js", "navigation.js"]
 
 doctest_global_setup = """
 import builtins
@@ -1696,10 +1696,21 @@ logging.getLogger("py.warnings").setLevel(logging.ERROR)
 logging.getLogger("snowflake").setLevel(logging.WARNING)
 logging.captureWarnings(True)
 
-with contextlib.redirect_stdout(io.StringIO()):
-    with contextlib.suppress(ImportError):
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
         from airflow.sdk.bases.operator import ExecutorSafeguard
         ExecutorSafeguard.test_mode = True
+    except Exception:
+        pass
+
+    _doctest_orig_cwd = os.getcwd()
+    _doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
+    os.chdir(_doctest_tmpdir.name)
+
+    from imednet.simulation.state import get_default_simulation_state
+    get_default_simulation_state().reset()
+
+    __file__ = "/a/b/c/d/e/dummy.py"
 
     _mongo_client_patcher = patch("pymongo.MongoClient", return_value=MagicMock())
     _mongo_client_patcher.start()
@@ -1709,15 +1720,6 @@ with contextlib.redirect_stdout(io.StringIO()):
 
     _snowflake_connect_patcher = patch("snowflake.connector.connect", return_value=MagicMock())
     _snowflake_connect_patcher.start()
-
-_doctest_orig_cwd = os.getcwd()
-_doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
-os.chdir(_doctest_tmpdir.name)
-
-from imednet.simulation.state import get_default_simulation_state
-get_default_simulation_state().reset()
-
-__file__ = "/a/b/c/d/e/dummy.py"
 
 _original_print = builtins.print
 
