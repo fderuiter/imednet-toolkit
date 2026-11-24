@@ -70,7 +70,7 @@ List record revisions
      - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
-     - None
+     - ``recordRevisionId,asc``
      - Sorting expression (e.g. ``recordRevisionId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String

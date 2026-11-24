@@ -1,5 +1,45 @@
 # Changelog
 
+## [1.2.0](https://github.com/fderuiter/imednet-toolkit/compare/apache-airflow-providers-imednet-v1.1.0...apache-airflow-providers-imednet-v1.2.0) (2026-11-23)
+
+
+### Features
+
+* **airflow:** add provider metadata, deferrable trigger, and SDK parity ([#2004](https://github.com/fderuiter/imednet-toolkit/issues/2004)) ([2763e22](https://github.com/fderuiter/imednet-toolkit/commit/2763e22cfe08226230345de354731620d22909cf))
+* **airflow:** align Airflow 3 provider UI metadata, template fields, and SQL exports ([#1999](https://github.com/fderuiter/imednet-toolkit/issues/1999)) ([fb5b4c0](https://github.com/fderuiter/imednet-toolkit/commit/fb5b4c0dcf68200855f79f00e0bf75ef07e3eb65))
+* centralize default PHI masking across enrichment and exports ([#1936](https://github.com/fderuiter/imednet-toolkit/issues/1936)) ([99a0bc0](https://github.com/fderuiter/imednet-toolkit/commit/99a0bc0aef9d389c48a53d1841ddb10f23516d33))
+* dynamic sdk sinks resolution with architectural import guard ([#1865](https://github.com/fderuiter/imednet-toolkit/issues/1865)) ([50ef9e7](https://github.com/fderuiter/imednet-toolkit/commit/50ef9e728bde341e322b58a25adaea3dec5283dc))
+* embed CDISC SDTM transformation and standards readiness in core SPI ([#2002](https://github.com/fderuiter/imednet-toolkit/issues/2002)) ([1d7ca31](https://github.com/fderuiter/imednet-toolkit/commit/1d7ca3164a958194be9aae5e3e5746912de78112))
+* enforce mode-safe plugin protocols and static types ([#2000](https://github.com/fderuiter/imednet-toolkit/issues/2000)) ([5c46bfa](https://github.com/fderuiter/imednet-toolkit/commit/5c46bfaf7f321e7026f5d6fbabfcec5acee2e954))
+* merge tabular records with Snowflake schema evolution ([a596cc1](https://github.com/fderuiter/imednet-toolkit/commit/a596cc154cc426f5c3c51139139b281e0951c1ca))
+* unify streaming batches and ledger checkpoints via SPI ([#1912](https://github.com/fderuiter/imednet-toolkit/issues/1912)) ([820d2b6](https://github.com/fderuiter/imednet-toolkit/commit/820d2b621ec78ff2f7b10d6ea9a62174a578d94e))
+
+
+### Bug Fixes
+
+* **airflow:** isolate sensor summaries and credential guards ([#2053](https://github.com/fderuiter/imednet-toolkit/issues/2053)) ([9ddbb06](https://github.com/fderuiter/imednet-toolkit/commit/9ddbb06782ffbceeeb1375dc5847323590d3f000))
+* **airflow:** repair Airflow 3 provider discovery, XCom checkpoints, and DuckDB dispatch ([#1970](https://github.com/fderuiter/imednet-toolkit/issues/1970)) ([e778b17](https://github.com/fderuiter/imednet-toolkit/commit/e778b17e91025a11e0aeb11d8eee8d558cb09700))
+* **airflow:** restore get_conn method on ImednetHook ([#1826](https://github.com/fderuiter/imednet-toolkit/issues/1826)) ([263678f](https://github.com/fderuiter/imednet-toolkit/commit/263678f4332f56ab966b33b2b1f872fe3abd8ec2))
+* **airflow:** sync provider aliases and isolate dummy-Airflow test modules ([#2007](https://github.com/fderuiter/imednet-toolkit/issues/2007)) ([c4236be](https://github.com/fderuiter/imednet-toolkit/commit/c4236be941cb2d1281b7d3870378debee74e1b73))
+* **airflow:** use Airflow Variable checkpoints and verify Job resultUrl ([#1995](https://github.com/fderuiter/imednet-toolkit/issues/1995)) ([ce2e65c](https://github.com/fderuiter/imednet-toolkit/commit/ce2e65c14ce46ad999d80498d4f78d9d0fcbc7d2))
+* **core,airflow:** guard optional pandas import and stabilize Airflow 3.4 CI suites ([#2005](https://github.com/fderuiter/imednet-toolkit/issues/2005)) ([b0e99ff](https://github.com/fderuiter/imednet-toolkit/commit/b0e99ff852d5e19c3d88b5d312a0a4cb39da344f))
+* **docs:** fix examples and expand docs verification scripts ([#1945](https://github.com/fderuiter/imednet-toolkit/issues/1945)) ([78b3ad8](https://github.com/fderuiter/imednet-toolkit/commit/78b3ad859e67b930bbb396c12622914cca1d0892))
+* pass resolved Config and scope HTTP client lifecycles ([#1929](https://github.com/fderuiter/imednet-toolkit/issues/1929)) ([ff6775b](https://github.com/fderuiter/imednet-toolkit/commit/ff6775b444dac188d128533afa0e5cdc87c48f14))
+* resolve Airflow destination connections and merge Snowflake batches ([c2a1b79](https://github.com/fderuiter/imednet-toolkit/commit/c2a1b7955b86c5c58e9339a80ffd90f3ddf94c07))
+* **security:** standardize PHI redaction on SensitivityRegistry ([#1923](https://github.com/fderuiter/imednet-toolkit/issues/1923)) ([cb52acc](https://github.com/fderuiter/imednet-toolkit/commit/cb52accc22789ee6f805bc8f8d6cc1f2c9379dad))
+* **security:** validate and encode API path segments strictly ([#1968](https://github.com/fderuiter/imednet-toolkit/issues/1968)) ([78e605b](https://github.com/fderuiter/imednet-toolkit/commit/78e605bea40845d6a3130aafe432091b58357b49))
+* unify opt-in quality gates and optional variable readiness scoring ([#2046](https://github.com/fderuiter/imednet-toolkit/issues/2046)) ([f2c54b8](https://github.com/fderuiter/imednet-toolkit/commit/f2c54b89084f84d6e482ed7eaa2795e529336131))
+
+
+### Performance Improvements
+
+* **export:** stream study records once across per-form exports ([#1996](https://github.com/fderuiter/imednet-toolkit/issues/1996)) ([3fec197](https://github.com/fderuiter/imednet-toolkit/commit/3fec1974fecc1f27f55c220aefc744910cbe2d8a))
+
+
+### Documentation
+
+* align guides, demos, and READMEs to current fixtures ([#2016](https://github.com/fderuiter/imednet-toolkit/issues/2016)) ([86c2aec](https://github.com/fderuiter/imednet-toolkit/commit/86c2aec01ba3cd2f1a640e23e39f53b3c019cc8b))
+
 ## [1.1.0](https://github.com/fderuiter/imednet-toolkit/compare/apache-airflow-providers-imednet-v1.0.0...apache-airflow-providers-imednet-v1.1.0) (2026-11-16)
 
 

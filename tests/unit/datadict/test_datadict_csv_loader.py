@@ -215,3 +215,43 @@ def test_csv_loader_crlf_and_bom() -> None:
     assert len(dd.forms) == 1
     assert dd.forms[0].formKey == "AE"
     assert dd.forms[0].variables[0].variableName == "AESTDAT"
+
+
+def test_fixtures_directory_loads_cleanly_in_strict_mode() -> None:
+    """tests/fixtures/data_dictionary loads with strict=True and zero warnings."""
+    dd = load_from_csv(FIXTURES_DIR, strict=True)
+    assert dd.metadata.validationWarnings == []
+    assert {f.formKey for f in dd.forms} == {"AE", "AEACTEL", "AESDC"}
+    ae_form = dd.form_for_key("AE")
+    assert ae_form is not None
+    aenum = next(v for v in ae_form.variables if v.variableName == "AENUM")
+    assert [c.choiceValue for c in aenum.choices] == ["1", "2", "3"]
+
+
+def test_csv_loader_updated_by_emits_no_timestamp_warning_while_date_modified_validates() -> None:
+    """validate_timestamp runs only on explicit timestamp keys, ignoring updatedBy/createdBy."""
+    forms_csv = "Form Key,Form Name,updatedBy,createdBy,dateModified\nAE,Adverse Event,jdoe,admin,09-28-2026\n"
+    questions_csv = "Form,Variable Name,updatedBy\nAE,AESTDAT,clinician_01\n"
+    choices_csv = "Form,Variable Name,Choice Text,Choice Value\n"
+    logic_csv = "Type,Name,Status,ID,Form\n"
+
+    dd = load_from_csv_files(
+        forms_file=io.StringIO(forms_csv),
+        questions_file=io.StringIO(questions_csv),
+        choices_file=io.StringIO(choices_csv),
+        business_logic_file=io.StringIO(logic_csv),
+        strict=False,
+    )
+    assert not any("Invalid timestamp" in w for w in dd.metadata.validationWarnings)
+
+    bad_ts_forms = "Form Key,Form Name,dateModified\nAE,Adverse Event,2026/99/99\n"
+    dd_bad = load_from_csv_files(
+        forms_file=io.StringIO(bad_ts_forms),
+        questions_file=io.StringIO("Form,Variable Name\nAE,AESTDAT\n"),
+        choices_file=io.StringIO(choices_csv),
+        business_logic_file=io.StringIO(logic_csv),
+        strict=False,
+    )
+    assert any(
+        "dateModified" in w and "Invalid timestamp" in w for w in dd_bad.metadata.validationWarnings
+    )

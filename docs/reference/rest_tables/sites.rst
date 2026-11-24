@@ -70,8 +70,8 @@ List sites
      - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
-     - None
-     - Sorting expression (e.g. ``siteName,asc`` or ``dateCreated,desc``).
+     - ``siteId,asc``
+     - Sorting expression (e.g. ``siteId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String
      - None

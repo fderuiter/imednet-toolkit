@@ -70,8 +70,8 @@ List variables
      - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
-     - None
-     - Sorting expression (e.g. ``variableName,asc`` or ``dateCreated,desc``).
+     - ``formId,asc``
+     - Sorting expression (e.g. ``formId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String
      - None

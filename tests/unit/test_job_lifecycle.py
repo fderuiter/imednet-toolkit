@@ -297,19 +297,26 @@ def test_airflow_job_sensor_stale_response_protection(monkeypatch: pytest.Monkey
         sdk.jobs.get.return_value = running_job
         assert sensor.poke({}) is False
 
-        # 2. Terminal completion poke -> returns truthy PokeReturnValue(is_done=True)
+        # 2. Terminal completion poke -> returns truthy PokeReturnValue(is_done=True) with summary
         completed_job = JobStatus(batchId="B", state="COMPLETED")
         sdk.jobs.get.return_value = completed_job
-        terminal_poke = sensor.poke({})
-        assert bool(terminal_poke) is True
-        assert getattr(terminal_poke, "is_done", terminal_poke) is True
+        done_poke = sensor.poke({})
+        assert isinstance(done_poke, sensors.PokeReturnValue)
+        assert bool(done_poke) is True
+        assert getattr(done_poke, "is_done", done_poke) is True
+        assert done_poke.xcom_value is not None
+        assert done_poke.xcom_value["batch_id"] == "B"
+        assert done_poke.xcom_value["state"] == "COMPLETED"
+        assert "results" not in done_poke.xcom_value
 
-        # 3. Subsequent stale non-terminal poke -> succeeds deterministically
+        # 3. Subsequent stale non-terminal poke -> succeeds deterministically with cached summary
         stale_job = JobStatus(batchId="B", state="RUNNING")
         sdk.jobs.get.return_value = stale_job
         stale_poke = sensor.poke({})
+        assert isinstance(stale_poke, sensors.PokeReturnValue)
         assert bool(stale_poke) is True
         assert getattr(stale_poke, "is_done", stale_poke) is True
+        assert stale_poke.xcom_value == done_poke.xcom_value
     finally:
         for mod in list(sys.modules):
             if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):

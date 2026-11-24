@@ -616,7 +616,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                         dry_run=args.dry_run,
                         collect_errors=True,
                     )
-                    total_count = getattr(raw_summary, "total_records", 0)
+                    total_count = getattr(raw_summary, "total_records", None) or 0
         except (ValidationError, ValueError) as exc:
             exit_cli_validation_error(exc)
         except (JobFailedError, JobTimeoutError, ApiError) as exc:

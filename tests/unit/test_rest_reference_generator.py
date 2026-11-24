@@ -198,6 +198,40 @@ def test_generated_files_formatting(tmp_path: Path) -> None:
         assert not content.endswith("\n\n")
 
 
+def test_purified_rest_tables_have_zero_unbacked_routes_or_fields() -> None:
+    """Verify committed REST reference tables match upstream Studies, Jobs, Records, and Intervals."""
+    studies_rst = (REST_TABLES_DIR / "studies.rst").read_text(encoding="utf-8")
+    assert "GET /api/v1/edc/studies" in studies_rst
+    assert "Retrieve a study" not in studies_rst
+    assert "/api/v1/edc/studies/{studyKey}" not in studies_rst
+    assert '"lastUpdated"' in studies_rst
+    assert "``studyKey,asc``" in studies_rst
+
+    jobs_rst = (REST_TABLES_DIR / "jobs.rst").read_text(encoding="utf-8")
+    assert '"progress"' not in jobs_rst
+    assert '"resultUrl"' not in jobs_rst
+    assert '"dateStarted"' in jobs_rst
+
+    intervals_rst = (REST_TABLES_DIR / "intervals.rst").read_text(encoding="utf-8")
+    assert "``filter``" not in intervals_rst
+    assert "``intervalId,asc``" in intervals_rst
+
+    users_rst = (REST_TABLES_DIR / "users.rst").read_text(encoding="utf-8")
+    assert "``filter``" not in users_rst
+    assert "``login,asc``" in users_rst
+
+    records_rst = (REST_TABLES_DIR / "records.rst").read_text(encoding="utf-8")
+    assert "   * - ``formKey``\n     - String\n     - Conditional" in records_rst
+    assert "   * - ``subjectKey``\n     - String\n     - Conditional" in records_rst
+    assert "   * - ``siteName``\n     - String\n     - Conditional" in records_rst
+    assert "   * - ``intervalName``\n     - String\n     - Conditional" in records_rst
+    assert "   * - ``data``\n     - Object\n     - Required" in records_rst
+
+    ref_rst = REST_API_REFERENCE.read_text(encoding="utf-8")
+    assert "``202``" in ref_rst
+    assert "``GET /api/v1/edc/studies/{studyKey}``" not in ref_rst
+
+
 def test_rest_api_reference_filter_examples_pass_sdk_validators() -> None:
     """Verify every filter and recordDataFilter example in rest_api_reference.rst passes SDK syntax validation."""
     content = REST_API_REFERENCE.read_text(encoding="utf-8")

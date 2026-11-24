@@ -18,7 +18,7 @@ from imednet.spi.cli import (
     supports_interactive_stdin,
 )
 
-from .state_ledger import DEFAULT_LEDGER_PATH, get_state_provider
+from .state_ledger import DEFAULT_LEDGER_PATH, BaseStateProvider, LedgerState, get_state_provider
 
 
 def ensure_interactive_stdin(*, force_non_interactive: bool = False) -> None:
@@ -407,20 +407,27 @@ def prompt_non_negative_int(prompt_text: str, default: int = 0) -> int:
 
 
 def display_ledger_streams(
-    ledger_path: str = DEFAULT_LEDGER_PATH, study_key: str | None = None
-) -> None:
+    ledger_path: str = DEFAULT_LEDGER_PATH,
+    study_key: str | None = None,
+    *,
+    state_provider: BaseStateProvider | None = None,
+) -> LedgerState | None:
     """Display active ledger streams to stderr for interactive inspection.
 
     Args:
         ledger_path: Path to the pipeline ledger JSON file.
         study_key: Optional study key to filter displayed streams.
+        state_provider: Optional pre-initialized state provider to reuse.
+
+    Returns:
+        The loaded :class:`LedgerState` when readable, or ``None`` on error.
     """
-    ledger = get_state_provider(ledger_path)
+    ledger = state_provider if state_provider is not None else get_state_provider(ledger_path)
     try:
         state = ledger.read_state()
     except Exception as err:
         print_progress(f"Notice: Could not read existing ledger at {ledger_path}: {err}")
-        return
+        return None
 
     print_progress(f"\n--- Current Ledger Streams ({ledger_path}) ---")
     header = "Study Key | Stream Name | Last Timestamp (UTC) | Records Processed | Status | Error Message"
@@ -443,3 +450,4 @@ def display_ledger_streams(
     if not found:
         print_progress("No active stream records found in ledger.")
     print_progress("")
+    return state

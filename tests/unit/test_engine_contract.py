@@ -259,18 +259,27 @@ def test_zero_any_fields_across_collection_models_and_job():
 
 def test_all_nullable_integer_and_boolean_contract_attributes_default_to_none():
     """Verify all nullable integer and boolean contract attributes default to None when omitted."""
+    from imednet.models.base import ImednetBaseModel
+
     contract = get_contract()
     int_bool_count = 0
+    explicit_zero_fields = {("Keyword", "keyword_id"), ("SubjectKeyword", "keyword_id")}
     for model_name, model_def in contract.models.items():
         dyn_cls = ModelEngine.get_model(model_name)
         instance = dyn_cls.from_json({})
+        raw_cls = ModelEngine.get_model(model_name, ImednetBaseModel)
+        raw_instance = raw_cls.from_json({})
         for fname, fdef in model_def.fields.items():
             if fdef.type_name in {"integer", "boolean"}:
                 int_bool_count += 1
                 assert fdef.default_value is None, f"{model_name}.{fname} default is not None"
-                assert getattr(instance, fname) is None, (
-                    f"{model_name}.{fname} resolved to {getattr(instance, fname)!r} instead of None"
+                assert getattr(raw_instance, fname) is None, (
+                    f"raw {model_name}.{fname} resolved to {getattr(raw_instance, fname)!r}"
                 )
+                if (model_name, fname) not in explicit_zero_fields:
+                    assert getattr(instance, fname) is None, (
+                        f"{model_name}.{fname} resolved to {getattr(instance, fname)!r} instead of None"
+                    )
     assert int_bool_count >= 46
 
 
@@ -1006,9 +1015,9 @@ def test_all_39_aliased_models_emit_unified_constructors_and_field_aliases():
         and stmt.returns is not None
         and any(isinstance(d, ast.Name) and d.id == "property" for d in stmt.decorator_list)
     }
-    assert job_status_props["total_records"] == "int"
-    assert job_status_props["successful_records"] == "int"
-    assert job_status_props["failed_records"] == "int"
+    assert job_status_props["total_records"] == "int | None"
+    assert job_status_props["successful_records"] == "int | None"
+    assert job_status_props["failed_records"] == "int | None"
 
 
 def test_stub_formatting_helpers_cover_wrapping_and_defaults():
@@ -1079,6 +1088,40 @@ def test_stub_formatting_helpers_cover_wrapping_and_defaults():
         "    ", "plain_opt", "int | None", unaliased_finfo
     )
     assert unaliased_dyn == ["    plain_opt: int | None = None"]
+
+
+def test_contract_builder_extracts_study_from_list_and_all_nested_array_models():
+    """Verify ContractBuilder.ingest_postman populates Study from List studies and nested models."""
+    contract = get_contract()
+    assert "Study" in contract.models
+    assert "last_updated" in contract.models["Study"].fields
+    assert len(contract.models["Study"].fields) == 9
+
+    assert set(contract.models["FormSummary"].fields) == {"form_id", "form_key", "form_name"}
+    assert {
+        "sequence",
+        "annotation_status",
+        "user",
+        "comment",
+        "closed",
+        "date",
+    }.issubset(contract.models["QueryComment"].fields)
+    assert {"keyword_name", "keyword_key", "keyword_id", "date_added"}.issubset(
+        contract.models["Keyword"].fields
+    )
+    assert {"keyword_name", "keyword_key", "keyword_id", "date_added"}.issubset(
+        contract.models["SubjectKeyword"].fields
+    )
+    assert {
+        "role_id",
+        "name",
+        "community_id",
+        "inactive",
+        "date_created",
+        "date_modified",
+    }.issubset(contract.models["Role"].fields)
+    assert "progress" not in contract.models["JobStatus"].fields
+    assert "result_url" not in contract.models["JobStatus"].fields
 
 
 def test_mypy_strict_accepts_aliased_models_and_rejects_missing_required_fields(tmp_path):

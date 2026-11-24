@@ -12,30 +12,7 @@ class IntervalsOperationDef:
     _id_param = "intervalId"
     _lookup_key_hint = "intervalName"
     PAGE_SIZE = 500
-    FILTER_ATTRIBUTES = frozenset(
-        {
-            "intervalId",
-            "intervalName",
-            "intervalDescription",
-            "intervalSequence",
-            "intervalGroupId",
-            "intervalGroupName",
-            "timeline",
-            "definedUsingInterval",
-            "windowCalculationForm",
-            "windowCalculationDate",
-            "actualDateForm",
-            "actualDate",
-            "dueDateWillBeIn",
-            "negativeSlack",
-            "positiveSlack",
-            "eproGracePeriod",
-            "disabled",
-            "dateCreated",
-            "dateModified",
-            "lastUpdated",
-        }
-    )
+    FILTER_ATTRIBUTES: frozenset[str] = frozenset()
 
 
 class IntervalsEndpoint(IntervalsOperationDef, EdcSyncListGetEndpoint[Interval]):  # type: ignore[misc]

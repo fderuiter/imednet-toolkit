@@ -717,7 +717,7 @@ class BulkRecordSubmissionWorkflow:
         )
 
     def _poll_registration_batches(self, study_key: str, batch_ids: list[str]) -> JobPollSummary:
-        """Poll Phase 1 batches via facade poll_jobs (fetching resultUrl) with mock fallback."""
+        """Poll Phase 1 batches via facade poll_jobs with mock fallback."""
         poll_kwargs: dict[str, Any] = {
             "timeout": float(self.registration_timeout),
             "fail_fast": False,

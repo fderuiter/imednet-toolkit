@@ -490,9 +490,11 @@ def test_uat_workflow_run_simulation_enrolls_without_subject_key_and_resolves_ph
         sdk.close()
 
 
-def test_uat_workflow_fetches_result_url_and_flags_partial_failures() -> None:
-    """UATWorkflow resolves Subject keys from resultUrl and fails monitor on nonzero failed_records."""
+def test_uat_workflow_skips_result_url_and_flags_batch_failures() -> None:
+    """UATWorkflow resolves Subject keys via EDC records/subjects without polling resultUrl."""
     submitted_batches: list[list[dict[str, Any]]] = []
+    enrolled_subjects: list[dict[str, Any]] = []
+    stored_records: list[dict[str, Any]] = []
     result_url_calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -565,45 +567,55 @@ def test_uat_workflow_fetches_result_url_and_flags_partial_failures() -> None:
                 },
             )
         if request.method == "GET" and path.endswith("/subjects"):
-            return httpx.Response(200, json={"data": []})
+            return httpx.Response(200, json={"data": list(enrolled_subjects)})
+        if request.method == "GET" and path.endswith("/records"):
+            return httpx.Response(200, json={"data": list(stored_records)})
         if request.method == "POST" and path.endswith("/records"):
             body = json.loads(request.content.decode("utf-8"))
             submitted_batches.append(body)
             bid = f"B{len(submitted_batches)}"
+            if bid == "B1":
+                for idx, item in enumerate(body, start=101):
+                    subj_key = f"ASSIGNED-{idx}"
+                    enrolled_subjects.append(
+                        {
+                            "studyKey": "S",
+                            "subjectId": idx,
+                            "subjectKey": subj_key,
+                            "siteId": 1,
+                            "siteName": "Site1",
+                        }
+                    )
+                    stored_records.append(
+                        {
+                            "studyKey": "S",
+                            "recordId": idx,
+                            "formKey": item["formKey"],
+                            "subjectId": idx,
+                            "subjectKey": subj_key,
+                            "siteId": 1,
+                            "siteName": item.get("siteName", "Site1"),
+                            "recordData": dict(item.get("data", {})),
+                        }
+                    )
             return httpx.Response(
                 200, json={"jobId": f"J-{bid}", "batchId": bid, "state": "QUEUED"}
             )
         if request.method == "GET" and "/jobs/B" in path and not path.endswith("/results"):
             bid = path.rsplit("/", 1)[-1]
+            state = "COMPLETED" if bid == "B1" else "FAILED"
             return httpx.Response(
                 200,
                 json={
                     "jobId": f"J-{bid}",
                     "batchId": bid,
-                    "state": "COMPLETED",
-                    "progress": 100,
+                    "state": state,
                     "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/S/jobs/{bid}/results",
                 },
             )
         if request.method == "GET" and path.endswith("/results"):
             result_url_calls.append(str(request.url))
-            bid = path.split("/")[-2]
-            if bid == "B1":
-                return httpx.Response(
-                    200,
-                    json=[
-                        {"subjectKey": "ASSIGNED-101", "status": "SUCCESS"},
-                        {"subjectKey": "ASSIGNED-102", "status": "SUCCESS"},
-                    ],
-                )
-            # B2 has one failed record -> partial failure must mark UAT overall_success False
-            return httpx.Response(
-                200,
-                json=[
-                    {"subjectKey": "ASSIGNED-101", "status": "SUCCESS"},
-                    {"subjectKey": "ASSIGNED-102", "status": "FAILED", "error": "Invalid visit"},
-                ],
-            )
+            return httpx.Response(500, json={"error": "resultUrl should not be polled"})
         return httpx.Response(404)
 
     sdk = ImednetSDK(
@@ -619,13 +631,13 @@ def test_uat_workflow_fetches_result_url_and_flags_partial_failures() -> None:
         assert len(submitted_batches) == 2
         # Phase 1 registration omitted subjectKey
         assert all("subjectKey" not in rec for rec in submitted_batches[0])
-        # Phase 2 used server-assigned Subject keys from B1's resultUrl
+        # Phase 2 resolved server-assigned Subject keys via EDC endpoints without resultUrl
         assert [rec["subjectKey"] for rec in submitted_batches[1]] == [
             "ASSIGNED-101",
             "ASSIGNED-102",
         ]
-        assert len(result_url_calls) >= 2
-        # Because B2 had 1 failed record in its resultUrl payload, overall_success is False
+        assert result_url_calls == []
+        # Because B2 reached FAILED terminal state, overall_success is False
         assert res.overall_success is False
         assert res.poll_summary.all_successful is False
         assert "B2" in res.poll_summary.failures

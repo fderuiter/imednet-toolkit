@@ -109,7 +109,7 @@ def extract_single_submitted_job(
 def _job_is_settled_success(job: Job) -> bool:
     return (
         bool(getattr(job, "is_successful", False))
-        and getattr(job, "failed_records", 0) == 0
+        and (getattr(job, "failed_records", None) or 0) == 0
         and not getattr(job, "result_error", None)
     )
 
@@ -117,7 +117,7 @@ def _job_is_settled_success(job: Job) -> bool:
 def _job_has_no_failure(job: Job) -> bool:
     return (
         not getattr(job, "is_failed", False)
-        and getattr(job, "failed_records", 0) == 0
+        and (getattr(job, "failed_records", None) or 0) == 0
         and not getattr(job, "result_error", None)
     )
 
@@ -451,7 +451,7 @@ def _raise_from_poll_summary(
         for batch_id, status in sanitized_poll.results.items():
             if (
                 getattr(status, "is_failed", False)
-                or getattr(status, "failed_records", 0) > 0
+                or (getattr(status, "failed_records", None) or 0) > 0
                 or bool(getattr(status, "result_error", None))
             ):
                 target_exc = JobFailedError(
