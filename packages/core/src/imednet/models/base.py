@@ -47,40 +47,64 @@ def _optional_str(v: Any) -> Any:
     return parse_str_or_default(v)
 
 
+def _required_int(v: Any) -> int:
+    """Convert value to int, converting OverflowError to ValueError for Pydantic validation."""
+    try:
+        return parse_int_or_default(v)
+    except OverflowError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _optional_int(v: Any) -> Any:
     """Convert value to int, returning None if missing."""
-    return None if is_missing_value(v) else parse_int_or_default(v)
+    if v is None or (not is_strict_mode() and is_missing_value(v)):
+        return None
+    try:
+        return parse_int_or_default(v)
+    except OverflowError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _optional_bool(v: Any) -> Any:
     """Convert value to bool, returning None if missing."""
-    return None if is_missing_value(v) else parse_bool(v)
+    if v is None or (not is_strict_mode() and is_missing_value(v)):
+        return None
+    return parse_bool(v)
 
 
 def _optional_datetime(v: Any) -> Any:
     """Convert value to datetime, returning None if missing."""
-    return None if is_missing_value(v) else parse_datetime(v)
+    if v is None or (not is_strict_mode() and is_missing_value(v)):
+        return None
+    return parse_datetime(v)
 
 
 def _optional_list(v: Any) -> Any:
     """Convert value to list, returning None if missing."""
-    return None if is_missing_value(v) else parse_list_or_default(v)
+    if v is None or (not is_strict_mode() and is_missing_value(v)):
+        return None
+    return parse_list_or_default(v)
 
 
 def _optional_dict(v: Any) -> Any:
     """Convert value to dict, returning None if missing."""
-    return None if is_missing_value(v) else parse_dict_or_default(v)
+    if v is None or (not is_strict_mode() and is_missing_value(v)):
+        return None
+    return parse_dict_or_default(v)
 
 
 def _extract_single_item(v: Any) -> Any:
     """Extract the first item if a list is provided where an object was expected."""
-    if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-        import logging
+    if isinstance(v, list):
+        if is_strict_mode():
+            raise ValueError("Expected object, got list")
+        if len(v) > 0 and isinstance(v[0], dict):
+            import logging
 
-        logging.getLogger(__name__).warning(
-            "Structural shift detected: API returned a list where an object was expected. Coercing by extracting the first item."
-        )
-        return v[0]
+            logging.getLogger(__name__).warning(
+                "Structural shift detected: API returned a list where an object was expected. Coercing by extracting the first item."
+            )
+            return v[0]
     return v
 
 
@@ -114,7 +138,7 @@ def _get_normalizer(cls: type[BaseModel], field_name: str) -> Callable[[Any], An
     elif annotation is str:
         normalizer = _optional_str if optional else parse_str_or_default
     elif annotation is int:
-        normalizer = _optional_int if optional else parse_int_or_default
+        normalizer = _optional_int if optional else _required_int
     elif annotation is bool:
         normalizer = _optional_bool if optional else parse_bool
     elif annotation is datetime:
@@ -174,7 +198,7 @@ class ImednetBaseModel(BaseModel):
     @classmethod
     def from_json(cls, data: Any) -> Self:
         """Validate data coming from JSON APIs."""
-        if isinstance(data, list):
+        if isinstance(data, list) and not is_strict_mode():
             if len(data) > 0 and isinstance(data[0], dict):
                 import logging
 
