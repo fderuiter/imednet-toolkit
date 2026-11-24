@@ -13,6 +13,7 @@ from typing import Any
 
 from .models import BusinessLogicRule, Choice, DataDictionary, Form, Variable
 from .normalize import (
+    normalize_form_id,
     normalize_measurement_units,
     normalize_variable_bounds,
     normalize_variable_type,
@@ -20,6 +21,23 @@ from .normalize import (
 
 ODM_NS = "http://www.cdisc.org/ns/odm/v1.3"
 IMEDNET_NS = "http://www.imednet.com/ns/odm/metadata"
+
+_ROUNDTRIP_VENDOR_VARIABLE_TYPES: frozenset[str] = frozenset(
+    {"Calculation", "Slider", "File", "Descriptive"}
+)
+_PRESERVED_ODM_DATA_TYPES: frozenset[str] = frozenset(
+    {
+        "partialDate",
+        "incompleteDate",
+        "partialDatetime",
+        "incompleteDatetime",
+        "partialTime",
+        "incompleteTime",
+        "durationDatetime",
+        "intervalDatetime",
+        "URI",
+    }
+)
 
 
 def _sort_key_int_then_str(num: int | None, text: str | None) -> tuple[int, int, str]:
@@ -128,11 +146,21 @@ def _map_to_odm_datatype(
     *,
     precision: str | None = None,
     has_choices: bool = False,
+    extra_attributes: dict[str, Any] | None = None,
 ) -> tuple[str, str | None]:
     """Map canonical iMednet variableType to CDISC ODM DataType and ControlType."""
+    if isinstance(extra_attributes, dict):
+        odm_dt = extra_attributes.get("odmDataType")
+        if isinstance(odm_dt, str) and odm_dt.strip() in _PRESERVED_ODM_DATA_TYPES:
+            return odm_dt.strip(), None
+    if isinstance(var_type, str) and var_type.strip() in _PRESERVED_ODM_DATA_TYPES:
+        return var_type.strip(), None
+
     vt_norm = normalize_variable_type(var_type, precision=precision)
     if not vt_norm:
         return "text", ("RadioButton" if has_choices else None)
+    if vt_norm in _ROUNDTRIP_VENDOR_VARIABLE_TYPES:
+        return "text", None
     if vt_norm == "Integer":
         return "integer", None
     if vt_norm == "Float":
@@ -208,6 +236,7 @@ def _codelist_signature(var: Variable) -> tuple[str, tuple[Any, ...]] | None:
         var.variableType,
         precision=var.precision,
         has_choices=True,
+        extra_attributes=var.extraAttributes,
     )
     cl_dtype = datatype if datatype in ("integer", "float", "text") else "text"
     return (cl_dtype, _choices_signature(var.choices))
@@ -216,7 +245,17 @@ def _codelist_signature(var: Variable) -> tuple[str, tuple[Any, ...]] | None:
 def _item_def_signature(var: Variable) -> Any:
     """Compute an equivalence signature for an ODM ItemDef + CodeList definition."""
     choices_sig = _choices_signature(var.choices)
-    excluded_keys = {"Domain", "SASDatasetName", "methodOid", "collectionExceptionConditionOid"}
+    excluded_keys = {
+        "Domain",
+        "SASDatasetName",
+        "Purpose",
+        "methodOid",
+        "collectionExceptionConditionOid",
+        "Role",
+        "role",
+        "RoleCodeListOID",
+        "roleCodeListOid",
+    }
     merged_extra = {k: v for k, v in (var.model_extra or {}).items() if k not in excluded_keys}
     for k, v in var.extraAttributes.items():
         if k not in excluded_keys:
@@ -231,6 +270,7 @@ def _item_def_signature(var: Variable) -> Any:
             var.variableType,
             precision=var.precision,
             has_choices=bool(var.choices),
+            extra_attributes=var.extraAttributes,
         ),
         var.format,
         var.precision,
@@ -538,63 +578,147 @@ def _emit_protocol_and_visits(mdv_elem: ET.Element, extra_meta: dict[str, Any]) 
                     ET.SubElement(se_elem, f"{{{ODM_NS}}}FormRef", fr_attribs)
 
 
-def _emit_formal_rules(mdv_elem: ET.Element, rules: list[BusinessLogicRule]) -> None:
-    """Emit ODM ConditionDef and MethodDef elements for rules carrying ODM formal logic."""
+def _emit_native_odm_rules(
+    mdv_elem: ET.Element,
+    scoped_rules: list[tuple[str | None, BusinessLogicRule]],
+    target_tag: str,
+    seen_oids: set[tuple[str, str]],
+    used_cond_oids: set[str],
+) -> None:
+    """Emit native ODM ConditionDef or MethodDef elements for ``target_tag``."""
+    for _, rule in scoped_rules:
+        logic = rule.logic if isinstance(rule.logic, dict) else {}
+        odm_elem_type = logic.get("odmElement") or rule.extraAttributes.get("odmElement")
+        if odm_elem_type != target_tag or rule.id is None:
+            continue
+        r_oid = str(rule.id).strip()
+        if not r_oid or (target_tag, r_oid) in seen_oids:
+            continue
+        seen_oids.add((target_tag, r_oid))
+        if target_tag == "ConditionDef":
+            used_cond_oids.add(r_oid)
+
+        attribs: dict[str, str] = {
+            "OID": r_oid,
+            "Name": str(rule.name or r_oid),
+        }
+        if target_tag == "MethodDef":
+            m_type = (
+                logic.get("methodType") or rule.extraAttributes.get("methodType") or "Computation"
+            )
+            attribs["Type"] = str(m_type)
+
+        rule_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}{target_tag}", attribs)
+        desc = logic.get("description") or rule.extraAttributes.get("description")
+        if desc:
+            d_elem = ET.SubElement(rule_elem, f"{{{ODM_NS}}}Description")
+            tt_elem = ET.SubElement(d_elem, f"{{{ODM_NS}}}TranslatedText", {"xml:lang": "en"})
+            tt_elem.text = str(desc)
+
+        exprs = logic.get("formalExpressions")
+        if isinstance(exprs, list):
+            for expr in exprs:
+                if not isinstance(expr, dict):
+                    continue
+                fe_attribs: dict[str, str] = {}
+                if ctx := expr.get("context"):
+                    fe_attribs["Context"] = str(ctx)
+                fe_elem = ET.SubElement(rule_elem, f"{{{ODM_NS}}}FormalExpression", fe_attribs)
+                if body := expr.get("expression"):
+                    fe_elem.text = str(body)
+
+        aliases = rule.extraAttributes.get("aliases")
+        if isinstance(aliases, list):
+            for alias in aliases:
+                if not isinstance(alias, dict):
+                    continue
+                alias_attribs: dict[str, str] = {}
+                if a_ctx := alias.get("context"):
+                    alias_attribs["Context"] = str(a_ctx)
+                if a_name := alias.get("name"):
+                    alias_attribs["Name"] = str(a_name)
+                if alias_attribs:
+                    ET.SubElement(rule_elem, f"{{{ODM_NS}}}Alias", alias_attribs)
+
+
+def _emit_formal_rules(
+    mdv_elem: ET.Element,
+    scoped_rules: list[tuple[str | None, BusinessLogicRule]],
+) -> None:
+    """Emit ODM ConditionDef (all sources) followed by MethodDef elements."""
     seen_oids: set[tuple[str, str]] = set()
-    for target_tag in ("ConditionDef", "MethodDef"):
-        for rule in rules:
-            logic = rule.logic if isinstance(rule.logic, dict) else {}
-            odm_elem_type = logic.get("odmElement") or rule.extraAttributes.get("odmElement")
-            if odm_elem_type != target_tag or rule.id is None:
-                continue
-            r_oid = str(rule.id).strip()
-            if not r_oid or (target_tag, r_oid) in seen_oids:
-                continue
-            seen_oids.add((target_tag, r_oid))
+    used_cond_oids: set[str] = set()
 
-            attribs: dict[str, str] = {
-                "OID": r_oid,
-                "Name": str(rule.name or r_oid),
-            }
-            if target_tag == "MethodDef":
-                m_type = (
-                    logic.get("methodType")
-                    or rule.extraAttributes.get("methodType")
-                    or "Computation"
-                )
-                attribs["Type"] = str(m_type)
+    # Pass 1: Standard ODM ConditionDef rules
+    _emit_native_odm_rules(mdv_elem, scoped_rules, "ConditionDef", seen_oids, used_cond_oids)
 
-            rule_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}{target_tag}", attribs)
-            desc = logic.get("description") or rule.extraAttributes.get("description")
-            if desc:
-                d_elem = ET.SubElement(rule_elem, f"{{{ODM_NS}}}Description")
-                tt_elem = ET.SubElement(d_elem, f"{{{ODM_NS}}}TranslatedText", {"xml:lang": "en"})
-                tt_elem.text = str(desc)
+    # Pass 2: iMednet / CSV business logic rules (Form, Workflow, Query, Approval, Required, etc.)
+    auto_idx = 1
+    for container_form, rule in scoped_rules:
+        logic = rule.logic if isinstance(rule.logic, dict) else {}
+        odm_elem_type = logic.get("odmElement") or rule.extraAttributes.get("odmElement")
+        if odm_elem_type in ("ConditionDef", "MethodDef"):
+            continue
 
-            exprs = logic.get("formalExpressions")
-            if isinstance(exprs, list):
-                for expr in exprs:
-                    if not isinstance(expr, dict):
-                        continue
-                    fe_attribs: dict[str, str] = {}
-                    if ctx := expr.get("context"):
-                        fe_attribs["Context"] = str(ctx)
-                    fe_elem = ET.SubElement(rule_elem, f"{{{ODM_NS}}}FormalExpression", fe_attribs)
-                    if body := expr.get("expression"):
-                        fe_elem.text = str(body)
+        candidate_oid = str(rule.id).strip() if rule.id is not None else ""
+        if not candidate_oid or candidate_oid in used_cond_oids:
+            while f"COND.IMEDNET.{auto_idx}" in used_cond_oids:
+                auto_idx += 1
+            cond_oid = f"COND.IMEDNET.{auto_idx}"
+            auto_idx += 1
+        else:
+            cond_oid = candidate_oid
+        used_cond_oids.add(cond_oid)
 
-            aliases = rule.extraAttributes.get("aliases")
-            if isinstance(aliases, list):
-                for alias in aliases:
-                    if not isinstance(alias, dict):
-                        continue
-                    alias_attribs: dict[str, str] = {}
-                    if a_ctx := alias.get("context"):
-                        alias_attribs["Context"] = str(a_ctx)
-                    if a_name := alias.get("name"):
-                        alias_attribs["Name"] = str(a_name)
-                    if alias_attribs:
-                        ET.SubElement(rule_elem, f"{{{ODM_NS}}}Alias", alias_attribs)
+        cond_attribs: dict[str, str] = {
+            "OID": cond_oid,
+            "Name": str(rule.name or cond_oid),
+            f"{{{IMEDNET_NS}}}RuleSource": "imednet",
+        }
+        if rule.id is not None:
+            cond_attribs[f"{{{IMEDNET_NS}}}RuleId"] = str(rule.id)
+            cond_attribs[f"{{{IMEDNET_NS}}}RuleIdType"] = (
+                "int" if isinstance(rule.id, int) and not isinstance(rule.id, bool) else "str"
+            )
+        if rule.name is not None:
+            cond_attribs[f"{{{IMEDNET_NS}}}RuleName"] = rule.name
+        if rule.type is not None:
+            cond_attribs[f"{{{IMEDNET_NS}}}RuleType"] = rule.type
+        if rule.status is not None:
+            cond_attribs[f"{{{IMEDNET_NS}}}Status"] = rule.status
+        if rule.form is not None:
+            cond_attribs[f"{{{IMEDNET_NS}}}FormKey"] = rule.form
+        if container_form is not None:
+            cond_attribs[f"{{{IMEDNET_NS}}}ContainerForm"] = container_form
+        if rule.sequence is not None:
+            cond_attribs[f"{{{IMEDNET_NS}}}Sequence"] = str(rule.sequence)
+        if rule.extraAttributes:
+            cond_attribs[f"{{{IMEDNET_NS}}}ExtraAttributes"] = json.dumps(
+                rule.extraAttributes, sort_keys=True
+            )
+
+        cond_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}ConditionDef", cond_attribs)
+        d_elem = ET.SubElement(cond_elem, f"{{{ODM_NS}}}Description")
+        tt_elem = ET.SubElement(d_elem, f"{{{ODM_NS}}}TranslatedText", {"xml:lang": "en"})
+        tt_elem.text = str(rule.name or rule.type or cond_oid)
+
+        if rule.logicRawXml is not None:
+            fe_xml = ET.SubElement(
+                cond_elem,
+                f"{{{ODM_NS}}}FormalExpression",
+                {"Context": "imednet:logicRawXml"},
+            )
+            fe_xml.text = rule.logicRawXml
+        if rule.logic is not None:
+            fe_json = ET.SubElement(
+                cond_elem,
+                f"{{{ODM_NS}}}FormalExpression",
+                {"Context": "imednet:logicJson"},
+            )
+            fe_json.text = json.dumps(rule.logic, sort_keys=True)
+
+    # Pass 3: Standard ODM MethodDef rules (always after all ConditionDef elements)
+    _emit_native_odm_rules(mdv_elem, scoped_rules, "MethodDef", seen_oids, used_cond_oids)
 
 
 def to_odm_xml(
@@ -709,16 +833,29 @@ def to_odm_xml(
         }
         if form.formType:
             form_attribs["FormType"] = form.formType
+        norm_fid = normalize_form_id(form.formId, form_key=form.formKey)
+        if norm_fid is not None:
+            form_attribs[f"{{{IMEDNET_NS}}}FormId"] = str(norm_fid)
 
         form_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}FormDef", form_attribs)
         ig_oid = f"IG_{form.formKey}"
+        ig_ref_attribs: dict[str, str] = {
+            "ItemGroupOID": ig_oid,
+            "OrderNumber": "1",
+            "Mandatory": "No",
+        }
+        if (ig_cond := form.extraAttributes.get("collectionExceptionConditionOid")) and str(
+            ig_cond
+        ).strip():
+            ig_ref_attribs["CollectionExceptionConditionOID"] = str(ig_cond).strip()
         ET.SubElement(
             form_elem,
             f"{{{ODM_NS}}}ItemGroupRef",
-            {"ItemGroupOID": ig_oid, "OrderNumber": "1", "Mandatory": "No"},
+            ig_ref_attribs,
         )
 
     # 3. ItemGroupDef elements
+    referenced_role_codelists: dict[str, list[str]] = {}
     for f_idx, form in enumerate(sorted_forms):
         ig_attribs: dict[str, str] = {
             "OID": f"IG_{form.formKey}",
@@ -727,18 +864,23 @@ def to_odm_xml(
         }
         domain = _extract_sdtm_attr(form, "Domain")
         sas_dataset = _extract_sdtm_attr(form, "SASDatasetName")
-        if not domain or not sas_dataset:
+        purpose = _extract_sdtm_attr(form, "Purpose")
+        if not domain or not sas_dataset or not purpose:
             for child_var in form.variables:
                 if not domain:
                     domain = _extract_sdtm_attr(child_var, "Domain")
                 if not sas_dataset:
                     sas_dataset = _extract_sdtm_attr(child_var, "SASDatasetName")
-                if domain and sas_dataset:
+                if not purpose:
+                    purpose = _extract_sdtm_attr(child_var, "Purpose")
+                if domain and sas_dataset and purpose:
                     break
         if domain:
             ig_attribs["Domain"] = domain
         if sas_dataset:
             ig_attribs["SASDatasetName"] = sas_dataset
+        if purpose:
+            ig_attribs["Purpose"] = purpose
 
         ig_elem = ET.SubElement(
             mdv_elem,
@@ -758,14 +900,28 @@ def to_odm_xml(
                 "OrderNumber": str(var.sequence if var.sequence is not None else var_idx),
                 "Mandatory": "Yes" if is_yes else "No",
             }
-            if req_str and not is_yes and not is_no:
-                item_ref_attribs[f"{{{IMEDNET_NS}}}RequiredPolicy"] = req_str
             if (method_oid := var.extraAttributes.get("methodOid")) and str(method_oid).strip():
                 item_ref_attribs["MethodOID"] = str(method_oid).strip()
+            role_val = var.extraAttributes.get("Role") or var.extraAttributes.get("role")
+            if role_val is not None and str(role_val).strip():
+                item_ref_attribs["Role"] = str(role_val).strip()
+            role_cl_oid = var.extraAttributes.get("RoleCodeListOID") or var.extraAttributes.get(
+                "roleCodeListOid"
+            )
+            if role_cl_oid is not None and str(role_cl_oid).strip():
+                clean_role_cl = str(role_cl_oid).strip()
+                item_ref_attribs["RoleCodeListOID"] = clean_role_cl
+                role_bucket = referenced_role_codelists.setdefault(clean_role_cl, [])
+                if role_val is not None and str(role_val).strip():
+                    clean_role = str(role_val).strip()
+                    if clean_role not in role_bucket:
+                        role_bucket.append(clean_role)
             if (cond_oid := var.extraAttributes.get("collectionExceptionConditionOid")) and str(
                 cond_oid
             ).strip():
                 item_ref_attribs["CollectionExceptionConditionOID"] = str(cond_oid).strip()
+            if req_str and not is_yes and not is_no:
+                item_ref_attribs[f"{{{IMEDNET_NS}}}RequiredPolicy"] = req_str
 
             ET.SubElement(ig_elem, f"{{{ODM_NS}}}ItemRef", item_ref_attribs)
 
@@ -782,6 +938,7 @@ def to_odm_xml(
                     var.variableType,
                     precision=var.precision,
                     has_choices=bool(var.choices),
+                    extra_attributes=var.extraAttributes,
                 )
                 item_def_elements.append(
                     (var, form.formKey, item_oid, datatype, cl_oid_by_occ.get((f_idx, v_idx)))
@@ -792,37 +949,53 @@ def to_odm_xml(
             var.variableType,
             precision=var.precision,
             has_choices=bool(var.choices),
+            extra_attributes=var.extraAttributes,
         )
+        vt_norm = normalize_variable_type(var.variableType, precision=var.precision)
 
         item_attribs: dict[str, str] = {
             "OID": item_oid,
             "Name": var.variableName,
             "DataType": datatype,
         }
+        vendor_item_attribs: dict[str, str] = {}
+        if vt_norm in _ROUNDTRIP_VENDOR_VARIABLE_TYPES or (
+            vt_norm
+            and datatype in _PRESERVED_ODM_DATA_TYPES
+            and vt_norm != normalize_variable_type(datatype)
+        ):
+            vendor_item_attribs[f"{{{IMEDNET_NS}}}VariableType"] = vt_norm
         ref_forms = referencing_forms_by_oid.get(item_oid, [form_key])
         if any(
             _default_unwrapped_name(item_oid, fk) != var.variableName
             or (fk and var.variableName.startswith((f"{fk}.", f"IT.{fk}.", f"IG_{fk}.")))
             for fk in ref_forms
         ):
-            item_attribs[f"{{{IMEDNET_NS}}}VariableName"] = var.variableName
+            vendor_item_attribs[f"{{{IMEDNET_NS}}}VariableName"] = var.variableName
         if var.format is not None and str(var.format).strip():
             fmt_str = str(var.format).strip()
             if fmt_str.isascii() and fmt_str.isdigit() and int(fmt_str) > 0:
                 item_attribs["Length"] = fmt_str
             else:
-                item_attribs[f"{{{IMEDNET_NS}}}Format"] = fmt_str
+                vendor_item_attribs[f"{{{IMEDNET_NS}}}Format"] = fmt_str
         if var.precision is not None and str(var.precision).strip():
             prec_str = str(var.precision).strip()
             if prec_str.isascii() and prec_str.isdigit():
                 item_attribs["SignificantDigits"] = prec_str
             else:
-                item_attribs[f"{{{IMEDNET_NS}}}Precision"] = prec_str
+                vendor_item_attribs[f"{{{IMEDNET_NS}}}Precision"] = prec_str
         if control_type:
             item_attribs["ControlType"] = control_type
+
+        origin_desc = _extract_sdtm_attr(var, "originDescription")
+        origin_source = _extract_sdtm_attr(var, "originSource")
+        has_origin_child = bool(origin_desc or origin_source)
         for sdtm_key in ("SDSVarName", "SASFieldName", "Origin", "Comment"):
+            if sdtm_key == "Origin" and has_origin_child:
+                continue
             if sdtm_val := _extract_sdtm_attr(var, sdtm_key):
                 item_attribs[sdtm_key] = sdtm_val
+        item_attribs.update(vendor_item_attribs)
 
         item_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}ItemDef", item_attribs)
         if var.label:
@@ -871,8 +1044,22 @@ def to_odm_xml(
         if item_cl_oid:
             ET.SubElement(item_elem, f"{{{ODM_NS}}}CodeListRef", {"CodeListOID": item_cl_oid})
 
+        if has_origin_child:
+            origin_attribs: dict[str, str] = {}
+            if origin_type := _extract_sdtm_attr(var, "Origin"):
+                origin_attribs["Type"] = origin_type
+            if origin_source:
+                origin_attribs["Source"] = origin_source
+            origin_elem = ET.SubElement(item_elem, f"{{{ODM_NS}}}Origin", origin_attribs)
+            if origin_desc:
+                od_elem = ET.SubElement(origin_elem, f"{{{ODM_NS}}}Description")
+                tt_od = ET.SubElement(od_elem, f"{{{ODM_NS}}}TranslatedText", {"xml:lang": "en"})
+                tt_od.text = origin_desc
+
     # 5. CodeList elements
+    emitted_cl_oids: set[str] = set()
     for cl_oid, cl_name, cl_dtype, choices in codelist_elements:
+        emitted_cl_oids.add(cl_oid)
         cl_elem = ET.SubElement(
             mdv_elem,
             f"{{{ODM_NS}}}CodeList",
@@ -901,13 +1088,88 @@ def to_odm_xml(
                 )
                 tt_child.text = choice.choiceText
 
-    # 6. ConditionDef and MethodDef elements (when formal ODM rules are present)
-    all_rules: list[BusinessLogicRule] = []
+    role_cls = datadict.metadata.extraAttributes.get("roleCodeLists")
+    if isinstance(role_cls, list):
+        for rcl in role_cls:
+            if not isinstance(rcl, dict):
+                continue
+            rcl_oid = str(rcl.get("oid") or "").strip()
+            if not rcl_oid or rcl_oid in emitted_cl_oids:
+                continue
+            emitted_cl_oids.add(rcl_oid)
+            rcl_elem = ET.SubElement(
+                mdv_elem,
+                f"{{{ODM_NS}}}CodeList",
+                {
+                    "OID": rcl_oid,
+                    "Name": str(rcl.get("name") or rcl_oid),
+                    "DataType": str(rcl.get("dataType") or "text"),
+                },
+            )
+            rcl_items = rcl.get("items")
+            if isinstance(rcl_items, list):
+                for r_idx, r_item in enumerate(rcl_items, 1):
+                    if not isinstance(r_item, dict):
+                        continue
+                    cval = str(r_item.get("choiceValue") or "")
+                    ctext = str(r_item.get("choiceText") or cval)
+                    pos_str = str(r_item.get("position") or r_idx)
+                    if ctext == cval:
+                        ET.SubElement(
+                            rcl_elem,
+                            f"{{{ODM_NS}}}EnumeratedItem",
+                            {"CodedValue": cval, "OrderNumber": pos_str},
+                        )
+                    else:
+                        item_child = ET.SubElement(
+                            rcl_elem,
+                            f"{{{ODM_NS}}}CodeListItem",
+                            {"CodedValue": cval, "OrderNumber": pos_str},
+                        )
+                        decode_elem = ET.SubElement(item_child, f"{{{ODM_NS}}}Decode")
+                        tt_child = ET.SubElement(
+                            decode_elem, f"{{{ODM_NS}}}TranslatedText", {"xml:lang": "en"}
+                        )
+                        tt_child.text = ctext
+
+    for rcl_oid, role_values in referenced_role_codelists.items():
+        if rcl_oid in emitted_cl_oids:
+            continue
+        emitted_cl_oids.add(rcl_oid)
+        rcl_elem = ET.SubElement(
+            mdv_elem,
+            f"{{{ODM_NS}}}CodeList",
+            {
+                "OID": rcl_oid,
+                "Name": rcl_oid,
+                "DataType": "text",
+                f"{{{IMEDNET_NS}}}SyntheticRoleCodeList": "Yes",
+            },
+        )
+        for r_idx, r_val in enumerate(role_values or ["Role"], 1):
+            ET.SubElement(
+                rcl_elem,
+                f"{{{ODM_NS}}}EnumeratedItem",
+                {"CodedValue": r_val, "OrderNumber": str(r_idx)},
+            )
+
+    # 6. ConditionDef and MethodDef elements (ODM formal rules and iMednet business logic rules)
+    scoped_rules: list[tuple[str | None, BusinessLogicRule]] = []
     for form in sorted_forms:
-        all_rules.extend(form.businessLogic)
-    all_rules.extend(datadict.unassignedBusinessLogic)
-    if all_rules:
-        _emit_formal_rules(mdv_elem, all_rules)
+        sorted_form_rules = sorted(
+            form.businessLogic,
+            key=lambda r: _sort_key_int_then_str(r.sequence, str(r.id) if r.id is not None else ""),
+        )
+        for rule in sorted_form_rules:
+            scoped_rules.append((form.formKey, rule))
+    sorted_unassigned_rules = sorted(
+        datadict.unassignedBusinessLogic,
+        key=lambda r: _sort_key_int_then_str(r.sequence, str(r.id) if r.id is not None else ""),
+    )
+    for rule in sorted_unassigned_rules:
+        scoped_rules.append((None, rule))
+    if scoped_rules:
+        _emit_formal_rules(mdv_elem, scoped_rules)
 
     ET.indent(root, space=indent)
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)

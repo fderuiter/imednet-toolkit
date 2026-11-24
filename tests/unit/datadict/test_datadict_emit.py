@@ -1185,3 +1185,328 @@ def test_to_odm_xml_shares_codelist_when_only_item_attributes_diverge() -> None:
     reloaded = load_from_cdisc_odm(xml_str, strict=True)
     assert reloaded.metadata.validationWarnings == []
     assert not diff(dd, reloaded).has_changes
+
+
+def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> None:
+    """to_odm_xml and load_from_cdisc_odm round-trip formIds, all types, 5 CSV rule types, and ODM 1.3 attributes."""
+    import io
+
+    from imednet.datadict import BusinessLogicRule, parse_logic_xml
+    from imednet.datadict.diff import diff
+    from imednet.datadict.schema import get_schema, validate
+
+    dd = DataDictionary(
+        metadata=Metadata(
+            studyKey="ODM_FIDELITY_01",
+            source="cdisc_odm",
+            extraAttributes={
+                "studyName": "ODM Fidelity Study",
+                "protocolName": "PROTO-ODM-01",
+                "roleCodeLists": [
+                    {
+                        "oid": "CL_ROLE_STD",
+                        "name": "Standard Roles",
+                        "dataType": "text",
+                        "items": [
+                            {
+                                "choiceValue": "IDENTIFIER",
+                                "choiceText": "Subject Identifier",
+                                "position": 1,
+                            },
+                            {
+                                "choiceValue": "TIMING",
+                                "choiceText": "Timing Variable",
+                                "position": 2,
+                            },
+                        ],
+                    }
+                ],
+            },
+        ),
+        forms=[
+            Form(
+                formKey="DM",
+                formName="Demographics",
+                formId=10101,
+                formType="Subject",
+                sequence=1,
+                extraAttributes={
+                    "Purpose": "Tabulation",
+                },
+                variables=[
+                    Variable(
+                        variableName="SUBJID",
+                        label="Subject ID",
+                        variableType="Text",
+                        sequence=1,
+                        required="Yes",
+                        extraAttributes={
+                            "Role": "IDENTIFIER",
+                            "RoleCodeListOID": "CL_ROLE_STD",
+                            "Origin": "CRF",
+                            "originSource": "Investigator",
+                            "originDescription": "Recorded on screening form",
+                        },
+                    ),
+                    Variable(
+                        variableName="BMI_CALC",
+                        label="Calculated BMI",
+                        variableType="Calculation",
+                        precision="2",
+                        sequence=2,
+                        required="No",
+                        extraAttributes={"Origin": "Derived"},
+                    ),
+                    Variable(
+                        variableName="PAIN_SLIDER",
+                        label="Pain VAS Slider",
+                        variableType="Slider",
+                        sequence=3,
+                        required="No",
+                    ),
+                    Variable(
+                        variableName="CONSENT_PDF",
+                        label="Signed Consent Upload",
+                        variableType="File",
+                        sequence=4,
+                        required="No",
+                    ),
+                    Variable(
+                        variableName="SECT_HDR",
+                        label="Section Instructions",
+                        variableType="Descriptive",
+                        sequence=5,
+                        required="No",
+                    ),
+                    Variable(
+                        variableName="ONSET_PARTIAL",
+                        label="Partial Onset Date",
+                        variableType="Date/Time Precision",
+                        sequence=6,
+                        required="No",
+                        extraAttributes={"odmDataType": "partialDate"},
+                    ),
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="R_FORM_1",
+                        name="Form Edit Check",
+                        type="Form",
+                        status="Active",
+                        form="DM",
+                        sequence=1,
+                        description="Pain slider high check",
+                        targetVariables=["PAIN_SLIDER"],
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition><variable>PAIN_SLIDER</variable>"
+                            "<operator>&gt;</operator><value>8</value></condition></conditions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        id="R_WF_1",
+                        name="Workflow Trigger",
+                        type="Workflow",
+                        status="Active",
+                        form="DM",
+                        sequence=2,
+                        description="Route high BMI",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition><variable>BMI_CALC</variable>"
+                            "<operator>&gt;=</operator><value>35</value></condition></conditions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        id="R_QRY_1",
+                        name="Auto Query Rule",
+                        type="Query",
+                        status="Inactive",
+                        form="DM",
+                        sequence=3,
+                        description="Missing consent upload check",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition><variable>CONSENT_PDF</variable>"
+                            "<operator>==</operator><value/></condition></conditions></rule>"
+                        ),
+                    ),
+                    BusinessLogicRule(
+                        id="R_APPR_1",
+                        name="Medical Monitor Approval",
+                        type="Approval",
+                        status="Active",
+                        form="DM",
+                        sequence=4,
+                        description="Requires approval",
+                        extraAttributes={"rawLogic": "PAIN_SLIDER > 9"},
+                    ),
+                    BusinessLogicRule(
+                        id="R_REQ_1",
+                        name="Conditional Required Rule",
+                        type="Required",
+                        status="Active",
+                        form="DM",
+                        sequence=5,
+                        description="Require partial date when pain > 5",
+                        targetVariables=["ONSET_PARTIAL"],
+                    ),
+                ],
+            ),
+            Form(
+                formKey="AE",
+                formName="Adverse Events",
+                formId="FRM_AE_CUSTOM",
+                formType="Subject",
+                sequence=2,
+                extraAttributes={
+                    "collectionExceptionConditionOid": "COND.IG_AE_ACTIVE",
+                    "Purpose": "Analysis",
+                    "repeating": "Yes",
+                },
+                variables=[
+                    Variable(
+                        variableName="AESTDTC",
+                        label="AE Start Partial Date",
+                        variableType="Text",
+                        sequence=1,
+                        required="No",
+                        extraAttributes={"odmDataType": "partialDate"},
+                    )
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="COND.IG_AE_ACTIVE",
+                        name="AE Collection Condition",
+                        type="Form",
+                        status="Active",
+                        form="AE",
+                        sequence=1,
+                        description="Collect AE when enrolled",
+                        logic={
+                            "odmElement": "ConditionDef",
+                            "description": "Collect AE when enrolled",
+                            "formalExpressions": [
+                                {"context": "XPath", "expression": "../DM/ENROLLED = 'Y'"}
+                            ],
+                        },
+                        extraAttributes={
+                            "odmElement": "ConditionDef",
+                            "description": "Collect AE when enrolled",
+                        },
+                    )
+                ],
+            ),
+        ],
+        unassignedBusinessLogic=[
+            BusinessLogicRule(
+                id="R_CROSS_UNASSIGNED",
+                name="Cross-Form Timing Rule",
+                type="Query",
+                status="Active",
+                form=None,
+                sequence=7,
+                description="Cross form check",
+                logic=parse_logic_xml(
+                    "<rule><conditions><condition><variable>AE.AESTDTC</variable>"
+                    "<operator>&lt;</operator><compareVariable>DM.ONSET_PARTIAL</compareVariable>"
+                    "</condition></conditions></rule>"
+                ),
+            )
+        ],
+    )
+
+    xml_str = to_odm_xml(dd)
+    root = fromstring(xml_str)
+    ns = {
+        "odm": "http://www.cdisc.org/ns/odm/v1.3",
+        "imednet": "http://www.imednet.com/ns/odm/metadata",
+    }
+
+    # Verify standard ODM 1.3 child ordering in MetaDataVersion (ConditionDef before MethodDef)
+    mdv = root.find(".//odm:MetaDataVersion", ns)
+    assert mdv is not None
+    mdv_tags = [elem.tag.split("}", 1)[-1] for elem in list(mdv)]
+    if "ConditionDef" in mdv_tags and "MethodDef" in mdv_tags:
+        assert max(i for i, t in enumerate(mdv_tags) if t == "ConditionDef") < min(
+            i for i, t in enumerate(mdv_tags) if t == "MethodDef"
+        )
+
+    # Verify ItemGroupRef CollectionExceptionConditionOID, Purpose, partialDate, Origin, RoleCodeListOID
+    ae_ig_ref = root.find(".//odm:FormDef[@OID='AE']/odm:ItemGroupRef", ns)
+    assert ae_ig_ref is not None
+    assert ae_ig_ref.attrib.get("CollectionExceptionConditionOID") == "COND.IG_AE_ACTIVE"
+
+    dm_form_def = root.find(".//odm:FormDef[@OID='DM']", ns)
+    assert dm_form_def is not None
+    assert dm_form_def.attrib.get("{http://www.imednet.com/ns/odm/metadata}FormId") == "10101"
+
+    dm_ig = root.find(".//odm:ItemGroupDef[@OID='IG_DM']", ns)
+    assert dm_ig is not None
+    assert dm_ig.attrib.get("Purpose") == "Tabulation"
+
+    subjid_ref = root.find(".//odm:ItemGroupDef[@OID='IG_DM']/odm:ItemRef[@ItemOID='SUBJID']", ns)
+    assert subjid_ref is not None
+    assert subjid_ref.attrib.get("Role") == "IDENTIFIER"
+    assert subjid_ref.attrib.get("RoleCodeListOID") == "CL_ROLE_STD"
+
+    subjid_item = root.find(".//odm:ItemDef[@OID='SUBJID']", ns)
+    assert subjid_item is not None
+    origin_el = subjid_item.find("odm:Origin", ns)
+    assert origin_el is not None
+    assert origin_el.attrib.get("Type") == "CRF"
+    assert origin_el.attrib.get("Source") == "Investigator"
+
+    bmi_item = root.find(".//odm:ItemDef[@OID='BMI_CALC']", ns)
+    assert bmi_item is not None
+    assert bmi_item.attrib.get("Origin") == "Derived"
+
+    partial_item = root.find(".//odm:ItemDef[@OID='ONSET_PARTIAL']", ns)
+    assert partial_item is not None
+    assert partial_item.attrib.get("DataType") == "partialDate"
+
+    # Reload via io.StringIO and verify zero degradations, zero dropped rules, matching formIds
+    reloaded = load_from_cdisc_odm(io.StringIO(xml_str), strict=True)
+    assert reloaded.metadata.validationWarnings == []
+    assert validate(reloaded, schema=get_schema()) == []
+
+    reloaded_dm = reloaded.form_for_key("DM")
+    reloaded_ae = reloaded.form_for_key("AE")
+    assert reloaded_dm is not None and reloaded_dm.formId == 10101
+    assert reloaded_ae is not None and reloaded_ae.formId == "FRM_AE_CUSTOM"
+    assert reloaded_dm.extraAttributes.get("Purpose") == "Tabulation"
+    assert reloaded_ae.extraAttributes.get("collectionExceptionConditionOid") == "COND.IG_AE_ACTIVE"
+
+    dm_var_types = {v.variableName: v.variableType for v in reloaded_dm.variables}
+    assert dm_var_types == {
+        "SUBJID": "Text",
+        "BMI_CALC": "Calculation",
+        "PAIN_SLIDER": "Slider",
+        "CONSENT_PDF": "File",
+        "SECT_HDR": "Descriptive",
+        "ONSET_PARTIAL": "DateTime",
+    }
+    reloaded_subjid = next(v for v in reloaded_dm.variables if v.variableName == "SUBJID")
+    assert reloaded_subjid.extraAttributes.get("Role") == "IDENTIFIER"
+    assert reloaded_subjid.extraAttributes.get("RoleCodeListOID") == "CL_ROLE_STD"
+    assert reloaded_subjid.extraAttributes.get("Origin") == "CRF"
+    assert reloaded_subjid.extraAttributes.get("originSource") == "Investigator"
+    assert reloaded_subjid.extraAttributes.get("originDescription") == "Recorded on screening form"
+    reloaded_bmi = next(v for v in reloaded_dm.variables if v.variableName == "BMI_CALC")
+    assert reloaded_bmi.extraAttributes.get("Origin") == "Derived"
+
+    assert [r.type for r in reloaded_dm.businessLogic] == [
+        "Form",
+        "Workflow",
+        "Query",
+        "Approval",
+        "Required",
+    ]
+    assert [r.id for r in reloaded.unassignedBusinessLogic] == ["R_CROSS_UNASSIGNED"]
+
+    report_no_raw = diff(
+        dd,
+        load_from_cdisc_odm(io.StringIO(xml_str), strict=True, no_raw_xml=True),
+    )
+    assert not report_no_raw.has_changes, f"Unexpected diff changes: {report_no_raw}"
+
+    reloaded_twice = load_from_cdisc_odm(io.StringIO(to_odm_xml(reloaded)), strict=True)
+    report_idempotent = diff(reloaded, reloaded_twice)
+    assert not report_idempotent.has_changes, f"Unexpected idempotent diff: {report_idempotent}"

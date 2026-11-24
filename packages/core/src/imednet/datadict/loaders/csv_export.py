@@ -74,6 +74,36 @@ LOGIC_XML_HEADERS = {
     "xml",
 }
 
+_EXPLICIT_TIMESTAMP_KEYS = frozenset(
+    {
+        "createdDate",
+        "dateCreated",
+        "modifiedDate",
+        "dateModified",
+        "updatedDate",
+        "dateUpdated",
+        "lastUpdated",
+        "lastModified",
+        "lastModifiedDate",
+        "deletedDate",
+        "dateDeleted",
+        "publishedDate",
+        "datePublished",
+        "effectiveDate",
+        "expirationDate",
+        "createdAt",
+        "updatedAt",
+        "modifiedAt",
+        "deletedAt",
+        "timestamp",
+        "createdTime",
+        "modifiedTime",
+        "updatedTime",
+        "dateTime",
+        "datetime",
+    }
+)
+
 
 @contextmanager
 def _open_text(source: Path | str | TextIO) -> Iterator[TextIO]:
@@ -303,7 +333,7 @@ def load_from_csv_files(
 
     for entity_name, extra in all_extras:
         for k, v in extra.items():
-            if isinstance(v, str) and v.strip() and ("date" in k.lower() or "time" in k.lower()):
+            if isinstance(v, str) and v.strip() and k in _EXPLICIT_TIMESTAMP_KEYS:
                 try:
                     validate_timestamp(v)
                 except ValueError as exc:

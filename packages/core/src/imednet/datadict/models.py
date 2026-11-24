@@ -537,6 +537,43 @@ class DataDictionary(DictCompatMixin, BaseModel):
                 return form.formKey
         return None
 
+    def _unassigned_rule_matches_form(
+        self,
+        rule: BusinessLogicRule,
+        form: Form | None,
+        form_key: str,
+    ) -> bool:
+        """Return True if an unassigned rule with form=None applies to ``form_key``."""
+        if form is None:
+            return False
+        from .logic import LogicTreeEvaluator
+
+        meta = LogicTreeEvaluator().extract_rule_metadata(rule)
+        if meta is None or meta.is_cross_scope:
+            return False
+
+        referenced_vars = {
+            v for cond in meta.conditions for v in (cond.variable, cond.compare_variable) if v
+        }
+        if not referenced_vars:
+            target_vars = rule.extraAttributes.get("targetVariables")
+            if isinstance(target_vars, list):
+                referenced_vars = {str(v).strip() for v in target_vars if str(v).strip()}
+        if not referenced_vars:
+            return False
+
+        form_vars = {var.variableName for var in form.variables if var.variableName}
+        if meta.form is not None:
+            if meta.form != form_key:
+                return False
+            if not form_vars:
+                return True
+            return referenced_vars.issubset(form_vars) or all(
+                v in form_vars or f"{form_key}.{v}" in form_vars for v in referenced_vars
+            )
+
+        return bool(form_vars) and referenced_vars.issubset(form_vars)
+
     def rules_for_form(self, form_key: str) -> list[BusinessLogicRule]:
         """Return all business logic rules scoped or attached to ``form_key``."""
         rules: list[BusinessLogicRule] = []
@@ -549,11 +586,14 @@ class DataDictionary(DictCompatMixin, BaseModel):
         for rule in self.unassignedBusinessLogic:
             if id(rule) in seen_ids:
                 continue
-            if rule.form == form_key:
-                rules.append(rule)
-            elif rule.form is None and (rule.logic is not None or rule.logicRawXml):
-                # Include unassigned rules that have no explicit form override;
-                # cross-form conditions are filtered out safely by LogicTreeEvaluator.
+            rule_form = (
+                rule.form.strip() if isinstance(rule.form, str) and rule.form.strip() else None
+            )
+            if rule_form == form_key or (
+                rule_form is None
+                and (rule.logic is not None or rule.logicRawXml)
+                and self._unassigned_rule_matches_form(rule, form, form_key)
+            ):
                 rules.append(rule)
         return rules
 
