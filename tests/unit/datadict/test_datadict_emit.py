@@ -860,7 +860,7 @@ def test_odm_round_trip_when_both_unprefixed_and_prefixed_raw_names_are_scoped()
                         label="F1 Age Integer",
                         variableType="Integer",
                         sequence=1,
-                        SDSVarName="AGE_F1",
+                        extraAttributes={"SDSVarName": "AGE_F1"},
                     ),
                     Variable(
                         variableName="F1.AGE",
@@ -880,7 +880,7 @@ def test_odm_round_trip_when_both_unprefixed_and_prefixed_raw_names_are_scoped()
                         label="F1 Age Integer",
                         variableType="Integer",
                         sequence=1,
-                        SDSVarName="AGE_F2",
+                        extraAttributes={"SDSVarName": "AGE_F2"},
                     ),
                     Variable(
                         variableName="F1.AGE",
@@ -1229,7 +1229,6 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
                 formName="Demographics",
                 formId=10101,
                 formType="Subject",
-                sequence=1,
                 extraAttributes={
                     "Purpose": "Tabulation",
                 },
@@ -1295,8 +1294,10 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
                         status="Active",
                         form="DM",
                         sequence=1,
-                        description="Pain slider high check",
-                        targetVariables=["PAIN_SLIDER"],
+                        extraAttributes={
+                            "description": "Pain slider high check",
+                            "targetVariables": ["PAIN_SLIDER"],
+                        },
                         logic=parse_logic_xml(
                             "<rule><conditions><condition><variable>PAIN_SLIDER</variable>"
                             "<operator>&gt;</operator><value>8</value></condition></conditions></rule>"
@@ -1309,7 +1310,7 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
                         status="Active",
                         form="DM",
                         sequence=2,
-                        description="Route high BMI",
+                        extraAttributes={"description": "Route high BMI"},
                         logic=parse_logic_xml(
                             "<rule><conditions><condition><variable>BMI_CALC</variable>"
                             "<operator>&gt;=</operator><value>35</value></condition></conditions></rule>"
@@ -1322,7 +1323,7 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
                         status="Inactive",
                         form="DM",
                         sequence=3,
-                        description="Missing consent upload check",
+                        extraAttributes={"description": "Missing consent upload check"},
                         logic=parse_logic_xml(
                             "<rule><conditions><condition><variable>CONSENT_PDF</variable>"
                             "<operator>==</operator><value/></condition></conditions></rule>"
@@ -1335,8 +1336,10 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
                         status="Active",
                         form="DM",
                         sequence=4,
-                        description="Requires approval",
-                        extraAttributes={"rawLogic": "PAIN_SLIDER > 9"},
+                        extraAttributes={
+                            "description": "Requires approval",
+                            "rawLogic": "PAIN_SLIDER > 9",
+                        },
                     ),
                     BusinessLogicRule(
                         id="R_REQ_1",
@@ -1345,8 +1348,10 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
                         status="Active",
                         form="DM",
                         sequence=5,
-                        description="Require partial date when pain > 5",
-                        targetVariables=["ONSET_PARTIAL"],
+                        extraAttributes={
+                            "description": "Require partial date when pain > 5",
+                            "targetVariables": ["ONSET_PARTIAL"],
+                        },
                     ),
                 ],
             ),
@@ -1355,7 +1360,6 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
                 formName="Adverse Events",
                 formId="FRM_AE_CUSTOM",
                 formType="Subject",
-                sequence=2,
                 extraAttributes={
                     "collectionExceptionConditionOid": "COND.IG_AE_ACTIVE",
                     "Purpose": "Analysis",
@@ -1379,7 +1383,6 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
                         status="Active",
                         form="AE",
                         sequence=1,
-                        description="Collect AE when enrolled",
                         logic={
                             "odmElement": "ConditionDef",
                             "description": "Collect AE when enrolled",
@@ -1403,7 +1406,7 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
                 status="Active",
                 form=None,
                 sequence=7,
-                description="Cross form check",
+                extraAttributes={"description": "Cross form check"},
                 logic=parse_logic_xml(
                     "<rule><conditions><condition><variable>AE.AESTDTC</variable>"
                     "<operator>&lt;</operator><compareVariable>DM.ONSET_PARTIAL</compareVariable>"

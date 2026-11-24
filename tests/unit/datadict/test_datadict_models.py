@@ -186,9 +186,42 @@ def test_metadata_create() -> None:
         study_key="STUDY_123",
         source="api",
         validation_warnings=["warning 1"],
+        vendorExportVersion="2026.1",
     )
     assert meta.schemaVersion == "1.0.0"
     assert meta.studyKey == "STUDY_123"
     assert meta.source == "api"
     assert meta.validationWarnings == ["warning 1"]
     assert meta.generatedAt is not None
+    assert meta.extraAttributes["vendorExportVersion"] == "2026.1"
+
+
+def test_datadict_models_forbid_undeclared_keys_and_preserve_extra_attributes() -> None:
+    """All canonical datadict models reject undeclared keys while preserving extraAttributes."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        Metadata(studyKey="S1", misspelledStudy="bad")  # type: ignore[call-arg]
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        Choice(choiceValue="1", choiceText="Yes", order=1)  # type: ignore[call-arg]
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        Variable(variableName="V1", varType="Text")  # type: ignore[call-arg]
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        BusinessLogicRule(id="R1", targetVariables=["V1"])  # type: ignore[call-arg]
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        Form(formKey="DM", sequence=1)  # type: ignore[call-arg]
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        DataDictionary.model_validate({"forms": [], "unexpectedRootKey": True})
+
+    # Legacy flexible kwargs preserve custom study metadata in metadata.extraAttributes
+    legacy_dd = DataDictionary(
+        forms=[{"Form Key": "F1", "Form Name": "Form 1"}],
+        questions=[],
+        customVendorTag="preserved",
+    )
+    assert legacy_dd.metadata.extraAttributes["customVendorTag"] == "preserved"

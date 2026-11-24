@@ -473,3 +473,134 @@ def test_cli_datadict_keyboard_interrupt_exits_130(
     cap_api = capsys.readouterr()
     assert cap_api.out == ""
     assert "Aborted by user." in cap_api.err
+
+
+def test_cli_from_redcap_bare_missing_filename_exits_without_traceback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """from-redcap with a bare missing filename exits 1 with FileNotFoundError and no traceback."""
+    with pytest.raises(SystemExit) as exc:
+        app(["datadict", "from-redcap", "missing_bare_redcap_file"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Error loading from REDCap:" in captured.err
+    assert "missing_bare_redcap_file" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_datadict_output_confirmations_on_stderr_and_oserror_handling(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """datadict -o commands write confirmations to stderr and exit 1 cleanly on OSError."""
+    odm_file = tmp_path / "sample.xml"
+    odm_file.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3">'
+        '<Study OID="S1"><MetaDataVersion OID="M1">'
+        '<FormDef OID="F1" Name="Form 1"/></MetaDataVersion></Study></ODM>',
+        encoding="utf-8",
+    )
+    redcap_file = tmp_path / "sample_redcap.csv"
+    redcap_file.write_text(
+        '"Variable / Field Name","Form Name","Field Type","Field Label"\n'
+        '"v1","demographics","text","Label 1"\n',
+        encoding="utf-8",
+    )
+    valid_dd = tmp_path / "valid_dd.json"
+    valid_dd.write_text(
+        json.dumps({"metadata": {"schemaVersion": "1.0.0"}, "forms": [{"formKey": "F1"}]}),
+        encoding="utf-8",
+    )
+
+    mock_sdk = Mock()
+    mock_sdk.forms.list.return_value = [{"form_key": "F1", "form_name": "Form 1"}]
+    mock_sdk.variables.list.return_value = []
+
+    commands_with_outputs = [
+        (["datadict", "from-csv", str(FIXTURES_DIR), "-o", str(tmp_path / "o_csv.json")], False),
+        (["datadict", "from-odm", str(odm_file), "-o", str(tmp_path / "o_odm.json")], False),
+        (
+            ["datadict", "from-redcap", str(redcap_file), "-o", str(tmp_path / "o_rc.json")],
+            False,
+        ),
+        (
+            ["datadict", "from-api", "--study-key", "S1", "-o", str(tmp_path / "o_api.json")],
+            True,
+        ),
+        (["datadict", "to-odm", str(valid_dd), "-o", str(tmp_path / "o_export.xml")], False),
+        (["datadict", "schema", "-o", str(tmp_path / "o_schema.json")], False),
+    ]
+
+    for argv, needs_sdk in commands_with_outputs:
+        if needs_sdk:
+            with patch("imednet.cli.datadict.get_sdk", return_value=mock_sdk):
+                app(argv)
+        else:
+            app(argv)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Successfully wrote" in captured.err
+
+    # Unwritable directory target triggers OSError -> exit 1 without traceback
+    unwritable_dir = tmp_path / "dir_target"
+    unwritable_dir.mkdir()
+    oserror_commands = [
+        (["datadict", "from-csv", str(FIXTURES_DIR), "-o", str(unwritable_dir)], False),
+        (["datadict", "from-odm", str(odm_file), "-o", str(unwritable_dir)], False),
+        (["datadict", "from-redcap", str(redcap_file), "-o", str(unwritable_dir)], False),
+        (["datadict", "from-api", "--study-key", "S1", "-o", str(unwritable_dir)], True),
+        (["datadict", "to-odm", str(valid_dd), "-o", str(unwritable_dir)], False),
+        (["datadict", "schema", "-o", str(unwritable_dir)], False),
+    ]
+    for argv, needs_sdk in oserror_commands:
+        with pytest.raises(SystemExit) as exc:
+            if needs_sdk:
+                with patch("imednet.cli.datadict.get_sdk", return_value=mock_sdk):
+                    app(argv)
+            else:
+                app(argv)
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Error" in captured.err
+        assert "Traceback" not in captured.err
+
+
+def test_cli_datadict_validate_json_format_and_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """datadict validate supports --format json and IMEDNET_CLI_OUTPUT_FORMAT=json."""
+    valid_dd = tmp_path / "valid.json"
+    valid_dd.write_text(
+        json.dumps({"metadata": {"schemaVersion": "1.0.0"}, "forms": [{"formKey": "F1"}]}),
+        encoding="utf-8",
+    )
+
+    app(["datadict", "validate", str(valid_dd), "--format", "json"])
+    cap_ok = capsys.readouterr()
+    assert cap_ok.err == ""
+    payload_ok = json.loads(cap_ok.out)
+    assert payload_ok["schemaVersion"] == "1.0"
+    assert payload_ok["valid"] is True
+    assert payload_ok["error_count"] == 0
+    assert payload_ok["errors"] == []
+
+    invalid_dd = tmp_path / "invalid.json"
+    invalid_dd.write_text(json.dumps({"foo": "bar"}), encoding="utf-8")
+
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    with pytest.raises(SystemExit) as exc_bad:
+        app(["datadict", "validate", str(invalid_dd)])
+    assert exc_bad.value.code == 1
+    cap_bad = capsys.readouterr()
+    assert cap_bad.err == ""
+    payload_bad = json.loads(cap_bad.out)
+    assert payload_bad["valid"] is False
+    assert payload_bad["error_count"] >= 1
+    assert any(
+        "forms" in err or "foo" in err or "Additional" in err for err in payload_bad["errors"]
+    )

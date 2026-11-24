@@ -218,6 +218,8 @@ def test_load_from_redcap_missing_file() -> None:
         "nested/path/to/missing.csv",
         Path("nonexistent.csv"),
         "some/path/nonexistent",
+        "missing_bare_filename",
+        "redcap_export_without_extension",
     ]:
         with pytest.raises(FileNotFoundError, match="Target file .* does not exist"):
             load_from_redcap(missing)

@@ -85,7 +85,10 @@ def test_validate_raw_json_string() -> None:
     assert errors == []
 
     # Valid raw JSON string containing path separators in values
-    raw_json_with_slash = '{"forms": [{"formKey": "F1", "variables": [{"variableName": "V1", "uri": "http://example.com/api"}]}]}'
+    raw_json_with_slash = (
+        '{"forms": [{"formKey": "F1", "variables": '
+        '[{"variableName": "V1", "extraAttributes": {"uri": "http://example.com/api"}}]}]}'
+    )
     errors = validate(raw_json_with_slash)
     assert errors == []
 
@@ -210,3 +213,90 @@ def test_validate_catches_duplicate_keys_broken_references_and_inverted_bounds()
     inv_errors = "\n".join(validate(inverted_dd, schema=get_schema()))
     assert "minValue (200.0) > maxValue (50.0)" in inv_errors
     assert "minLength (12) > maxLength (6)" in inv_errors
+
+
+def test_validate_requires_root_forms_and_rejects_undeclared_keys() -> None:
+    """validate() rejects payloads missing forms or containing misspelled/undeclared keys."""
+    import json
+
+    from imednet.datadict.schema import SCHEMA_PATH
+
+    committed_schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    assert get_schema() == committed_schema
+
+    for schema_arg in (None, committed_schema):
+        empty_errors = "\n".join(validate({}, schema=schema_arg))
+        assert "forms" in empty_errors
+
+        foo_errors = "\n".join(validate('{"foo": "bar"}', schema=schema_arg))
+        assert "forms" in foo_errors
+
+        typo_payload = {
+            "metadata": {"schemaVersion": "1.0.0", "study_key": "TYPO"},
+            "forms": [
+                {
+                    "formKey": "F1",
+                    "formkey_typo": "bad",
+                    "variables": [
+                        {
+                            "variableName": "V1",
+                            "varType": "Text",
+                            "choices": [{"choiceValue": "1", "choiceText": "Yes", "pos": 1}],
+                        }
+                    ],
+                }
+            ],
+        }
+        typo_errors = "\n".join(validate(typo_payload, schema=schema_arg))
+        assert typo_errors != ""
+
+
+def test_validate_catches_malformed_business_logic_xml_and_csv_rules() -> None:
+    """validate() fails on malformed rule.logicRawXml and broken BUSINESS_LOGIC.csv XML."""
+    import io
+
+    from imednet.datadict import load_from_csv_files
+    from imednet.datadict.models import BusinessLogicRule
+
+    bad_rule_dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="F1",
+                variables=[Variable(variableName="V1")],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="R_MALFORMED",
+                        name="Malformed XML",
+                        type="Form",
+                        form="F1",
+                        logic=None,
+                        logicRawXml="<rule><conditions><unclosed>",
+                    )
+                ],
+            )
+        ]
+    )
+    errs = "\n".join(validate(bad_rule_dd, schema=get_schema()))
+    assert "logicRawXml" in errs
+    assert "Malformed business logic XML" in errs
+
+    forms_csv = "Form Key,Form Name\nF1,Form 1\n"
+    questions_csv = "Form Key,Variable Name,Label,Variable Type\nF1,V1,Var 1,Text\n"
+    choices_csv = "Form Key,Variable Name,Choice Value,Choice Text,Position\n"
+    broken_logic_csv = (
+        "ID,Name,Type,Status,Form,Sequence,Logic\n"
+        '99,Broken Check,Form,Active,F1,1,"<rule><conditions><broken>"\n'
+    )
+
+    for no_raw in (False, True):
+        compiled = load_from_csv_files(
+            forms_file=io.StringIO(forms_csv),
+            questions_file=io.StringIO(questions_csv),
+            choices_file=io.StringIO(choices_csv),
+            business_logic_file=io.StringIO(broken_logic_csv),
+            strict=False,
+            no_raw_xml=no_raw,
+        )
+        compiled_errors = "\n".join(validate(compiled, schema=get_schema()))
+        assert compiled_errors != ""
+        assert "Malformed" in compiled_errors or "logic" in compiled_errors
