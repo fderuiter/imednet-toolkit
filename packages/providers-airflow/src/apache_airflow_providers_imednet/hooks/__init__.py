@@ -463,7 +463,7 @@ class ImednetHook(BaseHook):
                 resolved["table"] = table
             return resolved
 
-        if dest == "duckdb":
+        if dest in {"duckdb", "duckdb_by_form"}:
             resolved = {}
             db_path = (
                 cls._string_or_none(extras.get("db_path"))

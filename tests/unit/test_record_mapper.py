@@ -2045,6 +2045,8 @@ def test_record_mapper_hydrates_site_interval_and_form_maps(tmp_path) -> None:
             transport=transport,
         )
     )
+    seeded_count = len(state.get_records("STUDY"))
+    assert seeded_count == 3  # 3 scheduled seeded records (DM, VS, AE)
     # Seed an unscheduled record (no visitId / intervalId) alongside the scheduled seeded records
     sdk.records.create_batch(
         "STUDY",
@@ -2059,7 +2061,7 @@ def test_record_mapper_hydrates_site_interval_and_form_maps(tmp_path) -> None:
     )
     before_records = state.get_records("STUDY")
     before_count = len(before_records)
-    assert before_count == 3  # 2 scheduled + 1 unscheduled
+    assert before_count == seeded_count + 1  # 3 scheduled + 1 unscheduled
 
     csv_file = tmp_path / "study_records.csv"
     export_to_csv(sdk, "STUDY", str(csv_file), mask_phi=False)

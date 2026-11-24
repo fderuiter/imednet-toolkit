@@ -862,15 +862,41 @@ def test_workflows_validate_standards_reports_scores_and_enforces_min_score(
             "json",
         ],
     )
-    assert res_json.exit_code == 0
-    report_payload = json.loads(res_json.stdout)
+    assert res_json.exit_code == 1
+    envelope = json.loads(res_json.stdout)
+    assert envelope["schemaVersion"] == "1.0"
+    assert envelope["resource"] == "standards_readiness"
+    assert envelope["status"] == "complete"
+    assert envelope["count"] == 1
+    report_payload = envelope["items"][0]
     assert report_payload["study_key"] == "STUDY_STD"
     assert report_payload["profile"] == "drug"
     assert report_payload["domain"] == "AE"
     assert report_payload["score"] < 100.0
     assert report_payload["is_ready"] is False
+    assert report_payload["passed"] is False
     assert any("unprefixedVar" in w for w in report_payload["warnings"])
     assert "Secret Patient" not in res_json.stdout
+
+    # Passing explicit permissive --min-score exits 0 when score >= min_score
+    res_pass_threshold = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_STD",
+            "--profile",
+            "drug",
+            "--domain",
+            "AE",
+            "--min-score",
+            "0",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_pass_threshold.exit_code == 0
+    assert json.loads(res_pass_threshold.stdout)["items"][0]["passed"] is True
 
     # Also honors IMEDNET_CLI_OUTPUT_FORMAT=json
     monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
@@ -878,8 +904,10 @@ def test_workflows_validate_standards_reports_scores_and_enforces_min_score(
         cli.app,
         ["workflows", "validate-standards", "STUDY_STD", "--profile", "drug", "--domain", "AE"],
     )
-    assert res_env_json.exit_code == 0
-    assert json.loads(res_env_json.stdout)["study_key"] == "STUDY_STD"
+    assert res_env_json.exit_code == 1
+    env_envelope = json.loads(res_env_json.stdout)
+    assert env_envelope["schemaVersion"] == "1.0"
+    assert env_envelope["items"][0]["study_key"] == "STUDY_STD"
     monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
 
     res_gated = runner.invoke(

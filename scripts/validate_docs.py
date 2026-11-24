@@ -9,11 +9,13 @@ import importlib
 import inspect
 import io
 import json
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 import typing
 from collections.abc import Sequence
@@ -374,12 +376,13 @@ def check_cli_snippets(repo_root: Path | None = None) -> bool:
                         cmd_tokens = cmd_tokens[2:]
                     if cmd_tokens and cmd_tokens[0] == "imednet":
                         checked_count += 1
+                        parsed_args: argparse.Namespace | None = None
                         try:
                             with (
                                 contextlib.redirect_stdout(io.StringIO()),
                                 contextlib.redirect_stderr(io.StringIO()),
                             ):
-                                parser.parse_args(cmd_tokens[1:])
+                                parsed_args = parser.parse_args(cmd_tokens[1:])
                         except SystemExit as exc:
                             if exc.code not in (0, None):
                                 print(
@@ -387,11 +390,64 @@ def check_cli_snippets(repo_root: Path | None = None) -> bool:
                                     f"(exited with code {exc.code})"
                                 )
                                 has_errors = True
+                            continue
                         except _CLIValidationError as exc:
                             print(
                                 f"Error: Invalid CLI command '{' '.join(cmd_tokens)}' at {path}:{lineno}: {exc}"
                             )
                             has_errors = True
+                            continue
+
+                        if (
+                            parsed_args is not None
+                            and "--simulation" in cmd_tokens[1:]
+                            and getattr(parsed_args, "command", None) != "tui"
+                            and "--interactive" not in cmd_tokens[1:]
+                        ):
+                            from imednet.cli import app as cli_app
+                            from imednet.simulation.state import reset_default_simulation_state
+
+                            placeholder_map = {
+                                "<STUDY_KEY>": "STUDY",
+                                "<SUBJECT_KEY>": "SUB1",
+                            }
+                            exec_args = [placeholder_map.get(t, t) for t in cmd_tokens[1:]]
+                            prev_cwd = Path.cwd()
+                            prev_non_interactive = os.environ.get("IMEDNET_NON_INTERACTIVE")
+                            out_buf = io.StringIO()
+                            err_buf = io.StringIO()
+                            reset_default_simulation_state()
+                            try:
+                                with tempfile.TemporaryDirectory() as tmp_dir:
+                                    os.chdir(tmp_dir)
+                                    os.environ["IMEDNET_NON_INTERACTIVE"] = "1"
+                                    with (
+                                        contextlib.redirect_stdout(out_buf),
+                                        contextlib.redirect_stderr(err_buf),
+                                    ):
+                                        cli_app(exec_args)
+                            except SystemExit as exc:
+                                if exc.code not in (0, None):
+                                    err_text = err_buf.getvalue().strip()
+                                    print(
+                                        f"Error: Simulation CLI command '{' '.join(cmd_tokens)}' at {path}:{lineno} "
+                                        f"exited with code {exc.code}"
+                                        + (f": {err_text}" if err_text else "")
+                                    )
+                                    has_errors = True
+                            except Exception as exc:
+                                print(
+                                    f"Error: Simulation CLI command '{' '.join(cmd_tokens)}' at {path}:{lineno} "
+                                    f"failed: {exc}"
+                                )
+                                has_errors = True
+                            finally:
+                                reset_default_simulation_state()
+                                os.chdir(prev_cwd)
+                                if prev_non_interactive is None:
+                                    os.environ.pop("IMEDNET_NON_INTERACTIVE", None)
+                                else:
+                                    os.environ["IMEDNET_NON_INTERACTIVE"] = prev_non_interactive
 
     if not has_errors:
         print(f"CLI command validation passed ({checked_count} command(s) verified).")

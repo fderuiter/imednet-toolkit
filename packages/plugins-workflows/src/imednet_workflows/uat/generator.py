@@ -430,6 +430,10 @@ class SyntheticRecordGenerator:
             return date.today().isoformat()
 
         if v_norm in _DATETIME_TYPES:
+            if spec.global_date_value:
+                return f"{spec.global_date_value.isoformat()}T12:00:00+00:00"
+            if self._seed is not None or spec.seed is not None:
+                return f"{date.today().isoformat()}T12:00:00+00:00"
             return datetime.now(UTC).isoformat()
 
         if v_norm == "time":

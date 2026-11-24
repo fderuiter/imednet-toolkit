@@ -948,7 +948,15 @@ class UATWorkflow:
                 # 4. Submit
                 self.transition_to(UATWorkflowState.SUBMITTING)
                 t0 = time.monotonic()
-                effective_submit_schema = schema if schema is not None else active_dd
+                effective_submit_schema: ValidationSchemaProtocol | None = (
+                    schema
+                    if schema is not None
+                    else (
+                        _merge_snapshot_into_data_dictionary(active_dd, snapshot)
+                        if active_dd is not None
+                        else None
+                    )
+                )
                 if effective_submit_schema is not None:
                     submission_result = self.submit(
                         study_key,
@@ -1079,7 +1087,7 @@ class UATWorkflow:
         if schema is not None:
             return schema
         if data_dictionary is not None:
-            return data_dictionary
+            return _merge_snapshot_into_data_dictionary(data_dictionary, snapshot)
         cache = SchemaCache()
         snapshot_vars = getattr(snapshot, "variables", None)
         if isinstance(snapshot_vars, list):
@@ -1180,6 +1188,110 @@ class UATWorkflow:
             timeout=self._poll_timeout,
             on_progress=self._on_progress,
         )
+
+
+def _merge_snapshot_into_data_dictionary(
+    data_dictionary: DataDictionary,
+    snapshot: Any,
+) -> DataDictionary:
+    """Backfill active StudySnapshot forms/variables omitted from an enrichment DataDictionary."""
+    if isinstance(snapshot, NonCallableMock) or not isinstance(data_dictionary, DataDictionary):
+        return data_dictionary
+    snap_forms = getattr(snapshot, "forms", None)
+    vars_by_form = getattr(snapshot, "variables_by_form", None)
+    if not isinstance(snap_forms, list) or not isinstance(vars_by_form, Mapping):
+        return data_dictionary
+
+    existing_forms = {f.formKey: f for f in data_dictionary.forms}
+    active_snap_forms: list[tuple[str, Any, list[Any]]] = []
+    needs_backfill = False
+
+    for form in snap_forms:
+        if is_disabled_form(form) or is_non_subject_form(form):
+            continue
+        fk = getattr(form, "form_key", None) or ""
+        if not fk:
+            continue
+        active_vars = [
+            v
+            for v in vars_by_form.get(fk, [])
+            if getattr(v, "disabled", None) is not True and getattr(v, "deleted", None) is not True
+        ]
+        active_snap_forms.append((fk, form, active_vars))
+        if fk not in existing_forms:
+            needs_backfill = True
+        else:
+            known_vars = set(data_dictionary.variables_for_form(fk).keys())
+            for v in active_vars:
+                vname = getattr(v, "variable_name", None) or getattr(v, "variableName", None)
+                if vname and vname not in known_vars:
+                    needs_backfill = True
+                    break
+
+    if not needs_backfill:
+        return data_dictionary
+
+    snap_vars_lookup = {fk: active_vars for fk, _, active_vars in active_snap_forms}
+    merged_forms: list[Any] = []
+    for dd_form in data_dictionary.forms:
+        known_vars = {v.variableName for v in dd_form.variables}
+        extra_vars: list[dict[str, Any]] = []
+        for v in snap_vars_lookup.get(dd_form.formKey, []):
+            vname = getattr(v, "variable_name", None) or getattr(v, "variableName", None)
+            if vname and vname not in known_vars:
+                known_vars.add(vname)
+                extra_vars.append(
+                    {
+                        "variableName": vname,
+                        "variableType": getattr(v, "variable_type", None)
+                        or getattr(v, "variableType", None),
+                        "label": getattr(v, "label", None),
+                    }
+                )
+        if extra_vars:
+            merged_forms.append(
+                {
+                    **dd_form.model_dump(),
+                    "variables": [*dd_form.variables, *extra_vars],
+                }
+            )
+        else:
+            merged_forms.append(dd_form)
+
+    for fk, form, active_vars in active_snap_forms:
+        if fk in existing_forms:
+            continue
+        snap_var_dicts: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        for v in active_vars:
+            vname = getattr(v, "variable_name", None) or getattr(v, "variableName", None)
+            if vname and vname not in seen_names:
+                seen_names.add(vname)
+                snap_var_dicts.append(
+                    {
+                        "variableName": vname,
+                        "variableType": getattr(v, "variable_type", None)
+                        or getattr(v, "variableType", None),
+                        "label": getattr(v, "label", None),
+                    }
+                )
+        merged_forms.append(
+            {
+                "formKey": fk,
+                "formName": getattr(form, "form_name", None),
+                "formId": getattr(form, "form_id", None),
+                "formType": getattr(form, "form_type", None),
+                "variables": snap_var_dicts,
+            }
+        )
+
+    return DataDictionary.model_validate(
+        {
+            "metadata": data_dictionary.metadata,
+            "forms": merged_forms,
+            "unassignedBusinessLogic": data_dictionary.unassignedBusinessLogic,
+        }
+    )
 
 
 UATRunResult.model_rebuild()

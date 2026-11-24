@@ -475,19 +475,19 @@ Public API exposure
   * :mod:`imednet_sinks.graph`
   * :mod:`imednet_sinks.warehouse`
 
-* :mod:`apache_airflow_providers_imednet.export` wraps the 8 single-target
-  tabular helpers (``export_to_csv``, ``export_to_duckdb``, ``export_to_excel``,
-  ``export_to_json``, ``export_to_long_sql``, ``export_to_parquet``,
-  ``export_to_sql``, and ``export_to_sql_by_form``; multi-artifact
-  ``export_to_duckdb_by_form`` and ``export_to_hive_parquet`` remain in
-  :mod:`imednet.integrations`).
+* :mod:`apache_airflow_providers_imednet.export` wraps all 10 tabular helpers
+  (``export_to_csv``, ``export_to_duckdb``, ``export_to_duckdb_by_form``,
+  ``export_to_excel``, ``export_to_hive_parquet``, ``export_to_json``,
+  ``export_to_long_sql``, ``export_to_parquet``, ``export_to_sql``, and
+  ``export_to_sql_by_form``).
   :class:`~apache_airflow_providers_imednet.operators.export.ImednetExportOperator`
-  dispatches those 8 tabular targets alongside ``mongodb``, ``neo4j``, and
+  dispatches those 10 tabular targets alongside ``mongodb``, ``neo4j``, and
   ``snowflake`` plugin sinks resolved dynamically via ``sdk.sinks`` at runtime
   (keeping ``apache_airflow_providers_imednet`` decoupled from ``imednet_sinks``),
   while :meth:`~apache_airflow_providers_imednet.hooks.ImednetHook.resolve_destination_connection`
   resolves ``destination_conn_id`` settings for ``snowflake``, ``neo4j``,
-  ``mongodb``, ``duckdb``, ``sql``, ``sql_by_form``, and ``long_sql``.
+  ``mongodb``, ``duckdb``, ``duckdb_by_form``, ``sql``, ``sql_by_form``, and
+  ``long_sql``.
 
 Adding New Export Sinks
 ~~~~~~~~~~~~~~~~~~~~~~~

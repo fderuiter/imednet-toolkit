@@ -295,7 +295,8 @@ subcommands, including SQLite per-``Form``, ``--single-table``, and
 .. code-block:: bash
 
    imednet export csv STUDY ./ae_sdtm.csv --sdtm-domain AE --standards-profile drug \
-       --min-standards-score 85
+       --min-standards-score 85 --simulation
+   imednet workflows validate-standards STUDY --profile drug --simulation
    imednet export parquet STUDY ./aligned_study.parquet --naming-convention snake_case
    imednet export json STUDY ./study_tree.json --hierarchical --use-labels
    imednet export neo4j STUDY bolt://localhost:7687 neo4j "$NEO4J_PASSWORD" \

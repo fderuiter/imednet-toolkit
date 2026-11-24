@@ -119,6 +119,18 @@ def reset_circuit_breaker_between_tests():
     get_global_circuit_breaker().reset()
 
 
+@pytest.fixture(autouse=True)
+def reset_simulation_state_between_tests():
+    """Reset the global default simulation state between tests when initialized."""
+    from imednet.simulation import state as sim_state_mod
+
+    if sim_state_mod._default_state is not None:
+        sim_state_mod.reset_default_simulation_state()
+    yield
+    if sim_state_mod._default_state is not None:
+        sim_state_mod.reset_default_simulation_state()
+
+
 def _is_closed_stream_handler(handler: logging.Handler) -> bool:
     """Return True when *handler* is a non-file StreamHandler bound to a closed stream."""
     return (

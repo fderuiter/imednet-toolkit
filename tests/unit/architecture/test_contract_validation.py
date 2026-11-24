@@ -999,13 +999,13 @@ def test_sink_schemas_and_keys_narrative_parity() -> None:
 
 
 def test_airflow_export_and_connection_targets_narrative_parity() -> None:
-    """Assert Airflow 8-helper export subset and connection targets match narrative docs."""
+    """Assert Airflow 10-helper export surface and connection targets match narrative docs."""
     from apache_airflow_providers_imednet import export as airflow_export
     from apache_airflow_providers_imednet.hooks import ImednetHook
     from apache_airflow_providers_imednet.operators.export import _TABULAR_EXPORTS
 
     airflow_helpers = list(airflow_export.__all__)
-    assert len(airflow_helpers) == 8
+    assert len(airflow_helpers) == 10
     assert {fn.__name__ for fn in _TABULAR_EXPORTS.values()} == set(airflow_helpers)
 
     conn_targets = _extract_airflow_connection_targets(ImednetHook.resolve_destination_connection)
@@ -1014,6 +1014,7 @@ def test_airflow_export_and_connection_targets_narrative_parity() -> None:
         "neo4j",
         "mongodb",
         "duckdb",
+        "duckdb_by_form",
         "sql",
         "sql_by_form",
         "long_sql",

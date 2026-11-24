@@ -1133,7 +1133,7 @@ def test_default_uat_submission_with_tagged_synthetic_subject_and_real_sdk():
     assert run_result.submission_result is not None
     assert "F_DM" in run_result.submission_result.skipped_forms
     assert len(run_result.submission_result.registration_batches) == 0
-    assert len(run_result.submission_result.data_batches) == 1
+    assert len(run_result.submission_result.data_batches) == 2
 
 
 def test_submission_phase_transition_table_and_validation(mock_sdk):
