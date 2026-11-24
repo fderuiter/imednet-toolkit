@@ -93,16 +93,17 @@ with patch("imednet.integrations.export." + FUNC, side_effect=ImportError("optio
         raise AssertionError("dependency error was swallowed")
 '''
     repo_root = Path(__file__).resolve().parents[2]
-    package_paths = [
-        str(repo_root / "packages" / "providers-airflow" / "src"),
-        str(repo_root / "packages" / "core" / "src"),
-    ]
     env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH")
-    if existing_pythonpath:
-        env["PYTHONPATH"] = os.pathsep.join(package_paths + [existing_pythonpath])
-    else:
-        env["PYTHONPATH"] = os.pathsep.join(package_paths)
+    if env.get("IMEDNET_TEST_WHEELS") != "1":
+        package_paths = [
+            str(repo_root / "packages" / "providers-airflow" / "src"),
+            str(repo_root / "packages" / "core" / "src"),
+        ]
+        existing_pythonpath = env.get("PYTHONPATH")
+        if existing_pythonpath:
+            env["PYTHONPATH"] = os.pathsep.join([*package_paths, existing_pythonpath])
+        else:
+            env["PYTHONPATH"] = os.pathsep.join(package_paths)
 
     result = subprocess.run(
         [sys.executable, "-c", "FUNC = " + repr(func_name) + "\n" + script],

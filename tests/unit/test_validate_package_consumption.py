@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from scripts import validate_package_consumption as vpc
@@ -273,3 +276,174 @@ def test_main_exits_nonzero_when_manifest_coverage_fails(monkeypatch: pytest.Mon
     with pytest.raises(SystemExit) as exc_info:
         vpc.main([])
     assert exc_info.value.code == 1
+
+
+def _write_typed_wheel(
+    wheel_path: Path,
+    *,
+    dist_name: str,
+    import_pkg: str,
+    include_py_typed: bool = True,
+    include_typed_classifier: bool = True,
+) -> None:
+    dist_info = f"{vpc._normalize_wheel_prefix(dist_name)}-1.0.0.dist-info"
+    classifiers = list(vpc.REQUIRED_PYTHON_CLASSIFIERS)
+    if include_typed_classifier:
+        classifiers.append(vpc.TYPED_CLASSIFIER)
+    cls_block = "".join(f"Classifier: {c}\n" for c in classifiers)
+    metadata = (
+        f"Metadata-Version: 2.4\n"
+        f"Name: {dist_name}\n"
+        f"Version: 1.0.0\n"
+        f"License-Expression: MIT\n"
+        f"Description-Content-Type: text/markdown\n"
+        f"{cls_block}\n"
+        f"# {dist_name}\n"
+    )
+    with zipfile.ZipFile(wheel_path, "w") as zf:
+        zf.writestr(f"{dist_info}/METADATA", metadata)
+        zf.writestr(f"{import_pkg}/__init__.py", "VALUE: int = 1\n")
+        if include_py_typed:
+            zf.writestr(f"{import_pkg}/py.typed", "")
+
+
+def test_verify_wheel_py_typed_enforces_marker_and_classifier_across_all_five_packages(
+    tmp_path: Path,
+) -> None:
+    packages_dir, _, pyprojects = _write_fake_workspace(tmp_path)
+    import_map = {
+        "core": ("imednet", "imednet"),
+        "plugins-sinks": ("imednet-plugins-sinks", "imednet_sinks"),
+        "plugins-tui": ("imednet-tui", "imednet_tui"),
+        "plugins-workflows": ("imednet-workflows", "imednet_workflows"),
+        "providers-airflow": (
+            "apache-airflow-providers-imednet",
+            "apache_airflow_providers_imednet",
+        ),
+    }
+    for folder, (_, import_pkg) in import_map.items():
+        with pyprojects[folder].open("a", encoding="utf-8") as fh:
+            fh.write(
+                f'\n[tool.hatch.build.targets.wheel]\npackages = ["src/{import_pkg}"]\n'
+                f'artifacts = ["src/{import_pkg}/py.typed"]\n'
+            )
+
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    for dist_name, import_pkg in import_map.values():
+        wheel_name = f"{vpc._normalize_wheel_prefix(dist_name)}-1.0.0-py3-none-any.whl"
+        _write_typed_wheel(dist_dir / wheel_name, dist_name=dist_name, import_pkg=import_pkg)
+
+    vpc.verify_wheel_py_typed(dist_dir, packages_dir=packages_dir)
+
+    # Omit imednet_sinks/py.typed -> fails with ConsumptionValidationError
+    sinks_wheel = dist_dir / "imednet_plugins_sinks-1.0.0-py3-none-any.whl"
+    _write_typed_wheel(
+        sinks_wheel,
+        dist_name="imednet-plugins-sinks",
+        import_pkg="imednet_sinks",
+        include_py_typed=False,
+    )
+    with pytest.raises(vpc.ConsumptionValidationError, match="imednet_sinks/py.typed"):
+        vpc.verify_wheel_py_typed(dist_dir, packages_dir=packages_dir)
+
+    # Restore py.typed, omit Typing :: Typed classifier -> fails
+    _write_typed_wheel(
+        sinks_wheel,
+        dist_name="imednet-plugins-sinks",
+        import_pkg="imednet_sinks",
+        include_py_typed=True,
+        include_typed_classifier=False,
+    )
+    with pytest.raises(vpc.ConsumptionValidationError, match="Typing :: Typed"):
+        vpc.verify_wheel_py_typed(dist_dir, packages_dir=packages_dir)
+
+
+def test_verify_wheel_mypy_strict_validates_typed_wheels_and_catches_type_errors(
+    tmp_path: Path,
+) -> None:
+    pkgs_dir = tmp_path / "packages" / "sample"
+    pkgs_dir.mkdir(parents=True)
+    (pkgs_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet-sample"\nversion = "1.0.0"\n'
+        '[tool.hatch.build.targets.wheel]\npackages = ["src/imednet_sample"]\n',
+        encoding="utf-8",
+    )
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    wheel_path = dist_dir / "imednet_sample-1.0.0-py3-none-any.whl"
+    _write_typed_wheel(wheel_path, dist_name="imednet-sample", import_pkg="imednet_sample")
+    with zipfile.ZipFile(wheel_path, "a") as zf:
+        zf.writestr(
+            "imednet_sample/WHEEL_TEST_DUMMY",
+            "",
+        )
+        zf.writestr(
+            "imednet_sample-1.0.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        zf.writestr("imednet_sample-1.0.0.dist-info/RECORD", "")
+
+    valid_consumer = "from imednet_sample import VALUE\n\ndef use_val() -> int:\n    return VALUE\n"
+    vpc.verify_wheel_mypy_strict(
+        dist_dir,
+        packages_dir=tmp_path / "packages",
+        uv_lock_path=tmp_path / "nonexistent.lock",
+        consumer_source=valid_consumer,
+    )
+
+    invalid_consumer = (
+        "from imednet_sample import VALUE\n\ndef bad_val() -> str:\n    return VALUE\n"
+    )
+    with pytest.raises(vpc.ConsumptionValidationError, match="mypy --strict failed"):
+        vpc.verify_wheel_mypy_strict(
+            dist_dir,
+            packages_dir=tmp_path / "packages",
+            uv_lock_path=tmp_path / "nonexistent.lock",
+            consumer_source=invalid_consumer,
+        )
+
+
+def test_conftest_wheel_mode_gates_sys_path_and_architecture_resolves_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.util
+
+    from tests.unit.architecture import test_architecture
+
+    conftest_path = vpc.ROOT / "tests" / "conftest.py"
+    local_core_src = str(vpc.ROOT / "packages" / "core" / "src")
+
+    # Wheel mode (IMEDNET_TEST_WHEELS=1) does NOT inject local packages/*/src
+    clean_sys_path = [p for p in sys.path if not p.startswith(str(vpc.ROOT / "packages"))]
+    monkeypatch.setattr(sys, "path", list(clean_sys_path))
+    monkeypatch.setenv("IMEDNET_TEST_WHEELS", "1")
+    spec = importlib.util.spec_from_file_location("_conftest_wheel_probe", conftest_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert local_core_src not in sys.path
+
+    # Unset IMEDNET_TEST_WHEELS preserves local source injection
+    with monkeypatch.context() as m:
+        m.setattr(sys, "path", list(clean_sys_path))
+        m.delenv("IMEDNET_TEST_WHEELS", raising=False)
+        spec_default = importlib.util.spec_from_file_location(
+            "_conftest_default_probe", conftest_path
+        )
+        assert spec_default is not None and spec_default.loader is not None
+        mod_default = importlib.util.module_from_spec(spec_default)
+        spec_default.loader.exec_module(mod_default)
+        assert local_core_src in sys.path
+
+    # test_extensions_use_spi still scans workspace packages when imednet loads from site-packages
+    fake_site_pkg = tmp_path / ".venv" / "lib" / "python3.12" / "site-packages" / "imednet"
+    fake_site_pkg.mkdir(parents=True)
+    fake_init = fake_site_pkg / "__init__.py"
+    fake_init.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        test_architecture,
+        "imednet",
+        SimpleNamespace(__file__=str(fake_init)),
+    )
+    test_architecture.test_extensions_use_spi()

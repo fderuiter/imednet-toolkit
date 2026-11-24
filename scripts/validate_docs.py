@@ -290,7 +290,10 @@ def check_cli_snippets(repo_root: Path | None = None) -> bool:
     """Parse documented `imednet ...` CLI invocations against imednet.cli.get_parser()."""
     print("Checking documented imednet CLI commands against CLI argument parser...")
     root_dir = repo_root or REPO_ROOT
+    wheel_mode = os.environ.get("IMEDNET_TEST_WHEELS") == "1"
     for root in (root_dir, REPO_ROOT):
+        if wheel_mode and root.resolve() == REPO_ROOT.resolve():
+            continue
         for pkg_sub in (
             "packages/core/src",
             "packages/plugins-workflows/src",
@@ -2385,6 +2388,8 @@ _EXPECTED_FACTORY_DATACLASSES = {
 
 def _ensure_workspace_src_on_path(repo_root: Path) -> None:
     """Ensure all workspace package src/ directories are importable."""
+    if os.environ.get("IMEDNET_TEST_WHEELS") == "1" and repo_root.resolve() == REPO_ROOT.resolve():
+        return
     for pkg_sub in (
         "packages/core/src",
         "packages/plugins-workflows/src",
@@ -3619,7 +3624,7 @@ def check_sdtm_and_phi_parity(repo_root: Path | None = None) -> bool:
     print("Checking SDTM domains and SensitivityRegistry keys against record_mapping.rst...")
     root = repo_root or REPO_ROOT
     core_src = str(REPO_ROOT / "packages" / "core" / "src")
-    if core_src not in sys.path:
+    if os.environ.get("IMEDNET_TEST_WHEELS") != "1" and core_src not in sys.path:
         sys.path.insert(0, core_src)
 
     record_mapping_rst = root / "docs" / "how-to" / "record_mapping.rst"

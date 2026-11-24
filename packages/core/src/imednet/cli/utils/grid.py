@@ -171,12 +171,6 @@ def extract_item_details(detail: Any) -> tuple[dict[str, Any], dict[str, Any]]:
             data_dict = dumped
         else:
             data_dict = {k: v for k, v in vars(detail).items() if not k.startswith("_")}
-    elif hasattr(detail, "dict") and callable(detail.dict):
-        dumped_legacy = detail.dict()
-        if isinstance(dumped_legacy, dict):
-            data_dict = dumped_legacy
-        else:
-            data_dict = {k: v for k, v in vars(detail).items() if not k.startswith("_")}
     else:
         data_dict = {k: v for k, v in vars(detail).items() if not k.startswith("_")}
 

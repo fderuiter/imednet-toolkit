@@ -63,6 +63,9 @@ MD_PYTHON_FENCE_CLOSE_PATTERN = re.compile(r"^\s*```\s*$")
 
 def configure_sys_path(repo_root: Path) -> None:
     """Add workspace package source trees to sys.path so local modules resolve."""
+    default_root = Path(__file__).resolve().parent.parent
+    if os.environ.get("IMEDNET_TEST_WHEELS") == "1" and repo_root.resolve() == default_root:
+        return
     candidate_dirs = [
         repo_root / "packages" / "core" / "src",
         repo_root / "packages" / "plugins-workflows" / "src",

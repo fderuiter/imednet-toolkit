@@ -101,5 +101,10 @@ jobs:
             if [[ -f pytest_output.txt ]]; then
               cat pytest_output.txt
             fi
+            if [[ -f reports/verification/drift_report.txt ]]; then
+              cat reports/verification/drift_report.txt
+            elif [[ -f drift_report.txt ]]; then
+              cat drift_report.txt
+            fi
             exit 1
           fi
