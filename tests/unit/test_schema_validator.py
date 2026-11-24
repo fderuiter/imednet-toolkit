@@ -237,15 +237,20 @@ def test_validate_record_entry_with_form_id() -> None:
 
 
 def test_validate_record_entry_missing_both() -> None:
-    """Test that validate record entry missing both."""
-    from imednet.validation.cache import SchemaCache, validate_record_entry
+    """Test that validate record entry missing both formKey and formId is rejected."""
+    from imednet.validation.cache import SchemaCache, ValidationError, validate_record_entry
 
     var = Variable(variable_name="age", variable_type="integer", form_id=1, form_key="F1")
     schema = SchemaCache()
     schema.populate([var])
 
-    # Should not raise, just skips validation
-    validate_record_entry(schema, {"data": {"age": 1}})
+    with pytest.raises(ValidationError, match="formKey.*formId"):
+        validate_record_entry(schema, {"data": {"age": 1}})
+
+    report = validate_record_entry(schema, {"data": {"age": 1}}, collect_errors=True)
+    assert not report.is_valid
+    assert report.invalid_records == 1
+    assert report.errors[0].rule_id == "missing_form_identifier"
 
 
 def test_type_validators_coverage() -> None:

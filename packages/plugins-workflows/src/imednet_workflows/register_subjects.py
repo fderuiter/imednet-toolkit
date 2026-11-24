@@ -236,7 +236,11 @@ class RegisterSubjectsWorkflow:
         sdk = cast("ImednetFacade", self._sdk)
         offline_dry_run = _is_offline_schema_dry_run(dry_run=dry_run, schema=schema)
         sites = None if offline_dry_run else sdk.get_sites(study_key=study_key)
-        normalized_pairs = normalize_subject_registration_inputs(subjects, schema=schema)
+        normalized_pairs = normalize_subject_registration_inputs(
+            subjects,
+            schema=schema,
+            study_key=study_key,
+        )
         should_filter = (
             self._filter_enrolled if filter_enrolled is None else filter_enrolled
         ) or skip_existing
@@ -392,7 +396,11 @@ class RegisterSubjectsWorkflow:
         sdk = cast("AsyncImednetFacade", self._sdk)
         offline_dry_run = _is_offline_schema_dry_run(dry_run=dry_run, schema=schema)
         sites = None if offline_dry_run else await sdk.async_get_sites(study_key=study_key)
-        normalized_pairs = normalize_subject_registration_inputs(subjects, schema=schema)
+        normalized_pairs = normalize_subject_registration_inputs(
+            subjects,
+            schema=schema,
+            study_key=study_key,
+        )
         should_filter = (
             self._filter_enrolled if filter_enrolled is None else filter_enrolled
         ) or skip_existing

@@ -23,16 +23,23 @@ from imednet.errors import (
     RateLimitError,
     UnauthorizedError,
 )
-from imednet.models.jobs import Job
+from imednet.models.jobs import Job, JobStatus
 from imednet.sdk import ImednetSDK
 from imednet.utils.batch_coordinator import (
     DEFAULT_BATCH_CHUNK_SIZE,
     BatchSubmissionSummary,
     sanitize_job_diagnostics,
 )
-from imednet.utils.job_poller import JobFailedError, JobProgressHandler, JobTimeoutError
+from imednet.utils.job_poller import (
+    JobFailedError,
+    JobPollSummary,
+    JobProgressHandler,
+    JobTimeoutError,
+)
 from imednet.utils.security import sanitize_diagnostic_payload
 from imednet.utils.tabular import (
+    _INT_LITERAL_RE,
+    _SLASH_SPACE_RE,
     _TEXT_LIKE_TYPES,
     MASKED_SENTINEL,
     _coerce_clinical_value,
@@ -210,25 +217,17 @@ def _resolve_cli_var_type(
     """Resolve normalized variable type from *schema* and optional form context."""
     if schema is None:
         return None
-    if isinstance(schema, BaseSchemaCache) and study_key:
-        resolved_fk = form_key
-        if not resolved_fk and form_id is not None:
-            resolved_fk = schema.form_key_from_id(form_id, study_key=study_key)
-        if resolved_fk:
-            vars_map = schema.variables_for_form(resolved_fk, study_key=study_key)
-            if vars_map and var_name in vars_map:
-                raw = getattr(vars_map[var_name], "variable_type", None) or getattr(
-                    vars_map[var_name], "variableType", None
-                )
-                if isinstance(raw, str):
-                    return re.sub(r"[\s_-]+", " ", raw.strip().lower())
-            return None
-    else:
-        direct = _resolve_expected_var_type(schema, form_key, form_id, var_name)
-        if direct is not None:
-            return direct
-        if form_key or form_id is not None:
-            return None
+    direct = _resolve_expected_var_type(
+        schema,
+        form_key,
+        form_id,
+        var_name,
+        study_key=study_key,
+    )
+    if direct is not None:
+        return direct
+    if form_key or form_id is not None:
+        return None
 
     # Form-less update fallback: check if variable has a single unambiguous type across forms
     candidate_fks: Sequence[str]
@@ -257,7 +256,8 @@ def _resolve_cli_var_type(
                 form_vars[var_name], "variableType", None
             )
             if isinstance(raw, str) and raw.strip():
-                matched_types.add(re.sub(r"[\s_-]+", " ", raw.strip().lower()))
+                normalized = re.sub(r"[\s_-]+", " ", raw.strip().lower())
+                matched_types.add(_SLASH_SPACE_RE.sub("/", normalized))
     if len(matched_types) == 1:
         return next(iter(matched_types))
     return None
@@ -297,7 +297,19 @@ def parse_key_value_pairs(
             parsed[key] = raw_val
             continue
         val_stripped = raw_val.strip()
-        if val_stripped.lower() in {"true", "false"}:
+        if expected_var_type is None:
+            if _INT_LITERAL_RE.match(val_stripped):
+                parsed[key] = int(val_stripped)
+            else:
+                parsed[key] = _coerce_clinical_value(
+                    raw_val,
+                    from_csv_str=True,
+                    expected_var_type=None,
+                )
+        elif expected_var_type in {"checkbox", "check box"} and val_stripped.lower() in {
+            "true",
+            "false",
+        }:
             parsed[key] = val_stripped.lower() == "true"
         else:
             parsed[key] = _coerce_clinical_value(
@@ -316,6 +328,14 @@ def parse_json_records_text(raw_text: str, *, source_label: str) -> list[dict[st
         raise ValueError(f"Invalid JSON in {source_label}: {exc}") from exc
 
     if isinstance(loaded, dict):
+        if ("items" in loaded and ("schemaVersion" in loaded or "resource" in loaded)) or (
+            isinstance(loaded.get("data"), list)
+            and not any(k in loaded for k in ("formKey", "form_key", "formId", "form_id"))
+        ):
+            raise ValueError(
+                f"JSON payload in {source_label} is a list response envelope, "
+                "not a Record write payload or array of Record payloads."
+            )
         items = [loaded]
     elif isinstance(loaded, list) and all(isinstance(x, dict) for x in loaded):
         items = list(loaded)
@@ -331,6 +351,9 @@ def load_records_from_path_or_stdin(
     file_arg: str,
     *,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """Load record payloads from ``'-'`` (stdin JSON), ``.json``, or ``.csv``."""
     if file_arg == "-":
@@ -342,7 +365,13 @@ def load_records_from_path_or_stdin(
         return parse_json_records_text(
             file_path.read_text(encoding="utf-8"), source_label=str(file_path)
         )
-    return csv_to_records(file_path, schema=schema)
+    return csv_to_records(
+        file_path,
+        schema=schema,
+        study_key=study_key,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+    )
 
 
 @contextmanager
@@ -457,16 +486,70 @@ def submit_cli_records_batch(
 _sanitize_job_for_cli = sanitize_job_diagnostics
 
 
+def summary_from_job_failure(
+    exc: JobFailedError,
+    *,
+    study_key: str,
+    total_records: int,
+    skipped_count: int = 0,
+) -> BatchSubmissionSummary:
+    """Construct a :class:`BatchSubmissionSummary` from a raised :class:`JobFailedError`."""
+    partial = getattr(exc, "partial_summary", None)
+    if isinstance(partial, BatchSubmissionSummary):
+        return partial
+    committed_jobs = getattr(exc, "jobs", None)
+    if isinstance(committed_jobs, list) and committed_jobs:
+        jobs: list[Job] = [_sanitize_job_for_cli(j) for j in committed_jobs]
+    elif exc.status is not None:
+        jobs = [_sanitize_job_for_cli(exc.status)]
+    else:
+        jobs = []
+
+    raw_chunk_sizes = getattr(exc, "chunk_sizes", None)
+    if isinstance(raw_chunk_sizes, list) and raw_chunk_sizes:
+        chunk_sizes = list(raw_chunk_sizes)
+    elif jobs and total_records:
+        chunk_sizes = [total_records]
+    else:
+        chunk_sizes = []
+
+    fail_key = getattr(exc.status, "batch_id", None) or getattr(exc, "batch_id", None) or "failed"
+    results_map = {j.batch_id: j for j in jobs if isinstance(j, JobStatus) and j.batch_id}
+    poll_summary = JobPollSummary(
+        study_key=study_key,
+        results=results_map,
+        failures={str(fail_key): exc},
+        elapsed_total=0.0,
+    )
+    return BatchSubmissionSummary(
+        study_key=study_key,
+        jobs=jobs,
+        chunk_sizes=chunk_sizes,
+        total_records=total_records,
+        skipped_count=skipped_count,
+        poll_summary=poll_summary,
+        wait_for_completion=True,
+    )
+
+
+def _serialize_job_for_json(job: Job) -> dict[str, Any]:
+    """Serialize a sanitized :class:`Job` or :class:`JobStatus` including computed record counts."""
+    sanitized = _sanitize_job_for_cli(job)
+    dumped = cast(
+        dict[str, Any],
+        sanitize_diagnostic_payload(sanitized.model_dump(mode="json", by_alias=True)),
+    )
+    if isinstance(sanitized, JobStatus):
+        dumped["totalRecords"] = sanitized.total_records
+        dumped["successfulRecords"] = sanitized.successful_records
+        dumped["failedRecords"] = sanitized.failed_records
+        if sanitized.result_error is not None:
+            dumped["resultError"] = sanitized.result_error
+    return dumped
+
+
 def _summary_to_json_item(summary: BatchSubmissionSummary) -> dict[str, Any]:
-    sanitized_jobs = [
-        cast(
-            dict[str, Any],
-            sanitize_diagnostic_payload(
-                _sanitize_job_for_cli(j).model_dump(mode="json", by_alias=True)
-            ),
-        )
-        for j in summary.jobs
-    ]
+    sanitized_jobs = [_serialize_job_for_json(j) for j in summary.jobs]
     sanitized_report = (
         cast(dict[str, Any], sanitize_diagnostic_payload(summary.validation_report.to_dict()))
         if summary.validation_report is not None
@@ -588,14 +671,42 @@ def render_write_summary(
         sys.exit(1)
 
 
-def exit_cli_validation_error(exc: Exception) -> NoReturn:
-    """Print a secret-redacted and PHI-masked CLI validation error to stderr and exit 1."""
-    print_error(f"Validation Error: {_redact_secrets(str(exc))}")
+def exit_cli_validation_error(
+    exc: Exception,
+    *,
+    resource: str = "validation_error",
+    study_key: str | None = None,
+    output_format: str | None = None,
+) -> NoReturn:
+    """Print a secret-redacted and PHI-masked CLI validation error, emit JSON if needed, and exit 1."""
+    redacted_msg = _redact_secrets(str(exc))
+    print_error(f"Validation Error: {redacted_msg}")
+    if resolve_output_format(output_format) == "json":
+        val_report = getattr(exc, "validation_report", None)
+        diagnostic_item: dict[str, Any] = {
+            "studyKey": study_key,
+            "allSuccessful": False,
+            "error": redacted_msg,
+            "validationReport": (
+                sanitize_diagnostic_payload(val_report.to_dict())
+                if val_report is not None and hasattr(val_report, "to_dict")
+                else None
+            ),
+        }
+        emit_json([diagnostic_item], resource)
     sys.exit(1)
 
 
-def exit_cli_write_error(exc: Exception) -> NoReturn:
-    """Print redacted/PHI-masked batch or job failure diagnostics to stderr and exit 1."""
+def exit_cli_write_error(
+    exc: Exception,
+    *,
+    resource: str = "write_error",
+    study_key: str | None = None,
+    total_records: int = 0,
+    skipped_count: int = 0,
+    output_format: str | None = None,
+) -> NoReturn:
+    """Print redacted/PHI-masked batch or job failure diagnostics, emit JSON if needed, and exit 1."""
     base_msg = _redact_secrets(str(exc))
     partial = getattr(exc, "partial_summary", None)
     context_parts: list[str] = []
@@ -622,5 +733,32 @@ def exit_cli_write_error(exc: Exception) -> NoReturn:
         prefix = "API Error"
     else:
         prefix = "Error"
-    print_error(f"{prefix}: {_redact_secrets(base_msg + suffix)}")
+    formatted_err = _redact_secrets(base_msg + suffix)
+    print_error(f"{prefix}: {formatted_err}")
+    if resolve_output_format(output_format) == "json":
+        summary_for_json: BatchSubmissionSummary | None = None
+        if isinstance(partial, BatchSubmissionSummary):
+            summary_for_json = partial
+        elif isinstance(exc, JobFailedError) and study_key is not None:
+            summary_for_json = summary_from_job_failure(
+                exc,
+                study_key=study_key,
+                total_records=total_records,
+                skipped_count=skipped_count,
+            )
+        if summary_for_json is not None:
+            emit_json([_summary_to_json_item(summary_for_json)], resource)
+        else:
+            emit_json(
+                [
+                    {
+                        "studyKey": study_key,
+                        "allSuccessful": False,
+                        "error": formatted_err,
+                        "jobs": [],
+                        "validationReport": None,
+                    }
+                ],
+                resource,
+            )
     sys.exit(1)

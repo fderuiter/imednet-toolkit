@@ -379,6 +379,199 @@ def test_spi_reexports_all_tabular_enrollment_and_validation_helpers() -> None:
         assert hasattr(spi_validation, name), f"Missing {name} in imednet.spi.validation"
 
 
+def test_tabular_preserves_categorical_and_text_strings_and_serializes_timestamps(
+    tmp_path: Path,
+) -> None:
+    """AC 1 & Req 1: Preserve '1.0' strings with/without schema, scope by study_key, serialize timestamps."""
+    from datetime import UTC, date, datetime, time
+
+    from imednet.models.variables import Variable as SdkVariable
+    from imednet.utils.tabular import normalize_records_input
+    from imednet.validation.cache import SchemaCache
+
+    csv_path = tmp_path / "categorical.csv"
+    csv_path.write_text(
+        "formKey,subjectKey,CAT_CODE,SCORE_TEXT,VISIT_COUNT,IS_ACTIVE\n"
+        "F_ASSESS,SUB-1,1.0,true,7.0,true\n",
+        encoding="utf-8",
+    )
+
+    # Without schema: all scalar strings like "1.0" and "true" stay exact strings
+    untyped = csv_to_records(csv_path, schema=None)
+    assert untyped[0]["data"] == {
+        "CAT_CODE": "1.0",
+        "SCORE_TEXT": "true",
+        "VISIT_COUNT": "7.0",
+        "IS_ACTIVE": "true",
+    }
+
+    # Shared SchemaCache with two studies defining F_ASSESS differently
+    cache = SchemaCache()
+    cache.populate(
+        [
+            SdkVariable(
+                study_key="STUDY_TEXT",
+                form_id=10,
+                form_key="F_ASSESS",
+                variable_id=1,
+                variable_name="CAT_CODE",
+                variable_type="radio",
+            ),
+            SdkVariable(
+                study_key="STUDY_TEXT",
+                form_id=10,
+                form_key="F_ASSESS",
+                variable_id=2,
+                variable_name="SCORE_TEXT",
+                variable_type="text",
+            ),
+            SdkVariable(
+                study_key="STUDY_TEXT",
+                form_id=10,
+                form_key="F_ASSESS",
+                variable_id=3,
+                variable_name="VISIT_COUNT",
+                variable_type="integer",
+            ),
+            SdkVariable(
+                study_key="STUDY_TEXT",
+                form_id=10,
+                form_key="F_ASSESS",
+                variable_id=4,
+                variable_name="IS_ACTIVE",
+                variable_type="boolean",
+            ),
+            SdkVariable(
+                study_key="STUDY_NUM",
+                form_id=20,
+                form_key="F_ASSESS",
+                variable_id=5,
+                variable_name="CAT_CODE",
+                variable_type="float",
+            ),
+        ],
+        study_key=None,
+    )
+
+    typed_text_study = csv_to_records(csv_path, schema=cache, study_key="STUDY_TEXT")
+    assert typed_text_study[0]["data"] == {
+        "CAT_CODE": "1.0",
+        "SCORE_TEXT": "true",
+        "VISIT_COUNT": 7,
+        "IS_ACTIVE": True,
+    }
+
+    typed_num_study = csv_to_records(csv_path, schema=cache, study_key="STUDY_NUM")
+    assert typed_num_study[0]["data"]["CAT_CODE"] == 1.0
+    assert isinstance(typed_num_study[0]["data"]["CAT_CODE"], float)
+
+    # Timestamp serialization across datetime, date, time, and pd.Timestamp
+    ts_df = pd.DataFrame(
+        [
+            {
+                "formKey": "F_ASSESS",
+                "subjectKey": "SUB-TS",
+                "DT_UTC": datetime(2026, 5, 1, 14, 30, tzinfo=UTC),
+                "VISIT_DATE": date(2026, 5, 1),
+                "VISIT_TIME": time(9, 15, 0),
+                "PD_TS": pd.Timestamp("2026-05-02T08:00:00Z"),
+            }
+        ]
+    )
+    ts_records = normalize_records_input(ts_df)
+    assert ts_records[0]["data"] == {
+        "DT_UTC": "2026-05-01T14:30:00+00:00",
+        "VISIT_DATE": "2026-05-01",
+        "VISIT_TIME": "09:15:00",
+        "PD_TS": "2026-05-02T08:00:00+00:00",
+    }
+    json.dumps(ts_records)  # Guaranteed JSON-serializable
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_refreshes_schema_cache_per_study_before_csv_normalization(
+    tmp_path: Path,
+) -> None:
+    """AC 3 & Req 2: RecordUpdateWorkflow refreshes SchemaCache across two Study keys before CSV coercion."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from imednet.models.variables import Variable as SdkVariable
+
+    csv_study_a = tmp_path / "study_a.csv"
+    csv_study_a.write_text("formKey,subjectKey,CODE\nF_SHARED,SUB-A,1.0\n", encoding="utf-8")
+
+    csv_study_b = tmp_path / "study_b.csv"
+    csv_study_b.write_text("formKey,subjectKey,CODE\nF_SHARED,SUB-B,42.0\n", encoding="utf-8")
+
+    vars_by_study = {
+        "STUDY_A": [
+            SdkVariable(
+                study_key="STUDY_A",
+                form_id=101,
+                form_key="F_SHARED",
+                variable_id=1,
+                variable_name="CODE",
+                variable_type="text",
+            )
+        ],
+        "STUDY_B": [
+            SdkVariable(
+                study_key="STUDY_B",
+                form_id=202,
+                form_key="F_SHARED",
+                variable_id=2,
+                variable_name="CODE",
+                variable_type="integer",
+            )
+        ],
+    }
+
+    # Sync workflow across two studies
+    sync_submitted: list[tuple[str, list[dict[str, object]]]] = []
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.get_variables.side_effect = lambda study_key, **_: vars_by_study[study_key]
+
+    def _capture_sync_create(
+        study_key: str, records_data: list[dict[str, object]], **_kw: object
+    ) -> Job:
+        sync_submitted.append((study_key, records_data))
+        return Job(jobId=f"J-{study_key}", batchId=f"B-{study_key}", state="COMPLETED")
+
+    sync_sdk.create_record.side_effect = _capture_sync_create
+    sync_wf = RecordUpdateWorkflow(sync_sdk)
+    sync_wf.create_or_update_records("STUDY_A", csv_study_a)
+    sync_wf.create_or_update_records("STUDY_B", csv_study_b)
+
+    assert sync_submitted[0][0] == "STUDY_A"
+    assert sync_submitted[0][1][0]["data"] == {"CODE": "1.0"}
+    assert isinstance(sync_submitted[0][1][0]["data"]["CODE"], str)  # type: ignore[index]
+    assert sync_submitted[1][0] == "STUDY_B"
+    assert sync_submitted[1][1][0]["data"] == {"CODE": 42}
+    assert isinstance(sync_submitted[1][1][0]["data"]["CODE"], int)  # type: ignore[index]
+
+    # Async batch workflow across two studies
+    async_submitted: list[tuple[str, list[dict[str, object]]]] = []
+    async_sdk = MagicMock()
+    async_sdk.async_get_variables = AsyncMock(
+        side_effect=lambda study_key, **_: vars_by_study[study_key]
+    )
+
+    async def _capture_async_create(
+        study_key: str, records_data: list[dict[str, object]], **_kw: object
+    ) -> Job:
+        async_submitted.append((study_key, records_data))
+        return Job(jobId=f"AJ-{study_key}", batchId=f"AB-{study_key}", state="COMPLETED")
+
+    async_sdk.async_create_record = AsyncMock(side_effect=_capture_async_create)
+    async_wf = RecordUpdateWorkflow(async_sdk)
+    await async_wf.async_create_or_update_records_batch("STUDY_A", csv_study_a)
+    await async_wf.async_create_or_update_records_batch("STUDY_B", csv_study_b)
+
+    assert async_submitted[0][1][0]["data"] == {"CODE": "1.0"}
+    assert async_submitted[1][1][0]["data"] == {"CODE": 42}
+
+
 def test_register_subject_request_optional_identifiers_exclude_none() -> None:
     """Req 6: RegisterSubjectRequest supports subjectKey, subjectOid, and siteId with exclude_none."""
     from imednet.models.records import RegisterSubjectRequest

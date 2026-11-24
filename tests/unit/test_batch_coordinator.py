@@ -1091,3 +1091,56 @@ async def test_poll_facade_helpers_argument_preparation_and_fallback() -> None:
     )
     assert set(afallback_summary.results) == {"AB1", "AB2"}
     assert afallback_summary.elapsed_total == 0.0
+
+
+@pytest.mark.asyncio
+async def test_batch_coordinator_chunk_two_failure_attaches_committed_jobs_and_batch_ids() -> None:
+    """AC 5 & Req 6: Failing on chunk 2 exposes committed chunk 1 Job and batch_id on raised error."""
+    records = [
+        {"formKey": "F1", "data": {"age": 1}},
+        {"formKey": "F1", "data": {"age": 2}},
+        {"formKey": "F1", "data": {"age": 3}},
+    ]
+
+    # Sync BatchCoordinator: chunk 1 succeeds (BATCH-1), chunk 2 raises RuntimeError
+    sync_calls = 0
+
+    def submit_sync(_chunk: list[dict[str, Any]]) -> Job:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            return Job(jobId="JOB-1", batchId="BATCH-1", state="PROCESSING")
+        raise RuntimeError("Upstream 502 on chunk 2")
+
+    sync_coord = BatchCoordinator(chunk_size=2)
+    with pytest.raises(RuntimeError, match="Upstream 502 on chunk 2") as sync_exc:
+        sync_coord.submit("STUDY", records, submit_sync, skip_validation=True)
+
+    err_sync: Any = sync_exc.value
+    assert len(err_sync.jobs) == 1
+    assert err_sync.jobs[0].batch_id == "BATCH-1"
+    assert err_sync.committed_jobs == err_sync.jobs
+    assert err_sync.batch_ids == ["BATCH-1"]
+    assert err_sync.committed_batch_ids == ["BATCH-1"]
+    assert err_sync.batch_id == "BATCH-1"
+
+    # AsyncBatchCoordinator: chunk 1 succeeds (ABATCH-1), chunk 2 raises RuntimeError
+    async_calls = 0
+
+    async def submit_async(_chunk: list[dict[str, Any]]) -> Job:
+        nonlocal async_calls
+        async_calls += 1
+        if async_calls == 1:
+            return Job(jobId="AJOB-1", batchId="ABATCH-1", state="PROCESSING")
+        raise RuntimeError("Async upstream timeout on chunk 2")
+
+    async_coord = AsyncBatchCoordinator(chunk_size=2)
+    with pytest.raises(RuntimeError, match="Async upstream timeout on chunk 2") as async_exc:
+        await async_coord.submit("STUDY", records, submit_async, skip_validation=True)
+
+    err_async: Any = async_exc.value
+    assert len(err_async.jobs) == 1
+    assert err_async.jobs[0].batch_id == "ABATCH-1"
+    assert err_async.committed_jobs == err_async.jobs
+    assert err_async.batch_ids == ["ABATCH-1"]
+    assert err_async.batch_id == "ABATCH-1"

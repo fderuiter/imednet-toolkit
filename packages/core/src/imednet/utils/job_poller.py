@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import inspect
+import json
 import logging
 import threading
 import time
@@ -305,14 +306,30 @@ def evaluate_job_state(
 
 
 def _attach_fetched_result(status: JobStatus | Any, res: Any) -> JobStatus | Any:
-    """Attach a fetched ``resultUrl`` HTTP response or decoded payload to ``status``."""
-    if hasattr(res, "json"):
-        try:
-            status.results = res.json()
-        except Exception:
-            status.results = getattr(res, "text", str(res))
-    else:
+    """Attach a fetched ``resultUrl`` JSON payload to ``status`` or raise on non-JSON bodies."""
+    parsed: Any
+    if isinstance(res, (dict, list)):
         status.results = res
+        return status
+
+    try:
+        if hasattr(res, "json"):
+            parsed = res.json()
+        elif isinstance(res, (str, bytes)):
+            parsed = json.loads(res)
+        else:
+            raise ValueError(f"Unsupported resultUrl response type: {type(res).__name__}")
+        if not isinstance(parsed, (dict, list)):
+            raise ValueError(
+                f"Expected JSON object or array from resultUrl, got {type(parsed).__name__}"
+            )
+    except Exception as exc:
+        redacted_err = sanitize_diagnostic_text(str(exc)) or "Invalid JSON in resultUrl body"
+        status.results = None
+        status.result_error = redacted_err
+        raise ValueError(f"Non-JSON resultUrl response: {redacted_err}") from exc
+
+    status.results = parsed
     return status
 
 
@@ -322,7 +339,16 @@ def resolve_sdk_result_fetcher(sdk: Any) -> Callable[[str], Any] | None:
 
     from imednet.endpoints.jobs import JobsEndpoint
 
-    jobs = getattr(sdk, "jobs", None)
+    if not isinstance(sdk, NonCallableMock) or "fetch_job_result" in vars(sdk):
+        facade_fn = getattr(sdk, "fetch_job_result", None)
+        if callable(facade_fn):
+            return cast(Callable[[str], Any], facade_fn)
+
+    jobs = (
+        getattr(sdk, "jobs", None)
+        if not isinstance(sdk, NonCallableMock) or "jobs" in vars(sdk)
+        else None
+    )
     if isinstance(jobs, JobsEndpoint):
         return jobs.fetch_result
     if jobs is not None and not isinstance(jobs, NonCallableMock):

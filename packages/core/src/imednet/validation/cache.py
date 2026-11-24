@@ -1811,6 +1811,19 @@ def calculate_readiness_score(
     return score, reasons
 
 
+def _has_existing_record_target(record: Mapping[str, Any]) -> bool:
+    """Return True when *record* specifies an existing record or visit target."""
+    for int_key in ("recordId", "record_id", "visitId", "visit_id"):
+        val = record.get(int_key)
+        if val is not None and not isinstance(val, bool) and str(val).strip() != "":
+            return True
+    for str_key in ("recordOid", "record_oid"):
+        val = record.get(str_key)
+        if val is not None and str(val).strip() != "":
+            return True
+    return False
+
+
 @overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
@@ -1909,6 +1922,24 @@ def validate_record_entry(
             study_key=eff_study_key,
             collect_errors=collect_errors,
             record_index=record_index,
+        )
+    if not _has_existing_record_target(record):
+        msg = "Record payload must include 'formKey' or 'formId'"
+        if not collect_errors:
+            raise ValidationError(msg)
+        return BatchValidationReport(
+            total_records=1,
+            valid_records=0,
+            invalid_records=1,
+            errors=[
+                RecordValidationIssue(
+                    record_index=record_index,
+                    form_key=None,
+                    variable_name=None,
+                    message=msg,
+                    rule_id="missing_form_identifier",
+                )
+            ],
         )
 
     raw_data = record.get("recordData", record.get("data", {}))

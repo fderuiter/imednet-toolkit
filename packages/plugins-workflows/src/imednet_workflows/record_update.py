@@ -1,5 +1,6 @@
 """Utilities for submitting and updating records in iMedNet studies."""
 
+import os
 from typing import TYPE_CHECKING, Any, Literal, Union, cast
 
 from imednet.spi.errors import ValidationError
@@ -92,6 +93,14 @@ class RecordUpdateWorkflow:
                 f"(ImednetFacade). With AsyncImednetSDK, await "
                 f"workflow.{async_counterpart}(...) instead."
             )
+
+    @staticmethod
+    def _is_tabular_input(records_data: RecordsInput) -> bool:
+        """Return True when *records_data* is a CSV path or pandas DataFrame."""
+        if isinstance(records_data, (str, os.PathLike)):
+            return True
+        cls = type(records_data)
+        return cls.__name__ == "DataFrame" and cls.__module__.startswith("pandas")
 
     def _resolve_active_schema(
         self, schema: ValidationSchemaProtocol | None
@@ -207,8 +216,27 @@ class RecordUpdateWorkflow:
             "create_or_update_records_batch", "async_create_or_update_records_batch"
         )
         effective_chunk_size = chunk_size or self._batch_size
+        if _single_job_method is not None and dry_run:
+            validate_single_job_preflight(
+                [],
+                chunk_size=effective_chunk_size,
+                dry_run=True,
+                method_name=_single_job_method[0],
+                batch_method_name=_single_job_method[1],
+            )
         active_schema, is_offline = self._resolve_active_schema(schema)
-        normalized = normalize_records_input(records_data, schema=active_schema)
+        if (
+            not is_offline
+            and self._is_tabular_input(records_data)
+            and isinstance(active_schema, BaseSchemaCache)
+            and not active_schema.forms_for_study(study_key)
+        ):
+            cast(SchemaValidator, self._validator).refresh(study_key)
+        normalized = normalize_records_input(
+            records_data,
+            schema=active_schema,
+            study_key=study_key,
+        )
         if _single_job_method is not None:
             validate_single_job_preflight(
                 normalized,
@@ -316,8 +344,27 @@ class RecordUpdateWorkflow:
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once, submit chunks, and return a batch summary."""
         effective_chunk_size = chunk_size or self._batch_size
+        if _single_job_method is not None and dry_run:
+            validate_single_job_preflight(
+                [],
+                chunk_size=effective_chunk_size,
+                dry_run=True,
+                method_name=_single_job_method[0],
+                batch_method_name=_single_job_method[1],
+            )
         active_schema, is_offline = self._resolve_active_schema(schema)
-        normalized = normalize_records_input(records_data, schema=active_schema)
+        if (
+            not is_offline
+            and self._is_tabular_input(records_data)
+            and isinstance(active_schema, BaseSchemaCache)
+            and not active_schema.forms_for_study(study_key)
+        ):
+            await cast(AsyncSchemaValidator, self._validator).refresh(study_key)
+        normalized = normalize_records_input(
+            records_data,
+            schema=active_schema,
+            study_key=study_key,
+        )
         if _single_job_method is not None:
             validate_single_job_preflight(
                 normalized,

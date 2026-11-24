@@ -162,6 +162,8 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
     _client: ClientT
     _executor: ExecutorT
     _circuit_breaker: CircuitBreaker
+    _external_executor: ExecutorT
+    _external_circuit_breaker: CircuitBreaker
 
     @abstractmethod
     def _get_client_class(self) -> type[ClientT]:
@@ -210,6 +212,10 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
         self._circuit_breaker = CircuitBreaker()
         self._executor = self._create_executor(self._client, self.retry_config)
         self._executor.circuit_breaker = self._circuit_breaker
+
+        self._external_circuit_breaker = CircuitBreaker()
+        self._external_executor = self._create_executor(self._client, self.retry_config)
+        self._external_executor.circuit_breaker = self._external_circuit_breaker
 
     def _create_client(self, auth: AuthStrategy) -> ClientT:
         """Create the underlying httpx client with origin-scoped authentication."""
@@ -289,6 +295,7 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
     def retry_policy(self, policy: RetryPolicy) -> None:
         """Set a new retry policy for the executor."""
         self._executor.retry_config.retry_policy = policy
+        self._external_executor.retry_config.retry_policy = policy
 
     @abstractmethod
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:

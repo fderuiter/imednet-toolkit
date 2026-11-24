@@ -8,7 +8,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, RootModel, field_validator
+from pydantic import (
+    Field,
+    RootModel,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
@@ -257,7 +263,8 @@ class RegisterSubjectRequest(BaseRecordRequest):
 
     Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
     Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
-    ``None`` so server-assigned subject keys continue working by default.
+    ``None`` so server-assigned subject keys continue working by default; when
+    explicitly supplied, they are preserved for enrollment and deduplication.
     """
 
     site_name: str = Field(
@@ -278,6 +285,33 @@ class RegisterSubjectRequest(BaseRecordRequest):
         alias="subjectOid",
         description="Optional subject OID",
     )
+
+    @field_validator("subject_key", "subject_oid", mode="before")
+    @classmethod
+    def _normalize_optional_subject_identifier(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @model_serializer(mode="wrap")
+    def _serialize_omitting_unset_enrollment_fields(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        serialized: dict[str, Any] = handler(self)
+        if self.site_id is None:
+            serialized.pop("site_id", None)
+            serialized.pop("siteId", None)
+        elif not self.site_name:
+            serialized.pop("site_name", None)
+            serialized.pop("siteName", None)
+        if self.subject_key is None:
+            serialized.pop("subject_key", None)
+            serialized.pop("subjectKey", None)
+        if self.subject_oid is None:
+            serialized.pop("subject_oid", None)
+            serialized.pop("subjectOid", None)
+        return serialized
 
     def model_dump(self, **kwargs: Any) -> dict[str, Any]:
         """Serialize enrollment payload, omitting ``None`` optional attributes by default."""

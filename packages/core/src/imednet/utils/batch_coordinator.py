@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, TypedDict, Unpack, cast
@@ -20,10 +20,12 @@ from imednet.utils.job_poller import (
 from imednet.utils.security import sanitize_diagnostic_payload, sanitize_diagnostic_text
 from imednet.utils.tabular import ensure_no_masked_sentinel, normalize_records_input
 from imednet.utils.typing import RecordsInput
+from imednet.validation._base import _extract_form_ref
 from imednet.validation.cache import (
     BatchValidationReport,
     RecordValidationIssue,
     ValidationSchemaProtocol,
+    _has_existing_record_target,
     is_schema_record_prevalidated,
     prevalidated_records,
     validate_record_entry,
@@ -231,22 +233,38 @@ def _accepts_kwarg(fn: Callable[..., Any], kwarg_name: str) -> bool:
 
 
 def _masked_only_report(records_data: list[dict[str, Any]]) -> BatchValidationReport:
-    """Build a :class:`BatchValidationReport` checking masked PHI sentinels when schema is absent."""
+    """Build a :class:`BatchValidationReport` checking form identifiers and masked PHI sentinels."""
     report = BatchValidationReport(total_records=len(records_data))
     for idx, rec in enumerate(records_data):
-        try:
-            ensure_no_masked_sentinel([rec])
-            report.valid_records += 1
-        except ValidationError as exc:
-            report.invalid_records += 1
-            report.errors.append(
+        row_errors: list[RecordValidationIssue] = []
+        fk, fid = _extract_form_ref(rec)
+        has_valid_fid = fid is not None and not isinstance(fid, bool)
+        if not fk and not has_valid_fid and not _has_existing_record_target(rec):
+            row_errors.append(
                 RecordValidationIssue(
                     record_index=idx,
-                    form_key=str(rec.get("formKey") or rec.get("form_key") or "") or None,
+                    form_key=None,
+                    variable_name=None,
+                    message="Record payload must specify either 'formKey' or 'formId'.",
+                    rule_id="missing_form_identifier",
+                )
+            )
+        try:
+            ensure_no_masked_sentinel([rec])
+        except ValidationError as exc:
+            row_errors.append(
+                RecordValidationIssue(
+                    record_index=idx,
+                    form_key=fk,
                     variable_name=None,
                     message=str(exc),
                 )
             )
+        if row_errors:
+            report.invalid_records += 1
+            report.errors.extend(row_errors)
+        else:
+            report.valid_records += 1
     return report
 
 
@@ -377,6 +395,29 @@ def _apply_poll_summary_to_jobs(jobs: list[Job], poll_summary: JobPollSummary | 
             jobs[idx] = terminal_map[job.batch_id]
 
 
+def _attach_committed_jobs_context(
+    exc: BaseException,
+    jobs: Sequence[Job],
+    chunk_sizes: Sequence[int] | None = None,
+) -> None:
+    """Attach committed chunk ``Job`` objects and ``batch_id`` values onto *exc*."""
+    if not jobs:
+        return
+    committed = list(jobs)
+    batch_ids = [j.batch_id for j in committed if j.batch_id]
+    try:
+        exc.jobs = committed  # type: ignore[attr-defined]
+        exc.committed_jobs = committed  # type: ignore[attr-defined]
+        exc.batch_ids = batch_ids  # type: ignore[attr-defined]
+        exc.committed_batch_ids = batch_ids  # type: ignore[attr-defined]
+        if batch_ids and not getattr(exc, "batch_id", None):
+            exc.batch_id = batch_ids[0]  # type: ignore[attr-defined]
+        if chunk_sizes is not None:
+            exc.chunk_sizes = list(chunk_sizes)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
+
+
 def _attach_mid_batch_error(
     exc: Exception,
     *,
@@ -413,6 +454,7 @@ def _attach_mid_batch_error(
     exc.unsubmitted_records = partial_summary.unsubmitted_records  # type: ignore[attr-defined]
     exc.submitted_jobs = list(sanitized_jobs)  # type: ignore[attr-defined]
     exc.poll_summary = sanitized_poll  # type: ignore[attr-defined]
+    _attach_committed_jobs_context(exc, sanitized_jobs, chunk_sizes)
 
 
 def _extract_batch_ids(jobs: list[Job], *, require_batch_id: bool) -> list[str]:
@@ -466,6 +508,7 @@ def _raise_from_poll_summary(
         target_exc.poll_summary = sanitized_poll  # type: ignore[attr-defined]
         target_exc.partial_summary = attached_summary  # type: ignore[attr-defined]
         target_exc.submitted_jobs = list(sanitized_jobs)  # type: ignore[attr-defined]
+        _attach_committed_jobs_context(target_exc, sanitized_jobs, partial_summary.chunk_sizes)
         raise target_exc
 
 
@@ -1087,7 +1130,7 @@ def _prepare_records_batch_execution(
     wait = options.get("wait_for_completion", False)
     timeout = options.get("timeout", 300.0)
     interval = options.get("interval", 5.0)
-    normalized = normalize_records_input(records_data, schema=schema)
+    normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
 
     def _submit_chunk(chunk: list[dict[str, Any]]) -> Any:
         return create_records_fn(

@@ -45,25 +45,25 @@ def _load_cli_subject_inputs(
     if args.input_file and args.json_payload:
         raise ValueError("Cannot combine --file and --json.")
 
-    inline_data = parse_key_value_pairs(
-        args.data_pairs,
-        schema=schema,
-        form_key=args.form_key,
-        study_key=getattr(args, "study_key", None),
-    )
+    study_key = getattr(args, "study_key", None)
     if args.input_file:
         if args.input_file == "-":
             items = parse_json_records_text(sys.stdin.read(), source_label="stdin")
-            if inline_data:
+            if args.data_pairs:
                 return _merge_subject_inline_overrides(items, args=args, schema=schema)
             return items
-        if inline_data:
-            items = load_records_from_path_or_stdin(args.input_file, schema=schema)
+        if args.data_pairs:
+            items = load_records_from_path_or_stdin(
+                args.input_file,
+                schema=schema,
+                study_key=study_key,
+                default_form_key=args.form_key,
+            )
             return _merge_subject_inline_overrides(items, args=args, schema=schema)
         return Path(args.input_file)
     if args.json_payload:
         items = parse_json_records_text(args.json_payload, source_label="--json")
-        if inline_data:
+        if args.data_pairs:
             return _merge_subject_inline_overrides(items, args=args, schema=schema)
         return items
 
@@ -71,6 +71,12 @@ def _load_cli_subject_inputs(
         raise ValueError(
             "Provide --file, --json, or both --form-key and --site-name to register a subject."
         )
+    inline_data = parse_key_value_pairs(
+        args.data_pairs,
+        schema=schema,
+        form_key=args.form_key,
+        study_key=study_key,
+    )
     single: dict[str, Any] = {
         "formKey": args.form_key,
         "data": inline_data,
@@ -215,6 +221,8 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             dry_run=args.dry_run,
             schema_source=args.schema_source,
         )
+        subjects_data: list[dict[str, Any]] = []
+        skipped_count = 0
         try:
             resolved_schema = resolve_cli_schema(
                 sdk,
@@ -229,7 +237,22 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 default_site_name=args.site_name,
                 default_site_id=args.site_id,
                 schema=resolved_schema,
+                study_key=args.study_key,
             )
+            if (
+                (args.subject_key or getattr(args, "subject_oid", None))
+                and (args.input_file or args.json_payload)
+                and len(normalized_pairs) == 1
+            ):
+                dumped_only = normalized_pairs[0][1].model_dump(by_alias=True, exclude_none=True)
+                if args.subject_key and not normalized_pairs[0][1].subject_key:
+                    dumped_only["subjectKey"] = args.subject_key
+                if getattr(args, "subject_oid", None) and not normalized_pairs[0][1].subject_oid:
+                    dumped_only["subjectOid"] = args.subject_oid
+                normalized_pairs = [
+                    (dumped_only, normalized_pairs[0][1].model_validate(dumped_only))
+                ]
+
             sites = None if offline_dry_run else list(sdk.sites.list(args.study_key))
             validate_subject_registration_sites(normalized_pairs, sites)
 
@@ -250,9 +273,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 skipped_count=skipped_count,
             )
         except (ValidationError, ValueError) as exc:
-            exit_cli_validation_error(exc)
+            exit_cli_validation_error(
+                exc,
+                resource="subjects_register",
+                study_key=args.study_key,
+                output_format=args.output_format,
+            )
         except (JobFailedError, JobTimeoutError, ApiError) as exc:
-            exit_cli_write_error(exc)
+            exit_cli_write_error(
+                exc,
+                resource="subjects_register",
+                study_key=args.study_key,
+                total_records=len(subjects_data),
+                skipped_count=skipped_count,
+                output_format=args.output_format,
+            )
 
         render_write_summary(
             summary,

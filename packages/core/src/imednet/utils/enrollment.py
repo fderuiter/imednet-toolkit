@@ -87,6 +87,7 @@ def normalize_subject_registration_inputs(
     default_site_name: str | None = None,
     default_site_id: int | None = None,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
 ) -> list[tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]]:
     """Normalize registration requests from models, dicts, DataFrame, or CSV/JSON file path."""
     raw_items: Sequence[RegisterSubjectRequest | dict[str, Any]]
@@ -94,11 +95,25 @@ def normalize_subject_registration_inputs(
         file_path = Path(subjects)
         if file_path.suffix.lower() == ".json":
             raw_json = json.loads(file_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(raw_json, dict)
+                and "items" in raw_json
+                and ("schemaVersion" in raw_json or "resource" in raw_json)
+            ):
+                raise ValueError(
+                    f"JSON payload in {file_path} is a CLI list response envelope, "
+                    "not a Subject registration payload."
+                )
             items = raw_json if isinstance(raw_json, list) else [raw_json]
             records = [dict(x) for x in items]
             ensure_no_masked_sentinel(records)
         else:
-            records = csv_to_records(file_path, schema=schema)
+            records = csv_to_records(
+                file_path,
+                schema=schema,
+                study_key=study_key,
+                default_form_key=default_form_key,
+            )
         raw_items = _apply_registration_defaults(
             records,
             default_form_key=default_form_key,
@@ -106,7 +121,12 @@ def normalize_subject_registration_inputs(
             default_site_id=default_site_id,
         )
     elif _is_dataframe_instance(subjects):
-        records = dataframe_rows_to_records(subjects, schema=schema)
+        records = dataframe_rows_to_records(
+            subjects,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+        )
         raw_items = _apply_registration_defaults(
             records,
             default_form_key=default_form_key,
