@@ -313,3 +313,64 @@ def test_airflow_recovers_stale_running_variable_and_blocks_active_lease(
 
     assert pushed_statuses == ["failed", "running", "success"]
     assert provider.get_last_timestamp("ST1", "recs") == committed
+
+
+def test_file_and_airflow_transaction_hydrate_persist_rollback_and_redact_sdtm_metadata(
+    tmp_path: Path,
+    sdk_variable_store: dict[str, Any],
+) -> None:
+    """Both state providers hydrate, redact, persist, and roll back SDTM metadata in transactions."""
+    _ = sdk_variable_store
+    file_provider = FileStateProvider(ledger_path=tmp_path / "sdtm_meta_ledger.json")
+    airflow_provider = AirflowStateProvider()
+
+    for label, provider in (("file", file_provider), ("airflow", airflow_provider)):
+        study = f"STUDY_{label.upper()}"
+        t1 = datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc)
+        t2 = datetime(2026, 7, 1, 11, 0, tzinfo=timezone.utc)
+        t3 = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+
+        # Run 1: populate SDTM sequence counters and verify PHI redaction in metadata
+        with provider.transaction(study, "ae_sdtm") as tx1:
+            assert tx1["metadata"] == {}
+            tx1["metadata"]["sdtm_seq_counters"] = {"AE:SUBJ-01": 2, "AE:SUBJ-02": 1}
+            tx1["metadata"]["sdtm_record_seqs"] = {"AE:1": 1, "AE:2": 2, "AE:3": 1}
+            tx1["metadata"]["patientName"] = "Jane Secret"
+            tx1["new_timestamp"] = t1
+            tx1["records_processed"] = 3
+
+        committed_1 = provider.read_state().studies[study].streams["ae_sdtm"]
+        assert committed_1.last_timestamp == t1
+        assert committed_1.metadata["sdtm_seq_counters"] == {"AE:SUBJ-01": 2, "AE:SUBJ-02": 1}
+        assert committed_1.metadata["sdtm_record_seqs"] == {"AE:1": 1, "AE:2": 2, "AE:3": 1}
+        assert committed_1.metadata["patientName"] == "***MASKED***"
+
+        # Run 2 (failed mid-stream): mutate metadata in place, then raise -> rolls back metadata & timestamp
+        with pytest.raises(RuntimeError, match="reconcile boom"):
+            with provider.transaction(study, "ae_sdtm") as tx_fail:
+                assert tx_fail["metadata"]["sdtm_seq_counters"]["AE:SUBJ-01"] == 2
+                tx_fail["metadata"]["sdtm_seq_counters"]["AE:SUBJ-01"] = 99
+                tx_fail["metadata"]["sdtm_record_seqs"]["AE:999"] = 99
+                tx_fail["new_timestamp"] = t2
+                raise RuntimeError("reconcile boom")
+
+        rolled_back = provider.read_state().studies[study].streams["ae_sdtm"]
+        assert rolled_back.last_run_status == StreamExecutionStatus.FAILED
+        assert rolled_back.last_timestamp == t1
+        assert rolled_back.metadata["sdtm_seq_counters"] == {"AE:SUBJ-01": 2, "AE:SUBJ-02": 1}
+        assert "AE:999" not in rolled_back.metadata["sdtm_record_seqs"]
+
+        # Run 3 (retry succeeds): hydrates Run 1 counters and advances to 3
+        with provider.transaction(study, "ae_sdtm") as tx3:
+            assert tx3["last_timestamp"] == t1
+            assert tx3["metadata"]["sdtm_seq_counters"] == {"AE:SUBJ-01": 2, "AE:SUBJ-02": 1}
+            tx3["metadata"]["sdtm_seq_counters"]["AE:SUBJ-01"] = 3
+            tx3["metadata"]["sdtm_record_seqs"]["AE:4"] = 3
+            tx3["new_timestamp"] = t3
+            tx3["records_processed"] = 1
+
+        committed_3 = provider.read_state().studies[study].streams["ae_sdtm"]
+        assert committed_3.last_run_status == StreamExecutionStatus.SUCCESS
+        assert committed_3.last_timestamp == t3
+        assert committed_3.metadata["sdtm_seq_counters"] == {"AE:SUBJ-01": 3, "AE:SUBJ-02": 1}
+        assert committed_3.metadata["sdtm_record_seqs"]["AE:4"] == 3

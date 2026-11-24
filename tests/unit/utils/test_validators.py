@@ -140,9 +140,9 @@ def test_parse_datetime_handles_string_timestamps():
 
 def test_parse_bool_handles_unusual_strings():
     """Test that parse bool handles unusual strings."""
-    # Test cases that trigger the float fallback
-    assert parse_bool("inf") is True
-    assert parse_bool("nan") is True
+    # Non-finite float strings must be rejected (False in permissive mode)
+    assert parse_bool("inf") is False
+    assert parse_bool("nan") is False
     assert parse_bool("1.5") is True
     assert parse_bool("100") is True
     assert parse_bool("-1") is True
@@ -165,8 +165,8 @@ def test_parse_bool_handles_non_string_types():
 
 def test_parse_bool_handles_extra_numeric_values():
     """Test that parse bool handles extra numeric values."""
-    # Numeric types are truthy if non-zero
-    assert parse_bool(float("inf")) is True
-    assert parse_bool(float("nan")) is True
+    # Non-finite floats return False in permissive mode; finite non-zero numbers are True
+    assert parse_bool(float("inf")) is False
+    assert parse_bool(float("nan")) is False
     assert parse_bool(100) is True
     assert parse_bool(-1) is True

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, overload
+from typing import Any
 
 from pydantic import Field, field_validator
 
@@ -43,34 +43,28 @@ class AdverseEvent(ImednetBaseModel):
         None, alias="aeActionTaken", description="Action taken with study drug/device (AEACN)"
     )
 
-    @overload
     def __init__(
         self,
         *,
-        subject_key: str,
-        ae_term: str,
+        subject_key: str = ...,
+        subjectKey: str = ...,
+        ae_term: str = ...,
+        aeTerm: str = ...,
         ae_decod: str | None = None,
-        ae_severity: str,
-        ae_serious: bool = False,
-        ae_start_date: datetime | None = None,
-        ae_end_date: datetime | None = None,
-        ae_outcome: str | None = None,
-        ae_relationship: str | None = None,
-        ae_action_taken: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        subjectKey: str,
-        aeTerm: str,
         aeDecod: str | None = None,
-        aeSeverity: str,
+        ae_severity: str = ...,
+        aeSeverity: str = ...,
+        ae_serious: bool = False,
         aeSerious: bool = False,
+        ae_start_date: datetime | None = None,
         aeStartDate: datetime | None = None,
+        ae_end_date: datetime | None = None,
         aeEndDate: datetime | None = None,
+        ae_outcome: str | None = None,
         aeOutcome: str | None = None,
+        ae_relationship: str | None = None,
         aeRelationship: str | None = None,
+        ae_action_taken: str | None = None,
         aeActionTaken: str | None = None,
     ) -> None: ...
 
@@ -92,26 +86,20 @@ class ProtocolDeviation(ImednetBaseModel):
         "Unreviewed", alias="dvStatus", description="Triage status: Unreviewed, Approved, Escalated"
     )
 
-    @overload
     def __init__(
         self,
         *,
-        subject_key: str,
-        dv_term: str,
-        dv_category: str,
-        dv_severity: str,
-        dv_date: datetime,
+        subject_key: str = ...,
+        subjectKey: str = ...,
+        dv_term: str = ...,
+        dvTerm: str = ...,
+        dv_category: str = ...,
+        dvCategory: str = ...,
+        dv_severity: str = ...,
+        dvSeverity: str = ...,
+        dv_date: datetime = ...,
+        dvDate: datetime = ...,
         dv_status: str = "Unreviewed",
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        subjectKey: str,
-        dvTerm: str,
-        dvCategory: str,
-        dvSeverity: str,
-        dvDate: datetime,
         dvStatus: str = "Unreviewed",
     ) -> None: ...
 
@@ -128,25 +116,19 @@ class DeviceDeficiency(ImednetBaseModel):
         ..., alias="ddDate", description="Date/time of deficiency occurrence (DDSTDTC)"
     )
 
-    @overload
     def __init__(
         self,
         *,
-        subject_key: str,
-        dd_term: str,
-        dd_category: str,
+        subject_key: str = ...,
+        subjectKey: str = ...,
+        dd_term: str = ...,
+        ddTerm: str = ...,
+        dd_category: str = ...,
+        ddCategory: str = ...,
         dd_serious: bool = False,
-        dd_date: datetime,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        subjectKey: str,
-        ddTerm: str,
-        ddCategory: str,
         ddSerious: bool = False,
-        ddDate: datetime,
+        dd_date: datetime = ...,
+        ddDate: datetime = ...,
     ) -> None: ...
 
 class SubjectLevelAnalysis(ImednetBaseModel):
@@ -154,30 +136,27 @@ class SubjectLevelAnalysis(ImednetBaseModel):
 
     subject_key: str = Field(..., alias="subjectKey")
 
-    @overload
-    def __init__(self, *, subject_key: str, **extra_data: Any) -> None: ...
-    @overload
-    def __init__(self, *, subjectKey: str, **extra_data: Any) -> None: ...
+    def __init__(
+        self, *, subject_key: str = ..., subjectKey: str = ..., **extra_data: Any
+    ) -> None: ...
 
 class AnalysisAdverseEvent(ImednetBaseModel):
     """Analysis Adverse Event Dataset (ADAE)."""
 
     subject_key: str = Field(..., alias="subjectKey")
 
-    @overload
-    def __init__(self, *, subject_key: str, **extra_data: Any) -> None: ...
-    @overload
-    def __init__(self, *, subjectKey: str, **extra_data: Any) -> None: ...
+    def __init__(
+        self, *, subject_key: str = ..., subjectKey: str = ..., **extra_data: Any
+    ) -> None: ...
 
 class AnalysisLabResult(ImednetBaseModel):
     """Analysis Lab Result Dataset (ADLB)."""
 
     subject_key: str = Field(..., alias="subjectKey")
 
-    @overload
-    def __init__(self, *, subject_key: str, **extra_data: Any) -> None: ...
-    @overload
-    def __init__(self, *, subjectKey: str, **extra_data: Any) -> None: ...
+    def __init__(
+        self, *, subject_key: str = ..., subjectKey: str = ..., **extra_data: Any
+    ) -> None: ...
 
 class Demographics(ImednetBaseModel):
     """Canonical CDISC-aligned Demographics (DM) reporting model."""
@@ -193,23 +172,13 @@ class Demographics(ImednetBaseModel):
         None, alias="ethnicity", description="Ethnicity of the subject (ETHNIC)"
     )
 
-    @overload
     def __init__(
         self,
         *,
-        subject_key: str,
+        subject_key: str = ...,
+        subjectKey: str = ...,
         sex: str,
         birth_date: datetime | None = None,
-        age: int | None = None,
-        race: str | None = None,
-        ethnicity: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        subjectKey: str,
-        sex: str,
         birthDate: datetime | None = None,
         age: int | None = None,
         race: str | None = None,
@@ -234,27 +203,21 @@ class VitalSigns(ImednetBaseModel):
         ..., alias="vsDate", description="Date/time of vital signs measurement (VSDTC)"
     )
 
-    @overload
     def __init__(
         self,
         *,
-        subject_key: str,
-        vs_test: str,
+        subject_key: str = ...,
+        subjectKey: str = ...,
+        vs_test: str = ...,
+        vsTest: str = ...,
         vs_test_cd: str | None = None,
-        vs_result: float | str,
-        vs_unit: str | None = None,
-        vs_date: datetime,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        subjectKey: str,
-        vsTest: str,
         vsTestCd: str | None = None,
-        vsResult: float | str,
+        vs_result: float | str = ...,
+        vsResult: float | str = ...,
+        vs_unit: str | None = None,
         vsUnit: str | None = None,
-        vsDate: datetime,
+        vs_date: datetime = ...,
+        vsDate: datetime = ...,
     ) -> None: ...
     @field_validator("vs_result", mode="before")
     @classmethod

@@ -360,6 +360,12 @@ class SinkConfig:
             raise ValueError("retry_backoff must be a finite non-negative number")
         if not isinstance(self.mask_phi, bool):
             raise ValueError("mask_phi must be a boolean")
+        if not self.idempotent and (self.incremental or self.state_provider is not None):
+            raise ExportConfigurationError(
+                "SinkConfig(idempotent=False) cannot be combined with incremental=True or "
+                "state_provider because inclusive dateModified>= watermarks require "
+                "idempotent=True."
+            )
         validate_max_buffered_records(self.max_buffered_records)
         if not isinstance(self.as_sdtm, bool):
             raise ValueError("as_sdtm must be a boolean")
@@ -652,6 +658,12 @@ class ExportSink(ABC):
         """Initialize the export sink with a configuration."""
         self.config: SinkConfig = config
         self._circuit_breaker: CircuitBreaker = CircuitBreaker()
+
+    reconciles_deleted_on_full_sync: bool = False
+
+    def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
+        """Bind mutable checkpoint metadata for the active streaming run."""
+        _ = metadata
 
     def _get_circuit_breaker(self) -> CircuitBreaker:
         """Return this sink's isolated circuit breaker, initializing lazily if needed."""
@@ -2081,15 +2093,21 @@ def _extract_safe_config_options(config: Any) -> dict[str, Any]:
     raw_ledger = config.ledger_path if is_real_cfg else getattr(config, "ledger_path", None)
     ledger_path = raw_ledger if isinstance(raw_ledger, (str, Path)) else None
 
-    explicit_provider = (
-        config.state_provider
-        if is_real_cfg
-        else (
-            getattr(config, "state_provider", None)
-            if incremental and hasattr(getattr(config, "state_provider", None), "transaction")
-            else None
+    explicit_provider: Any = None
+    if is_real_cfg:
+        explicit_provider = config.state_provider
+    elif not isinstance(config, NonCallableMock):
+        cand_provider = getattr(config, "state_provider", None)
+        if cand_provider is not None and hasattr(cand_provider, "transaction"):
+            explicit_provider = cand_provider
+    elif incremental and hasattr(getattr(config, "state_provider", None), "transaction"):
+        explicit_provider = getattr(config, "state_provider", None)
+
+    if not idempotent and (incremental or explicit_provider is not None):
+        raise ExportConfigurationError(
+            "SinkConfig(idempotent=False) cannot be combined with incremental=True or "
+            "state_provider because inclusive dateModified>= watermarks require idempotent=True."
         )
-    )
 
     raw_max_buf = (
         config.max_buffered_records
@@ -2263,10 +2281,20 @@ def run_streaming_export(
             sink_obj = sink()
         stack.enter_context(sink_obj)
 
+        if tx is not None:
+            tx_meta = tx.setdefault("metadata", {})
+            bind_fn = getattr(sink_obj, "bind_stream_metadata", None)
+            if callable(bind_fn) and isinstance(tx_meta, dict):
+                bind_fn(tx_meta)
+
         reconcile_voided = (
             (not opts["include_deleted"])
             and opts["idempotent"]
-            and (use_checkpoint or watermark is not None)
+            and (
+                use_checkpoint
+                or watermark is not None
+                or bool(getattr(sink_obj, "reconciles_deleted_on_full_sync", False))
+            )
         )
         exclude_deleted_upstream = (not opts["include_deleted"]) and (not reconcile_voided)
 
@@ -2381,6 +2409,39 @@ def run_streaming_export(
     return total_written
 
 
+def is_incremental_sink_config(config: Any) -> bool:
+    """Return True when ``config`` activates incremental, watermark, or stateful sync."""
+    return bool(
+        getattr(config, "incremental", False) is True
+        or getattr(config, "modified_since", None) is not None
+        or getattr(config, "state_provider", None) is not None
+    )
+
+
+def bind_sdtm_stream_metadata(
+    metadata: dict[str, Any],
+    seq_counters: dict[str, int],
+    record_seqs: dict[str, int] | None = None,
+) -> None:
+    """Hydrate and bind mutable SDTM sequence counters into ``StreamState.metadata``."""
+    raw_counters = metadata.get("sdtm_seq_counters")
+    seq_counters.clear()
+    if isinstance(raw_counters, dict):
+        for subj_key, val in raw_counters.items():
+            if isinstance(subj_key, str) and isinstance(val, int) and not isinstance(val, bool):
+                seq_counters[subj_key] = val
+    metadata["sdtm_seq_counters"] = seq_counters
+
+    if record_seqs is not None:
+        raw_rec_seqs = metadata.get("sdtm_record_seqs")
+        record_seqs.clear()
+        if isinstance(raw_rec_seqs, dict):
+            for rec_key, val in raw_rec_seqs.items():
+                if isinstance(rec_key, str) and isinstance(val, int) and not isinstance(val, bool):
+                    record_seqs[rec_key] = val
+        metadata["sdtm_record_seqs"] = record_seqs
+
+
 __all__ = [
     "DEFAULT_MAX_BUFFERED_RECORDS",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
@@ -2392,6 +2453,7 @@ __all__ = [
     "_redact_uri",
     "_require_optional_dep",
     "apply_quality_gate",
+    "bind_sdtm_stream_metadata",
     "build_record_query_branches",
     "evaluate_standards_readiness",
     "extract_record_form_ref",
@@ -2400,6 +2462,7 @@ __all__ = [
     "get_state_provider",
     "get_tabular_batch_stamp",
     "has_valid_tabular_batch_stamp",
+    "is_incremental_sink_config",
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
