@@ -94,12 +94,13 @@ from typing import Any
 
 from imednet.errors import ExportBatchError, ExportConfigurationError
 from imednet.sdk import ImednetSDK
-from imednet.spi.sink_base import _require_optional_dep
+from imednet.spi.sink_base import _require_optional_dep, is_record_deleted
 from imednet.spi.sinks import (
     CentralizedMapper,
     ExportSink,
     SinkConfig,
     apply_quality_gate,
+    bind_sdtm_stream_metadata,
     build_sink_mapper,
     extract_record_id,
     format_variable_name,
@@ -199,9 +200,11 @@ class SnowflakeSinkConfig(SinkConfig):
         Optional path to a JSON-lines file where each loaded batch is
         recorded.
     hard_delete:
-        When ``True`` (and ``idempotent=True``), matched records with
-        ``deleted=True`` are deleted from the target table during
-        ``MERGE INTO`` rather than retained with ``deleted=True`` metadata.
+        When ``True`` (with ``idempotent=True`` and ``include_deleted=True``),
+        matched records with ``deleted=True`` are deleted from the target table
+        during ``MERGE INTO`` rather than retained as ``deleted=True`` tombstones.
+        When ``include_deleted=False`` (default), voided records are routed to
+        :meth:`SnowflakeExportSink.reconcile_deleted`.
     """
 
     account: str = ""
@@ -1074,6 +1077,8 @@ class SnowflakeExportSink(ExportSink):
         ImportError: When ``snowflake-connector-python`` or ``pyarrow`` are not installed.
     """
 
+    reconciles_deleted_on_full_sync = True
+
     def __init__(self, config: SnowflakeSinkConfig) -> None:
         """Initialize the Snowflake export sink.
 
@@ -1083,12 +1088,17 @@ class SnowflakeExportSink(ExportSink):
         super().__init__(config)
         self._cfg: SnowflakeSinkConfig = config
         self._seq_counters: dict[str, int] = {}
-        self._existing_record_seqs: dict[str, int] = {}
+        self._record_seqs: dict[str, int] = {}
         self._seeded_sdtm_domains: set[str] = set()
         self._domains_with_existing_seq: set[str] = set()
         self._conn: Any = None
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
+
+    def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
+        """Hydrate and bind SDTM sequence counters into transactional stream metadata."""
+        if self._cfg.as_sdtm:
+            bind_sdtm_stream_metadata(metadata, self._seq_counters, self._record_seqs)
 
     # ------------------------------------------------------------------
     # Connection management
@@ -1223,7 +1233,7 @@ class SnowflakeExportSink(ExportSink):
                 if (rid := extract_record_id(rec)) is not None
                 and not isinstance(rid, bool)
                 and (cid := str(rid).strip())
-                and cid not in self._existing_record_seqs
+                and cid not in self._record_seqs
             ]
             if lookup_ids:
                 placeholders = ", ".join(["%s"] * len(lookup_ids))
@@ -1238,7 +1248,7 @@ class SnowflakeExportSink(ExportSink):
                         parsed = _extract_sql_key_seq(id_row, "RECORD_ID", seq_col)
                         if parsed is not None:
                             cid, seq_int = parsed
-                            self._existing_record_seqs[cid] = seq_int
+                            self._record_seqs[cid] = seq_int
 
     def _ensure_table_schema(
         self,
@@ -1283,6 +1293,22 @@ class SnowflakeExportSink(ExportSink):
                 batch_id=batch_id,
             )
 
+        active_records: Sequence[Any] = records
+        should_reconcile_in_batch = self.config.idempotent and (
+            not cfg.include_deleted or (cfg.as_sdtm and cfg.hard_delete)
+        )
+        if should_reconcile_in_batch:
+            voided_records = [r for r in records if is_record_deleted(r)]
+            if voided_records:
+                self.reconcile_deleted(voided_records, batch_id=batch_id)
+                active_records = [r for r in records if not is_record_deleted(r)]
+                if not active_records:
+                    return 0
+        elif not cfg.include_deleted:
+            active_records = [r for r in records if not is_record_deleted(r)]
+            if not active_records:
+                return 0
+
         if cfg.as_sdtm:
             post_proc: Any = functools.partial(
                 _post_process_warehouse_sdtm,
@@ -1307,7 +1333,7 @@ class SnowflakeExportSink(ExportSink):
             mode="tabular",
             post_processor=post_proc,
             seq_counters=self._seq_counters,
-            existing_record_seqs=self._existing_record_seqs,
+            record_seqs=self._record_seqs,
         )
 
         local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
@@ -1317,7 +1343,7 @@ class SnowflakeExportSink(ExportSink):
 
         if not (cfg.as_sdtm and self.config.idempotent):
             arrow_table = _records_to_arrow_table(
-                records,
+                active_records,
                 mask_phi=self.config.mask_phi,
                 study_key=cfg.study_key,
                 mapper=mapper,
@@ -1343,9 +1369,9 @@ class SnowflakeExportSink(ExportSink):
                 prefetched_cols: set[str] | None = None
                 if arrow_table is None:
                     prefetched_cols = self._fetch_existing_table_columns(cur)
-                    self._seed_sdtm_seq_counters(cur, target_table, prefetched_cols, records)
+                    self._seed_sdtm_seq_counters(cur, target_table, prefetched_cols, active_records)
                     arrow_table = _records_to_arrow_table(
-                        records,
+                        active_records,
                         mask_phi=self.config.mask_phi,
                         study_key=cfg.study_key,
                         mapper=mapper,
@@ -1461,10 +1487,11 @@ class SnowflakeExportSink(ExportSink):
                             for k in merge_keys
                         )
                     if cfg.hard_delete and deleted_col is not None:
+                        quoted_del = _quote_identifier(deleted_col.upper())
                         matched_clause = (
-                            'WHEN MATCHED AND COALESCE(source."DELETED", FALSE) = TRUE THEN DELETE '  # noqa: S608
+                            f"WHEN MATCHED AND COALESCE(source.{quoted_del}, FALSE) = TRUE THEN DELETE "  # noqa: S608
                             f"WHEN MATCHED THEN UPDATE SET {update_clause} "
-                            'WHEN NOT MATCHED AND COALESCE(source."DELETED", FALSE) = FALSE '
+                            f"WHEN NOT MATCHED AND COALESCE(source.{quoted_del}, FALSE) = FALSE "
                             f"THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
                         )
                     else:
@@ -1491,7 +1518,7 @@ class SnowflakeExportSink(ExportSink):
                         f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
                         f"FORCE = TRUE"
                     )  # nosem
-                rows_loaded = len(records)
+                rows_loaded = len(active_records)
                 logger.debug(
                     "Loaded batch %s (%d rows) via stage %s",
                     batch_id,
@@ -1524,10 +1551,10 @@ class SnowflakeExportSink(ExportSink):
         )
         placeholders = ", ".join(["%s"] * len(record_ids))
 
-        if cfg.naming_convention == "camelCase":
-            where_clause = f'"STUDYKEY" = %s AND "RECORDID" IN ({placeholders})'
-        elif cfg.as_sdtm or cfg.naming_convention == "sdtm":
+        if cfg.as_sdtm or cfg.naming_convention == "sdtm":
             where_clause = f'"STUDYID" = %s AND "RECORD_ID" IN ({placeholders})'
+        elif cfg.naming_convention == "camelCase":
+            where_clause = f'"STUDYKEY" = %s AND "RECORDID" IN ({placeholders})'
         else:
             where_clause = f"STUDY_KEY = %s AND RECORD_ID IN ({placeholders})"
 
@@ -1541,6 +1568,14 @@ class SnowflakeExportSink(ExportSink):
                 )  # nosem
                 logger.debug("Reconciled %d voided records in batch %s", len(record_ids), batch_id)
                 return len(record_ids)
+            except Exception as exc:
+                if getattr(exc, "errno", None) == 2003 or getattr(exc, "sqlstate", None) == "42S02":
+                    logger.debug(
+                        "Skipping voided record reconciliation for %s (table does not exist yet)",
+                        target_table,
+                    )
+                    return 0
+                raise
             finally:
                 cur.close()
 
@@ -1587,22 +1622,13 @@ def export_to_snowflake(
 ) -> int:
     """Export study records to Snowflake using :class:`SnowflakeExportSink`."""
     resolved_cfg = replace(config, mask_phi=mask_phi) if mask_phi is not None else config
-    stream_cfg = resolved_cfg
-    if (
-        resolved_cfg.idempotent
-        and not resolved_cfg.include_deleted
-        and not resolved_cfg.incremental
-        and resolved_cfg.modified_since is None
-        and resolved_cfg.state_provider is None
-    ):
-        stream_cfg = replace(resolved_cfg, include_deleted=True)
 
     run_id = uuid.uuid4().hex[:12]
     return run_streaming_export(
         sdk,
         study_key,
         lambda: SnowflakeExportSink(config=resolved_cfg),
-        stream_cfg,
+        resolved_cfg,
         stream_name=f"snowflake_{resolved_cfg.table}",
         batch_id_prefix=f"{study_key}/records/{run_id}",
         quality_gate_fn=apply_quality_gate,

@@ -1882,6 +1882,97 @@ def test_sdtm_variable_whitelist_projection_and_custom_domain_phi(
     assert ae_df.iloc[0]["AESTDTC"] is None
 
 
+def test_record_mapper_sdtm_preserve_record_id_and_record_seqs() -> None:
+    """Snapshots omit RECORD_ID across all 6 SDTM domains while incremental runs retain it and stabilize SEQ."""
+    sdk = MagicMock()
+    mapper = RecordMapper(sdk)
+
+    domain_payloads: dict[str, dict[str, Any]] = {
+        "AE": {"AETERM": "Headache"},
+        "CM": {"CMTRT": "Aspirin"},
+        "DD": {"DDTESTCD": "COD", "DDORRES": "Natural"},
+        "DM": {"AGE": 42, "SEX": "F"},
+        "DV": {"DVTERM": "Missed visit window"},
+        "VS": {"VSTESTCD": "SYSBP", "VSORRES": "120"},
+    }
+    for domain, payload in domain_payloads.items():
+        rec = Record(
+            record_id=101,
+            study_key="STUDY-SDTM",
+            subject_key="SUBJ-01",
+            form_id=1,
+            form_key=domain,
+            deleted=False,
+            record_data=payload,
+        )
+        snap_df = mapper.transform_to_sdtm([rec], domain=domain, study_key="STUDY-SDTM")
+        assert "RECORD_ID" not in snap_df.columns
+
+        inc_df = mapper.transform_to_sdtm(
+            [rec],
+            domain=domain,
+            study_key="STUDY-SDTM",
+            preserve_record_id=True,
+        )
+        assert "RECORD_ID" in inc_df.columns
+        assert int(inc_df.iloc[0]["RECORD_ID"]) == 101
+
+    seq_counters: dict[str, int] = {}
+    record_seqs: dict[str, int] = {}
+    r1 = Record(
+        record_id=1,
+        study_key="STUDY-SDTM",
+        subject_key="SUBJ-01",
+        form_id=1,
+        form_key="AE",
+        date_created="2026-06-01T08:00:00Z",
+        record_data={"AETERM": "Nausea", "AESTDTC": "2026-06-01"},
+    )
+    r2 = Record(
+        record_id=2,
+        study_key="STUDY-SDTM",
+        subject_key="SUBJ-01",
+        form_id=1,
+        form_key="AE",
+        date_created="2026-06-01T09:00:00Z",
+        record_data={"AETERM": "Fatigue", "AESTDTC": "2026-06-02"},
+    )
+    df_run1 = mapper.transform_to_sdtm(
+        [r1, r2],
+        domain="AE",
+        study_key="STUDY-SDTM",
+        seq_counters=seq_counters,
+        record_seqs=record_seqs,
+        preserve_record_id=True,
+    )
+    assert list(df_run1["RECORD_ID"]) == [1, 2]
+    assert list(df_run1["AESEQ"]) == [1, 2]
+
+    # Run 2: boundary replay of r2 (updated term) + brand-new r3 for same subject
+    r2_updated = r2.model_copy(
+        update={"record_data": {"AETERM": "Severe Fatigue", "AESTDTC": "2026-06-02"}}
+    )
+    r3 = Record(
+        record_id=3,
+        study_key="STUDY-SDTM",
+        subject_key="SUBJ-01",
+        form_id=1,
+        form_key="AE",
+        date_created="2026-06-02T09:00:00Z",
+        record_data={"AETERM": "Dizziness", "AESTDTC": "2026-06-03"},
+    )
+    df_run2 = mapper.transform_to_sdtm(
+        [r2_updated, r3],
+        domain="AE",
+        study_key="STUDY-SDTM",
+        seq_counters=seq_counters,
+        record_seqs=record_seqs,
+        preserve_record_id=True,
+    )
+    assert list(df_run2["RECORD_ID"]) == [2, 3]
+    assert list(df_run2["AESEQ"]) == [2, 3]
+
+
 def test_record_mapper_hydrates_site_interval_and_form_maps(tmp_path) -> None:
     """Req 1: RecordMapper hydrates recordOid, formKey, intervalId/Name, and siteId/Name."""
     import pandas as pd

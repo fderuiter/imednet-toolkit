@@ -979,13 +979,15 @@ class _SdtmNormalizer:
         phi_keys: Iterable[str] | None = None,
         registry: SensitivityRegistry | None = None,
         include_record_id: bool = False,
+        preserve_record_id: bool = False,
     ) -> None:
         domain_clean = resolve_sdtm_domain(domain)
         self.domain_clean = domain_clean
         self.study_key = study_key
         self.include_deleted = include_deleted
         self.mask_phi = mask_phi
-        self.include_record_id = include_record_id
+        self.include_record_id = bool(include_record_id or preserve_record_id)
+        self.preserve_record_id = self.include_record_id
         self.pipeline = pipeline
         self.registry: SensitivityRegistry = (
             global_sensitivity_registry if registry is None else registry
@@ -1176,6 +1178,12 @@ class _SdtmNormalizer:
                     if k not in rec_dict:
                         rec_dict[k] = v
 
+        if explicit_record_id is None:
+            for id_key in ("recordId", "record_id", "RECORD_ID"):
+                if id_key in rec_dict and rec_dict[id_key] is not None:
+                    explicit_record_id = rec_dict[id_key]
+                    break
+
         raw_record_id: Any = explicit_record_id
         if raw_record_id is None:
             raw_record_id = getattr(rec, "record_oid", None)
@@ -1226,6 +1234,7 @@ class _SdtmNormalizer:
             row[self.seq_var] = 0
 
         consumed_keys: set[str] = set(base_consumed)
+        consumed_keys.add("RECORD_ID")
         if not self.include_seq:
             consumed_keys.add("DMSEQ")
             consumed_keys.add("dmseq")
@@ -1382,6 +1391,9 @@ class _SdtmNormalizer:
                 else:
                     row[k] = extra_val
 
+        canonical_rid = _canonicalize_sdtm_record_id(
+            explicit_record_id if explicit_record_id is not None else raw_record_id
+        )
         topic_vals = tuple(unmasked_topic_map.get(tv) for tv in self.topic_vars)
         sort_key = (
             _dtc_sort_key(canonical_dtc_for_sort),
@@ -1393,7 +1405,7 @@ class _SdtmNormalizer:
             usubjid=usubjid,
             sort_key=sort_key,
             row=row,
-            canonical_record_id=_canonicalize_sdtm_record_id(explicit_record_id),
+            canonical_record_id=canonical_rid,
         )
 
     def finalize_subject_group(
@@ -1401,37 +1413,45 @@ class _SdtmNormalizer:
         group: list[_PreparedSdtmRow],
         seq_counters: dict[str, int],
         existing_record_seqs: Mapping[str, int] | None = None,
+        record_seqs: MutableMapping[str, int] | None = None,
     ) -> list[dict[str, Any]]:
         """Sort a Subject's normalized rows and stamp sequential <DOM>SEQ values."""
         group.sort(key=lambda item: item.sort_key)
         rows: list[dict[str, Any]] = []
         for item in group:
             if self.include_seq:
-                if (
-                    existing_record_seqs is not None
-                    and item.canonical_record_id is not None
-                    and item.canonical_record_id in existing_record_seqs
-                ):
-                    existing_seq = existing_record_seqs[item.canonical_record_id]
-                    item.row[self.seq_var] = existing_seq
-                    if existing_seq > seq_counters.get(item.usubjid, 0):
-                        seq_counters[item.usubjid] = existing_seq
+                rkey = item.canonical_record_id
+                assigned_seq: int | None = None
+                if rkey is not None:
+                    if record_seqs is not None and rkey in record_seqs:
+                        assigned_seq = record_seqs[rkey]
+                    elif existing_record_seqs is not None and rkey in existing_record_seqs:
+                        assigned_seq = existing_record_seqs[rkey]
+                if assigned_seq is not None:
+                    item.row[self.seq_var] = assigned_seq
+                    if assigned_seq > seq_counters.get(item.usubjid, 0):
+                        seq_counters[item.usubjid] = assigned_seq
+                    if isinstance(record_seqs, MutableMapping) and rkey is not None:
+                        record_seqs[rkey] = assigned_seq
                 else:
                     next_seq = seq_counters.get(item.usubjid, 0) + 1
                     seq_counters[item.usubjid] = next_seq
                     item.row[self.seq_var] = next_seq
-                    if (
-                        isinstance(existing_record_seqs, MutableMapping)
-                        and item.canonical_record_id is not None
-                    ):
-                        existing_record_seqs[item.canonical_record_id] = next_seq
+                    if rkey is not None:
+                        if isinstance(record_seqs, MutableMapping):
+                            record_seqs[rkey] = next_seq
+                        if (
+                            isinstance(existing_record_seqs, MutableMapping)
+                            and existing_record_seqs is not record_seqs
+                        ):
+                            existing_record_seqs[rkey] = next_seq
             rows.append(item.row)
         return rows
 
     def rows_to_dataframe(self, rows: list[dict[str, Any]]) -> pd.DataFrame:
         """Build a column-ordered SDTM DataFrame from finalized rows."""
         if not rows:
-            return pd.DataFrame(columns=self.std_vars)
+            return pd.DataFrame(columns=list(self.std_vars))
         df = pd.DataFrame(rows)
         cols = [c for c in self.std_vars if c in df.columns]
         extra_cols = [c for c in df.columns if c not in self.std_vars]
@@ -1590,7 +1610,9 @@ def transform_records_to_sdtm_rows(
     include_deleted: bool = False,
     mask_phi: bool = True,
     seq_counters: dict[str, int] | None = None,
+    record_seqs: MutableMapping[str, int] | None = None,
     existing_record_seqs: Mapping[str, int] | None = None,
+    preserve_record_id: bool = False,
     phi_keys: Iterable[str] | None = None,
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
@@ -1616,6 +1638,7 @@ def transform_records_to_sdtm_rows(
         phi_keys=phi_keys,
         registry=registry,
         include_record_id=include_record_id,
+        preserve_record_id=preserve_record_id,
     )
     counters = seq_counters if seq_counters is not None else {}
 
@@ -1632,6 +1655,7 @@ def transform_records_to_sdtm_rows(
                 grouped[usubjid],
                 counters,
                 existing_record_seqs=existing_record_seqs,
+                record_seqs=record_seqs,
             )
         )
     return rows
@@ -1645,7 +1669,9 @@ def transform_records_to_sdtm(
     include_deleted: bool = False,
     mask_phi: bool = True,
     seq_counters: dict[str, int] | None = None,
+    record_seqs: MutableMapping[str, int] | None = None,
     existing_record_seqs: Mapping[str, int] | None = None,
+    preserve_record_id: bool = False,
     phi_keys: Iterable[str] | None = None,
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
@@ -1676,6 +1702,7 @@ def transform_records_to_sdtm(
         phi_keys=phi_keys,
         registry=registry,
         include_record_id=include_record_id,
+        preserve_record_id=preserve_record_id,
     )
     counters = seq_counters if seq_counters is not None else {}
 
@@ -1692,6 +1719,7 @@ def transform_records_to_sdtm(
                 grouped[usubjid],
                 counters,
                 existing_record_seqs=existing_record_seqs,
+                record_seqs=record_seqs,
             )
         )
 

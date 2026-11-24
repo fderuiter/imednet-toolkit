@@ -88,6 +88,7 @@ from imednet.spi.sinks import (
     ExportSink,
     SinkConfig,
     apply_quality_gate,
+    bind_sdtm_stream_metadata,
     build_sink_mapper,
     extract_record_id,
     normalize_sink_value,
@@ -430,6 +431,8 @@ class Neo4jExportSink(ExportSink):
         ImportError: When the ``neo4j`` package is not installed.
     """
 
+    reconciles_deleted_on_full_sync = True
+
     def __init__(self, config: Neo4jSinkConfig) -> None:
         """Initialize the Neo4j export sink.
 
@@ -442,11 +445,16 @@ class Neo4jExportSink(ExportSink):
         self._auth = self.config.auth
         self._study_key = self.config.study_key
         self._seq_counters: dict[str, int] = {}
-        self._existing_record_seqs: dict[str, int] = {}
+        self._record_seqs: dict[str, int] = {}
         self._seeded_sdtm_domains: set[str] = set()
         self._domains_with_existing_seq: set[str] = set()
         self._driver: Any = None
         self._connect()
+
+    def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
+        """Hydrate and bind SDTM sequence counters into transactional stream metadata."""
+        if self.config.as_sdtm:
+            bind_sdtm_stream_metadata(metadata, self._seq_counters, self._record_seqs)
 
     # ------------------------------------------------------------------
     # Connection management
@@ -525,7 +533,7 @@ class Neo4jExportSink(ExportSink):
                 if (rid := extract_record_id(rec)) is not None
                 and not isinstance(rid, bool)
                 and (cid := str(rid).strip())
-                and cid not in self._existing_record_seqs
+                and cid not in self._record_seqs
             ]
             if lookup_ids:
                 id_cypher = (
@@ -544,8 +552,8 @@ class Neo4jExportSink(ExportSink):
                         parsed = _extract_cypher_key_seq(item, "record_id", "seq")
                         if parsed is not None:
                             cid, seq_int = parsed
-                            if self._existing_record_seqs.get(cid) != seq_int:
-                                self._existing_record_seqs[cid] = seq_int
+                            if self._record_seqs.get(cid) != seq_int:
+                                self._record_seqs[cid] = seq_int
                                 changed = True
         return changed
 
@@ -556,13 +564,13 @@ class Neo4jExportSink(ExportSink):
 
         post_proc = _post_process_graph_sdtm if self.config.as_sdtm else _post_process_graph
         preview_counters = dict(self._seq_counters)
-        preview_existing = dict(self._existing_record_seqs)
+        preview_record_seqs = dict(self._record_seqs)
         preview_mapper = build_sink_mapper(
             self.config,
             mode="document",
             post_processor=post_proc,
             seq_counters=preview_counters,
-            existing_record_seqs=preview_existing,
+            record_seqs=preview_record_seqs,
         )
         database = getattr(self.config, "database", "neo4j")
         try:
@@ -640,7 +648,7 @@ class Neo4jExportSink(ExportSink):
                             mode="document",
                             post_processor=post_proc,
                             seq_counters=self._seq_counters,
-                            existing_record_seqs=self._existing_record_seqs,
+                            record_seqs=self._record_seqs,
                         )
                         mapped_rows = [
                             _record_to_row(r, self._study_key, mapper=seeded_mapper)
@@ -648,7 +656,7 @@ class Neo4jExportSink(ExportSink):
                         ]
                     else:
                         self._seq_counters.update(preview_counters)
-                        self._existing_record_seqs.update(preview_existing)
+                        self._record_seqs.update(preview_record_seqs)
                     counters_committed = True
                 session.run(cypher, rows=mapped_rows)
             logger.debug("Wrote batch %s (%d records)", batch_id, len(mapped_rows))

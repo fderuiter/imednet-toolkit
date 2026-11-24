@@ -269,7 +269,9 @@ class CentralizedMapper:
         as_sdtm: bool = False,
         sdtm_domain: str | None = None,
         seq_counters: dict[str, int] | None = None,
+        record_seqs: dict[str, int] | None = None,
         existing_record_seqs: dict[str, int] | None = None,
+        preserve_record_id: bool = False,
         include_record_id: bool = False,
     ):
         """Initialize the mapper.
@@ -283,7 +285,9 @@ class CentralizedMapper:
             as_sdtm: When True, transform records directly into CDISC SDTM domain rows.
             sdtm_domain: Optional SDTM domain code (e.g. 'AE', 'VS', 'DM').
             seq_counters: Optional per-USUBJID sequence counter map shared across batches.
+            record_seqs: Optional per-Record sequence map for idempotent incremental reruns.
             existing_record_seqs: Optional canonical RECORD_ID to assigned sequence map.
+            preserve_record_id: When True, retain RECORD_ID in transformed SDTM rows.
             include_record_id: Whether to include ``RECORD_ID`` in SDTM output rows.
         """
         self.mode = mode
@@ -296,8 +300,10 @@ class CentralizedMapper:
             else None
         )
         self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
-        self.include_record_id = bool(include_record_id)
+        self.include_record_id = bool(include_record_id or preserve_record_id)
+        self._preserve_record_id = self.include_record_id
         self._seq_counters: dict[str, int] = seq_counters if seq_counters is not None else {}
+        self._record_seqs: dict[str, int] | None = record_seqs
         self._existing_record_seqs: dict[str, int] | None = existing_record_seqs
         self._pipeline_cache: dict[str, Any] = {}
         self._sens_snapshot: frozenset[str] = frozenset()
@@ -412,7 +418,9 @@ class CentralizedMapper:
                 include_deleted=True,
                 mask_phi=self.mask_phi,
                 seq_counters=self._seq_counters,
+                record_seqs=self._record_seqs,
                 existing_record_seqs=self._existing_record_seqs,
+                preserve_record_id=self._preserve_record_id,
                 phi_keys=pipeline_phi_keys or None,
                 pipeline=active_pipeline if has_active_rules else None,
                 include_record_id=self.include_record_id,
