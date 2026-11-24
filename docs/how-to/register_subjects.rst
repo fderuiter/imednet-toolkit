@@ -9,8 +9,16 @@ target ``Site`` names exist and are open for enrollment before submitting
 Single-Submission Example
 -------------------------
 
-For small cohorts, :meth:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow.register_subjects`
-submits registration payloads and returns the final ``Job``:
+For small cohorts that fit within a single chunk,
+:meth:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow.register_subjects`
+(and ``async_register_subjects``) submits registration payloads and returns the single
+submitted ``Job``. Passing multi-chunk inputs, ``dry_run=True``, or empty/all-skipped
+cohorts that produce zero ``Job`` objects raises :class:`~imednet.errors.ValidationError`
+rather than returning synthetic ``COMPLETED`` states; use
+:meth:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow.register_subjects_batch`
+whenever chunking, dry-run validation, or zero-``Job`` filtering is expected. When
+``wait_for_completion=True``, the submitted ``Job`` must also carry a non-empty
+``batchId`` so terminal status can be polled:
 
 .. testcode::
 
@@ -59,7 +67,7 @@ and returns a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
        {
            "formKey": "F_DM",
            "siteName": "SITE",
-           "data": {"SUBJID": "SUBJ-001", "V_AGE": 41, "V_GENDER": "F"},
+           "data": {"SUBJID": "SUB1", "V_AGE": 41, "V_GENDER": "F"},
        },
        {
            "formKey": "F_DM",
@@ -78,6 +86,9 @@ and returns a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
        filter_enrolled=True,
        subject_key_field="SUBJID",
    )
+   assert batch_summary.total_records == 1
+   assert batch_summary.skipped_count == 1
+   assert batch_summary.all_successful is True
    print(batch_summary.total_records, batch_summary.skipped_count, batch_summary.all_successful)
    reset_default_simulation_state()
 

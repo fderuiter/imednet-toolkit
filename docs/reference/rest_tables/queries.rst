@@ -67,11 +67,11 @@ List queries
    * - ``size``
      - Integer
      - ``25``
-     - Maximum number of records to return per page.
+     - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
-     - None
-     - Sorting expression (e.g. ``studyKey,asc`` or ``dateCreated,desc``).
+     - ``annotationId,asc``
+     - Sorting expression (e.g. ``annotationId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String
      - None
@@ -151,7 +151,16 @@ List queries
                "subjectOid": "",
                "type": "",
                "lastUpdated": "<string>",
-               "queryComments": []
+               "queryComments": [
+                   {
+                       "sequence": "<integer>",
+                       "annotationStatus": "<string>",
+                       "user": "<string>",
+                       "comment": "<string>",
+                       "closed": "<boolean>",
+                       "date": "<string>"
+                   }
+               ]
            },
            {
                "studyKey": "<string>",

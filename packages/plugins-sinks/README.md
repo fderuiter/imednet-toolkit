@@ -4,33 +4,37 @@ Unified database sinks plugin for the iMednet Python SDK.
 
 ## Install
 
-Install the package via standard pip using the public package distribution name:
+### Published PyPI Releases
+
+Install the package and optional destination drivers from PyPI:
 
 ```bash
 pip install imednet-plugins-sinks
+pip install "imednet-plugins-sinks[mongodb]"
+pip install "imednet-plugins-sinks[neo4j]"
+pip install "imednet-plugins-sinks[snowflake]"
+pip install "imednet-plugins-sinks[all]"
 ```
 
-Or using the workspace-relative path install command:
+### Source Checkout
+
+From a local repository checkout:
 
 ```bash
-pip install ./packages/plugins-sinks
+git clone https://github.com/fderuiter/imednet-toolkit.git
+cd imednet-toolkit
+pip install -e ./packages/plugins-sinks
 ```
 
-**Optional Dependencies:**
-Depending on your target backend, you can install the required drivers using optional dependency flags:
-- MongoDB: `pip install imednet-plugins-sinks[mongodb]`
-- Neo4j: `pip install imednet-plugins-sinks[neo4j]`
-- Snowflake: `pip install imednet-plugins-sinks[snowflake]`
-- All Sinks: `pip install imednet-plugins-sinks[all]`
-
-## Launch via CLI
+## Programmatic Usage
 
 The package provides a unified SDK namespace integration (`SinksNamespace`) directly registered with the core SDK client via entry points (`imednet.plugins`).
 
-You can initialize and execute sinks programmatically:
+Outside simulation mode, pass both `api_key` and `security_key` when initializing `ImednetSDK`:
 
 ```python
 import os
+
 from imednet import ImednetSDK
 from imednet_sinks import (
     MongoDbSinkConfig,
@@ -41,27 +45,48 @@ from imednet_sinks import (
     export_to_snowflake,
 )
 
-sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+sdk = ImednetSDK(
+    api_key=os.environ["IMEDNET_API_KEY"],
+    security_key=os.environ["IMEDNET_SECURITY_KEY"],
+)
 
 config = MongoDbSinkConfig(
-    study_key="STUDY-123",
+    study_key="STUDY",
     uri="mongodb://localhost:27017",
     database="imednet",
     collection="records",
 )
-export_to_mongodb(sdk, "STUDY-123", config=config)
+export_to_mongodb(sdk, "STUDY", config=config)
+sdk.close()
 ```
 
-Alternatively, commands can be launched via standard CLI structures mapped to these functions if exposed by your main SDK runner.
+For offline testing and dry-run pipeline verification without API credentials, enable `simulation_mode=True`:
+
+```python
+from imednet import ImednetSDK
+from imednet_sinks import MongoDbSinkConfig, export_to_mongodb
+
+with ImednetSDK(simulation_mode=True) as sdk:
+    config = MongoDbSinkConfig(
+        study_key="STUDY",
+        uri="mongodb://localhost:27017",
+        database="imednet",
+        collection="records",
+    )
+    loaded = export_to_mongodb(sdk, "STUDY", config=config)
+    print(f"Exported {loaded} simulated Record items.")
+```
+
+Alternatively, commands can be launched via standard CLI structures mapped to these functions when installed alongside `imednet[cli]`.
 
 ## Features
 
 - **Multi-backend Support**: Tailored exporters mapping Study Records to Document Store (MongoDB), Property Graph (Neo4j), or Data Warehouse (Snowflake) systems.
 - **Dynamic Lazy Imports**: Keeps package initialization light by lazy-loading heavy drivers (e.g. PyMongo, Neo4j, Snowflake Connector, PyArrow) at execution time.
 - **Idempotency & Resiliency**:
-  - **MongoDB**: Uses bulk upserts mapping unique compound keys (`<study_key>/<record_id>`) using PyMongo `bulk_write` update/upsert actions.
-  - **Neo4j**: Merges hierarchies (`Study -> Subject -> Visit -> Record`) idempotently using query templates.
-  - **Snowflake**: Two-phase loading converting Study Records to Apache Arrow tables, writing staged Parquet batches, and running staged `COPY INTO` + `MERGE INTO` keyed on `(study_key, record_id)`.
+  - **MongoDB**: Uses PyMongo `bulk_write` upserts keyed on deterministic `_id` `<study_key>/<record_id>` (falling back to `<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>`, with `*SEQ` defaulting to `1`, when `as_sdtm=True` and `record_id` is absent), encoding pure `date` values as ISO-8601 strings and `Decimal` values as `bson.Decimal128`.
+  - **Neo4j**: Merges `Study -> Subject -> Visit -> Record` for scheduled `Visit` items while normalizing `visit_id <= 0` to `None` so unscheduled `Record` nodes link directly via `(:Subject)-[:HAS_RECORD]->(:Record)`, keying `as_sdtm=True` `Record` nodes on `(STUDYID, DOMAIN, USUBJID, *SEQ)` (or `(STUDYID, DOMAIN, USUBJID)` for domains without `*SEQ` such as `DM`).
+  - **Snowflake**: Two-phase loading converting `Study` `Record` batches to Apache Arrow tables, writing staged Parquet files, and running `COPY INTO` + `MERGE INTO` keyed on `(study_key, record_id)` (`snake_case`), `(studyKey, recordId)` (`camelCase`), `(STUDYID, RECORD_ID)` (`sdtm`), or `(STUDYID, DOMAIN, USUBJID, *SEQ)` when `as_sdtm=True` (`(STUDYID, DOMAIN, USUBJID)` for `DM` without `*SEQ`).
 - **Unified SDK Namespace Integration**: Seamless integration through the `SinksNamespace` registered directly with the core SDK client.
 
 ## Component Description Table
@@ -72,3 +97,10 @@ Alternatively, commands can be launched via standard CLI structures mapped to th
 | `Neo4jExportSink` | Property graph backend exporter merging hierarchical models idempotently. |
 | `SnowflakeExportSink` | Data warehouse backend exporter using Apache Arrow and atomic `COPY INTO`. |
 | `SinksNamespace` | Unified SDK namespace integration registered with the core SDK client. |
+
+## Links
+
+- Export Destinations Guide: <https://fderuiter.github.io/imednet-toolkit/how-to/export_destinations.html>
+- Examples: <https://fderuiter.github.io/imednet-toolkit/tutorials/examples/index.html>
+- Repository: <https://github.com/fderuiter/imednet-toolkit>
+- License: [MIT](https://github.com/fderuiter/imednet-toolkit/blob/main/LICENSE)

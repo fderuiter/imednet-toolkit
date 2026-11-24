@@ -4,7 +4,8 @@ These protocols define the expected interface for the iMednet SDK clients,
 allowing for easier mocking and decoupling in dependent packages.
 """
 
-from typing import TYPE_CHECKING, Any, Protocol
+from contextlib import AbstractContextManager
+from typing import TYPE_CHECKING, Any, Protocol, Self
 
 from imednet.auth import AuthStrategy
 from imednet.models.codings import Coding
@@ -40,7 +41,11 @@ if TYPE_CHECKING:
 class ImednetFacade(Protocol):
     """Protocol for the synchronous iMednet SDK facade."""
 
-    def get_codings(self, study_key: str, **filters: FilterValue) -> list[Coding]:
+    def study_context(self, study_key: str) -> AbstractContextManager[Self]:
+        """Bind a study key to this facade instance for the duration of the with-block."""
+        ...
+
+    def get_codings(self, study_key: str | None = None, **filters: FilterValue) -> list[Coding]:
         """Fetch code list definitions for a specific study.
 
         Args:
@@ -52,7 +57,7 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_forms(self, study_key: str, **filters: FilterValue) -> list[Form]:
+    def get_forms(self, study_key: str | None = None, **filters: FilterValue) -> list[Form]:
         """Fetch form definitions for a specific study.
 
         Args:
@@ -64,7 +69,7 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_intervals(self, study_key: str, **filters: FilterValue) -> list[Interval]:
+    def get_intervals(self, study_key: str | None = None, **filters: FilterValue) -> list[Interval]:
         """Fetch visit interval definitions for a specific study.
 
         Args:
@@ -99,7 +104,7 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_queries(self, study_key: str, **filters: FilterValue) -> list[Query]:
+    def get_queries(self, study_key: str | None = None, **filters: FilterValue) -> list[Query]:
         """Fetch queries for a specific study.
 
         Args:
@@ -111,7 +116,9 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_record_revisions(self, study_key: str, **filters: FilterValue) -> list[RecordRevision]:
+    def get_record_revisions(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[RecordRevision]:
         """Fetch record revision history for a specific study.
 
         Args:
@@ -123,7 +130,7 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_records(self, study_key: str, **filters: FilterValue) -> list[Record]:
+    def get_records(self, study_key: str | None = None, **filters: FilterValue) -> list[Record]:
         """Fetch data records for a specific study.
 
         Args:
@@ -135,7 +142,7 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_sites(self, study_key: str, **filters: FilterValue) -> list[Site]:
+    def get_sites(self, study_key: str | None = None, **filters: FilterValue) -> list[Site]:
         """Fetch site definitions for a specific study.
 
         Args:
@@ -158,7 +165,7 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_subjects(self, study_key: str, **filters: FilterValue) -> list[Subject]:
+    def get_subjects(self, study_key: str | None = None, **filters: FilterValue) -> list[Subject]:
         """Fetch subject records for a specific study.
 
         Args:
@@ -170,7 +177,7 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_users(self, study_key: str, **filters: FilterValue) -> list[User]:
+    def get_users(self, study_key: str | None = None, **filters: FilterValue) -> list[User]:
         """Fetch user definitions for a specific study.
 
         Args:
@@ -182,7 +189,7 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_variables(self, study_key: str, **filters: FilterValue) -> list[Variable]:
+    def get_variables(self, study_key: str | None = None, **filters: FilterValue) -> list[Variable]:
         """Fetch variable definitions for a specific study.
 
         Args:
@@ -194,7 +201,7 @@ class ImednetFacade(Protocol):
         """
         ...
 
-    def get_visits(self, study_key: str, **filters: FilterValue) -> list[Visit]:
+    def get_visits(self, study_key: str | None = None, **filters: FilterValue) -> list[Visit]:
         """Fetch visit definitions for a specific study.
 
         Args:
@@ -281,7 +288,7 @@ class ImednetFacade(Protocol):
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
-        """Wait for multiple background jobs concurrently and fetch resultUrl payloads."""
+        """Wait for multiple background jobs concurrently until terminal states."""
         ...
 
     @property
@@ -293,7 +300,13 @@ class ImednetFacade(Protocol):
 class AsyncImednetFacade(Protocol):
     """Protocol for the asynchronous iMednet SDK facade."""
 
-    async def async_get_codings(self, study_key: str, **filters: FilterValue) -> list[Coding]:
+    def study_context(self, study_key: str) -> AbstractContextManager[Self]:
+        """Bind a study key to this facade instance for the duration of the with-block."""
+        ...
+
+    async def async_get_codings(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[Coding]:
         """Asynchronously fetch code list definitions for a specific study.
 
         Args:
@@ -305,7 +318,9 @@ class AsyncImednetFacade(Protocol):
         """
         ...
 
-    async def async_get_forms(self, study_key: str, **filters: FilterValue) -> list[Form]:
+    async def async_get_forms(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[Form]:
         """Asynchronously fetch form definitions for a specific study.
 
         Args:
@@ -317,7 +332,9 @@ class AsyncImednetFacade(Protocol):
         """
         ...
 
-    async def async_get_intervals(self, study_key: str, **filters: FilterValue) -> list[Interval]:
+    async def async_get_intervals(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[Interval]:
         """Asynchronously fetch visit interval definitions for a specific study.
 
         Args:
@@ -352,7 +369,9 @@ class AsyncImednetFacade(Protocol):
         """
         ...
 
-    async def async_get_queries(self, study_key: str, **filters: FilterValue) -> list[Query]:
+    async def async_get_queries(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[Query]:
         """Asynchronously fetch queries for a specific study.
 
         Args:
@@ -365,7 +384,7 @@ class AsyncImednetFacade(Protocol):
         ...
 
     async def async_get_record_revisions(
-        self, study_key: str, **filters: FilterValue
+        self, study_key: str | None = None, **filters: FilterValue
     ) -> list[RecordRevision]:
         """Asynchronously fetch record revision history for a specific study.
 
@@ -378,7 +397,9 @@ class AsyncImednetFacade(Protocol):
         """
         ...
 
-    async def async_get_records(self, study_key: str, **filters: FilterValue) -> list[Record]:
+    async def async_get_records(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[Record]:
         """Asynchronously fetch data records for a specific study.
 
         Args:
@@ -390,7 +411,9 @@ class AsyncImednetFacade(Protocol):
         """
         ...
 
-    async def async_get_sites(self, study_key: str, **filters: FilterValue) -> list[Site]:
+    async def async_get_sites(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[Site]:
         """Asynchronously fetch site definitions for a specific study.
 
         Args:
@@ -413,7 +436,9 @@ class AsyncImednetFacade(Protocol):
         """
         ...
 
-    async def async_get_subjects(self, study_key: str, **filters: FilterValue) -> list[Subject]:
+    async def async_get_subjects(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[Subject]:
         """Asynchronously fetch subject records for a specific study.
 
         Args:
@@ -425,7 +450,9 @@ class AsyncImednetFacade(Protocol):
         """
         ...
 
-    async def async_get_users(self, study_key: str, **filters: FilterValue) -> list[User]:
+    async def async_get_users(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[User]:
         """Asynchronously fetch user definitions for a specific study.
 
         Args:
@@ -437,7 +464,9 @@ class AsyncImednetFacade(Protocol):
         """
         ...
 
-    async def async_get_variables(self, study_key: str, **filters: FilterValue) -> list[Variable]:
+    async def async_get_variables(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[Variable]:
         """Asynchronously fetch variable definitions for a specific study.
 
         Args:
@@ -449,7 +478,9 @@ class AsyncImednetFacade(Protocol):
         """
         ...
 
-    async def async_get_visits(self, study_key: str, **filters: FilterValue) -> list[Visit]:
+    async def async_get_visits(
+        self, study_key: str | None = None, **filters: FilterValue
+    ) -> list[Visit]:
         """Asynchronously fetch visit definitions for a specific study.
 
         Args:
@@ -536,7 +567,7 @@ class AsyncImednetFacade(Protocol):
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
-        """Asynchronously wait for multiple background jobs and fetch resultUrl payloads."""
+        """Asynchronously wait for multiple background jobs until terminal states."""
         ...
 
     @property

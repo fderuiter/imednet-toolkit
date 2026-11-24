@@ -21,6 +21,7 @@ from imednet.spi.utils import (
     JobTimeoutError,
     chunk_records,
 )
+from imednet.spi.validation import ValidationSchemaProtocol
 
 from .generator import GeneratedRecordSet, SyntheticRecordGenerator
 from .models import RecordTestType
@@ -64,7 +65,7 @@ class _PreExistingSubjectsSnapshot:
     subject_oids: set[str]
 
 
-def _is_unconfigured_mock_method(fn: Any) -> bool:
+def is_unconfigured_mock_method(fn: Any) -> bool:
     """Return True if ``fn`` is an unconfigured unittest.mock child method."""
     if not callable(fn):
         return True
@@ -72,8 +73,44 @@ def _is_unconfigured_mock_method(fn: Any) -> bool:
         return False
     if getattr(fn, "side_effect", None) is not None:
         return False
+    if getattr(fn, "_mock_wraps", None) is not None:
+        return False
     ret = getattr(fn, "return_value", None)
     return type(ret).__module__.startswith("unittest.mock")
+
+
+_is_unconfigured_mock_method = is_unconfigured_mock_method
+
+
+def subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
+    """Return True if ``subj`` has a keyword matching ``keyword_tag``."""
+    if not keyword_tag:
+        return True
+    keywords = subj.get("keywords") if isinstance(subj, dict) else getattr(subj, "keywords", None)
+    if not keywords:
+        return False
+    for kw in keywords:
+        if isinstance(kw, str):
+            if kw == keyword_tag:
+                return True
+            continue
+        if isinstance(kw, dict):
+            candidates = (
+                kw.get("keyword_key"),
+                kw.get("keywordKey"),
+                kw.get("keyword_name"),
+                kw.get("keywordName"),
+            )
+        else:
+            candidates = (
+                getattr(kw, "keyword_key", None),
+                getattr(kw, "keywordKey", None),
+                getattr(kw, "keyword_name", None),
+                getattr(kw, "keywordName", None),
+            )
+        if keyword_tag in candidates:
+            return True
+    return False
 
 
 def _clean_str(val: Any) -> str | None:
@@ -390,6 +427,7 @@ class BulkRecordSubmissionWorkflow:
         self.registration_poll_interval = registration_poll_interval
         self._phase: SubmissionPhase = SubmissionPhase.PENDING
         self._initial_subjects_snapshot: _PreExistingSubjectsSnapshot | None = None
+        self._ordered_existing_uat_keys: list[str] = []
 
     @property
     def phase(self) -> SubmissionPhase:
@@ -407,6 +445,7 @@ class BulkRecordSubmissionWorkflow:
         """Reset the submission workflow phase back to ``PENDING``."""
         self._phase = SubmissionPhase.PENDING
         self._initial_subjects_snapshot = None
+        self._ordered_existing_uat_keys = []
 
     def submit(
         self,
@@ -415,6 +454,7 @@ class BulkRecordSubmissionWorkflow:
         *,
         email_notify: bool | str | None = None,
         keyword_tag: str = "UAT",
+        schema: ValidationSchemaProtocol | None = None,
     ) -> SubmissionResult:
         """Execute the two-phase submission.
 
@@ -434,11 +474,21 @@ class BulkRecordSubmissionWorkflow:
         data_sets = [rs for rs in record_sets if rs.test_type != RecordTestType.REGISTER_SUBJECT]
 
         self._initial_subjects_snapshot = None
+        self._ordered_existing_uat_keys = []
         existing_subjects: set[str] = set()
 
         try:
+            ordered_existing: list[str] = []
             if self.skip_existing_subjects:
                 existing_subjects = self._find_existing_uat_subjects(study_key, keyword_tag)
+                ordered_existing = [
+                    k for k in self._ordered_existing_uat_keys if k in existing_subjects
+                ]
+                if len(ordered_existing) < len(existing_subjects):
+                    seen_ord = set(ordered_existing)
+                    ordered_existing.extend(
+                        sorted(k for k in existing_subjects if k not in seen_ord)
+                    )
 
             pre_existing = _PreExistingSubjectsSnapshot(
                 subject_keys=set(existing_subjects),
@@ -455,6 +505,24 @@ class BulkRecordSubmissionWorkflow:
                 pre_existing.subject_ids.update(snap.subject_ids)
                 pre_existing.subject_oids.update(snap.subject_oids)
 
+            reused_key_map: dict[str, str] = {}
+            if registration_sets and ordered_existing:
+                placeholder_order: list[str] = []
+                seen_ph: set[str] = set()
+                for rs in (*registration_sets, *data_sets):
+                    for sk in rs.subject_keys:
+                        if isinstance(sk, str) and sk and sk not in seen_ph:
+                            seen_ph.add(sk)
+                            placeholder_order.append(sk)
+                remaining_existing = list(ordered_existing)
+                for ph in placeholder_order:
+                    if ph in existing_subjects and ph in remaining_existing:
+                        reused_key_map[ph] = ph
+                        remaining_existing.remove(ph)
+                for ph in placeholder_order:
+                    if ph not in reused_key_map and remaining_existing:
+                        reused_key_map[ph] = remaining_existing.pop(0)
+
             submitted_placeholders: list[str | None] = []
             skipped_placeholders: set[str] = set()
             batch_item_groups: list[tuple[BatchSubmission, list[_SubmittedRegistrationItem]]] = []
@@ -466,8 +534,12 @@ class BulkRecordSubmissionWorkflow:
                 filtered_items: list[_SubmittedRegistrationItem] = []
                 for i, payload in enumerate(rs.payloads):
                     subj_key = rs.subject_keys[i] if i < len(rs.subject_keys) else None
-                    if subj_key and subj_key in existing_subjects:
-                        logger.info("Skipping registration for existing subject: %s", subj_key)
+                    if subj_key and subj_key in reused_key_map:
+                        logger.info(
+                            "Skipping registration for placeholder %s (reusing UAT subject %s)",
+                            subj_key,
+                            reused_key_map[subj_key],
+                        )
                         skipped_placeholders.add(subj_key)
                         continue
                     clean_payload = dict(payload)
@@ -514,6 +586,7 @@ class BulkRecordSubmissionWorkflow:
                         form_key=rs.form_key,
                         form_name=rs.form_name,
                         email_notify=email_notify,
+                        schema=schema,
                     )
                     for item in chunk_items:
                         item.batch_id = batch.job.batch_id
@@ -537,13 +610,36 @@ class BulkRecordSubmissionWorkflow:
                         allow_record_lookup=bool(data_sets),
                     )
                     if enrolled_keys is not None:
-                        result.enrolled_subject_keys = list(enrolled_keys)
-                        SyntheticRecordGenerator.resolve_subject_keys(
-                            record_sets,
-                            enrolled_keys,
-                            placeholder_keys=submitted_placeholders,
-                            preserved_keys=skipped_placeholders,
-                        )
+                        if reused_key_map:
+                            unique_sub_ph = list(
+                                dict.fromkeys(
+                                    p
+                                    for p in submitted_placeholders
+                                    if isinstance(p, str) and p and p not in reused_key_map
+                                )
+                            )
+                            new_bindings = {
+                                ph: enrolled_keys[idx % len(enrolled_keys)]
+                                for idx, ph in enumerate(unique_sub_ph)
+                            }
+                            full_placeholders = [*reused_key_map.keys(), *new_bindings.keys()]
+                            full_enrolled = [*reused_key_map.values(), *new_bindings.values()]
+                            result.enrolled_subject_keys = list(
+                                dict.fromkeys([*reused_key_map.values(), *enrolled_keys])
+                            )
+                            SyntheticRecordGenerator.resolve_subject_keys(
+                                record_sets,
+                                full_enrolled,
+                                placeholder_keys=full_placeholders,
+                            )
+                        else:
+                            result.enrolled_subject_keys = list(enrolled_keys)
+                            SyntheticRecordGenerator.resolve_subject_keys(
+                                record_sets,
+                                enrolled_keys,
+                                placeholder_keys=submitted_placeholders,
+                                preserved_keys=skipped_placeholders,
+                            )
                     elif must_correlate:
                         raise BulkSubmissionError(
                             correlation_error
@@ -552,6 +648,13 @@ class BulkRecordSubmissionWorkflow:
                         )
                 self.transition_to(SubmissionPhase.DATA)
             else:
+                if reused_key_map and not result.registration_batches:
+                    result.enrolled_subject_keys = list(dict.fromkeys(reused_key_map.values()))
+                    SyntheticRecordGenerator.resolve_subject_keys(
+                        record_sets,
+                        list(reused_key_map.values()),
+                        placeholder_keys=list(reused_key_map.keys()),
+                    )
                 self.transition_to(SubmissionPhase.DATA)
                 if batch_item_groups and self._requires_phase2_correlation(data_sets, poll_summary):
                     raise BulkSubmissionError(
@@ -569,6 +672,7 @@ class BulkRecordSubmissionWorkflow:
                         form_key=rs.form_key,
                         form_name=rs.form_name,
                         email_notify=email_notify,
+                        schema=schema,
                     )
                     result.data_batches.append(batch)
             self.transition_to(SubmissionPhase.COMPLETED)
@@ -594,9 +698,18 @@ class BulkRecordSubmissionWorkflow:
         form_key: str | None,
         form_name: str | None,
         email_notify: bool | str | None,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> BatchSubmission:
         """Submit a single batch and return a BatchSubmission."""
-        job = self.sdk.create_record(study_key, payloads, email_notify=email_notify)
+        if schema is not None:
+            job = self.sdk.create_record(
+                study_key,
+                payloads,
+                email_notify=email_notify,
+                schema=schema,
+            )
+        else:
+            job = self.sdk.create_record(study_key, payloads, email_notify=email_notify)
         return BatchSubmission(
             phase=phase,
             form_key=form_key,
@@ -606,7 +719,7 @@ class BulkRecordSubmissionWorkflow:
         )
 
     def _poll_registration_batches(self, study_key: str, batch_ids: list[str]) -> JobPollSummary:
-        """Poll Phase 1 batches via facade poll_jobs (fetching resultUrl) with mock fallback."""
+        """Poll Phase 1 batches via facade poll_jobs with mock fallback."""
         poll_kwargs: dict[str, Any] = {
             "timeout": float(self.registration_timeout),
             "fail_fast": False,
@@ -1105,40 +1218,13 @@ class BulkRecordSubmissionWorkflow:
     @staticmethod
     def _subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
         """Return True if the subject has a keyword matching keyword_tag."""
-        if not keyword_tag:
-            return True
-        keywords = (
-            subj.get("keywords") if isinstance(subj, dict) else getattr(subj, "keywords", None)
-        )
-        if not keywords:
-            return False
-        for kw in keywords:
-            if isinstance(kw, str):
-                if kw == keyword_tag:
-                    return True
-                continue
-            if isinstance(kw, dict):
-                candidates = (
-                    kw.get("keyword_key"),
-                    kw.get("keywordKey"),
-                    kw.get("keyword_name"),
-                    kw.get("keywordName"),
-                )
-            else:
-                candidates = (
-                    getattr(kw, "keyword_key", None),
-                    getattr(kw, "keywordKey", None),
-                    getattr(kw, "keyword_name", None),
-                    getattr(kw, "keywordName", None),
-                )
-            if keyword_tag in candidates:
-                return True
-        return False
+        return subject_has_keyword(subj, keyword_tag)
 
     def _find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
         """Query non-deleted subjects and inspect Subject keywords locally for UAT tags."""
         subjects = self.sdk.get_subjects(study_key, deleted=False)
         self._initial_subjects_snapshot = self._extract_snapshot_from_subjects(subjects)
+        ordered_keys: list[str] = []
         existing_keys: set[str] = set()
         for subj in subjects:
             deleted = (
@@ -1146,7 +1232,7 @@ class BulkRecordSubmissionWorkflow:
                 if isinstance(subj, dict)
                 else getattr(subj, "deleted", False)
             )
-            if deleted:
+            if deleted is True:
                 continue
             if not self._subject_has_keyword(subj, keyword_tag):
                 continue
@@ -1155,8 +1241,10 @@ class BulkRecordSubmissionWorkflow:
                 if isinstance(subj, dict)
                 else (getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None))
             )
-            if key:
+            if isinstance(key, str) and key and key not in existing_keys:
                 existing_keys.add(key)
+                ordered_keys.append(key)
+        self._ordered_existing_uat_keys = ordered_keys
         return existing_keys
 
 

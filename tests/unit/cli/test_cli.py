@@ -1025,20 +1025,57 @@ def test_sync_worker_command_exits_nonzero_when_worker_fails(
     )
 
 
-def test_queries_list_success(runner: CliRunner, sdk: MagicMock) -> None:
-    """Test that queries list success."""
-    obj = MagicMock()
-    obj.description = "Q1"
-    obj.annotation_type = "Query"
-    obj.subject_key = "S1"
-    obj.variable = "V1"
-    obj.date_created = "2023"
-    sdk.queries.list.return_value = [obj]
+def test_queries_list_success(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that queries list renders annotation ID, status, and colorizes answered queries."""
+    from imednet.models.queries import Query, QueryComment, QueryStatus
+
+    query = Query(
+        annotationId=701,
+        studyKey="STUDY",
+        subjectId=201,
+        subjectKey="S1",
+        recordId=601,
+        variable="V1",
+        annotationType="Query",
+        description="Q1",
+        dateCreated="2023-01-01",
+        status=QueryStatus.ANSWERED,
+        queryComments=[QueryComment(sequence=1, closed=False, comment="Site answered")],
+    )
+    sdk.queries.list.return_value = [query]
     result = runner.invoke(cli.app, ["queries", "list", "STUDY"])
     assert result.exit_code == 0
     sdk.queries.list.assert_called_once_with("STUDY")
     assert "Found 1 queries:" in result.stdout
+    assert "Annotation ID" in result.stdout
+    assert "Status" in result.stdout
+    assert "Subject Key" in result.stdout
+    assert "Variable" in result.stdout
+    assert "Annotation Type" in result.stdout
+    assert "Description" in result.stdout
+    assert "Date Created" in result.stdout
+    assert "701" in result.stdout
+    assert "ANSWERED" in result.stdout
     assert "Q1" in result.stdout
+
+    # Verify TTY ANSI color on ANSWERED status and JSON envelope preservation
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
+    tty_res = runner.invoke(cli.app, ["queries", "list", "STUDY", "--no-interactive"], tty=True)
+    assert tty_res.exit_code == 0
+    assert "\x1b[33mANSWERED\x1b[0m" in tty_res.stdout
+
+    json_res = runner.invoke(cli.app, ["queries", "list", "STUDY", "--format", "json"])
+    assert json_res.exit_code == 0
+    payload = json.loads(json_res.stdout)
+    assert payload["resource"] == "queries"
+    assert payload["count"] == 1
+    assert payload["items"][0]["annotationId"] == 701
+    assert payload["items"][0]["status"] == "ANSWERED"
+    assert payload["items"][0]["queryComments"][0]["comment"] == "Site answered"
 
 
 def test_queries_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
@@ -1050,19 +1087,41 @@ def test_queries_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
 
 
 def test_variables_list_success(runner: CliRunner, sdk: MagicMock) -> None:
-    """Test that variables list success."""
-    obj = MagicMock()
-    obj.variable_name = "V1"
-    obj.label = "Var 1"
-    obj.variable_type = "Text"
-    obj.form_name = "Form"
-    obj.disabled = False
-    sdk.variables.list.return_value = [obj]
+    """Test that variables list surfaces form_key while preserving form_name in JSON."""
+    from imednet.models.variables import Variable
+
+    var = Variable(
+        studyKey="STUDY",
+        variableId=801,
+        variableOid="VAR-OID-801",
+        variableName="V1",
+        label="Var 1",
+        variableType="Text",
+        formId=301,
+        formKey="F_DM",
+        formName="Demographics",
+        disabled=False,
+    )
+    sdk.variables.list.return_value = [var]
     result = runner.invoke(cli.app, ["variables", "list", "STUDY"])
     assert result.exit_code == 0
     sdk.variables.list.assert_called_once_with("STUDY")
     assert "Found 1 variables:" in result.stdout
+    assert "Variable Name" in result.stdout
+    assert "Label" in result.stdout
+    assert "Variable Type" in result.stdout
+    assert "Form Key" in result.stdout
+    assert "Form Name" not in result.stdout
+    assert "Disabled" in result.stdout
     assert "V1" in result.stdout
+    assert "F_DM" in result.stdout
+
+    json_res = runner.invoke(cli.app, ["variables", "list", "STUDY", "--format", "json"])
+    assert json_res.exit_code == 0
+    payload = json.loads(json_res.stdout)
+    assert payload["resource"] == "variables"
+    assert payload["items"][0]["formKey"] == "F_DM"
+    assert payload["items"][0]["formName"] == "Demographics"
 
 
 def test_variables_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
@@ -1073,14 +1132,97 @@ def test_variables_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
     assert "No variables found." in result.stdout
 
 
-def test_record_revisions_list_success(runner: CliRunner, sdk: MagicMock) -> None:
-    """Test that record revisions list success."""
-    sdk.record_revisions.list.return_value = ["R1"]
+def test_record_revisions_list_success(
+    runner: CliRunner, sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that record-revisions list curates 7 audit summary columns while keeping 19 details and JSON."""
+    from unittest.mock import patch
+
+    from tests.unit.cli.test_interactive_grid import MockWindow
+
+    from imednet.cli.utils.grid import InteractiveDataGrid
+    from imednet.models.record_revisions import RecordRevision
+
+    rev = RecordRevision(
+        studyKey="STUDY",
+        recordRevisionId=5001,
+        recordId=101,
+        recordRevision=2,
+        dataRevision=1,
+        recordStatus="Complete",
+        subjectId=201,
+        subjectKey="SUBJ-001",
+        siteId=10,
+        formKey="F_VS",
+        intervalId=501,
+        deleted=False,
+        dateCreated="2026-01-15",
+        reasonForChange="Corrected systolic BP",
+        recordOid="REC-OID-101",
+        role="Investigator",
+        subjectOid="SUBJ-OID-201",
+        user="dr_smith",
+        lastUpdated="2026-01-16",
+    )
+    sdk.record_revisions.list.return_value = [rev]
     result = runner.invoke(cli.app, ["record-revisions", "list", "STUDY"])
     assert result.exit_code == 0
     sdk.record_revisions.list.assert_called_once_with("STUDY")
     assert "Found 1 record revisions:" in result.stdout
-    assert "R1" in result.stdout
+    header_line = result.stdout.splitlines()[1]
+    headers = [h.strip() for h in header_line.split("|")]
+    assert headers == [
+        "Record Revision ID",
+        "Record ID",
+        "Subject Key",
+        "Form Key",
+        "User",
+        "Reason For Change",
+        "Date Created",
+    ]
+    assert "5001" in result.stdout
+    assert "SUBJ-001" in result.stdout
+    assert "F_VS" in result.stdout
+    assert "dr_smith" in result.stdout
+    assert "Corrected systolic BP" in result.stdout
+    assert "REC-OID-101" not in result.stdout
+
+    # Verify interactive grid receives projected 7-field row and full 19-attribute RecordRevision in details
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+    with patch("imednet.cli.utils.grid.run_interactive_grid", return_value=True) as mock_grid:
+        interactive_res = runner.invoke(cli.app, ["record-revisions", "list", "STUDY"])
+        assert interactive_res.exit_code == 0
+        mock_grid.assert_called_once()
+        _, grid_kwargs = mock_grid.call_args
+        assert len(grid_kwargs["fields"]) == 7
+        assert grid_kwargs["details"] == [rev]
+
+        win = MockWindow(height=40, width=100)
+        grid = InteractiveDataGrid(
+            win,
+            items=grid_kwargs["items"],
+            fields=grid_kwargs["fields"],
+            label=grid_kwargs["label"],
+            details=grid_kwargs["details"],
+        )
+        panel_lines = "\n".join(line for line, _ in grid._build_side_panel_lines(content_w=40))
+        assert len(rev.model_dump()) == 19
+        assert "Record Revision ID: 5001" in panel_lines
+        assert "Record OID: REC-OID-101" in panel_lines
+        assert "Subject OID: SUBJ-OID-201" in panel_lines
+        assert "Data Revision: 1" in panel_lines
+        assert "Last Updated: 2026-01-16" in panel_lines
+
+    # Verify --format json still serializes all 19 model fields
+    json_res = runner.invoke(cli.app, ["record-revisions", "list", "STUDY", "--format", "json"])
+    assert json_res.exit_code == 0
+    payload = json.loads(json_res.stdout)
+    assert payload["resource"] == "record_revisions"
+    assert payload["count"] == 1
+    assert payload["items"][0]["recordRevisionId"] == 5001
+    assert payload["items"][0]["recordOid"] == "REC-OID-101"
+    assert payload["items"][0]["subjectOid"] == "SUBJ-OID-201"
+    assert len(payload["items"][0]) == 19
 
 
 def test_record_revisions_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
@@ -1092,13 +1234,13 @@ def test_record_revisions_list_empty(runner: CliRunner, sdk: MagicMock) -> None:
 
 
 def test_jobs_status_success(runner: CliRunner, sdk: MagicMock) -> None:
-    """Test that jobs status outputs formatted table headers and fields."""
+    """Test that jobs status outputs formatted table headers and six upstream fields."""
     job = JobStatus(
         batchId="BATCH123",
         jobId="JOB456",
         state="RUNNING",
-        progress=45,
         dateCreated="2026-11-17 10:00",
+        dateStarted="2026-11-17 10:01",
         dateFinished=None,
     )
     sdk.get_job.return_value = job
@@ -1106,30 +1248,31 @@ def test_jobs_status_success(runner: CliRunner, sdk: MagicMock) -> None:
     assert result.exit_code == 0
     sdk.get_job.assert_called_once_with("STUDY", "BATCH123")
     assert "Found 1 jobs:" in result.stdout
-    assert "Batch Id" in result.stdout
-    assert "Job Id" in result.stdout
+    assert "Batch ID" in result.stdout
+    assert "Job ID" in result.stdout
     assert "State" in result.stdout
-    assert "Progress" in result.stdout
     assert "Date Created" in result.stdout
+    assert "Date Started" in result.stdout
     assert "Date Finished" in result.stdout
+    assert "Progress" not in result.stdout
     assert "BATCH123" in result.stdout
     assert "JOB456" in result.stdout
     assert "RUNNING" in result.stdout
-    assert "45" in result.stdout
     assert "2026-11-17 10:00" in result.stdout
+    assert "2026-11-17 10:01" in result.stdout
     assert "-" in result.stdout
     # ANSI escape sequences stripped on non-tty
     assert "\x1b[" not in result.stdout
 
 
 def test_jobs_wait_success(runner: CliRunner, sdk: MagicMock) -> None:
-    """Test that jobs wait outputs formatted table headers and fields."""
+    """Test that jobs wait outputs formatted table headers and six upstream fields."""
     job = JobStatus(
         batchId="BATCH123",
         jobId="JOB456",
         state="COMPLETE",
-        progress=100,
         dateCreated="2026-11-17 10:00",
+        dateStarted="2026-11-17 10:01",
         dateFinished="2026-11-17 10:05",
     )
     sdk.poll_job.return_value = job
@@ -1139,15 +1282,16 @@ def test_jobs_wait_success(runner: CliRunner, sdk: MagicMock) -> None:
         "STUDY", "BATCH123", interval=5, timeout=300, on_progress=ANY
     )
     assert "Found 1 jobs:" in result.stdout
-    assert "Batch Id" in result.stdout
-    assert "Job Id" in result.stdout
+    assert "Batch ID" in result.stdout
+    assert "Job ID" in result.stdout
     assert "State" in result.stdout
-    assert "Progress" in result.stdout
     assert "Date Created" in result.stdout
+    assert "Date Started" in result.stdout
     assert "Date Finished" in result.stdout
+    assert "Progress" not in result.stdout
     assert "BATCH123" in result.stdout
     assert "COMPLETE" in result.stdout
-    assert "100" in result.stdout
+    assert "2026-11-17 10:01" in result.stdout
     assert "\x1b[" not in result.stdout
 
 
@@ -1842,20 +1986,6 @@ def test_jobs_json_mode_interactive_and_redirected(
         ),
         (
             [
-                "intervals",
-                "list",
-                "STUDY",
-                "-f",
-                "interval_name=Screening",
-                "--filter",
-                "disabled=false",
-            ],
-            "intervals",
-            ("STUDY",),
-            {"interval_name": "Screening", "disabled": False},
-        ),
-        (
-            [
                 "visits",
                 "list",
                 "STUDY",
@@ -2076,7 +2206,6 @@ def test_records_list_output_conflicts_checked_before_filters(
         ("sites", "sites"),
         ("forms", "forms"),
         ("variables", "variables"),
-        ("intervals", "intervals"),
         ("visits", "visits"),
         ("queries", "queries"),
         ("record-revisions", "record_revisions"),
@@ -2107,6 +2236,13 @@ def test_study_scoped_list_commands_reject_study_key_in_filter(
     assert "'study_key' and 'studyKey' cannot be used in --filter" in result.stderr
     assert "TypeError" not in result.stderr
     getattr(sdk, attr).list.assert_not_called()
+
+
+def test_intervals_list_omits_filter_flag(runner: CliRunner, sdk: MagicMock) -> None:
+    """Intervals list omits --filter/-f per Table 1 in the upstream Common spec."""
+    result = runner.invoke(cli.app, ["intervals", "list", "STUDY", "-f", "intervalId==1"])
+    assert result.exit_code == 2
+    sdk.intervals.list.assert_not_called()
 
 
 def test_get_model_value_and_cli_utils_export() -> None:

@@ -18,6 +18,7 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
 
 .. testcode::
 
+   import asyncio
    from imednet import AsyncImednetSDK, ImednetSDK
    from imednet.simulation import reset_default_simulation_state
 
@@ -30,14 +31,14 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
            {
                "formKey": "F_VS",
                "siteName": "SITE",
-               "subjectKey": "SUBJ-001",
+               "subjectKey": "SUB1",
                "intervalName": "Baseline",
                "data": {"V_WEIGHT": 71.5},
            },
            {
                "formKey": "F_VS",
                "siteName": "SITE",
-               "subjectKey": "SUBJ-001",
+               "subjectKey": "SUB1",
                "intervalName": "Baseline",
                "data": {"V_WEIGHT": 72.0},
            },
@@ -51,13 +52,13 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
 
    async def run_async_batch() -> None:
        async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
-           await async_sdk.workflows.record_update.async_create_or_update_records_batch(
+           async_summary = await async_sdk.workflows.record_update.async_create_or_update_records_batch(
                "STUDY",
                [
                    {
                        "formKey": "F_VS",
                        "siteName": "SITE",
-                       "subjectKey": "SUBJ-001",
+                       "subjectKey": "SUB1",
                        "intervalName": "Baseline",
                        "data": {"V_WEIGHT": 73.0},
                    }
@@ -65,11 +66,21 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
                wait_for_completion=True,
                poll_interval=1,
            )
+           assert async_summary.all_successful is True
 
+   asyncio.run(run_async_batch())
    reset_default_simulation_state()
 
 Single-Record Convenience Helpers
 ---------------------------------
+
+:meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.create_or_update_records`
+(and ``async_create_or_update_records``) enforces a strict single-``Job`` contract:
+passing multi-chunk payloads, ``dry_run=True``, empty ``Record`` lists, or invalid
+``DataDictionary`` inputs raises :class:`~imednet.errors.ValidationError` instead of
+truncating outcomes or fabricating synthetic ``COMPLETED`` states. Use
+:meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.create_or_update_records_batch`
+for multi-chunk writes or dry-run validation reports.
 
 For targeted operational scripts, ``RecordUpdateWorkflow`` also provides typed
 builders that construct properly aliased ``Record`` dictionaries and return the
@@ -88,6 +99,7 @@ submitted ``Job`` (along with ``async_*`` counterparts for ``AsyncImednetSDK``):
 
 .. testcode::
 
+   import asyncio
    from imednet import AsyncImednetSDK, ImednetSDK
    from imednet.simulation import reset_default_simulation_state
 
@@ -105,7 +117,7 @@ submitted ``Job`` (along with ``async_*`` counterparts for ``AsyncImednetSDK``):
    sched_job = helper_workflow.update_scheduled_record(
        study_key="STUDY",
        form_identifier="F_VS",
-       subject_identifier="SUBJ-001",
+       subject_identifier="SUB1",
        interval_identifier="Baseline",
        data={"V_WEIGHT": 69.5},
        wait_for_completion=True,
@@ -114,15 +126,16 @@ submitted ``Job`` (along with ``async_*`` counterparts for ``AsyncImednetSDK``):
    unsched_job = helper_workflow.create_new_record(
        study_key="STUDY",
        form_identifier="F_VS",
-       subject_identifier="SUBJ-001",
+       subject_identifier="SUB1",
        data={"V_WEIGHT": 70.0},
        wait_for_completion=True,
        poll_interval=1,
    )
+   assert reg_job.batch_id and sched_job.batch_id and unsched_job.batch_id
 
    async def run_async_helpers() -> None:
        async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
-           await async_sdk.workflows.record_update.async_register_subject(
+           async_reg_job = await async_sdk.workflows.record_update.async_register_subject(
                study_key="STUDY",
                form_identifier="F_DM",
                site_identifier="SITE",
@@ -130,6 +143,8 @@ submitted ``Job`` (along with ``async_*`` counterparts for ``AsyncImednetSDK``):
                wait_for_completion=True,
                poll_interval=1,
            )
+           assert async_reg_job.batch_id
 
+   asyncio.run(run_async_helpers())
    print(reg_job.batch_id, sched_job.batch_id, unsched_job.batch_id)
    reset_default_simulation_state()

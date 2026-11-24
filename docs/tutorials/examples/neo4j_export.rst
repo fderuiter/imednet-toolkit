@@ -1,8 +1,12 @@
 Neo4j Export Example
 ====================
 
-Export Study Records into a Neo4j property graph preserving the
-``Study → Subject → Visit → Record`` hierarchy.
+Export ``Study`` ``Record`` items into a Neo4j property graph preserving the
+``Study → Subject → Visit → Record`` hierarchy for scheduled ``Visit`` items,
+normalizing ``visit_id <= 0`` to ``None`` so unscheduled ``Record`` nodes link
+directly via ``(:Subject)-[:HAS_RECORD]->(:Record)``, and keying ``as_sdtm=True``
+domain nodes on ``(STUDYID, DOMAIN, USUBJID, *SEQ)`` (or ``(STUDYID, DOMAIN, USUBJID)``
+for domains without ``*SEQ`` such as ``DM``).
 
 Prerequisites
 -------------
@@ -19,7 +23,7 @@ Environment variables
 .. code-block:: bash
 
    export IMEDNET_API_KEY=...
-   export IMEDNET_SECURITY_KEY=...      # if required by your environment
+   export IMEDNET_SECURITY_KEY=...      # required outside simulation mode
    export NEO4J_URI=bolt://localhost:7687
    export NEO4J_USER=neo4j
    export NEO4J_PASSWORD=...            # never hardcode

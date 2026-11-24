@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -167,7 +168,8 @@ def test_validation_schema_protocol_conformance() -> None:
         ("Multi Select", "ASIAN`WHITE", 42),
         ("Multi Select", ["ASIAN", "WHITE"], [False]),
         ("Multi Select", [1, 2], {"race": 1}),
-        ("Multi Select", True, 2.5),
+        ("Multi Select", "ASIAN, WHITE", True),
+        ("Multi Select", ("A", "B"), False),
         ("Memo", "Detailed clinical observation.", 42),
         ("TextArea", "Clinical narrative text.", 100),
         ("Notes", "Investigator follow-up note.", ["note"]),
@@ -522,7 +524,7 @@ def test_datadict_validation_explicit_or_group_rule() -> None:
         ("single-select", "OPT_2"),
         ("SingleSelect", 2),
         ("  multi\tselect\n", ["A", 1]),
-        ("MULTI_SELECT", True),
+        ("MULTI_SELECT", "A`B"),
         ("Date / Time   Precision", "2026-03"),
         ("date_time_precision", "2026-03-15"),
         ("Yes / No", 1),
@@ -605,3 +607,384 @@ async def test_seeded_simulation_state_f_dm_validates_sync_and_async() -> None:
         )
         assert async_score == pytest.approx(100.0)
         assert async_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_retired_deleted_and_disabled_required_variables_skipped_and_form_id_kept() -> None:
+    """SchemaCache, AsyncSchemaCache, SchemaValidator, and AsyncSchemaValidator skip retired Variables."""
+    from imednet.validation.cache import AsyncSchemaCache
+
+    active_var = ApiVariable.model_validate(
+        {
+            "variableName": "ACTIVE_NOTES",
+            "variableType": "Text",
+            "formId": 401,
+            "formKey": "F_MIXED",
+            "deleted": False,
+            "disabled": False,
+        }
+    )
+    deleted_req = ApiVariable.model_validate(
+        {
+            "variableName": "DELETED_REQ",
+            "variableType": "Text",
+            "formId": 401,
+            "formKey": "F_MIXED",
+            "deleted": True,
+            "disabled": False,
+            "required": True,
+        }
+    )
+    disabled_req = ApiVariable.model_validate(
+        {
+            "variableName": "DISABLED_REQ",
+            "variableType": "Integer",
+            "formId": 401,
+            "formKey": "F_MIXED",
+            "deleted": False,
+            "disabled": True,
+            "required": True,
+        }
+    )
+    retired_only_form_var = ApiVariable.model_validate(
+        {
+            "variableName": "LEGACY_REQ",
+            "variableType": "Text",
+            "formId": 402,
+            "formKey": "F_RETIRED_ONLY",
+            "deleted": True,
+            "required": True,
+        }
+    )
+    all_vars = [active_var, deleted_req, disabled_req, retired_only_form_var]
+
+    cache = SchemaCache()
+    cache.populate(all_vars, study_key="STUDY_RET")
+    assert list(cache.variables_for_form("F_MIXED", study_key="STUDY_RET").keys()) == [
+        "ACTIVE_NOTES"
+    ]
+    assert cache.variables_for_form("F_RETIRED_ONLY", study_key="STUDY_RET") == {}
+    assert cache.form_key_from_id(401, study_key="STUDY_RET") == "F_MIXED"
+    assert cache.form_key_from_id(402, study_key="STUDY_RET") == "F_RETIRED_ONLY"
+
+    validate_record_data(cache, "F_MIXED", {"ACTIVE_NOTES": "ok"}, study_key="STUDY_RET")
+    validate_record_data(cache, "F_RETIRED_ONLY", {}, study_key="STUDY_RET")
+
+    sync_sdk = MagicMock()
+    sync_sdk.get_variables.return_value = all_vars
+    sync_validator = SchemaValidator(sync_sdk)
+    sync_validator.validate_record("STUDY_RET", {"formId": 401, "data": {"ACTIVE_NOTES": "ok"}})
+    sync_validator.validate_record("STUDY_RET", {"formId": 402, "data": {}})
+
+    async_cache = AsyncSchemaCache()
+    async_cache.populate(all_vars, study_key="STUDY_RET")
+    assert async_cache.form_key_from_id(402, study_key="STUDY_RET") == "F_RETIRED_ONLY"
+
+    async_sdk = MagicMock()
+    async_sdk.async_get_variables = AsyncMock(return_value=all_vars)
+    async_validator = AsyncSchemaValidator(async_sdk)
+    await async_validator.validate_record(
+        "STUDY_RET", {"formId": 401, "data": {"ACTIVE_NOTES": "ok"}}
+    )
+    await async_validator.validate_record("STUDY_RET", {"formId": 402, "data": {}})
+
+
+@pytest.mark.parametrize(
+    "bad_num",
+    [float("nan"), float("inf"), float("-inf"), "nan", "NaN", "inf", "-inf", "Infinity"],
+)
+@pytest.mark.parametrize("var_type", ["Float", "Decimal", "Calculation", "Slider"])
+def test_non_finite_floats_rejected_in_type_and_bounds_validators(
+    bad_num: object,
+    var_type: str,
+) -> None:
+    """validate_record_data and _validate_numeric_bounds reject NaN, Inf, and -Inf."""
+    from imednet.validation.cache import _validate_numeric_bounds
+
+    with pytest.raises(ValidationError, match="finite"):
+        _validate_numeric_bounds("LAB_VAL", "LB", bad_num, 0.0, 100.0)
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="LB",
+                variables=[
+                    DDVariable(
+                        variableName="LAB_VAL",
+                        variableType=var_type,
+                        extraAttributes={"minValue": 0, "maxValue": 100},
+                    )
+                ],
+            )
+        ]
+    )
+    with pytest.raises(ValidationError):
+        validate_record_data(dd, "LB", {"LAB_VAL": bad_num})
+
+
+def test_temporal_validators_calendar_clock_and_phi_masking() -> None:
+    """Date, DateTime, Date/Time Precision, and Time enforce calendar/clock bounds and mask PHI."""
+    from imednet.utils.security import global_sensitivity_registry
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="DM",
+                variables=[
+                    DDVariable(variableName="VISDAT", variableType="Date"),
+                    DDVariable(variableName="DateOfBirth", variableType="Date"),
+                    DDVariable(variableName="VSDTC", variableType="DateTime"),
+                    DDVariable(variableName="ONSET_PREC", variableType="Date/Time Precision"),
+                    DDVariable(variableName="VSTIM", variableType="Time"),
+                ],
+            )
+        ]
+    )
+
+    validate_record_data(
+        dd,
+        "DM",
+        {
+            "VISDAT": "2024-02-29",
+            "DateOfBirth": "02-29-2000",
+            "VSDTC": "2026-03-15T14:30:00Z",
+            "ONSET_PREC": "2026-03",
+            "VSTIM": "23:59:59",
+        },
+    )
+
+    for bad_date in ("2023-02-29", "2024-02-30", "2024-13-01", "02-30-2026", "not-a-date"):
+        with pytest.raises(ValidationError):
+            validate_record_data(dd, "DM", {"VISDAT": bad_date})
+
+    for bad_dt in ("2023-02-29T10:00:00", "2024-05-01T25:00:00", "bad-datetime"):
+        with pytest.raises(ValidationError):
+            validate_record_data(dd, "DM", {"VSDTC": bad_dt})
+
+    for bad_prec in ("2026-13", "2023-02-29", "2026-03-15T25", "bad-prec"):
+        with pytest.raises(ValidationError):
+            validate_record_data(dd, "DM", {"ONSET_PREC": bad_prec})
+
+    for bad_time in ("24:00:00", "25:00:00", "12:60:00", "12:00:60", "noon"):
+        with pytest.raises(ValidationError):
+            validate_record_data(dd, "DM", {"VSTIM": bad_time})
+
+    # PHI variable DateOfBirth must mask invalid temporal input in error messages
+    raw_phi_dob = "1985-02-29"
+    assert global_sensitivity_registry.is_sensitive("DateOfBirth")
+    with pytest.raises(ValidationError) as exc_info:
+        validate_record_data(dd, "DM", {"DateOfBirth": raw_phi_dob})
+    assert MASKED_SENTINEL in str(exc_info.value)
+    assert raw_phi_dob not in str(exc_info.value)
+
+
+def test_multi_select_rejects_booleans_and_blank_delimiters_while_checkbox_keeps_bool() -> None:
+    """Multi Select rejects bool and blank delimiters; Checkbox preserves bool support."""
+    cache = SchemaCache()
+    cache.populate(
+        [
+            ApiVariable(
+                variable_name="MS_VAR",
+                variable_type="Multi Select",
+                form_id=10,
+                form_key="F_CHOICE",
+            ),
+            ApiVariable(
+                variable_name="CB_VAR",
+                variable_type="Checkbox",
+                form_id=10,
+                form_key="F_CHOICE",
+            ),
+        ]
+    )
+
+    validate_record_data(cache, "F_CHOICE", {"CB_VAR": True, "MS_VAR": "A`B"})
+    validate_record_data(cache, "F_CHOICE", {"CB_VAR": False, "MS_VAR": "A, B"})
+
+    for bad_ms in (True, False, " , , ", " ` ` ", "   "):
+        with pytest.raises(ValidationError):
+            validate_record_data(cache, "F_CHOICE", {"MS_VAR": bad_ms})
+
+    # Also verify DataDictionary Choice validation rejects bool/blank delimiters and masks PHI
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    dd_choice = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_CHOICE",
+                variables=[
+                    DDVariable(
+                        variableName="MS_VAR",
+                        variableType="Multi Select",
+                        choices=[
+                            Choice(choiceValue="A", choiceText="Alpha"),
+                            Choice(choiceValue="B", choiceText="Beta"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="DateOfBirth",
+                        variableType="Multi Select",
+                        choices=[Choice(choiceValue="1990", choiceText="1990")],
+                    ),
+                ],
+            )
+        ]
+    )
+    for bad_ms in (True, False, " , , ", " ` ` "):
+        with pytest.raises(ValidationError):
+            validate_record_data(dd_choice, "F_CHOICE", {"MS_VAR": bad_ms})
+    with pytest.raises(ValidationError) as exc_info:
+        validate_record_data(dd_choice, "F_CHOICE", {"DateOfBirth": "1985-04-12"})
+    assert MASKED_SENTINEL in str(exc_info.value)
+    assert "1985-04-12" not in str(exc_info.value)
+
+
+def test_odm_range_checks_comparators_softhard_and_phi_masking(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """extraAttributes['rangeChecks'] enforces all 8 ODM comparators, SoftHard, and PHI masking."""
+    from imednet.datadict.logic import extract_variable_constraints
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="VS",
+                variables=[
+                    DDVariable(
+                        variableName="HR",
+                        variableType="Integer",
+                        extraAttributes={
+                            "rangeChecks": [
+                                {"comparator": "GT", "softHard": "Hard", "checkValue": "30"},
+                                {"comparator": "LT", "softHard": "Hard", "checkValue": "220"},
+                                {"comparator": "NE", "softHard": "Hard", "checkValue": "999"},
+                                {
+                                    "comparator": "LE",
+                                    "softHard": "Soft",
+                                    "checkValue": "100",
+                                    "errorMessage": "Tachycardia warning",
+                                },
+                            ]
+                        },
+                    ),
+                    DDVariable(
+                        variableName="DOSE_COHORT",
+                        variableType="Integer",
+                        extraAttributes={
+                            "rangeChecks": [
+                                {
+                                    "comparator": "IN",
+                                    "softHard": "Hard",
+                                    "checkValues": ["10", "20", "40"],
+                                },
+                            ]
+                        },
+                    ),
+                    DDVariable(
+                        variableName="VISIT_NUM",
+                        variableType="Integer",
+                        extraAttributes={
+                            "rangeChecks": [
+                                {
+                                    "comparator": "NOTIN",
+                                    "softHard": "Hard",
+                                    "checkValues": ["13", "99"],
+                                },
+                                {"comparator": "GE", "softHard": "Hard", "checkValue": "1"},
+                            ]
+                        },
+                    ),
+                    DDVariable(
+                        variableName="PROTO_VER",
+                        variableType="Integer",
+                        extraAttributes={
+                            "rangeChecks": [
+                                {"comparator": "EQ", "softHard": "Hard", "checkValue": "3"},
+                            ]
+                        },
+                    ),
+                    DDVariable(
+                        variableName="DateOfBirth",
+                        variableType="Date",
+                        extraAttributes={
+                            "rangeChecks": [
+                                {
+                                    "comparator": "GE",
+                                    "softHard": "Hard",
+                                    "checkValue": "1920-01-01",
+                                }
+                            ]
+                        },
+                    ),
+                ],
+            )
+        ]
+    )
+
+    hr_constraints = extract_variable_constraints(dd.forms[0].variables[0])
+    assert [rc.comparator for rc in hr_constraints.range_checks] == ["GT", "LT", "NE", "LE"]
+    assert [rc.soft_hard for rc in hr_constraints.range_checks] == ["Hard", "Hard", "Hard", "Soft"]
+
+    # Valid payload with Soft RangeCheck warning (HR=110 > 100)
+    with caplog.at_level(logging.WARNING):
+        report = validate_record_data(
+            dd,
+            "VS",
+            {
+                "HR": 110,
+                "DOSE_COHORT": 20,
+                "VISIT_NUM": 2,
+                "PROTO_VER": 3,
+                "DateOfBirth": "1990-05-15",
+            },
+            collect_errors=True,
+        )
+    assert report is not None
+    assert report.errors == []
+    assert len(report.warnings) == 1
+    assert "Tachycardia warning" in report.warnings[0].message
+
+    # Hard RangeCheck violations raise ValidationError
+    with pytest.raises(ValidationError, match="GT 30"):
+        validate_record_data(dd, "VS", {"HR": 30})
+    with pytest.raises(ValidationError, match="LT 220"):
+        validate_record_data(dd, "VS", {"HR": 220})
+    with pytest.raises(ValidationError, match="IN"):
+        validate_record_data(dd, "VS", {"DOSE_COHORT": 30})
+    with pytest.raises(ValidationError, match="NOTIN"):
+        validate_record_data(dd, "VS", {"VISIT_NUM": 13})
+    with pytest.raises(ValidationError, match="GE 1"):
+        validate_record_data(dd, "VS", {"VISIT_NUM": 0})
+    with pytest.raises(ValidationError, match="EQ 3"):
+        validate_record_data(dd, "VS", {"PROTO_VER": 4})
+
+    # PHI variable masks violated value in RangeCheck error message
+    secret_dob = "1905-06-12"
+    with pytest.raises(ValidationError) as exc_info:
+        validate_record_data(dd, "VS", {"DateOfBirth": secret_dob})
+    assert MASKED_SENTINEL in str(exc_info.value)
+    assert secret_dob not in str(exc_info.value)
+
+
+def test_load_offline_schema_supports_zip_archive_and_is_file_target(tmp_path: Path) -> None:
+    """load_offline_schema loads .zip Data Dictionary archives and _is_file_target matches .zip."""
+    import zipfile
+
+    from imednet.cli.utils.write_helpers import load_offline_schema
+    from imednet.datadict.normalize import _is_file_target
+
+    assert _is_file_target("study_datadict.zip") is True
+    assert _is_file_target(Path("exports/archive.zip")) is True
+
+    fixtures_dir = Path(__file__).parent.parent / "fixtures" / "data_dictionary"
+    zip_path = tmp_path / "study_dd.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for csv_name in ("FORMS.csv", "QUESTIONS.csv", "CHOICES.csv", "BUSINESS_LOGIC.csv"):
+            zf.write(fixtures_dir / csv_name, arcname=csv_name)
+
+    dd = load_offline_schema(zip_path, study_key="ZIP_STUDY")
+    assert isinstance(dd, DataDictionary)
+    assert dd.metadata.studyKey == "ZIP_STUDY"
+    assert {f.formKey for f in dd.forms} == {"AE", "AEACTEL", "AESDC"}

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from itertools import pairwise
 from typing import Any
 
@@ -26,6 +27,24 @@ def _coerce_optional_int_for_bounds(value: Any, field_name: str) -> int | None:
         stripped = value.strip()
         if stripped.lstrip("-").isdigit():
             return int(stripped)
+    return None
+
+
+def _parse_revision_timestamp(value: Any) -> datetime | None:
+    """Parse an optional revision timestamp into a UTC-normalized datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
     return None
 
 
@@ -96,13 +115,18 @@ class RecordRevision(ImednetBaseModel):
         super().__setattr__(name, value)
 
     def validate_follows(self, previous: RecordRevision) -> bool:
-        """Validate that this revision monotonically follows *previous*."""
+        """Validate that this revision contiguously and chronologically follows *previous*."""
         if previous.record_revision is None or self.record_revision is None:
             raise ValueError("RecordRevision chain validation requires non-null record_revision.")
         if self.record_revision <= previous.record_revision:
             raise ValueError(
                 f"Non-monotonic record_revision: {self.record_revision} must be greater than "
                 f"previous {previous.record_revision}."
+            )
+        if self.record_revision != previous.record_revision + 1:
+            raise ValueError(
+                f"Missing record_revision in chain: expected {previous.record_revision + 1}, "
+                f"got {self.record_revision}."
             )
         if (
             previous.data_revision is not None
@@ -112,6 +136,13 @@ class RecordRevision(ImednetBaseModel):
             raise ValueError(
                 f"Decreasing data_revision: {self.data_revision} cannot be less than "
                 f"previous {previous.data_revision}."
+            )
+        prev_dt = _parse_revision_timestamp(getattr(previous, "date_created", None))
+        curr_dt = _parse_revision_timestamp(getattr(self, "date_created", None))
+        if prev_dt is not None and curr_dt is not None and curr_dt < prev_dt:
+            raise ValueError(
+                f"Backdated date_created: {getattr(self, 'date_created', None)!r} precedes "
+                f"previous {getattr(previous, 'date_created', None)!r}."
             )
         return True
 
@@ -139,16 +170,17 @@ def validate_record_revision_chain(revisions: Sequence[RevisionInput]) -> list[R
         item if isinstance(item, RecordRevision) else RecordRevision.model_validate(item)
         for item in revisions
     ]
-    chains: dict[tuple[str, Any], list[RecordRevision]] = {}
+    chains: dict[tuple[str, str, Any], list[RecordRevision]] = {}
     for rev in parsed:
+        study_scope = str(getattr(rev, "study_key", None) or "")
         rec_id = getattr(rev, "record_id", None)
         rec_oid = getattr(rev, "record_oid", None)
         if rec_id is not None:
-            key: tuple[str, Any] = ("id", rec_id)
+            key: tuple[str, str, Any] = (study_scope, "id", rec_id)
         elif rec_oid:
-            key = ("oid", rec_oid)
+            key = (study_scope, "oid", rec_oid)
         else:
-            key = ("unkeyed", None)
+            key = (study_scope, "unkeyed", None)
         chains.setdefault(key, []).append(rev)
 
     for group in chains.values():

@@ -301,8 +301,10 @@ def test_job_status_record_counts():
     assert js_text_fail.successful_records == 0
     assert js_text_fail.failed_records == 1
 
-    # Empty format
+    # Empty format (unknown record counts return None)
     js_empty = JobStatus(batchId="1", state="COMPLETED", progress=100, jobId="1", resultUrl="")
-    assert js_empty.total_records == 0
-    assert js_empty.successful_records == 0
-    assert js_empty.failed_records == 0
+    assert js_empty.total_records is None
+    assert js_empty.successful_records is None
+    assert js_empty.failed_records is None
+    assert js_empty.is_successful is True
+    assert js_empty.is_failed is False

@@ -2257,6 +2257,151 @@ def test_by_form_exports_recover_stale_running_lease_without_premature_commit(
     )
 
 
+def test_by_form_exports_use_batch_transaction_and_fallback_for_custom_provider(
+    tmp_path: Path,
+) -> None:
+    """DuckDB, SQL, and Hive Parquet use batch_transaction and fall back when omitted."""
+    import contextlib
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from imednet.integrations import parquet as parquet_mod
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [
+        SimpleNamespace(form_id=1, form_key="DM"),
+        SimpleNamespace(form_id=2, form_key="VS"),
+    ]
+    vars_list = [
+        Variable(
+            variable_name="AGE", label="Age", variable_type="integer", form_id=1, form_key="DM"
+        ),
+        Variable(variable_name="HR", label="HR", variable_type="integer", form_id=2, form_key="VS"),
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.get_variables.return_value = vars_list
+
+    recs = [
+        Record(
+            record_id=1,
+            subject_key="S1",
+            visit_id=1,
+            form_id=1,
+            form_key="DM",
+            date_modified="2026-07-01T00:00:00Z",
+            record_data={"AGE": 35},
+        ),
+        Record(
+            record_id=2,
+            subject_key="S1",
+            visit_id=1,
+            form_id=2,
+            form_key="VS",
+            date_modified="2026-07-02T00:00:00Z",
+            record_data={"HR": 70},
+        ),
+    ]
+
+    # 1. Verify batch_transaction is called once per study for SQL, DuckDB, and Hive Parquet
+    batch_calls: list[tuple[str, list[str]]] = []
+    provider = FileStateProvider(str(tmp_path / "batch_by_form.json"))
+    orig_batch_tx = provider.batch_transaction
+
+    @contextlib.contextmanager
+    def _spy_batch_tx(study_key: str, stream_names: Any, fallback_timestamp: Any = None):
+        batch_calls.append((study_key, list(stream_names)))
+        with orig_batch_tx(study_key, stream_names, fallback_timestamp=fallback_timestamp) as tx_m:
+            yield tx_m
+
+    provider.batch_transaction = _spy_batch_tx  # type: ignore[method-assign]
+
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in recs])
+    export_mod.export_to_sql_by_form(
+        sdk,
+        "BATCH_ST",
+        f"sqlite:///{tmp_path / 'b.sqlite'}",
+        incremental=True,
+        state_provider=provider,
+        quality_gate_enabled=False,
+    )
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in recs])
+    export_mod.export_to_duckdb_by_form(
+        sdk,
+        "BATCH_ST",
+        str(tmp_path / "b.duckdb"),
+        incremental=True,
+        state_provider=provider,
+        quality_gate_enabled=False,
+    )
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in recs])
+    parquet_mod.export_to_hive_parquet(
+        sdk,
+        "BATCH_ST",
+        str(tmp_path / "hive_out"),
+        incremental=True,
+        state_provider=provider,
+        quality_gate_enabled=False,
+    )
+
+    assert batch_calls == [
+        ("BATCH_ST", ["sql_DM", "sql_VS"]),
+        ("BATCH_ST", ["duckdb_DM", "duckdb_VS"]),
+        ("BATCH_ST", ["hive_parquet_DM", "hive_parquet_VS"]),
+    ]
+
+    # 2. Custom StateProviderProtocol without batch_transaction falls back to per-stream transaction
+    tx_entered: list[str] = []
+    committed_ts: dict[str, datetime | None] = {}
+
+    class _CustomProviderWithoutBatchTx:
+        def get_last_timestamp(self, study_key: str, stream_name: str) -> datetime | None:
+            return committed_ts.get(f"{study_key}:{stream_name}")
+
+        def set_last_timestamp(
+            self, study_key: str, stream_name: str, timestamp: Any, **kw: Any
+        ) -> None:
+            committed_ts[f"{study_key}:{stream_name}"] = timestamp
+
+        @contextlib.contextmanager
+        def transaction(self, study_key: str, stream_name: str, fallback_timestamp: Any = None):
+            tx_entered.append(stream_name)
+            tx_d: dict[str, Any] = {
+                "last_timestamp": fallback_timestamp,
+                "new_timestamp": None,
+                "records_processed": 0,
+                "metadata": {},
+            }
+            yield tx_d
+            committed_ts[f"{study_key}:{stream_name}"] = tx_d["new_timestamp"]
+
+        def read_state(self) -> Any:
+            return {}
+
+        def delete_entry(self, study_key: str, stream_name: str | None = None) -> bool:
+            return False
+
+    custom_prov = _CustomProviderWithoutBatchTx()
+    assert not hasattr(custom_prov, "batch_transaction")
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in recs])
+    export_mod.export_to_sql_by_form(
+        sdk,
+        "CUSTOM_ST",
+        f"sqlite:///{tmp_path / 'custom.sqlite'}",
+        incremental=True,
+        state_provider=custom_prov,
+        quality_gate_enabled=False,
+    )
+    assert tx_entered == ["sql_DM", "sql_VS"]
+    assert committed_ts["CUSTOM_ST:sql_DM"] == datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+    assert committed_ts["CUSTOM_ST:sql_VS"] == datetime(2026, 7, 2, 0, 0, tzinfo=UTC)
+
+
 def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2414,7 +2559,9 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
     vitals_payloads = dataframe_to_records(vitals_unmasked_df, schema=schema)
     assert demo_payloads == [
         {
-            "formId": 10,
+            "recordId": 101,
+            "visitId": 1,
+            "formKey": "DEMO",
             "subjectKey": "SUBJ-1",
             "data": {
                 "patientName": "Jane Doe",
@@ -2426,7 +2573,9 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
     ]
     assert vitals_payloads == [
         {
-            "formId": 20,
+            "recordId": 201,
+            "visitId": 1,
+            "formKey": "VITALS",
             "subjectKey": "SUBJ-1",
             "data": {"HR": 72},
         }

@@ -163,3 +163,161 @@ def test_register_subjects_skips_soft_deleted_existing_subject_and_filters_activ
         subjects=[deleted_subj, active_subj],
     )
     assert snapshot.active_sites() == [open_site]
+
+
+@pytest.mark.asyncio
+async def test_register_subjects_single_job_guards_and_empty_batch_id_when_waiting() -> None:
+    """AC 2 & AC 3: register_subjects guards single-Job inputs and enforces non-empty batchId on wait."""
+    from unittest.mock import AsyncMock
+
+    from imednet.datadict import DataDictionary, Form
+    from imednet.datadict import Variable as DDVariable
+    from imednet.errors import ValidationError
+    from imednet.utils.batch_coordinator import BatchSubmissionSummary
+
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="ENROLL",
+                formName="Enrollment",
+                variables=[DDVariable(variableName="AGE", variableType="Integer", required="Yes")],
+            )
+        ]
+    )
+    active_site = Site(studyKey="STUDY", siteId=1, siteName="SITE", siteEnrollmentStatus="Active")
+
+    sdk = MagicMock()
+    del sdk.async_create_record
+    sdk.get_sites.return_value = [active_site]
+    sdk.create_record.return_value = Job(jobId="1", batchId="", state="OPEN")
+    wf = RegisterSubjectsWorkflow(sdk, batch_size=2)
+
+    # AC 2: multi-chunk, dry_run=True, empty, and invalid DD raise ValidationError
+    with pytest.raises(ValidationError, match="register_subjects_batch"):
+        wf.register_subjects(
+            "STUDY",
+            [
+                {"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": 20}},
+                {"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": 21}},
+                {"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": 22}},
+            ],
+        )
+    with pytest.raises(ValidationError, match="dry_run=True"):
+        wf.register_subjects(
+            "STUDY",
+            [{"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": 20}}],
+            dry_run=True,
+        )
+    with pytest.raises(ValidationError, match="at least one record"):
+        wf.register_subjects("STUDY", [])
+    with pytest.raises(ValidationError):
+        wf.register_subjects(
+            "STUDY",
+            [{"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": "bad"}}],
+            schema=dd,
+            collect_errors=True,
+        )
+    sdk.create_record.assert_not_called()
+
+    # AC 3: empty batchId with wait_for_completion=True raises error instead of all_successful=True
+    with pytest.raises(ValueError, match="no batch_id received"):
+        wf.register_subjects_batch(
+            "STUDY",
+            [{"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": 30}}],
+            wait_for_completion=True,
+        )
+    with pytest.raises(ValueError, match="no batch_id received"):
+        wf.register_subjects(
+            "STUDY",
+            [{"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": 30}}],
+            wait_for_completion=True,
+        )
+
+    # Even if a BatchSubmissionSummary is constructed with wait_for_completion=True on an OPEN Job,
+    # all_successful is False because polling never settled the OPEN Job.
+    unpolled_summary = BatchSubmissionSummary(
+        study_key="STUDY",
+        jobs=[Job(jobId="1", batchId="", state="OPEN")],
+        chunk_sizes=[1],
+        total_records=1,
+        wait_for_completion=True,
+    )
+    assert unpolled_summary.all_successful is False
+
+    # Async parity for AC 2 & AC 3
+    async_sdk = MagicMock()
+    async_sdk.async_get_sites = AsyncMock(return_value=[active_site])
+    async_sdk.async_create_record = AsyncMock(return_value=Job(jobId="2", batchId="", state="OPEN"))
+    async_wf = RegisterSubjectsWorkflow(async_sdk, batch_size=2)
+
+    with pytest.raises(ValidationError, match="dry_run=True"):
+        await async_wf.async_register_subjects(
+            "STUDY",
+            [{"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": 30}}],
+            dry_run=True,
+        )
+    with pytest.raises(ValueError, match="no batch_id received"):
+        await async_wf.async_register_subjects_batch(
+            "STUDY",
+            [{"formKey": "ENROLL", "siteName": "SITE", "data": {"AGE": 30}}],
+            wait_for_completion=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_register_subjects_workflow_offline_dry_run_skips_sites_and_subjects_reads() -> None:
+    """Req 4: RegisterSubjectsWorkflow with dry_run=True and offline DataDictionary makes zero HTTP reads."""
+    from unittest.mock import AsyncMock
+
+    from imednet.datadict import DataDictionary
+
+    dd = DataDictionary.model_validate(
+        {
+            "forms": [
+                {
+                    "formKey": "F_ENROLL",
+                    "variables": [{"variableName": "V_AGE", "variableType": "integer"}],
+                }
+            ]
+        }
+    )
+
+    # Sync workflow
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_wf = RegisterSubjectsWorkflow(sync_sdk, filter_enrolled=True)
+    summary = sync_wf.register_subjects_batch(
+        "STUDY",
+        [{"formKey": "F_ENROLL", "siteName": "SITE", "subjectKey": "SUB-1", "data": {"V_AGE": 30}}],
+        skip_existing=True,
+        schema=dd,
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert summary.dry_run is True
+    assert summary.validation_report is not None
+    assert summary.validation_report.is_valid is True
+    sync_sdk.get_sites.assert_not_called()
+    sync_sdk.get_subjects.assert_not_called()
+    sync_sdk.create_record.assert_not_called()
+
+    # Async workflow
+    async_sdk = MagicMock()
+    async_sdk.async_create_record = AsyncMock()
+    async_sdk.async_get_sites = AsyncMock()
+    async_sdk.async_get_subjects = AsyncMock()
+    async_wf = RegisterSubjectsWorkflow(async_sdk, filter_enrolled=True)
+    async_summary = await async_wf.async_register_subjects_batch(
+        "STUDY",
+        [{"formKey": "F_ENROLL", "siteId": 101, "subjectKey": "SUB-2", "data": {"V_AGE": 44}}],
+        skip_existing=True,
+        schema=dd,
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert async_summary.dry_run is True
+    assert async_summary.validation_report is not None
+    assert async_summary.validation_report.is_valid is True
+    async_sdk.async_get_sites.assert_not_called()
+    async_sdk.async_get_subjects.assert_not_called()
+    async_sdk.async_create_record.assert_not_called()

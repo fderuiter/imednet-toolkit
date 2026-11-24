@@ -123,6 +123,7 @@ from imednet.utils.filters import (
     validate_record_filter,
 )
 from imednet.utils.security import (
+    SensitivityRegistry,
     _normalize_key,
     global_sensitivity_registry,
     mask_clinical_phi,
@@ -171,6 +172,15 @@ class StateProviderProtocol(Protocol):
         fallback_timestamp: datetime | None = None,
     ) -> AbstractContextManager[dict[str, Any]]:
         """Execute a checkpoint transaction committing only on clean exit."""
+        ...
+
+    def batch_transaction(
+        self,
+        study_key: str,
+        stream_names: Sequence[str],
+        fallback_timestamp: datetime | None = None,
+    ) -> AbstractContextManager[dict[str, dict[str, Any]]]:
+        """Execute a batched checkpoint transaction across multiple streams in one study."""
         ...
 
     def read_state(self) -> Any:
@@ -359,6 +369,12 @@ class SinkConfig:
             raise ValueError("retry_backoff must be a finite non-negative number")
         if not isinstance(self.mask_phi, bool):
             raise ValueError("mask_phi must be a boolean")
+        if not self.idempotent and (self.incremental or self.state_provider is not None):
+            raise ExportConfigurationError(
+                "SinkConfig(idempotent=False) cannot be combined with incremental=True or "
+                "state_provider because inclusive dateModified>= watermarks require "
+                "idempotent=True."
+            )
         validate_max_buffered_records(self.max_buffered_records)
         if not isinstance(self.as_sdtm, bool):
             raise ValueError("as_sdtm must be a boolean")
@@ -408,6 +424,120 @@ class SinkConfig:
 # ---------------------------------------------------------------------------
 
 
+_TABULAR_BATCH_STAMP_ATTR = "_imednet_tabular_batch_stamp"
+_CONTAINER_CELL_TYPES = (dict, list, tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class TabularBatchStamp:
+    """Immutable preparation stamp bound to a prepared pandas DataFrame batch."""
+
+    mask_phi: bool
+    registry_snapshot: tuple[frozenset[str], frozenset[str]]
+    phi_keys: frozenset[str]
+    columns: tuple[Any, ...]
+    sanitized: bool = False
+
+
+def normalize_phi_keys_snapshot(
+    phi_keys: Iterable[str] | None,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> frozenset[str]:
+    """Normalize custom StudyConfiguration PHI keys into a canonical collapsed frozenset."""
+    if not phi_keys:
+        return frozenset()
+    active_registry = global_sensitivity_registry if registry is None else registry
+    normalized: set[str] = set()
+    for raw_key in phi_keys:
+        if raw_key is None or active_registry.is_exempt(raw_key):
+            continue
+        norm = _normalize_key(raw_key)
+        if norm:
+            collapsed = norm.replace("_", "")
+            if collapsed:
+                normalized.add(collapsed)
+    return frozenset(normalized)
+
+
+def stamp_tabular_batch(
+    df: Any,
+    *,
+    mask_phi: bool,
+    phi_keys: Iterable[str] | None = None,
+    sanitized: bool = False,
+    registry: SensitivityRegistry | None = None,
+) -> Any:
+    """Attach a :class:`TabularBatchStamp` to ``df`` binding active PHI and header state."""
+    columns = getattr(df, "columns", None)
+    obj_dict = getattr(df, "__dict__", None)
+    if not isinstance(obj_dict, dict) or columns is None:
+        return df
+    active_registry = global_sensitivity_registry if registry is None else registry
+    obj_dict[_TABULAR_BATCH_STAMP_ATTR] = TabularBatchStamp(
+        mask_phi=bool(mask_phi),
+        registry_snapshot=active_registry.snapshot(),
+        phi_keys=normalize_phi_keys_snapshot(phi_keys, registry=active_registry)
+        if mask_phi
+        else frozenset(),
+        columns=tuple(columns),
+        sanitized=bool(sanitized),
+    )
+    return df
+
+
+def get_tabular_batch_stamp(df: Any) -> TabularBatchStamp | None:
+    """Return ``df``'s :class:`TabularBatchStamp` when present and matching ``df.columns``."""
+    columns = getattr(df, "columns", None)
+    obj_dict = getattr(df, "__dict__", None)
+    if not isinstance(obj_dict, dict) or columns is None:
+        return None
+    stamp = obj_dict.get(_TABULAR_BATCH_STAMP_ATTR)
+    if not isinstance(stamp, TabularBatchStamp):
+        return None
+    if tuple(columns) != stamp.columns:
+        return None
+    return stamp
+
+
+def has_valid_tabular_batch_stamp(
+    df: Any,
+    *,
+    mask_phi: bool = True,
+    phi_keys: Iterable[str] | None = None,
+    require_sanitized: bool = False,
+    registry: SensitivityRegistry | None = None,
+) -> bool:
+    """Verify whether ``df`` carries a valid preparation stamp for the requested requirements."""
+    stamp = get_tabular_batch_stamp(df)
+    if stamp is None:
+        return False
+    if mask_phi:
+        if not stamp.mask_phi:
+            return False
+        active_registry = global_sensitivity_registry if registry is None else registry
+        if stamp.registry_snapshot != active_registry.snapshot():
+            return False
+        required_phi = normalize_phi_keys_snapshot(phi_keys, registry=active_registry)
+        if not required_phi.issubset(stamp.phi_keys):
+            return False
+    return not (require_sanitized and not stamp.sanitized)
+
+
+def _mask_series_containers_default_phi(series: Any) -> Any:
+    """Mask nested container cells in a pandas Series without invoking scalar mask_clinical_phi."""
+    values = series.tolist()
+    if not any(isinstance(v, _CONTAINER_CELL_TYPES) for v in values):
+        return series
+    pd_mod = sys.modules.get("pandas")
+    new_vals = [mask_clinical_phi(v) if isinstance(v, _CONTAINER_CELL_TYPES) else v for v in values]
+    if pd_mod is not None:
+        return pd_mod.Series(new_vals, index=series.index, dtype=object)
+    return series.apply(
+        lambda v: mask_clinical_phi(v) if isinstance(v, _CONTAINER_CELL_TYPES) else v
+    )
+
+
 def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
     """Return a PHI-redacted copy of a pandas DataFrame without mutating caller state."""
     masked = df.copy()
@@ -433,9 +563,9 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
     for col in object_cols:
         target = masked[col]
         if hasattr(target, "columns"):
-            masked[col] = target.apply(lambda s: s.apply(mask_clinical_phi))
+            masked[col] = target.apply(_mask_series_containers_default_phi)
         else:
-            masked[col] = target.apply(mask_clinical_phi)
+            masked[col] = _mask_series_containers_default_phi(target)
     return masked
 
 
@@ -537,6 +667,12 @@ class ExportSink(ABC):
         """Initialize the export sink with a configuration."""
         self.config: SinkConfig = config
         self._circuit_breaker: CircuitBreaker = CircuitBreaker()
+
+    reconciles_deleted_on_full_sync: bool = False
+
+    def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
+        """Bind mutable checkpoint metadata for the active streaming run."""
+        _ = metadata
 
     def _get_circuit_breaker(self) -> CircuitBreaker:
         """Return this sink's isolated circuit breaker, initializing lazily if needed."""
@@ -1257,9 +1393,9 @@ def apply_quality_gate(
                 data = rec_dict.get("recordData")
             if data is None:
                 data = rec_dict.get("data", {})
-            if data is None:
+            if not isinstance(data, Mapping):
                 data = {}
-            score, reasons = calculate_readiness_score(validator.schema, fk, data)
+            score, reasons = calculate_readiness_score(validator.schema, fk, dict(data))
         finally:
             reset_study_context(ctx_token)
 
@@ -1966,15 +2102,21 @@ def _extract_safe_config_options(config: Any) -> dict[str, Any]:
     raw_ledger = config.ledger_path if is_real_cfg else getattr(config, "ledger_path", None)
     ledger_path = raw_ledger if isinstance(raw_ledger, (str, Path)) else None
 
-    explicit_provider = (
-        config.state_provider
-        if is_real_cfg
-        else (
-            getattr(config, "state_provider", None)
-            if incremental and hasattr(getattr(config, "state_provider", None), "transaction")
-            else None
+    explicit_provider: Any = None
+    if is_real_cfg:
+        explicit_provider = config.state_provider
+    elif not isinstance(config, NonCallableMock):
+        cand_provider = getattr(config, "state_provider", None)
+        if cand_provider is not None and hasattr(cand_provider, "transaction"):
+            explicit_provider = cand_provider
+    elif incremental and hasattr(getattr(config, "state_provider", None), "transaction"):
+        explicit_provider = getattr(config, "state_provider", None)
+
+    if not idempotent and (incremental or explicit_provider is not None):
+        raise ExportConfigurationError(
+            "SinkConfig(idempotent=False) cannot be combined with incremental=True or "
+            "state_provider because inclusive dateModified>= watermarks require idempotent=True."
         )
-    )
 
     raw_max_buf = (
         config.max_buffered_records
@@ -2123,7 +2265,10 @@ def run_streaming_export(
     total_reconciled = 0
     max_ts: datetime | None = None
 
+    from imednet.core.context import sdk_governance_context
+
     with contextlib.ExitStack() as stack:
+        stack.enter_context(sdk_governance_context(sdk))
         tx: dict[str, Any] | None = None
         if provider is not None:
             tx = stack.enter_context(
@@ -2145,10 +2290,20 @@ def run_streaming_export(
             sink_obj = sink()
         stack.enter_context(sink_obj)
 
+        if tx is not None:
+            tx_meta = tx.setdefault("metadata", {})
+            bind_fn = getattr(sink_obj, "bind_stream_metadata", None)
+            if callable(bind_fn) and isinstance(tx_meta, dict):
+                bind_fn(tx_meta)
+
         reconcile_voided = (
             (not opts["include_deleted"])
             and opts["idempotent"]
-            and (use_checkpoint or watermark is not None)
+            and (
+                use_checkpoint
+                or watermark is not None
+                or bool(getattr(sink_obj, "reconciles_deleted_on_full_sync", False))
+            )
         )
         exclude_deleted_upstream = (not opts["include_deleted"]) and (not reconcile_voided)
 
@@ -2263,6 +2418,39 @@ def run_streaming_export(
     return total_written
 
 
+def is_incremental_sink_config(config: Any) -> bool:
+    """Return True when ``config`` activates incremental, watermark, or stateful sync."""
+    return bool(
+        getattr(config, "incremental", False) is True
+        or getattr(config, "modified_since", None) is not None
+        or getattr(config, "state_provider", None) is not None
+    )
+
+
+def bind_sdtm_stream_metadata(
+    metadata: dict[str, Any],
+    seq_counters: dict[str, int],
+    record_seqs: dict[str, int] | None = None,
+) -> None:
+    """Hydrate and bind mutable SDTM sequence counters into ``StreamState.metadata``."""
+    raw_counters = metadata.get("sdtm_seq_counters")
+    seq_counters.clear()
+    if isinstance(raw_counters, dict):
+        for subj_key, val in raw_counters.items():
+            if isinstance(subj_key, str) and isinstance(val, int) and not isinstance(val, bool):
+                seq_counters[subj_key] = val
+    metadata["sdtm_seq_counters"] = seq_counters
+
+    if record_seqs is not None:
+        raw_rec_seqs = metadata.get("sdtm_record_seqs")
+        record_seqs.clear()
+        if isinstance(raw_rec_seqs, dict):
+            for rec_key, val in raw_rec_seqs.items():
+                if isinstance(rec_key, str) and isinstance(val, int) and not isinstance(val, bool):
+                    record_seqs[rec_key] = val
+        metadata["sdtm_record_seqs"] = record_seqs
+
+
 __all__ = [
     "DEFAULT_MAX_BUFFERED_RECORDS",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
@@ -2270,22 +2458,29 @@ __all__ = [
     "ExportSink",
     "SinkConfig",
     "StateProviderProtocol",
+    "TabularBatchStamp",
     "_redact_uri",
     "_require_optional_dep",
     "apply_quality_gate",
+    "bind_sdtm_stream_metadata",
     "build_record_query_branches",
     "evaluate_standards_readiness",
     "extract_record_form_ref",
     "extract_record_id",
     "extract_record_timestamp",
     "get_state_provider",
+    "get_tabular_batch_stamp",
+    "has_valid_tabular_batch_stamp",
+    "is_incremental_sink_config",
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
+    "normalize_phi_keys_snapshot",
     "normalize_sink_value",
     "normalize_watermark_datetime",
     "redact_batch_records",
     "resolve_max_buffered_records",
     "run_streaming_export",
+    "stamp_tabular_batch",
     "validate_max_buffered_records",
 ]

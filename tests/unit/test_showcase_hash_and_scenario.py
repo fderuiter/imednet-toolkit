@@ -930,7 +930,8 @@ def test_readonly_explorer_immediate_scenario_and_mode_updates_via_node() -> Non
     assert re.search(r"\b\d+(?:\.\d+)?\s*ms\b", out["initialBadge"]) is None
 
     assert "QueryStatus.OPEN" in out["queriesSnippet"]
-    assert "Study Queries Ledger (STUDY)" in out["queriesBadge"]
+    assert "Study Queries Ledger (STUDY) (2 items)" in out["queriesBadge"]
+    assert [item["annotationId"] for item in out["queriesJson"]] == [701, 702]
     assert all(item["studyKey"] == "STUDY" for item in out["queriesJson"])
     assert all("variable" in item for item in out["queriesJson"])
     assert all("queryComments" in item and "status" not in item for item in out["queriesJson"])
@@ -1160,7 +1161,8 @@ def test_persona_routing_and_datadict_subcommands_surfaced() -> None:
         assert cmd in index_rst, f"Subcommand '{cmd}' missing from docs/index.rst"
         assert cmd in readme_md, f"Subcommand '{cmd}' missing from README.md"
 
-    assert "docs/how-to/data_dictionary.rst" in readme_md
+    assert "https://fderuiter.github.io/imednet-toolkit/how-to/data_dictionary.html" in readme_md
+    assert "docs/how-to/data_dictionary.rst" not in readme_md
     assert "how-to/data_dictionary" in index_rst
     assert "how-to/audit_compliance" in index_rst
     assert "LogicTreeEvaluator" in datadict_rst
@@ -1573,5 +1575,19 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
         assert "domain" not in form_item
     assert "[object Object]" not in probe["queriesTableHtml"]
     assert "Monitor Open" in probe["queriesTableHtml"]
+    assert "Subject Answered" not in probe["queriesTableHtml"]
+    assert "Monitor Closed" not in probe["queriesTableHtml"]
     assert "variables" in probe["cdmJson"] and "businessLogic" in probe["cdmJson"]
     assert "V_WEIGHT" in probe["cdmHtml"] and "BL-VS-001" in probe["cdmHtml"]
+
+
+def test_pyodide_study_key_defaults_to_canonical_study() -> None:
+    """Verify docs/conf.py and thebe_pyodide.js default IMEDNET_STUDY_KEY to 'STUDY'."""
+    from docs.conf import pyodide_config
+
+    assert pyodide_config["env"]["IMEDNET_STUDY_KEY"] == "STUDY"
+
+    repo_root = get_repo_root()
+    thebe_js = (repo_root / "docs" / "_static" / "thebe_pyodide.js").read_text(encoding="utf-8")
+    assert 'IMEDNET_STUDY_KEY: "STUDY"' in thebe_js
+    assert '"MY_STUDY"' not in thebe_js

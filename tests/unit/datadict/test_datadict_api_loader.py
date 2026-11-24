@@ -131,3 +131,68 @@ def test_load_from_api_pydantic_sdk_models_preserves_extra_attributes() -> None:
     assert unassigned_form.formType == "Subject"
     assert unassigned_form.variables[0].variableType == "Radio"
     assert unassigned_form.variables[0].extraAttributes["variableOid"] == "OID_ORPHAN"
+
+
+def test_load_from_api_skips_deleted_and_disabled_variables_and_keeps_forms() -> None:
+    """load_from_api filters deleted=True and disabled=True Variables while preserving Form IDs."""
+    from imednet.validation.cache import validate_record_data
+
+    mock_sdk = Mock()
+    mock_sdk.forms.list.return_value = [
+        {"form_key": "DM", "form_name": "Demographics", "form_id": 1001, "form_type": "Patient"},
+        {
+            "form_key": "LEGACY",
+            "form_name": "Retired Form",
+            "form_id": 1009,
+            "form_type": "Patient",
+        },
+    ]
+    mock_sdk.variables.list.return_value = [
+        {
+            "form_key": "DM",
+            "variable_name": "SUBJID",
+            "label": "Subject ID",
+            "variable_type": "Text",
+            "deleted": False,
+            "disabled": False,
+        },
+        {
+            "form_key": "DM",
+            "variable_name": "OLD_DELETED_REQ",
+            "label": "Retired Deleted Field",
+            "variable_type": "Text",
+            "deleted": True,
+            "disabled": False,
+            "required": "Yes",
+        },
+        {
+            "form_key": "DM",
+            "variable_name": "OLD_DISABLED_REQ",
+            "label": "Retired Disabled Field",
+            "variable_type": "Number",
+            "deleted": False,
+            "disabled": True,
+            "required": "Yes",
+        },
+        {
+            "form_key": "LEGACY",
+            "variable_name": "RETIRED_ONLY",
+            "label": "Retired Only",
+            "variable_type": "Text",
+            "deleted": True,
+            "required": "Yes",
+        },
+    ]
+
+    dd = load_from_api(mock_sdk, study_key="STUDY_FILTER")
+    dm_form = dd.form_for_key("DM")
+    legacy_form = dd.form_for_key("LEGACY")
+    assert dm_form is not None
+    assert legacy_form is not None
+    assert [v.variableName for v in dm_form.variables] == ["SUBJID"]
+    assert legacy_form.variables == []
+    assert dd.form_key_from_id(1001) == "DM"
+    assert dd.form_key_from_id(1009) == "LEGACY"
+
+    validate_record_data(dd, "DM", {"SUBJID": "SUBJ-001"})
+    validate_record_data(dd, "LEGACY", {})

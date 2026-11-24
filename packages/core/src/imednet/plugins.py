@@ -47,7 +47,8 @@ import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, overload, runtime_checkable
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, Self, overload, runtime_checkable
 
 from typing_extensions import deprecated
 
@@ -158,8 +159,25 @@ class DuckDBIngestionWorkflowProtocol(Protocol):
         """Ingest study record revisions into the DuckDB bronze table."""
         ...
 
-    def build_silver_view(self, study_key: str) -> None:
+    def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
         """Create or replace the deduplicated DuckDB silver view for a study."""
+        ...
+
+    def close(self) -> None:
+        """Close the underlying DuckDB connection."""
+        ...
+
+    def __enter__(self) -> Self:
+        """Enter the context manager and return the workflow instance."""
+        ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the context manager and close the DuckDB connection."""
         ...
 
 
@@ -298,6 +316,8 @@ class RecordMapperProtocol(Protocol):
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
         seq_counters: dict[str, int] | None = None,
+        record_seqs: dict[str, int] | None = None,
+        preserve_record_id: bool = False,
     ) -> pd.DataFrame:
         """Transform records into a normalized SDTM domain DataFrame."""
         ...
@@ -342,6 +362,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
@@ -359,6 +380,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -379,6 +401,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Register a new subject by submitting a single enrollment record."""
@@ -398,6 +421,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Update an existing scheduled record for a subject."""
@@ -415,6 +439,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Create a new unscheduled record for an existing subject."""
@@ -432,6 +457,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         chunk_size: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
@@ -449,6 +475,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -469,6 +496,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously register a new subject via the Records API."""
@@ -488,6 +516,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously update an existing scheduled record for a subject."""
@@ -505,6 +534,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously create a new unscheduled record for an existing subject."""
@@ -917,6 +947,16 @@ class UATRunResultProtocol(Protocol):
         ...
 
     @property
+    def dry_run(self) -> bool:
+        """Whether the run executed in local dry-run validation mode."""
+        ...
+
+    @property
+    def validation_report(self) -> Any:
+        """Local batch validation report captured during dry-run execution, if any."""
+        ...
+
+    @property
     def phase_durations(self) -> Mapping[str, float]:
         """Elapsed seconds recorded per execution phase."""
         ...
@@ -944,7 +984,7 @@ class UATWorkflowProtocol(Protocol):
         """Result from the most recent ``run()`` invocation, if any."""
         ...
 
-    def transition_to(self, target: str) -> str:
+    def transition_to(self, target: str, *, dry_run: bool = False) -> str:
         """Transition workflow state along a valid lifecycle edge."""
         ...
 
@@ -958,6 +998,9 @@ class UATWorkflowProtocol(Protocol):
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
         data_dictionary: DataDictionary | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        seed: int | None = None,
+        dry_run: bool = False,
     ) -> UATRunResultProtocol:
         """Execute the end-to-end UAT pipeline and return its run result."""
         ...
@@ -976,6 +1019,7 @@ class UATWorkflowProtocol(Protocol):
         snapshot: Any,
         *,
         data_dictionary: DataDictionary | None = None,
+        seed: int | None = None,
     ) -> list[Any]:
         """Generate synthetic record sets from a UAT specification and snapshot."""
         ...
@@ -985,6 +1029,8 @@ class UATWorkflowProtocol(Protocol):
         study_key: str,
         record_sets: list[Any],
         email_notify: bool | str | None = None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> Any:
         """Submit generated UAT record sets in two phases."""
         ...

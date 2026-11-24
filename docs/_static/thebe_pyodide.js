@@ -54,9 +54,9 @@
 
   function getConfig() {
     const defaultWheels = [
-      "_static/wheels/imednet-1.1.0-py3-none-any.whl",
-      "_static/wheels/imednet_workflows-1.1.0-py3-none-any.whl",
-      "_static/wheels/imednet_plugins_sinks-1.0.1-py3-none-any.whl",
+      "_static/wheels/imednet-1.2.0-py3-none-any.whl", // x-release-please-version
+      "_static/wheels/imednet_workflows-1.2.0-py3-none-any.whl",
+      "_static/wheels/imednet_plugins_sinks-1.1.0-py3-none-any.whl",
     ];
     const defaultPyodidePackages = [
       "micropip",
@@ -79,7 +79,7 @@
       IMEDNET_API_KEY: "dummy_api_key", // pragma: allowlist secret
       IMEDNET_SECURITY_KEY: "dummy_security_key", // pragma: allowlist secret
       SNOWFLAKE_PASSWORD: "dummy_password", // pragma: allowlist secret
-      IMEDNET_STUDY_KEY: "MY_STUDY",
+      IMEDNET_STUDY_KEY: "STUDY",
     };
 
     let rawConfig = null;

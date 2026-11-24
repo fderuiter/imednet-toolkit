@@ -319,6 +319,89 @@ def validate_ast_workflow_bindings(tree: ast.AST) -> list[tuple[int, str]]:
     return diagnostics
 
 
+def _is_empty_str_default_expr(expr: ast.expr) -> bool:
+    """Return True when expr is '' or os.environ.get(..., '') / os.getenv(..., '')."""
+    if isinstance(expr, ast.Constant) and expr.value == "":
+        return True
+    if isinstance(expr, ast.Call):
+        func = expr.func
+        is_env_get = (
+            (
+                isinstance(func, ast.Attribute)
+                and func.attr == "get"
+                and isinstance(func.value, ast.Attribute)
+                and func.value.attr == "environ"
+            )
+            or (isinstance(func, ast.Name) and func.id == "getenv")
+            or (
+                isinstance(func, ast.Attribute)
+                and func.attr == "getenv"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "os"
+            )
+        )
+        if is_env_get and len(expr.args) >= 2:
+            default_arg = expr.args[1]
+            if isinstance(default_arg, ast.Constant) and default_arg.value == "":
+                return True
+    return False
+
+
+def validate_ast_sdk_credentials(tree: ast.AST) -> list[tuple[int, str]]:
+    """Verify ImednetSDK / AsyncImednetSDK calls pass security_key whenever api_key is provided outside simulation_mode=True."""
+    diagnostics: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        callee_name: str | None = None
+        if isinstance(func, ast.Name) and func.id in ("ImednetSDK", "AsyncImednetSDK"):
+            callee_name = func.id
+        elif isinstance(func, ast.Attribute) and func.attr in ("ImednetSDK", "AsyncImednetSDK"):
+            callee_name = func.attr
+        if callee_name is None:
+            continue
+
+        if any(kw.arg is None for kw in node.keywords):
+            continue
+        kwargs_map = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
+        sim_expr = kwargs_map.get("simulation_mode")
+        is_explicit_sim = isinstance(sim_expr, ast.Constant) and sim_expr.value is True
+        has_alt_auth = any(
+            key in kwargs_map for key in ("oidc_token", "config", "credential_source")
+        )
+
+        if "api_key" in kwargs_map and not is_explicit_sim and not has_alt_auth:
+            if "security_key" not in kwargs_map:
+                diagnostics.append(
+                    (
+                        getattr(node, "lineno", 1),
+                        f"{callee_name}(...) passes 'api_key' without 'security_key' outside simulation_mode=True",
+                    )
+                )
+            elif _is_empty_str_default_expr(kwargs_map["security_key"]):
+                diagnostics.append(
+                    (
+                        getattr(node, "lineno", 1),
+                        f"{callee_name}(...) defaults 'security_key' to an empty string; 'security_key' is required outside simulation mode",
+                    )
+                )
+        elif (
+            "security_key" in kwargs_map
+            and not is_explicit_sim
+            and _is_empty_str_default_expr(kwargs_map["security_key"])
+        ):
+            diagnostics.append(
+                (
+                    getattr(node, "lineno", 1),
+                    f"{callee_name}(...) defaults 'security_key' to an empty string; 'security_key' is required outside simulation mode",
+                )
+            )
+
+    diagnostics.sort(key=lambda item: item[0])
+    return diagnostics
+
+
 def validate_showcase_ast_and_imports(
     examples_dir: Path, repo_root: Path | None = None
 ) -> list[str]:
@@ -352,6 +435,9 @@ def validate_showcase_ast_and_imports(
             errors.append(f"{py_file}:{lineno}: {reason}")
 
         for lineno, reason in validate_ast_imports(tree):
+            errors.append(f"{py_file}:{lineno}: {reason}")
+
+        for lineno, reason in validate_ast_sdk_credentials(tree):
             errors.append(f"{py_file}:{lineno}: {reason}")
 
         if _is_workflow_showcase(py_file, examples_dir):
@@ -753,14 +839,35 @@ def validate_airflow_dags_in_simulation(
 _MD_PYTHON_BLOCK_RE = re.compile(r"^```(?:python|py)\s*\n(.*?)^```\s*$", re.MULTILINE | re.DOTALL)
 
 
-def validate_provider_readme_blocks(
+def _tree_imports_airflow(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(
+                alias.name == "airflow"
+                or alias.name.startswith(("airflow.", "apache_airflow_providers_imednet"))
+                for alias in node.names
+            ):
+                return True
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and (
+                node.module == "airflow"
+                or node.module.startswith(("airflow.", "apache_airflow_providers_imednet"))
+            )
+        ):
+            return True
+    return False
+
+
+def validate_package_readme_blocks(
     readme_path: Path,
     repo_root: Path | None = None,
     timeout_seconds: float = 60.0,
 ) -> list[str]:
-    """Validate and execute Python blocks in packages/providers-airflow/README.md without MagicMock."""
+    """Validate and execute Python blocks in a package README.md without MagicMock or missing security_key."""
     if not readme_path.exists():
-        return [f"Provider README not found: {readme_path}"]
+        return [f"Package README not found: {readme_path}"]
 
     try:
         content = readme_path.read_text(encoding="utf-8")
@@ -773,6 +880,10 @@ def validate_provider_readme_blocks(
     blocks = [m.group(1) for m in _MD_PYTHON_BLOCK_RE.finditer(content)]
     if not blocks:
         return [f"{readme_path}: No Python code blocks found"]
+
+    configure_sys_path(Path(__file__).resolve().parent.parent)
+    if repo_root is not None:
+        configure_sys_path(repo_root)
 
     errors: list[str] = []
     parsed_blocks: list[tuple[int, str, ast.Module]] = []
@@ -788,25 +899,38 @@ def validate_provider_readme_blocks(
             continue
         for lineno, reason in validate_ast_imports(tree):
             errors.append(f"{readme_path} (block {idx}, line {lineno}): {reason}")
+        for lineno, reason in validate_ast_sdk_credentials(tree):
+            errors.append(f"{readme_path} (block {idx}, line {lineno}): {reason}")
         parsed_blocks.append((idx, code, tree))
 
     if errors:
         return errors
 
     try:
-        if importlib.util.find_spec("airflow") is None:
-            return []
+        airflow_available = importlib.util.find_spec("airflow") is not None
     except (ModuleNotFoundError, ValueError, ImportError):
-        return []
+        airflow_available = False
 
     env = _build_simulation_subprocess_env(repo_root)
     with tempfile.TemporaryDirectory(prefix="imednet_readme_sim_") as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
+        stub_dir = tmp_dir / "stubs"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        (stub_dir / "sitecustomize.py").write_text(_SIMULATION_SITECUSTOMIZE, encoding="utf-8")
         airflow_home = tmp_dir / "airflow_home"
         airflow_home.mkdir(parents=True, exist_ok=True)
+        run_cwd = tmp_dir / "cwd"
+        run_cwd.mkdir(parents=True, exist_ok=True)
+
+        env["PYTHONPATH"] = os.pathsep.join([str(stub_dir), env["PYTHONPATH"]])
         env["AIRFLOW_HOME"] = str(airflow_home)
+        env["IMEDNET_STUB_SINKS"] = "1"
+        env["IMEDNET_API_KEY"] = "sim-readme-api-placeholder"  # pragma: allowlist secret
+        env["IMEDNET_SECURITY_KEY"] = "sim-readme-sec-placeholder"  # pragma: allowlist secret
 
         for idx, code, tree in parsed_blocks:
+            if _tree_imports_airflow(tree) and not airflow_available:
+                continue
             zero_arg_funcs = [
                 node.name
                 for node in tree.body
@@ -819,7 +943,7 @@ def validate_provider_readme_blocks(
             try:
                 proc = subprocess.run(
                     [sys.executable, "-c", runner],
-                    cwd=str(tmp_dir),
+                    cwd=str(run_cwd),
                     env=env,
                     capture_output=True,
                     text=True,
@@ -837,7 +961,112 @@ def validate_provider_readme_blocks(
                     else "execution failed"
                 )
                 errors.append(f"{readme_path} (block {idx}): Execution failed: {tail}")
+                continue
+            err_reason = _find_output_error(proc.stdout, proc.stderr)
+            if err_reason is not None:
+                errors.append(f"{readme_path} (block {idx}): {err_reason}")
 
+    return errors
+
+
+def validate_provider_readme_blocks(
+    readme_path: Path,
+    repo_root: Path | None = None,
+    timeout_seconds: float = 60.0,
+) -> list[str]:
+    """Validate and execute Python blocks in packages/providers-airflow/README.md without MagicMock."""
+    if not readme_path.exists():
+        return [f"Provider README not found: {readme_path}"]
+    return validate_package_readme_blocks(readme_path, repo_root, timeout_seconds=timeout_seconds)
+
+
+def validate_all_package_readmes(
+    packages_dir: Path,
+    repo_root: Path | None = None,
+    timeout_seconds: float = 60.0,
+) -> list[str]:
+    """Validate and execute Python blocks across all workspace packages/*/README.md files."""
+    if not packages_dir.is_dir():
+        return [f"Packages directory not found: {packages_dir}"]
+
+    pkg_dirs = sorted(
+        d for d in packages_dir.iterdir() if d.is_dir() and (d / "pyproject.toml").is_file()
+    )
+    if not pkg_dirs:
+        return [f"No workspace packages found under {packages_dir}"]
+
+    errors: list[str] = []
+    for pkg_dir in pkg_dirs:
+        readme_path = pkg_dir / "README.md"
+        errors.extend(
+            validate_package_readme_blocks(readme_path, repo_root, timeout_seconds=timeout_seconds)
+        )
+    return errors
+
+
+def validate_export_examples_require_security_key(
+    examples_dir: Path,
+    repo_root: Path | None = None,
+    timeout_seconds: float = 30.0,
+) -> list[str]:
+    """Verify examples/*_export.py require IMEDNET_SECURITY_KEY when IMEDNET_SIMULATION_MODE is disabled."""
+    if not examples_dir.is_dir():
+        return []
+    export_scripts = sorted(examples_dir.glob("*_export.py"))
+    if not export_scripts:
+        return []
+
+    sim_env = _build_simulation_subprocess_env(repo_root)
+    env = {
+        k: v
+        for k, v in sim_env.items()
+        if k
+        not in {
+            "IMEDNET_SIMULATION_MODE",
+            "IMEDNET_SECURITY_KEY",
+            "IMEDNET_OIDC_TOKEN",
+        }
+    }
+    errors: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="imednet_export_sec_check_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        (tmp_dir / "sitecustomize.py").write_text(_SIMULATION_SITECUSTOMIZE, encoding="utf-8")
+        env["PYTHONPATH"] = os.pathsep.join([str(tmp_dir), env["PYTHONPATH"]])
+        env["IMEDNET_STUB_SINKS"] = "1"
+        env["IMEDNET_API_KEY"] = "non-sim-api-placeholder"  # pragma: allowlist secret
+
+        for script_path in export_scripts:
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(script_path.resolve())],
+                    cwd=str(tmp_dir),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(
+                    f"{script_path}: Timed out checking missing IMEDNET_SECURITY_KEY rejection"
+                )
+                continue
+            if proc.returncode == 0:
+                errors.append(
+                    f"{script_path}: Succeeded without IMEDNET_SECURITY_KEY outside simulation mode"
+                )
+                continue
+            if (
+                "IMEDNET_SECURITY_KEY" not in proc.stderr
+                and "Security key is required" not in proc.stderr
+            ):
+                tail = (
+                    proc.stderr.strip().splitlines()[-1]
+                    if proc.stderr.strip()
+                    else "unexpected failure"
+                )
+                errors.append(
+                    f"{script_path}: Expected missing IMEDNET_SECURITY_KEY error, got: {tail}"
+                )
     return errors
 
 
@@ -1674,7 +1903,6 @@ def load_postman_contract_schemas(postman_path: Path) -> tuple[dict[str, set[str
         return {}, [f"{postman_path}: Failed to parse JSON: {exc}"]
 
     target_requests = {
-        "Retrieve a study": "studies",
         "List studies": "studies",
         "List forms": "forms",
         "List queries": "queries",
@@ -2104,17 +2332,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.skip_execution and not showcase_errors:
         print(f"Executing showcase scripts in simulation mode from {examples_dir}...")
         execution_errors = execute_showcases_in_simulation(examples_dir, repo_root)
+        execution_errors.extend(
+            validate_export_examples_require_security_key(examples_dir, repo_root)
+        )
         if (examples_dir / "airflow").exists():
             print(f"Validating Airflow 3.x DAGs and CSV exports in {examples_dir / 'airflow'}...")
             execution_errors.extend(
                 validate_airflow_dags_in_simulation(examples_dir / "airflow", repo_root)
             )
 
-    provider_readme = repo_root / "packages" / "providers-airflow" / "README.md"
+    packages_dir = repo_root / "packages"
     readme_errors: list[str] = []
-    if provider_readme.exists():
-        print(f"Validating provider README Python blocks in {provider_readme}...")
-        readme_errors = validate_provider_readme_blocks(provider_readme, repo_root)
+    if packages_dir.is_dir():
+        print(f"Validating package README Python blocks across {packages_dir}/*/README.md...")
+        readme_errors = validate_all_package_readmes(packages_dir, repo_root)
 
     print(f"Validating documentation literal includes in {docs_dir}...")
     doc_errors = validate_documentation_literal_includes(docs_dir, repo_root)

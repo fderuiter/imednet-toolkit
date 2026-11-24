@@ -117,12 +117,20 @@ def test_sync_poll_job_strips_credentials_on_cross_origin_s3_result_url(
         base_url=EDC_BASE_URL,
         transport=httpx.MockTransport(handler),
     ) as sdk:
-        status = sdk.poll_job("STUDY1", "BATCH-1", interval=0, timeout=5)
+        # Default SDK polling does not fetch unbacked resultUrl
+        default_status = sdk.poll_job("STUDY1", "BATCH-1", interval=0, timeout=5)
+        assert default_status.results is None
+        assert captured_s3_headers == []
+
+        # Explicit opt-in via JobPoller(..., fetch_result=sdk.jobs.fetch_result) strips credentials
+        poller = JobPoller(sdk.jobs.get, fetch_result=sdk.jobs.fetch_result)
+        status = poller.run("STUDY1", "BATCH-1", interval=0, timeout=5)
 
     assert status.results == [{"recordId": "R-1", "status": "SUCCESS"}]
-    assert len(captured_edc_headers) == 1
+    assert len(captured_edc_headers) == 2
     for hdr, val in expected_edc_headers.items():
         assert captured_edc_headers[0][hdr] == val
+        assert captured_edc_headers[1][hdr] == val
     assert len(captured_s3_headers) == 1
     assert CREDENTIAL_HEADERS.isdisjoint(captured_s3_headers[0].keys())
 
@@ -173,13 +181,22 @@ async def test_async_poll_job_strips_credentials_on_cross_origin_s3_result_url(
         base_url=EDC_BASE_URL,
         transport=httpx.MockTransport(handler),
     ) as sdk:
-        summary = await sdk.async_poll_jobs("STUDY1", ["BATCH-1"], interval=0, timeout=5)
+        # Default async SDK polling does not fetch unbacked resultUrl
+        default_summary = await sdk.async_poll_jobs("STUDY1", ["BATCH-1"], interval=0, timeout=5)
+        assert default_summary.all_successful is True
+        assert default_summary.results["BATCH-1"].results is None
+        assert captured_s3_headers == []
+
+        # Explicit opt-in via AsyncJobPoller(..., fetch_result=sdk.jobs.fetch_result) strips auth
+        poller = AsyncJobPoller(sdk.jobs.get, fetch_result=sdk.jobs.fetch_result)
+        summary = await poller.async_poll_many("STUDY1", ["BATCH-1"], interval=0, timeout=5)
 
     assert summary.all_successful is True
     assert summary.results["BATCH-1"].results == [{"recordId": "R-2", "status": "SUCCESS"}]
-    assert len(captured_edc_headers) == 1
+    assert len(captured_edc_headers) == 2
     for hdr, val in expected_edc_headers.items():
         assert captured_edc_headers[0][hdr] == val
+        assert captured_edc_headers[1][hdr] == val
     assert len(captured_s3_headers) == 1
     assert CREDENTIAL_HEADERS.isdisjoint(captured_s3_headers[0].keys())
 
@@ -234,8 +251,9 @@ def test_external_result_url_ssrf_and_scheme_violations_fail_closed(unsafe_url: 
         base_url=EDC_BASE_URL,
         transport=httpx.MockTransport(handler),
     ) as sdk:
+        poller = JobPoller(sdk.jobs.get, fetch_result=sdk.jobs.fetch_result)
         with pytest.raises(JobFailedError, match="failed to fetch resultUrl"):
-            sdk.poll_job("STUDY1", "BATCH-SSRF", interval=0, timeout=5)
+            poller.run("STUDY1", "BATCH-SSRF", interval=0, timeout=5)
 
     assert external_called is False
 
@@ -285,9 +303,10 @@ async def test_external_result_url_dns_private_ip_and_cross_origin_redirects_fai
         base_url=EDC_BASE_URL,
         transport=httpx.MockTransport(handler),
     ) as sdk:
+        poller = AsyncJobPoller(sdk.jobs.get, fetch_result=sdk.jobs.fetch_result)
         # Cross-origin redirect fails closed with JobFailedError
         with pytest.raises(JobFailedError, match="Cross-origin redirects are not allowed"):
-            await sdk.async_poll_job("STUDY1", "B-REDIRECT", interval=0, timeout=5)
+            await poller.run("STUDY1", "B-REDIRECT", interval=0, timeout=5)
 
         # Same-origin HTTPS redirect succeeds without leaking credentials
         same_origin_resp = await sdk._async_client.fetch_external_url(
@@ -305,7 +324,7 @@ async def test_external_result_url_dns_private_ip_and_cross_origin_redirects_fai
             ],
         )
         with pytest.raises(JobFailedError, match="Blocked non-public IP"):
-            await sdk.async_poll_job("STUDY1", "B-DNS", interval=0, timeout=5)
+            await poller.run("STUDY1", "B-DNS", interval=0, timeout=5)
 
 
 @pytest.mark.asyncio
@@ -337,7 +356,7 @@ async def test_mock_transport_skips_live_dns_lookup() -> None:
 
 
 def test_uat_execution_engine_routes_polling_through_facade_poll_jobs() -> None:
-    """UATExecutionEngine delegates batch polling to ImednetFacade.poll_jobs without leaking auth."""
+    """UATExecutionEngine delegates batch polling to ImednetFacade.poll_jobs without resultUrl."""
     s3_headers_seen: list[dict[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -354,10 +373,17 @@ def test_uat_execution_engine_routes_polling_through_facade_poll_jobs() -> None:
                         "jobId": "J-UAT-1",
                         "batchId": "B-UAT-1",
                         "state": "COMPLETED",
-                        "progress": 100,
                         "failedRecords": 1,
                         "resultUrl": S3_RESULT_URL,
                     },
+                )
+            if request.method == "GET" and any(
+                request.url.path.endswith(suffix)
+                for suffix in ("/forms", "/variables", "/intervals", "/sites", "/subjects")
+            ):
+                return httpx.Response(
+                    200,
+                    json={"data": [], "pagination": {"totalPages": 1}},
                 )
         if request.url.host == "imednet-results.s3.us-east-1.amazonaws.com":
             s3_headers_seen.append({k.lower(): v for k, v in request.headers.items()})
@@ -408,8 +434,7 @@ def test_uat_execution_engine_routes_polling_through_facade_poll_jobs() -> None:
     )
     assert report.passed_rules == 1
     assert report.results[0]["status"] == EditCheckResultStatus.PASS
-    assert len(s3_headers_seen) == 1
-    assert CREDENTIAL_HEADERS.isdisjoint(s3_headers_seen[0].keys())
+    assert s3_headers_seen == []
 
 
 @pytest.mark.asyncio
@@ -780,7 +805,7 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
             return httpx.Response(503, json={"error": "Service Unavailable"})
         return httpx.Response(404)
 
-    # Sync SDK: 5 external resultUrl 503s + 5 local NaN serialization errors
+    # Sync SDK: 5 external resultUrl 503s via SPI fetch_job_result + 5 local NaN serialization errors
     with ImednetSDK(
         api_key="k",
         security_key="s",
@@ -788,9 +813,10 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
         retries=0,
         transport=httpx.MockTransport(handler),
     ) as sync_sdk:
+        sync_poller = JobPoller(sync_sdk.jobs.get, fetch_result=sync_sdk.fetch_job_result)
         for i in range(5):
             with pytest.raises(JobFailedError, match="failed to fetch resultUrl"):
-                sync_sdk.poll_job("STUDY1", f"B-503-{i}", interval=0, timeout=5)
+                sync_poller.run("STUDY1", f"B-503-{i}", interval=0, timeout=5)
 
         assert sync_sdk._client._external_circuit_breaker.state == CircuitState.OPEN
         assert sync_sdk._client._circuit_breaker.state == CircuitState.CLOSED
@@ -808,7 +834,7 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
         assert len(studies) == 1
         assert studies[0].study_key == "STUDY1"
 
-    # Async SDK: 5 external resultUrl 503s + 5 local NaN serialization errors
+    # Async SDK: 5 external resultUrl 503s via SPI async_fetch_job_result + 5 local NaN serialization errors
     async with AsyncImednetSDK(
         api_key="k",
         security_key="s",
@@ -816,9 +842,12 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
         retries=0,
         transport=httpx.MockTransport(handler),
     ) as async_sdk:
+        async_poller = AsyncJobPoller(
+            async_sdk.jobs.get, fetch_result=async_sdk.async_fetch_job_result
+        )
         for i in range(5):
             with pytest.raises(JobFailedError, match="failed to fetch resultUrl"):
-                await async_sdk.async_poll_job("STUDY1", f"AB-503-{i}", interval=0, timeout=5)
+                await async_poller.run("STUDY1", f"AB-503-{i}", interval=0, timeout=5)
 
         assert async_sdk._async_client._external_circuit_breaker.state == CircuitState.OPEN
         assert async_sdk._async_client._circuit_breaker.state == CircuitState.CLOSED

@@ -16,4 +16,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "intervals",
         requires_study_key=True,
         summary_fields=["interval_id", "interval_name", "interval_sequence"],
+        include_filter=False,
+        preflight_query=False,
     )

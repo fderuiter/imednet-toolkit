@@ -261,24 +261,29 @@ class BaseRecordRequest(ImednetBaseModel):
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Registering a subject requires ``formKey`` and ``siteName``. When ``subjectKey``
-    or ``subjectOid`` are omitted, they are excluded from serialized payloads so
-    studies with server-assigned subject identifiers continue to work; when
+    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
+    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
+    ``None`` so server-assigned subject keys continue working by default; when
     explicitly supplied, they are preserved for enrollment and deduplication.
     """
 
     site_name: str = Field(
         "", alias="siteName", description="Name of the site where the subject is enrolled"
     )
+    site_id: int | None = Field(
+        default=None,
+        alias="siteId",
+        description="Numeric ID of the site where the subject is enrolled",
+    )
     subject_key: str | None = Field(
         default=None,
         alias="subjectKey",
-        description="Optional subject key when explicitly supplied by the caller",
+        description="Optional client-assigned subject key",
     )
     subject_oid: str | None = Field(
         default=None,
         alias="subjectOid",
-        description="Optional subject OID when explicitly supplied by the caller",
+        description="Optional subject OID",
     )
 
     @field_validator("subject_key", "subject_oid", mode="before")
@@ -290,10 +295,16 @@ class RegisterSubjectRequest(BaseRecordRequest):
         return text or None
 
     @model_serializer(mode="wrap")
-    def _serialize_omitting_unset_subject_keys(
+    def _serialize_omitting_unset_enrollment_fields(
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, Any]:
         serialized: dict[str, Any] = handler(self)
+        if self.site_id is None:
+            serialized.pop("site_id", None)
+            serialized.pop("siteId", None)
+        elif not self.site_name:
+            serialized.pop("site_name", None)
+            serialized.pop("siteName", None)
         if self.subject_key is None:
             serialized.pop("subject_key", None)
             serialized.pop("subjectKey", None)
@@ -301,6 +312,21 @@ class RegisterSubjectRequest(BaseRecordRequest):
             serialized.pop("subject_oid", None)
             serialized.pop("subjectOid", None)
         return serialized
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        """Serialize enrollment payload, omitting ``None`` optional attributes by default."""
+        kwargs.setdefault("exclude_none", True)
+        if not self.site_name and self.site_id is not None:
+            raw_exclude = kwargs.get("exclude")
+            if raw_exclude is None:
+                kwargs["exclude"] = {"site_name"}
+            elif isinstance(raw_exclude, set):
+                kwargs["exclude"] = raw_exclude | {"site_name"}
+            elif isinstance(raw_exclude, dict):
+                merged = dict(raw_exclude)
+                merged["site_name"] = True
+                kwargs["exclude"] = merged
+        return super().model_dump(**kwargs)
 
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):

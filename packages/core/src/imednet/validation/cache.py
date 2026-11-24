@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import date as _date_cls
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -25,7 +26,16 @@ from typing import (
 from typing_extensions import Protocol, runtime_checkable
 
 from imednet.core.context import get_study_context
-from imednet.datadict.logic import LogicTreeEvaluator, extract_variable_constraints
+from imednet.datadict.logic import (
+    _MAX_BOUND_KEYS,
+    _MIN_BOUND_KEYS,
+    LogicTreeEvaluator,
+    RangeCheckConstraint,
+    _lookup_attr_or_extra,
+    _parse_comparable_temporal,
+    _to_finite_float,
+    extract_variable_constraints,
+)
 from imednet.datadict.models import DataDictionary
 from imednet.errors import UnknownVariableTypeError, ValidationError
 from imednet.utils.security import global_sensitivity_registry
@@ -106,6 +116,17 @@ class ValidationSchemaProtocol(Protocol):
         ...
 
 
+def _is_retired_variable(var: Any) -> bool:
+    """Return True if an API Variable is marked ``deleted=True`` or ``disabled=True``."""
+    for attr in ("deleted", "disabled"):
+        val = getattr(var, attr, None)
+        if isinstance(val, bool) and val:
+            return True
+        if isinstance(val, str) and val.strip().lower() in {"true", "yes", "y", "1"}:
+            return True
+    return False
+
+
 class BaseSchemaCache(Generic[_TClient]):
     """Cache of variables partitioned by ``(study_key, form_key)`` and ``(study_key, form_id)``."""
 
@@ -118,6 +139,7 @@ class BaseSchemaCache(Generic[_TClient]):
         self._is_async = is_async
         self._form_variables: dict[tuple[str, str] | str, dict[str, Variable]] = {}
         self._form_id_to_key: dict[tuple[str, int] | int, str] = {}
+        self._known_forms: set[tuple[str, str] | str] = set()
         self._refreshed_studies: set[str] = set()
 
     @property
@@ -169,25 +191,38 @@ class BaseSchemaCache(Generic[_TClient]):
             or (study_key == "" and isinstance(k, int))
         ]:
             del self._form_id_to_key[fid_key]
+        known_forms = getattr(self, "_known_forms", None)
+        if known_forms is not None:
+            for kf_key in [
+                k
+                for k in known_forms
+                if (isinstance(k, tuple) and k[0] == study_key)
+                or (study_key == "" and isinstance(k, str))
+            ]:
+                known_forms.discard(kf_key)
 
     def populate(
         self,
         variables: Iterable[Variable],
         study_key: str | None = None,
     ) -> None:
-        """Populate the cache with ``variables``, isolated by ``study_key``."""
+        """Populate the cache with active ``variables``, isolated by ``study_key``."""
         vars_list = list(variables)
+        known_forms = getattr(self, "_known_forms", None)
+        if known_forms is None:
+            known_forms = set()
+            self._known_forms = known_forms
         if study_key is not None:
             self._clear_study_partition(study_key)
             self._refreshed_studies.add(study_key)
             for var in vars_list:
                 if var.form_key is not None:
+                    known_forms.add((study_key, var.form_key))
+                    form_bucket = self._form_variables.setdefault((study_key, var.form_key), {})
                     if var.form_id is not None:
                         self._form_id_to_key[(study_key, var.form_id)] = var.form_key
-                    if var.variable_name is not None:
-                        self._form_variables.setdefault((study_key, var.form_key), {})[
-                            var.variable_name
-                        ] = var
+                    if var.variable_name is not None and not _is_retired_variable(var):
+                        form_bucket[var.variable_name] = var
             return
 
         target_studies = {var.study_key or "" for var in vars_list} or {""}
@@ -198,10 +233,12 @@ class BaseSchemaCache(Generic[_TClient]):
         for var in vars_list:
             sk = var.study_key or ""
             if var.form_key is not None:
+                known_forms.add((sk, var.form_key))
+                form_bucket = self._form_variables.setdefault((sk, var.form_key), {})
                 if var.form_id is not None:
                     self._form_id_to_key[(sk, var.form_id)] = var.form_key
-                if var.variable_name is not None:
-                    self._form_variables.setdefault((sk, var.form_key), {})[var.variable_name] = var
+                if var.variable_name is not None and not _is_retired_variable(var):
+                    form_bucket[var.variable_name] = var
 
     async def _refresh_async(
         self,
@@ -312,6 +349,56 @@ class BaseSchemaCache(Generic[_TClient]):
                 "specify study_key."
             )
         return {}
+
+    def _has_form(self, form_key: str, study_key: str | None = None) -> bool:
+        """Return True if ``form_key`` is registered (including forms with only retired vars)."""
+        refreshed: set[str] = getattr(self, "_refreshed_studies", None) or set()
+        known_forms: set[tuple[str, str] | str] = getattr(self, "_known_forms", None) or set()
+        if study_key is not None:
+            if (study_key, form_key) in self._form_variables or (
+                study_key,
+                form_key,
+            ) in known_forms:
+                return True
+            if study_key not in refreshed:
+                return (
+                    ("", form_key) in self._form_variables
+                    or form_key in self._form_variables
+                    or ("", form_key) in known_forms
+                    or form_key in known_forms
+                )
+            return False
+
+        ctx_study = get_study_context()
+        if ctx_study:
+            if (ctx_study, form_key) in self._form_variables or (
+                ctx_study,
+                form_key,
+            ) in known_forms:
+                return True
+            if ctx_study in refreshed:
+                return False
+
+        if (
+            form_key in self._form_variables
+            or ("", form_key) in self._form_variables
+            or form_key in known_forms
+            or ("", form_key) in known_forms
+        ):
+            return True
+
+        known_studies = {
+            k[0]
+            for k in (*self._form_variables.keys(), *known_forms)
+            if isinstance(k, tuple) and k[0] != "" and k[1] == form_key
+        }
+        if len(known_studies) > 1:
+            studies = ", ".join(sorted(known_studies))
+            raise ValidationError(
+                f"Ambiguous form '{form_key}' cached across multiple studies ({studies}); "
+                "specify study_key."
+            )
+        return len(known_studies) == 1
 
     @staticmethod
     def _coerce_form_id_int(form_id: int | str) -> int | None:
@@ -444,16 +531,18 @@ def _validate_int(value: Any) -> None:
 
 
 def _validate_float(value: Any) -> None:
-    """Validate that the value is numeric (int or float, excluding booleans).
+    """Validate that the value is a finite number (int or float, excluding booleans).
 
     Args:
         value: The value to validate.
 
     Raises:
-        ValidationError: If the value is not numeric or is a boolean.
+        ValidationError: If the value is not numeric, is a boolean, or is non-finite.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError("Value must be numeric")
+    if not math.isfinite(value):
+        raise ValidationError("Value must be a finite numeric value")
 
 
 def _validate_bool(value: Any) -> None:
@@ -496,9 +585,19 @@ def _is_choice_code(item: Any) -> bool:
     return isinstance(item, str) or (isinstance(item, int) and not isinstance(item, bool))
 
 
-def _validate_multi_choice(value: Any) -> None:
-    """Validate that a multi-choice value is text, boolean, or a collection of codes."""
-    if isinstance(value, (bool, str)):
+def _has_non_blank_delimited_tokens(value: str) -> bool:
+    """Return True if a non-empty delimited string yields at least one non-blank token."""
+    sep = "`" if "`" in value else ","
+    return any(part.strip() for part in value.split(sep))
+
+
+def _validate_checkbox(value: Any) -> None:
+    """Validate that a Checkbox value is boolean, non-blank text, or a collection of codes."""
+    if isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        if value != "" and not _has_non_blank_delimited_tokens(value):
+            raise ValidationError("Checkbox value cannot contain only blank delimiters")
         return
     if isinstance(value, (list, tuple, set, frozenset)) and all(
         _is_choice_code(item) for item in value
@@ -509,10 +608,203 @@ def _validate_multi_choice(value: Any) -> None:
     )
 
 
+def _validate_multi_choice(value: Any) -> None:
+    """Validate that a Multi Select value is non-blank text or a collection of codes (not bool)."""
+    if isinstance(value, bool):
+        raise ValidationError(
+            "Multi Select value must be a string or collection of string or integer codes"
+        )
+    if isinstance(value, str):
+        if value != "" and not _has_non_blank_delimited_tokens(value):
+            raise ValidationError("Multi Select value cannot contain only blank delimiters")
+        return
+    if isinstance(value, (list, tuple, set, frozenset)) and all(
+        _is_choice_code(item) for item in value
+    ):
+        return
+    raise ValidationError("Value must be a string or collection of string or integer codes")
+
+
 def _validate_calculation(value: Any) -> None:
-    """Validate that a computed or range value is non-boolean numeric or text."""
+    """Validate that a computed or range value is a finite non-boolean number or text."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ValidationError("Value must be numeric or a string")
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise ValidationError("Value must be a finite numeric value")
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            try:
+                parsed = float(stripped)
+            except ValueError:
+                return
+            if not math.isfinite(parsed):
+                raise ValidationError("Value must be a finite numeric value")
+
+
+_MONTH_ABBR_TO_NUM: dict[str, int] = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+_DATE_YMD_RE = re.compile(r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$")
+_DATE_MDY_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])-([0-9]{4})$")
+_DATE_DMY_RE = re.compile(r"^(0[1-9]|[12][0-9]|3[01])-(0[1-9]|1[0-2])-([0-9]{4})$")
+_DATE_DD_MMM_YYYY_RE = re.compile(r"^(0[1-9]|[12][0-9]|3[01])-([A-Za-z]{3})-([0-9]{4})$")
+_TIME_24H_RE = re.compile(
+    r"^([01][0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9])(?:\.[0-9]{1,9})?)?"
+    r"(?:Z|[+-](?:[01][0-9]|2[0-3]):?[0-5][0-9])?$"
+)
+_DATETIME_HAS_TIME_RE = re.compile(r"[T ][0-9]{2}:[0-9]{2}")
+_PARTIAL_YEAR_RE = re.compile(r"^[0-9]{4}$")
+_PARTIAL_YM_RE = re.compile(r"^([0-9]{4})-(0[1-9]|1[0-2])$")
+_PARTIAL_MY_RE = re.compile(r"^(0[1-9]|1[0-2])-([0-9]{4})$")
+_PARTIAL_YMD_HOUR_RE = re.compile(
+    r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[T ]([01][0-9]|2[0-3])$"
+)
+_ISO_DURATION_RE = re.compile(
+    r"^P(?=[0-9T])(?:[0-9]+Y)?(?:[0-9]+M)?(?:[0-9]+W)?(?:[0-9]+D)?"
+    r"(?:T(?=[0-9])(?:[0-9]+H)?(?:[0-9]+M)?(?:[0-9]+(?:\.[0-9]+)?S)?)?$"
+)
+
+
+def _is_valid_calendar_ymd(year: int, month: int, day: int) -> bool:
+    try:
+        _date_cls(year, month, day)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_valid_date_str(cleaned: str, *, allow_dmy: bool = False) -> bool:
+    m_ymd = _DATE_YMD_RE.match(cleaned)
+    if m_ymd is not None:
+        return _is_valid_calendar_ymd(int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3)))
+    if allow_dmy:
+        m_dmy = _DATE_DMY_RE.match(cleaned)
+        if m_dmy is not None:
+            return _is_valid_calendar_ymd(
+                int(m_dmy.group(3)), int(m_dmy.group(2)), int(m_dmy.group(1))
+            )
+    m_mdy = _DATE_MDY_RE.match(cleaned)
+    if m_mdy is not None:
+        return _is_valid_calendar_ymd(int(m_mdy.group(3)), int(m_mdy.group(1)), int(m_mdy.group(2)))
+    m_mmm = _DATE_DD_MMM_YYYY_RE.match(cleaned)
+    if m_mmm is not None:
+        mon = _MONTH_ABBR_TO_NUM.get(m_mmm.group(2).lower())
+        if mon is not None:
+            return _is_valid_calendar_ymd(int(m_mmm.group(3)), mon, int(m_mmm.group(1)))
+    return False
+
+
+def _validate_date(value: Any) -> None:
+    """Validate that ``value`` is a valid calendar Date string."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be a valid date string")
+    cleaned = value.strip()
+    if not cleaned or not _is_valid_date_str(cleaned, allow_dmy=False):
+        raise ValidationError("Value must be a valid calendar date")
+
+
+def _validate_date_dmy(value: Any) -> None:
+    """Validate that ``value`` is a valid DMY or ISO calendar Date string."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be a valid date string")
+    cleaned = value.strip()
+    if not cleaned or not _is_valid_date_str(cleaned, allow_dmy=True):
+        raise ValidationError("Value must be a valid calendar date")
+
+
+def _is_valid_datetime_str(cleaned: str) -> bool:
+    if not _DATETIME_HAS_TIME_RE.search(cleaned):
+        return False
+    return _parse_comparable_temporal(cleaned) is not None
+
+
+def _validate_datetime(value: Any) -> None:
+    """Validate that ``value`` is a valid calendar DateTime string with 24-hour clock."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be a valid datetime string")
+    cleaned = value.strip()
+    if not cleaned or not _is_valid_datetime_str(cleaned):
+        raise ValidationError("Value must be a valid calendar datetime")
+
+
+def _validate_duration_or_datetime(value: Any) -> None:
+    """Validate ODM DurationDateTime / IntervalDateTime or standard DateTime strings."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be a valid datetime string")
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValidationError("Value must be a valid calendar datetime")
+    if _is_valid_datetime_str(cleaned) or _ISO_DURATION_RE.match(cleaned) is not None:
+        return
+    if "/" in cleaned:
+        parts = cleaned.split("/")
+        if len(parts) == 2 and all(
+            _is_valid_datetime_str(p) or _ISO_DURATION_RE.match(p) is not None for p in parts
+        ):
+            return
+    raise ValidationError("Value must be a valid calendar datetime")
+
+
+def _validate_datetime_precision(value: Any) -> None:
+    """Validate full or partial precision Date/DateTime strings (YYYY, YYYY-MM, Date, DateTime)."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be a valid date/time precision string")
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValidationError("Value must be a valid date/time precision value")
+    if _PARTIAL_YEAR_RE.match(cleaned) is not None and int(cleaned) >= 1:
+        return
+    m_ym = _PARTIAL_YM_RE.match(cleaned)
+    if m_ym is not None and int(m_ym.group(1)) >= 1:
+        return
+    m_my = _PARTIAL_MY_RE.match(cleaned)
+    if m_my is not None and int(m_my.group(2)) >= 1:
+        return
+    m_ymdh = _PARTIAL_YMD_HOUR_RE.match(cleaned)
+    if m_ymdh is not None and _is_valid_calendar_ymd(
+        int(m_ymdh.group(1)), int(m_ymdh.group(2)), int(m_ymdh.group(3))
+    ):
+        return
+    if _is_valid_date_str(cleaned, allow_dmy=False) or _is_valid_datetime_str(cleaned):
+        return
+    raise ValidationError("Value must be a valid date/time precision value")
+
+
+def _validate_time(value: Any) -> None:
+    """Validate that ``value`` is a valid 24-hour clock Time string."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be a valid time string")
+    cleaned = value.strip()
+    if not cleaned or _TIME_24H_RE.match(cleaned) is None:
+        raise ValidationError("Value must be a valid 24-hour time")
+
+
+_PARTIAL_HOUR_RE = re.compile(r"^([01][0-9]|2[0-3])$")
+
+
+def _validate_partial_time(value: Any) -> None:
+    """Validate full or partial 24-hour Time strings (HH or HH:MM[:SS])."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be a valid time string")
+    cleaned = value.strip()
+    if not cleaned or (
+        _TIME_24H_RE.match(cleaned) is None and _PARTIAL_HOUR_RE.match(cleaned) is None
+    ):
+        raise ValidationError("Value must be a valid 24-hour time")
 
 
 _TYPE_SEP_RE = re.compile(r"[\s_-]+")
@@ -564,8 +856,8 @@ _CANONICAL_VARIABLE_TAXONOMY: dict[str, tuple[str, Any, Callable[[Any], None]]] 
     "truefalse": ("yes/no", "1", _validate_single_choice),
     "true false": ("yes/no", "1", _validate_single_choice),
     # Multi-choice categorical types
-    "checkbox": ("checkbox", True, _validate_multi_choice),
-    "check box": ("checkbox", True, _validate_multi_choice),
+    "checkbox": ("checkbox", True, _validate_checkbox),
+    "check box": ("checkbox", True, _validate_checkbox),
     "multi select": ("multi select", "1", _validate_multi_choice),
     "multiselect": ("multi select", "1", _validate_multi_choice),
     # Narrative & free-text types
@@ -578,19 +870,25 @@ _CANONICAL_VARIABLE_TAXONOMY: dict[str, tuple[str, Any, Callable[[Any], None]]] 
     "notes": ("memo", "example memo", _validate_text),
     "note": ("memo", "example memo", _validate_text),
     # Temporal & precision date/time types
-    "date": ("date", "2024-01-01", _validate_text),
-    "date ymd": ("date", "2024-01-01", _validate_text),
-    "date mdy": ("date", "2024-01-01", _validate_text),
-    "date dmy": ("date", "2024-01-01", _validate_text),
-    "datetime": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "date/time": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "date time": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "durationdatetime": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "intervaldatetime": ("datetime", "2024-01-01T00:00:00", _validate_text),
-    "date/time precision": ("date/time precision", "2024-01-01", _validate_text),
-    "datetime precision": ("date/time precision", "2024-01-01", _validate_text),
-    "date time precision": ("date/time precision", "2024-01-01", _validate_text),
-    "time": ("time", "12:00:00", _validate_text),
+    "date": ("date", "2024-01-01", _validate_date),
+    "date ymd": ("date", "2024-01-01", _validate_date),
+    "date mdy": ("date", "2024-01-01", _validate_date),
+    "date dmy": ("date", "2024-01-01", _validate_date_dmy),
+    "partialdate": ("date/time precision", "2024-01", _validate_datetime_precision),
+    "incompletedate": ("date/time precision", "2024-01", _validate_datetime_precision),
+    "datetime": ("datetime", "2024-01-01T00:00:00", _validate_datetime),
+    "date/time": ("datetime", "2024-01-01T00:00:00", _validate_datetime),
+    "date time": ("datetime", "2024-01-01T00:00:00", _validate_datetime),
+    "durationdatetime": ("datetime", "2024-01-01T00:00:00", _validate_duration_or_datetime),
+    "intervaldatetime": ("datetime", "2024-01-01T00:00:00", _validate_duration_or_datetime),
+    "partialdatetime": ("date/time precision", "2024-01", _validate_datetime_precision),
+    "incompletedatetime": ("date/time precision", "2024-01", _validate_datetime_precision),
+    "date/time precision": ("date/time precision", "2024-01-01", _validate_datetime_precision),
+    "datetime precision": ("date/time precision", "2024-01-01", _validate_datetime_precision),
+    "date time precision": ("date/time precision", "2024-01-01", _validate_datetime_precision),
+    "time": ("time", "12:00:00", _validate_time),
+    "partialtime": ("time", "12:00:00", _validate_partial_time),
+    "incompletetime": ("time", "12:00:00", _validate_partial_time),
     # Computed & range types
     "calculation": ("calculation", 1, _validate_calculation),
     "calc": ("calculation", 1, _validate_calculation),
@@ -615,8 +913,26 @@ _NORMALIZED_TYPE_VALIDATORS: dict[str, Callable[[Any], None]] = {
     key: spec[2] for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items()
 }
 
+_CHECKBOX_TYPE_KEYS: frozenset[str] = frozenset(
+    key for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items() if spec[2] is _validate_checkbox
+)
+
 _MULTI_CHOICE_TYPE_KEYS: frozenset[str] = frozenset(
-    key for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items() if spec[2] is _validate_multi_choice
+    key
+    for key, spec in _CANONICAL_VARIABLE_TAXONOMY.items()
+    if spec[2] in (_validate_multi_choice, _validate_checkbox)
+)
+
+_TEMPORAL_VALIDATORS: frozenset[Callable[[Any], None]] = frozenset(
+    {
+        _validate_date,
+        _validate_date_dmy,
+        _validate_datetime,
+        _validate_duration_or_datetime,
+        _validate_datetime_precision,
+        _validate_time,
+        _validate_partial_time,
+    }
 )
 
 # Pre-index common casings and word-separator forms to avoid per-Record string
@@ -644,10 +960,10 @@ for _key, _validator in list(_NORMALIZED_TYPE_VALIDATORS.items()):
 _TYPE_VALIDATORS.update(
     {
         "TextArea": _validate_text,
-        "DateTime": _validate_text,
-        "DateTimePrecision": _validate_text,
-        "DurationDateTime": _validate_text,
-        "IntervalDateTime": _validate_text,
+        "DateTime": _validate_datetime,
+        "DateTimePrecision": _validate_datetime_precision,
+        "DurationDateTime": _validate_duration_or_datetime,
+        "IntervalDateTime": _validate_duration_or_datetime,
         "RadioButton": _validate_single_choice,
         "DropdownList": _validate_single_choice,
         "SingleSelect": _validate_single_choice,
@@ -671,12 +987,20 @@ def _resolve_type_validator(var_type: str) -> Callable[[Any], None] | None:
     return validator
 
 
-def _check_type(var_type: str | None, value: Any) -> None:
+def _check_type(
+    var_type: str | None,
+    value: Any,
+    *,
+    name: str | None = None,
+    form_key: str | None = None,
+) -> None:
     """Check the type of a value against an iMednet variable type.
 
     Args:
         var_type: The expected iMednet variable type (e.g., 'int', 'text').
         value: The value to check.
+        name: Optional variable name for PHI-safe error context.
+        form_key: Optional form key for error context.
 
     Raises:
         UnknownVariableTypeError: If the variable type is not recognized.
@@ -694,7 +1018,29 @@ def _check_type(var_type: str | None, value: Any) -> None:
     if value == "":
         return
 
-    validator(value)
+    try:
+        validator(value)
+    except ValidationError as exc:
+        if validator in _TEMPORAL_VALIDATORS and name is not None:
+            shown_val = _display_constraint_value(name, value)
+            loc = (
+                f" for variable '{name}' on form '{form_key}'"
+                if form_key
+                else f" for variable '{name}'"
+            )
+            raise ValidationError(f"{exc.message} '{shown_val}'{loc}") from exc
+        raise
+
+
+def _effective_variable_type(var_obj: Any) -> str | None:
+    """Return the effective variable type for type checking, honoring odmDataType."""
+    var_extra = getattr(var_obj, "extraAttributes", None)
+    if isinstance(var_extra, Mapping):
+        odm_dt = var_extra.get("odmDataType")
+        if isinstance(odm_dt, str) and odm_dt.strip():
+            return odm_dt.strip()
+    vtype = getattr(var_obj, "variable_type", getattr(var_obj, "variableType", None))
+    return str(vtype) if isinstance(vtype, str) else None
 
 
 def _is_empty_value(value: Any) -> bool:
@@ -807,7 +1153,13 @@ def _validate_choice_membership(
 
     if vtype_norm in _MULTI_CHOICE_TYPE_KEYS:
         if isinstance(value, bool):
-            return
+            if vtype_norm in _CHECKBOX_TYPE_KEYS:
+                return
+            shown_val = _display_constraint_value(name, value)
+            raise ValidationError(
+                f"Invalid choice '{shown_val}' for variable '{name}' on form '{form_key}'. "
+                f"Allowed values: {choices}"
+            )
         if isinstance(value, (list, tuple, set, frozenset)):
             tokens = [str(item) for item in value]
         elif isinstance(value, str):
@@ -815,6 +1167,12 @@ def _validate_choice_membership(
                 return
             sep = "`" if "`" in value else ","
             tokens = [part.strip() for part in value.split(sep) if part.strip()]
+            if not tokens:
+                shown_val = _display_constraint_value(name, value)
+                raise ValidationError(
+                    f"Invalid blank choice '{shown_val}' for variable '{name}' on form '{form_key}'. "
+                    f"Allowed values: {choices}"
+                )
         else:
             tokens = [str(value)]
 
@@ -853,10 +1211,14 @@ def _validate_numeric_bounds(
             num = float(value.strip())
         except ValueError:
             return
-    if num is None or not math.isfinite(num):
+    if num is None:
         return
 
     shown_val = _display_constraint_value(name, value)
+    if not math.isfinite(num):
+        raise ValidationError(
+            f"Value {shown_val} for variable '{name}' on form '{form_key}' must be finite"
+        )
     if min_value is not None and num < min_value:
         raise ValidationError(
             f"Value {shown_val} for variable '{name}' on form '{form_key}' is below minimum {min_value}"
@@ -865,6 +1227,110 @@ def _validate_numeric_bounds(
         raise ValidationError(
             f"Value {shown_val} for variable '{name}' on form '{form_key}' exceeds maximum {max_value}"
         )
+
+
+def _matches_single_range_item(actual_item: Any, check_val: str) -> bool:
+    """Return True if ``actual_item`` matches ``check_val`` numerically, temporally, or lexically."""
+    num_act = _to_finite_float(actual_item)
+    num_exp = _to_finite_float(check_val)
+    if num_act is not None and num_exp is not None:
+        return math.isclose(num_act, num_exp, rel_tol=1e-9, abs_tol=1e-12)
+    dt_act = _parse_comparable_temporal(actual_item)
+    dt_exp = _parse_comparable_temporal(check_val)
+    if dt_act is not None and dt_exp is not None:
+        return dt_act == dt_exp
+    return str(actual_item).strip() == check_val
+
+
+def _evaluate_range_check(value: Any, rc: RangeCheckConstraint) -> bool:
+    """Return True when ``value`` satisfies ``rc`` without using eval."""
+    comp = rc.comparator
+    if comp in {"IN", "NOTIN"}:
+        if isinstance(value, (list, tuple, set, frozenset)):
+            items = list(value)
+        elif isinstance(value, str) and "`" in value:
+            items = [tok.strip() for tok in value.split("`") if tok.strip()]
+        else:
+            items = [value]
+        if comp == "IN":
+            return bool(items) and all(
+                any(_matches_single_range_item(item, cv) for cv in rc.check_values)
+                for item in items
+            )
+        return all(
+            not any(_matches_single_range_item(item, cv) for cv in rc.check_values)
+            for item in items
+        )
+
+    target = rc.check_values[0]
+    num_act = _to_finite_float(value)
+    num_exp = _to_finite_float(target)
+    if num_act is not None and num_exp is not None:
+        if comp == "LT":
+            return num_act < num_exp
+        if comp == "LE":
+            return num_act <= num_exp
+        if comp == "GT":
+            return num_act > num_exp
+        if comp == "GE":
+            return num_act >= num_exp
+        if comp == "EQ":
+            return math.isclose(num_act, num_exp, rel_tol=1e-9, abs_tol=1e-12)
+        return not math.isclose(num_act, num_exp, rel_tol=1e-9, abs_tol=1e-12)
+
+    dt_act = _parse_comparable_temporal(value)
+    dt_exp = _parse_comparable_temporal(target)
+    if dt_act is not None and dt_exp is not None:
+        if comp == "LT":
+            return dt_act < dt_exp
+        if comp == "LE":
+            return dt_act <= dt_exp
+        if comp == "GT":
+            return dt_act > dt_exp
+        if comp == "GE":
+            return dt_act >= dt_exp
+        if comp == "EQ":
+            return dt_act == dt_exp
+        return dt_act != dt_exp
+
+    str_act = str(value).strip()
+    if comp == "LT":
+        return str_act < target
+    if comp == "LE":
+        return str_act <= target
+    if comp == "GT":
+        return str_act > target
+    if comp == "GE":
+        return str_act >= target
+    if comp == "EQ":
+        return str_act == target
+    return str_act != target
+
+
+def _format_range_check_message(
+    name: str,
+    form_key: str,
+    value: Any,
+    rc: RangeCheckConstraint,
+) -> str:
+    """Build a PHI-masked RangeCheck violation message."""
+    shown_val = _display_constraint_value(name, value)
+    expected_desc = list(rc.check_values) if len(rc.check_values) > 1 else rc.check_values[0]
+    base = (
+        f"Value {shown_val} for variable '{name}' on form '{form_key}' "
+        f"violated ODM RangeCheck ({rc.comparator} {expected_desc})"
+    )
+    if rc.error_message:
+        return f"{base}: {rc.error_message}"
+    return base
+
+
+def _has_explicit_numeric_bounds(var_obj: Any) -> bool:
+    """Return True if ``var_obj`` declares explicit min/max attributes outside rangeChecks."""
+    return (
+        _lookup_attr_or_extra(var_obj, _MIN_BOUND_KEYS) is not None
+        or _lookup_attr_or_extra(var_obj, _MAX_BOUND_KEYS) is not None
+    )
 
 
 def _validate_text_length(
@@ -1025,10 +1491,11 @@ def validate_record_data(
     )
     if not variables:
         unknown_form = True
-        if isinstance(schema, DataDictionary):
-            form_obj = schema.form_for_key(form_key)
-            if form_obj is not None and schema.rules_for_form(form_key):
+        if isinstance(schema, BaseSchemaCache):
+            if schema._has_form(form_key, study_key=study_key):
                 unknown_form = False
+        elif isinstance(schema, DataDictionary) and schema.form_for_key(form_key) is not None:
+            unknown_form = False
         if unknown_form:
             _record_error(f"Unknown form {form_key}", rule_id="unknown_form")
             return _finish()
@@ -1056,9 +1523,9 @@ def validate_record_data(
         if name not in variables:
             continue
         var_obj = variables[name]
-        vtype = getattr(var_obj, "variable_type", getattr(var_obj, "variableType", None))
+        vtype = _effective_variable_type(var_obj)
         try:
-            _check_type(vtype, value)
+            _check_type(vtype, value, name=name, form_key=form_key)
         except ValidationError as exc:
             type_failed_vars.add(name)
             _record_error(exc.message, variable_name=name, rule_id="type", exc=exc)
@@ -1114,13 +1581,43 @@ def validate_record_data(
                 _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
             except ValidationError as exc:
                 _record_error(exc.message, variable_name=name, rule_id="choice", exc=exc)
-        if constraints.min_value is not None or constraints.max_value is not None:
+        if (constraints.min_value is not None or constraints.max_value is not None) and (
+            not constraints.range_checks or _has_explicit_numeric_bounds(var_obj)
+        ):
             try:
                 _validate_numeric_bounds(
                     name, form_key, value, constraints.min_value, constraints.max_value
                 )
             except ValidationError as exc:
                 _record_error(exc.message, variable_name=name, rule_id="bounds", exc=exc)
+        if constraints.range_checks:
+            try:
+                _validate_numeric_bounds(name, form_key, value, None, None)
+            except ValidationError as exc:
+                _record_error(exc.message, variable_name=name, rule_id="range_check", exc=exc)
+            else:
+                for rc in constraints.range_checks:
+                    if not _evaluate_range_check(value, rc):
+                        rc_msg = _format_range_check_message(name, form_key, value, rc)
+                        if rc.soft_hard == "Soft":
+                            logger.warning(
+                                "Soft RangeCheck warning on variable '%s' (form '%s'): %s",
+                                name,
+                                form_key,
+                                rc_msg,
+                            )
+                            warnings.append(
+                                RecordValidationIssue(
+                                    record_index=record_index,
+                                    form_key=form_key,
+                                    variable_name=name,
+                                    message=rc_msg,
+                                    rule_id="range_check_soft",
+                                    severity="warning",
+                                )
+                            )
+                        else:
+                            _record_error(rc_msg, variable_name=name, rule_id="range_check")
         if isinstance(value, str) and (
             constraints.min_length is not None or constraints.max_length is not None
         ):
@@ -1187,10 +1684,10 @@ def calculate_readiness_score(
     *,
     study_key: str | None = None,
 ) -> tuple[float, list[str]]:
-    """Calculate the schema readiness score for a record's data.
+    """Calculate the schema readiness score for a Study Record's data.
 
     Returns:
-        A tuple of (score, list of validation failure reasons).
+        A tuple of (score, list of validation failure or warning reasons).
     """
     variables = (
         schema.variables_for_form(form_key, study_key=study_key)
@@ -1198,43 +1695,97 @@ def calculate_readiness_score(
         else schema.variables_for_form(form_key)
     )
     if not variables:
-        return 0.0, [f"Unknown form {form_key}"]
+        is_known = (
+            schema._has_form(form_key, study_key=study_key)
+            if isinstance(schema, BaseSchemaCache)
+            else (
+                schema.form_for_key(form_key) is not None
+                if isinstance(schema, DataDictionary)
+                else False
+            )
+        )
+        if not is_known:
+            return 0.0, [f"Unknown form {form_key}"]
+        if data:
+            return 0.0, [f"Unknown variables: {', '.join(data)}"]
+        return 100.0, []
 
     expected_count = len(variables)
     if expected_count == 0:
         return 100.0, []
 
+    data_map: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
     valid_count = 0
     reasons: list[str] = []
 
-    unknown = [k for k in data if k not in variables]
+    if not data_map:
+        for name, var in variables.items():
+            constraints = extract_variable_constraints(var)
+            if constraints.required_policy == "yes":
+                reasons.append(f"Missing required variable: {name}")
+            elif constraints.required_policy == "auto_query":
+                reasons.append(f"Auto Query warning for variable {name}: variable is missing")
+        if not reasons:
+            reasons.append("Empty record data")
+        return 0.0, reasons
+
+    unknown = [k for k in data_map if k not in variables]
     if unknown:
         reasons.append(f"Unknown variables: {', '.join(unknown)}")
 
+    has_clinical_data = any(k in variables and not _is_empty_value(v) for k, v in data_map.items())
     is_cache = isinstance(schema, BaseSchemaCache)
 
     for name, var in variables.items():
-        if name not in data:
-            reasons.append(f"Missing expected variable: {name}")
+        if name not in data_map:
+            constraints = extract_variable_constraints(var)
+            if constraints.required_policy == "yes":
+                reasons.append(f"Missing required variable: {name}")
+            elif constraints.required_policy == "auto_query":
+                reasons.append(f"Auto Query warning for variable {name}: variable is missing")
+                if has_clinical_data:
+                    valid_count += 1
+            elif has_clinical_data:
+                valid_count += 1
+            else:
+                reasons.append(f"Missing expected variable: {name}")
             continue
 
-        value = data[name]
-        vtype = getattr(var, "variable_type", getattr(var, "variableType", None))
+        value = data_map[name]
+        vtype = _effective_variable_type(var)
+        raw_vtype = getattr(var, "variable_type", getattr(var, "variableType", None))
         try:
-            _check_type(vtype, value)
+            _check_type(vtype, value, name=name, form_key=form_key)
             constraints = extract_variable_constraints(var)
             if _is_empty_value(value):
                 if constraints.required_policy == "yes":
                     raise ValidationError("Required variable is empty")
                 if constraints.required_policy == "auto_query":
                     reasons.append(f"Auto Query warning for variable {name}: value is empty")
+                if not has_clinical_data:
+                    continue
             elif not is_cache:
                 if constraints.choices:
-                    _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
-                if constraints.min_value is not None or constraints.max_value is not None:
+                    _validate_choice_membership(
+                        name, form_key, raw_vtype, value, constraints.choices
+                    )
+                if (constraints.min_value is not None or constraints.max_value is not None) and (
+                    not constraints.range_checks or _has_explicit_numeric_bounds(var)
+                ):
                     _validate_numeric_bounds(
                         name, form_key, value, constraints.min_value, constraints.max_value
                     )
+                if constraints.range_checks:
+                    _validate_numeric_bounds(name, form_key, value, None, None)
+                    for rc in constraints.range_checks:
+                        if not _evaluate_range_check(value, rc):
+                            rc_msg = _format_range_check_message(name, form_key, value, rc)
+                            if rc.soft_hard == "Soft":
+                                reasons.append(
+                                    f"Soft RangeCheck warning for variable {name}: {rc_msg}"
+                                )
+                            else:
+                                raise ValidationError(rc_msg)
                 if isinstance(value, str) and (
                     constraints.min_length is not None or constraints.max_length is not None
                 ):
@@ -1249,7 +1800,7 @@ def calculate_readiness_score(
         rules_getter = getattr(schema, "rules_for_form", None)
         if callable(rules_getter):
             report = _LOGIC_EVALUATOR.evaluate_rules(
-                rules_getter(form_key), data, form_key=form_key
+                rules_getter(form_key), dict(data_map), form_key=form_key
             )
             for err in report.errors:
                 reasons.append(f"Rule {err.rule_name} failed: {err.message}")
@@ -1258,6 +1809,19 @@ def calculate_readiness_score(
 
     score = (valid_count / expected_count) * 100.0
     return score, reasons
+
+
+def _has_existing_record_target(record: Mapping[str, Any]) -> bool:
+    """Return True when *record* specifies an existing record or visit target."""
+    for int_key in ("recordId", "record_id", "visitId", "visit_id"):
+        val = record.get(int_key)
+        if val is not None and not isinstance(val, bool) and str(val).strip() != "":
+            return True
+    for str_key in ("recordOid", "record_oid"):
+        val = record.get(str_key)
+        if val is not None and str(val).strip() != "":
+            return True
+    return False
 
 
 @overload
@@ -1359,23 +1923,111 @@ def validate_record_entry(
             collect_errors=collect_errors,
             record_index=record_index,
         )
-    msg = "Record payload must include 'formKey' or 'formId'"
-    if not collect_errors:
-        raise ValidationError(msg)
-    return BatchValidationReport(
-        total_records=1,
-        valid_records=0,
-        invalid_records=1,
-        errors=[
-            RecordValidationIssue(
-                record_index=record_index,
-                form_key=None,
-                variable_name=None,
-                message=msg,
-                rule_id="missing_form_identifier",
-            )
-        ],
-    )
+    if not _has_existing_record_target(record):
+        msg = "Record payload must include 'formKey' or 'formId'"
+        if not collect_errors:
+            raise ValidationError(msg)
+        return BatchValidationReport(
+            total_records=1,
+            valid_records=0,
+            invalid_records=1,
+            errors=[
+                RecordValidationIssue(
+                    record_index=record_index,
+                    form_key=None,
+                    variable_name=None,
+                    message=msg,
+                    rule_id="missing_form_identifier",
+                )
+            ],
+        )
+
+    raw_data = record.get("recordData", record.get("data", {}))
+    if isinstance(raw_data, Mapping) and raw_data:
+        forms_attr = getattr(schema, "forms", None)
+        is_datadict_like = isinstance(forms_attr, Sequence) and not isinstance(
+            schema, BaseSchemaCache
+        )
+        if is_datadict_like or collect_errors:
+            form_keys: Iterable[str]
+            if isinstance(schema, BaseSchemaCache):
+                form_keys = schema.forms_for_study(eff_study_key) if eff_study_key else schema.forms
+            elif isinstance(forms_attr, Sequence):
+                form_keys = [
+                    str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
+                    for f in forms_attr
+                    if getattr(f, "form_key", None) or getattr(f, "formKey", None)
+                ]
+            else:
+                form_keys = ()
+
+            known_vars: dict[str, list[Any]] = {}
+            for candidate_fk in form_keys:
+                f_vars = (
+                    schema.variables_for_form(candidate_fk, study_key=eff_study_key)
+                    if isinstance(schema, BaseSchemaCache)
+                    else schema.variables_for_form(candidate_fk)
+                )
+                for v_name, v_obj in f_vars.items():
+                    known_vars.setdefault(v_name, []).append(v_obj)
+
+            if known_vars:
+                formless_errors: list[RecordValidationIssue] = []
+                for var_name, var_val in raw_data.items():
+                    candidates = known_vars.get(var_name)
+                    if not candidates:
+                        msg = f"Unknown variable {var_name}"
+                        if not collect_errors:
+                            raise ValidationError(msg)
+                        formless_errors.append(
+                            RecordValidationIssue(
+                                record_index=record_index,
+                                form_key=None,
+                                variable_name=var_name,
+                                message=msg,
+                                rule_id="unknown_variable",
+                            )
+                        )
+                        continue
+                    if not _is_empty_value(var_val):
+                        distinct_types = {
+                            str(getattr(vo, "variable_type", getattr(vo, "variableType", "")) or "")
+                            .strip()
+                            .lower()
+                            for vo in candidates
+                        }
+                        distinct_types.discard("")
+                        if len(distinct_types) == 1:
+                            vtype = getattr(
+                                candidates[0],
+                                "variable_type",
+                                getattr(candidates[0], "variableType", None),
+                            )
+                            try:
+                                _check_type(vtype, var_val)
+                            except ValidationError as exc:
+                                if not collect_errors:
+                                    raise
+                                formless_errors.append(
+                                    RecordValidationIssue(
+                                        record_index=record_index,
+                                        form_key=None,
+                                        variable_name=var_name,
+                                        message=str(exc),
+                                        rule_id="invalid_type",
+                                    )
+                                )
+                if formless_errors:
+                    return BatchValidationReport(
+                        total_records=1,
+                        valid_records=0,
+                        invalid_records=1,
+                        errors=formless_errors,
+                    )
+
+    if collect_errors:
+        return BatchValidationReport(total_records=1, valid_records=1, invalid_records=0)
+    return None
 
 
 def validate_records_batch(
@@ -1445,7 +2097,7 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
         """
         form_key = self._resolve_form_key(record, study_key=study_key)
         if form_key:
-            return form_key, not bool(self.schema.variables_for_form(form_key, study_key=study_key))
+            return form_key, not self.schema._has_form(form_key, study_key=study_key)
         _, fid = _extract_form_ref(record)
         if fid is not None and not isinstance(fid, bool):
             return None, True

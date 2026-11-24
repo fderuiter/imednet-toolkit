@@ -1,7 +1,7 @@
-"""Example using :class:`DataExtractionWorkflow.extract_audit_trail`.
+"""Extract Study Record audit trail revisions using ``DataExtractionWorkflow``.
 
-Retrieves audit trail entries for a study using environment variables
-(or simulation defaults when ``IMEDNET_SIMULATION_MODE=true``).
+Retrieves Record revision entries across a Study date range using environment
+variables (or simulation defaults when ``IMEDNET_SIMULATION_MODE=true``).
 """
 
 import os

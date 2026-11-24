@@ -1,12 +1,24 @@
 [project]
 name = "imednet-tui"
-version = "1.0.0"
+version = "0.1.0"
 description = "Terminal user interface plugin for the iMednet Python SDK"
 authors = [
     { name = "Frederick de Ruiter", email = "127706008+fderuiter@users.noreply.github.com" }
 ]
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
     "Typing :: Typed",
 ]
 dependencies = [

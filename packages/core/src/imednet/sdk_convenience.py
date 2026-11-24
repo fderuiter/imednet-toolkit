@@ -436,33 +436,21 @@ class SyncSDKConvenienceMixin:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once and submit records in bounded chunks (default 100 per POST)."""
-        from imednet.utils.batch_coordinator import BatchCoordinator
-        from imednet.utils.tabular import normalize_records_input
+        from imednet.utils.batch_coordinator import _submit_records_batch_sync
 
-        normalized = normalize_records_input(records_data, schema=schema)
-        coordinator = BatchCoordinator(chunk_size=chunk_size)
-        return coordinator.submit(
+        return _submit_records_batch_sync(
             study_key,
-            normalized,
-            lambda chunk: self.records.create(
-                study_key,
-                chunk,
-                email_notify=email_notify,
-                schema=schema,
-                skip_validation=True,
-            ),
+            records_data,
+            email_notify,
+            create_records_fn=lambda *args, **kwargs: self.records.create(*args, **kwargs),
+            poll_many_fn=lambda *args, **kwargs: self.poll_jobs(*args, **kwargs),
             schema=schema,
+            chunk_size=chunk_size,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
-            poll_many=lambda batch_ids, *, on_progress=None: self.poll_jobs(
-                study_key,
-                batch_ids,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-            ),
+            timeout=timeout,
+            interval=interval,
             on_progress=on_progress,
-            require_batch_id=wait_for_completion,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -493,7 +481,7 @@ class SyncSDKConvenienceMixin:
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
-        """Poll multiple jobs concurrently and fetch terminal resultUrl payloads."""
+        """Poll multiple jobs concurrently until they reach terminal states."""
         return self.jobs.poll_many(
             study_key,
             batch_ids,
@@ -606,33 +594,21 @@ class AsyncSDKConvenienceMixin:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once and submit records in bounded chunks."""
-        from imednet.utils.batch_coordinator import AsyncBatchCoordinator
-        from imednet.utils.tabular import normalize_records_input
+        from imednet.utils.batch_coordinator import _submit_records_batch_async
 
-        normalized = normalize_records_input(records_data, schema=schema)
-        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size)
-        return await coordinator.submit(
+        return await _submit_records_batch_async(
             study_key,
-            normalized,
-            lambda chunk: self.records.create(
-                study_key,
-                chunk,
-                email_notify=email_notify,
-                schema=schema,
-                skip_validation=True,
-            ),
+            records_data,
+            email_notify,
+            create_records_fn=lambda *args, **kwargs: self.records.create(*args, **kwargs),
+            poll_many_fn=lambda *args, **kwargs: self.async_poll_jobs(*args, **kwargs),
             schema=schema,
+            chunk_size=chunk_size,
             skip_validation=skip_validation,
             wait_for_completion=wait_for_completion,
-            poll_many=lambda batch_ids, *, on_progress=None: self.async_poll_jobs(
-                study_key,
-                batch_ids,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-            ),
+            timeout=timeout,
+            interval=interval,
             on_progress=on_progress,
-            require_batch_id=wait_for_completion,
             dry_run=dry_run,
             collect_errors=collect_errors,
         )
@@ -663,7 +639,7 @@ class AsyncSDKConvenienceMixin:
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
-        """Asynchronously poll multiple jobs concurrently and fetch resultUrl payloads."""
+        """Asynchronously poll multiple jobs concurrently until they reach terminal states."""
         return await self.jobs.poll_many(
             study_key,
             batch_ids,

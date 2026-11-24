@@ -159,10 +159,12 @@ async def test_async_batch_coordinator_single_and_multi_chunk() -> None:
 
 
 def test_sdk_create_records_batch_and_poll_jobs_with_transport() -> None:
-    """ImednetSDK.create_records_batch chunks at 100 Records and poll_jobs fetches resultUrl."""
+    """ImednetSDK.create_records_batch chunks at 100 Records and poll_jobs skips resultUrl."""
     post_payloads: list[list[dict[str, Any]]] = []
+    results_fetched = False
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal results_fetched
         path = request.url.path
         if request.method == "GET" and path.endswith("/variables"):
             return httpx.Response(
@@ -204,16 +206,12 @@ def test_sdk_create_records_batch_and_poll_jobs_with_transport() -> None:
                     "jobId": f"J-{batch_id}",
                     "batchId": batch_id,
                     "state": "COMPLETED",
-                    "progress": 100,
                     "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/STUDY/jobs/{batch_id}/results",
                 },
             )
         if request.method == "GET" and path.endswith("/results"):
-            batch_id = path.split("/")[-2]
-            return httpx.Response(
-                200,
-                json=[{"batchId": batch_id, "status": "SUCCESS"}],
-            )
+            results_fetched = True
+            return httpx.Response(500, json={"error": "resultUrl should not be polled"})
         return httpx.Response(404, json={"error": "Not found"})
 
     sdk = ImednetSDK(
@@ -230,20 +228,22 @@ def test_sdk_create_records_batch_and_poll_jobs_with_transport() -> None:
 
         poll_summary = sdk.poll_jobs("STUDY", [j.batch_id for j in jobs], interval=0)
         assert poll_summary.all_successful is True
+        assert results_fetched is False
         for job in jobs:
-            assert poll_summary.results[job.batch_id].results == [
-                {"batchId": job.batch_id, "status": "SUCCESS"}
-            ]
+            assert poll_summary.results[job.batch_id].state == "COMPLETED"
+            assert poll_summary.results[job.batch_id].results is None
     finally:
         sdk.close()
 
 
 @pytest.mark.asyncio
 async def test_async_sdk_create_records_batch_and_async_poll_jobs() -> None:
-    """AsyncImednetSDK.async_create_records_batch chunks at 100 and async_poll_jobs fetches results."""
+    """AsyncImednetSDK.async_create_records_batch chunks at 100 and skips resultUrl polling."""
     post_counts: list[int] = []
+    results_fetched = False
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal results_fetched
         path = request.url.path
         if request.method == "POST" and path.endswith("/records"):
             body = json.loads(request.content.decode("utf-8"))
@@ -261,13 +261,12 @@ async def test_async_sdk_create_records_batch_and_async_poll_jobs() -> None:
                     "jobId": f"AJ-{batch_id}",
                     "batchId": batch_id,
                     "state": "COMPLETED",
-                    "progress": 100,
                     "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/STUDY/jobs/{batch_id}/results",
                 },
             )
         if request.method == "GET" and path.endswith("/results"):
-            batch_id = path.split("/")[-2]
-            return httpx.Response(200, json=[{"batchId": batch_id, "status": "SUCCESS"}])
+            results_fetched = True
+            return httpx.Response(500, json={"error": "resultUrl should not be polled"})
         return httpx.Response(404)
 
     async with AsyncImednetSDK(
@@ -283,7 +282,9 @@ async def test_async_sdk_create_records_batch_and_async_poll_jobs() -> None:
 
         summary = await sdk.async_poll_jobs("STUDY", [j.batch_id for j in jobs], interval=0)
         assert summary.all_successful is True
-        assert summary.results["ABATCH-1"].results == [{"batchId": "ABATCH-1", "status": "SUCCESS"}]
+        assert results_fetched is False
+        assert summary.results["ABATCH-1"].state == "COMPLETED"
+        assert summary.results["ABATCH-1"].results is None
 
 
 @pytest.mark.asyncio
@@ -504,10 +505,597 @@ def test_sdk_create_records_batch_with_data_dictionary_prevalidates_once() -> No
 
 
 @pytest.mark.asyncio
+async def test_mid_batch_503_attaches_settled_jobs_and_masked_unsubmitted_chunks() -> None:
+    """AC 1: HTTP 503 on chunk 2 settles chunk 1 when waiting and attaches sanitized unsubmitted chunks."""
+    from imednet.errors import ServerError
+    from imednet.utils.batch_coordinator import BatchSubmissionSummary
+
+    poll_calls: list[str] = []
+    post_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            post_count += 1
+            if post_count == 1:
+                return httpx.Response(
+                    200,
+                    json={"jobId": "JOB-1", "batchId": "BATCH-1", "state": "PROCESSING"},
+                )
+            return httpx.Response(503, json={"message": "Service temporarily unavailable"})
+        if request.method == "GET" and request.url.path.endswith("/jobs/BATCH-1"):
+            poll_calls.append("BATCH-1")
+            return httpx.Response(
+                200,
+                json={
+                    "jobId": "JOB-1",
+                    "batchId": "BATCH-1",
+                    "state": "COMPLETED",
+                    "progress": 100,
+                    "results": [{"recordId": 1, "status": "SUCCESS", "ssn": "123-45-6789"}],
+                },
+            )
+        return httpx.Response(404)
+
+    records = [
+        {"formKey": "F1", "subjectKey": "S1", "data": {"age": 30}},
+        {
+            "formKey": "F1",
+            "subjectKey": "S2",
+            "data": {
+                "age": 31,
+                "patient_name": "Jane Doe",
+                "ssn": "999-00-1111",
+                "api_key": "sk-live-secret",  # pragma: allowlist secret
+            },
+        },
+        {"formKey": "F1", "subjectKey": "S3", "data": {"dob": "1985-04-12"}},
+    ]
+
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        retries=0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(ServerError) as exc_info:
+            sdk.records.create_batch(
+                "STUDY",
+                records,
+                chunk_size=1,
+                wait_for_completion=True,
+                interval=0,
+                timeout=5,
+            )
+    finally:
+        sdk.close()
+
+    err = exc_info.value
+    assert poll_calls == ["BATCH-1"]
+    partial = getattr(err, "partial_summary", None)
+    assert isinstance(partial, BatchSubmissionSummary)
+    assert partial.all_successful is False
+    assert partial.batch_ids == ["BATCH-1"]
+    assert len(partial.jobs) == 1
+    assert partial.jobs[0].state == "COMPLETED"
+    assert partial.poll_summary is not None
+    assert partial.poll_summary.results["BATCH-1"].state == "COMPLETED"
+    assert partial.poll_summary.results["BATCH-1"].results[0]["ssn"] == "***MASKED***"
+
+    assert len(partial.unsubmitted_chunks) == 2
+    assert len(partial.unsubmitted_records) == 2
+    chunk2_rec = partial.unsubmitted_chunks[0][0]
+    assert chunk2_rec["subjectKey"] == "S2"
+    assert chunk2_rec["data"]["patient_name"] == "***MASKED***"
+    assert chunk2_rec["data"]["ssn"] == "***MASKED***"
+    assert chunk2_rec["data"]["api_key"] == "***"
+    assert partial.unsubmitted_chunks[1][0]["data"]["dob"] == "***MASKED***"
+    # Caller input dictionary was not mutated in place
+    assert records[1]["data"]["patient_name"] == "Jane Doe"
+    assert records[1]["data"]["api_key"] == "sk-live-secret"  # pragma: allowlist secret
+
+    # Async parity check on AsyncRecordsEndpoint.create_batch
+    post_count = 0
+    poll_calls.clear()
+
+    class AsyncMockMidBatchTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return handler(request)
+
+    async with AsyncImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://mock.imednet.test",
+        retries=0,
+        transport=AsyncMockMidBatchTransport(),
+    ) as async_sdk:
+        with pytest.raises(ServerError) as async_exc_info:
+            await async_sdk.records.create_batch(
+                "STUDY",
+                records,
+                chunk_size=1,
+                wait_for_completion=True,
+                interval=0,
+                timeout=5,
+            )
+
+    async_partial = getattr(async_exc_info.value, "partial_summary", None)
+    assert isinstance(async_partial, BatchSubmissionSummary)
+    assert async_partial.jobs[0].state == "COMPLETED"
+    assert len(async_partial.unsubmitted_chunks) == 2
+    assert async_partial.unsubmitted_records[0]["data"]["patient_name"] == "***MASKED***"
+
+
+@pytest.mark.asyncio
+async def test_sibling_job_batches_settle_before_raising_job_failed_error() -> None:
+    """AC 4: Failing chunk Job settles all sibling batchIds and attaches them to JobFailedError."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from imednet.utils.batch_coordinator import poll_facade_many_async, poll_facade_many_sync
+    from imednet.utils.job_poller import JobFailedError
+
+    # 1. Test poll_facade_many_sync / poll_facade_many_async fallback loops directly
+    polled_sync: list[str] = []
+
+    def fake_poll_job(_study: str, bid: str, **_kwargs: Any) -> JobStatus:
+        polled_sync.append(bid)
+        if bid == "B1":
+            failed = JobStatus(
+                batchId="B1",
+                jobId="J1",
+                state="FAILED",
+                results=[
+                    {
+                        "status": "FAILED",
+                        "error": "Bad record token=tok-secret patient_name=Alice",
+                        "ssn": "123-45-6789",
+                    }
+                ],
+            )
+            raise JobFailedError("Job B1 ended in state FAILED", failed)
+        return JobStatus(batchId=bid, jobId=f"J-{bid}", state="COMPLETED", progress=100)
+
+    sync_facade = MagicMock(spec=["poll_job"])
+    sync_facade.poll_job.side_effect = fake_poll_job
+    sync_many = poll_facade_many_sync(
+        sync_facade, "STUDY", ["B1", "B2", "B3"], timeout=5, poll_interval=0
+    )
+    assert polled_sync == ["B1", "B2", "B3"]
+    assert set(sync_many.terminal_statuses) == {"B1", "B2", "B3"}
+    assert sync_many.terminal_statuses["B1"].state == "FAILED"
+    assert sync_many.terminal_statuses["B2"].state == "COMPLETED"
+    assert sync_many.terminal_statuses["B3"].state == "COMPLETED"
+
+    polled_async: list[str] = []
+
+    async def fake_async_poll_job(study: str, bid: str, **kwargs: Any) -> JobStatus:
+        polled_async.append(bid)
+        return fake_poll_job(study, bid, **kwargs)
+
+    async_facade = MagicMock(spec=["async_poll_job"])
+    async_facade.async_poll_job = AsyncMock(side_effect=fake_async_poll_job)
+    async_many = await poll_facade_many_async(
+        async_facade, "STUDY", ["B1", "B2", "B3"], timeout=5, poll_interval=0
+    )
+    assert polled_async == ["B1", "B2", "B3"]
+    assert set(async_many.terminal_statuses) == {"B1", "B2", "B3"}
+
+    # 2. Test BatchCoordinator & AsyncBatchCoordinator raise JobFailedError with all siblings settled
+    coord = BatchCoordinator(chunk_size=1)
+    idx_counter = 0
+
+    def submit_chunk(_chunk: list[dict[str, Any]]) -> Job:
+        nonlocal idx_counter
+        idx_counter += 1
+        return Job(jobId=f"J{idx_counter}", batchId=f"B{idx_counter}", state="PROCESSING")
+
+    with pytest.raises(JobFailedError) as exc_info:
+        coord.submit(
+            "STUDY",
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            submit_chunk,
+            wait_for_completion=True,
+            poll_single=lambda bid: fake_poll_job("STUDY", bid),
+        )
+
+    jf_err = exc_info.value
+    assert "tok-secret" not in str(jf_err)
+    assert "Alice" not in str(jf_err)
+    assert "123-45-6789" not in str(jf_err)
+    assert jf_err.poll_summary is not None
+    assert set(jf_err.poll_summary.terminal_statuses) == {"B1", "B2", "B3"}
+    assert jf_err.poll_summary.results["B2"].state == "COMPLETED"
+    assert jf_err.poll_summary.results["B3"].state == "COMPLETED"
+    assert jf_err.partial_summary is not None
+    assert [j.state for j in jf_err.partial_summary.jobs] == ["FAILED", "COMPLETED", "COMPLETED"]
+
+    idx_counter = 0
+
+    async def async_submit_chunk(chunk: list[dict[str, Any]]) -> Job:
+        return submit_chunk(chunk)
+
+    acoord = AsyncBatchCoordinator(chunk_size=1)
+    with pytest.raises(JobFailedError) as async_exc_info:
+        await acoord.submit(
+            "STUDY",
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            async_submit_chunk,
+            wait_for_completion=True,
+            poll_single=lambda bid: fake_async_poll_job("STUDY", bid),
+        )
+    assert set(async_exc_info.value.poll_summary.terminal_statuses) == {"B1", "B2", "B3"}
+    assert [j.state for j in async_exc_info.value.partial_summary.jobs] == [
+        "FAILED",
+        "COMPLETED",
+        "COMPLETED",
+    ]
+
+    # 3. Even if custom poll_many raises during mid-batch settlement, the chunk error propagates intact
+    chunk_idx = 0
+
+    def fail_on_chunk_three(_chunk: list[dict[str, Any]]) -> Job:
+        nonlocal chunk_idx
+        chunk_idx += 1
+        if chunk_idx == 3:
+            raise RuntimeError("chunk 3 failed")
+        return Job(jobId=f"JM{chunk_idx}", batchId=f"BM{chunk_idx}", state="PROCESSING")
+
+    def broken_poll_many(_bids: list[str]) -> JobPollSummary:
+        raise RuntimeError("poll_many transport error")
+
+    with pytest.raises(RuntimeError, match="chunk 3 failed") as mid_exc_info:
+        coord.submit(
+            "STUDY",
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            fail_on_chunk_three,
+            wait_for_completion=True,
+            poll_many=broken_poll_many,
+        )
+    mid_partial = getattr(mid_exc_info.value, "partial_summary", None)
+    assert mid_partial is not None
+    assert mid_partial.batch_ids == ["BM1", "BM2"]
+    assert mid_partial.unsubmitted_records == [{"a": 3}]
+    assert mid_partial.poll_summary is not None
+    assert "BM1" in mid_partial.poll_summary.failures
+
+
+@pytest.mark.asyncio
+async def test_sdk_convenience_batch_preserves_nested_spans_and_partial_mocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Convenience batch methods emit nested poll_jobs spans and preserve partial mock seams."""
+    from contextlib import contextmanager
+    from unittest.mock import AsyncMock
+
+    import imednet.sdk_convenience as sdk_conv_mod
+
+    span_events: list[tuple[str, tuple[str, ...]]] = []
+    active_stack: list[str] = []
+
+    class FakeTracer:
+        @contextmanager
+        def start_as_current_span(self, name: str) -> Any:
+            active_stack.append(name)
+            span_events.append((name, tuple(active_stack)))
+            try:
+                yield
+            finally:
+                active_stack.pop()
+
+    monkeypatch.setattr(sdk_conv_mod, "tracer", FakeTracer())
+
+    sdk = ImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    )
+    try:
+        mock_create = MagicMock(
+            return_value=Job(jobId="J-1", batchId="B-1", state="QUEUED"),
+        )
+        mock_poll_jobs = MagicMock(
+            side_effect=lambda study_key, batch_ids, **_kw: JobPollSummary(
+                study_key=study_key,
+                results={
+                    bid: JobStatus(jobId="J-1", batchId=bid, state="COMPLETED") for bid in batch_ids
+                },
+                failures={},
+                elapsed_total=1.25,
+            )
+        )
+        monkeypatch.setattr(sdk.records, "create", mock_create)
+        monkeypatch.setattr(sdk, "poll_jobs", mock_poll_jobs)
+        partial_summary = sdk.create_records_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 29}}],
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert partial_summary.poll_summary is not None
+        assert partial_summary.poll_summary.elapsed_total == 1.25
+        mock_create.assert_called_once()
+        mock_poll_jobs.assert_called_once()
+    finally:
+        sdk.close()
+
+    # Exercise tracedbound SDK methods directly with jobs.poll_many mocked
+    span_events.clear()
+    sdk2 = ImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    )
+    try:
+        create_spy = MagicMock(return_value=Job(jobId="J-1", batchId="B-1", state="QUEUED"))
+        poll_many_spy = MagicMock(
+            return_value=JobPollSummary(
+                study_key="STUDY",
+                results={"B-1": JobStatus(jobId="J-1", batchId="B-1", state="COMPLETED")},
+                failures={},
+                elapsed_total=2.5,
+            )
+        )
+        monkeypatch.setattr(sdk2.records, "create", create_spy)
+        monkeypatch.setattr(sdk2.jobs, "poll_many", poll_many_spy)
+
+        summary = sdk2.create_records_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 30}}],
+            email_notify="ops@example.test",
+            skip_validation=True,
+            wait_for_completion=True,
+            timeout=15.0,
+            interval=0.5,
+        )
+        assert summary.poll_summary is not None
+        assert summary.poll_summary.elapsed_total == 2.5
+        assert summary.last_job is not None and summary.last_job.state == "COMPLETED"
+        create_spy.assert_called_once_with(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 30}}],
+            email_notify="ops@example.test",
+            schema=None,
+            skip_validation=True,
+        )
+        poll_many_spy.assert_called_once_with(
+            "STUDY",
+            ["B-1"],
+            interval=0.5,
+            timeout=15.0,
+            on_progress=None,
+            fail_fast=False,
+        )
+        assert span_events == [
+            ("create_records_batch", ("create_records_batch",)),
+            ("poll_jobs", ("create_records_batch", "poll_jobs")),
+        ]
+    finally:
+        sdk2.close()
+
+    span_events.clear()
+    async with AsyncImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    ) as async_sdk:
+        acreate_spy = AsyncMock(return_value=Job(jobId="AJ-1", batchId="AB-1", state="QUEUED"))
+        apoll_many_spy = AsyncMock(
+            return_value=JobPollSummary(
+                study_key="STUDY",
+                results={"AB-1": JobStatus(jobId="AJ-1", batchId="AB-1", state="COMPLETED")},
+                failures={},
+                elapsed_total=3.75,
+            )
+        )
+        monkeypatch.setattr(async_sdk.records, "create", acreate_spy)
+        monkeypatch.setattr(async_sdk.jobs, "poll_many", apoll_many_spy)
+
+        asummary = await async_sdk.async_create_records_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 31}}],
+            skip_validation=True,
+            wait_for_completion=True,
+            timeout=20.0,
+            interval=1.0,
+        )
+        assert asummary.poll_summary is not None
+        assert asummary.poll_summary.elapsed_total == 3.75
+        acreate_spy.assert_awaited_once()
+        apoll_many_spy.assert_awaited_once_with(
+            "STUDY",
+            ["AB-1"],
+            interval=1.0,
+            timeout=20.0,
+            on_progress=None,
+            fail_fast=False,
+        )
+        assert span_events == [
+            ("async_create_records_batch", ("async_create_records_batch",)),
+            ("async_poll_jobs", ("async_create_records_batch", "async_poll_jobs")),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_records_endpoint_create_batch_dispatches_poll_single_and_poll_many(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Endpoint create_batch uses JobsEndpoint.poll for 1 chunk and poll_many for >1 chunks."""
+    from unittest.mock import AsyncMock
+
+    from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
+    from imednet.errors.validation import PathTraversalValidationError
+
+    sdk = ImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    )
+    try:
+        seq = 0
+
+        def _fake_sync_create(study_key: str, chunk: list[dict[str, Any]], **_kw: Any) -> Job:
+            nonlocal seq
+            seq += 1
+            return Job(jobId=f"J-{seq}", batchId=f"B-{seq}", state="QUEUED")
+
+        with pytest.raises(PathTraversalValidationError):
+            sdk.records.create_batch("   ", [{"formKey": "F1", "data": {"age": 1}}])
+
+        poll_single_spy = MagicMock(
+            side_effect=lambda _sk, bid, **_kw: JobStatus(
+                jobId=f"J-{bid}", batchId=bid, state="COMPLETED"
+            )
+        )
+        poll_many_spy = MagicMock(
+            side_effect=lambda sk, bids, **_kw: JobPollSummary(
+                study_key=sk,
+                results={
+                    bid: JobStatus(jobId=f"J-{bid}", batchId=bid, state="COMPLETED") for bid in bids
+                },
+                failures={},
+                elapsed_total=1.5,
+            )
+        )
+        monkeypatch.setattr(sdk.records, "create", _fake_sync_create)
+        monkeypatch.setattr(JobsEndpoint, "poll", poll_single_spy)
+        monkeypatch.setattr(JobsEndpoint, "poll_many", poll_many_spy)
+
+        single = sdk.records.create_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 1}}],
+            chunk_size=2,
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert single.batch_ids == ["B-1"]
+        assert poll_single_spy.call_count == 1
+        assert poll_many_spy.call_count == 0
+
+        multi = sdk.records.create_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": i}} for i in range(3)],
+            chunk_size=2,
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert multi.batch_ids == ["B-2", "B-3"]
+        assert poll_single_spy.call_count == 1
+        assert poll_many_spy.call_count == 1
+    finally:
+        sdk.close()
+
+    async with AsyncImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://mock.imednet.test",
+    ) as async_sdk:
+        aseq = 0
+
+        async def _fake_async_create(
+            study_key: str, chunk: list[dict[str, Any]], **_kw: Any
+        ) -> Job:
+            nonlocal aseq
+            aseq += 1
+            return Job(jobId=f"AJ-{aseq}", batchId=f"AB-{aseq}", state="QUEUED")
+
+        with pytest.raises(PathTraversalValidationError):
+            await async_sdk.records.create_batch("   ", [{"formKey": "F1", "data": {"age": 1}}])
+
+        apoll_single_spy = AsyncMock(
+            side_effect=lambda _sk, bid, **_kw: JobStatus(
+                jobId=f"AJ-{bid}", batchId=bid, state="COMPLETED"
+            )
+        )
+        apoll_many_spy = AsyncMock(
+            side_effect=lambda sk, bids, **_kw: JobPollSummary(
+                study_key=sk,
+                results={
+                    bid: JobStatus(jobId=f"AJ-{bid}", batchId=bid, state="COMPLETED")
+                    for bid in bids
+                },
+                failures={},
+                elapsed_total=1.5,
+            )
+        )
+        monkeypatch.setattr(async_sdk.records, "create", _fake_async_create)
+        monkeypatch.setattr(AsyncJobsEndpoint, "poll", apoll_single_spy)
+        monkeypatch.setattr(AsyncJobsEndpoint, "poll_many", apoll_many_spy)
+
+        asingle = await async_sdk.records.create_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": 1}}],
+            chunk_size=2,
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert asingle.batch_ids == ["AB-1"]
+        assert apoll_single_spy.await_count == 1
+        assert apoll_many_spy.await_count == 0
+
+        amulti = await async_sdk.records.create_batch(
+            "STUDY",
+            [{"formKey": "F1", "data": {"age": i}} for i in range(3)],
+            chunk_size=2,
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert amulti.batch_ids == ["AB-2", "AB-3"]
+        assert apoll_single_spy.await_count == 1
+        assert apoll_many_spy.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_facade_helpers_argument_preparation_and_fallback() -> None:
+    """poll_facade_* helpers omit None on_progress and fall back sequentially when needed."""
+    from unittest.mock import AsyncMock
+
+    from imednet.utils.batch_coordinator import (
+        poll_facade_many_async,
+        poll_facade_many_sync,
+        poll_facade_single_async,
+        poll_facade_single_sync,
+    )
+
+    sync_facade = MagicMock(spec=["poll_job"])
+    sync_facade.poll_job.side_effect = lambda _sk, bid, **_kw: JobStatus(
+        jobId=f"J-{bid}", batchId=bid, state="COMPLETED"
+    )
+    single_res = poll_facade_single_sync(
+        sync_facade, "STUDY", "B1", timeout=10, poll_interval=2, on_progress=None
+    )
+    assert single_res.batch_id == "B1"
+    sync_facade.poll_job.assert_called_once_with("STUDY", "B1", timeout=10, interval=2)
+
+    fallback_summary = poll_facade_many_sync(
+        sync_facade, "STUDY", ["B1", "B2"], timeout=10, poll_interval=2
+    )
+    assert set(fallback_summary.results) == {"B1", "B2"}
+    assert fallback_summary.elapsed_total == 0.0
+
+    async_facade = MagicMock(spec=["async_poll_job"])
+    async_facade.async_poll_job = AsyncMock(
+        side_effect=lambda _sk, bid, **_kw: JobStatus(
+            jobId=f"AJ-{bid}", batchId=bid, state="COMPLETED"
+        )
+    )
+    asingle_res = await poll_facade_single_async(
+        async_facade, "STUDY", "AB1", timeout=12, poll_interval=3, on_progress=None
+    )
+    assert asingle_res.batch_id == "AB1"
+    async_facade.async_poll_job.assert_awaited_once_with("STUDY", "AB1", timeout=12, interval=3)
+
+    afallback_summary = await poll_facade_many_async(
+        async_facade, "STUDY", ["AB1", "AB2"], timeout=12, poll_interval=3
+    )
+    assert set(afallback_summary.results) == {"AB1", "AB2"}
+    assert afallback_summary.elapsed_total == 0.0
+
+
+@pytest.mark.asyncio
 async def test_batch_coordinator_chunk_two_failure_attaches_committed_jobs_and_batch_ids() -> None:
     """AC 5 & Req 6: Failing on chunk 2 exposes committed chunk 1 Job and batch_id on raised error."""
-    from imednet.utils.batch_coordinator import AsyncBatchCoordinator, BatchCoordinator
-
     records = [
         {"formKey": "F1", "data": {"age": 1}},
         {"formKey": "F1", "data": {"age": 2}},
@@ -517,7 +1105,7 @@ async def test_batch_coordinator_chunk_two_failure_attaches_committed_jobs_and_b
     # Sync BatchCoordinator: chunk 1 succeeds (BATCH-1), chunk 2 raises RuntimeError
     sync_calls = 0
 
-    def submit_sync(chunk: list[dict[str, Any]]) -> Job:
+    def submit_sync(_chunk: list[dict[str, Any]]) -> Job:
         nonlocal sync_calls
         sync_calls += 1
         if sync_calls == 1:
@@ -539,7 +1127,7 @@ async def test_batch_coordinator_chunk_two_failure_attaches_committed_jobs_and_b
     # AsyncBatchCoordinator: chunk 1 succeeds (ABATCH-1), chunk 2 raises RuntimeError
     async_calls = 0
 
-    async def submit_async(chunk: list[dict[str, Any]]) -> Job:
+    async def submit_async(_chunk: list[dict[str, Any]]) -> Job:
         nonlocal async_calls
         async_calls += 1
         if async_calls == 1:

@@ -5,37 +5,34 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from ...models.records import RegisterSubjectRequest
-
-from ...errors import ValidationError
+from ...errors import ApiError, ValidationError
 from ...sdk import ImednetSDK
 from ...utils.enrollment import (
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
     validate_subject_registration_sites,
 )
-from ...utils.job_poller import JobFailedError
+from ...utils.job_poller import JobFailedError, JobTimeoutError
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import print_error, register_list_command, simulation_mode_context
 from ..utils.args import (
     add_study_key_args,
     resolve_study_key,
 )
+from ..utils.context import is_offline_schema_dry_run
 from ..utils.write_helpers import (
     add_write_common_args,
-    coerce_batch_summary,
     exit_cli_validation_error,
-    parse_email_notify,
+    exit_cli_write_error,
+    load_records_from_path_or_stdin,
     parse_json_records_text,
     parse_key_value_pairs,
     render_write_summary,
     resolve_cli_schema,
-    summary_from_job_failure,
+    submit_cli_records_batch,
     validate_write_numeric_flags,
-    write_progress_context,
 )
 
 
@@ -48,32 +45,74 @@ def _load_cli_subject_inputs(
     if args.input_file and args.json_payload:
         raise ValueError("Cannot combine --file and --json.")
 
-    study_key: str | None = getattr(args, "study_key", None)
+    study_key = getattr(args, "study_key", None)
     if args.input_file:
         if args.input_file == "-":
-            return parse_json_records_text(sys.stdin.read(), source_label="stdin")
+            items = parse_json_records_text(sys.stdin.read(), source_label="stdin")
+            if args.data_pairs:
+                return _merge_subject_inline_overrides(items, args=args, schema=schema)
+            return items
+        if args.data_pairs:
+            items = load_records_from_path_or_stdin(
+                args.input_file,
+                schema=schema,
+                study_key=study_key,
+                default_form_key=args.form_key,
+            )
+            return _merge_subject_inline_overrides(items, args=args, schema=schema)
         return Path(args.input_file)
     if args.json_payload:
-        return parse_json_records_text(args.json_payload, source_label="--json")
+        items = parse_json_records_text(args.json_payload, source_label="--json")
+        if args.data_pairs:
+            return _merge_subject_inline_overrides(items, args=args, schema=schema)
+        return items
 
-    if not args.form_key or not args.site_name:
+    if not args.form_key or (not args.site_name and getattr(args, "site_id", None) is None):
         raise ValueError(
             "Provide --file, --json, or both --form-key and --site-name to register a subject."
         )
     inline_data = parse_key_value_pairs(
         args.data_pairs,
         schema=schema,
-        study_key=study_key,
         form_key=args.form_key,
+        study_key=study_key,
     )
     single: dict[str, Any] = {
         "formKey": args.form_key,
-        "siteName": args.site_name,
         "data": inline_data,
     }
+    if args.site_name:
+        single["siteName"] = args.site_name
+    if getattr(args, "site_id", None) is not None:
+        single["siteId"] = args.site_id
     if args.subject_key:
         single["subjectKey"] = args.subject_key
+    if getattr(args, "subject_oid", None):
+        single["subjectOid"] = args.subject_oid
     return [single]
+
+
+def _merge_subject_inline_overrides(
+    items: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+    schema: Any = None,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for item in items:
+        rec = dict(item)
+        eff_fk = args.form_key or rec.get("formKey") or rec.get("form_key")
+        row_inline = parse_key_value_pairs(
+            args.data_pairs,
+            schema=schema,
+            form_key=str(eff_fk) if eff_fk else None,
+            study_key=getattr(args, "study_key", None),
+        )
+        existing_data = dict(rec.get("data") or rec.get("recordData") or {})
+        existing_data.update(row_inline)
+        rec["data"] = existing_data
+        merged.append(rec)
+    return merged
 
 
 def _subject_view_model(s: Any) -> dict[str, Any]:
@@ -138,9 +177,20 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         help="Enrollment site name (siteName) for inline registration or file default.",
     )
     register_parser.add_argument(
+        "--site-id",
+        type=int,
+        default=None,
+        help="Enrollment site ID (siteId) for inline registration or file default.",
+    )
+    register_parser.add_argument(
         "--subject-key",
         default=None,
         help="Subject key (subjectKey) for inline registration.",
+    )
+    register_parser.add_argument(
+        "--subject-oid",
+        default=None,
+        help="Subject OID (subjectOid) for inline registration.",
     )
     register_parser.add_argument(
         "-d",
@@ -167,101 +217,61 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def register_subjects_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
-        no_interactive = getattr(args, "no_interactive", False)
+        offline_dry_run = is_offline_schema_dry_run(
+            dry_run=args.dry_run,
+            schema_source=args.schema_source,
+        )
         subjects_data: list[dict[str, Any]] = []
         skipped_count = 0
         try:
-            resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
+            resolved_schema = resolve_cli_schema(
+                sdk,
+                args.study_key,
+                args.schema_source,
+                dry_run=args.dry_run,
+            )
             raw_inputs = _load_cli_subject_inputs(args, schema=resolved_schema)
             normalized_pairs = normalize_subject_registration_inputs(
                 raw_inputs,
                 default_form_key=args.form_key,
                 default_site_name=args.site_name,
+                default_site_id=args.site_id,
                 schema=resolved_schema,
                 study_key=args.study_key,
             )
-            if args.data_pairs and (args.input_file or args.json_payload):
-                updated_pairs: list[
-                    tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]
-                ] = []
-                for _raw_item, model_item in normalized_pairs:
-                    eff_fk = model_item.form_key or args.form_key
-                    extra_data = parse_key_value_pairs(
-                        args.data_pairs,
-                        schema=resolved_schema,
-                        study_key=args.study_key,
-                        form_key=eff_fk or None,
-                    )
-                    dumped_model = model_item.model_dump(by_alias=True)
-                    merged_data = dict(dumped_model.get("data") or {})
-                    merged_data.update(extra_data)
-                    dumped_model["data"] = merged_data
-                    if (
-                        args.subject_key
-                        and len(normalized_pairs) == 1
-                        and not dumped_model.get("subjectKey")
-                    ):
-                        dumped_model["subjectKey"] = args.subject_key
-                    updated_pairs.append((dumped_model, model_item.model_validate(dumped_model)))
-                normalized_pairs = updated_pairs
-            elif (
-                args.subject_key
+            if (
+                (args.subject_key or getattr(args, "subject_oid", None))
                 and (args.input_file or args.json_payload)
                 and len(normalized_pairs) == 1
-                and not normalized_pairs[0][1].subject_key
             ):
-                dumped_only = normalized_pairs[0][1].model_dump(by_alias=True)
-                dumped_only["subjectKey"] = args.subject_key
+                dumped_only = normalized_pairs[0][1].model_dump(by_alias=True, exclude_none=True)
+                if args.subject_key and not normalized_pairs[0][1].subject_key:
+                    dumped_only["subjectKey"] = args.subject_key
+                if getattr(args, "subject_oid", None) and not normalized_pairs[0][1].subject_oid:
+                    dumped_only["subjectOid"] = args.subject_oid
                 normalized_pairs = [
                     (dumped_only, normalized_pairs[0][1].model_validate(dumped_only))
                 ]
 
-            sites = list(sdk.sites.list(args.study_key))
+            sites = None if offline_dry_run else list(sdk.sites.list(args.study_key))
             validate_subject_registration_sites(normalized_pairs, sites)
 
-            existing_subjects = (
-                list(sdk.subjects.list(args.study_key)) if args.skip_existing else None
-            )
+            should_filter = args.skip_existing and not offline_dry_run
+            existing_subjects = list(sdk.subjects.list(args.study_key)) if should_filter else None
             subjects_data, skipped_count = filter_existing_subject_registrations(
                 normalized_pairs,
                 existing_subjects,
-                should_filter=args.skip_existing,
+                should_filter=should_filter,
                 subject_key_field=args.subject_key_field,
             )
-
-            email_notify = parse_email_notify(args.email_notify)
-            with write_progress_context(
-                "subject registration",
-                args.study_key,
-                no_interactive=no_interactive,
-                output_format=args.output_format,
-            ) as on_progress:
-                raw_summary = sdk.records.create_batch(
-                    args.study_key,
-                    subjects_data,
-                    email_notify=email_notify,
-                    schema=resolved_schema,
-                    chunk_size=args.chunk_size,
-                    wait_for_completion=args.wait,
-                    timeout=args.timeout,
-                    interval=args.interval,
-                    on_progress=on_progress,
-                    dry_run=args.dry_run,
-                    collect_errors=True,
-                )
-        except JobFailedError as exc:
-            failed_summary = summary_from_job_failure(
-                exc,
-                study_key=args.study_key,
-                total_records=len(subjects_data),
+            summary = submit_cli_records_batch(
+                sdk,
+                args,
+                subjects_data,
+                action_label="subject registration",
+                schema=resolved_schema,
                 skipped_count=skipped_count,
             )
-            render_write_summary(
-                failed_summary,
-                resource="subjects_register",
-                output_format=args.output_format,
-            )
-            return
         except (ValidationError, ValueError) as exc:
             exit_cli_validation_error(
                 exc,
@@ -269,15 +279,16 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 study_key=args.study_key,
                 output_format=args.output_format,
             )
+        except (JobFailedError, JobTimeoutError, ApiError) as exc:
+            exit_cli_write_error(
+                exc,
+                resource="subjects_register",
+                study_key=args.study_key,
+                total_records=len(subjects_data),
+                skipped_count=skipped_count,
+                output_format=args.output_format,
+            )
 
-        summary = coerce_batch_summary(
-            raw_summary,
-            study_key=args.study_key,
-            total_records=len(subjects_data),
-            dry_run=args.dry_run,
-            skipped_count=skipped_count,
-        )
-        summary.skipped_count = skipped_count
         render_write_summary(
             summary,
             resource="subjects_register",
@@ -299,7 +310,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if (
             not args.input_file
             and not args.json_payload
-            and (not args.form_key or not args.site_name)
+            and (not args.form_key or (not args.site_name and args.site_id is None))
         ):
             print_error(
                 "Error: Provide --file, --json, or both --form-key and --site-name to register subjects."

@@ -283,6 +283,8 @@ Job = ModelEngine.get_model('Job', Job)
 class JobStatus(Job):
     """Extended job information returned when polling."""
 
+    progress: int | None = Field(default=None, alias="progress")
+    result_url: str | None = Field(default=None, alias="resultUrl")
     results: Any = Field(default=None)
     record_total_count: int | None = Field(default=None, alias="totalRecords")
     record_success_count: int | None = Field(default=None, alias="successfulRecords")
@@ -316,10 +318,12 @@ class JobStatus(Job):
         """
         if v is None:
             return None
+        from imednet.utils.validators import parse_int_or_default
+
         try:
-            return int(v)
-        except (TypeError, ValueError):
-            return 0
+            return parse_int_or_default(v, default=0)
+        except OverflowError as exc:
+            raise ValueError(str(exc)) from exc
 
     @staticmethod
     def _count_dict_record_failures(results: dict[str, Any]) -> int:
@@ -346,8 +350,8 @@ class JobStatus(Job):
         return err_count
 
     @property
-    def total_records(self) -> int:
-        """Return the total number of records processed."""
+    def total_records(self) -> int | None:
+        """Return the total number of records processed, or None when unknown."""
         if isinstance(self.results, list):
             if len(self.results) == 0:
                 if self.record_total_count is not None:
@@ -360,25 +364,27 @@ class JobStatus(Job):
             return len(self.results)
         if isinstance(self.results, dict):
             if "total" in self.results and self.results.get("total") is not None:
-                return int(self.results.get("total", 0))
+                return int(self.results["total"])
             err_count = self._count_dict_record_failures(self.results)
             records_val = self.results.get("records")
             if isinstance(records_val, list) and len(records_val) > 0:
                 return max(len(records_val), int(self.record_total_count or 0), err_count)
             if self.record_total_count is not None:
                 return max(int(self.record_total_count), err_count)
-            if "success" in self.results or err_count > 0:
+            if (
+                "success" in self.results and self.results.get("success") is not None
+            ) or err_count > 0:
                 return int(self.results.get("success", 0) or 0) + err_count
-            return 0
+            return None
         if self.record_total_count is not None:
             return int(self.record_total_count)
         if self.results:
             return 1
-        return 0
+        return None
 
     @property
-    def successful_records(self) -> int:
-        """Return the total number of successful records processed."""
+    def successful_records(self) -> int | None:
+        """Return the total number of successful records processed, or None when unknown."""
         if isinstance(self.results, list):
             if len(self.results) == 0:
                 return (
@@ -392,7 +398,7 @@ class JobStatus(Job):
             )
         if isinstance(self.results, dict):
             if "success" in self.results and self.results.get("success") is not None:
-                return int(self.results.get("success", 0))
+                return int(self.results["success"])
             records_val = self.results.get("records")
             if isinstance(records_val, list) and len(records_val) > 0:
                 return sum(
@@ -403,16 +409,16 @@ class JobStatus(Job):
                 )
             if self.record_success_count is not None:
                 return int(self.record_success_count)
-            return 0
+            return None
         if self.record_success_count is not None:
             return int(self.record_success_count)
-        if super().is_successful and self.results:
-            return 1
-        return 0
+        if self.results:
+            return 1 if super().is_successful else 0
+        return None
 
     @property
-    def failed_records(self) -> int:
-        """Return the total number of failed records processed."""
+    def failed_records(self) -> int | None:
+        """Return the total number of failed records processed, or None when unknown."""
         if isinstance(self.results, list):
             if len(self.results) == 0:
                 return (
@@ -433,28 +439,30 @@ class JobStatus(Job):
         if isinstance(self.results, dict):
             err_count = self._count_dict_record_failures(self.results)
             if "failed" in self.results and self.results.get("failed") is not None:
-                return max(int(self.results.get("failed", 0)), err_count)
+                return max(int(self.results["failed"]), err_count)
             if err_count > 0:
                 return max(err_count, int(self.record_failure_count or 0))
             if self.record_failure_count is not None:
                 return int(self.record_failure_count)
-            return 0
+            return None
         if self.record_failure_count is not None:
             return int(self.record_failure_count)
-        if super().is_failed and self.results:
-            return 1
-        return 0
+        if self.results:
+            return 1 if super().is_failed else 0
+        return None
 
     @property
     def is_successful(self) -> bool:
         """Checks if the job completed in a success state with zero failed records."""
-        return super().is_successful and self.failed_records == 0 and not self.result_error
+        failed = self.failed_records
+        return super().is_successful and (failed is None or failed == 0) and not self.result_error
 
     @property
     def is_failed(self) -> bool:
         """Checks if the job failed, was cancelled, or finished with record/result errors."""
+        failed = self.failed_records
         return super().is_failed or (
-            self.is_terminal and (self.failed_records > 0 or bool(self.result_error))
+            self.is_terminal and ((failed is not None and failed > 0) or bool(self.result_error))
         )
 
 

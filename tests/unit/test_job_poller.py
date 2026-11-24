@@ -7,13 +7,17 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from imednet.errors import PathTraversalValidationError
 from imednet.models.jobs import JobStatus
 from imednet.utils.job_poller import (
     AsyncJobPoller,
+    BaseJobPoller,
     JobFailedError,
     JobPoller,
     JobStatusEvent,
     JobTimeoutError,
+    _raise_fetch_result_error,
+    fetch_terminal_job_result,
 )
 
 
@@ -635,3 +639,173 @@ async def test_job_status_errors_dict_empty_results_list_and_html_result_url(
         await AsyncJobPoller(_async_completed_job, fetch_result=_async_html_fetch).run(
             "ST", "B-ASYNC-HTML", interval=0
         )
+
+
+@pytest.mark.asyncio
+async def test_raise_fetch_result_error_redaction_parity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """_raise_fetch_result_error redacts secrets identically across helper, sync, and async paths."""
+    raw_failure_text = "403 Forbidden with Authorization: Bearer top-secret-token"
+
+    direct_status = JobStatus(batchId="B_DIR", state="COMPLETED", progress=100)
+    cause = RuntimeError(raw_failure_text)
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(JobFailedError, match="Job B_DIR failed to fetch resultUrl") as direct_exc,
+    ):
+        _raise_fetch_result_error("B_DIR", direct_status, cause)
+
+    assert direct_exc.value.__cause__ is cause
+    assert direct_status.result_error is not None
+    assert "top-secret-token" not in direct_status.result_error
+    assert "top-secret-token" not in str(direct_exc.value)
+    assert "top-secret-token" not in caplog.text
+    assert "[JobPoller] batch_id=B_DIR FAILED fetching resultUrl:" in caplog.text
+
+    caplog.clear()
+    sync_status = JobStatus(
+        batchId="B_SYNC",
+        state="COMPLETED",
+        progress=100,
+        resultUrl="https://example.test/res",
+    )
+
+    def fail_sync(_url: str) -> object:
+        raise RuntimeError(raw_failure_text)
+
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(JobFailedError) as sync_exc,
+    ):
+        fetch_terminal_job_result(sync_status, fail_sync)
+
+    assert sync_exc.value.result_error == direct_status.result_error
+    assert "top-secret-token" not in caplog.text
+
+    caplog.clear()
+
+    async def get_async_job(_study: str, batch_id: str) -> JobStatus:
+        return JobStatus(
+            batchId=batch_id,
+            state="COMPLETED",
+            progress=100,
+            resultUrl="https://example.test/res-async",
+        )
+
+    async def fail_async(_url: str) -> object:
+        raise RuntimeError(raw_failure_text)
+
+    async_poller = AsyncJobPoller(get_async_job, fetch_result=fail_async)
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(JobFailedError) as async_exc,
+    ):
+        await async_poller.run("ST", "B_ASYNC", interval=0)
+
+    assert async_exc.value.result_error == direct_status.result_error
+    assert async_exc.value.status.result_error == direct_status.result_error
+    assert "top-secret-token" not in str(async_exc.value)
+    assert "top-secret-token" not in caplog.text
+    assert "[JobPoller] batch_id=B_ASYNC FAILED fetching resultUrl:" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_process_fetch_result_hook_and_async_cancellation() -> None:
+    """Custom _process_fetch_result hook transforms results and CancelledError propagates unwrapped."""
+    hook_calls: list[tuple[str, object]] = []
+
+    class CustomAsyncJobPoller(AsyncJobPoller):
+        def _process_fetch_result(self, status: JobStatus, res: object) -> JobStatus:
+            hook_calls.append((status.batch_id, res))
+            processed = super()._process_fetch_result(status, res)
+            if isinstance(processed.results, dict):
+                processed.results = {**processed.results, "hook_applied": True}
+            return processed
+
+    async def get_job(_study: str, batch_id: str) -> JobStatus:
+        return JobStatus(
+            batchId=batch_id,
+            state="COMPLETED",
+            progress=100,
+            resultUrl="https://example.test/out",
+        )
+
+    async def fetch_ok(_url: str) -> dict[str, object]:
+        return {"rows": 3}
+
+    poller = CustomAsyncJobPoller(get_job, fetch_result=fetch_ok)
+    final_status = await poller.run("ST", "B_HOOK", interval=0)
+    assert hook_calls == [("B_HOOK", {"rows": 3})]
+    assert final_status.results == {"rows": 3, "hook_applied": True}
+
+    async def fetch_cancelled(_url: str) -> object:
+        raise asyncio.CancelledError
+
+    cancelled_poller = CustomAsyncJobPoller(get_job, fetch_result=fetch_cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_poller.run("ST", "B_CANCEL", interval=0)
+
+
+@pytest.mark.asyncio
+async def test_poll_step_events_and_batch_helpers_parity(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sync and async pollers emit identical poll-step events, logs, and batch guard semantics."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    sync_states = [
+        JobStatus(batchId="B_PAR", state="PROCESSING", progress=25, jobId="1", resultUrl=""),
+        JobStatus(batchId="B_PAR", state="COMPLETED", progress=100, jobId="1", resultUrl=""),
+    ]
+    async_states = [
+        JobStatus(batchId="B_PAR", state="PROCESSING", progress=25, jobId="1", resultUrl=""),
+        JobStatus(batchId="B_PAR", state="COMPLETED", progress=100, jobId="1", resultUrl=""),
+    ]
+
+    sync_events: list[JobStatusEvent] = []
+    async_events: list[JobStatusEvent] = []
+
+    sync_poller = JobPoller(lambda _s, _b: sync_states.pop(0))
+    async_poller = AsyncJobPoller(AsyncMock(side_effect=lambda _s, _b: async_states.pop(0)))
+
+    with caplog.at_level(logging.DEBUG):
+        sync_res = sync_poller.run("ST", "B_PAR", interval=0, on_progress=sync_events.append)
+    sync_logs = caplog.text
+    caplog.clear()
+
+    with caplog.at_level(logging.DEBUG):
+        async_res = await async_poller.run(
+            "ST", "B_PAR", interval=0, on_progress=async_events.append
+        )
+    async_logs = caplog.text
+
+    assert sync_res.state == async_res.state == "COMPLETED"
+    assert [(e.batch_id, e.poll_number, e.status.state, e.is_terminal) for e in sync_events] == [
+        (e.batch_id, e.poll_number, e.status.state, e.is_terminal) for e in async_events
+    ]
+    assert "[JobPoller] batch_id=B_PAR state=PROCESSING progress=25% elapsed=" in sync_logs
+    assert "[JobPoller] batch_id=B_PAR state=PROCESSING progress=25% elapsed=" in async_logs
+    assert "[JobPoller] batch_id=B_PAR COMPLETED after 2 polls" in sync_logs
+    assert "[JobPoller] batch_id=B_PAR COMPLETED after 2 polls" in async_logs
+
+    # Path segment validation applies uniformly across run, poll_many, and async_poll_many
+    with pytest.raises(PathTraversalValidationError):
+        sync_poller.run("../bad", "B1")
+    with pytest.raises(PathTraversalValidationError):
+        await async_poller.run("ST", "../bad")
+    with pytest.raises(PathTraversalValidationError):
+        sync_poller.poll_many("ST", ["../bad"])
+    with pytest.raises(PathTraversalValidationError):
+        await async_poller.async_poll_many("ST", ["../bad"])
+
+    # _record_batch_result preserves terminal results against non-terminal regressions
+    base = BaseJobPoller()
+    recorded: dict[str, JobStatus] = {}
+    terminal = JobStatus(batchId="B1", state="COMPLETED", progress=100)
+    stale = JobStatus(batchId="B1", state="RUNNING", progress=50)
+    base._record_batch_result(recorded, "B1", terminal)
+    base._record_batch_result(recorded, "B1", stale)
+    assert recorded["B1"] is terminal

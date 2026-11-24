@@ -50,11 +50,15 @@ class ContractBuilder:
             return "boolean", None
         if isinstance(val, int):
             return "integer", None
+        if isinstance(val, float):
+            return "float", None
         if isinstance(val, str):
             if val == "<boolean>":
                 return "boolean", None
             if val == "<integer>":
                 return "integer", None
+            if val in {"<float>", "<double>", "<number>"}:
+                return "float", None
             return "string", None
         if isinstance(val, dict):
             return "dict", None
@@ -74,6 +78,7 @@ class ContractBuilder:
             return
 
         name_mapping = {
+            "List of studies": "Study",
             "Study information": "Study",
             "List of forms": "Form",
             "Variable list": "Variable",
@@ -89,6 +94,26 @@ class ContractBuilder:
             "Visit list": "Visit",
             "User list": "User",
         }
+        nested_model_mapping = {
+            ("Interval", "forms"): "FormSummary",
+            ("Query", "queryComments"): "QueryComment",
+            ("Record", "keywords"): "Keyword",
+            ("Subject", "keywords"): "SubjectKeyword",
+            ("User", "roles"): "Role",
+        }
+
+        def build_model_definition(target_name: str, obj_schema: dict[str, Any]) -> ModelDefinition:
+            fields: dict[str, FieldDefinition] = {}
+            for key, val in obj_schema.items():
+                snake_key = to_snake(key)
+                type_name, default_value = self.parse_postman_type(val)
+                fields[snake_key] = FieldDefinition(
+                    name=snake_key,
+                    type_name=type_name,
+                    default_value=default_value,
+                    alias=key,
+                )
+            return ModelDefinition(name=target_name, fields=fields)
 
         def extract_schemas(items: list[dict[str, Any]]) -> None:
             if not isinstance(items, list):
@@ -122,20 +147,23 @@ class ContractBuilder:
                                     elif 'data' not in parsed and 'metadata' not in parsed:
                                         schema_dict = parsed
 
-                                    if schema_dict:
-                                        fields = {}
-                                        for key, val in schema_dict.items():
-                                            snake_key = to_snake(key)
-                                            type_name, default_value = self.parse_postman_type(val)
-                                            fields[snake_key] = FieldDefinition(
-                                                name=snake_key,
-                                                type_name=type_name,
-                                                default_value=default_value,
-                                                alias=key,
-                                            )
-                                        self.contract.models[model_name] = ModelDefinition(
-                                            name=model_name, fields=fields
+                                    if isinstance(schema_dict, dict) and schema_dict:
+                                        self.contract.models[model_name] = build_model_definition(
+                                            model_name, schema_dict
                                         )
+                                        for key, val in schema_dict.items():
+                                            nested_name = nested_model_mapping.get(
+                                                (model_name, key)
+                                            )
+                                            if (
+                                                nested_name is not None
+                                                and isinstance(val, list)
+                                                and len(val) > 0
+                                                and isinstance(val[0], dict)
+                                            ):
+                                                self.contract.models[nested_name] = (
+                                                    build_model_definition(nested_name, val[0])
+                                                )
 
                                         # Map path to model dynamically
                                         req = resp.get('originalRequest', {})
@@ -165,6 +193,133 @@ class ContractBuilder:
 
         extract_schemas(data.get('item', []))
 
+    @staticmethod
+    def _unwrap_nullable_type(raw_type: Any) -> str | None:
+        """Normalize an OpenAPI `type` string or nullable type array (e.g., `['number', 'null']`)."""
+        if isinstance(raw_type, str):
+            return None if raw_type == "null" else raw_type
+        if isinstance(raw_type, list):
+            non_null = [t for t in raw_type if isinstance(t, str) and t != "null"]
+            if len(non_null) == 1:
+                return non_null[0]
+        return None
+
+    @classmethod
+    def _resolve_openapi_schema(
+        cls,
+        schema: Any,
+        root: dict[str, Any],
+        seen: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Dereference local `$ref` pointers and single-branch `allOf`/`anyOf`/`oneOf` wrappers."""
+        if not isinstance(schema, dict):
+            return {}
+        visited = set() if seen is None else set(seen)
+
+        ref = schema.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/") and ref not in visited:
+            visited.add(ref)
+            target: Any = root
+            for part in ref[2:].split("/"):
+                if isinstance(target, dict) and part in target:
+                    target = target[part]
+                else:
+                    target = None
+                    break
+            if isinstance(target, dict):
+                resolved_target = cls._resolve_openapi_schema(target, root, visited)
+                merged = dict(resolved_target)
+                for k, v in schema.items():
+                    if k != "$ref":
+                        merged[k] = v
+                return merged
+
+        for combiner in ("allOf", "anyOf", "oneOf"):
+            branches = schema.get(combiner)
+            if isinstance(branches, list):
+                non_null_branches = [
+                    b for b in branches if isinstance(b, dict) and b.get("type") != "null"
+                ]
+                if len(non_null_branches) == 1:
+                    resolved_branch = cls._resolve_openapi_schema(
+                        non_null_branches[0], root, visited
+                    )
+                    merged = dict(resolved_branch)
+                    for k, v in schema.items():
+                        if k != combiner:
+                            merged[k] = v
+                    return merged
+
+        return schema
+
+    @classmethod
+    def _extract_schema_ref(cls, schema: Any) -> str | None:
+        """Extract component `$ref` from direct, array, nullable-union, or envelope schemas."""
+        if not isinstance(schema, dict):
+            return None
+        ref_val = schema.get("$ref")
+        if isinstance(ref_val, str):
+            return ref_val
+
+        for combiner in ("allOf", "anyOf", "oneOf"):
+            branches = schema.get(combiner)
+            if isinstance(branches, list):
+                for branch in branches:
+                    found = cls._extract_schema_ref(branch)
+                    if found:
+                        return found
+
+        schema_type = cls._unwrap_nullable_type(schema.get("type"))
+        if schema_type == "array" and isinstance(schema.get("items"), dict):
+            found = cls._extract_schema_ref(schema["items"])
+            if found:
+                return found
+
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            for envelope_key in ("data", "recordData"):
+                if envelope_key in props:
+                    found = cls._extract_schema_ref(props[envelope_key])
+                    if found:
+                        return found
+        return None
+
+    def _infer_openapi_property_type(self, prop: Any, root: dict[str, Any]) -> str:
+        """Map an OpenAPI property schema (including `$ref` and nullable arrays) to internal type."""
+        if not isinstance(prop, dict):
+            return "any"
+        resolved = self._resolve_openapi_schema(prop, root)
+        prop_type = self._unwrap_nullable_type(resolved.get("type"))
+        if prop_type == "string":
+            return "string"
+        if prop_type == "integer":
+            return "integer"
+        if prop_type in {"number", "float"}:
+            return "float"
+        if prop_type == "boolean":
+            return "boolean"
+        if prop_type == "array":
+            return "list"
+        if (
+            prop_type == "object"
+            or isinstance(resolved.get("properties"), dict)
+            or "additionalProperties" in resolved
+        ):
+            return "dict"
+
+        for candidate_schema in (prop, resolved):
+            for literal_key in ("example", "default", "const"):
+                if literal_key in candidate_schema and candidate_schema[literal_key] is not None:
+                    type_name, _ = self.parse_postman_type(candidate_schema[literal_key])
+                    return type_name
+            enum_vals = candidate_schema.get("enum")
+            if isinstance(enum_vals, list) and enum_vals:
+                non_null_enum = [v for v in enum_vals if v is not None]
+                if non_null_enum:
+                    type_name, _ = self.parse_postman_type(non_null_enum[0])
+                    return type_name
+        return "any"
+
     def ingest_openapi(self, file_path: str) -> None:
         """Ingest an OpenAPI specification JSON file."""
         if not os.path.exists(file_path):
@@ -177,104 +332,80 @@ class ContractBuilder:
             return
 
         components = data.get("components", {})
-        schemas = components.get("schemas", {})
+        schemas = components.get("schemas", {}) if isinstance(components, dict) else {}
+        if not isinstance(schemas, dict):
+            schemas = {}
 
-        for model_name, schema in schemas.items():
-            if schema.get("type") == "object":
+        for model_name, raw_schema in schemas.items():
+            schema = self._resolve_openapi_schema(raw_schema, data)
+            schema_type = self._unwrap_nullable_type(schema.get("type"))
+            if schema_type == "object" or isinstance(schema.get("properties"), dict):
                 properties = schema.get("properties", {})
+                if not isinstance(properties, dict):
+                    continue
                 fields = {}
                 for key, prop in properties.items():
                     snake_key = to_snake(key)
-
-                    type_name = "any"
-                    default_value = None
-                    prop_type = prop.get("type")
-                    if prop_type == "string":
-                        type_name = "string"
-                    elif prop_type == "integer":
-                        type_name = "integer"
-                    elif prop_type == "boolean":
-                        type_name = "boolean"
-                    elif prop_type == "object":
-                        type_name = "dict"
-                    elif prop_type == "array":
-                        type_name = "list"
-                    elif "example" in prop and prop["example"] is not None:
-                        type_name, _ = self.parse_postman_type(prop["example"])
-                    elif "default" in prop and prop["default"] is not None:
-                        type_name, _ = self.parse_postman_type(prop["default"])
-                    elif "const" in prop and prop["const"] is not None:
-                        type_name, _ = self.parse_postman_type(prop["const"])
-                    elif (
-                        "enum" in prop
-                        and isinstance(prop["enum"], list)
-                        and prop["enum"]
-                        and prop["enum"][0] is not None
-                    ):
-                        type_name, _ = self.parse_postman_type(prop["enum"][0])
-
+                    type_name = self._infer_openapi_property_type(prop, data)
                     fields[snake_key] = FieldDefinition(
                         name=snake_key,
                         type_name=type_name,
-                        default_value=default_value,
+                        default_value=None,
                         alias=key,
                     )
 
                 self.contract.models[model_name] = ModelDefinition(name=model_name, fields=fields)
 
         openapi_paths = data.get("paths", {})
+        if not isinstance(openapi_paths, dict):
+            return
+
         for path, path_obj in openapi_paths.items():
+            if not isinstance(path_obj, dict):
+                continue
             for method, method_obj in path_obj.items():
-                if method.lower() != "get":
+                method_lower = method.lower()
+                if method_lower not in {"get", "post"} or not isinstance(method_obj, dict):
                     continue
+
+                ref: str | None = None
                 responses = method_obj.get("responses", {})
-                for status, response_obj in responses.items():
-                    if status.startswith("2"):
-                        content = response_obj.get("content", {})
-                        for content_type, content_obj in content.items():  # noqa: B007
-                            schema = content_obj.get("schema", {})
-                            ref = None
+                if isinstance(responses, dict):
+                    for status, response_obj in responses.items():
+                        if not str(status).startswith("2") or not isinstance(response_obj, dict):
+                            continue
+                        resolved_resp = self._resolve_openapi_schema(response_obj, data)
+                        content = resolved_resp.get("content", {})
+                        if not isinstance(content, dict):
+                            continue
+                        for content_obj in content.values():
+                            if isinstance(content_obj, dict):
+                                ref = self._extract_schema_ref(content_obj.get("schema", {}))
+                                if ref:
+                                    break
+                        if ref:
+                            break
 
-                            if "$ref" in schema:
-                                ref = schema["$ref"]
-                            elif (
-                                schema.get("type") == "array"
-                                and "items" in schema
-                                and "$ref" in schema["items"]
-                            ):
-                                ref = schema["items"]["$ref"]
-                            elif "properties" in schema:
-                                data_prop = schema["properties"].get("data")
-                                if data_prop and "$ref" in data_prop:
-                                    ref = data_prop["$ref"]
-                                elif (
-                                    data_prop
-                                    and data_prop.get("type") == "array"
-                                    and "items" in data_prop
-                                    and "$ref" in data_prop["items"]
-                                ):
-                                    ref = data_prop["items"]["$ref"]
-                                elif "recordData" in schema["properties"]:
-                                    data_prop = schema["properties"]["recordData"]
-                                    if data_prop and "$ref" in data_prop:
-                                        ref = data_prop["$ref"]
-                                    elif (
-                                        data_prop
-                                        and data_prop.get("type") == "array"
-                                        and "items" in data_prop
-                                        and "$ref" in data_prop["items"]
-                                    ):
-                                        ref = data_prop["items"]["$ref"]
+                if ref is None and method_lower == "post":
+                    req_body = self._resolve_openapi_schema(method_obj.get("requestBody", {}), data)
+                    req_content = req_body.get("content", {})
+                    if isinstance(req_content, dict):
+                        for content_obj in req_content.values():
+                            if isinstance(content_obj, dict):
+                                ref = self._extract_schema_ref(content_obj.get("schema", {}))
+                                if ref:
+                                    break
 
-                            if ref:
-                                model_name = ref.split("/")[-1]
-                                path_segments = [p for p in path.split("/") if p]
-                                for p in reversed(path_segments):
-                                    if (  # noqa: SIM102
-                                        isinstance(p, str)
-                                        and not p.startswith('{')
-                                        and not p.startswith(':')
-                                    ):
-                                        if p.isalpha() or p.replace('_', '').isalpha():
-                                            self.contract.paths[p] = model_name
-                                            break
+                if ref:
+                    model_name = ref.split("/")[-1]
+                    path_segments = [p for p in path.split("/") if p]
+                    for p in reversed(path_segments):
+                        if (
+                            isinstance(p, str)
+                            and not p.startswith("{")
+                            and not p.startswith(":")
+                            and (p.isalpha() or p.replace("_", "").isalpha())
+                        ):
+                            if p not in self.contract.paths or method_lower == "get":
+                                self.contract.paths[p] = model_name
+                            break

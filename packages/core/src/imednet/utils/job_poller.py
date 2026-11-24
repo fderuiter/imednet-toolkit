@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, NoReturn, Protocol, cast, runtime_checkable
 
 from imednet.models.jobs import (
     InvalidJobStateError,
@@ -23,7 +23,10 @@ from imednet.models.jobs import (
     normalize_job_state,
     validate_job_transition,
 )
-from imednet.utils.secrets import redact_sensitive_payload
+from imednet.utils.security import (
+    sanitize_diagnostic_payload,
+    sanitize_diagnostic_text,
+)
 from imednet.utils.url import validate_path_segment
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,17 @@ _ORIGINAL_TIME_SLEEP = time.sleep
 
 class _PollAbortedError(Exception):
     """Internal cooperative stop signal for sibling synchronous pollers."""
+
+
+@dataclass
+class _PollState:
+    """Mutable per-run state for single-job polling loops."""
+
+    batch_id: str
+    start: float
+    poll_number: int = 0
+    last_status: JobStatus | None = None
+    terminal_status: JobStatus | None = None
 
 
 __all__ = [
@@ -105,7 +119,7 @@ class JobPollSummary:
         """Return True if all jobs were successful with zero failed records."""
         return not self.failures and all(
             cast(Any, s).is_successful
-            and getattr(s, "failed_records", 0) == 0
+            and (getattr(s, "failed_records", None) or 0) == 0
             and not getattr(s, "result_error", None)
             for s in self.results.values()
         )
@@ -115,10 +129,20 @@ class JobPollSummary:
         """Return True if any job failed, timed out, or reported failed records."""
         return bool(self.failures) or any(
             cast(Any, s).is_failed
-            or getattr(s, "failed_records", 0) > 0
+            or (getattr(s, "failed_records", None) or 0) > 0
             or bool(getattr(s, "result_error", None))
             for s in self.results.values()
         )
+
+    @property
+    def terminal_statuses(self) -> dict[str, JobStatus]:
+        """Return all terminal JobStatus objects across completed results and failed batches."""
+        combined: dict[str, JobStatus] = dict(self.results)
+        for batch_id, err in self.failures.items():
+            status = getattr(err, "status", None)
+            if isinstance(status, JobStatus) and batch_id not in combined:
+                combined[batch_id] = status
+        return combined
 
 
 class JobTimeoutError(TimeoutError):
@@ -136,17 +160,17 @@ def _extract_record_errors(status: JobStatus | Any) -> list[dict[str, Any]]:
             item_status = str(item.get("status") or "").upper()
             has_err_key = bool(item.get("error") or item.get("errors"))
             if item_status in {"FAIL", "FAILED", "ERROR"} or (not item_status and has_err_key):
-                extracted.append(cast(dict[str, Any], redact_sensitive_payload(item)))
+                extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(item)))
     elif isinstance(results, dict):
         nested_errors = results.get("errors")
         if isinstance(nested_errors, list):
             for err_item in nested_errors:
                 if isinstance(err_item, dict):
-                    extracted.append(cast(dict[str, Any], redact_sensitive_payload(err_item)))
+                    extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(err_item)))
                 elif err_item is not None:
-                    extracted.append({"error": str(redact_sensitive_payload(err_item))})
+                    extracted.append({"error": sanitize_diagnostic_text(str(err_item))})
         elif results.get("error"):
-            extracted.append(cast(dict[str, Any], redact_sensitive_payload(results)))
+            extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(results)))
     return extracted
 
 
@@ -200,21 +224,26 @@ class JobFailedError(Exception):
         *,
         record_errors: list[dict[str, Any]] | None = None,
         result_error: str | None = None,
+        poll_summary: JobPollSummary | None = None,
+        partial_summary: Any | None = None,
     ) -> None:
-        """Initialize the JobFailedError with attached record diagnostics."""
+        """Initialize the JobFailedError with attached record and batch diagnostics."""
         resolved_errors = (
-            record_errors if record_errors is not None else _extract_record_errors(status)
+            cast(list[dict[str, Any]], sanitize_diagnostic_payload(record_errors))
+            if record_errors is not None
+            else _extract_record_errors(status)
         )
         raw_res_err = (
             result_error if result_error is not None else getattr(status, "result_error", None)
         )
         resolved_result_error = (
-            str(redact_sensitive_payload(raw_res_err))
+            sanitize_diagnostic_text(raw_res_err)
             if isinstance(raw_res_err, str) and raw_res_err
             else None
         )
+        sanitized_base = sanitize_diagnostic_text(message)
         formatted_message = _format_job_failure_details(
-            message,
+            sanitized_base,
             status,
             resolved_errors,
             resolved_result_error,
@@ -223,6 +252,8 @@ class JobFailedError(Exception):
         self.status = status
         self.record_errors = resolved_errors
         self.result_error = resolved_result_error
+        self.poll_summary = poll_summary
+        self.partial_summary = partial_summary
 
 
 def evaluate_job_state(
@@ -293,7 +324,7 @@ def _attach_fetched_result(status: JobStatus | Any, res: Any) -> JobStatus | Any
                 f"Expected JSON object or array from resultUrl, got {type(parsed).__name__}"
             )
     except Exception as exc:
-        redacted_err = str(redact_sensitive_payload(str(exc))) or "Invalid JSON in resultUrl body"
+        redacted_err = sanitize_diagnostic_text(str(exc)) or "Invalid JSON in resultUrl body"
         status.results = None
         status.result_error = redacted_err
         raise ValueError(f"Non-JSON resultUrl response: {redacted_err}") from exc
@@ -327,6 +358,26 @@ def resolve_sdk_result_fetcher(sdk: Any) -> Callable[[str], Any] | None:
     return None
 
 
+def _raise_fetch_result_error(
+    batch_id: str,
+    status: JobStatus | Any,
+    exc: Exception,
+) -> NoReturn:
+    """Redact credentials and PHI, record ``result_error``, log, and raise :class:`JobFailedError`."""
+    redacted_err = sanitize_diagnostic_text(str(exc))
+    status.result_error = redacted_err
+    logger.error(
+        "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",
+        batch_id,
+        redacted_err,
+    )
+    raise JobFailedError(
+        f"Job {batch_id} failed to fetch resultUrl: {redacted_err}",
+        status,
+        result_error=redacted_err,
+    ) from exc
+
+
 def fetch_terminal_job_result(
     status: JobStatus | Any,
     fetch_result: Callable[[str], Any] | None,
@@ -347,18 +398,7 @@ def fetch_terminal_job_result(
         res = fetch_result(cast(str, result_url))
         return _attach_fetched_result(status, res)
     except Exception as exc:
-        redacted_err = str(redact_sensitive_payload(str(exc)))
-        status.result_error = redacted_err
-        logger.error(
-            "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",
-            resolved_batch_id,
-            redacted_err,
-        )
-        raise JobFailedError(
-            f"Job {resolved_batch_id} failed to fetch resultUrl: {redacted_err}",
-            status,
-            result_error=redacted_err,
-        ) from exc
+        _raise_fetch_result_error(resolved_batch_id, status, exc)
 
 
 class BaseJobPoller:
@@ -461,6 +501,111 @@ class BaseJobPoller:
         else:
             cast(JobProgressCallback, on_progress)(*legacy_args)
 
+    def _prepare_poll(self, study_key: str, batch_id: str) -> _PollState:
+        """Validate polling path segments, start timer, and inspect terminal ledger."""
+        validate_path_segment(study_key, name="study_key")
+        validate_path_segment(batch_id, name="batch_id")
+        start = time.monotonic()
+        with self._lock:
+            terminal_status = self._terminal_states.get(batch_id)
+        return _PollState(batch_id=batch_id, start=start, terminal_status=terminal_status)
+
+    def _record_poll_step(
+        self,
+        poll: _PollState,
+        result: JobStatus,
+        timeout: float,
+        on_progress: JobProgressHandler | None,
+    ) -> JobStatusEvent:
+        """Validate transition, evaluate timeout/completion, log progress, and notify callbacks."""
+        poll.poll_number += 1
+        status = self._check_complete(result, poll.batch_id)
+        status, poll.terminal_status = self._guard_transition(
+            poll.batch_id, status, poll.last_status, poll.terminal_status
+        )
+        poll.last_status = status
+        elapsed = time.monotonic() - poll.start
+        is_terminal = self._evaluate(poll.start, timeout, poll.batch_id, status)
+        event = JobStatusEvent(
+            batch_id=poll.batch_id,
+            status=status,
+            poll_number=poll.poll_number,
+            elapsed=elapsed,
+            is_terminal=is_terminal,
+        )
+        logger.debug(
+            "[JobPoller] batch_id=%s state=%s progress=%s%% elapsed=%ss",
+            poll.batch_id,
+            status.state,
+            getattr(status, "progress", 0),
+            round(elapsed, 1),
+        )
+        self._trigger_callback(on_progress, event)
+        return event
+
+    def _finalize_poll(self, event: JobStatusEvent) -> JobStatus:
+        """Log terminal polling status, evaluate final job state, and return status."""
+        status = event.status
+        if cast(Any, status).is_successful:
+            logger.info(
+                "[JobPoller] batch_id=%s COMPLETED after %s polls (%ss)",
+                event.batch_id,
+                event.poll_number,
+                round(event.elapsed, 1),
+            )
+        else:
+            logger.error(
+                "[JobPoller] batch_id=%s FAILED: state=%s failed_records=%s",
+                event.batch_id,
+                status.state,
+                getattr(status, "failed_records", 0),
+            )
+        evaluate_job_state(status)
+        return status
+
+    def _prepare_batch_poll(
+        self, study_key: str, batch_ids: list[str]
+    ) -> tuple[float, dict[str, JobStatus], dict[str, Exception], JobPollSummary | None]:
+        """Validate batch path segments and initialize summary state."""
+        validate_path_segment(study_key, name="study_key")
+        for batch_id in batch_ids:
+            validate_path_segment(batch_id, name="batch_id")
+        start = time.monotonic()
+        results: dict[str, JobStatus] = {}
+        failures: dict[str, Exception] = {}
+        empty = (
+            self._build_poll_summary(study_key, results, failures, start) if not batch_ids else None
+        )
+        return start, results, failures, empty
+
+    def _record_batch_result(
+        self, results: dict[str, JobStatus], batch_id: str, status: JobStatus
+    ) -> None:
+        """Record a batch status while preserving previously recorded terminal states."""
+        existing = results.get(batch_id)
+        if (
+            existing is not None
+            and getattr(existing, "is_terminal", False)
+            and not getattr(status, "is_terminal", False)
+        ):
+            return
+        results[batch_id] = status
+
+    def _build_poll_summary(
+        self,
+        study_key: str,
+        results: dict[str, JobStatus],
+        failures: dict[str, Exception],
+        start: float,
+    ) -> JobPollSummary:
+        """Assemble a :class:`JobPollSummary` with total elapsed polling duration."""
+        return JobPollSummary(
+            study_key=study_key,
+            results=results,
+            failures=failures,
+            elapsed_total=time.monotonic() - start,
+        )
+
 
 class JobPoller(BaseJobPoller):
     """Synchronously poll a job until completion."""
@@ -506,8 +651,6 @@ class JobPoller(BaseJobPoller):
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Synchronously poll a job until completion."""
-        validate_path_segment(study_key, name="study_key")
-        validate_path_segment(batch_id, name="batch_id")
         return self._run_with_stop(
             study_key,
             batch_id,
@@ -528,69 +671,17 @@ class JobPoller(BaseJobPoller):
         stop_event: threading.Event | None = None,
     ) -> JobStatus:
         """Synchronously poll a job until completion or cooperative stop_event signal."""
-        validate_path_segment(study_key, name="study_key")
-        validate_path_segment(batch_id, name="batch_id")
-        start = time.monotonic()
-        poll_number = 0
-        last_status: JobStatus | None = None
-        with self._lock:
-            terminal_status: JobStatus | None = self._terminal_states.get(batch_id)
-
+        poll = self._prepare_poll(study_key, batch_id)
         while True:
             if stop_event is not None and stop_event.is_set():
                 raise _PollAbortedError
-            poll_number += 1
             result = self._get_job(study_key, batch_id)
-            status = self._check_complete(result, batch_id)
-            status, terminal_status = self._guard_transition(
-                batch_id, status, last_status, terminal_status
-            )
-            last_status = status
-            elapsed = time.monotonic() - start
-            is_terminal = self._evaluate(start, timeout, batch_id, status)
-
-            event = JobStatusEvent(
-                batch_id=batch_id,
-                status=status,
-                poll_number=poll_number,
-                elapsed=elapsed,
-                is_terminal=is_terminal,
-            )
-
-            # Structured logging
-            logger.debug(
-                "[JobPoller] batch_id=%s state=%s progress=%s%% elapsed=%ss",
-                batch_id,
-                status.state,
-                getattr(status, "progress", 0),
-                round(elapsed, 1),
-            )
-
-            self._trigger_callback(on_progress, event)
-
-            if is_terminal:
+            event = self._record_poll_step(poll, result, timeout, on_progress)
+            if event.is_terminal:
                 if stop_event is not None and stop_event.is_set():
                     raise _PollAbortedError
-                fetch_terminal_job_result(status, self._fetch_result, batch_id=batch_id)
-
-                if cast(Any, status).is_successful:
-                    logger.info(
-                        "[JobPoller] batch_id=%s COMPLETED after %s polls (%ss)",
-                        batch_id,
-                        poll_number,
-                        round(elapsed, 1),
-                    )
-                else:
-                    logger.error(
-                        "[JobPoller] batch_id=%s FAILED: state=%s failed_records=%s",
-                        batch_id,
-                        status.state,
-                        getattr(status, "failed_records", 0),
-                    )
-
-                evaluate_job_state(status)
-                return status
-
+                fetch_terminal_job_result(event.status, self._fetch_result, batch_id=batch_id)
+                return self._finalize_poll(event)
             self._wait_or_abort(interval, stop_event)
 
     def poll_many(
@@ -625,23 +716,12 @@ class JobPoller(BaseJobPoller):
             Called for each job on each poll cycle. Thread-safe: the callback
             must be safe to call from multiple threads simultaneously.
         """
-        results: dict[str, JobStatus] = {}
-        failures: dict[str, Exception] = {}
-        validate_path_segment(study_key, name="study_key")
-        for batch_id in batch_ids:
-            validate_path_segment(batch_id, name="batch_id")
+        start, results, failures, empty_summary = self._prepare_batch_poll(study_key, batch_ids)
+        if empty_summary is not None:
+            return empty_summary
         lock = threading.Lock()
         stop_event = threading.Event()
         first_failure: Exception | None = None
-        start = time.monotonic()
-
-        if not batch_ids:
-            return JobPollSummary(
-                study_key=study_key,
-                results=results,
-                failures=failures,
-                elapsed_total=time.monotonic() - start,
-            )
 
         def _poll_one(batch_id: str) -> None:
             nonlocal first_failure
@@ -657,14 +737,7 @@ class JobPoller(BaseJobPoller):
                     stop_event=stop_event if fail_fast else None,
                 )
                 with lock:
-                    if (
-                        batch_id in results
-                        and getattr(results[batch_id], "is_terminal", False)
-                        and not getattr(status, "is_terminal", False)
-                    ):
-                        pass
-                    else:
-                        results[batch_id] = status
+                    self._record_batch_result(results, batch_id, status)
             except _PollAbortedError:
                 return
             except Exception as exc:
@@ -685,12 +758,7 @@ class JobPoller(BaseJobPoller):
         if fail_fast and first_failure is not None:
             raise first_failure
 
-        return JobPollSummary(
-            study_key=study_key,
-            results=results,
-            failures=failures,
-            elapsed_total=time.monotonic() - start,
-        )
+        return self._build_poll_summary(study_key, results, failures, start)
 
 
 class AsyncJobPoller(BaseJobPoller):
@@ -711,6 +779,18 @@ class AsyncJobPoller(BaseJobPoller):
         self._get_job = get_job
         self._fetch_result = fetch_result
 
+    async def _fetch_terminal_result(self, batch_id: str, status: JobStatus) -> JobStatus:
+        """Fetch and attach ``resultUrl`` output for a terminal job status when available."""
+        result_url = getattr(status, "result_url", None)
+        if not self._fetch_result or not _is_fetchable_result_url(result_url):
+            return status
+        try:
+            res = await self._fetch_result(cast(str, result_url))
+            self._process_fetch_result(status, res)
+            return status
+        except Exception as exc:
+            _raise_fetch_result_error(batch_id, status, exc)
+
     async def run(
         self,
         study_key: str,
@@ -721,83 +801,13 @@ class AsyncJobPoller(BaseJobPoller):
         on_progress: JobProgressHandler | None = None,
     ) -> JobStatus:
         """Asynchronously poll a job until completion."""
-        validate_path_segment(study_key, name="study_key")
-        validate_path_segment(batch_id, name="batch_id")
-        start = time.monotonic()
-        poll_number = 0
-        last_status: JobStatus | None = None
-        with self._lock:
-            terminal_status: JobStatus | None = self._terminal_states.get(batch_id)
-
+        poll = self._prepare_poll(study_key, batch_id)
         while True:
-            poll_number += 1
             result = await self._get_job(study_key, batch_id)
-            status = self._check_complete(result, batch_id)
-            status, terminal_status = self._guard_transition(
-                batch_id, status, last_status, terminal_status
-            )
-            last_status = status
-            elapsed = time.monotonic() - start
-            is_terminal = self._evaluate(start, timeout, batch_id, status)
-
-            event = JobStatusEvent(
-                batch_id=batch_id,
-                status=status,
-                poll_number=poll_number,
-                elapsed=elapsed,
-                is_terminal=is_terminal,
-            )
-
-            # Structured logging
-            logger.debug(
-                "[JobPoller] batch_id=%s state=%s progress=%s%% elapsed=%ss",
-                batch_id,
-                status.state,
-                getattr(status, "progress", 0),
-                round(elapsed, 1),
-            )
-
-            self._trigger_callback(on_progress, event)
-
-            if is_terminal:
-                if self._fetch_result and _is_fetchable_result_url(
-                    getattr(status, "result_url", None)
-                ):
-                    try:
-                        res = await self._fetch_result(status.result_url)  # type: ignore
-                        self._process_fetch_result(status, res)
-                    except Exception as exc:
-                        redacted_err = str(redact_sensitive_payload(str(exc)))
-                        status.result_error = redacted_err
-                        logger.error(
-                            "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",
-                            batch_id,
-                            redacted_err,
-                        )
-                        raise JobFailedError(
-                            f"Job {batch_id} failed to fetch resultUrl: {redacted_err}",
-                            status,
-                            result_error=redacted_err,
-                        ) from exc
-
-                if cast(Any, status).is_successful:
-                    logger.info(
-                        "[JobPoller] batch_id=%s COMPLETED after %s polls (%ss)",
-                        batch_id,
-                        poll_number,
-                        round(elapsed, 1),
-                    )
-                else:
-                    logger.error(
-                        "[JobPoller] batch_id=%s FAILED: state=%s failed_records=%s",
-                        batch_id,
-                        status.state,
-                        getattr(status, "failed_records", 0),
-                    )
-
-                evaluate_job_state(status)
-                return status
-
+            event = self._record_poll_step(poll, result, timeout, on_progress)
+            if event.is_terminal:
+                await self._fetch_terminal_result(batch_id, event.status)
+                return self._finalize_poll(event)
             await asyncio.sleep(interval)
 
     async def async_poll_many(
@@ -816,20 +826,9 @@ class AsyncJobPoller(BaseJobPoller):
         individual failures unless fail_fast=True, which cancels and awaits
         pending sibling tasks before raising the triggering exception.
         """
-        start = time.monotonic()
-        results: dict[str, JobStatus] = {}
-        failures: dict[str, Exception] = {}
-        validate_path_segment(study_key, name="study_key")
-        for batch_id in batch_ids:
-            validate_path_segment(batch_id, name="batch_id")
-
-        if not batch_ids:
-            return JobPollSummary(
-                study_key=study_key,
-                results=results,
-                failures=failures,
-                elapsed_total=time.monotonic() - start,
-            )
+        start, results, failures, empty_summary = self._prepare_batch_poll(study_key, batch_ids)
+        if empty_summary is not None:
+            return empty_summary
 
         async def _poll_one(batch_id: str) -> None:
             try:
@@ -840,14 +839,7 @@ class AsyncJobPoller(BaseJobPoller):
                     timeout=timeout,
                     on_progress=on_progress,
                 )
-                if (
-                    batch_id in results
-                    and getattr(results[batch_id], "is_terminal", False)
-                    and not getattr(status, "is_terminal", False)
-                ):
-                    pass
-                else:
-                    results[batch_id] = status
+                self._record_batch_result(results, batch_id, status)
             except Exception as exc:
                 failures[batch_id] = exc
                 if fail_fast:
@@ -884,9 +876,4 @@ class AsyncJobPoller(BaseJobPoller):
                     sibling.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
 
-        return JobPollSummary(
-            study_key=study_key,
-            results=results,
-            failures=failures,
-            elapsed_total=time.monotonic() - start,
-        )
+        return self._build_poll_summary(study_key, results, failures, start)

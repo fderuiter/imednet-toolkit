@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, overload
+from typing import Any
 
 from pydantic import (
     Field,
@@ -67,22 +67,16 @@ class Keyword(ImednetBaseModel):
     keyword_id: int = Field(0, alias="keywordId")
     date_added: datetime = Field(default_factory=datetime.now, alias="dateAdded")
 
-    @overload
     def __init__(
         self,
         *,
         keyword_name: str = "",
-        keyword_key: str = "",
-        keyword_id: int = 0,
-        date_added: datetime = ...,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         keywordName: str = "",
+        keyword_key: str = "",
         keywordKey: str = "",
+        keyword_id: int = 0,
         keywordId: int = 0,
+        date_added: datetime = ...,
         dateAdded: datetime = ...,
     ) -> None: ...
 
@@ -110,54 +104,46 @@ class Record(ImednetBaseModel):
     parent_record_id: int | None = Field(default=None, alias="parentRecordId")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         keywords: list[Keyword] = ...,
         record_data: dict[str, Any] = ...,
-        record_status: RecordStatus | str | None = None,
-        deleted: bool | None = None,
-        study_key: str | None = None,
-        interval_id: int | None = None,
-        form_id: int | None = None,
-        form_key: str | None = None,
-        site_id: int | None = None,
-        record_id: int | None = None,
-        record_oid: str | None = None,
-        record_type: str | None = None,
-        date_created: str | None = None,
-        date_modified: str | None = None,
-        subject_id: int | None = None,
-        subject_oid: str | None = None,
-        subject_key: str | None = None,
-        visit_id: int | None = None,
-        parent_record_id: int | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        keywords: list[Keyword] = ...,
         recordData: dict[str, Any] = ...,
+        record_status: RecordStatus | str | None = None,
         recordStatus: RecordStatus | str | None = None,
         deleted: bool | None = None,
+        study_key: str | None = None,
         studyKey: str | None = None,
+        interval_id: int | None = None,
         intervalId: int | None = None,
+        form_id: int | None = None,
         formId: int | None = None,
+        form_key: str | None = None,
         formKey: str | None = None,
+        site_id: int | None = None,
         siteId: int | None = None,
+        record_id: int | None = None,
         recordId: int | None = None,
+        record_oid: str | None = None,
         recordOid: str | None = None,
+        record_type: str | None = None,
         recordType: str | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_modified: str | None = None,
         dateModified: str | None = None,
+        subject_id: int | None = None,
         subjectId: int | None = None,
+        subject_oid: str | None = None,
         subjectOid: str | None = None,
+        subject_key: str | None = None,
         subjectKey: str | None = None,
+        visit_id: int | None = None,
         visitId: int | None = None,
+        parent_record_id: int | None = None,
         parentRecordId: int | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
     @field_validator("record_status", mode="before")
@@ -179,10 +165,15 @@ class RecordJobResponse(ImednetBaseModel):
     batch_id: str = Field("", alias="batchId")
     state: str = Field("", alias="state")
 
-    @overload
-    def __init__(self, *, job_id: str = "", batch_id: str = "", state: str = "") -> None: ...
-    @overload
-    def __init__(self, *, jobId: str = "", batchId: str = "", state: str = "") -> None: ...
+    def __init__(
+        self,
+        *,
+        job_id: str = "",
+        jobId: str = "",
+        batch_id: str = "",
+        batchId: str = "",
+        state: str = "",
+    ) -> None: ...
 
 class RecordData(RootModel[dict[str, Any]]):
     """Arbitrary record data as a dictionary."""
@@ -193,61 +184,57 @@ class BaseRecordRequest(ImednetBaseModel):
     form_key: str = Field("", alias="formKey")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
 
-    @overload
-    def __init__(self, *, form_key: str = "", data: RecordData = ...) -> None: ...
-    @overload
-    def __init__(self, *, formKey: str = "", data: RecordData = ...) -> None: ...
+    def __init__(
+        self, *, form_key: str = "", formKey: str = "", data: RecordData | dict[str, Any] = ...
+    ) -> None: ...
 
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Registering a subject requires ``formKey`` and ``siteName``. When ``subjectKey``
-    or ``subjectOid`` are omitted, they are excluded from serialized payloads so
-    studies with server-assigned subject identifiers continue to work; when
+    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
+    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
+    ``None`` so server-assigned subject keys continue working by default; when
     explicitly supplied, they are preserved for enrollment and deduplication.
     """
 
     site_name: str = Field(
         "", alias="siteName", description="Name of the site where the subject is enrolled"
     )
-    subject_key: str | None = Field(
+    site_id: int | None = Field(
         default=None,
-        alias="subjectKey",
-        description="Optional subject key when explicitly supplied by the caller",
+        alias="siteId",
+        description="Numeric ID of the site where the subject is enrolled",
+    )
+    subject_key: str | None = Field(
+        default=None, alias="subjectKey", description="Optional client-assigned subject key"
     )
     subject_oid: str | None = Field(
-        default=None,
-        alias="subjectOid",
-        description="Optional subject OID when explicitly supplied by the caller",
+        default=None, alias="subjectOid", description="Optional subject OID"
     )
 
-    @overload
     def __init__(
         self,
         *,
         form_key: str = "",
-        data: RecordData = ...,
-        site_name: str = "",
-        subject_key: str | None = None,
-        subject_oid: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         formKey: str = "",
-        data: RecordData = ...,
+        data: RecordData | dict[str, Any] = ...,
+        site_name: str = "",
         siteName: str = "",
+        site_id: int | None = None,
+        siteId: int | None = None,
+        subject_key: str | None = None,
         subjectKey: str | None = None,
+        subject_oid: str | None = None,
         subjectOid: str | None = None,
     ) -> None: ...
     @field_validator("subject_key", "subject_oid", mode="before")
     @classmethod
     def _normalize_optional_subject_identifier(cls, value: Any) -> str | None: ...
     @model_serializer(mode="wrap")
-    def _serialize_omitting_unset_subject_keys(
+    def _serialize_omitting_unset_enrollment_fields(
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, Any]: ...
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]: ...
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):
     """Payload for updating an existing scheduled record."""
@@ -255,22 +242,15 @@ class UpdateScheduledRecordRequest(BaseRecordRequest):
     subject_key: str = Field("", alias="subjectKey")
     interval_name: str = Field("", alias="intervalName")
 
-    @overload
     def __init__(
         self,
         *,
         form_key: str = "",
-        data: RecordData = ...,
-        subject_key: str = "",
-        interval_name: str = "",
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         formKey: str = "",
-        data: RecordData = ...,
+        data: RecordData | dict[str, Any] = ...,
+        subject_key: str = "",
         subjectKey: str = "",
+        interval_name: str = "",
         intervalName: str = "",
     ) -> None: ...
 
@@ -279,13 +259,14 @@ class CreateNewRecordRequest(BaseRecordRequest):
 
     subject_key: str = Field("", alias="subjectKey")
 
-    @overload
     def __init__(
-        self, *, form_key: str = "", data: RecordData = ..., subject_key: str = ""
-    ) -> None: ...
-    @overload
-    def __init__(
-        self, *, formKey: str = "", data: RecordData = ..., subjectKey: str = ""
+        self,
+        *,
+        form_key: str = "",
+        formKey: str = "",
+        data: RecordData | dict[str, Any] = ...,
+        subject_key: str = "",
+        subjectKey: str = "",
     ) -> None: ...
 
 __all__ = [

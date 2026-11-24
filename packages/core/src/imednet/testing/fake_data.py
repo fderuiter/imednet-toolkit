@@ -119,13 +119,19 @@ def _fake_value(var_type: str) -> Any:
     """Return a fake value matching ``var_type``."""
     spec = _CANONICAL_VARIABLE_TAXONOMY.get(_normalize_variable_type_key(var_type))
     if spec is not None:
-        validator = spec[2]
+        category, _, validator = spec
         if validator is _validate_int:
             return faker.random_int(min=0, max=100)
         if validator in (_validate_float, _validate_calculation):
             return faker.pyfloat(left_digits=2, right_digits=2, positive=True)
         if validator is _validate_bool:
             return faker.boolean()
+        if category in ("date", "date/time precision"):
+            return faker.date_time().strftime("%Y-%m-%d")
+        if category == "datetime":
+            return faker.date_time().strftime("%Y-%m-%dT%H:%M:%S")
+        if category == "time":
+            return faker.date_time().strftime("%H:%M:%S")
     return faker.word()
 
 
@@ -136,7 +142,8 @@ def fake_record(schema: SchemaCache | None = None) -> dict[str, Any]:
     ``recordData`` values.
     """
     if schema and schema._form_variables:
-        raw_key = faker.random_element(list(schema._form_variables))
+        non_empty_keys = [k for k, v in schema._form_variables.items() if v]
+        raw_key = faker.random_element(non_empty_keys or list(schema._form_variables))
         if isinstance(raw_key, tuple):
             study_key_val, form_key = raw_key
             variables = schema.variables_for_form(form_key, study_key=study_key_val)
@@ -144,8 +151,8 @@ def fake_record(schema: SchemaCache | None = None) -> dict[str, Any]:
             study_key_val = ""
             form_key = raw_key
             variables = schema.variables_for_form(form_key)
-        first_var = next(iter(variables.values()))
-        form_id = first_var.form_id
+        first_var = next(iter(variables.values()), None)
+        form_id = first_var.form_id if first_var is not None else faker.random_int(min=1, max=10000)
         record_data = {
             name: _fake_value(var.variable_type or "") for name, var in variables.items()
         }
@@ -264,6 +271,8 @@ def fake_variables_for_cache(
     for form in forms:
         for _ in range(vars_per_form):
             data = fake_variable()
+            data["deleted"] = False
+            data["disabled"] = False
             data["formId"] = form.form_id
             data["formKey"] = form.form_key
             data["formName"] = form.form_name

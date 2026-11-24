@@ -4,16 +4,22 @@ Workflow plugin package for the iMednet Python SDK.
 
 ## Install
 
-Install the package via standard pip using the public package distribution name:
+### Published PyPI Release
+
+Install the package via `pip` using the public package distribution name:
 
 ```bash
 pip install imednet-workflows
 ```
 
-Or using the workspace-relative path install command:
+### Source Checkout
+
+From a local repository checkout:
 
 ```bash
-pip install ./packages/plugins-workflows
+git clone https://github.com/fderuiter/imednet-toolkit.git
+cd imednet-toolkit
+pip install -e ./packages/plugins-workflows
 ```
 
 **Required Dependencies:**
@@ -21,6 +27,28 @@ Requires Python 3.11 or newer, `imednet`, `pandas`, `cryptography`, and
 `filelock>=4.2.1` for cross-platform file locking. Recreate Python 3.10 virtual
 environments before upgrading. UAT commands are included; there is no separate
 `uat` extra.
+
+## Programmatic Usage
+
+Initialize `ImednetSDK` in offline `simulation_mode=True` or pass both `api_key` and `security_key` for live environments:
+
+```python
+import os
+
+from imednet import ImednetSDK
+from imednet_workflows import get_study_structure
+
+with ImednetSDK(simulation_mode=True) as sim_sdk:
+    structure = get_study_structure(sim_sdk, "STUDY")
+    print(f"Study {structure.study_key}: {len(structure.forms)} Form definitions.")
+
+with ImednetSDK(
+    api_key=os.environ["IMEDNET_API_KEY"],
+    security_key=os.environ["IMEDNET_SECURITY_KEY"],
+) as live_sdk:
+    live_structure = get_study_structure(live_sdk, "STUDY")
+    print(len(live_structure.intervals))
+```
 
 ## Launch via CLI
 
@@ -74,4 +102,12 @@ The following components are exposed via Python entry points:
 | `ChunkedRecordPipeline` | Memory-efficient streaming partitions to export sequence-numbered tabular files. |
 | `SchemaProfiler` | Profiles clinical records schemas against expected structures. |
 | `StandardsReadinessValidator` | Validates records against standard CDISC definitions. |
-| `UatOrchestrator` | Test generation engine that generates valid and invalid mock payloads. |
+| `UATWorkflow` | Test generation engine that generates valid and invalid mock payloads. |
+
+## Links
+
+- UAT Workflow Guide: <https://fderuiter.github.io/imednet-toolkit/how-to/workflows/uat_workflow.html>
+- Bulk Record Creation Guide: <https://fderuiter.github.io/imednet-toolkit/how-to/workflows/bulk_submission.html>
+- Documentation: <https://fderuiter.github.io/imednet-toolkit/>
+- Repository: <https://github.com/fderuiter/imednet-toolkit>
+- License: [MIT](https://github.com/fderuiter/imednet-toolkit/blob/main/LICENSE)

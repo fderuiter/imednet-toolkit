@@ -97,6 +97,7 @@ _STATUS_COLOR_MAP = {
     "hold": "yellow",
     "incomplete": "yellow",
     "initiated": "yellow",
+    "answered": "yellow",
     "inactive": "red",
     "closed": "red",
     "error": "red",
@@ -126,6 +127,7 @@ _HC_STATUS_COLOR_MAP = {
     "hold": "hc_warning",
     "incomplete": "hc_warning",
     "initiated": "hc_warning",
+    "answered": "hc_warning",
     "inactive": "hc_danger",
     "closed": "hc_danger",
     "error": "hc_danger",
@@ -325,20 +327,33 @@ def format_job_progress(
         status_obj = status
         elapsed_val = float(elapsed) if elapsed is not None else 0.0
 
-    raw_progress = getattr(status_obj, "progress", 0) if status_obj is not None else 0
-    try:
-        progress = max(0, min(100, int(raw_progress)))
-    except (TypeError, ValueError):
-        progress = 0
+    raw_progress = getattr(status_obj, "progress", None) if status_obj is not None else None
+    parsed_progress: int | None = None
+    if isinstance(raw_progress, (int, float, str)) and not isinstance(raw_progress, bool):
+        try:
+            parsed_progress = max(0, min(100, int(raw_progress)))
+        except (TypeError, ValueError):
+            parsed_progress = None
 
     state_val = getattr(status_obj, "state", "UNKNOWN") if status_obj is not None else "UNKNOWN"
     state_label = state_val.value if hasattr(state_val, "value") else str(state_val)
 
-    filled = round(bar_width * progress / 100.0)
+    if parsed_progress is not None:
+        filled = round(bar_width * parsed_progress / 100.0)
+        empty = max(0, bar_width - filled)
+        bar = "=" * filled + "-" * empty
+        return f"Job {batch_id}: [{bar}] {parsed_progress}% - {state_label} ({elapsed_val:.1f}s)"
+
+    state_upper = state_label.strip().upper()
+    if state_upper in {"COMPLETED", "COMPLETE", "SUCCESS"}:
+        filled = bar_width
+    elif state_upper in {"RUNNING", "PROCESSING"}:
+        filled = bar_width // 2
+    else:
+        filled = 0
     empty = max(0, bar_width - filled)
     bar = "=" * filled + "-" * empty
-
-    return f"Job {batch_id}: [{bar}] {progress}% - {state_label} ({elapsed_val:.1f}s)"
+    return f"Job {batch_id}: [{bar}] {state_label} ({elapsed_val:.1f}s)"
 
 
 class Status:
@@ -629,6 +644,15 @@ def _format_cell_value(value: Any, key: str | None = None) -> str:
     return _sanitize_cell_text(str(value))
 
 
+_HEADER_ACRONYM_RE = re.compile(r"\b(?:id|oid|url|utc)\b", re.IGNORECASE)
+
+
+def _format_header_label(header: Any) -> str:
+    """Format a field key into a title-cased header while preserving uppercase acronyms."""
+    cleaned = _sanitize_cell_text(str(header).replace("_", " ")).title()
+    return _HEADER_ACRONYM_RE.sub(lambda match: match.group(0).upper(), cleaned)
+
+
 def _colorize(text: str, color: str) -> str:
     if not supports_ansi_color(sys.stdout):
         return text
@@ -640,7 +664,7 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
     if not items:
         return
 
-    headers = [_sanitize_cell_text(str(header).replace("_", " ").title()) for header in fields]
+    headers = [_format_header_label(header) for header in fields]
 
     rows = []
     for item in items:

@@ -1796,7 +1796,66 @@ async def test_pilot_async_simulation_sdk_selection_logs_refresh_and_zero_to_thr
         assert remaining_textual_handlers == []
         assert imednet_logger.level == logging.WARNING
     finally:
+        from imednet.simulation import reset_default_simulation_state
+
+        reset_default_simulation_state()
         imednet_logger.setLevel(saved_level)
+
+
+@pytest.mark.asyncio
+async def test_pilot_simulation_my_study_site_filter_and_cross_study_job_isolation() -> None:
+    """Selecting Main Site (103) in MY_STUDY keeps matching Subjects and isolates cross-Study Jobs."""
+    from imednet.simulation import SimulationState, SimulationTransport
+
+    sim_state = SimulationState()
+    transport = SimulationTransport(state=sim_state)
+
+    async with AsyncImednetSDK(simulation_mode=True, transport=transport) as sdk:
+        study_batch = await sdk.async_create_record(
+            "STUDY",
+            [{"subjectKey": "SUB1", "formKey": "F_VS", "data": {"V_WEIGHT": 71.0}}],
+        )
+        assert study_batch.batch_id is not None
+
+        # Advance JOB-1002 to COMPLETED in DEMO-STUDY before inspecting MY_STUDY
+        polled_demo = await sdk.jobs.poll("DEMO-STUDY", "JOB-1002", interval=0.001, timeout=5.0)
+        assert str(polled_demo.state) == "COMPLETED"
+
+        app = ImednetTuiApp(sdk, study_key="MY_STUDY")
+        async with app.run_test() as pilot:
+            await _settle(pilot)
+            assert isinstance(app.screen, DashboardScreen)
+            dashboard = app.screen
+            site_list = dashboard.query_one(SiteList)
+            subject_table = dashboard.query_one(SubjectTable)
+            job_monitor = dashboard.query_one(JobMonitor)
+
+            assert dashboard.selected_study_key == "MY_STUDY"
+            assert len(site_list.children) == 1
+            assert subject_table.row_count == 1
+
+            # Select Main Site (103) via Enter -> retains matching MY_STUDY subject
+            site_list.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await _settle(pilot)
+            assert dashboard.selected_site_id == "103"
+            assert subject_table.row_count == 1
+            assert str(subject_table.get_row_at(0)[1]) == "103"
+
+            # Foreign STUDY BATCH-* job resolves to NOT_FOUND in MY_STUDY, while JOB-1002 stays RUNNING (50%)
+            job_monitor.track_job(study_batch.batch_id)
+            job_monitor.track_job("JOB-1002")
+            await _settle(pilot)
+
+            job_table = job_monitor.query_one(JobTable)
+            rows_by_batch = {
+                str(job_table.get_row_at(idx)[0]): [str(cell) for cell in job_table.get_row_at(idx)]
+                for idx in range(job_table.row_count)
+            }
+            assert rows_by_batch[study_batch.batch_id][1] == "NOT_FOUND"
+            assert rows_by_batch["JOB-1002"][1] == "RUNNING"
+            assert rows_by_batch["JOB-1002"][2] == "50%"
 
 
 @pytest.mark.asyncio
@@ -3396,17 +3455,16 @@ async def test_not_found_placeholder_pauses_timer_retries_on_r_and_untracks_via_
 
 
 @pytest.mark.asyncio
-async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_red() -> None:
-    """Verify AsyncImednetSDK and ImednetSDK fetch resultUrl once and style partial failures red."""
+async def test_terminal_job_skips_result_url_fetches_and_renders_dash_for_unknown_counts() -> None:
+    """Verify AsyncImednetSDK and ImednetSDK never fetch resultUrl and render '-' for unknown counts."""
     base_url = "https://edc.result-test.imednetapi.com"
-    marker_val = "sec-result-marker-999"  # pragma: allowlist secret
 
     with respx.mock(base_url=base_url, assert_all_called=False) as router:
         router.get("/api/v1/edc/studies").mock(
             return_value=httpx.Response(
                 200,
                 json={
-                    "data": [{"studyKey": "ST_RES", "studyName": "Result URL Study"}],
+                    "data": [{"studyKey": "ST_RES", "studyName": "Six-Field Job Study"}],
                     "pagination": {"page": 0, "size": 100, "totalPages": 1, "totalItems": 1},
                 },
             )
@@ -3429,23 +3487,33 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
                 },
             )
         )
-        router.get("/api/v1/edc/studies/ST_RES/jobs/B_CLEAN").mock(
+        router.get("/api/v1/edc/studies/ST_RES/jobs/B_SIX_FIELD").mock(
             return_value=httpx.Response(
                 200,
                 json={
-                    "batchId": "B_CLEAN",
+                    "jobId": "J_SIX",
+                    "batchId": "B_SIX_FIELD",
                     "state": "COMPLETED",
-                    "progress": 100,
-                    "resultUrl": f"{base_url}/api/v1/edc/studies/ST_RES/jobs/B_CLEAN/results",
                     "dateCreated": "2026-07-01T10:00:00Z",
+                    "dateStarted": "2026-07-01T10:00:02Z",
+                    "dateFinished": "2026-07-01T10:00:09Z",
                 },
             )
         )
-        clean_res_route = router.get("/api/v1/edc/studies/ST_RES/jobs/B_CLEAN/results").mock(
+        router.get("/api/v1/edc/studies/ST_RES/jobs/B_WITH_URL").mock(
             return_value=httpx.Response(
                 200,
-                json=[{"status": "SUCCESS"}, {"status": "SUCCESS"}],
+                json={
+                    "jobId": "J_URL",
+                    "batchId": "B_WITH_URL",
+                    "state": "COMPLETED",
+                    "resultUrl": f"{base_url}/api/v1/edc/studies/ST_RES/jobs/B_WITH_URL/results",
+                    "dateCreated": "2026-07-01T10:05:00Z",
+                },
             )
+        )
+        unbacked_res_route = router.get("/api/v1/edc/studies/ST_RES/jobs/B_WITH_URL/results").mock(
+            return_value=httpx.Response(500, json={"message": "Should never be called"})
         )
 
         router.get("/api/v1/edc/studies/ST_RES/jobs/B_PARTIAL").mock(
@@ -3454,42 +3522,10 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
                 json={
                     "batchId": "B_PARTIAL",
                     "state": "COMPLETED",
-                    "progress": 100,
-                    "resultUrl": "/api/v1/edc/studies/ST_RES/jobs/B_PARTIAL/results",
-                    "dateCreated": "2026-07-01T10:05:00Z",
-                },
-            )
-        )
-        partial_res_route = router.get("/api/v1/edc/studies/ST_RES/jobs/B_PARTIAL/results").mock(
-            return_value=httpx.Response(
-                200,
-                json=[
-                    {"status": "SUCCESS"},
-                    {"status": "FAILED", "error": "Invalid visit date"},
-                    {"error": "Missing subject key"},
-                ],
-            )
-        )
-
-        router.get("/api/v1/edc/studies/ST_RES/jobs/B_RES_ERR").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "batchId": "B_RES_ERR",
-                    "state": "COMPLETED",
-                    "progress": 100,
-                    "resultUrl": (
-                        f"{base_url}/api/v1/edc/studies/ST_RES/jobs/B_RES_ERR/results"
-                        f"?apiKey={marker_val}"
-                    ),
+                    "totalRecords": 3,
+                    "failedRecords": 2,
                     "dateCreated": "2026-07-01T10:10:00Z",
                 },
-            )
-        )
-        err_res_route = router.get("/api/v1/edc/studies/ST_RES/jobs/B_RES_ERR/results").mock(
-            return_value=httpx.Response(
-                500,
-                json={"message": f"Upstream error for token={marker_val}"},
             )
         )
 
@@ -3503,32 +3539,40 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
                 app = ImednetTuiApp(
                     async_sdk,
                     study_key="ST_RES",
-                    batch_ids=["B_CLEAN", "B_PARTIAL", "B_RES_ERR"],
+                    batch_ids=["B_SIX_FIELD", "B_WITH_URL", "B_PARTIAL"],
                 )
                 async with app.run_test(size=(110, 32)) as pilot:
                     await _settle(pilot)
                     job_monitor = app.screen.query_one(JobMonitor)
                     job_table = app.screen.query_one("#job_table", JobTable)
-                    log_viewer = app.screen.query_one(LogViewer)
 
                     assert spy_to_thread.call_count == 0
-                    assert clean_res_route.call_count == 1
-                    assert partial_res_route.call_count == 1
-                    assert err_res_route.call_count == 1
+                    assert unbacked_res_route.call_count == 0
 
-                    # Row 0: B_CLEAN -> Total=2, Failed=0, styled green
-                    row_clean = job_table.get_row_at(0)
-                    assert [str(c) for c in row_clean[:5]] == [
-                        "B_CLEAN",
+                    # Row 0: Six-field upstream COMPLETED payload -> Total='-', Failed='-', styled green
+                    row_six = job_table.get_row_at(0)
+                    assert [str(c) for c in row_six[:5]] == [
+                        "B_SIX_FIELD",
                         "COMPLETED",
                         "100%",
-                        "2",
-                        "0",
+                        "-",
+                        "-",
                     ]
-                    assert row_clean[1].style == "green"
+                    assert row_six[1].style == "green"
 
-                    # Row 1: B_PARTIAL -> Total=3, Failed=2, styled red despite COMPLETED state
-                    row_partial = job_table.get_row_at(1)
+                    # Row 1: Payload with resultUrl is NOT fetched -> Total='-', Failed='-', styled green
+                    row_url = job_table.get_row_at(1)
+                    assert [str(c) for c in row_url[:5]] == [
+                        "B_WITH_URL",
+                        "COMPLETED",
+                        "100%",
+                        "-",
+                        "-",
+                    ]
+                    assert row_url[1].style == "green"
+
+                    # Row 2: Explicit failedRecords > 0 still styles red
+                    row_partial = job_table.get_row_at(2)
                     assert [str(c) for c in row_partial[:5]] == [
                         "B_PARTIAL",
                         "COMPLETED",
@@ -3538,59 +3582,13 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
                     ]
                     assert row_partial[1].style == "red"
 
-                    # Row 2: B_RES_ERR -> result_error populated & redacted, styled red
-                    row_err = job_table.get_row_at(2)
-                    assert str(row_err[0]) == "B_RES_ERR"
-                    assert str(row_err[1]) == "COMPLETED"
-                    assert row_err[1].style == "red"
-
                     summary_renderable = job_monitor.render()
-                    spans_text = [
-                        (
-                            summary_renderable.plain[span.start : span.end],
-                            str(span.style),
-                        )
-                        for span in summary_renderable.spans
-                    ]
-                    completed_styles = [
-                        style for label, style in spans_text if label == "COMPLETED"
-                    ]
-                    assert completed_styles == ["green", "red", "red"]
+                    summary_plain = summary_renderable.plain
+                    assert "total=-, failed=-" in summary_plain
+                    assert "total=0, failed=0" not in summary_plain
+                    assert "[0%," not in summary_plain
 
-                    log_dump = "\n".join(log_viewer.lines)
-                    assert "B_RES_ERR" in log_dump
-                    assert marker_val not in log_dump
-                    assert "***" in log_dump
-
-                    # Manual refresh must NOT re-fetch already-succeeded terminal jobs,
-                    # AND MUST retry terminal jobs whose previous resultUrl fetch failed.
-                    err_res_route.mock(
-                        return_value=httpx.Response(
-                            200,
-                            json=[{"status": "SUCCESS"}, {"status": "SUCCESS"}],
-                        )
-                    )
-                    await pilot.press("r")
-                    await _settle(pilot)
-                    assert clean_res_route.call_count == 1
-                    assert partial_res_route.call_count == 1
-                    assert err_res_route.call_count == 2
-                    row_err_recovered = job_table.get_row_at(2)
-                    assert [str(c) for c in row_err_recovered[:5]] == [
-                        "B_RES_ERR",
-                        "COMPLETED",
-                        "100%",
-                        "2",
-                        "0",
-                    ]
-                    assert row_err_recovered[1].style == "green"
-
-                    # Once recovered, further manual refreshes do NOT re-fetch B_RES_ERR
-                    await pilot.press("r")
-                    await _settle(pilot)
-                    assert err_res_route.call_count == 2
-
-        # Verify synchronous ImednetSDK also populates resultUrl counts off the main thread
+        # Verify synchronous ImednetSDK also renders '-' for unknown counts and never fetches resultUrl
         with ImednetSDK(
             api_key="test-key",  # pragma: allowlist secret
             security_key="test-sec",  # pragma: allowlist secret
@@ -3600,21 +3598,21 @@ async def test_terminal_job_fetches_result_url_once_and_styles_partial_failures_
             sync_app = ImednetTuiApp(
                 sync_sdk,
                 study_key="ST_RES",
-                batch_ids=["B_PARTIAL"],
+                batch_ids=["B_SIX_FIELD", "B_WITH_URL"],
             )
             async with sync_app.run_test(size=(100, 30)) as pilot:
                 await _settle(pilot)
                 sync_table = sync_app.screen.query_one("#job_table", JobTable)
                 sync_row = sync_table.get_row_at(0)
                 assert [str(c) for c in sync_row[:5]] == [
-                    "B_PARTIAL",
+                    "B_SIX_FIELD",
                     "COMPLETED",
                     "100%",
-                    "3",
-                    "2",
+                    "-",
+                    "-",
                 ]
-                assert sync_row[1].style == "red"
-                assert partial_res_route.call_count == 2
+                assert sync_row[1].style == "green"
+                assert unbacked_res_route.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -3968,10 +3966,8 @@ async def test_app_env_subtitle_resolution_simulation_client_and_default_fallbac
 
 
 @pytest.mark.asyncio
-async def test_job_monitor_facade_only_no_private_probes_and_retries_failed_html_result_url() -> (
-    None
-):
-    """AC 8 & Req 10: JobMonitor uses ImednetFacade without private probes and retries failed fetches."""
+async def test_job_monitor_facade_only_no_private_probes_and_skips_unbacked_result_url() -> None:
+    """AC 8 & Req 10: JobMonitor uses ImednetFacade without private probes and skips unbacked resultUrl."""
     import re
     from pathlib import Path
 
@@ -3995,6 +3991,7 @@ async def test_job_monitor_facade_only_no_private_probes_and_retries_failed_html
     # 2. Strict custom AsyncImednetFacade that raises AssertionError on any private attribute probe
     class _StrictAsyncFacade:
         def __init__(self) -> None:
+            self.get_job_calls = 0
             self.fetch_calls = 0
 
         def __getattr__(self, name: str) -> Any:
@@ -4004,40 +4001,427 @@ async def test_job_monitor_facade_only_no_private_probes_and_retries_failed_html
 
         async def async_get_job(self, study_key: str, batch_id: str) -> JobStatus:
             assert study_key == "STUDY-STRICT"
+            self.get_job_calls += 1
             return JobStatus(
                 batch_id=batch_id,
                 state=JobState.COMPLETED,
-                progress=100,
                 result_url=f"https://results.strict.example/{batch_id}",
             )
 
         async def async_fetch_job_result(self, result_url: str) -> Any:
             self.fetch_calls += 1
-            if self.fetch_calls == 1:
-                return "<html><body>503 Service Unavailable</body></html>"
-            return [{"status": "SUCCESS"}, {"status": "FAILED", "error": "Bad field"}]
+            return [{"status": "SUCCESS"}]
 
     strict_facade: Any = _StrictAsyncFacade()
     monitor = JobMonitor(strict_facade)
     monitor.current_study_key = "STUDY-STRICT"
     monitor.track_jobs(["B-STRICT"], refresh=False)
 
-    # First refresh: HTML body fails JSON decode -> result_error set, result_fetched stays False
+    # First refresh: polls async_get_job via SPI without private probes or unbacked resultUrl calls
     await monitor.refresh_jobs()
-    assert strict_facade.fetch_calls == 1
+    assert strict_facade.get_job_calls == 1
+    assert strict_facade.fetch_calls == 0
     entry = monitor._entries_for_study("STUDY-STRICT")["B-STRICT"]  # noqa: SLF001
     assert entry.is_terminal is True
-    assert entry.result_fetched is False
-    assert entry.last_job.result_error is not None
+    assert entry.last_job.total_records is None
+    assert entry.last_job.failed_records is None
+    assert "total=-, failed=-" in str(monitor.render())
 
-    # Second refresh: retries terminal job resultUrl without re-polling get_job, succeeds & freezes
+    # Second refresh: terminal entry stays frozen without redundant polling
     await monitor.refresh_jobs()
-    assert strict_facade.fetch_calls == 2
-    assert entry.result_fetched is True
-    assert entry.last_job.result_error is None
-    assert entry.last_job.total_records == 2
-    assert entry.last_job.failed_records == 1
+    assert strict_facade.get_job_calls == 1
+    assert strict_facade.fetch_calls == 0
 
-    # Third refresh: already fetched -> no redundant fetch
-    await monitor.refresh_jobs()
-    assert strict_facade.fetch_calls == 2
+
+@pytest.mark.asyncio
+async def test_job_monitor_preserves_failure_warning_and_toggles_inline_detail_panel() -> None:
+    """Preserve JobFailedError warnings and inspect sanitized result/record errors inline."""
+    from textual.color import Color
+
+    from imednet.models.jobs import JobState, JobStatus
+    from imednet.models.sites import Site
+    from imednet.models.studies import Study
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(
+        return_value=[Study(study_key="STUDY-DETAIL", study_name="Detail Study")]
+    )
+    sdk.async_get_sites = AsyncMock(
+        return_value=[Site(study_key="STUDY-DETAIL", site_id=10, site_name="Site Ten")]
+    )
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    res_err_job = JobStatus(
+        job_id="BATCH-RES-ERR",
+        batch_id="BATCH-RES-ERR",
+        state=JobState.COMPLETED,
+        progress=100,
+        total_records=5,
+        failed_records=0,
+        result_error="502 Bad Gateway x-api-key: raw-res-secret patient_name=Alice Smith",
+    )
+    rec_err_job = JobStatus(
+        job_id="BATCH-REC-ERR",
+        batch_id="BATCH-REC-ERR",
+        state=JobState.COMPLETED,
+        progress=100,
+        total_records=4,
+        failed_records=2,
+        results=[
+            {
+                "status": "FAILED",
+                "recordId": 42,
+                "subjectKey": "SUBJ-007",
+                "formKey": "AE",
+                "patient_name": "Jane Doe",
+                "api_key": "sk-secret-inline",  # pragma: allowlist secret
+                "error": "Invalid onset date for ssn=123-45-6789",
+            },
+            {
+                "status": "ERROR",
+                "record_id": 43,
+                "subject_key": "SUBJ-008",
+                "errors": ["Missing AE severity for email=jane@example.com"],
+            },
+        ],
+    )
+    clean_job = JobStatus(
+        job_id="BATCH-OK",
+        batch_id="BATCH-OK",
+        state=JobState.COMPLETED,
+        progress=100,
+        total_records=3,
+        failed_records=0,
+    )
+
+    jobs_by_id = {
+        "BATCH-RES-ERR": res_err_job,
+        "BATCH-REC-ERR": rec_err_job,
+        "BATCH-OK": clean_job,
+    }
+    sdk.async_get_job = AsyncMock(side_effect=lambda _sk, jid: jobs_by_id[jid])
+    sdk.async_client = MagicMock()
+    sdk.async_client.fetch_external_url = AsyncMock(
+        side_effect=RuntimeError(
+            "502 Bad Gateway x-api-key: raw-res-secret patient_name=Alice Smith"
+        )
+    )
+
+    app = ImednetTuiApp(
+        sdk,
+        high_contrast=True,
+        study_key="STUDY-DETAIL",
+        batch_ids=["BATCH-RES-ERR", "BATCH-REC-ERR", "BATCH-OK"],
+    )
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+
+        dashboard = app.screen
+        assert isinstance(dashboard, DashboardScreen)
+        job_monitor = dashboard.query_one(JobMonitor)
+        notice = job_monitor.query_one("#job_monitor_notice", Static)
+        job_table = job_monitor.query_one("#job_table", JobTable)
+        detail_panel = job_monitor.query_one("#job_detail_panel", Static)
+
+        rendered_summary = str(job_monitor.render())
+        assert "502 Bad Gateway" in rendered_summary
+        assert "raw-res-secret" not in rendered_summary
+        assert "Alice Smith" not in rendered_summary
+        assert "***MASKED***" in rendered_summary
+        assert "failed_records=2" in rendered_summary
+        assert "Jane Doe" not in rendered_summary
+        assert "123-45-6789" not in rendered_summary
+
+        notice_text = str(notice.render())
+        assert "Warning:" in notice_text
+        assert "BATCH-RES-ERR" in notice_text
+        assert "BATCH-REC-ERR" in notice_text
+        assert "raw-res-secret" not in notice_text
+        assert "Alice Smith" not in notice_text
+        assert "Jane Doe" not in notice_text
+
+        # Detail panel is hidden initially (no modal overlays)
+        assert not detail_panel.has_class("visible")
+        assert len(app.screen_stack) <= 2
+
+        # Activate a site filter so we can verify Escape closes #job_detail_panel first
+        dashboard.on_site_list_site_selected(SiteList.SiteSelected("10", "Site Ten"))
+        await pilot.pause()
+        assert dashboard.selected_site_id == "10"
+
+        # Press Enter on row 0 (BATCH-RES-ERR) -> opens inline #job_detail_panel
+        job_table.focus()
+        job_table.move_cursor(row=0)
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert detail_panel.has_class("visible")
+        assert detail_panel.styles.background == Color.parse("#000000")
+        assert detail_panel.styles.color == Color.parse("#FFFFFF")
+        panel_text_res = str(detail_panel.render())
+        assert "BATCH-RES-ERR" in panel_text_res
+        assert "Result Error:" in panel_text_res
+        assert "502 Bad Gateway" in panel_text_res
+        assert "raw-res-secret" not in panel_text_res
+        assert "Alice Smith" not in panel_text_res
+        assert "***MASKED***" in panel_text_res
+
+        # Move to row 1 (BATCH-REC-ERR) and press Space -> switches inline panel to BATCH-REC-ERR
+        job_table.move_cursor(row=1)
+        await pilot.pause()
+        await pilot.press("space")
+        await pilot.pause()
+
+        assert detail_panel.has_class("visible")
+        panel_text_rec = str(detail_panel.render())
+        assert "BATCH-REC-ERR" in panel_text_rec
+        assert "Record Errors (2):" in panel_text_rec
+        assert "recordId=42" in panel_text_rec
+        assert "subjectKey=SUBJ-007" in panel_text_rec
+        assert "SUBJ-008" in panel_text_rec
+        assert "Jane Doe" not in panel_text_rec
+        assert "123-45-6789" not in panel_text_rec
+        assert "jane@example.com" not in panel_text_rec
+        assert "sk-secret-inline" not in panel_text_rec
+        assert "***MASKED***" in panel_text_rec
+
+        # Pressing Space again on the same row toggles #job_detail_panel closed
+        await pilot.press("space")
+        await pilot.pause()
+        assert not detail_panel.has_class("visible")
+
+        # Re-open on clean job (row 2) -> shows "No errors reported."
+        job_table.move_cursor(row=2)
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert detail_panel.has_class("visible")
+        assert "No errors reported." in str(detail_panel.render())
+
+        # First Escape closes #job_detail_panel without clearing active site filter
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not detail_panel.has_class("visible")
+        assert dashboard.selected_site_id == "10"
+
+        # Second Escape clears active site filter
+        await pilot.press("escape")
+        await pilot.pause()
+        assert dashboard.selected_site_id is None
+
+
+@pytest.mark.asyncio
+async def test_batch_input_preflight_validation_and_terminal_path_traversal_error() -> None:
+    """Reject invalid #batch_id_input segments before polling and mark PathTraversalValidationError terminal."""
+    from imednet.models.studies import Study
+    from imednet.spi.utils import PathTraversalValidationError
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(
+        return_value=[Study(study_key="STUDY-SAFE", study_name="Safe Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+    sdk.async_get_job = AsyncMock()
+
+    notifications: list[tuple[str, str]] = []
+    app = ImednetTuiApp(sdk, study_key="STUDY-SAFE")
+    orig_notify = app.notify
+
+    def _capture_notify(message: Any, *args: Any, **kwargs: Any) -> Any:
+        notifications.append((str(message), str(kwargs.get("severity", "information"))))
+        return orig_notify(message, *args, **kwargs)
+
+    app.notify = _capture_notify  # type: ignore[method-assign]
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        job_monitor = app.screen.query_one(JobMonitor)
+        notice = job_monitor.query_one("#job_monitor_notice", Static)
+        batch_input = job_monitor.query_one("#batch_id_input", Input)
+        job_table = job_monitor.query_one("#job_table", JobTable)
+
+        for bad_token in ("../bad-segment", "BATCH?foo=1"):
+            notifications.clear()
+            batch_input.focus()
+            batch_input.value = bad_token
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert batch_input.value == ""
+            assert job_table.row_count == 0
+            assert "Validation Warning:" in str(notice.render())
+            assert any(sev == "warning" for _, sev in notifications)
+            sdk.async_get_job.assert_not_called()
+
+        # Also verify _poll_tracked_entry marks PathTraversalValidationError terminal without re-polling
+        sdk.async_get_job = AsyncMock(
+            side_effect=PathTraversalValidationError("batch_id must not contain '..'")
+        )
+        job_monitor.track_jobs(["../forced-bad"], study_key="STUDY-SAFE", refresh=False)
+        await job_monitor.refresh_jobs()
+        assert sdk.async_get_job.call_count == 1
+        assert [str(c) for c in job_table.get_row_at(0)[:2]] == ["../forced-bad", "INVALID"]
+        assert "batch_id" in str(notice.render())
+        assert job_monitor.is_polling_active is False
+
+        # Neither interval refresh nor manual retry_placeholders refresh re-polls it
+        await job_monitor.refresh_jobs()
+        await job_monitor.refresh_jobs(retry_placeholders=True)
+        assert sdk.async_get_job.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_unassigned_cli_batches_render_queued_and_poll_on_study_selection() -> None:
+    """Show CLI batch_ids as QUEUED when study_key=None and poll upon Study selection."""
+    from imednet.models.jobs import JobState, JobStatus
+    from imednet.models.studies import Study
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(
+        return_value=[Study(study_key="STUDY-Q", study_name="Queued Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+    sdk.async_get_job = AsyncMock(
+        side_effect=lambda _sk, jid: JobStatus(
+            job_id=jid,
+            batch_id=jid,
+            state=JobState.COMPLETED,
+            progress=100,
+            total_records=8,
+            failed_records=0,
+        )
+    )
+
+    app = ImednetTuiApp(sdk, batch_ids=["BATCH-01", "BATCH-02"], study_key=None)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        dashboard = app.screen
+        assert isinstance(dashboard, DashboardScreen)
+        job_monitor = dashboard.query_one(JobMonitor)
+        notice = job_monitor.query_one("#job_monitor_notice", Static)
+        job_table = job_monitor.query_one("#job_table", JobTable)
+        detail_panel = job_monitor.query_one("#job_detail_panel", Static)
+
+        assert job_table.row_count == 2
+        assert [str(c) for c in job_table.get_row_at(0)[:2]] == ["BATCH-01", "QUEUED"]
+        assert [str(c) for c in job_table.get_row_at(1)[:2]] == ["BATCH-02", "QUEUED"]
+        assert "Queued Jobs (2)" in str(notice.render())
+        assert "BATCH-01" in str(notice.render())
+        assert job_monitor.is_polling_active is False
+        sdk.async_get_job.assert_not_called()
+
+        # Inspecting a QUEUED job opens #job_detail_panel cleanly
+        job_table.focus()
+        job_table.move_cursor(row=0)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert detail_panel.has_class("visible")
+        assert "BATCH-01 [QUEUED]" in str(detail_panel.render())
+
+        # Untracking BATCH-02 while queued updates the table to 1 queued row
+        job_table.move_cursor(row=1)
+        await pilot.press("delete")
+        await pilot.pause()
+        assert job_table.row_count == 1
+        assert str(job_table.get_row_at(0)[0]) == "BATCH-01"
+
+        # Selecting a Study binds and polls BATCH-01 immediately
+        study_list = dashboard.query_one(StudyList)
+        study_list.focus()
+        study_list.index = 0
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        sdk.async_get_job.assert_called_once_with("STUDY-Q", "BATCH-01")
+        assert job_table.row_count == 1
+        assert [str(c) for c in job_table.get_row_at(0)[:2]] == ["BATCH-01", "COMPLETED"]
+
+
+@pytest.mark.asyncio
+async def test_textual_log_handler_and_sanitize_text_mask_phi_and_preserve_relational_keys() -> (
+    None
+):
+    """Mask Subject PHI dicts and key-value substrings to ***MASKED*** while preserving relational keys."""
+    from imednet.spi.utils import global_sensitivity_registry
+    from imednet_tui.app import LogViewer, _sanitize_text
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(return_value=[])
+
+    global_sensitivity_registry.add_sensitive_key("custom_mrn")
+    try:
+        app = ImednetTuiApp(sdk)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            imednet_logger = logging.getLogger("imednet")
+
+            # 1. Structured dict payload via logger
+            imednet_logger.info(
+                {
+                    "study_key": "STUDY-REL-1",
+                    "subject_key": "SUBJ-REL-2",
+                    "record_id": "REC-REL-3",
+                    "usubjid": "USUBJ-REL-4",
+                    "subjid": "SUBJID-REL-5",
+                    "studyid": "STUDYID-REL-6",
+                    "patient_name": "Jane Doe",
+                    "ssn": "123-45-6789",
+                    "dob": "1980-04-15",
+                    "email": "jane.doe@example.com",
+                    "brthdtc": "1980-04-15",
+                    "custom_mrn": "MRN-998877",
+                }
+            )
+
+            # 2. Formatted key-value text payload via logger
+            imednet_logger.warning(
+                "Subject audit study_key=STUDY-REL-1 subject_key=SUBJ-REL-2 "
+                "patient_name='John Roe' ssn=987-65-4321, dob: 1975-12-31; "
+                "email=john.roe@example.org brthdtc=1975-12-31 custom_mrn=\"MRN-112233\""
+            )
+            await pilot.pause()
+
+            log_viewer = app.screen.query_one(LogViewer)
+            rendered_logs = "\n".join(str(line) for line in log_viewer.lines)
+
+            assert "***MASKED***" in rendered_logs
+            for leaked_phi in (
+                "Jane Doe",
+                "John Roe",
+                "123-45-6789",
+                "987-65-4321",
+                "1980-04-15",
+                "1975-12-31",
+                "jane.doe@example.com",
+                "john.roe@example.org",
+                "MRN-998877",
+                "MRN-112233",
+            ):
+                assert leaked_phi not in rendered_logs
+
+            for relational_id in (
+                "STUDY-REL-1",
+                "SUBJ-REL-2",
+                "REC-REL-3",
+                "USUBJ-REL-4",
+                "SUBJID-REL-5",
+                "STUDYID-REL-6",
+            ):
+                assert relational_id in rendered_logs
+
+            direct = _sanitize_text(
+                RuntimeError(
+                    "Failed record_id=77 patient_name= Clara Oswald & email=clara@tardis.uk"
+                )
+            )
+            assert "record_id=77" in direct
+            assert "Clara Oswald" not in direct
+            assert "clara@tardis.uk" not in direct
+            assert "***MASKED***" in direct
+    finally:
+        global_sensitivity_registry.remove_sensitive_key("custom_mrn")

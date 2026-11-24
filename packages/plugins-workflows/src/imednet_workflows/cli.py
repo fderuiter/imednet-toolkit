@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from imednet.spi.cli import (
     NON_INTERACTIVE_ENV,
@@ -36,10 +36,13 @@ from imednet.spi.cli import (
     emit_json,
     fetching_status,
     is_json_output_mode,
+    load_offline_schema,
+    parse_email_notify,
     parse_filter_args,
     positive_int,
     print_error,
     redact_cli_secrets,
+    resolve_cli_schema,
     resolve_hybrid_study_and_key,
     resolve_output_format,
     resolve_study_key,
@@ -55,6 +58,7 @@ from imednet.spi.utils import (
     resolve_study_configuration,
     validate_path_segment,
 )
+from imednet.spi.validation import DataDictionary, ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     from imednet.sdk import ImednetSDK
@@ -107,6 +111,122 @@ def _emit_line(text: str = "", *, err: bool = False) -> None:
         return
     with contextlib.suppress(BrokenPipeError, OSError):
         builtins.print(sanitized, file=sys.stdout)
+
+
+def _exit_uat_validation_error(exc: BaseException | str) -> NoReturn:
+    """Emit a secret- and PHI-redacted UAT validation error to stderr and exit 1."""
+    sanitized = redact_cli_secrets(redact_sensitive_text(str(exc)))
+    prefix = "" if sanitized.startswith("Validation Error:") else "Validation Error: "
+    print_error(f"{prefix}{sanitized}")
+    sys.exit(1)
+
+
+def _validate_uat_subject_count(subject_count: int) -> int:
+    """Validate --subject-count bounds (1..100) during CLI preflight."""
+    if isinstance(subject_count, bool) or not 1 <= subject_count <= 100:
+        _exit_uat_validation_error("subject_count must be between 1 and 100.")
+    return subject_count
+
+
+def _load_uat_data_dictionary(
+    dd_path: str | None,
+    *,
+    study_key: str,
+) -> DataDictionary | None:
+    """Load an offline DataDictionary from JSON, CDISC ODM XML, REDCap CSV, or CSV dir."""
+    if not dd_path:
+        return None
+    loaded = load_offline_schema(dd_path, study_key=study_key)
+    if not isinstance(loaded, DataDictionary):
+        raise ValueError(
+            f"Unsupported Data Dictionary source '{dd_path}': expected JSON, ODM XML, REDCap CSV, or CSV directory."
+        )
+    return loaded
+
+
+def _serialize_uat_run_result(
+    result: Any,
+    *,
+    study_key: str,
+    dry_run: bool,
+    custom_phi_fields: set[str],
+) -> dict[str, Any]:
+    """Serialize a UATRunResult into a PHI-masked camelCase dictionary for emit_json."""
+    state_raw = getattr(result, "state", None)
+    state_str = (
+        state_raw.value
+        if state_raw is not None and hasattr(state_raw, "value")
+        else str(state_raw or "COMPLETED")
+    )
+    history_raw = getattr(result, "state_history", None)
+    history_list = (
+        [s.value if hasattr(s, "value") else str(s) for s in history_raw]
+        if isinstance(history_raw, list)
+        else []
+    )
+    fail_raw = getattr(result, "failure_phase", None)
+    fail_str = (
+        fail_raw.value
+        if fail_raw is not None and hasattr(fail_raw, "value")
+        else (str(fail_raw) if fail_raw is not None else None)
+    )
+    record_sets = getattr(result, "record_sets", None)
+    forms_tested = len(record_sets) if isinstance(record_sets, list) else 0
+    records_generated = (
+        sum(len(getattr(rs, "payloads", []) or []) for rs in record_sets)
+        if isinstance(record_sets, list)
+        else 0
+    )
+    sub_res = getattr(result, "submission_result", None)
+    records_submitted = (
+        int(sub_res.total_records_submitted)
+        if sub_res is not None
+        and isinstance(getattr(sub_res, "total_records_submitted", None), int)
+        else 0
+    )
+    poll_sum = getattr(result, "poll_summary", None)
+    jobs_monitored = 0
+    if poll_sum is not None:
+        res_map = getattr(poll_sum, "results", None)
+        fail_map = getattr(poll_sum, "failures", None)
+        if isinstance(res_map, dict):
+            jobs_monitored += len(res_map)
+        if isinstance(fail_map, dict):
+            jobs_monitored += len(fail_map)
+
+    val_rep = getattr(result, "validation_report", None)
+    if val_rep is not None and callable(getattr(val_rep, "to_dict", None)):
+        val_rep_dict = val_rep.to_dict()
+    elif isinstance(val_rep, dict):
+        val_rep_dict = val_rep
+    else:
+        val_rep_dict = None
+
+    err_msg = getattr(result, "error_message", None)
+    sanitized_err = (
+        redact_cli_secrets(redact_sensitive_text(err_msg)) if isinstance(err_msg, str) else None
+    )
+    raw_durations = getattr(result, "phase_durations", None)
+    phase_durations = dict(raw_durations) if isinstance(raw_durations, Mapping) else {}
+
+    item: dict[str, Any] = {
+        "runId": str(getattr(result, "run_id", "") or ""),
+        "studyKey": str(getattr(result, "study_key", None) or study_key),
+        "dryRun": bool(getattr(result, "dry_run", dry_run)),
+        "state": state_str,
+        "stateHistory": history_list,
+        "overallSuccess": bool(getattr(result, "overall_success", False)),
+        "formsTested": forms_tested,
+        "recordsGenerated": records_generated,
+        "recordsSubmitted": records_submitted,
+        "jobsMonitored": jobs_monitored,
+        "failurePhase": fail_str,
+        "errorMessage": sanitized_err,
+        "validationReport": val_rep_dict,
+        "phaseDurations": phase_durations,
+    }
+    masked = _mask_workflow_value(item, custom_phi_fields=custom_phi_fields)
+    return masked if isinstance(masked, dict) else item
 
 
 def _resolve_custom_phi_fields(study_key: str | None) -> set[str]:
@@ -339,7 +459,12 @@ def _execute_set_state(
     )
 
     ensure_interactive_stdin(force_non_interactive=no_interactive)
-    display_ledger_streams(ledger_path=ledger_path, study_key=study_key)
+    ledger = _resolve_attr("get_state_provider")(ledger_path)
+    current_state = display_ledger_streams(
+        ledger_path=ledger_path,
+        study_key=study_key,
+        state_provider=ledger,
+    )
     study_key = prompt_study_key(study_key)
     stream = prompt_stream_name(stream)
 
@@ -361,20 +486,19 @@ def _execute_set_state(
         "Enter number of records processed", default=records_processed
     )
 
-    ledger = _resolve_attr("get_state_provider")(ledger_path)
     current_status = "None"
     current_ts_str = "None"
-    try:
-        current_state = ledger.read_state()
-        if (
-            study_key in current_state.studies
-            and stream in current_state.studies[study_key].streams
-        ):
-            st = current_state.studies[study_key].streams[stream]
-            current_status = str(st.last_run_status)
-            current_ts_str = st.last_timestamp.isoformat() if st.last_timestamp else "None"
-    except Exception as exc:
-        print_progress(f"Notice: unable to read stream state from ledger: {exc}")
+    if current_state is not None:
+        try:
+            if (
+                study_key in current_state.studies
+                and stream in current_state.studies[study_key].streams
+            ):
+                st = current_state.studies[study_key].streams[stream]
+                current_status = str(st.last_run_status)
+                current_ts_str = st.last_timestamp.isoformat() if st.last_timestamp else "None"
+        except Exception as exc:
+            print_progress(f"Notice: unable to read stream state from ledger: {exc}")
 
     print_progress("\nProposed State Transition:")
     print_progress(f"  Study:             {study_key}")
@@ -904,6 +1028,112 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     # UAT command integration
     uat_parser = sub.add_parser("uat", help="Manage and execute UAT acceptance test pipelines.")
     uat_sub = uat_parser.add_subparsers(dest="uat_command")
+    uat_parser.set_defaults(
+        func=lambda _args: uat_parser.error("the following arguments are required: uat_command")
+    )
+
+    uat_build_spec_parser = uat_sub.add_parser(
+        "build-spec",
+        help="Inspect a study and export a UATSpecification JSON plan.",
+    )
+    add_study_key_args(uat_build_spec_parser)
+    uat_build_spec_parser.add_argument(
+        "--subject-count",
+        type=int,
+        default=2,
+        help="Number of test subjects to generate (1..100).",
+    )
+    uat_build_spec_parser.add_argument(
+        "--site-name",
+        default=None,
+        help="Target enrollment-eligible site name for synthetic subjects.",
+    )
+    uat_build_spec_parser.add_argument(
+        "--form-key",
+        action="append",
+        dest="enabled_form_keys",
+        help="Target active form key to include. Repeat for multiple forms.",
+    )
+    uat_build_spec_parser.add_argument(
+        "--data-dictionary",
+        dest="data_dictionary",
+        default=None,
+        help="Offline Data Dictionary path (.json, .xml ODM, .csv REDCap, or CSV directory).",
+    )
+    uat_build_spec_parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional random seed to record in the generated UATSpecification.",
+    )
+    uat_build_spec_parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output file path for UATSpecification JSON (writes to stdout if omitted).",
+    )
+    add_no_interactive(uat_build_spec_parser)
+    add_simulation_arg(uat_build_spec_parser)
+
+    @with_sdk
+    def uat_build_spec(
+        sdk: ImednetSDK,
+        *,
+        study_key: str,
+        subject_count: int = 2,
+        site_name: str | None = None,
+        enabled_form_keys: list[str] | None = None,
+        data_dictionary: DataDictionary | None = None,
+        seed: int | None = None,
+        output_path: str | None = None,
+    ) -> None:
+        from .uat import StudySchemaInspector, UATSpecificationBuilder
+        from .wizard import print_progress
+
+        try:
+            snapshot = StudySchemaInspector(sdk).inspect(study_key)  # type: ignore[arg-type]
+            spec = UATSpecificationBuilder(data_dictionary=data_dictionary).build(
+                snapshot,
+                subject_count=subject_count,
+                site_name=site_name,
+                enabled_form_keys=enabled_form_keys,
+                seed=seed,
+            )
+            serialized = spec.model_dump_json(indent=2, by_alias=True)
+            if output_path:
+                dest = Path(output_path)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(f"{serialized}\n", encoding="utf-8")
+                if not is_json_output_mode():
+                    print_progress(f"Wrote UAT specification for study '{study_key}' to '{dest}'.")
+                return
+            with contextlib.suppress(BrokenPipeError, OSError):
+                sys.stdout.write(f"{serialized}\n")
+                sys.stdout.flush()
+        except (ValueError, OSError) as exc:
+            _exit_uat_validation_error(exc)
+
+    def _handle_uat_build_spec(args: argparse.Namespace) -> None:
+        study_key = resolve_study_key(uat_build_spec_parser, args, required=True)
+        assert study_key is not None
+        validate_cli_path_segment(study_key, name="study_key")
+        subject_count = _validate_uat_subject_count(args.subject_count)
+        try:
+            loaded_dd = _load_uat_data_dictionary(args.data_dictionary, study_key=study_key)
+        except (ValueError, OSError) as exc:
+            _exit_uat_validation_error(exc)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            uat_build_spec(
+                study_key=study_key,
+                subject_count=subject_count,
+                site_name=args.site_name,
+                enabled_form_keys=args.enabled_form_keys,
+                data_dictionary=loaded_dd,
+                seed=args.seed,
+                output_path=args.output,
+            )
+
+    uat_build_spec_parser.set_defaults(func=_handle_uat_build_spec)
 
     uat_run_parser = uat_sub.add_parser("run", help="Run the end-to-end UAT pipeline for a study.")
     add_study_key_args(uat_run_parser)
@@ -911,7 +1141,10 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
     uat_run_parser.add_argument(
-        "--subject-count", type=int, default=2, help="Number of test subjects to generate."
+        "--subject-count",
+        type=int,
+        default=2,
+        help="Number of test subjects to generate (1..100).",
     )
     uat_run_parser.add_argument(
         "--site-name", default=None, help="Target site name for synthetic subjects."
@@ -925,8 +1158,42 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     uat_run_parser.add_argument(
         "--email-notify",
         default=None,
-        help="Optional email notification destination or flag.",
+        help="Optional email notification destination or boolean ('true'/'false').",
     )
+    uat_run_parser.add_argument(
+        "--spec",
+        dest="spec_path",
+        default=None,
+        help="Path to a saved UATSpecification JSON file.",
+    )
+    uat_run_parser.add_argument(
+        "--data-dictionary",
+        dest="data_dictionary",
+        default=None,
+        help="Offline Data Dictionary path (.json, .xml ODM, .csv REDCap, or CSV directory).",
+    )
+    uat_run_parser.add_argument(
+        "--schema",
+        dest="schema_source",
+        default=None,
+        help=(
+            "Validation schema path (.json, .xml ODM, .csv REDCap, or CSV dir) "
+            "or 'api' to fetch live study variables."
+        ),
+    )
+    uat_run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Inspect, generate, and validate synthetic UAT payloads locally without API writes.",
+    )
+    uat_run_parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Deterministic random seed for synthetic record generation.",
+    )
+    add_output_format(uat_run_parser)
     add_no_interactive(uat_run_parser)
     add_simulation_arg(uat_run_parser)
 
@@ -940,20 +1207,31 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
         no_interactive: bool = False,
+        *,
+        spec: Any = None,
+        data_dictionary: DataDictionary | None = None,
+        preloaded_schema: ValidationSchemaProtocol | None = None,
+        schema_source: str | None = None,
+        dry_run: bool = False,
+        seed: int | None = None,
+        output_format: str | None = None,
     ) -> None:
         from .uat import UATWorkflow, UATWorkflowState
         from .wizard import (
             ensure_interactive_stdin,
             print_progress,
             prompt_input,
-            prompt_positive_int,
             prompt_study_key,
+            prompt_subject_count,
         )
+
+        resolved_format = resolve_output_format(output_format)
+        json_mode = resolved_format == "json" or is_json_output_mode()
 
         if interactive:
             ensure_interactive_stdin(force_non_interactive=no_interactive)
             study_key = prompt_study_key(study_key)
-            subject_count = prompt_positive_int(
+            subject_count = prompt_subject_count(
                 "Enter number of test subjects", default=subject_count
             )
             site_input = prompt_input(
@@ -972,46 +1250,137 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         elif not study_key:
             uat_run_parser.error("the following arguments are required: study_key")
 
+        assert study_key is not None
         validate_path_segment(study_key, name="study_key")
+        if spec is not None and getattr(spec, "study_key", study_key) != study_key:
+            _exit_uat_validation_error(
+                f"Specification studyKey '{spec.study_key}' does not match study '{study_key}'."
+            )
 
-        active_phase_descriptions = {
-            UATWorkflowState.INSPECTING: "[Phase 1/5] Inspecting study schema and metadata...",
-            UATWorkflowState.BUILDING_SPEC: "[Phase 2/5] Building test specification...",
-            UATWorkflowState.GENERATING: "[Phase 3/5] Generating synthetic test records...",
-            UATWorkflowState.SUBMITTING: "[Phase 4/5] Submitting records to iMednet API...",
-            UATWorkflowState.MONITORING: "[Phase 5/5] Monitoring asynchronous job completion...",
-        }
+        try:
+            resolved_schema = (
+                preloaded_schema
+                if preloaded_schema is not None
+                else resolve_cli_schema(sdk, study_key, schema_source)
+            )
+        except (ValueError, OSError) as exc:
+            _exit_uat_validation_error(exc)
+
+        def _emit_progress(message: str) -> None:
+            if not json_mode:
+                print_progress(message)
+
+        if dry_run:
+            active_phase_descriptions = {
+                UATWorkflowState.INSPECTING: (
+                    "[Phase 1/3] Inspecting study schema and metadata..."
+                ),
+                UATWorkflowState.BUILDING_SPEC: "[Phase 2/3] Building test specification...",
+                UATWorkflowState.GENERATING: (
+                    "[Phase 3/3] Generating and validating synthetic test records..."
+                ),
+            }
+        else:
+            active_phase_descriptions = {
+                UATWorkflowState.INSPECTING: (
+                    "[Phase 1/5] Inspecting study schema and metadata..."
+                ),
+                UATWorkflowState.BUILDING_SPEC: "[Phase 2/5] Building test specification...",
+                UATWorkflowState.GENERATING: "[Phase 3/5] Generating synthetic test records...",
+                UATWorkflowState.SUBMITTING: "[Phase 4/5] Submitting records to iMednet API...",
+                UATWorkflowState.MONITORING: (
+                    "[Phase 5/5] Monitoring asynchronous job completion..."
+                ),
+            }
 
         def on_phase(phase: UATWorkflowState) -> None:
             if phase in (UATWorkflowState.COMPLETED, UATWorkflowState.FAILED):
                 return
             msg = active_phase_descriptions.get(phase, f"UAT Phase transition: {phase.value}")
-            print_progress(msg)
+            _emit_progress(msg)
 
         def on_progress(batch_id: str, status: Any, elapsed: float) -> None:
             state_val = getattr(status, "state", getattr(status, "status", str(status)))
-            print_progress(f"[Job Progress] Batch {batch_id}: {state_val} ({elapsed:.1f}s)")
+            _emit_progress(f"[Job Progress] Batch {batch_id}: {state_val} ({elapsed:.1f}s)")
 
-        print_progress(f"Starting UAT pipeline for study '{study_key}'...")
+        effective_seed = (
+            seed
+            if seed is not None
+            else (getattr(spec, "seed", None) if spec is not None else None)
+        )
+
+        _emit_progress(f"Starting UAT pipeline for study '{study_key}'...")
+        wf_kwargs: dict[str, Any] = {
+            "on_progress": on_progress,
+            "on_phase_change": on_phase,
+        }
+        if effective_seed is not None:
+            wf_kwargs["seed"] = effective_seed
+        if data_dictionary is not None:
+            wf_kwargs["data_dictionary"] = data_dictionary
+
         workflow = UATWorkflow(
             sdk,  # type: ignore[arg-type]
-            on_progress=on_progress,
-            on_phase_change=on_phase,
+            **wf_kwargs,
         )
-        result = workflow.run(
-            study_key=study_key,  # type: ignore[arg-type]
-            subject_count=subject_count,
-            site_name=site_name,
-            enabled_form_keys=enabled_form_keys,
-            email_notify=email_notify,
-        )
+
+        run_kwargs: dict[str, Any] = {
+            "study_key": study_key,
+            "subject_count": subject_count,
+            "site_name": site_name,
+            "enabled_form_keys": enabled_form_keys,
+            "email_notify": email_notify,
+        }
+        if spec is not None:
+            run_kwargs["spec"] = spec
+        if data_dictionary is not None:
+            run_kwargs["data_dictionary"] = data_dictionary
+        if resolved_schema is not None:
+            run_kwargs["schema"] = resolved_schema
+        if effective_seed is not None:
+            run_kwargs["seed"] = effective_seed
+        if dry_run:
+            run_kwargs["dry_run"] = True
+
+        try:
+            result = workflow.run(**run_kwargs)
+        except (ValueError, OSError) as exc:
+            _exit_uat_validation_error(exc)
 
         result_state = getattr(result, "state", None)
         is_success = bool(result.overall_success) and result_state != UATWorkflowState.FAILED
+
+        if resolved_format == "json":
+            has_structured_outcome = (
+                is_success
+                or getattr(result, "validation_report", None) is not None
+                or getattr(result, "submission_result", None) is not None
+                or getattr(result, "poll_summary", None) is not None
+            )
+            if not has_structured_outcome:
+                err_detail = (
+                    getattr(result, "error_message", None)
+                    or "UAT pipeline execution encountered an error."
+                )
+                print_error(redact_cli_secrets(redact_sensitive_text(str(err_detail))))
+                sys.exit(1)
+
+            custom_phi = _resolve_custom_phi_fields(study_key)
+            item = _serialize_uat_run_result(
+                result,
+                study_key=study_key,
+                dry_run=dry_run,
+                custom_phi_fields=custom_phi,
+            )
+            emit_json([item], "uat_run")
+            if not is_success:
+                sys.exit(1)
+            return
+
         if is_success:
-            print_progress("[Complete] UAT pipeline execution finished successfully.")
+            _emit_progress("[Complete] UAT pipeline execution finished successfully.")
         else:
-            print_progress("[Failed] UAT pipeline execution encountered an error.")
+            _emit_progress("[Failed] UAT pipeline execution encountered an error.")
 
         _emit_line(result.summary())
         if not is_success:
@@ -1019,23 +1388,79 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
     def _handle_uat_run(args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
-        study_key = resolve_study_key(uat_run_parser, args, required=not args.interactive)
+        raw_format = getattr(args, "output_format", None)
+        resolved_format = resolve_output_format(raw_format)
+        if args.interactive and (resolved_format == "json" or is_json_output_mode()):
+            print_error("Error: Cannot combine --interactive with --format json.")
+            sys.exit(1)
+
+        subject_count = _validate_uat_subject_count(args.subject_count)
+        try:
+            normalized_email_notify = parse_email_notify(args.email_notify)
+        except ValueError as exc:
+            _exit_uat_validation_error(exc)
+
+        loaded_spec: Any = None
+        if getattr(args, "spec_path", None):
+            from .uat import UATSpecification
+
+            spec_file = Path(args.spec_path)
+            if not spec_file.is_file():
+                _exit_uat_validation_error(f"Specification file not found: '{args.spec_path}'")
+            try:
+                loaded_spec = UATSpecification.from_json(spec_file)
+            except (ValueError, OSError) as exc:
+                _exit_uat_validation_error(f"Invalid UAT specification '{args.spec_path}': {exc}")
+
+        study_key = resolve_study_key(uat_run_parser, args, required=False)
+        if study_key is None and loaded_spec is not None:
+            study_key = loaded_spec.study_key
+
         if args.interactive:
             from .wizard import ensure_interactive_stdin
 
             ensure_interactive_stdin(force_non_interactive=no_interactive)
         else:
+            if not study_key:
+                uat_run_parser.error("the following arguments are required: study_key")
             assert study_key is not None
             validate_cli_path_segment(study_key, name="study_key")
+            if loaded_spec is not None and loaded_spec.study_key != study_key:
+                _exit_uat_validation_error(
+                    f"Specification studyKey '{loaded_spec.study_key}' does not match study '{study_key}'."
+                )
+
+        preflight_study_key = study_key or "STUDY"
+        try:
+            loaded_dd = _load_uat_data_dictionary(
+                getattr(args, "data_dictionary", None),
+                study_key=preflight_study_key,
+            )
+            raw_schema_src = getattr(args, "schema_source", None)
+            preloaded_schema = (
+                load_offline_schema(raw_schema_src, study_key=preflight_study_key)
+                if raw_schema_src and raw_schema_src.strip().lower() != "api"
+                else None
+            )
+        except (ValueError, OSError) as exc:
+            _exit_uat_validation_error(exc)
+
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             uat_run(
                 study_key=study_key,
                 interactive=args.interactive,
-                subject_count=args.subject_count,
+                subject_count=subject_count,
                 site_name=args.site_name,
                 enabled_form_keys=args.enabled_form_keys,
-                email_notify=args.email_notify,
+                email_notify=normalized_email_notify,
                 no_interactive=no_interactive,
+                spec=loaded_spec,
+                data_dictionary=loaded_dd,
+                preloaded_schema=preloaded_schema,
+                schema_source=getattr(args, "schema_source", None),
+                dry_run=bool(getattr(args, "dry_run", False)),
+                seed=getattr(args, "seed", None),
+                output_format=raw_format,
             )
 
     uat_run_parser.set_defaults(func=_handle_uat_run)

@@ -56,6 +56,7 @@ submission:
 
 .. testcode::
 
+   import asyncio
    from imednet import AsyncImednetSDK, ImednetSDK
    from imednet.simulation import reset_default_simulation_state
    from imednet.utils.batch_coordinator import AsyncBatchCoordinator, BatchCoordinator
@@ -65,14 +66,14 @@ submission:
        {
            "formKey": "F_VS",
            "siteName": "SITE",
-           "subjectKey": "SUBJ-001",
+           "subjectKey": "SUB1",
            "intervalName": "Baseline",
            "data": {"V_WEIGHT": 70.5},
        },
        {
            "formKey": "F_VS",
            "siteName": "SITE",
-           "subjectKey": "SUBJ-001",
+           "subjectKey": "SUB1",
            "intervalName": "Baseline",
            "data": {"V_WEIGHT": 71.2},
        },
@@ -81,6 +82,8 @@ submission:
    # 1. Endpoint-level create_batch + explicit poll_jobs
    endpoint_summary = batch_sdk.records.create_batch("STUDY", records_payload, chunk_size=1)
    poll_summary = batch_sdk.poll_jobs("STUDY", endpoint_summary.batch_ids, interval=0.05, timeout=10.0)
+   assert endpoint_summary.chunk_count == 2
+   assert poll_summary.all_successful is True
    print(endpoint_summary.chunk_count, poll_summary.all_successful)
 
    # 2. One-step convenience batch submission with polling
@@ -92,6 +95,8 @@ submission:
        interval=0.05,
        timeout=10.0,
    )
+   assert convenience_summary.total_records == 2
+   assert convenience_summary.all_successful is True
    print(convenience_summary.total_records, convenience_summary.all_successful)
 
    # 3. Direct BatchCoordinator and AsyncBatchCoordinator usage
@@ -101,6 +106,7 @@ submission:
        records_payload,
        lambda chunk: batch_sdk.records.create("STUDY", chunk),
    )
+   assert len(coord_summary.batch_ids) == 2
    print(len(coord_summary.batch_ids))
 
    async def submit_async_batches() -> None:
@@ -111,8 +117,10 @@ submission:
                records_payload,
                lambda chunk: async_batch_sdk.records.create("STUDY", chunk),
            )
-           await async_batch_sdk.async_poll_jobs("STUDY", summary.batch_ids, interval=0.05)
+           async_poll = await async_batch_sdk.async_poll_jobs("STUDY", summary.batch_ids, interval=0.05)
+           assert async_poll.all_successful is True
 
+   asyncio.run(submit_async_batches())
    reset_default_simulation_state()
 
 Inspecting ``JobStatus`` Record Counts and Partial Failures
@@ -159,6 +167,35 @@ and partial-failure predicates:
    assert partial_failure.result_error == "1 Record rejected by Range Check"
    assert partial_failure.is_failed is True
    assert partial_failure.is_successful is False
+
+Mid-Batch Errors, Sibling Settlement, and Validation Modes
+----------------------------------------------------------
+
+Chunked write helpers (:meth:`~imednet.endpoints.records.RecordsEndpoint.create_batch`,
+:class:`~imednet.utils.batch_coordinator.BatchCoordinator`, and
+:class:`~imednet.utils.batch_coordinator.AsyncBatchCoordinator`) preserve full batch
+state when partial progress occurs before an error:
+
+* **Mid-batch write errors**: If chunk *N* fails after earlier chunks were accepted by
+  the API, any accepted ``batch_id`` values are settled to terminal states when
+  ``wait_for_completion=True`` and a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`
+  is attached to ``exc.partial_summary`` (along with ``exc.unsubmitted_chunks``).
+  Credentials are redacted and clinical PHI fields are masked on all attached diagnostic
+  payloads without mutating caller input dictionaries.
+* **Sibling settlement on polling failures**: When ``wait_for_completion=True`` polls
+  multiple chunks and one ``Job`` ends in a failed state, all sibling ``batch_id``
+  values are settled to terminal states before :class:`~imednet.utils.job_poller.JobFailedError`
+  is raised. Callers can inspect ``exc.poll_summary`` (including
+  ``exc.poll_summary.terminal_statuses``) and ``exc.partial_summary`` to reconcile which
+  chunks succeeded and which failed; in accordance with
+  :doc:`/adr/0006-endpoint-composition-and-job-polling`, local errors never imply
+  server-side ``Job`` cancellation.
+* **Dry-run and skipped validation semantics**: Calling ``submit(..., dry_run=True)``
+  returns the :class:`~imednet.validation.cache.BatchValidationReport` on
+  ``summary.validation_report`` without raising :class:`~imednet.errors.ValidationError`,
+  and ``summary.all_successful`` reflects ``report.is_valid``. Passing
+  ``skip_validation=True`` leaves ``summary.validation_report`` as ``None`` so unvalidated
+  batches never claim valid ``Record`` counts.
 
 Typed Endpoint Interface and Terminal Semantics
 -----------------------------------------------

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import overload
-
 from pydantic import Field
 
 from imednet.models.base import ImednetBaseModel
@@ -30,50 +28,42 @@ class Form(ImednetBaseModel):
     user_agreement: bool | None = Field(default=None, alias="userAgreement")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         subject_record_report: bool | None = None,
-        unscheduled_visit: bool | None = None,
-        disabled: bool | None = None,
-        study_key: str | None = None,
-        form_id: int | None = None,
-        form_key: str | None = None,
-        form_name: str | None = None,
-        form_type: str | None = None,
-        revision: int | None = None,
-        date_created: str | None = None,
-        date_modified: str | None = None,
-        epro_form: bool | None = None,
-        allow_copy: bool | None = None,
-        embedded_log: bool | None = None,
-        enforce_ownership: bool | None = None,
-        other_forms: bool | None = None,
-        user_agreement: bool | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         subjectRecordReport: bool | None = None,
+        unscheduled_visit: bool | None = None,
         unscheduledVisit: bool | None = None,
         disabled: bool | None = None,
+        study_key: str | None = None,
         studyKey: str | None = None,
+        form_id: int | None = None,
         formId: int | None = None,
+        form_key: str | None = None,
         formKey: str | None = None,
+        form_name: str | None = None,
         formName: str | None = None,
+        form_type: str | None = None,
         formType: str | None = None,
         revision: int | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_modified: str | None = None,
         dateModified: str | None = None,
+        epro_form: bool | None = None,
         eproForm: bool | None = None,
+        allow_copy: bool | None = None,
         allowCopy: bool | None = None,
+        embedded_log: bool | None = None,
         embeddedLog: bool | None = None,
+        enforce_ownership: bool | None = None,
         enforceOwnership: bool | None = None,
+        other_forms: bool | None = None,
         otherForms: bool | None = None,
+        user_agreement: bool | None = None,
         userAgreement: bool | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
 
