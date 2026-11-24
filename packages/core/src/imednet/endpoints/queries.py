@@ -9,6 +9,7 @@ class QueriesOperationDef:
 
     PATH = "queries"
     MODEL = Query
+    PAGE_SIZE = 500
     FILTER_ATTRIBUTES = frozenset(
         {
             "subjectId",

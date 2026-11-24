@@ -207,25 +207,115 @@ def test_verification_workflows_enforce_reports_caching_and_deep_fuzzing() -> No
     assert perf_upload["with"]["path"] == "reports/verification/performance_report.json"
     assert perf_upload["with"]["if-no-files-found"] == "error"
 
-    main_wf = yaml.safe_load((WORKFLOWS / "main.yml").read_text(encoding="utf-8"))
-    fuzz_steps = main_wf["jobs"]["fuzzing"]["steps"]
-    assert any("25,000 iterations" in s.get("name", "") for s in fuzz_steps)
-    assert any(
-        s.get("uses", "").startswith("actions/cache/restore@")
-        and ".cache/verification/fuzz_corpus" in s.get("with", {}).get("path", "")
-        for s in fuzz_steps
+    expected_restore_key = (
+        "fuzz-corpus-${{ runner.os }}-sha256-restore-${{ github.run_id }}-${{ github.run_attempt }}"
     )
-    save_corpus = next(s for s in fuzz_steps if s.get("name") == "Save Fuzzing Corpus Cache")
-    assert "github.event_name == 'push'" in save_corpus["if"]
-    assert "refs/heads/main" in save_corpus["if"]
+    expected_restore_prefixes = [
+        "fuzz-corpus-${{ runner.os }}-sha256-",
+        "fuzz-corpus-${{ runner.os }}-",
+    ]
+    expected_save_key = (
+        "fuzz-corpus-${{ runner.os }}-sha256-${{ hashFiles('.cache/verification/fuzz_corpus/**') }}"
+    )
+    expected_non_empty_digest = "hashFiles('.cache/verification/fuzz_corpus/**') != ''"
+    expected_matched_key_guard = (
+        "steps.restore-fuzz-corpus.outputs.cache-matched-key != "
+        "format('fuzz-corpus-{0}-sha256-{1}', runner.os, "
+        "hashFiles('.cache/verification/fuzz_corpus/**'))"
+    )
+    legacy_static_key = "fuzz-corpus-${{ runner.os }}-${{ github.sha }}"
+
+    main_raw = (WORKFLOWS / "main.yml").read_text(encoding="utf-8")
+    deep_raw = (WORKFLOWS / "fuzzing-deep.yml").read_text(encoding="utf-8")
+    assert legacy_static_key not in main_raw
+    assert legacy_static_key not in deep_raw
+
+    main_wf = yaml.safe_load(main_raw)
+    fuzz_job = main_wf["jobs"]["fuzzing"]
+    assert fuzz_job["needs"] == ["plan", "build"]
+    assert fuzz_job["if"] == "needs.plan.outputs.matrix != '[]'"
+    assert fuzz_job["permissions"] == {"contents": "read"}
+
+    fuzz_steps = fuzz_job["steps"]
+    fuzz_runs = [s.get("run", "") for s in fuzz_steps if "run" in s]
+    assert not any("pip install" in r for r in fuzz_runs)
+    assert any("uv sync --locked --all-packages --all-extras" in r for r in fuzz_runs)
+    assert any("25,000 iterations" in s.get("name", "") for s in fuzz_steps)
+
+    deep = yaml.safe_load(deep_raw)
+    triggers = deep.get("on") or deep.get(True)
+    assert "schedule" in triggers and "workflow_dispatch" in triggers
+    deep_job = deep["jobs"]["deep-fuzzing"]
+    assert deep_job["permissions"] == {"contents": "read"}
+    deep_steps = deep_job["steps"]
+    deep_setup_uv = next(
+        s for s in deep_steps if str(s.get("uses", "")).startswith("astral-sh/setup-uv@")
+    )
+    fuzz_setup_uv = next(
+        s for s in fuzz_steps if str(s.get("uses", "")).startswith("astral-sh/setup-uv@")
+    )
+    assert fuzz_setup_uv["uses"] == deep_setup_uv["uses"]
+    assert len(fuzz_setup_uv["uses"].split("@", 1)[1]) == 40
+    assert fuzz_setup_uv["with"]["enable-cache"] == "false"
+
+    for steps in (fuzz_steps, deep_steps):
+        for step in steps:
+            if "uses" in step:
+                assert len(step["uses"].split("@", 1)[1]) == 40
+
+        aggregate_step = next(s for s in steps if s.get("name") == "Aggregate Verification Report")
+        assert aggregate_step["if"] == "always()"
+        assert (
+            "aggregate_verification.py --report-dir reports/verification --expect-track fuzzing"
+            in aggregate_step["run"]
+        )
+
+        upload_step = next(s for s in steps if s.get("name") == "Save Verification Artifact")
+        assert upload_step["if"] == "always()"
+
+        restore_corpus = next(s for s in steps if s.get("id") == "restore-fuzz-corpus")
+        assert restore_corpus["uses"].startswith("actions/cache/restore@")
+        assert restore_corpus["with"]["path"] == ".cache/verification/fuzz_corpus/"
+        assert restore_corpus["with"]["key"] == expected_restore_key
+        restore_prefixes = [
+            line.strip()
+            for line in restore_corpus["with"]["restore-keys"].splitlines()
+            if line.strip()
+        ]
+        assert restore_prefixes == expected_restore_prefixes
+
+        save_corpus = next(s for s in steps if s.get("name") == "Save Fuzzing Corpus Cache")
+        assert save_corpus["uses"].startswith("actions/cache/save@")
+        assert save_corpus["with"]["path"] == ".cache/verification/fuzz_corpus/"
+        assert save_corpus["with"]["key"] == expected_save_key
+        save_cond = " ".join(str(save_corpus["if"]).split())
+        assert expected_non_empty_digest in save_cond
+        assert expected_matched_key_guard in save_cond
+        assert "cache-hit" not in save_cond
+
+    main_save_cond = " ".join(
+        str(
+            next(s for s in fuzz_steps if s.get("name") == "Save Fuzzing Corpus Cache")["if"]
+        ).split()
+    )
+    assert "github.event_name == 'push'" in main_save_cond
+    assert "github.ref == 'refs/heads/main'" in main_save_cond
+
     fuzz_upload = next(s for s in fuzz_steps if s.get("name") == "Save Verification Artifact")
+    assert fuzz_upload["with"]["name"] == "fuzzing-report"
     assert fuzz_upload["with"]["path"] == "reports/verification/fuzzing_report.json"
     assert fuzz_upload["with"]["if-no-files-found"] == "error"
 
-    deep = yaml.safe_load((WORKFLOWS / "fuzzing-deep.yml").read_text(encoding="utf-8"))
-    triggers = deep.get("on") or deep.get(True)
-    assert "schedule" in triggers and "workflow_dispatch" in triggers
-    deep_steps = deep["jobs"]["deep-fuzzing"]["steps"]
     assert any(s.get("env", {}).get("IMEDNET_FUZZ_RUNS") == "1000000" for s in deep_steps)
+    deep_save_cond = " ".join(
+        str(
+            next(s for s in deep_steps if s.get("name") == "Save Fuzzing Corpus Cache")["if"]
+        ).split()
+    )
+    assert "refs/heads/main" not in deep_save_cond
+    assert "github.event_name" not in deep_save_cond
+
     deep_upload = next(s for s in deep_steps if s.get("name") == "Save Verification Artifact")
+    assert deep_upload["with"]["name"] == "deep-fuzzing-report"
+    assert deep_upload["with"]["path"] == "reports/verification/fuzzing_report.json"
     assert deep_upload["with"]["if-no-files-found"] == "error"

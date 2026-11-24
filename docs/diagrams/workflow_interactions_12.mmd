@@ -1,13 +1,12 @@
 graph TD
     accTitle: Epoch-Fenced Delta Sync and SyncWorker Health Lifecycle
-    accDescr: Flowchart showing SyncWorker running lock-free remote delta and active-ID fetches, short FileLock epoch-stamped SQLite upserts and epoch-fenced orphan reconciliation, and transitioning across RUNNING, DEGRADED, FAILED, and STOPPED states
+    accDescr: Flowchart showing SyncWorker running lock-free remote delta, projection, and missing-record fetches before a single atomic FileLock SQLite commit for upserts, epoch-fenced orphan reconciliation, and watermark updates across RUNNING, DEGRADED, FAILED, and STOPPED states
     A[run_forever] --> B{stop_event set?}
     B -- No --> C[_fetch_delta_records]
-    C --> D["FileLock: epoch _upsert_records"]
-    D --> E[_fetch_active_record_ids]
-    E --> F[_fetch_missing_records]
-    F --> G["FileLock: epoch reconcile_cache + watermark"]
-    G --> H{cycle succeeded?}
+    C --> D[_fetch_active_records_projection]
+    D --> E[_fetch_missing_records]
+    E --> F["FileLock: atomic _upsert_records_unlocked + reconcile_cache + watermark"]
+    F --> H{cycle succeeded?}
     H -- Yes --> I[state = RUNNING]
     I --> M[wait interval_seconds]
     H -- No --> J{failure limit reached?}

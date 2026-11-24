@@ -1,11 +1,40 @@
 /**
- * WCAG 2.1 Level AA keyboard focus management for overflowing <pre> code blocks
- * and Mermaid diagram regions across all documentation pages.
+ * WCAG 2.1 Level AA keyboard focus management for overflowing <pre> code blocks,
+ * Mermaid diagram regions, and wide .table-wrapper containers across documentation pages.
  */
 (function () {
     "use strict";
 
     let codeBlocksRaf = null;
+
+    function resolveTableRegionLabel(wrapper) {
+        if (!wrapper) return "Scrollable data table";
+        if (typeof wrapper.querySelector === "function") {
+            const captionEl = wrapper.querySelector("caption");
+            if (captionEl && captionEl.textContent && captionEl.textContent.trim()) {
+                return captionEl.textContent.trim();
+            }
+        }
+        let cur = wrapper.previousElementSibling;
+        while (cur) {
+            if (/^H[1-6]$/i.test(cur.tagName || "") && cur.textContent && cur.textContent.trim()) {
+                return cur.textContent.trim() + " table";
+            }
+            cur = cur.previousElementSibling;
+        }
+        const section =
+            typeof wrapper.closest === "function" ? wrapper.closest("section") : null;
+        if (section && typeof section.querySelector === "function") {
+            const heading = section.querySelector("h1, h2, h3, h4, h5, h6");
+            if (heading && heading.textContent) {
+                const cleaned = heading.textContent.replace(/¶|#$/g, "").trim();
+                if (cleaned) {
+                    return cleaned + " table";
+                }
+            }
+        }
+        return "Scrollable data table";
+    }
 
     function checkCodeBlocks() {
         const blocks = document.querySelectorAll("pre");
@@ -64,6 +93,30 @@
                 }
             }
         });
+
+        const tableWrappers = document.querySelectorAll(".table-wrapper");
+        tableWrappers.forEach(function (wrapper) {
+            const isOverflowing =
+                wrapper.clientWidth > 0 && wrapper.scrollWidth > wrapper.clientWidth;
+            if (isOverflowing) {
+                const tableLabel = resolveTableRegionLabel(wrapper);
+                wrapper.setAttribute("tabindex", "0");
+                wrapper.setAttribute("role", "region");
+                if (!wrapper.getAttribute("aria-label") || wrapper.hasAttribute("data-table-region")) {
+                    wrapper.setAttribute("aria-label", tableLabel);
+                    wrapper.setAttribute("data-table-region", "true");
+                }
+            } else {
+                if (wrapper.hasAttribute("tabindex")) {
+                    wrapper.removeAttribute("tabindex");
+                }
+                if (wrapper.hasAttribute("data-table-region")) {
+                    wrapper.removeAttribute("role");
+                    wrapper.removeAttribute("aria-label");
+                    wrapper.removeAttribute("data-table-region");
+                }
+            }
+        });
     }
 
     function scheduleCheckCodeBlocks() {
@@ -91,8 +144,10 @@
         globalThis.imednetScheduleCheckCodeBlocks = scheduleCheckCodeBlocks;
 
         checkCodeBlocks();
-        window.addEventListener("resize", scheduleCheckCodeBlocks);
-        window.addEventListener("load", scheduleCheckCodeBlocks);
+        if (typeof globalThis.addEventListener === "function") {
+            globalThis.addEventListener("resize", scheduleCheckCodeBlocks);
+            globalThis.addEventListener("load", scheduleCheckCodeBlocks);
+        }
 
         if (typeof MutationObserver !== "undefined") {
             const observer = new MutationObserver(function () {

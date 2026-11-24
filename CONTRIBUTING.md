@@ -68,13 +68,13 @@ hatch run test
 ```
 
 ### Pre-commit hooks
-To install the lightweight pre-commit hooks for automatic formatting, lint fixes, spell checking, and secret leak prevention:
+To install the lightweight pre-commit hooks for automatic formatting, lint fixes, non-mutating spell checking, and secret leak prevention:
 
 ```bash
 pre-commit install
 ```
 
-Our pre-commit configuration is optimized for developer velocity: hooks execute in <1.5s on staged files only (`ruff format`, `ruff --fix`, `typos`, `detect-secrets`, root sanitization). Slower, whole-codebase checks (`mypy`, `pytest`, `pylint-sim`, `vulture`, `pip-audit`) are reserved for pre-PR verification and CI.
+Our pre-commit configuration is optimized for developer velocity: hooks execute in <1.5s on staged files only (`ruff-format`, `ruff-check --fix`, non-mutating `typos --force-exclude`, `detect-secrets`, root sanitization). Slower, whole-codebase checks (`mypy`, `pytest`, `pylint-sim`, `vulture`, `pip-audit`) are reserved for pre-PR verification and CI.
 
 ## Issue reporting and triage
 The repository uses a documented issue operating model for intake, prioritization,
@@ -94,7 +94,7 @@ Run before committing:
 ```bash
 uvx pre-commit run --all-files
 hatch run verify
-hatch run lint:all
+uvx hatch run quality:all
 hatch run docs
 ```
 Coverage must stay ≥ 90% across all five workspace packages (`imednet`, `imednet_workflows`, `apache_airflow_providers_imednet`, `imednet_sinks`, and `imednet_tui`).
@@ -166,7 +166,7 @@ Releases are fully automated and driven by merged PR titles:
    ```bash
    uvx pre-commit run --all-files
    hatch run verify
-   hatch run lint:all
+   uvx hatch run quality:all
    hatch run docs
    ```
 3. Merge to `main` using **Squash and merge** so the PR title becomes the merged commit message.

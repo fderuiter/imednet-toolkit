@@ -47,6 +47,7 @@ _CANONICAL_DOMAINS: dict[str, str] = {
     "DM": "DM",
     "DEMOGRAPHICS": "DM",
     "DEMOGRAPHIC": "DM",
+    "DEMO": "DM",
     "VS": "VS",
     "VITALS": "VS",
     "VITAL SIGNS": "VS",
@@ -56,19 +57,45 @@ _CANONICAL_DOMAINS: dict[str, str] = {
     "ADVERSE EVENTS": "AE",
     "ADVERSE_EVENTS": "AE",
     "ADVERSE EVENT": "AE",
+    "ADVERSE_EVENT": "AE",
+    "ADVERSEEVENTS": "AE",
+    "ADVERSEEVENT": "AE",
     "PD": "PD",
+    "DV": "PD",
     "PROTOCOL DEVIATIONS": "PD",
     "PROTOCOL_DEVIATIONS": "PD",
     "PROTOCOL DEVIATION": "PD",
+    "PROTOCOL_DEVIATION": "PD",
+    "PROTOCOLDEVIATIONS": "PD",
+    "PROTOCOLDEVIATION": "PD",
     "DD": "DD",
     "DEVICE DEFICIENCIES": "DD",
     "DEVICE_DEFICIENCIES": "DD",
     "DEVICE DEFICIENCY": "DD",
+    "DEVICE_DEFICIENCY": "DD",
+    "DEVICEDEFICIENCIES": "DD",
+    "DEVICEDEFICIENCY": "DD",
     "CM": "CM",
+    "CONMEDS": "CM",
     "CONCOMITANT MEDICATIONS": "CM",
     "CONCOMITANT_MEDICATIONS": "CM",
     "CONCOMITANT MEDICATION": "CM",
     "CONCOMITANT_MEDICATION": "CM",
+    "CONCOMITANTMEDICATIONS": "CM",
+    "LB": "LB",
+    "LAB": "LB",
+    "LABS": "LB",
+    "LABORATORY": "LB",
+    "LABORATORY RESULTS": "LB",
+    "LABORATORY_RESULTS": "LB",
+    "EX": "EX",
+    "EXPOSURE": "EX",
+    "EXPOSURES": "EX",
+    "MH": "MH",
+    "MEDICAL HISTORY": "MH",
+    "MEDICAL_HISTORY": "MH",
+    "MEDICALHISTORY": "MH",
+    "MEDHIST": "MH",
 }
 
 _STANDARD_SEX_VALUES: list[str] = ["M", "F", "U", "UNDIFFERENTIATED"]
@@ -240,7 +267,7 @@ class StandardsProfile:
 
 
 class GeneralClinicalProfile(StandardsProfile):
-    """General clinical profile with basic AE, PD, DM, and VS requirements."""
+    """General clinical profile with basic AE, PD, DM, VS, LB, CM, EX, and MH requirements."""
 
     def __init__(self) -> None:
         """Initialize the general clinical profile."""
@@ -251,12 +278,20 @@ class GeneralClinicalProfile(StandardsProfile):
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "CM": ["subjectKey", "cmTerm", "cmStartDate"],
+                "EX": ["subjectKey", "exTrt", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm", "mhStartDate"],
             },
             recommended_fields={
                 "AE": ["aeDecod", "aeRelationship"],
                 "PD": ["dvStatus"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                "LB": ["lbTestCd", "lbUnit"],
+                "CM": ["cmDose", "cmDoseUnit", "cmRoute"],
+                "EX": ["exDose", "exDoseUnit", "exRoute"],
+                "MH": ["mhCategory", "mhDecod"],
             },
             optional_fields={
                 "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
@@ -265,7 +300,7 @@ class GeneralClinicalProfile(StandardsProfile):
 
 
 class DrugSafetyProfile(StandardsProfile):
-    """Drug safety profile with stricter requirements for AE data."""
+    """Drug safety profile with stricter requirements for AE and safety domains."""
 
     def __init__(self) -> None:
         """Initialize the drug safety profile."""
@@ -276,11 +311,19 @@ class DrugSafetyProfile(StandardsProfile):
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "CM": ["subjectKey", "cmTerm", "cmStartDate"],
+                "EX": ["subjectKey", "exTrt", "exDose", "exDoseUnit", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm", "mhStartDate"],
             },
             recommended_fields={
                 "AE": ["aeActionTaken", "aeOutcome"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                "LB": ["lbTestCd", "lbUnit"],
+                "CM": ["cmDecod", "cmDose", "cmDoseUnit", "cmRoute", "cmIndication"],
+                "EX": ["exRoute"],
+                "MH": ["mhCategory", "mhDecod"],
             },
             optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
             value_constraints={
@@ -303,13 +346,19 @@ class BiologicSafetyProfile(StandardsProfile):
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "CM": ["subjectKey", "cmTerm", "cmStartDate"],
                 "EX": ["subjectKey", "exTrt", "exDose", "exDoseUnit", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm", "mhStartDate"],
             },
             recommended_fields={
                 "AE": ["aeActionTaken", "aeOutcome", "aeSerious"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                "LB": ["lbTestCd", "lbUnit"],
+                "CM": ["cmDecod", "cmDose", "cmDoseUnit", "cmRoute", "cmIndication"],
                 "EX": ["exRoute"],
+                "MH": ["mhCategory", "mhDecod"],
             },
             optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
             value_constraints={
@@ -332,13 +381,19 @@ class VaccineSafetyProfile(StandardsProfile):
                 "PD": ["subjectKey", "dvTerm", "dvCategory", "dvSeverity", "dvDate"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "CM": ["subjectKey", "cmTerm", "cmStartDate"],
                 "EX": ["subjectKey", "exTrt", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm", "mhStartDate"],
             },
             recommended_fields={
                 "AE": ["aeActionTaken", "aeOutcome", "aeSerious"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                "LB": ["lbTestCd", "lbUnit"],
+                "CM": ["cmDose", "cmDoseUnit", "cmRoute"],
                 "EX": ["exDose", "exDoseUnit", "exRoute"],
+                "MH": ["mhCategory", "mhDecod"],
             },
             optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
             value_constraints={
@@ -362,11 +417,19 @@ class DeviceSafetyProfile(StandardsProfile):
                 "DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"],
                 "DM": ["subjectKey", "sex"],
                 "VS": ["subjectKey", "vsTest", "vsResult", "vsDate"],
+                "LB": ["subjectKey", "lbTest", "lbResult", "lbDate"],
+                "CM": ["subjectKey", "cmTerm", "cmStartDate"],
+                "EX": ["subjectKey", "exTrt", "exStartDate"],
+                "MH": ["subjectKey", "mhTerm", "mhStartDate"],
             },
             recommended_fields={
                 "DD": ["ddRelationship", "ddActionTaken"],
                 "DM": ["birthDate", "age", "race", "ethnicity"],
                 "VS": ["vsTestCd", "vsUnit"],
+                "LB": ["lbTestCd", "lbUnit"],
+                "CM": ["cmDose", "cmDoseUnit", "cmRoute"],
+                "EX": ["exDose", "exDoseUnit", "exRoute"],
+                "MH": ["mhCategory", "mhDecod"],
             },
             optional_fields={},
             value_constraints={
@@ -1040,6 +1103,7 @@ class StandardsReadinessValidator:
             for field, terms in getattr(self._normalizer, "cdisc_ct", {}).items()
         }
 
+        has_unconfigured_domain = False
         for domain, records in records_by_domain.items():
             effective_domain = (
                 "PD"
@@ -1047,6 +1111,31 @@ class StandardsReadinessValidator:
                 else domain
             )
             expected_fields = self._profile.expected_fields(effective_domain)
+            if not expected_fields:
+                has_unconfigured_domain = True
+                checked_records += len(records)
+                domain_scores[domain] = 0.0
+                violations.append(
+                    ValidationViolation(
+                        field=domain,
+                        message=(
+                            f"Domain '{domain}' has no configured standards rules in "
+                            f"profile '{self._profile.profile_name}'."
+                        ),
+                        severity="ERROR",
+                    )
+                )
+                continue
+            if not records:
+                domain_scores[domain] = 0.0
+                violations.append(
+                    ValidationViolation(
+                        field=domain,
+                        message=f"No records found for domain '{domain}'.",
+                        severity="ERROR",
+                    )
+                )
+                continue
             dom_valid_fields = 0
             dom_expected_fields = 0
             for record in records:
@@ -1110,11 +1199,19 @@ class StandardsReadinessValidator:
                 else (dom_valid_fields / dom_expected_fields) * 100.0
             )
 
-        if checked_records == 0 or total_expected_fields == 0:
+        if checked_records == 0 or total_expected_fields == 0 or has_unconfigured_domain:
             score = 0.0
             warnings.append(
                 "No study records or expected standard fields were evaluated; readiness score is 0.0."
             )
+            if not any(v.severity.upper() == "ERROR" for v in violations):
+                violations.append(
+                    ValidationViolation(
+                        field="study",
+                        message="No study records or expected standard fields were evaluated.",
+                        severity="ERROR",
+                    )
+                )
         else:
             score = (successfully_validated_fields / total_expected_fields) * 100.0
         return StandardsReadinessReport(

@@ -108,8 +108,8 @@ sites, forms, records, subjects, intervals, visits, codings, and users, alongsid
 summaries for ``records create``, ``records update``, ``records import``, and
 ``subjects register``). JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
-``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
-and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it), while
+``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands,
+``datadict validate``, and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it), while
 write commands emit ``status: "failed"`` with exit code ``1`` when pre-write validation,
 a mid-batch chunk ``POST``, or ``--wait`` polling fails after validating or committing
 earlier chunks. Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'

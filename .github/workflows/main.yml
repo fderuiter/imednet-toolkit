@@ -58,10 +58,15 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: pip install 'ruff==0.15.22'
-      - name: Run Ruff Linter
-        run: ruff check . --select F401,F841
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
+      - name: Run Global Lint & Spelling Checks
+        run: |
+          uvx --from "ruff==0.15.22" ruff format --check .
+          uvx --from "ruff==0.15.22" ruff check .
+          uvx --from "typos==1.30.0" typos --force-exclude .
 
   # ------------------------------------------------------------------
   # JOB 0.2: PRE-COMMIT CHECK (Runs unconditionally)
@@ -85,10 +90,12 @@ jobs:
           key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
           restore-keys: |
             pre-commit-${{ runner.os }}-
-      - name: Install pre-commit
-        run: pip install pre-commit
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
       - name: Run pre-commit hooks
-        run: pre-commit run --all-files --show-diff-on-failure
+        run: uvx --from "pre-commit==4.7.0" pre-commit run --all-files --show-diff-on-failure
 
   # ------------------------------------------------------------------
   # JOB 0.5: DETECT CHANGES & PLAN
@@ -177,6 +184,7 @@ jobs:
 
   quality:
     name: Workspace Quality & Security
+    needs: [pre-commit]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -222,6 +230,7 @@ jobs:
         run: |
           uv run ruff format --check .
           uv run ruff check .
+          uv run typos --force-exclude .
           uv run mypy packages examples tests/typing/endpoint_contracts.py
           uv run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_sinks --cov=imednet_tui --cov-fail-under=90
 
@@ -463,7 +472,7 @@ jobs:
   # ------------------------------------------------------------------
   fuzzing:
     name: Robustness Fuzzing
-    needs: build
+    needs: [plan, build]
     if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     permissions:
@@ -486,9 +495,14 @@ jobs:
           key: uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles('uv.lock') }}
           restore-keys: |
             uv-venv-${{ runner.os }}-"3.12"-
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
+
       - name: Install Dependencies
         run: |
-          python -m pip install uv hatch
           uv sync --locked --all-packages --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
@@ -506,8 +520,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/verification/fuzz_corpus/
-          key: fuzz-corpus-${{ runner.os }}-${{ github.sha }}
+          key: fuzz-corpus-${{ runner.os }}-sha256-restore-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            fuzz-corpus-${{ runner.os }}-sha256-
             fuzz-corpus-${{ runner.os }}-
 
       - name: Run Coverage-Guided Fuzzing (25,000 iterations)
@@ -528,11 +543,15 @@ jobs:
           if-no-files-found: error
 
       - name: Save Fuzzing Corpus Cache
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.restore-fuzz-corpus.outputs.cache-hit != 'true'
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          hashFiles('.cache/verification/fuzz_corpus/**') != '' &&
+          steps.restore-fuzz-corpus.outputs.cache-matched-key != format('fuzz-corpus-{0}-sha256-{1}', runner.os, hashFiles('.cache/verification/fuzz_corpus/**'))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/verification/fuzz_corpus/
-          key: fuzz-corpus-${{ runner.os }}-${{ github.sha }}
+          key: fuzz-corpus-${{ runner.os }}-sha256-${{ hashFiles('.cache/verification/fuzz_corpus/**') }}
 
   # ------------------------------------------------------------------
   # JOB 3.8: VALIDATE PACKAGE CONSUMPTION

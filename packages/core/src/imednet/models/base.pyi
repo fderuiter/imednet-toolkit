@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Generic, Self, TypeVar
@@ -9,6 +10,8 @@ from typing import Any, Generic, Self, TypeVar
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 _NORMALIZERS: dict[type, dict[str, Callable[[Any], Any]]]
+_logger: logging.Logger
+_drift_logger: logging.Logger
 
 def _identity(v: Any) -> Any: ...
 def _optional_str(v: Any) -> Any: ...
@@ -36,6 +39,8 @@ class ImednetBaseModel(BaseModel):
     str_strip_whitespace trims leading and trailing whitespace from string values.
     """
 
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None: ...
     @classmethod
     def from_json(cls, data: Any) -> Self: ...
     @model_validator(mode="before")

@@ -79,8 +79,11 @@ div.highlight {
 }
 
 div.highlight pre:focus-visible,
-pre:focus-visible {
+pre:focus-visible,
+.table-wrapper:focus-visible,
+.explorer-table-wrapper:focus-visible {
     outline: 2px solid var(--color-brand-primary);
+    outline-offset: 2px;
 }
 
 /* Keyboard-accessible Furo sidebar submenu switches & responsive drawer guards */
@@ -143,8 +146,21 @@ input.toctree-checkbox {
     .sidebar-drawer,
     .toc-drawer,
     #__navigation:not(:checked) ~ .page .sidebar-drawer,
-    #__toc:not(:checked) ~ .page .toc-drawer {
-        transition: none;
+    #__toc:not(:checked) ~ .page .toc-drawer,
+    .role-card,
+    .role-card:hover,
+    .role-card-launch-btn,
+    .showcase-persona-tab,
+    .mode-pill-btn,
+    .explorer-run-btn,
+    .explorer-run-btn:hover,
+    .explorer-snippet-copy-btn,
+    .explorer-output-tab,
+    .explorer-copy-btn,
+    .thebelab-button,
+    .thebe-launch-button {
+        transition: none !important;
+        transform: none !important;
     }
 }
 
@@ -645,10 +661,20 @@ body[data-theme="dark"] .role-card:hover {
     font-size: 0.875rem;
     font-weight: 500;
     cursor: pointer;
-    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231f2328' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
     background-repeat: no-repeat;
     background-position: right 0.6rem center;
     background-size: 1em;
+}
+
+body[data-theme="dark"] .explorer-select {
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23e6edf3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .explorer-select {
+        background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23e6edf3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+    }
 }
 
 .explorer-select:focus-visible {
@@ -824,6 +850,24 @@ body[data-theme="dark"] .role-card:hover {
     display: inline-flex;
     align-items: center;
     gap: 0.35rem;
+}
+
+.explorer-metric-badge.explorer-metric-badge--danger {
+    color: var(--color-status-danger, var(--color-badge-danger, #b91c1c));
+    background-color: rgba(239, 68, 68, 0.1);
+    border-color: rgba(239, 68, 68, 0.35);
+}
+
+body[data-theme="dark"] .explorer-metric-badge.explorer-metric-badge--danger {
+    background-color: rgba(239, 68, 68, 0.12);
+    border-color: rgba(248, 113, 113, 0.4);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .explorer-metric-badge.explorer-metric-badge--danger {
+        background-color: rgba(239, 68, 68, 0.12);
+        border-color: rgba(248, 113, 113, 0.4);
+    }
 }
 
 /* Output view tabs */
@@ -1498,25 +1542,29 @@ img.toggler:focus-visible,
    ========================================================================= */
 
 @media (prefers-contrast: more) {
-    body,
-    body[data-theme="light"] {
+    html body,
+    html body[data-theme="light"] {
         --color-background-primary: #ffffff;
         --color-background-secondary: #f4f6f8;
-        --color-background-border: #4a5056;
+        --color-background-hover: #eef2f6;
+        --color-background-border: #1f2328;
         --color-foreground-primary: #000000;
         --color-foreground-secondary: #1f2328;
         --color-foreground-muted: #24292f;
+        --color-foreground-border: #1f2328;
         --color-code-background: #ffffff;
         --color-code-foreground: #000000;
+        --color-inline-code-background: #f4f6f8;
         --color-brand-primary: #004385;
         --color-brand-primary-hover: #003366;
         --color-brand-content: #004385;
+        --color-brand-visited: #432371;
         --color-brand-btn-text: #ffffff;
         --color-brand-button-text: #ffffff;
-        --color-status-success: #065f46;
+        --color-status-success: #04543c;
         --color-status-warning: #78350f;
         --color-status-danger: #991b1b;
-        --color-badge-success: #065f46;
+        --color-badge-success: #04543c;
         --color-badge-warning: #78350f;
         --color-badge-danger: #991b1b;
         --color-badge-required: #991b1b;
@@ -1528,20 +1576,236 @@ img.toggler:focus-visible,
         --color-diagram-note-bg: #fffbeb;
         --color-diagram-note-text: #000000;
         --color-diagram-note-border: #78350f;
+        --color-sidebar-background: #f4f6f8;
+        --color-sidebar-brand-text: #000000;
+        --color-sidebar-link-text: #1f2328;
+        --color-sidebar-link-text--top-level: #000000;
+        --color-api-name: #004385;
+        --color-api-pre-name: #004385;
     }
 
-    body[data-theme="dark"] {
+    html body .explorer-select,
+    html body[data-theme="light"] .explorer-select {
+        background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000000' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+    }
+
+    html body div.highlight,
+    html body .highlight,
+    html body div.highlight pre,
+    html body[data-theme="light"] div.highlight,
+    html body[data-theme="light"] .highlight,
+    html body[data-theme="light"] div.highlight pre {
+        background: #ffffff !important;
+        background-color: #ffffff !important;
+        color: #000000 !important;
+        border: 1px solid #1f2328;
+    }
+
+    html body div.highlight pre,
+    html body[data-theme="light"] div.highlight pre {
+        border: 0;
+    }
+
+    html body .highlight .hll,
+    html body[data-theme="light"] .highlight .hll {
+        background-color: #f4f6f8 !important;
+    }
+
+    html body .highlight .c,
+    html body .highlight .ch,
+    html body .highlight .cm,
+    html body .highlight .cpf,
+    html body .highlight .c1,
+    html body .highlight .cs,
+    html body[data-theme="light"] .highlight .c,
+    html body[data-theme="light"] .highlight .ch,
+    html body[data-theme="light"] .highlight .cm,
+    html body[data-theme="light"] .highlight .cpf,
+    html body[data-theme="light"] .highlight .c1,
+    html body[data-theme="light"] .highlight .cs {
+        color: #32383f !important;
+        background-color: transparent !important;
+    }
+
+    html body .highlight .k,
+    html body .highlight .kc,
+    html body .highlight .kd,
+    html body .highlight .kn,
+    html body .highlight .kp,
+    html body .highlight .kr,
+    html body .highlight .kt,
+    html body .highlight .cp,
+    html body .highlight .nb,
+    html body .highlight .bp,
+    html body .highlight .ne,
+    html body .highlight .ow,
+    html body .highlight .nt,
+    html body[data-theme="light"] .highlight .k,
+    html body[data-theme="light"] .highlight .kc,
+    html body[data-theme="light"] .highlight .kd,
+    html body[data-theme="light"] .highlight .kn,
+    html body[data-theme="light"] .highlight .kp,
+    html body[data-theme="light"] .highlight .kr,
+    html body[data-theme="light"] .highlight .kt,
+    html body[data-theme="light"] .highlight .cp,
+    html body[data-theme="light"] .highlight .nb,
+    html body[data-theme="light"] .highlight .bp,
+    html body[data-theme="light"] .highlight .ne,
+    html body[data-theme="light"] .highlight .ow,
+    html body[data-theme="light"] .highlight .nt {
+        color: #004385 !important;
+    }
+
+    html body .highlight .nf,
+    html body .highlight .fm,
+    html body .highlight .nc,
+    html body .highlight .nn,
+    html body .highlight .nl,
+    html body .highlight .nd,
+    html body .highlight .gh,
+    html body .highlight .gu,
+    html body .highlight .gt,
+    html body[data-theme="light"] .highlight .nf,
+    html body[data-theme="light"] .highlight .fm,
+    html body[data-theme="light"] .highlight .nc,
+    html body[data-theme="light"] .highlight .nn,
+    html body[data-theme="light"] .highlight .nl,
+    html body[data-theme="light"] .highlight .nd,
+    html body[data-theme="light"] .highlight .gh,
+    html body[data-theme="light"] .highlight .gu,
+    html body[data-theme="light"] .highlight .gt {
+        color: #05286b !important;
+    }
+
+    html body .highlight .s,
+    html body .highlight .sa,
+    html body .highlight .sb,
+    html body .highlight .sc,
+    html body .highlight .dl,
+    html body .highlight .sd,
+    html body .highlight .s2,
+    html body .highlight .se,
+    html body .highlight .sh,
+    html body .highlight .si,
+    html body .highlight .sx,
+    html body .highlight .sr,
+    html body .highlight .s1,
+    html body .highlight .ss,
+    html body .highlight .na,
+    html body .highlight .gi,
+    html body[data-theme="light"] .highlight .s,
+    html body[data-theme="light"] .highlight .sa,
+    html body[data-theme="light"] .highlight .sb,
+    html body[data-theme="light"] .highlight .sc,
+    html body[data-theme="light"] .highlight .dl,
+    html body[data-theme="light"] .highlight .sd,
+    html body[data-theme="light"] .highlight .s2,
+    html body[data-theme="light"] .highlight .se,
+    html body[data-theme="light"] .highlight .sh,
+    html body[data-theme="light"] .highlight .si,
+    html body[data-theme="light"] .highlight .sx,
+    html body[data-theme="light"] .highlight .sr,
+    html body[data-theme="light"] .highlight .s1,
+    html body[data-theme="light"] .highlight .ss,
+    html body[data-theme="light"] .highlight .na,
+    html body[data-theme="light"] .highlight .gi {
+        color: #04543c !important;
+    }
+
+    html body .highlight .m,
+    html body .highlight .mb,
+    html body .highlight .mf,
+    html body .highlight .mh,
+    html body .highlight .mi,
+    html body .highlight .mo,
+    html body .highlight .il,
+    html body .highlight .no,
+    html body .highlight .nv,
+    html body .highlight .vc,
+    html body .highlight .vg,
+    html body .highlight .vi,
+    html body .highlight .vm,
+    html body .highlight .ni,
+    html body[data-theme="light"] .highlight .m,
+    html body[data-theme="light"] .highlight .mb,
+    html body[data-theme="light"] .highlight .mf,
+    html body[data-theme="light"] .highlight .mh,
+    html body[data-theme="light"] .highlight .mi,
+    html body[data-theme="light"] .highlight .mo,
+    html body[data-theme="light"] .highlight .il,
+    html body[data-theme="light"] .highlight .no,
+    html body[data-theme="light"] .highlight .nv,
+    html body[data-theme="light"] .highlight .vc,
+    html body[data-theme="light"] .highlight .vg,
+    html body[data-theme="light"] .highlight .vi,
+    html body[data-theme="light"] .highlight .vm,
+    html body[data-theme="light"] .highlight .ni {
+        color: #5b168c !important;
+    }
+
+    html body .highlight .err,
+    html body .highlight .gd,
+    html body .highlight .gr,
+    html body .highlight .gp,
+    html body[data-theme="light"] .highlight .err,
+    html body[data-theme="light"] .highlight .gd,
+    html body[data-theme="light"] .highlight .gr,
+    html body[data-theme="light"] .highlight .gp {
+        color: #8c0b18 !important;
+        background-color: transparent !important;
+    }
+
+    html body .highlight .o,
+    html body .highlight .p,
+    html body .highlight .n,
+    html body .highlight .nx,
+    html body .highlight .py,
+    html body .highlight .pm,
+    html body .highlight .l,
+    html body .highlight .ld,
+    html body .highlight .g,
+    html body .highlight .ge,
+    html body .highlight .ges,
+    html body .highlight .gs,
+    html body .highlight .go,
+    html body .highlight .w,
+    html body .highlight .x,
+    html body .highlight .esc,
+    html body[data-theme="light"] .highlight .o,
+    html body[data-theme="light"] .highlight .p,
+    html body[data-theme="light"] .highlight .n,
+    html body[data-theme="light"] .highlight .nx,
+    html body[data-theme="light"] .highlight .py,
+    html body[data-theme="light"] .highlight .pm,
+    html body[data-theme="light"] .highlight .l,
+    html body[data-theme="light"] .highlight .ld,
+    html body[data-theme="light"] .highlight .g,
+    html body[data-theme="light"] .highlight .ge,
+    html body[data-theme="light"] .highlight .ges,
+    html body[data-theme="light"] .highlight .gs,
+    html body[data-theme="light"] .highlight .go,
+    html body[data-theme="light"] .highlight .w,
+    html body[data-theme="light"] .highlight .x,
+    html body[data-theme="light"] .highlight .esc {
+        color: #000000 !important;
+    }
+
+    html body[data-theme="dark"] {
         --color-background-primary: #0a0c10;
         --color-background-secondary: #11141a;
-        --color-background-border: #9ca3af;
+        --color-background-hover: #161b22;
+        --color-background-border: #c9d1d9;
         --color-foreground-primary: #ffffff;
         --color-foreground-secondary: #e6edf3;
         --color-foreground-muted: #c9d1d9;
+        --color-foreground-border: #c9d1d9;
         --color-code-background: #0a0c10;
         --color-code-foreground: #ffffff;
+        --color-inline-code-background: #11141a;
         --color-brand-primary: #79c0ff;
         --color-brand-primary-hover: #a5d6ff;
         --color-brand-content: #79c0ff;
+        --color-brand-visited: #d2a8ff;
         --color-brand-btn-text: #0a0c10;
         --color-brand-button-text: #0a0c10;
         --color-status-success: #6ee7b7;
@@ -1559,10 +1823,139 @@ img.toggler:focus-visible,
         --color-diagram-note-bg: #1c1908;
         --color-diagram-note-text: #ffffff;
         --color-diagram-note-border: #fde68a;
+        --color-sidebar-background: #11141a;
+        --color-sidebar-brand-text: #ffffff;
+        --color-sidebar-link-text: #e6edf3;
+        --color-sidebar-link-text--top-level: #ffffff;
+        --color-api-name: #79c0ff;
+        --color-api-pre-name: #79c0ff;
+    }
+
+    html body[data-theme="dark"] .explorer-select {
+        background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+    }
+
+    html body[data-theme="dark"] div.highlight,
+    html body[data-theme="dark"] .highlight,
+    html body[data-theme="dark"] div.highlight pre {
+        background: #0a0c10 !important;
+        background-color: #0a0c10 !important;
+        color: #ffffff !important;
+        border: 1px solid #c9d1d9;
+    }
+
+    html body[data-theme="dark"] div.highlight pre {
+        border: 0;
+    }
+
+    html body[data-theme="dark"] .highlight .hll {
+        background-color: #161b22 !important;
+    }
+
+    html body[data-theme="dark"] .highlight .c,
+    html body[data-theme="dark"] .highlight .ch,
+    html body[data-theme="dark"] .highlight .cm,
+    html body[data-theme="dark"] .highlight .cpf,
+    html body[data-theme="dark"] .highlight .c1,
+    html body[data-theme="dark"] .highlight .cs {
+        color: #c9d1d9 !important;
+        background-color: transparent !important;
+    }
+
+    html body[data-theme="dark"] .highlight .k,
+    html body[data-theme="dark"] .highlight .kc,
+    html body[data-theme="dark"] .highlight .kd,
+    html body[data-theme="dark"] .highlight .kn,
+    html body[data-theme="dark"] .highlight .kp,
+    html body[data-theme="dark"] .highlight .kr,
+    html body[data-theme="dark"] .highlight .kt,
+    html body[data-theme="dark"] .highlight .ow,
+    html body[data-theme="dark"] .highlight .nt,
+    html body[data-theme="dark"] .highlight .gi {
+        color: #7ee787 !important;
+    }
+
+    html body[data-theme="dark"] .highlight .nf,
+    html body[data-theme="dark"] .highlight .fm,
+    html body[data-theme="dark"] .highlight .nc,
+    html body[data-theme="dark"] .highlight .nn,
+    html body[data-theme="dark"] .highlight .nb,
+    html body[data-theme="dark"] .highlight .bp,
+    html body[data-theme="dark"] .highlight .nl {
+        color: #79c0ff !important;
+    }
+
+    html body[data-theme="dark"] .highlight .s,
+    html body[data-theme="dark"] .highlight .sa,
+    html body[data-theme="dark"] .highlight .sb,
+    html body[data-theme="dark"] .highlight .sc,
+    html body[data-theme="dark"] .highlight .dl,
+    html body[data-theme="dark"] .highlight .sd,
+    html body[data-theme="dark"] .highlight .s2,
+    html body[data-theme="dark"] .highlight .se,
+    html body[data-theme="dark"] .highlight .sh,
+    html body[data-theme="dark"] .highlight .si,
+    html body[data-theme="dark"] .highlight .sx,
+    html body[data-theme="dark"] .highlight .sr,
+    html body[data-theme="dark"] .highlight .s1,
+    html body[data-theme="dark"] .highlight .ss,
+    html body[data-theme="dark"] .highlight .nd {
+        color: #ffa657 !important;
+    }
+
+    html body[data-theme="dark"] .highlight .m,
+    html body[data-theme="dark"] .highlight .mb,
+    html body[data-theme="dark"] .highlight .mf,
+    html body[data-theme="dark"] .highlight .mh,
+    html body[data-theme="dark"] .highlight .mi,
+    html body[data-theme="dark"] .highlight .mo,
+    html body[data-theme="dark"] .highlight .il,
+    html body[data-theme="dark"] .highlight .no,
+    html body[data-theme="dark"] .highlight .nv,
+    html body[data-theme="dark"] .highlight .vc,
+    html body[data-theme="dark"] .highlight .vg,
+    html body[data-theme="dark"] .highlight .vi,
+    html body[data-theme="dark"] .highlight .vm {
+        color: #a5d6ff !important;
+    }
+
+    html body[data-theme="dark"] .highlight .err,
+    html body[data-theme="dark"] .highlight .cp,
+    html body[data-theme="dark"] .highlight .gd,
+    html body[data-theme="dark"] .highlight .gr,
+    html body[data-theme="dark"] .highlight .gt {
+        color: #fca5a5 !important;
+        background-color: transparent !important;
+    }
+
+    html body[data-theme="dark"] .highlight .o,
+    html body[data-theme="dark"] .highlight .p,
+    html body[data-theme="dark"] .highlight .n,
+    html body[data-theme="dark"] .highlight .na,
+    html body[data-theme="dark"] .highlight .ne,
+    html body[data-theme="dark"] .highlight .ni,
+    html body[data-theme="dark"] .highlight .nx,
+    html body[data-theme="dark"] .highlight .py,
+    html body[data-theme="dark"] .highlight .pm,
+    html body[data-theme="dark"] .highlight .l,
+    html body[data-theme="dark"] .highlight .ld,
+    html body[data-theme="dark"] .highlight .g,
+    html body[data-theme="dark"] .highlight .ge,
+    html body[data-theme="dark"] .highlight .ges,
+    html body[data-theme="dark"] .highlight .gh,
+    html body[data-theme="dark"] .highlight .go,
+    html body[data-theme="dark"] .highlight .gp,
+    html body[data-theme="dark"] .highlight .gs,
+    html body[data-theme="dark"] .highlight .gu,
+    html body[data-theme="dark"] .highlight .w,
+    html body[data-theme="dark"] .highlight .x,
+    html body[data-theme="dark"] .highlight .esc {
+        color: #ffffff !important;
     }
 
     .showcase-client-badge,
     .explorer-metric-badge,
+    .explorer-metric-badge.explorer-metric-badge--danger,
     .status-badge,
     .badge-success,
     .badge-warning,
@@ -1570,8 +1963,8 @@ img.toggler:focus-visible,
     .crf-badge-required,
     .crf-badge-optional,
     .thebe-stderr {
-        background-color: var(--color-background-primary);
-        border: 1px solid currentColor;
+        background-color: var(--color-background-primary) !important;
+        border: 1px solid currentColor !important;
     }
 
     .thebe-launch-button,
@@ -1581,6 +1974,11 @@ img.toggler:focus-visible,
     .explorer-copy-btn,
     .role-card-launch-btn {
         border: 2px solid currentColor;
+    }
+
+    .explorer-run-btn:hover {
+        opacity: 1;
+        background-color: var(--color-brand-primary-hover);
     }
 
     .toctree-checkbox:focus-visible,
@@ -1593,24 +1991,30 @@ img.toggler:focus-visible,
     .theme-toggle:focus-visible,
     .skip-to-content:focus-visible,
     .sidebar-tree .reference:focus-visible,
-    .toc-tree a:focus-visible {
+    .toc-tree a:focus-visible,
+    .table-wrapper:focus-visible,
+    .explorer-table-wrapper:focus-visible {
         outline: 2px solid var(--color-brand-primary);
     }
 }
 
 @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
-    body:not([data-theme="light"]) {
+    html body:not([data-theme="light"]) {
         --color-background-primary: #0a0c10;
         --color-background-secondary: #11141a;
-        --color-background-border: #9ca3af;
+        --color-background-hover: #161b22;
+        --color-background-border: #c9d1d9;
         --color-foreground-primary: #ffffff;
         --color-foreground-secondary: #e6edf3;
         --color-foreground-muted: #c9d1d9;
+        --color-foreground-border: #c9d1d9;
         --color-code-background: #0a0c10;
         --color-code-foreground: #ffffff;
+        --color-inline-code-background: #11141a;
         --color-brand-primary: #79c0ff;
         --color-brand-primary-hover: #a5d6ff;
         --color-brand-content: #79c0ff;
+        --color-brand-visited: #d2a8ff;
         --color-brand-btn-text: #0a0c10;
         --color-brand-button-text: #0a0c10;
         --color-status-success: #6ee7b7;
@@ -1628,6 +2032,134 @@ img.toggler:focus-visible,
         --color-diagram-note-bg: #1c1908;
         --color-diagram-note-text: #ffffff;
         --color-diagram-note-border: #fde68a;
+        --color-sidebar-background: #11141a;
+        --color-sidebar-brand-text: #ffffff;
+        --color-sidebar-link-text: #e6edf3;
+        --color-sidebar-link-text--top-level: #ffffff;
+        --color-api-name: #79c0ff;
+        --color-api-pre-name: #79c0ff;
+    }
+
+    html body:not([data-theme="light"]) .explorer-select {
+        background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+    }
+
+    html body:not([data-theme="light"]) div.highlight,
+    html body:not([data-theme="light"]) .highlight,
+    html body:not([data-theme="light"]) div.highlight pre {
+        background: #0a0c10 !important;
+        background-color: #0a0c10 !important;
+        color: #ffffff !important;
+        border: 1px solid #c9d1d9;
+    }
+
+    html body:not([data-theme="light"]) div.highlight pre {
+        border: 0;
+    }
+
+    html body:not([data-theme="light"]) .highlight .hll {
+        background-color: #161b22 !important;
+    }
+
+    html body:not([data-theme="light"]) .highlight .c,
+    html body:not([data-theme="light"]) .highlight .ch,
+    html body:not([data-theme="light"]) .highlight .cm,
+    html body:not([data-theme="light"]) .highlight .cpf,
+    html body:not([data-theme="light"]) .highlight .c1,
+    html body:not([data-theme="light"]) .highlight .cs {
+        color: #c9d1d9 !important;
+        background-color: transparent !important;
+    }
+
+    html body:not([data-theme="light"]) .highlight .k,
+    html body:not([data-theme="light"]) .highlight .kc,
+    html body:not([data-theme="light"]) .highlight .kd,
+    html body:not([data-theme="light"]) .highlight .kn,
+    html body:not([data-theme="light"]) .highlight .kp,
+    html body:not([data-theme="light"]) .highlight .kr,
+    html body:not([data-theme="light"]) .highlight .kt,
+    html body:not([data-theme="light"]) .highlight .ow,
+    html body:not([data-theme="light"]) .highlight .nt,
+    html body:not([data-theme="light"]) .highlight .gi {
+        color: #7ee787 !important;
+    }
+
+    html body:not([data-theme="light"]) .highlight .nf,
+    html body:not([data-theme="light"]) .highlight .fm,
+    html body:not([data-theme="light"]) .highlight .nc,
+    html body:not([data-theme="light"]) .highlight .nn,
+    html body:not([data-theme="light"]) .highlight .nb,
+    html body:not([data-theme="light"]) .highlight .bp,
+    html body:not([data-theme="light"]) .highlight .nl {
+        color: #79c0ff !important;
+    }
+
+    html body:not([data-theme="light"]) .highlight .s,
+    html body:not([data-theme="light"]) .highlight .sa,
+    html body:not([data-theme="light"]) .highlight .sb,
+    html body:not([data-theme="light"]) .highlight .sc,
+    html body:not([data-theme="light"]) .highlight .dl,
+    html body:not([data-theme="light"]) .highlight .sd,
+    html body:not([data-theme="light"]) .highlight .s2,
+    html body:not([data-theme="light"]) .highlight .se,
+    html body:not([data-theme="light"]) .highlight .sh,
+    html body:not([data-theme="light"]) .highlight .si,
+    html body:not([data-theme="light"]) .highlight .sx,
+    html body:not([data-theme="light"]) .highlight .sr,
+    html body:not([data-theme="light"]) .highlight .s1,
+    html body:not([data-theme="light"]) .highlight .ss,
+    html body:not([data-theme="light"]) .highlight .nd {
+        color: #ffa657 !important;
+    }
+
+    html body:not([data-theme="light"]) .highlight .m,
+    html body:not([data-theme="light"]) .highlight .mb,
+    html body:not([data-theme="light"]) .highlight .mf,
+    html body:not([data-theme="light"]) .highlight .mh,
+    html body:not([data-theme="light"]) .highlight .mi,
+    html body:not([data-theme="light"]) .highlight .mo,
+    html body:not([data-theme="light"]) .highlight .il,
+    html body:not([data-theme="light"]) .highlight .no,
+    html body:not([data-theme="light"]) .highlight .nv,
+    html body:not([data-theme="light"]) .highlight .vc,
+    html body:not([data-theme="light"]) .highlight .vg,
+    html body:not([data-theme="light"]) .highlight .vi,
+    html body:not([data-theme="light"]) .highlight .vm {
+        color: #a5d6ff !important;
+    }
+
+    html body:not([data-theme="light"]) .highlight .err,
+    html body:not([data-theme="light"]) .highlight .cp,
+    html body:not([data-theme="light"]) .highlight .gd,
+    html body:not([data-theme="light"]) .highlight .gr,
+    html body:not([data-theme="light"]) .highlight .gt {
+        color: #fca5a5 !important;
+        background-color: transparent !important;
+    }
+
+    html body:not([data-theme="light"]) .highlight .o,
+    html body:not([data-theme="light"]) .highlight .p,
+    html body:not([data-theme="light"]) .highlight .n,
+    html body:not([data-theme="light"]) .highlight .na,
+    html body:not([data-theme="light"]) .highlight .ne,
+    html body:not([data-theme="light"]) .highlight .ni,
+    html body:not([data-theme="light"]) .highlight .nx,
+    html body:not([data-theme="light"]) .highlight .py,
+    html body:not([data-theme="light"]) .highlight .pm,
+    html body:not([data-theme="light"]) .highlight .l,
+    html body:not([data-theme="light"]) .highlight .ld,
+    html body:not([data-theme="light"]) .highlight .g,
+    html body:not([data-theme="light"]) .highlight .ge,
+    html body:not([data-theme="light"]) .highlight .ges,
+    html body:not([data-theme="light"]) .highlight .gh,
+    html body:not([data-theme="light"]) .highlight .go,
+    html body:not([data-theme="light"]) .highlight .gp,
+    html body:not([data-theme="light"]) .highlight .gs,
+    html body:not([data-theme="light"]) .highlight .gu,
+    html body:not([data-theme="light"]) .highlight .w,
+    html body:not([data-theme="light"]) .highlight .x,
+    html body:not([data-theme="light"]) .highlight .esc {
+        color: #ffffff !important;
     }
 }
 
@@ -1688,6 +2220,7 @@ img.toggler:focus-visible,
     .explorer-json-wrapper,
     .explorer-select,
     .explorer-metric-badge,
+    .explorer-metric-badge.explorer-metric-badge--danger,
     .showcase-client-badge,
     .status-badge,
     .crf-tag,
@@ -1697,6 +2230,14 @@ img.toggler:focus-visible,
         background-color: Canvas !important;
         color: CanvasText !important;
         border: 1px solid CanvasText !important;
+    }
+
+    .explorer-select {
+        forced-color-adjust: auto !important;
+        appearance: auto !important;
+        -webkit-appearance: auto !important;
+        background-image: none !important;
+        padding-right: 0.75rem !important;
     }
 
     .nav-overlay-icon,
@@ -1758,6 +2299,8 @@ img.toggler:focus-visible,
     .sidebar-tree .reference:focus-visible,
     .toc-tree a:focus-visible,
     .mermaid:focus-visible,
+    .table-wrapper:focus-visible,
+    .explorer-table-wrapper:focus-visible,
     pre:focus-visible {
         outline: 2px solid Highlight !important;
         outline-offset: 2px !important;

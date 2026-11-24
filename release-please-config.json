@@ -8,10 +8,6 @@
         {
           "type": "generic",
           "path": "/packages/core/src/imednet/__init__.py"
-        },
-        {
-          "type": "generic",
-          "path": "/docs/_static/thebe_pyodide.js"
         }
       ]
     },

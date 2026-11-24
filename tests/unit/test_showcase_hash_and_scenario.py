@@ -1077,9 +1077,11 @@ def test_showcase_mock_forms_match_canonical_datadict_form_contract() -> None:
         assert isinstance(domain_records, list) and domain_records
         sample_record = domain_records[0]
         assert isinstance(sample_record, dict)
+        sample_record_data = sample_record.get("recordData")
+        assert isinstance(sample_record_data, dict) and sample_record_data
         eval_report = evaluator.evaluate_rules(
             parsed_form.businessLogic,
-            sample_record,
+            sample_record_data,
             form_key=parsed_form.formKey,
         )
         assert len(eval_report.results) == len(parsed_form.businessLogic)
@@ -1170,14 +1172,19 @@ def test_persona_routing_and_datadict_subcommands_surfaced() -> None:
     assert "extract_audit_trail" in audit_rst
     assert "validate_chain" in audit_rst
 
-    # Isolate role cards in docs/index.rst
-    cards_section = index_rst[
-        index_rst.index(".. rubric:: Clinical Data Managers") : index_rst.index(
-            '<div id="interactive-showcase-root"'
-        )
-    ]
-    cdm_card = cards_section[: cards_section.index(".. rubric:: Integration Engineers")]
-    aud_card = cards_section[cards_section.index(".. rubric:: Regulatory Compliance Auditors") :]
+    # Isolate role cards in docs/index.rst and verify persona tab order parity
+    ie_idx = index_rst.index(".. rubric:: Integration Engineers")
+    cdm_idx = index_rst.index(".. rubric:: Clinical Data Managers")
+    aud_idx = index_rst.index(".. rubric:: Regulatory Compliance Auditors")
+    showcase_idx = index_rst.index('<div id="interactive-showcase-root"')
+    assert ie_idx < cdm_idx < aud_idx < showcase_idx, (
+        "Role cards in docs/index.rst must follow Integration Engineers -> "
+        "Clinical Data Managers -> Regulatory Compliance Auditors order"
+    )
+    ie_card = index_rst[ie_idx:cdm_idx]
+    cdm_card = index_rst[cdm_idx:aud_idx]
+    aud_card = index_rst[aud_idx:showcase_idx]
+    assert 'data-persona-target="panel-integration"' in ie_card
 
     for expected_cdm_doc in (
         "how-to/data_dictionary",
@@ -1509,9 +1516,26 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
     for rest_form in mock_data["formsCatalog"]:  # type: ignore[attr-defined]
         assert set(rest_form.keys()) == schemas["forms"]
         Form.model_validate(rest_form)
+    records_by_domain = mock_data["records"]  # type: ignore[index]
+    assert isinstance(records_by_domain, dict)
+    dm_record_ids: set[int] = set()
+    for domain_key in ("VS", "DM", "AE", "LB"):
+        domain_records = records_by_domain[domain_key]
+        assert isinstance(domain_records, list) and domain_records
+        for rec in domain_records:
+            assert set(rec.keys()) == schemas["records"]
+            assert isinstance(rec["recordData"], dict) and rec["recordData"]
+            Record.model_validate(rec)
+            if domain_key == "DM":
+                dm_record_ids.add(rec["recordId"])
     for query in mock_data["queries"]:  # type: ignore[attr-defined]
         assert set(query.keys()) == schemas["queries"]
         Query.model_validate(query)
+    first_query = mock_data["queries"][0]  # type: ignore[index]
+    assert first_query["annotationId"] == 701
+    assert first_query["variable"] == "V_AGE"
+    assert first_query["recordId"] == 611
+    assert first_query["recordId"] in dm_record_ids
 
     node_bin = shutil.which("node")
     if not node_bin:
@@ -1523,10 +1547,20 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
     function makeEl(id, val = '') {{
         const attrs = {{}};
         const handlers = {{}};
+        const classes = new Set();
         return {{
             id, value: val, textContent: '', innerHTML: '', className: '',
             clientWidth: 400, scrollWidth: 400,
-            classList: {{ add: () => {{}}, remove: () => {{}}, toggle: () => {{}}, contains: () => false }},
+            classList: {{
+                add: (...c) => c.forEach(x => classes.add(x)),
+                remove: (...c) => c.forEach(x => classes.delete(x)),
+                toggle: (c, f) => {{
+                    const next = f === undefined ? !classes.has(c) : Boolean(f);
+                    if (next) classes.add(c); else classes.delete(c);
+                    return next;
+                }},
+                contains: (c) => classes.has(c)
+            }},
             setAttribute: (k, v) => {{ attrs[k] = String(v); }},
             removeAttribute: (k) => {{ delete attrs[k]; }},
             getAttribute: (k) => attrs[k] || null,
@@ -1537,14 +1571,24 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
     }}
     const els = {{
         '#ie-dataset-select': makeEl('ie-dataset-select', 'forms'),
+        '#ie-mode-sdk': makeEl('ie-mode-sdk'),
+        '#ie-mode-rest': makeEl('ie-mode-rest'),
         '#ie-code-display': makeEl('ie-code-display'),
         '#ie-metric-badge': makeEl('ie-metric-badge'),
         '#ie-view-table': makeEl('ie-view-table'),
         '#ie-json-pre code': makeEl('ie-json-code'),
         '#cdm-form-select': makeEl('cdm-form-select', 'VS'),
+        '#cdm-validate-btn': makeEl('cdm-validate-btn'),
         '#cdm-metric-badge': makeEl('cdm-metric-badge'),
         '#cdm-view-crf': makeEl('cdm-view-crf'),
-        '#cdm-json-pre code': makeEl('cdm-json-code')
+        '#cdm-json-pre code': makeEl('cdm-json-code'),
+        '#aud-scenario-select': makeEl('aud-scenario-select', 'part11'),
+        '#aud-verify-btn': makeEl('aud-verify-btn'),
+        '#aud-metric-badge': makeEl('aud-metric-badge'),
+        '#aud-tab-table': makeEl('aud-tab-table'),
+        '#aud-tab-json': makeEl('aud-tab-json'),
+        '#aud-view-table': makeEl('aud-view-table'),
+        '#aud-json-pre code': makeEl('aud-json-code')
     }};
     const root = makeEl('interactive-showcase-root');
     root.querySelector = (sel) => els[sel] || null;
@@ -1562,9 +1606,46 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
     els['#ie-dataset-select'].value = 'queries';
     els['#ie-dataset-select'].trigger('change');
     const queriesTableHtml = els['#ie-view-table'].innerHTML;
+    const sdkQueriesJson = JSON.parse(els['#ie-json-pre code'].textContent);
+
+    // Switch to REST mode and inspect /queries and /records envelopes
+    els['#ie-mode-rest'].trigger('click');
+    const restQueriesEnvelope = JSON.parse(els['#ie-json-pre code'].textContent);
+    const restQueriesHtml = els['#ie-view-table'].innerHTML;
+
+    els['#ie-dataset-select'].value = 'records';
+    els['#ie-dataset-select'].trigger('change');
+    const restRecordsEnvelope = JSON.parse(els['#ie-json-pre code'].textContent);
+
+    // Verify CDM & Auditor interactive buttons mutate aria-live badges & VPAT renames Auditor sub-tabs
+    const cdmInitialBadge = els['#cdm-metric-badge'].textContent;
+    els['#cdm-validate-btn'].trigger('click');
+    const cdmFirstClickBadge = els['#cdm-metric-badge'].textContent;
+    els['#cdm-validate-btn'].trigger('click');
+    const cdmSecondClickBadge = els['#cdm-metric-badge'].textContent;
+
+    const audInitialBadge = els['#aud-metric-badge'].textContent;
+    els['#aud-verify-btn'].trigger('click');
+    const audFirstClickBadge = els['#aud-metric-badge'].textContent;
+    els['#aud-scenario-select'].value = 'vpat';
+    els['#aud-scenario-select'].trigger('change');
+    const vpatTabTable = els['#aud-tab-table'].textContent;
+    const vpatTabJson = els['#aud-tab-json'].textContent;
+    els['#aud-scenario-select'].value = 'part11';
+    els['#aud-scenario-select'].trigger('change');
+    const part11TabTable = els['#aud-tab-table'].textContent;
+    const part11TabJson = els['#aud-tab-json'].textContent;
+
     const cdmJson = JSON.parse(els['#cdm-json-pre code'].textContent);
     const cdmHtml = els['#cdm-view-crf'].innerHTML;
-    console.log(JSON.stringify({{ formsJson, queriesTableHtml, cdmJson, cdmHtml }}));
+    console.log(JSON.stringify({{
+        formsJson, queriesTableHtml, sdkQueriesJson,
+        restQueriesEnvelope, restQueriesHtml, restRecordsEnvelope,
+        cdmInitialBadge, cdmFirstClickBadge, cdmSecondClickBadge,
+        audInitialBadge, audFirstClickBadge,
+        vpatTabTable, vpatTabJson, part11TabTable, part11TabJson,
+        cdmJson, cdmHtml
+    }}));
     """
     res = subprocess.run([node_bin, "-e", js_probe], capture_output=True, text=True, check=True)
     probe = json.loads(res.stdout)
@@ -1573,10 +1654,38 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
         assert "variableCount" not in form_item
         assert "ruleCount" not in form_item
         assert "domain" not in form_item
+    assert len(probe["sdkQueriesJson"]) == 2
     assert "[object Object]" not in probe["queriesTableHtml"]
     assert "Monitor Open" in probe["queriesTableHtml"]
     assert "Subject Answered" not in probe["queriesTableHtml"]
     assert "Monitor Closed" not in probe["queriesTableHtml"]
+
+    # REST envelope assertions
+    assert set(probe["restQueriesEnvelope"].keys()) == {"metadata", "pagination", "data"}
+    assert probe["restQueriesEnvelope"]["metadata"]["path"] == "/api/v1/edc/studies/STUDY/queries"
+    assert probe["restQueriesEnvelope"]["pagination"]["size"] == 25
+    assert len(probe["restQueriesEnvelope"]["data"]) == 4
+    assert "Subject Answered" in probe["restQueriesHtml"]
+    assert "Monitor Closed" in probe["restQueriesHtml"]
+
+    assert set(probe["restRecordsEnvelope"].keys()) == {"metadata", "pagination", "data"}
+    assert probe["restRecordsEnvelope"]["metadata"]["path"] == "/api/v1/edc/studies/STUDY/records"
+    assert probe["restRecordsEnvelope"]["pagination"]["size"] == 10
+    assert probe["restRecordsEnvelope"]["pagination"]["totalElements"] == 15
+    assert probe["restRecordsEnvelope"]["pagination"]["totalPages"] == 2
+    assert len(probe["restRecordsEnvelope"]["data"]) == 10
+    assert set(probe["restRecordsEnvelope"]["data"][0].keys()) == schemas["records"]
+    assert isinstance(probe["restRecordsEnvelope"]["data"][0]["recordData"], dict)
+
+    # Interactive badge updates & VPAT tab labels
+    assert probe["cdmFirstClickBadge"] != probe["cdmInitialBadge"]
+    assert probe["cdmSecondClickBadge"] != probe["cdmFirstClickBadge"]
+    assert probe["audFirstClickBadge"] != probe["audInitialBadge"]
+    assert probe["vpatTabTable"] == "VPAT Conformance Criteria"
+    assert probe["vpatTabJson"] == "VPAT Conformance JSON"
+    assert probe["part11TabTable"] == "Audit Trail Records"
+    assert probe["part11TabJson"] == "Signed Audit JSON"
+
     assert "variables" in probe["cdmJson"] and "businessLogic" in probe["cdmJson"]
     assert "V_WEIGHT" in probe["cdmHtml"] and "BL-VS-001" in probe["cdmHtml"]
 

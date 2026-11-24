@@ -18,6 +18,7 @@ from scripts.build_docs import (
     generate_api_reference,
     require_sphinx_tools,
     scope_apidoc_inherited_members,
+    write_wheel_manifest,
 )
 from scripts.validate_docs import (
     RETIRED_GITHUB_LABELS,
@@ -1098,13 +1099,14 @@ def test_check_examples_index_parity_detects_unindexed_script(tmp_path: Path) ->
 def test_check_release_please_parity_detects_version_drift_and_missing_extra_files(
     tmp_path: Path,
 ) -> None:
-    """check_release_please_parity enforces extra-files and version parity with manifest."""
+    """check_release_please_parity enforces dynamic wheels, manifest.json, and extra-files parity."""
     import json
 
     for pkg, ver in (
-        ("packages/core", "1.1.0"),
-        ("packages/plugins-workflows", "1.1.0"),
-        ("packages/plugins-sinks", "1.0.1"),
+        ("packages/core", "1.2.0"),
+        ("packages/plugins-workflows", "1.2.0"),
+        ("packages/plugins-sinks", "1.1.0"),
+        ("packages/plugins-tui", "1.0.0"),
     ):
         pkg_dir = tmp_path / pkg
         pkg_dir.mkdir(parents=True)
@@ -1115,44 +1117,145 @@ def test_check_release_please_parity_detects_version_drift_and_missing_extra_fil
 
     init_py = tmp_path / "packages" / "core" / "src" / "imednet" / "__init__.py"
     init_py.parent.mkdir(parents=True)
-    init_py.write_text('__version__ = "1.1.0"  # x-release-please-version\n', encoding="utf-8")
+    init_py.write_text('__version__ = "1.2.0"  # x-release-please-version\n', encoding="utf-8")
 
     thebe_js = tmp_path / "docs" / "_static" / "thebe_pyodide.js"
     thebe_js.parent.mkdir(parents=True)
-    thebe_js.write_text(
-        '"_static/wheels/imednet-1.1.0-py3-none-any.whl", // x-release-please-version\n'
-        '"_static/wheels/imednet_workflows-1.1.0-py3-none-any.whl",\n'
-        '"_static/wheels/imednet_plugins_sinks-1.0.1-py3-none-any.whl",\n',
-        encoding="utf-8",
+    clean_thebe_js = (
+        "const docRootUrl = new URL('./', 'http://localhost/').href;\n"
+        "const wheelManifestUrl = new URL('_static/wheels/manifest.json', docRootUrl).href;\n"
     )
+    thebe_js.write_text(clean_thebe_js, encoding="utf-8")
+
+    conf_py = tmp_path / "docs" / "conf.py"
+    valid_conf_py = (
+        "_PYODIDE_WHEEL_SPECS = (\n"
+        "    ('imednet', 'core'),\n"
+        "    ('imednet_workflows', 'plugins-workflows'),\n"
+        "    ('imednet_plugins_sinks', 'plugins-sinks'),\n"
+        ")\n"
+        "def _resolve_pyodide_wheels() -> list[str]:\n"
+        "    resolved: list[str] = []\n"
+        "    for dist_prefix, pkg_dir_name in _PYODIDE_WHEEL_SPECS:\n"
+        "        pyproject_file = Path(_REPO_ROOT) / 'packages' / pkg_dir_name / 'pyproject.toml'\n"
+        "        with pyproject_file.open('rb') as fh:\n"
+        "            ver = str(tomllib.load(fh)['project']['version'])\n"
+        "        resolved.append(f'_static/wheels/{dist_prefix}-{ver}-py3-none-any.whl')\n"
+        "    return resolved\n"
+        "pyodide_config = {'wheels': _resolve_pyodide_wheels()}\n"
+    )
+    conf_py.write_text(valid_conf_py, encoding="utf-8")
 
     manifest = {
-        "packages/core": "1.1.0",
-        "packages/plugins-workflows": "1.1.0",
-        "packages/plugins-sinks": "1.0.1",
+        "packages/core": "1.2.0",
+        "packages/plugins-workflows": "1.2.0",
+        "packages/plugins-sinks": "1.1.0",
+        "packages/plugins-tui": "1.0.0",
     }
     (tmp_path / ".release-please-manifest.json").write_text(
         json.dumps(manifest),
         encoding="utf-8",
     )
-    cfg = {
+    valid_cfg = {
         "packages": {
+            "packages/core": {
+                "extra-files": [
+                    {"type": "generic", "path": "/packages/core/src/imednet/__init__.py"},
+                ]
+            },
+            "packages/plugins-workflows": {},
+            "packages/plugins-sinks": {},
+            "packages/plugins-tui": {"initial-version": "1.0.0"},
+        }
+    }
+    (tmp_path / "release-please-config.json").write_text(json.dumps(valid_cfg), encoding="utf-8")
+    assert check_release_please_parity(tmp_path) is False
+
+    # Drift in __init__.py version fails parity
+    init_py.write_text('__version__ = "1.0.0"  # x-release-please-version\n', encoding="utf-8")
+    assert check_release_please_parity(tmp_path) is True
+    init_py.write_text('__version__ = "1.2.0"  # x-release-please-version\n', encoding="utf-8")
+
+    # Generic updater pointing to .js path in release-please-config.json fails parity
+    bad_js_cfg = {
+        "packages": {
+            **valid_cfg["packages"],
             "packages/core": {
                 "extra-files": [
                     {"type": "generic", "path": "/packages/core/src/imednet/__init__.py"},
                     {"type": "generic", "path": "/docs/_static/thebe_pyodide.js"},
                 ]
             },
-            "packages/plugins-workflows": {},
-            "packages/plugins-sinks": {},
         }
     }
-    (tmp_path / "release-please-config.json").write_text(json.dumps(cfg), encoding="utf-8")
-    assert check_release_please_parity(tmp_path) is False
-
-    # Drift in __init__.py version fails parity
-    init_py.write_text('__version__ = "1.0.0"  # x-release-please-version\n', encoding="utf-8")
+    (tmp_path / "release-please-config.json").write_text(json.dumps(bad_js_cfg), encoding="utf-8")
     assert check_release_please_parity(tmp_path) is True
+    (tmp_path / "release-please-config.json").write_text(json.dumps(valid_cfg), encoding="utf-8")
+
+    # Hardcoded .whl version or x-release-please-version in thebe_pyodide.js fails parity
+    thebe_js.write_text(
+        clean_thebe_js + '"_static/wheels/imednet-1.2.0-py3-none-any.whl"\n',
+        encoding="utf-8",
+    )
+    assert check_release_please_parity(tmp_path) is True
+    thebe_js.write_text(
+        clean_thebe_js + "// x-release-please-version\n",
+        encoding="utf-8",
+    )
+    assert check_release_please_parity(tmp_path) is True
+    thebe_js.write_text(clean_thebe_js, encoding="utf-8")
+
+    # Drift in docs/conf.py _resolve_pyodide_wheels() fails parity
+    conf_py.write_text(
+        "def _resolve_pyodide_wheels() -> list[str]:\n"
+        "    return ['_static/wheels/imednet-1.0.0-py3-none-any.whl']\n"
+        "pyodide_config = {'wheels': _resolve_pyodide_wheels()}\n",
+        encoding="utf-8",
+    )
+    assert check_release_please_parity(tmp_path) is True
+    conf_py.write_text(valid_conf_py, encoding="utf-8")
+
+    # --require-html validates built _static/wheels/manifest.json and staged wheel files
+    built_html_dir = tmp_path / "docs" / "_build" / "html"
+    assert check_release_please_parity(tmp_path, html_dir=built_html_dir, require_html=True) is True
+
+    built_wheels_dir = built_html_dir / "_static" / "wheels"
+    built_wheels_dir.mkdir(parents=True)
+    for whl_name in (
+        "imednet-1.2.0-py3-none-any.whl",
+        "imednet_workflows-1.2.0-py3-none-any.whl",
+        "imednet_plugins_sinks-1.1.0-py3-none-any.whl",
+        "imednet_tui-1.0.0-py3-none-any.whl",
+    ):
+        (built_wheels_dir / whl_name).write_bytes(b"PK")
+
+    manifest_file = write_wheel_manifest(built_wheels_dir, repo_root=tmp_path)
+    manifest_payload = json.loads(manifest_file.read_text(encoding="utf-8"))
+    assert manifest_payload == {
+        "wheels": [
+            "_static/wheels/imednet-1.2.0-py3-none-any.whl",
+            "_static/wheels/imednet_workflows-1.2.0-py3-none-any.whl",
+            "_static/wheels/imednet_plugins_sinks-1.1.0-py3-none-any.whl",
+        ]
+    }
+    assert not (tmp_path / "docs" / "_static" / "wheels").exists()
+    assert (
+        check_release_please_parity(tmp_path, html_dir=built_html_dir, require_html=True) is False
+    )
+
+    # Non-browser wheel in _static/wheels/manifest.json fails --require-html check
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "wheels": [
+                    *manifest_payload["wheels"],
+                    "_static/wheels/imednet_tui-1.0.0-py3-none-any.whl",
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert check_release_please_parity(tmp_path, html_dir=built_html_dir, require_html=True) is True
 
 
 def test_check_diataxis_sidebar_isolation_rejects_internal_leak_and_duplicate_toctree(

@@ -1,7 +1,7 @@
 {
   "$defs": {
     "BusinessLogicRule": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "description": "An edit check, workflow trigger, or business logic rule.",
       "properties": {
         "id": {
@@ -123,7 +123,7 @@
       "type": "object"
     },
     "Choice": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "description": "A choice option for single-select or multi-select variables.",
       "properties": {
         "choiceText": {
@@ -164,7 +164,7 @@
       "type": "object"
     },
     "Form": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "description": "A form defining data fields and rules for clinical data entry.",
       "properties": {
         "formKey": {
@@ -244,7 +244,7 @@
       "type": "object"
     },
     "Metadata": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "description": "Metadata envelope for the study data dictionary.",
       "properties": {
         "schemaVersion": {
@@ -311,7 +311,7 @@
       "type": "object"
     },
     "Variable": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "description": "A clinical data variable (data point) on a form.",
       "properties": {
         "variableName": {
@@ -419,7 +419,7 @@
       "type": "object"
     }
   },
-  "additionalProperties": true,
+  "additionalProperties": false,
   "description": "Canonical root data dictionary container.",
   "properties": {
     "metadata": {
@@ -444,5 +444,8 @@
   "title": "iMednet Data Dictionary Schema",
   "type": "object",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "version": "1.0.0"
+  "version": "1.0.0",
+  "required": [
+    "forms"
+  ]
 }

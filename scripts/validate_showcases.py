@@ -1906,12 +1906,14 @@ def load_postman_contract_schemas(postman_path: Path) -> tuple[dict[str, set[str
         return {}, [f"{postman_path}: Failed to parse JSON: {exc}"]
 
     target_requests = {
+        "List records": "records",
         "List studies": "studies",
         "List forms": "forms",
         "List queries": "queries",
         "List record revisions": "audits",
     }
     schemas: dict[str, set[str]] = {
+        "records": set(),
         "studies": set(),
         "forms": set(),
         "queries": set(),
@@ -1964,7 +1966,7 @@ def validate_showcase_mock_data_schemas(
     showcase_js_path: Path,
     postman_path: Path,
 ) -> list[str]:
-    """Validate MOCK_DATA REST (studies, formsCatalog, queries, audits) and DataDictionary (forms) schemas."""
+    """Validate MOCK_DATA REST (records, studies, formsCatalog, queries, audits) and DataDictionary (forms) schemas."""
     if not showcase_js_path.exists():
         return [f"Showcase script not found: {showcase_js_path}"]
 
@@ -2039,6 +2041,38 @@ def validate_showcase_mock_data_schemas(
                                 f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments[{c_idx}] "
                                 f"contains non-contract keys {extra_comment_keys}"
                             )
+
+    raw_records = mock_data.get("records")
+    if isinstance(raw_records, dict) and raw_records:
+        allowed_record_keys = schemas["records"]
+        for rec_domain, domain_items in raw_records.items():
+            if not isinstance(domain_items, list) or not domain_items:
+                errors.append(
+                    f"{showcase_js_path}: MOCK_DATA.records.{rec_domain} must be a non-empty list"
+                )
+                continue
+            for r_idx, rec_val in enumerate(domain_items):
+                rec_label = f"records.{rec_domain}[{r_idx}]"
+                if not isinstance(rec_val, dict) or not rec_val:
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.{rec_label} must be a non-empty object"
+                    )
+                    continue
+                unexpected_rec = sorted(set(rec_val.keys()) - allowed_record_keys)
+                if unexpected_rec:
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.{rec_label} contains non-contract keys "
+                        f"{unexpected_rec}; allowed Postman records keys: "
+                        f"{sorted(allowed_record_keys)}"
+                    )
+                if "recordData" not in rec_val or not isinstance(rec_val.get("recordData"), dict):
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.{rec_label}.recordData must be an object"
+                    )
+    else:
+        errors.append(
+            f"{showcase_js_path}: MOCK_DATA.records is missing or has invalid container type"
+        )
 
     raw_forms = mock_data.get("forms")
     if isinstance(raw_forms, dict) and raw_forms:

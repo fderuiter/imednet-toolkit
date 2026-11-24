@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from datetime import UTC, datetime
 from typing import Any
 
@@ -85,7 +84,7 @@ class DictCompatMixin:
 class Metadata(BaseModel):
     """Metadata envelope for the study data dictionary."""
 
-    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     schemaVersion: str = Field(default="1.0.0", description="Data dictionary schema version")
     studyKey: str | None = Field(default=None, description="Study key")
@@ -110,13 +109,18 @@ class Metadata(BaseModel):
     ) -> Metadata:
         """Create a Metadata envelope with current UTC timestamp."""
         now_timestamp = datetime.now(UTC).strftime("%m-%d-%Y %H:%M:%S")
+        explicit_extra = extra.pop("extraAttributes", None)
+        merged_extra: dict[str, Any] = {}
+        if isinstance(explicit_extra, dict):
+            merged_extra.update(explicit_extra)
+        merged_extra.update(extra)
         return cls(
             schemaVersion="1.0.0",
             studyKey=study_key,
             generatedAt=now_timestamp,
             source=source,
             validationWarnings=validation_warnings or [],
-            **extra,
+            extraAttributes=merged_extra,
         )
 
     def __eq__(self, other: Any) -> bool:
@@ -135,7 +139,7 @@ class Metadata(BaseModel):
 class Choice(DictCompatMixin, BaseModel):
     """A choice option for single-select or multi-select variables."""
 
-    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     choiceText: str = Field(description="Display text of the choice")
     choiceValue: str = Field(description="Coded value of the choice")
@@ -148,7 +152,7 @@ class Choice(DictCompatMixin, BaseModel):
 class Variable(DictCompatMixin, BaseModel):
     """A clinical data variable (data point) on a form."""
 
-    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     variableName: str = Field(description="Unique identifier for variable within form")
     label: str | None = Field(
@@ -184,7 +188,7 @@ class Variable(DictCompatMixin, BaseModel):
 class BusinessLogicRule(DictCompatMixin, BaseModel):
     """An edit check, workflow trigger, or business logic rule."""
 
-    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     id: str | int | None = Field(default=None, description="Unique rule identifier")
     name: str | None = Field(default=None, description="Descriptive name of the rule")
@@ -210,7 +214,7 @@ class BusinessLogicRule(DictCompatMixin, BaseModel):
 class Form(DictCompatMixin, BaseModel):
     """A form defining data fields and rules for clinical data entry."""
 
-    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     formKey: str = Field(description="Unique short code/mnemonic for the form")
     formName: str | None = Field(default=None, description="Human-readable form title")
@@ -232,7 +236,7 @@ class Form(DictCompatMixin, BaseModel):
 class DataDictionary(DictCompatMixin, BaseModel):
     """Canonical root data dictionary container."""
 
-    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     metadata: Metadata = Field(default_factory=Metadata)
     forms: list[Form] = Field(default_factory=list)
@@ -434,10 +438,18 @@ class DataDictionary(DictCompatMixin, BaseModel):
                         xml_content = raw_xml
                 elif isinstance(raw_logic_val, str) and raw_logic_val.strip():
                     xml_content = raw_logic_val
-                    with contextlib.suppress(Exception):
+                    try:
                         from .logic import parse_logic_xml
 
                         logic_ast = parse_logic_xml(raw_logic_val)
+                    except ValueError as exc:
+                        malformed_err = str(exc)
+                    except Exception:
+                        malformed_err = None
+                    else:
+                        malformed_err = None
+                else:
+                    malformed_err = None
 
                 extra = {
                     to_camel_case(k): v
@@ -467,6 +479,8 @@ class DataDictionary(DictCompatMixin, BaseModel):
                         "businessLogic",
                     }
                 }
+                if isinstance(raw_logic_val, str) and raw_logic_val.strip() and malformed_err:
+                    extra.setdefault("malformedLogicXml", malformed_err)
                 rule = BusinessLogicRule(
                     id=rid,
                     name=rname,
@@ -483,8 +497,43 @@ class DataDictionary(DictCompatMixin, BaseModel):
                 else:
                     unassigned.append(rule)
 
+        raw_meta = data.get("metadata")
+        if isinstance(raw_meta, Metadata):
+            meta_obj = raw_meta
+        elif isinstance(raw_meta, dict):
+            meta_known = {k: v for k, v in raw_meta.items() if k in Metadata.model_fields}
+            meta_extra = dict(meta_known.get("extraAttributes") or {})
+            for k, v in raw_meta.items():
+                if k not in Metadata.model_fields:
+                    meta_extra[to_camel_case(k)] = v
+            if meta_extra:
+                meta_known["extraAttributes"] = meta_extra
+            meta_obj = Metadata(**meta_known)
+        else:
+            meta_obj = Metadata()
+
+        top_extra = {
+            to_camel_case(k): v
+            for k, v in data.items()
+            if k
+            not in {
+                "metadata",
+                "forms",
+                "questions",
+                "choices",
+                "business_logic",
+                "unassignedBusinessLogic",
+            }
+        }
+        if top_extra:
+            meta_obj.extraAttributes.update(top_extra)
+
+        existing_unassigned = data.get("unassignedBusinessLogic")
+        if isinstance(existing_unassigned, list):
+            unassigned = [*existing_unassigned, *unassigned]
+
         res_data: dict[str, Any] = {
-            "metadata": data.get("metadata", Metadata()),
+            "metadata": meta_obj,
             "forms": list(forms_map.values()),
             "unassignedBusinessLogic": unassigned,
         }

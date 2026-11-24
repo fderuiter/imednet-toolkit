@@ -138,7 +138,10 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         "--domain",
         dest="sdtm_domain",
         default=None,
-        help="Target CDISC SDTM domain code (e.g. AE, DM, VS, CM, DV, DD); implies --as-sdtm.",
+        help=(
+            "Target CDISC SDTM domain code (e.g. AE, DM, VS, LB, CM, EX, MH, DV, DD); "
+            "implies --as-sdtm."
+        ),
     )
     parser.add_argument(
         "--standards-profile",
