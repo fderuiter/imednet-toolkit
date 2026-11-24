@@ -26,7 +26,7 @@ Project maintainers are responsible for clarifying standards of acceptable behav
 
 ## Reporting Guidelines
 
-If you are subject to or witness unacceptable behavior, please report it by contacting the project maintainers at [open an issue](https://github.com/fderuiter/imednet-python-sdk/issues) or emailing <fpderuiter@gmail.com>.
+If you are subject to or witness unacceptable behavior, please report it by contacting the project maintainers at [open an issue](https://github.com/fderuiter/imednet-toolkit/issues) or emailing <fpderuiter@gmail.com>.
 
 ## License & Attribution
 
