@@ -16,10 +16,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "queries",
         requires_study_key=True,
         summary_fields=[
-            "description",
-            "annotation_type",
+            "annotation_id",
+            "status",
             "subject_key",
             "variable",
+            "annotation_type",
+            "description",
             "date_created",
         ],
     )

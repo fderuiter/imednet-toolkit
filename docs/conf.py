@@ -1752,7 +1752,7 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["code_blocks.js"]
+html_js_files: list[str] = ["code_blocks.js", "navigation.js"]
 
 doctest_global_setup = """
 import builtins
@@ -1771,6 +1771,7 @@ for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_provid
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
 logging.getLogger("py.warnings").setLevel(logging.ERROR)
+logging.getLogger("snowflake").setLevel(logging.WARNING)
 logging.getLogger("snowflake.connector").setLevel(logging.ERROR)
 logging.captureWarnings(True)
 
@@ -1782,7 +1783,7 @@ os.environ["IMEDNET_STUDY_KEY"] = "STUDY"
 os.environ["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
 os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
 
-with contextlib.redirect_stdout(io.StringIO()):
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
     with contextlib.suppress(Exception):
         from airflow.sdk.bases.operator import ExecutorSafeguard
         ExecutorSafeguard.test_mode = True

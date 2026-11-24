@@ -178,6 +178,88 @@ div.highlight.thebelab-cell button.copybtn {
     outline-offset: 2px;
 }
 
+/* Keyboard-accessible Furo sidebar submenu switches & responsive drawer guards */
+.sidebar-tree .toctree-checkbox,
+input.toctree-checkbox {
+    display: block;
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: var(--sidebar-expander-width, 32px);
+    height: var(--sidebar-item-height, 32px);
+    min-width: 32px;
+    min-height: 32px;
+    margin: 0;
+    padding: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    border: 0;
+    border-radius: 4px;
+    cursor: pointer;
+    z-index: 1;
+}
+
+.sidebar-tree .toctree-checkbox:hover ~ label {
+    background: var(--color-sidebar-item-expander-background--hover);
+}
+
+@media (max-width: 82em) {
+    .toc-drawer {
+        transition: right 0.25s ease-in-out, visibility 0s linear 0s;
+    }
+
+    #__toc:not(:checked) ~ .page .toc-drawer {
+        visibility: hidden;
+        transition: right 0.25s ease-in-out, visibility 0s linear 0.25s;
+    }
+
+    #__toc:checked ~ .page .toc-drawer {
+        visibility: visible;
+    }
+}
+
+@media (max-width: 63em) {
+    .sidebar-drawer {
+        transition: left 0.25s ease-in-out, visibility 0s linear 0s;
+    }
+
+    #__navigation:not(:checked) ~ .page .sidebar-drawer {
+        visibility: hidden;
+        transition: left 0.25s ease-in-out, visibility 0s linear 0.25s;
+    }
+
+    #__navigation:checked ~ .page .sidebar-drawer {
+        visibility: visible;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .sidebar-drawer,
+    .toc-drawer,
+    #__navigation:not(:checked) ~ .page .sidebar-drawer,
+    #__toc:not(:checked) ~ .page .toc-drawer {
+        transition: none;
+    }
+}
+
+img.toggler {
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    vertical-align: middle;
+}
+
+body[data-theme="dark"] img.toggler {
+    filter: invert(1);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) img.toggler {
+        filter: invert(1);
+    }
+}
+
 /* Admonition margins */
 .admonition {
     margin: 1.5rem 0;
@@ -1386,6 +1468,21 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     background-color: var(--color-background-primary);
 }
 
+.toctree-checkbox:focus-visible,
+.sidebar-search:focus-visible {
+    outline: 2px solid var(--color-brand-primary);
+    outline-offset: -2px;
+}
+
+.nav-overlay-icon:focus-visible,
+.toc-overlay-icon:focus-visible,
+.toc-header-icon:focus-visible,
+.toc-content-icon:focus-visible,
+img.toggler:focus-visible,
+.theme-toggle:focus-visible,
+.skip-to-content:focus-visible,
+.sidebar-tree .reference:focus-visible,
+.toc-tree a:focus-visible,
 .mermaid:focus-visible {
     outline: 2px solid var(--color-brand-primary);
     outline-offset: 2px;
@@ -1614,6 +1711,20 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     .bottom-of-page .right-details .icons a {
         color: var(--color-foreground-primary);
     }
+
+    .toctree-checkbox:focus-visible,
+    .sidebar-search:focus-visible,
+    .nav-overlay-icon:focus-visible,
+    .toc-overlay-icon:focus-visible,
+    .toc-header-icon:focus-visible,
+    .toc-content-icon:focus-visible,
+    img.toggler:focus-visible,
+    .theme-toggle:focus-visible,
+    .skip-to-content:focus-visible,
+    .sidebar-tree .reference:focus-visible,
+    .toc-tree a:focus-visible {
+        outline: 2px solid var(--color-brand-primary);
+    }
 }
 
 @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
@@ -1730,6 +1841,42 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
         border: 1px solid CanvasText !important;
     }
 
+    .nav-overlay-icon,
+    .toc-header-icon:not(.no-toc),
+    .toc-content-icon:not(.no-toc),
+    img.toggler {
+        forced-color-adjust: none;
+        background-color: ButtonFace !important;
+        color: ButtonText !important;
+        border: 1px solid ButtonText !important;
+    }
+
+    .nav-overlay-icon .icon,
+    .toc-overlay-icon .icon,
+    .sidebar-tree label .icon,
+    .theme-toggle svg {
+        color: ButtonText !important;
+    }
+
+    body[data-theme="dark"] img.toggler,
+    img.toggler {
+        filter: none !important;
+    }
+
+    @media (prefers-color-scheme: dark) {
+        body[data-theme="dark"] img.toggler,
+        img.toggler {
+            filter: invert(1) !important;
+        }
+    }
+
+    .toctree-checkbox:focus-visible,
+    .sidebar-search:focus-visible {
+        forced-color-adjust: none;
+        outline: 2px solid Highlight !important;
+        outline-offset: -2px !important;
+    }
+
     #furo-main-content:focus-visible,
     div.highlight button.copybtn:focus-visible,
     button.copybtn:focus-visible,
@@ -1746,6 +1893,15 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
     .mode-pill-btn:focus-visible,
     .explorer-select:focus-visible,
     .quick-start-callout a:focus-visible,
+    .nav-overlay-icon:focus-visible,
+    .toc-overlay-icon:focus-visible,
+    .toc-header-icon:focus-visible,
+    .toc-content-icon:focus-visible,
+    img.toggler:focus-visible,
+    .theme-toggle:focus-visible,
+    .skip-to-content:focus-visible,
+    .sidebar-tree .reference:focus-visible,
+    .toc-tree a:focus-visible,
     .mermaid:focus-visible,
     pre:focus-visible {
         outline: 2px solid Highlight !important;

@@ -54,6 +54,7 @@ def test_sphinx_seo_hooks_emit_meta_tags_sitemap_robots_and_404(tmp_path: Path) 
     shutil.copy2(REPO_ROOT / "docs" / "_static" / "logo.png", static_dir / "logo.png")
     (static_dir / "custom.css").write_text("body {}\n", encoding="utf-8")
     (static_dir / "code_blocks.js").write_text("", encoding="utf-8")
+    (static_dir / "navigation.js").write_text("", encoding="utf-8")
     (static_dir / "showcase.js").write_text("", encoding="utf-8")
     (static_dir / "thebe_pyodide.js").write_text("", encoding="utf-8")
 
