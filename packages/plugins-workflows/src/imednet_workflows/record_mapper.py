@@ -14,10 +14,7 @@ import types
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
-try:
-    import pandas as pd
-except ImportError:
-    pd = None  # type: ignore[assignment, unused-ignore]
+import pandas as pd
 from pydantic import BaseModel, Field, ValidationError, create_model
 
 from imednet.spi.endpoints import Record as RecordModel
@@ -1221,11 +1218,6 @@ class RecordMapper:
             )
             return
 
-        if pd is None:
-            raise ImportError(
-                "pandas is required for RecordMapper.dataframe. Install "
-                "with 'pip install \"imednet[export]\"'."
-            )
         variable_keys, label_map = self._fetch_variable_metadata(
             study_key,
             variable_whitelist=variable_whitelist,
@@ -1514,11 +1506,6 @@ class RecordMapper:
         include_deleted: bool | None = None,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` transformed into a CDISC SDTM domain dataset."""
-        if pd is None:
-            raise ImportError(
-                "pandas is required for RecordMapper.sdtm_dataframe. Install "
-                "with 'pip install \"imednet[export]\"'."
-            )
         should_mask = self.mask_phi if mask_phi is None else mask_phi
         frames = list(
             self.iter_sdtm_dataframes(
@@ -1577,11 +1564,6 @@ class RecordMapper:
         include_deleted: bool | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked pandas DataFrames transformed into an SDTM domain dataset."""
-        if pd is None:
-            raise ImportError(
-                "pandas is required for RecordMapper.iter_sdtm_dataframes. Install "
-                "with 'pip install \"imednet[export]\"'."
-            )
         if variable_whitelist is not None and len(variable_whitelist) == 0:
             return
         effective_include_deleted = (
@@ -1777,11 +1759,6 @@ class RecordMapper:
                 include_deleted=include_deleted,
             )
 
-        if pd is None:
-            raise ImportError(
-                "pandas is required for RecordMapper.dataframe. Install "
-                "with 'pip install \"imednet[export]\"'."
-            )
         frames = list(
             self.iter_dataframes(
                 study_key,

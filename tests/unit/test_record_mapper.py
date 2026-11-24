@@ -369,14 +369,6 @@ def test_parse_records_counts_errors() -> None:
     assert count == 2
 
 
-def test_dataframe_raises_importerror_when_pandas_missing(monkeypatch) -> None:
-    """Test that dataframe raises importerror when pandas missing."""
-    monkeypatch.setattr("imednet_workflows.record_mapper.pd", None)
-    mapper = RecordMapper(MagicMock())
-    with pytest.raises(ImportError, match="pandas is required for RecordMapper.dataframe"):
-        mapper.dataframe("STUDY")
-
-
 def test_iter_dataframes_streams_large_study_with_bounded_memory() -> None:
     """Test that iter dataframes streams large study with bounded memory."""
     fake = Faker()
