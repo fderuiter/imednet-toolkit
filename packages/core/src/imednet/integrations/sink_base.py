@@ -239,9 +239,16 @@ def get_state_provider(
     """Discover and instantiate a pluggable checkpoint state provider at runtime."""
     from importlib.metadata import entry_points
 
-    target_name = provider_name or "default"
     eps = list(entry_points(group=STATE_PROVIDER_ENTRY_POINT_GROUP))
-    matched = [ep for ep in eps if ep.name == target_name]
+    if ledger_path is not None:
+        target_name = provider_name if provider_name not in (None, "airflow") else "file"
+        matched = [ep for ep in eps if ep.name == target_name]
+        if not matched and target_name == "file":
+            target_name = "default"
+            matched = [ep for ep in eps if ep.name == target_name]
+    else:
+        target_name = provider_name or "default"
+        matched = [ep for ep in eps if ep.name == target_name]
     if not matched and provider_name is None and eps:
         matched = [eps[0]]
     if not matched:
@@ -251,12 +258,12 @@ def get_state_provider(
         )
 
     factory = matched[0].load()
-    if target_name == "airflow":
-        provider = factory()
-    elif ledger_path is not None:
+    if ledger_path is not None:
         provider = (
             factory(ledger_path=ledger_path) if target_name == "default" else factory(ledger_path)
         )
+    elif target_name == "airflow":
+        provider = factory()
     else:
         provider = factory()
     return cast(StateProviderProtocol, provider)
@@ -1743,8 +1750,28 @@ class BoundedFormBufferRouter:
 
 
 def extract_record_timestamp(record: Any) -> datetime | None:
-    """Extract a normalized UTC modification timestamp from a record."""
+    """Extract the latest normalized UTC modification or status timestamp from a record."""
+    latest: datetime | None = None
     for attr in ("date_modified", "dateModified", "last_updated", "lastUpdated"):
+        raw = record.get(attr) if isinstance(record, Mapping) else getattr(record, attr, None)
+        if isinstance(raw, (datetime, str)):
+            try:
+                ts = normalize_watermark_datetime(raw)
+            except ValueError:
+                continue
+            if ts is not None and (latest is None or ts > latest):
+                latest = ts
+    return latest
+
+
+def _extract_record_field_timestamp(record: Any, canonical_attr: str) -> datetime | None:
+    """Extract a normalized UTC timestamp for a specific canonical Record field."""
+    attrs = (
+        ("last_updated", "lastUpdated")
+        if canonical_attr == "lastUpdated"
+        else ("date_modified", "dateModified")
+    )
+    for attr in attrs:
         raw = record.get(attr) if isinstance(record, Mapping) else getattr(record, attr, None)
         if isinstance(raw, (datetime, str)):
             try:
@@ -1815,8 +1842,11 @@ def _merge_and_condition(target: dict[str, Any], key: str, condition: Any) -> No
     target[key] = condition
 
 
-def _coerce_date_modified_clauses(raw_cond: Any) -> list[tuple[str, datetime]]:
-    """Normalize a branch's ``dateModified`` value into ``[(operator, utc_datetime), ...]``."""
+def _coerce_timestamp_clauses(
+    raw_cond: Any,
+    canonical_attr: str = "dateModified",
+) -> list[tuple[str, datetime]]:
+    """Normalize a branch's timestamp filter value into ``[(operator, utc_datetime), ...]``."""
     raw_items: list[tuple[str, Any]]
     if isinstance(raw_cond, list):
         raw_items = []
@@ -1828,7 +1858,7 @@ def _coerce_date_modified_clauses(raw_cond: Any) -> list[tuple[str, datetime]]:
     elif isinstance(raw_cond, tuple):
         if len(raw_cond) != 2:
             raise ValueError(
-                f"Filter tuple for 'dateModified' must have 2 elements, got {len(raw_cond)}"
+                f"Filter tuple for '{canonical_attr}' must have 2 elements, got {len(raw_cond)}"
             )
         raw_items = [(raw_cond[0], raw_cond[1])]
     else:
@@ -1839,40 +1869,51 @@ def _coerce_date_modified_clauses(raw_cond: Any) -> list[tuple[str, datetime]]:
         validate_filter_operator(op, allow_regex=False)
         dt = normalize_watermark_datetime(val)
         if dt is None:
-            raise ValueError(f"Invalid dateModified filter value: {val!r}")
+            raise ValueError(f"Invalid {canonical_attr} filter value: {val!r}")
         parsed.append((op, dt))
     return parsed
 
 
-def _combine_branch_with_watermark(
-    branch: dict[str, Any],
-    norm_wm: datetime | None,
-) -> tuple[dict[str, Any], Callable[[Any], bool] | None] | None:
-    """Combine a branch filter dict with ``norm_wm`` using at most one ``dateModified`` key.
+def _coerce_date_modified_clauses(raw_cond: Any) -> list[tuple[str, datetime]]:
+    """Normalize a branch's ``dateModified`` value into ``[(operator, utc_datetime), ...]``."""
+    return _coerce_timestamp_clauses(raw_cond, "dateModified")
 
-    Returns ``None`` when the combined ``dateModified`` bounds are unsatisfiable
-    so callers can skip issuing an upstream request for an empty intersection.
+
+def _combine_branch_with_timestamp_attr(
+    branch: dict[str, Any],
+    canonical_attr: str,
+    norm_wm: datetime | None,
+) -> tuple[dict[str, Any], Callable[[Any], bool] | None, bool] | None:
+    """Combine a branch filter dict with ``norm_wm`` on ``canonical_attr``.
+
+    Returns ``(updated_branch, post_predicate, existing_guarantees_wm)`` or
+    ``None`` when the combined bounds on ``canonical_attr`` are unsatisfiable.
     """
     out = dict(branch)
-    dm_keys = [k for k in out if _snake_to_camel(k) == "dateModified"]
-    if len(dm_keys) > 1:
-        raise ValueError("Duplicate filter attribute 'dateModified' in AND clause")
+    matched_keys = [k for k in out if _snake_to_camel(k) == canonical_attr]
+    if len(matched_keys) > 1:
+        raise ValueError(f"Duplicate filter attribute '{canonical_attr}' in AND clause")
 
     clauses: list[tuple[str, datetime]] = []
-    if dm_keys:
-        raw_existing = out.pop(dm_keys[0])
-        # Preserve original non-list condition directly when watermark is absent
+    existing_guarantees_wm = False
+    if matched_keys:
+        raw_existing = out.pop(matched_keys[0])
         if norm_wm is None and not isinstance(raw_existing, list):
-            _coerce_date_modified_clauses(raw_existing)
-            out["dateModified"] = raw_existing
-            return out, None
-        clauses.extend(_coerce_date_modified_clauses(raw_existing))
+            _coerce_timestamp_clauses(raw_existing, canonical_attr)
+            out[canonical_attr] = raw_existing
+            return out, None, False
+        existing_clauses = _coerce_timestamp_clauses(raw_existing, canonical_attr)
+        if norm_wm is not None:
+            existing_guarantees_wm = any(
+                op in ("==", ">=", ">") and dt >= norm_wm for op, dt in existing_clauses
+            )
+        clauses.extend(existing_clauses)
 
     if norm_wm is not None:
         clauses.append((">=", norm_wm))
 
     if not clauses:
-        return out, None
+        return out, None, False
 
     lower: tuple[datetime, bool] | None = None
     upper: tuple[datetime, bool] | None = None
@@ -1918,8 +1959,8 @@ def _combine_branch_with_watermark(
             return None
         if upper is not None and (exact > upper[0] or (exact == upper[0] and upper[1])):
             return None
-        out["dateModified"] = ("==", format_iso_datetime(exact))
-        return out, None
+        out[canonical_attr] = ("==", format_iso_datetime(exact))
+        return out, None, existing_guarantees_wm
 
     if lower is not None and upper is not None:
         if lower[0] > upper[0]:
@@ -1927,33 +1968,33 @@ def _combine_branch_with_watermark(
         if lower[0] == upper[0]:
             if lower[1] or upper[1] or lower[0] in excluded:
                 return None
-            out["dateModified"] = ("==", format_iso_datetime(lower[0]))
-            return out, None
+            out[canonical_attr] = ("==", format_iso_datetime(lower[0]))
+            return out, None, existing_guarantees_wm
 
     residual_upper: tuple[datetime, bool] | None = None
     if lower is not None:
-        out["dateModified"] = (
+        out[canonical_attr] = (
             ">" if lower[1] else ">=",
             format_iso_datetime(lower[0]),
         )
         residual_upper = upper
     elif upper is not None:
-        out["dateModified"] = (
+        out[canonical_attr] = (
             "<" if upper[1] else "<=",
             format_iso_datetime(upper[0]),
         )
     elif excluded:
         first_ex = min(excluded)
         excluded.discard(first_ex)
-        out["dateModified"] = ("!=", format_iso_datetime(first_ex))
+        out[canonical_attr] = ("!=", format_iso_datetime(first_ex))
 
     if residual_upper is None and not excluded:
-        return out, None
+        return out, None, existing_guarantees_wm
 
     frozen_excluded = frozenset(excluded)
 
     def _post_predicate(record: Any) -> bool:
-        rec_ts = extract_record_timestamp(record)
+        rec_ts = _extract_record_field_timestamp(record, canonical_attr)
         if rec_ts is None:
             return False
         if residual_upper is not None:
@@ -1964,7 +2005,87 @@ def _combine_branch_with_watermark(
                 return False
         return rec_ts not in frozen_excluded
 
-    return out, _post_predicate
+    return out, _post_predicate, existing_guarantees_wm
+
+
+def _combine_predicates(
+    first: Callable[[Any], bool] | None,
+    second: Callable[[Any], bool] | None,
+) -> Callable[[Any], bool] | None:
+    """Combine two optional record post-predicates with logical AND."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return lambda record: first(record) and second(record)
+
+
+def _combine_branch_with_watermark(
+    branch: dict[str, Any],
+    norm_wm: datetime | None,
+) -> tuple[dict[str, Any], Callable[[Any], bool] | None] | None:
+    """Combine a branch filter dict with ``norm_wm`` using at most one ``dateModified`` key."""
+    combined = _combine_branch_with_timestamp_attr(branch, "dateModified", norm_wm)
+    if combined is None:
+        return None
+    out, pred, _ = combined
+    return out, pred
+
+
+def _expand_branch_with_dual_watermark(
+    branch: dict[str, Any],
+    norm_wm: datetime | None,
+) -> list[tuple[dict[str, Any], Callable[[Any], bool] | None]]:
+    """Expand a base AND branch into separate ``dateModified`` and ``lastUpdated`` branches."""
+    if norm_wm is None:
+        dm_res = _combine_branch_with_timestamp_attr(branch, "dateModified", None)
+        if dm_res is None:
+            return []
+        b_dm, pred_dm, _ = dm_res
+        lu_res = _combine_branch_with_timestamp_attr(b_dm, "lastUpdated", None)
+        if lu_res is None:
+            return []
+        b_both, pred_lu, _ = lu_res
+        return [(b_both, _combine_predicates(pred_dm, pred_lu))]
+
+    dm_candidate: tuple[dict[str, Any], Callable[[Any], bool] | None] | None = None
+    dm_guarantees_wm = False
+    dm_res = _combine_branch_with_timestamp_attr(branch, "dateModified", norm_wm)
+    if dm_res is not None:
+        b_dm, pred_dm, dm_guarantees_wm = dm_res
+        lu_existing = _combine_branch_with_timestamp_attr(b_dm, "lastUpdated", None)
+        if lu_existing is not None:
+            b_dm_full, pred_lu_existing, _ = lu_existing
+            dm_candidate = (b_dm_full, _combine_predicates(pred_dm, pred_lu_existing))
+
+    lu_candidate: tuple[dict[str, Any], Callable[[Any], bool] | None] | None = None
+    lu_guarantees_wm = False
+    lu_res = _combine_branch_with_timestamp_attr(branch, "lastUpdated", norm_wm)
+    if lu_res is not None:
+        b_lu, pred_lu, lu_guarantees_wm = lu_res
+        dm_existing = _combine_branch_with_timestamp_attr(b_lu, "dateModified", None)
+        if dm_existing is not None:
+            b_lu_full, pred_dm_existing, _ = dm_existing
+            lu_candidate = (b_lu_full, _combine_predicates(pred_dm_existing, pred_lu))
+
+    if dm_candidate is not None and dm_guarantees_wm:
+        return [dm_candidate]
+    if lu_candidate is not None and lu_guarantees_wm:
+        return [lu_candidate]
+
+    expanded: list[tuple[dict[str, Any], Callable[[Any], bool] | None]] = []
+    if dm_candidate is not None:
+        expanded.append(dm_candidate)
+    if lu_candidate is not None:
+        b_lu_dict, existing_lu_pred = lu_candidate
+        wm_bound: datetime = norm_wm
+
+        def _lu_wm_guard(record: Any) -> bool:
+            lu_ts = _extract_record_field_timestamp(record, "lastUpdated")
+            return lu_ts is not None and lu_ts >= wm_bound
+
+        expanded.append((b_lu_dict, _combine_predicates(existing_lu_pred, _lu_wm_guard)))
+    return expanded
 
 
 def _expand_scalar_list_branches(base: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2118,13 +2239,10 @@ def _resolve_record_query_branches(
 
     final_branches: list[tuple[dict[str, Any], Callable[[Any], bool] | None]] = []
     for branch in base_branches:
-        merged = _combine_branch_with_watermark(branch, norm_wm)
-        if merged is None:
-            continue
-        b, post_pred = merged
-        if exclude_deleted_upstream and not any(_snake_to_camel(k) == "deleted" for k in b):
-            b["deleted"] = False
-        final_branches.append((b, post_pred))
+        for b, post_pred in _expand_branch_with_dual_watermark(branch, norm_wm):
+            if exclude_deleted_upstream and not any(_snake_to_camel(k) == "deleted" for k in b):
+                b["deleted"] = False
+            final_branches.append((b, post_pred))
     return final_branches
 
 
@@ -2885,7 +3003,7 @@ def run_streaming_export(
             if opts["state_provider"] is not None
             else get_state_provider(
                 ledger_path=opts["ledger_path"],
-                provider_name=default_provider_name,
+                provider_name=None if opts["ledger_path"] is not None else default_provider_name,
             )
         )
 

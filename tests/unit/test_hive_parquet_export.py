@@ -475,7 +475,7 @@ def test_export_to_hive_parquet_streaming_checkpoints_incremental_upsert_and_voi
         mask_phi=False,
     )
 
-    assert sdk.records.list.call_count == 1
+    assert sdk.records.list.call_count == 2
     assert provider.get_last_timestamp("HIVE_INC", "lake_DEMO") == datetime(
         2026, 6, 5, 0, 0, tzinfo=UTC
     )

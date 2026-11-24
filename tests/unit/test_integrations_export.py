@@ -1983,7 +1983,7 @@ def test_incremental_sql_by_form_watermarks_reconcile_deleted_and_post_flush_che
         state_provider=provider,
     )
 
-    assert sdk.records.list.call_count == 1
+    assert sdk.records.list.call_count == 2
     assert flush_order[:3] == ["enter:sql_DEMO", "enter:sql_VITALS", "enter:sql_UNCHANGED"]
     assert set(flush_order[3:6]) == {"flush:DEMO", "flush:VITALS", "flush:UNCHANGED"}
     assert set(flush_order[6:]) == {"commit:sql_DEMO", "commit:sql_VITALS", "commit:sql_UNCHANGED"}
@@ -2027,7 +2027,7 @@ def test_incremental_sql_by_form_watermarks_reconcile_deleted_and_post_flush_che
         incremental=True,
         state_provider=ddb_provider,
     )
-    assert sdk.records.list.call_count == 1
+    assert sdk.records.list.call_count == 2
 
     with duckdb_mod.connect(str(ddb_path)) as dconn:
         ddb_demo = dconn.execute(

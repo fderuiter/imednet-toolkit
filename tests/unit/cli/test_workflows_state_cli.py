@@ -1016,3 +1016,82 @@ def test_interactive_state_set_reads_ledger_once_and_reuses_wizard_state(
     assert mock_ledger.return_value.read_state.call_count == 1
     assert "Current Status:    success (timestamp: 2026-05-22T12:00:00+00:00)" in res.stderr
     mock_ledger.return_value.set_last_timestamp.assert_called_once()
+
+
+def test_cli_state_set_preserves_existing_stream_metadata_headless_and_interactive(
+    runner: CliRunner,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """workflows state set retains prior SDTM and custom stream metadata in both headless and interactive modes."""
+    import sys
+
+    from imednet.cli import app as main_app
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    ledger_path = tmp_path / "cli_meta_retain.json"
+    provider = FileStateProvider(ledger_path)
+    initial_meta = {
+        "sdtm_seq_counters": {"DOB": 5, "SUBJ-02": 3},
+        "sdtm_record_seqs": {"101": 1, "102": 2},
+        "sdtm_lineage": {"domain": "AE", "spec_hash": "hash-001"},
+        "custom_tag": "preserve-across-cli-set",
+    }
+    provider.set_last_timestamp(
+        "STUDY-CLI-META",
+        "ae_sdtm",
+        datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+        records_processed=5,
+        metadata=initial_meta,
+    )
+
+    # 1. Headless CLI state set
+    res_headless = runner.invoke(
+        main_app,
+        [
+            "workflows",
+            "state",
+            "set",
+            "--study-key",
+            "STUDY-CLI-META",
+            "--stream",
+            "ae_sdtm",
+            "--timestamp",
+            "2026-06-02T12:00:00Z",
+            "--records-processed",
+            "9",
+            "--ledger-path",
+            str(ledger_path),
+        ],
+    )
+    assert res_headless.exit_code == 0
+    stream_after_headless = provider.read_state().studies["STUDY-CLI-META"].streams["ae_sdtm"]
+    assert stream_after_headless.last_timestamp == datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)
+    assert stream_after_headless.records_processed == 9
+    assert stream_after_headless.metadata == initial_meta
+
+    # 2. Interactive CLI state set
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    monkeypatch.setattr(sys, "stdin", _InteractiveStringIO("14\ny\n"))
+    res_interactive = runner.invoke(
+        state_app,
+        [
+            "set",
+            "--interactive",
+            "-s",
+            "STUDY-CLI-META",
+            "-m",
+            "ae_sdtm",
+            "-t",
+            "2026-06-03T15:30:00Z",
+            "-l",
+            str(ledger_path),
+        ],
+    )
+    assert res_interactive.exit_code == 0
+    stream_after_interactive = provider.read_state().studies["STUDY-CLI-META"].streams["ae_sdtm"]
+    assert stream_after_interactive.last_timestamp == datetime(
+        2026, 6, 3, 15, 30, tzinfo=timezone.utc
+    )
+    assert stream_after_interactive.records_processed == 14
+    assert stream_after_interactive.metadata == initial_meta

@@ -291,6 +291,9 @@ class CachedRecordsLoader:
                 voided_delta_ids: set[int] = set()
                 for record in delta_records:
                     cycle_timestamps.append(_serialize_date_modified(record.date_modified))
+                    cycle_timestamps.append(
+                        _serialize_date_modified(getattr(record, "last_updated", None))
+                    )
                     if is_record_deleted(record):
                         if record.record_id is not None:
                             voided_delta_ids.add(record.record_id)
@@ -329,6 +332,9 @@ class CachedRecordsLoader:
                         fetched_missing = self._fetch_missing_records(study_key, ids_to_fetch)
                         for record in fetched_missing:
                             cycle_timestamps.append(_serialize_date_modified(record.date_modified))
+                            cycle_timestamps.append(
+                                _serialize_date_modified(getattr(record, "last_updated", None))
+                            )
                             if is_record_deleted(record):
                                 if record.record_id is not None:
                                     voided_delta_ids.add(record.record_id)
@@ -846,13 +852,26 @@ class CachedRecordsLoader:
             max_epoch = int(epoch_row[0]) if epoch_row is not None else 1
             ts_rows = conn.execute(
                 """
-                SELECT date_modified
+                SELECT date_modified, payload
                 FROM record_cache
-                WHERE base_url = ? AND study_key = ? AND date_modified IS NOT NULL
+                WHERE base_url = ? AND study_key = ?
                 """,
                 (legacy_base_url, legacy_study_key),
             ).fetchall()
-            hwm = _max_timestamp(cast(str | None, ts_row["date_modified"]) for ts_row in ts_rows)
+            legacy_timestamps: list[str | None] = []
+            for ts_row in ts_rows:
+                legacy_timestamps.append(cast(str | None, ts_row["date_modified"]))
+                raw_payload = ts_row["payload"]
+                if isinstance(raw_payload, str) and "lastUpdated" in raw_payload:
+                    try:
+                        parsed_payload = json.loads(raw_payload)
+                    except json.JSONDecodeError:
+                        parsed_payload = None
+                    if isinstance(parsed_payload, dict):
+                        lu_val = parsed_payload.get("lastUpdated")
+                        if isinstance(lu_val, str) and lu_val.strip():
+                            legacy_timestamps.append(lu_val)
+            hwm = _max_timestamp(legacy_timestamps)
             conn.execute(
                 """
                 INSERT OR IGNORE INTO study_sync_state (
@@ -1006,7 +1025,7 @@ class CachedRecordsLoader:
         return value if value is not None and value.strip() else None
 
     def _fetch_delta_records(self, study_key: str, high_water_mark: str | None) -> list[Record]:
-        """Fetch records from the API that have been modified since the high water mark."""
+        """Fetch records from the API whose modification or status timestamp meets the watermark."""
         if not high_water_mark:
             records = self._list_records(
                 study_key=study_key,
@@ -1015,13 +1034,31 @@ class CachedRecordsLoader:
             )
             return [record for record in records if not is_record_deleted(record)]
 
-        # Use >= to avoid missing updates that share the high-water-mark timestamp.
-        # _upsert_records keeps refresh idempotent by deduplicating on (base_url, study_key, record_id).
-        delta_filter = build_filter_string({"date_modified": (">=", high_water_mark)})
-        return self._list_records_with_filter_override(
+        # Issue separate AND-only branches for dateModified and lastUpdated because
+        # the upstream iMednet Records API rejects mixed AND (;) and OR (,) filters.
+        dm_filter = build_filter_string({"date_modified": (">=", high_water_mark)})
+        lu_filter = build_filter_string({"last_updated": (">=", high_water_mark)})
+        dm_records = self._list_records_with_filter_override(
             study_key=study_key,
-            filter_string=delta_filter,
+            filter_string=dm_filter,
         )
+        lu_records = self._list_records_with_filter_override(
+            study_key=study_key,
+            filter_string=lu_filter,
+        )
+
+        deduped_index: dict[int, int] = {}
+        combined: list[Record] = []
+        for record in (*dm_records, *lu_records):
+            rec_id = record.record_id
+            if rec_id is None:
+                combined.append(record)
+            elif rec_id in deduped_index:
+                combined[deduped_index[rec_id]] = record
+            else:
+                deduped_index[rec_id] = len(combined)
+                combined.append(record)
+        return combined
 
     def _fetch_active_records_projection(self, study_key: str) -> list[Record]:
         """Fetch lightweight non-deleted Record projections for reconciliation and draft checks."""

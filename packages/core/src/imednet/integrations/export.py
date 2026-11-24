@@ -3397,12 +3397,9 @@ def _make_mapper_records_source(
                 iter_filters.update(config.record_filter)
             elif isinstance(config.record_filter, str) and config.record_filter.strip():
                 iter_filters["filter"] = config.record_filter
-            if watermark is not None:
-                from imednet.utils.dates import format_iso_datetime
-
-                iter_filters["dateModified"] = (">=", format_iso_datetime(watermark))
-            return _filter_by_allowed_forms(
-                cast(
+            norm_wm = normalize_watermark_datetime(watermark)
+            if getattr(mapper, "_loader", None) is not None or norm_wm is None:
+                base_stream = cast(
                     Iterable[Any],
                     mapper._iter_records(
                         study_key,
@@ -3412,7 +3409,63 @@ def _make_mapper_records_source(
                         include_deleted=not exclude_deleted_upstream,
                     ),
                 )
+                if norm_wm is not None:
+                    base_stream = (
+                        rec
+                        for rec in base_stream
+                        if (rec_ts := extract_record_timestamp(rec)) is not None
+                        and rec_ts >= norm_wm
+                    )
+                return _filter_by_allowed_forms(base_stream)
+
+            from imednet.utils.dates import format_iso_datetime
+
+            wm_iso = format_iso_datetime(norm_wm)
+            has_custom_ts_filter = any(
+                k in iter_filters
+                for k in ("dateModified", "date_modified", "lastUpdated", "last_updated", "filter")
             )
+            if has_custom_ts_filter:
+                raw_fallback = cast(
+                    Iterable[Any],
+                    mapper._iter_records(
+                        study_key,
+                        visit_key=None,
+                        extra_filters=iter_filters or None,
+                        record_data_filter=config.record_data_filter,
+                        include_deleted=not exclude_deleted_upstream,
+                    ),
+                )
+                return _filter_by_allowed_forms(
+                    rec
+                    for rec in raw_fallback
+                    if (rec_ts := extract_record_timestamp(rec)) is not None and rec_ts >= norm_wm
+                )
+
+            def _iter_dual_mapper_branches() -> Iterator[Any]:
+                seen_ids: set[Any] = set()
+                for ts_attr in ("dateModified", "lastUpdated"):
+                    branch_filters = {**iter_filters, ts_attr: (">=", wm_iso)}
+                    for rec in cast(
+                        Iterable[Any],
+                        mapper._iter_records(
+                            study_key,
+                            visit_key=None,
+                            extra_filters=branch_filters,
+                            record_data_filter=config.record_data_filter,
+                            include_deleted=not exclude_deleted_upstream,
+                        ),
+                    ):
+                        rec_id = extract_record_id(rec)
+                        if rec_id is not None:
+                            if rec_id in seen_ids:
+                                continue
+                            seen_ids.add(rec_id)
+                        rec_ts = extract_record_timestamp(rec)
+                        if rec_ts is None or rec_ts >= norm_wm:
+                            yield rec
+
+            return _filter_by_allowed_forms(_iter_dual_mapper_branches())
         return _filter_by_allowed_forms(
             iter_filtered_sdk_records(
                 sdk,

@@ -697,7 +697,8 @@ def test_export_operator_jinja_templating_and_secret_rejection() -> None:
 
     _, call_kwargs = export_csv_mock.call_args
     assert "modified_since" not in call_kwargs
-    assert call_kwargs["stream_name"] == "csv_blank_watermark_export"
+    assert call_kwargs["stream_name"].startswith("csv_blank_watermark_export_out.csv_")
+    assert call_kwargs["stream_name"] == blank_op._default_airflow_stream_name("csv")
 
     # Non-secret record_filter keys and clinical Variable equality filters are accepted,
     # while inline credentials, credentialed URIs, and bearer JWTs are rejected eagerly.
