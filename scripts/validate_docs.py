@@ -1406,16 +1406,78 @@ def check_pypi_install_tags(repo_root: Path | None = None) -> bool:
     return has_errors
 
 
-def check_release_please_parity(repo_root: Path | None = None) -> bool:
-    """Verify release-please-config.json extra-files and version parity with .release-please-manifest.json."""
+def _evaluate_conf_pyodide_wheels(
+    conf_path: Path, repo_root: Path, core_expected: str
+) -> tuple[list[str] | None, str | None]:
+    """Extract and evaluate _resolve_pyodide_wheels() from docs/conf.py without Sphinx side effects."""
+    try:
+        conf_text = conf_path.read_text(encoding="utf-8")
+        tree = ast.parse(conf_text, filename=str(conf_path))
+    except Exception as exc:
+        return None, f"Failed to parse {conf_path}: {exc}"
+
+    selected_nodes: list[ast.stmt] = []
+    has_resolver_fn = False
+    has_pyodide_config_call = False
+
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            target_names = {t.id for t in targets if isinstance(t, ast.Name)}
+            if "_PYODIDE_WHEEL_SPECS" in target_names:
+                selected_nodes.append(node)
+            if "pyodide_config" in target_names:
+                for sub in ast.walk(node):
+                    if (
+                        isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Name)
+                        and sub.func.id == "_resolve_pyodide_wheels"
+                    ):
+                        has_pyodide_config_call = True
+        elif isinstance(node, ast.FunctionDef) and node.name == "_resolve_pyodide_wheels":
+            selected_nodes.append(node)
+            has_resolver_fn = True
+
+    if not has_resolver_fn:
+        return None, f"{conf_path} is missing '_resolve_pyodide_wheels()'."
+    if not has_pyodide_config_call:
+        return None, f"{conf_path} pyodide_config does not call '_resolve_pyodide_wheels()'."
+
+    mod = ast.Module(body=selected_nodes, type_ignores=[])
+    ast.fix_missing_locations(mod)
+    namespace: dict[str, Any] = {
+        "Path": Path,
+        "tomllib": tomllib,
+        "_DOCS_DIR": str(repo_root / "docs"),
+        "_REPO_ROOT": str(repo_root),
+        "imednet_version": core_expected,
+    }
+    try:
+        exec(compile(mod, str(conf_path), "exec"), namespace)  # noqa: S102
+        resolved = namespace["_resolve_pyodide_wheels"]()
+    except Exception as exc:
+        return None, f"Error evaluating _resolve_pyodide_wheels() in {conf_path}: {exc}"
+
+    if not isinstance(resolved, list) or not all(isinstance(item, str) for item in resolved):
+        return None, f"_resolve_pyodide_wheels() in {conf_path} must return list[str]."
+    return resolved, None
+
+
+def check_release_please_parity(
+    repo_root: Path | None = None,
+    html_dir: Path | None = None,
+    require_html: bool = False,
+) -> bool:
+    """Verify release-please-config.json extra-files, dynamic Pyodide wheels, and manifest parity."""
     print("Checking Release Please extra-files and manifest version parity...")
     root = repo_root or REPO_ROOT
     config_path = root / "release-please-config.json"
     manifest_path = root / ".release-please-manifest.json"
     core_init_path = root / "packages" / "core" / "src" / "imednet" / "__init__.py"
     thebe_js_path = root / "docs" / "_static" / "thebe_pyodide.js"
+    conf_path = root / "docs" / "conf.py"
 
-    for req_path in (config_path, manifest_path, core_init_path, thebe_js_path):
+    for req_path in (config_path, manifest_path, core_init_path, thebe_js_path, conf_path):
         if not req_path.is_file():
             print(f"Error: Required Release Please / fallback version file missing: {req_path}")
             return True
@@ -1447,6 +1509,13 @@ def check_release_please_parity(repo_root: Path | None = None) -> bool:
         return f"{pkg_key.rstrip('/')}/{raw_path.lstrip('/')}"
 
     declared_extra_paths: set[str] = set()
+    for cfg_pkg_key, cfg_pkg_entry in sorted(packages_cfg.items()):
+        if isinstance(cfg_pkg_entry, dict):
+            for ef in cfg_pkg_entry.get("extra-files", []):
+                norm = _normalize_extra_path(cfg_pkg_key, ef)
+                if norm:
+                    declared_extra_paths.add(norm)
+
     for pkg_key, expected_ver in sorted(manifest_data.items()):
         if pkg_key not in packages_cfg:
             print(
@@ -1454,12 +1523,6 @@ def check_release_please_parity(repo_root: Path | None = None) -> bool:
             )
             has_errors = True
             continue
-        pkg_entry = packages_cfg[pkg_key]
-        if isinstance(pkg_entry, dict):
-            for ef in pkg_entry.get("extra-files", []):
-                norm = _normalize_extra_path(pkg_key, ef)
-                if norm:
-                    declared_extra_paths.add(norm)
 
         pyproject_file = root / pkg_key / "pyproject.toml"
         if not pyproject_file.is_file():
@@ -1477,13 +1540,17 @@ def check_release_please_parity(repo_root: Path | None = None) -> bool:
                 )
                 has_errors = True
 
-    for required_extra in (
-        "packages/core/src/imednet/__init__.py",
-        "docs/_static/thebe_pyodide.js",
-    ):
-        if required_extra not in declared_extra_paths:
+    required_extra = "packages/core/src/imednet/__init__.py"
+    if required_extra not in declared_extra_paths:
+        print(
+            f"Error: release-please-config.json is missing extra-files entry for '{required_extra}'."
+        )
+        has_errors = True
+
+    for extra_path in sorted(declared_extra_paths):
+        if extra_path.endswith((".js", ".whl")):
             print(
-                f"Error: release-please-config.json is missing extra-files entry for '{required_extra}'."
+                f"Error: release-please-config.json must not target JavaScript or wheel asset '{extra_path}'."
             )
             has_errors = True
 
@@ -1506,32 +1573,108 @@ def check_release_please_parity(repo_root: Path | None = None) -> bool:
         has_errors = True
 
     thebe_text = thebe_js_path.read_text(encoding="utf-8")
-    if "x-release-please-version" not in thebe_text:
-        print("Error: docs/_static/thebe_pyodide.js is missing 'x-release-please-version' marker.")
+    if "x-release-please-version" in thebe_text:
+        print(
+            "Error: docs/_static/thebe_pyodide.js must not contain 'x-release-please-version' comments."
+        )
         has_errors = True
+
+    hardcoded_whl_match = re.search(
+        r"[A-Za-z0-9_.-]+-[0-9]+\.[0-9]+\.[0-9]+[^\s\"'`]*\.whl",
+        thebe_text,
+    )
+    if hardcoded_whl_match:
+        print(
+            "Error: docs/_static/thebe_pyodide.js contains hardcoded versioned wheel path "
+            f"'{hardcoded_whl_match.group(0)}'."
+        )
+        has_errors = True
+
+    for required_js_token in ("_static/wheels/manifest.json", "docRootUrl", "wheelManifestUrl"):
+        if required_js_token not in thebe_text:
+            print(
+                f"Error: docs/_static/thebe_pyodide.js is missing '{required_js_token}' fallback manifest support."
+            )
+            has_errors = True
 
     wheel_manifest_map = (
         ("imednet", "packages/core"),
         ("imednet_workflows", "packages/plugins-workflows"),
         ("imednet_plugins_sinks", "packages/plugins-sinks"),
     )
+    forbidden_wheel_substrings = (
+        "imednet_workspace",
+        "imednet-workspace",
+        "apache_airflow_providers_imednet",
+        "apache-airflow-providers-imednet",
+        "imednet_tui",
+        "imednet-tui",
+    )
+    expected_browser_wheels: list[str] = []
     for wheel_prefix, manifest_key in wheel_manifest_map:
-        expected_wheel_ver = str(manifest_data.get(manifest_key, ""))
-        wheel_match = re.search(
-            rf"_static/wheels/{re.escape(wheel_prefix)}-([0-9]+\.[0-9]+\.[0-9]+)-py3-none-any\.whl",
-            thebe_text,
+        if manifest_key not in manifest_data:
+            print(f"Error: '{manifest_key}' missing from .release-please-manifest.json.")
+            has_errors = True
+            continue
+        expected_browser_wheels.append(
+            f"_static/wheels/{wheel_prefix}-{manifest_data[manifest_key]}-py3-none-any.whl"
         )
-        if not wheel_match:
+
+    resolved_conf_wheels, conf_err = _evaluate_conf_pyodide_wheels(conf_path, root, core_expected)
+    if conf_err is not None:
+        print(f"Error: {conf_err}")
+        has_errors = True
+    elif resolved_conf_wheels is not None:
+        for wheel_entry in resolved_conf_wheels:
+            if any(forbidden in wheel_entry for forbidden in forbidden_wheel_substrings):
+                print(
+                    f"Error: docs/conf.py _resolve_pyodide_wheels() includes non-browser wheel '{wheel_entry}'."
+                )
+                has_errors = True
+        if expected_browser_wheels and resolved_conf_wheels != expected_browser_wheels:
             print(
-                f"Error: Fallback wheel entry for '{wheel_prefix}' not found in docs/_static/thebe_pyodide.js."
+                f"Error: docs/conf.py _resolve_pyodide_wheels() resolved {resolved_conf_wheels} != expected {expected_browser_wheels}."
             )
             has_errors = True
-        elif wheel_match.group(1) != expected_wheel_ver:
-            print(
-                f"Error: docs/_static/thebe_pyodide.js wheel '{wheel_prefix}' version "
-                f"'{wheel_match.group(1)}' != manifest '{expected_wheel_ver}'."
-            )
+
+    if require_html:
+        target_html_dir = html_dir if html_dir is not None else (root / "docs" / "_build" / "html")
+        wheel_manifest_file = target_html_dir / "_static" / "wheels" / "manifest.json"
+        if not wheel_manifest_file.is_file():
+            print(f"Error: Missing built Pyodide wheel manifest: {wheel_manifest_file}")
             has_errors = True
+        else:
+            try:
+                wheel_manifest_payload = json.loads(wheel_manifest_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                print(f"Error parsing {wheel_manifest_file}: {exc}")
+                has_errors = True
+                wheel_manifest_payload = None
+
+            if not isinstance(wheel_manifest_payload, dict) or not isinstance(
+                wheel_manifest_payload.get("wheels"), list
+            ):
+                print(f"Error: {wheel_manifest_file} must be a JSON object with a 'wheels' list.")
+                has_errors = True
+            else:
+                manifest_wheels = [str(w) for w in wheel_manifest_payload["wheels"]]
+                for wheel_entry in manifest_wheels:
+                    if any(forbidden in wheel_entry for forbidden in forbidden_wheel_substrings):
+                        print(
+                            f"Error: {wheel_manifest_file} includes non-browser wheel '{wheel_entry}'."
+                        )
+                        has_errors = True
+                    wheel_disk_path = target_html_dir / wheel_entry
+                    if not wheel_disk_path.is_file():
+                        print(
+                            f"Error: Staged wheel listed in {wheel_manifest_file} is missing: {wheel_disk_path}"
+                        )
+                        has_errors = True
+                if expected_browser_wheels and manifest_wheels != expected_browser_wheels:
+                    print(
+                        f"Error: {wheel_manifest_file} wheels {manifest_wheels} != expected {expected_browser_wheels}."
+                    )
+                    has_errors = True
 
     if not has_errors:
         print("Release Please extra-files and manifest version parity verified.")
@@ -3810,7 +3953,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     docs_failed = check_package_docs()
     governance_failed = check_governance_and_issue_templates()
     pypi_tags_failed = check_pypi_install_tags()
-    release_please_failed = check_release_please_parity()
+    release_please_failed = check_release_please_parity(
+        html_dir=args.html_dir,
+        require_html=args.require_html,
+    )
     examples_failed = check_examples_index_parity()
     sidebars_failed = check_diataxis_sidebar_isolation()
     adr_failed = check_adr_records()

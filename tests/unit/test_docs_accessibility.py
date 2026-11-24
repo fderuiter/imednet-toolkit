@@ -810,6 +810,150 @@ __result__ = {
         if (cfg.wheels[0] !== "https://example.org/docs/_static/wheels/imednet-1.1.0-py3-none-any.whl") {{
             throw new Error("Unexpected wheel URL via data-content_root: " + cfg.wheels[0]);
         }}
+        if (cfg.docRootUrl !== "https://example.org/docs/") {{
+            throw new Error("Unexpected docRootUrl: " + cfg.docRootUrl);
+        }}
+        if (cfg.wheelManifestUrl !== "https://example.org/docs/_static/wheels/manifest.json") {{
+            throw new Error("Unexpected wheelManifestUrl: " + cfg.wheelManifestUrl);
+        }}
+
+        // Verify standalone page without inline #imednet-pyodide-config returns empty synchronous wheels
+        // and fetches _static/wheels/manifest.json in fallbackToMainThread / worker runtime.
+        (async () => {{
+            const installedMain = [];
+            let createdScript = null;
+            const standaloneSandbox = {{
+                URL,
+                console,
+                fetch: async (url) => {{
+                    if (url !== "https://example.org/docs/_static/wheels/manifest.json") {{
+                        throw new Error("Unexpected manifest fetch URL: " + url);
+                    }}
+                    return {{
+                        ok: true,
+                        status: 200,
+                        json: async () => ({{
+                            wheels: [
+                                "_static/wheels/imednet-1.2.0-py3-none-any.whl",
+                                "_static/wheels/imednet_workflows-1.2.0-py3-none-any.whl",
+                                "_static/wheels/imednet_plugins_sinks-1.1.0-py3-none-any.whl",
+                                "_static/wheels/imednet_tui-1.0.0-py3-none-any.whl"
+                            ]
+                        }})
+                    }};
+                }},
+                window: {{
+                    location: {{ href: "https://example.org/docs/tutorials/standalone.html" }},
+                    loadPyodide: async () => ({{
+                        loadPackage: async () => {{}},
+                        toPy: (v) => ({{ destroy: () => {{}}, val: v }}),
+                        globals: {{ set: () => {{}}, delete: () => {{}} }},
+                        runPythonAsync: async (code) => {{
+                            const m = code.match(/micropip\\.install\\("([^"]+)"/);
+                            if (m) installedMain.push(m[1]);
+                        }}
+                    }})
+                }},
+                document: {{
+                    readyState: "complete",
+                    documentElement: {{
+                        getAttribute: (attr) => attr === "data-content_root" ? "../" : null
+                    }},
+                    getElementById: () => null,
+                    querySelectorAll: () => [],
+                    createElement: () => {{
+                        createdScript = {{}};
+                        return createdScript;
+                    }},
+                    head: {{
+                        appendChild: (s) => {{
+                            if (s && typeof s.onload === "function") s.onload();
+                        }}
+                    }}
+                }}
+            }};
+            standaloneSandbox.window.document = standaloneSandbox.document;
+            vm.runInNewContext(thebeSource, standaloneSandbox);
+            const standaloneCfg = standaloneSandbox.window.pyodideRuntime.getConfig();
+            if (standaloneCfg.wheels.length !== 0 || standaloneCfg.hasInlineWheels !== false) {{
+                throw new Error("Expected empty inline wheels on standalone page, got: " + JSON.stringify(standaloneCfg));
+            }}
+            if (standaloneCfg.wheelManifestUrl !== "https://example.org/docs/_static/wheels/manifest.json") {{
+                throw new Error("Unexpected standalone wheelManifestUrl: " + standaloneCfg.wheelManifestUrl);
+            }}
+            standaloneSandbox.window.initPyodide();
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            const expectedInstalled = [
+                "https://example.org/docs/_static/wheels/imednet-1.2.0-py3-none-any.whl",
+                "https://example.org/docs/_static/wheels/imednet_workflows-1.2.0-py3-none-any.whl",
+                "https://example.org/docs/_static/wheels/imednet_plugins_sinks-1.1.0-py3-none-any.whl"
+            ];
+            if (JSON.stringify(installedMain) !== JSON.stringify(expectedInstalled)) {{
+                throw new Error("Unexpected installed manifest wheels: " + JSON.stringify(installedMain));
+            }}
+
+            // Also verify Web Worker runtime fetches _static/wheels/manifest.json when inline wheels are absent.
+            const installedWorker = [];
+            let capturedWorkerSource = "";
+            let workerReady = false;
+            const workerHostSandbox = {{
+                URL: Object.assign(function(u, b) {{ return new URL(u, b); }}, {{
+                    createObjectURL: (blobObj) => {{
+                        capturedWorkerSource = blobObj.parts.join("");
+                        return "blob:pyodide-worker";
+                    }}
+                }}),
+                Blob: function(parts) {{ this.parts = parts; }},
+                Worker: function() {{
+                    const workerSelf = this;
+                    const workerCtx = {{
+                        URL,
+                        console,
+                        fetch: standaloneSandbox.fetch,
+                        importScripts: () => {{}},
+                        loadPyodide: async () => ({{
+                            loadPackage: async () => {{}},
+                            toPy: (v) => ({{ destroy: () => {{}}, val: v }}),
+                            globals: {{ set: () => {{}}, delete: () => {{}} }},
+                            runPythonAsync: async (code) => {{
+                                const m = code.match(/micropip\\.install\\("([^"]+)"/);
+                                if (m) installedWorker.push(m[1]);
+                            }}
+                        }}),
+                        postMessage: (msg) => {{
+                            if (msg && msg.type === "status" && msg.status === "ready") {{
+                                workerReady = true;
+                            }}
+                            if (typeof workerSelf.onmessage === "function") {{
+                                workerSelf.onmessage({{ data: msg }});
+                            }}
+                        }}
+                    }};
+                    vm.runInNewContext(capturedWorkerSource, workerCtx);
+                    this.postMessage = (data) => workerCtx.onmessage({{ data }});
+                }},
+                console,
+                window: {{ location: {{ href: "https://example.org/docs/tutorials/standalone.html" }} }},
+                document: {{
+                    readyState: "complete",
+                    documentElement: {{
+                        getAttribute: (attr) => attr === "data-content_root" ? "../" : null
+                    }},
+                    getElementById: () => null,
+                    querySelectorAll: () => []
+                }}
+            }};
+            workerHostSandbox.window.document = workerHostSandbox.document;
+            vm.runInNewContext(thebeSource, workerHostSandbox);
+            workerHostSandbox.window.initPyodide();
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            if (!workerReady || JSON.stringify(installedWorker) !== JSON.stringify(expectedInstalled)) {{
+                throw new Error("Unexpected worker manifest wheels: " + JSON.stringify({{ workerReady, installedWorker }}));
+            }}
+        }})().catch((err) => {{
+            console.error(err);
+            process.exit(1);
+        }});
         """
         proc = subprocess.run([node_bin, "-e", node_script], capture_output=True, text=True)
         assert proc.returncode == 0, (

@@ -1,10 +1,15 @@
 # Changelog
 
-## 0.1.0 (2026-11-23)
+## 1.0.0 (2026-11-23)
 
 
 ### Features
 
+* Initial release of `imednet-tui` modular terminal interface plugin.
+* Dynamic CLI discovery via `imednet.cli_plugins` entry points.
+* Interactive study, site, subject, and job exploration views with keyboard navigation.
+* High contrast accessibility mode with `IMEDNET_HIGH_CONTRAST` support.
+* Zero local credential storage in compliance with ADR 0005.
 * add CLI server filters and bounded fetches ([#1887](https://github.com/fderuiter/imednet-toolkit/issues/1887)) ([4a9f24b](https://github.com/fderuiter/imednet-toolkit/commit/4a9f24b2cdd37059e95ac229da878537506ec9d1))
 * **cli:** add modular terminal interface plugin with dynamic discovery ([#1842](https://github.com/fderuiter/imednet-toolkit/issues/1842)) ([e4d5070](https://github.com/fderuiter/imednet-toolkit/commit/e4d50708f828befc900e0d4be35141d2dbd878e7))
 * **cli:** expose shared CLI helpers in SPI ([#1998](https://github.com/fderuiter/imednet-toolkit/issues/1998)) ([b52e79b](https://github.com/fderuiter/imednet-toolkit/commit/b52e79ba6ac80e8562b5b77c930eda9be372cb6f))
@@ -28,13 +33,3 @@
 ### Performance Improvements
 
 * adopt lazy package barrels and deferred imports ([#2013](https://github.com/fderuiter/imednet-toolkit/issues/2013)) ([733cfe7](https://github.com/fderuiter/imednet-toolkit/commit/733cfe736f52423a02fe5577936e4012dad96884))
-
-## 1.0.0 (2026-11-17)
-
-### Features
-
-- Initial release of `imednet-tui` modular terminal interface plugin.
-- Dynamic CLI discovery via `imednet.cli_plugins` entry points.
-- Interactive study, site, subject, and job exploration views with keyboard navigation.
-- High contrast accessibility mode with `IMEDNET_HIGH_CONTRAST` support.
-- Zero local credential storage in compliance with ADR 0005.
