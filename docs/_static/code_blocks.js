@@ -81,72 +81,7 @@
         }
     }
 
-    function initMainContentFocus() {
-        const mainContent =
-            typeof document.getElementById === "function"
-                ? document.getElementById("furo-main-content")
-                : null;
-        if (
-            mainContent &&
-            typeof mainContent.hasAttribute === "function" &&
-            !mainContent.hasAttribute("tabindex") &&
-            typeof mainContent.setAttribute === "function"
-        ) {
-            mainContent.setAttribute("tabindex", "-1");
-        }
-
-        if (typeof document.querySelectorAll !== "function") {
-            return;
-        }
-        const backToTopLinks = document.querySelectorAll("a.back-to-top");
-        Array.from(backToTopLinks || []).forEach(function (link) {
-            if (
-                !link ||
-                typeof link.addEventListener !== "function" ||
-                (typeof link.hasAttribute === "function" && link.hasAttribute("data-btt-bound"))
-            ) {
-                return;
-            }
-            if (typeof link.setAttribute === "function") {
-                link.setAttribute("data-btt-bound", "true");
-            }
-            link.addEventListener("click", function (e) {
-                if (e && typeof e.preventDefault === "function") {
-                    e.preventDefault();
-                }
-                const mql =
-                    typeof globalThis.matchMedia === "function"
-                        ? globalThis.matchMedia("(prefers-reduced-motion: reduce)")
-                        : null;
-                const prefersReducedMotion = Boolean(mql && mql.matches);
-                if (typeof globalThis.scrollTo === "function") {
-                    globalThis.scrollTo({
-                        top: 0,
-                        behavior: prefersReducedMotion ? "auto" : "smooth"
-                    });
-                }
-                const target =
-                    typeof document.getElementById === "function"
-                        ? document.getElementById("furo-main-content")
-                        : mainContent;
-                if (target) {
-                    if (
-                        typeof target.hasAttribute === "function" &&
-                        !target.hasAttribute("tabindex") &&
-                        typeof target.setAttribute === "function"
-                    ) {
-                        target.setAttribute("tabindex", "-1");
-                    }
-                    if (typeof target.focus === "function") {
-                        target.focus({ preventScroll: true });
-                    }
-                }
-            });
-        });
-    }
-
     function initAccessibleCodeBlocks() {
-        initMainContentFocus();
         if (globalThis.__imednetCodeBlocksInitialized) {
             checkCodeBlocks();
             return;

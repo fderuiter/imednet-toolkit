@@ -359,8 +359,9 @@ def test_uat_execution_engine_routes_polling_through_facade_poll_jobs() -> None:
                         "resultUrl": S3_RESULT_URL,
                     },
                 )
-            if request.method == "GET" and request.url.path.endswith(
-                ("/forms", "/variables", "/intervals", "/sites", "/subjects")
+            if request.method == "GET" and any(
+                request.url.path.endswith(suffix)
+                for suffix in ("/forms", "/variables", "/intervals", "/sites", "/subjects")
             ):
                 return httpx.Response(
                     200,

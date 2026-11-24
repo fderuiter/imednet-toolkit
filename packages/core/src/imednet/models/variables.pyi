@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import overload
-
 from pydantic import Field
 
 from imednet.models.base import ImednetBaseModel
@@ -30,50 +28,37 @@ class Variable(ImednetBaseModel):
     disabled: bool | None = Field(default=None, alias="disabled")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         label: str | None = None,
         variable_oid: str | None = None,
-        required: bool | str | None = None,
-        study_key: str | None = None,
-        variable_id: int | None = None,
-        variable_type: str | None = None,
-        variable_name: str | None = None,
-        sequence: int | None = None,
-        revision: int | None = None,
-        date_created: str | None = None,
-        date_modified: str | None = None,
-        form_id: int | None = None,
-        form_key: str | None = None,
-        form_name: str | None = None,
-        blinded: bool | None = None,
-        deleted: bool | None = None,
-        disabled: bool | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        label: str | None = None,
         variableOid: str | None = None,
         required: bool | str | None = None,
+        study_key: str | None = None,
         studyKey: str | None = None,
+        variable_id: int | None = None,
         variableId: int | None = None,
+        variable_type: str | None = None,
         variableType: str | None = None,
+        variable_name: str | None = None,
         variableName: str | None = None,
         sequence: int | None = None,
         revision: int | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_modified: str | None = None,
         dateModified: str | None = None,
+        form_id: int | None = None,
         formId: int | None = None,
+        form_key: str | None = None,
         formKey: str | None = None,
+        form_name: str | None = None,
         formName: str | None = None,
         blinded: bool | None = None,
         deleted: bool | None = None,
         disabled: bool | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
 

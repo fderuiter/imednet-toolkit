@@ -2303,7 +2303,7 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
         staged_rows: list[dict[str, object]] = []
         copied_stage_paths: list[str] = []
 
-        def fake_execute(sql: str):
+        def fake_execute(sql: str, params: object = None):
             nonlocal staged_rows
             if "INFORMATION_SCHEMA.COLUMNS" in sql:
                 cursor.fetchall.return_value = (
@@ -2333,6 +2333,12 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
                     elif not (hard_del and is_del):
                         warehouse_rows[key] = dict(row)
                 cursor.fetchall.return_value = []
+            elif sql.startswith("DELETE FROM"):
+                assert isinstance(params, list) and len(params) >= 2
+                study_val = str(params[0])
+                for rid in params[1:]:
+                    warehouse_rows.pop((study_val, int(rid)), None)
+                cursor.fetchall.return_value = []
             else:
                 cursor.fetchall.return_value = []
 
@@ -2359,7 +2365,7 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
                 record_data={"score": 20},
             ),
         ]
-        # Run 2 (soft delete default): record 1 updated, record 2 marked deleted=True
+        # Run 2: record 1 updated, matched record 2 voided, unmatched record 99 voided
         run2_records = [
             Record(
                 record_id=1,
@@ -2379,8 +2385,45 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
                 date_modified="2026-04-02T10:05:00Z",
                 record_data={"score": 20},
             ),
+            Record(
+                record_id=99,
+                form_id=1,
+                form_key="F1",
+                subject_key="S99",
+                deleted=True,
+                date_modified="2026-04-02T10:10:00Z",
+                record_data={"score": 0},
+            ),
         ]
 
+        default_cfg = SnowflakeSinkConfig(
+            study_key="STUDY_DEL",
+            account="acct",
+            user="loader",
+            password="secret",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="RECORDS",
+            local_staging_dir=str(tmp_path / "default"),
+            include_deleted=False,
+            hard_delete=False,
+        )
+
+        sdk_mock.records.list.side_effect = lambda **_kw: iter(run1_records)
+        assert export_to_snowflake(sdk_mock, "STUDY_DEL", config=default_cfg) == 2
+
+        sdk_mock.records.list.side_effect = lambda **_kw: iter(run2_records)
+        assert export_to_snowflake(sdk_mock, "STUDY_DEL", config=default_cfg) == 1
+
+        # Default include_deleted=False deletes matched voided row 2 and excludes unmatched row 99
+        assert len(copied_stage_paths) == 2
+        assert copied_stage_paths[0] != copied_stage_paths[1]
+        assert list(warehouse_rows.keys()) == [("STUDY_DEL", 1)]
+        assert warehouse_rows[("STUDY_DEL", 1)]["score"] == 15
+
+        # Explicit include_deleted=True, hard_delete=False retains deleted=True tombstones
         soft_cfg = SnowflakeSinkConfig(
             study_key="STUDY_DEL",
             account="acct",
@@ -2392,23 +2435,19 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
             stage="STG",
             table="RECORDS",
             local_staging_dir=str(tmp_path / "soft"),
+            include_deleted=True,
             hard_delete=False,
         )
-
         sdk_mock.records.list.side_effect = lambda **_kw: iter(run1_records)
         assert export_to_snowflake(sdk_mock, "STUDY_DEL", config=soft_cfg) == 2
 
-        sdk_mock.records.list.side_effect = lambda **_kw: iter(run2_records)
+        sdk_mock.records.list.side_effect = lambda **_kw: iter(run2_records[:2])
         assert export_to_snowflake(sdk_mock, "STUDY_DEL", config=soft_cfg) == 2
-
-        # Distinct run-scoped stage paths and soft-delete metadata retained
-        assert len(copied_stage_paths) == 2
-        assert copied_stage_paths[0] != copied_stage_paths[1]
         assert len(warehouse_rows) == 2
         assert warehouse_rows[("STUDY_DEL", 1)]["score"] == 15
         assert warehouse_rows[("STUDY_DEL", 2)]["deleted"] is True
 
-        # Run 3 (hard_delete=True): matched deleted=True row 2 is deleted; unmatched deleted=True row 99 is not inserted
+        # Explicit include_deleted=True, hard_delete=True deletes matched row 2 and skips unmatched row 99
         run3_records = [
             Record(
                 record_id=1,
@@ -2449,6 +2488,7 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
             stage="STG",
             table="RECORDS",
             local_staging_dir=str(tmp_path / "hard"),
+            include_deleted=True,
             hard_delete=True,
         )
         sdk_mock.records.list.side_effect = lambda **_kw: iter(run3_records)

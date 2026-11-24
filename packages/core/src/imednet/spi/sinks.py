@@ -19,11 +19,13 @@ from imednet.integrations.sink_base import (
     _redact_uri,
     _require_optional_dep,
     apply_quality_gate,
+    bind_sdtm_stream_metadata,
     evaluate_standards_readiness,
     extract_record_form_ref,
     extract_record_id,
     extract_record_timestamp,
     get_state_provider,
+    is_incremental_sink_config,
     is_record_deleted,
     iter_batches,
     iter_filtered_sdk_records,
@@ -54,6 +56,7 @@ __all__ = [
     "SinkConfig",
     "StateProviderProtocol",
     "apply_quality_gate",
+    "bind_sdtm_stream_metadata",
     "build_sink_mapper",
     "evaluate_standards_readiness",
     "extract_record_form_ref",
@@ -62,6 +65,7 @@ __all__ = [
     "format_variable_name",
     "get_sdtm_domain_variables",
     "get_state_provider",
+    "is_incremental_sink_config",
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
@@ -87,10 +91,17 @@ def build_sink_mapper(
     mode: str = "document",
     post_processor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     seq_counters: dict[str, int] | None = None,
+    record_seqs: dict[str, int] | None = None,
+    preserve_record_id: bool | None = None,
 ) -> CentralizedMapper:
     """Create a CentralizedMapper configured with SinkConfig PHI, SDTM, and naming rules."""
     extra = getattr(config, "extra", None)
     extra_dict = extra if isinstance(extra, dict) else {}
+    effective_preserve_record_id = (
+        is_incremental_sink_config(config)
+        if preserve_record_id is None
+        else bool(preserve_record_id)
+    )
     mapper = CentralizedMapper(
         mode=mode,
         post_processor=post_processor,
@@ -100,6 +111,8 @@ def build_sink_mapper(
         as_sdtm=bool(getattr(config, "as_sdtm", False)),
         sdtm_domain=getattr(config, "sdtm_domain", None),
         seq_counters=seq_counters,
+        record_seqs=record_seqs,
+        preserve_record_id=effective_preserve_record_id,
     )
     custom_pipeline = extra_dict.get("enrichment_pipeline")
     if custom_pipeline is not None and hasattr(custom_pipeline, "process"):
