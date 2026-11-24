@@ -256,3 +256,86 @@ def test_extract_audit_trail_emits_single_date_created_http_filter_and_filters_l
         assert "startDate" not in sent_filter
         assert "endDate" not in sent_filter
         assert [r.record_revision_id for r in revisions] == [5]
+
+
+def test_data_extraction_date_helpers_and_progress_callbacks() -> None:
+    """Test date parsing/comparison helpers, progress callbacks, and compound date bounds."""
+    from datetime import UTC, date, datetime
+
+    import pytest
+
+    from imednet_workflows.data_extraction import (
+        _matches_local_date_bound,
+        _parse_date_created_utc,
+    )
+
+    assert _parse_date_created_utc(None) is None
+    assert _parse_date_created_utc(datetime(2026, 1, 2, 3, 4)) == datetime(
+        2026, 1, 2, 3, 4, tzinfo=UTC
+    )
+    assert _parse_date_created_utc(date(2026, 1, 2)) == datetime(2026, 1, 2, tzinfo=UTC)
+    assert _parse_date_created_utc("   ") is None
+    assert _parse_date_created_utc("not-a-date") is None
+    assert _parse_date_created_utc(12345) is None
+
+    rev_dt = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    assert _matches_local_date_bound(None, "==", rev_dt) is False
+    assert _matches_local_date_bound(rev_dt, "==", datetime(2026, 1, 15, 12, 0)) is True
+    assert _matches_local_date_bound(rev_dt, "!=", date(2026, 1, 16)) is True
+    assert _matches_local_date_bound(rev_dt, "<", "2026-01-16") is True
+    assert _matches_local_date_bound(rev_dt, ">", "2026-01-14") is True
+    assert _matches_local_date_bound(rev_dt, ">=", "2026-01-15T12:00:00Z") is True
+    assert _matches_local_date_bound(rev_dt, "<=", "bad-bound") is False
+    assert _matches_local_date_bound(rev_dt, "==", object()) is False
+    with pytest.raises(ValueError, match="Unsupported dateCreated filter operator"):
+        _matches_local_date_bound(rev_dt, "~=", rev_dt)
+
+    progress_events: list[str] = []
+    sdk = MagicMock()
+    sdk.get_subjects.return_value = []
+    wf = DataExtractionWorkflow(sdk)
+    assert (
+        wf.extract_records_by_criteria(
+            "STUDY",
+            subject_filter={"status": "active"},
+            on_progress=progress_events.append,
+        )
+        == []
+    )
+    assert any("No subjects matched" in msg for msg in progress_events)
+
+    progress_events.clear()
+    sdk.get_subjects.return_value = [Subject(subject_key="S1")]
+    sdk.get_visits.return_value = []
+    assert (
+        wf.extract_records_by_criteria(
+            "STUDY",
+            subject_filter={"status": "active"},
+            visit_filter={"name": "V1"},
+            on_progress=progress_events.append,
+        )
+        == []
+    )
+    assert any("No visits matched" in msg for msg in progress_events)
+
+    progress_events.clear()
+    sdk.get_visits.return_value = [Visit(visit_id=10, subject_key="S1")]
+    sdk.get_records.return_value = [Record(record_id=1, subject_key="S1", visit_id=10)]
+    matched = wf.extract_records_by_criteria(
+        "STUDY",
+        subject_filter={"status": "active"},
+        visit_filter={"name": "V1"},
+        on_progress=progress_events.append,
+    )
+    assert [r.record_id for r in matched] == [1]
+    assert any("Extraction complete" in msg for msg in progress_events)
+
+    sdk.get_record_revisions.return_value = [
+        RecordRevision(record_revision_id=1, date_created="2026-01-15T12:00:00Z")
+    ]
+    revs = wf.extract_audit_trail(
+        "STUDY",
+        user_filter={"date_created": [(">=", "2026-01-01T00:00:00Z"), "2026-01-15T12:00:00Z"]},
+        dateCreated=("<=", "2026-02-01T00:00:00Z"),
+    )
+    assert [r.record_revision_id for r in revs] == [1]

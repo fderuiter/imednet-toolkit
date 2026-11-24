@@ -76,6 +76,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "build_safe_path": ("imednet.utils.url", "build_safe_path"),
     "validate_path_segment": ("imednet.utils.url", "validate_path_segment"),
     "sanitize_csv_formula": ("imednet.utils.security", "sanitize_csv_formula"),
+    "sanitize_diagnostic_payload": ("imednet.utils.security", "sanitize_diagnostic_payload"),
+    "sanitize_diagnostic_text": ("imednet.utils.security", "sanitize_diagnostic_text"),
     "validate_partition_key": ("imednet.utils.security", "validate_partition_key"),
     "RestrictedAstEvaluator": ("imednet.utils.evaluator", "RestrictedAstEvaluator"),
     "evaluate_expression": ("imednet.utils.evaluator", "evaluate_expression"),
@@ -85,10 +87,18 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "BatchCoordinator": ("imednet.utils.batch_coordinator", "BatchCoordinator"),
     "BatchSubmissionSummary": ("imednet.utils.batch_coordinator", "BatchSubmissionSummary"),
     "chunk_records": ("imednet.utils.batch_coordinator", "chunk_records"),
+    "extract_single_submitted_job": (
+        "imednet.utils.batch_coordinator",
+        "extract_single_submitted_job",
+    ),
     "poll_facade_many_async": ("imednet.utils.batch_coordinator", "poll_facade_many_async"),
     "poll_facade_many_sync": ("imednet.utils.batch_coordinator", "poll_facade_many_sync"),
     "poll_facade_single_async": ("imednet.utils.batch_coordinator", "poll_facade_single_async"),
     "poll_facade_single_sync": ("imednet.utils.batch_coordinator", "poll_facade_single_sync"),
+    "validate_single_job_preflight": (
+        "imednet.utils.batch_coordinator",
+        "validate_single_job_preflight",
+    ),
 }
 
 
@@ -134,6 +144,7 @@ __all__ = [
     "evaluate_expression",
     "export_records_csv",
     "extract_candidate_subject_key",
+    "extract_single_submitted_job",
     "filter_existing_subject_registrations",
     "flatten",
     "format_iso_datetime",
@@ -164,6 +175,8 @@ __all__ = [
     "records_to_dataframe",
     "sanitize_base_url",
     "sanitize_csv_formula",
+    "sanitize_diagnostic_payload",
+    "sanitize_diagnostic_text",
     "sites_to_dataframe",
     "subjects_to_dataframe",
     "to_arrow_table",
@@ -175,6 +188,7 @@ __all__ = [
     "validate_partition_key",
     "validate_path_segment",
     "validate_record_filter",
+    "validate_single_job_preflight",
     "validate_subject_registration_sites",
     "variables_to_dataframe",
     "visits_to_dataframe",

@@ -7,13 +7,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ...errors import ValidationError
+from ...errors import ApiError, ValidationError
 from ...sdk import ImednetSDK
 from ...utils.enrollment import (
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
     validate_subject_registration_sites,
 )
+from ...utils.job_poller import JobFailedError, JobTimeoutError
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import print_error, register_list_command, simulation_mode_context
 from ..utils.args import (
@@ -23,16 +24,15 @@ from ..utils.args import (
 from ..utils.context import is_offline_schema_dry_run
 from ..utils.write_helpers import (
     add_write_common_args,
-    coerce_batch_summary,
     exit_cli_validation_error,
+    exit_cli_write_error,
     load_records_from_path_or_stdin,
-    parse_email_notify,
     parse_json_records_text,
     parse_key_value_pairs,
     render_write_summary,
     resolve_cli_schema,
+    submit_cli_records_batch,
     validate_write_numeric_flags,
-    write_progress_context,
 )
 
 
@@ -211,7 +211,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def register_subjects_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
-        no_interactive = getattr(args, "no_interactive", False)
         offline_dry_run = is_offline_schema_dry_run(
             dry_run=args.dry_run,
             schema_source=args.schema_source,
@@ -242,38 +241,19 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 should_filter=should_filter,
                 subject_key_field=args.subject_key_field,
             )
-
-            email_notify = parse_email_notify(args.email_notify)
-            with write_progress_context(
-                "subject registration",
-                args.study_key,
-                no_interactive=no_interactive,
-                output_format=args.output_format,
-            ) as on_progress:
-                raw_summary = sdk.records.create_batch(
-                    args.study_key,
-                    subjects_data,
-                    email_notify=email_notify,
-                    schema=resolved_schema,
-                    chunk_size=args.chunk_size,
-                    wait_for_completion=args.wait,
-                    timeout=args.timeout,
-                    interval=args.interval,
-                    on_progress=on_progress,
-                    dry_run=args.dry_run,
-                    collect_errors=True,
-                )
+            summary = submit_cli_records_batch(
+                sdk,
+                args,
+                subjects_data,
+                action_label="subject registration",
+                schema=resolved_schema,
+                skipped_count=skipped_count,
+            )
         except (ValidationError, ValueError) as exc:
             exit_cli_validation_error(exc)
+        except (JobFailedError, JobTimeoutError, ApiError) as exc:
+            exit_cli_write_error(exc)
 
-        summary = coerce_batch_summary(
-            raw_summary,
-            study_key=args.study_key,
-            total_records=len(subjects_data),
-            dry_run=args.dry_run,
-            skipped_count=skipped_count,
-        )
-        summary.skipped_count = skipped_count
         render_write_summary(
             summary,
             resource="subjects_register",

@@ -168,6 +168,35 @@ and partial-failure predicates:
    assert partial_failure.is_failed is True
    assert partial_failure.is_successful is False
 
+Mid-Batch Errors, Sibling Settlement, and Validation Modes
+----------------------------------------------------------
+
+Chunked write helpers (:meth:`~imednet.endpoints.records.RecordsEndpoint.create_batch`,
+:class:`~imednet.utils.batch_coordinator.BatchCoordinator`, and
+:class:`~imednet.utils.batch_coordinator.AsyncBatchCoordinator`) preserve full batch
+state when partial progress occurs before an error:
+
+* **Mid-batch write errors**: If chunk *N* fails after earlier chunks were accepted by
+  the API, any accepted ``batch_id`` values are settled to terminal states when
+  ``wait_for_completion=True`` and a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`
+  is attached to ``exc.partial_summary`` (along with ``exc.unsubmitted_chunks``).
+  Credentials are redacted and clinical PHI fields are masked on all attached diagnostic
+  payloads without mutating caller input dictionaries.
+* **Sibling settlement on polling failures**: When ``wait_for_completion=True`` polls
+  multiple chunks and one ``Job`` ends in a failed state, all sibling ``batch_id``
+  values are settled to terminal states before :class:`~imednet.utils.job_poller.JobFailedError`
+  is raised. Callers can inspect ``exc.poll_summary`` (including
+  ``exc.poll_summary.terminal_statuses``) and ``exc.partial_summary`` to reconcile which
+  chunks succeeded and which failed; in accordance with
+  :doc:`/adr/0006-endpoint-composition-and-job-polling`, local errors never imply
+  server-side ``Job`` cancellation.
+* **Dry-run and skipped validation semantics**: Calling ``submit(..., dry_run=True)``
+  returns the :class:`~imednet.validation.cache.BatchValidationReport` on
+  ``summary.validation_report`` without raising :class:`~imednet.errors.ValidationError`,
+  and ``summary.all_successful`` reflects ``report.is_valid``. Passing
+  ``skip_validation=True`` leaves ``summary.validation_report`` as ``None`` so unvalidated
+  batches never claim valid ``Record`` counts.
+
 Typed Endpoint Interface and Terminal Semantics
 -----------------------------------------------
 

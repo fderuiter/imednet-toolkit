@@ -825,6 +825,87 @@ async def test_all_record_update_workflow_methods_accept_clinical_variable_types
 
 
 @pytest.mark.asyncio
+async def test_single_job_record_update_rejects_multi_chunk_dry_run_empty_and_invalid_dd() -> None:
+    """AC 2: create_or_update_records rejects multi-chunk, dry_run=True, empty, and invalid DD inputs."""
+    from imednet.datadict import DataDictionary, Form
+    from imednet.datadict import Variable as DDVariable
+
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="F_DM",
+                formName="Demographics",
+                variables=[DDVariable(variableName="AGE", variableType="Integer", required="Yes")],
+            )
+        ]
+    )
+
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.create_record.return_value = Job(jobId="1", batchId="B1", state="PROCESSING")
+    wf = RecordUpdateWorkflow(sync_sdk, batch_size=2, schema=dd)
+
+    # Multi-chunk payload rejected before any POST
+    with pytest.raises(ValidationError, match="create_or_update_records_batch"):
+        wf.create_or_update_records(
+            "STUDY",
+            [
+                {"formKey": "F_DM", "data": {"AGE": 20}},
+                {"formKey": "F_DM", "data": {"AGE": 21}},
+                {"formKey": "F_DM", "data": {"AGE": 22}},
+            ],
+        )
+    # dry_run=True rejected without fabricating COMPLETED Job
+    with pytest.raises(ValidationError, match="dry_run=True"):
+        wf.create_or_update_records(
+            "STUDY",
+            [{"formKey": "F_DM", "data": {"AGE": 20}}],
+            dry_run=True,
+        )
+    # Empty input rejected without fabricating COMPLETED Job
+    with pytest.raises(ValidationError, match="at least one record"):
+        wf.create_or_update_records("STUDY", [])
+    # Invalid DataDictionary input rejected even with collect_errors=True
+    with pytest.raises(ValidationError):
+        wf.create_or_update_records(
+            "STUDY",
+            [{"formKey": "F_DM", "data": {"AGE": "not-an-int"}}],
+            collect_errors=True,
+        )
+    sync_sdk.create_record.assert_not_called()
+
+    # Async parity
+    async_sdk = MagicMock()
+    async_sdk.async_create_record = AsyncMock()
+    async_wf = RecordUpdateWorkflow(async_sdk, batch_size=2, schema=dd)
+
+    with pytest.raises(ValidationError, match="async_create_or_update_records_batch"):
+        await async_wf.async_create_or_update_records(
+            "STUDY",
+            [
+                {"formKey": "F_DM", "data": {"AGE": 20}},
+                {"formKey": "F_DM", "data": {"AGE": 21}},
+                {"formKey": "F_DM", "data": {"AGE": 22}},
+            ],
+        )
+    with pytest.raises(ValidationError, match="dry_run=True"):
+        await async_wf.async_create_or_update_records(
+            "STUDY",
+            [{"formKey": "F_DM", "data": {"AGE": 20}}],
+            dry_run=True,
+        )
+    with pytest.raises(ValidationError, match="at least one record"):
+        await async_wf.async_create_or_update_records("STUDY", [])
+    with pytest.raises(ValidationError):
+        await async_wf.async_create_or_update_records(
+            "STUDY",
+            [{"formKey": "F_DM", "data": {"AGE": "not-an-int"}}],
+            collect_errors=True,
+        )
+    async_sdk.async_create_record.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_record_update_workflow_email_notify_across_all_ten_methods() -> None:
     """Req 8: RecordUpdateWorkflow forwards email_notify and sends x-email-notify across all 10 methods."""
     import httpx

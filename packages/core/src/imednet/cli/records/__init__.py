@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from ...endpoints.records import RecordsEndpoint
-from ...errors import ValidationError
+from ...errors import ApiError, ValidationError
 from ...models.records import Record
 from ...sdk import ImednetSDK
+from ...utils.job_poller import JobFailedError, JobTimeoutError
 from ...utils.pandas import import_records_csv
 from ...utils.tabular import ensure_no_masked_sentinel
 from ..decorators import validate_cli_path_segment, with_sdk
@@ -30,12 +31,14 @@ from ..utils.write_helpers import (
     add_write_common_args,
     coerce_batch_summary,
     exit_cli_validation_error,
+    exit_cli_write_error,
     load_records_from_path_or_stdin,
     parse_email_notify,
     parse_json_records_text,
     parse_key_value_pairs,
     render_write_summary,
     resolve_cli_schema,
+    submit_cli_records_batch,
     validate_write_numeric_flags,
     write_progress_context,
 )
@@ -438,7 +441,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def create_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
-        no_interactive = getattr(args, "no_interactive", False)
         try:
             resolved_schema = resolve_cli_schema(
                 sdk,
@@ -447,35 +449,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 dry_run=args.dry_run,
             )
             payload = _assemble_create_records_payload(args, schema=resolved_schema)
-            email_notify = parse_email_notify(args.email_notify)
-            with write_progress_context(
-                "record submission",
-                args.study_key,
-                no_interactive=no_interactive,
-                output_format=args.output_format,
-            ) as on_progress:
-                raw_summary = sdk.records.create_batch(
-                    args.study_key,
-                    payload,
-                    email_notify=email_notify,
-                    schema=resolved_schema,
-                    chunk_size=args.chunk_size,
-                    wait_for_completion=args.wait,
-                    timeout=args.timeout,
-                    interval=args.interval,
-                    on_progress=on_progress,
-                    dry_run=args.dry_run,
-                    collect_errors=True,
-                )
+            summary = submit_cli_records_batch(
+                sdk,
+                args,
+                payload,
+                action_label="record submission",
+                schema=resolved_schema,
+            )
         except (ValidationError, ValueError) as exc:
             exit_cli_validation_error(exc)
+        except (JobFailedError, JobTimeoutError, ApiError) as exc:
+            exit_cli_write_error(exc)
 
-        summary = coerce_batch_summary(
-            raw_summary,
-            study_key=args.study_key,
-            total_records=len(payload),
-            dry_run=args.dry_run,
-        )
         render_write_summary(
             summary,
             resource="records_create",
@@ -518,7 +503,6 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def update_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
-        no_interactive = getattr(args, "no_interactive", False)
         try:
             resolved_schema = resolve_cli_schema(
                 sdk,
@@ -527,35 +511,18 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 dry_run=args.dry_run,
             )
             payload = _assemble_records_payload(args, schema=resolved_schema, is_update=True)
-            email_notify = parse_email_notify(args.email_notify)
-            with write_progress_context(
-                "record update",
-                args.study_key,
-                no_interactive=no_interactive,
-                output_format=args.output_format,
-            ) as on_progress:
-                raw_summary = sdk.records.create_batch(
-                    args.study_key,
-                    payload,
-                    email_notify=email_notify,
-                    schema=resolved_schema,
-                    chunk_size=args.chunk_size,
-                    wait_for_completion=args.wait,
-                    timeout=args.timeout,
-                    interval=args.interval,
-                    on_progress=on_progress,
-                    dry_run=args.dry_run,
-                    collect_errors=True,
-                )
+            summary = submit_cli_records_batch(
+                sdk,
+                args,
+                payload,
+                action_label="record update",
+                schema=resolved_schema,
+            )
         except (ValidationError, ValueError) as exc:
             exit_cli_validation_error(exc)
+        except (JobFailedError, JobTimeoutError, ApiError) as exc:
+            exit_cli_write_error(exc)
 
-        summary = coerce_batch_summary(
-            raw_summary,
-            study_key=args.study_key,
-            total_records=len(payload),
-            dry_run=args.dry_run,
-        )
         render_write_summary(
             summary,
             resource="records_update",
@@ -652,12 +619,15 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     total_count = getattr(raw_summary, "total_records", None) or 0
         except (ValidationError, ValueError) as exc:
             exit_cli_validation_error(exc)
+        except (JobFailedError, JobTimeoutError, ApiError) as exc:
+            exit_cli_write_error(exc)
 
         summary = coerce_batch_summary(
             raw_summary,
             study_key=args.study_key,
             total_records=total_count,
             dry_run=args.dry_run,
+            wait_for_completion=args.wait,
         )
         render_write_summary(
             summary,
