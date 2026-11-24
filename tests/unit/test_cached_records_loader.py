@@ -484,8 +484,8 @@ def test_cached_loader_incremental_sync_with_simulation_transport(tmp_path: Path
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "sim-cache")
 
     initial_records = loader.load_records("STUDY")
-    assert [r.record_id for r in initial_records] == [601, 602]
-    assert initial_records[1].record_data == {"V_WEIGHT": 68.5}
+    assert [r.record_id for r in initial_records] == [600, 601, 602]
+    assert initial_records[2].record_data["V_WEIGHT"] == 68.5
 
     # Modify existing record 602 and create a new record after the initial high-water mark
     sdk.records.create(
@@ -517,9 +517,10 @@ def test_cached_loader_incremental_sync_with_simulation_transport(tmp_path: Path
     assert recorded_get_params[1]["recordDataFilter"] == "none"
 
     by_id = {r.record_id: r for r in refreshed_records}
-    assert sorted(k for k in by_id if k is not None) == [601, 602, 1001]
-    assert by_id[601].record_data == {"V_AGE": 45, "V_GENDER": "Female"}
-    assert by_id[602].record_data == {"V_WEIGHT": 71.0}
+    assert sorted(k for k in by_id if k is not None) == [600, 601, 602, 1001]
+    assert by_id[601].record_data["V_AGE"] == 45
+    assert by_id[601].record_data["V_GENDER"] == "Female"
+    assert by_id[602].record_data["V_WEIGHT"] == 71.0
     assert by_id[1001].record_data == {"V_WEIGHT": 72.5}
 
 

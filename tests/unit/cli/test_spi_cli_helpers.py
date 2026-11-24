@@ -468,5 +468,7 @@ def test_validate_standards_supports_simulation_and_study_key_flag(
     assert err == ""
     assert spi_cli.SIMULATION_MODE_ENV not in os.environ
     payload = json.loads(out)
-    assert payload["study_key"] == "STUDY"
-    assert "score" in payload
+    assert payload["schemaVersion"] == "1.0"
+    assert payload["resource"] == "standards_readiness"
+    assert payload["items"][0]["study_key"] == "STUDY"
+    assert "score" in payload["items"][0]

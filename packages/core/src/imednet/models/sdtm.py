@@ -659,12 +659,17 @@ def resolve_sdtm_domain(domain: str | None, *, fallback: str = "AE") -> str:
     compact = "".join(ch for ch in cleaned.upper() if ch.isalnum())
     if compact in _DOMAIN_NAME_ALIASES:
         return _DOMAIN_NAME_ALIASES[compact]
-    # Prefix heuristics for common EDC form keys (e.g. 'F_AE', 'AE_FORM', 'VS_VITALS')
+    # Prefix heuristics for common EDC form keys (e.g. 'F_AE', 'AE1', 'AE_FORM', 'VS_VITALS')
     upper = cleaned.upper()
-    tokens = [tok for tok in upper.replace("-", "_").split("_") if tok and tok != "F"]
+    tokens = [
+        tok for tok in upper.replace("-", "_").replace(" ", "_").split("_") if tok and tok != "F"
+    ]
     for tok in tokens:
         if tok in _DOMAIN_NAME_ALIASES:
             return _DOMAIN_NAME_ALIASES[tok]
+        stripped_digits = tok.rstrip("0123456789")
+        if stripped_digits and stripped_digits in _DOMAIN_NAME_ALIASES:
+            return _DOMAIN_NAME_ALIASES[stripped_digits]
     return upper
 
 
@@ -904,6 +909,14 @@ def _extract_stream_usubjid_and_id(rec: Any) -> tuple[str, tuple[int, int, str]]
     return str(usubjid), _record_id_sort_key(raw_id)
 
 
+def _canonical_record_id_key(raw_id: Any) -> str | None:
+    """Normalize a record identifier to a canonical string key for sidecar lineage."""
+    if raw_id is None or isinstance(raw_id, bool):
+        return None
+    text = str(raw_id).strip()
+    return text if text else None
+
+
 @dataclass
 class _PreparedSdtmRow:
     """Normalized SDTM row prior to final per-subject sequence number assignment."""
@@ -911,6 +924,7 @@ class _PreparedSdtmRow:
     usubjid: str
     sort_key: tuple[tuple[int, str], tuple[tuple[int, str], ...], tuple[int, int, str], int]
     row: dict[str, Any]
+    record_id: Any = None
 
 
 class _SdtmNormalizer:
@@ -1325,32 +1339,74 @@ class _SdtmNormalizer:
             _record_id_sort_key(raw_record_id),
             orig_idx,
         )
-        return _PreparedSdtmRow(usubjid=usubjid, sort_key=sort_key, row=row)
+        return _PreparedSdtmRow(
+            usubjid=usubjid,
+            sort_key=sort_key,
+            row=row,
+            record_id=raw_record_id,
+        )
 
     def finalize_subject_group(
         self,
         group: list[_PreparedSdtmRow],
         seq_counters: dict[str, int],
+        *,
+        seq_overrides: Mapping[str, int] | None = None,
+        lineage_out: dict[str, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Sort a Subject's normalized rows and stamp sequential <DOM>SEQ values."""
         group.sort(key=lambda item: item.sort_key)
+        if self.include_seq and seq_overrides:
+            for item in group:
+                rk = _canonical_record_id_key(item.record_id)
+                if rk is not None and rk in seq_overrides:
+                    seq_counters[item.usubjid] = max(
+                        seq_counters.get(item.usubjid, 0),
+                        int(seq_overrides[rk]),
+                    )
         rows: list[dict[str, Any]] = []
         for item in group:
+            rec_id_key = _canonical_record_id_key(item.record_id)
+            assigned_seq: int | None = None
             if self.include_seq:
-                next_seq = seq_counters.get(item.usubjid, 0) + 1
-                seq_counters[item.usubjid] = next_seq
-                item.row[self.seq_var] = next_seq
+                override_seq = (
+                    seq_overrides.get(rec_id_key)
+                    if seq_overrides is not None and rec_id_key is not None
+                    else None
+                )
+                if override_seq is not None:
+                    assigned_seq = int(override_seq)
+                    seq_counters[item.usubjid] = max(
+                        seq_counters.get(item.usubjid, 0),
+                        assigned_seq,
+                    )
+                else:
+                    assigned_seq = seq_counters.get(item.usubjid, 0) + 1
+                    seq_counters[item.usubjid] = assigned_seq
+                item.row[self.seq_var] = assigned_seq
+            if lineage_out is not None and rec_id_key is not None:
+                lineage_out[rec_id_key] = {
+                    "study_id": self.study_key,
+                    "domain": self.domain_clean,
+                    "usubjid": item.usubjid,
+                    "seq_col": self.seq_var if self.include_seq else None,
+                    "seq_val": assigned_seq if self.include_seq else None,
+                }
             rows.append(item.row)
         return rows
 
     def rows_to_dataframe(self, rows: list[dict[str, Any]]) -> pd.DataFrame:
         """Build a column-ordered SDTM DataFrame from finalized rows."""
         if not rows:
-            return pd.DataFrame(columns=self.std_vars)
+            empty_df = pd.DataFrame(columns=self.std_vars)
+            empty_df.attrs["imednet_sdtm_redacted"] = bool(self.mask_phi)
+            return empty_df
         df = pd.DataFrame(rows)
         cols = [c for c in self.std_vars if c in df.columns]
         extra_cols = [c for c in df.columns if c not in self.std_vars]
-        return df[cols + extra_cols]
+        out = df[cols + extra_cols]
+        out.attrs["imednet_sdtm_redacted"] = bool(self.mask_phi)
+        return out
 
 
 def _iter_sorted_sdtm_frames(
@@ -1360,6 +1416,8 @@ def _iter_sorted_sdtm_frames(
     chunk_size: int,
     seq_counters: dict[str, int],
     source_is_ordered: bool = False,
+    seq_overrides: Mapping[str, int] | None = None,
+    lineage_out: dict[str, dict[str, Any]] | None = None,
 ) -> Iterator[pd.DataFrame]:
     """Yield bounded SDTM DataFrames grouped by USUBJID with continuous sequence counters."""
     if isinstance(records, (list, tuple)):
@@ -1370,7 +1428,14 @@ def _iter_sorted_sdtm_frames(
                 grouped.setdefault(prepared.usubjid, []).append(prepared)
         emit_rows: list[dict[str, Any]] = []
         for usubjid in sorted(grouped):
-            emit_rows.extend(normalizer.finalize_subject_group(grouped[usubjid], seq_counters))
+            emit_rows.extend(
+                normalizer.finalize_subject_group(
+                    grouped[usubjid],
+                    seq_counters,
+                    seq_overrides=seq_overrides,
+                    lineage_out=lineage_out,
+                )
+            )
             while len(emit_rows) >= chunk_size:
                 batch = emit_rows[:chunk_size]
                 emit_rows = emit_rows[chunk_size:]
@@ -1409,7 +1474,12 @@ def _iter_sorted_sdtm_frames(
                         staged_groups.setdefault(tail_prepared.usubjid, []).append(tail_prepared)
                 for usubjid in sorted(staged_groups):
                     emit_buffer.extend(
-                        normalizer.finalize_subject_group(staged_groups[usubjid], seq_counters)
+                        normalizer.finalize_subject_group(
+                            staged_groups[usubjid],
+                            seq_counters,
+                            seq_overrides=seq_overrides,
+                            lineage_out=lineage_out,
+                        )
                     )
                     while len(emit_buffer) >= chunk_size:
                         batch = emit_buffer[:chunk_size]
@@ -1432,7 +1502,14 @@ def _iter_sorted_sdtm_frames(
             if completed_groups >= min_completed_groups and completed_rows >= chunk_size:
                 for done_subj in group_order[:-1]:
                     done_group = staged_groups.pop(done_subj)
-                    emit_buffer.extend(normalizer.finalize_subject_group(done_group, seq_counters))
+                    emit_buffer.extend(
+                        normalizer.finalize_subject_group(
+                            done_group,
+                            seq_counters,
+                            seq_overrides=seq_overrides,
+                            lineage_out=lineage_out,
+                        )
+                    )
                 group_order = [last_usubjid]
                 staged_total_rows = len(staged_groups[last_usubjid])
                 while len(emit_buffer) >= chunk_size:
@@ -1446,7 +1523,14 @@ def _iter_sorted_sdtm_frames(
         assert last_usubjid is not None
         if prepared.usubjid != last_usubjid:
             finished_group = staged_groups.pop(last_usubjid)
-            emit_buffer.extend(normalizer.finalize_subject_group(finished_group, seq_counters))
+            emit_buffer.extend(
+                normalizer.finalize_subject_group(
+                    finished_group,
+                    seq_counters,
+                    seq_overrides=seq_overrides,
+                    lineage_out=lineage_out,
+                )
+            )
             staged_groups[prepared.usubjid] = [prepared]
             last_usubjid = prepared.usubjid
             while len(emit_buffer) >= chunk_size:
@@ -1457,7 +1541,14 @@ def _iter_sorted_sdtm_frames(
             staged_groups[last_usubjid].append(prepared)
 
     for rem_subj in sorted(staged_groups) if not yielded_any else list(staged_groups):
-        emit_buffer.extend(normalizer.finalize_subject_group(staged_groups[rem_subj], seq_counters))
+        emit_buffer.extend(
+            normalizer.finalize_subject_group(
+                staged_groups[rem_subj],
+                seq_counters,
+                seq_overrides=seq_overrides,
+                lineage_out=lineage_out,
+            )
+        )
     while len(emit_buffer) >= chunk_size:
         batch = emit_buffer[:chunk_size]
         emit_buffer = emit_buffer[chunk_size:]
@@ -1500,6 +1591,8 @@ def transform_records_to_sdtm_rows(
     include_deleted: bool = False,
     mask_phi: bool = True,
     seq_counters: dict[str, int] | None = None,
+    seq_overrides: Mapping[str, int] | None = None,
+    lineage_out: dict[str, dict[str, Any]] | None = None,
     phi_keys: Iterable[str] | None = None,
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
@@ -1534,7 +1627,14 @@ def transform_records_to_sdtm_rows(
 
     rows: list[dict[str, Any]] = []
     for usubjid in sorted(grouped):
-        rows.extend(normalizer.finalize_subject_group(grouped[usubjid], counters))
+        rows.extend(
+            normalizer.finalize_subject_group(
+                grouped[usubjid],
+                counters,
+                seq_overrides=seq_overrides,
+                lineage_out=lineage_out,
+            )
+        )
     return rows
 
 
@@ -1546,6 +1646,8 @@ def transform_records_to_sdtm(
     include_deleted: bool = False,
     mask_phi: bool = True,
     seq_counters: dict[str, int] | None = None,
+    seq_overrides: Mapping[str, int] | None = None,
+    lineage_out: dict[str, dict[str, Any]] | None = None,
     phi_keys: Iterable[str] | None = None,
     registry: SensitivityRegistry | None = None,
     pipeline: Any = _UNSET_PIPELINE,
@@ -1585,7 +1687,14 @@ def transform_records_to_sdtm(
 
     rows: list[dict[str, Any]] = []
     for usubjid in sorted(grouped):
-        rows.extend(normalizer.finalize_subject_group(grouped[usubjid], counters))
+        rows.extend(
+            normalizer.finalize_subject_group(
+                grouped[usubjid],
+                counters,
+                seq_overrides=seq_overrides,
+                lineage_out=lineage_out,
+            )
+        )
 
     return normalizer.rows_to_dataframe(rows)
 

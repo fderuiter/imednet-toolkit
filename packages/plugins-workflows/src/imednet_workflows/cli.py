@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import builtins
 import contextlib
-import json
 import os
 import sys
 from collections.abc import Mapping
@@ -47,6 +46,7 @@ from imednet.spi.cli import (
     validate_cli_path_segment,
     with_sdk,
 )
+from imednet.spi.models import PROFILE_REGISTRY
 from imednet.spi.utils import (
     global_sensitivity_registry,
     mask_clinical_phi,
@@ -1049,7 +1049,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--profile",
         "--standards-profile",
         dest="standards_profile",
-        choices=("general", "drug", "biologic", "vaccine", "device"),
+        choices=tuple(PROFILE_REGISTRY.list_profiles()),
         default="general",
         help="Regulatory CDISC standards profile (default: general).",
     )
@@ -1092,7 +1092,11 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             resolve_sdtm_domain,
             validate_cdash_variable,
         )
-        from imednet.spi.sink_base import evaluate_standards_readiness
+        from imednet.spi.sink_base import (
+            evaluate_standards_readiness,
+            filter_forms_by_sdtm_domain,
+            redact_batch_records,
+        )
 
         validate_path_segment(study_key, name="study_key")
         if min_standards_score is not None and not 0.0 <= min_standards_score <= 100.0:
@@ -1100,6 +1104,9 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
         resolved_fmt = resolve_output_format(output_format)
         json_mode = resolved_fmt == "json" or is_json_output_mode()
+        target_domain = (
+            resolve_sdtm_domain(sdtm_domain, fallback="") if sdtm_domain else ""
+        ) or None
 
         def _fetch_inputs() -> tuple[list[Any], list[Any], list[Any]]:
             forms = list(sdk.forms.list(study_key=study_key))
@@ -1121,47 +1128,123 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             with fetching_status("standards readiness", study_key):
                 raw_forms, raw_variables, raw_records = _fetch_inputs()
 
-        sanitized_records = (
-            _sanitize_workflow_payload(raw_records, study_key=study_key, mask_phi=True)
-            if mask_phi
-            else raw_records
-        )
-
         form_id_to_key: dict[Any, str] = {}
         for f_obj in raw_forms:
             fid = (
-                f_obj.get("form_id")
+                f_obj.get("form_id", f_obj.get("formId"))
                 if isinstance(f_obj, Mapping)
-                else getattr(f_obj, "form_id", None)
+                else getattr(f_obj, "form_id", getattr(f_obj, "formId", None))
             )
             fkey = (
-                f_obj.get("form_key")
+                f_obj.get("form_key", f_obj.get("formKey"))
                 if isinstance(f_obj, Mapping)
-                else getattr(f_obj, "form_key", None)
+                else getattr(f_obj, "form_key", getattr(f_obj, "formKey", None))
             )
             if fid is not None and fkey:
                 form_id_to_key[fid] = str(fkey)
 
+        if target_domain is not None:
+            if raw_forms:
+                matching_forms = filter_forms_by_sdtm_domain(raw_forms, target_domain)
+                allowed_form_ids = {
+                    f_obj.get("form_id", f_obj.get("formId"))
+                    if isinstance(f_obj, Mapping)
+                    else getattr(f_obj, "form_id", getattr(f_obj, "formId", None))
+                    for f_obj in matching_forms
+                } - {None}
+                allowed_form_keys = {
+                    str(
+                        f_obj.get("form_key", f_obj.get("formKey"))
+                        if isinstance(f_obj, Mapping)
+                        else getattr(f_obj, "form_key", getattr(f_obj, "formKey", ""))
+                    )
+                    for f_obj in matching_forms
+                } - {""}
+                raw_variables = [
+                    var
+                    for var in raw_variables
+                    if (
+                        (
+                            var.get("form_id", var.get("formId"))
+                            if isinstance(var, Mapping)
+                            else getattr(var, "form_id", getattr(var, "formId", None))
+                        )
+                        in allowed_form_ids
+                        or str(
+                            var.get("form_key", var.get("formKey"))
+                            if isinstance(var, Mapping)
+                            else getattr(var, "form_key", getattr(var, "formKey", ""))
+                        )
+                        in allowed_form_keys
+                    )
+                ]
+                raw_records = [
+                    rec
+                    for rec in raw_records
+                    if (
+                        (
+                            rec.get("form_id", rec.get("formId"))
+                            if isinstance(rec, Mapping)
+                            else getattr(rec, "form_id", getattr(rec, "formId", None))
+                        )
+                        in allowed_form_ids
+                        or str(
+                            rec.get("form_key", rec.get("formKey"))
+                            if isinstance(rec, Mapping)
+                            else getattr(rec, "form_key", getattr(rec, "formKey", ""))
+                        )
+                        in allowed_form_keys
+                    )
+                ]
+            else:
+                raw_records = [
+                    rec
+                    for rec in raw_records
+                    if resolve_sdtm_domain(
+                        (
+                            rec.get("form_key", rec.get("formKey"))
+                            if isinstance(rec, Mapping)
+                            else getattr(rec, "form_key", getattr(rec, "formKey", None))
+                        )
+                        or target_domain,
+                        fallback="",
+                    )
+                    == target_domain
+                ]
+
+        serialized_records = _to_serializable(raw_records)
+        if mask_phi:
+            sanitized_records: Any = redact_batch_records(
+                serialized_records, mask_phi=True, as_sdtm=True
+            )
+            custom_phi = _resolve_custom_phi_fields(study_key)
+            if custom_phi:
+                sanitized_records = mask_custom_phi_recursive(sanitized_records, custom_phi)
+        else:
+            sanitized_records = serialized_records
+
         cdash_warnings: list[str] = []
         for var in raw_variables:
             var_name = (
-                var.get("variable_name")
+                var.get("variable_name", var.get("variableName"))
                 if isinstance(var, Mapping)
-                else getattr(var, "variable_name", None)
+                else getattr(var, "variable_name", getattr(var, "variableName", None))
             )
             if not var_name:
                 continue
             fkey = (
-                var.get("form_key") if isinstance(var, Mapping) else getattr(var, "form_key", None)
+                var.get("form_key", var.get("formKey"))
+                if isinstance(var, Mapping)
+                else getattr(var, "form_key", getattr(var, "formKey", None))
             )
             if not fkey:
                 fid = (
-                    var.get("form_id")
+                    var.get("form_id", var.get("formId"))
                     if isinstance(var, Mapping)
-                    else getattr(var, "form_id", None)
+                    else getattr(var, "form_id", getattr(var, "formId", None))
                 )
                 fkey = form_id_to_key.get(fid)
-            inferred_dom = resolve_sdtm_domain(sdtm_domain or fkey, fallback="")
+            inferred_dom = resolve_sdtm_domain(target_domain or fkey, fallback="")
             if inferred_dom:
                 valid_cdash, warning = validate_cdash_variable(str(var_name), inferred_dom)
                 if not valid_cdash and warning and warning not in cdash_warnings:
@@ -1171,11 +1254,34 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             sanitized_records,
             study_key=study_key,
             standards_profile=standards_profile,
-            sdtm_domain=sdtm_domain,
+            sdtm_domain=target_domain,
+            form_domain_map=(
+                {
+                    str(
+                        f_obj.get("form_key", f_obj.get("formKey"))
+                        if isinstance(f_obj, Mapping)
+                        else getattr(f_obj, "form_key", getattr(f_obj, "formKey", ""))
+                    ): resolve_sdtm_domain(
+                        (
+                            f_obj.get("form_key", f_obj.get("formKey"))
+                            if isinstance(f_obj, Mapping)
+                            else getattr(f_obj, "form_key", getattr(f_obj, "formKey", None))
+                        ),
+                        fallback="",
+                    )
+                    for f_obj in raw_forms
+                }
+                if raw_forms and target_domain is None
+                else None
+            ),
         )
         all_warnings = list(dict.fromkeys([*report.warnings, *cdash_warnings]))
         threshold = 100.0 if min_standards_score is None else float(min_standards_score)
-        passed = report.is_ready if min_standards_score is None else report.score >= threshold
+        passed = (
+            False
+            if (report.checked_records == 0 or report.checked_fields == 0)
+            else (report.is_ready if min_standards_score is None else report.score >= threshold)
+        )
         serialized_violations = [
             v.model_dump() if hasattr(v, "model_dump") else str(v) for v in report.violations
         ]
@@ -1183,7 +1289,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         payload = {
             "study_key": study_key,
             "profile": report.profile,
-            "domain": resolve_sdtm_domain(sdtm_domain) if sdtm_domain else None,
+            "domain": target_domain,
             "score": report.score,
             "is_ready": report.is_ready,
             "passed": passed,
@@ -1194,13 +1300,13 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "warnings": all_warnings,
             "violations": serialized_violations,
         }
-        if resolved_fmt == "json":
+        if json_mode:
             sanitized_payload = _sanitize_workflow_payload(
                 payload,
                 study_key=study_key,
                 mask_phi=mask_phi,
             )
-            _emit_line(json.dumps(sanitized_payload, indent=2, default=str))
+            emit_json([sanitized_payload], "standards_readiness")
         else:
             _emit_line(
                 f"Standards Readiness Report — Study: {study_key} (profile: {report.profile})"
@@ -1227,7 +1333,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     )
                     _emit_line(f"  - {v_msg}")
 
-        if min_standards_score is not None and report.score < min_standards_score:
+        if not passed:
             sys.exit(1)
 
     def _handle_validate_standards(args: argparse.Namespace) -> None:
