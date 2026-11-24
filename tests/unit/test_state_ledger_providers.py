@@ -603,16 +603,25 @@ def test_airflow_legacy_keys_migrate_cleanly_and_sdk_rpc_budgets(
     assert [op for op, _ in ops] == ["keys", "get", "get", "get", "get", "get"]
     assert len(ops) == 6
 
-    # 3. Verify delete_entry(study_key) executes 2 RPCs (keys + delete, 0 get) & preserves sibling
+    # 3. Verify unforced delete_entry(study_key) checks active leases (keys + get + delete) & preserves sibling
     provider.set_last_timestamp("STUDY_1_OTHER", "sql_FORM_01", t3)
     ops.clear()
     assert provider.delete_entry("STUDY_1") is True
     assert ops == [
         ("keys", provider._get_variable_key("STUDY_1")),
+        ("get", provider._get_variable_key("STUDY_1")),
         ("delete", provider._get_variable_key("STUDY_1")),
     ]
     assert provider.get_last_timestamp("STUDY_1_OTHER", "sql_FORM_01") == t3
     assert provider.delete_entry("STUDY_1") is False
+
+    # Forced delete_entry(study_key, force=True) skips lease read (keys + delete)
+    ops.clear()
+    assert provider.delete_entry("STUDY_2", force=True) is True
+    assert ops == [
+        ("keys", provider._get_variable_key("STUDY_2")),
+        ("delete", provider._get_variable_key("STUDY_2")),
+    ]
 
     # Single-stream delete removing one stream, then the final stream
     provider.set_last_timestamp("SINGLE_DEL", "s1", t1)
@@ -917,3 +926,89 @@ def test_file_and_airflow_transaction_hydrate_persist_rollback_and_redact_sdtm_m
         assert batch_committed["ae_sdtm"].metadata["sdtm_seq_counters"]["AE:SUBJ-01"] == 4
         assert batch_committed["vs_sdtm"].metadata["sdtm_seq_counters"] == {"VS:SUBJ-01": 1}
         assert batch_committed["vs_sdtm"].metadata["patientName"] == "***MASKED***"
+
+
+def test_file_and_airflow_lease_protection_fencing_and_key_validation(
+    tmp_path: Path,
+    sdk_variable_store: dict[str, Any],
+) -> None:
+    """AC 7 & AC 8: Providers reject invalid keys, block unforced RUNNING mutations/deletes, and fence displaced commits/rollbacks."""
+    from imednet.spi.utils import PathTraversalValidationError
+
+    _ = sdk_variable_store
+    file_provider = FileStateProvider(ledger_path=tmp_path / "fencing_ledger.json")
+    airflow_provider = AirflowStateProvider()
+
+    for provider in (file_provider, airflow_provider):
+        # 1. Reject traversal and blank keys across CRUD and transaction APIs
+        for bad_key in ("../evil", "   "):
+            with pytest.raises(PathTraversalValidationError):
+                provider.get_last_timestamp(bad_key, "records")
+            with pytest.raises(PathTraversalValidationError):
+                provider.get_last_timestamp("STUDY_OK", bad_key)
+            with pytest.raises(PathTraversalValidationError):
+                provider.set_last_timestamp(bad_key, "records", None)
+            with pytest.raises(PathTraversalValidationError):
+                provider.delete_entry(bad_key)
+            with pytest.raises(PathTraversalValidationError):
+                provider.delete_entry("STUDY_OK", bad_key)
+            with pytest.raises(PathTraversalValidationError):
+                with provider.transaction(bad_key, "records"):
+                    pass
+            with pytest.raises(PathTraversalValidationError):
+                with provider.batch_transaction("STUDY_OK", [bad_key]):
+                    pass
+
+        # 2. Active RUNNING lease blocks unforced set_last_timestamp and delete_entry; force=True displaces and fences commit
+        t_forced = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+        t_stale = datetime(2026, 8, 1, 13, 0, tzinfo=timezone.utc)
+        with pytest.raises(InvalidStateTransitionError, match="displaced RUNNING lease"):
+            with provider.transaction("ST_FENCE", "s1") as tx:
+                tx["new_timestamp"] = t_stale
+                with pytest.raises(InvalidStateTransitionError):
+                    provider.set_last_timestamp("ST_FENCE", "s1", t_forced)
+                with pytest.raises(InvalidStateTransitionError):
+                    provider.delete_entry("ST_FENCE", "s1")
+                with pytest.raises(InvalidStateTransitionError):
+                    provider.delete_entry("ST_FENCE")
+
+                # Operator forces a manual checkpoint while worker is still running
+                provider.set_last_timestamp(
+                    "ST_FENCE",
+                    "s1",
+                    t_forced,
+                    records_processed=42,
+                    force=True,
+                )
+
+        # Forced checkpoint remains intact (not overwritten by displaced commit)
+        assert provider.get_last_timestamp("ST_FENCE", "s1") == t_forced
+        assert provider.get_last_status("ST_FENCE", "s1") == StreamExecutionStatus.SUCCESS
+        assert provider.read_state().studies["ST_FENCE"].streams["s1"].records_processed == 42
+
+        # 3. Displaced transaction raising an exception does NOT clobber forced checkpoint on rollback
+        t_forced_2 = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        with pytest.raises(RuntimeError, match="worker crash after displacement"):
+            with provider.transaction("ST_FENCE", "s1"):
+                provider.set_last_timestamp(
+                    "ST_FENCE",
+                    "s1",
+                    t_forced_2,
+                    records_processed=99,
+                    force=True,
+                )
+                raise RuntimeError("worker crash after displacement")
+
+        assert provider.get_last_timestamp("ST_FENCE", "s1") == t_forced_2
+        assert provider.get_last_status("ST_FENCE", "s1") == StreamExecutionStatus.SUCCESS
+
+        # 4. Forced delete_entry inside batch_transaction fences commit without resurrecting deleted streams
+        with pytest.raises(InvalidStateTransitionError, match="displaced RUNNING lease"):
+            with provider.batch_transaction("ST_BATCH_FENCE", ["a", "b"]) as btx:
+                btx["a"]["new_timestamp"] = t_stale
+                btx["b"]["new_timestamp"] = t_stale
+                with pytest.raises(InvalidStateTransitionError):
+                    provider.delete_entry("ST_BATCH_FENCE")
+                assert provider.delete_entry("ST_BATCH_FENCE", force=True) is True
+
+        assert "ST_BATCH_FENCE" not in provider.read_state().studies

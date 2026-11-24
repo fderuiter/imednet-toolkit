@@ -16,6 +16,7 @@ from imednet.spi.cli import (
     print_error,
     redact_cli_secrets,
     supports_interactive_stdin,
+    validate_cli_path_segment,
 )
 
 from .state_ledger import DEFAULT_LEDGER_PATH, BaseStateProvider, LedgerState, get_state_provider
@@ -43,12 +44,18 @@ def print_progress(message: str) -> None:
     sys.stderr.flush()
 
 
-def prompt_input(prompt_text: str, default: str | None = None) -> str:
+def prompt_input(
+    prompt_text: str,
+    default: str | None = None,
+    *,
+    allow_clear: bool = True,
+) -> str:
     """Prompt the user for input on stderr and read from stdin.
 
     Args:
         prompt_text: Prompt message describing the expected input.
         default: Optional default value if the user provides an empty line.
+        allow_clear: When True, typing ``-`` clears any default and returns ``""``.
 
     Returns:
         The stripped string provided by the user, or the default.
@@ -65,9 +72,11 @@ def prompt_input(prompt_text: str, default: str | None = None) -> str:
 
     line = sys.stdin.readline()
     if line == "":
-        print_progress("Error: Input stream closed (EOF). Operation cancelled.")
+        print_error("Error: Input stream closed (EOF). Operation cancelled.")
         sys.exit(1)
     stripped = line.strip()
+    if allow_clear and stripped == "-":
+        return ""
     if not stripped and default is not None:
         return default
     return stripped
@@ -93,7 +102,7 @@ def prompt_confirm(prompt_text: str, default: bool = False) -> bool:
 
     line = sys.stdin.readline()
     if line == "":
-        print_progress("Error: Input stream closed (EOF). Operation cancelled.")
+        print_error("Error: Input stream closed (EOF). Operation cancelled.")
         sys.exit(1)
     choice = line.strip().lower()
     if not choice:
@@ -144,7 +153,7 @@ def prompt_iso8601_timestamp(
         A tuple of (raw_timestamp_string, parsed_datetime_utc).
     """
     while True:
-        value = prompt_input(prompt_text, default=default)
+        value = prompt_input(prompt_text, default=default, allow_clear=False)
         is_valid, dt, err = validate_iso8601_timestamp(value)
         if is_valid and dt is not None:
             return value, dt
@@ -266,17 +275,22 @@ def prompt_filters(
     prompt_msg = (
         f"Enter {category_name} (e.g., '{example}', or press Enter to skip/finish)"
         if not filters
-        else f"Enter additional {category_name} (e.g., '{example}', or press Enter to finish)"
+        else f"Enter additional {category_name} (e.g., '{example}', '-' to clear, or press Enter to finish)"
     )
 
     while True:
-        entry = prompt_input(prompt_msg)
+        entry = prompt_input(prompt_msg, allow_clear=False)
+        if entry == "-":
+            filters.clear()
+            break
         if not entry:
             break
         is_valid, err = _validate_filter_with_context(entry, filters, model=model)
         if is_valid:
             filters.append(entry)
-            prompt_msg = f"Enter additional {category_name} (or press Enter to finish)"
+            prompt_msg = (
+                f"Enter additional {category_name} ('-' to clear, or press Enter to finish)"
+            )
         else:
             print_progress(f"Validation Error: {err}")
 
@@ -293,11 +307,14 @@ def prompt_study_key(study_key: str | None = None) -> str:
         Non-empty study key string.
     """
     if study_key and study_key.strip():
-        return study_key.strip()
+        cleaned = study_key.strip()
+        validate_cli_path_segment(cleaned, name="study_key")
+        return cleaned
 
     while True:
-        val = prompt_input("Enter study key")
+        val = prompt_input("Enter study key", allow_clear=False)
         if val:
+            validate_cli_path_segment(val, name="study_key")
             return val
         print_progress(
             "Validation Error: Study key cannot be empty. Please enter a valid study key."
@@ -314,11 +331,14 @@ def prompt_stream_name(stream: str | None = None) -> str:
         Non-empty stream name string.
     """
     if stream and stream.strip():
-        return stream.strip()
+        cleaned = stream.strip()
+        validate_cli_path_segment(cleaned, name="stream")
+        return cleaned
 
     while True:
-        val = prompt_input("Enter stream name (e.g., 'records')")
+        val = prompt_input("Enter stream name (e.g., 'records')", allow_clear=False)
         if val:
+            validate_cli_path_segment(val, name="stream")
             return val
         print_progress(
             "Validation Error: Stream name cannot be empty. Please enter a valid stream name."
@@ -336,7 +356,7 @@ def prompt_positive_int(prompt_text: str, default: int = 1) -> int:
         Validated positive integer (> 0).
     """
     while True:
-        raw = prompt_input(prompt_text, default=str(default))
+        raw = prompt_input(prompt_text, default=str(default), allow_clear=False)
         try:
             val = int(raw)
             if val > 0:
@@ -352,7 +372,7 @@ def prompt_subject_count(
 ) -> int:
     """Prompt for a UAT subject count bounded within 1..100 before Study inspection."""
     while True:
-        raw = prompt_input(prompt_text, default=str(default))
+        raw = prompt_input(prompt_text, default=str(default), allow_clear=False)
         try:
             val = int(raw)
         except ValueError:
@@ -365,7 +385,7 @@ def prompt_subject_count(
 
 def prompt_email_notify(
     prompt_text: str = (
-        "Enter email notification ('true', 'false', email address, or leave blank)"
+        "Enter email notification ('true', 'false', email address, '-' to clear, or leave blank)"
     ),
     default: str | bool | None = None,
 ) -> bool | str | None:
@@ -376,7 +396,7 @@ def prompt_email_notify(
         else (str(default).lower() if isinstance(default, bool) else str(default))
     )
     while True:
-        raw = prompt_input(prompt_text, default=default_str)
+        raw = prompt_input(prompt_text, default=default_str, allow_clear=True)
         if not raw:
             return None
         try:
@@ -396,7 +416,7 @@ def prompt_non_negative_int(prompt_text: str, default: int = 0) -> int:
         Validated non-negative integer (>= 0).
     """
     while True:
-        raw = prompt_input(prompt_text, default=str(default))
+        raw = prompt_input(prompt_text, default=str(default), allow_clear=False)
         try:
             val = int(raw)
             if val >= 0:

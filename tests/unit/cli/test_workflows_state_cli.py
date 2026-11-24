@@ -1016,3 +1016,163 @@ def test_interactive_state_set_reads_ledger_once_and_reuses_wizard_state(
     assert mock_ledger.return_value.read_state.call_count == 1
     assert "Current Status:    success (timestamp: 2026-05-22T12:00:00+00:00)" in res.stderr
     mock_ledger.return_value.set_last_timestamp.assert_called_once()
+
+
+@pytest.mark.parametrize("bad_key", ["../evil", "   "])
+def test_state_commands_reject_traversal_and_blank_keys(
+    runner: CliRunner,
+    tmp_path,
+    bad_key: str,
+) -> None:
+    """AC 7: workflows state show, set, and reset reject '../evil' and '   ' with exit code 1."""
+    from imednet.cli import app as main_app
+
+    ledger_path = str(tmp_path / "ledger.json")
+    for argv in (
+        ["workflows", "state", "show", "-s", bad_key, "-l", ledger_path],
+        [
+            "workflows",
+            "state",
+            "set",
+            "-s",
+            bad_key,
+            "-m",
+            "records",
+            "-t",
+            "2026-05-22T12:00:00Z",
+            "-l",
+            ledger_path,
+        ],
+        [
+            "workflows",
+            "state",
+            "set",
+            "-s",
+            "VALID_STUDY",
+            "-m",
+            bad_key,
+            "-t",
+            "2026-05-22T12:00:00Z",
+            "-l",
+            ledger_path,
+        ],
+        ["workflows", "state", "reset", "-s", bad_key, "-l", ledger_path],
+        ["workflows", "state", "reset", "-s", "VALID_STUDY", "-m", bad_key, "-l", ledger_path],
+    ):
+        res = runner.invoke(main_app, argv)
+        assert res.exit_code == 1, (argv, res.stdout, res.stderr)
+        assert res.stdout == ""
+        assert res.stderr != ""
+
+
+def test_state_set_and_reset_running_lease_force_parity(
+    runner: CliRunner,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 7 & AC 8: state set and state reset block active RUNNING leases without --force and override with --force."""
+    import sys
+
+    from imednet.cli import app as main_app
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    ledger_path = str(tmp_path / "running_ledger.json")
+    provider = FileStateProvider(ledger_path)
+
+    # Hold an active RUNNING lease on current process PID/host inside a live transaction
+    tx_ctx = provider.transaction("STUDY_RUN", "records")
+    tx = tx_ctx.__enter__()
+    tx["new_timestamp"] = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+
+    # Unforced headless & interactive state set and state reset fail with exit 1
+    unforced_set = runner.invoke(
+        main_app,
+        [
+            "workflows",
+            "state",
+            "set",
+            "-s",
+            "STUDY_RUN",
+            "-m",
+            "records",
+            "-t",
+            "2026-06-02T00:00:00Z",
+            "-l",
+            ledger_path,
+        ],
+    )
+    assert unforced_set.exit_code == 1
+    assert unforced_set.stdout == ""
+
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    monkeypatch.setattr(sys, "stdin", _InteractiveStringIO("0\ny\n"))
+    unforced_interactive_set = runner.invoke(
+        main_app,
+        [
+            "workflows",
+            "state",
+            "set",
+            "--interactive",
+            "-s",
+            "STUDY_RUN",
+            "-m",
+            "records",
+            "-t",
+            "2026-06-02T00:00:00Z",
+            "-l",
+            ledger_path,
+        ],
+    )
+    assert unforced_interactive_set.exit_code == 1
+    assert unforced_interactive_set.stdout == ""
+
+    unforced_reset = runner.invoke(
+        main_app,
+        ["workflows", "state", "reset", "-s", "STUDY_RUN", "-l", ledger_path],
+    )
+    assert unforced_reset.exit_code == 1
+    assert unforced_reset.stdout == ""
+
+    # Forced interactive state set overrides RUNNING lease and fences out displaced worker commit
+    monkeypatch.setattr(sys, "stdin", _InteractiveStringIO("7\ny\n"))
+    forced_set = runner.invoke(
+        main_app,
+        [
+            "workflows",
+            "state",
+            "set",
+            "--interactive",
+            "--force",
+            "-s",
+            "STUDY_RUN",
+            "-m",
+            "records",
+            "-t",
+            "2026-06-02T00:00:00Z",
+            "-l",
+            ledger_path,
+        ],
+    )
+    assert forced_set.exit_code == 0, forced_set.stderr
+    from imednet_workflows.state_ledger import InvalidStateTransitionError
+
+    with pytest.raises(InvalidStateTransitionError, match="displaced RUNNING lease"):
+        tx_ctx.__exit__(None, None, None)
+
+    assert provider.get_last_timestamp("STUDY_RUN", "records") == datetime(
+        2026, 6, 2, 0, 0, tzinfo=timezone.utc
+    )
+
+    # Start a second RUNNING lease and verify state reset --force deletes it and fences commit
+    tx_ctx_2 = provider.transaction("STUDY_RUN", "records")
+    tx_2 = tx_ctx_2.__enter__()
+    tx_2["new_timestamp"] = datetime(2026, 6, 3, 0, 0, tzinfo=timezone.utc)
+
+    forced_reset = runner.invoke(
+        main_app,
+        ["workflows", "state", "reset", "-s", "STUDY_RUN", "--force", "-l", ledger_path],
+    )
+    assert forced_reset.exit_code == 0, forced_reset.stderr
+    with pytest.raises(InvalidStateTransitionError, match="displaced RUNNING lease"):
+        tx_ctx_2.__exit__(None, None, None)
+    assert provider.get_last_timestamp("STUDY_RUN", "records") is None

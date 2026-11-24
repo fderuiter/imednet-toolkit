@@ -501,13 +501,13 @@ def test_state_set_interactive_confirm_writes_ledger(tmp_path) -> None:
         assert "Proposed State Transition:" in result.stderr
         assert "Confirm state transition" in result.stderr
 
-        # Check ledger was called with force=True
+        # Check ledger was called with force=False by default
         mock_ledger.return_value.set_last_timestamp.assert_called_once()
         call_kwargs = mock_ledger.return_value.set_last_timestamp.call_args.kwargs
         assert call_kwargs["study_key"] == "TEST_STUDY"
         assert call_kwargs["stream_name"] == "records"
         assert call_kwargs["records_processed"] == 25
-        assert call_kwargs["force"] is True
+        assert call_kwargs["force"] is False
 
 
 def test_state_set_interactive_abort_on_rejection(tmp_path) -> None:
@@ -584,7 +584,8 @@ def test_workflows_uat_run_interactive_success(monkeypatch: pytest.MonkeyPatch) 
     # 2. Test subjects count: 5
     # 3. Site name: Site Alpha
     # 4. Target forms: DEMO, VISITS
-    stdin_input = "UAT_STUDY\n5\nSite Alpha\nDEMO, VISITS\n"
+    # 5. Email notify: (blank -> None)
+    stdin_input = "UAT_STUDY\n5\nSite Alpha\nDEMO, VISITS\n\n"
 
     result = run_cli_command(
         cli_app,
@@ -1428,3 +1429,650 @@ def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(
     with patch("sys.stderr", err_buf):
         print_progress("Should be suppressed in JSON mode")
     assert err_buf.getvalue() == ""
+
+
+def test_uat_run_offline_dry_run_five_formats_zero_http_calls(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC 1: uat run STUDY --schema <path> --dry-run --format json exits 0 across all 5 formats without HTTP calls."""
+    import json
+    import zipfile
+    from pathlib import Path
+
+    from tests.unit.datadict.test_datadict_cdisc_odm_loader import SAMPLE_ODM_XML
+    from tests.unit.datadict.test_datadict_redcap_loader import SAMPLE_REDCAP_CSV
+
+    from imednet.datadict import load_from_csv
+
+    # Provide real-looking credentials so _forbid_offline_http is enforced on any SDK transport call
+    monkeypatch.setenv("IMEDNET_API_KEY", "live_key_should_not_send_http")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "live_sec_should_not_send_http")
+
+    fixtures_dir = Path(__file__).parent.parent.parent / "fixtures" / "data_dictionary"
+    json_path = tmp_path / "dd.json"
+    json_path.write_text(
+        load_from_csv(fixtures_dir, study_key="OTHER").model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    odm_xml_extra = SAMPLE_ODM_XML.replace(
+        '<ItemRef ItemOID="SYSBP" OrderNumber="1" Mandatory="No"/>',
+        (
+            '<ItemRef ItemOID="SYSBP" OrderNumber="1" Mandatory="No"/>'
+            '<ItemRef ItemOID="PDAT" OrderNumber="2" Mandatory="Yes"/>'
+            '<ItemRef ItemOID="DOCURI" OrderNumber="3" Mandatory="Yes"/>'
+        ),
+    ).replace(
+        '<CodeList OID="CL_SEX"',
+        (
+            '<ItemDef OID="PDAT" Name="PDAT" DataType="partialDate"><Question>'
+            '<TranslatedText xml:lang="en">Partial Date</TranslatedText></Question></ItemDef>'
+            '<ItemDef OID="DOCURI" Name="DOCURI" DataType="URI"><Question>'
+            '<TranslatedText xml:lang="en">Document Link</TranslatedText></Question></ItemDef>'
+            '<CodeList OID="CL_SEX"'
+        ),
+    )
+    xml_path = tmp_path / "dd.xml"
+    xml_path.write_text(odm_xml_extra, encoding="utf-8")
+    csv_path = tmp_path / "redcap.csv"
+    csv_path.write_text(SAMPLE_REDCAP_CSV, encoding="utf-8")
+    zip_path = tmp_path / "dd.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for fname in ("FORMS.csv", "QUESTIONS.csv", "CHOICES.csv", "BUSINESS_LOGIC.csv"):
+            zf.write(fixtures_dir / fname, arcname=fname)
+
+    for schema_path in (json_path, xml_path, csv_path, zip_path, fixtures_dir):
+        res = run_cli_command(
+            cli_app,
+            [
+                "workflows",
+                "uat",
+                "run",
+                "STUDY",
+                "--schema",
+                str(schema_path),
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            capsys=capsys,
+        )
+        assert res.exit_code == 0, f"{schema_path}: stderr={res.stderr!r} stdout={res.stdout!r}"
+        assert res.stderr == ""
+        envelope = json.loads(res.stdout)
+        assert envelope["status"] == "complete"
+        assert envelope["resource"] == "uat_run"
+        assert envelope["count"] == 1
+        item = envelope["items"][0]
+        assert item["studyKey"] == "STUDY"
+        assert item["dryRun"] is True
+        assert item["state"] == "COMPLETED"
+        assert item["overallSuccess"] is True
+        assert item["validationReport"]["isValid"] is True
+
+
+def test_uat_run_json_failure_envelopes_and_phi_secret_redaction(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC 2: Headless uat run --format json emits one status='failed' JSON envelope on preflight, inspection, and validation failures."""
+    import json
+
+    from imednet.datadict import DataDictionary, Metadata
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVar
+    from imednet.errors import UnauthorizedError
+    from imednet_workflows.uat.models import (
+        RecordTestType,
+        UATFormSpec,
+        UATSpecification,
+        UATSubjectSpec,
+        UATVariableSpec,
+        VariableTestStrategy,
+    )
+
+    # 1. Preflight failure (--subject-count 0 with secret in --email-notify test)
+    pre_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "STUDY_PRE",
+            "--subject-count",
+            "0",
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert pre_res.exit_code == 1
+    assert pre_res.stderr == ""
+    pre_env = json.loads(pre_res.stdout)
+    assert pre_env["status"] == "failed"
+    assert pre_env["resource"] == "uat_run"
+    assert pre_env["count"] == 1
+    assert pre_env["items"][0]["overallSuccess"] is False
+    assert pre_env["items"][0]["state"] == "FAILED"
+
+    # 2. Inspection failure (live SDK raises UnauthorizedError containing credential and PHI)
+    bad_sdk = MagicMock()
+    bad_sdk.get_forms.side_effect = UnauthorizedError(
+        "401 Unauthorized for x-api-key: super_secret_token_999 and patientName=Alice_Patient"
+    )
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=bad_sdk))
+    insp_res = run_cli_command(
+        cli_app,
+        ["workflows", "uat", "run", "STUDY_INSP", "--format", "json"],
+        capsys=capsys,
+    )
+    assert insp_res.exit_code == 1
+    assert insp_res.stderr == ""
+    insp_env = json.loads(insp_res.stdout)
+    assert insp_env["status"] == "failed"
+    assert insp_env["items"][0]["failurePhase"] == "INSPECTING"
+    assert "super_secret_token_999" not in insp_res.stdout
+    assert "Alice_Patient" not in insp_res.stdout
+
+    # 3. Validation failure with PHI variable name (patientName) -> status="failed" and PHI masked
+    phi_dd = DataDictionary(
+        metadata=Metadata.create(study_key="STUDY_VAL"),
+        forms=[
+            DDForm(
+                formKey="DM",
+                formName="Demographics",
+                variables=[
+                    DDVar(variableName="patientName", variableType="Date", required="Yes"),
+                ],
+            )
+        ],
+    )
+    phi_dd_path = tmp_path / "phi_dd.json"
+    phi_dd_path.write_text(phi_dd.model_dump_json(indent=2), encoding="utf-8")
+
+    phi_spec = UATSpecification(
+        study_key="STUDY_VAL",
+        study_name="STUDY_VAL",
+        subject_specs=[UATSubjectSpec(site_name="Site 1", subject_count=1)],
+        form_specs=[
+            UATFormSpec(
+                form_key="DM",
+                form_name="Demographics",
+                form_type="Standard",
+                test_type=RecordTestType.CREATE_NEW_RECORD,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="patientName",
+                        variable_key="patientName",
+                        variable_type="Text",
+                        form_key="DM",
+                        required=True,
+                        strategy=VariableTestStrategy.FIXED,
+                        fixed_value="Jane_Real_Patient_Name",
+                    )
+                ],
+            )
+        ],
+    )
+    phi_spec_path = tmp_path / "phi_spec.json"
+    phi_spec_path.write_text(phi_spec.model_dump_json(indent=2, by_alias=True), encoding="utf-8")
+
+    val_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "STUDY_VAL",
+            "--spec",
+            str(phi_spec_path),
+            "--schema",
+            str(phi_dd_path),
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert val_res.exit_code == 1
+    assert val_res.stderr == ""
+    val_env = json.loads(val_res.stdout)
+    assert val_env["status"] == "failed"
+    assert val_env["items"][0]["validationReport"]["isValid"] is False
+    assert "Jane_Real_Patient_Name" not in val_res.stdout
+
+
+def test_uat_run_spec_subject_count_override_and_wizard_defaults_and_clear(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC 3, AC 4, AC 5: --spec subject_count preservation/override, '-' clearing, email prompt, Step 1 traversal check, and deferred schema stamping."""
+    import json
+    from pathlib import Path
+
+    from imednet.datadict import load_from_csv
+
+    fixtures_dir = Path(__file__).parent.parent.parent / "fixtures" / "data_dictionary"
+    dd_obj = load_from_csv(fixtures_dir, study_key="UNSTAMPED")
+    dd_json_path = tmp_path / "unstamped_dd.json"
+    dd_json_path.write_text(dd_obj.model_dump_json(indent=2), encoding="utf-8")
+
+    # Build a saved spec with subject_count=3
+    spec_path = tmp_path / "saved_spec.json"
+    build_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "build-spec",
+            "SIM_STUDY",
+            "--subject-count",
+            "3",
+            "--seed",
+            "11",
+            "--simulation",
+            "-o",
+            str(spec_path),
+        ],
+        capsys=capsys,
+    )
+    assert build_res.exit_code == 0, build_res.stderr
+    from imednet_workflows.uat.models import UATSpecification
+
+    saved_spec = UATSpecification.from_json(spec_path)
+    num_enabled_forms = len(saved_spec.enabled_forms())
+    assert num_enabled_forms >= 1
+
+    # Headless without --subject-count preserves saved spec count (3 per enabled form)
+    keep_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "--spec",
+            str(spec_path),
+            "--dry-run",
+            "--simulation",
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert keep_res.exit_code == 0
+    assert json.loads(keep_res.stdout)["items"][0]["recordsGenerated"] == 3 * num_enabled_forms
+
+    # Headless with --subject-count 5 updates both Subject and Form counts (5 per enabled form)
+    override_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "--spec",
+            str(spec_path),
+            "--subject-count",
+            "5",
+            "--dry-run",
+            "--simulation",
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert override_res.exit_code == 0
+    assert json.loads(override_res.stdout)["items"][0]["recordsGenerated"] == 5 * num_enabled_forms
+
+    # Interactive Enter keeps saved spec count (3), while entering 5 generates 5 per enabled form
+    enter_keep_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "--spec",
+            str(spec_path),
+            "--dry-run",
+            "--simulation",
+            "--interactive",
+        ],
+        stdin_input="\n\n\n",
+        capsys=capsys,
+    )
+    assert enter_keep_res.exit_code == 0, enter_keep_res.stderr
+    assert "[3]:" in enter_keep_res.stderr
+    assert (
+        f"Total Records:    {3 * num_enabled_forms}" in enter_keep_res.stdout
+        or str(3 * num_enabled_forms) in enter_keep_res.stdout
+    )
+
+    inter_override_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "--spec",
+            str(spec_path),
+            "--dry-run",
+            "--simulation",
+            "--interactive",
+        ],
+        stdin_input="5\n\n\n",
+        capsys=capsys,
+    )
+    assert inter_override_res.exit_code == 0, inter_override_res.stderr
+    assert str(5 * num_enabled_forms) in inter_override_res.stdout
+
+    # AC 4 & AC 5: '-' clears optional defaults (site, forms, email), Enter retains defaults,
+    # and interactive uat run stamps the prompted study_key onto loaded --schema & --data-dictionary.
+    captured_kwargs: dict[str, object] = {}
+
+    class _RecordingWorkflow:
+        def __init__(self, sdk, **kwargs):
+            self.init_kwargs = kwargs
+
+        def run(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            res = MagicMock(spec=UATRunResult)
+            res.overall_success = True
+            res.summary.return_value = "OK"
+            return res
+
+    monkeypatch.setenv("IMEDNET_API_KEY", "dummy_api_key_12345")  # pragma: allowlist secret
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "dummy_sec_key_12345")  # pragma: allowlist secret
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr("imednet_workflows.uat.UATWorkflow", _RecordingWorkflow)
+
+    clear_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "--site-name",
+            "Prefilled Site",
+            "--form-key",
+            "AE",
+            "--email-notify",
+            "ops@example.com",
+            "--schema",
+            str(dd_json_path),
+            "--data-dictionary",
+            str(dd_json_path),
+            "--interactive",
+        ],
+        # Study=PROMPTED_STUDY, count=Enter(2), site='-' (clear), forms='-' (clear), email='-' (clear)
+        stdin_input="PROMPTED_STUDY\n\n-\n-\n-\n",
+        capsys=capsys,
+    )
+    assert clear_res.exit_code == 0, clear_res.stderr
+    assert captured_kwargs["study_key"] == "PROMPTED_STUDY"
+    assert captured_kwargs["site_name"] is None
+    assert captured_kwargs["enabled_form_keys"] is None
+    assert captured_kwargs["email_notify"] is None
+    assert captured_kwargs["schema"].metadata.studyKey == "PROMPTED_STUDY"  # type: ignore[attr-defined]
+    assert captured_kwargs["data_dictionary"].metadata.studyKey == "PROMPTED_STUDY"  # type: ignore[attr-defined]
+
+    # Step 1 path traversal rejection in prompt_study_key and prompt_stream_name
+    bad_study_wiz = run_cli_command(
+        cli_app,
+        ["workflows", "uat", "run", "--interactive"],
+        stdin_input="../bad\n",
+        capsys=capsys,
+    )
+    assert bad_study_wiz.exit_code == 1
+    assert bad_study_wiz.stdout == ""
+    assert "study_key" in bad_study_wiz.stderr
+
+    bad_stream_wiz = run_cli_command(
+        state_app,
+        ["set", "-s", "VALID_STUDY", "--interactive", "-l", str(tmp_path / "l.json")],
+        stdin_input="../bad\n",
+        capsys=capsys,
+    )
+    assert bad_stream_wiz.exit_code == 1
+    assert bad_stream_wiz.stdout == ""
+    assert "stream" in bad_stream_wiz.stderr
+
+
+def test_all_five_interactive_wizards_reject_json_mode_flag_and_env(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC 6: All 5 --interactive workflow wizards exit 1 on stderr with empty stdout under --format json and IMEDNET_CLI_OUTPUT_FORMAT=json."""
+    ledger_path = str(tmp_path / "ledger.json")
+    commands_with_flag = [
+        ["workflows", "extract-records", "--interactive", "--format", "json"],
+        ["workflows", "uat", "run", "--interactive", "--format", "json"],
+        ["workflows", "state", "show", "--interactive", "--format", "json", "-l", ledger_path],
+        ["workflows", "state", "set", "--interactive", "--format", "json", "-l", ledger_path],
+        ["workflows", "state", "reset", "--interactive", "--format", "json", "-l", ledger_path],
+    ]
+    # Test explicit --format json across all 5 wizards
+    for argv in commands_with_flag:
+        res = run_cli_command(cli_app, argv, stdin_input="SHOULD_NOT_READ\n", capsys=capsys)
+        assert res.exit_code == 1, argv
+        assert res.stdout == ""
+        assert "json" in res.stderr.lower()
+
+    # Test IMEDNET_CLI_OUTPUT_FORMAT=json across all 5 wizards
+    monkeypatch.setenv("IMEDNET_CLI_OUTPUT_FORMAT", "json")
+    for argv in [
+        ["workflows", "extract-records", "--interactive"],
+        ["workflows", "uat", "run", "--interactive"],
+        ["workflows", "state", "show", "--interactive", "-l", ledger_path],
+        ["workflows", "state", "set", "--interactive", "-l", ledger_path],
+        ["workflows", "state", "reset", "--interactive", "-l", ledger_path],
+    ]:
+        res = run_cli_command(cli_app, argv, stdin_input="SHOULD_NOT_READ\n", capsys=capsys)
+        assert res.exit_code == 1, argv
+        assert res.stdout == ""
+        assert "IMEDNET_CLI_OUTPUT_FORMAT=json" in res.stderr
+
+
+def test_uat_snapshot_metadata_and_cli_json_preflight_and_state_envelopes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Cover StudySnapshot metadata intervals/sites, CLI JSON preflight branches, custom PHI masking, and headless state JSON envelopes."""
+    import json
+    from types import SimpleNamespace
+
+    from imednet.datadict import DataDictionary, Metadata
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVar
+    from imednet.models import Interval, Site
+    from imednet_workflows.uat.inspector import StudySnapshot
+    from imednet_workflows.uat.models import UATSpecification, UATSubjectSpec
+
+    dd = DataDictionary(
+        metadata=Metadata(
+            studyKey="META_ST",
+            extraAttributes={
+                "intervals": [
+                    Interval(study_key="META_ST", interval_id=1, interval_name="Screening"),
+                    {"intervalName": "Week 4", "intervalId": 2, "disabled": "No"},
+                ],
+                "sites": [
+                    Site(
+                        study_key="META_ST",
+                        site_name="Alpha Clinic",
+                        site_enrollment_status="Enrollment Open",
+                    ),
+                    {"siteName": "Beta Clinic", "siteEnrollmentStatus": "Enrollment Open"},
+                ],
+            },
+        ),
+        forms=[
+            DDForm(
+                formKey="DM",
+                formName="Demographics",
+                extraAttributes={
+                    "formId": 10,
+                    "subjectRecordReport": "Yes",
+                    "visits": ["Unscheduled", "Week 8"],
+                    "intervalName": "Screening",
+                },
+                variables=[
+                    DDVar(
+                        variableName="CUSTOM_SECRET_ID",
+                        variableType="Text",
+                        required="Yes",
+                        extraAttributes={"variableId": 77, "itemOid": "OID_77", "disabled": "No"},
+                    )
+                ],
+            )
+        ],
+    )
+    snap = StudySnapshot.from_data_dictionary(dd, "META_ST")
+    assert [i.interval_name for i in snap.intervals] == ["Screening", "Week 4"]
+    assert [s.site_name for s in snap.sites] == ["Alpha Clinic", "Beta Clinic"]
+    assert snap.variables[0].variable_id == 77
+    assert snap.variables[0].variable_oid == "OID_77"
+
+    # Custom study PHI configuration masks custom_phi_fields in JSON failure envelopes and stderr
+    monkeypatch.setattr(
+        "imednet_workflows.cli.resolve_study_configuration",
+        lambda _sk: SimpleNamespace(phi_fields=["CUSTOM_SECRET_ID"]),
+    )
+
+    bad_spec_file = tmp_path / "corrupt_spec.json"
+    bad_spec_file.write_text("{not-json", encoding="utf-8")
+    mismatch_spec_file = tmp_path / "mismatch_spec.json"
+    mismatch_spec_file.write_text(
+        UATSpecification(
+            study_key="OTHER_STUDY",
+            study_name="OTHER_STUDY",
+            subject_specs=[UATSubjectSpec(site_name="Alpha Clinic", subject_count=1)],
+            form_specs=[],
+        ).model_dump_json(by_alias=True),
+        encoding="utf-8",
+    )
+
+    for argv in [
+        ["workflows", "uat", "run", "   ", "--format", "json"],
+        ["workflows", "uat", "run", "../traversal", "--format", "json"],
+        [
+            "workflows",
+            "uat",
+            "run",
+            "META_ST",
+            "--spec",
+            str(tmp_path / "missing.json"),
+            "--format",
+            "json",
+        ],
+        ["workflows", "uat", "run", "META_ST", "--spec", str(bad_spec_file), "--format", "json"],
+        [
+            "workflows",
+            "uat",
+            "run",
+            "META_ST",
+            "--spec",
+            str(mismatch_spec_file),
+            "--format",
+            "json",
+        ],
+        [
+            "workflows",
+            "uat",
+            "run",
+            "META_ST",
+            "--email-notify",
+            "CUSTOM_SECRET_ID=Patient42\r\nbad",
+            "--format",
+            "json",
+        ],
+    ]:
+        res = run_cli_command(cli_app, argv, capsys=capsys)
+        assert res.exit_code == 1, argv
+        assert res.stderr == ""
+        env = json.loads(res.stdout)
+        assert env["status"] == "failed"
+        assert "Patient42" not in res.stdout
+
+    # Headless non-JSON preflight error masks custom PHI on stderr
+    err_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "META_ST",
+            "--email-notify",
+            "CUSTOM_SECRET_ID=Patient42\r\nbad",
+        ],
+        capsys=capsys,
+    )
+    assert err_res.exit_code == 1
+    assert err_res.stdout == ""
+    assert "Patient42" not in err_res.stderr
+
+    # Headless state set and state reset --format json emit ledger_state envelopes
+    ledger_file = str(tmp_path / "json_state.json")
+    set_json = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "state",
+            "set",
+            "-s",
+            "META_ST",
+            "-m",
+            "records",
+            "-t",
+            "2026-06-01T00:00:00Z",
+            "-r",
+            "5",
+            "-l",
+            ledger_file,
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert set_json.exit_code == 0
+    assert json.loads(set_json.stdout)["resource"] == "ledger_state"
+
+    reset_stream_json = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "state",
+            "reset",
+            "-s",
+            "META_ST",
+            "-m",
+            "records",
+            "-l",
+            ledger_file,
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert reset_stream_json.exit_code == 0
+    assert json.loads(reset_stream_json.stdout)["items"][0]["removed"] is True
+
+    reset_study_json = run_cli_command(
+        cli_app,
+        ["workflows", "state", "reset", "-s", "META_ST", "-l", ledger_file, "--format", "json"],
+        capsys=capsys,
+    )
+    assert reset_study_json.exit_code == 0
+    assert json.loads(reset_study_json.stdout)["items"][0]["removed"] is True
+
+    reset_study_again = run_cli_command(
+        cli_app,
+        ["workflows", "state", "reset", "-s", "META_ST", "-l", ledger_file, "--format", "json"],
+        capsys=capsys,
+    )
+    assert reset_study_again.exit_code == 0
+    assert json.loads(reset_study_again.stdout)["items"][0]["removed"] is False
