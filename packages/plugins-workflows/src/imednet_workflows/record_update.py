@@ -1,24 +1,16 @@
 """Utilities for submitting and updating records in iMedNet studies."""
 
 import os
-from typing import TYPE_CHECKING, Any, Literal, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from imednet.spi.errors import ValidationError
 from imednet.spi.models import Job
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
-    AsyncBatchCoordinator,
-    BatchCoordinator,
     BatchSubmissionSummary,
     JobProgressHandler,
     RecordsInput,
-    extract_single_submitted_job,
     normalize_records_input,
-    poll_facade_many_async,
-    poll_facade_many_sync,
-    poll_facade_single_async,
-    poll_facade_single_sync,
-    validate_single_job_preflight,
 )
 from imednet.spi.validation import (
     AsyncSchemaValidator,
@@ -28,10 +20,22 @@ from imednet.spi.validation import (
     ValidationSchemaProtocol,
 )
 
+from ._workflow_helpers import (
+    FacadeLike,
+    WorkflowBatchSpec,
+    build_positional_record_chunk_submitter,
+    build_record_payload,
+    build_single_record_call_kwargs,
+    enforce_single_job_records,
+    ensure_sync_workflow_mode,
+    prepare_batch_preflight,
+    submit_workflow_batch_async,
+    submit_workflow_batch_sync,
+    unwrap_single_submitted_job,
+)
+
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
-
-FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
 
 
 def _extract_record_form_ref(record: dict[str, Any]) -> tuple[str | None, Any]:
@@ -41,12 +45,6 @@ def _extract_record_form_ref(record: dict[str, Any]) -> tuple[str | None, Any]:
     raw_fid = record.get("formId") if record.get("formId") is not None else record.get("form_id")
     fid = None if raw_fid == "" else raw_fid
     return fk, fid
-
-
-_poll_single_sync = poll_facade_single_sync
-_poll_single_async = poll_facade_single_async
-_poll_many_sync = poll_facade_many_sync
-_poll_many_async = poll_facade_many_async
 
 
 class RecordUpdateWorkflow:
@@ -87,12 +85,9 @@ class RecordUpdateWorkflow:
 
     def _ensure_sync_mode(self, method_name: str, async_counterpart: str) -> None:
         """Raise TypeError when synchronous record methods are called on an async SDK."""
-        if self._is_async:
-            raise TypeError(
-                f"RecordUpdateWorkflow.{method_name}() requires a synchronous ImednetSDK "
-                f"(ImednetFacade). With AsyncImednetSDK, await "
-                f"workflow.{async_counterpart}(...) instead."
-            )
+        ensure_sync_workflow_mode(
+            self._is_async, "RecordUpdateWorkflow", method_name, async_counterpart
+        )
 
     @staticmethod
     def _is_tabular_input(records_data: RecordsInput) -> bool:
@@ -113,7 +108,7 @@ class RecordUpdateWorkflow:
         return self._schema, not isinstance(self._schema, BaseSchemaCache)
 
     def _collect_distinct_form_refs(
-        self, records_data: list[dict[str, Any]], cache: BaseSchemaCache[Any]
+        self, records_data: list[dict[str, Any]]
     ) -> tuple[list[str], list[Any]]:
         """Collect distinct explicit form keys and form IDs across all records in order."""
         seen_keys: set[str] = set()
@@ -136,7 +131,6 @@ class RecordUpdateWorkflow:
                     seen_ids.add(fid)
                     form_ids.append(fid)
 
-        _ = cache
         return explicit_form_keys, form_ids
 
     def _check_form_refs_need_refresh(
@@ -172,14 +166,27 @@ class RecordUpdateWorkflow:
             if not resolved or resolved not in study_forms:
                 raise ValidationError(f"Unknown form ID {fid}")
 
+    def _prepare_form_ref_validation(
+        self, study_key: str, records_data: list[dict[str, Any]]
+    ) -> tuple[BaseSchemaCache[Any], list[str], list[Any], bool] | None:
+        """Collect distinct form references and determine whether cache refresh is needed."""
+        if not records_data or not isinstance(self._schema, BaseSchemaCache):
+            return None
+        cache = self._schema
+        explicit_form_keys, form_ids = self._collect_distinct_form_refs(records_data)
+        needs_refresh = self._check_form_refs_need_refresh(
+            cache, study_key, explicit_form_keys, form_ids
+        )
+        return cache, explicit_form_keys, form_ids, needs_refresh
+
     def _validate_form_key(self, study_key: str, records_data: list[dict[str, Any]]) -> None:
         """Refresh schema once if any distinct form key or form ID in the batch is uncached."""
         self._ensure_sync_mode("_validate_form_key", "_async_validate_form_key")
-        if not records_data or not isinstance(self._schema, BaseSchemaCache):
+        prepared = self._prepare_form_ref_validation(study_key, records_data)
+        if prepared is None:
             return
-        cache = self._schema
-        explicit_form_keys, form_ids = self._collect_distinct_form_refs(records_data, cache)
-        if self._check_form_refs_need_refresh(cache, study_key, explicit_form_keys, form_ids):
+        cache, explicit_form_keys, form_ids, needs_refresh = prepared
+        if needs_refresh:
             cast(SchemaValidator, self._validator).refresh(study_key)
         self._verify_cached_form_refs(cache, study_key, explicit_form_keys, form_ids)
 
@@ -187,13 +194,64 @@ class RecordUpdateWorkflow:
         self, study_key: str, records_data: list[dict[str, Any]]
     ) -> None:
         """Asynchronous variant of :meth:`_validate_form_key`."""
-        if not records_data or not isinstance(self._schema, BaseSchemaCache):
+        prepared = self._prepare_form_ref_validation(study_key, records_data)
+        if prepared is None:
             return
-        cache = self._schema
-        explicit_form_keys, form_ids = self._collect_distinct_form_refs(records_data, cache)
-        if self._check_form_refs_need_refresh(cache, study_key, explicit_form_keys, form_ids):
+        cache, explicit_form_keys, form_ids, needs_refresh = prepared
+        if needs_refresh:
             await cast(AsyncSchemaValidator, self._validator).refresh(study_key)
         self._verify_cached_form_refs(cache, study_key, explicit_form_keys, form_ids)
+
+    def _prepare_batch_context(
+        self,
+        study_key: str,
+        records_data: RecordsInput,
+        chunk_size: int | None,
+        schema: ValidationSchemaProtocol | None,
+        dry_run: bool,
+        single_job_method: tuple[str, str] | None,
+    ) -> tuple[int, ValidationSchemaProtocol, bool, bool]:
+        """Resolve chunk size, active schema, offline flag, and cold tabular refresh flag."""
+        effective_chunk_size = prepare_batch_preflight(
+            chunk_size, self._batch_size, dry_run, single_job_method
+        )
+        active_schema, is_offline = self._resolve_active_schema(schema)
+        needs_tabular_refresh = (
+            not is_offline
+            and self._is_tabular_input(records_data)
+            and isinstance(active_schema, BaseSchemaCache)
+            and not active_schema.forms_for_study(study_key)
+        )
+        return effective_chunk_size, active_schema, is_offline, needs_tabular_refresh
+
+    @staticmethod
+    def _build_batch_spec(
+        study_key: str,
+        records_data: RecordsInput,
+        active_schema: ValidationSchemaProtocol,
+        chunk_size: int,
+        options: tuple[bool, int, int, JobProgressHandler | None, bool, bool],
+        single_job_method: tuple[str, str] | None,
+    ) -> WorkflowBatchSpec:
+        """Normalize tabular or sequence record inputs and assemble a batch submission spec."""
+        wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors = options
+        normalized = normalize_records_input(
+            records_data, schema=active_schema, study_key=study_key
+        )
+        enforce_single_job_records(normalized, chunk_size, dry_run, single_job_method)
+        return WorkflowBatchSpec(
+            study_key,
+            normalized,
+            chunk_size,
+            wait_for_completion,
+            timeout,
+            poll_interval,
+            True,
+            schema=active_schema,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
+        )
 
     def create_or_update_records_batch(
         self,
@@ -215,80 +273,24 @@ class RecordUpdateWorkflow:
         self._ensure_sync_mode(
             "create_or_update_records_batch", "async_create_or_update_records_batch"
         )
-        effective_chunk_size = chunk_size or self._batch_size
-        if _single_job_method is not None and dry_run:
-            validate_single_job_preflight(
-                [],
-                chunk_size=effective_chunk_size,
-                dry_run=True,
-                method_name=_single_job_method[0],
-                batch_method_name=_single_job_method[1],
-            )
-        active_schema, is_offline = self._resolve_active_schema(schema)
-        if (
-            not is_offline
-            and self._is_tabular_input(records_data)
-            and isinstance(active_schema, BaseSchemaCache)
-            and not active_schema.forms_for_study(study_key)
-        ):
-            cast(SchemaValidator, self._validator).refresh(study_key)
-        normalized = normalize_records_input(
-            records_data,
-            schema=active_schema,
-            study_key=study_key,
+        eff_chunk, active_schema, is_offline, needs_refresh = self._prepare_batch_context(
+            study_key, records_data, chunk_size, schema, dry_run, _single_job_method
         )
-        if _single_job_method is not None:
-            validate_single_job_preflight(
-                normalized,
-                chunk_size=effective_chunk_size,
-                dry_run=dry_run,
-                method_name=_single_job_method[0],
-                batch_method_name=_single_job_method[1],
-            )
+        validator = cast(SchemaValidator, self._validator)
+        if needs_refresh:
+            validator.refresh(study_key)
+        opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
+        spec = self._build_batch_spec(
+            study_key, records_data, active_schema, eff_chunk, opts, _single_job_method
+        )
         if not is_offline:
-            self._validate_form_key(study_key, normalized)
+            self._validate_form_key(study_key, spec.records_data)
         sdk = cast("ImednetFacade", self._sdk)
-        coordinator = BatchCoordinator(chunk_size=effective_chunk_size, sdk=sdk)
-
-        def _submit_chunk(chunk: list[dict[str, Any]]) -> Job:
-            if email_notify is not None:
-                return sdk.create_record(
-                    study_key,
-                    chunk,
-                    email_notify=email_notify,
-                    schema=active_schema,
-                )
-            return sdk.create_record(study_key, chunk, schema=active_schema)
-
-        return coordinator.submit(
-            study_key,
-            normalized,
-            _submit_chunk,
-            schema=active_schema,
-            validate_batch_fn=(
-                None if is_offline else cast(SchemaValidator, self._validator).validate_batch
-            ),
-            wait_for_completion=wait_for_completion,
-            poll_single=lambda bid, *, on_progress=None: _poll_single_sync(
-                sdk,
-                study_key,
-                bid,
-                timeout=timeout,
-                poll_interval=poll_interval,
-                on_progress=on_progress,
-            ),
-            poll_many=lambda bids, *, on_progress=None: _poll_many_sync(
-                sdk,
-                study_key,
-                bids,
-                timeout=timeout,
-                poll_interval=poll_interval,
-                on_progress=on_progress,
-            ),
-            on_progress=on_progress,
-            require_batch_id=True,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
+        submitter = build_positional_record_chunk_submitter(
+            sdk.create_record, study_key, schema=active_schema, email_notify=email_notify
+        )
+        return submit_workflow_batch_sync(
+            sdk, spec, submitter, validate_batch_fn=None if is_offline else validator.validate_batch
         )
 
     def create_or_update_records(
@@ -307,24 +309,21 @@ class RecordUpdateWorkflow:
     ) -> Job:
         """Submit a single-chunk record payload and return its Job."""
         self._ensure_sync_mode("create_or_update_records", "async_create_or_update_records")
+        pair = ("create_or_update_records", "create_or_update_records_batch")
         summary = self.create_or_update_records_batch(
-            study_key=study_key,
-            records_data=records_data,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
+            study_key,
+            records_data,
+            wait_for_completion,
+            timeout,
+            poll_interval,
             email_notify=email_notify,
             schema=schema,
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
-            _single_job_method=("create_or_update_records", "create_or_update_records_batch"),
+            _single_job_method=pair,
         )
-        return extract_single_submitted_job(
-            summary,
-            method_name="create_or_update_records",
-            batch_method_name="create_or_update_records_batch",
-        )
+        return unwrap_single_submitted_job(summary, pair)
 
     async def async_create_or_update_records_batch(
         self,
@@ -343,80 +342,24 @@ class RecordUpdateWorkflow:
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once, submit chunks, and return a batch summary."""
-        effective_chunk_size = chunk_size or self._batch_size
-        if _single_job_method is not None and dry_run:
-            validate_single_job_preflight(
-                [],
-                chunk_size=effective_chunk_size,
-                dry_run=True,
-                method_name=_single_job_method[0],
-                batch_method_name=_single_job_method[1],
-            )
-        active_schema, is_offline = self._resolve_active_schema(schema)
-        if (
-            not is_offline
-            and self._is_tabular_input(records_data)
-            and isinstance(active_schema, BaseSchemaCache)
-            and not active_schema.forms_for_study(study_key)
-        ):
-            await cast(AsyncSchemaValidator, self._validator).refresh(study_key)
-        normalized = normalize_records_input(
-            records_data,
-            schema=active_schema,
-            study_key=study_key,
+        eff_chunk, active_schema, is_offline, needs_refresh = self._prepare_batch_context(
+            study_key, records_data, chunk_size, schema, dry_run, _single_job_method
         )
-        if _single_job_method is not None:
-            validate_single_job_preflight(
-                normalized,
-                chunk_size=effective_chunk_size,
-                dry_run=dry_run,
-                method_name=_single_job_method[0],
-                batch_method_name=_single_job_method[1],
-            )
+        validator = cast(AsyncSchemaValidator, self._validator)
+        if needs_refresh:
+            await validator.refresh(study_key)
+        opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
+        spec = self._build_batch_spec(
+            study_key, records_data, active_schema, eff_chunk, opts, _single_job_method
+        )
         if not is_offline:
-            await self._async_validate_form_key(study_key, normalized)
+            await self._async_validate_form_key(study_key, spec.records_data)
         sdk = cast("AsyncImednetFacade", self._sdk)
-        coordinator = AsyncBatchCoordinator(chunk_size=effective_chunk_size, sdk=sdk)
-
-        async def _submit_chunk_async(chunk: list[dict[str, Any]]) -> Job:
-            if email_notify is not None:
-                return await sdk.async_create_record(
-                    study_key,
-                    chunk,
-                    email_notify=email_notify,
-                    schema=active_schema,
-                )
-            return await sdk.async_create_record(study_key, chunk, schema=active_schema)
-
-        return await coordinator.submit(
-            study_key,
-            normalized,
-            _submit_chunk_async,
-            schema=active_schema,
-            validate_batch_fn=(
-                None if is_offline else cast(AsyncSchemaValidator, self._validator).validate_batch
-            ),
-            wait_for_completion=wait_for_completion,
-            poll_single=lambda bid, *, on_progress=None: _poll_single_async(
-                sdk,
-                study_key,
-                bid,
-                timeout=timeout,
-                poll_interval=poll_interval,
-                on_progress=on_progress,
-            ),
-            poll_many=lambda bids, *, on_progress=None: _poll_many_async(
-                sdk,
-                study_key,
-                bids,
-                timeout=timeout,
-                poll_interval=poll_interval,
-                on_progress=on_progress,
-            ),
-            on_progress=on_progress,
-            require_batch_id=True,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
+        submitter = build_positional_record_chunk_submitter(
+            sdk.async_create_record, study_key, schema=active_schema, email_notify=email_notify
+        )
+        return await submit_workflow_batch_async(
+            sdk, spec, submitter, validate_batch_fn=None if is_offline else validator.validate_batch
         )
 
     async def async_create_or_update_records(
@@ -434,70 +377,21 @@ class RecordUpdateWorkflow:
         collect_errors: bool = False,
     ) -> Job:
         """Asynchronous variant of :meth:`create_or_update_records`."""
+        pair = ("async_create_or_update_records", "async_create_or_update_records_batch")
         summary = await self.async_create_or_update_records_batch(
-            study_key=study_key,
-            records_data=records_data,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
+            study_key,
+            records_data,
+            wait_for_completion,
+            timeout,
+            poll_interval,
             email_notify=email_notify,
             schema=schema,
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
-            _single_job_method=(
-                "async_create_or_update_records",
-                "async_create_or_update_records_batch",
-            ),
+            _single_job_method=pair,
         )
-        return extract_single_submitted_job(
-            summary,
-            method_name="async_create_or_update_records",
-            batch_method_name="async_create_or_update_records_batch",
-        )
-
-    def _build_record_payload(
-        self,
-        *,
-        form_identifier: str | int,
-        form_identifier_type: Literal["key", "id"] = "key",
-        data: dict[str, Any],
-        subject_identifier: str | int | None = None,
-        subject_identifier_type: Literal["key", "id", "oid"] = "key",
-        site_identifier: str | int | None = None,
-        site_identifier_type: Literal["name", "id"] = "name",
-        interval_identifier: str | int | None = None,
-        interval_identifier_type: Literal["name", "id"] = "name",
-    ) -> dict[str, Any]:
-        """Return a record payload for ``create_or_update_records``."""
-        record: dict[str, Any] = {
-            "formKey" if form_identifier_type == "key" else "formId": form_identifier,
-            "data": data,
-        }
-
-        if subject_identifier is not None:
-            subject_id_field_map = {
-                "key": "subjectKey",
-                "id": "subjectId",
-                "oid": "subjectOid",
-            }
-            record[subject_id_field_map[subject_identifier_type]] = subject_identifier
-
-        if site_identifier is not None:
-            site_id_field_map = {
-                "name": "siteName",
-                "id": "siteId",
-            }
-            record[site_id_field_map[site_identifier_type]] = site_identifier
-
-        if interval_identifier is not None:
-            interval_id_field_map = {
-                "name": "intervalName",
-                "id": "intervalId",
-            }
-            record[interval_id_field_map[interval_identifier_type]] = interval_identifier
-
-        return record
+        return unwrap_single_submitted_job(summary, pair)
 
     def register_subject(
         self,
@@ -514,40 +408,18 @@ class RecordUpdateWorkflow:
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
-        """Registers a new subject by submitting a single record.
-
-        Args:
-            study_key: The study key.
-            form_identifier: The form key or ID.
-            site_identifier: The site name or ID.
-            data: The dictionary of record data (variable names and values).
-            form_identifier_type: Whether `form_identifier` is a 'key' or 'id'.
-            site_identifier_type: Whether `site_identifier` is a 'name' or 'id'.
-            wait_for_completion: If True, wait for the job to complete.
-            timeout: Timeout in seconds for waiting.
-            poll_interval: Polling interval in seconds.
-            email_notify: Optional email notification flag or recipient address.
-            schema: Optional validation schema override.
-
-        Returns:
-            The Job status object.
-        """
+        """Register a new subject by submitting a single enrollment record."""
         self._ensure_sync_mode("register_subject", "async_register_subject")
-        record = self._build_record_payload(
-            form_identifier=form_identifier,
-            form_identifier_type=form_identifier_type,
-            site_identifier=site_identifier,
-            site_identifier_type=site_identifier_type,
-            data=data,
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            site_id=site_identifier,
+            site_type=site_identifier_type,
         )
-        return self._submit_single_record(
-            study_key,
-            record,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            email_notify=email_notify,
-            schema=schema,
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        return self.create_or_update_records(
+            **build_single_record_call_kwargs(study_key, rec, *opts)
         )
 
     async def async_register_subject(
@@ -566,21 +438,16 @@ class RecordUpdateWorkflow:
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously register a new subject by submitting a single record."""
-        record = self._build_record_payload(
-            form_identifier=form_identifier,
-            form_identifier_type=form_identifier_type,
-            site_identifier=site_identifier,
-            site_identifier_type=site_identifier_type,
-            data=data,
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            site_id=site_identifier,
+            site_type=site_identifier_type,
         )
-        return await self._async_submit_single_record(
-            study_key,
-            record,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            email_notify=email_notify,
-            schema=schema,
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        return await self.async_create_or_update_records(
+            **build_single_record_call_kwargs(study_key, rec, *opts)
         )
 
     def update_scheduled_record(
@@ -600,44 +467,20 @@ class RecordUpdateWorkflow:
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
-        """Updates an existing scheduled record for a subject.
-
-        Args:
-            study_key: The study key.
-            form_identifier: The form key or ID.
-            subject_identifier: The subject key, ID, or OID.
-            interval_identifier: The interval name or ID.
-            data: The dictionary of record data (variable names and values).
-            form_identifier_type: Whether `form_identifier` is a 'key' or 'id'.
-            subject_identifier_type: Whether `subject_identifier` is a 'key', 'id', or 'oid'.
-            interval_identifier_type: Whether `interval_identifier` is a 'name' or 'id'.
-            wait_for_completion: If True, wait for the job to complete.
-            timeout: Timeout in seconds for waiting.
-            poll_interval: Polling interval in seconds.
-            email_notify: Optional email notification flag or recipient address.
-            schema: Optional validation schema override.
-
-        Returns:
-            The Job status object.
-        """
+        """Update an existing scheduled visit record for a subject."""
         self._ensure_sync_mode("update_scheduled_record", "async_update_scheduled_record")
-        record = self._build_record_payload(
-            form_identifier=form_identifier,
-            form_identifier_type=form_identifier_type,
-            subject_identifier=subject_identifier,
-            subject_identifier_type=subject_identifier_type,
-            interval_identifier=interval_identifier,
-            interval_identifier_type=interval_identifier_type,
-            data=data,
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            subject_id=subject_identifier,
+            subject_type=subject_identifier_type,
+            interval_id=interval_identifier,
+            interval_type=interval_identifier_type,
         )
-        return self._submit_single_record(
-            study_key,
-            record,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            email_notify=email_notify,
-            schema=schema,
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        return self.create_or_update_records(
+            **build_single_record_call_kwargs(study_key, rec, *opts)
         )
 
     async def async_update_scheduled_record(
@@ -658,23 +501,18 @@ class RecordUpdateWorkflow:
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously update an existing scheduled record for a subject."""
-        record = self._build_record_payload(
-            form_identifier=form_identifier,
-            form_identifier_type=form_identifier_type,
-            subject_identifier=subject_identifier,
-            subject_identifier_type=subject_identifier_type,
-            interval_identifier=interval_identifier,
-            interval_identifier_type=interval_identifier_type,
-            data=data,
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            subject_id=subject_identifier,
+            subject_type=subject_identifier_type,
+            interval_id=interval_identifier,
+            interval_type=interval_identifier_type,
         )
-        return await self._async_submit_single_record(
-            study_key,
-            record,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            email_notify=email_notify,
-            schema=schema,
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        return await self.async_create_or_update_records(
+            **build_single_record_call_kwargs(study_key, rec, *opts)
         )
 
     def create_new_record(
@@ -692,40 +530,18 @@ class RecordUpdateWorkflow:
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
-        """Creates a new (unscheduled) record for an existing subject.
-
-        Args:
-            study_key: The study key.
-            form_identifier: The form key or ID.
-            subject_identifier: The subject key, ID, or OID.
-            data: The dictionary of record data (variable names and values).
-            form_identifier_type: Whether `form_identifier` is a 'key' or 'id'.
-            subject_identifier_type: Whether `subject_identifier` is a 'key', 'id', or 'oid'.
-            wait_for_completion: If True, wait for the job to complete.
-            timeout: Timeout in seconds for waiting.
-            poll_interval: Polling interval in seconds.
-            email_notify: Optional email notification flag or recipient address.
-            schema: Optional validation schema override.
-
-        Returns:
-            The Job status object.
-        """
+        """Create a new unscheduled record for an existing subject."""
         self._ensure_sync_mode("create_new_record", "async_create_new_record")
-        record = self._build_record_payload(
-            form_identifier=form_identifier,
-            form_identifier_type=form_identifier_type,
-            subject_identifier=subject_identifier,
-            subject_identifier_type=subject_identifier_type,
-            data=data,
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            subject_id=subject_identifier,
+            subject_type=subject_identifier_type,
         )
-        return self._submit_single_record(
-            study_key,
-            record,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            email_notify=email_notify,
-            schema=schema,
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        return self.create_or_update_records(
+            **build_single_record_call_kwargs(study_key, rec, *opts)
         )
 
     async def async_create_new_record(
@@ -744,71 +560,14 @@ class RecordUpdateWorkflow:
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously create a new (unscheduled) record for an existing subject."""
-        record = self._build_record_payload(
-            form_identifier=form_identifier,
-            form_identifier_type=form_identifier_type,
-            subject_identifier=subject_identifier,
-            subject_identifier_type=subject_identifier_type,
-            data=data,
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            subject_id=subject_identifier,
+            subject_type=subject_identifier_type,
         )
-        return await self._async_submit_single_record(
-            study_key,
-            record,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            email_notify=email_notify,
-            schema=schema,
-        )
-
-    def _submit_single_record(
-        self,
-        study_key: str,
-        record: dict[str, Any],
-        *,
-        wait_for_completion: bool,
-        timeout: int,
-        poll_interval: int,
-        email_notify: bool | str | None = None,
-        schema: ValidationSchemaProtocol | None,
-    ) -> Job:
-        """Submit a single constructed record payload synchronously."""
-        extra_kwargs: dict[str, Any] = {}
-        if schema is not None:
-            extra_kwargs["schema"] = schema
-        if email_notify is not None:
-            extra_kwargs["email_notify"] = email_notify
-        return self.create_or_update_records(
-            study_key=study_key,
-            records_data=[record],
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            **extra_kwargs,
-        )
-
-    async def _async_submit_single_record(
-        self,
-        study_key: str,
-        record: dict[str, Any],
-        *,
-        wait_for_completion: bool,
-        timeout: int,
-        poll_interval: int,
-        email_notify: bool | str | None = None,
-        schema: ValidationSchemaProtocol | None,
-    ) -> Job:
-        """Submit a single constructed record payload asynchronously."""
-        extra_kwargs: dict[str, Any] = {}
-        if schema is not None:
-            extra_kwargs["schema"] = schema
-        if email_notify is not None:
-            extra_kwargs["email_notify"] = email_notify
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
         return await self.async_create_or_update_records(
-            study_key=study_key,
-            records_data=[record],
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            **extra_kwargs,
+            **build_single_record_call_kwargs(study_key, rec, *opts)
         )
