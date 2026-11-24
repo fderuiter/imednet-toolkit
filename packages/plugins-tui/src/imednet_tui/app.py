@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, ClassVar, cast
+from unittest.mock import NonCallableMock
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -150,27 +151,15 @@ def _get_configured_attr(obj: object, name: str) -> Any:
     """Read ``name`` from ``obj`` without auto-creating unconfigured mock attributes."""
     if obj is None:
         return None
-    if type(obj).__module__.startswith("unittest.mock"):
-        instance_dict = getattr(obj, "__dict__", {})
-        if name in instance_dict:
-            return instance_dict[name]
-        children = instance_dict.get("_mock_children")
-        if isinstance(children, dict) and name in children:
-            return children[name]
-        wrapped = instance_dict.get("_mock_wraps")
-        if wrapped is not None:
-            return getattr(wrapped, name, None)
-        return None
+    if isinstance(obj, NonCallableMock):
+        return vars(obj).get(name)
     return getattr(obj, name, None)
 
 
 def _resolve_env_subtitle(sdk: object) -> str:
     """Resolve the active environment subtitle from simulation mode, base_url, or default."""
     config = _get_configured_attr(sdk, "config")
-    clients = [
-        _get_configured_attr(sdk, attr)
-        for attr in ("_client", "_async_client", "client", "async_client")
-    ]
+    clients = [_get_configured_attr(sdk, attr) for attr in ("client", "async_client")]
     if (
         _get_configured_attr(config, "simulation_mode") is True
         or _get_configured_attr(sdk, "simulation_mode") is True

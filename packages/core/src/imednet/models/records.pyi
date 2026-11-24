@@ -7,7 +7,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, RootModel, field_validator
+from pydantic import (
+    Field,
+    RootModel,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 from imednet.models.base import ImednetBaseModel
 
@@ -187,7 +193,8 @@ class RegisterSubjectRequest(BaseRecordRequest):
 
     Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
     Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
-    ``None`` so server-assigned subject keys continue working by default.
+    ``None`` so server-assigned subject keys continue working by default; when
+    explicitly supplied, they are preserved for enrollment and deduplication.
     """
 
     site_name: str = Field(
@@ -220,6 +227,13 @@ class RegisterSubjectRequest(BaseRecordRequest):
         subject_oid: str | None = None,
         subjectOid: str | None = None,
     ) -> None: ...
+    @field_validator("subject_key", "subject_oid", mode="before")
+    @classmethod
+    def _normalize_optional_subject_identifier(cls, value: Any) -> str | None: ...
+    @model_serializer(mode="wrap")
+    def _serialize_omitting_unset_enrollment_fields(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]: ...
     def model_dump(self, **kwargs: Any) -> dict[str, Any]: ...
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):

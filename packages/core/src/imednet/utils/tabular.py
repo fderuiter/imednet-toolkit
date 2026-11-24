@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import datetime
 import io
 import json
 import math
@@ -23,6 +24,7 @@ MASKED_SENTINEL: str = "***MASKED***"
 
 _INT_LITERAL_RE = re.compile(r"^-?(?:0|[1-9]\d*)$")
 _DECIMAL_LITERAL_RE = re.compile(r"^-?(?:0|[1-9]\d*)\.\d+$")
+_SLASH_SPACE_RE = re.compile(r"\s*/\s*")
 
 _READ_ONLY_RECORD_COLUMNS: frozenset[str] = frozenset(
     {
@@ -111,20 +113,46 @@ _TEXT_LIKE_TYPES: frozenset[str] = frozenset(
     }
 )
 
+_INT_LIKE_TYPES: frozenset[str] = frozenset({"int", "integer", "number"})
+_FLOAT_LIKE_TYPES: frozenset[str] = frozenset({"float", "decimal", "double", "numeric"})
+_NUMERIC_LIKE_TYPES: frozenset[str] = _INT_LIKE_TYPES | _FLOAT_LIKE_TYPES
 _BOOL_LIKE_TYPES: frozenset[str] = frozenset({"bool", "boolean"})
+_COMPUTED_FLEX_TYPES: frozenset[str] = frozenset({"calculation", "calc", "calculated", "slider"})
 
 
 def _unwrap_scalar(value: Any) -> Any:
     """Unwrap NumPy/Pandas scalar wrappers into native Python primitives."""
-    if value is not None and not isinstance(
-        value, (str, bytes, int, float, bool, dict, list, tuple, set, frozenset)
+    if value is None:
+        return None
+    cls_name = type(value).__name__
+    if cls_name in {"NAType", "NaTType"}:
+        return value
+    if cls_name == "datetime64":
+        return value
+    if isinstance(
+        value,
+        (
+            str,
+            bytes,
+            int,
+            float,
+            bool,
+            dict,
+            list,
+            tuple,
+            set,
+            frozenset,
+            datetime.date,
+            datetime.time,
+        ),
     ):
-        item_fn = getattr(value, "item", None)
-        if callable(item_fn):
-            try:
-                return item_fn()
-            except (ValueError, TypeError):
-                return value
+        return value
+    item_fn = getattr(value, "item", None)
+    if callable(item_fn):
+        try:
+            return item_fn()
+        except (ValueError, TypeError):
+            return value
     return value
 
 
@@ -172,7 +200,9 @@ def _is_missing_cell(value: Any) -> bool:
     if isinstance(unwrapped, str):
         return unwrapped.strip() == ""
     cls_name = type(unwrapped).__name__
-    return cls_name in {"NAType", "NaTType"}
+    if cls_name in {"NAType", "NaTType"}:
+        return True
+    return cls_name == "datetime64" and str(unwrapped) == "NaT"
 
 
 def _coerce_str_identifier(value: Any) -> str:
@@ -203,6 +233,36 @@ def _coerce_int_identifier(value: Any, *, row_index: int, column_name: str) -> i
     raise ValidationError(f"Row {row_index}: identifier '{column_name}' must be an integer.")
 
 
+def _lookup_form_key_from_id(
+    schema: ValidationSchemaProtocol,
+    form_id: int,
+    *,
+    study_key: str | None = None,
+) -> str | None:
+    """Resolve ``formId`` to ``formKey`` while forwarding ``study_key`` when supported."""
+    if study_key is not None:
+        try:
+            return schema.form_key_from_id(form_id, study_key=study_key)  # type: ignore[call-arg]
+        except TypeError:
+            pass
+    return schema.form_key_from_id(form_id)
+
+
+def _lookup_variables_for_form(
+    schema: ValidationSchemaProtocol,
+    form_key: str,
+    *,
+    study_key: str | None = None,
+) -> Mapping[str, Any]:
+    """Resolve form variables while forwarding ``study_key`` when supported."""
+    if study_key is not None:
+        try:
+            return schema.variables_for_form(form_key, study_key=study_key)  # type: ignore[call-arg]
+        except TypeError:
+            pass
+    return schema.variables_for_form(form_key)
+
+
 def _resolve_expected_var_type(
     schema: ValidationSchemaProtocol | None,
     form_key: str | None,
@@ -216,32 +276,20 @@ def _resolve_expected_var_type(
         return None
     resolved_fk = form_key
     if not resolved_fk and form_id is not None:
-        try:
-            resolved_fk = (
-                schema.form_key_from_id(form_id, study_key=study_key)  # type: ignore[call-arg]
-                if study_key is not None
-                else schema.form_key_from_id(form_id)
-            )
-        except TypeError:
-            resolved_fk = schema.form_key_from_id(form_id)
+        resolved_fk = _lookup_form_key_from_id(schema, form_id, study_key=study_key)
     if not resolved_fk:
         return None
-    try:
-        variables = (
-            schema.variables_for_form(resolved_fk, study_key=study_key)  # type: ignore[call-arg]
-            if study_key is not None
-            else schema.variables_for_form(resolved_fk)
-        )
-    except TypeError:
-        variables = schema.variables_for_form(resolved_fk)
+    variables = _lookup_variables_for_form(schema, resolved_fk, study_key=study_key)
     if not variables or var_name not in variables:
         return None
     var_obj = variables[var_name]
     raw_type = getattr(var_obj, "variable_type", None) or getattr(var_obj, "variableType", None)
     if not isinstance(raw_type, str):
         return None
-    normalized = re.sub(r"[\s_-]+", " ", raw_type.strip().lower())
-    return re.sub(r"\s*/\s*", "/", normalized)
+    cleaned = re.sub(r"[\s_-]+", " ", raw_type.strip().lower())
+    if "/" in cleaned:
+        cleaned = _SLASH_SPACE_RE.sub("/", cleaned)
+    return cleaned
 
 
 def _coerce_clinical_value(
@@ -250,20 +298,62 @@ def _coerce_clinical_value(
     from_csv_str: bool,
     expected_var_type: str | None = None,
 ) -> Any:
-    """Coerce integer floats and CSV scalar tokens while preserving clinical strings."""
+    """Coerce integer floats, timestamps, and typed CSV scalars while preserving strings."""
     unwrapped = _unwrap_scalar(value)
+    if unwrapped is None:
+        return None
+
+    cls_name = type(unwrapped).__name__
+    if cls_name in {"NAType", "NaTType"}:
+        return None
+    if cls_name == "datetime64":
+        text_dt = str(unwrapped)
+        return None if text_dt == "NaT" else text_dt
+    if isinstance(unwrapped, (datetime.datetime, datetime.date, datetime.time)):
+        return unwrapped.isoformat()
+
     if isinstance(unwrapped, bool):
         return unwrapped
 
-    if expected_var_type in _TEXT_LIKE_TYPES:
-        if isinstance(unwrapped, float) and math.isfinite(unwrapped) and unwrapped.is_integer():
-            return str(int(unwrapped))
-        return str(unwrapped)
+    if expected_var_type is not None:
+        if expected_var_type in _BOOL_LIKE_TYPES:
+            if isinstance(unwrapped, str):
+                low = unwrapped.strip().lower()
+                if low in {"true", "false"}:
+                    return low == "true"
+            return unwrapped
 
-    if expected_var_type in _BOOL_LIKE_TYPES and isinstance(unwrapped, str):
-        low = unwrapped.strip().lower()
-        if low in {"true", "false"}:
-            return low == "true"
+        if expected_var_type in _NUMERIC_LIKE_TYPES:
+            if isinstance(unwrapped, int):
+                return unwrapped
+            if isinstance(unwrapped, float):
+                if (
+                    expected_var_type in _INT_LIKE_TYPES
+                    and math.isfinite(unwrapped)
+                    and unwrapped.is_integer()
+                ):
+                    return int(unwrapped)
+                return unwrapped
+            if isinstance(unwrapped, str):
+                stripped = unwrapped.strip()
+                if _INT_LITERAL_RE.match(stripped):
+                    return int(stripped)
+                if _DECIMAL_LITERAL_RE.match(stripped):
+                    fval = float(stripped)
+                    if math.isfinite(fval):
+                        if expected_var_type in _INT_LIKE_TYPES and fval.is_integer():
+                            return int(fval)
+                        return fval
+            return unwrapped
+
+        if expected_var_type not in _COMPUTED_FLEX_TYPES:
+            if isinstance(unwrapped, str):
+                return unwrapped
+            if isinstance(unwrapped, float) and math.isfinite(unwrapped):
+                return str(int(unwrapped)) if unwrapped.is_integer() else str(unwrapped)
+            if expected_var_type in _TEXT_LIKE_TYPES:
+                return str(unwrapped)
+            return unwrapped
 
     if isinstance(unwrapped, int):
         return unwrapped
@@ -274,13 +364,7 @@ def _coerce_clinical_value(
         return unwrapped
 
     if from_csv_str and isinstance(unwrapped, str):
-        stripped = unwrapped.strip()
-        if _INT_LITERAL_RE.match(stripped):
-            return int(stripped)
-        if _DECIMAL_LITERAL_RE.match(stripped):
-            fval = float(stripped)
-            if math.isfinite(fval):
-                return int(fval) if fval.is_integer() else fval
+        return unwrapped
 
     return unwrapped
 
@@ -321,6 +405,9 @@ def normalize_tabular_row(
     row_index: int = 0,
     from_csv_str: bool = False,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
 ) -> JsonDict | None:
     """Normalize a single DataFrame or CSV row into a REST create-records payload dict.
 
@@ -346,6 +433,12 @@ def normalize_tabular_row(
             if name in raw_row and not _is_missing_cell(raw_row[name]):
                 return name, raw_row[name]
         return None
+
+    eff_study_key = study_key
+    if not eff_study_key:
+        study_pair = _first_present("studyKey", "study_key")
+        if study_pair is not None:
+            eff_study_key = _coerce_str_identifier(study_pair[1])
 
     envelope: JsonDict = {}
 
@@ -386,6 +479,12 @@ def normalize_tabular_row(
             form_id_pair[1], row_index=row_index, column_name=form_id_pair[0]
         )
         envelope["formId"] = resolved_form_id
+    elif default_form_key:
+        resolved_form_key = default_form_key
+        envelope["formKey"] = default_form_key
+    elif default_form_id is not None:
+        resolved_form_id = default_form_id
+        envelope["formId"] = default_form_id
 
     subj_key_pair = _first_present("subjectKey", "subject_key")
     subj_oid_pair = _first_present("subjectOid", "subject_oid")
@@ -433,7 +532,11 @@ def normalize_tabular_row(
                 if _is_missing_cell(var_val):
                     continue
                 vtype = _resolve_expected_var_type(
-                    schema, resolved_form_key, resolved_form_id, str(var_key)
+                    schema,
+                    resolved_form_key,
+                    resolved_form_id,
+                    str(var_key),
+                    study_key=eff_study_key,
                 )
                 clinical_data[str(var_key)] = _coerce_clinical_value(
                     var_val, from_csv_str=False, expected_var_type=vtype
@@ -447,7 +550,13 @@ def normalize_tabular_row(
             or _is_missing_cell(raw_val)
         ):
             continue
-        vtype = _resolve_expected_var_type(schema, resolved_form_key, resolved_form_id, col_name)
+        vtype = _resolve_expected_var_type(
+            schema,
+            resolved_form_key,
+            resolved_form_id,
+            col_name,
+            study_key=eff_study_key,
+        )
         clinical_data[col_name] = _coerce_clinical_value(
             raw_val,
             from_csv_str=from_csv_str,
@@ -462,6 +571,9 @@ def _read_csv_stream_records(
     stream: Any,
     *,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
 ) -> list[JsonDict]:
     records: list[JsonDict] = []
     reader = csv.DictReader(stream)
@@ -473,6 +585,9 @@ def _read_csv_stream_records(
             row_index=idx,
             from_csv_str=True,
             schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
         )
         if normalized is not None:
             records.append(normalized)
@@ -483,10 +598,19 @@ def csv_text_to_records(
     raw_csv: str,
     *,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
 ) -> list[JsonDict]:
     """Parse CSV text into REST create-records payload dicts."""
     cleaned = raw_csv.lstrip("\ufeff")
-    return _read_csv_stream_records(io.StringIO(cleaned), schema=schema)
+    return _read_csv_stream_records(
+        io.StringIO(cleaned),
+        schema=schema,
+        study_key=study_key,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+    )
 
 
 def csv_to_records(
@@ -494,6 +618,9 @@ def csv_to_records(
     *,
     encoding: str = "utf-8-sig",
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
 ) -> list[JsonDict]:
     """Load a CSV file into REST create-records payload dicts using the standard library.
 
@@ -501,7 +628,13 @@ def csv_to_records(
     """
     csv_path = Path(path)
     with csv_path.open("r", encoding=encoding, newline="") as handle:
-        return _read_csv_stream_records(handle, schema=schema)
+        return _read_csv_stream_records(
+            handle,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
 
 
 def _is_dataframe_instance(obj: object) -> bool:
@@ -514,6 +647,9 @@ def dataframe_rows_to_records(
     df: Any,
     *,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
 ) -> list[JsonDict]:
     """Convert a ``pandas.DataFrame`` into REST create-records payload dicts."""
     if getattr(df, "empty", False):
@@ -527,6 +663,9 @@ def dataframe_rows_to_records(
             row_index=idx,
             from_csv_str=False,
             schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
         )
         if normalized is not None:
             records.append(normalized)
@@ -537,12 +676,27 @@ def normalize_records_input(
     records_data: RecordsInput,
     *,
     schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
 ) -> list[JsonDict]:
     """Normalize ``DataFrame``, CSV path, or ``list[JsonDict]`` into record payload dicts."""
     if isinstance(records_data, (str, os.PathLike)):
-        return csv_to_records(records_data, schema=schema)
+        return csv_to_records(
+            records_data,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
     if _is_dataframe_instance(records_data):
-        return dataframe_rows_to_records(records_data, schema=schema)
+        return dataframe_rows_to_records(
+            records_data,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
     if isinstance(records_data, list):
         ensure_no_masked_sentinel(records_data)
         return records_data

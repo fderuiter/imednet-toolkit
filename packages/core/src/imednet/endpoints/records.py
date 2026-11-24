@@ -95,7 +95,7 @@ class RecordsOperationDef:
             The background job for the creation operation.
         """
         self._validate_study_key(study_key)  # type: ignore
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         path = self._get_endpoint_path(study_key)  # type: ignore
         return RecordCreateOperation[Job](
             path=path,

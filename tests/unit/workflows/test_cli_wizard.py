@@ -48,11 +48,18 @@ class CliResult:
 
 
 def run_cli_command(
-    app_fn, args: list[str], stdin_input: str = "", *, tty_stdin: bool = True
+    app_fn,
+    args: list[str],
+    stdin_input: str = "",
+    *,
+    tty_stdin: bool = True,
+    capsys: pytest.CaptureFixture[str] | None = None,
 ) -> CliResult:
     """Invoke CLI entry point with redirected stdin, stdout, and stderr."""
     from contextlib import redirect_stderr, redirect_stdout
 
+    if capsys is not None:
+        capsys.readouterr()
     out = io.StringIO()
     err = io.StringIO()
     stdin_stream = _TTYStringIO(stdin_input) if tty_stdin else io.StringIO(stdin_input)
@@ -63,7 +70,13 @@ def run_cli_command(
         except SystemExit as exc:
             exit_code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
 
-    return CliResult(exit_code, out.getvalue(), err.getvalue())
+    extra_out = ""
+    extra_err = ""
+    if capsys is not None:
+        captured = capsys.readouterr()
+        extra_out = captured.out
+        extra_err = captured.err
+    return CliResult(exit_code, out.getvalue() + extra_out, err.getvalue() + extra_err)
 
 
 # ---------------------------------------------------------------------------
@@ -1256,7 +1269,11 @@ def test_uat_cli_and_wizard_preflight_rejects_invalid_bounds_and_email_before_in
     assert "email-notify" in email_err.getvalue()
 
 
-def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(tmp_path, monkeypatch):
+def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(
+    tmp_path,
+    monkeypatch,
+    capsys: pytest.CaptureFixture[str],
+):
     """Test uat build-spec, --spec, --seed reproducibility, --dry-run, and --format json envelope."""
     import json
 
@@ -1286,6 +1303,7 @@ def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(tmp_path, mo
             "-o",
             str(spec_file),
         ],
+        capsys=capsys,
     )
     assert build_res.exit_code == 0, build_res.stderr
     assert spec_file.exists()
@@ -1313,6 +1331,7 @@ def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(tmp_path, mo
             "NON_EXISTENT_SITE",
             "--simulation",
         ],
+        capsys=capsys,
     )
     assert bad_site_res.exit_code == 1
     assert "NON_EXISTENT_SITE" in bad_site_res.stderr
@@ -1331,6 +1350,7 @@ def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(tmp_path, mo
             "--format",
             "json",
         ],
+        capsys=capsys,
     )
     assert run_res_1.exit_code == 0, run_res_1.stderr
     assert run_res_1.stderr == ""
@@ -1390,6 +1410,7 @@ def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(tmp_path, mo
             "--format",
             "json",
         ],
+        capsys=capsys,
     )
     assert fail_res.exit_code == 1
     assert fail_res.stderr == ""

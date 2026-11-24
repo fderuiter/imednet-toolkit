@@ -385,6 +385,11 @@ class SyncSDKConvenienceMixin:
         return self.jobs.get(study_key, batch_id)
 
     @_trace_method
+    def fetch_job_result(self, result_url: str) -> Any:
+        """Fetch the result payload for a terminal job ``resultUrl``."""
+        return self.jobs.fetch_result(result_url)
+
+    @_trace_method
     def create_record(
         self,
         study_key: str,
@@ -536,6 +541,11 @@ class AsyncSDKConvenienceMixin:
     async def async_get_job(self, study_key: str, batch_id: str) -> JobStatus:
         """Asynchronously get job status."""
         return await self.jobs.get(study_key, batch_id)
+
+    @_async_trace_method
+    async def async_fetch_job_result(self, result_url: str) -> Any:
+        """Asynchronously fetch the result payload for a terminal job ``resultUrl``."""
+        return await self.jobs.fetch_result(result_url)
 
     @_async_trace_method
     async def async_create_record(

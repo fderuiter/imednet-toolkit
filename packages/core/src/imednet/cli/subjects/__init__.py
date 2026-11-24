@@ -167,10 +167,9 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 default_site_name=args.site_name,
                 default_site_id=args.site_id,
                 schema=resolved_schema,
+                study_key=args.study_key,
             )
-            sites = (
-                None if (args.dry_run and offline_dry_run) else list(sdk.sites.list(args.study_key))
-            )
+            sites = None if offline_dry_run else list(sdk.sites.list(args.study_key))
             validate_subject_registration_sites(normalized_pairs, sites)
 
             existing_subjects = (

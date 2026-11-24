@@ -171,7 +171,9 @@ class BaseRequestExecutor(ABC):
         if error.last_attempt and not error.last_attempt.failed:
             response: httpx.Response = error.last_attempt.result()
             return response
-        lease.record_failure()
+        last_exc = error.last_attempt.exception() if error.last_attempt else None
+        if not isinstance(last_exc, (ValueError, TypeError)):
+            lease.record_failure()
         return monitor.on_retry_error(error, attempt_count=attempt_count)
 
     @staticmethod
@@ -303,6 +305,8 @@ class SyncRequestExecutor(BaseRequestExecutor):
                 )
             except httpx.RequestError as err:
                 self._handle_request_error(err, lease, monitor, attempt_count=attempts or None)
+            except (ValueError, TypeError):
+                raise
             except Exception:
                 lease.record_failure()
                 raise
@@ -368,6 +372,8 @@ class AsyncRequestExecutor(BaseRequestExecutor):
                 )
             except httpx.RequestError as err:
                 self._handle_request_error(err, lease, monitor, attempt_count=attempts or None)
+            except (ValueError, TypeError):
+                raise
             except Exception:
                 lease.record_failure()
                 raise

@@ -23,15 +23,21 @@ _FALSE_VARIANTS = _FALSE_LOWER | {"False", "FALSE"}
 _SENTINEL_DATETIME = datetime(1969, 4, 20, 16, 20)
 
 _drift_reported: set[str] = set()
+_IS_STRICT_MODE_FN: Callable[[], bool] | None = None
 
 
 def _effective_strict(strict: bool | None) -> bool:
     """Resolve explicit strict override or active strict-mode context."""
+    global _IS_STRICT_MODE_FN
     if strict is not None:
         return strict
-    from imednet.core.context import is_strict_mode
+    fn = _IS_STRICT_MODE_FN
+    if fn is None:
+        from imednet.core.context import is_strict_mode
 
-    return is_strict_mode()
+        _IS_STRICT_MODE_FN = is_strict_mode
+        fn = is_strict_mode
+    return fn()
 
 
 def _report_drift(drift_key: str) -> None:
@@ -70,9 +76,9 @@ def parse_datetime(
            Numeric values are assumed to be UTC timestamps.
         strict: Optional explicit strict-mode override.
     """
-    use_strict = _effective_strict(strict)
     if isinstance(v, datetime):
         return v
+    use_strict = _effective_strict(strict)
     if isinstance(v, bool):
         if use_strict:
             raise ValueError("Expected datetime, got bool")
@@ -120,20 +126,20 @@ def parse_bool(v: Any, strict: bool | None = None) -> bool:
         >>> parse_bool(None)
         False
     """
-    use_strict = _effective_strict(strict)
     if isinstance(v, bool):
         return v
     if isinstance(v, str):
-        # Gracefully handle empty string in permissive mode; reject in strict mode
-        if not v or v.strip() == "":
-            if use_strict:
-                raise ValueError("Expected bool, got empty str")
-            return False
-
         # Optimized path for common API responses to avoid string manipulation
         if v in _TRUE_VARIANTS:
             return True
         if v in _FALSE_VARIANTS:
+            return False
+
+        use_strict = _effective_strict(strict)
+        # Gracefully handle empty string in permissive mode; reject in strict mode
+        if not v or v.strip() == "":
+            if use_strict:
+                raise ValueError("Expected bool, got empty str")
             return False
 
         # Fallback for irregular casing or whitespace
@@ -164,6 +170,7 @@ def parse_bool(v: Any, strict: bool | None = None) -> bool:
         return False
 
     if isinstance(v, float):
+        use_strict = _effective_strict(strict)
         if not math.isfinite(v):
             if use_strict:
                 raise ValueError("Expected bool, got non-finite float")
@@ -173,6 +180,7 @@ def parse_bool(v: Any, strict: bool | None = None) -> bool:
             raise ValueError("Expected bool, got float")
         return bool(v)
 
+    use_strict = _effective_strict(strict)
     if isinstance(v, int):
         if use_strict:
             raise ValueError("Expected bool, got int")
@@ -191,6 +199,8 @@ def parse_int_or_default(v: Any, default: int = 0, strict: bool | None = None) -
     Rejects ``bool`` inputs across all modes, and raises ``ValueError`` (or
     ``OverflowError`` on string infinity) when ``strict=True`` or strict mode is active.
     """
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
     use_strict = _effective_strict(strict)
     if isinstance(v, bool):
         if use_strict:
@@ -279,9 +289,9 @@ def parse_list_or_default(
 
     Raises ``ValueError`` in strict mode when ``v`` is not a ``list``.
     """
-    use_strict = _effective_strict(strict)
     if isinstance(v, list):
         return v
+    use_strict = _effective_strict(strict)
     if use_strict:
         raise ValueError(f"Expected list, got {type(v).__name__}")
     if is_missing_value(v):
@@ -304,9 +314,9 @@ def parse_dict_or_default(
 
     Raises ``ValueError`` in strict mode when ``v`` is not a ``dict``.
     """
-    use_strict = _effective_strict(strict)
     if isinstance(v, dict):
         return v
+    use_strict = _effective_strict(strict)
     if use_strict:
         raise ValueError(f"Expected dict, got {type(v).__name__}")
     if is_missing_value(v):

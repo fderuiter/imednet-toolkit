@@ -58,3 +58,82 @@ def test_register_subjects_validation_errors() -> None:
     assert "Index 1: site 'INVALID_SITE' not found" in error_msg
 
     sdk.create_record.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_register_subject_request_omits_unset_keys_and_batch_rerun_skips_existing() -> None:
+    """AC 4 & Req 5: Omit unset subjectKey/subjectOid and deduplicate explicit subjectKey reruns."""
+    from imednet import AsyncImednetSDK, ImednetSDK
+    from imednet.simulation import SimulationState, SimulationTransport
+
+    unset_req = RegisterSubjectRequest(
+        formKey="F_DM", siteName="SITE", data=RecordData({"AGE": 30})
+    )
+    dumped_unset = unset_req.model_dump(by_alias=True)
+    assert "subjectKey" not in dumped_unset
+    assert "subjectOid" not in dumped_unset
+
+    explicit_req = RegisterSubjectRequest(
+        formKey="F_DM",
+        siteName="SITE",
+        subjectKey="SUB-EXPL-1",
+        subjectOid="OID-EXPL-1",
+        data=RecordData({"V_AGE": 35}),
+    )
+    dumped_explicit = explicit_req.model_dump(by_alias=True)
+    assert dumped_explicit["subjectKey"] == "SUB-EXPL-1"
+    assert dumped_explicit["subjectOid"] == "OID-EXPL-1"
+
+    state = SimulationState()
+    batch_inputs = [
+        RegisterSubjectRequest(
+            formKey="F_DM",
+            siteName="SITE",
+            subjectKey="SUB-BATCH-1",
+            data=RecordData({"V_AGE": 29}),
+        ),
+        {
+            "formKey": "F_DM",
+            "siteName": "SITE",
+            "subjectKey": "SUB-BATCH-2",
+            "data": {"V_AGE": 41},
+        },
+    ]
+
+    with ImednetSDK(transport=SimulationTransport(state=state)) as sync_sdk:
+        before = len(state.get_subjects("STUDY"))
+        wf = RegisterSubjectsWorkflow(sync_sdk)
+        first = wf.register_subjects_batch(
+            "STUDY",
+            batch_inputs,
+            skip_existing=True,
+            wait_for_completion=True,
+            poll_interval=0,
+        )
+        assert first.total_records == 2
+        assert first.skipped_count == 0
+        assert len(state.get_subjects("STUDY")) == before + 2
+
+        second = wf.register_subjects_batch(
+            "STUDY",
+            batch_inputs,
+            skip_existing=True,
+            wait_for_completion=True,
+            poll_interval=0,
+        )
+        assert second.total_records == 0
+        assert second.skipped_count == 2
+        assert len(state.get_subjects("STUDY")) == before + 2
+
+    async with AsyncImednetSDK(transport=SimulationTransport(state=state)) as async_sdk:
+        awf = RegisterSubjectsWorkflow(async_sdk)
+        third = await awf.async_register_subjects_batch(
+            "STUDY",
+            batch_inputs,
+            skip_existing=True,
+            wait_for_completion=True,
+            poll_interval=0,
+        )
+        assert third.total_records == 0
+        assert third.skipped_count == 2
+        assert len(state.get_subjects("STUDY")) == before + 2

@@ -467,7 +467,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 dry_run=args.dry_run,
             )
             if args.file == "-" or input_path.suffix.lower() == ".json":
-                payload = load_records_from_path_or_stdin(args.file, schema=resolved_schema)
+                payload = load_records_from_path_or_stdin(
+                    args.file,
+                    schema=resolved_schema,
+                    study_key=args.study_key,
+                )
                 return submit_cli_records_batch(
                     sdk,
                     args,
@@ -502,6 +506,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 study_key=args.study_key,
                 total_records=getattr(raw_summary, "total_records", None) or 0,
                 dry_run=args.dry_run,
+                wait_for_completion=args.wait,
             )
 
         execute_cli_write(
