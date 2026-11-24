@@ -878,14 +878,6 @@ class CachedRecordsLoader:
             return 0
         return int(row["sync_epoch"])
 
-    def _get_local_record_ids(self, conn: sqlite3.Connection, study_key: str) -> set[int]:
-        """Return all locally cached record IDs for ``study_key``."""
-        rows = conn.execute(
-            "SELECT record_id FROM record_cache WHERE base_url = ? AND study_key = ?",
-            (self._base_url, study_key),
-        ).fetchall()
-        return {cast(int, row["record_id"]) for row in rows}
-
     def _get_local_record_metadata(
         self, conn: sqlite3.Connection, study_key: str
     ) -> dict[int, _LocalRecordMeta]:
@@ -921,29 +913,6 @@ class CachedRecordsLoader:
                 last_updated=_serialize_date_modified(row["last_updated"]),
             )
         return metadata
-
-    def _mark_study_syncing(self, conn: sqlite3.Connection, study_key: str) -> None:
-        """Mark ``study_key`` as actively syncing without modifying its watermark."""
-        with self._lock, conn:
-            conn.execute(
-                """
-                INSERT INTO study_sync_state (base_url, study_key, sync_epoch, status)
-                VALUES (?, ?, 0, ?)
-                ON CONFLICT(base_url, study_key) DO UPDATE SET
-                    status = excluded.status
-                """,
-                (self._base_url, study_key, StudySyncStatus.SYNCING.value),
-            )
-
-    def _complete_study_sync(
-        self,
-        conn: sqlite3.Connection,
-        study_key: str,
-        candidate_timestamps: Iterable[str | None],
-    ) -> None:
-        """Advance ``high_water_mark`` monotonically and record sync completion under lock."""
-        with self._lock, conn:
-            self._complete_study_sync_unlocked(conn, study_key, candidate_timestamps)
 
     def _complete_study_sync_unlocked(
         self,
@@ -1016,7 +985,7 @@ class CachedRecordsLoader:
             return [record for record in records if not is_record_deleted(record)]
 
         # Use >= to avoid missing updates that share the high-water-mark timestamp.
-        # _upsert_records keeps refresh idempotent by deduplicating on (base_url, study_key, record_id).
+        # _upsert_records_unlocked keeps refresh idempotent by deduplicating on (base_url, study_key, record_id).
         delta_filter = build_filter_string({"date_modified": (">=", high_water_mark)})
         return self._list_records_with_filter_override(
             study_key=study_key,
@@ -1027,11 +996,6 @@ class CachedRecordsLoader:
         """Fetch lightweight non-deleted Record projections for reconciliation and draft checks."""
         records = self._list_records(study_key=study_key, record_data_filter="none", deleted=False)
         return [record for record in records if not is_record_deleted(record)]
-
-    def _fetch_active_record_ids(self, study_key: str) -> set[int]:
-        """Fetch the set of all non-deleted record IDs for a study from the API using lightweight projection."""
-        records = self._fetch_active_records_projection(study_key)
-        return {record.record_id for record in records if record.record_id is not None}
 
     def _fetch_missing_records(self, study_key: str, missing_ids: set[int]) -> list[Record]:
         """Fetch full record payloads for upstream active IDs missing or stale in local cache."""
@@ -1096,11 +1060,6 @@ class CachedRecordsLoader:
             return _fetch_delta()
 
         return self._execute_with_retry_ownership(_fetch_delta)
-
-    def _upsert_records(self, conn: sqlite3.Connection, records: Iterable[Record]) -> None:
-        """Insert or update active records in the local SQLite cache stamped with a new sync epoch."""
-        with self._lock, conn:
-            self._upsert_records_unlocked(conn, records)
 
     def _upsert_records_unlocked(
         self,
