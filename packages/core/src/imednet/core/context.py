@@ -77,16 +77,45 @@ def security_key_context(security_key: str | None) -> Iterator[None]:
         reset_security_key_context(token)
 
 
+def _safe_context_attr(obj: Any, attr: str) -> Any:
+    """Read an attribute without invoking ``__getattr__`` on private names or spawning child mocks."""
+    if obj is None:
+        return None
+    if isinstance(obj, NonCallableMock):
+        try:
+            obj_dict = object.__getattribute__(obj, "__dict__")
+        except AttributeError:
+            return None
+        mock_children = obj_dict.get("_mock_children") or {}
+        if attr not in obj_dict and attr not in mock_children:
+            return None
+        return getattr(obj, attr, None)
+    if attr.startswith("_"):
+        try:
+            obj_dict = object.__getattribute__(obj, "__dict__")
+        except AttributeError:
+            obj_dict = None
+        if isinstance(obj_dict, dict) and attr in obj_dict:
+            return obj_dict[attr]
+        for cls in type(obj).__mro__:
+            if attr in cls.__dict__:
+                return getattr(obj, attr, None)
+        return None
+    return getattr(obj, attr, None)
+
+
 def extract_sdk_base_url(sdk: Any) -> str | None:
     """Extract a normalized string base URL from an SDK or client instance, if present."""
-    if sdk is None or isinstance(sdk, NonCallableMock):
+    if sdk is None:
         return None
     candidates = (
-        getattr(sdk, "_base_url", None),
-        getattr(sdk, "base_url", None),
-        getattr(getattr(sdk, "config", None), "base_url", None),
-        getattr(getattr(sdk, "_client", None), "base_url", None),
-        getattr(getattr(sdk, "_async_client", None), "base_url", None),
+        _safe_context_attr(sdk, "_base_url"),
+        _safe_context_attr(sdk, "base_url"),
+        _safe_context_attr(_safe_context_attr(sdk, "config"), "base_url"),
+        _safe_context_attr(_safe_context_attr(sdk, "_client"), "base_url"),
+        _safe_context_attr(_safe_context_attr(sdk, "_async_client"), "base_url"),
+        _safe_context_attr(_safe_context_attr(sdk, "client"), "base_url"),
+        _safe_context_attr(_safe_context_attr(sdk, "async_client"), "base_url"),
     )
     for candidate in candidates:
         if isinstance(candidate, str) and candidate.strip():
@@ -102,11 +131,21 @@ def extract_sdk_security_key(sdk: Any) -> str | None:
     if sdk is None:
         return None
     candidates = (
-        getattr(sdk, "_security_key", None),
-        getattr(getattr(sdk, "config", None), "security_key", None),
-        getattr(getattr(sdk, "auth", None), "security_key", None),
-        getattr(getattr(getattr(sdk, "_client", None), "auth", None), "security_key", None),
-        getattr(getattr(getattr(sdk, "_async_client", None), "auth", None), "security_key", None),
+        _safe_context_attr(sdk, "_security_key"),
+        _safe_context_attr(_safe_context_attr(sdk, "config"), "security_key"),
+        _safe_context_attr(_safe_context_attr(sdk, "auth"), "security_key"),
+        _safe_context_attr(
+            _safe_context_attr(_safe_context_attr(sdk, "_client"), "auth"), "security_key"
+        ),
+        _safe_context_attr(
+            _safe_context_attr(_safe_context_attr(sdk, "_async_client"), "auth"), "security_key"
+        ),
+        _safe_context_attr(
+            _safe_context_attr(_safe_context_attr(sdk, "client"), "auth"), "security_key"
+        ),
+        _safe_context_attr(
+            _safe_context_attr(_safe_context_attr(sdk, "async_client"), "auth"), "security_key"
+        ),
     )
     for candidate in candidates:
         if isinstance(candidate, str) and candidate.strip():

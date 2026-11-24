@@ -493,3 +493,117 @@ def test_sensitivity_registry_resyncs_collapsed_sets_after_direct_set_restore() 
     assert not registry.is_sensitive("subjectOid")
     assert not registry.is_exempt("custom_safe_id")
     assert not registry.is_exempt("CUSTOMSAFEID")
+
+
+def test_sanitize_diagnostic_text_masks_url_plain_filters_and_multiline_address_json() -> None:
+    """Mask PHI across URL filters, plain filter operators, multiline JSON, and custom registries."""
+    from imednet.utils.security import (
+        global_sensitivity_registry,
+        sanitize_diagnostic_payload,
+        sanitize_diagnostic_text,
+    )
+
+    custom_registry = SensitivityRegistry()
+    custom_registry.add_sensitive_key("medicalChartId")
+    custom_registry.add_sensitive_key("subject_key")  # Exempt key must remain unmasked
+
+    # 1. Plain filter operators: ==, !=, =~, <=, >=, <, >, =, :
+    plain_filters = (
+        "Filter failure study_key==STUDY-100;subject_key==SUBJ-200;record_id=300;"
+        "usubjid==USUBJ-400;subjid:SUBJID-500;studyid==STUDYID-600;"
+        'ssn==123-45-6789;patientName!="Jane Doe";email=~jane.doe@example.com;'
+        "dob>=1980-01-01;dob<=1990-12-31;brthyr>1975;brthyr<1995;"
+        "medicalChartId: CHART-9988"
+    )
+    sanitized_plain = sanitize_diagnostic_text(plain_filters, registry=custom_registry)
+    assert sanitized_plain.count("***MASKED***") >= 8
+    for leaked in (
+        "123-45-6789",
+        "Jane Doe",
+        "jane.doe@example.com",
+        "1980-01-01",
+        "1990-12-31",
+        "1975",
+        "1995",
+        "CHART-9988",
+    ):
+        assert leaked not in sanitized_plain
+    for preserved in (
+        "STUDY-100",
+        "SUBJ-200",
+        "300",
+        "USUBJ-400",
+        "SUBJID-500",
+        "STUDYID-600",
+    ):
+        assert preserved in sanitized_plain
+
+    # 2. Multiline "address" JSON (valid outer JSON, key-prefixed fragment, and multiline string)
+    multiline_json_log = """Validation error payload={
+  "study_key": "STUDY-100",
+  "subject_key": "SUBJ-200",
+  "record_id": 300,
+  "usubjid": "USUBJ-400",
+  "subjid": "SUBJID-500",
+  "studyid": "STUDYID-600",
+  "patientName": "Homer Simpson",
+  "ssn": "123-45-6789",
+  "email": "homer@example.com",
+  "medical_chart_id": "CHART-1122",
+  "address": {
+    "street": "742 Evergreen Terrace",
+    "city": "Springfield",
+    "postalCode": "62704"
+  }
+}"""
+    sanitized_json = sanitize_diagnostic_text(multiline_json_log, registry=custom_registry)
+    assert '"address": "***MASKED***"' in sanitized_json
+    for leaked in (
+        "Homer Simpson",
+        "123-45-6789",
+        "homer@example.com",
+        "CHART-1122",
+        "742 Evergreen Terrace",
+        "Springfield",
+        "62704",
+    ):
+        assert leaked not in sanitized_json
+    for preserved in ("STUDY-100", "SUBJ-200", "USUBJ-400", "SUBJID-500", "STUDYID-600"):
+        assert preserved in sanitized_json
+
+    fragment_and_multiline_str = (
+        'Fragment "address": {\n  "street": "221B Baker St",\n  "city": "London"\n} '
+        'and multiline "address": "1600 Pennsylvania Ave\nWashington, DC"'
+    )
+    sanitized_frag = sanitize_diagnostic_text(fragment_and_multiline_str, registry=custom_registry)
+    assert "221B Baker St" not in sanitized_frag
+    assert "London" not in sanitized_frag
+    assert "1600 Pennsylvania Ave" not in sanitized_frag
+    assert sanitized_frag.count("***MASKED***") == 2
+
+    # 3. URL filter & recordDataFilter alongside credentials
+    url_log = (
+        "GET https://edc.example.com/api/v1/edc/studies/STUDY-100/records"
+        "?api_key=sec-999&filter=ssn%3D%3D123-45-6789%3BsubjectKey%3D%3DSUBJ-200"
+        "&recordDataFilter=patientName%3D%3D%22Jane+Doe%22%3Bemail%3D~jane%40example.com "
+        "Authorization: Bearer tok-abc"  # pragma: allowlist secret
+    )
+    sanitized_url_log = sanitize_diagnostic_text(url_log, registry=custom_registry)
+    assert "api_key=***" in sanitized_url_log
+    assert "Authorization: ***" in sanitized_url_log
+    assert "***MASKED***" in sanitized_url_log
+    assert "SUBJ-200" in sanitized_url_log
+    for leaked in ("sec-999", "tok-abc", "123-45-6789", "Jane", "Doe", "jane"):
+        assert leaked not in sanitized_url_log
+
+    # 4. Indirect field target dict and global registry isolation
+    indirect = {
+        "error": [
+            {"variable": "ssn", "value": "123-45-6789"},
+            {"variable": "subject_key", "value": "SUBJ-200"},
+        ]
+    }
+    sanitized_indirect = sanitize_diagnostic_payload(indirect, registry=custom_registry)
+    assert sanitized_indirect["error"][0]["value"] == "***MASKED***"
+    assert sanitized_indirect["error"][1]["value"] == "SUBJ-200"
+    assert not global_sensitivity_registry.is_sensitive("medicalChartId")
