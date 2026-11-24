@@ -29,12 +29,14 @@ logger = logging.getLogger(__name__)
 _TABULAR_EXPORTS = {
     "csv": export.export_to_csv,
     "parquet": export.export_to_parquet,
+    "hive_parquet": export.export_to_hive_parquet,
     "excel": export.export_to_excel,
     "json": export.export_to_json,
     "sql": export.export_to_sql,
     "sql_by_form": export.export_to_sql_by_form,
     "long_sql": export.export_to_long_sql,
     "duckdb": export.export_to_duckdb,
+    "duckdb_by_form": export.export_to_duckdb_by_form,
 }
 
 _SECRET_EXPORT_KEYS = frozenset(
@@ -788,7 +790,7 @@ class ImednetExportOperator(BaseOperator):
             ).strip()
             raw_name = f"{database}.{collection}" if database else collection
             outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(raw_name)))
-        elif dest == "duckdb":
+        elif dest in {"duckdb", "duckdb_by_form"}:
             raw_db_path = str(
                 self.output_path
                 or runtime_kwargs.get("db_path")
@@ -801,7 +803,7 @@ class ImednetExportOperator(BaseOperator):
                 runtime_kwargs.get("table_name")
                 or runtime_kwargs.get("table")
                 or conn_settings.get("table_name")
-                or "records"
+                or ("forms" if dest == "duckdb_by_form" else "records")
             ).strip()
             raw_name = f"{safe_db_path}.{table_target}" if safe_db_path else table_target
             outputs.append(dataset_cls(namespace="duckdb", name=_sanitize_lineage_text(raw_name)))
@@ -974,6 +976,38 @@ class ImednetExportOperator(BaseOperator):
                     self._build_tabular_kwargs(runtime_kwargs, dest=dest),
                     implicit_quality_gate=implicit_gate,
                 )
+                if dest == "duckdb_by_form":
+                    conn_settings = self._resolve_destination_connection(dest)
+                    db_path_arg = (
+                        self.output_path
+                        or tabular_kwargs.pop("db_path", None)
+                        or tabular_kwargs.pop("path", None)
+                        or conn_settings.get("db_path")
+                    )
+                    if db_path_arg is not None:
+                        _validate_no_secrets_in_value(db_path_arg, field_name="output_path")
+                    export_callable(
+                        sdk,
+                        self.study_key,
+                        db_path_arg,
+                        **tabular_kwargs,
+                    )
+                    return redact_uri(str(db_path_arg)) if db_path_arg is not None else None
+                if dest == "hive_parquet":
+                    base_dir_arg = (
+                        self.output_path
+                        or tabular_kwargs.pop("base_dir", None)
+                        or tabular_kwargs.pop("path", None)
+                    )
+                    if base_dir_arg is not None:
+                        _validate_no_secrets_in_value(base_dir_arg, field_name="output_path")
+                    export_callable(
+                        sdk,
+                        self.study_key,
+                        base_dir_arg,
+                        **tabular_kwargs,
+                    )
+                    return redact_uri(str(base_dir_arg)) if base_dir_arg is not None else None
                 if dest == "duckdb":
                     conn_settings = self._resolve_destination_connection(dest)
                     db_path_arg = (

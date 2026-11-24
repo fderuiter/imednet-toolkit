@@ -1763,3 +1763,126 @@ def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.Monkey
         quality_gate_enabled=False,
     )
     assert res_long == "override_long_records"
+
+
+def test_operator_sdtm_phi_redaction_and_incremental_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ImednetExportOperator preserves BRTHDTC='1981'/None and reconciles incremental SDTM deltas."""
+    import json
+    from datetime import UTC, datetime
+
+    import pandas as pd
+
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    study_key = "STUDY_AF_SDTM"
+    upstream = {
+        1: Record(
+            record_id=1,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=301,
+            form_key="F_DM",
+            deleted=False,
+            date_modified=datetime(2026, 6, 1, 10, 0, tzinfo=UTC),
+            record_data={"BRTHDTC": "1981-05-14", "patientName": "Hidden Name"},
+        ),
+        2: Record(
+            record_id=2,
+            study_key=study_key,
+            subject_key="S02",
+            form_id=301,
+            form_key="F_DM",
+            deleted=False,
+            date_modified=datetime(2026, 6, 1, 10, 1, tzinfo=UTC),
+            record_data={"BRTHDTC": None, "patientName": "Hidden Name 2"},
+        ),
+    }
+
+    sdk = MagicMock(sinks=None)
+    forms = [Form(form_id=301, form_key="F_DM", form_name="Demographics", form_type="Enrollment")]
+    variables = [
+        Variable(
+            variable_id=1,
+            variable_name="BRTHDTC",
+            variable_type="text",
+            form_id=301,
+            form_key="F_DM",
+        ),
+        Variable(
+            variable_id=2,
+            variable_name="patientName",
+            variable_type="text",
+            form_id=301,
+            form_key="F_DM",
+        ),
+    ]
+    sdk.forms.list.return_value = forms
+    sdk.get_forms.return_value = forms
+    sdk.variables.list.return_value = variables
+    sdk.get_variables.return_value = variables
+    sdk.get_intervals.return_value = []
+    sdk.records.list.side_effect = lambda **_kw: iter(
+        [r.model_copy(deep=True) for r in upstream.values()]
+    )
+
+    ledger_path = tmp_path / "af_sdtm_ledger.json"
+    xl_path = tmp_path / "af_sdtm.xlsx"
+    json_path = tmp_path / "af_sdtm.json"
+
+    for dest, out_path in [("excel", xl_path), ("json", json_path)]:
+        op = ImednetExportOperator(
+            task_id=f"af_sdtm_{dest}_1",
+            study_key=study_key,
+            destination=dest,
+            output_path=str(out_path),
+            as_sdtm=True,
+            mask_phi=True,
+            incremental=True,
+            stream_name=f"af_{dest}",
+            ledger_path=str(ledger_path),
+        )
+        monkeypatch.setattr(op, "_get_sdk", lambda: sdk)
+        op.execute({"run_id": "r1"})
+
+    xl_rows = pd.read_excel(xl_path, dtype=str).to_dict(orient="records")
+    by_subj_xl = {r["USUBJID"]: r for r in xl_rows}
+    assert by_subj_xl["S01"]["BRTHDTC"] == "1981"
+    assert pd.isna(by_subj_xl["S02"]["BRTHDTC"])
+    assert "recordId" not in by_subj_xl["S01"]
+
+    json_rows = json.loads(json_path.read_text(encoding="utf-8"))
+    by_subj_json = {r["USUBJID"]: r for r in json_rows}
+    assert by_subj_json["S01"]["BRTHDTC"] == "1981"
+    assert by_subj_json["S02"]["BRTHDTC"] is None
+
+    # Void S02 on Run 2 and verify incremental reconciliation removes it cleanly
+    upstream[2].deleted = True
+    upstream[2].date_modified = datetime(2026, 6, 2, 12, 0, tzinfo=UTC)
+    for dest, out_path in [("excel", xl_path), ("json", json_path)]:
+        op2 = ImednetExportOperator(
+            task_id=f"af_sdtm_{dest}_2",
+            study_key=study_key,
+            destination=dest,
+            output_path=str(out_path),
+            as_sdtm=True,
+            mask_phi=True,
+            incremental=True,
+            stream_name=f"af_{dest}",
+            ledger_path=str(ledger_path),
+        )
+        monkeypatch.setattr(op2, "_get_sdk", lambda: sdk)
+        op2.execute({"run_id": "r2"})
+
+    xl_rows2 = pd.read_excel(xl_path, dtype=str).to_dict(orient="records")
+    assert len(xl_rows2) == 1 and xl_rows2[0]["USUBJID"] == "S01"
+    assert xl_rows2[0]["BRTHDTC"] == "1981"
+
+    json_rows2 = json.loads(json_path.read_text(encoding="utf-8"))
+    assert len(json_rows2) == 1 and json_rows2[0]["USUBJID"] == "S01"
+    assert json_rows2[0]["BRTHDTC"] == "1981"

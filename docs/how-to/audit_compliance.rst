@@ -180,7 +180,7 @@ alongside synchronous or asynchronous SDK endpoints:
    reset_default_simulation_state()
    audit_trail = extract_verified_audit_trail("STUDY")
    form_revisions = asyncio.run(stream_form_revisions_async("STUDY"))
-   assert len(audit_trail) == 2
+   assert len(audit_trail) == 3
    assert all(rev.user == "sim_user" for rev in audit_trail)
    assert len(form_revisions) == 1
    assert form_revisions[0].form_key == "F_VS"

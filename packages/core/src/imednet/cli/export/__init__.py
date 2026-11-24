@@ -12,6 +12,7 @@ from ...endpoints.records import RecordsEndpoint
 from ...integrations.sink_base import normalize_watermark_datetime
 from ...models.records import Record
 from ...sdk import ImednetSDK
+from ...spi.models import PROFILE_REGISTRY
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import (
     add_no_interactive,
@@ -142,7 +143,7 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--standards-profile",
         dest="standards_profile",
-        choices=["general", "drug", "device"],
+        choices=PROFILE_REGISTRY.list_profiles(),
         default=None,
         help="CDISC standards readiness profile used to validate study batches.",
     )

@@ -1,6 +1,6 @@
 """Supported core capabilities for external export sink implementations."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from imednet.integrations.enrichment import (
@@ -20,10 +20,15 @@ from imednet.integrations.sink_base import (
     _require_optional_dep,
     apply_quality_gate,
     bind_sdtm_stream_metadata,
+    build_form_sdtm_domain_map,
+    commit_sdtm_lineage,
+    deduplicate_sdtm_rows,
     evaluate_standards_readiness,
     extract_record_form_ref,
     extract_record_id,
     extract_record_timestamp,
+    extract_sdtm_composite_key,
+    filter_forms_by_sdtm_domain,
     get_state_provider,
     is_incremental_sink_config,
     is_record_deleted,
@@ -31,7 +36,10 @@ from imednet.integrations.sink_base import (
     iter_filtered_sdk_records,
     normalize_sink_value,
     redact_batch_records,
+    rehydrate_sdtm_lineage,
+    resolve_form_sdtm_domain,
     resolve_max_buffered_records,
+    resolve_voided_sdtm_keys,
     run_streaming_export,
     validate_max_buffered_records,
 )
@@ -57,11 +65,16 @@ __all__ = [
     "StateProviderProtocol",
     "apply_quality_gate",
     "bind_sdtm_stream_metadata",
+    "build_form_sdtm_domain_map",
     "build_sink_mapper",
+    "commit_sdtm_lineage",
+    "deduplicate_sdtm_rows",
     "evaluate_standards_readiness",
     "extract_record_form_ref",
     "extract_record_id",
     "extract_record_timestamp",
+    "extract_sdtm_composite_key",
+    "filter_forms_by_sdtm_domain",
     "format_variable_name",
     "get_sdtm_domain_variables",
     "get_state_provider",
@@ -73,11 +86,14 @@ __all__ = [
     "normalize_sink_value",
     "redact_batch_records",
     "redact_uri",
+    "rehydrate_sdtm_lineage",
     "require_optional_dep",
     "resolve_enrichment_pipeline",
+    "resolve_form_sdtm_domain",
     "resolve_max_buffered_records",
     "resolve_sdtm_domain",
     "resolve_study_configuration",
+    "resolve_voided_sdtm_keys",
     "run_streaming_export",
     "transform_records_to_sdtm",
     "transform_records_to_sdtm_rows",
@@ -91,6 +107,10 @@ def build_sink_mapper(
     mode: str = "document",
     post_processor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     seq_counters: dict[str, int] | None = None,
+    domain_seq_counters: dict[str, dict[str, int]] | None = None,
+    form_domain_map: Mapping[Any, str] | None = None,
+    seq_overrides: Mapping[str, int] | None = None,
+    lineage_out: dict[str, dict[str, Any]] | None = None,
     record_seqs: dict[str, int] | None = None,
     preserve_record_id: bool | None = None,
 ) -> CentralizedMapper:
@@ -111,6 +131,10 @@ def build_sink_mapper(
         as_sdtm=bool(getattr(config, "as_sdtm", False)),
         sdtm_domain=getattr(config, "sdtm_domain", None),
         seq_counters=seq_counters,
+        domain_seq_counters=domain_seq_counters,
+        form_domain_map=form_domain_map,
+        seq_overrides=seq_overrides,
+        lineage_out=lineage_out,
         record_seqs=record_seqs,
         preserve_record_id=effective_preserve_record_id,
     )

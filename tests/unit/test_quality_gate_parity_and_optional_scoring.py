@@ -1023,12 +1023,12 @@ def test_simulation_transport_sparse_optional_records_export_and_advance_waterma
             ledger_path=str(ledger_path),
         )
 
-    assert sorted(pd.read_csv(sim_csv)["recordId"].tolist()) == [601, 602]
+    assert sorted(pd.read_csv(sim_csv)["recordId"].tolist()) == [600, 601, 602]
     with sqlite3.connect(sim_sql) as scon:
         assert [
             r[0]
             for r in scon.execute('SELECT "recordId" FROM "records" ORDER BY "recordId"').fetchall()
-        ] == [601, 602]
+        ] == [600, 601, 602]
 
     ledger = FileStateProvider(str(ledger_path))
     assert ledger.get_last_timestamp("STUDY", "sim_csv") == datetime(2026, 1, 10, 9, 35, tzinfo=UTC)

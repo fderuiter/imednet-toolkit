@@ -110,8 +110,9 @@ so ``test_connection()`` and ``dag.test()`` resolve database-stored
 - ``describe_connection()`` returns redacted connection metadata and never exposes
   raw credentials.
 - ``resolve_destination_connection()`` resolves runtime destination connection
-  settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb``, and ``sql``
-  (including ``sql_by_form`` and ``long_sql``) targets.
+  settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb`` (including
+  ``duckdb_by_form``), and ``sql`` (including ``sql_by_form`` and ``long_sql``)
+  targets.
 
 Operators and Sensors
 ---------------------

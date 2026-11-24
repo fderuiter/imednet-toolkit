@@ -167,7 +167,7 @@ def test_simulation_codings_and_record_revisions_routes():
         assert all(c.study_key == "DEMO-STUDY" for c in fallback_codings)
 
         revisions = list(sdk.record_revisions.list(study_key="STUDY"))
-        assert len(revisions) == 2
+        assert len(revisions) == 3
         rev = sdk.record_revisions.get(study_key="STUDY", item_id=1201)
         assert rev.record_revision_id == 1201
         assert rev.record_id == 601
@@ -248,10 +248,10 @@ def test_simulation_strict_mode_zero_additive_drift():
         assert len(list(sdk.studies.list())) == 3
         assert len(list(sdk.sites.list(study_key="STUDY"))) >= 1
         assert len(list(sdk.subjects.list(study_key="STUDY"))) >= 1
-        assert len(list(sdk.forms.list(study_key="STUDY"))) == 2
+        assert len(list(sdk.forms.list(study_key="STUDY"))) == 3
         assert len(list(sdk.visits.list(study_key="STUDY"))) == 2
-        assert len(list(sdk.records.list(study_key="STUDY"))) == 2
-        assert len(list(sdk.record_revisions.list(study_key="STUDY"))) == 2
+        assert len(list(sdk.records.list(study_key="STUDY"))) == 3
+        assert len(list(sdk.record_revisions.list(study_key="STUDY"))) == 3
         assert len(list(sdk.codings.list(study_key="STUDY"))) == 2
         assert len(list(sdk.queries.list(study_key="STUDY"))) == 2
         assert len(list(sdk.intervals.list(study_key="STUDY"))) == 1
@@ -273,7 +273,7 @@ def test_simulation_filter_operators_quotes_and_connectors():
 
         # Comparison operators (<, <=, >, >=, !=) on numeric formId and distinct AND attributes
         gt_forms = list(sdk.forms.list(study_key="STUDY", form_id=(">", 301)))
-        assert [f.form_key for f in gt_forms] == ["F_VS"]
+        assert [f.form_key for f in gt_forms] == ["F_VS", "F_AE"]
 
         ge_and_key_forms = list(
             sdk.forms.list(study_key="STUDY", form_id=(">=", 301), form_key="F_DM")
@@ -307,7 +307,7 @@ def test_simulation_filter_operators_quotes_and_connectors():
         assert [f.form_key for f in le_forms] == ["F_DM"]
 
         ne_forms = list(sdk.forms.list(study_key="STUDY", form_id=("!=", 301)))
-        assert [f.form_key for f in ne_forms] == ["F_VS"]
+        assert [f.form_key for f in ne_forms] == ["F_VS", "F_AE"]
 
         # Regex / contains operator (=~) via HTTP transport filter
         regex_resp = client.get(
@@ -445,7 +445,7 @@ def test_simulation_record_data_filter_and_missing_keys():
 
         # record_data_filter="none" projects records with wire recordData=None (normalized to {} on Record)
         projected = list(sdk.records.list(study_key="STUDY", record_data_filter="none"))
-        assert len(projected) == 3
+        assert len(projected) == 4
         assert all(r.record_data == {} for r in projected)
 
         client = httpx.Client(transport=transport, base_url="https://sim.local")
@@ -454,7 +454,7 @@ def test_simulation_record_data_filter_and_missing_keys():
             params={"recordDataFilter": "none", "sort": "recordData.V_WEIGHT,desc"},
         )
         assert sorted_proj_resp.status_code == 200
-        assert [r["recordId"] for r in sorted_proj_resp.json()["data"]] == [603, 602, 601]
+        assert [r["recordId"] for r in sorted_proj_resp.json()["data"]] == [603, 602, 601, 600]
         assert all(r["recordData"] is None for r in sorted_proj_resp.json()["data"])
 
 
@@ -492,8 +492,8 @@ def test_simulation_sort_and_pagination_metadata_envelopes():
     assert "totalItems" not in pagination_p0
     assert pagination_p0["currentPage"] == 0
     assert pagination_p0["size"] == 1
-    assert pagination_p0["totalPages"] == 2
-    assert pagination_p0["totalElements"] == 2
+    assert pagination_p0["totalPages"] == 3
+    assert pagination_p0["totalElements"] == 3
     assert pagination_p0["sort"] == [{"property": "recordId", "direction": "DESC"}]
     assert [r["recordId"] for r in body_p0["data"]] == [602]
 
@@ -501,8 +501,8 @@ def test_simulation_sort_and_pagination_metadata_envelopes():
     parsed_env = ApiResponse[list[Record]].model_validate(body_p0)
     assert parsed_env.pagination is not None
     assert parsed_env.pagination.current_page == 0
-    assert parsed_env.pagination.total_elements == 2
-    assert parsed_env.pagination.total_pages == 2
+    assert parsed_env.pagination.total_elements == 3
+    assert parsed_env.pagination.total_pages == 3
     assert parsed_env.pagination.sort[0].property == "recordId"
     assert parsed_env.pagination.sort[0].direction == "DESC"
 
@@ -605,7 +605,7 @@ async def test_async_sdk_simulation_mode():
             assert whodrug[0].dictionary_name == "WHODrug"
 
             initial_revisions = [r async for r in sdk.record_revisions.list(study_key="STUDY")]
-            assert len(initial_revisions) == 2
+            assert len(initial_revisions) == 3
 
             # Record creation appends record and audit revision
             records = [r async for r in sdk.records.list(study_key="STUDY")]
@@ -760,7 +760,7 @@ def test_simulation_filter_sort_and_state_edge_cases():
                 "/api/v1/edc/studies/STUDY/forms", params={"filter": "formId!=notanumber"}
             ).json()["data"]
         )
-        == 2
+        == 3
     )
 
     # Multi-field sort (;), colon direction (:), default ASC, ISO sort, and missing recordData sort
@@ -769,7 +769,7 @@ def test_simulation_filter_sort_and_state_edge_cases():
         params={"sort": "deleted;dateCreated:desc;V_AGE,asc", "page": "invalid", "size": "-5"},
     )
     assert sort_resp.status_code == 200
-    assert [r["recordId"] for r in sort_resp.json()["data"]] == [602, 601]
+    assert [r["recordId"] for r in sort_resp.json()["data"]] == [602, 601, 600]
 
     # Empty result pagination, variables/jobs/direct-jobs/fallback routes, single-dict POST
     empty_resp = client.get(
@@ -1093,8 +1093,8 @@ async def test_simulation_strict_mode_validation():
         records = list(sdk.records.list(study_key="STUDY"))
         revisions = list(sdk.record_revisions.list(study_key="STUDY"))
         assert len(subjects) == 2
-        assert len(records) == 3
-        assert len(revisions) == 4
+        assert len(records) == 4
+        assert len(revisions) == 5
 
         async with AsyncImednetSDK(transport=transport, simulation_mode=True) as async_sdk:
             async_subjects = [s async for s in async_sdk.subjects.list(study_key="STUDY")]
@@ -1103,8 +1103,8 @@ async def test_simulation_strict_mode_validation():
                 rev async for rev in async_sdk.record_revisions.list(study_key="STUDY")
             ]
             assert len(async_subjects) == 2
-            assert len(async_records) == 3
-            assert len(async_revisions) == 4
+            assert len(async_records) == 4
+            assert len(async_revisions) == 5
 
 
 @pytest.mark.asyncio
@@ -1136,7 +1136,7 @@ async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
 
         # 2. UpdateScheduledRecordRequest updates existing scheduled record (602, Baseline) in place
         before_study_records = list(sdk.records.list(study_key="STUDY"))
-        assert len(before_study_records) == 2
+        assert len(before_study_records) == 3
 
         sched_update = UpdateScheduledRecordRequest(
             subjectKey="SUB1",
@@ -1149,7 +1149,7 @@ async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
             records_data=[sched_update.model_dump(by_alias=True)],
         )
         after_sched_update = list(sdk.records.list(study_key="STUDY"))
-        assert len(after_sched_update) == 2
+        assert len(after_sched_update) == 3
         updated_602 = sdk.records.get(study_key="STUDY", item_id=602)
         assert updated_602.record_data["V_WEIGHT"] == 71.5
         assert updated_602.interval_id == 501
@@ -1168,7 +1168,7 @@ async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
             records_data=[followup_req.model_dump(by_alias=True)],
         )
         records_with_followup = list(sdk.records.list(study_key="STUDY"))
-        assert len(records_with_followup) == 3
+        assert len(records_with_followup) == 4
         followup_rec = next(r for r in records_with_followup if r.interval_id == 502)
         assert followup_rec.visit_id == 402
         assert followup_rec.subject_id == 201
@@ -1202,7 +1202,7 @@ async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
             )
 
             final_records = [r async for r in async_sdk.records.list(study_key="STUDY")]
-            assert len(final_records) == 5
+            assert len(final_records) == 6
             unscheduled_records = [r for r in final_records if r.interval_id is None]
             assert len(unscheduled_records) == 2
             assert all(r.visit_id is None for r in unscheduled_records)
@@ -1220,8 +1220,8 @@ async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
             demo_revisions = [
                 rev async for rev in async_sdk.record_revisions.list(study_key="DEMO-STUDY")
             ]
-            assert len(demo_revisions) == 3
-            assert [r.subject_id for r in demo_revisions] == [202, 202, 203]
+            assert len(demo_revisions) == 4
+            assert [r.subject_id for r in demo_revisions] == [202, 202, 202, 203]
             validate_record_revision_chain(demo_revisions)
             validate_record_revision_chain(study_revisions)
 
@@ -1258,8 +1258,8 @@ async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
         state.reset()
         assert state._job_poll_counts == {}
         assert state._next_subject_id == 202
-        assert state._next_revision_id == 1202
-        assert len(state.record_revisions) == 2
+        assert state._next_revision_id == 1203
+        assert len(state.record_revisions) == 3
 
 
 def test_simulation_study_coherent_foreign_keys_and_cleared_fixtures():
@@ -1295,13 +1295,14 @@ def test_simulation_study_coherent_foreign_keys_and_cleared_fixtures():
             assert all(v.subject_id == subj_id for v in visits)
 
             records = list(sdk.records.list(study_key=study_key, subject_key=subj_key))
-            assert len(records) == 2
+            assert len(records) == 3
             assert all(r.site_id == site_id and r.subject_id == subj_id for r in records)
             dm_rec = next(r for r in records if r.form_key == "F_DM")
-            assert dm_rec.record_data == {"V_AGE": 45, "V_GENDER": "Female"}
+            assert dm_rec.record_data["V_AGE"] == 45
+            assert dm_rec.record_data["V_GENDER"] == "Female"
 
             revisions = list(sdk.record_revisions.list(study_key=study_key))
-            assert len(revisions) == 2
+            assert len(revisions) == 3
             assert all(
                 rev.site_id == site_id and rev.subject_id == subj_id and rev.subject_key == subj_key
                 for rev in revisions
@@ -1389,13 +1390,13 @@ def test_simulation_create_records_materializes_unseeded_study_and_isolates_jobs
         assert {s.subject_key for s in my_subjects} == {"SUB1", "SUBJ-1001"}
 
         my_records = list(sdk.records.list(study_key="MY_STUDY"))
-        assert len(my_records) == 3
+        assert len(my_records) == 4
         updated_vs = next(r for r in my_records if r.record_id == 602)
         assert updated_vs.record_data["V_WEIGHT"] == 77.5
         assert updated_vs.site_id == 103
 
         my_revisions = list(sdk.record_revisions.list(study_key="MY_STUDY"))
-        assert len(my_revisions) == 4
+        assert len(my_revisions) == 5
         validate_record_revision_chain(my_revisions)
 
         # BATCH-* job created in STUDY returns 404 in DEMO-STUDY and MY_STUDY, while /jobs/{batchId} works
@@ -1467,7 +1468,7 @@ def test_simulation_workflows_subject_data_and_queries_by_site():
                 assert bundle.subject_details is not None
                 assert bundle.subject_details.site_name == expected_site
                 assert len(bundle.visits) == 2
-                assert len(bundle.records) == 2
+                assert len(bundle.records) == 3
                 assert len(bundle.queries) == 2
 
             query_wf = QueryManagementWorkflow(sdk)

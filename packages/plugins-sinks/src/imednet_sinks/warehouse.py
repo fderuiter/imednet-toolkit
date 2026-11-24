@@ -102,9 +102,15 @@ from imednet.spi.sinks import (
     apply_quality_gate,
     bind_sdtm_stream_metadata,
     build_sink_mapper,
+    commit_sdtm_lineage,
+    deduplicate_sdtm_rows,
     extract_record_id,
     format_variable_name,
+    is_incremental_sink_config,
     normalize_sink_value,
+    redact_batch_records,
+    rehydrate_sdtm_lineage,
+    resolve_voided_sdtm_keys,
     run_streaming_export,
 )
 from imednet.spi.utils import flatten, global_sensitivity_registry, mask_clinical_phi
@@ -621,7 +627,7 @@ def _post_process_warehouse_sdtm(
     """Normalize and validate an SDTM domain row for Snowflake Parquet staging."""
     normalized = _normalize_warehouse_value(row)
     if mask_phi and not _already_masked:
-        normalized = mask_clinical_phi(normalized)
+        normalized = redact_batch_records(normalized, mask_phi=True, as_sdtm=True)
     cleaned: dict[str, Any] = {}
     for col, val in normalized.items():
         if not isinstance(col, str) or not _IDENTIFIER_PATTERN.match(col):
@@ -857,16 +863,27 @@ def _resolve_merge_keys(
     *,
     as_sdtm: bool = False,
     naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
 ) -> tuple[str, ...]:
     """Resolve Snowflake ``MERGE INTO`` natural key columns for the active schema mode."""
     col_set = set(columns)
     if as_sdtm:
         if "STUDYID" in col_set and "RECORD_ID" in col_set:
             return ("STUDYID", "RECORD_ID")
-        seq_col = next(
-            (c for c in columns if c.endswith("SEQ") and c not in ("STUDYID", "DOMAIN", "USUBJID")),
-            None,
-        )
+        dom_upper = sdtm_domain.strip().upper() if isinstance(sdtm_domain, str) else ""
+        if dom_upper == "DM":
+            seq_col: str | None = None
+        elif dom_upper and f"{dom_upper}SEQ" in col_set:
+            seq_col = f"{dom_upper}SEQ"
+        else:
+            seq_col = next(
+                (
+                    c
+                    for c in columns
+                    if c.endswith("SEQ") and c not in ("STUDYID", "DOMAIN", "USUBJID", "DMSEQ")
+                ),
+                None,
+            )
         candidates = (
             ("STUDYID", "DOMAIN", "USUBJID", seq_col)
             if seq_col is not None
@@ -879,6 +896,60 @@ def _resolve_merge_keys(
     if naming_convention == "sdtm":
         return ("STUDYID", "RECORD_ID")
     return ("study_key", "record_id")
+
+
+def _resolve_sdtm_domain_merge_partitions(
+    arrow_table: Any,
+    merge_columns: Sequence[str],
+    *,
+    sdtm_domain: str | None = None,
+) -> list[tuple[str | None, tuple[str, ...]]]:
+    """Resolve ``(domain_filter, merge_keys)`` partitions for single- or mixed-domain SDTM merges."""
+    if "STUDYID" in merge_columns and "RECORD_ID" in merge_columns:
+        return [(None, ("STUDYID", "RECORD_ID"))]
+
+    domains_in_batch: list[str] = []
+    seen_domains: set[str] = set()
+    col_names = getattr(arrow_table, "column_names", ())
+    if (
+        isinstance(col_names, (list, tuple))
+        and "DOMAIN" in col_names
+        and hasattr(arrow_table, "column")
+    ):
+        try:
+            for val in arrow_table.column("DOMAIN").to_pylist():
+                if val is not None:
+                    dom_str = str(val).strip().upper()
+                    if dom_str and dom_str not in seen_domains:
+                        seen_domains.add(dom_str)
+                        domains_in_batch.append(dom_str)
+        except Exception:
+            domains_in_batch = []
+
+    if len(domains_in_batch) <= 1:
+        single_dom = domains_in_batch[0] if domains_in_batch else sdtm_domain
+        return [
+            (
+                None,
+                _resolve_merge_keys(
+                    merge_columns,
+                    as_sdtm=True,
+                    sdtm_domain=single_dom,
+                ),
+            )
+        ]
+
+    return [
+        (
+            dom,
+            _resolve_merge_keys(
+                merge_columns,
+                as_sdtm=True,
+                sdtm_domain=dom,
+            ),
+        )
+        for dom in domains_in_batch
+    ]
 
 
 def _records_to_arrow_table(
@@ -948,6 +1019,7 @@ def _records_to_arrow_table(
                 as_sdtm=True,
                 sdtm_domain=sdtm_domain,
             )
+            raw_rows = deduplicate_sdtm_rows(mapper.map_batch(records, study_key=study_key))
         else:
             post_proc = (
                 _make_mapped_post_proc(False, mapper_convention)
@@ -960,9 +1032,25 @@ def _records_to_arrow_table(
                 mask_phi=mask_phi,
                 naming_convention=None if is_default_conv else mapper_convention,
             )
-        raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+            raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
     elif mapper_as_sdtm:
-        mapped_rows = [mapper.map_record(r, study_key=study_key) for r in records]
+        if isinstance(mapper, CentralizedMapper):
+            raw_sdtm = mapper.map_batch(records, study_key=study_key)
+        else:
+            raw_sdtm = [mapper.map_record(r, study_key=study_key) for r in records]
+        if raw_sdtm and "RECORD_ID" in raw_sdtm[0]:
+            dedup_by_rec: dict[tuple[Any, Any], int] = {}
+            staged_sdtm: list[dict[str, Any] | None] = []
+            for r_row in raw_sdtm:
+                rk = (r_row.get("STUDYID"), r_row.get("RECORD_ID"))
+                if rk[1] is not None and rk in dedup_by_rec:
+                    staged_sdtm[dedup_by_rec[rk]] = None
+                if rk[1] is not None:
+                    dedup_by_rec[rk] = len(staged_sdtm)
+                staged_sdtm.append(r_row)
+            mapped_rows = [r_row for r_row in staged_sdtm if r_row is not None]
+        else:
+            mapped_rows = deduplicate_sdtm_rows(raw_sdtm)
         orig_post_proc = getattr(mapper, "post_processor", None)
         if getattr(orig_post_proc, "func", orig_post_proc) is _post_process_warehouse_sdtm:
             raw_rows = mapped_rows
@@ -1050,6 +1138,7 @@ class SnowflakeExportSink(ExportSink):
         ImportError: When ``snowflake-connector-python`` or ``pyarrow`` are not installed.
     """
 
+    _delegates_sdtm_redaction = True
     reconciles_deleted_on_full_sync = True
 
     def __init__(self, config: SnowflakeSinkConfig) -> None:
@@ -1061,6 +1150,7 @@ class SnowflakeExportSink(ExportSink):
         super().__init__(config)
         self._cfg: SnowflakeSinkConfig = config
         self._seq_counters: dict[str, int] = {}
+        self._domain_seq_counters: dict[str, dict[str, int]] = {}
         self._record_seqs: dict[str, int] = {}
         self._conn: Any = None
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
@@ -1202,7 +1292,14 @@ class SnowflakeExportSink(ExportSink):
             if not active_records:
                 return 0
 
+        lineage_out: dict[str, dict[str, Any]] = {}
+        seq_overrides: dict[str, int] | None = None
         if cfg.as_sdtm:
+            rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
+            for dom_code, subj_map in rehydrated_counters.items():
+                local_map = self._domain_seq_counters.setdefault(dom_code, {})
+                for subj_key, wm_val in subj_map.items():
+                    local_map[subj_key] = max(local_map.get(subj_key, 0), wm_val)
             post_proc: Any = functools.partial(
                 _post_process_warehouse_sdtm,
                 mask_phi=self.config.mask_phi,
@@ -1225,7 +1322,13 @@ class SnowflakeExportSink(ExportSink):
             cfg,
             mode="tabular",
             post_processor=post_proc,
-            seq_counters=self._seq_counters,
+            seq_counters=(
+                self._seq_counters if (not cfg.as_sdtm or cfg.sdtm_domain is not None) else None
+            ),
+            domain_seq_counters=self._domain_seq_counters if cfg.as_sdtm else None,
+            form_domain_map=getattr(self, "_active_form_domain_map", None),
+            seq_overrides=seq_overrides,
+            lineage_out=lineage_out if cfg.as_sdtm else None,
             record_seqs=self._record_seqs,
         )
 
@@ -1276,21 +1379,6 @@ class SnowflakeExportSink(ExportSink):
                         f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
                         f"FORCE = TRUE"
                     )  # nosem
-                    merge_keys = _resolve_merge_keys(
-                        merge_columns,
-                        as_sdtm=cfg.as_sdtm,
-                        naming_convention=cfg.naming_convention,
-                    )
-                    non_key_cols = [col for col in merge_columns if col not in merge_keys]
-                    if non_key_cols:
-                        update_clause = ", ".join(
-                            f"target.{_quote_identifier(col.upper())} = "
-                            f"source.{_quote_identifier(col.upper())}"
-                            for col in non_key_cols
-                        )
-                    else:
-                        first_key = _quote_identifier(merge_keys[0].upper())
-                        update_clause = f"target.{first_key} = source.{first_key}"
                     insert_cols = ", ".join(_quote_identifier(col.upper()) for col in merge_columns)
                     insert_vals = ", ".join(
                         f"source.{_quote_identifier(col.upper())}" for col in merge_columns
@@ -1299,61 +1387,107 @@ class SnowflakeExportSink(ExportSink):
                         (c for c in ("deleted", "DELETED") if c in merge_columns),
                         None,
                     )
-                    if not cfg.as_sdtm and cfg.naming_convention in (None, "snake_case"):
-                        partition_expr = "study_key, record_id"
-                        order_expr = (
-                            "ORDER BY date_modified DESC NULLS LAST"
-                            if "date_modified" in merge_columns
-                            else "ORDER BY record_id"
+                    merge_partitions = (
+                        _resolve_sdtm_domain_merge_partitions(
+                            arrow_table,
+                            merge_columns,
+                            sdtm_domain=cfg.sdtm_domain,
                         )
-                        on_expr = (
-                            "target.study_key = source.study_key "
-                            "AND target.record_id = source.record_id"
-                        )
-                    else:
-                        partition_expr = ", ".join(_quote_identifier(k.upper()) for k in merge_keys)
-                        modified_col = next(
+                        if cfg.as_sdtm
+                        else [
                             (
-                                c
-                                for c in ("date_modified", "dateModified", "DATE_MODIFIED")
-                                if c in merge_columns
-                            ),
-                            None,
-                        )
-                        order_expr = (
-                            f"ORDER BY {_quote_identifier(modified_col.upper())} DESC NULLS LAST"
-                            if modified_col is not None
-                            else f"ORDER BY {_quote_identifier(merge_keys[-1].upper())}"
-                        )
-                        on_expr = " AND ".join(
-                            f"target.{_quote_identifier(k.upper())} = "
-                            f"source.{_quote_identifier(k.upper())}"
-                            for k in merge_keys
-                        )
-                    if cfg.hard_delete and deleted_col is not None:
-                        quoted_del = _quote_identifier(deleted_col.upper())
-                        matched_clause = (
-                            f"WHEN MATCHED AND COALESCE(source.{quoted_del}, FALSE) = TRUE THEN DELETE "  # noqa: S608
-                            f"WHEN MATCHED THEN UPDATE SET {update_clause} "
-                            f"WHEN NOT MATCHED AND COALESCE(source.{quoted_del}, FALSE) = FALSE "
-                            f"THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
-                        )
-                    else:
-                        matched_clause = (
-                            f"WHEN MATCHED THEN UPDATE SET {update_clause} "  # noqa: S608
-                            f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
-                        )
-                    cur.execute(
-                        f"MERGE INTO {target_table} AS target "  # noqa: S608
-                        f"USING ("
-                        f"SELECT * FROM {staging_table} "
-                        f"QUALIFY ROW_NUMBER() OVER ("
-                        f"PARTITION BY {partition_expr} {order_expr}"
-                        f") = 1"
-                        f") AS source "
-                        f"ON {on_expr} "
-                        f"{matched_clause}"
-                    )  # nosem
+                                None,
+                                _resolve_merge_keys(
+                                    merge_columns,
+                                    as_sdtm=False,
+                                    naming_convention=cfg.naming_convention,
+                                ),
+                            )
+                        ]
+                    )
+                    for domain_filter, merge_keys in merge_partitions:
+                        non_key_cols = [col for col in merge_columns if col not in merge_keys]
+                        if non_key_cols:
+                            update_clause = ", ".join(
+                                f"target.{_quote_identifier(col.upper())} = "
+                                f"source.{_quote_identifier(col.upper())}"
+                                for col in non_key_cols
+                            )
+                        else:
+                            first_key = _quote_identifier(merge_keys[0].upper())
+                            update_clause = f"target.{first_key} = source.{first_key}"
+
+                        if not cfg.as_sdtm and cfg.naming_convention in (None, "snake_case"):
+                            partition_expr = "study_key, record_id"
+                            order_expr = (
+                                "ORDER BY date_modified DESC NULLS LAST"
+                                if "date_modified" in merge_columns
+                                else "ORDER BY record_id"
+                            )
+                            on_expr = (
+                                "target.study_key = source.study_key "
+                                "AND target.record_id = source.record_id"
+                            )
+                        else:
+                            partition_expr = ", ".join(
+                                _quote_identifier(k.upper()) for k in merge_keys
+                            )
+                            modified_col = next(
+                                (
+                                    c
+                                    for c in ("date_modified", "dateModified", "DATE_MODIFIED")
+                                    if c in merge_columns
+                                ),
+                                None,
+                            )
+                            order_expr = (
+                                f"ORDER BY {_quote_identifier(modified_col.upper())} DESC NULLS LAST"
+                                if modified_col is not None
+                                else f"ORDER BY {_quote_identifier(merge_keys[-1].upper())}"
+                            )
+                            on_expr = " AND ".join(
+                                f"target.{_quote_identifier(k.upper())} = "
+                                f"source.{_quote_identifier(k.upper())}"
+                                for k in merge_keys
+                            )
+                        if cfg.hard_delete and deleted_col is not None:
+                            quoted_del = _quote_identifier(deleted_col.upper())
+                            matched_clause = (
+                                f"WHEN MATCHED AND COALESCE(source.{quoted_del}, FALSE) = TRUE THEN DELETE "  # noqa: S608
+                                f"WHEN MATCHED THEN UPDATE SET {update_clause} "
+                                f"WHEN NOT MATCHED AND COALESCE(source.{quoted_del}, FALSE) = FALSE "
+                                f"THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+                            )
+                        else:
+                            matched_clause = (
+                                f"WHEN MATCHED THEN UPDATE SET {update_clause} "  # noqa: S608
+                                f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+                            )
+                        if domain_filter is None:
+                            cur.execute(
+                                f"MERGE INTO {target_table} AS target "  # noqa: S608
+                                f"USING ("
+                                f"SELECT * FROM {staging_table} "
+                                f"QUALIFY ROW_NUMBER() OVER ("
+                                f"PARTITION BY {partition_expr} {order_expr}"
+                                f") = 1"
+                                f") AS source "
+                                f"ON {on_expr} "
+                                f"{matched_clause}"
+                            )  # nosem
+                        else:
+                            cur.execute(
+                                f"MERGE INTO {target_table} AS target "  # noqa: S608
+                                f"USING ("
+                                f'SELECT * FROM {staging_table} WHERE "DOMAIN" = %s '
+                                f"QUALIFY ROW_NUMBER() OVER ("
+                                f"PARTITION BY {partition_expr} {order_expr}"
+                                f") = 1"
+                                f") AS source "
+                                f"ON {on_expr} "
+                                f"{matched_clause}",
+                                [domain_filter],
+                            )  # nosem
                 else:
                     cur.execute(
                         f"COPY INTO {target_table} "
@@ -1362,7 +1496,9 @@ class SnowflakeExportSink(ExportSink):
                         f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
                         f"FORCE = TRUE"
                     )  # nosem
-                rows_loaded = len(active_records)
+                rows_loaded = getattr(arrow_table, "num_rows", len(active_records))
+                if not isinstance(rows_loaded, int):
+                    rows_loaded = len(active_records)
                 logger.debug(
                     "Loaded batch %s (%d rows) via stage %s",
                     batch_id,
@@ -1370,11 +1506,14 @@ class SnowflakeExportSink(ExportSink):
                     stage_path,
                 )
                 self._append_manifest(batch_id, stage_path, rows_loaded)
-                return rows_loaded
+                return int(rows_loaded)
             finally:
                 cur.close()
 
-        return self._execute_with_retry("export_warehouse", batch_id, execute_export)
+        written_total = self._execute_with_retry("export_warehouse", batch_id, execute_export)
+        if cfg.as_sdtm and lineage_out:
+            commit_sdtm_lineage(self, lineage_out)
+        return written_total
 
     def flush(self) -> None:
         """No-op: each batch is committed individually."""
@@ -1383,16 +1522,68 @@ class SnowflakeExportSink(ExportSink):
         """Delete newly voided rows from Snowflake when running idempotently."""
         if not self.config.idempotent or not records:
             return 0
-        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
-        if not record_ids:
-            return 0
-
         cfg = self._cfg
         target_table = (
             f"{_quote_identifier(cfg.database)}."
             f"{_quote_identifier(cfg.schema)}."
             f"{_quote_identifier(cfg.table)}"
         )
+
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if cfg.as_sdtm and (not is_incremental_sink_config(cfg) or not record_ids):
+            sdtm_entries = resolve_voided_sdtm_keys(
+                records,
+                self,
+                study_key=getattr(self, "_active_study_key", None) or cfg.study_key,
+                stream_name=getattr(self, "_active_stream_name", None) or cfg.stream_name,
+                sdtm_domain=cfg.sdtm_domain,
+                form_domain_map=getattr(self, "_active_form_domain_map", None),
+            )
+            if not sdtm_entries:
+                return 0
+
+            def execute_sdtm_reconcile() -> int:
+                cur = self._conn.cursor()
+                deleted = 0
+                try:
+                    for entry in sdtm_entries:
+                        st_id = entry.get("study_id")
+                        dom = str(entry.get("domain") or "").strip().upper()
+                        usubj = entry.get("usubjid")
+                        seq_col = entry.get("seq_col")
+                        seq_val = entry.get("seq_val")
+                        if not st_id or not dom or not usubj:
+                            continue
+                        if dom == "DM" or seq_col is None:
+                            cur.execute(
+                                f"DELETE FROM {target_table} "  # noqa: S608
+                                'WHERE "STUDYID" = %s AND "DOMAIN" = %s AND "USUBJID" = %s',
+                                [st_id, dom, usubj],
+                            )  # nosem
+                            deleted += 1
+                        elif seq_val is not None and _IDENTIFIER_PATTERN.match(str(seq_col)):
+                            q_seq = _quote_identifier(str(seq_col).upper())
+                            cur.execute(
+                                f"DELETE FROM {target_table} "  # noqa: S608
+                                f'WHERE "STUDYID" = %s AND "DOMAIN" = %s '
+                                f'AND "USUBJID" = %s AND {q_seq} = %s',
+                                [st_id, dom, usubj, int(seq_val)],
+                            )  # nosem
+                            deleted += 1
+                    logger.debug("Reconciled %d voided SDTM records in batch %s", deleted, batch_id)
+                    return deleted
+                finally:
+                    cur.close()
+
+            return self._execute_with_retry(
+                "reconcile_warehouse_deleted",
+                batch_id,
+                execute_sdtm_reconcile,
+            )
+
+        if not record_ids:
+            return 0
+
         placeholders = ", ".join(["%s"] * len(record_ids))
 
         if cfg.as_sdtm or cfg.naming_convention == "sdtm":

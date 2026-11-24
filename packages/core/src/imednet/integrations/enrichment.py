@@ -7,7 +7,7 @@ data using configured mappings, terminology lookups, and PHI masking rules.
 import functools
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from typing import Any
@@ -284,6 +284,10 @@ class CentralizedMapper:
         as_sdtm: bool = False,
         sdtm_domain: str | None = None,
         seq_counters: dict[str, int] | None = None,
+        domain_seq_counters: dict[str, dict[str, int]] | None = None,
+        form_domain_map: Mapping[Any, str] | None = None,
+        seq_overrides: Mapping[str, int] | None = None,
+        lineage_out: dict[str, dict[str, Any]] | None = None,
         record_seqs: dict[str, int] | None = None,
         preserve_record_id: bool = False,
     ):
@@ -298,6 +302,10 @@ class CentralizedMapper:
             as_sdtm: When True, transform records directly into CDISC SDTM domain rows.
             sdtm_domain: Optional SDTM domain code (e.g. 'AE', 'VS', 'DM').
             seq_counters: Optional per-USUBJID sequence counter map shared across batches.
+            domain_seq_counters: Optional per-domain sequence counter map for multi-Form SDTM.
+            form_domain_map: Optional lookup from form_id / form_key to SDTM domain code.
+            seq_overrides: Optional rehydrated record_id -> <DOM>SEQ overrides.
+            lineage_out: Optional dictionary populated with record_id -> SDTM lineage metadata.
             record_seqs: Optional per-Record sequence map for idempotent incremental reruns.
             preserve_record_id: When True, retain RECORD_ID in transformed SDTM rows.
         """
@@ -311,7 +319,20 @@ class CentralizedMapper:
             else None
         )
         self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
+        self._explicit_seq_counters = seq_counters is not None
         self._seq_counters: dict[str, int] = seq_counters if seq_counters is not None else {}
+        self._domain_seq_counters: dict[str, dict[str, int]] = (
+            domain_seq_counters if domain_seq_counters is not None else {}
+        )
+        if self.sdtm_domain is not None and seq_counters is not None:
+            existing = self._domain_seq_counters.get(self.sdtm_domain)
+            if existing and existing is not seq_counters:
+                for subj, seq_val in existing.items():
+                    seq_counters[subj] = max(seq_counters.get(subj, 0), seq_val)
+            self._domain_seq_counters[self.sdtm_domain] = seq_counters
+        self._form_domain_map: Mapping[Any, str] = form_domain_map or {}
+        self._seq_overrides: Mapping[str, int] | None = seq_overrides
+        self._lineage_out: dict[str, dict[str, Any]] | None = lineage_out
         self._record_seqs: dict[str, int] | None = record_seqs
         self._preserve_record_id = bool(preserve_record_id)
         self._pipeline_cache: dict[str, Any] = {}
@@ -361,6 +382,139 @@ class CentralizedMapper:
             cached = frozenset(masked)
             self._masked_meta_cache[cache_key] = cached
         return cached
+
+    def _resolve_record_sdtm_domain(self, record: Any) -> str:
+        """Resolve the target SDTM domain for *record* using explicit domain or Form metadata."""
+        if self.sdtm_domain:
+            return self.sdtm_domain
+        is_mapping = isinstance(record, Mapping)
+        raw_dom: Any = None
+        if is_mapping:
+            raw_dom = record.get("DOMAIN") or record.get("domain")
+            if not raw_dom and self._form_domain_map:
+                fid = record.get("formId") if "formId" in record else record.get("form_id")
+                fkey = record.get("formKey") or record.get("form_key")
+                raw_dom = self._form_domain_map.get(fid) or self._form_domain_map.get(fkey)
+            if not raw_dom:
+                raw_dom = record.get("form_key") or record.get("formKey")
+        else:
+            raw_dom = getattr(record, "domain", None) or getattr(record, "DOMAIN", None)
+            if not raw_dom and self._form_domain_map:
+                fid = getattr(record, "form_id", None)
+                if fid is None:
+                    fid = getattr(record, "formId", None)
+                fkey = getattr(record, "form_key", None) or getattr(record, "formKey", None)
+                raw_dom = self._form_domain_map.get(fid) or self._form_domain_map.get(fkey)
+            if not raw_dom:
+                raw_dom = getattr(record, "form_key", None) or getattr(record, "formKey", None)
+        return resolve_sdtm_domain(raw_dom, fallback="AE")
+
+    def _counters_for_domain(self, domain: str) -> dict[str, int]:
+        """Return the per-USUBJID sequence counter map scoped to ``domain``."""
+        if self.sdtm_domain is not None and self._explicit_seq_counters:
+            return self._seq_counters
+        return self._domain_seq_counters.setdefault(domain, {})
+
+    def map_batch(
+        self, records: Sequence[Any], study_key: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Map a batch of records, sorting and sequencing SDTM batches per domain and USUBJID."""
+        if not self.as_sdtm:
+            return [self.map_record(r, study_key=study_key) for r in records]
+        return [doc for _src, doc in self.map_batch_with_sources(records, study_key=study_key)]
+
+    def map_batch_with_sources(
+        self,
+        records: Sequence[Any],
+        study_key: str | None = None,
+    ) -> list[tuple[Any, dict[str, Any]]]:
+        """Map an SDTM batch returning ``(source_record, sdtm_row)`` pairs in finalized order."""
+        if not records:
+            return []
+        if not self.as_sdtm:
+            return [(r, self.map_record(r, study_key=study_key)) for r in records]
+
+        from imednet.models.sdtm import _PreparedSdtmRow, _SdtmNormalizer
+
+        # Partition records by (study_key, target_domain) while preserving first-seen partition order
+        partitions: dict[tuple[str, str], list[tuple[int, Any]]] = {}
+        partition_order: list[tuple[str, str]] = []
+        for idx, rec in enumerate(records):
+            is_mapping = isinstance(rec, Mapping)
+            resolved_sk = (
+                study_key
+                if study_key is not None
+                else (
+                    rec.get("study_key") or rec.get("studyKey") or rec.get("STUDYID")
+                    if is_mapping
+                    else getattr(rec, "study_key", None)
+                )
+            ) or "UNKNOWN"
+            dom = self._resolve_record_sdtm_domain(rec)
+            key = (str(resolved_sk), dom)
+            if key not in partitions:
+                partitions[key] = []
+                partition_order.append(key)
+            partitions[key].append((idx, rec))
+
+        results: list[tuple[Any, dict[str, Any]]] = []
+        for sk, dom in partition_order:
+            if sk not in self._pipeline_cache:
+                if self._default_pipeline is not None:
+                    self._pipeline_cache[sk] = self._default_pipeline
+                else:
+                    sdk_obj = getattr(self, "sdk", None)
+                    if sdk_obj is not None:
+                        from imednet.core.context import sdk_governance_context
+
+                        with sdk_governance_context(sdk_obj):
+                            resolved_cfg = resolve_study_configuration(sk)
+                    else:
+                        resolved_cfg = resolve_study_configuration(sk)
+                    self._pipeline_cache[sk] = (
+                        EnrichmentPipeline(resolved_cfg)
+                        if resolved_cfg is not None
+                        else self._DEFAULT_PIPELINE
+                    )
+            active_pipeline = self._pipeline_cache[sk]
+            pipeline_phi_keys: set[str] = getattr(active_pipeline, "phi_keys", set())
+            has_active_rules = bool(
+                active_pipeline is not None
+                and not (
+                    active_pipeline.__class__ is EnrichmentPipeline
+                    and not active_pipeline._has_rules
+                )
+            )
+            normalizer = _SdtmNormalizer(
+                domain=dom,
+                study_key=sk,
+                include_deleted=True,
+                mask_phi=self.mask_phi,
+                preserve_record_id=self._preserve_record_id,
+                pipeline=active_pipeline if has_active_rules else None,
+                phi_keys=pipeline_phi_keys or None,
+            )
+            counters = self._counters_for_domain(dom)
+            grouped: dict[str, list[_PreparedSdtmRow]] = {}
+            source_by_row_id: dict[int, Any] = {}
+            for orig_idx, src_rec in partitions[(sk, dom)]:
+                prepared = normalizer.prepare_record(src_rec, orig_idx)
+                if prepared is not None:
+                    source_by_row_id[id(prepared.row)] = src_rec
+                    grouped.setdefault(prepared.usubjid, []).append(prepared)
+            for usubjid in sorted(grouped):
+                finalized_rows = normalizer.finalize_subject_group(
+                    grouped[usubjid],
+                    counters,
+                    record_seqs=self._record_seqs,
+                    seq_overrides=self._seq_overrides,
+                    lineage_out=self._lineage_out,
+                )
+                for row_dict in finalized_rows:
+                    src = source_by_row_id.get(id(row_dict))
+                    out_row = self.post_processor(row_dict) if self.post_processor else row_dict
+                    results.append((src, out_row))
+        return results
 
     def map_record(self, record: Any, study_key: str | None = None) -> dict[str, Any]:
         """Map a clinical record to the unified destination format."""
@@ -413,26 +567,19 @@ class CentralizedMapper:
         )
 
         if self.as_sdtm:
-            raw_dom = self.sdtm_domain
-            if not raw_dom:
-                raw_dom = (
-                    record.get("DOMAIN")
-                    or record.get("domain")
-                    or record.get("form_key")
-                    or record.get("formKey")
-                    if is_mapping
-                    else getattr(record, "form_key", None)
-                )
-            target_domain = resolve_sdtm_domain(raw_dom, fallback="AE")
+            target_domain = self._resolve_record_sdtm_domain(record)
+            domain_counters = self._counters_for_domain(target_domain)
             sdtm_rows = transform_records_to_sdtm_rows(
                 [record],
                 domain=target_domain,
                 study_key=sk,
                 include_deleted=True,
                 mask_phi=self.mask_phi,
-                seq_counters=self._seq_counters,
+                seq_counters=domain_counters,
                 record_seqs=self._record_seqs,
                 preserve_record_id=self._preserve_record_id,
+                seq_overrides=self._seq_overrides,
+                lineage_out=self._lineage_out,
                 phi_keys=pipeline_phi_keys or None,
                 pipeline=active_pipeline if has_active_rules else None,
             )

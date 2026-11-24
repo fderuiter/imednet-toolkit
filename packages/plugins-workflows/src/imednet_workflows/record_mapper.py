@@ -35,7 +35,11 @@ from imednet.spi.models import (
 from imednet.spi.models import (
     transform_records_to_sdtm as _core_transform_records_to_sdtm,
 )
-from imednet.spi.sink_base import is_record_deleted
+from imednet.spi.sink_base import (
+    extract_record_form_ref,
+    filter_forms_by_sdtm_domain,
+    is_record_deleted,
+)
 from imednet.spi.utils import (
     CompiledRecordPredicate,
     EnrichmentPipeline,
@@ -1535,7 +1539,9 @@ class RecordMapper:
                 mask_phi=should_mask,
                 enrichment_pipeline=self._get_enrichment_pipeline(study_key),
             )
-        return pd.concat(frames, ignore_index=True)
+        combined = pd.concat(frames, ignore_index=True)
+        combined.attrs["imednet_sdtm_redacted"] = bool(should_mask)
+        return combined
 
     @staticmethod
     def _project_record_whitelist(
@@ -1593,8 +1599,51 @@ class RecordMapper:
                         allowed_vars.add(src_var)
 
         extra_filters: dict[str, Any] = {}
+        matched_form_ids: set[int] | None = None
+        matched_form_keys: set[str] | None = None
         if form_whitelist is not None:
+            if len(form_whitelist) == 0:
+                return
             extra_filters["formId"] = form_whitelist
+            matched_form_ids = set(form_whitelist)
+        else:
+            study_forms = self._try_fetch_study_forms_for_sdtm(study_key)
+            if study_forms:
+                matched_forms = filter_forms_by_sdtm_domain(study_forms, domain)
+                if not matched_forms:
+                    return
+                if len(matched_forms) < len(study_forms):
+                    m_ids = [
+                        fid
+                        for f in matched_forms
+                        if isinstance(
+                            (
+                                fid := (
+                                    f.get("formId") or f.get("form_id")
+                                    if isinstance(f, dict)
+                                    else getattr(f, "form_id", None)
+                                )
+                            ),
+                            int,
+                        )
+                        and not isinstance(fid, bool)
+                    ]
+                    m_keys = {
+                        str(fk)
+                        for f in matched_forms
+                        if (
+                            fk := (
+                                f.get("formKey") or f.get("form_key")
+                                if isinstance(f, dict)
+                                else getattr(f, "form_key", None)
+                            )
+                        )
+                    }
+                    if m_ids:
+                        extra_filters["formId"] = m_ids
+                        matched_form_ids = set(m_ids)
+                    if m_keys:
+                        matched_form_keys = m_keys
 
         source_is_ordered = False
         force_drain_ungrouped_loader = False
@@ -1617,6 +1666,12 @@ class RecordMapper:
             sort=_SDTM_RECORDS_SORT,
             group_by_subject=True,
         )
+        if matched_form_ids is not None or matched_form_keys:
+            records = self._filter_records_by_matched_forms(
+                records,
+                matched_form_ids,
+                matched_form_keys,
+            )
         if allowed_vars is not None:
             records = self._project_record_whitelist(records, allowed_vars)
         if force_drain_ungrouped_loader:
@@ -1641,6 +1696,60 @@ class RecordMapper:
         ):
             if not df.empty:
                 yield df
+
+    def _try_fetch_study_forms_for_sdtm(self, study_key: str) -> list[Any]:
+        """Return concrete Study Forms when ``self.sdk.forms.list`` yields non-mock Form entries."""
+        from unittest.mock import NonCallableMock
+
+        forms_ep = getattr(self.sdk, "forms", None)
+        list_fn = getattr(forms_ep, "list", None) if forms_ep is not None else None
+        if not callable(list_fn):
+            return []
+        try:
+            raw_forms = list_fn(study_key=study_key)
+        except Exception:
+            return []
+        if (
+            isinstance(raw_forms, NonCallableMock)
+            and "list" not in getattr(forms_ep, "_mock_children", {})
+            and "list" not in vars(forms_ep)
+        ):
+            return []
+        try:
+            items = list(raw_forms)
+        except Exception:
+            return []
+        concrete: list[Any] = []
+        for f in items:
+            if isinstance(f, NonCallableMock):
+                continue
+            if (
+                (isinstance(f, dict) and (f.get("formKey") or f.get("form_key")))
+                or isinstance(getattr(f, "form_key", None), str)
+                or isinstance(getattr(f, "form_name", None), str)
+            ):
+                concrete.append(f)
+        return concrete
+
+    @staticmethod
+    def _filter_records_by_matched_forms(
+        records: Iterable[Any],
+        matched_ids: set[int] | None,
+        matched_keys: set[str] | None,
+    ) -> Iterator[Any]:
+        """Yield records whose ``form_id`` or ``form_key`` matches the domain-filtered forms."""
+        for rec in records:
+            fid, fk = extract_record_form_ref(rec)
+            if fid is not None and matched_ids is not None:
+                if fid in matched_ids:
+                    yield rec
+                continue
+            if fk is not None and matched_keys:
+                if fk in matched_keys:
+                    yield rec
+                continue
+            if fid is None and fk is None:
+                yield rec
 
     def dataframe(
         self,

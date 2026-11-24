@@ -98,10 +98,12 @@ from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
 from imednet.models.standards import (
+    PROFILE_REGISTRY,
     SDTM_DOMAIN_SPECS,
     StandardsProfile,
     StandardsReadinessReport,
     StandardsReadinessValidator,
+    format_iso8601_dtc,
     normalize_naming_convention,
     resolve_sdtm_domain,
     resolve_standards_profile,
@@ -189,6 +191,20 @@ class StateProviderProtocol(Protocol):
 
     def delete_entry(self, study_key: str, stream_name: str | None = None) -> bool:
         """Delete ledger state entry."""
+        ...
+
+    def get_sdtm_lineage(self, study_key: str, stream_name: str) -> dict[str, Any]:
+        """Retrieve persisted SDTM sidecar lineage and monotonic sequence watermarks."""
+        ...
+
+    def record_sdtm_lineage(
+        self,
+        study_key: str,
+        stream_name: str,
+        lineage_updates: Mapping[str, dict[str, Any] | None] | None = None,
+        seq_watermarks: Mapping[str, int] | None = None,
+    ) -> None:
+        """Persist SDTM sidecar lineage and monotonic sequence watermarks."""
         ...
 
 
@@ -387,9 +403,10 @@ class SinkConfig:
             try:
                 resolved_prof = resolve_standards_profile(self.standards_profile)
             except KeyError as exc:
+                available = ", ".join(f"'{p}'" for p in PROFILE_REGISTRY.list_profiles())
                 raise ValueError(
                     f"Unknown standards_profile '{self.standards_profile}'. "
-                    "Expected 'general', 'drug', 'device', or a StandardsProfile instance."
+                    f"Expected {available}, or a StandardsProfile instance."
                 ) from exc
             if isinstance(self.standards_profile, str):
                 self.standards_profile = resolved_prof.profile_name
@@ -423,6 +440,16 @@ class SinkConfig:
 # Abstract base class
 # ---------------------------------------------------------------------------
 
+
+_SDTM_BIRTH_SOURCE_KEYS: frozenset[str] = frozenset(
+    {
+        "brthdtc",
+        "brthdat",
+        "birthdate",
+        "dateofbirth",
+        "dob",
+    }
+)
 
 _TABULAR_BATCH_STAMP_ATTR = "_imednet_tabular_batch_stamp"
 _CONTAINER_CELL_TYPES = (dict, list, tuple)
@@ -538,12 +565,70 @@ def _mask_series_containers_default_phi(series: Any) -> Any:
     )
 
 
-def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
+def _is_sdtm_birth_date_key(raw_key: str) -> bool:
+    """Return True if *raw_key* represents an SDTM birth-date variable or source alias."""
+    norm = _normalize_key(raw_key)
+    if not norm:
+        return False
+    return norm in _SDTM_BIRTH_SOURCE_KEYS or norm.endswith("brthdtc")
+
+
+def _redact_mapping_for_sdtm(mapping_val: Mapping[Any, Any]) -> dict[Any, Any]:
+    """Redact PHI across a mapping while truncating birth-date fields to ISO year or None."""
+    out: dict[Any, Any] = {}
+    for k, v in mapping_val.items():
+        key_str = str(k)
+        if _is_sdtm_birth_date_key(key_str) and not global_sensitivity_registry.is_exempt(key_str):
+            out[k] = format_iso8601_dtc(v, mask_phi=True)
+        elif global_sensitivity_registry.is_sensitive(key_str):
+            out[k] = MASKED_SENTINEL
+        elif isinstance(v, Mapping):
+            out[k] = _redact_mapping_for_sdtm(v)
+        elif isinstance(v, list):
+            out[k] = [
+                _redact_mapping_for_sdtm(elem)
+                if isinstance(elem, Mapping)
+                else mask_clinical_phi(elem)
+                for elem in v
+            ]
+        elif isinstance(v, tuple):
+            out[k] = tuple(
+                _redact_mapping_for_sdtm(elem)
+                if isinstance(elem, Mapping)
+                else mask_clinical_phi(elem)
+                for elem in v
+            )
+        else:
+            out[k] = mask_clinical_phi(v)
+    return out
+
+
+def _redact_dataframe_batch(df: Any, pd_mod: Any, *, as_sdtm: bool = False) -> Any:
     """Return a PHI-redacted copy of a pandas DataFrame without mutating caller state."""
+    if getattr(df, "attrs", {}).get("imednet_sdtm_redacted") is True:
+        return df
+
     masked = df.copy()
+    birth_cols = (
+        [
+            col
+            for col in masked.columns
+            if _is_sdtm_birth_date_key(str(col))
+            and not global_sensitivity_registry.is_exempt(str(col))
+        ]
+        if as_sdtm
+        else []
+    )
+    birth_col_set = set(birth_cols)
+    for col in birth_cols:
+        if len(masked) > 0:
+            masked[col] = masked[col].map(lambda val: format_iso8601_dtc(val, mask_phi=True))
+
     sensitive_cols = list(
         dict.fromkeys(
-            col for col in masked.columns if global_sensitivity_registry.is_sensitive(str(col))
+            col
+            for col in masked.columns
+            if col not in birth_col_set and global_sensitivity_registry.is_sensitive(str(col))
         )
     )
     for col in sensitive_cols:
@@ -551,9 +636,11 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
             masked[col] = MASKED_SENTINEL
 
     if len(masked) == 0:
+        if as_sdtm:
+            masked.attrs["imednet_sdtm_redacted"] = True
         return masked
 
-    remaining = masked.drop(columns=sensitive_cols)
+    remaining = masked.drop(columns=[*sensitive_cols, *birth_cols], errors="ignore")
     try:
         object_cols = list(dict.fromkeys(remaining.select_dtypes(include=[object, "str"]).columns))
     except TypeError:
@@ -566,12 +653,16 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any) -> Any:
             masked[col] = target.apply(_mask_series_containers_default_phi)
         else:
             masked[col] = _mask_series_containers_default_phi(target)
+    if as_sdtm:
+        masked.attrs["imednet_sdtm_redacted"] = True
     return masked
 
 
-def _redact_single_record(item: Any) -> Any:
+def _redact_single_record(item: Any, *, as_sdtm: bool = False) -> Any:
     """Redact PHI on a single Mapping, Pydantic model, or record-like object."""
     if isinstance(item, Mapping):
+        if as_sdtm:
+            return _redact_mapping_for_sdtm(item)
         return mask_clinical_phi(dict(item))
     if isinstance(item, NonCallableMock):
         return item
@@ -582,13 +673,20 @@ def _redact_single_record(item: Any) -> Any:
         updates: dict[str, Any] = {}
         record_data = getattr(item, "record_data", None)
         if isinstance(record_data, dict):
-            masked_rd = mask_clinical_phi(record_data)
+            masked_rd = (
+                _redact_mapping_for_sdtm(record_data) if as_sdtm else mask_clinical_phi(record_data)
+            )
             if masked_rd != record_data:
                 updates["record_data"] = masked_rd
         for field_name in model_fields:
             if field_name == "record_data" or global_sensitivity_registry.is_exempt(field_name):
                 continue
-            if global_sensitivity_registry.is_sensitive(field_name):
+            if as_sdtm and _is_sdtm_birth_date_key(field_name):
+                val = getattr(item, field_name, None)
+                redacted_year = format_iso8601_dtc(val, mask_phi=True)
+                if redacted_year != val:
+                    updates[field_name] = redacted_year
+            elif global_sensitivity_registry.is_sensitive(field_name):
                 val = getattr(item, field_name, None)
                 if val is not None and val != MASKED_SENTINEL:
                     updates[field_name] = MASKED_SENTINEL
@@ -596,7 +694,9 @@ def _redact_single_record(item: Any) -> Any:
 
     record_data = getattr(item, "record_data", None)
     if isinstance(record_data, dict):
-        masked_rd = mask_clinical_phi(record_data)
+        masked_rd = (
+            _redact_mapping_for_sdtm(record_data) if as_sdtm else mask_clinical_phi(record_data)
+        )
         if masked_rd != record_data:
             copied = copy.copy(item)
             copied.record_data = masked_rd
@@ -604,23 +704,30 @@ def _redact_single_record(item: Any) -> Any:
     return item
 
 
-def redact_batch_records(records: Any, *, mask_phi: bool = True) -> Any:
+def redact_batch_records(
+    records: Any,
+    *,
+    mask_phi: bool = True,
+    as_sdtm: bool = False,
+) -> Any:
     """Apply default SensitivityRegistry PHI redaction across a batch of records or DataFrame."""
     if not mask_phi or records is None:
         return records
 
     pd_mod = sys.modules.get("pandas")
     if pd_mod is not None and isinstance(records, pd_mod.DataFrame):
-        return _redact_dataframe_batch(records, pd_mod)
+        return _redact_dataframe_batch(records, pd_mod, as_sdtm=as_sdtm)
 
     if isinstance(records, Mapping):
+        if as_sdtm:
+            return _redact_mapping_for_sdtm(records)
         return mask_clinical_phi(dict(records))
     if isinstance(records, (str, bytes)):
         return records
     if isinstance(records, tuple):
-        return tuple(_redact_single_record(item) for item in records)
+        return tuple(_redact_single_record(item, as_sdtm=as_sdtm) for item in records)
     if isinstance(records, Iterable):
-        return [_redact_single_record(item) for item in records]
+        return [_redact_single_record(item, as_sdtm=as_sdtm) for item in records]
     return records
 
 
@@ -638,6 +745,7 @@ class ExportSink(ABC):
     """
 
     _skip_auto_redact_batch: bool = False
+    _delegates_sdtm_redaction: bool = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Automatically wrap concrete ``write_batch`` implementations with PHI redaction."""
@@ -667,6 +775,8 @@ class ExportSink(ABC):
         """Initialize the export sink with a configuration."""
         self.config: SinkConfig = config
         self._circuit_breaker: CircuitBreaker = CircuitBreaker()
+        self._sdtm_lineage: dict[str, dict[str, Any]] = {}
+        self._sdtm_seq_watermarks: dict[str, int] = {}
 
     reconciles_deleted_on_full_sync: bool = False
 
@@ -685,7 +795,13 @@ class ExportSink(ABC):
     def redact_batch(self, records: Sequence[Any]) -> Any:
         """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
         should_mask = getattr(self.config, "mask_phi", True) is not False
-        return redact_batch_records(records, mask_phi=should_mask)
+        raw_domain = getattr(self.config, "sdtm_domain", None)
+        is_sdtm = getattr(self.config, "as_sdtm", False) is True or (
+            isinstance(raw_domain, str) and bool(raw_domain.strip())
+        )
+        if is_sdtm and getattr(self, "_delegates_sdtm_redaction", False):
+            return records
+        return redact_batch_records(records, mask_phi=should_mask, as_sdtm=is_sdtm)
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -1112,9 +1228,11 @@ def _extract_record_for_standards(
     record: Any,
     *,
     configured_domain: str | None = None,
+    form_domain_map: Mapping[Any, str] | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """Return ``(domain, raw_data, canonical_data)`` without mutating ``record``."""
     raw_domain: str | None = None
+    form_id_val: Any = None
     subject_val: Any = None
     raw_data: dict[str, Any] = {}
 
@@ -1122,6 +1240,7 @@ def _extract_record_for_standards(
         rd = getattr(record, "record_data", None)
         raw_data = dict(rd) if isinstance(rd, Mapping) else {}
         raw_domain = getattr(record, "form_key", None)
+        form_id_val = getattr(record, "form_id", None)
         subject_val = getattr(record, "subject_key", None)
     elif isinstance(record, Mapping):
         raw_domain = (
@@ -1130,6 +1249,7 @@ def _extract_record_for_standards(
             or record.get("formKey")
             or record.get("form_key")
         )
+        form_id_val = record.get("formId", record.get("form_id"))
         subject_val = record.get("subjectKey") or record.get("subject_key") or record.get("USUBJID")
         nested = record.get("record_data")
         if nested is None:
@@ -1151,6 +1271,7 @@ def _extract_record_for_standards(
                 or dumped.get("formKey")
                 or dumped.get("form_key")
             )
+            form_id_val = dumped.get("formId", dumped.get("form_id"))
             subject_val = (
                 dumped.get("subjectKey")
                 or dumped.get("subject_key")
@@ -1166,6 +1287,7 @@ def _extract_record_for_standards(
                 }
     elif hasattr(record, "__dict__"):
         raw_domain = getattr(record, "form_key", None) or getattr(record, "domain", None)
+        form_id_val = getattr(record, "form_id", getattr(record, "formId", None))
         subject_val = getattr(record, "subject_key", None) or getattr(record, "subjectKey", None)
         rd = (
             getattr(record, "record_data", None)
@@ -1174,7 +1296,13 @@ def _extract_record_for_standards(
         )
         raw_data = dict(rd) if isinstance(rd, Mapping) else {}
 
-    domain = resolve_sdtm_domain(configured_domain or raw_domain, fallback="AE")
+    mapped_domain: str | None = None
+    if form_domain_map and not configured_domain:
+        if raw_domain is not None and raw_domain in form_domain_map:
+            mapped_domain = form_domain_map[raw_domain]
+        elif form_id_val is not None and form_id_val in form_domain_map:
+            mapped_domain = form_domain_map[form_id_val]
+    domain = resolve_sdtm_domain(configured_domain or mapped_domain or raw_domain, fallback="AE")
     canonical: dict[str, Any] = dict(raw_data)
 
     resolved_subject = (
@@ -1226,6 +1354,7 @@ def evaluate_standards_readiness(
     standards_profile: str | StandardsProfile | None = None,
     sdtm_domain: str | None = None,
     terminology_lookups: dict[str, dict[str, str]] | None = None,
+    form_domain_map: Mapping[Any, str] | None = None,
 ) -> StandardsReadinessReport:
     """Validate and score records against CDASH naming rules and a StandardsProfile."""
     _ = study_key
@@ -1257,6 +1386,7 @@ def evaluate_standards_readiness(
         domain, raw_data, canonical = _extract_record_for_standards(
             rec,
             configured_domain=cfg_domain,
+            form_domain_map=form_domain_map,
         )
         records_by_domain.setdefault(domain, []).append(canonical)
         for field_key in raw_data:
@@ -2226,6 +2356,504 @@ def _enforce_batch_standards_readiness(
         )
 
 
+def resolve_form_sdtm_domain(form: Any, *, fallback: str = "AE") -> str:
+    """Resolve the 2-character or canonical SDTM domain for a Study Form object or mapping."""
+    if isinstance(form, Mapping):
+        raw_key = form.get("formKey") or form.get("form_key")
+        raw_name = form.get("formName") or form.get("form_name")
+    else:
+        raw_key = getattr(form, "form_key", None) or getattr(form, "formKey", None)
+        raw_name = getattr(form, "form_name", None) or getattr(form, "formName", None)
+
+    key_dom = (
+        resolve_sdtm_domain(raw_key, fallback="")
+        if isinstance(raw_key, str) and raw_key.strip()
+        else ""
+    )
+    if key_dom and key_dom in SDTM_DOMAIN_SPECS:
+        return key_dom
+
+    name_dom = (
+        resolve_sdtm_domain(raw_name, fallback="")
+        if isinstance(raw_name, str) and raw_name.strip()
+        else ""
+    )
+    if name_dom and name_dom in SDTM_DOMAIN_SPECS:
+        return name_dom
+
+    if key_dom:
+        return key_dom
+    if name_dom:
+        return name_dom
+    return fallback
+
+
+def filter_forms_by_sdtm_domain(
+    forms: Sequence[Any],
+    sdtm_domain: str | None,
+) -> list[Any]:
+    """Filter Study Forms down to those matching ``sdtm_domain`` when specified."""
+    if not sdtm_domain or not isinstance(sdtm_domain, str) or not sdtm_domain.strip():
+        return list(forms)
+    target = resolve_sdtm_domain(sdtm_domain)
+    return [f for f in forms if resolve_form_sdtm_domain(f, fallback="") == target]
+
+
+def build_form_sdtm_domain_map(forms: Iterable[Any]) -> dict[Any, str]:
+    """Build a lookup map from ``form_id`` and ``form_key`` to resolved SDTM domain."""
+    mapping: dict[Any, str] = {}
+    for form in forms:
+        if isinstance(form, NonCallableMock):
+            continue
+        dom = resolve_form_sdtm_domain(form, fallback="")
+        if not dom:
+            continue
+        if isinstance(form, Mapping):
+            fid = form.get("formId") if "formId" in form else form.get("form_id")
+            fkey = form.get("formKey") or form.get("form_key")
+        else:
+            fid = getattr(form, "form_id", None)
+            if fid is None:
+                fid = getattr(form, "formId", None)
+            fkey = getattr(form, "form_key", None) or getattr(form, "formKey", None)
+        if isinstance(fid, int) and not isinstance(fid, bool):
+            mapping[fid] = dom
+        if isinstance(fkey, str) and fkey.strip():
+            mapping[fkey] = dom
+            mapping[fkey.strip()] = dom
+    return mapping
+
+
+def _try_fetch_study_forms(sdk: Any, study_key: str) -> list[Any]:
+    """Safely fetch concrete Study Forms when ``sdk.forms.list`` is available and non-mocked."""
+    if sdk is None or isinstance(sdk, NonCallableMock):
+        forms_ep = getattr(sdk, "forms", None)
+        list_fn = getattr(forms_ep, "list", None) if forms_ep is not None else None
+        if list_fn is None:
+            return []
+        try:
+            candidate = list_fn(study_key=study_key)
+        except Exception:
+            return []
+        if isinstance(candidate, NonCallableMock):
+            return []
+        try:
+            items = list(candidate)
+        except Exception:
+            return []
+        return [
+            f
+            for f in items
+            if not isinstance(f, NonCallableMock)
+            and (
+                (isinstance(f, Mapping) and (f.get("formKey") or f.get("form_key")))
+                or isinstance(getattr(f, "form_key", None), str)
+            )
+        ]
+
+    forms_ep = getattr(sdk, "forms", None)
+    list_fn = getattr(forms_ep, "list", None) if forms_ep is not None else None
+    if not callable(list_fn):
+        return []
+    try:
+        return [f for f in list_fn(study_key=study_key) if f is not None]
+    except Exception:
+        return []
+
+
+def extract_sdtm_composite_key(
+    row: Mapping[str, Any],
+) -> tuple[str, str, str, str | None, int | None] | None:
+    """Return ``(STUDYID, DOMAIN, USUBJID, seq_col, seq_val)`` for a transformed SDTM row."""
+    study_id = row.get("STUDYID")
+    domain = row.get("DOMAIN")
+    usubjid = row.get("USUBJID")
+    if study_id is None or domain is None or usubjid is None:
+        return None
+    dom_str = str(domain).strip().upper()
+    if not dom_str:
+        return None
+    if dom_str == "DM":
+        return (str(study_id), "DM", str(usubjid), None, None)
+    seq_col = f"{dom_str}SEQ"
+    raw_seq = row.get(seq_col)
+    if raw_seq is None:
+        for cand_col, cand_val in row.items():
+            cand_str = str(cand_col)
+            if cand_str.endswith("SEQ") and cand_str.upper() != "DMSEQ" and cand_val is not None:
+                seq_col = cand_str
+                raw_seq = cand_val
+                break
+    if raw_seq is None or isinstance(raw_seq, bool):
+        return (str(study_id), dom_str, str(usubjid), seq_col, None)
+    try:
+        seq_val = int(raw_seq)
+    except (TypeError, ValueError):
+        try:
+            as_float = float(raw_seq)
+        except (TypeError, ValueError):
+            return (str(study_id), dom_str, str(usubjid), seq_col, None)
+        if math.isnan(as_float) or math.isinf(as_float) or not as_float.is_integer():
+            return (str(study_id), dom_str, str(usubjid), seq_col, None)
+        seq_val = int(as_float)
+    return (str(study_id), dom_str, str(usubjid), seq_col, seq_val)
+
+
+def deduplicate_sdtm_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate transformed SDTM rows by composite key ``(STUDYID, DOMAIN, USUBJID[, <DOM>SEQ])``."""
+    if len(rows) <= 1:
+        return list(rows)
+    dedup_index: dict[tuple[Any, ...], int] = {}
+    ordered_rows: list[dict[str, Any] | None] = []
+    for row in rows:
+        comp = extract_sdtm_composite_key(row)
+        if comp is None or (comp[1] != "DM" and comp[4] is None):
+            ordered_rows.append(row)
+            continue
+        if comp in dedup_index:
+            ordered_rows[dedup_index[comp]] = None
+        dedup_index[comp] = len(ordered_rows)
+        ordered_rows.append(row)
+    return [r for r in ordered_rows if r is not None]
+
+
+def _resolve_lineage_target(
+    sink_or_config: Any,
+    *,
+    study_key: str | None = None,
+    stream_name: str | None = None,
+) -> tuple[Any, SinkConfig | Any, str, str, dict[str, Any] | None]:
+    """Resolve ``(provider, cfg, resolved_study, resolved_stream, active_tx)`` for SDTM lineage."""
+    is_sink = (
+        isinstance(sink_or_config, ExportSink)
+        or hasattr(sink_or_config, "write_batch")
+        or hasattr(sink_or_config, "_active_tx")
+        or hasattr(sink_or_config, "_sdtm_lineage")
+    )
+    cfg = getattr(sink_or_config, "config", sink_or_config) if is_sink else sink_or_config
+    resolved_study = (
+        study_key
+        or (getattr(sink_or_config, "_active_study_key", None) if is_sink else None)
+        or getattr(cfg, "study_key", "")
+        or "UNKNOWN"
+    )
+    cfg_stream = getattr(cfg, "stream_name", None)
+    resolved_stream = (
+        stream_name
+        or (getattr(sink_or_config, "_active_stream_name", None) if is_sink else None)
+        or (cfg_stream if isinstance(cfg_stream, str) and cfg_stream.strip() else None)
+        or "records"
+    )
+    active_tx = getattr(sink_or_config, "_active_tx", None) if is_sink else None
+    if not isinstance(active_tx, dict):
+        active_tx = None
+
+    provider = getattr(sink_or_config, "_active_state_provider", None) if is_sink else None
+    if provider is None:
+        explicit_prov = getattr(cfg, "state_provider", None)
+        if (explicit_prov is not None and not isinstance(explicit_prov, NonCallableMock)) or (
+            explicit_prov is not None and hasattr(explicit_prov, "get_sdtm_lineage")
+        ):
+            provider = explicit_prov
+        elif (
+            getattr(cfg, "incremental", False) is True
+            and getattr(cfg, "ledger_path", None) is not None
+        ):
+            with contextlib.suppress(Exception):
+                provider = get_state_provider(ledger_path=cfg.ledger_path)
+    return provider, cfg, str(resolved_study), str(resolved_stream), active_tx
+
+
+def _read_provider_lineage_payload(
+    provider: Any,
+    study_key: str,
+    stream_name: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+    """Read ``(sdtm_lineage, sdtm_seq_watermarks)`` from ``provider``."""
+    lineage: dict[str, dict[str, Any]] = {}
+    watermarks: dict[str, int] = {}
+    if provider is None:
+        return lineage, watermarks
+
+    raw_payload: Any = None
+    get_fn = getattr(provider, "get_sdtm_lineage", None)
+    if callable(get_fn) and not isinstance(get_fn, NonCallableMock):
+        with contextlib.suppress(Exception):
+            raw_payload = get_fn(study_key, stream_name)
+    if not isinstance(raw_payload, Mapping):
+        read_fn = getattr(provider, "read_state", None)
+        if callable(read_fn):
+            with contextlib.suppress(Exception):
+                ledger_state = read_fn()
+                studies = getattr(ledger_state, "studies", None)
+                if isinstance(studies, Mapping) and study_key in studies:
+                    streams = getattr(studies[study_key], "streams", None)
+                    if isinstance(streams, Mapping) and stream_name in streams:
+                        raw_payload = getattr(streams[stream_name], "metadata", None)
+
+    if isinstance(raw_payload, Mapping):
+        raw_lin = raw_payload.get("sdtm_lineage")
+        if isinstance(raw_lin, Mapping):
+            for rk, rv in raw_lin.items():
+                if isinstance(rv, Mapping):
+                    lineage[str(rk)] = dict(rv)
+        raw_wm = raw_payload.get("sdtm_seq_watermarks")
+        if isinstance(raw_wm, Mapping):
+            for wk, wv in raw_wm.items():
+                if isinstance(wv, int) and not isinstance(wv, bool):
+                    watermarks[str(wk)] = wv
+    return lineage, watermarks
+
+
+def rehydrate_sdtm_lineage(
+    sink_or_config: Any,
+    *,
+    study_key: str | None = None,
+    stream_name: str | None = None,
+) -> tuple[dict[str, dict[str, int]], dict[str, int], dict[str, dict[str, Any]]]:
+    """Rehydrate ``(domain_seq_counters, seq_overrides, full_lineage)`` from ledger & sink memory."""
+    provider, _cfg, resolved_study, resolved_stream, active_tx = _resolve_lineage_target(
+        sink_or_config,
+        study_key=study_key,
+        stream_name=stream_name,
+    )
+    full_lineage, watermarks = _read_provider_lineage_payload(
+        provider,
+        resolved_study,
+        resolved_stream,
+    )
+
+    if active_tx is not None:
+        tx_meta = active_tx.get("metadata")
+        if isinstance(tx_meta, Mapping):
+            tx_lin = tx_meta.get("sdtm_lineage")
+            if isinstance(tx_lin, Mapping):
+                for rk, rv in tx_lin.items():
+                    if isinstance(rv, Mapping):
+                        full_lineage[str(rk)] = dict(rv)
+            tx_wm = tx_meta.get("sdtm_seq_watermarks")
+            if isinstance(tx_wm, Mapping):
+                for wk, wv in tx_wm.items():
+                    if isinstance(wv, int) and not isinstance(wv, bool):
+                        watermarks[str(wk)] = max(watermarks.get(str(wk), 0), wv)
+
+    mem_lin = getattr(sink_or_config, "_sdtm_lineage", None)
+    if isinstance(mem_lin, Mapping):
+        for rk, rv in mem_lin.items():
+            if isinstance(rv, Mapping):
+                full_lineage[str(rk)] = dict(rv)
+    mem_wm = getattr(sink_or_config, "_sdtm_seq_watermarks", None)
+    if isinstance(mem_wm, Mapping):
+        for wk, wv in mem_wm.items():
+            if isinstance(wv, int) and not isinstance(wv, bool):
+                watermarks[str(wk)] = max(watermarks.get(str(wk), 0), wv)
+
+    domain_seq_counters: dict[str, dict[str, int]] = {}
+    seq_overrides: dict[str, int] = {}
+
+    for wk, wv in watermarks.items():
+        dom_part, sep, subj_part = wk.partition(":")
+        if sep and dom_part:
+            dom_map = domain_seq_counters.setdefault(dom_part, {})
+            dom_map[subj_part] = max(dom_map.get(subj_part, 0), wv)
+
+    for rec_id_str, entry in full_lineage.items():
+        dom = str(entry.get("domain") or "").strip().upper()
+        usubjid = str(entry.get("usubjid") or "")
+        seq_val = entry.get("seq_val")
+        if dom and dom != "DM" and isinstance(seq_val, int) and not isinstance(seq_val, bool):
+            seq_overrides[rec_id_str] = seq_val
+            dom_map = domain_seq_counters.setdefault(dom, {})
+            dom_map[usubjid] = max(dom_map.get(usubjid, 0), seq_val)
+
+    return domain_seq_counters, seq_overrides, full_lineage
+
+
+def commit_sdtm_lineage(
+    sink_or_config: Any,
+    lineage_updates: Mapping[str, dict[str, Any]],
+    *,
+    study_key: str | None = None,
+    stream_name: str | None = None,
+) -> None:
+    """Record new/updated SDTM lineage entries and monotonic sequence watermarks."""
+    if not lineage_updates:
+        return
+
+    provider, _cfg, resolved_study, resolved_stream, active_tx = _resolve_lineage_target(
+        sink_or_config,
+        study_key=study_key,
+        stream_name=stream_name,
+    )
+
+    wm_updates: dict[str, int] = {}
+    clean_updates: dict[str, dict[str, Any]] = {}
+    for rec_id_key, entry in lineage_updates.items():
+        if not isinstance(entry, Mapping):
+            continue
+        copied_entry = dict(entry)
+        clean_updates[str(rec_id_key)] = copied_entry
+        dom = str(copied_entry.get("domain") or "").strip().upper()
+        usubjid = str(copied_entry.get("usubjid") or "")
+        seq_val = copied_entry.get("seq_val")
+        if dom and dom != "DM" and isinstance(seq_val, int) and not isinstance(seq_val, bool):
+            wm_key = f"{dom}:{usubjid}"
+            wm_updates[wm_key] = max(wm_updates.get(wm_key, 0), seq_val)
+
+    is_sink = (
+        isinstance(sink_or_config, ExportSink)
+        or hasattr(sink_or_config, "write_batch")
+        or hasattr(sink_or_config, "_active_tx")
+        or hasattr(sink_or_config, "_sdtm_lineage")
+    )
+    if is_sink:
+        mem_lin = getattr(sink_or_config, "_sdtm_lineage", None)
+        if not isinstance(mem_lin, dict):
+            mem_lin = {}
+            with contextlib.suppress(Exception):
+                sink_or_config._sdtm_lineage = mem_lin
+        mem_lin.update(clean_updates)
+
+        mem_wm = getattr(sink_or_config, "_sdtm_seq_watermarks", None)
+        if not isinstance(mem_wm, dict):
+            mem_wm = {}
+            with contextlib.suppress(Exception):
+                sink_or_config._sdtm_seq_watermarks = mem_wm
+        for wk, wv in wm_updates.items():
+            mem_wm[wk] = max(mem_wm.get(wk, 0), wv)
+
+    if active_tx is not None:
+        existing_lin, existing_wm = _read_provider_lineage_payload(
+            provider,
+            resolved_study,
+            resolved_stream,
+        )
+        tx_meta = active_tx.setdefault("metadata", {})
+        if not isinstance(tx_meta, dict):
+            tx_meta = {}
+            active_tx["metadata"] = tx_meta
+        merged_lin = dict(existing_lin)
+        if isinstance(tx_meta.get("sdtm_lineage"), Mapping):
+            merged_lin.update(tx_meta["sdtm_lineage"])
+        merged_lin.update(clean_updates)
+        tx_meta["sdtm_lineage"] = merged_lin
+
+        merged_wm = dict(existing_wm)
+        if isinstance(tx_meta.get("sdtm_seq_watermarks"), Mapping):
+            for wk, wv in tx_meta["sdtm_seq_watermarks"].items():
+                if isinstance(wv, int) and not isinstance(wv, bool):
+                    merged_wm[str(wk)] = max(merged_wm.get(str(wk), 0), wv)
+        for wk, wv in wm_updates.items():
+            merged_wm[wk] = max(merged_wm.get(wk, 0), wv)
+        tx_meta["sdtm_seq_watermarks"] = merged_wm
+        return
+
+    if provider is not None:
+        record_fn = getattr(provider, "record_sdtm_lineage", None)
+        if callable(record_fn) and not isinstance(record_fn, NonCallableMock):
+            with contextlib.suppress(Exception):
+                record_fn(
+                    resolved_study,
+                    resolved_stream,
+                    lineage_updates=clean_updates,
+                    seq_watermarks=wm_updates,
+                )
+
+
+def resolve_voided_sdtm_keys(
+    records: Sequence[Any],
+    sink_or_config: Any,
+    *,
+    study_key: str | None = None,
+    stream_name: str | None = None,
+    sdtm_domain: str | None = None,
+    form_domain_map: Mapping[Any, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve voided records to composite SDTM keys ``(study_id, domain, usubjid, seq_col, seq_val)``."""
+    _dom_counters, _overrides, full_lineage = rehydrate_sdtm_lineage(
+        sink_or_config,
+        study_key=study_key,
+        stream_name=stream_name,
+    )
+    _provider, _cfg, resolved_study, _resolved_stream, _tx = _resolve_lineage_target(
+        sink_or_config,
+        study_key=study_key,
+        stream_name=stream_name,
+    )
+    active_form_map = form_domain_map or getattr(sink_or_config, "_active_form_domain_map", None)
+
+    resolved_keys: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for rec in records:
+        rid = extract_record_id(rec)
+        rid_str = str(rid).strip() if rid is not None and not isinstance(rid, bool) else None
+        if rid_str and rid_str in full_lineage:
+            entry = dict(full_lineage[rid_str])
+            sig = (
+                entry.get("study_id"),
+                entry.get("domain"),
+                entry.get("usubjid"),
+                entry.get("seq_col"),
+                entry.get("seq_val"),
+            )
+            if sig not in seen:
+                seen.add(sig)
+                resolved_keys.append(entry)
+            continue
+
+        if isinstance(rec, Mapping):
+            comp = extract_sdtm_composite_key(rec)
+            if comp is not None and (comp[1] == "DM" or comp[4] is not None):
+                if comp not in seen:
+                    seen.add(comp)
+                    resolved_keys.append(
+                        {
+                            "study_id": comp[0],
+                            "domain": comp[1],
+                            "usubjid": comp[2],
+                            "seq_col": comp[3],
+                            "seq_val": comp[4],
+                        }
+                    )
+                continue
+
+        # Fallback for one-Record-per-Subject DM records where seq_col is None
+        raw_dom = sdtm_domain
+        if not raw_dom:
+            fref_id, fref_key = extract_record_form_ref(rec)
+            if isinstance(active_form_map, Mapping):
+                raw_dom = active_form_map.get(fref_id) or active_form_map.get(fref_key)
+            if not raw_dom and fref_key:
+                raw_dom = fref_key
+        inferred_dom = resolve_sdtm_domain(raw_dom, fallback="") if raw_dom else ""
+        if inferred_dom == "DM":
+            if isinstance(rec, Mapping):
+                subj = (
+                    rec.get("USUBJID")
+                    or rec.get("usubjid")
+                    or rec.get("subjectKey")
+                    or rec.get("subject_key")
+                )
+                st_id = rec.get("STUDYID") or rec.get("studyKey") or rec.get("study_key")
+            else:
+                subj = getattr(rec, "subject_key", None) or getattr(rec, "subjectKey", None)
+                st_id = getattr(rec, "study_key", None) or getattr(rec, "studyKey", None)
+            if subj:
+                dm_sig = (str(st_id or resolved_study), "DM", str(subj), None, None)
+                if dm_sig not in seen:
+                    seen.add(dm_sig)
+                    resolved_keys.append(
+                        {
+                            "study_id": dm_sig[0],
+                            "domain": "DM",
+                            "usubjid": dm_sig[2],
+                            "seq_col": None,
+                            "seq_val": None,
+                        }
+                    )
+    return resolved_keys
+
+
 def run_streaming_export(
     sdk: Any,
     study_key: str,
@@ -2290,6 +2918,11 @@ def run_streaming_export(
             sink_obj = sink()
         stack.enter_context(sink_obj)
 
+        with contextlib.suppress(Exception):
+            sink_obj._active_state_provider = provider  # type: ignore[attr-defined]
+            sink_obj._active_stream_name = resolved_stream  # type: ignore[attr-defined]
+            sink_obj._active_study_key = study_key  # type: ignore[attr-defined]
+            sink_obj._active_tx = tx  # type: ignore[attr-defined]
         if tx is not None:
             tx_meta = tx.setdefault("metadata", {})
             bind_fn = getattr(sink_obj, "bind_stream_metadata", None)
@@ -2307,17 +2940,87 @@ def run_streaming_export(
         )
         exclude_deleted_upstream = (not opts["include_deleted"]) and (not reconcile_voided)
 
+        study_forms = _try_fetch_study_forms(sdk, study_key) if opts["as_sdtm"] else []
+        if study_forms:
+            with contextlib.suppress(Exception):
+                sink_obj._active_form_domain_map = build_form_sdtm_domain_map(study_forms)  # type: ignore[attr-defined]
+
         if records_source is not None:
             raw_records = records_source(watermark, exclude_deleted_upstream)
         else:
-            raw_records = iter_filtered_sdk_records(
-                sdk,
-                study_key,
-                watermark=watermark,
-                record_filter=opts["record_filter"],
-                record_data_filter=opts["record_data_filter"],
-                exclude_deleted_upstream=exclude_deleted_upstream,
-            )
+            allowed_sdtm_form_ids: set[int] | None = None
+            allowed_sdtm_form_keys: set[str] | None = None
+            if opts["sdtm_domain"] is not None and study_forms:
+                matched_forms = filter_forms_by_sdtm_domain(study_forms, opts["sdtm_domain"])
+                if not matched_forms:
+                    raw_records = iter(())
+                else:
+                    if len(matched_forms) < len(study_forms):
+                        allowed_sdtm_form_ids = {
+                            fid
+                            for f in matched_forms
+                            if isinstance(
+                                (
+                                    fid := (
+                                        f.get("formId") or f.get("form_id")
+                                        if isinstance(f, Mapping)
+                                        else getattr(f, "form_id", None)
+                                    )
+                                ),
+                                int,
+                            )
+                            and not isinstance(fid, bool)
+                        }
+                        allowed_sdtm_form_keys = {
+                            str(fkey)
+                            for f in matched_forms
+                            if (
+                                fkey := (
+                                    f.get("formKey") or f.get("form_key")
+                                    if isinstance(f, Mapping)
+                                    else getattr(f, "form_key", None)
+                                )
+                            )
+                        }
+                    raw_records = iter_filtered_sdk_records(
+                        sdk,
+                        study_key,
+                        watermark=watermark,
+                        record_filter=opts["record_filter"],
+                        record_data_filter=opts["record_data_filter"],
+                        exclude_deleted_upstream=exclude_deleted_upstream,
+                    )
+                    if allowed_sdtm_form_ids is not None or allowed_sdtm_form_keys is not None:
+                        base_iter = raw_records
+
+                        def _filter_by_domain_forms(it: Iterable[Any]) -> Iterator[Any]:
+                            for item in it:
+                                fid, fkey = extract_record_form_ref(item)
+                                if (
+                                    (
+                                        allowed_sdtm_form_ids
+                                        and fid is not None
+                                        and fid in allowed_sdtm_form_ids
+                                    )
+                                    or (
+                                        allowed_sdtm_form_keys
+                                        and fkey is not None
+                                        and fkey in allowed_sdtm_form_keys
+                                    )
+                                    or (fid is None and not fkey)
+                                ):
+                                    yield item
+
+                        raw_records = _filter_by_domain_forms(base_iter)
+            else:
+                raw_records = iter_filtered_sdk_records(
+                    sdk,
+                    study_key,
+                    watermark=watermark,
+                    record_filter=opts["record_filter"],
+                    record_data_filter=opts["record_data_filter"],
+                    exclude_deleted_upstream=exclude_deleted_upstream,
+                )
 
         pending_voided: list[Any] = []
         voided_batch_idx = 0
@@ -2463,11 +3166,16 @@ __all__ = [
     "_require_optional_dep",
     "apply_quality_gate",
     "bind_sdtm_stream_metadata",
+    "build_form_sdtm_domain_map",
     "build_record_query_branches",
+    "commit_sdtm_lineage",
+    "deduplicate_sdtm_rows",
     "evaluate_standards_readiness",
     "extract_record_form_ref",
     "extract_record_id",
     "extract_record_timestamp",
+    "extract_sdtm_composite_key",
+    "filter_forms_by_sdtm_domain",
     "get_state_provider",
     "get_tabular_batch_stamp",
     "has_valid_tabular_batch_stamp",
@@ -2479,7 +3187,10 @@ __all__ = [
     "normalize_sink_value",
     "normalize_watermark_datetime",
     "redact_batch_records",
+    "rehydrate_sdtm_lineage",
+    "resolve_form_sdtm_domain",
     "resolve_max_buffered_records",
+    "resolve_voided_sdtm_keys",
     "run_streaming_export",
     "stamp_tabular_batch",
     "validate_max_buffered_records",

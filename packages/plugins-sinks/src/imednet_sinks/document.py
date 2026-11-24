@@ -97,9 +97,13 @@ from imednet.spi.sinks import (
     apply_quality_gate,
     bind_sdtm_stream_metadata,
     build_sink_mapper,
+    commit_sdtm_lineage,
     extract_record_id,
+    extract_sdtm_composite_key,
     normalize_sink_value,
+    rehydrate_sdtm_lineage,
     require_optional_dep,
+    resolve_voided_sdtm_keys,
     run_streaming_export,
 )
 
@@ -180,12 +184,56 @@ def _attach_sdtm_document_id(doc: dict[str, Any], record: Any, study_key: str) -
     if rid is not None:
         doc["_id"] = _make_document_id(resolved_study, rid)
     else:
-        domain = str(doc.get("DOMAIN") or "DM")
+        domain = str(doc.get("DOMAIN") or "DM").strip().upper()
         usubjid = str(doc.get("USUBJID") or "")
-        seq_val = next((doc[k] for k in doc if k.endswith("SEQ")), 1)
-        doc["_id"] = f"{resolved_study}/{domain}/{usubjid}/{seq_val}"
+        if domain == "DM":
+            doc["_id"] = f"{resolved_study}/DM/{usubjid}"
+        else:
+            seq_val = next((doc[k] for k in doc if k.endswith("SEQ")), 1)
+            doc["_id"] = f"{resolved_study}/{domain}/{usubjid}/{seq_val}"
     normalized: dict[str, Any] = normalize_sink_value(doc)
     return _encode_bson_scalars(normalized)  # type: ignore[no-any-return]
+
+
+def _sdtm_composite_mongo_filter(entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a MongoDB query filter matching an SDTM composite key."""
+    study_id = entry.get("study_id") or entry.get("STUDYID")
+    domain = entry.get("domain") or entry.get("DOMAIN")
+    usubjid = entry.get("usubjid") or entry.get("USUBJID")
+    if not study_id or not domain or not usubjid:
+        return None
+    dom_str = str(domain).strip().upper()
+    base_flt: dict[str, Any] = {
+        "STUDYID": str(study_id),
+        "DOMAIN": dom_str,
+        "USUBJID": str(usubjid),
+    }
+    if dom_str == "DM":
+        return base_flt
+    seq_col = entry.get("seq_col") or f"{dom_str}SEQ"
+    seq_val = entry.get("seq_val")
+    if seq_val is None:
+        return None
+    base_flt[str(seq_col)] = int(seq_val)
+    return base_flt
+
+
+def _dedupe_sdtm_mongo_docs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate mapped SDTM MongoDB documents in-batch by SDTM composite key."""
+    if len(docs) <= 1:
+        return docs
+    index_by_key: dict[tuple[Any, ...], int] = {}
+    ordered: list[dict[str, Any] | None] = []
+    for doc in docs:
+        comp = extract_sdtm_composite_key(doc)
+        if comp is None or (comp[1] != "DM" and comp[4] is None):
+            ordered.append(doc)
+            continue
+        if comp in index_by_key:
+            ordered[index_by_key[comp]] = None
+        index_by_key[comp] = len(ordered)
+        ordered.append(doc)
+    return [d for d in ordered if d is not None]
 
 
 def _record_to_document(
@@ -221,6 +269,7 @@ class MongoDbExportSink(ExportSink):
         ImportError: When the ``pymongo`` package is not installed.
     """
 
+    _delegates_sdtm_redaction = True
     reconciles_deleted_on_full_sync = True
 
     def __init__(self, config: MongoDbSinkConfig) -> None:
@@ -236,6 +285,7 @@ class MongoDbExportSink(ExportSink):
         self._collection_name = self.config.collection
         self._study_key = self.config.study_key
         self._seq_counters: dict[str, int] = {}
+        self._domain_seq_counters: dict[str, dict[str, int]] = {}
         self._record_seqs: dict[str, int] = {}
         self._client: Any = None
         self._collection: Any = None
@@ -275,24 +325,54 @@ class MongoDbExportSink(ExportSink):
         if not records:
             return 0
 
+        lineage_out: dict[str, dict[str, Any]] = {}
+        seq_overrides: dict[str, int] | None = None
+        if self.config.as_sdtm:
+            rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
+            for dom_code, subj_map in rehydrated_counters.items():
+                local_map = self._domain_seq_counters.setdefault(dom_code, {})
+                for subj_key, wm_val in subj_map.items():
+                    local_map[subj_key] = max(local_map.get(subj_key, 0), wm_val)
+
         post_proc = None if self.config.as_sdtm else _post_process_document
         mapper = build_sink_mapper(
             self.config,
             mode="document",
             post_processor=post_proc,
-            seq_counters=self._seq_counters,
+            seq_counters=(
+                self._seq_counters
+                if (not self.config.as_sdtm or self.config.sdtm_domain is not None)
+                else None
+            ),
+            domain_seq_counters=self._domain_seq_counters if self.config.as_sdtm else None,
+            form_domain_map=getattr(self, "_active_form_domain_map", None),
+            seq_overrides=seq_overrides,
+            lineage_out=lineage_out if self.config.as_sdtm else None,
             record_seqs=self._record_seqs,
         )
         mapped_docs: list[dict[str, Any]] | None = None
+        is_incremental = bool(
+            self.config.incremental
+            or self.config.modified_since is not None
+            or self.config.state_provider is not None
+        )
 
         def execute_export() -> int:
             """Perform the actual write or upsert operation to MongoDB."""
             nonlocal mapped_docs
             if mapped_docs is None:
                 try:
-                    mapped_docs = [
-                        _record_to_document(r, self._study_key, mapper=mapper) for r in records
-                    ]
+                    if self.config.as_sdtm:
+                        pairs = mapper.map_batch_with_sources(records, study_key=self._study_key)
+                        raw_docs = [
+                            _attach_sdtm_document_id(doc, src_rec, self._study_key)
+                            for src_rec, doc in pairs
+                        ]
+                        mapped_docs = _dedupe_sdtm_mongo_docs(raw_docs)
+                    else:
+                        mapped_docs = [
+                            _record_to_document(r, self._study_key, mapper=mapper) for r in records
+                        ]
                 except ExportConfigurationError:
                     raise
                 except Exception:
@@ -301,6 +381,29 @@ class MongoDbExportSink(ExportSink):
                 return 0
             if self.config.idempotent:
                 pymongo = _require_optional_dep("pymongo", "mongodb")
+                if self.config.as_sdtm and is_incremental:
+                    superseded_clauses: list[dict[str, Any]] = []
+                    for doc in mapped_docs:
+                        if "RECORD_ID" in doc:
+                            continue
+                        comp = extract_sdtm_composite_key(doc)
+                        if comp is not None and (comp[1] == "DM" or comp[4] is not None):
+                            flt: dict[str, Any] = {
+                                "STUDYID": comp[0],
+                                "DOMAIN": comp[1],
+                                "USUBJID": comp[2],
+                                "_id": {"$ne": doc["_id"]},
+                            }
+                            if comp[1] != "DM" and comp[3] is not None:
+                                flt[comp[3]] = comp[4]
+                            superseded_clauses.append(flt)
+                    if superseded_clauses:
+                        prune_q = (
+                            superseded_clauses[0]
+                            if len(superseded_clauses) == 1
+                            else {"$or": superseded_clauses}
+                        )
+                        self._collection.delete_many(prune_q)
                 ops = [
                     pymongo.UpdateOne(
                         {"_id": doc["_id"]},
@@ -318,7 +421,10 @@ class MongoDbExportSink(ExportSink):
             logger.debug("Wrote batch %s (%d records)", batch_id, written)
             return written
 
-        return self._execute_with_retry("export_mongodb", batch_id, execute_export)
+        written_total = self._execute_with_retry("export_mongodb", batch_id, execute_export)
+        if self.config.as_sdtm and lineage_out:
+            commit_sdtm_lineage(self, lineage_out)
+        return written_total
 
     def flush(self) -> None:
         """No-op: MongoDB writes are committed per bulk operation."""
@@ -327,6 +433,50 @@ class MongoDbExportSink(ExportSink):
         """Delete newly voided documents from MongoDB when running idempotently."""
         if not self.config.idempotent or not records:
             return 0
+        if self.config.as_sdtm:
+            doc_ids = [
+                _make_document_id(self._study_key, rid)
+                for r in records
+                if (rid := extract_record_id(r)) is not None
+            ]
+            unmatched_records = [r for r in records if extract_record_id(r) is None]
+            comp_filters: list[dict[str, Any]] = []
+            if unmatched_records:
+                sdtm_entries = resolve_voided_sdtm_keys(
+                    unmatched_records,
+                    self,
+                    study_key=getattr(self, "_active_study_key", None) or self._study_key,
+                    stream_name=getattr(self, "_active_stream_name", None)
+                    or self.config.stream_name,
+                    sdtm_domain=self.config.sdtm_domain,
+                    form_domain_map=getattr(self, "_active_form_domain_map", None),
+                )
+                comp_filters = [
+                    flt
+                    for e in sdtm_entries
+                    if (flt := _sdtm_composite_mongo_filter(e)) is not None
+                ]
+            or_clauses: list[dict[str, Any]] = list(comp_filters)
+            if doc_ids:
+                or_clauses.append({"_id": {"$in": doc_ids}})
+            if not or_clauses:
+                return 0
+            delete_query = or_clauses[0] if len(or_clauses) == 1 else {"$or": or_clauses}
+            expected_count = len(doc_ids) + len(comp_filters)
+
+            def execute_sdtm_reconcile() -> int:
+                self._collection.delete_many(delete_query)
+                logger.debug(
+                    "Reconciled %d voided SDTM records in batch %s", expected_count, batch_id
+                )
+                return expected_count
+
+            return self._execute_with_retry(
+                "reconcile_mongodb_deleted",
+                batch_id,
+                execute_sdtm_reconcile,
+            )
+
         doc_ids = [
             _make_document_id(self._study_key, rid)
             for r in records

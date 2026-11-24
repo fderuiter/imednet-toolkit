@@ -11,7 +11,7 @@ import re
 import socket
 import sys
 import tempfile
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -264,6 +264,76 @@ class BaseStateProvider(abc.ABC):
     def read_state(self) -> LedgerState:
         """Reads and validates the current full state (for CLI display)."""
 
+    def get_sdtm_lineage(self, study_key: str, stream_name: str) -> dict[str, Any]:
+        """Return persisted SDTM sidecar lineage and monotonic sequence watermarks."""
+        state = self.read_state()
+        study = state.studies.get(study_key)
+        if not study:
+            return {"sdtm_lineage": {}, "sdtm_seq_watermarks": {}}
+        stream = study.streams.get(stream_name)
+        if not stream or not isinstance(stream.metadata, dict):
+            return {"sdtm_lineage": {}, "sdtm_seq_watermarks": {}}
+        raw_lin = stream.metadata.get("sdtm_lineage")
+        raw_wm = stream.metadata.get("sdtm_seq_watermarks")
+        return {
+            "sdtm_lineage": copy.deepcopy(raw_lin) if isinstance(raw_lin, dict) else {},
+            "sdtm_seq_watermarks": copy.deepcopy(raw_wm) if isinstance(raw_wm, dict) else {},
+        }
+
+    def record_sdtm_lineage(
+        self,
+        study_key: str,
+        stream_name: str,
+        lineage_updates: Mapping[str, dict[str, Any] | None] | None = None,
+        seq_watermarks: Mapping[str, int] | None = None,
+    ) -> None:
+        """Persist SDTM sidecar lineage and monotonic sequence watermarks."""
+        _ = (study_key, stream_name, lineage_updates, seq_watermarks)
+
+
+def _merge_preserved_lineage_metadata(
+    existing_meta: Mapping[str, Any] | None,
+    incoming_meta: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge incoming checkpoint metadata while preserving SDTM sidecar lineage and watermarks."""
+    merged: dict[str, Any] = dict(incoming_meta) if isinstance(incoming_meta, Mapping) else {}
+    if not isinstance(existing_meta, Mapping):
+        return merged
+
+    prior_lin = existing_meta.get("sdtm_lineage")
+    inc_lin = merged.get("sdtm_lineage")
+    if isinstance(prior_lin, Mapping) or isinstance(inc_lin, Mapping):
+        combined_lin: dict[str, Any] = (
+            {str(k): copy.deepcopy(v) for k, v in prior_lin.items() if isinstance(v, Mapping)}
+            if isinstance(prior_lin, Mapping)
+            else {}
+        )
+        if isinstance(inc_lin, Mapping):
+            for rk, rv in inc_lin.items():
+                if rv is None:
+                    combined_lin.pop(str(rk), None)
+                elif isinstance(rv, Mapping):
+                    combined_lin[str(rk)] = copy.deepcopy(dict(rv))
+        if combined_lin:
+            merged["sdtm_lineage"] = combined_lin
+
+    prior_wm = existing_meta.get("sdtm_seq_watermarks")
+    inc_wm = merged.get("sdtm_seq_watermarks")
+    if isinstance(prior_wm, Mapping) or isinstance(inc_wm, Mapping):
+        combined_wm: dict[str, int] = {}
+        if isinstance(prior_wm, Mapping):
+            for wk, wv in prior_wm.items():
+                if isinstance(wv, int) and not isinstance(wv, bool):
+                    combined_wm[str(wk)] = wv
+        if isinstance(inc_wm, Mapping):
+            for wk, wv in inc_wm.items():
+                if isinstance(wv, int) and not isinstance(wv, bool):
+                    combined_wm[str(wk)] = max(combined_wm.get(str(wk), 0), wv)
+        if combined_wm:
+            merged["sdtm_seq_watermarks"] = combined_wm
+
+    return merged
+
 
 DEFAULT_LEDGER_PATH: str = os.environ.get(
     "IMEDNET_WORKFLOW_LEDGER_PATH",
@@ -462,13 +532,15 @@ class FileStateProvider(BaseStateProvider):
             state = self.read_state()
             study = state.studies.setdefault(study_key, StudyState())
 
+            current_stream = study.streams.get(stream_name)
             if not force:
-                current_stream = study.streams.get(stream_name)
                 current_status = current_stream.last_run_status if current_stream else None
                 validate_transition(current_status, validated_status)
 
             normalized_ts = _normalize_optional_utc(timestamp)
-            redacted_meta = _sanitize_metadata(metadata)
+            prior_meta = current_stream.metadata if current_stream else None
+            merged_meta = _merge_preserved_lineage_metadata(prior_meta, metadata)
+            redacted_meta = _sanitize_metadata(merged_meta)
 
             study.streams[stream_name] = StreamState(
                 last_timestamp=normalized_ts,
@@ -477,6 +549,45 @@ class FileStateProvider(BaseStateProvider):
                 error_message=error_message,
                 metadata=redacted_meta,
             )
+            self.write_state(state)
+
+    def get_sdtm_lineage(self, study_key: str, stream_name: str) -> dict[str, Any]:
+        """Return persisted SDTM sidecar lineage and sequence watermarks under file lock."""
+        with self._lock():
+            return super().get_sdtm_lineage(study_key, stream_name)
+
+    def record_sdtm_lineage(
+        self,
+        study_key: str,
+        stream_name: str,
+        lineage_updates: Mapping[str, dict[str, Any] | None] | None = None,
+        seq_watermarks: Mapping[str, int] | None = None,
+    ) -> None:
+        """Atomically merge SDTM sidecar lineage and monotonic sequence watermarks into the ledger."""
+        if not lineage_updates and not seq_watermarks:
+            return
+        with self._lock():
+            state = self.read_state()
+            study = state.studies.setdefault(study_key, StudyState())
+            current_stream = study.streams.get(stream_name)
+            prior_meta = current_stream.metadata if current_stream else {}
+            incoming: dict[str, Any] = {}
+            if lineage_updates:
+                incoming["sdtm_lineage"] = dict(lineage_updates)
+            if seq_watermarks:
+                incoming["sdtm_seq_watermarks"] = dict(seq_watermarks)
+            merged_meta = _sanitize_metadata(
+                _merge_preserved_lineage_metadata(prior_meta, incoming)
+            )
+            if current_stream is not None:
+                current_stream.metadata = merged_meta
+            else:
+                study.streams[stream_name] = StreamState(
+                    last_timestamp=None,
+                    records_processed=0,
+                    last_run_status=StreamExecutionStatus.SUCCESS,
+                    metadata=merged_meta,
+                )
             self.write_state(state)
 
     @contextlib.contextmanager
@@ -580,10 +691,17 @@ class FileStateProvider(BaseStateProvider):
                     _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
                 )
                 raw_commit_meta = tx_data.get("metadata")
-                redacted_commit_meta = (
-                    _sanitize_metadata(raw_commit_meta) if isinstance(raw_commit_meta, dict) else {}
-                )
                 study_entry = state.studies.setdefault(study_key, StudyState())
+                running_stream = study_entry.streams.get(stream_name)
+                base_meta = _merge_preserved_lineage_metadata(
+                    prior_metadata,
+                    running_stream.metadata if running_stream else None,
+                )
+                commit_meta = _merge_preserved_lineage_metadata(
+                    base_meta,
+                    raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
+                )
+                redacted_commit_meta = _sanitize_metadata(commit_meta)
                 study_entry.streams[stream_name] = StreamState(
                     last_timestamp=commit_ts,
                     records_processed=tx_data.get("records_processed", 0),
@@ -705,11 +823,16 @@ class FileStateProvider(BaseStateProvider):
                         else prior_ts_map[stream_name]
                     )
                     raw_commit_meta = tx_data.get("metadata")
-                    redacted_commit_meta = (
-                        _sanitize_metadata(raw_commit_meta)
-                        if isinstance(raw_commit_meta, dict)
-                        else {}
+                    running_stream = study_entry.streams.get(stream_name)
+                    base_meta = _merge_preserved_lineage_metadata(
+                        prior_meta_map[stream_name],
+                        running_stream.metadata if running_stream else None,
                     )
+                    commit_meta = _merge_preserved_lineage_metadata(
+                        base_meta,
+                        raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
+                    )
+                    redacted_commit_meta = _sanitize_metadata(commit_meta)
                     study_entry.streams[stream_name] = StreamState(
                         last_timestamp=commit_ts,
                         records_processed=tx_data.get("records_processed", 0),
@@ -1285,6 +1408,60 @@ class AirflowStateProvider(BaseStateProvider):
         payload = self._read_stream_entry(study_key, stream_name)
         return self._parse_status(payload)
 
+    def get_sdtm_lineage(self, study_key: str, stream_name: str) -> dict[str, Any]:
+        """Return persisted SDTM sidecar lineage and sequence watermarks from Airflow Variables."""
+        payload = self._read_stream_entry(study_key, stream_name)
+        meta = payload.get("metadata") if isinstance(payload, dict) else None
+        if not isinstance(meta, dict):
+            return {"sdtm_lineage": {}, "sdtm_seq_watermarks": {}}
+        raw_lin = meta.get("sdtm_lineage")
+        raw_wm = meta.get("sdtm_seq_watermarks")
+        return {
+            "sdtm_lineage": copy.deepcopy(raw_lin) if isinstance(raw_lin, dict) else {},
+            "sdtm_seq_watermarks": copy.deepcopy(raw_wm) if isinstance(raw_wm, dict) else {},
+        }
+
+    def record_sdtm_lineage(
+        self,
+        study_key: str,
+        stream_name: str,
+        lineage_updates: Mapping[str, dict[str, Any] | None] | None = None,
+        seq_watermarks: Mapping[str, int] | None = None,
+    ) -> None:
+        """Persist SDTM sidecar lineage and monotonic sequence watermarks in Airflow Variables."""
+        if not lineage_updates and not seq_watermarks:
+            return
+        resolved_study, streams, legacy_keys = self._load_study_state(study_key)
+        existing = streams.get(stream_name)
+        prior_meta = existing.get("metadata") if isinstance(existing, dict) else {}
+        incoming: dict[str, Any] = {}
+        if lineage_updates:
+            incoming["sdtm_lineage"] = dict(lineage_updates)
+        if seq_watermarks:
+            incoming["sdtm_seq_watermarks"] = dict(seq_watermarks)
+        merged_meta = _merge_preserved_lineage_metadata(
+            prior_meta if isinstance(prior_meta, Mapping) else None,
+            incoming,
+        )
+        if isinstance(existing, dict):
+            updated = dict(existing)
+            updated["metadata"] = _sanitize_metadata(merged_meta)
+            streams[stream_name] = updated
+        else:
+            streams[stream_name] = self._build_stream_payload(
+                study_key=resolved_study,
+                stream_name=stream_name,
+                timestamp=None,
+                records_processed=0,
+                status=StreamExecutionStatus.SUCCESS,
+                metadata=merged_meta,
+            )
+        self._save_study_state(
+            resolved_study,
+            streams,
+            legacy_keys_to_delete=legacy_keys,
+        )
+
     def set_last_timestamp(
         self,
         study_key: str,
@@ -1299,15 +1476,26 @@ class AirflowStateProvider(BaseStateProvider):
         owner_pid: int | None = None,
         owner_host: str | None = None,
         lease_expires_at: datetime | None = None,
+        _preserve_existing_lineage: bool = True,
     ) -> None:
         """Persist the high-water mark checkpoint for a Study and stream in Airflow Variables."""
         validated_status = _coerce_and_validate_status(status)
         resolved_study, streams, legacy_keys = self._load_study_state(study_key)
+        existing_payload = streams.get(stream_name)
 
         if not force:
-            current_status = self._parse_status(streams.get(stream_name))
+            current_status = self._parse_status(existing_payload)
             validate_transition(current_status, validated_status)
 
+        prior_meta = (
+            existing_payload.get("metadata")
+            if _preserve_existing_lineage and isinstance(existing_payload, dict)
+            else None
+        )
+        merged_meta = _merge_preserved_lineage_metadata(
+            prior_meta if isinstance(prior_meta, Mapping) else None,
+            metadata,
+        )
         streams[stream_name] = self._build_stream_payload(
             study_key=resolved_study,
             stream_name=stream_name,
@@ -1315,7 +1503,7 @@ class AirflowStateProvider(BaseStateProvider):
             records_processed=records_processed,
             status=validated_status,
             error_message=error_message,
-            metadata=metadata,
+            metadata=merged_meta,
             owner_pid=owner_pid,
             owner_host=owner_host,
             lease_expires_at=lease_expires_at,
@@ -1446,13 +1634,17 @@ class AirflowStateProvider(BaseStateProvider):
             raw_new_ts = tx_data.get("new_timestamp")
             commit_ts = _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
             raw_commit_meta = tx_data.get("metadata")
+            merged_commit_meta = _merge_preserved_lineage_metadata(
+                prior_metadata,
+                raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
+            )
             streams[stream_name] = self._build_stream_payload(
                 study_key=resolved_study,
                 stream_name=stream_name,
                 timestamp=commit_ts,
                 records_processed=tx_data.get("records_processed", 0),
                 status=StreamExecutionStatus.SUCCESS,
-                metadata=raw_commit_meta if isinstance(raw_commit_meta, dict) else {},
+                metadata=merged_commit_meta,
             )
             self._save_study_state(resolved_study, streams)
 
@@ -1562,13 +1754,17 @@ class AirflowStateProvider(BaseStateProvider):
                     else prior_ts_map[stream_name]
                 )
                 raw_commit_meta = tx_data.get("metadata")
+                merged_commit_meta = _merge_preserved_lineage_metadata(
+                    prior_meta_map[stream_name],
+                    raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
+                )
                 streams[stream_name] = self._build_stream_payload(
                     study_key=resolved_study,
                     stream_name=stream_name,
                     timestamp=commit_ts,
                     records_processed=tx_data.get("records_processed", 0),
                     status=StreamExecutionStatus.SUCCESS,
-                    metadata=raw_commit_meta if isinstance(raw_commit_meta, dict) else {},
+                    metadata=merged_commit_meta,
                 )
             self._save_study_state(resolved_study, streams)
 
