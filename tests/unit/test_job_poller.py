@@ -809,3 +809,46 @@ async def test_poll_step_events_and_batch_helpers_parity(
     base._record_batch_result(recorded, "B1", terminal)
     base._record_batch_result(recorded, "B1", stale)
     assert recorded["B1"] is terminal
+
+
+def test_retired_facade_result_wrappers_and_resolve_sdk_result_fetcher_contract() -> None:
+    """Verify SPI/SDK omit fetch_job_result wrappers while resolve_sdk_result_fetcher resolves jobs.fetch_result."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    from imednet.sdk import AsyncImednetSDK, ImednetSDK
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+    from imednet.utils.job_poller import resolve_sdk_result_fetcher
+
+    assert not hasattr(ImednetFacade, "fetch_job_result")
+    assert not hasattr(AsyncImednetFacade, "async_fetch_job_result")
+    assert not hasattr(ImednetSDK, "fetch_job_result")
+    assert not hasattr(AsyncImednetSDK, "async_fetch_job_result")
+
+    with ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://edc.test.imednetapi.com",
+        transport=httpx.MockTransport(lambda _req: httpx.Response(200, json=[])),
+    ) as sdk:
+        resolved = resolve_sdk_result_fetcher(sdk)
+        assert resolved == sdk.jobs.fetch_result
+
+    # Unconfigured MagicMock does not synthesize a fake fetcher
+    unconfigured_mock = MagicMock()
+    _ = unconfigured_mock.jobs.get
+    assert resolve_sdk_result_fetcher(unconfigured_mock) is None
+
+    # Configured jobs.fetch_result on MagicMock and SimpleNamespace resolves cleanly
+    configured_mock = MagicMock()
+    configured_mock.jobs.fetch_result.return_value = [{"status": "COMPLETED"}]
+    assert resolve_sdk_result_fetcher(configured_mock) is configured_mock.jobs.fetch_result
+
+    fn = lambda url: [{"url": url}]  # noqa: E731
+    double = SimpleNamespace(
+        fetch_job_result=lambda _u: (_ for _ in ()).throw(AssertionError("must be ignored")),
+        jobs=SimpleNamespace(fetch_result=fn),
+    )
+    assert resolve_sdk_result_fetcher(double) is fn

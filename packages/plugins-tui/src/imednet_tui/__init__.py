@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from .app import (
         DashboardScreen,
         ImednetTuiApp,
+        JobDetailPanel,
         JobMonitor,
         JobTable,
         SiteList,
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "DashboardScreen": ("imednet_tui.app", "DashboardScreen"),
     "ImednetTuiApp": ("imednet_tui.app", "ImednetTuiApp"),
+    "JobDetailPanel": ("imednet_tui.app", "JobDetailPanel"),
     "JobMonitor": ("imednet_tui.app", "JobMonitor"),
     "JobTable": ("imednet_tui.app", "JobTable"),
     "SiteList": ("imednet_tui.app", "SiteList"),
@@ -54,6 +56,7 @@ def __dir__() -> list[str]:
 __all__ = [
     "DashboardScreen",
     "ImednetTuiApp",
+    "JobDetailPanel",
     "JobMonitor",
     "JobTable",
     "SiteList",

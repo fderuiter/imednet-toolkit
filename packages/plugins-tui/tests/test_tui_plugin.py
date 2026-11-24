@@ -32,6 +32,7 @@ from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet_tui.app import (
     DashboardScreen,
     ImednetTuiApp,
+    JobDetailPanel,
     JobMonitor,
     JobTable,
     LogViewer,
@@ -2508,8 +2509,10 @@ async def test_more_than_15_jobs_rendered_and_keyboard_scrollable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_batch_submission_without_study_notifies_and_pending_cli_batches_attach() -> None:
-    """Verify submitting batch IDs before study selection warns, while initial CLI batches attach on first select."""
+async def test_batch_submission_without_study_stages_queued_and_pending_cli_batches_attach() -> (
+    None
+):
+    """Verify submitting valid batch IDs before study selection stages QUEUED rows and attaches on select."""
     from textual.widgets import Input
 
     from imednet_tui.app import JobTable
@@ -2529,24 +2532,29 @@ async def test_batch_submission_without_study_notifies_and_pending_cli_batches_a
     async with app.run_test(size=(100, 30)) as pilot:
         await _settle(pilot)
 
-        # Before selecting a study, no poll happens and submitting in Input warns gracefully
+        # Before selecting a study, no poll happens and submitting in Input stages QUEUED entry
         sdk.async_get_job.assert_not_called()
         batch_input = app.screen.query_one("#batch_id_input", Input)
+        job_table = app.screen.query_one("#job_table", JobTable)
         batch_input.focus()
         await pilot.pause()
         batch_input.value = "EARLY-BATCH"
         await pilot.press("enter")
         await _settle(pilot)
+        assert batch_input.value == ""
         sdk.async_get_job.assert_not_called()
+        assert job_table.row_count == 2
+        assert [str(c) for c in job_table.get_row_at(0)[:2]] == ["PENDING-BATCH-1", "QUEUED"]
+        assert [str(c) for c in job_table.get_row_at(1)[:2]] == ["EARLY-BATCH", "QUEUED"]
 
-        # Selecting a study attaches the deferred CLI batch ID
+        # Selecting a study attaches both CLI and staged batch IDs
         study_list = app.screen.query_one(StudyList)
         study_list.post_message(StudyList.StudySelected("STUDY-DEFER", "Deferred Study"))
         await _settle(pilot)
 
-        job_table = app.screen.query_one("#job_table", JobTable)
-        assert job_table.row_count == 1
+        assert job_table.row_count == 2
         assert str(job_table.get_row_at(0)[0]) == "PENDING-BATCH-1"
+        assert str(job_table.get_row_at(1)[0]) == "EARLY-BATCH"
 
 
 @pytest.mark.asyncio
@@ -3657,10 +3665,10 @@ async def test_result_url_edge_cases_skip_fetch_safely() -> None:
     assert "B-INLINE" in rendered
     assert "total=1, failed=0" in rendered
 
-    # Case 2: Configured async_fetch_job_result spy is NOT called for inline, empty, or <...> URLs
+    # Case 2: Configured jobs.fetch_result spy is NOT called for inline, empty, or <...> URLs
     fetch_spy = AsyncMock(return_value=[{"status": "SUCCESS"}])
     configured_sdk = MagicMock(spec=AsyncImednetFacade)
-    configured_sdk.async_fetch_job_result = fetch_spy
+    configured_sdk.jobs = MagicMock(fetch_result=fetch_spy)
     configured_sdk.async_get_job = AsyncMock(
         side_effect=[
             JobStatus(
@@ -4008,10 +4016,6 @@ async def test_job_monitor_facade_only_no_private_probes_and_skips_unbacked_resu
                 result_url=f"https://results.strict.example/{batch_id}",
             )
 
-        async def async_fetch_job_result(self, result_url: str) -> Any:
-            self.fetch_calls += 1
-            return [{"status": "SUCCESS"}]
-
     strict_facade: Any = _StrictAsyncFacade()
     monitor = JobMonitor(strict_facade)
     monitor.current_study_key = "STUDY-STRICT"
@@ -4122,7 +4126,7 @@ async def test_job_monitor_preserves_failure_warning_and_toggles_inline_detail_p
         job_monitor = dashboard.query_one(JobMonitor)
         notice = job_monitor.query_one("#job_monitor_notice", Static)
         job_table = job_monitor.query_one("#job_table", JobTable)
-        detail_panel = job_monitor.query_one("#job_detail_panel", Static)
+        detail_panel = job_monitor.query_one("#job_detail_panel", JobDetailPanel)
 
         rendered_summary = str(job_monitor.render())
         assert "502 Bad Gateway" in rendered_summary
@@ -4250,7 +4254,7 @@ async def test_batch_input_preflight_validation_and_terminal_path_traversal_erro
             await pilot.press("enter")
             await pilot.pause()
 
-            assert batch_input.value == ""
+            assert batch_input.value == bad_token
             assert job_table.row_count == 0
             assert "Validation Warning:" in str(notice.render())
             assert any(sev == "warning" for _, sev in notifications)
@@ -4304,7 +4308,7 @@ async def test_unassigned_cli_batches_render_queued_and_poll_on_study_selection(
         job_monitor = dashboard.query_one(JobMonitor)
         notice = job_monitor.query_one("#job_monitor_notice", Static)
         job_table = job_monitor.query_one("#job_table", JobTable)
-        detail_panel = job_monitor.query_one("#job_detail_panel", Static)
+        detail_panel = job_monitor.query_one("#job_detail_panel", JobDetailPanel)
 
         assert job_table.row_count == 2
         assert [str(c) for c in job_table.get_row_at(0)[:2]] == ["BATCH-01", "QUEUED"]
@@ -4425,3 +4429,460 @@ async def test_textual_log_handler_and_sanitize_text_mask_phi_and_preserve_relat
             assert "***MASKED***" in direct
     finally:
         global_sensitivity_registry.remove_sensitive_key("custom_mrn")
+
+
+@pytest.mark.asyncio
+async def test_split_job_detail_panel_80x24_retains_table_rows_and_keyboard_scrolls() -> None:
+    """AC 1: On 80x24 Pilot viewport, opening #job_detail_panel retains >= 2 #job_table rows and Tab + PageDown scrolls."""
+    from imednet.models.jobs import JobState, JobStatus
+    from imednet.models.studies import Study
+    from imednet_tui.app import JobDetailPanel, JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(
+        return_value=[Study(study_key="STUDY-80X24", study_name="Compact Split Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    many_errors = [
+        {
+            "status": "FAILED",
+            "recordId": idx,
+            "subjectKey": f"SUBJ-{idx:03d}",
+            "formKey": "AE",
+            "error": f"Validation failure #{idx} for ssn==123-45-{idx:04d}",
+        }
+        for idx in range(1, 25)
+    ]
+
+    async def _get_job(_sk: str, bid: str) -> JobStatus:
+        return JobStatus(
+            job_id=f"J-{bid}",
+            batch_id=bid,
+            state=JobState.COMPLETED,
+            date_created="2026-11-24 09:00:00",
+            date_started="2026-11-24 09:00:05",
+            date_finished="2026-11-24 09:01:10",
+            progress=100,
+            total_records=24,
+            failed_records=24 if bid == "BATCH-1" else 0,
+            results=many_errors if bid == "BATCH-1" else [],
+        )
+
+    sdk.async_get_job = AsyncMock(side_effect=_get_job)
+
+    app = ImednetTuiApp(
+        sdk,
+        study_key="STUDY-80X24",
+        batch_ids=["BATCH-1", "BATCH-2", "BATCH-3", "BATCH-4"],
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _settle(pilot)
+        job_table = app.screen.query_one("#job_table", JobTable)
+        detail_panel = app.screen.query_one("#job_detail_panel", JobDetailPanel)
+
+        job_table.focus()
+        job_table.move_cursor(row=0)
+        await pilot.pause()
+        await pilot.press("enter")
+        await _settle(pilot)
+
+        assert detail_panel.has_class("visible")
+        # Header consumes 1 row inside JobTable; verify >= 2 data rows remain visible on 80x24
+        visible_data_rows = job_table.content_size.height - 1
+        assert visible_data_rows >= 2
+        assert job_table.row_count == 4
+
+        # Tab focuses #job_detail_panel and PageDown advances scroll_y > 0.0
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.focused is detail_panel
+        assert detail_panel.scroll_y == 0.0
+
+        await pilot.press("pagedown")
+        await pilot.pause()
+        assert detail_panel.scroll_y > 0.0
+        after_pagedown = detail_panel.scroll_y
+
+        await pilot.press("down")
+        await pilot.pause()
+        assert detail_panel.scroll_y >= after_pagedown
+
+        await pilot.press("end")
+        await pilot.pause()
+        assert detail_panel.scroll_y == detail_panel.max_scroll_y > 0.0
+
+        await pilot.press("up")
+        await pilot.pause()
+        assert detail_panel.scroll_y < detail_panel.max_scroll_y
+
+        await pilot.press("pageup")
+        await pilot.pause()
+        await pilot.press("home")
+        await pilot.pause()
+        assert detail_panel.scroll_y == 0.0
+
+
+@pytest.mark.asyncio
+async def test_job_detail_panel_renders_six_field_metadata_and_explicit_not_found_diagnostic() -> (
+    None
+):
+    """AC 2: #job_detail_panel renders all six Job fields, sanitized resultUrl/Record errors, and explicit NOT_FOUND diagnostic."""
+    from imednet.models.jobs import JobState, JobStatus
+    from imednet.models.studies import Study
+    from imednet_tui.app import JobDetailPanel, JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(
+        return_value=[Study(study_key="STUDY-META", study_name="Metadata Study")]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+
+    full_job = JobStatus(
+        jobId="JOB-9001",
+        batchId="BATCH-META-1",
+        state=JobState.COMPLETED,
+        dateCreated="2026-11-24 08:00:00",
+        dateStarted="2026-11-24 08:00:02",
+        dateFinished="2026-11-24 08:00:19",
+        progress=100,
+        totalRecords=2,
+        failedRecords=1,
+        resultUrl=(
+            "https://edc.test.imednetapi.com/api/v1/edc/results/BATCH-META-1"
+            "?api_key=sec-url-token&filter=ssn%3D%3D123-45-6789"  # pragma: allowlist secret
+        ),
+        results=[
+            {
+                "status": "FAILED",
+                "recordId": 101,
+                "subjectKey": "SUBJ-101",
+                "error": 'Rejected patientName=="Alice Wonderland"',
+            }
+        ],
+    )
+
+    async def _get_job(_sk: str, bid: str) -> JobStatus:
+        if bid == "BATCH-MISSING-MSG":
+            raise NotFoundError("Batch BATCH-MISSING-MSG not found", status_code=404)
+        if bid == "BATCH-MISSING-EMPTY":
+            raise NotFoundError("", status_code=404)
+        return full_job
+
+    sdk.async_get_job = AsyncMock(side_effect=_get_job)
+
+    app = ImednetTuiApp(
+        sdk,
+        study_key="STUDY-META",
+        batch_ids=["BATCH-META-1", "BATCH-MISSING-MSG", "BATCH-MISSING-EMPTY"],
+    )
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settle(pilot)
+        job_table = app.screen.query_one("#job_table", JobTable)
+        detail_panel = app.screen.query_one("#job_detail_panel", JobDetailPanel)
+
+        job_table.focus()
+        job_table.move_cursor(row=0)
+        await pilot.press("enter")
+        await pilot.pause()
+
+        rendered_meta = str(detail_panel.render())
+        assert "jobId: JOB-9001" in rendered_meta
+        assert "batchId: BATCH-META-1" in rendered_meta
+        assert "state: COMPLETED" in rendered_meta
+        assert "dateCreated: 2026-11-24 08:00:00" in rendered_meta
+        assert "dateStarted: 2026-11-24 08:00:02" in rendered_meta
+        assert "dateFinished: 2026-11-24 08:00:19" in rendered_meta
+        assert "resultUrl: https://edc.test.imednetapi.com/api/v1/edc/results/BATCH-META-1" in (
+            rendered_meta
+        )
+        assert "api_key=***" in rendered_meta
+        assert "Record Errors (1):" in rendered_meta
+        assert "SUBJ-101" in rendered_meta
+        assert "sec-url-token" not in rendered_meta
+        assert "123-45-6789" not in rendered_meta
+        assert "Alice Wonderland" not in rendered_meta
+        assert "***MASKED***" in rendered_meta
+
+        # Row 1 & Row 2: NOT_FOUND entries render explicit diagnostics and NEVER "No errors reported."
+        for missing_row_idx, expected_bid in (
+            (1, "BATCH-MISSING-MSG"),
+            (2, "BATCH-MISSING-EMPTY"),
+        ):
+            job_table.move_cursor(row=missing_row_idx)
+            await pilot.press("space")
+            await pilot.pause()
+            not_found_text = str(detail_panel.render())
+            assert f"batchId: {expected_bid}" in not_found_text
+            assert "state: NOT_FOUND" in not_found_text
+            assert "jobId: -" in not_found_text
+            assert "dateCreated: -" in not_found_text
+            assert "dateStarted: -" in not_found_text
+            assert "dateFinished: -" in not_found_text
+            assert "Diagnostic:" in not_found_text
+            assert "No errors reported." not in not_found_text
+
+
+@pytest.mark.asyncio
+async def test_batch_input_stages_queued_before_study_and_preserves_invalid_input() -> None:
+    """AC 4: Submitting valid batch IDs before Study selection stages QUEUED rows; invalid input preserves text."""
+    from textual.widgets import Input
+
+    from imednet_tui.app import JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(return_value=[])
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+    sdk.async_get_job = AsyncMock()
+
+    app = ImednetTuiApp(sdk, study_key=None)
+    async with app.run_test(size=(100, 28)) as pilot:
+        await _settle(pilot)
+        batch_input = app.screen.query_one("#batch_id_input", Input)
+        job_table = app.screen.query_one("#job_table", JobTable)
+
+        batch_input.focus()
+        batch_input.value = "BATCH-001 BATCH-002"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert batch_input.value == ""
+        assert job_table.row_count == 2
+        assert [str(c) for c in job_table.get_row_at(0)[:2]] == ["BATCH-001", "QUEUED"]
+        assert [str(c) for c in job_table.get_row_at(1)[:2]] == ["BATCH-002", "QUEUED"]
+        sdk.async_get_job.assert_not_called()
+
+        # Mixed valid + invalid input preserves text in #batch_id_input without adding BATCH-GOOD-1
+        batch_input.value = "BATCH-GOOD-1 ../bad"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert batch_input.value == "BATCH-GOOD-1 ../bad"
+        assert job_table.row_count == 2
+        assert "BATCH-GOOD-1" not in [
+            str(job_table.get_row_at(i)[0]) for i in range(job_table.row_count)
+        ]
+
+
+@pytest.mark.asyncio
+async def test_escape_on_logs_tab_clears_site_filter_first_while_job_detail_open() -> None:
+    """AC 5: Pressing Escape on #logs-tab clears selected_site_id on the first keypress even if #job_detail_panel is open."""
+    from textual.widgets import TabbedContent
+
+    from imednet.models.jobs import JobState, JobStatus
+    from imednet.models.sites import Site
+    from imednet.models.studies import Study
+    from imednet_tui.app import JobDetailPanel, JobTable
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_studies = AsyncMock(
+        return_value=[Study(study_key="STUDY-ESC", study_name="Escape Study")]
+    )
+    sdk.async_get_sites = AsyncMock(
+        return_value=[Site(study_key="STUDY-ESC", site_id=10, site_name="Site Ten")]
+    )
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+    sdk.async_get_job = AsyncMock(
+        return_value=JobStatus(batch_id="BATCH-ESC", state=JobState.COMPLETED, progress=100)
+    )
+
+    app = ImednetTuiApp(sdk, study_key="STUDY-ESC", batch_ids=["BATCH-ESC"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await _settle(pilot)
+        dashboard = app.screen
+        assert isinstance(dashboard, DashboardScreen)
+        job_table = dashboard.query_one("#job_table", JobTable)
+        detail_panel = dashboard.query_one("#job_detail_panel", JobDetailPanel)
+        bottom_pane = dashboard.query_one("#bottom-pane", TabbedContent)
+
+        # Open #job_detail_panel on #jobs-tab and activate a Site filter
+        job_table.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert detail_panel.has_class("visible")
+
+        dashboard.on_site_list_site_selected(SiteList.SiteSelected("10", "Site Ten"))
+        await _settle(pilot)
+        assert dashboard.selected_site_id == "10"
+
+        # Switch to #logs-tab and press Escape ONCE -> clears selected_site_id immediately
+        bottom_pane.active = "logs-tab"
+        await pilot.pause()
+        await pilot.press("escape")
+        await _settle(pilot)
+        assert dashboard.selected_site_id is None
+        assert detail_panel.has_class("visible")
+
+        # Switch back to #jobs-tab, focus #job_detail_panel, press Escape -> closes panel and restores focus to #job_table
+        bottom_pane.active = "jobs-tab"
+        detail_panel.focus()
+        await pilot.pause()
+        assert app.focused is detail_panel
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not detail_panel.has_class("visible")
+        assert app.focused is job_table
+
+
+@pytest.mark.asyncio
+async def test_tui_sanitizers_delegate_to_core_with_cached_study_phi_fields_without_global_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 6: TUI masks URL/plain filters, multiline address JSON, and per-Study phi_fields without mutating global registry."""
+    from imednet.models.jobs import JobState, JobStatus
+    from imednet.models.studies import Study
+    from imednet.models.study_config import StudyConfiguration
+    from imednet.spi.utils import global_sensitivity_registry
+    from imednet_tui import app as tui_app_mod
+    from imednet_tui.app import JobDetailPanel, JobTable, LogViewer
+
+    resolve_calls: list[str] = []
+
+    def _fake_resolve(study_key: str | None) -> StudyConfiguration | None:
+        if study_key:
+            resolve_calls.append(study_key)
+        if study_key == "STUDY-PHI-A":
+            return StudyConfiguration(
+                studyKey="STUDY-PHI-A",
+                version="1.0",
+                reportingProfile="general",
+                phiFields=["customChartNumber", "subject_key"],
+            )
+        return None
+
+    monkeypatch.setattr(tui_app_mod, "resolve_study_configuration", _fake_resolve)
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.config = MagicMock(base_url="https://edc.test.imednetapi.com")
+    sdk.async_get_studies = AsyncMock(
+        return_value=[
+            Study(study_key="STUDY-PHI-A", study_name="PHI Study A"),
+            Study(study_key="STUDY-PHI-B", study_name="PHI Study B"),
+        ]
+    )
+    sdk.async_get_sites = AsyncMock(return_value=[])
+    sdk.async_get_subjects = AsyncMock(return_value=[])
+    sdk.async_get_job = AsyncMock(
+        return_value=JobStatus(
+            jobId="J-PHI-1",
+            batchId="BATCH-PHI-1",
+            state=JobState.COMPLETED,
+            progress=100,
+            totalRecords=1,
+            failedRecords=1,
+            resultUrl=(
+                "https://edc.test.imednetapi.com/api/v1/edc/studies/STUDY-PHI-A/records"
+                "?filter=ssn%3D%3D123-45-6789%3BcustomChartNumber%3D%3DCHART-A-777"
+                "&recordDataFilter=patientName%3D%3D%22Jane+Doe%22%3Bemail%3D~jane%40example.com"
+            ),
+            results=[
+                {
+                    "status": "FAILED",
+                    "recordId": 501,
+                    "subjectKey": "SUBJ-EXEMPT-1",
+                    "error": (
+                        'Plain filter customChartNumber==CHART-A-888;ssn!=123-45-6789 '
+                        'payload={\n  "study_key": "STUDY-PHI-A",\n  "usubjid": "USUBJ-9",\n'
+                        '  "subjid": "SUBJID-9",\n  "studyid": "STUDY-PHI-A",\n'
+                        '  "address": {\n    "street": "742 Evergreen Terrace",\n    "city": "Springfield"\n  }\n}'
+                    ),
+                }
+            ],
+        )
+    )
+
+    sens_before, exempt_before = global_sensitivity_registry.snapshot()
+
+    app = ImednetTuiApp(sdk, study_key="STUDY-PHI-A", batch_ids=["BATCH-PHI-1"])
+    async with app.run_test(size=(110, 30)) as pilot:
+        await _settle(pilot)
+        dashboard = app.screen
+        assert isinstance(dashboard, DashboardScreen)
+        log_viewer = dashboard.query_one(LogViewer)
+        job_table = dashboard.query_one("#job_table", JobTable)
+        detail_panel = dashboard.query_one("#job_detail_panel", JobDetailPanel)
+
+        imednet_logger = logging.getLogger("imednet")
+        imednet_logger.warning(
+            "Request GET https://edc.test.imednetapi.com/api/v1/edc/studies/STUDY-PHI-A/records"
+            "?filter=ssn%3D%3D123-45-6789%3Bsubject_key%3D%3DSUBJ-EXEMPT-1 "
+            "plain customChartNumber: CHART-A-999; email=~jane@example.com; record_id=501"
+        )
+        log_viewer.write_lines(
+            [
+                "{",
+                '  "study_key": "STUDY-PHI-A",',
+                '  "subject_key": "SUBJ-EXEMPT-1",',
+                '  "record_id": "501",',
+                '  "usubjid": "USUBJ-9",',
+                '  "subjid": "SUBJID-9",',
+                '  "studyid": "STUDY-PHI-A",',
+                '  "custom_chart_number": "CHART-A-555",',
+                '  "address": {',
+                '    "street": "742 Evergreen Terrace",',
+                '    "city": "Springfield"',
+                "  }",
+                "}",
+            ]
+        )
+        await pilot.pause()
+
+        # Inspect job detail panel as well
+        job_table.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        logs_text = "\n".join(str(line) for line in log_viewer.lines)
+        detail_text = str(detail_panel.render())
+
+        for target in (logs_text, detail_text):
+            assert "***MASKED***" in target
+            for leaked in (
+                "123-45-6789",
+                "Jane",
+                "Doe",
+                "jane@example.com",
+                "jane%40example.com",
+                "742 Evergreen Terrace",
+                "Springfield",
+                "CHART-A-777",
+                "CHART-A-888",
+                "CHART-A-999",
+                "CHART-A-555",
+            ):
+                assert leaked not in target
+
+        for exempt_val in (
+            "STUDY-PHI-A",
+            "SUBJ-EXEMPT-1",
+            "501",
+            "USUBJ-9",
+            "SUBJID-9",
+        ):
+            assert exempt_val in logs_text
+
+        # Cached once per study across multiple log + detail renders
+        assert resolve_calls.count("STUDY-PHI-A") == 1
+
+        # Global registry was never mutated
+        assert global_sensitivity_registry.snapshot() == (sens_before, exempt_before)
+        assert not global_sensitivity_registry.is_sensitive("customChartNumber")
+
+        # Switching to STUDY-PHI-B (which has no custom phiFields) does not mask customChartNumber
+        study_list = dashboard.query_one(StudyList)
+        study_list.post_message(StudyList.StudySelected("STUDY-PHI-B", "PHI Study B"))
+        await _settle(pilot)
+        imednet_logger.info("Study B audit customChartNumber=CHART-B-VISIBLE ssn=123-45-6789")
+        await pilot.pause()
+        updated_logs = "\n".join(str(line) for line in log_viewer.lines)
+        assert "CHART-B-VISIBLE" in updated_logs
+        assert "123-45-6789" not in updated_logs
+
+        # Pressing 'r' invalidates per-study cache and re-resolves active study once
+        calls_before_refresh = len(resolve_calls)
+        await pilot.press("r")
+        await _settle(pilot)
+        assert len(resolve_calls) >= calls_before_refresh + 1
