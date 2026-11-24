@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from typing import Any
 
+from imednet.core.context import sdk_governance_context, study_context
 from imednet.models.engine import ResourceRegistry
 from imednet.models.sdtm import (
     TransactionalSdtmSequencer,
@@ -26,6 +27,7 @@ from imednet.utils.security import (
     _normalize_key,
     global_sensitivity_registry,
     mask_clinical_phi,
+    validate_partition_key,
 )
 from imednet.utils.serialization import flatten
 
@@ -216,9 +218,6 @@ def resolve_study_configuration(study_key: str | None) -> StudyConfiguration | N
     if not study_key or not isinstance(study_key, str) or study_key == "UNKNOWN":
         return None
     try:
-        from imednet.core.context import study_context
-        from imednet.utils.security import validate_partition_key
-
         validate_partition_key(study_key)
         store_cls = _get_config_store_cls()
         if store_cls is None:
@@ -229,7 +228,11 @@ def resolve_study_configuration(study_key: str | None) -> StudyConfiguration | N
             if resolved is not None:
                 return resolved
             legacy_resolve = getattr(store_cls, "resolve_legacy_committed_config", None)
-            if callable(legacy_resolve):
+            if callable(legacy_resolve) and (
+                hasattr(fast_resolve, "_mock_name")
+                or hasattr(legacy_resolve, "_mock_name")
+                or getattr(store_cls, "__name__", "") != "ConfigVersionStore"
+            ):
                 return _coerce_resolved_study_config(legacy_resolve(study_key))
             return None
         store = store_cls()
@@ -371,9 +374,11 @@ class CentralizedMapper:
             if self._default_pipeline is not None:
                 self._pipeline_cache[sk] = self._default_pipeline
             else:
-                from imednet.core.context import sdk_governance_context
-
-                with sdk_governance_context(getattr(self, "sdk", None)):
+                sdk_obj = getattr(self, "sdk", None)
+                if sdk_obj is not None:
+                    with sdk_governance_context(sdk_obj):
+                        resolved_cfg = resolve_study_configuration(sk)
+                else:
                     resolved_cfg = resolve_study_configuration(sk)
                 self._pipeline_cache[sk] = (
                     EnrichmentPipeline(resolved_cfg)

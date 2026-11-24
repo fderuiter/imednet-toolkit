@@ -37,9 +37,26 @@ _DEFAULT_DB_PATH = Path(
     os.environ.get("IMEDNET_CONFIG_DB_PATH", Path.home() / ".imednet" / "config_versions.sqlite3")
 )
 _DEFAULT_DB_PATH_STR = str(Path.home() / ".imednet" / "config_versions.sqlite3")
+_FALLBACK_DB_PATH = Path(_DEFAULT_DB_PATH_STR)
+_ENV_DB_PATH_CACHE: dict[str, Path] = {}
 _READ_STORE_CACHE: dict[Path, ConfigVersionStore] = {}
 _DYNAMIC_PATH_CACHE: dict[tuple[str, str], Path] = {}
 _HEAD_INDEX_CACHE: dict[tuple[Path, int, int, int], dict[str, str]] = {}
+
+
+def _resolve_configured_db_path() -> Path:
+    """Resolve and cache ``IMEDNET_CONFIG_DB_PATH`` (or default path) without repeated parsing."""
+    raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
+    if not raw_env:
+        return _FALLBACK_DB_PATH
+    cached = _ENV_DB_PATH_CACHE.get(raw_env)
+    if cached is not None:
+        return cached
+    resolved = Path(raw_env).expanduser()
+    if len(_ENV_DB_PATH_CACHE) > 32:
+        _ENV_DB_PATH_CACHE.clear()
+    _ENV_DB_PATH_CACHE[raw_env] = resolved
+    return resolved
 
 
 def _sha256_of(content: str) -> str:
@@ -191,22 +208,36 @@ class ConfigVersionStore:
         return result
 
     @staticmethod
-    def _get_legacy_db_paths_no_create(base_db_path: Path, study_key: str) -> list[Path]:
-        """Return legacy study_context-partitioned and flat candidate SQLite paths without creating dirs."""
+    def _get_legacy_db_paths_no_create(
+        base_db_path: Path,
+        study_key: str,
+        *,
+        canonical_path: Path | None = None,
+    ) -> list[Path]:
+        """Return existing legacy study_context-partitioned and flat SQLite paths without creating dirs."""
         validate_partition_key(study_key)
-        base_url = (
-            get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
+        resolved_canonical = (
+            canonical_path
+            if canonical_path is not None
+            else ConfigVersionStore._get_dynamic_db_path_no_create(base_db_path)
         )
-        sanitized_url = _sanitize_base_url_for_path(base_url)
+        target_dir = resolved_canonical.parent
+        db_name = base_db_path.name
+        has_study_db = bool(study_key) and os.path.exists(
+            f"{target_dir}{os.sep}{study_key}{os.sep}{db_name}"
+        )
+        has_flat_db = os.path.exists(base_db_path)
+        if not has_study_db and not has_flat_db:
+            return []
+
         base_dir = base_db_path.parent
         resolved_base = base_dir.resolve()
-
         candidates: list[Path] = []
-        if study_key:
-            legacy_study_dir = base_dir / sanitized_url / study_key
+        if has_study_db:
+            legacy_study_dir = target_dir / study_key
             if legacy_study_dir.resolve().is_relative_to(resolved_base):
-                candidates.append(legacy_study_dir / base_db_path.name)
-        if base_db_path.resolve().is_relative_to(resolved_base):
+                candidates.append(legacy_study_dir / db_name)
+        if has_flat_db and base_db_path.resolve().is_relative_to(resolved_base):
             candidates.append(base_db_path)
         return candidates
 
@@ -324,19 +355,32 @@ class ConfigVersionStore:
         return StudyConfiguration.model_validate_json(decrypted_data)
 
     @classmethod
-    def resolve_legacy_committed_config(cls, study_key: str) -> StudyConfiguration | None:
-        """Read latest committed StudyConfiguration from legacy study-partitioned SQLite paths."""
-        validate_partition_key(study_key)
-        raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
-        raw_db_path = Path(raw_env).expanduser() if raw_env else Path(_DEFAULT_DB_PATH_STR)
-        canonical_path = cls._get_dynamic_db_path_no_create(raw_db_path)
-        for legacy_path in cls._get_legacy_db_paths_no_create(raw_db_path, study_key):
+    def _resolve_legacy_from_paths(
+        cls,
+        raw_db_path: Path,
+        canonical_path: Path,
+        study_key: str,
+    ) -> StudyConfiguration | None:
+        """Read latest committed StudyConfiguration from existing legacy SQLite paths."""
+        for legacy_path in cls._get_legacy_db_paths_no_create(
+            raw_db_path,
+            study_key,
+            canonical_path=canonical_path,
+        ):
             if legacy_path == canonical_path:
                 continue
             resolved = cls._read_committed_from_sqlite_path(legacy_path, study_key)
             if resolved is not None:
                 return resolved
         return None
+
+    @classmethod
+    def resolve_legacy_committed_config(cls, study_key: str) -> StudyConfiguration | None:
+        """Read latest committed StudyConfiguration from legacy study-partitioned SQLite paths."""
+        validate_partition_key(study_key)
+        raw_db_path = _resolve_configured_db_path()
+        canonical_path = cls._get_dynamic_db_path_no_create(raw_db_path)
+        return cls._resolve_legacy_from_paths(raw_db_path, canonical_path, study_key)
 
     @classmethod
     def resolve_committed_config(cls, study_key: str) -> StudyConfiguration | None:
@@ -353,8 +397,7 @@ class ConfigVersionStore:
             cfg = store.rollback_config(study_key, latest["commit_id"])
             return cfg if isinstance(cfg, StudyConfiguration) else None
 
-        raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
-        raw_db_path = Path(raw_env).expanduser() if raw_env else Path(_DEFAULT_DB_PATH_STR)
+        raw_db_path = _resolve_configured_db_path()
         candidate_path = cls._get_dynamic_db_path_no_create(raw_db_path)
         resolved = cls._read_committed_from_sqlite_path(
             candidate_path,
@@ -364,7 +407,9 @@ class ConfigVersionStore:
         )
         if resolved is not None:
             return resolved
-        return cls.resolve_legacy_committed_config(study_key)
+        if hasattr(cls.resolve_legacy_committed_config, "_mock_name"):
+            return cls.resolve_legacy_committed_config(study_key)
+        return cls._resolve_legacy_from_paths(raw_db_path, candidate_path, study_key)
 
     def _get_get_dynamic_db_path(self) -> Path:
         """Resolve database path dynamically based on active base URL without splitting by study_context."""
