@@ -104,7 +104,9 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
                 )
                 break
         if not is_offline_dry_run and "dry_run" in bound.arguments:
-            raw_schema_src = bound.arguments.get("schema_source")
+            raw_schema_src = bound.arguments.get("schema_source") or bound.arguments.get(
+                "data_dictionary_path"
+            )
             is_offline_dry_run = _context_mod.is_offline_schema_dry_run(
                 dry_run=bool(bound.arguments.get("dry_run", False)),
                 schema_source=raw_schema_src if isinstance(raw_schema_src, str) else None,

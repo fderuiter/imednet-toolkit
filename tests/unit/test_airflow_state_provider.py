@@ -728,7 +728,7 @@ def test_50_form_export_runtime_comms_orm_sql_budgets_and_legacy_migration(
     )
     assert str(dag_run.state) == "success"
     seen_rt_msgs = json.loads(comms_report.read_text(encoding="utf-8"))
-    assert seen_rt_msgs == ["GetVariable", "PutVariable", "PutVariable"]
+    assert seen_rt_msgs == ["GetVariable", "PutVariable", "GetVariable", "PutVariable"]
     rt_state = provider_rt.read_state()
     assert len(rt_state.studies["STUDY_50_RT"].streams) == 50
     assert provider_rt.get_last_timestamp("STUDY_50_RT", "sql_F50") == datetime(

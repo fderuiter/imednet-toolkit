@@ -205,7 +205,10 @@ def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSche
     if suffix == ".zip":
         return load_from_csv(path, study_key=study_key)
     if suffix == ".json":
-        return DataDictionary.model_validate_json(path.read_text(encoding="utf-8"))
+        dd = DataDictionary.model_validate_json(path.read_text(encoding="utf-8"))
+        if study_key:
+            dd.metadata.studyKey = study_key
+        return dd
     if suffix == ".xml":
         return load_from_cdisc_odm(path, study_key=study_key)
     if suffix == ".csv":

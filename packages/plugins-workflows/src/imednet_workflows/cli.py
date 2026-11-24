@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import builtins
 import contextlib
+import io
 import os
+import re
 import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -51,11 +53,14 @@ from imednet.spi.cli import (
 )
 from imednet.spi.models import PROFILE_REGISTRY
 from imednet.spi.utils import (
+    PathTraversalValidationError,
+    SensitivityRegistry,
     global_sensitivity_registry,
     mask_clinical_phi,
     mask_custom_phi_recursive,
     redact_sensitive_text,
     resolve_study_configuration,
+    sanitize_diagnostic_text,
     validate_path_segment,
 )
 from imednet.spi.validation import DataDictionary, ValidationSchemaProtocol
@@ -113,9 +118,31 @@ def _emit_line(text: str = "", *, err: bool = False) -> None:
         builtins.print(sanitized, file=sys.stdout)
 
 
-def _exit_uat_validation_error(exc: BaseException | str) -> NoReturn:
+def _reject_interactive_json_mode(interactive: bool, output_format: str | None) -> None:
+    """Exit 1 on stderr with empty stdout when --interactive conflicts with JSON output mode."""
+    if not interactive:
+        return
+    resolved = resolve_output_format(output_format)
+    if resolved == "json" or (output_format is None and is_json_output_mode()):
+        print_error(
+            "Error: Cannot combine --interactive with --format json or IMEDNET_CLI_OUTPUT_FORMAT=json."
+        )
+        sys.exit(1)
+
+
+def _exit_uat_validation_error(
+    exc: BaseException | str,
+    *,
+    study_key: str | None = None,
+) -> NoReturn:
     """Emit a secret- and PHI-redacted UAT validation error to stderr and exit 1."""
-    sanitized = redact_cli_secrets(redact_sensitive_text(str(exc)))
+    safe_phi_study: str | None = None
+    if isinstance(study_key, str) and study_key.strip():
+        with contextlib.suppress(Exception):
+            validate_path_segment(study_key.strip(), name="study_key")
+            safe_phi_study = study_key.strip()
+    custom_phi = _resolve_custom_phi_fields(safe_phi_study)
+    sanitized = _sanitize_uat_error_text(str(exc), custom_phi_fields=custom_phi)
     prefix = "" if sanitized.startswith("Validation Error:") else "Validation Error: "
     print_error(f"{prefix}{sanitized}")
     sys.exit(1)
@@ -124,7 +151,7 @@ def _exit_uat_validation_error(exc: BaseException | str) -> NoReturn:
 def _validate_uat_subject_count(subject_count: int) -> int:
     """Validate --subject-count bounds (1..100) during CLI preflight."""
     if isinstance(subject_count, bool) or not 1 <= subject_count <= 100:
-        _exit_uat_validation_error("subject_count must be between 1 and 100.")
+        raise ValueError("subject_count must be between 1 and 100.")
     return subject_count
 
 
@@ -133,15 +160,137 @@ def _load_uat_data_dictionary(
     *,
     study_key: str,
 ) -> DataDictionary | None:
-    """Load an offline DataDictionary from JSON, CDISC ODM XML, REDCap CSV, or CSV dir."""
+    """Load an offline DataDictionary from JSON, CDISC ODM XML, REDCap CSV, ZIP, or CSV dir."""
     if not dd_path:
         return None
     loaded = load_offline_schema(dd_path, study_key=study_key)
     if not isinstance(loaded, DataDictionary):
         raise ValueError(
-            f"Unsupported Data Dictionary source '{dd_path}': expected JSON, ODM XML, REDCap CSV, or CSV directory."
+            f"Unsupported Data Dictionary source '{dd_path}': expected JSON, ODM XML, REDCap CSV, ZIP, or CSV directory."
         )
     return loaded
+
+
+def _sanitize_phi_issue_message(
+    message: str,
+    *,
+    variable_name: str | None,
+    custom_phi_fields: set[str],
+) -> str:
+    """Redact credentials, sensitive URIs, and clinical PHI values in issue messages."""
+    active_registry = global_sensitivity_registry
+    if custom_phi_fields:
+        active_registry = SensitivityRegistry()
+        base_sens, base_exempt = global_sensitivity_registry.snapshot()
+        for k in base_exempt:
+            active_registry.add_exempt_key(k)
+        for k in base_sens:
+            active_registry.add_sensitive_key(k)
+        for k in custom_phi_fields:
+            active_registry.add_sensitive_key(k)
+
+    sanitized = redact_cli_secrets(
+        sanitize_diagnostic_text(redact_sensitive_text(message), registry=active_registry)
+    )
+
+    if variable_name is None:
+        inferred = re.search(r"variable '([A-Za-z0-9_-]+)'", sanitized)
+        if inferred:
+            variable_name = inferred.group(1)
+
+    if isinstance(variable_name, str) and _is_key_phi_sensitive(variable_name, custom_phi_fields):
+
+        def _mask_quote(match: re.Match[str]) -> str:
+            inner = match.group(1)
+            if inner == variable_name:
+                return match.group(0)
+            return "'***MASKED***'"
+
+        sanitized = re.sub(r"'([^']*)'", _mask_quote, sanitized)
+    return sanitized
+
+
+def _sanitize_validation_report_dict(
+    report_dict: dict[str, Any],
+    *,
+    custom_phi_fields: set[str],
+) -> dict[str, Any]:
+    """Sanitize validationReport issue messages for secrets and clinical PHI."""
+    cleaned = dict(report_dict)
+    for list_key in ("errors", "warnings"):
+        raw_items = cleaned.get(list_key)
+        if not isinstance(raw_items, list):
+            continue
+        sanitized_items: list[Any] = []
+        for entry in raw_items:
+            if not isinstance(entry, Mapping):
+                sanitized_items.append(entry)
+                continue
+            rebuilt_entry = dict(entry)
+            raw_msg = rebuilt_entry.get("message")
+            var_name = rebuilt_entry.get("variableName")
+            if isinstance(raw_msg, str):
+                rebuilt_entry["message"] = _sanitize_phi_issue_message(
+                    raw_msg,
+                    variable_name=var_name if isinstance(var_name, str) else None,
+                    custom_phi_fields=custom_phi_fields,
+                )
+            sanitized_items.append(rebuilt_entry)
+        cleaned[list_key] = sanitized_items
+    return cleaned
+
+
+def _sanitize_uat_error_text(text: str, *, custom_phi_fields: set[str]) -> str:
+    """Redact secrets and mask PHI values across multi-line UAT error summaries."""
+    sanitized_lines: list[str] = []
+    for line in text.splitlines():
+        var_match = re.search(r"\[variable=([^\]]+)\]", line)
+        var_name = var_match.group(1) if var_match else None
+        sanitized_lines.append(
+            _sanitize_phi_issue_message(
+                line,
+                variable_name=var_name,
+                custom_phi_fields=custom_phi_fields,
+            )
+        )
+    return "\n".join(sanitized_lines)
+
+
+def _emit_uat_json_failure(
+    exc: BaseException | str,
+    *,
+    study_key: str | None,
+    dry_run: bool,
+    failure_phase: str = "PREFLIGHT",
+) -> NoReturn:
+    """Emit a single PHI-masked, secret-redacted failed uat_run JSON envelope and exit 1."""
+    resolved_study = study_key.strip() if isinstance(study_key, str) and study_key.strip() else ""
+    safe_phi_study: str | None = None
+    if resolved_study:
+        with contextlib.suppress(Exception):
+            validate_path_segment(resolved_study, name="study_key")
+            safe_phi_study = resolved_study
+    custom_phi = _resolve_custom_phi_fields(safe_phi_study)
+    sanitized_err = _sanitize_uat_error_text(str(exc), custom_phi_fields=custom_phi)
+    item: dict[str, Any] = {
+        "runId": "",
+        "studyKey": resolved_study,
+        "dryRun": bool(dry_run),
+        "state": "FAILED",
+        "stateHistory": [failure_phase, "FAILED"] if failure_phase else ["FAILED"],
+        "overallSuccess": False,
+        "formsTested": 0,
+        "recordsGenerated": 0,
+        "recordsSubmitted": 0,
+        "jobsMonitored": 0,
+        "failurePhase": failure_phase,
+        "errorMessage": sanitized_err,
+        "validationReport": None,
+        "phaseDurations": {},
+    }
+    masked = _mask_workflow_value(item, custom_phi_fields=custom_phi)
+    emit_json([masked if isinstance(masked, dict) else item], "uat_run", status="failed")
+    sys.exit(1)
 
 
 def _serialize_uat_run_result(
@@ -196,15 +345,23 @@ def _serialize_uat_run_result(
 
     val_rep = getattr(result, "validation_report", None)
     if val_rep is not None and callable(getattr(val_rep, "to_dict", None)):
-        val_rep_dict = val_rep.to_dict()
+        val_rep_dict = _sanitize_validation_report_dict(
+            val_rep.to_dict(),
+            custom_phi_fields=custom_phi_fields,
+        )
     elif isinstance(val_rep, dict):
-        val_rep_dict = val_rep
+        val_rep_dict = _sanitize_validation_report_dict(
+            val_rep,
+            custom_phi_fields=custom_phi_fields,
+        )
     else:
         val_rep_dict = None
 
     err_msg = getattr(result, "error_message", None)
     sanitized_err = (
-        redact_cli_secrets(redact_sensitive_text(err_msg)) if isinstance(err_msg, str) else None
+        _sanitize_uat_error_text(err_msg, custom_phi_fields=custom_phi_fields)
+        if isinstance(err_msg, str)
+        else None
     )
     raw_durations = getattr(result, "phase_durations", None)
     phase_durations = dict(raw_durations) if isinstance(raw_durations, Mapping) else {}
@@ -401,8 +558,15 @@ def _execute_set_state(
     parser: argparse.ArgumentParser | None = None,
     no_interactive: bool = False,
     force: bool = False,
+    output_format: str | None = None,
 ) -> None:
     """Execute high-water mark timestamp update for a study/stream in the ledger."""
+    _reject_interactive_json_mode(interactive, output_format)
+    if study_key is not None:
+        validate_cli_path_segment(study_key, name="study_key")
+    if stream is not None:
+        validate_cli_path_segment(stream, name="stream")
+
     if not interactive:
         missing = [
             flag
@@ -438,9 +602,24 @@ def _execute_set_state(
                 status="success",
                 force=force,
             )
-            _emit_line(
-                f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
-            )
+            if resolve_output_format(output_format) == "json":
+                emit_json(
+                    [
+                        {
+                            "studyKey": study_key,
+                            "streamName": stream,
+                            "lastTimestamp": dt.isoformat(),
+                            "recordsProcessed": records_processed,
+                            "status": "success",
+                            "errorMessage": None,
+                        }
+                    ],
+                    "ledger_state",
+                )
+            else:
+                _emit_line(
+                    f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
+                )
         except Exception as err:
             _emit_line(f"Failed to write ledger: {err}", err=True)
             sys.exit(1)
@@ -519,7 +698,7 @@ def _execute_set_state(
             timestamp=dt,
             records_processed=records_processed,
             status="success",
-            force=True,
+            force=force,
         )
         _emit_line(
             f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
@@ -536,8 +715,16 @@ def _execute_reset_state(
     interactive: bool = False,
     parser: argparse.ArgumentParser | None = None,
     no_interactive: bool = False,
+    force: bool = False,
+    output_format: str | None = None,
 ) -> None:
     """Execute high-water mark state deletion for a study/stream."""
+    _reject_interactive_json_mode(interactive, output_format)
+    if study_key is not None:
+        validate_cli_path_segment(study_key, name="study_key")
+    if stream is not None:
+        validate_cli_path_segment(stream, name="stream")
+
     if interactive:
         from .wizard import (
             ensure_interactive_stdin,
@@ -567,14 +754,34 @@ def _execute_reset_state(
     ledger = _resolve_attr("get_state_provider")(ledger_path)
     try:
         if stream:
-            removed = ledger.delete_entry(study_key, stream)
+            removed = (
+                ledger.delete_entry(study_key, stream, force=True)
+                if force
+                else ledger.delete_entry(study_key, stream)
+            )
+            if resolve_output_format(output_format) == "json":
+                emit_json(
+                    [{"studyKey": study_key, "streamName": stream, "removed": bool(removed)}],
+                    "ledger_state",
+                )
+                return
             if removed:
                 _emit_line(f"Successfully reset stream '{stream}' for study '{study_key}'.")
             else:
                 _emit_line(f"No stream '{stream}' found for study '{study_key}'.")
                 return
         else:
-            removed = ledger.delete_entry(study_key)
+            removed = (
+                ledger.delete_entry(study_key, force=True)
+                if force
+                else ledger.delete_entry(study_key)
+            )
+            if resolve_output_format(output_format) == "json":
+                emit_json(
+                    [{"studyKey": study_key, "streamName": None, "removed": bool(removed)}],
+                    "ledger_state",
+                )
+                return
             if removed:
                 _emit_line(f"Successfully reset all streams for study '{study_key}'.")
             else:
@@ -594,10 +801,10 @@ def _execute_show_state(
     output_format: str | None = None,
 ) -> None:
     """Display current high-water mark records and stream metadata from the ledger."""
+    _reject_interactive_json_mode(interactive, output_format)
     resolved_format = resolve_output_format(output_format)
-    if interactive and resolved_format == "json":
-        print_error("Error: Cannot combine --interactive with --format json.")
-        sys.exit(1)
+    if study_key is not None:
+        validate_cli_path_segment(study_key, name="study_key")
 
     if interactive:
         from .wizard import ensure_interactive_stdin, prompt_input
@@ -608,6 +815,8 @@ def _execute_show_state(
             default=study_key or "",
         )
         study_key = study_input if study_input else None
+        if study_key is not None:
+            validate_cli_path_segment(study_key, name="study_key")
 
     ledger = _resolve_attr("get_state_provider")(ledger_path)
     try:
@@ -655,6 +864,23 @@ def _execute_show_state(
         _emit_line("No ledger entries found matching filters.")
 
 
+def _resolve_state_study_key(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> str | None:
+    """Resolve study_key for state commands, exiting 1 on blank/whitespace or path-traversal keys."""
+    flag_val = getattr(args, "study_key_flag", None)
+    pos_val = getattr(args, "study_key", None)
+    if isinstance(flag_val, str) and not flag_val.strip():
+        validate_cli_path_segment(flag_val, name="study_key")
+    if isinstance(pos_val, str) and not pos_val.strip():
+        validate_cli_path_segment(pos_val, name="study_key")
+    study_key = resolve_study_key(parser, args, required=False)
+    if study_key is not None:
+        validate_cli_path_segment(study_key, name="study_key")
+    return study_key
+
+
 def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     """Attach show, set, and reset subparsers to a state ArgumentParser."""
     state_sub = state_parser.add_subparsers(dest="state_command")
@@ -675,7 +901,8 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     add_output_format(show_parser)
 
     def _dispatch_show_state(args: argparse.Namespace) -> None:
-        study_key = resolve_study_key(show_parser, args, required=False)
+        _reject_interactive_json_mode(args.interactive, getattr(args, "output_format", None))
+        study_key = _resolve_state_study_key(show_parser, args)
         _execute_show_state(
             ledger_path=args.ledger_path,
             study_key=study_key,
@@ -710,10 +937,11 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
     set_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
-    add_no_interactive(set_parser)
+    add_output_format(set_parser)
 
     def _dispatch_set_state(args: argparse.Namespace) -> None:
-        study_key = resolve_study_key(set_parser, args, required=False)
+        _reject_interactive_json_mode(args.interactive, getattr(args, "output_format", None))
+        study_key = _resolve_state_study_key(set_parser, args)
         _execute_set_state(
             study_key=study_key,
             stream=args.stream,
@@ -724,6 +952,7 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
             parser=set_parser,
             no_interactive=getattr(args, "no_interactive", False),
             force=getattr(args, "force", False),
+            output_format=getattr(args, "output_format", None),
         )
 
     set_parser.set_defaults(func=_dispatch_set_state)
@@ -744,12 +973,19 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
         help="Path to the pipeline ledger JSON file.",
     )
     reset_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Force state reset even when an active RUNNING lease is held.",
+    )
+    reset_parser.add_argument(
         "--interactive", action="store_true", help="Run in interactive wizard mode."
     )
-    add_no_interactive(reset_parser)
+    add_output_format(reset_parser)
 
     def _dispatch_reset_state(args: argparse.Namespace) -> None:
-        study_key = resolve_study_key(reset_parser, args, required=False)
+        _reject_interactive_json_mode(args.interactive, getattr(args, "output_format", None))
+        study_key = _resolve_state_study_key(reset_parser, args)
         _execute_reset_state(
             study_key=study_key,
             stream=args.stream,
@@ -757,6 +993,8 @@ def _configure_state_subparsers(state_parser: argparse.ArgumentParser) -> None:
             interactive=args.interactive,
             parser=reset_parser,
             no_interactive=getattr(args, "no_interactive", False),
+            force=getattr(args, "force", False),
+            output_format=getattr(args, "output_format", None),
         )
 
     reset_parser.set_defaults(func=_dispatch_reset_state)
@@ -818,8 +1056,9 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
         from .wizard import print_progress
 
+        _reject_interactive_json_mode(interactive, output_format)
         resolved_format = resolve_output_format(output_format)
-        json_mode = resolved_format == "json" or is_json_output_mode()
+        json_mode = resolved_format == "json" or (output_format is None and is_json_output_mode())
 
         if interactive:
             from .wizard import ensure_interactive_stdin, prompt_filters, prompt_study_key
@@ -915,10 +1154,9 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
     def _handle_extract_records(args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
-        output_format = resolve_output_format(getattr(args, "output_format", None))
-        if args.interactive and output_format == "json":
-            print_error("Error: Cannot combine --interactive with --format json.")
-            sys.exit(1)
+        raw_format = getattr(args, "output_format", None)
+        _reject_interactive_json_mode(args.interactive, raw_format)
+        output_format = resolve_output_format(raw_format)
         study_key = resolve_study_key(extract_parser, args, required=not args.interactive)
         if args.interactive:
             from .wizard import ensure_interactive_stdin
@@ -1058,7 +1296,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--data-dictionary",
         dest="data_dictionary",
         default=None,
-        help="Offline Data Dictionary path (.json, .xml ODM, .csv REDCap, or CSV directory).",
+        help="Offline Data Dictionary path (.json, .xml ODM, .csv REDCap, .zip, or CSV directory).",
     )
     uat_build_spec_parser.add_argument(
         "--seed",
@@ -1117,8 +1355,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         study_key = resolve_study_key(uat_build_spec_parser, args, required=True)
         assert study_key is not None
         validate_cli_path_segment(study_key, name="study_key")
-        subject_count = _validate_uat_subject_count(args.subject_count)
         try:
+            subject_count = _validate_uat_subject_count(args.subject_count)
             loaded_dd = _load_uat_data_dictionary(args.data_dictionary, study_key=study_key)
         except (ValueError, OSError) as exc:
             _exit_uat_validation_error(exc)
@@ -1143,7 +1381,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     uat_run_parser.add_argument(
         "--subject-count",
         type=int,
-        default=2,
+        default=None,
         help="Number of test subjects to generate (1..100).",
     )
     uat_run_parser.add_argument(
@@ -1170,14 +1408,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--data-dictionary",
         dest="data_dictionary",
         default=None,
-        help="Offline Data Dictionary path (.json, .xml ODM, .csv REDCap, or CSV directory).",
+        help="Offline Data Dictionary path (.json, .xml ODM, .csv REDCap, .zip, or CSV directory).",
     )
     uat_run_parser.add_argument(
         "--schema",
         dest="schema_source",
         default=None,
         help=(
-            "Validation schema path (.json, .xml ODM, .csv REDCap, or CSV dir) "
+            "Validation schema path (.json, .xml ODM, .csv REDCap, .zip, or CSV dir) "
             "or 'api' to fetch live study variables."
         ),
     )
@@ -1202,7 +1440,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         sdk: ImednetSDK,
         study_key: str | None,
         interactive: bool = False,
-        subject_count: int = 2,
+        subject_count: int | None = None,
         site_name: str | None = None,
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
@@ -1210,30 +1448,58 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         *,
         spec: Any = None,
         data_dictionary: DataDictionary | None = None,
+        data_dictionary_path: str | None = None,
         preloaded_schema: ValidationSchemaProtocol | None = None,
         schema_source: str | None = None,
         dry_run: bool = False,
         seed: int | None = None,
         output_format: str | None = None,
+        _entered_marker: list[bool] | None = None,
     ) -> None:
+        if _entered_marker is not None:
+            _entered_marker.append(True)
+
         from .uat import UATWorkflow, UATWorkflowState
         from .wizard import (
             ensure_interactive_stdin,
             print_progress,
+            prompt_email_notify,
             prompt_input,
             prompt_study_key,
             prompt_subject_count,
         )
 
+        _reject_interactive_json_mode(interactive, output_format)
         resolved_format = resolve_output_format(output_format)
-        json_mode = resolved_format == "json" or is_json_output_mode()
+        json_mode = resolved_format == "json" or (output_format is None and is_json_output_mode())
 
+        effective_subject_count: int | None = subject_count
         if interactive:
             ensure_interactive_stdin(force_non_interactive=no_interactive)
             study_key = prompt_study_key(study_key)
-            subject_count = prompt_subject_count(
-                "Enter number of test subjects", default=subject_count
+            if subject_count is not None:
+                spec_default_count = subject_count
+            elif spec is not None and getattr(spec, "subject_specs", None):
+                raw_sc = getattr(spec.subject_specs[0], "subject_count", 2)
+                spec_default_count = (
+                    int(raw_sc) if isinstance(raw_sc, int) and not isinstance(raw_sc, bool) else 2
+                )
+            elif spec is not None and getattr(spec, "form_specs", None):
+                raw_fc = getattr(spec.form_specs[0], "subject_count", 2)
+                spec_default_count = (
+                    int(raw_fc) if isinstance(raw_fc, int) and not isinstance(raw_fc, bool) else 2
+                )
+            else:
+                spec_default_count = 2
+            spec_default_count = min(max(spec_default_count, 1), 100)
+            prompted_count = prompt_subject_count(
+                "Enter number of test subjects", default=spec_default_count
             )
+            if spec is not None and subject_count is None and prompted_count == spec_default_count:
+                effective_subject_count = None
+            else:
+                effective_subject_count = prompted_count
+
             site_input = prompt_input(
                 "Enter target site name (leave blank for study default)",
                 default=site_name or "",
@@ -1247,24 +1513,72 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 enabled_form_keys = [k.strip() for k in form_input.split(",") if k.strip()]
             else:
                 enabled_form_keys = None
+            if not dry_run:
+                email_notify = prompt_email_notify(default=email_notify)
         elif not study_key:
             uat_run_parser.error("the following arguments are required: study_key")
+        elif spec is None and effective_subject_count is None:
+            effective_subject_count = 2
 
         assert study_key is not None
-        validate_path_segment(study_key, name="study_key")
+        try:
+            validate_path_segment(study_key, name="study_key")
+        except PathTraversalValidationError as exc:
+            if json_mode:
+                _emit_uat_json_failure(
+                    exc,
+                    study_key=study_key,
+                    dry_run=dry_run,
+                    failure_phase="PREFLIGHT",
+                )
+            validate_cli_path_segment(study_key, name="study_key")
+
         if spec is not None and getattr(spec, "study_key", study_key) != study_key:
-            _exit_uat_validation_error(
+            mismatch_msg = (
                 f"Specification studyKey '{spec.study_key}' does not match study '{study_key}'."
             )
+            if json_mode:
+                _emit_uat_json_failure(
+                    mismatch_msg,
+                    study_key=study_key,
+                    dry_run=dry_run,
+                    failure_phase="PREFLIGHT",
+                )
+            _exit_uat_validation_error(mismatch_msg)
 
         try:
+            if data_dictionary is None and data_dictionary_path:
+                data_dictionary = _load_uat_data_dictionary(
+                    data_dictionary_path,
+                    study_key=study_key,
+                )
+            if (
+                preloaded_schema is None
+                and schema_source
+                and schema_source.strip().lower() != "api"
+            ):
+                preloaded_schema = load_offline_schema(schema_source, study_key=study_key)
             resolved_schema = (
                 preloaded_schema
                 if preloaded_schema is not None
                 else resolve_cli_schema(sdk, study_key, schema_source)
             )
-        except (ValueError, OSError) as exc:
-            _exit_uat_validation_error(exc)
+        except Exception as exc:
+            if json_mode:
+                phase = (
+                    "INSPECTING"
+                    if schema_source and schema_source.strip().lower() == "api"
+                    else "PREFLIGHT"
+                )
+                _emit_uat_json_failure(
+                    exc,
+                    study_key=study_key,
+                    dry_run=dry_run,
+                    failure_phase=phase,
+                )
+            if isinstance(exc, (ValueError, OSError)):
+                _exit_uat_validation_error(exc)
+            raise
 
         def _emit_progress(message: str) -> None:
             if not json_mode:
@@ -1326,7 +1640,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
         run_kwargs: dict[str, Any] = {
             "study_key": study_key,
-            "subject_count": subject_count,
+            "subject_count": effective_subject_count,
             "site_name": site_name,
             "enabled_form_keys": enabled_form_keys,
             "email_notify": email_notify,
@@ -1344,27 +1658,33 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
         try:
             result = workflow.run(**run_kwargs)
-        except (ValueError, OSError) as exc:
-            _exit_uat_validation_error(exc)
+        except Exception as exc:
+            if json_mode:
+                last_res = getattr(workflow, "last_result", None)
+                if last_res is not None and isinstance(getattr(last_res, "run_id", None), str):
+                    custom_phi = _resolve_custom_phi_fields(study_key)
+                    item = _serialize_uat_run_result(
+                        last_res,
+                        study_key=study_key,
+                        dry_run=dry_run,
+                        custom_phi_fields=custom_phi,
+                    )
+                    emit_json([item], "uat_run", status="failed")
+                    sys.exit(1)
+                _emit_uat_json_failure(
+                    exc,
+                    study_key=study_key,
+                    dry_run=dry_run,
+                    failure_phase="PREFLIGHT",
+                )
+            if isinstance(exc, (ValueError, OSError)):
+                _exit_uat_validation_error(exc)
+            raise
 
         result_state = getattr(result, "state", None)
         is_success = bool(result.overall_success) and result_state != UATWorkflowState.FAILED
 
-        if resolved_format == "json":
-            has_structured_outcome = (
-                is_success
-                or getattr(result, "validation_report", None) is not None
-                or getattr(result, "submission_result", None) is not None
-                or getattr(result, "poll_summary", None) is not None
-            )
-            if not has_structured_outcome:
-                err_detail = (
-                    getattr(result, "error_message", None)
-                    or "UAT pipeline execution encountered an error."
-                )
-                print_error(redact_cli_secrets(redact_sensitive_text(str(err_detail))))
-                sys.exit(1)
-
+        if json_mode:
             custom_phi = _resolve_custom_phi_fields(study_key)
             item = _serialize_uat_run_result(
                 result,
@@ -1372,7 +1692,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 dry_run=dry_run,
                 custom_phi_fields=custom_phi,
             )
-            emit_json([item], "uat_run")
+            emit_json([item], "uat_run", status="complete" if is_success else "failed")
             if not is_success:
                 sys.exit(1)
             return
@@ -1389,16 +1709,46 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     def _handle_uat_run(args: argparse.Namespace) -> None:
         no_interactive = getattr(args, "no_interactive", False)
         raw_format = getattr(args, "output_format", None)
+        dry_run_flag = bool(getattr(args, "dry_run", False))
+        _reject_interactive_json_mode(args.interactive, raw_format)
         resolved_format = resolve_output_format(raw_format)
-        if args.interactive and (resolved_format == "json" or is_json_output_mode()):
-            print_error("Error: Cannot combine --interactive with --format json.")
-            sys.exit(1)
+        json_mode = not args.interactive and (
+            resolved_format == "json" or (raw_format is None and is_json_output_mode())
+        )
 
-        subject_count = _validate_uat_subject_count(args.subject_count)
+        def _fail_preflight(
+            exc: BaseException | str, *, resolved_study: str | None = None
+        ) -> NoReturn:
+            if json_mode:
+                _emit_uat_json_failure(
+                    exc,
+                    study_key=resolved_study,
+                    dry_run=dry_run_flag,
+                    failure_phase="PREFLIGHT",
+                )
+            _exit_uat_validation_error(exc)
+
+        raw_flag_study = getattr(args, "study_key_flag", None)
+        raw_pos_study = getattr(args, "study_key", None)
+        candidate_study = (
+            raw_flag_study
+            if isinstance(raw_flag_study, str) and raw_flag_study.strip()
+            else (
+                raw_pos_study if isinstance(raw_pos_study, str) and raw_pos_study.strip() else None
+            )
+        )
+
+        subject_count: int | None = None
+        if args.subject_count is not None:
+            try:
+                subject_count = _validate_uat_subject_count(args.subject_count)
+            except ValueError as exc:
+                _fail_preflight(exc, resolved_study=candidate_study)
+
         try:
             normalized_email_notify = parse_email_notify(args.email_notify)
         except ValueError as exc:
-            _exit_uat_validation_error(exc)
+            _fail_preflight(exc, resolved_study=candidate_study)
 
         loaded_spec: Any = None
         if getattr(args, "spec_path", None):
@@ -1406,62 +1756,117 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
 
             spec_file = Path(args.spec_path)
             if not spec_file.is_file():
-                _exit_uat_validation_error(f"Specification file not found: '{args.spec_path}'")
+                _fail_preflight(
+                    f"Specification file not found: '{args.spec_path}'",
+                    resolved_study=candidate_study,
+                )
             try:
                 loaded_spec = UATSpecification.from_json(spec_file)
             except (ValueError, OSError) as exc:
-                _exit_uat_validation_error(f"Invalid UAT specification '{args.spec_path}': {exc}")
+                _fail_preflight(
+                    f"Invalid UAT specification '{args.spec_path}': {exc}",
+                    resolved_study=candidate_study,
+                )
+
+        if not args.interactive:
+            if isinstance(raw_flag_study, str) and not raw_flag_study.strip():
+                _fail_preflight(
+                    "Invalid study_key: segment must not be empty.",
+                    resolved_study="",
+                )
+            if isinstance(raw_pos_study, str) and not raw_pos_study.strip():
+                _fail_preflight(
+                    "Invalid study_key: segment must not be empty.",
+                    resolved_study="",
+                )
 
         study_key = resolve_study_key(uat_run_parser, args, required=False)
         if study_key is None and loaded_spec is not None:
             study_key = loaded_spec.study_key
 
+        loaded_dd: DataDictionary | None = None
+        preloaded_schema: ValidationSchemaProtocol | None = None
+        raw_dd_path = getattr(args, "data_dictionary", None)
+        raw_schema_src = getattr(args, "schema_source", None)
+
         if args.interactive:
             from .wizard import ensure_interactive_stdin
 
             ensure_interactive_stdin(force_non_interactive=no_interactive)
+            if study_key is not None:
+                validate_cli_path_segment(study_key, name="study_key")
         else:
             if not study_key:
                 uat_run_parser.error("the following arguments are required: study_key")
             assert study_key is not None
-            validate_cli_path_segment(study_key, name="study_key")
+            try:
+                validate_path_segment(study_key, name="study_key")
+            except PathTraversalValidationError as exc:
+                if json_mode:
+                    _emit_uat_json_failure(
+                        exc,
+                        study_key=study_key,
+                        dry_run=dry_run_flag,
+                        failure_phase="PREFLIGHT",
+                    )
+                validate_cli_path_segment(study_key, name="study_key")
             if loaded_spec is not None and loaded_spec.study_key != study_key:
-                _exit_uat_validation_error(
-                    f"Specification studyKey '{loaded_spec.study_key}' does not match study '{study_key}'."
+                _fail_preflight(
+                    f"Specification studyKey '{loaded_spec.study_key}' does not match study '{study_key}'.",
+                    resolved_study=study_key,
                 )
+            try:
+                loaded_dd = _load_uat_data_dictionary(raw_dd_path, study_key=study_key)
+                preloaded_schema = (
+                    load_offline_schema(raw_schema_src, study_key=study_key)
+                    if raw_schema_src and raw_schema_src.strip().lower() != "api"
+                    else None
+                )
+            except (ValueError, OSError) as exc:
+                _fail_preflight(exc, resolved_study=study_key)
 
-        preflight_study_key = study_key or "STUDY"
-        try:
-            loaded_dd = _load_uat_data_dictionary(
-                getattr(args, "data_dictionary", None),
-                study_key=preflight_study_key,
-            )
-            raw_schema_src = getattr(args, "schema_source", None)
-            preloaded_schema = (
-                load_offline_schema(raw_schema_src, study_key=preflight_study_key)
-                if raw_schema_src and raw_schema_src.strip().lower() != "api"
-                else None
-            )
-        except (ValueError, OSError) as exc:
-            _exit_uat_validation_error(exc)
-
+        entered_marker: list[bool] = []
+        uat_call_kwargs: dict[str, Any] = {
+            "study_key": study_key,
+            "interactive": args.interactive,
+            "subject_count": subject_count,
+            "site_name": args.site_name,
+            "enabled_form_keys": args.enabled_form_keys,
+            "email_notify": normalized_email_notify,
+            "no_interactive": no_interactive,
+            "spec": loaded_spec,
+            "data_dictionary": loaded_dd,
+            "data_dictionary_path": raw_dd_path,
+            "preloaded_schema": preloaded_schema,
+            "schema_source": raw_schema_src,
+            "dry_run": dry_run_flag,
+            "seed": getattr(args, "seed", None),
+            "output_format": raw_format,
+            "_entered_marker": entered_marker,
+        }
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
-            uat_run(
-                study_key=study_key,
-                interactive=args.interactive,
-                subject_count=subject_count,
-                site_name=args.site_name,
-                enabled_form_keys=args.enabled_form_keys,
-                email_notify=normalized_email_notify,
-                no_interactive=no_interactive,
-                spec=loaded_spec,
-                data_dictionary=loaded_dd,
-                preloaded_schema=preloaded_schema,
-                schema_source=getattr(args, "schema_source", None),
-                dry_run=bool(getattr(args, "dry_run", False)),
-                seed=getattr(args, "seed", None),
-                output_format=raw_format,
-            )
+            if json_mode:
+                sdk_err_buf = io.StringIO()
+                try:
+                    with contextlib.redirect_stderr(sdk_err_buf):
+                        uat_run(**uat_call_kwargs)
+                except SystemExit as exc:
+                    if not entered_marker and exc.code not in (0, None, 130):
+                        captured_err = (
+                            sdk_err_buf.getvalue().strip() or "SDK initialization failed."
+                        )
+                        _emit_uat_json_failure(
+                            captured_err,
+                            study_key=study_key,
+                            dry_run=dry_run_flag,
+                            failure_phase="PREFLIGHT",
+                        )
+                    captured = sdk_err_buf.getvalue()
+                    if captured:
+                        print_error(captured, end="")
+                    raise
+            else:
+                uat_run(**uat_call_kwargs)
 
     uat_run_parser.set_defaults(func=_handle_uat_run)
 

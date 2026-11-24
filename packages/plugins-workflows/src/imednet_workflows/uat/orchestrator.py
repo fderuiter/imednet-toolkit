@@ -357,10 +357,20 @@ class UATSpecificationBuilder:
         )
 
         snap_type = getattr(variable, "variable_type", None)
+        dd_extra = (
+            getattr(source_dd_var, "extraAttributes", None) if source_dd_var is not None else None
+        )
+        raw_odm_dt = dd_extra.get("odmDataType") if isinstance(dd_extra, Mapping) else None
         dd_type = (
-            getattr(source_dd_var, "variable_type", getattr(source_dd_var, "variableType", None))
-            if source_dd_var is not None
-            else None
+            raw_odm_dt.strip()
+            if isinstance(raw_odm_dt, str) and raw_odm_dt.strip()
+            else (
+                getattr(
+                    source_dd_var, "variable_type", getattr(source_dd_var, "variableType", None)
+                )
+                if source_dd_var is not None
+                else None
+            )
         )
         snap_norm = snap_type.strip().lower() if isinstance(snap_type, str) else ""
         dd_norm = dd_type.strip().lower() if isinstance(dd_type, str) else ""
@@ -388,6 +398,20 @@ class UATSpecificationBuilder:
                 }
             )
             or (snap_norm == "text" and dd_norm != "text")
+            or (
+                snap_norm in {"date", "datetime", "time"}
+                and dd_norm
+                in {
+                    "partialdate",
+                    "incompletedate",
+                    "partialdatetime",
+                    "incompletedatetime",
+                    "durationdatetime",
+                    "intervaldatetime",
+                    "partialtime",
+                    "incompletetime",
+                }
+            )
         ):
             resolved_type = dd_type
         else:
@@ -584,11 +608,14 @@ def _coerce_payloads_for_validation(
                 else:
                     new_data[var_name] = val
             elif norm_type in _FLOAT_SCHEMA_TYPES:
-                try:
-                    parsed_float = float(stripped)
-                    new_data[var_name] = parsed_float if math.isfinite(parsed_float) else val
-                except ValueError:
-                    new_data[var_name] = val
+                if getattr(var_meta, "choices", None) and stripped.lstrip("+-").isdigit():
+                    new_data[var_name] = int(stripped)
+                else:
+                    try:
+                        parsed_float = float(stripped)
+                        new_data[var_name] = parsed_float if math.isfinite(parsed_float) else val
+                    except ValueError:
+                        new_data[var_name] = val
             elif norm_type in _BOOL_SCHEMA_TYPES:
                 low = stripped.lower()
                 if low in {"true", "yes", "1"}:
@@ -604,6 +631,25 @@ def _coerce_payloads_for_validation(
         copied["data"] = new_data
         coerced_records.append(copied)
     return coerced_records
+
+
+def _apply_subject_count_override(
+    spec: UATSpecification,
+    subject_count: int,
+) -> UATSpecification:
+    """Update both subject_specs and form_specs with an explicit subject_count override."""
+    updated_subjects = (
+        [s.model_copy(update={"subject_count": subject_count}) for s in spec.subject_specs]
+        if spec.subject_specs
+        else [UATSubjectSpec(site_name="Default Site", subject_count=subject_count)]
+    )
+    updated_forms = [f.model_copy(update={"subject_count": subject_count}) for f in spec.form_specs]
+    return spec.model_copy(
+        update={
+            "subject_specs": updated_subjects,
+            "form_specs": updated_forms,
+        }
+    )
 
 
 def _validate_spec_sites(snapshot: Any, spec: UATSpecification, *, custom_spec: bool) -> None:
@@ -749,7 +795,7 @@ class UATWorkflow:
         study_key: str,
         *,
         spec: UATSpecification | None = None,
-        subject_count: int = 2,
+        subject_count: int | None = None,
         site_name: str | None = None,
         enabled_form_keys: list[str] | None = None,
         email_notify: bool | str | None = None,
@@ -767,9 +813,16 @@ class UATWorkflow:
         poll_summary: Any = None
         validation_report: Any = None
         active_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
+        effective_dd: DataDictionary | None = (
+            active_dd
+            if active_dd is not None
+            else (schema if isinstance(schema, DataDictionary) else None)
+        )
         custom_spec_provided = spec is not None
 
-        if isinstance(subject_count, bool) or not 1 <= subject_count <= 100:
+        if subject_count is not None and (
+            isinstance(subject_count, bool) or not 1 <= subject_count <= 100
+        ):
             raise ValueError("subject_count must be between 1 and 100.")
         if isinstance(email_notify, str):
             if "\r" in email_notify or "\n" in email_notify or "\x00" in email_notify:
@@ -789,7 +842,22 @@ class UATWorkflow:
                 # 1. Inspect
                 self.transition_to(UATWorkflowState.INSPECTING)
                 t0 = time.monotonic()
-                snapshot = self.inspect(study_key)
+                if dry_run and effective_dd is not None and "inspect" not in vars(self):
+                    from .inspector import StudySnapshot
+
+                    spec_sites = (
+                        [s.site_name for s in spec.subject_specs if s.site_name]
+                        if spec is not None and not isinstance(spec, NonCallableMock)
+                        else None
+                    )
+                    snapshot = StudySnapshot.from_data_dictionary(
+                        effective_dd,
+                        study_key,
+                        site_name=site_name,
+                        spec_site_names=spec_sites,
+                    )
+                else:
+                    snapshot = self.inspect(study_key)
                 phase_durations[UATRunPhase.INSPECT] = time.monotonic() - t0
 
                 # 2. Build or Validate Spec
@@ -797,44 +865,54 @@ class UATWorkflow:
                 t0 = time.monotonic()
                 effective_seed = seed if seed is not None else self._seed
                 if spec is None:
+                    resolved_subject_count = (
+                        UATSpecificationBuilder.DEFAULT_SUBJECT_COUNT
+                        if subject_count is None
+                        else subject_count
+                    )
                     build_kwargs: dict[str, Any] = {
-                        "subject_count": subject_count,
+                        "subject_count": resolved_subject_count,
                         "site_name": site_name,
                         "enabled_form_keys": enabled_form_keys,
                     }
                     if effective_seed is not None:
                         build_kwargs["seed"] = effective_seed
-                    if active_dd is not None:
-                        build_kwargs["data_dictionary"] = active_dd
+                    if effective_dd is not None:
+                        build_kwargs["data_dictionary"] = effective_dd
                     spec = self.build_spec(snapshot, **build_kwargs)
-                elif not isinstance(snapshot, NonCallableMock):
-                    if site_name is not None:
-                        resolved_override = self._builder.resolve_site_name(snapshot, site_name)
-                        if not isinstance(spec, NonCallableMock) and spec.subject_specs:
-                            spec = spec.model_copy(
-                                update={
-                                    "subject_specs": [
-                                        s.model_copy(update={"site_name": resolved_override})
-                                        for s in spec.subject_specs
-                                    ]
-                                }
+                else:
+                    if subject_count is not None and not isinstance(spec, NonCallableMock):
+                        spec = _apply_subject_count_override(spec, subject_count)
+                    if not isinstance(snapshot, NonCallableMock):
+                        if site_name is not None:
+                            resolved_override = self._builder.resolve_site_name(snapshot, site_name)
+                            if not isinstance(spec, NonCallableMock) and spec.subject_specs:
+                                spec = spec.model_copy(
+                                    update={
+                                        "subject_specs": [
+                                            s.model_copy(update={"site_name": resolved_override})
+                                            for s in spec.subject_specs
+                                        ]
+                                    }
+                                )
+                        if enabled_form_keys is not None:
+                            validated_keys = set(
+                                self._builder.validate_enabled_form_keys(
+                                    snapshot, enabled_form_keys
+                                )
+                                or []
                             )
-                    if enabled_form_keys is not None:
-                        validated_keys = set(
-                            self._builder.validate_enabled_form_keys(snapshot, enabled_form_keys)
-                            or []
-                        )
-                        if not isinstance(spec, NonCallableMock):
-                            spec = spec.model_copy(
-                                update={
-                                    "form_specs": [
-                                        f.model_copy(
-                                            update={"enabled": f.form_key in validated_keys}
-                                        )
-                                        for f in spec.form_specs
-                                    ]
-                                }
-                            )
+                            if not isinstance(spec, NonCallableMock):
+                                spec = spec.model_copy(
+                                    update={
+                                        "form_specs": [
+                                            f.model_copy(
+                                                update={"enabled": f.form_key in validated_keys}
+                                            )
+                                            for f in spec.form_specs
+                                        ]
+                                    }
+                                )
                 _validate_spec_sites(snapshot, spec, custom_spec=custom_spec_provided)
                 if (
                     effective_seed is None
@@ -848,8 +926,8 @@ class UATWorkflow:
                 self.transition_to(UATWorkflowState.GENERATING)
                 t0 = time.monotonic()
                 gen_kwargs: dict[str, Any] = {}
-                if active_dd is not None:
-                    gen_kwargs["data_dictionary"] = active_dd
+                if effective_dd is not None:
+                    gen_kwargs["data_dictionary"] = effective_dd
                 if effective_seed != self._seed:
                     gen_kwargs["seed"] = effective_seed
                 record_sets = self.generate(spec, snapshot, **gen_kwargs)
