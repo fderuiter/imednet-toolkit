@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Generic, Self, TypeVar, overload
+from typing import Any, Generic, Self, TypeVar
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -12,6 +12,7 @@ _NORMALIZERS: dict[type, dict[str, Callable[[Any], Any]]]
 
 def _identity(v: Any) -> Any: ...
 def _optional_str(v: Any) -> Any: ...
+def _required_int(v: Any) -> int: ...
 def _optional_int(v: Any) -> Any: ...
 def _optional_bool(v: Any) -> Any: ...
 def _optional_datetime(v: Any) -> Any: ...
@@ -58,23 +59,15 @@ class Pagination(ImednetBaseModel):
     total_elements: int = Field(0, alias="totalElements")
     sort: list[SortField] = Field(default_factory=list)
 
-    @overload
     def __init__(
         self,
         *,
         current_page: int = 0,
-        size: int = 25,
-        total_pages: int = 0,
-        total_elements: int = 0,
-        sort: list[SortField] = ...,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         currentPage: int = 0,
         size: int = 25,
+        total_pages: int = 0,
         totalPages: int = 0,
+        total_elements: int = 0,
         totalElements: int = 0,
         sort: list[SortField] = ...,
     ) -> None: ...

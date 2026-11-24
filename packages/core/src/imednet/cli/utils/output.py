@@ -97,6 +97,7 @@ _STATUS_COLOR_MAP = {
     "hold": "yellow",
     "incomplete": "yellow",
     "initiated": "yellow",
+    "answered": "yellow",
     "inactive": "red",
     "closed": "red",
     "error": "red",
@@ -126,6 +127,7 @@ _HC_STATUS_COLOR_MAP = {
     "hold": "hc_warning",
     "incomplete": "hc_warning",
     "initiated": "hc_warning",
+    "answered": "hc_warning",
     "inactive": "hc_danger",
     "closed": "hc_danger",
     "error": "hc_danger",
@@ -629,6 +631,15 @@ def _format_cell_value(value: Any, key: str | None = None) -> str:
     return _sanitize_cell_text(str(value))
 
 
+_HEADER_ACRONYM_RE = re.compile(r"\b(?:id|oid|url|utc)\b", re.IGNORECASE)
+
+
+def _format_header_label(header: Any) -> str:
+    """Format a field key into a title-cased header while preserving uppercase acronyms."""
+    cleaned = _sanitize_cell_text(str(header).replace("_", " ")).title()
+    return _HEADER_ACRONYM_RE.sub(lambda match: match.group(0).upper(), cleaned)
+
+
 def _colorize(text: str, color: str) -> str:
     if not supports_ansi_color(sys.stdout):
         return text
@@ -640,7 +651,7 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
     if not items:
         return
 
-    headers = [_sanitize_cell_text(str(header).replace("_", " ").title()) for header in fields]
+    headers = [_format_header_label(header) for header in fields]
 
     rows = []
     for item in items:

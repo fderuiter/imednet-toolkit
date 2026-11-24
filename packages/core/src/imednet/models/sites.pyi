@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, overload
+from typing import Any
 
 from pydantic import Field, field_validator
 
@@ -48,28 +48,22 @@ class Site(ImednetBaseModel):
     date_modified: str | None = Field(default=None, alias="dateModified")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         site_enrollment_status: SiteEnrollmentStatus | str | None = None,
-        study_key: str | None = None,
-        site_id: int | None = None,
-        site_name: str | None = None,
-        date_created: str | None = None,
-        date_modified: str | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         siteEnrollmentStatus: SiteEnrollmentStatus | str | None = None,
+        study_key: str | None = None,
         studyKey: str | None = None,
+        site_id: int | None = None,
         siteId: int | None = None,
+        site_name: str | None = None,
         siteName: str | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_modified: str | None = None,
         dateModified: str | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
     @field_validator("site_enrollment_status", mode="before")
