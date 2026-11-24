@@ -177,13 +177,18 @@ and ``(STUDYID, DOMAIN, USUBJID, *SEQ)`` when ``as_sdtm=True`` (or ``(STUDYID, D
 when a domain such as ``DM`` has no ``*SEQ`` column). Scheduled re-runs update modified
 ``Record`` rows in place without inserting duplicates.
 
-By default (``hard_delete=False``), records with ``deleted=True`` update the ``DELETED``
-metadata column on matched target rows. Set ``hard_delete=True`` on
-:class:`~imednet_sinks.warehouse.SnowflakeSinkConfig` (or ``export_kwargs={"hard_delete": True}``
-in ``ImednetExportOperator``) to delete matched target rows when ``deleted=True`` and skip
-inserting unmatched voided records. Set ``idempotent = False`` (``--force-reload`` in the CLI)
-to bypass staging-table merges and append directly into the target table via
-``COPY INTO ... FORCE = TRUE``.
+By default (``include_deleted=False``), voided (``deleted=True``) ``Record`` items are
+routed through :meth:`~imednet_sinks.warehouse.SnowflakeExportSink.reconcile_deleted` on
+both full and incremental idempotent runs, deleting matched target rows and excluding
+unmatched voided records. Set ``include_deleted=True`` with ``hard_delete=False`` to
+retain ``DELETED = TRUE`` tombstones on matched or newly loaded rows, or pair
+``include_deleted=True`` with ``hard_delete=True`` on
+:class:`~imednet_sinks.warehouse.SnowflakeSinkConfig` (or
+``export_kwargs={"include_deleted": True, "hard_delete": True}`` in
+``ImednetExportOperator``) to delete matched target rows during ``MERGE INTO`` while
+skipping unmatched voided records. Set ``idempotent = False`` (``--force-reload`` in the
+CLI) on non-incremental runs to bypass staging-table merges and append directly into the
+target table via ``COPY INTO ... FORCE = TRUE``.
 
 Incremental checkpoints with ``ExtractionStateLedger`` and ``AirflowStateProvider``
 -----------------------------------------------------------------------------------

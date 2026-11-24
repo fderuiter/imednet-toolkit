@@ -55,7 +55,8 @@ class User(ImednetBaseModel):
 
     roles: list[Role] = Field(default_factory=list, alias="roles")
 
-    @computed_field
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def name(self) -> str:
         """A convenience full-name property so you can do `user.name`.
 

@@ -1666,7 +1666,7 @@ exclude_patterns: list[str] = [
 ]  # annotated per mypy requirement
 html_static_path: list[str] = ["_static"]
 html_css_files: list[str] = ["custom.css"]
-html_js_files: list[str] = ["code_blocks.js"]
+html_js_files: list[str] = ["code_blocks.js", "navigation.js"]
 
 doctest_global_setup = """
 import builtins
@@ -1682,17 +1682,11 @@ from unittest.mock import MagicMock, patch
 for _mod in [m for m in list(sys.modules) if m.startswith("apache_airflow_providers_imednet")]:
     del sys.modules[_mod]
 
-logging.getLogger("snowflake").setLevel(logging.WARNING)
-logging.getLogger("snowflake.connector").setLevel(logging.WARNING)
-
-with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-    with contextlib.suppress(Exception):
-        from airflow.sdk.bases.operator import ExecutorSafeguard
-        ExecutorSafeguard.test_mode = True
-
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
 logging.getLogger("py.warnings").setLevel(logging.ERROR)
+logging.getLogger("snowflake").setLevel(logging.WARNING)
+logging.getLogger("snowflake.connector").setLevel(logging.WARNING)
 logging.captureWarnings(True)
 
 os.environ["IMEDNET_SIMULATION_MODE"] = "true"
@@ -1703,16 +1697,22 @@ os.environ["IMEDNET_STUDY_KEY"] = "STUDY"
 os.environ["AIRFLOW_CONN_IMEDNET_DEFAULT"] = "http://mock:mock@localhost"  # pragma: allowlist secret
 os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
 
-_doctest_orig_cwd = os.getcwd()
-_doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
-os.chdir(_doctest_tmpdir.name)
-
-from imednet.simulation.state import get_default_simulation_state
-get_default_simulation_state().reset()
-
-__file__ = "/a/b/c/d/e/dummy.py"
-
 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        from airflow.sdk.bases.operator import ExecutorSafeguard
+        ExecutorSafeguard.test_mode = True
+    except Exception:
+        pass
+
+    _doctest_orig_cwd = os.getcwd()
+    _doctest_tmpdir = tempfile.TemporaryDirectory(prefix="imednet_doctest_")
+    os.chdir(_doctest_tmpdir.name)
+
+    from imednet.simulation.state import get_default_simulation_state
+    get_default_simulation_state().reset()
+
+    __file__ = "/a/b/c/d/e/dummy.py"
+
     _mongo_client_patcher = patch("pymongo.MongoClient", return_value=MagicMock())
     _mongo_client_patcher.start()
 
