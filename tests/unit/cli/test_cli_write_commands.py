@@ -2285,3 +2285,315 @@ def test_cli_write_wait_exits_1_and_emits_json_counts_on_result_url_errors_or_ht
     assert job_entry["batchId"] == "B-FAIL-1"
     assert (job_entry["failedRecords"] or 0) >= 1 or bool(job_entry.get("resultError"))
     assert "Error:" in res.stderr
+
+
+def test_all_four_cli_write_commands_json_emit_unsubmitted_chunks_plain_states_and_empty_prewrite_stdout(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """All 4 CLI write commands emit unsubmittedChunks + plain JobState names on partial/wait failures and keep stdout empty on pre-write API errors."""
+    from imednet.cli.utils.write_helpers import exit_cli_write_error
+    from imednet.errors import AuthenticationError, ServerError
+    from imednet.models.jobs import JobState, JobStatus
+    from imednet.utils.batch_coordinator import BatchSubmissionSummary
+    from imednet.utils.job_poller import JobFailedError, JobPollSummary
+
+    secret_token = "SECRET-BEARER-777"  # pragma: allowlist secret
+    monkeypatch.setenv("IMEDNET_API_KEY", secret_token)
+
+    csv_file = tmp_path / "batch_import.csv"
+    csv_file.write_text(
+        "form_key,site_name,subject_key,V_AGE\nF_DM,SITE,SUB1,30\nF_DM,SITE,SUB2,31\n",
+        encoding="utf-8",
+    )
+    two_rec_json = json.dumps(
+        [
+            {"formKey": "F_DM", "siteName": "SITE", "subjectKey": "SUB1", "data": {"V_AGE": 30}},
+            {"formKey": "F_DM", "siteName": "SITE", "subjectKey": "SUB2", "data": {"V_AGE": 31}},
+        ]
+    )
+    two_upd_json = json.dumps(
+        [
+            {"recordId": 601, "data": {"V_AGE": 40}},
+            {"recordId": 602, "data": {"V_AGE": 41}},
+        ]
+    )
+
+    mode = "mid_batch"
+    post_idx = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_idx
+        path = request.url.path
+        if mode == "prewrite_auth":
+            return httpx.Response(401, json={"error": f"Unauthorized key={secret_token}"})
+        if request.method == "GET" and path.endswith("/sites"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "siteId": 1,
+                            "siteName": "SITE",
+                            "studyKey": "STUDY",
+                            "siteEnrollmentStatus": "Enrollment Open",
+                        }
+                    ]
+                },
+            )
+        if request.method == "GET" and path.endswith("/forms"):
+            return httpx.Response(
+                200,
+                json={"data": [{"formId": 1, "formKey": "F_DM", "studyKey": "STUDY"}]},
+            )
+        if request.method == "GET" and path.endswith("/variables"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "variableId": 1,
+                            "variableName": "V_AGE",
+                            "variableType": "integer",
+                            "formId": 1,
+                            "formKey": "F_DM",
+                            "studyKey": "STUDY",
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and path.endswith("/records"):
+            post_idx += 1
+            if mode == "mid_batch" and post_idx == 2:
+                return httpx.Response(
+                    503,
+                    json={"error": f"Chunk 2 unavailable token={secret_token} ssn=123-45-6789"},
+                )
+            return httpx.Response(
+                202,
+                json={
+                    "jobId": f"JOB-{post_idx}",
+                    "batchId": f"BATCH-{post_idx}",
+                    "state": "QUEUED",
+                },
+            )
+        if request.method == "GET" and "/jobs/BATCH-" in path:
+            bid = path.rsplit("/", 1)[-1]
+            state = "FAILED" if (mode == "wait_fail" and bid == "BATCH-2") else "COMPLETED"
+            return httpx.Response(
+                200,
+                json={
+                    "jobId": f"J-{bid}",
+                    "batchId": bid,
+                    "state": state,
+                    "progress": 100,
+                    "totalRecords": 1,
+                    "failedRecords": 1 if state == "FAILED" else 0,
+                },
+            )
+        return httpx.Response(404)
+
+    def _make_sdk(**_kwargs: object) -> ImednetSDK:
+        return ImednetSDK(
+            client=Client(
+                api_key=secret_token,
+                security_key="sim-secret",  # pragma: allowlist secret
+                base_url="https://edc.sim.imednet.com",
+                transport=httpx.MockTransport(handler),
+            )
+        )
+
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _make_sdk)
+
+    four_commands = [
+        (
+            "records_create",
+            [
+                "records",
+                "create",
+                "STUDY",
+                "--json",
+                two_rec_json,
+                "--chunk-size",
+                "1",
+                "--wait",
+                "--interval",
+                "0",
+                "--no-interactive",
+                "--format",
+                "json",
+            ],
+        ),
+        (
+            "records_update",
+            [
+                "records",
+                "update",
+                "STUDY",
+                "--json",
+                two_upd_json,
+                "--chunk-size",
+                "1",
+                "--wait",
+                "--interval",
+                "0",
+                "--no-interactive",
+                "--format",
+                "json",
+            ],
+        ),
+        (
+            "records_import",
+            [
+                "records",
+                "import",
+                "STUDY",
+                str(csv_file),
+                "--chunk-size",
+                "1",
+                "--wait",
+                "--interval",
+                "0",
+                "--no-interactive",
+                "--format",
+                "json",
+            ],
+        ),
+        (
+            "subjects_register",
+            [
+                "subjects",
+                "register",
+                "STUDY",
+                "--json",
+                two_rec_json,
+                "--chunk-size",
+                "1",
+                "--wait",
+                "--interval",
+                "0",
+                "--no-interactive",
+                "--format",
+                "json",
+            ],
+        ),
+    ]
+
+    # 1. Mid-batch chunk 2 POST failure across all 4 commands emits unsubmittedChunks + plain states
+    mode = "mid_batch"
+    for expected_resource, argv in four_commands:
+        post_idx = 0
+        res = _invoke_cli(capsys, argv)
+        assert res.exit_code == 1
+        payload = json.loads(res.stdout)
+        assert payload["schemaVersion"] == "1.0"
+        assert payload["resource"] == expected_resource
+        assert payload["status"] == "failed"
+        item = payload["items"][0]
+        assert item["batchIds"] == ["BATCH-1"]
+        assert len(item["unsubmittedChunks"]) == 1
+        assert "<JobState." not in res.stderr
+        assert "'COMPLETED'" in res.stderr
+        assert secret_token not in res.stderr
+        assert "123-45-6789" not in res.stderr
+
+    # 2. --wait polling failure across all 4 commands emits plain COMPLETED/FAILED states with zero <JobState.
+    mode = "wait_fail"
+    for expected_resource, argv in four_commands:
+        post_idx = 0
+        res = _invoke_cli(capsys, argv)
+        assert res.exit_code == 1
+        payload = json.loads(res.stdout)
+        assert payload["schemaVersion"] == "1.0"
+        assert payload["resource"] == expected_resource
+        assert payload["status"] == "failed"
+        item = payload["items"][0]
+        assert [j["state"] for j in item["jobs"]] == ["COMPLETED", "FAILED"]
+        assert "<JobState." not in res.stderr
+        assert "'COMPLETED'" in res.stderr
+        assert "'FAILED'" in res.stderr
+
+    # 3. Direct exit_cli_write_error prints plain 'COMPLETED' and 'FAILED' without study_key kwarg and zero <JobState.
+    st_ok = JobStatus(jobId="J1", batchId="BATCH-1", state=JobState.COMPLETED, progress=100)
+    st_fail = JobStatus(jobId="J2", batchId="BATCH-2", state=JobState.FAILED, progress=100)
+    poll_sum = JobPollSummary(
+        study_key="STUDY",
+        results={"BATCH-1": st_ok},
+        failures={"BATCH-2": JobFailedError("Job BATCH-2 failed", st_fail)},
+        elapsed_total=0.1,
+    )
+    direct_partial = BatchSubmissionSummary(
+        study_key="STUDY",
+        jobs=[st_ok, st_fail],
+        chunk_sizes=[1, 1],
+        total_records=3,
+        poll_summary=poll_sum,
+        unsubmitted_chunks=[[{"formKey": "F_DM", "data": {"V_AGE": 50}}]],
+        wait_for_completion=True,
+        has_error=True,
+    )
+    direct_exc = ServerError("Upstream error", status_code=502)
+    direct_exc.partial_summary = direct_partial  # type: ignore[attr-defined]
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as sys_exit:
+        exit_cli_write_error(direct_exc, resource="records_create", output_format="json")
+    assert sys_exit.value.code == 1
+    direct_captured = capsys.readouterr()
+    assert "'COMPLETED'" in direct_captured.err
+    assert "'FAILED'" in direct_captured.err
+    assert "<JobState." not in direct_captured.err
+    direct_json = json.loads(direct_captured.out)
+    assert direct_json["schemaVersion"] == "1.0"
+    assert len(direct_json["items"][0]["unsubmittedChunks"]) == 1
+
+    # 4. Pre-write API error before chunk writes start keeps stdout completely empty
+    mode = "prewrite_auth"
+    for prewrite_argv in (
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "-d",
+            "V_AGE=30",
+            "--schema",
+            "api",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--site-name",
+            "SITE",
+            "-d",
+            "V_AGE=30",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    ):
+        res_pre = _invoke_cli(capsys, prewrite_argv)
+        assert res_pre.exit_code == 1
+        assert res_pre.stdout == ""
+        assert "Authentication Failed:" in res_pre.stderr
+        assert secret_token not in res_pre.stderr
+
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as auth_exit:
+        exit_cli_write_error(
+            AuthenticationError(f"Bad key {secret_token}", status_code=401),
+            resource="records_create",
+            study_key="STUDY",
+            output_format="json",
+        )
+    assert auth_exit.value.code == 1
+    auth_captured = capsys.readouterr()
+    assert auth_captured.out == ""
+    assert secret_token not in auth_captured.err

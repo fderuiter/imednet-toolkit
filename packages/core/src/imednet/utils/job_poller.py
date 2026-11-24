@@ -43,6 +43,7 @@ class _PollState:
 
     batch_id: str
     start: float
+    study_key: str = ""
     poll_number: int = 0
     last_status: JobStatus | None = None
     terminal_status: JobStatus | None = None
@@ -140,8 +141,10 @@ class JobPollSummary:
         combined: dict[str, JobStatus] = dict(self.results)
         for batch_id, err in self.failures.items():
             status = getattr(err, "status", None)
-            if isinstance(status, JobStatus) and batch_id not in combined:
-                combined[batch_id] = status
+            if isinstance(status, JobStatus):
+                resolved_bid = status.batch_id or batch_id
+                if resolved_bid not in combined:
+                    combined[resolved_bid] = status
         return combined
 
 
@@ -406,7 +409,7 @@ class BaseJobPoller:
 
     def __init__(self) -> None:
         """Initialize transition tracking ledger."""
-        self._terminal_states: dict[str, JobStatus] = {}
+        self._terminal_states: dict[tuple[str, str] | str, JobStatus] = {}
         self._lock = threading.Lock()
 
     def _guard_transition(
@@ -415,6 +418,8 @@ class BaseJobPoller:
         status: JobStatus,
         last_status: JobStatus | None,
         terminal_status: JobStatus | None,
+        *,
+        study_key: str = "",
     ) -> tuple[JobStatus, JobStatus | None]:
         """Guard against state regressions and validate monotonic transitions.
 
@@ -426,10 +431,12 @@ class BaseJobPoller:
             status: The newly polled JobStatus payload.
             last_status: The most recent status observed in this polling run.
             terminal_status: The terminal status if one has already been reached.
+            study_key: Optional study key scoping the cached terminal status.
 
         Returns:
             A tuple of (effective_status, effective_terminal_status).
         """
+        cache_key: tuple[str, str] | str = (study_key, batch_id) if study_key else batch_id
         # If terminal state was already recorded, ignore stale non-terminal responses
         if terminal_status is not None and getattr(terminal_status, "is_terminal", False):
             if not getattr(status, "is_terminal", False):
@@ -442,14 +449,14 @@ class BaseJobPoller:
                 return terminal_status, terminal_status
             terminal_status = status
             with self._lock:
-                self._terminal_states[batch_id] = status
+                self._terminal_states[cache_key] = status
             return status, terminal_status
 
         # If the newly polled status is terminal, record it
         if getattr(status, "is_terminal", False):
             terminal_status = status
             with self._lock:
-                self._terminal_states[batch_id] = status
+                self._terminal_states[cache_key] = status
             return status, terminal_status
 
         # If both previous and new status are active, validate monotonic transition
@@ -507,8 +514,15 @@ class BaseJobPoller:
         validate_path_segment(batch_id, name="batch_id")
         start = time.monotonic()
         with self._lock:
-            terminal_status = self._terminal_states.get(batch_id)
-        return _PollState(batch_id=batch_id, start=start, terminal_status=terminal_status)
+            terminal_status = self._terminal_states.get((study_key, batch_id))
+            if terminal_status is None:
+                terminal_status = self._terminal_states.get(batch_id)
+        return _PollState(
+            batch_id=batch_id,
+            start=start,
+            study_key=study_key,
+            terminal_status=terminal_status,
+        )
 
     def _record_poll_step(
         self,
@@ -521,7 +535,11 @@ class BaseJobPoller:
         poll.poll_number += 1
         status = self._check_complete(result, poll.batch_id)
         status, poll.terminal_status = self._guard_transition(
-            poll.batch_id, status, poll.last_status, poll.terminal_status
+            poll.batch_id,
+            status,
+            poll.last_status,
+            poll.terminal_status,
+            study_key=poll.study_key,
         )
         poll.last_status = status
         elapsed = time.monotonic() - poll.start
@@ -606,6 +624,25 @@ class BaseJobPoller:
             elapsed_total=time.monotonic() - start,
         )
 
+    def _attach_fail_fast_context(
+        self,
+        exc: Exception,
+        *,
+        study_key: str,
+        failed_batch_id: str | None,
+        results: dict[str, JobStatus],
+        failures: dict[str, Exception],
+        start: float,
+    ) -> None:
+        """Attach partial :class:`JobPollSummary` and failing ``batch_id`` onto ``exc``."""
+        summary = self._build_poll_summary(study_key, dict(results), dict(failures), start)
+        try:
+            exc.poll_summary = summary  # type: ignore[attr-defined]
+            if failed_batch_id and not getattr(exc, "batch_id", None):
+                exc.batch_id = failed_batch_id  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+
 
 class JobPoller(BaseJobPoller):
     """Synchronously poll a job until completion."""
@@ -678,9 +715,10 @@ class JobPoller(BaseJobPoller):
             result = self._get_job(study_key, batch_id)
             event = self._record_poll_step(poll, result, timeout, on_progress)
             if event.is_terminal:
-                if stop_event is not None and stop_event.is_set():
-                    raise _PollAbortedError
-                fetch_terminal_job_result(event.status, self._fetch_result, batch_id=batch_id)
+                if self._fetch_result is not None:
+                    if stop_event is not None and stop_event.is_set():
+                        raise _PollAbortedError
+                    fetch_terminal_job_result(event.status, self._fetch_result, batch_id=batch_id)
                 return self._finalize_poll(event)
             self._wait_or_abort(interval, stop_event)
 
@@ -722,9 +760,10 @@ class JobPoller(BaseJobPoller):
         lock = threading.Lock()
         stop_event = threading.Event()
         first_failure: Exception | None = None
+        first_failure_batch_id: str | None = None
 
         def _poll_one(batch_id: str) -> None:
-            nonlocal first_failure
+            nonlocal first_failure, first_failure_batch_id
             if fail_fast and stop_event.is_set():
                 return
             try:
@@ -745,6 +784,7 @@ class JobPoller(BaseJobPoller):
                     failures[batch_id] = exc
                     if fail_fast and first_failure is None:
                         first_failure = exc
+                        first_failure_batch_id = batch_id
                         stop_event.set()
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -756,6 +796,14 @@ class JobPoller(BaseJobPoller):
                 future.result()
 
         if fail_fast and first_failure is not None:
+            self._attach_fail_fast_context(
+                first_failure,
+                study_key=study_key,
+                failed_batch_id=first_failure_batch_id,
+                results=results,
+                failures=failures,
+                start=start,
+            )
             raise first_failure
 
         return self._build_poll_summary(study_key, results, failures, start)
@@ -830,7 +878,10 @@ class AsyncJobPoller(BaseJobPoller):
         if empty_summary is not None:
             return empty_summary
 
+        triggering_batch_id: str | None = None
+
         async def _poll_one(batch_id: str) -> None:
+            nonlocal triggering_batch_id
             try:
                 status = await self.run(
                     study_key,
@@ -843,6 +894,8 @@ class AsyncJobPoller(BaseJobPoller):
             except Exception as exc:
                 failures[batch_id] = exc
                 if fail_fast:
+                    if triggering_batch_id is None:
+                        triggering_batch_id = batch_id
                     raise
 
         pending: set[asyncio.Task[None]] = {
@@ -866,6 +919,14 @@ class AsyncJobPoller(BaseJobPoller):
                         if pending:
                             await asyncio.gather(*pending, return_exceptions=True)
                         pending.clear()
+                        self._attach_fail_fast_context(
+                            triggering_exc,
+                            study_key=study_key,
+                            failed_batch_id=triggering_batch_id,
+                            results=results,
+                            failures=failures,
+                            start=start,
+                        )
                         raise triggering_exc
             else:
                 await asyncio.gather(*pending, return_exceptions=True)

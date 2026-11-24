@@ -94,7 +94,9 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.intervals.get('S', 1), Interval)
     assert_type(sdk.jobs.get('S', 'B'), JobStatus)
     assert_type(sdk.jobs.poll('S', 'B'), JobStatus)
+    assert_type(sdk.jobs.poll('S', 'B', resolve_results=True), JobStatus)
     assert_type(sdk.jobs.poll_many('S', ['B1', 'B2']), JobPollSummary)
+    assert_type(sdk.jobs.poll_many('S', ['B1', 'B2'], resolve_results=True), JobPollSummary)
     assert_type(sdk.queries.list('S'), Iterator[Query])
     assert_type(sdk.record_revisions.list('S'), Iterator[RecordRevision])
     assert_type(sdk.record_revisions.get('S', 1), RecordRevision)
@@ -146,7 +148,11 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.create_record('S', [{'formKey': 'DEMOG'}]), Job)
     assert_type(sdk.create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(sdk.poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
+    assert_type(sdk.poll_job('S', 'B', resolve_results=True), JobStatus)
+    assert_type(facade.poll_job('S', 'B', resolve_results=True), JobStatus)
     assert_type(sdk.poll_jobs('S', ['B1', 'B2']), JobPollSummary)
+    assert_type(sdk.poll_jobs('S', ['B1', 'B2'], resolve_results=True), JobPollSummary)
+    assert_type(facade.poll_jobs('S', ['B1', 'B2'], resolve_results=True), JobPollSummary)
 
     # JobStatus and Enum literal typing
     job_status = sdk.get_job('S', 'B')
@@ -333,7 +339,9 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.intervals.get('S', 1), Interval)
     assert_type(await sdk.jobs.get('S', 'B'), JobStatus)
     assert_type(await sdk.jobs.poll('S', 'B'), JobStatus)
+    assert_type(await sdk.jobs.poll('S', 'B', resolve_results=True), JobStatus)
     assert_type(await sdk.jobs.poll_many('S', ['B1', 'B2']), JobPollSummary)
+    assert_type(await sdk.jobs.poll_many('S', ['B1', 'B2'], resolve_results=True), JobPollSummary)
     assert_type(sdk.queries.list('S'), AsyncIterator[Query])
     assert_type(sdk.record_revisions.list('S'), AsyncIterator[RecordRevision])
     assert_type(await sdk.record_revisions.get('S', 1), RecordRevision)
@@ -385,7 +393,13 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.async_create_record('S', [{'formKey': 'DEMOG'}]), Job)
     assert_type(await sdk.async_create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(await sdk.async_poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
+    assert_type(await sdk.async_poll_job('S', 'B', resolve_results=True), JobStatus)
+    assert_type(await facade.async_poll_job('S', 'B', resolve_results=True), JobStatus)
     assert_type(await sdk.async_poll_jobs('S', ['B1', 'B2']), JobPollSummary)
+    assert_type(await sdk.async_poll_jobs('S', ['B1', 'B2'], resolve_results=True), JobPollSummary)
+    assert_type(
+        await facade.async_poll_jobs('S', ['B1', 'B2'], resolve_results=True), JobPollSummary
+    )
 
     # Narrowed auth, study_context Self preservation, and async plugin protocols
     assert_type(sdk.auth, AuthStrategy | None)
