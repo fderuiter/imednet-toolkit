@@ -115,6 +115,7 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.studies.get(study_key='S', item_id='S'), Study)
     assert_type(sdk.studies.get('S', item_id='S'), Study)
     assert_type(sdk.subjects.list('S'), Iterator[Subject])
+    assert_type(sdk.subjects.list_by_site('S', 1), list[Subject])
     assert_type(sdk.subjects.get('S', 1), Subject)
     assert_type(sdk.subjects.get('S', 1).keywords, list[SubjectKeyword])
     assert_type(sdk.users.list('S'), Iterator[User])
@@ -229,6 +230,21 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert _sync_cm
     with sdk.study_context('S') as scoped_sdk:
         assert_type(scoped_sdk, ImednetSDK)
+    _facade_sync_cm: AbstractContextManager[ImednetFacade] = facade.study_context('S')
+    assert _facade_sync_cm
+    with facade.study_context('S') as scoped_facade:
+        assert_type(scoped_facade, ImednetFacade)
+        assert_type(scoped_facade.get_codings(), list[Coding])
+        assert_type(scoped_facade.get_forms(), list[Form])
+        assert_type(scoped_facade.get_intervals(), list[Interval])
+        assert_type(scoped_facade.get_queries(), list[Query])
+        assert_type(scoped_facade.get_record_revisions(), list[RecordRevision])
+        assert_type(scoped_facade.get_records(), list[Record])
+        assert_type(scoped_facade.get_sites(), list[Site])
+        assert_type(scoped_facade.get_subjects(), list[Subject])
+        assert_type(scoped_facade.get_users(), list[User])
+        assert_type(scoped_facade.get_variables(), list[Variable])
+        assert_type(scoped_facade.get_visits(), list[Visit])
 
     assert_type(sdk.workflows, SyncWorkflowsNamespaceProtocol)
     assert_type(sdk.workflows.data_extraction.extract_records_by_criteria('S'), list[Record])
@@ -332,6 +348,7 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.studies.get(study_key='S', item_id='S'), Study)
     assert_type(await sdk.studies.get('S', item_id='S'), Study)
     assert_type(sdk.subjects.list('S'), AsyncIterator[Subject])
+    assert_type(await sdk.subjects.list_by_site('S', 1), list[Subject])
     assert_type(await sdk.subjects.get('S', 1), Subject)
     assert_type((await sdk.subjects.get('S', 1)).keywords, list[SubjectKeyword])
     assert_type(sdk.users.list('S'), AsyncIterator[User])
@@ -369,6 +386,21 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert _async_cm
     with sdk.study_context('S') as scoped_async_sdk:
         assert_type(scoped_async_sdk, AsyncImednetSDK)
+    _facade_async_cm: AbstractContextManager[AsyncImednetFacade] = facade.study_context('S')
+    assert _facade_async_cm
+    with facade.study_context('S') as scoped_async_facade:
+        assert_type(scoped_async_facade, AsyncImednetFacade)
+        assert_type(await scoped_async_facade.async_get_codings(), list[Coding])
+        assert_type(await scoped_async_facade.async_get_forms(), list[Form])
+        assert_type(await scoped_async_facade.async_get_intervals(), list[Interval])
+        assert_type(await scoped_async_facade.async_get_queries(), list[Query])
+        assert_type(await scoped_async_facade.async_get_record_revisions(), list[RecordRevision])
+        assert_type(await scoped_async_facade.async_get_records(), list[Record])
+        assert_type(await scoped_async_facade.async_get_sites(), list[Site])
+        assert_type(await scoped_async_facade.async_get_subjects(), list[Subject])
+        assert_type(await scoped_async_facade.async_get_users(), list[User])
+        assert_type(await scoped_async_facade.async_get_variables(), list[Variable])
+        assert_type(await scoped_async_facade.async_get_visits(), list[Visit])
 
     assert_type(sdk.workflows, AsyncWorkflowsNamespaceProtocol)
     assert_type(sdk.workflows.record_update, AsyncRecordUpdateWorkflowProtocol)
@@ -821,3 +853,150 @@ def aliased_model_constructor_contracts() -> None:
         ),
         VitalSigns,
     )
+
+
+def mixed_alias_and_narrowed_type_contracts() -> None:
+    now = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+
+    # User.name property resolves to str, Role accepts 7-int timestamp arrays,
+    # and BaseRecordRequest hierarchy accepts plain dict[str, Any] on data
+    user_inst = User(user_id='u-1', firstName='Ada', last_name='Lovelace')
+    assert_type(user_inst, User)
+    assert_type(user_inst.name, str)
+    assert_type(
+        Role(
+            role_id='R1',
+            communityId=10,
+            dateCreated=[2026, 5, 13, 14, 6, 50, 612000000],
+            date_modified='2026-05-13T14:06:50Z',
+        ),
+        Role,
+    )
+    assert_type(BaseRecordRequest(form_key='DM', data={'SUBJID': '001'}), BaseRecordRequest)
+    assert_type(
+        RegisterSubjectRequest(form_key='DM', siteName='SITE-01', data={'SUBJID': '001'}),
+        RegisterSubjectRequest,
+    )
+    assert_type(
+        UpdateScheduledRecordRequest(
+            form_key='VS',
+            subjectKey='SUBJ-01',
+            interval_name='Visit 1',
+            data={'SYSBP': 120},
+        ),
+        UpdateScheduledRecordRequest,
+    )
+    assert_type(
+        CreateNewRecordRequest(form_key='AE', subjectKey='SUBJ-01', data={'AETERM': 'Headache'}),
+        CreateNewRecordRequest,
+    )
+
+    # Mixed snake_case + camelCase constructors across all 33 multi-alias models
+    assert_type(Pagination(current_page=1, totalPages=3, total_elements=60), Pagination)
+    assert_type(Coding(study_key='S', siteName='SITE-01'), Coding)
+    assert_type(Form(subject_record_report=True, unscheduledVisit=False), Form)
+    assert_type(FormSummary(form_id=1, formKey='DM', form_name='Demographics'), FormSummary)
+    assert_type(Interval(study_key='S', intervalId=10), Interval)
+    assert_type(Job(job_id='J1', batchId='B1'), Job)
+    assert_type(
+        JobStatus(job_id='J1', batchId='B1', total_records=5, successfulRecords=5),
+        JobStatus,
+    )
+    assert_type(
+        Query(study_key='S', queryComments=[QueryComment(annotationStatus='Open')]),
+        Query,
+    )
+    assert_type(RecordRevision(record_revision=1, dataRevision=2), RecordRevision)
+    assert_type(Keyword(keyword_name='Safety', keywordKey='SAFE', keyword_id=1), Keyword)
+    assert_type(Record(record_data={'AGE': 42}, recordStatus='Record Complete'), Record)
+    assert_type(RecordJobResponse(job_id='J1', batchId='B1', state='OPEN'), RecordJobResponse)
+    assert_type(
+        AdverseEvent(
+            subject_key='SUBJ-01',
+            aeTerm='Headache',
+            ae_severity='MILD',
+            aeSerious=False,
+        ),
+        AdverseEvent,
+    )
+    assert_type(
+        ProtocolDeviation(
+            subject_key='SUBJ-01',
+            dvTerm='Late visit',
+            dv_category='VISIT_WINDOW',
+            dvSeverity='MINOR',
+        ),
+        ProtocolDeviation,
+    )
+    assert_type(
+        DeviceDeficiency(
+            subject_key='SUBJ-01',
+            ddTerm='Sensor drift',
+            dd_category='MALFUNCTION',
+        ),
+        DeviceDeficiency,
+    )
+    assert_type(Demographics(subject_key='SUBJ-01', sex='F', birthDate=now), Demographics)
+    assert_type(
+        VitalSigns(
+            subject_key='SUBJ-01',
+            vsTest='Systolic BP',
+            vs_test_cd='SYSBP',
+            vsResult=120.0,
+        ),
+        VitalSigns,
+    )
+    assert_type(Site(study_key='S', siteEnrollmentStatus='Enrollment Open'), Site)
+    assert_type(Study(sponsor_key='SP', studyKey='S'), Study)
+    assert_type(
+        MappingRule(
+            domain='AE',
+            target_field='aeTerm',
+            sourceFormKey='AE_FORM',
+            source_variable_name='AETERM',
+        ),
+        MappingRule,
+    )
+    assert_type(
+        WidgetConfig(
+            widget_id='w-1',
+            type='bar',
+            title='AE Count',
+            domain='AE',
+            xAxis='aeSeverity',
+        ),
+        WidgetConfig,
+    )
+    assert_type(
+        StudyConfiguration(study_key='STUDY-1', reportingProfile='drug'), StudyConfiguration
+    )
+    assert_type(
+        FormStructure(
+            form_id=1,
+            formKey='DM',
+            form_name='Demographics',
+            formType='CRF',
+            revision=1,
+            date_created=now,
+            dateModified=now,
+        ),
+        FormStructure,
+    )
+    assert_type(
+        IntervalStructure(
+            interval_id=10,
+            intervalName='Baseline',
+            interval_sequence=1,
+            intervalDescription='Visit 1',
+            interval_group_name='Core',
+            dateCreated=now,
+            date_modified=now,
+        ),
+        IntervalStructure,
+    )
+    assert_type(
+        SubjectKeyword(keyword_name='Enrolled', keywordKey='ENR', keyword_id=2), SubjectKeyword
+    )
+    assert_type(Subject(study_key='S', subjectStatus='Enrolled'), Subject)
+    assert_type(Variable(study_key='S', variableOid='VAR_AGE'), Variable)
+    assert_type(Visit(study_key='S', visitId=1), Visit)

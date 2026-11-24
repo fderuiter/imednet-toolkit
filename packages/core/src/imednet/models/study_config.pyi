@@ -6,7 +6,7 @@ including reporting profiles, widgets, and mapping rules.
 
 from __future__ import annotations
 
-from typing import Self, overload
+from typing import Self
 
 from pydantic import Field, field_validator, model_validator
 
@@ -26,34 +26,26 @@ class MappingRule(ImednetBaseModel):
     strict_mode: bool = Field(default=False, alias="strictMode")
     strict_cdash: bool = Field(default=False, alias="strictCdash")
 
-    @overload
     def __init__(
         self,
         *,
         domain: str,
-        target_field: str,
-        source_form_key: str,
-        source_variable_name: str,
+        target_field: str = ...,
+        targetField: str = ...,
+        source_form_key: str = ...,
+        sourceFormKey: str = ...,
+        source_variable_name: str = ...,
+        sourceVariableName: str = ...,
         fallback_value: str | None = None,
-        business_logic: str | None = None,
-        is_baseline: bool = False,
-        strict: bool = False,
-        strict_mode: bool = False,
-        strict_cdash: bool = False,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        domain: str,
-        targetField: str,
-        sourceFormKey: str,
-        sourceVariableName: str,
         fallbackValue: str | None = None,
+        business_logic: str | None = None,
         businessLogic: str | None = None,
+        is_baseline: bool = False,
         isBaseline: bool = False,
         strict: bool = False,
+        strict_mode: bool = False,
         strictMode: bool = False,
+        strict_cdash: bool = False,
         strictCdash: bool = False,
     ) -> None: ...
     @model_validator(mode="after")
@@ -70,28 +62,19 @@ class WidgetConfig(ImednetBaseModel):
     y_axis: str | None = Field(default=None, alias="yAxis")
     layout_cols: int = Field(default=12, alias="layoutCols")
 
-    @overload
     def __init__(
         self,
         *,
-        widget_id: str,
+        widget_id: str = ...,
+        widgetId: str = ...,
         type: str,
         title: str,
         domain: str,
         x_axis: str | None = None,
-        y_axis: str | None = None,
-        layout_cols: int = 12,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        widgetId: str,
-        type: str,
-        title: str,
-        domain: str,
         xAxis: str | None = None,
+        y_axis: str | None = None,
         yAxis: str | None = None,
+        layout_cols: int = 12,
         layoutCols: int = 12,
     ) -> None: ...
 
@@ -111,34 +94,24 @@ class StudyConfiguration(ImednetBaseModel):
     strict_mode: bool = Field(default=False, alias="strictMode")
     strict_cdash: bool = Field(default=False, alias="strictCdash")
 
-    @overload
     def __init__(
         self,
         *,
         version: str = "1.0.0",
-        study_key: str,
+        study_key: str = ...,
+        studyKey: str = ...,
         reporting_profile: str = "general",
-        mappings: list[MappingRule] = ...,
-        terminology_lookups: dict[str, dict[str, str]] = ...,
-        widgets: list[WidgetConfig] = ...,
-        phi_fields: list[str] = ...,
-        strict: bool = False,
-        strict_mode: bool = False,
-        strict_cdash: bool = False,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        version: str = "1.0.0",
-        studyKey: str,
         reportingProfile: str = "general",
         mappings: list[MappingRule] = ...,
+        terminology_lookups: dict[str, dict[str, str]] = ...,
         terminologyLookups: dict[str, dict[str, str]] = ...,
         widgets: list[WidgetConfig] = ...,
+        phi_fields: list[str] = ...,
         phiFields: list[str] = ...,
         strict: bool = False,
+        strict_mode: bool = False,
         strictMode: bool = False,
+        strict_cdash: bool = False,
         strictCdash: bool = False,
     ) -> None: ...
     @field_validator("reporting_profile", check_fields=False, mode="before")

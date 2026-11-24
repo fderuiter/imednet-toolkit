@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
-from typing import Any, overload
+from typing import Any
 
-from pydantic import Field, computed_field, field_validator
+from pydantic import Field, field_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -25,33 +26,22 @@ class Role(ImednetBaseModel):
     date_created: datetime | None = Field(default=None, alias="dateCreated")
     date_modified: datetime | None = Field(default=None, alias="dateModified")
 
-    @overload
     def __init__(
         self,
         *,
         role_id: str | None = None,
-        name: str | None = None,
-        description: str | None = None,
-        level: int | None = None,
-        type: str | None = None,
-        inactive: bool | None = None,
-        community_id: int | None = None,
-        date_created: datetime | None = None,
-        date_modified: datetime | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         roleId: str | None = None,
         name: str | None = None,
         description: str | None = None,
         level: int | None = None,
         type: str | None = None,
         inactive: bool | None = None,
+        community_id: int | None = None,
         communityId: int | None = None,
-        dateCreated: datetime | None = None,
-        dateModified: datetime | None = None,
+        date_created: datetime | str | Sequence[int] | None = None,
+        dateCreated: datetime | str | Sequence[int] | None = None,
+        date_modified: datetime | str | Sequence[int] | None = None,
+        dateModified: datetime | str | Sequence[int] | None = None,
     ) -> None: ...
     @field_validator("date_created", "date_modified", mode="before")
     @classmethod
@@ -68,31 +58,22 @@ class User(ImednetBaseModel):
     email: str | None = Field(default=None, alias="email")
     user_active_in_study: bool | None = Field(default=None, alias="userActiveInStudy")
 
-    @overload
     def __init__(
         self,
         *,
         roles: list[Role] = ...,
         user_id: str | None = None,
-        login: str | None = None,
-        first_name: str | None = None,
-        last_name: str | None = None,
-        email: str | None = None,
-        user_active_in_study: bool | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        roles: list[Role] = ...,
         userId: str | None = None,
         login: str | None = None,
+        first_name: str | None = None,
         firstName: str | None = None,
+        last_name: str | None = None,
         lastName: str | None = None,
         email: str | None = None,
+        user_active_in_study: bool | None = None,
         userActiveInStudy: bool | None = None,
     ) -> None: ...
-    @computed_field
+    @property
     def name(self) -> str: ...
 
 __all__ = ["Role", "User"]
