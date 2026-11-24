@@ -713,6 +713,636 @@ def test_ingest_revisions_unregisters_staging_view_on_insert_failure() -> None:
         real_conn.execute(f'SELECT * FROM "{view_name}"')
 
 
+def test_ingest_revisions_normalizes_record_revision_cst_and_offset_strings() -> None:
+    """Test RecordRevision ISO-8601 -06:00, +02:00, Z, fractional, and naive string timestamps."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+    revisions = [
+        RecordRevision(
+            studyKey="STUDY",
+            recordRevisionId=1001,
+            recordId=50,
+            recordOid="REC-50",
+            formKey="VITALS",
+            subjectKey="SUBJ-01",
+            siteId=10,
+            intervalId=1,
+            recordStatus="Record Complete",
+            recordRevision=1,
+            dataRevision=1,
+            user="crc_cst",
+            role="CRC",
+            reasonForChange="Captured in CST -06:00",
+            deleted=False,
+            dateCreated="2024-01-15T08:30:00-06:00",
+            lastUpdated="2024-01-15T09:45:15-06:00",
+        ),
+        RecordRevision(
+            studyKey="STUDY",
+            recordRevisionId=1002,
+            recordId=50,
+            recordOid="REC-50",
+            formKey="VITALS",
+            subjectKey="SUBJ-01",
+            siteId=10,
+            intervalId=1,
+            recordStatus="Verified",
+            recordRevision=1,
+            dataRevision=1,
+            user="pi_utc",
+            role="PI",
+            reasonForChange="Updated 15 minutes later in UTC",
+            deleted=False,
+            dateCreated="2024-01-15T14:45:00Z",
+            lastUpdated="2024-01-15T14:45:00.250000-06:00",
+        ),
+        RecordRevision(
+            studyKey="STUDY",
+            recordRevisionId=1003,
+            recordId=51,
+            recordOid="REC-51",
+            formKey="DEMO",
+            subjectKey="SUBJ-02",
+            siteId=10,
+            intervalId=1,
+            recordStatus="Signed",
+            recordRevision=1,
+            dataRevision=1,
+            user="pi_naive",
+            role="PI",
+            reasonForChange="Space-separated naive UTC and blank lastUpdated",
+            deleted=False,
+            dateCreated="2024-01-15 18:10:00",
+            lastUpdated="   ",
+        ),
+    ]
+
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=revisions):
+        assert workflow.ingest_revisions("STUDY", mode="replace") == 3
+
+    stored = workflow._connection.execute("""
+        SELECT record_revision_id, date_created, last_updated
+        FROM bronze_revisions
+        ORDER BY record_revision_id
+        """).fetchall()
+    assert stored == [
+        (
+            1001,
+            datetime(2024, 1, 15, 14, 30, 0),
+            datetime(2024, 1, 15, 15, 45, 15),
+        ),
+        (
+            1002,
+            datetime(2024, 1, 15, 14, 45, 0),
+            datetime(2024, 1, 15, 20, 45, 0, 250000),
+        ),
+        (
+            1003,
+            datetime(2024, 1, 15, 18, 10, 0),
+            None,
+        ),
+    ]
+
+    workflow.build_silver_view("STUDY")
+    winner = workflow._connection.execute("""
+        SELECT record_revision_id, "user", date_created
+        FROM silver_current_state
+        WHERE record_id = 50
+        """).fetchone()
+    assert winner == (1002, "pi_utc", datetime(2024, 1, 15, 14, 45, 0))
+    workflow.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_key",
+    [
+        "STUDY 01",
+        "STUDY'; DROP TABLE bronze_revisions; --",
+        'STUDY" OR 1=1',
+        "",
+        "   ",
+    ],
+)
+def test_ingest_revisions_rejects_invalid_study_key_and_revision_study_key(
+    invalid_key: str,
+) -> None:
+    """Test ingest_revisions validates study_key and non-empty revision.study_key."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+    with (
+        patch.object(DataExtractionWorkflow, "extract_audit_trail") as extract_mock,
+        pytest.raises(ValueError, match="Invalid study key"),
+    ):
+        workflow.ingest_revisions(invalid_key)
+    extract_mock.assert_not_called()
+
+    seed = [
+        RecordRevision(
+            study_key="STUDY",
+            record_revision_id=1,
+            record_id=1,
+            form_key="DEMO",
+            record_revision=1,
+            date_created="2024-01-01T00:00:00Z",
+        )
+    ]
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=seed):
+        assert workflow.ingest_revisions("STUDY", mode="replace") == 1
+
+    if invalid_key != "":
+        bad_rev = [
+            SimpleNamespace(
+                study_key=invalid_key,
+                record_revision_id=2,
+                record_id=2,
+                form_key="DEMO",
+                record_revision=1,
+                date_created="2024-01-02T00:00:00Z",
+            )
+        ]
+        with (
+            patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=bad_rev),
+            pytest.raises(ValueError, match="Invalid study key"),
+        ):
+            workflow.ingest_revisions("STUDY", mode="replace")
+
+        # Existing study rows remain untouched because validation failed before transaction
+        remaining = workflow._connection.execute(
+            "SELECT study_key, record_revision_id FROM bronze_revisions"
+        ).fetchall()
+        assert remaining == [("STUDY", 1)]
+    else:
+        # Empty string revision.study_key falls back to validated study_key
+        empty_study_rev = [
+            RecordRevision(
+                study_key="",
+                record_revision_id=3,
+                record_id=3,
+                form_key="DEMO",
+                record_revision=1,
+                date_created="2024-01-03T00:00:00Z",
+            )
+        ]
+        with patch.object(
+            DataExtractionWorkflow, "extract_audit_trail", return_value=empty_study_rev
+        ):
+            assert workflow.ingest_revisions("STUDY", mode="append") == 1
+        stored_keys = workflow._connection.execute(
+            "SELECT study_key, record_revision_id FROM bronze_revisions ORDER BY record_revision_id"
+        ).fetchall()
+        assert stored_keys == [("STUDY", 1), ("STUDY", 3)]
+
+    workflow.close()
+
+
+def test_ingest_revisions_boundary_deduplication_and_legacy_table(tmp_path) -> None:
+    """Test append deduplicates overlapping keys, intra-batch duplicates, and legacy tables."""
+    duckdb = pytest.importorskip("duckdb")
+
+    # 1. Pre-create a legacy DuckDB file WITHOUT a UNIQUE constraint and WITH duplicate rows
+    db_file = str(tmp_path / "legacy_audit.duckdb")
+    legacy_conn = duckdb.connect(db_file)
+    legacy_conn.execute("""
+        CREATE TABLE bronze_revisions (
+            study_key VARCHAR,
+            record_revision_id BIGINT,
+            record_id BIGINT,
+            record_oid VARCHAR,
+            form_key VARCHAR,
+            subject_key VARCHAR,
+            site_id BIGINT,
+            interval_id BIGINT,
+            record_status VARCHAR,
+            record_revision INTEGER,
+            data_revision INTEGER,
+            "user" VARCHAR,
+            role VARCHAR,
+            reason_for_change VARCHAR,
+            deleted BOOLEAN,
+            date_created TIMESTAMP,
+            last_updated TIMESTAMP
+        )
+        """)
+    for dup_reason in ("Legacy duplicate 1", "Legacy duplicate 2"):
+        legacy_conn.execute(
+            """
+            INSERT INTO bronze_revisions (
+                study_key, record_revision_id, record_id, form_key,
+                record_revision, data_revision, "user", reason_for_change,
+                deleted, date_created
+            ) VALUES ('STUDY', 501, 10, 'VITALS', 1, 1, 'alice', ?, FALSE, '2024-01-31 23:59:59')
+            """,
+            [dup_reason],
+        )
+    legacy_conn.close()
+
+    with DuckDBIngestionWorkflow(MagicMock(), db_file) as workflow:
+        overlapping_batch = [
+            RecordRevision(
+                study_key="STUDY",
+                record_revision_id=501,
+                record_id=10,
+                form_key="VITALS",
+                record_revision=1,
+                data_revision=1,
+                user="alice",
+                reason_for_change="Stale intra-batch copy",
+                deleted=False,
+                date_created="2024-01-31T17:59:59-06:00",
+            ),
+            RecordRevision(
+                study_key="STUDY",
+                record_revision_id=501,
+                record_id=10,
+                form_key="VITALS",
+                record_revision=1,
+                data_revision=1,
+                user="alice",
+                reason_for_change="Canonical boundary revision",
+                deleted=False,
+                date_created="2024-01-31T17:59:59-06:00",
+            ),
+            RecordRevision(
+                study_key=None,
+                record_revision_id=None,
+                record_id=None,
+                record_oid="UNKEYED-1",
+                form_key="NOTES",
+                record_revision=1,
+                data_revision=1,
+                user="bob",
+                reason_for_change="Null revision id 1",
+                deleted=False,
+                date_created="2024-02-01T00:00:00Z",
+            ),
+        ]
+        next_batch = [
+            RecordRevision(
+                study_key=None,
+                record_revision_id=None,
+                record_id=None,
+                record_oid="UNKEYED-2",
+                form_key="NOTES",
+                record_revision=1,
+                data_revision=1,
+                user="carol",
+                reason_for_change="Null revision id 2",
+                deleted=False,
+                date_created="2024-02-02T00:00:00Z",
+            ),
+        ]
+        with patch.object(
+            DataExtractionWorkflow,
+            "extract_audit_trail",
+            side_effect=[overlapping_batch, next_batch],
+        ):
+            assert workflow.ingest_revisions("STUDY", mode="append") == 1
+            assert workflow.ingest_revisions("STUDY", mode="append") == 1
+
+        rows = workflow._connection.execute("""
+            SELECT record_revision_id, record_oid, reason_for_change, date_created
+            FROM bronze_revisions
+            ORDER BY date_created
+            """).fetchall()
+        assert rows == [
+            (501, None, "Canonical boundary revision", datetime(2024, 1, 31, 23, 59, 59)),
+            (None, "UNKEYED-1", "Null revision id 1", datetime(2024, 2, 1, 0, 0, 0)),
+            (None, "UNKEYED-2", "Null revision id 2", datetime(2024, 2, 2, 0, 0, 0)),
+        ]
+
+
+def test_ingest_revisions_transactional_rollback_and_study_isolated_replace() -> None:
+    """Test replace mode isolates target study and rolls back DELETE on INSERT failure."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+    study_a_initial = [
+        RecordRevision(
+            study_key="STUDY_A",
+            record_revision_id=101,
+            record_id=1,
+            form_key="DEMO",
+            record_revision=1,
+            user="alice",
+            date_created="2024-01-01T00:00:00Z",
+        )
+    ]
+    study_b_initial = [
+        RecordRevision(
+            study_key="STUDY_B",
+            record_revision_id=201,
+            record_id=2,
+            form_key="VITALS",
+            record_revision=1,
+            user="bob",
+            date_created="2024-01-02T00:00:00Z",
+        )
+    ]
+    with patch.object(
+        DataExtractionWorkflow,
+        "extract_audit_trail",
+        side_effect=[study_a_initial, study_b_initial],
+    ):
+        assert workflow.ingest_revisions("STUDY_A", mode="append") == 1
+        assert workflow.ingest_revisions("STUDY_B", mode="append") == 1
+
+    # Simulate INSERT failure during mode="replace" for STUDY_A; DELETE must roll back
+    real_conn = workflow._connection
+    spy_conn = MagicMock(wraps=real_conn)
+
+    def fail_on_insert(query: str, *args: object, **kwargs: object) -> object:
+        if "INSERT INTO bronze_revisions" in query:
+            raise RuntimeError("Disk full on insert")
+        return real_conn.execute(query, *args, **kwargs)
+
+    spy_conn.execute.side_effect = fail_on_insert
+    workflow._connection = spy_conn
+
+    replacement_attempt = [
+        RecordRevision(
+            study_key="STUDY_A",
+            record_revision_id=199,
+            record_id=9,
+            form_key="AE",
+            record_revision=1,
+            user="carol",
+            date_created="2024-01-05T00:00:00Z",
+        )
+    ]
+    with (
+        patch.object(
+            DataExtractionWorkflow, "extract_audit_trail", return_value=replacement_attempt
+        ),
+        pytest.raises(RuntimeError, match="Disk full on insert"),
+    ):
+        workflow.ingest_revisions("STUDY_A", mode="replace")
+
+    workflow._connection = real_conn
+    preserved = real_conn.execute(
+        "SELECT study_key, record_revision_id FROM bronze_revisions ORDER BY study_key"
+    ).fetchall()
+    assert preserved == [("STUDY_A", 101), ("STUDY_B", 201)]
+
+    # Successful non-empty replace on STUDY_A preserves STUDY_B
+    with patch.object(
+        DataExtractionWorkflow, "extract_audit_trail", return_value=replacement_attempt
+    ):
+        assert workflow.ingest_revisions("STUDY_A", mode="replace") == 1
+
+    after_replace = real_conn.execute(
+        "SELECT study_key, record_revision_id FROM bronze_revisions ORDER BY study_key"
+    ).fetchall()
+    assert after_replace == [("STUDY_A", 199), ("STUDY_B", 201)]
+
+    # Empty replace on STUDY_A clears ONLY STUDY_A while keeping STUDY_B intact
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=[]):
+        assert workflow.ingest_revisions("STUDY_A", mode="replace") == 0
+
+    after_empty_replace = real_conn.execute(
+        "SELECT study_key, record_revision_id FROM bronze_revisions ORDER BY study_key"
+    ).fetchall()
+    assert after_empty_replace == [("STUDY_B", 201)]
+    workflow.close()
+
+
+def test_build_silver_view_excludes_deleted_partitions_oid_and_preserves_multi_study() -> None:
+    """Test silver views exclude voided records, partition null record_id by record_oid, and isolate studies."""
+    pytest.importorskip("duckdb")
+    workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+
+    study_a_revisions = [
+        # Record 10: active in rev 1, voided (deleted=True) in rev 2 -> must NOT resurface rev 1
+        RecordRevision(
+            study_key="STUDY-A",
+            record_revision_id=1,
+            record_id=10,
+            record_oid="REC-10",
+            form_key="DEMO",
+            record_revision=1,
+            data_revision=1,
+            deleted=False,
+            date_created="2024-01-01T10:00:00Z",
+        ),
+        RecordRevision(
+            study_key="STUDY-A",
+            record_revision_id=2,
+            record_id=10,
+            record_oid="REC-10",
+            form_key="DEMO",
+            record_revision=2,
+            data_revision=1,
+            deleted=True,
+            reason_for_change="Voided duplicate subject",
+            date_created="2024-01-02T10:00:00Z",
+        ),
+        # Record with record_id=None partitioned by record_oid="OID-ONLY-1"
+        RecordRevision(
+            study_key="STUDY-A",
+            record_revision_id=3,
+            record_id=None,
+            record_oid="OID-ONLY-1",
+            form_key="VITALS",
+            record_revision=1,
+            data_revision=1,
+            user="crc1",
+            deleted=False,
+            date_created="2024-01-03T10:00:00Z",
+        ),
+        RecordRevision(
+            study_key="STUDY-A",
+            record_revision_id=4,
+            record_id=None,
+            record_oid="OID-ONLY-1",
+            form_key="VITALS",
+            record_revision=2,
+            data_revision=2,
+            user="pi1",
+            deleted=False,
+            date_created="2024-01-04T10:00:00Z",
+        ),
+        # Distinct record with record_id=None and different record_oid="OID-ONLY-2"
+        RecordRevision(
+            study_key="STUDY-A",
+            record_revision_id=5,
+            record_id=None,
+            record_oid="OID-ONLY-2",
+            form_key="LABS",
+            record_revision=1,
+            data_revision=1,
+            user="crc2",
+            deleted=False,
+            date_created="2024-01-05T10:00:00Z",
+        ),
+    ]
+    study_b_revisions = [
+        RecordRevision(
+            study_key="PROT:202",
+            record_revision_id=10,
+            record_id=10,
+            record_oid="REC-10",
+            form_key="AE",
+            record_revision=1,
+            data_revision=1,
+            user="site_b",
+            deleted=False,
+            date_created="2024-01-06T08:00:00-06:00",
+        )
+    ]
+
+    with patch.object(
+        DataExtractionWorkflow,
+        "extract_audit_trail",
+        side_effect=[study_a_revisions, study_b_revisions],
+    ):
+        assert workflow.ingest_revisions("STUDY-A", mode="append") == 5
+        assert workflow.ingest_revisions("PROT:202", mode="append") == 1
+
+    workflow.build_silver_view("STUDY-A")
+    workflow.build_silver_view("PROT:202")
+
+    study_a_silver = workflow._connection.execute("""
+        SELECT record_revision_id, record_id, record_oid, record_revision, "user"
+        FROM "silver_current_state_STUDY-A"
+        ORDER BY record_revision_id
+        """).fetchall()
+    assert study_a_silver == [
+        (4, None, "OID-ONLY-1", 2, "pi1"),
+        (5, None, "OID-ONLY-2", 1, "crc2"),
+    ]
+
+    study_b_silver = workflow._connection.execute("""
+        SELECT study_key, record_revision_id, record_id, date_created
+        FROM "silver_current_state_PROT:202"
+        """).fetchall()
+    assert study_b_silver == [("PROT:202", 10, 10, datetime(2024, 1, 6, 14, 0, 0))]
+
+    combined_silver = workflow._connection.execute("""
+        SELECT study_key, record_revision_id, deleted
+        FROM silver_current_state
+        ORDER BY study_key, record_revision_id
+        """).fetchall()
+    assert combined_silver == [
+        ("PROT:202", 10, False),
+        ("STUDY-A", 4, False),
+        ("STUDY-A", 5, False),
+    ]
+
+    # Rebuilding STUDY-A with include_deleted=True retains voided rev 2 without overwriting PROT:202
+    workflow.build_silver_view("STUDY-A", include_deleted=True)
+    combined_with_deleted = workflow._connection.execute("""
+        SELECT study_key, record_revision_id, deleted
+        FROM silver_current_state
+        ORDER BY study_key, record_revision_id
+        """).fetchall()
+    assert combined_with_deleted == [
+        ("PROT:202", 10, False),
+        ("STUDY-A", 2, True),
+        ("STUDY-A", 4, False),
+        ("STUDY-A", 5, False),
+    ]
+
+    combined_history = workflow._connection.execute("""
+        SELECT study_key, record_revision_id, valid_from, valid_to, is_current
+        FROM silver_records_history
+        WHERE study_key = 'PROT:202' OR record_id = 10
+        ORDER BY study_key, record_revision_id
+        """).fetchall()
+    assert combined_history == [
+        ("PROT:202", 10, datetime(2024, 1, 6, 14, 0, 0), None, True),
+        (
+            "STUDY-A",
+            1,
+            datetime(2024, 1, 1, 10, 0, 0),
+            datetime(2024, 1, 2, 10, 0, 0),
+            False,
+        ),
+        ("STUDY-A", 2, datetime(2024, 1, 2, 10, 0, 0), None, True),
+    ]
+    workflow.close()
+
+
+def test_duckdb_workflow_close_context_manager_and_persistent_reopen(tmp_path) -> None:
+    """Test idempotent close(), context manager cleanup, and persistent multi-Study silver views."""
+    duckdb = pytest.importorskip("duckdb")
+    db_file = str(tmp_path / "centralized.duckdb")
+
+    rev_a = [
+        RecordRevision(
+            study_key="STUDY_A",
+            record_revision_id=1,
+            record_id=100,
+            form_key="DEMO",
+            record_revision=1,
+            date_created="2024-03-01T06:00:00-06:00",
+        )
+    ]
+    rev_b = [
+        RecordRevision(
+            study_key="STUDY_B",
+            record_revision_id=2,
+            record_id=200,
+            form_key="VITALS",
+            record_revision=1,
+            date_created="2024-03-02T07:00:00-06:00",
+        )
+    ]
+
+    assert DuckDBIngestionWorkflow._optional_timestamp(20240115) == "20240115"
+
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=rev_a):
+        with DuckDBIngestionWorkflow(MagicMock(), db_file) as wf1:
+            assert wf1.ingest_revisions("STUDY_A", mode="append") == 1
+            wf1.build_silver_view("STUDY_A")
+            real_conn = wf1._connection
+            spy_conn = MagicMock(wraps=real_conn)
+            wf1._connection = spy_conn
+        # Exiting context manager called close() once; subsequent close() is a no-op
+        wf1.close()
+        spy_conn.close.assert_called_once()
+
+    # Verify rollback when DELETE fails during an empty mode="replace" run
+    wf_err = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+    real_mem = wf_err._connection
+    spy_mem = MagicMock(wraps=real_mem)
+
+    def fail_delete(query: str, *args: object, **kwargs: object) -> object:
+        if "DELETE FROM bronze_revisions" in query:
+            raise RuntimeError("Simulated delete failure")
+        return real_mem.execute(query, *args, **kwargs)
+
+    spy_mem.execute.side_effect = fail_delete
+    wf_err._connection = spy_mem
+    with (
+        patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=[]),
+        pytest.raises(RuntimeError, match="Simulated delete failure"),
+    ):
+        wf_err.ingest_revisions("STUDY_A", mode="replace")
+    wf_err._connection = real_mem
+    wf_err.close()
+
+    with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=rev_b):
+        with DuckDBIngestionWorkflow(MagicMock(), db_file) as wf2:
+            assert wf2.ingest_revisions("STUDY_B", mode="append") == 1
+            wf2.build_silver_view("STUDY_B")
+
+    # Reopen persistent DuckDB file in read_only mode after with-block closed connection
+    conn = duckdb.connect(db_file, read_only=True)
+    try:
+        rows = conn.execute("""
+            SELECT study_key, record_id, date_created
+            FROM silver_current_state
+            ORDER BY study_key
+            """).fetchall()
+        assert rows == [
+            ("STUDY_A", 100, datetime(2024, 3, 1, 12, 0, 0)),
+            ("STUDY_B", 200, datetime(2024, 3, 2, 13, 0, 0)),
+        ]
+    finally:
+        conn.close()
+
+
 def test_ingest_revisions_deduplicates_keyed_appends_and_preserves_unkeyed() -> None:
     """Verify repeated append calls deduplicate keyed record_revision_id items while keeping unkeyed rows."""
     pytest.importorskip("duckdb")
