@@ -77,7 +77,7 @@ Usage
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -100,6 +100,7 @@ from imednet.spi.sinks import (
     commit_sdtm_lineage,
     extract_record_id,
     extract_sdtm_composite_key,
+    is_incremental_sink_config,
     normalize_sink_value,
     rehydrate_sdtm_lineage,
     require_optional_dep,
@@ -287,6 +288,11 @@ class MongoDbExportSink(ExportSink):
         self._seq_counters: dict[str, int] = {}
         self._domain_seq_counters: dict[str, dict[str, int]] = {}
         self._record_seqs: dict[str, int] = {}
+        self._form_domain_map_ref: dict[Any, str] = {}
+        self._seq_overrides_ref: dict[str, int] = {}
+        self._lineage_out_ref: dict[str, dict[str, Any]] = {}
+        self._mapper: CentralizedMapper | None = None
+        self._mapper_key: tuple[Any, ...] | None = None
         self._client: Any = None
         self._collection: Any = None
         self._connect()
@@ -320,12 +326,58 @@ class MongoDbExportSink(ExportSink):
     # ExportSink interface
     # ------------------------------------------------------------------
 
+    def _get_mapper(
+        self,
+        post_proc: Any,
+        seq_overrides: Mapping[str, int] | None,
+    ) -> CentralizedMapper:
+        """Return a reusable sink-scoped mapper synchronized for the active MongoDB batch."""
+        doc_cfg = self.config
+        self._form_domain_map_ref.clear()
+        active_map = getattr(self, "_active_form_domain_map", None)
+        if isinstance(active_map, Mapping):
+            self._form_domain_map_ref.update(active_map)
+        self._seq_overrides_ref.clear()
+        if seq_overrides:
+            self._seq_overrides_ref.update(seq_overrides)
+        self._lineage_out_ref.clear()
+
+        extra = doc_cfg.extra if isinstance(doc_cfg.extra, dict) else {}
+        key = (
+            bool(doc_cfg.mask_phi),
+            bool(doc_cfg.as_sdtm),
+            doc_cfg.sdtm_domain,
+            doc_cfg.naming_convention,
+            is_incremental_sink_config(doc_cfg),
+            id(extra.get("study_config")),
+            id(extra.get("enrichment_pipeline")),
+        )
+        if self._mapper is None or self._mapper_key != key:
+            self._mapper = build_sink_mapper(
+                doc_cfg,
+                mode="document",
+                post_processor=post_proc,
+                seq_counters=(
+                    self._seq_counters
+                    if (not doc_cfg.as_sdtm or doc_cfg.sdtm_domain is not None)
+                    else None
+                ),
+                domain_seq_counters=self._domain_seq_counters if doc_cfg.as_sdtm else None,
+                form_domain_map=self._form_domain_map_ref,
+                seq_overrides=self._seq_overrides_ref if doc_cfg.as_sdtm else None,
+                lineage_out=self._lineage_out_ref if doc_cfg.as_sdtm else None,
+                record_seqs=self._record_seqs,
+            )
+            self._mapper_key = key
+        else:
+            self._mapper.post_processor = post_proc
+        return self._mapper
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to MongoDB using upsert (idempotent) or insert."""
         if not records:
             return 0
 
-        lineage_out: dict[str, dict[str, Any]] = {}
         seq_overrides: dict[str, int] | None = None
         if self.config.as_sdtm:
             rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
@@ -335,21 +387,8 @@ class MongoDbExportSink(ExportSink):
                     local_map[subj_key] = max(local_map.get(subj_key, 0), wm_val)
 
         post_proc = None if self.config.as_sdtm else _post_process_document
-        mapper = build_sink_mapper(
-            self.config,
-            mode="document",
-            post_processor=post_proc,
-            seq_counters=(
-                self._seq_counters
-                if (not self.config.as_sdtm or self.config.sdtm_domain is not None)
-                else None
-            ),
-            domain_seq_counters=self._domain_seq_counters if self.config.as_sdtm else None,
-            form_domain_map=getattr(self, "_active_form_domain_map", None),
-            seq_overrides=seq_overrides,
-            lineage_out=lineage_out if self.config.as_sdtm else None,
-            record_seqs=self._record_seqs,
-        )
+        mapper = self._get_mapper(post_proc, seq_overrides)
+        lineage_out = self._lineage_out_ref
         mapped_docs: list[dict[str, Any]] | None = None
         is_incremental = bool(
             self.config.incremental

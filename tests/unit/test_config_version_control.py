@@ -1233,3 +1233,172 @@ def test_legacy_study_partitioned_sqlite_fallback_and_fail_closed(
         assert mapped["record_data"]["patient_name"] == "***MASKED***"
     finally:
         reset_base_url_context(b_tok)
+
+
+def test_dynamic_home_and_monkeypatched_path_home_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_sdk: MockSDK,
+) -> None:
+    """Verify ConfigVersionStore honors dynamic HOME and monkeypatched Path.home() overrides."""
+    monkeypatch.delenv("IMEDNET_CONFIG_DB_PATH", raising=False)
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "home-override-test-key")  # pragma: allowlist secret
+
+    env_home = tmp_path / "env_home"
+    monkeypatch.setenv("HOME", str(env_home))
+    assert ConfigVersionStore.resolve_committed_config("STUDY-HOME") is None
+
+    env_store = ConfigVersionStore()
+    assert env_store.db_path.is_relative_to(env_home / ".imednet")
+    env_cfg = StudyConfiguration(study_key="STUDY-HOME", phi_fields=["env_home_phi"])
+    env_store.commit_config("STUDY-HOME", env_cfg, desc="env home commit", sdk=mock_sdk)
+    resolved_env = ConfigVersionStore.resolve_committed_config("STUDY-HOME")
+    assert resolved_env is not None
+    assert resolved_env.phi_fields == ["env_home_phi"]
+
+    patched_home = tmp_path / "patched_home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: patched_home))
+    assert ConfigVersionStore.resolve_committed_config("STUDY-HOME") is None
+
+    patched_store = ConfigVersionStore()
+    assert patched_store.db_path.is_relative_to(patched_home / ".imednet")
+    patched_cfg = StudyConfiguration(study_key="STUDY-HOME", phi_fields=["patched_home_phi"])
+    patched_store.commit_config("STUDY-HOME", patched_cfg, desc="patched home commit", sdk=mock_sdk)
+    resolved_patched = ConfigVersionStore.resolve_committed_config("STUDY-HOME")
+    assert resolved_patched is not None
+    assert resolved_patched.phi_fields == ["patched_home_phi"]
+
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", "~/tilde_dir/versions.sqlite3")
+    tilde_store = ConfigVersionStore()
+    assert tilde_store.db_path.is_relative_to(patched_home / "tilde_dir")
+
+
+def test_committed_config_cache_deep_copy_invalidation_and_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_sdk: MockSDK,
+) -> None:
+    """Verify verified StudyConfiguration caching, deep-copy isolation, write invalidation, key rotation, and bounds."""
+    from unittest.mock import patch
+
+    import imednet_workflows.config_version_control as cvc
+    from imednet.integrations.enrichment import resolve_study_configuration
+
+    db_file = tmp_path / "cache_test" / "config_versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "cache-key-alpha")  # pragma: allowlist secret
+
+    store = ConfigVersionStore(db_path=db_file)
+    v1 = StudyConfiguration(study_key="STUDY-CACHE", phi_fields=["alpha_mrn"])
+    store.commit_config("STUDY-CACHE", v1, desc="v1", sdk=mock_sdk)
+
+    decrypt_calls = 0
+    orig_decrypt = cvc._decrypt_payload
+
+    def counting_decrypt(payload: str, *, fallback_key: str | None = None) -> str:
+        nonlocal decrypt_calls
+        decrypt_calls += 1
+        return orig_decrypt(payload, fallback_key=fallback_key)
+
+    rollback_calls = 0
+    orig_rollback = ConfigVersionStore.rollback_config
+
+    def counting_rollback(self: ConfigVersionStore, sk: str, cid: str) -> StudyConfiguration:
+        nonlocal rollback_calls
+        rollback_calls += 1
+        return orig_rollback(self, sk, cid)
+
+    monkeypatch.setattr(cvc, "_decrypt_payload", counting_decrypt)
+    monkeypatch.setattr(ConfigVersionStore, "rollback_config", counting_rollback)
+
+    first = ConfigVersionStore.resolve_committed_config("STUDY-CACHE")
+    assert first is not None
+    assert first.phi_fields == ["alpha_mrn"]
+    assert decrypt_calls == 1
+    assert rollback_calls == 0
+
+    # Mutating returned model must not pollute cached StudyConfiguration
+    first.phi_fields.append("caller_mutated")
+    second = ConfigVersionStore.resolve_committed_config("STUDY-CACHE")
+    assert second is not None
+    assert second.phi_fields == ["alpha_mrn"]
+    assert decrypt_calls == 1
+    assert rollback_calls == 0
+
+    # In-session commit_config bumps write_generation and invalidates cached model immediately
+    v2 = StudyConfiguration(study_key="STUDY-CACHE", phi_fields=["beta_mrn"])
+    store.commit_config("STUDY-CACHE", v2, desc="v2", sdk=mock_sdk)
+    third = ConfigVersionStore.resolve_committed_config("STUDY-CACHE")
+    assert third is not None
+    assert third.phi_fields == ["beta_mrn"]
+    assert decrypt_calls == 2
+
+    # Key rotation or removal fails closed immediately without serving prior cached config
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "cache-key-rotated")  # pragma: allowlist secret
+    assert resolve_study_configuration("STUDY-CACHE") is None
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    assert resolve_study_configuration("STUDY-CACHE") is None
+
+    # Mocked get_head still instantiates ConfigVersionStore fallback
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "cache-key-alpha")  # pragma: allowlist secret
+    head_id = store.get_head("STUDY-CACHE")
+    with patch.object(ConfigVersionStore, "get_head", return_value=head_id) as mock_get_head:
+        via_mock_head = ConfigVersionStore.resolve_committed_config("STUDY-CACHE")
+        assert via_mock_head is not None
+        assert via_mock_head.phi_fields == ["beta_mrn"]
+        mock_get_head.assert_called_once_with("STUDY-CACHE")
+
+    # Verify bounded helper enforces fixed max size
+    sample_cache: dict[int, int] = {}
+    for idx in range(20):
+        cvc._bounded_cache_put(sample_cache, idx, idx, 8)
+    assert len(sample_cache) == 8
+    assert list(sample_cache.keys()) == list(range(12, 20))
+
+
+def test_ten_thousand_uncached_study_lookups_skip_duplicate_legacy_and_path_resolve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify 10,000 uncached resolve_study_configuration calls run 0 legacy fallbacks and <=3 Path.resolve calls."""
+    import imednet_workflows.config_version_control as cvc
+    from imednet.integrations.enrichment import resolve_study_configuration
+
+    missing_db = tmp_path / "absent_config_dir" / "config_versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(missing_db))
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "bench-unit-key")  # pragma: allowlist secret
+
+    cvc._RAW_DB_PATH_CACHE.clear()
+    cvc._ORIGIN_LAYOUT_CACHE.clear()
+    cvc._BASE_DIR_ENTRIES_CACHE.clear()
+    cvc._HOST_SUBDIR_CACHE.clear()
+
+    orig_resolve = Path.resolve
+    resolve_count = 0
+
+    def counting_resolve(self: Path, *args: Any, **kwargs: Any) -> Path:
+        nonlocal resolve_count
+        resolve_count += 1
+        return orig_resolve(self, *args, **kwargs)
+
+    orig_legacy_func = ConfigVersionStore.__dict__["resolve_legacy_committed_config"].__func__
+    legacy_count = 0
+
+    def counting_legacy(cls: type[ConfigVersionStore], study_key: str) -> StudyConfiguration | None:
+        nonlocal legacy_count
+        legacy_count += 1
+        return orig_legacy_func(cls, study_key)
+
+    monkeypatch.setattr(Path, "resolve", counting_resolve)
+    monkeypatch.setattr(
+        ConfigVersionStore,
+        "resolve_legacy_committed_config",
+        classmethod(counting_legacy),
+    )
+
+    for idx in range(10000):
+        assert resolve_study_configuration(f"STUDY_{idx:05d}") is None
+
+    assert legacy_count == 0
+    assert resolve_count <= 3

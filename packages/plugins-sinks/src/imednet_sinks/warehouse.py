@@ -1152,6 +1152,11 @@ class SnowflakeExportSink(ExportSink):
         self._seq_counters: dict[str, int] = {}
         self._domain_seq_counters: dict[str, dict[str, int]] = {}
         self._record_seqs: dict[str, int] = {}
+        self._form_domain_map_ref: dict[Any, str] = {}
+        self._seq_overrides_ref: dict[str, int] = {}
+        self._lineage_out_ref: dict[str, dict[str, Any]] = {}
+        self._mapper: CentralizedMapper | None = None
+        self._mapper_key: tuple[Any, ...] | None = None
         self._conn: Any = None
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
@@ -1261,6 +1266,56 @@ class SnowflakeExportSink(ExportSink):
             )
             cur.execute(f"ALTER TABLE {target_table} ADD COLUMN {add_defs}")  # nosem
 
+    def _get_mapper(
+        self,
+        post_proc: Any,
+        seq_overrides: Mapping[str, int] | None,
+    ) -> CentralizedMapper:
+        """Return a reusable sink-scoped mapper synchronized for the active warehouse batch."""
+        cfg = self._cfg
+        self._form_domain_map_ref.clear()
+        active_map = getattr(self, "_active_form_domain_map", None)
+        if isinstance(active_map, Mapping):
+            self._form_domain_map_ref.update(active_map)
+        self._seq_overrides_ref.clear()
+        if seq_overrides:
+            self._seq_overrides_ref.update(seq_overrides)
+        self._lineage_out_ref.clear()
+
+        extra = cfg.extra if isinstance(cfg.extra, dict) else {}
+        key = (
+            bool(self.config.mask_phi),
+            bool(cfg.as_sdtm),
+            cfg.sdtm_domain,
+            cfg.naming_convention,
+            is_incremental_sink_config(cfg),
+            id(extra.get("study_config")),
+            id(extra.get("enrichment_pipeline")),
+        )
+        if self._mapper is None or self._mapper_key != key:
+            mapper_cfg = (
+                replace(cfg, mask_phi=self.config.mask_phi)
+                if cfg.mask_phi != self.config.mask_phi
+                else cfg
+            )
+            self._mapper = build_sink_mapper(
+                mapper_cfg,
+                mode="tabular",
+                post_processor=post_proc,
+                seq_counters=(
+                    self._seq_counters if (not cfg.as_sdtm or cfg.sdtm_domain is not None) else None
+                ),
+                domain_seq_counters=self._domain_seq_counters if cfg.as_sdtm else None,
+                form_domain_map=self._form_domain_map_ref,
+                seq_overrides=self._seq_overrides_ref if cfg.as_sdtm else None,
+                lineage_out=self._lineage_out_ref if cfg.as_sdtm else None,
+                record_seqs=self._record_seqs,
+            )
+            self._mapper_key = key
+        else:
+            self._mapper.post_processor = post_proc
+        return self._mapper
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to Snowflake via Parquet staging, DDL evolution, and MERGE INTO (or COPY INTO)."""
         if not records:
@@ -1292,7 +1347,6 @@ class SnowflakeExportSink(ExportSink):
             if not active_records:
                 return 0
 
-        lineage_out: dict[str, dict[str, Any]] = {}
         seq_overrides: dict[str, int] | None = None
         if cfg.as_sdtm:
             rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
@@ -1318,19 +1372,8 @@ class SnowflakeExportSink(ExportSink):
                 if self.config.mask_phi
                 else _post_process_warehouse_unmasked
             )
-        mapper = build_sink_mapper(
-            cfg,
-            mode="tabular",
-            post_processor=post_proc,
-            seq_counters=(
-                self._seq_counters if (not cfg.as_sdtm or cfg.sdtm_domain is not None) else None
-            ),
-            domain_seq_counters=self._domain_seq_counters if cfg.as_sdtm else None,
-            form_domain_map=getattr(self, "_active_form_domain_map", None),
-            seq_overrides=seq_overrides,
-            lineage_out=lineage_out if cfg.as_sdtm else None,
-            record_seqs=self._record_seqs,
-        )
+        mapper = self._get_mapper(post_proc, seq_overrides)
+        lineage_out = self._lineage_out_ref
 
         arrow_table = _records_to_arrow_table(
             active_records,

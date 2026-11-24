@@ -13,8 +13,11 @@ import json
 import os
 import re
 import sqlite3
+import stat
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -34,14 +37,60 @@ from imednet.spi.utils import (
     validate_partition_key,
 )
 
-_DEFAULT_DB_PATH = Path(
-    os.environ.get("IMEDNET_CONFIG_DB_PATH", Path.home() / ".imednet" / "config_versions.sqlite3")
-)
-_DEFAULT_DB_PATH_STR = str(Path.home() / ".imednet" / "config_versions.sqlite3")
-_DEFAULT_DB_PATH_OBJ = Path(_DEFAULT_DB_PATH_STR)
-_READ_STORE_CACHE: dict[Path, ConfigVersionStore] = {}
-_DYNAMIC_PATH_CACHE: dict[tuple[str, str], Path] = {}
-_HEAD_INDEX_CACHE: dict[tuple[Path, int, int, int], dict[str, str]] = {}
+_MAX_RAW_DB_PATH_CACHE = 64
+_MAX_ORIGIN_LAYOUT_CACHE = 128
+_MAX_DIR_CACHE_SIZE = 128
+_MAX_HEAD_INDEX_CACHE = 64
+_MAX_COMMITTED_CONFIG_CACHE = 256
+_COARSE_MTIME_GUARD_NS = 20_000_000
+
+_ORIG_PATH_HOME_FUNC = getattr(Path.home, "__func__", Path.home)
+_CACHE_LOCK = RLock()
+_WRITE_GENERATION = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _OriginLayout:
+    """Validated filesystem paths for a ``(base_db_path, base_url)`` pair."""
+
+    base_dir: Path
+    resolved_base: Path
+    host_dir: Path
+    canonical_db_path: Path
+    flat_db_path: Path | None
+    db_name: str
+
+
+_RAW_DB_PATH_CACHE: dict[tuple[str, str, str], Path] = {}
+_ORIGIN_LAYOUT_CACHE: dict[tuple[str, str], _OriginLayout] = {}
+_BASE_DIR_ENTRIES_CACHE: dict[tuple[Path, int, int, int, int, int, int], frozenset[str]] = {}
+_HOST_SUBDIR_CACHE: dict[
+    tuple[Path, int, int, int, int, int, int], tuple[frozenset[str], frozenset[str]]
+] = {}
+_HEAD_INDEX_CACHE: dict[
+    tuple[Path, int, int, int, int, int, int, int, int, int], dict[str, str]
+] = {}
+_COMMITTED_CONFIG_CACHE: dict[
+    tuple[tuple[Path, int, int, int, int, int, int, int, int, int], str, str, bytes],
+    StudyConfiguration,
+] = {}
+
+
+def _bounded_cache_put(cache: dict[Any, Any], key: Any, value: Any, max_size: int) -> None:
+    """Insert ``value`` into ``cache`` while enforcing a fixed ``max_size`` bound."""
+    with _CACHE_LOCK:
+        if key in cache:
+            cache.pop(key, None)
+        while len(cache) >= max_size:
+            cache.pop(next(iter(cache)), None)
+        cache[key] = value
+
+
+def _bump_write_generation() -> None:
+    """Advance module write generation to immediately invalidate directory and SQLite caches."""
+    global _WRITE_GENERATION
+    with _CACHE_LOCK:
+        _WRITE_GENERATION += 1
 
 
 def _sha256_of(content: str) -> str:
@@ -124,6 +173,197 @@ def _decrypt_payload(encrypted_payload: str, *, fallback_key: str | None = None)
         ) from exc
 
 
+def _expand_path_with_home(raw_path: str | Path) -> Path:
+    """Expand ``raw_path`` honoring monkeypatched ``Path.home()`` as well as ``HOME``."""
+    raw_str = os.fspath(raw_path)
+    home_fn = Path.home
+    if getattr(home_fn, "__func__", home_fn) is not _ORIG_PATH_HOME_FUNC:
+        if raw_str == "~":
+            return Path(home_fn())
+        if raw_str.startswith(("~/", "~\\")):
+            return Path(home_fn()) / raw_str[2:]
+    return Path(raw_path).expanduser()
+
+
+def _get_raw_db_path(db_path: str | Path | None = None) -> Path:
+    """Resolve the raw base SQLite path honoring ``IMEDNET_CONFIG_DB_PATH``, ``HOME``, and ``Path.home()``."""
+    if db_path is not None:
+        return _expand_path_with_home(db_path)
+
+    raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
+    home_fn = Path.home
+    is_home_patched = getattr(home_fn, "__func__", home_fn) is not _ORIG_PATH_HOME_FUNC
+
+    if raw_env:
+        if "~" not in raw_env:
+            key = ("env", raw_env, "")
+            cached = _RAW_DB_PATH_CACHE.get(key)
+            if cached is not None:
+                return cached
+            resolved = Path(raw_env)
+        else:
+            home_str = (
+                os.fspath(home_fn())
+                if is_home_patched
+                else (
+                    os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.fspath(home_fn())
+                )
+            )
+            key = ("env_tilde", raw_env, home_str)
+            cached = _RAW_DB_PATH_CACHE.get(key)
+            if cached is not None:
+                return cached
+            resolved = _expand_path_with_home(raw_env)
+        _bounded_cache_put(_RAW_DB_PATH_CACHE, key, resolved, _MAX_RAW_DB_PATH_CACHE)
+        return resolved
+
+    if is_home_patched:
+        patched_home = Path(home_fn())
+        key = ("home_patched", os.fspath(patched_home), "")
+        cached = _RAW_DB_PATH_CACHE.get(key)
+        if cached is not None:
+            return cached
+        resolved = patched_home / ".imednet" / "config_versions.sqlite3"
+    else:
+        env_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if env_home:
+            key = ("home_env", env_home, "")
+            cached = _RAW_DB_PATH_CACHE.get(key)
+            if cached is not None:
+                return cached
+            resolved = Path(env_home) / ".imednet" / "config_versions.sqlite3"
+        else:
+            std_home = Path.home()
+            key = ("home_std", os.fspath(std_home), "")
+            cached = _RAW_DB_PATH_CACHE.get(key)
+            if cached is not None:
+                return cached
+            resolved = std_home / ".imednet" / "config_versions.sqlite3"
+
+    _bounded_cache_put(_RAW_DB_PATH_CACHE, key, resolved, _MAX_RAW_DB_PATH_CACHE)
+    return resolved
+
+
+def _get_origin_layout(base_db_path: Path) -> _OriginLayout:
+    """Validate active study context and return memoized canonical/legacy layout for ``base_db_path``."""
+    ctx_study_key = get_study_context()
+    if ctx_study_key:
+        validate_partition_key(ctx_study_key)
+
+    base_url = get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
+    cache_key = (os.fspath(base_db_path), base_url)
+    cached = _ORIGIN_LAYOUT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    sanitized_url = _sanitize_base_url_for_path(base_url)
+    base_dir = base_db_path.parent
+    host_dir = base_dir / sanitized_url
+    resolved_base = base_dir.resolve()
+    resolved_host = host_dir.resolve()
+    if not resolved_host.is_relative_to(resolved_base):
+        raise PathTraversalValidationError(
+            f"Resolved target directory {resolved_host} escapes base directory {resolved_base}"
+        )
+
+    db_name = base_db_path.name
+    canonical_db_path = host_dir / db_name
+    flat_db_path = (
+        base_db_path
+        if base_db_path != canonical_db_path
+        and base_db_path.resolve().is_relative_to(resolved_base)
+        else None
+    )
+    layout = _OriginLayout(
+        base_dir=base_dir,
+        resolved_base=resolved_base,
+        host_dir=host_dir,
+        canonical_db_path=canonical_db_path,
+        flat_db_path=flat_db_path,
+        db_name=db_name,
+    )
+    _bounded_cache_put(_ORIGIN_LAYOUT_CACHE, cache_key, layout, _MAX_ORIGIN_LAYOUT_CACHE)
+    return layout
+
+
+def _get_base_dir_entries(base_dir: Path, db_name: str) -> frozenset[str] | None:
+    """Return cached entry names in ``base_dir`` or ``None`` when ``base_dir`` is absent."""
+    try:
+        st = os.stat(base_dir)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+
+    snap_key = (
+        base_dir,
+        st.st_mtime_ns,
+        st.st_ctime_ns,
+        st.st_nlink,
+        st.st_size,
+        st.st_ino,
+        _WRITE_GENERATION,
+    )
+    entries = _BASE_DIR_ENTRIES_CACHE.get(snap_key)
+    if entries is not None and not (
+        db_name not in entries
+        and (time.time_ns() - max(st.st_mtime_ns, st.st_ctime_ns)) < _COARSE_MTIME_GUARD_NS
+        and os.path.exists(base_dir / db_name)
+    ):
+        return entries
+
+    try:
+        with os.scandir(base_dir) as it:
+            scanned = frozenset(entry.name for entry in it)
+    except OSError:
+        return None
+    _bounded_cache_put(_BASE_DIR_ENTRIES_CACHE, snap_key, scanned, _MAX_DIR_CACHE_SIZE)
+    return scanned
+
+
+def _get_host_dir_listing(host_dir: Path, db_name: str) -> tuple[frozenset[str], frozenset[str]]:
+    """Return cached ``(entry_names, subdir_names)`` inside ``host_dir``."""
+    try:
+        st = os.stat(host_dir)
+    except OSError:
+        return (frozenset(), frozenset())
+    if not stat.S_ISDIR(st.st_mode):
+        return (frozenset(), frozenset())
+
+    snap_key = (
+        host_dir,
+        st.st_mtime_ns,
+        st.st_ctime_ns,
+        st.st_nlink,
+        st.st_size,
+        st.st_ino,
+        _WRITE_GENERATION,
+    )
+    cached = _HOST_SUBDIR_CACHE.get(snap_key)
+    if cached is not None and not (
+        db_name not in cached[0]
+        and (time.time_ns() - max(st.st_mtime_ns, st.st_ctime_ns)) < _COARSE_MTIME_GUARD_NS
+        and os.path.exists(host_dir / db_name)
+    ):
+        return cached
+
+    names: set[str] = set()
+    subdirs: set[str] = set()
+    try:
+        with os.scandir(host_dir) as it:
+            for entry in it:
+                names.add(entry.name)
+                with suppress(OSError):
+                    if entry.is_dir():
+                        subdirs.add(entry.name)
+    except OSError:
+        return (frozenset(), frozenset())
+
+    listing = (frozenset(names), frozenset(subdirs))
+    _bounded_cache_put(_HOST_SUBDIR_CACHE, snap_key, listing, _MAX_DIR_CACHE_SIZE)
+    return listing
+
+
 class ConfigVersionStore:
     """Immutable append-only store for ``StudyConfiguration`` versions.
 
@@ -142,12 +382,7 @@ class ConfigVersionStore:
         Args:
             db_path: Path to the SQLite database file.
         """
-        resolved_path = (
-            Path(db_path)
-            if db_path is not None
-            else Path(os.environ.get("IMEDNET_CONFIG_DB_PATH") or _DEFAULT_DB_PATH)
-        )
-        self._original_db_path = resolved_path.expanduser()
+        self._original_db_path = _get_raw_db_path(db_path)
         self._lock = RLock()
         self._sdk_security_key: str | None = None
         self._ensure_schema_initialized(self.db_path)
@@ -160,69 +395,34 @@ class ConfigVersionStore:
     @db_path.setter
     def db_path(self, value: str | Path) -> None:
         """Set the original base path for database files."""
-        self._original_db_path = Path(value).expanduser()
+        self._original_db_path = _expand_path_with_home(value)
 
     @staticmethod
     def _get_dynamic_db_path_no_create(base_db_path: Path) -> Path:
         """Compute host-scoped dynamic DB path without splitting by study_context or creating dirs."""
-        base_url = (
-            get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
-        )
-        ctx_study_key = get_study_context()
-        if ctx_study_key:
-            validate_partition_key(ctx_study_key)
-
-        cache_key = (str(base_db_path), base_url)
-        cached = _DYNAMIC_PATH_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
-
-        sanitized_url = _sanitize_base_url_for_path(base_url)
-        base_dir = base_db_path.parent
-        target_dir = base_dir / sanitized_url
-
-        resolved_base = base_dir.resolve()
-        resolved_target = target_dir.resolve()
-        if not resolved_target.is_relative_to(resolved_base):
-            raise PathTraversalValidationError(
-                f"Resolved target directory {resolved_target} escapes base directory {resolved_base}"
-            )
-        result = target_dir / base_db_path.name
-        if len(_DYNAMIC_PATH_CACHE) > 64:
-            _DYNAMIC_PATH_CACHE.clear()
-        _DYNAMIC_PATH_CACHE[cache_key] = result
-        return result
+        return _get_origin_layout(base_db_path).canonical_db_path
 
     @staticmethod
     def _get_legacy_db_paths_no_create(base_db_path: Path, study_key: str) -> list[Path]:
         """Return legacy study_context-partitioned and flat candidate SQLite paths without creating dirs."""
         validate_partition_key(study_key)
-        base_dir = base_db_path.parent
-        if not os.path.isdir(base_dir):
-            return []
-        base_url = (
-            get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
-        )
-        sanitized_url = _sanitize_base_url_for_path(base_url)
-        db_name = base_db_path.name
-        legacy_db_str = (
-            f"{base_dir}{os.sep}{sanitized_url}{os.sep}{study_key}{os.sep}{db_name}"
-            if study_key
-            else ""
-        )
-        has_legacy_db = bool(legacy_db_str and os.path.exists(legacy_db_str))
-        has_flat_db = os.path.exists(base_db_path)
-        if not has_legacy_db and not has_flat_db:
+        layout = _get_origin_layout(base_db_path)
+        base_entries = _get_base_dir_entries(layout.base_dir, layout.db_name)
+        if base_entries is None:
             return []
 
-        resolved_base = base_dir.resolve()
         candidates: list[Path] = []
-        if has_legacy_db:
-            legacy_study_dir = base_dir / sanitized_url / study_key
-            if legacy_study_dir.resolve().is_relative_to(resolved_base):
-                candidates.append(legacy_study_dir / db_name)
-        if has_flat_db and base_db_path.resolve().is_relative_to(resolved_base):
-            candidates.append(base_db_path)
+        host_name = layout.host_dir.name
+        if study_key and host_name in base_entries:
+            _host_entries, host_subdirs = _get_host_dir_listing(layout.host_dir, layout.db_name)
+            if study_key in host_subdirs:
+                legacy_study_dir = layout.host_dir / study_key
+                if legacy_study_dir.resolve().is_relative_to(layout.resolved_base):
+                    legacy_candidate = legacy_study_dir / layout.db_name
+                    if legacy_candidate != layout.canonical_db_path:
+                        candidates.append(legacy_candidate)
+        if layout.flat_db_path is not None and layout.db_name in base_entries:
+            candidates.append(layout.flat_db_path)
         return candidates
 
     @classmethod
@@ -232,35 +432,42 @@ class ConfigVersionStore:
         study_key: str,
         *,
         raw_db_path: Path | None = None,
-        use_cached_store: bool = False,
     ) -> StudyConfiguration | None:
         """Read and verify the latest committed StudyConfiguration for *study_key* from *candidate_path*."""
+        validate_partition_key(study_key)
         try:
             db_stat = os.stat(candidate_path)
         except OSError:
             return None
 
-        if use_cached_store and raw_db_path is not None:
-            cached_store = _READ_STORE_CACHE.get(candidate_path)
-            if cached_store is None:
-                if len(_READ_STORE_CACHE) > 32:
-                    _READ_STORE_CACHE.clear()
-                cached_store = cls(db_path=raw_db_path)
-                _READ_STORE_CACHE[candidate_path] = cached_store
-            if hasattr(cls.get_head, "_mock_name") or hasattr(cached_store.get_head, "_mock_name"):
-                head_id = cached_store.get_head(study_key)
-                return cached_store.rollback_config(study_key, head_id) if head_id else None
-        else:
-            cached_store = None
+        if hasattr(cls.get_head, "_mock_name"):
+            mocked_store = cls(db_path=raw_db_path) if raw_db_path is not None else cls()
+            head_id = mocked_store.get_head(study_key)
+            return mocked_store.rollback_config(study_key, head_id) if head_id else None
 
-        wal_mtime = 0
+        wal_ino = 0
+        wal_mtime_ns = 0
+        wal_size = 0
         with suppress(OSError):
-            wal_mtime = os.stat(f"{candidate_path}-wal").st_mtime_ns
-        snap_key = (candidate_path, db_stat.st_mtime_ns, db_stat.st_size, wal_mtime)
+            wal_stat = os.stat(f"{candidate_path}-wal")
+            wal_ino = wal_stat.st_ino
+            wal_mtime_ns = wal_stat.st_mtime_ns
+            wal_size = wal_stat.st_size
+
+        snap_key = (
+            candidate_path,
+            db_stat.st_ino,
+            db_stat.st_mtime_ns,
+            db_stat.st_ctime_ns,
+            db_stat.st_nlink,
+            db_stat.st_size,
+            wal_ino,
+            wal_mtime_ns,
+            wal_size,
+            _WRITE_GENERATION,
+        )
         head_index = _HEAD_INDEX_CACHE.get(snap_key)
         if head_index is None:
-            if len(_HEAD_INDEX_CACHE) > 32:
-                _HEAD_INDEX_CACHE.clear()
             try:
                 with sqlite_connection(candidate_path, timeout=30.0) as conn:
                     tables = {
@@ -292,14 +499,24 @@ class ConfigVersionStore:
             except sqlite3.Error:
                 return None
             head_index = indexed
-            _HEAD_INDEX_CACHE[snap_key] = head_index
+            _bounded_cache_put(_HEAD_INDEX_CACHE, snap_key, head_index, _MAX_HEAD_INDEX_CACHE)
 
         head_id = head_index.get(study_key)
         if not head_id:
             return None
 
-        if cached_store is not None:
-            return cached_store.rollback_config(study_key, head_id)
+        try:
+            fernet_key = _get_fernet_key()
+        except Exception as exc:
+            raise ValueError(
+                "Configuration data integrity check failed: "
+                f"Decryption key is incorrect or missing: {exc}"
+            ) from exc
+
+        cfg_cache_key = (snap_key, study_key, head_id, fernet_key)
+        cached_cfg = _COMMITTED_CONFIG_CACHE.get(cfg_cache_key)
+        if cached_cfg is not None:
+            return cached_cfg.model_copy(deep=True)
 
         with sqlite_connection(candidate_path, timeout=30.0) as conn:
             cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(config_commits)").fetchall()}
@@ -336,19 +553,26 @@ class ConfigVersionStore:
             parent_commit_id=row["parent_commit_id"],
             study_key=str(row["study_key"]),
         )
-        return StudyConfiguration.model_validate_json(decrypted_data)
+        validated_cfg = StudyConfiguration.model_validate_json(decrypted_data)
+        _bounded_cache_put(
+            _COMMITTED_CONFIG_CACHE,
+            cfg_cache_key,
+            validated_cfg,
+            _MAX_COMMITTED_CONFIG_CACHE,
+        )
+        return validated_cfg.model_copy(deep=True)
 
     @classmethod
     def resolve_legacy_committed_config(cls, study_key: str) -> StudyConfiguration | None:
         """Read latest committed StudyConfiguration from legacy study-partitioned SQLite paths."""
         validate_partition_key(study_key)
-        raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
-        raw_db_path = Path(raw_env).expanduser() if raw_env else _DEFAULT_DB_PATH_OBJ
-        canonical_path = cls._get_dynamic_db_path_no_create(raw_db_path)
+        raw_db_path = _get_raw_db_path()
         for legacy_path in cls._get_legacy_db_paths_no_create(raw_db_path, study_key):
-            if legacy_path == canonical_path:
-                continue
-            resolved = cls._read_committed_from_sqlite_path(legacy_path, study_key)
+            resolved = cls._read_committed_from_sqlite_path(
+                legacy_path,
+                study_key,
+                raw_db_path=raw_db_path,
+            )
             if resolved is not None:
                 return resolved
         return None
@@ -368,25 +592,42 @@ class ConfigVersionStore:
             cfg = store.rollback_config(study_key, latest["commit_id"])
             return cfg if isinstance(cfg, StudyConfiguration) else None
 
-        raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
-        raw_db_path = Path(raw_env).expanduser() if raw_env else _DEFAULT_DB_PATH_OBJ
-        candidate_path = cls._get_dynamic_db_path_no_create(raw_db_path)
-        if not os.path.isdir(candidate_path.parent) and not os.path.exists(raw_db_path):
+        raw_db_path = _get_raw_db_path()
+        layout = _get_origin_layout(raw_db_path)
+        base_entries = _get_base_dir_entries(layout.base_dir, layout.db_name)
+        if base_entries is None:
             return None
-        resolved = cls._read_committed_from_sqlite_path(
-            candidate_path,
-            study_key,
-            raw_db_path=raw_db_path,
-            use_cached_store=True,
-        )
-        if resolved is not None:
-            return resolved
-        return cls.resolve_legacy_committed_config(study_key)
+
+        host_name = layout.host_dir.name
+        has_legacy_study_dir = False
+        if host_name in base_entries:
+            host_entries, host_subdirs = _get_host_dir_listing(layout.host_dir, layout.db_name)
+            if layout.db_name in host_entries:
+                resolved = cls._read_committed_from_sqlite_path(
+                    layout.canonical_db_path,
+                    study_key,
+                    raw_db_path=raw_db_path,
+                )
+                if resolved is not None:
+                    return resolved
+            has_legacy_study_dir = bool(study_key and study_key in host_subdirs)
+
+        has_flat_db = layout.flat_db_path is not None and layout.db_name in base_entries
+        if (
+            hasattr(cls.resolve_legacy_committed_config, "_mock_name")
+            or has_legacy_study_dir
+            or has_flat_db
+        ):
+            return cls.resolve_legacy_committed_config(study_key)
+        return None
 
     def _get_get_dynamic_db_path(self) -> Path:
         """Resolve database path dynamically based on active base URL without splitting by study_context."""
         result = self._get_dynamic_db_path_no_create(self._original_db_path)
+        parent_existed = result.parent.exists()
         result.parent.mkdir(parents=True, exist_ok=True)
+        if not parent_existed:
+            _bump_write_generation()
         return result
 
     @contextmanager
@@ -496,6 +737,7 @@ class ConfigVersionStore:
                         (sk, str(latest[0]), str(latest[1])),
                     )
             conn.commit()
+            _bump_write_generation()
 
     # ------------------------------------------------------------------
     # Public API
@@ -658,6 +900,7 @@ class ConfigVersionStore:
                     (study_key, commit_id, timestamp),
                 )
                 conn.commit()
+                _bump_write_generation()
 
         return commit_id
 

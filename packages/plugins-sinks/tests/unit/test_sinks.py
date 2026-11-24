@@ -1986,6 +1986,204 @@ class TestSinkPhiMaskingControls:
             global_sensitivity_registry._sensitive_keys.clear()
             global_sensitivity_registry._sensitive_keys.update(snapshot)
 
+    def test_sinks_reuse_mapper_across_fifty_sdtm_batches_with_single_sqlite_decryption(
+        self, monkeypatch, tmp_path
+    ):
+        """50 streaming batches across Snowflake, MongoDB, and Neo4j invoke build_sink_mapper once per sink, decrypt SQLite once, and preserve monotonic SDTM *SEQ."""
+        import imednet_sinks.document as doc_mod
+        import imednet_sinks.graph as graph_mod
+        import imednet_sinks.warehouse as wh_mod
+        import imednet_workflows.config_version_control as cvc
+        from imednet.models.records import Record
+        from imednet.models.study_config import StudyConfiguration
+        from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
+        from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+        from imednet_workflows.config_version_control import ConfigVersionStore
+
+        db_file = tmp_path / "fifty_batch_store" / "config_versions.sqlite3"
+        monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+        monkeypatch.setenv(
+            "IMEDNET_SECURITY_KEY", "fifty-batch-test-secret-key"
+        )  # pragma: allowlist secret
+
+        sdk_admin = MagicMock()
+        sdk_admin.auth.get_user_roles.return_value = ["admin"]
+        sdk_admin.auth.get_user_id.return_value = "auditor"
+
+        study_key = "STUDY_50_BATCH"
+        store = ConfigVersionStore(db_path=db_file)
+        store.commit_config(
+            study_key,
+            StudyConfiguration(studyKey=study_key, phiFields=["customBatchPhi"]),
+            desc="governed PHI for 50-batch sink test",
+            sdk=sdk_admin,
+        )
+
+        decrypt_calls = 0
+        orig_decrypt = cvc._decrypt_payload
+
+        def counting_decrypt(payload: str, *, fallback_key: str | None = None) -> str:
+            nonlocal decrypt_calls
+            decrypt_calls += 1
+            return orig_decrypt(payload, fallback_key=fallback_key)
+
+        rollback_calls = 0
+        orig_rollback = ConfigVersionStore.rollback_config
+
+        def counting_rollback(self_store, sk: str, cid: str):
+            nonlocal rollback_calls
+            rollback_calls += 1
+            return orig_rollback(self_store, sk, cid)
+
+        monkeypatch.setattr(cvc, "_decrypt_payload", counting_decrypt)
+        monkeypatch.setattr(ConfigVersionStore, "rollback_config", counting_rollback)
+
+        mapper_counts = {"snowflake": 0, "mongodb": 0, "neo4j": 0}
+        orig_wh_builder = wh_mod.build_sink_mapper
+        orig_doc_builder = doc_mod.build_sink_mapper
+        orig_graph_builder = graph_mod.build_sink_mapper
+
+        monkeypatch.setattr(
+            wh_mod,
+            "build_sink_mapper",
+            lambda *a, **kw: (
+                mapper_counts.__setitem__("snowflake", mapper_counts["snowflake"] + 1),
+                orig_wh_builder(*a, **kw),
+            )[1],
+        )
+        monkeypatch.setattr(
+            doc_mod,
+            "build_sink_mapper",
+            lambda *a, **kw: (
+                mapper_counts.__setitem__("mongodb", mapper_counts["mongodb"] + 1),
+                orig_doc_builder(*a, **kw),
+            )[1],
+        )
+        monkeypatch.setattr(
+            graph_mod,
+            "build_sink_mapper",
+            lambda *a, **kw: (
+                mapper_counts.__setitem__("neo4j", mapper_counts["neo4j"] + 1),
+                orig_graph_builder(*a, **kw),
+            )[1],
+        )
+
+        batches = [
+            [
+                Record(
+                    record_id=idx + 1,
+                    study_key=study_key,
+                    subject_key="SUBJ-001",
+                    visit_id=1,
+                    form_id=20,
+                    form_key="AE",
+                    record_data={
+                        "AETERM": f"Event {idx + 1}",
+                        "customBatchPhi": f"RAW-{idx + 1}",
+                    },
+                )
+            ]
+            for idx in range(50)
+        ]
+
+        # 1. SnowflakeExportSink across 50 batches
+        sf, _conn, _cursor = _fake_snowflake_module()
+        pa, pq, _table = _fake_pyarrow_modules()
+        sf_staged_seqs: list[int] = []
+
+        def capture_pylist(rows):
+            sf_staged_seqs.append(rows[0]["AESEQ"])
+            assert rows[0]["customBatchPhi"] == "***MASKED***"
+            tbl = MagicMock()
+            tbl.column_names = list(rows[0].keys())
+            tbl.num_rows = len(rows)
+            return tbl
+
+        pa.Table.from_pylist.side_effect = capture_pylist
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, _ex: (
+                sf if pkg == "snowflake.connector" else (pq if "parquet" in pkg else pa)
+            ),
+        )
+        with SnowflakeExportSink(
+            SnowflakeSinkConfig(
+                study_key=study_key,
+                account="acct",
+                user="usr",
+                password="placeholder",  # pragma: allowlist secret
+                database="DB",
+                schema="PUBLIC",
+                warehouse="WH",
+                stage="STG",
+                table="AE_SDTM",
+                local_staging_dir=str(tmp_path / "sf_stage"),
+                as_sdtm=True,
+                sdtm_domain="AE",
+            )
+        ) as sf_sink:
+            for idx, batch in enumerate(batches):
+                assert sf_sink.write_batch(batch, batch_id=f"{study_key}_AE_{idx}") == 1
+
+        # 2. MongoDbExportSink across 50 batches
+        pymongo, _client, _collection = _fake_pymongo_module()
+        mongo_seqs: list[int] = []
+
+        def capture_update_one(flt, upd, upsert=False):
+            doc = upd["$set"]
+            mongo_seqs.append(doc["AESEQ"])
+            assert doc["customBatchPhi"] == "***MASKED***"
+            return (flt, upd, upsert)
+
+        pymongo.UpdateOne.side_effect = capture_update_one
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+        with MongoDbExportSink(
+            MongoDbSinkConfig(
+                study_key=study_key,
+                uri="mongodb://localhost:27017",
+                database="clinical",
+                collection="ae_sdtm",
+                as_sdtm=True,
+                sdtm_domain="AE",
+            )
+        ) as mongo_sink:
+            for idx, batch in enumerate(batches):
+                assert mongo_sink.write_batch(batch, batch_id=f"{study_key}/AE/{idx}") == 1
+
+        # 3. Neo4jExportSink across 50 batches
+        neo4j_mod, driver = _fake_neo4j_module()
+        session_mock = driver.session.return_value.__enter__.return_value
+        neo4j_seqs: list[int] = []
+
+        def capture_neo4j_run(_cypher, rows=None, **_kw):
+            if rows:
+                neo4j_seqs.append(rows[0]["AESEQ"])
+                assert rows[0]["customBatchPhi"] == "***MASKED***"
+
+        session_mock.run.side_effect = capture_neo4j_run
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key=study_key,
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "placeholder"),
+                as_sdtm=True,
+                sdtm_domain="AE",
+            )
+        ) as neo4j_sink:
+            for idx, batch in enumerate(batches):
+                assert neo4j_sink.write_batch(batch, batch_id=f"{study_key}/AE/{idx}") == 1
+
+        expected_seqs = list(range(1, 51))
+        assert sf_staged_seqs == expected_seqs
+        assert mongo_seqs == expected_seqs
+        assert neo4j_seqs == expected_seqs
+        assert mapper_counts == {"snowflake": 1, "mongodb": 1, "neo4j": 1}
+        assert decrypt_calls == 1
+        assert rollback_calls == 0
+
 
 # ---------------------------------------------------------------------------
 # Snowflake tabular flattening, schema evolution, and hard_delete tests
