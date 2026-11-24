@@ -140,24 +140,47 @@ def reset_strict_mode_context(token: contextvars.Token[bool | None]) -> None:
     _active_strict_mode.reset(token)
 
 
-_CACHED_STRICT_ENV_RAW: str | None = None
-_CACHED_STRICT_ENV_VAL: bool = False
+_DEFAULT_ENVIRON = os.environ
+_ENVIRON_DATA: dict[Any, Any] | None = getattr(_DEFAULT_ENVIRON, "_data", None)
+_STRICT_ENV_KEY = "IMEDNET_STRICT_MODE"
+_ENCODED_STRICT_KEY: Any = (
+    _DEFAULT_ENVIRON.encodekey(_STRICT_ENV_KEY)
+    if hasattr(_DEFAULT_ENVIRON, "encodekey")
+    else _STRICT_ENV_KEY
+)
+_STRICT_ENV_CACHE: dict[Any, bool] = {}
 
 
 def is_strict_mode() -> bool:
     """Return whether strict validation mode is enabled in the active context or environment."""
-    global _CACHED_STRICT_ENV_RAW, _CACHED_STRICT_ENV_VAL
     active = _active_strict_mode.get()
     if active is not None:
         return active
-    raw = os.environ.get("IMEDNET_STRICT_MODE")
-    if raw is None:
+    env = os.environ
+    if env is _DEFAULT_ENVIRON and _ENVIRON_DATA is not None:
+        raw = _ENVIRON_DATA.get(_ENCODED_STRICT_KEY)
+        if raw is None:
+            return False
+        cached = _STRICT_ENV_CACHE.get(raw)
+        if cached is not None:
+            return cached
+        decoded = _DEFAULT_ENVIRON.decodevalue(raw)
+        val = parse_bool(decoded, strict=False)
+        if len(_STRICT_ENV_CACHE) > 32:
+            _STRICT_ENV_CACHE.clear()
+        _STRICT_ENV_CACHE[raw] = val
+        return val
+
+    raw_str = env.get(_STRICT_ENV_KEY)
+    if raw_str is None:
         return False
-    if raw == _CACHED_STRICT_ENV_RAW:
-        return _CACHED_STRICT_ENV_VAL
-    val = parse_bool(raw, strict=False)
-    _CACHED_STRICT_ENV_RAW = raw
-    _CACHED_STRICT_ENV_VAL = val
+    cached = _STRICT_ENV_CACHE.get(raw_str)
+    if cached is not None:
+        return cached
+    val = parse_bool(raw_str, strict=False)
+    if len(_STRICT_ENV_CACHE) > 32:
+        _STRICT_ENV_CACHE.clear()
+    _STRICT_ENV_CACHE[raw_str] = val
     return val
 
 
