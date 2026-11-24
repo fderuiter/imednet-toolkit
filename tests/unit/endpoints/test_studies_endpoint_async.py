@@ -30,40 +30,43 @@ async def test_async_list_builds_path_and_filters(
 
 
 @pytest.mark.asyncio
-async def test_async_get_single_arg_success(response_factory):
-    """Test async single-argument study retrieval targets /api/v1/edc/studies/{studyKey}."""
-    async_client = AsyncMock()
-    async_client.get.return_value = response_factory({"studyKey": "S1", "studyName": "Demo Trial"})
-    ep = studies.AsyncStudiesEndpoint(async_client)
+async def test_async_get_single_arg_success(dummy_client, async_paginator_factory):
+    """Test async single-argument study retrieval queries /api/v1/edc/studies?filter=studyKey==S1."""
+    ep = studies.AsyncStudiesEndpoint(dummy_client)
+    captured = async_paginator_factory(
+        studies,
+        [{"studyKey": "S1", "studyName": "Demo Trial", "lastUpdated": "2026-01-15T00:00:00Z"}],
+    )
 
     res = await ep.get("S1")
 
-    async_client.get.assert_called_once_with("/api/v1/edc/studies/S1")
+    assert captured["path"] == "/api/v1/edc/studies"
+    assert captured["params"] == {"filter": "studyKey==S1"}
     assert isinstance(res, Study)
     assert res.study_key == "S1"
     assert res.study_name == "Demo Trial"
+    assert res.last_updated == "2026-01-15T00:00:00Z"
 
 
 @pytest.mark.asyncio
-async def test_async_get_legacy_two_arg_success(response_factory):
-    """Test async legacy two-argument study retrieval targets /api/v1/edc/studies/{studyKey}."""
-    async_client = AsyncMock()
-    async_client.get.return_value = response_factory({"studyKey": "S1"})
-    ep = studies.AsyncStudiesEndpoint(async_client)
+async def test_async_get_legacy_two_arg_success(dummy_client, async_paginator_factory):
+    """Test async legacy two-argument study retrieval uses studyKey filter."""
+    ep = studies.AsyncStudiesEndpoint(dummy_client)
+    captured = async_paginator_factory(studies, [{"studyKey": "S1"}])
 
     res = await ep.get(None, "S1")
 
-    async_client.get.assert_called_once_with("/api/v1/edc/studies/S1")
+    assert captured["path"] == "/api/v1/edc/studies"
+    assert captured["params"] == {"filter": "studyKey==S1"}
     assert isinstance(res, Study)
     assert res.study_key == "S1"
 
 
 @pytest.mark.asyncio
-async def test_async_get_keyword_arguments_success(response_factory):
+async def test_async_get_keyword_arguments_success(dummy_client, async_paginator_factory):
     """Test async keyword argument forms for backward compatibility."""
-    async_client = AsyncMock()
-    async_client.get.return_value = response_factory({"studyKey": "S1"})
-    ep = studies.AsyncStudiesEndpoint(async_client)
+    ep = studies.AsyncStudiesEndpoint(dummy_client)
+    async_paginator_factory(studies, [{"studyKey": "S1"}])
 
     res1 = await ep.get(study_key="S1")
     assert res1.study_key == "S1"
@@ -82,11 +85,10 @@ async def test_async_get_keyword_arguments_success(response_factory):
 
 
 @pytest.mark.asyncio
-async def test_async_get_not_found(response_factory):
-    """Test async get raises NotFoundError on empty payload."""
-    async_client = AsyncMock()
-    async_client.get.return_value = response_factory({})
-    ep = studies.AsyncStudiesEndpoint(async_client)
+async def test_async_get_not_found(dummy_client, async_paginator_factory):
+    """Test async get raises NotFoundError on empty list response."""
+    ep = studies.AsyncStudiesEndpoint(dummy_client)
+    async_paginator_factory(studies, [])
 
     with pytest.raises(NotFoundError):
         await ep.get("missing")

@@ -143,12 +143,6 @@ def test_records_list_forwards_filter_record_data_filter_sort_and_limit(
         ("studies", "/api/v1/edc/studies", False, {"studyKey": "S1", "studyName": "Trial 1"}),
         ("sites", "/api/v1/edc/studies/S1/sites", True, {"siteId": 1, "siteName": "Site A"}),
         ("forms", "/api/v1/edc/studies/S1/forms", True, {"formId": 10, "formKey": "DM"}),
-        (
-            "intervals",
-            "/api/v1/edc/studies/S1/intervals",
-            True,
-            {"intervalId": 2, "intervalName": "V1"},
-        ),
         ("queries", "/api/v1/edc/studies/S1/queries", True, {"annotationId": 3, "type": "Open"}),
         (
             "record-revisions",
@@ -239,8 +233,7 @@ def test_users_list_supports_sort_limit_all_and_omits_filter(
     monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """Req 4 & Constraint 3: users list supports --sort/--limit/--all and omits --filter."""
-    sdk = _make_sdk()
-    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _make_sdk)
 
     route = respx.get("https://api.test/api/v1/edc/studies/S1/users").mock(
         return_value=httpx.Response(
@@ -276,10 +269,32 @@ def test_users_list_supports_sort_limit_all_and_omits_filter(
         "page": "0",
     }
 
-    # Passing --filter to users list must be rejected by argparse with exit code 2
+    # Passing --filter to users or intervals list must be rejected by argparse with exit code 2
     with pytest.raises(SystemExit) as exc_info:
         cli.app(["users", "list", "S1", "--filter", "login==alice"])
     assert exc_info.value.code == 2
+
+    intervals_route = respx.get("https://api.test/api/v1/edc/studies/S1/intervals").mock(
+        return_value=httpx.Response(
+            200,
+            json=_paginated_payload(
+                [{"intervalId": 1, "intervalName": "Baseline"}], page=0, size=5
+            ),
+        )
+    )
+    cli.app(
+        ["intervals", "list", "S1", "--sort", "intervalId,asc", "--limit", "5", "--format", "json"]
+    )
+    int_out = json.loads(capfd.readouterr().out)
+    assert int_out["count"] == 1
+    assert dict(intervals_route.calls[0].request.url.params) == {
+        "sort": "intervalId,asc",
+        "size": "5",
+        "page": "0",
+    }
+    with pytest.raises(SystemExit) as int_exc_info:
+        cli.app(["intervals", "list", "S1", "--filter", "intervalId==1"])
+    assert int_exc_info.value.code == 2
 
 
 @pytest.mark.parametrize(
@@ -660,7 +675,6 @@ def test_cli_query_validation_errors_exit_one(
         (["sites", "list", "S1", "--filter", "visit_key=SCREENING"], "Site"),
         (["forms", "list", "S1", "--filter", "visit_key=SCREENING"], "Form"),
         (["variables", "list", "S1", "--filter", "visit_key=SCREENING"], "Variable"),
-        (["intervals", "list", "S1", "--filter", "visit_key=SCREENING"], "Interval"),
         (["visits", "list", "S1", "--filter", "visit_key=SCREENING"], "Visit"),
         (["queries", "list", "S1", "--filter", "visit_key=SCREENING"], "Query"),
         (["record-revisions", "list", "S1", "--filter", "visit_key=SCREENING"], "RecordRevision"),
@@ -676,7 +690,7 @@ def test_all_eleven_list_commands_reject_unknown_model_filter_attributes(
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """All 11 filterable list commands validate filter keys against their resource model before HTTP."""
+    """All 10 filterable list commands validate filter keys against their resource model before HTTP."""
     sdk = _make_sdk()
     monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: sdk)
     route = respx.get(url__regex=r"https://api\.test/.*").mock(
@@ -1054,7 +1068,6 @@ def test_records_list_record_data_filter_with_json_and_file_output(
     [
         "sites",
         "forms",
-        "intervals",
         "queries",
         "record-revisions",
         "variables",
@@ -1116,7 +1129,6 @@ def test_studies_list_preserves_study_key_and_study_key_camel_filters(
         (["queries", "list", "STUDY", "-f", "status=Open"], "annotationType"),
         (["visits", "list", "STUDY", "-f", "visit_id=1"], "intervalName"),
         (["codings", "list", "STUDY", "-f", "coding_id=1"], "dictionaryName"),
-        (["intervals", "list", "STUDY", "-f", "forms=DEMO"], "intervalName"),
         (["records", "list", "STUDY", "-f", "keywords=urgent"], "formKey"),
         (["subjects", "list", "STUDY", "-f", "keywords=vip"], "subjectStatus"),
     ],

@@ -70,8 +70,8 @@ List codings
      - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
-     - None
-     - Sorting expression (e.g. ``codingId,asc`` or ``dateCoded,desc``).
+     - ``formId,asc``
+     - Sorting expression (e.g. ``formId,asc`` or ``dateCoded,desc``).
    * - ``filter``
      - String
      - None

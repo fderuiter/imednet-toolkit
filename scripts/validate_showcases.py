@@ -1674,7 +1674,6 @@ def load_postman_contract_schemas(postman_path: Path) -> tuple[dict[str, set[str
         return {}, [f"{postman_path}: Failed to parse JSON: {exc}"]
 
     target_requests = {
-        "Retrieve a study": "studies",
         "List studies": "studies",
         "List forms": "forms",
         "List queries": "queries",

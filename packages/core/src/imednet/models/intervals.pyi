@@ -9,19 +9,19 @@ from imednet.models.base import ImednetBaseModel
 class FormSummary(ImednetBaseModel):
     """Minimal form details embedded within an interval definition."""
 
-    form_id: int = Field(0, alias="formId")
-    form_key: str = Field("", alias="formKey")
-    form_name: str = Field("", alias="formName")
+    form_id: int | None = Field(default=None, alias="formId")
+    form_key: str | None = Field(default=None, alias="formKey")
+    form_name: str | None = Field(default=None, alias="formName")
 
     def __init__(
         self,
         *,
-        form_id: int = 0,
-        formId: int = 0,
-        form_key: str = "",
-        formKey: str = "",
-        form_name: str = "",
-        formName: str = "",
+        form_id: int | None = None,
+        formId: int | None = None,
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_name: str | None = None,
+        formName: str | None = None,
     ) -> None: ...
 
 class Interval(ImednetBaseModel):

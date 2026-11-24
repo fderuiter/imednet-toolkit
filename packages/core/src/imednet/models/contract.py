@@ -78,6 +78,7 @@ class ContractBuilder:
             return
 
         name_mapping = {
+            "List of studies": "Study",
             "Study information": "Study",
             "List of forms": "Form",
             "Variable list": "Variable",
@@ -93,6 +94,26 @@ class ContractBuilder:
             "Visit list": "Visit",
             "User list": "User",
         }
+        nested_model_mapping = {
+            ("Interval", "forms"): "FormSummary",
+            ("Query", "queryComments"): "QueryComment",
+            ("Record", "keywords"): "Keyword",
+            ("Subject", "keywords"): "SubjectKeyword",
+            ("User", "roles"): "Role",
+        }
+
+        def build_model_definition(target_name: str, obj_schema: dict[str, Any]) -> ModelDefinition:
+            fields: dict[str, FieldDefinition] = {}
+            for key, val in obj_schema.items():
+                snake_key = to_snake(key)
+                type_name, default_value = self.parse_postman_type(val)
+                fields[snake_key] = FieldDefinition(
+                    name=snake_key,
+                    type_name=type_name,
+                    default_value=default_value,
+                    alias=key,
+                )
+            return ModelDefinition(name=target_name, fields=fields)
 
         def extract_schemas(items: list[dict[str, Any]]) -> None:
             if not isinstance(items, list):
@@ -126,20 +147,23 @@ class ContractBuilder:
                                     elif 'data' not in parsed and 'metadata' not in parsed:
                                         schema_dict = parsed
 
-                                    if schema_dict:
-                                        fields = {}
-                                        for key, val in schema_dict.items():
-                                            snake_key = to_snake(key)
-                                            type_name, default_value = self.parse_postman_type(val)
-                                            fields[snake_key] = FieldDefinition(
-                                                name=snake_key,
-                                                type_name=type_name,
-                                                default_value=default_value,
-                                                alias=key,
-                                            )
-                                        self.contract.models[model_name] = ModelDefinition(
-                                            name=model_name, fields=fields
+                                    if isinstance(schema_dict, dict) and schema_dict:
+                                        self.contract.models[model_name] = build_model_definition(
+                                            model_name, schema_dict
                                         )
+                                        for key, val in schema_dict.items():
+                                            nested_name = nested_model_mapping.get(
+                                                (model_name, key)
+                                            )
+                                            if (
+                                                nested_name is not None
+                                                and isinstance(val, list)
+                                                and len(val) > 0
+                                                and isinstance(val[0], dict)
+                                            ):
+                                                self.contract.models[nested_name] = (
+                                                    build_model_definition(nested_name, val[0])
+                                                )
 
                                         # Map path to model dynamically
                                         req = resp.get('originalRequest', {})

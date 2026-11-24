@@ -31,6 +31,7 @@ from imednet.core.protocols import AsyncRequesterProtocol, ParamProcessor, Reque
 from imednet.errors.validation import ConfigurationError
 from imednet.models.base import ImednetBaseModel
 from imednet.utils.filters import (
+    _camel_to_snake,
     _snake_to_camel,
     build_filter_string,
     extract_filter_attributes,
@@ -257,6 +258,15 @@ class _ListEndpointBase(GenericEndpoint[T]):
 
         raw_filter = extra_params.get("filter") if extra_params else None
         if raw_filter is not None:
+            if self.FILTER_ATTRIBUTES is not None and not self.FILTER_ATTRIBUTES:
+                validate_filter_syntax(raw_filter)
+                extracted = extract_filter_attributes(raw_filter)
+                if extracted:
+                    self._validate_filter_attributes(extracted, normalize_snake=False)
+                raise ConfigurationError(
+                    f"Unsupported filter attribute(s) for {self.__class__.__name__}: "
+                    "filter. Allowed filter attributes: none."
+                )
             validate_filter_syntax(raw_filter)
             self._validate_filter_attributes(
                 extract_filter_attributes(raw_filter),
@@ -433,10 +443,32 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
         if study_key is not None:
             self._validate_study_key(study_key)
         validated_id = self._validate_item_id(item_id)
-        filters: dict[str, Any] = {self._id_param: validated_id}
 
         from imednet.core.endpoint.operations.filter_get import FilterGetOperation
 
+        if self.FILTER_ATTRIBUTES is not None and self._id_param not in self.FILTER_ATTRIBUTES:
+            attr_name = _camel_to_snake(self._id_param)
+
+            def _validate_unfiltered_result(
+                items: builtins.list[T], sk: str | None, iid: ItemId
+            ) -> T:
+                matched = [
+                    item
+                    for item in items
+                    if getattr(item, attr_name, getattr(item, self._id_param, None)) == iid
+                ]
+                return self._validate_get_result(matched, sk, iid)
+
+            return FilterGetOperation[T](
+                study_key=study_key,
+                item_id=validated_id,
+                filters={},
+                validate_func=_validate_unfiltered_result,
+                list_sync_func=self._list_sync,
+                list_async_func=self._list_async,
+            )
+
+        filters: dict[str, Any] = {self._id_param: validated_id}
         return FilterGetOperation[T](
             study_key=study_key,
             item_id=validated_id,

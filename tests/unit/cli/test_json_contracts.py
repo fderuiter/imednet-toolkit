@@ -285,12 +285,6 @@ def test_jobs_json_preserves_nested_results_and_full_model_equality(sdk, capsys,
             {"variable_name": "AGE"},
         ),
         (
-            ["intervals", "list", "S", "-f", "interval_name=Screening"],
-            "intervals",
-            ("S",),
-            {"interval_name": "Screening"},
-        ),
-        (
             ["visits", "list", "S", "-f", "subject_key=001"],
             "visits",
             ("S",),
