@@ -9,7 +9,7 @@ verify monotonic 21 CFR Part 11 audit chains, enforce secure-by-default PHI
 WCAG 2.1 Level AA conformance disclosures.
 
 .. seealso::
-   * :doc:`duckdb_integration` — Ingest ``RecordRevision`` audit logs into ``bronze_revisions`` and materialize ``record_revisions``, ``silver_current_state``, and ``silver_records_history`` views in DuckDB.
+   * :doc:`duckdb_integration` — Ingest ``RecordRevision`` audit logs into ``bronze_revisions`` and materialize deduplicated ``record_revisions``, ``silver_current_state``, and SCD Type 2 ``silver_records_history`` views in DuckDB.
    * :doc:`export_destinations` — Enforce default ``mask_phi=True`` redaction and explicit ``StudyConfiguration`` PHI policies across CSV, Parquet, SQL, and Snowflake sinks.
    * :doc:`/reference/governance` — Track Fernet-encrypted, parent-chained SHA-256 ``Study`` configuration snapshots with ``ConfigVersionStore``.
    * :doc:`/reference/VPAT` — Review Voluntary Product Accessibility Template (WCAG 2.1 Level AA) conformance statements.
@@ -196,13 +196,16 @@ Combine ``RecordRevision`` verification with downstream compliance controls
 across the toolkit:
 
 1. **DuckDB Lakehouse Lineage** (:doc:`duckdb_integration`): Load deduplicated
-   ``(study_key, record_revision_id)`` audit metadata into the
-   ``bronze_revisions`` table (with a ``record_revisions`` compatibility view)
-   via ``DuckDBIngestionWorkflow.ingest_revisions``, and materialize both
-   ``silver_current_state`` (selecting the latest revision per
-   ``COALESCE(CAST(record_id AS VARCHAR), record_oid)`` ordered by
-   ``record_revision``, ``data_revision``, ``date_created``, and
-   ``record_revision_id``) and ``silver_records_history`` (an SCD Type 2
+   ``(study_key, record_revision_id)`` audit metadata (with UTC-normalized
+   timestamps) into the ``bronze_revisions`` table (with a ``record_revisions``
+   compatibility view) via ``DuckDBIngestionWorkflow.ingest_revisions``, and
+   materialize per-Study (``"silver_current_state_{study_key}"``,
+   ``"silver_records_history_{study_key}"``) and combined
+   ``silver_current_state`` (selecting the latest revision per ``study_key``
+   and ``COALESCE(CAST(record_id AS VARCHAR), NULLIF(record_oid, ''), CAST(record_revision_id AS VARCHAR))``
+   ordered by ``record_revision``, ``data_revision``, ``date_created``, and
+   ``record_revision_id``, excluding voided ``deleted=True`` records unless
+   ``include_deleted=True``) and ``silver_records_history`` (an SCD Type 2
    temporal view exposing ``valid_from``, ``valid_to``, and ``is_current``) via
    ``DuckDBIngestionWorkflow.build_silver_view``.
 2. **PHI Masking & Redaction** (:doc:`export_destinations`): All sink plugins
@@ -232,9 +235,9 @@ across the toolkit:
            security_key="sim-security-key",  # pragma: allowlist secret
            transport=SimulationTransport(),
        ) as sdk:
-           lakehouse = DuckDBIngestionWorkflow(sdk, db_path=db_file)
-           inserted = lakehouse.ingest_revisions("STUDY", mode="replace")
-           lakehouse.build_silver_view("STUDY")
+           with DuckDBIngestionWorkflow(sdk, db_path=db_file) as lakehouse:
+               inserted = lakehouse.ingest_revisions("STUDY", mode="replace")
+               lakehouse.build_silver_view("STUDY")
 
        conn = duckdb.connect(db_file)
        try:
