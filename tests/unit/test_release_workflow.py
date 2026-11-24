@@ -448,28 +448,64 @@ sys.exit(subprocess.call([{real_git!r}, *sys.argv[1:]]))
     assert captured["git_config_value_0"] == f"AUTHORIZATION: basic {expected_b64}"
 
 
+_SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+
+def _parse_semver(version_str: str) -> tuple[int, int, int]:
+    match = _SEMVER_RE.fullmatch(version_str.strip())
+    assert match is not None, f"Invalid SemVer version string: {version_str!r}"
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
 def _assert_manifest_matches_git_tags(
     manifest: dict[str, str], config: dict, git_tags: set[str]
 ) -> None:
     packages_cfg = config["packages"]
     for pkg_path, version in manifest.items():
-        pkg_name = packages_cfg[pkg_path]["package-name"]
-        expected_tag = f"{pkg_name}-v{version}"
-        assert expected_tag in git_tags, (
-            f"Manifest package {pkg_path}={version} missing expected Git tag {expected_tag}"
+        assert pkg_path in packages_cfg, (
+            f"Manifest package {pkg_path} is missing from release-please-config.json"
         )
+        pkg_cfg = packages_cfg[pkg_path]
+        pkg_name = pkg_cfg["package-name"]
+        manifest_ver = _parse_semver(version)
+
+        configured_floor_str = str(pkg_cfg.get("initial-version", "1.0.0"))
+        configured_floor = _parse_semver(configured_floor_str)
+        assert configured_floor >= (1, 0, 0), (
+            f"Package {pkg_path} initial-version {configured_floor_str} drops below 1.0.0 SemVer floor"
+        )
+        floor_ver = max(configured_floor, (1, 0, 0))
+        assert manifest_ver >= floor_ver, (
+            f"Manifest package {pkg_path}={version} drops below SemVer floor "
+            f"{'.'.join(map(str, floor_ver))}"
+        )
+
+        tag_pattern = re.compile(rf"^{re.escape(pkg_name)}-v(\d+\.\d+\.\d+)$")
+        matching_tag_versions = [
+            _parse_semver(m.group(1))
+            for tag in git_tags
+            if (m := tag_pattern.fullmatch(tag)) is not None
+        ]
+        if matching_tag_versions:
+            latest_tag_ver = max(matching_tag_versions)
+            latest_tag_str = ".".join(map(str, latest_tag_ver))
+            assert manifest_ver >= latest_tag_ver, (
+                f"Manifest package {pkg_path}={version} regressed below latest Git tag "
+                f"{pkg_name}-v{latest_tag_str}"
+            )
 
     unreleased_paths = set(packages_cfg) - set(manifest)
     for pkg_path in unreleased_paths:
         pkg_name = packages_cfg[pkg_path]["package-name"]
-        matching_tags = [t for t in git_tags if t.startswith(f"{pkg_name}-v")]
+        tag_pattern = re.compile(rf"^{re.escape(pkg_name)}-v(\d+\.\d+\.\d+)$")
+        matching_tags = sorted(t for t in git_tags if tag_pattern.fullmatch(t))
         assert not matching_tags, (
             f"Unreleased package {pkg_path} omitted from manifest has existing tags: {matching_tags}"
         )
 
 
 def test_release_please_manifest_and_config_parity(tmp_path: Path) -> None:
-    """Verify manifest/config/pyproject parity after release bumps and wheel tightening behavior."""
+    """Verify manifest/config/pyproject parity, SemVer floors, monotonic tags, and wheel tightening across all five packages."""
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     config = json.loads(RELEASE_PLEASE_CONFIG_PATH.read_text(encoding="utf-8"))
     packages_cfg = config["packages"]
@@ -485,25 +521,37 @@ def test_release_please_manifest_and_config_parity(tmp_path: Path) -> None:
     assert set(manifest) == expected_all_packages
     assert packages_cfg["packages/plugins-tui"].get("initial-version") == "1.0.0"
 
+    for pkg_path, pkg_cfg in packages_cfg.items():
+        for extra_entry in pkg_cfg.get("extra-files", []):
+            extra_path = extra_entry["path"] if isinstance(extra_entry, dict) else str(extra_entry)
+            assert not extra_path.endswith((".js", ".whl")), (
+                f"{pkg_path} extra-files must not point generic updater to {extra_path}"
+            )
+
     for pkg_path, manifest_ver in manifest.items():
         pkg_pyproject = tomllib.loads(
             (ROOT / pkg_path / "pyproject.toml").read_text(encoding="utf-8")
         )
         assert pkg_pyproject["project"]["version"] == manifest_ver
+        assert _parse_semver(manifest_ver) >= (1, 0, 0)
 
     internal_pkgs = td.get_internal_packages(MANIFEST_PATH)
-    assert set(internal_pkgs) == {
-        "imednet",
-        "apache-airflow-providers-imednet",
-        "imednet-workflows",
-        "imednet-plugins-sinks",
-        "imednet-tui",
+    expected_pkg_names = {
+        pkg_path: packages_cfg[pkg_path]["package-name"] for pkg_path in expected_all_packages
     }
-    tui_ver = manifest["packages/plugins-tui"]
-    assert (
-        td.process_dependency("imednet-tui", internal_pkgs)
-        == f"imednet-tui>={tui_ver},{td.compute_upper_bound(tui_ver)}"
-    )
+    assert set(internal_pkgs) == set(expected_pkg_names.values())
+    for pkg_path, pkg_name in expected_pkg_names.items():
+        manifest_ver = manifest[pkg_path]
+        assert internal_pkgs[pkg_name]["version"] == manifest_ver
+        assert internal_pkgs[pkg_name]["folder"] == pkg_path
+        assert (
+            internal_pkgs[pkg_name]["pyproject_path"]
+            == MANIFEST_PATH.parent / pkg_path / "pyproject.toml"
+        )
+        assert (
+            td.process_dependency(pkg_name, internal_pkgs)
+            == f"{pkg_name}>={manifest_ver},{td.compute_upper_bound(manifest_ver)}"
+        )
 
     # Verify unreleased packages omitted from a manifest remain unconstrained during wheel tightening
     partial_manifest_dir = tmp_path / "repo"
@@ -518,10 +566,20 @@ def test_release_please_manifest_and_config_parity(tmp_path: Path) -> None:
     assert "imednet-tui" not in partial_internal
     assert td.process_dependency("imednet-tui", partial_internal) == "imednet-tui"
 
-    sample_tags = {
+    # Passes when tags match manifest versions for all five packages
+    exact_tags = {
         f"{packages_cfg[pkg_path]['package-name']}-v{ver}" for pkg_path, ver in manifest.items()
     }
-    _assert_manifest_matches_git_tags(manifest, config, sample_tags)
+    _assert_manifest_matches_git_tags(manifest, config, exact_tags)
+
+    # Passes for untagged 1.0.0 packages and tagged monotonic Release PR bumps
+    prior_tags_with_untagged_tui = {
+        "imednet-v1.1.0",
+        "apache-airflow-providers-imednet-v1.1.0",
+        "imednet-workflows-v1.1.0",
+        "imednet-plugins-sinks-v1.0.1",
+    }
+    _assert_manifest_matches_git_tags(manifest, config, prior_tags_with_untagged_tui)
 
     unreleased_sub_cfg = {
         "packages": {
@@ -535,6 +593,28 @@ def test_release_please_manifest_and_config_parity(tmp_path: Path) -> None:
         {f"imednet-v{manifest['packages/core']}"},
     )
 
+    # Fails when any manifest version drops below 1.0.0 SemVer floor (e.g. 0.1.0 downgrade)
+    downgraded_floor_manifest = {**manifest, "packages/plugins-tui": "0.1.0"}
+    with pytest.raises(AssertionError, match="drops below SemVer floor 1.0.0"):
+        _assert_manifest_matches_git_tags(
+            downgraded_floor_manifest, config, prior_tags_with_untagged_tui
+        )
+
+    # Fails when any manifest version drops below an existing <package>-v* Git tag
+    regressed_tag_manifest = {**manifest, "packages/core": "1.0.0"}
+    with pytest.raises(AssertionError, match="regressed below latest Git tag imednet-v1.1.0"):
+        _assert_manifest_matches_git_tags(
+            regressed_tag_manifest, config, prior_tags_with_untagged_tui
+        )
+
+    # Fails when a package omitted from manifest already has published Git tags
+    with pytest.raises(AssertionError, match="omitted from manifest has existing tags"):
+        _assert_manifest_matches_git_tags(
+            partial_manifest,
+            unreleased_sub_cfg,
+            {f"imednet-v{manifest['packages/core']}", "imednet-tui-v1.0.0"},
+        )
+
     git_bin = shutil.which("git")
     if git_bin and (ROOT / ".git").exists():
         tag_proc = subprocess.run(
@@ -545,7 +625,7 @@ def test_release_please_manifest_and_config_parity(tmp_path: Path) -> None:
             check=False,
         )
         live_tags = {line.strip() for line in tag_proc.stdout.splitlines() if line.strip()}
-        if live_tags and sample_tags.issubset(live_tags):
+        if live_tags:
             _assert_manifest_matches_git_tags(manifest, config, live_tags)
 
 
