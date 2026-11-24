@@ -70,6 +70,7 @@ def parse_filter_args(
     model: type[Any] | None = None,
     allowed_attributes: Collection[str] | None = None,
     disallow_study_key: bool = False,
+    multi_bound_attributes: Collection[str] | None = None,
 ) -> dict[str, Any] | None:
     """Parse repeatable CLI ``--filter`` strings via the shared SPI filter parser.
 
@@ -98,6 +99,7 @@ def parse_filter_args(
             model=model,
             allowed_attributes=effective_allowed,
             allow_regex=False,
+            multi_bound_attributes=multi_bound_attributes,
         )
     except ValueError as exc:
         print_error(f"Error: {exc}")
@@ -422,6 +424,7 @@ def prepare_list_query(
     model: type[Any] | None = None,
     allowed_attributes: Collection[str] | None = None,
     disallow_study_key: bool = False,
+    multi_bound_attributes: Collection[str] | None = None,
 ) -> tuple[dict[str, Any], int | None]:
     """Validate CLI query options and resolve SDK ``list()`` kwargs and item bound.
 
@@ -446,6 +449,7 @@ def prepare_list_query(
         model=model,
         allowed_attributes=allowed_attributes,
         disallow_study_key=disallow_study_key,
+        multi_bound_attributes=multi_bound_attributes,
     )
     if parsed_filters:
         request_kwargs.update(parsed_filters)

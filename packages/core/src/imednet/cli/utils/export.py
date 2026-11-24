@@ -15,7 +15,12 @@ from imednet.integrations.enrichment import (
     resolve_enrichment_pipeline,
 )
 from imednet.utils import sanitize_csv_formula
-from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
+from imednet.utils.security import (
+    SensitivityRegistry,
+    global_sensitivity_registry,
+    mask_clinical_phi,
+    sanitize_diagnostic_text,
+)
 from imednet.utils.serialization import flatten
 
 from .output import print_error
@@ -96,7 +101,16 @@ def _prepare_export_row(
         custom_phi_keys: set[str] = (
             set(active_pipeline.phi_keys) if active_pipeline is not None else set()
         )
+        study_registry = global_sensitivity_registry
         if custom_phi_keys:
+            study_registry = SensitivityRegistry()
+            sens_keys, exempt_keys = global_sensitivity_registry.snapshot()
+            for ex_key in exempt_keys:
+                study_registry.add_exempt_key(ex_key)
+            for sens_key in sens_keys:
+                study_registry.add_sensitive_key(sens_key)
+            for custom_key in custom_phi_keys:
+                study_registry.add_sensitive_key(custom_key)
             for key, val in list(row.items()):
                 if global_sensitivity_registry.is_exempt(key):
                     continue
@@ -104,6 +118,10 @@ def _prepare_export_row(
                     row[key] = _MASKED_VALUE
                 elif isinstance(val, (Mapping, list, tuple)):
                     row[key] = mask_custom_phi_recursive(val, custom_phi_keys)
+        for reason_key in ("reasonForChange", "reason_for_change"):
+            reason_val = row.get(reason_key)
+            if isinstance(reason_val, str) and reason_val != _MASKED_VALUE:
+                row[reason_key] = sanitize_diagnostic_text(reason_val, registry=study_registry)
 
     for var_key, var_val in flat_record_data.items():
         target_key = f"recordData.{var_key}" if var_key in row else var_key
@@ -161,3 +179,95 @@ def export_list_to_file(
             json.dump(data, f, indent=2, default=str)
 
     print(f"Saved {len(items)} {filename_prefix} to {path}")
+
+
+def mask_cli_models(
+    items: Sequence[Any],
+    *,
+    study_key: str | None = None,
+    mask_phi: bool = True,
+) -> list[Any]:
+    """Return PHI-masked copies of model items for terminal rendering when *mask_phi* is True."""
+    if not mask_phi or not items:
+        return list(items)
+
+    pipelines: dict[str, Any] = {}
+    registries: dict[str, SensitivityRegistry] = {}
+    out: list[Any] = []
+
+    for item in items:
+        model_fields = getattr(type(item), "model_fields", None)
+        model_copy = getattr(item, "model_copy", None)
+        if not isinstance(model_fields, Mapping) or not callable(model_copy):
+            out.append(item)
+            continue
+
+        eff_study = study_key or getattr(item, "study_key", None)
+        custom_phi_keys: set[str] = set()
+        active_registry = global_sensitivity_registry
+        if isinstance(eff_study, str) and eff_study.strip():
+            sk = eff_study.strip()
+            if sk not in pipelines:
+                pipelines[sk] = resolve_enrichment_pipeline(sk)
+            pipe = pipelines[sk]
+            if pipe is not None and pipe.phi_keys:
+                custom_phi_keys = set(pipe.phi_keys)
+                if sk not in registries:
+                    reg = SensitivityRegistry()
+                    sens_keys, exempt_keys = global_sensitivity_registry.snapshot()
+                    for ex_key in exempt_keys:
+                        reg.add_exempt_key(ex_key)
+                    for sens_key in sens_keys:
+                        reg.add_sensitive_key(sens_key)
+                    for custom_key in custom_phi_keys:
+                        reg.add_sensitive_key(custom_key)
+                    registries[sk] = reg
+                active_registry = registries[sk]
+
+        updates: dict[str, Any] = {}
+        for fname, finfo in model_fields.items():
+            raw_val = getattr(item, fname, None)
+            if raw_val is None or active_registry.is_exempt(fname):
+                continue
+            alias = getattr(finfo, "alias", None)
+            is_sens = (
+                active_registry.is_sensitive(fname)
+                or (isinstance(alias, str) and active_registry.is_sensitive(alias))
+                or _matches_custom_phi_key(fname, custom_phi_keys)
+                or (isinstance(alias, str) and _matches_custom_phi_key(alias, custom_phi_keys))
+            )
+            if is_sens:
+                if isinstance(raw_val, str) and raw_val != _MASKED_VALUE:
+                    updates[fname] = _MASKED_VALUE
+            elif fname == "reason_for_change" and isinstance(raw_val, str):
+                scrubbed = sanitize_diagnostic_text(raw_val, registry=active_registry)
+                if scrubbed != raw_val:
+                    updates[fname] = scrubbed
+
+        extra = getattr(item, "__pydantic_extra__", None)
+        masked_extra: dict[str, Any] | None = None
+        if isinstance(extra, dict) and extra:
+            cand = mask_clinical_phi(extra, registry=active_registry)
+            if custom_phi_keys:
+                cand = mask_custom_phi_recursive(cand, custom_phi_keys)
+            for rkey in ("reasonForChange", "reason_for_change"):
+                rval = cand.get(rkey)
+                if isinstance(rval, str) and rval != _MASKED_VALUE:
+                    cand[rkey] = sanitize_diagnostic_text(rval, registry=active_registry)
+            if cand != extra:
+                masked_extra = dict(cand)
+
+        if not updates and masked_extra is None:
+            out.append(item)
+            continue
+
+        copied = model_copy(update=updates)
+        if masked_extra is not None:
+            copied_extra = getattr(copied, "__pydantic_extra__", None)
+            if isinstance(copied_extra, dict):
+                merged_extra = dict(copied_extra)
+                merged_extra.update(masked_extra)
+                object.__setattr__(copied, "__pydantic_extra__", merged_extra)
+        out.append(copied)
+
+    return out
