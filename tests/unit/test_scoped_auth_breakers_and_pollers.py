@@ -342,10 +342,6 @@ def test_uat_execution_engine_routes_polling_through_facade_poll_jobs() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "edc.synthetic.imednet.test":
-            if request.method == "GET" and request.url.path.endswith(
-                ("/forms", "/variables", "/intervals", "/sites", "/subjects")
-            ):
-                return httpx.Response(200, json={"data": []})
             if request.method == "POST" and request.url.path.endswith("/records"):
                 return httpx.Response(
                     200,
@@ -362,6 +358,14 @@ def test_uat_execution_engine_routes_polling_through_facade_poll_jobs() -> None:
                         "failedRecords": 1,
                         "resultUrl": S3_RESULT_URL,
                     },
+                )
+            if request.method == "GET" and any(
+                request.url.path.endswith(suffix)
+                for suffix in ("/forms", "/variables", "/intervals", "/sites", "/subjects")
+            ):
+                return httpx.Response(
+                    200,
+                    json={"data": [], "pagination": {"totalPages": 1}},
                 )
         if request.url.host == "imednet-results.s3.us-east-1.amazonaws.com":
             s3_headers_seen.append({k.lower(): v for k, v in request.headers.items()})

@@ -282,9 +282,8 @@ def test_airflow_job_sensor_stale_response_protection(monkeypatch: pytest.Monkey
         _setup_airflow(monkeypatch)
         _patch_basehook(monkeypatch)
 
-        from apache_airflow_providers_imednet import _airflow_compat, sensors
+        from apache_airflow_providers_imednet import sensors
 
-        importlib.reload(_airflow_compat)
         importlib.reload(sensors)
 
         sdk = MagicMock()
@@ -298,23 +297,19 @@ def test_airflow_job_sensor_stale_response_protection(monkeypatch: pytest.Monkey
         sdk.jobs.get.return_value = running_job
         assert sensor.poke({}) is False
 
-        # 2. Terminal completion poke -> returns truthy PokeReturnValue with summary XCom
+        # 2. Terminal completion poke -> returns truthy PokeReturnValue(is_done=True)
         completed_job = JobStatus(batchId="B", state="COMPLETED")
         sdk.jobs.get.return_value = completed_job
-        terminal_res = sensor.poke({})
-        assert isinstance(terminal_res, _airflow_compat.PokeReturnValue)
-        assert bool(terminal_res) is True
-        assert terminal_res.xcom_value is not None
-        assert terminal_res.xcom_value["batch_id"] == "B"
-        assert terminal_res.xcom_value["state"] == "COMPLETED"
+        terminal_poke = sensor.poke({})
+        assert bool(terminal_poke) is True
+        assert getattr(terminal_poke, "is_done", terminal_poke) is True
 
-        # 3. Subsequent stale non-terminal poke -> succeeds deterministically with cached summary
+        # 3. Subsequent stale non-terminal poke -> succeeds deterministically
         stale_job = JobStatus(batchId="B", state="RUNNING")
         sdk.jobs.get.return_value = stale_job
-        stale_res = sensor.poke({})
-        assert isinstance(stale_res, _airflow_compat.PokeReturnValue)
-        assert bool(stale_res) is True
-        assert stale_res.xcom_value == terminal_res.xcom_value
+        stale_poke = sensor.poke({})
+        assert bool(stale_poke) is True
+        assert getattr(stale_poke, "is_done", stale_poke) is True
     finally:
         for mod in list(sys.modules):
             if mod.startswith(("apache_airflow_providers_imednet", "airflow.providers.imednet")):

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Any, overload
+from typing import Any
 
 from pydantic import Field, model_validator
 
@@ -62,23 +62,12 @@ class QueryComment(ImednetBaseModel):
     comment: str | None = Field(default=None, alias="comment")
     date: str | None = Field(default=None, alias="date")
 
-    @overload
     def __init__(
         self,
         *,
         closed: bool | None = None,
         sequence: int | None = None,
         annotation_status: str | None = None,
-        user: str | None = None,
-        comment: str | None = None,
-        date: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        closed: bool | None = None,
-        sequence: int | None = None,
         annotationStatus: str | None = None,
         user: str | None = None,
         comment: str | None = None,
@@ -104,44 +93,34 @@ class Query(ImednetBaseModel):
     type: str | None = Field(default=None, alias="type")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         query_comments: list[QueryComment] = ...,
-        status: QueryStatus = QueryStatus.OPEN,
-        study_key: str | None = None,
-        subject_id: int | None = None,
-        annotation_id: int | None = None,
-        description: str | None = None,
-        record_id: int | None = None,
-        variable: str | None = None,
-        subject_key: str | None = None,
-        date_created: str | None = None,
-        date_modified: str | None = None,
-        annotation_type: str | None = None,
-        subject_oid: str | None = None,
-        type: str | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         queryComments: list[QueryComment] = ...,
         status: QueryStatus = QueryStatus.OPEN,
+        study_key: str | None = None,
         studyKey: str | None = None,
+        subject_id: int | None = None,
         subjectId: int | None = None,
+        annotation_id: int | None = None,
         annotationId: int | None = None,
         description: str | None = None,
+        record_id: int | None = None,
         recordId: int | None = None,
         variable: str | None = None,
+        subject_key: str | None = None,
         subjectKey: str | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_modified: str | None = None,
         dateModified: str | None = None,
+        annotation_type: str | None = None,
         annotationType: str | None = None,
+        subject_oid: str | None = None,
         subjectOid: str | None = None,
         type: str | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
     @model_validator(mode="before")
