@@ -138,22 +138,21 @@ For incremental bronze/silver ``Record`` revision ingestion, use
    from imednet_workflows import DuckDBIngestionWorkflow
 
    sdk = ImednetSDK(api_key="mock", security_key="mock")
-   workflow = DuckDBIngestionWorkflow(sdk, "./centralized.duckdb")
+   with DuckDBIngestionWorkflow(sdk, "./centralized.duckdb") as workflow:
+       # Incremental bronze load
+       inserted = workflow.ingest_revisions(
+           "STUDY",
+           start_date="2026-01-01",
+           end_date="2026-01-31",
+           mode="append",
+       )
+       assert inserted > 0
+       print(f"Inserted {inserted} revision rows")
 
-   # Incremental bronze load
-   inserted = workflow.ingest_revisions(
-       "STUDY",
-       start_date="2026-01-01",
-       end_date="2026-01-31",
-       mode="append",
-   )
-   assert inserted > 0
-   print(f"Inserted {inserted} revision rows")
+       # Build silver current-state projection
+       workflow.build_silver_view("STUDY")
 
-   # Build silver current-state projection
-   workflow.build_silver_view("STUDY")
-
-   conn = duckdb.connect("./centralized.duckdb")
+   conn = duckdb.connect("./centralized.duckdb", read_only=True)
    silver_rows = conn.execute(
        'SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created '
        "FROM silver_current_state ORDER BY record_id LIMIT 10"
@@ -162,11 +161,15 @@ For incremental bronze/silver ``Record`` revision ingestion, use
    print(silver_rows)
    conn.close()
 
-The two key methods are
+The key methods are
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.ingest_revisions`
-for incremental loads and
+for incremental ``bronze_revisions`` (and ``record_revisions`` view) loads,
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.build_silver_view`
-for current-state materialization.
+for current-state and SCD Type 2 history materialization (per-Study
+``"silver_current_state_{study_key}"`` / ``"silver_records_history_{study_key}"`` and
+combined ``silver_current_state`` / ``silver_records_history``), and
+:meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.close`
+(or a ``with`` block) to release the DuckDB connection cleanly.
 
 Incremental checkpoints for DuckDB and Hive Parquet helpers
 -----------------------------------------------------------
