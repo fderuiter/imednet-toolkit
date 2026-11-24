@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Event
+from typing import Any
 
 from imednet.spi.errors import (
     ApiError,
     AuthenticationError,
     AuthorizationError,
+    BadRequestError,
     NotFoundError,
 )
 
@@ -20,14 +23,42 @@ from .cached_loader import CachedRecordsLoader
 
 logger = logging.getLogger(__name__)
 
-_PERMANENT_STATUS_CODES: frozenset[int] = frozenset({401, 403, 404})
+_PERMANENT_STATUS_CODES: frozenset[int] = frozenset({400, 401, 403, 404})
 
 
 def _is_permanent_api_error(exc: ApiError) -> bool:
     """Return True when an API error represents a permanent client failure."""
-    if isinstance(exc, (AuthenticationError, AuthorizationError, NotFoundError)):
+    if isinstance(
+        exc,
+        (BadRequestError, AuthenticationError, AuthorizationError, NotFoundError),
+    ):
         return True
     return exc.status_code in _PERMANENT_STATUS_CODES
+
+
+def _validate_study_key_value(study_key: Any) -> None:
+    """Validate that ``study_key`` is a non-empty, non-whitespace string."""
+    if not isinstance(study_key, str) or not study_key.strip():
+        raise ValueError("study_key must be a non-empty string")
+
+
+def _validate_positive_number(value: Any, *, field_name: str) -> None:
+    """Validate that a numeric timeout or interval is finite, non-boolean, and > 0."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{field_name} must be greater than 0")
+
+
+def _validate_max_consecutive_failures(value: Any) -> None:
+    """Validate that ``max_consecutive_failures`` is None or a non-boolean integer >= 1."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("max_consecutive_failures must be at least 1")
 
 
 class SyncWorkerState(StrEnum):
@@ -83,10 +114,10 @@ class SyncWorkerConfig:
 
     def __post_init__(self) -> None:
         """Validate worker configuration bounds."""
-        if isinstance(self.interval_seconds, bool) or self.interval_seconds <= 0:
-            raise ValueError("interval_seconds must be greater than 0")
-        if self.max_consecutive_failures is not None and self.max_consecutive_failures < 1:
-            raise ValueError("max_consecutive_failures must be at least 1")
+        _validate_study_key_value(self.study_key)
+        _validate_positive_number(self.interval_seconds, field_name="interval_seconds")
+        _validate_positive_number(self.lock_timeout_seconds, field_name="lock_timeout_seconds")
+        _validate_max_consecutive_failures(self.max_consecutive_failures)
 
 
 class SyncWorker:
@@ -110,13 +141,18 @@ class SyncWorker:
             on_error: Optional callback invoked when a sync cycle raises an exception.
             max_consecutive_failures: Optional limit overriding ``config.max_consecutive_failures``.
         """
+        _validate_study_key_value(config.study_key)
+        _validate_positive_number(config.interval_seconds, field_name="interval_seconds")
+        _validate_positive_number(config.lock_timeout_seconds, field_name="lock_timeout_seconds")
+        _validate_max_consecutive_failures(config.max_consecutive_failures)
+        if max_consecutive_failures is not None:
+            _validate_max_consecutive_failures(max_consecutive_failures)
+
         effective_max = (
             max_consecutive_failures
             if max_consecutive_failures is not None
             else config.max_consecutive_failures
         )
-        if effective_max is not None and effective_max < 1:
-            raise ValueError("max_consecutive_failures must be at least 1")
 
         self._loader = loader
         self._config = config
@@ -148,11 +184,15 @@ class SyncWorker:
         return self._max_consecutive_failures
 
     def run_once(self) -> int:
-        """Run one idempotent cache sync cycle."""
+        """Run one idempotent cache sync cycle, preserving terminal FAILED state."""
+        if self._state == SyncWorkerState.FAILED:
+            if self._last_error is not None:
+                raise self._last_error
+            raise RuntimeError("SyncWorker cannot execute run_once from terminal FAILED state")
+
         if self._state in (
             SyncWorkerState.IDLE,
             SyncWorkerState.STOPPED,
-            SyncWorkerState.FAILED,
         ):
             self._state = SyncWorkerState.RUNNING
 
@@ -204,9 +244,13 @@ class SyncWorker:
         on_error: SyncErrorCallback | None = None,
     ) -> None:
         """Run sync cycles until stopped or failed."""
+        if self._state == SyncWorkerState.FAILED:
+            if isinstance(self._last_error, ApiError) and _is_permanent_api_error(self._last_error):
+                raise self._last_error
+            return
+
         if self._stop_event.is_set():
-            if self._state != SyncWorkerState.FAILED:
-                self._state = SyncWorkerState.STOPPED
+            self._state = SyncWorkerState.STOPPED
             return
 
         self._state = SyncWorkerState.RUNNING

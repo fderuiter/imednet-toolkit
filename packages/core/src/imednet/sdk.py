@@ -298,25 +298,57 @@ class _BaseSDK:
                 require_credentials=require_creds,
                 has_transport=has_injected_transport,
             )
+        from .constants import DEFAULT_BASE_URL
+        from .core.context import set_base_url_context, set_security_key_context
+        from .utils.url import sanitize_base_url
+
         self.config = resolved
         self._api_key = resolved.api_key
         self._security_key = resolved.security_key
-        self._base_url = resolved.base_url
+        raw_base_url = (
+            resolved.base_url
+            if isinstance(resolved.base_url, str) and resolved.base_url.strip()
+            else DEFAULT_BASE_URL
+        )
+        self._base_url = sanitize_base_url(raw_base_url)
         self._strict_mode_tokens = []
-        if isinstance(resolved.base_url, str) and resolved.base_url:
-            from .core.context import set_base_url_context
-
-            set_base_url_context(resolved.base_url)
+        self._governance_tokens: list[tuple[Any, Any]] = []
+        set_base_url_context(self._base_url)
+        if isinstance(self._security_key, str) and self._security_key.strip():
+            set_security_key_context(self._security_key)
         return resolved
 
     def _enter_strict_mode(self) -> None:
-        """Push this SDK's strict_mode onto the active task/thread context."""
+        """Push this SDK's strict_mode and governance context onto the active task/thread context."""
+        from .core.context import set_base_url_context, set_security_key_context
+
         strict_val = getattr(self.config, "strict_mode", None)
         if isinstance(strict_val, bool):
             self._strict_mode_tokens.append(set_strict_mode_context(strict_val))
+        token_base = None
+        if hasattr(self, "_base_url") and isinstance(self._base_url, str) and self._base_url:
+            token_base = set_base_url_context(self._base_url)
+        token_sec = None
+        if (
+            hasattr(self, "_security_key")
+            and isinstance(self._security_key, str)
+            and self._security_key.strip()
+        ):
+            token_sec = set_security_key_context(self._security_key)
+        if not hasattr(self, "_governance_tokens"):
+            self._governance_tokens = []
+        self._governance_tokens.append((token_base, token_sec))
 
     def _exit_strict_mode(self) -> None:
-        """Pop the most recent strict_mode token set by this SDK."""
+        """Pop the most recent strict_mode and governance tokens set by this SDK."""
+        from .core.context import reset_base_url_context, reset_security_key_context
+
+        if getattr(self, "_governance_tokens", None):
+            token_base, token_sec = self._governance_tokens.pop()
+            if token_sec is not None:
+                reset_security_key_context(token_sec)
+            if token_base is not None:
+                reset_base_url_context(token_base)
         if getattr(self, "_strict_mode_tokens", None):
             reset_strict_mode_context(self._strict_mode_tokens.pop())
 
@@ -391,22 +423,15 @@ class _BaseSDK:
     @contextmanager
     def study_context(self, study_key: str) -> Iterator[Self]:
         """Set a temporary default study key for the current thread/task context."""
-        from .core.context import reset_base_url_context, set_base_url_context
+        from .core.context import sdk_governance_context
 
-        token_base = None
-        if hasattr(self, "_base_url") and isinstance(self._base_url, str) and self._base_url:
-            token_base = set_base_url_context(self._base_url)
         strict_val = getattr(getattr(self, "config", None), "strict_mode", None)
-        with study_context(study_key):
-            try:
-                if isinstance(strict_val, bool):
-                    with strict_mode_context(strict_val):
-                        yield self
-                else:
+        with sdk_governance_context(self), study_context(study_key):
+            if isinstance(strict_val, bool):
+                with strict_mode_context(strict_val):
                     yield self
-            finally:
-                if token_base is not None:
-                    reset_base_url_context(token_base)
+            else:
+                yield self
 
     if not TYPE_CHECKING:
 

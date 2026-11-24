@@ -158,7 +158,7 @@ def test_documented_cli_query_scope_filter_succeeds_in_simulation(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Verify the documented Query target-scope CLI filter in docs/how-to/cli.rst executes cleanly."""
+    """Verify the documented Query target-scope CLI filter in docs/how-to/cli.rst returns matching queries."""
     monkeypatch.setenv("IMEDNET_SIMULATION_MODE", "true")
     monkeypatch.setenv("IMEDNET_NON_INTERACTIVE", "1")
     capsys.readouterr()
@@ -173,4 +173,27 @@ def test_documented_cli_query_scope_filter_succeeds_in_simulation(
             "annotationId,desc",
         ]
     )
-    capsys.readouterr()
+    out, _ = capsys.readouterr()
+    assert "Check vital sign measurement." in out
+    assert "Please verify demographic details." in out
+
+
+def test_documented_cli_subject_data_succeeds_across_studies_in_simulation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify imednet subject-data returns linked visits, records, and queries across Studies."""
+    import json
+
+    pytest.importorskip("imednet_workflows")
+    for study_key, subj_key in (("DEMO-STUDY", "SUBJ-001"), ("STUDY", "SUB1")):
+        capsys.readouterr()
+        app(["subject-data", study_key, subj_key, "--simulation", "--format", "json"])
+        out, err = capsys.readouterr()
+        assert err == ""
+        payload = json.loads(out)
+        assert payload["status"] == "complete"
+        assert payload["count"] == 1
+        item = payload["items"][0]
+        assert len(item["visits"]) >= 2
+        assert len(item["records"]) >= 2
+        assert len(item["queries"]) >= 2
