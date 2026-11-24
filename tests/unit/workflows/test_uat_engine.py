@@ -1163,7 +1163,7 @@ def test_uat_engine_verifies_soft_warning_and_query_rules_via_get_queries():
     engine = UATExecutionEngine(sdk, dd, poll_interval=0.01)
     report = engine.run_verification("STUDY1")
 
-    assert sdk.get_queries.call_count == 3
+    assert sdk.get_queries.call_count == 1
     by_name = {r["rule_name"]: r for r in report.results}
     assert all(r["expected_response"] == "Query Opened" for r in report.results)
 
@@ -1177,3 +1177,505 @@ def test_uat_engine_verifies_soft_warning_and_query_rules_via_get_queries():
     assert by_name["XMLWarningOpenQuery"]["actual_response"] == "Query Opened"
     assert report.passed_rules == 2
     assert report.failed_rules == 1
+
+
+def test_uat_engine_parallel_submissions_and_multipage_queries_single_subject():
+    """UATExecutionEngine parallelizes non-mock POST /records with contextvars and paginates Queries once at size=500."""
+    import contextvars
+    import threading
+    import time
+
+    import httpx
+    import respx
+
+    from imednet import ImednetSDK
+
+    trace_var: contextvars.ContextVar[str] = contextvars.ContextVar("uat_trace", default="unset")
+    rules = [
+        {
+            "Name": f"SoftRule_{i}",
+            "Status": "Active",
+            "Form": "F_VS",
+            "Variable": f"V_{i}",
+            "Operator": "<=",
+            "Value": "10",
+            "Check Type": "Query",
+        }
+        for i in range(6)
+    ]
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+
+    lock = threading.Lock()
+    in_flight = 0
+    max_in_flight = 0
+    seen_traces: list[str] = []
+    query_requests: list[httpx.Request] = []
+
+    def handle_records(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        import json
+
+        body = json.loads(request.content.decode("utf-8"))
+        var_name = next(iter(body[0]["data"].keys()))
+        idx = int(var_name.split("_")[1])
+        with lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            seen_traces.append(trace_var.get())
+        time.sleep(0.03)
+        with lock:
+            in_flight -= 1
+        return httpx.Response(202, json={"batchId": f"batch-{idx}", "state": "PENDING"})
+
+    def handle_job(_request: httpx.Request, batch_id: str) -> httpx.Response:
+        idx = int(batch_id.split("-")[1])
+        return httpx.Response(
+            200,
+            json={
+                "batchId": batch_id,
+                "state": "COMPLETED",
+                "failedRecords": 0,
+                "results": [{"recordId": 1000 + idx, "status": "SUCCESS"}],
+            },
+        )
+
+    all_query_items = [
+        {
+            "annotationId": i + 1,
+            "studyKey": "STUDY1",
+            "subjectKey": "SUBJ-SHARED-1",
+            "recordId": 9000 + i,
+            "variable": "NOISE_VAR",
+            "status": "CLOSED",
+        }
+        for i in range(1050)
+    ]
+    # Place matching open queries on page 0 and page 2 (index > 1000) to exercise multi-page indexing
+    all_query_items[5] = {
+        "annotationId": 6,
+        "studyKey": "STUDY1",
+        "subjectKey": "SUBJ-SHARED-1",
+        "recordId": 1000,
+        "variable": "V_0",
+        "status": "OPEN",
+    }
+    all_query_items[1049] = {
+        "annotationId": 1050,
+        "studyKey": "STUDY1",
+        "subjectKey": "SUBJ-SHARED-1",
+        "recordId": 1005,
+        "variable": "V_5",
+        "status": "OPEN",
+    }
+
+    def handle_queries(request: httpx.Request) -> httpx.Response:
+        query_requests.append(request)
+        page = int(request.url.params.get("page", "0"))
+        size = int(request.url.params.get("size", "100"))
+        start = page * size
+        chunk = all_query_items[start : start + size]
+        total_pages = (len(all_query_items) + size - 1) // size
+        return httpx.Response(
+            200,
+            json={
+                "data": chunk,
+                "pagination": {
+                    "currentPage": page,
+                    "size": size,
+                    "totalPages": total_pages,
+                    "totalElements": len(all_query_items),
+                },
+            },
+        )
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get("https://api.test/api/v1/edc/studies/STUDY1/forms").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"formId": 1, "formKey": "F_VS", "formName": "VS", "unscheduledVisit": True}
+                    ],
+                    "pagination": {"totalPages": 1},
+                },
+            )
+        )
+        router.get("https://api.test/api/v1/edc/studies/STUDY1/variables").mock(
+            return_value=httpx.Response(200, json={"data": [], "pagination": {"totalPages": 1}})
+        )
+        router.get("https://api.test/api/v1/edc/studies/STUDY1/intervals").mock(
+            return_value=httpx.Response(200, json={"data": [], "pagination": {"totalPages": 1}})
+        )
+        router.get("https://api.test/api/v1/edc/studies/STUDY1/sites").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"siteId": 1, "siteName": "TestSite", "siteEnrollmentStatus": "Active"}
+                    ],
+                    "pagination": {"totalPages": 1},
+                },
+            )
+        )
+        router.get("https://api.test/api/v1/edc/studies/STUDY1/subjects").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "subjectKey": "SUBJ-SHARED-1",
+                            "siteName": "TestSite",
+                            "deleted": False,
+                            "keywords": [{"keywordKey": "UAT", "keywordName": "UAT"}],
+                        }
+                    ],
+                    "pagination": {"totalPages": 1},
+                },
+            )
+        )
+        router.post("https://api.test/api/v1/edc/studies/STUDY1/records").mock(
+            side_effect=handle_records
+        )
+        router.get(
+            url__regex=r"^https://api\.test/api/v1/edc/studies/STUDY1/jobs/(?P<batch_id>[^/]+)$"
+        ).mock(side_effect=handle_job)
+        router.get("https://api.test/api/v1/edc/studies/STUDY1/queries").mock(
+            side_effect=handle_queries
+        )
+
+        token = trace_var.set("ctx-uat-42")
+        try:
+            with ImednetSDK(
+                api_key="k",
+                security_key="s",
+                base_url="https://api.test",
+                retries=0,
+            ) as real_sdk:
+                report = UATExecutionEngine(real_sdk, dd, poll_interval=0.01).run_verification(
+                    "STUDY1"
+                )
+        finally:
+            trace_var.reset(token)
+
+    assert max_in_flight >= 2
+    assert seen_traces == ["ctx-uat-42"] * 6
+    # 1,050 queries at PAGE_SIZE=500 -> exactly 3 GET /queries requests, all scoped to SUBJ-SHARED-1
+    assert len(query_requests) == 3
+    for page_idx, req in enumerate(query_requests):
+        assert req.url.params["size"] == "500"
+        assert req.url.params["page"] == str(page_idx)
+        assert "subjectKey==SUBJ-SHARED-1" in req.url.params["filter"]
+
+    assert [r["rule_name"] for r in report.results] == [f"SoftRule_{i}" for i in range(6)]
+    by_name = {r["rule_name"]: r["status"] for r in report.results}
+    assert by_name["SoftRule_0"] == EditCheckResultStatus.PASS
+    assert by_name["SoftRule_5"] == EditCheckResultStatus.PASS
+    for idx in (1, 2, 3, 4):
+        assert by_name[f"SoftRule_{idx}"] == EditCheckResultStatus.FAIL
+    assert report.passed_rules == 2
+    assert report.failed_rules == 4
+
+
+def test_uat_engine_mixed_sync_and_job_soft_acceptances_and_zero_soft_skip():
+    """UATExecutionEngine defers mixed sync and Job soft acceptances into one get_queries call and skips get_queries when zero soft rules are accepted."""
+    from imednet.models.queries import Query
+    from imednet.models.records import Record
+    from imednet.spi.models import Job, JobStatus
+
+    rules = [
+        {
+            "Name": "SyncDictSoftPass",
+            "Status": "Active",
+            "Form": "F_DM",
+            "Variable": "V_SYNC_DICT",
+            "Operator": "<=",
+            "Value": "10",
+            "Severity": "warning",
+        },
+        {
+            "Name": "SyncModelSoftFail",
+            "Status": "Active",
+            "Form": "F_VS",
+            "Variable": "V_SYNC_REC",
+            "Operator": "<=",
+            "Value": "10",
+            "Severity": "warning",
+        },
+        {
+            "Name": "AsyncJobSoftPass",
+            "Status": "Active",
+            "Form": "F_VS",
+            "Variable": "V_ASYNC_JOB",
+            "Operator": "<=",
+            "Value": "10",
+            "Severity": "warning",
+        },
+        {
+            "Name": "HardAcceptedFail",
+            "Status": "Active",
+            "Form": "F_VS",
+            "Variable": "V_HARD",
+            "Operator": ">=",
+            "Value": "18",
+        },
+    ]
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+
+    sdk = Mock()
+    sdk.poll_jobs = None
+
+    def create_mixed(_study, payloads):
+        data = payloads[0]["data"]
+        if "V_SYNC_DICT" in data:
+            # Simulate missing subjectKey on enrollment-like payload by mutating payload in test
+            payloads[0].pop("subjectKey", None)
+            return {"recordId": 501}
+        if "V_SYNC_REC" in data:
+            return Record(record_id=502)
+        if "V_ASYNC_JOB" in data:
+            return Job(batch_id="b-async-soft", state="PENDING")
+        return {"recordId": 504}
+
+    sdk.create_record.side_effect = create_mixed
+    sdk.get_job.return_value = JobStatus(
+        batch_id="b-async-soft",
+        state="COMPLETED",
+        failed_records=0,
+        results=[{"recordId": 503, "status": "SUCCESS"}],
+    )
+    sdk.get_queries.return_value = [
+        Query(study_key="STUDY1", record_id=501, variable="V_SYNC_DICT", status="OPEN"),
+        Query(study_key="STUDY1", record_id=999, variable="V_SYNC_REC", status="OPEN"),
+        Query(
+            study_key="STUDY1",
+            subject_key="UAT-SUBJ-2",
+            record_id=503,
+            variable="V_ASYNC_JOB",
+            status="OPEN",
+        ),
+    ]
+
+    report = UATExecutionEngine(sdk, dd, poll_interval=0.01).run_verification("STUDY1")
+    # Missing subjectKey on one accepted soft rule -> unscoped single get_queries("STUDY1") call
+    sdk.get_queries.assert_called_once_with("STUDY1")
+    by_name = {r["rule_name"]: r for r in report.results}
+    assert by_name["SyncDictSoftPass"]["status"] == EditCheckResultStatus.PASS
+    assert by_name["SyncModelSoftFail"]["status"] == EditCheckResultStatus.FAIL
+    assert by_name["AsyncJobSoftPass"]["status"] == EditCheckResultStatus.PASS
+    assert by_name["HardAcceptedFail"]["status"] == EditCheckResultStatus.FAIL
+    assert by_name["HardAcceptedFail"]["actual_response"] == "Accepted"
+
+    # When zero soft rules are accepted (all soft rules rejected), get_queries is never called
+    sdk_no_soft = Mock()
+    sdk_no_soft.create_record.side_effect = ValidationError("Rejected")
+    sdk_no_soft.get_queries.return_value = []
+    report_no_soft = UATExecutionEngine(sdk_no_soft, dd).run_verification("STUDY1")
+    assert sdk_no_soft.get_queries.call_count == 0
+    assert report_no_soft.failed_rules == 3
+    assert report_no_soft.passed_rules == 1
+
+
+def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
+    """_OpenQueryIndex matches wildcard Queries missing recordId/variable/subjectKey without cross-matching separate Queries."""
+    from imednet.models.queries import Query
+    from imednet.spi.models import Job, JobStatus
+
+    rules = [
+        {
+            "Name": "WildcardRecordId",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "VAR_NO_REC",
+            "Operator": "<=",
+            "Value": "5",
+            "Severity": "warning",
+        },
+        {
+            "Name": "WildcardVariable",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "VAR_ANY",
+            "Operator": "<=",
+            "Value": "5",
+            "Severity": "warning",
+        },
+        {
+            "Name": "WildcardSubjectKey",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "VAR_NO_SUBJ",
+            "Operator": "<=",
+            "Value": "5",
+            "Severity": "warning",
+        },
+        {
+            "Name": "CrossQueryMustNotMatch",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "VAR_TARGET",
+            "Operator": "<=",
+            "Value": "5",
+            "Severity": "warning",
+        },
+    ]
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+    sdk = Mock()
+    sdk.poll_jobs = None
+    sdk.create_record.side_effect = [
+        Job(batch_id="b-1", state="PENDING"),
+        Job(batch_id="b-2", state="PENDING"),
+        Job(batch_id="b-3", state="PENDING"),
+        Job(batch_id="b-4", state="PENDING"),
+    ]
+    rec_map = {"b-1": 701, "b-2": 702, "b-3": 703, "b-4": 704}
+    sdk.get_job.side_effect = lambda _s, bid: JobStatus(
+        batch_id=bid,
+        state="COMPLETED",
+        failed_records=0,
+        results=[{"recordId": rec_map[bid], "status": "SUCCESS"}],
+    )
+    sdk.get_queries.return_value = [
+        # Missing recordId (wildcard recordId)
+        Query(
+            study_key="STUDY1",
+            subject_key="UAT-SUBJ-0",
+            record_id=None,
+            variable="VAR_NO_REC",
+            status="OPEN",
+        ),
+        # Missing variable (wildcard variable)
+        Query(
+            study_key="STUDY1",
+            subject_key="UAT-SUBJ-1",
+            record_id=702,
+            variable=None,
+            status="OPEN",
+        ),
+        # Missing subjectKey (wildcard subjectKey)
+        Query(
+            study_key="STUDY1",
+            subject_key=None,
+            record_id=703,
+            variable="VAR_NO_SUBJ",
+            status="OPEN",
+        ),
+        # Two partial matches for CrossQueryMustNotMatch (record 704 has wrong var; right var has wrong record 999)
+        Query(
+            study_key="STUDY1",
+            subject_key="UAT-SUBJ-3",
+            record_id=704,
+            variable="OTHER_VAR",
+            status="OPEN",
+        ),
+        Query(
+            study_key="STUDY1",
+            subject_key="UAT-SUBJ-3",
+            record_id=999,
+            variable="VAR_TARGET",
+            status="OPEN",
+        ),
+    ]
+
+    engine = UATExecutionEngine(sdk, dd, poll_interval=0.01)
+    report = engine.run_verification("STUDY1")
+
+    assert sdk.get_queries.call_count == 1
+    by_name = {r["rule_name"]: r["status"] for r in report.results}
+    assert by_name == {
+        "WildcardRecordId": EditCheckResultStatus.PASS,
+        "WildcardVariable": EditCheckResultStatus.PASS,
+        "WildcardSubjectKey": EditCheckResultStatus.PASS,
+        "CrossQueryMustNotMatch": EditCheckResultStatus.FAIL,
+    }
+
+
+def test_uat_engine_records_get_queries_errors_per_accepted_soft_rule():
+    """UATExecutionEngine records get_queries errors per accepted soft rule without affecting hard rules."""
+    from imednet.spi.errors import DiagnosticContext, ServerError
+    from imednet.spi.models import Job, JobStatus
+
+    rules = [
+        {
+            "Name": "SoftErr1",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V_SOFT_1",
+            "Operator": "<=",
+            "Value": "10",
+            "Severity": "warning",
+        },
+        {
+            "Name": "SoftErr2",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V_SOFT_2",
+            "Operator": "<=",
+            "Value": "10",
+            "Severity": "warning",
+        },
+        {
+            "Name": "HardPass",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "V_HARD",
+            "Operator": ">=",
+            "Value": "18",
+        },
+    ]
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+    diag = DiagnosticContext(
+        method="GET",
+        url="https://api.test/api/v1/edc/studies/STUDY1/queries",
+        attempt_count=2,
+    )
+
+    def failing_paginated_queries(_study, **_kwargs):
+        yield {"recordId": 801, "variable": "V_SOFT_1", "status": "OPEN"}
+        raise ServerError("Queries page 2 failed", status_code=503, diagnostic_context=diag)
+
+    sdk = Mock()
+    sdk.poll_jobs = None
+    sdk.create_record.side_effect = [
+        {"recordId": 801},
+        Job(batch_id="b-soft-2", state="PENDING"),
+        ValidationError("Hard rule rejected"),
+    ]
+    sdk.get_job.return_value = JobStatus(
+        batch_id="b-soft-2",
+        state="COMPLETED",
+        failed_records=0,
+        results=[{"recordId": 802, "status": "SUCCESS"}],
+    )
+    sdk.get_queries.side_effect = failing_paginated_queries
+
+    report = UATExecutionEngine(sdk, dd, poll_interval=0.01).run_verification("STUDY1")
+    assert sdk.get_queries.call_count == 1
+    by_name = {r["rule_name"]: r for r in report.results}
+    for soft_name in ("SoftErr1", "SoftErr2"):
+        assert by_name[soft_name]["status"] == EditCheckResultStatus.ERROR
+        assert "HTTP 503" in by_name[soft_name]["actual_response"]
+        assert by_name[soft_name]["diagnostic_context"] == diag
+    assert by_name["HardPass"]["status"] == EditCheckResultStatus.PASS
+    assert report.passed_rules == 1
+    assert report.failed_rules == 2
+
+    # Verify TypeError fallback when custom get_queries accepts only positional study_key
+    sdk_pos = Mock()
+    sdk_pos.create_record.return_value = {"recordId": "801"}
+    sdk_pos.get_queries.side_effect = lambda study: [
+        {"recordId": "801", "variable": "V_SOFT_1", "subjectKey": "UAT-SUBJ-0", "status": "OPEN"}
+    ]
+    single_soft_dd = DataDictionary(business_logic=[rules[0]], choices=[], forms=[], questions=[])
+    pos_engine = UATExecutionEngine(sdk_pos, single_soft_dd)
+    pos_report = pos_engine.run_verification("STUDY1")
+    assert pos_report.passed_rules == 1
+    direct_res = {"expected_response": "Query Opened"}
+    pos_engine._record_acceptance(  # noqa: SLF001
+        "STUDY1",
+        direct_res,
+        pos_report,
+        rule=pos_engine._rules[0],  # noqa: SLF001
+        payload={"subjectKey": "UAT-SUBJ-0"},
+        job_status=type("SyncRec", (), {"recordId": "801"})(),
+    )
+    assert direct_res["status"] == EditCheckResultStatus.PASS

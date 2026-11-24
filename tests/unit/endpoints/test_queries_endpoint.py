@@ -11,7 +11,7 @@ from imednet.models.queries import Query
 
 
 def test_list_builds_path_and_filters(dummy_client, paginator_factory, patch_build_filter):
-    """Test that list builds path and omits studyKey from filter."""
+    """Test that list builds path, uses PAGE_SIZE=500, and omits studyKey from filter."""
     set_study_context("S1")
     ep = queries.QueriesEndpoint(dummy_client)
     capture = paginator_factory(queries, [{"annotationId": 1}])
@@ -19,10 +19,44 @@ def test_list_builds_path_and_filters(dummy_client, paginator_factory, patch_bui
 
     result = ep.list(variable="AETERM")
 
+    assert queries.QueriesOperationDef.PAGE_SIZE == 500
+    assert queries.QueriesEndpoint.PAGE_SIZE == 500
+    assert queries.AsyncQueriesEndpoint.PAGE_SIZE == 500
     assert capture["path"] == "/api/v1/edc/studies/S1/queries"
+    assert capture["page_size"] == 500
     assert capture["params"] == {"filter": "FILTERED"}
     assert patch["filters"] == {"variable": "AETERM"}
     assert isinstance(result[0], Query)
+
+
+def test_list_preserves_explicit_size_override(dummy_client):
+    """Test that QueriesEndpoint defaults to size=500 and preserves explicit size overrides."""
+    requested_params: list[dict[str, object]] = []
+
+    def fake_get(path, params=None):
+        assert path == "/api/v1/edc/studies/S1/queries"
+        requested_params.append(dict(params or {}))
+        return type(
+            "Resp",
+            (),
+            {
+                "json": lambda self: {
+                    "data": [{"annotationId": 1, "status": "OPEN"}],
+                    "pagination": {"totalPages": 1},
+                }
+            },
+        )()
+
+    dummy_client.get = fake_get
+    ep = queries.QueriesEndpoint(dummy_client)
+
+    default_items = list(ep.list("S1"))
+    override_items = list(ep.list("S1", size=50))
+
+    assert len(default_items) == 1
+    assert len(override_items) == 1
+    assert requested_params[0]["size"] == 500
+    assert requested_params[1]["size"] == 50
 
 
 def test_queries_endpoint_is_list_only_and_rejects_undocumented_filters(dummy_client):
