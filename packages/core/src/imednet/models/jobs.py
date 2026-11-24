@@ -316,10 +316,12 @@ class JobStatus(Job):
         """
         if v is None:
             return None
+        from imednet.utils.validators import parse_int_or_default
+
         try:
-            return int(v)
-        except (TypeError, ValueError):
-            return 0
+            return parse_int_or_default(v, default=0)
+        except OverflowError as exc:
+            raise ValueError(str(exc)) from exc
 
     @property
     def total_records(self) -> int:

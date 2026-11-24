@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import contextlib
+import copy
 import json
 import os
 import re
@@ -19,7 +20,17 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from imednet.spi.sinks import redact_uri
-from imednet.spi.utils import redact_sensitive_payload, redact_sensitive_text
+from imednet.spi.utils import mask_clinical_phi, redact_sensitive_payload, redact_sensitive_text
+
+
+def _sanitize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """Redact credentials and mask clinical PHI keys in stream checkpoint metadata."""
+    if not isinstance(metadata, dict) or not metadata:
+        return {}
+    masked = mask_clinical_phi(metadata)
+    redacted = redact_sensitive_payload(masked)
+    return redacted if isinstance(redacted, dict) else {}
+
 
 # Graceful fallback if fcntl is not available (e.g. non-UNIX environments)
 try:
@@ -457,13 +468,14 @@ class FileStateProvider(BaseStateProvider):
                 validate_transition(current_status, validated_status)
 
             normalized_ts = _normalize_optional_utc(timestamp)
+            redacted_meta = _sanitize_metadata(metadata)
 
             study.streams[stream_name] = StreamState(
                 last_timestamp=normalized_ts,
                 records_processed=records_processed,
                 last_run_status=validated_status,
                 error_message=error_message,
-                metadata=metadata or {},
+                metadata=redacted_meta,
             )
             self.write_state(state)
 
@@ -490,6 +502,11 @@ class FileStateProvider(BaseStateProvider):
             prior_ts = (
                 _normalize_optional_utc(current_stream.last_timestamp) if current_stream else None
             )
+            prior_metadata: dict[str, Any] = (
+                copy.deepcopy(dict(current_stream.metadata))
+                if current_stream is not None and isinstance(current_stream.metadata, dict)
+                else {}
+            )
             effective_ts = (
                 prior_ts if prior_ts is not None else _normalize_optional_utc(fallback_timestamp)
             )
@@ -509,7 +526,7 @@ class FileStateProvider(BaseStateProvider):
                         records_processed=current_stream.records_processed,
                         last_run_status=StreamExecutionStatus.FAILED,
                         error_message=f"Recovered stale running stream: {stale_reason}",
-                        metadata=dict(current_stream.metadata),
+                        metadata=copy.deepcopy(prior_metadata),
                     )
                     self.write_state(state)
                     current_status = StreamExecutionStatus.FAILED
@@ -522,6 +539,7 @@ class FileStateProvider(BaseStateProvider):
                 last_timestamp=prior_ts,
                 records_processed=0,
                 last_run_status=StreamExecutionStatus.RUNNING,
+                metadata=copy.deepcopy(prior_metadata),
                 owner_pid=os.getpid(),
                 owner_host=socket.gethostname(),
                 lease_expires_at=now + timedelta(seconds=ttl),
@@ -532,14 +550,14 @@ class FileStateProvider(BaseStateProvider):
             "last_timestamp": effective_ts,
             "new_timestamp": None,
             "records_processed": 0,
-            "metadata": {},
+            "metadata": copy.deepcopy(prior_metadata),
         }
         try:
             yield tx_data
         except BaseException as err:
             if isinstance(err, GeneratorExit):
                 raise
-            # Mark stream as failed and preserve previous committed high-water mark
+            # Mark stream as failed and roll back uncommitted high-water mark and metadata
             with self._lock():
                 state = self.read_state()
                 validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
@@ -549,7 +567,7 @@ class FileStateProvider(BaseStateProvider):
                     records_processed=tx_data.get("records_processed", 0),
                     last_run_status=StreamExecutionStatus.FAILED,
                     error_message=str(err),
-                    metadata=tx_data.get("metadata") or {},
+                    metadata=copy.deepcopy(prior_metadata),
                 )
                 self.write_state(state)
             raise
@@ -561,12 +579,16 @@ class FileStateProvider(BaseStateProvider):
                 commit_ts = (
                     _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
                 )
+                raw_commit_meta = tx_data.get("metadata")
+                redacted_commit_meta = (
+                    _sanitize_metadata(raw_commit_meta) if isinstance(raw_commit_meta, dict) else {}
+                )
                 study_entry = state.studies.setdefault(study_key, StudyState())
                 study_entry.streams[stream_name] = StreamState(
                     last_timestamp=commit_ts,
                     records_processed=tx_data.get("records_processed", 0),
                     last_run_status=StreamExecutionStatus.SUCCESS,
-                    metadata=tx_data.get("metadata") or {},
+                    metadata=redacted_commit_meta,
                 )
                 self.write_state(state)
 
@@ -587,6 +609,7 @@ class FileStateProvider(BaseStateProvider):
 
         fallback_utc = _normalize_optional_utc(fallback_timestamp)
         prior_ts_map: dict[str, datetime | None] = {}
+        prior_meta_map: dict[str, dict[str, Any]] = {}
         tx_map: dict[str, dict[str, Any]] = {}
 
         with self._lock():
@@ -602,7 +625,13 @@ class FileStateProvider(BaseStateProvider):
                     if current_stream
                     else None
                 )
+                prior_meta: dict[str, Any] = (
+                    copy.deepcopy(dict(current_stream.metadata))
+                    if current_stream is not None and isinstance(current_stream.metadata, dict)
+                    else {}
+                )
                 prior_ts_map[stream_name] = prior_ts
+                prior_meta_map[stream_name] = prior_meta
                 effective_ts = prior_ts if prior_ts is not None else fallback_utc
 
                 if current_stream is not None and current_status == StreamExecutionStatus.RUNNING:
@@ -621,7 +650,7 @@ class FileStateProvider(BaseStateProvider):
                     "last_timestamp": effective_ts,
                     "new_timestamp": None,
                     "records_processed": 0,
-                    "metadata": {},
+                    "metadata": copy.deepcopy(prior_meta),
                 }
 
             ttl = self.lease_ttl_seconds if lease_ttl_seconds is None else lease_ttl_seconds
@@ -633,6 +662,7 @@ class FileStateProvider(BaseStateProvider):
                     last_timestamp=prior_ts_map[stream_name],
                     records_processed=0,
                     last_run_status=StreamExecutionStatus.RUNNING,
+                    metadata=copy.deepcopy(prior_meta_map[stream_name]),
                     owner_pid=owner_pid,
                     owner_host=owner_host,
                     lease_expires_at=lease_exp,
@@ -655,7 +685,7 @@ class FileStateProvider(BaseStateProvider):
                         records_processed=tx_data.get("records_processed", 0),
                         last_run_status=StreamExecutionStatus.FAILED,
                         error_message=str(err),
-                        metadata=tx_data.get("metadata") or {},
+                        metadata=copy.deepcopy(prior_meta_map[stream_name]),
                     )
                 self.write_state(state)
             raise
@@ -674,11 +704,17 @@ class FileStateProvider(BaseStateProvider):
                         if raw_new_ts is not None
                         else prior_ts_map[stream_name]
                     )
+                    raw_commit_meta = tx_data.get("metadata")
+                    redacted_commit_meta = (
+                        _sanitize_metadata(raw_commit_meta)
+                        if isinstance(raw_commit_meta, dict)
+                        else {}
+                    )
                     study_entry.streams[stream_name] = StreamState(
                         last_timestamp=commit_ts,
                         records_processed=tx_data.get("records_processed", 0),
                         last_run_status=StreamExecutionStatus.SUCCESS,
-                        metadata=tx_data.get("metadata") or {},
+                        metadata=redacted_commit_meta,
                     )
                 self.write_state(state)
 
@@ -1052,8 +1088,7 @@ class AirflowStateProvider(BaseStateProvider):
             if error_message is not None
             else None
         )
-        raw_redacted_meta = redact_sensitive_payload(metadata) if metadata else {}
-        redacted_meta = raw_redacted_meta if isinstance(raw_redacted_meta, dict) else {}
+        redacted_meta = _sanitize_metadata(metadata)
         return {
             "study_key": study_key,
             "stream_name": stream_name,
@@ -1320,6 +1355,10 @@ class AirflowStateProvider(BaseStateProvider):
         resolved_study, streams, legacy_keys = self._load_study_state(study_key)
         raw_entry = streams.get(stream_name)
         prior_ts = _normalize_optional_utc(self._parse_timestamp(raw_entry))
+        raw_prior_meta = raw_entry.get("metadata") if isinstance(raw_entry, dict) else None
+        prior_metadata: dict[str, Any] = (
+            copy.deepcopy(raw_prior_meta) if isinstance(raw_prior_meta, dict) else {}
+        )
         effective_ts = (
             prior_ts if prior_ts is not None else _normalize_optional_utc(fallback_timestamp)
         )
@@ -1337,7 +1376,6 @@ class AirflowStateProvider(BaseStateProvider):
             if stale_reason is not None:
                 validate_transition(current_status, StreamExecutionStatus.FAILED)
                 raw_processed = raw_entry.get("records_processed", 0)
-                raw_meta = raw_entry.get("metadata")
                 streams[stream_name] = self._build_stream_payload(
                     study_key=resolved_study,
                     stream_name=stream_name,
@@ -1349,7 +1387,7 @@ class AirflowStateProvider(BaseStateProvider):
                     ),
                     status=StreamExecutionStatus.FAILED,
                     error_message=f"Recovered stale running stream: {stale_reason}",
-                    metadata=raw_meta if isinstance(raw_meta, dict) else None,
+                    metadata=copy.deepcopy(prior_metadata),
                 )
                 self._save_study_state(
                     resolved_study,
@@ -1368,6 +1406,7 @@ class AirflowStateProvider(BaseStateProvider):
             timestamp=prior_ts,
             records_processed=0,
             status=StreamExecutionStatus.RUNNING,
+            metadata=copy.deepcopy(prior_metadata),
             owner_pid=os.getpid(),
             owner_host=socket.gethostname(),
             lease_expires_at=now + timedelta(seconds=ttl),
@@ -1382,7 +1421,7 @@ class AirflowStateProvider(BaseStateProvider):
             "last_timestamp": effective_ts,
             "new_timestamp": None,
             "records_processed": 0,
-            "metadata": {},
+            "metadata": copy.deepcopy(prior_metadata),
         }
 
         try:
@@ -1398,7 +1437,7 @@ class AirflowStateProvider(BaseStateProvider):
                 records_processed=tx_data.get("records_processed", 0),
                 status=StreamExecutionStatus.FAILED,
                 error_message=str(err),
-                metadata=tx_data.get("metadata"),
+                metadata=copy.deepcopy(prior_metadata),
             )
             self._save_study_state(resolved_study, streams)
             raise
@@ -1406,13 +1445,14 @@ class AirflowStateProvider(BaseStateProvider):
             validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
             raw_new_ts = tx_data.get("new_timestamp")
             commit_ts = _normalize_optional_utc(raw_new_ts) if raw_new_ts is not None else prior_ts
+            raw_commit_meta = tx_data.get("metadata")
             streams[stream_name] = self._build_stream_payload(
                 study_key=resolved_study,
                 stream_name=stream_name,
                 timestamp=commit_ts,
                 records_processed=tx_data.get("records_processed", 0),
                 status=StreamExecutionStatus.SUCCESS,
-                metadata=tx_data.get("metadata"),
+                metadata=raw_commit_meta if isinstance(raw_commit_meta, dict) else {},
             )
             self._save_study_state(resolved_study, streams)
 
@@ -1435,12 +1475,18 @@ class AirflowStateProvider(BaseStateProvider):
         fallback_utc = _normalize_optional_utc(fallback_timestamp)
         now = datetime.now(UTC)
         prior_ts_map: dict[str, datetime | None] = {}
+        prior_meta_map: dict[str, dict[str, Any]] = {}
         tx_map: dict[str, dict[str, Any]] = {}
 
         for stream_name in unique_streams:
             raw_entry = streams.get(stream_name)
             prior_ts = _normalize_optional_utc(self._parse_timestamp(raw_entry))
+            raw_prior_meta = raw_entry.get("metadata") if isinstance(raw_entry, dict) else None
+            prior_meta: dict[str, Any] = (
+                copy.deepcopy(raw_prior_meta) if isinstance(raw_prior_meta, dict) else {}
+            )
             prior_ts_map[stream_name] = prior_ts
+            prior_meta_map[stream_name] = prior_meta
             effective_ts = prior_ts if prior_ts is not None else fallback_utc
             current_status = self._parse_status(raw_entry)
 
@@ -1461,7 +1507,7 @@ class AirflowStateProvider(BaseStateProvider):
                 "last_timestamp": effective_ts,
                 "new_timestamp": None,
                 "records_processed": 0,
-                "metadata": {},
+                "metadata": copy.deepcopy(prior_meta),
             }
 
         ttl = self.lease_ttl_seconds if lease_ttl_seconds is None else lease_ttl_seconds
@@ -1475,6 +1521,7 @@ class AirflowStateProvider(BaseStateProvider):
                 timestamp=prior_ts_map[stream_name],
                 records_processed=0,
                 status=StreamExecutionStatus.RUNNING,
+                metadata=copy.deepcopy(prior_meta_map[stream_name]),
                 owner_pid=owner_pid,
                 owner_host=owner_host,
                 lease_expires_at=lease_exp,
@@ -1500,7 +1547,7 @@ class AirflowStateProvider(BaseStateProvider):
                     records_processed=tx_data.get("records_processed", 0),
                     status=StreamExecutionStatus.FAILED,
                     error_message=str(err),
-                    metadata=tx_data.get("metadata"),
+                    metadata=copy.deepcopy(prior_meta_map[stream_name]),
                 )
             self._save_study_state(resolved_study, streams)
             raise
@@ -1514,13 +1561,14 @@ class AirflowStateProvider(BaseStateProvider):
                     if raw_new_ts is not None
                     else prior_ts_map[stream_name]
                 )
+                raw_commit_meta = tx_data.get("metadata")
                 streams[stream_name] = self._build_stream_payload(
                     study_key=resolved_study,
                     stream_name=stream_name,
                     timestamp=commit_ts,
                     records_processed=tx_data.get("records_processed", 0),
                     status=StreamExecutionStatus.SUCCESS,
-                    metadata=tx_data.get("metadata"),
+                    metadata=raw_commit_meta if isinstance(raw_commit_meta, dict) else {},
                 )
             self._save_study_state(resolved_study, streams)
 
