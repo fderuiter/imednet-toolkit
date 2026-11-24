@@ -46,7 +46,10 @@ Canonical tasks
 
 ``pyproject.toml`` defines ``hatch run verify-static`` (format, lint and the
 typing targets), ``hatch run verify-tests`` (offline workspace tests and
-90% coverage), and ``hatch run docs`` (strict documentation checks).
+90% coverage), ``hatch run docs`` (strict documentation checks), and
+``hatch run validate-package-consumption`` (isolated clean-venv wheel and
+optional-dependency smoke checks across all workspace packages and 21 extras;
+pass ``--wheel-dir <dir>`` to reuse prebuilt wheels).
 ``hatch run verify`` runs ``verify-static`` and ``verify-tests`` in order; the
 Pipeline ``docs`` job runs ``uv run python scripts/build_docs.py`` once on the
 synced ``.venv`` workspace. The expanded commands above are useful for diagnostics.
@@ -59,7 +62,7 @@ package/Python matrix jobs supplement the full workspace gate. Duplicate global
 similarity execution is removed; the canonical ``lint:pylint-sim`` and
 ``duplication:check`` tasks retain their documented scopes and thresholds.
 
-Fuzzing/performance tracks require their pytest flags; container integration
+Fuzzing and performance tracks require their pytest flags and write structured ``VerificationReport`` JSON files under gitignored ``reports/verification/`` (with mutable fuzz corpora under ``.cache/verification/``): run ``pytest tests/core/test_performance.py -m performance`` (pass ``--update-perf-baseline`` when intentionally refreshing ``tests/core/baselines/performance_baseline.json``), ``pytest tests/core/test_fuzz.py -m fuzzing`` (controlled by ``IMEDNET_FUZZ_RUNS``, defaulting to ``25000``), and ``python scripts/aggregate_verification.py --report-dir reports/verification --expect-track <track>`` (which exits ``1`` on missing tracks, malformed files, or ``status: "failed"``). Container integration
 requires ``IMEDNET_TEST_CONTAINERS=1`` with ``docker compose up -d`` and
 ``docker compose down -v`` teardown (see ``CONTRIBUTING.md``). Live tests remain outside the default
 suite and require explicit authorization and the live-test charter. Security

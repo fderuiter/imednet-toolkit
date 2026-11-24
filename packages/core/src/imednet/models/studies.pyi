@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import overload
-
 from pydantic import Field
 
 from imednet.models.base import ImednetBaseModel
@@ -21,32 +19,26 @@ class Study(ImednetBaseModel):
     date_modified: str | None = Field(default=None, alias="dateModified")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         sponsor_key: str | None = None,
-        study_key: str | None = None,
-        study_id: int | None = None,
-        study_name: str | None = None,
-        study_description: str | None = None,
-        study_type: str | None = None,
-        date_created: str | None = None,
-        date_modified: str | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         sponsorKey: str | None = None,
+        study_key: str | None = None,
         studyKey: str | None = None,
+        study_id: int | None = None,
         studyId: int | None = None,
+        study_name: str | None = None,
         studyName: str | None = None,
+        study_description: str | None = None,
         studyDescription: str | None = None,
+        study_type: str | None = None,
         studyType: str | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_modified: str | None = None,
         dateModified: str | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
 

@@ -15,7 +15,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -36,6 +36,7 @@ from imednet.integrations.sink_base import (
     _enforce_batch_standards_readiness,
     _extract_safe_config_options,
     apply_quality_gate,
+    bind_sdtm_stream_metadata,
     extract_record_form_ref,
     extract_record_id,
     extract_record_timestamp,
@@ -59,6 +60,7 @@ try:
 except ImportError:
     pd = None  # type: ignore[assignment, unused-ignore]
 from imednet.constants import MAX_SQLITE_COLUMNS
+from imednet.core.context import sdk_governance_context
 from imednet.utils import sanitize_csv_formula
 from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
 from imednet.utils.tabular import MASKED_SENTINEL
@@ -229,16 +231,17 @@ def _prepare_export_df(
     _mapper: Any = None,
 ) -> pd.DataFrame:
     """Prepare a DataFrame for export by fetching records and optionally sanitizing."""
-    df = _records_df(
-        sdk,
-        study_key,
-        use_labels_as_columns=use_labels_as_columns,
-        variable_whitelist=variable_whitelist,
-        form_whitelist=form_whitelist,
-        mask_phi=mask_phi,
-        _mapper=_mapper,
-    )
-    pipeline = resolve_enrichment_pipeline(study_key)
+    with sdk_governance_context(sdk):
+        df = _records_df(
+            sdk,
+            study_key,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            mask_phi=mask_phi,
+            _mapper=_mapper,
+        )
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     if mask_phi:
         df = _mask_df(df, phi_keys=phi_keys)
@@ -455,9 +458,35 @@ def _extract_row_canonical_id(row: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _canonical_study_key(value: Any, fallback: str | None = None) -> str | None:
+    """Normalize an optional study identifier scalar, falling back to ``fallback`` when missing."""
+    if value is None or value is pd.NA or isinstance(value, bool) or _is_missing_scalar(value):
+        return fallback
+    text = str(value).strip()
+    return text if text else fallback
+
+
+def _extract_row_study_key(row: Mapping[str, Any]) -> str | None:
+    """Extract study identifier from a row mapping under ``STUDYID``, ``study_key``, or ``studyKey``."""
+    for key in ("STUDYID", "study_key", "studyKey"):
+        if key in row:
+            skey = _canonical_study_key(row[key])
+            if skey is not None:
+                return skey
+    return None
+
+
 def _find_df_record_id_col(df: pd.DataFrame) -> str | None:
     """Return the record ID column name in ``df``, if present."""
     for candidate in ("recordId", "record_id", "RECORD_ID"):
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def _find_df_study_col(df: pd.DataFrame) -> str | None:
+    """Return the study identifier column name in ``df``, if present."""
+    for candidate in ("STUDYID", "study_key", "studyKey"):
         if candidate in df.columns:
             return candidate
     return None
@@ -467,8 +496,9 @@ def _dedupe_df_by_record_id(
     df: pd.DataFrame,
     *,
     exclude_ids: set[str] | None = None,
+    study_key: str | None = None,
 ) -> tuple[pd.DataFrame, set[str]]:
-    """Keep the latest row per canonical record ID and optionally drop ``exclude_ids``."""
+    """Keep the latest row per canonical ``(STUDYID, RECORD_ID)`` and optionally drop ``exclude_ids``."""
     if df.empty:
         return df, set()
     id_col = _find_df_record_id_col(df)
@@ -476,31 +506,60 @@ def _dedupe_df_by_record_id(
         return df.reset_index(drop=True), set()
 
     excluded = exclude_ids or set()
+    study_col = _find_df_study_col(df)
     raw_ids = df[id_col].tolist()
-    seen: set[str] = set()
+    raw_studies = df[study_col].tolist() if study_col is not None else None
+    seen_composite: set[tuple[str, str]] = set()
+    seen_cids_for_study: set[str] = set()
     kept_rev: list[int] = []
     for idx in range(len(raw_ids) - 1, -1, -1):
         cid = _canonical_record_id(raw_ids[idx])
         if cid is None:
             kept_rev.append(idx)
             continue
-        if cid in excluded or cid in seen:
+        row_study = (
+            _canonical_study_key(raw_studies[idx], study_key)
+            if raw_studies is not None
+            else study_key
+        )
+        matches_target_study = study_key is None or row_study is None or row_study == study_key
+        if cid in excluded and matches_target_study:
             continue
-        seen.add(cid)
+        comp_key = (row_study or "", cid)
+        if comp_key in seen_composite:
+            continue
+        seen_composite.add(comp_key)
+        if matches_target_study:
+            seen_cids_for_study.add(cid)
         kept_rev.append(idx)
 
     kept_rev.reverse()
-    return df.iloc[kept_rev].reset_index(drop=True), seen
+    return df.iloc[kept_rev].reset_index(drop=True), seen_cids_for_study
 
 
-def _filter_df_excluding_record_ids(df: pd.DataFrame, exclude_ids: set[str]) -> pd.DataFrame:
-    """Drop rows from ``df`` whose canonical record ID appears in ``exclude_ids``."""
+def _filter_df_excluding_record_ids(
+    df: pd.DataFrame,
+    exclude_ids: set[str],
+    *,
+    study_key: str | None = None,
+) -> pd.DataFrame:
+    """Drop rows from ``df`` whose ``(STUDYID, RECORD_ID)`` matches ``exclude_ids``."""
     if df.empty or not exclude_ids:
         return df
     id_col = _find_df_record_id_col(df)
     if id_col is None:
         return df
-    mask = [_canonical_record_id(val) not in exclude_ids for val in df[id_col].tolist()]
+    study_col = _find_df_study_col(df)
+    if study_col is not None and study_key:
+        mask = [
+            not (
+                _canonical_record_id(val) in exclude_ids
+                and (_canonical_study_key(sval, study_key) == study_key)
+            )
+            for val, sval in zip(df[id_col].tolist(), df[study_col].tolist(), strict=False)
+        ]
+    else:
+        mask = [_canonical_record_id(val) not in exclude_ids for val in df[id_col].tolist()]
     return df.loc[mask].reset_index(drop=True)
 
 
@@ -651,10 +710,17 @@ class TabularCSVSink(ExportSink):
                 rows_loaded = len(df)
                 self._append_manifest(batch_id, rows_loaded, checksum)
                 id_col = _find_df_record_id_col(df)
+                study_col = _find_df_study_col(df)
                 if id_col is not None:
-                    for raw_id in df[id_col].tolist():
+                    raw_studies = (
+                        df[study_col].tolist() if study_col is not None else [None] * len(df)
+                    )
+                    for raw_id, raw_sval in zip(df[id_col].tolist(), raw_studies, strict=False):
                         cid = _canonical_record_id(raw_id)
-                        if cid is not None:
+                        skey = _canonical_study_key(raw_sval, self._cfg.study_key)
+                        if cid is not None and (
+                            not self._cfg.study_key or skey == self._cfg.study_key
+                        ):
                             self._voided_ids.discard(cid)
                 self._staged_frames.append(df)
                 return rows_loaded
@@ -709,6 +775,7 @@ class TabularCSVSink(ExportSink):
         dedup_delta, delta_ids = _dedupe_df_by_record_id(
             combined_delta,
             exclude_ids=self._voided_ids,
+            study_key=self._cfg.study_key,
         )
         dest_exists = Path(self.path).exists() and Path(self.path).stat().st_size > 0
         sep = str(self._cfg.pandas_kwargs.get("sep", ","))
@@ -758,7 +825,16 @@ class TabularCSVSink(ExportSink):
                 writer.writeheader()
                 for row in reader:
                     row_cid = _extract_row_canonical_id(row)
-                    if row_cid is not None and row_cid in exclude_ids:
+                    row_study = _extract_row_study_key(row)
+                    if (
+                        row_cid is not None
+                        and row_cid in exclude_ids
+                        and (
+                            not self._cfg.study_key
+                            or row_study is None
+                            or row_study == self._cfg.study_key
+                        )
+                    ):
                         continue
                     writer.writerow({k: (row.get(k) or "") for k in unified_fields})
                 for d_row in delta_rows:
@@ -810,11 +886,15 @@ class TabularCSVSink(ExportSink):
 
 _RECORD_META_CONTRACT_TYPES: tuple[tuple[str, str], ...] = (
     ("recordId", "int64"),
+    ("recordOid", "string"),
     ("subjectKey", "string"),
     ("visitId", "int64"),
+    ("intervalId", "int64"),
+    ("intervalName", "string"),
     ("formId", "int64"),
     ("formKey", "string"),
-    ("intervalId", "int64"),
+    ("siteId", "int64"),
+    ("siteName", "string"),
     ("recordStatus", "string"),
     ("dateCreated", "string"),
 )
@@ -889,6 +969,7 @@ def _build_sdtm_contract_types(
     domain: str | None,
     *,
     variable_whitelist: Sequence[str] | None = None,
+    preserve_record_id: bool = False,
 ) -> dict[str, str | None]:
     """Derive expected uppercase SDTM column names and logical types for ``domain``."""
     dom = resolve_sdtm_domain(domain, fallback="AE")
@@ -900,6 +981,8 @@ def _build_sdtm_contract_types(
             contract[col] = "int64"
         else:
             contract[col] = "string"
+    if preserve_record_id and "RECORD_ID" not in contract:
+        contract["RECORD_ID"] = "int64"
     if variable_whitelist is not None:
         for extra_var in variable_whitelist:
             if extra_var not in contract:
@@ -1393,8 +1476,14 @@ def _unify_arrow_schemas(pa: Any, base_schema: Any, incoming_schema: Any) -> Any
     return pa.schema(unified_fields)
 
 
-def _filter_arrow_table_excluding_ids(pa: Any, tbl: Any, exclude_ids: set[str]) -> Any:
-    """Filter out rows from ``tbl`` whose canonical record ID is in ``exclude_ids``."""
+def _filter_arrow_table_excluding_ids(
+    pa: Any,
+    tbl: Any,
+    exclude_ids: set[str],
+    *,
+    study_key: str | None = None,
+) -> Any:
+    """Filter out rows from ``tbl`` whose canonical ``(STUDYID, RECORD_ID)`` is in ``exclude_ids``."""
     if tbl.num_rows == 0 or not exclude_ids:
         return tbl
     id_col = next(
@@ -1403,7 +1492,22 @@ def _filter_arrow_table_excluding_ids(pa: Any, tbl: Any, exclude_ids: set[str]) 
     )
     if id_col is None:
         return tbl
-    mask = [_canonical_record_id(val) not in exclude_ids for val in tbl[id_col].to_pylist()]
+    study_col = next(
+        (c for c in ("STUDYID", "study_key", "studyKey") if c in tbl.column_names),
+        None,
+    )
+    id_vals = tbl[id_col].to_pylist()
+    if study_col is not None and study_key:
+        study_vals = tbl[study_col].to_pylist()
+        mask = [
+            not (
+                _canonical_record_id(val) in exclude_ids
+                and (_canonical_study_key(sval, study_key) == study_key)
+            )
+            for val, sval in zip(id_vals, study_vals, strict=False)
+        ]
+    else:
+        mask = [_canonical_record_id(val) not in exclude_ids for val in id_vals]
     if all(mask):
         return tbl
     return tbl.filter(pa.array(mask, type=pa.bool_()))
@@ -1431,7 +1535,7 @@ class TabularParquetSink(ExportSink):
         self._parquet_kwargs.pop("engine", None)
         self._compression = self._parquet_kwargs.pop("compression", "snappy")
         self._voided_ids: set[str] = set()
-        self._delta_id_counts: dict[str, int] = {}
+        self._delta_id_counts: dict[tuple[str, str], int] = {}
         self._delta_path: str | None = None
 
     def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
@@ -1562,12 +1666,21 @@ class TabularParquetSink(ExportSink):
             self._writer.write_table(table)
             if self._use_staged_delta():
                 id_col = _find_df_record_id_col(df)
+                study_col = _find_df_study_col(df)
                 if id_col is not None:
-                    for raw_id in df[id_col].tolist():
+                    raw_studies = (
+                        df[study_col].tolist() if study_col is not None else [None] * len(df)
+                    )
+                    for raw_id, raw_sval in zip(df[id_col].tolist(), raw_studies, strict=False):
                         cid = _canonical_record_id(raw_id)
+                        skey = _canonical_study_key(raw_sval, self._cfg.study_key) or ""
                         if cid is not None:
-                            self._delta_id_counts[cid] = self._delta_id_counts.get(cid, 0) + 1
-                            self._voided_ids.discard(cid)
+                            comp_key = (skey, cid)
+                            self._delta_id_counts[comp_key] = (
+                                self._delta_id_counts.get(comp_key, 0) + 1
+                            )
+                            if not self._cfg.study_key or skey == self._cfg.study_key:
+                                self._voided_ids.discard(cid)
             return len(df)
 
         return self._execute_with_retry("export_parquet", batch_id, execute_export)
@@ -1626,15 +1739,27 @@ class TabularParquetSink(ExportSink):
                 (c for c in ("recordId", "record_id", "RECORD_ID") if c in tbl.column_names),
                 None,
             )
+            study_col = next(
+                (c for c in ("STUDYID", "study_key", "studyKey") if c in tbl.column_names),
+                None,
+            )
             if id_col is not None and tbl.num_rows > 0:
                 mask: list[bool] = []
-                for val in tbl[id_col].to_pylist():
+                study_vals = (
+                    tbl[study_col].to_pylist() if study_col is not None else [None] * tbl.num_rows
+                )
+                for val, sval in zip(tbl[id_col].to_pylist(), study_vals, strict=False):
                     cid = _canonical_record_id(val)
                     if cid is None:
                         mask.append(True)
                     else:
-                        remaining[cid] = remaining.get(cid, 1) - 1
-                        mask.append(cid not in self._voided_ids and remaining[cid] == 0)
+                        skey = _canonical_study_key(sval, self._cfg.study_key) or ""
+                        comp_key = (skey, cid)
+                        remaining[comp_key] = remaining.get(comp_key, 1) - 1
+                        is_voided = cid in self._voided_ids and (
+                            not self._cfg.study_key or skey == self._cfg.study_key
+                        )
+                        mask.append(not is_voided and remaining[comp_key] == 0)
                 if not all(mask):
                     tbl = tbl.filter(pa.array(mask, type=pa.bool_()))
             if tbl.num_rows > 0:
@@ -1658,8 +1783,13 @@ class TabularParquetSink(ExportSink):
 
         pq_any: Any = pq
 
+        delta_cids_for_study = {
+            cid
+            for (skey, cid) in self._delta_id_counts
+            if not self._cfg.study_key or skey == self._cfg.study_key
+        }
         needs_delta_filter = any(cnt > 1 for cnt in self._delta_id_counts.values()) or bool(
-            self._voided_ids & set(self._delta_id_counts)
+            self._voided_ids & delta_cids_for_study
         )
 
         if not dest_exists:
@@ -1695,7 +1825,7 @@ class TabularParquetSink(ExportSink):
         else:
             unified_schema = prev_schema
 
-        exclude_prev_ids = set(self._delta_id_counts) | self._voided_ids
+        exclude_prev_ids = delta_cids_for_study | self._voided_ids
 
         def _stream_merge(tmp_path: str) -> None:
             with pq_any.ParquetWriter(
@@ -1709,7 +1839,12 @@ class TabularParquetSink(ExportSink):
                         batch_size=max(1, self._cfg.batch_size)
                     ):
                         prev_tbl = pa.Table.from_batches([record_batch])
-                        kept_tbl = _filter_arrow_table_excluding_ids(pa, prev_tbl, exclude_prev_ids)
+                        kept_tbl = _filter_arrow_table_excluding_ids(
+                            pa,
+                            prev_tbl,
+                            exclude_prev_ids,
+                            study_key=self._cfg.study_key,
+                        )
                         if kept_tbl.num_rows > 0:
                             out_writer.write_table(
                                 _cast_arrow_table_to_schema(pa, kept_tbl, unified_schema)
@@ -1764,8 +1899,10 @@ def _execute_chunked_sql_id_delete(
     table_name: str,
     candidate_cols: Sequence[str],
     record_ids: Sequence[Any],
+    *,
+    study_key: str | None = None,
 ) -> int:
-    """Delete rows matching ``record_ids`` in chunks of 500 when ``table_name`` exists."""
+    """Delete rows matching ``record_ids`` (and ``study_key`` when present) in chunks of 500."""
     if not record_ids or isinstance(engine, NonCallableMock):
         return 0
     from sqlalchemy import inspect as sa_inspect
@@ -1778,16 +1915,28 @@ def _execute_chunked_sql_id_delete(
     id_col = next((col for col in candidate_cols if col in existing_cols), None)
     if id_col is None:
         return 0
+    study_col = next(
+        (col for col in ("STUDYID", "study_key", "studyKey") if col in existing_cols),
+        None,
+    )
 
     preparer = engine.dialect.identifier_preparer
     quoted_table = preparer.quote(table_name)
     quoted_col = preparer.quote(id_col)
+    quoted_study = preparer.quote(study_col) if (study_col is not None and study_key) else None
     with engine.begin() as conn:
         for start in range(0, len(record_ids), 500):
             chunk = record_ids[start : start + 500]
-            params = {f"id_{idx}": rid for idx, rid in enumerate(chunk)}
+            params: dict[str, Any] = {f"id_{idx}": rid for idx, rid in enumerate(chunk)}
             placeholders = ", ".join(f":{k}" for k in params)
-            stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})")
+            if quoted_study is not None:
+                params["study_key"] = study_key
+                stmt = sa_text(
+                    f"DELETE FROM {quoted_table} "
+                    f"WHERE {quoted_study} = :study_key AND {quoted_col} IN ({placeholders})"
+                )
+            else:
+                stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})")
             conn.execute(stmt, params)
     return len(record_ids)
 
@@ -1816,12 +1965,13 @@ class TabularSQLSink(ExportSink):
             self._initial_if_exists = "append" if self._is_incremental_sync else "replace"
 
     def _delete_existing_record_ids(self, record_ids: Sequence[Any]) -> int:
-        """Delete existing rows matching ``recordId`` when the destination table exists."""
+        """Delete existing rows matching ``(STUDYID, RECORD_ID)`` when the destination table exists."""
         return _execute_chunked_sql_id_delete(
             self.engine,
             self.table,
             ("recordId", "record_id", "RECORD_ID"),
             record_ids,
+            study_key=self._cfg.study_key,
         )
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
@@ -1833,6 +1983,10 @@ class TabularSQLSink(ExportSink):
         )
         if len(df) == 0:
             return 0
+        if self._is_incremental_sync and self._cfg.idempotent:
+            df, _ = _dedupe_df_by_record_id(df, study_key=self._cfg.study_key)
+            if len(df) == 0:
+                return 0
 
         def execute_export() -> int:
             if_exists = self._initial_if_exists if self._is_first_batch else "append"
@@ -1953,13 +2107,24 @@ class TabularDuckDBSink(ExportSink):
         )
         if id_col is None:
             return 0
+        study_col = next(
+            (c for c in ("STUDYID", "study_key", "studyKey") if c in cols),
+            None,
+        )
         placeholders = ", ".join(["?"] * len(record_ids))
         quoted_tbl = _quote_duckdb_identifier(self.table_name)
-        quoted_col = _quote_duckdb_identifier(id_col)
-        self._conn.execute(
-            f"DELETE FROM {quoted_tbl} WHERE {quoted_col} IN ({placeholders})",
-            list(record_ids),
-        )
+        quoted_col = _quote_duckdb_column(id_col)
+        if study_col is not None and self._cfg.study_key:
+            quoted_study = _quote_duckdb_column(study_col)
+            self._conn.execute(
+                f"DELETE FROM {quoted_tbl} WHERE {quoted_study} = ? AND {quoted_col} IN ({placeholders})",
+                [self._cfg.study_key, *record_ids],
+            )
+        else:
+            self._conn.execute(
+                f"DELETE FROM {quoted_tbl} WHERE {quoted_col} IN ({placeholders})",
+                list(record_ids),
+            )
         return len(record_ids)
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
@@ -1971,6 +2136,10 @@ class TabularDuckDBSink(ExportSink):
         )
         if len(df) == 0:
             return 0
+        if self._is_incremental_sync and self._cfg.idempotent:
+            df, _ = _dedupe_df_by_record_id(df, study_key=self._cfg.study_key)
+            if len(df) == 0:
+                return 0
 
         def execute_export() -> int:
             quoted_tbl = _quote_duckdb_identifier(self.table_name)
@@ -2229,7 +2398,13 @@ class _TabularTransformSink(ExportSink):
         self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
         self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
         self._seq_counters: dict[str, int] = {}
+        self._record_seqs: dict[str, int] = {}
         self._meta_cols = {name for name, _ in _RECORD_META_CONTRACT_TYPES}
+
+    def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
+        if self._cfg.as_sdtm:
+            bind_sdtm_stream_metadata(metadata, self._seq_counters, self._record_seqs)
+        self._inner.bind_stream_metadata(metadata)
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         if self._cfg.as_sdtm:
@@ -2280,6 +2455,8 @@ class _TabularTransformSink(ExportSink):
                 include_deleted=self._cfg.include_deleted,
                 mask_phi=self._cfg.mask_phi,
                 seq_counters=self._seq_counters,
+                record_seqs=self._record_seqs,
+                preserve_record_id=_is_incremental_config(self._cfg),
                 phi_keys=self._phi_keys,
                 pipeline=self._pipeline,
             )
@@ -2400,6 +2577,26 @@ def _tabular_export(
     *,
     stream_name: str | None = None,
 ) -> None:
+    with sdk_governance_context(sdk):
+        _tabular_export_impl(
+            sdk,
+            study_key,
+            sink,
+            config,
+            sanitize=sanitize,
+            stream_name=stream_name,
+        )
+
+
+def _tabular_export_impl(
+    sdk: Any,
+    study_key: str,
+    sink: ExportSink,
+    config: TabularSinkConfig,
+    sanitize: bool = False,
+    *,
+    stream_name: str | None = None,
+) -> None:
     mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
     empty_whitelist = (
         config.variable_whitelist is not None and len(config.variable_whitelist) == 0
@@ -2414,6 +2611,7 @@ def _tabular_export(
         contract_types = _build_sdtm_contract_types(
             config.sdtm_domain,
             variable_whitelist=config.variable_whitelist,
+            preserve_record_id=_is_incremental_config(config),
         )
         pipeline = resolve_enrichment_pipeline(study_key)
         record_model: Any = None
@@ -2607,6 +2805,18 @@ def _build_tabular_sink_config(
     config = kwargs.pop("config", None)
     if isinstance(config, TabularSinkConfig):
         return config
+    if isinstance(config, SinkConfig):
+        _pop_sink_kwargs(kwargs)
+        base_values = {f.name: getattr(config, f.name) for f in fields(SinkConfig)}
+        base_values["study_key"] = study_key
+        return TabularSinkConfig(
+            **base_values,
+            manifest_path=manifest_path,
+            pandas_kwargs=kwargs,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+        )
     explicit_sanitize = kwargs.pop("sanitize", None)
     sink_kwargs = _pop_sink_kwargs(kwargs)
     sink_kwargs.setdefault("quality_gate_enabled", default_quality_gate)
@@ -2714,38 +2924,27 @@ def export_to_csv(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
-    quality_gate_enabled: bool = True,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export study records to a CSV file.
+    """Export Study Records to a CSV file.
 
-    All exports now inherit StudyConfiguration rules by default.
+    All exports inherit StudyConfiguration rules by default.
 
     Parameters
     ----------
     use_labels_as_columns:
-        When ``True``, variable labels are used for column names instead of
-        variable names.
+        When ``True``, Variable labels are used for column names instead of
+        Variable names.
+    quality_gate_enabled:
+        When ``True``, filters Study Records through :func:`apply_quality_gate`
+        before writing. Defaults to ``False``.
     mask_phi:
-        When ``True`` (default), sensitive PHI values are replaced with
+        When ``True`` (default), sensitive Subject PHI values are replaced with
         ``***MASKED***``.
     """
-    has_sdtm_or_standards_opts = bool(
-        kwargs.get("as_sdtm")
-        or kwargs.get("sdtm_domain") is not None
-        or kwargs.get("domain") is not None
-        or kwargs.get("standards_profile") is not None
-        or kwargs.get("min_standards_score") is not None
-    )
-    effective_default_gate = (
-        False
-        if has_sdtm_or_standards_opts
-        and "quality_gate_enabled" not in kwargs
-        and quality_gate_enabled is True
-        else quality_gate_enabled
-    )
-    kwargs.setdefault("quality_gate_enabled", effective_default_gate)
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     kwargs.setdefault("sanitize", True)
     config = _build_tabular_sink_config(
         study_key,
@@ -2754,7 +2953,7 @@ def export_to_csv(
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         manifest_path=manifest_path or str(Path(path).with_suffix(".manifest.jsonl")),
-        default_quality_gate=effective_default_gate,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
 
@@ -2844,7 +3043,11 @@ def export_to_excel(
 
     excel_kwargs = dict(config.pandas_kwargs)
     sdtm_contract = (
-        _build_sdtm_contract_types(config.sdtm_domain, variable_whitelist=config.variable_whitelist)
+        _build_sdtm_contract_types(
+            config.sdtm_domain,
+            variable_whitelist=config.variable_whitelist,
+            preserve_record_id=_is_incremental_config(config),
+        )
         if config.as_sdtm
         else None
     )
@@ -2874,10 +3077,18 @@ def export_to_excel(
             )
             return
 
-        dedup_delta, delta_ids = _dedupe_df_by_record_id(combined, exclude_ids=voided_ids)
+        dedup_delta, delta_ids = _dedupe_df_by_record_id(
+            combined,
+            exclude_ids=voided_ids,
+            study_key=study_key,
+        )
         if dest_exists:
             prev_df = pd.read_excel(path)
-            prev_kept = _filter_df_excluding_record_ids(prev_df, delta_ids | voided_ids)
+            prev_kept = _filter_df_excluding_record_ids(
+                prev_df,
+                delta_ids | voided_ids,
+                study_key=study_key,
+            )
             if not prev_kept.empty:
                 if config.mask_phi:
                     pipeline = resolve_enrichment_pipeline(study_key)
@@ -2953,33 +3164,44 @@ def _merge_flat_json_records(
     existing_records: list[Any],
     delta_records: list[dict[str, Any]],
     voided_ids: set[str],
+    *,
+    study_key: str | None = None,
 ) -> list[Any]:
-    """Upsert ``delta_records`` by canonical record ID and drop ``voided_ids``."""
-    delta_by_cid: dict[str, dict[str, Any]] = {}
+    """Upsert ``delta_records`` by canonical ``(STUDYID, RECORD_ID)`` and drop ``voided_ids``."""
+    delta_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     unkeyed_delta: list[dict[str, Any]] = []
     for drec in delta_records:
         cid = _extract_row_canonical_id(drec)
         if cid is not None:
-            delta_by_cid[cid] = drec
+            dstudy = _extract_row_study_key(drec) or study_key or ""
+            delta_by_key[(dstudy, cid)] = drec
         else:
             unkeyed_delta.append(drec)
 
     merged: list[Any] = []
-    placed_cids: set[str] = set()
+    placed_keys: set[tuple[str, str]] = set()
     for erec in existing_records:
         if isinstance(erec, Mapping):
             cid = _extract_row_canonical_id(erec)
-            if cid is not None and cid in voided_ids:
+            estudy = _extract_row_study_key(erec) or study_key or ""
+            comp_key = (estudy, cid) if cid is not None else None
+            if (
+                cid is not None
+                and cid in voided_ids
+                and (not study_key or not estudy or estudy == study_key)
+            ):
                 continue
-            if cid is not None and cid in delta_by_cid:
-                if cid not in placed_cids:
-                    merged.append(delta_by_cid[cid])
-                    placed_cids.add(cid)
+            if comp_key is not None and comp_key in delta_by_key:
+                if comp_key not in placed_keys:
+                    merged.append(delta_by_key[comp_key])
+                    placed_keys.add(comp_key)
                 continue
         merged.append(erec)
 
-    for cid, drec in delta_by_cid.items():
-        if cid not in placed_cids and cid not in voided_ids:
+    for comp_key, drec in delta_by_key.items():
+        skey, cid = comp_key
+        is_voided = cid in voided_ids and (not study_key or not skey or skey == study_key)
+        if comp_key not in placed_keys and not is_voided:
             merged.append(drec)
     merged.extend(unkeyed_delta)
     return merged
@@ -3267,10 +3489,11 @@ def export_to_json(
             hier_kwargs["mask_phi"] = False
 
         if is_mock_hier_mapper and not _config_has_streaming_options(config):
-            data = mapper.build_hierarchy(study_key, **hier_kwargs)
-            if config.mask_phi:
-                data = mask_clinical_phi(data)
-            data = _apply_json_enrichment(study_key, data, mask_phi=config.mask_phi)
+            with sdk_governance_context(sdk):
+                data = mapper.build_hierarchy(study_key, **hier_kwargs)
+                if config.mask_phi:
+                    data = mask_clinical_phi(data)
+                data = _apply_json_enrichment(study_key, data, mask_phi=config.mask_phi)
             with _TabularCallableSink(
                 config,
                 "export_json",
@@ -3333,7 +3556,8 @@ def export_to_json(
                 )
         if df_mock is not None:
             mock_data = _dataframe_to_json_records(df_mock)
-            mock_data = _apply_json_enrichment(study_key, mock_data, mask_phi=config.mask_phi)
+            with sdk_governance_context(sdk):
+                mock_data = _apply_json_enrichment(study_key, mock_data, mask_phi=config.mask_phi)
             with _TabularCallableSink(
                 config,
                 "export_json",
@@ -3359,7 +3583,11 @@ def export_to_json(
             _dump_json_payload(path, [], config)
             return
 
-        dedup_delta, _ = _dedupe_df_by_record_id(combined, exclude_ids=voided_ids)
+        dedup_delta, _ = _dedupe_df_by_record_id(
+            combined,
+            exclude_ids=voided_ids,
+            study_key=study_key,
+        )
         delta_records = _dataframe_to_json_records(dedup_delta)
         existing_records: list[Any] = []
         if dest_exists:
@@ -3375,6 +3603,7 @@ def export_to_json(
             existing_records,
             delta_records,
             voided_ids,
+            study_key=study_key,
         )
         if config.mask_phi:
             pipeline = resolve_enrichment_pipeline(study_key)
@@ -3399,24 +3628,27 @@ def export_to_sql(
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
     manifest_path: str | None = None,
-    quality_gate_enabled: bool = True,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export study records to a SQL table.
+    """Export Study Records to a SQL table.
 
-    All exports now inherit StudyConfiguration rules by default.
+    All exports inherit StudyConfiguration rules by default.
 
     Parameters
     ----------
     use_labels_as_columns:
-        When ``True``, variable labels are used for column names instead of
-        variable names.
+        When ``True``, Variable labels are used for column names instead of
+        Variable names.
     manifest_path:
         Optional path to a file where manifest entries should be logged.
         Defaults to ``None``.
+    quality_gate_enabled:
+        When ``True``, filters Study Records through :func:`apply_quality_gate`
+        before writing. Defaults to ``False``.
     mask_phi:
-        When ``True`` (default), sensitive PHI values are replaced with
+        When ``True`` (default), sensitive Subject PHI values are replaced with
         ``***MASKED***``.
     """
     from sqlalchemy import create_engine
@@ -3604,6 +3836,8 @@ class _FormExportContext:
     max_ts: datetime | None = None
     pending_gate: dict[int, list[tuple[Any, datetime | None]]] = field(default_factory=dict)
     exported_timestamps: list[datetime] = field(default_factory=list)
+    seq_counters: dict[str, int] = field(default_factory=dict)
+    record_seqs: dict[str, int] = field(default_factory=dict)
     sink: Any = None
     tx: dict[str, Any] | None = None
 
@@ -3624,6 +3858,7 @@ def _build_form_export_contexts(
     as_sdtm: bool = False,
     sdtm_domain: str | None = None,
     naming_convention: str | None = None,
+    preserve_record_id: bool = False,
 ) -> tuple[list[_FormExportContext], list[Any]]:
     """Fetch study forms and variables once and build per-form export contexts."""
     forms = list(sdk.forms.list(study_key=study_key))
@@ -3664,7 +3899,11 @@ def _build_form_export_contexts(
         )
         record_model = None if as_sdtm else mapper._build_record_model(variable_keys, label_map)
         contract_types = (
-            _build_sdtm_contract_types(form_domain, variable_whitelist=variable_whitelist)
+            _build_sdtm_contract_types(
+                form_domain,
+                variable_whitelist=variable_whitelist,
+                preserve_record_id=preserve_record_id,
+            )
             if as_sdtm
             else _build_tabular_contract_types(
                 variable_keys,
@@ -3742,6 +3981,16 @@ def _stream_records_across_forms(
                     if isinstance(raw_last, (datetime, str))
                     else None
                 ) or opts["modified_since"]
+                raw_meta = ctx.tx.get("metadata")
+                if isinstance(raw_meta, dict):
+                    ctx_meta = raw_meta
+                else:
+                    ctx_meta = {}
+                    ctx.tx["metadata"] = ctx_meta
+                if config.as_sdtm:
+                    bind_sdtm_stream_metadata(ctx_meta, ctx.seq_counters, ctx.record_seqs)
+                if ctx.sink is not None and hasattr(ctx.sink, "bind_stream_metadata"):
+                    ctx.sink.bind_stream_metadata(ctx_meta)
             else:
                 ctx.watermark = opts["modified_since"]
 
@@ -3965,29 +4214,33 @@ def export_to_duckdb_by_form(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export records to separate DuckDB tables for each form.
+    """Export Study Records to separate DuckDB tables for each Form.
 
-    Each form is exported to a table named after ``form.form_key``.
+    Each Form is exported to a table named after ``form.form_key``.
 
     Parameters
     ----------
     sdk:
-        Authenticated SDK instance used to fetch study records.
+        Authenticated SDK instance used to fetch Study Records.
     study_key:
         Study identifier to export.
     db_path:
         Path to the target ``.duckdb`` database file.
     use_labels_as_columns:
-        When ``True``, variable labels are used for DataFrame column names.
+        When ``True``, Variable labels are used for DataFrame column names.
     variable_whitelist:
-        Optional list of variable names to include.
+        Optional list of Variable names to include.
     form_whitelist:
-        Optional list of form IDs to include.
+        Optional list of Form IDs to include.
+    quality_gate_enabled:
+        When ``True``, filters Study Records through :func:`apply_quality_gate`
+        before writing. Defaults to ``False``.
     mask_phi:
-        When ``True`` (default), sensitive PHI values are replaced with
+        When ``True`` (default), sensitive Subject PHI values are replaced with
         ``***MASKED***``.
 
     Raises:
@@ -4004,6 +4257,7 @@ def export_to_duckdb_by_form(
         ) from error
 
     manifest_path = kwargs.pop("manifest_path", None)
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
@@ -4011,12 +4265,14 @@ def export_to_duckdb_by_form(
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         manifest_path=manifest_path,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
-    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-    if hasattr(mapper, "_active_study_key"):
-        mapper._active_study_key = study_key
-    pipeline = resolve_enrichment_pipeline(study_key)
+    with sdk_governance_context(sdk):
+        mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+        if hasattr(mapper, "_active_study_key"):
+            mapper._active_study_key = study_key
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
@@ -4036,6 +4292,7 @@ def export_to_duckdb_by_form(
         as_sdtm=config.as_sdtm,
         sdtm_domain=config.sdtm_domain,
         naming_convention=config.naming_convention,
+        preserve_record_id=_is_incremental_config(config),
     )
 
     resolved_db_path = _coerce_path_str(db_path)
@@ -4148,13 +4405,15 @@ def export_to_sql_by_form(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export records to separate SQL tables for each form."""
+    """Export Study Records to separate SQL tables for each Form."""
     from sqlalchemy import create_engine
 
     manifest_path = kwargs.pop("manifest_path", None)
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
@@ -4162,16 +4421,18 @@ def export_to_sql_by_form(
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
         manifest_path=manifest_path,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
     resolved_if_exists: Literal["fail", "replace", "append", "delete_rows"] = (
         if_exists if if_exists is not None else ("replace" if config.idempotent else "append")
     )
 
-    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-    if hasattr(mapper, "_active_study_key"):
-        mapper._active_study_key = study_key
-    pipeline = resolve_enrichment_pipeline(study_key)
+    with sdk_governance_context(sdk):
+        mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+        if hasattr(mapper, "_active_study_key"):
+            mapper._active_study_key = study_key
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     engine = create_engine(conn_str)
@@ -4190,6 +4451,7 @@ def export_to_sql_by_form(
         as_sdtm=config.as_sdtm,
         sdtm_domain=config.sdtm_domain,
         naming_convention=config.naming_convention,
+        preserve_record_id=_is_incremental_config(config),
     )
 
     use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
@@ -4495,10 +4757,11 @@ def export_to_long_sql(
     conn_str: str,
     *,
     chunk_size: int = 1000,
+    quality_gate_enabled: bool = False,
     mask_phi: bool = True,
     **kwargs: Any,
 ) -> None:
-    """Export records to a normalized long-format SQL table."""
+    """Export Study Records to a normalized long-format SQL table."""
     if pd is None:
         raise ImportError(
             "pandas is required for export_to_long_sql. Install with "
@@ -4507,15 +4770,18 @@ def export_to_long_sql(
     from sqlalchemy import create_engine
 
     manifest_path = kwargs.pop("manifest_path", None)
+    kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
         manifest_path=manifest_path,
+        default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
     engine = create_engine(conn_str)
-    mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-    pipeline = resolve_enrichment_pipeline(study_key)
+    with sdk_governance_context(sdk):
+        mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
+        pipeline = resolve_enrichment_pipeline(study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
 
     if _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config):

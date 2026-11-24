@@ -55,7 +55,10 @@ Usage
     from imednet_sinks import MongoDbExportSink, MongoDbSinkConfig
     from imednet_workflows.data_extraction import DataExtractionWorkflow
 
-    sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+    sdk = ImednetSDK(
+        api_key=os.environ["IMEDNET_API_KEY"],
+        security_key=os.environ["IMEDNET_SECURITY_KEY"],
+    )
     records = DataExtractionWorkflow(sdk).extract_records_by_criteria(
         study_key="MYSTUDY",
     )
@@ -92,6 +95,7 @@ from imednet.spi.sinks import (
     ExportSink,
     SinkConfig,
     apply_quality_gate,
+    bind_sdtm_stream_metadata,
     build_sink_mapper,
     extract_record_id,
     normalize_sink_value,
@@ -170,6 +174,8 @@ def _post_process_document(doc: dict[str, Any]) -> dict[str, Any]:
 def _attach_sdtm_document_id(doc: dict[str, Any], record: Any, study_key: str) -> dict[str, Any]:
     """Attach a deterministic MongoDB ``_id`` to a flat SDTM domain document."""
     rid = extract_record_id(record)
+    if rid is None:
+        rid = doc.get("RECORD_ID")
     resolved_study = str(doc.get("STUDYID") or study_key)
     if rid is not None:
         doc["_id"] = _make_document_id(resolved_study, rid)
@@ -215,6 +221,8 @@ class MongoDbExportSink(ExportSink):
         ImportError: When the ``pymongo`` package is not installed.
     """
 
+    reconciles_deleted_on_full_sync = True
+
     def __init__(self, config: MongoDbSinkConfig) -> None:
         """Initialize the MongoDB export sink.
 
@@ -228,9 +236,15 @@ class MongoDbExportSink(ExportSink):
         self._collection_name = self.config.collection
         self._study_key = self.config.study_key
         self._seq_counters: dict[str, int] = {}
+        self._record_seqs: dict[str, int] = {}
         self._client: Any = None
         self._collection: Any = None
         self._connect()
+
+    def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
+        """Hydrate and bind SDTM sequence counters into transactional stream metadata."""
+        if self.config.as_sdtm:
+            bind_sdtm_stream_metadata(metadata, self._seq_counters, self._record_seqs)
 
     # ------------------------------------------------------------------
     # Connection management
@@ -267,6 +281,7 @@ class MongoDbExportSink(ExportSink):
             mode="document",
             post_processor=post_proc,
             seq_counters=self._seq_counters,
+            record_seqs=self._record_seqs,
         )
         mapped_docs: list[dict[str, Any]] | None = None
 

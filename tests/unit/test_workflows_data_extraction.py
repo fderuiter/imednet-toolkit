@@ -183,10 +183,17 @@ def test_extract_records_by_criteria_scaling_benchmark() -> None:
 
 
 def test_extract_audit_trail_builds_filters_and_dates() -> None:
-    """Test that extract audit trail normalizes UTC bounds and builds dateCreated range filters."""
+    """Test extract_audit_trail sends one dateCreated bound upstream and filters end_date locally."""
     sdk = MagicMock()
-    revisions = [RecordRevision(record_revision_id=1)]
-    sdk.get_record_revisions.return_value = revisions
+    in_window = RecordRevision(
+        record_revision_id=1,
+        date_created="2026-01-15T12:00:00Z",
+    )
+    after_window = RecordRevision(
+        record_revision_id=2,
+        date_created="2026-02-05T00:00:00Z",
+    )
+    sdk.get_record_revisions.return_value = [in_window, after_window]
 
     wf = DataExtractionWorkflow(sdk)
     result = wf.extract_audit_trail(
@@ -201,24 +208,37 @@ def test_extract_audit_trail_builds_filters_and_dates() -> None:
         "STUDY",
         role="data",
         status="open",
-        dateCreated=[
-            (">=", "2026-01-01T00:00:00Z"),
-            ("<=", "2026-02-01T23:59:59Z"),
-        ],
+        dateCreated=(">=", "2026-01-01T00:00:00Z"),
     )
-    assert result == revisions
+    assert result == [in_window]
 
 
-def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -> None:
-    """Test that extract_audit_trail sends dateCreated>=...;dateCreated<=... over HTTP."""
+def test_extract_audit_trail_emits_single_date_created_http_filter_and_filters_locally() -> None:
+    """Test extract_audit_trail sends a valid single-bound filter over HTTP and filters end_date locally."""
     import respx
 
     from imednet.sdk import ImednetSDK
+    from imednet.utils.filters import validate_filter_syntax
 
     with respx.mock(assert_all_called=True) as router:
         route = router.get("https://api.test/api/v1/edc/studies/STUDY/recordRevisions").respond(
             200,
-            json={"data": [{"recordRevisionId": 5, "recordId": 10, "recordRevision": 1}]},
+            json={
+                "data": [
+                    {
+                        "recordRevisionId": 5,
+                        "recordId": 10,
+                        "recordRevision": 1,
+                        "dateCreated": "2026-01-20 09:30:00",
+                    },
+                    {
+                        "recordRevisionId": 6,
+                        "recordId": 10,
+                        "recordRevision": 2,
+                        "dateCreated": "2026-02-03 10:00:00",
+                    },
+                ]
+            },
         )
         sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
         wf = DataExtractionWorkflow(sdk)
@@ -230,9 +250,100 @@ def test_extract_audit_trail_emits_semicolon_joined_date_created_http_filter() -
         )
 
         sent_filter = route.calls.last.request.url.params["filter"]
-        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z;dateCreated<=2026-02-01T23:59:59Z"
+        validate_filter_syntax(sent_filter)
+        assert sent_filter == "dateCreated>=2026-01-01T00:00:00Z"
         assert "studyKey" not in sent_filter
         assert "startDate" not in sent_filter
         assert "endDate" not in sent_filter
-        assert len(revisions) == 1
-        assert revisions[0].record_revision_id == 5
+        assert [r.record_revision_id for r in revisions] == [5]
+
+
+def test_data_extraction_date_helpers_progress_callbacks_and_audit_bounds() -> None:
+    """Cover _parse_date_created_utc, _matches_local_date_bound, on_progress, and tuple/list bounds."""
+    from datetime import UTC, date, datetime
+
+    import pytest
+
+    from imednet_workflows.data_extraction import (
+        _matches_local_date_bound,
+        _parse_date_created_utc,
+    )
+
+    dt_utc = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+    assert _parse_date_created_utc(None) is None
+    assert _parse_date_created_utc("   ") is None
+    assert _parse_date_created_utc("not-a-date") is None
+    assert _parse_date_created_utc(12345) is None
+    assert _parse_date_created_utc(datetime(2026, 1, 15, 12, 0)) == dt_utc
+    assert _parse_date_created_utc(date(2026, 1, 15)) == datetime(2026, 1, 15, 0, 0, tzinfo=UTC)
+
+    assert _matches_local_date_bound(None, "==", "2026-01-15") is False
+    assert _matches_local_date_bound(dt_utc, "==", 999) is False
+    assert _matches_local_date_bound(dt_utc, "==", "invalid") is False
+    assert _matches_local_date_bound(dt_utc, "==", dt_utc) is True
+    assert _matches_local_date_bound(dt_utc, "!=", "2026-01-16T00:00:00Z") is True
+    assert _matches_local_date_bound(dt_utc, "<", "2026-01-16") is True
+    assert _matches_local_date_bound(dt_utc, ">", "2026-01-14T00:00:00Z") is True
+    assert _matches_local_date_bound(dt_utc, ">=", date(2026, 1, 15)) is True
+    with pytest.raises(ValueError, match="Unsupported dateCreated filter operator"):
+        _matches_local_date_bound(dt_utc, "~=", dt_utc)
+
+    sdk = MagicMock()
+    progress_msgs: list[str] = []
+    sdk.get_subjects.return_value = []
+    wf = DataExtractionWorkflow(sdk)
+    assert (
+        wf.extract_records_by_criteria(
+            "STUDY", subject_filter={"status": "Active"}, on_progress=progress_msgs.append
+        )
+        == []
+    )
+    assert any("No subjects matched" in m for m in progress_msgs)
+
+    progress_msgs.clear()
+    subj_mock = MagicMock(subject_key="S1")
+    sdk.get_subjects.return_value = [subj_mock]
+    sdk.get_visits.return_value = []
+    assert (
+        wf.extract_records_by_criteria(
+            "STUDY",
+            subject_filter={"status": "Active"},
+            visit_filter={"interval": "V1"},
+            on_progress=progress_msgs.append,
+        )
+        == []
+    )
+    assert any("No visits matched" in m for m in progress_msgs)
+
+    progress_msgs.clear()
+    visit_mock = MagicMock(subject_key="S1", visit_id=10)
+    sdk.get_visits.return_value = [visit_mock]
+    sdk.get_records.return_value = [Record(record_id=1, subject_key="S1", visit_id=10)]
+    matched = wf.extract_records_by_criteria(
+        "STUDY",
+        subject_filter={"status": "Active"},
+        visit_filter={"interval": "V1"},
+        on_progress=progress_msgs.append,
+    )
+    assert len(matched) == 1
+    assert any("Extraction complete" in m for m in progress_msgs)
+
+    rev_match = RecordRevision(record_revision_id=1, date_created="2026-01-15T12:00:00Z")
+    sdk.get_record_revisions.return_value = [rev_match]
+    res_list = wf.extract_audit_trail(
+        "STUDY",
+        user_filter={"date_created": [(">=", "2026-01-01T00:00:00Z"), "2026-01-15T12:00:00Z"]},
+    )
+    assert res_list == [rev_match]
+    res_scalar = wf.extract_audit_trail(
+        "STUDY",
+        start_date="2026-01-01",
+        user_filter={"dateCreated": "2026-01-15T12:00:00Z"},
+    )
+    assert res_scalar == [rev_match]
+    res_tuple = wf.extract_audit_trail(
+        "STUDY",
+        end_date="2026-02-01",
+        user_filter={"date_created": (">=", "2026-01-01T00:00:00Z")},
+    )
+    assert res_tuple == [rev_match]

@@ -2415,6 +2415,7 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
     assert demo_payloads == [
         {
             "recordId": 101,
+            "visitId": 1,
             "formKey": "DEMO",
             "subjectKey": "SUBJ-1",
             "data": {
@@ -2428,6 +2429,7 @@ def test_by_form_exports_enforce_required_variables_and_tabular_import_roundtrip
     assert vitals_payloads == [
         {
             "recordId": 201,
+            "visitId": 1,
             "formKey": "VITALS",
             "subjectKey": "SUBJ-1",
             "data": {"HR": 72},

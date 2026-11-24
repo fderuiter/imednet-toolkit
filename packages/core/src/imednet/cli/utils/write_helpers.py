@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from imednet.datadict import load_from_cdisc_odm, load_from_csv, load_from_redcap
+from imednet.datadict import load_from_api, load_from_cdisc_odm, load_from_csv, load_from_redcap
+from imednet.datadict.loaders.api import can_load_from_api
 from imednet.datadict.models import DataDictionary
 from imednet.errors import ValidationError
 from imednet.models.jobs import Job, JobStatus
@@ -19,6 +21,7 @@ from imednet.utils.batch_coordinator import DEFAULT_BATCH_CHUNK_SIZE, BatchSubmi
 from imednet.utils.job_poller import JobFailedError, JobPollSummary, JobProgressHandler
 from imednet.utils.tabular import (
     _BOOL_LIKE_TYPES,
+    _SLASH_SPACE_RE,
     _TEXT_LIKE_TYPES,
     MASKED_SENTINEL,
     _coerce_clinical_value,
@@ -31,6 +34,7 @@ from imednet.utils.tabular import (
     reject_nonfinite_json_constant,
 )
 from imednet.validation.cache import (
+    BaseSchemaCache,
     BatchValidationReport,
     RecordValidationIssue,
     SchemaCache,
@@ -129,16 +133,40 @@ def validate_write_numeric_flags(
         sys.exit(1)
 
 
-def parse_email_notify(raw_email_notify: str | None) -> bool | str | None:
-    """Normalize ``--email-notify`` value into bool or email string."""
+def parse_email_notify(raw_email_notify: str | bool | None) -> bool | str | None:
+    """Normalize and validate ``--email-notify`` value into bool or header-safe email string."""
     if raw_email_notify is None:
         return None
-    low = raw_email_notify.strip().lower()
+    if isinstance(raw_email_notify, bool):
+        return raw_email_notify
+    if "\r" in raw_email_notify or "\n" in raw_email_notify or "\x00" in raw_email_notify:
+        raise ValueError("Invalid --email-notify value: header value must not contain newlines.")
+    cleaned = raw_email_notify.strip()
+    if not cleaned:
+        raise ValueError("Invalid --email-notify value: cannot be empty.")
+    low = cleaned.lower()
     if low == "true":
         return True
     if low == "false":
         return False
-    return raw_email_notify.strip()
+    if any(ch.isspace() for ch in cleaned):
+        raise ValueError(
+            f"Invalid --email-notify value '{cleaned}': expected 'true', 'false', or a valid email address."
+        )
+    local, sep, domain = cleaned.partition("@")
+    if (
+        sep != "@"
+        or not local
+        or not domain
+        or "@" in domain
+        or "." not in domain
+        or domain.startswith(".")
+        or domain.endswith(".")
+    ):
+        raise ValueError(
+            f"Invalid --email-notify value '{cleaned}': expected 'true', 'false', or a valid email address."
+        )
+    return cleaned
 
 
 def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSchemaProtocol:
@@ -155,6 +183,8 @@ def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSche
         return load_from_cdisc_odm(path, study_key=study_key)
     if suffix == ".csv":
         return load_from_redcap(path, study_key=study_key)
+    if suffix == ".zip":
+        return load_from_csv(path)
     raise ValueError(
         f"Unsupported schema file format '{path.suffix}'. Expected .json, .xml, .csv, or directory."
     )
@@ -164,9 +194,13 @@ def resolve_cli_schema(
     sdk: ImednetSDK,
     study_key: str,
     schema_source: str | None,
+    *,
+    dry_run: bool = False,
 ) -> ValidationSchemaProtocol | None:
     """Resolve ``--schema`` from disk or live study API variables."""
     if not schema_source:
+        if dry_run and can_load_from_api(sdk):
+            return load_from_api(sdk, study_key)
         return None
     if schema_source.strip().lower() == "api":
         cache = SchemaCache()
@@ -189,6 +223,77 @@ def validate_record_file_arg(file_arg: str) -> None:
             f"Unsupported file format '{file_path.suffix or '<none>'}' for '{file_arg}'. "
             f"Supported extensions: {supported}."
         )
+
+
+def _normalize_var_type_label(raw: str) -> str:
+    collapsed = re.sub(r"[\s_-]+", " ", raw.strip().lower())
+    return _SLASH_SPACE_RE.sub("/", collapsed)
+
+
+def _resolve_cli_var_type(
+    schema: ValidationSchemaProtocol | None,
+    *,
+    form_key: str | None,
+    form_id: int | None,
+    var_name: str,
+    study_key: str | None = None,
+) -> str | None:
+    """Resolve normalized variable type from *schema* and optional form context."""
+    if schema is None:
+        return None
+    if isinstance(schema, BaseSchemaCache) and study_key:
+        resolved_fk = form_key
+        if not resolved_fk and form_id is not None:
+            resolved_fk = schema.form_key_from_id(form_id, study_key=study_key)
+        if resolved_fk:
+            vars_map = schema.variables_for_form(resolved_fk, study_key=study_key)
+            if vars_map and var_name in vars_map:
+                raw = getattr(vars_map[var_name], "variable_type", None) or getattr(
+                    vars_map[var_name], "variableType", None
+                )
+                if isinstance(raw, str):
+                    return _normalize_var_type_label(raw)
+            return None
+    else:
+        direct = _resolve_expected_var_type(
+            schema, form_key, form_id, var_name, study_key=study_key
+        )
+        if direct is not None:
+            return direct
+        if form_key or form_id is not None:
+            return None
+
+    # Form-less update fallback: check if variable has a single unambiguous type across forms
+    candidate_fks: Sequence[str]
+    if isinstance(schema, BaseSchemaCache):
+        candidate_fks = list(schema.forms_for_study(study_key) if study_key else schema.forms)
+    else:
+        forms_attr = getattr(schema, "forms", None)
+        if isinstance(forms_attr, Sequence):
+            candidate_fks = [
+                str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
+                for f in forms_attr
+                if getattr(f, "form_key", None) or getattr(f, "formKey", None)
+            ]
+        else:
+            candidate_fks = []
+
+    matched_types: set[str] = set()
+    for fk in candidate_fks:
+        form_vars: Mapping[str, Any] = (
+            schema.variables_for_form(fk, study_key=study_key)
+            if isinstance(schema, BaseSchemaCache)
+            else schema.variables_for_form(fk)
+        )
+        if form_vars and var_name in form_vars:
+            raw = getattr(form_vars[var_name], "variable_type", None) or getattr(
+                form_vars[var_name], "variableType", None
+            )
+            if isinstance(raw, str) and raw.strip():
+                matched_types.add(_normalize_var_type_label(raw))
+    if len(matched_types) == 1:
+        return next(iter(matched_types))
+    return None
 
 
 def parse_key_value_pairs(
@@ -214,24 +319,24 @@ def parse_key_value_pairs(
             raise ValueError(
                 f"Variable '{key}' contains masked PHI sentinel '{MASKED_SENTINEL}' and cannot be submitted."
             )
-        expected_vtype = _resolve_expected_var_type(
+        expected_var_type = _resolve_cli_var_type(
             schema,
-            form_key,
-            form_id,
-            key,
+            form_key=form_key,
+            form_id=form_id,
+            var_name=key,
             study_key=study_key,
         )
-        val_stripped = raw_val.strip()
-        val_low = val_stripped.lower()
-        if expected_vtype in _TEXT_LIKE_TYPES:
+        if expected_var_type in _TEXT_LIKE_TYPES:
             parsed[key] = raw_val
             continue
+        val_stripped = raw_val.strip()
+        val_low = val_stripped.lower()
         if val_low in _NONFINITE_TOKENS:
             raise ValidationError(
                 f"Variable '{key}' contains invalid numeric constant '{val_stripped}': "
                 "NaN and Infinity are not allowed."
             )
-        if (expected_vtype in _BOOL_LIKE_TYPES or expected_vtype is None) and val_low in {
+        if (expected_var_type in _BOOL_LIKE_TYPES or expected_var_type is None) and val_low in {
             "true",
             "false",
         }:
@@ -240,7 +345,7 @@ def parse_key_value_pairs(
             parsed[key] = _coerce_clinical_value(
                 raw_val,
                 from_csv_str=True,
-                expected_var_type=expected_vtype,
+                expected_var_type=expected_var_type,
             )
     return parsed
 

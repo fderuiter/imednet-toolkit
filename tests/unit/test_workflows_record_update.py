@@ -822,3 +822,158 @@ async def test_all_record_update_workflow_methods_accept_clinical_variable_types
         "STUDY", [{"formKey": "F_CLIN", "data": clinical_data}]
     )
     assert async_job.batch_id == "B-ASYNC-CLIN"
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_email_notify_across_all_ten_methods() -> None:
+    """Req 8: RecordUpdateWorkflow forwards email_notify and sends x-email-notify across all 10 methods."""
+    import httpx
+
+    from imednet import AsyncImednetSDK
+    from imednet.core.async_client import AsyncClient
+    from imednet.core.client import Client
+    from imednet.simulation import SimulationState, SimulationTransport
+
+    state = SimulationState()
+    base_transport = SimulationTransport(state=state)
+    sync_post_headers: list[httpx.Headers] = []
+    async_post_headers: list[httpx.Headers] = []
+
+    class SyncSpyTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                sync_post_headers.append(request.headers)
+            return base_transport.handle_request(request)
+
+    class AsyncSpyTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                async_post_headers.append(request.headers)
+            return await base_transport.handle_async_request(request)
+
+    sync_sdk = ImednetSDK(
+        client=Client(
+            api_key="sim-key",  # pragma: allowlist secret
+            security_key="sim-secret",  # pragma: allowlist secret
+            base_url="https://edc.sim.imednet.com",
+            transport=SyncSpyTransport(),
+        )
+    )
+    async_sdk = AsyncImednetSDK(
+        async_client=AsyncClient(
+            api_key="sim-key",  # pragma: allowlist secret
+            security_key="sim-secret",  # pragma: allowlist secret
+            base_url="https://edc.sim.imednet.com",
+            transport=AsyncSpyTransport(),
+        )
+    )
+
+    sync_wf = RecordUpdateWorkflow(sync_sdk)
+    sync_wf.create_or_update_records_batch(
+        "STUDY",
+        [{"formKey": "F_DM", "subjectKey": "SUB1", "data": {"V_AGE": 31}}],
+        email_notify="ops@example.com",
+    )
+    sync_wf.create_or_update_records(
+        "STUDY",
+        [{"formKey": "F_DM", "subjectKey": "SUB1", "data": {"V_AGE": 32}}],
+        email_notify=True,
+    )
+    sync_wf.register_subject(
+        "STUDY",
+        "F_DM",
+        "SITE",
+        {"V_AGE": 33},
+        email_notify="enroll@example.com",
+    )
+    sync_wf.update_scheduled_record(
+        "STUDY",
+        "F_DM",
+        "SUB1",
+        "Baseline",
+        {"V_AGE": 34},
+        email_notify=False,
+    )
+    sync_wf.create_new_record(
+        "STUDY",
+        "F_VS",
+        "SUB1",
+        {"V_WEIGHT": 71.5},
+        email_notify="alerts@example.com",
+    )
+    assert [h.get("x-email-notify") for h in sync_post_headers] == [
+        "ops@example.com",
+        "true",
+        "enroll@example.com",
+        "false",
+        "alerts@example.com",
+    ]
+
+    async_wf = RecordUpdateWorkflow(async_sdk)
+    await async_wf.async_create_or_update_records_batch(
+        "STUDY",
+        [{"formKey": "F_DM", "subjectKey": "SUB1", "data": {"V_AGE": 41}}],
+        email_notify="async-ops@example.com",
+    )
+    await async_wf.async_create_or_update_records(
+        "STUDY",
+        [{"formKey": "F_DM", "subjectKey": "SUB1", "data": {"V_AGE": 42}}],
+        email_notify=True,
+    )
+    await async_wf.async_register_subject(
+        "STUDY",
+        "F_DM",
+        "SITE",
+        {"V_AGE": 43},
+        email_notify="async-enroll@example.com",
+    )
+    await async_wf.async_update_scheduled_record(
+        "STUDY",
+        "F_DM",
+        "SUB1",
+        "Baseline",
+        {"V_AGE": 44},
+        email_notify=False,
+    )
+    await async_wf.async_create_new_record(
+        "STUDY",
+        "F_VS",
+        "SUB1",
+        {"V_WEIGHT": 72.5},
+        email_notify="async-alerts@example.com",
+    )
+    assert [h.get("x-email-notify") for h in async_post_headers] == [
+        "async-ops@example.com",
+        "true",
+        "async-enroll@example.com",
+        "false",
+        "async-alerts@example.com",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_validate_form_key_direct_refresh_and_empty_noop() -> None:
+    """Direct _validate_form_key and _async_validate_form_key refresh uncached forms and skip empty input."""
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.get_variables.return_value = [
+        Variable(variable_name="V_AGE", variable_type="integer", form_id=10, form_key="F_DM")
+    ]
+    sync_wf = RecordUpdateWorkflow(sync_sdk)
+    sync_wf._validate_form_key("STUDY", [])
+    assert sync_sdk.get_variables.call_count == 0
+    sync_wf._validate_form_key("STUDY", [{"formKey": "F_DM", "data": {"V_AGE": 30}}])
+    assert sync_sdk.get_variables.call_count == 1
+
+    async_sdk = MagicMock()
+    async_sdk.async_get_variables = AsyncMock(
+        return_value=[
+            Variable(variable_name="V_AGE", variable_type="integer", form_id=10, form_key="F_DM")
+        ]
+    )
+    async_sdk.async_create_record = AsyncMock()
+    async_wf = RecordUpdateWorkflow(async_sdk)
+    await async_wf._async_validate_form_key("STUDY", [])
+    assert async_sdk.async_get_variables.call_count == 0
+    await async_wf._async_validate_form_key("STUDY", [{"formKey": "F_DM", "data": {"V_AGE": 30}}])
+    assert async_sdk.async_get_variables.call_count == 1

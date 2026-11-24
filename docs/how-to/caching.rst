@@ -16,7 +16,7 @@ the application layer using a library such as `cachetools`_, a request-level
 cache middleware (e.g. ``httpx-cache``), or your framework's own cache
 primitives (e.g. Django's cache framework or FastAPI dependency injection).
 
-.. _cachetools: https://cachetools.readthedocs.io/
+.. _cachetools: https://cachetools.readthedocs.io/en/stable/
 
 Schema Cache
 ------------

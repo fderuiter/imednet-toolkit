@@ -146,6 +146,7 @@ def test_export_operator_dispatches_duckdb(monkeypatch: pytest.MonkeyPatch) -> N
         "STUDY-123",
         "/tmp/test_study.duckdb",
         "clinical_records",
+        quality_gate_enabled=False,
     )
     assert result == "/tmp/test_study.duckdb"
 
@@ -169,7 +170,9 @@ def test_operator_csv_export_without_sinks_plugin(monkeypatch: pytest.MonkeyPatc
 
     result = op.execute({})
     assert result == "/tmp/output.csv"
-    mock_csv_export.assert_called_once_with(mock_sdk, "STUDY-CSV", "/tmp/output.csv")
+    mock_csv_export.assert_called_once_with(
+        mock_sdk, "STUDY-CSV", "/tmp/output.csv", quality_gate_enabled=False
+    )
 
 
 @pytest.mark.parametrize("destination", ["snowflake", "neo4j", "mongodb"])
@@ -506,7 +509,9 @@ def test_resolve_sink_direct_fallbacks_and_legacy_export_func(
     monkeypatch.setattr(csv_op, "_get_sdk", lambda: mock_sdk)
     monkeypatch.setattr(export, "export_to_csv", mock_csv)
     assert csv_op.execute({}) == "/tmp/default.csv"
-    mock_csv.assert_called_once_with(mock_sdk, "STUDY-FALLBACK", "/tmp/default.csv")
+    mock_csv.assert_called_once_with(
+        mock_sdk, "STUDY-FALLBACK", "/tmp/default.csv", quality_gate_enabled=False
+    )
 
     # 2. Legacy tabular export_func not in _TABULAR_EXPORTS (export_to_sql_by_form)
     sql_by_form_op = ImednetExportOperator(
@@ -519,7 +524,9 @@ def test_resolve_sink_direct_fallbacks_and_legacy_export_func(
     monkeypatch.setattr(sql_by_form_op, "_get_sdk", lambda: mock_sdk)
     monkeypatch.setattr(export, "export_to_sql_by_form", mock_sql_by_form)
     assert sql_by_form_op.execute({}) == "sqlite:///:memory:"
-    mock_sql_by_form.assert_called_once_with(mock_sdk, "STUDY-FALLBACK", "sqlite:///:memory:")
+    mock_sql_by_form.assert_called_once_with(
+        mock_sdk, "STUDY-FALLBACK", "sqlite:///:memory:", quality_gate_enabled=False
+    )
 
     # 3. _resolve_sink with export_func='export_to_neo4j' and sdk=None resolves via _get_sdk()
     mock_sink_cls = MagicMock()
@@ -699,6 +706,7 @@ def test_operator_resolves_sql_and_sql_by_form_via_destination_conn_id(
         "STUDY-SQL",
         "postgresql://etl_user:pg_secret_password@pg.internal:5432/clinical_wh",  # pragma: allowlist secret
         batch_size=150,
+        quality_gate_enabled=False,
     )
 
 
@@ -867,7 +875,11 @@ def test_operator_propagates_mask_phi_opt_out_to_tabular_and_plugin_sinks(
     monkeypatch.setattr(op_csv, "_get_sdk", lambda: mock_sdk_tab)
     op_csv.execute({})
     mock_csv.assert_called_once_with(
-        mock_sdk_tab, "STUDY-PHI", "/tmp/authorized.csv", mask_phi=False
+        mock_sdk_tab,
+        "STUDY-PHI",
+        "/tmp/authorized.csv",
+        mask_phi=False,
+        quality_gate_enabled=False,
     )
 
     # 2. Neo4j sink opt-out via operator parameter and MongoDB via export_kwargs
@@ -1044,7 +1056,7 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     staged_rows: list[dict[str, object]] = []
     stage_paths: list[str] = []
 
-    def fake_execute(sql: str) -> None:
+    def fake_execute(sql: str, params: object = None) -> None:
         nonlocal staged_rows
         if "INFORMATION_SCHEMA.COLUMNS" in sql:
             cursor.fetchall.return_value = [(c,) for c in known_cols]
@@ -1077,6 +1089,12 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
                         warehouse_rows[key].update(row)
                 elif not (hard_del and is_del):
                     warehouse_rows[key] = dict(row)
+            cursor.fetchall.return_value = []
+        elif sql.startswith("DELETE FROM"):
+            assert isinstance(params, list) and len(params) >= 2
+            study_val = str(params[0])
+            for rid in params[1:]:
+                warehouse_rows.pop((study_val, int(rid)), None)
             cursor.fetchall.return_value = []
         else:
             cursor.fetchall.return_value = []
@@ -1150,35 +1168,65 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
     ]
 
     manifest_file = tmp_path / "manifest.jsonl"
+    op_default = ImednetExportOperator(
+        task_id="daily_sf_sync_default",
+        study_key="STUDY_AF_SF",
+        destination="snowflake",
+        destination_conn_id="sf_dest",
+        export_kwargs={
+            "stage_prefix": "imednet/airflow",
+            "local_staging_dir": str(tmp_path / "stage_default"),
+            "manifest_path": str(manifest_file),
+            "include_deleted": False,
+            "hard_delete": False,
+        },
+    )
+    monkeypatch.setattr(op_default, "_get_sdk", lambda: sdk)
+
+    sdk.records.list.side_effect = lambda **_kw: iter(run1)
+    op_default.execute({"run_id": "scheduled__2026-04-01T00:00:00+00:00"})
+
+    unmatched_voided = Record(
+        record_id=99,
+        form_id=10,
+        form_key="F1",
+        subject_key="S99",
+        deleted=True,
+        date_modified="2026-04-02T08:10:00Z",
+        record_data={"score": 0, "newBiomarker": "NA"},
+    )
+    sdk.records.list.side_effect = lambda **_kw: iter([*run2, unmatched_voided])
+    op_default.execute({"run_id": "scheduled__2026-04-02T00:00:00+00:00"})
+
+    assert len(stage_paths) == 2
+    assert stage_paths[0] != stage_paths[1]
+    assert "NEW_BIOMARKER" in known_cols
+    assert list(warehouse_rows.keys()) == [("STUDY_AF_SF", 1)]
+    assert warehouse_rows[("STUDY_AF_SF", 1)]["score"] == 15
+    assert warehouse_rows[("STUDY_AF_SF", 1)]["new_biomarker"] == "POS"
+
+    # Explicit include_deleted=True, hard_delete=False retains deleted=True tombstones
     op_soft = ImednetExportOperator(
-        task_id="daily_sf_sync",
+        task_id="daily_sf_sync_soft",
         study_key="STUDY_AF_SF",
         destination="snowflake",
         destination_conn_id="sf_dest",
         export_kwargs={
             "stage_prefix": "imednet/airflow",
             "local_staging_dir": str(tmp_path / "stage_soft"),
-            "manifest_path": str(manifest_file),
+            "include_deleted": True,
             "hard_delete": False,
         },
     )
     monkeypatch.setattr(op_soft, "_get_sdk", lambda: sdk)
-
     sdk.records.list.side_effect = lambda **_kw: iter(run1)
-    op_soft.execute({"run_id": "scheduled__2026-04-01T00:00:00+00:00"})
-
+    op_soft.execute({"run_id": "scheduled__2026-04-02T12:00:00+00:00"})
     sdk.records.list.side_effect = lambda **_kw: iter(run2)
-    op_soft.execute({"run_id": "scheduled__2026-04-02T00:00:00+00:00"})
-
-    assert len(stage_paths) == 2
-    assert stage_paths[0] != stage_paths[1]
-    assert "NEW_BIOMARKER" in known_cols
+    op_soft.execute({"run_id": "scheduled__2026-04-02T18:00:00+00:00"})
     assert len(warehouse_rows) == 2
-    assert warehouse_rows[("STUDY_AF_SF", 1)]["score"] == 15
-    assert warehouse_rows[("STUDY_AF_SF", 1)]["new_biomarker"] == "POS"
     assert warehouse_rows[("STUDY_AF_SF", 2)]["deleted"] is True
 
-    # Run 3 with hard_delete=True removes matched deleted=True record 2
+    # Run with include_deleted=True, hard_delete=True removes matched deleted=True record 2
     op_hard = ImednetExportOperator(
         task_id="daily_sf_sync_hard",
         study_key="STUDY_AF_SF",
@@ -1187,11 +1235,12 @@ def test_operator_repeated_snowflake_reruns_merge_evolve_and_handle_deletes(
         export_kwargs={
             "stage_prefix": "imednet/airflow",
             "local_staging_dir": str(tmp_path / "stage_hard"),
+            "include_deleted": True,
             "hard_delete": True,
         },
     )
     monkeypatch.setattr(op_hard, "_get_sdk", lambda: sdk)
-    sdk.records.list.side_effect = lambda **_kw: iter(run2)
+    sdk.records.list.side_effect = lambda **_kw: iter([*run2, unmatched_voided])
     op_hard.execute({"run_id": "scheduled__2026-04-03T00:00:00+00:00"})
 
     assert list(warehouse_rows.keys()) == [("STUDY_AF_SF", 1)]
@@ -1555,7 +1604,6 @@ def test_airflow_operator_consecutive_incremental_runs_retain_all_10_records_and
             incremental=True,
             stream_name=f"stream_{label}",
             ledger_path=str(ledger_file),
-            quality_gate_enabled=False,
             export_kwargs=extra_kw,
         )
         monkeypatch.setattr(op, "_get_sdk", lambda: sdk)
@@ -1613,7 +1661,6 @@ def test_airflow_operator_consecutive_incremental_runs_retain_all_10_records_and
             incremental=True,
             stream_name=f"stream_{label}",
             ledger_path=str(ledger_file),
-            quality_gate_enabled=False,
             export_kwargs=extra_kw,
         )
         monkeypatch.setattr(op3, "_get_sdk", lambda: sdk)
@@ -1691,6 +1738,7 @@ def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.Monkey
         mock_sdk,
         "STUDY-SQL",
         sql_uri,
+        quality_gate_enabled=False,
     )
     assert res_by_form is not None
     assert "sql_secret_password" not in res_by_form
@@ -1712,5 +1760,6 @@ def test_operator_dispatches_sql_by_form_and_long_sql(monkeypatch: pytest.Monkey
         "override_long_records",
         conn_str=sql_uri,
         if_exists="append",
+        quality_gate_enabled=False,
     )
     assert res_long == "override_long_records"

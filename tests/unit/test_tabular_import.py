@@ -110,6 +110,11 @@ def test_flattened_dataframe_roundtrip_succeeds_in_simulation_transport() -> Non
         assert "data" in item
         assert isinstance(item["data"], dict)
         assert isinstance(item.get("recordId"), int)
+        assert "recordOid" in item
+        assert "visitId" in item
+        assert "recordStatus" in item
+        for envelope_preserved_key in ("recordId", "recordOid", "visitId", "recordStatus"):
+            assert envelope_preserved_key not in item["data"]
         for forbidden_key in (
             "study_key",
             "studyKey",
@@ -118,7 +123,6 @@ def test_flattened_dataframe_roundtrip_succeeds_in_simulation_transport() -> Non
             "record_type",
             "recordType",
             "record_status",
-            "recordStatus",
             "deleted",
             "date_created",
             "dateCreated",
@@ -127,7 +131,6 @@ def test_flattened_dataframe_roundtrip_succeeds_in_simulation_transport() -> Non
             "last_updated",
             "lastUpdated",
             "visit_id",
-            "visitId",
             "parent_record_id",
             "parentRecordId",
             "keywords",
@@ -246,6 +249,8 @@ def test_dataframe_to_records_identifier_mapping_nan_drop_and_float_coercion() -
     assert rec == {
         "recordId": 900,
         "recordOid": "OID-900",
+        "visitId": 401,
+        "recordStatus": "Complete",
         "formId": 301,
         "subjectOid": "SUBJ-OID-1",
         "siteId": 101,
@@ -289,8 +294,8 @@ def test_csv_to_records_and_import_records_csv_work_without_pandas(
 
     csv_path = tmp_path / "records.csv"
     csv_path.write_text(
-        "form_key,subject_key,site_name,interval_name,CODE,AGE,NOTES,record_id\n"
-        "F_DM,SUB-10,SITE,Baseline,007,45.0,,999\n",
+        "form_key,subject_key,site_name,interval_name,CODE,AGE,NOTES,record_id,reason_for_change\n"
+        "F_DM,SUB-10,SITE,Baseline,007,45.0,,999,Initial correction\n",
         encoding="utf-8",
     )
 
@@ -298,6 +303,7 @@ def test_csv_to_records_and_import_records_csv_work_without_pandas(
     assert parsed == [
         {
             "recordId": 999,
+            "reasonForChange": "Initial correction",
             "formKey": "F_DM",
             "subjectKey": "SUB-10",
             "siteName": "SITE",
@@ -635,3 +641,91 @@ async def test_nonfinite_floats_truefalse_bool_and_flattened_record_validation()
     await async_val.validate_record("STUDY", {"formKey": "F_VAL", "V_TXT": "ok", "V_TF": False})
     with pytest.raises(ValidationError):
         await async_val.validate_record("STUDY", {"formKey": "F_VAL", "V_TXT": 999})
+
+
+def test_register_subject_request_optional_identifiers_exclude_none() -> None:
+    """Req 6: RegisterSubjectRequest supports subjectKey, subjectOid, and siteId with exclude_none."""
+    from imednet.models.records import RegisterSubjectRequest
+    from imednet.models.sites import Site
+    from imednet.utils.enrollment import (
+        normalize_subject_registration_inputs,
+        validate_subject_registration_sites,
+    )
+
+    req_minimal = RegisterSubjectRequest(formKey="F_DM", siteName="SITE")
+    dumped_min = req_minimal.model_dump(by_alias=True)
+    assert dumped_min == {"formKey": "F_DM", "siteName": "SITE", "data": {}}
+    assert "subjectKey" not in dumped_min
+    assert "subjectOid" not in dumped_min
+    assert "siteId" not in dumped_min
+
+    req_by_site_id = RegisterSubjectRequest(
+        formKey="F_DM",
+        siteId=101,
+        subjectKey="SUB-500",
+        subjectOid="OID-500",
+        data={"V_AGE": 33},
+    )
+    dumped_site_id = req_by_site_id.model_dump(by_alias=True)
+    assert dumped_site_id == {
+        "formKey": "F_DM",
+        "siteId": 101,
+        "subjectKey": "SUB-500",
+        "subjectOid": "OID-500",
+        "data": {"V_AGE": 33},
+    }
+    assert "siteName" not in dumped_site_id
+
+    pairs = normalize_subject_registration_inputs([req_by_site_id])
+    assert pairs[0][0] is req_by_site_id
+    assert pairs[0][1].model_dump(by_alias=True) == dumped_site_id
+
+    sites = [Site(studyKey="STUDY", siteId=101, siteName="SITE", siteEnrollmentStatus="Active")]
+    validate_subject_registration_sites(pairs, sites)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_without_schema_loads_study_datadict_in_endpoint_and_import_csv(
+    tmp_path: Path,
+) -> None:
+    """Req 5: dry_run=True without schema loads Study Data Dictionary via load_from_api."""
+    sdk, _state, captured = _make_sim_sdk()
+
+    bad_form_summary = sdk.records.create_batch(
+        "STUDY",
+        [{"formKey": "NO_SUCH_FORM", "subjectKey": "SUB1", "data": {"V_AGE": 30}}],
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert bad_form_summary.dry_run is True
+    assert bad_form_summary.validation_report is not None
+    assert bad_form_summary.validation_report.is_valid is False
+    assert any("NO_SUCH_FORM" in e.message for e in bad_form_summary.validation_report.errors)
+    assert not any(r.method == "POST" for r in captured)
+
+    bad_var_csv = tmp_path / "bad_var.csv"
+    bad_var_csv.write_text(
+        "formKey,subjectKey,siteName,UNKNOWN_VAR\nF_DM,SUB1,SITE,99\n",
+        encoding="utf-8",
+    )
+    csv_summary = import_records_csv(
+        sdk,
+        "STUDY",
+        bad_var_csv,
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert csv_summary.validation_report is not None
+    assert csv_summary.validation_report.is_valid is False
+    assert any("UNKNOWN_VAR" in e.message for e in csv_summary.validation_report.errors)
+
+    async_sdk, _astate, async_captured = _make_async_sim_sdk()
+    async_summary = await async_sdk.records.create_batch(
+        "STUDY",
+        [{"formKey": "F_DM", "subjectKey": "SUB1", "data": {"NON_EXISTENT": 1}}],
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert async_summary.validation_report is not None
+    assert async_summary.validation_report.is_valid is False
+    assert not any(r.method == "POST" for r in async_captured)

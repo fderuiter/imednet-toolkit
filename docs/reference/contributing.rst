@@ -5,13 +5,11 @@ This guide summarizes how to set up your environment, validate changes, and subm
 pull requests. Please review our `Code of Conduct <https://github.com/fderuiter/imednet-toolkit/blob/main/CODE_OF_CONDUCT.md>`__ and
 see `CONTRIBUTING.md <https://github.com/fderuiter/imednet-toolkit/blob/main/CONTRIBUTING.md>`__ for complete details.
 
-.. toctree::
-   :maxdepth: 1
-   :caption: Contributor Guides
+Related contributor references:
 
-   issue_management
-   project_standards
-   triage_playbook
+* :doc:`issue_management`
+* :doc:`project_standards`
+* :doc:`triage_playbook`
 
 Developer Environment Setup
 ---------------------------
@@ -95,7 +93,8 @@ Symbols removed from the public API follow this process:
 
 1. Issue a ``DeprecationWarning`` via :func:`warnings.warn` with ``stacklevel=2`` for
    at least one minor release before removal.
-2. Document the migration path in ``CHANGELOG.md`` under a **Deprecated** heading.
+2. Document the migration path in the affected package's ``CHANGELOG.md`` (published in
+   :doc:`changelogs/index`) under a **Deprecated** heading.
 3. Remove the symbol in the next major version bump only.
 
 Internal modules

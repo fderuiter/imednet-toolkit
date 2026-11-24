@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any, overload
+from typing import Any
 
 from pydantic import Field, model_validator
 
@@ -29,46 +29,39 @@ class Visit(ImednetBaseModel):
     visit_date_question: str | None = Field(default=None, alias="visitDateQuestion")
     last_updated: str | None = Field(default=None, alias="lastUpdated")
 
-    @overload
     def __init__(
         self,
         *,
         visit_id: int | None = None,
-        study_key: str | None = None,
-        interval_id: int | None = None,
-        interval_name: str | None = None,
-        subject_id: int | None = None,
-        subject_key: str | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-        due_date: str | None = None,
-        visit_date: str | None = None,
-        deleted: bool | None = None,
-        date_created: str | None = None,
-        date_modified: str | None = None,
-        visit_date_form: str | None = None,
-        visit_date_question: str | None = None,
-        last_updated: str | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
         visitId: int | None = None,
+        study_key: str | None = None,
         studyKey: str | None = None,
+        interval_id: int | None = None,
         intervalId: int | None = None,
+        interval_name: str | None = None,
         intervalName: str | None = None,
+        subject_id: int | None = None,
         subjectId: int | None = None,
+        subject_key: str | None = None,
         subjectKey: str | None = None,
+        start_date: str | None = None,
         startDate: str | None = None,
+        end_date: str | None = None,
         endDate: str | None = None,
+        due_date: str | None = None,
         dueDate: str | None = None,
+        visit_date: str | None = None,
         visitDate: str | None = None,
         deleted: bool | None = None,
+        date_created: str | None = None,
         dateCreated: str | None = None,
+        date_modified: str | None = None,
         dateModified: str | None = None,
+        visit_date_form: str | None = None,
         visitDateForm: str | None = None,
+        visit_date_question: str | None = None,
         visitDateQuestion: str | None = None,
+        last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
     @model_validator(mode="before")

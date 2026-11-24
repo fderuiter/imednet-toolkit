@@ -24,7 +24,7 @@ from ..utils.args import (
     resolve_output_format,
     resolve_study_key,
 )
-from ..utils.export import export_list_to_file
+from ..utils.export import export_list_to_file, resolve_records_export_target
 from ..utils.write_helpers import (
     add_write_common_args,
     coerce_batch_summary,
@@ -42,13 +42,33 @@ from ..utils.write_helpers import (
 )
 
 
-def _assemble_create_records_payload(
+def _has_update_target_selector(args: argparse.Namespace) -> bool:
+    """Return True if at least one record update selector flag is set on *args*."""
+    return bool(
+        getattr(args, "record_id", None) is not None
+        or getattr(args, "record_oid", None)
+        or getattr(args, "visit_id", None) is not None
+        or getattr(args, "interval_name", None)
+        or getattr(args, "interval_id", None) is not None
+    )
+
+
+def _has_update_mutation_input(args: argparse.Namespace) -> bool:
+    """Return True if at least one record mutation flag is provided on *args*."""
+    return bool(
+        getattr(args, "data_pairs", None)
+        or getattr(args, "record_status", None)
+        or getattr(args, "reason_for_change", None)
+    )
+
+
+def _assemble_records_payload(
     args: argparse.Namespace,
     *,
     schema: Any = None,
     is_update: bool = False,
 ) -> list[dict[str, Any]]:
-    """Build record creation/update payload(s) from ``--file``, ``--json``, or inline flags."""
+    """Build record create/update payload(s) from ``--file``, ``--json``, or inline flags."""
     if args.input_file and args.json_payload:
         raise ValueError("Cannot combine --file and --json.")
 
@@ -59,6 +79,13 @@ def _assemble_create_records_payload(
         raise ValueError("Cannot combine --create-only with --record-id or --record-oid.")
 
     study_key = getattr(args, "study_key", None)
+    inline_data = parse_key_value_pairs(
+        args.data_pairs,
+        schema=schema,
+        form_key=args.form_key,
+        form_id=args.form_id,
+        study_key=study_key,
+    )
     records: list[dict[str, Any]]
     if args.input_file:
         records = load_records_from_path_or_stdin(
@@ -75,26 +102,33 @@ def _assemble_create_records_payload(
             create_only=create_only,
             study_key=study_key,
         )
+    elif is_update:
+        if not _has_update_target_selector(args):
+            raise ValueError(
+                "Provide --file, --json, or a target selector (--record-id, --record-oid, "
+                "--visit-id, --interval-name, or --interval-id) to update a record."
+            )
+        if not _has_update_mutation_input(args):
+            raise ValueError(
+                "Provide -d/--data, --record-status, or --reason-for-change to update a record."
+            )
+        single_update: dict[str, Any] = {}
+        if inline_data:
+            single_update["data"] = dict(inline_data)
+        records = [single_update]
     else:
         has_target = bool(
             args.form_key or args.form_id is not None or record_id is not None or record_oid
         )
         if not has_target:
-            if is_update:
-                raise ValueError(
-                    "Provide --file, --json, --record-id, --record-oid, or --form-key / --form-id to update a record."
-                )
             raise ValueError(
                 "Provide --file, --json, or at least --form-key / --form-id / --record-id / --record-oid to create a record."
             )
-        inline_data = parse_key_value_pairs(
-            args.data_pairs,
-            schema=schema,
-            form_key=args.form_key,
-            form_id=args.form_id,
-            study_key=study_key,
-        )
         records = [{"data": dict(inline_data)}]
+
+    visit_id = getattr(args, "visit_id", None)
+    record_status = getattr(args, "record_status", None)
+    reason_for_change = getattr(args, "reason_for_change", None)
 
     resolved: list[dict[str, Any]] = []
     for item in records:
@@ -106,8 +140,10 @@ def _assemble_create_records_payload(
                 and rec.get("record_id") is None
             ):
                 rec["recordId"] = record_id
-            if record_oid and not (rec.get("recordOid") or rec.get("record_oid")):
+            elif record_oid and not (rec.get("recordOid") or rec.get("record_oid")):
                 rec["recordOid"] = record_oid
+            if visit_id is not None and rec.get("visitId") is None and rec.get("visit_id") is None:
+                rec["visitId"] = visit_id
         else:
             rec.pop("recordId", None)
             rec.pop("record_id", None)
@@ -144,18 +180,31 @@ def _assemble_create_records_payload(
         ):
             rec["intervalId"] = args.interval_id
 
+        if record_status:
+            rec["recordStatus"] = record_status
+        if reason_for_change:
+            rec["reasonForChange"] = reason_for_change
+
         if args.data_pairs and (args.input_file or args.json_payload):
-            rec_fk = str(rec.get("formKey") or rec.get("form_key") or "") or args.form_key
-            raw_rec_fid = rec.get("formId") if rec.get("formId") is not None else rec.get("form_id")
-            rec_fid = int(raw_rec_fid) if isinstance(raw_rec_fid, int) else args.form_id
+            rec_fk = args.form_key or rec.get("formKey") or rec.get("form_key")
+            raw_rec_fid = (
+                args.form_id
+                if args.form_id is not None
+                else (rec.get("formId") if rec.get("formId") is not None else rec.get("form_id"))
+            )
+            rec_fid = (
+                int(raw_rec_fid)
+                if isinstance(raw_rec_fid, int) and not isinstance(raw_rec_fid, bool)
+                else None
+            )
             row_inline_data = parse_key_value_pairs(
                 args.data_pairs,
                 schema=schema,
-                form_key=rec_fk,
+                form_key=str(rec_fk) if rec_fk else None,
                 form_id=rec_fid,
                 study_key=study_key,
             )
-            existing_data = dict(rec.get("data") or {})
+            existing_data = dict(rec.get("data") or rec.get("recordData") or {})
             existing_data.update(row_inline_data)
             rec["data"] = existing_data
 
@@ -163,6 +212,15 @@ def _assemble_create_records_payload(
 
     ensure_no_masked_sentinel(resolved)
     return resolved
+
+
+def _assemble_create_records_payload(
+    args: argparse.Namespace,
+    *,
+    schema: Any = None,
+) -> list[dict[str, Any]]:
+    """Build record creation payload(s) from ``--file``, ``--json``, or inline flags."""
+    return _assemble_records_payload(args, schema=schema, is_update=False)
 
 
 def _record_view_model(r: Any) -> dict[str, Any]:
@@ -186,7 +244,23 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     list_parser.add_argument(
         "-o",
         "--output",
-        help="Deprecated: save records to a file (json or csv); prefer --format json or 'imednet export'.",
+        help=(
+            "Deprecated: save records to a file (json, csv, or a .json/.csv path); "
+            "prefer --format json or 'imednet export'."
+        ),
+    )
+    list_parser.add_argument(
+        "--mask-phi",
+        dest="mask_phi",
+        action="store_true",
+        default=True,
+        help="Mask sensitive Subject PHI fields with ***MASKED*** (enabled by default).",
+    )
+    list_parser.add_argument(
+        "--no-mask-phi",
+        dest="mask_phi",
+        action="store_false",
+        help="Disable default PHI masking for authorized raw exports.",
     )
     add_list_query_args(
         list_parser,
@@ -200,8 +274,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if output and output_format == "json":
             print_error("Choose --format json for stdout or --output for a file.")
             sys.exit(1)
-        if output and output.lower() not in {"json", "csv"}:
-            print_error("Invalid output format. Use 'json' or 'csv'.")
+        if output is not None and resolve_records_export_target(output, "records") is None:
+            print_error(
+                "Invalid output format. Use 'json' or 'csv'. "
+                "Explicit '.json' and '.csv' file paths are also supported."
+            )
             sys.exit(1)
         if output:
             print_error(
@@ -221,6 +298,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         limit: int | None = None,
         fetch_all: bool = False,
         no_interactive: bool = False,
+        mask_phi: bool = True,
         _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
         resolved_format = resolve_output_format(output_format)
@@ -251,7 +329,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if resolved_format == "json":
             display_list(records, "records", output_format="json")
         elif output:
-            export_list_to_file(records, "records", output.lower())
+            export_list_to_file(
+                records,
+                "records",
+                output,
+                study_key=study_key,
+                mask_phi=mask_phi,
+            )
         else:
             view_models = [_record_view_model(r) for r in records]
 
@@ -301,6 +385,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 limit=args.limit,
                 fetch_all=args.fetch_all,
                 no_interactive=no_interactive,
+                mask_phi=bool(getattr(args, "mask_phi", True)),
                 _prepared_query=prepared,
             )
 
@@ -328,20 +413,26 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             default=None,
             help="Inline JSON object or array of record payloads.",
         )
-        target_parser.add_argument(
-            "--record-id",
-            type=int,
-            default=None,
-            help="Target record ID (recordId) to update.",
-        )
-        target_parser.add_argument(
-            "--record-oid",
-            default=None,
-            help="Target record OID (recordOid) to update.",
-        )
         target_parser.add_argument("--form-key", default=None, help="Target form key (formKey).")
         target_parser.add_argument(
             "--form-id", type=int, default=None, help="Target form ID (formId)."
+        )
+        target_parser.add_argument(
+            "--record-id", type=int, default=None, help="Target record ID (recordId)."
+        )
+        target_parser.add_argument(
+            "--record-oid", default=None, help="Target record OID (recordOid)."
+        )
+        target_parser.add_argument(
+            "--visit-id", type=int, default=None, help="Target visit ID (visitId)."
+        )
+        target_parser.add_argument(
+            "--record-status", default=None, help="Target record status (recordStatus)."
+        )
+        target_parser.add_argument(
+            "--reason-for-change",
+            default=None,
+            help="Audit reason for modifying an existing record (reasonForChange).",
         )
         target_parser.add_argument(
             "--subject-key", default=None, help="Target subject key (subjectKey)."
@@ -392,8 +483,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             create_only = bool(getattr(args, "create_only", False))
             payload: list[dict[str, Any]] = []
             try:
-                resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
-                payload = _assemble_create_records_payload(
+                resolved_schema = resolve_cli_schema(
+                    sdk,
+                    args.study_key,
+                    args.schema_source,
+                    dry_run=args.dry_run,
+                )
+                payload = _assemble_records_payload(
                     args,
                     schema=resolved_schema,
                     is_update=is_update,
@@ -470,25 +566,30 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 except ValueError as exc:
                     print_error(f"Error: {exc}")
                     sys.exit(1)
-            if (
-                not args.input_file
-                and not args.json_payload
-                and not args.form_key
-                and args.form_id is None
-                and args.record_id is None
-                and not args.record_oid
-            ):
+            if not args.input_file and not args.json_payload:
                 if is_update:
-                    print_error(
-                        "Error: Provide --file, --json, --record-id, --record-oid, "
-                        "or --form-key / --form-id to update records."
-                    )
-                else:
+                    if not _has_update_target_selector(args):
+                        print_error(
+                            "Error: Provide --file, --json, or a target selector (--record-id, "
+                            "--record-oid, --visit-id, --interval-name, or --interval-id) to update records."
+                        )
+                        sys.exit(1)
+                    if not _has_update_mutation_input(args):
+                        print_error(
+                            "Error: Provide -d/--data, --record-status, or --reason-for-change to update records."
+                        )
+                        sys.exit(1)
+                elif (
+                    not args.form_key
+                    and args.form_id is None
+                    and args.record_id is None
+                    and not args.record_oid
+                ):
                     print_error(
                         "Error: Provide --file, --json, or at least --form-key / --form-id "
                         "/ --record-id / --record-oid to create records."
                     )
-                sys.exit(1)
+                    sys.exit(1)
             with simulation_mode_context(bool(getattr(args, "simulation", False))):
                 _records_write_cmd(args)
 
@@ -543,7 +644,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         no_interactive = getattr(args, "no_interactive", False)
         payload: list[dict[str, Any]] = []
         try:
-            resolved_schema = resolve_cli_schema(sdk, args.study_key, args.schema_source)
+            resolved_schema = resolve_cli_schema(
+                sdk,
+                args.study_key,
+                args.schema_source,
+                dry_run=args.dry_run,
+            )
             email_notify = parse_email_notify(args.email_notify)
             payload = load_records_from_path_or_stdin(
                 args.file,

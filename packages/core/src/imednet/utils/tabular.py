@@ -32,9 +32,6 @@ _READ_ONLY_RECORD_COLUMNS: frozenset[str] = frozenset(
         "record_type",
         "recordType",
         "RECORD_TYPE",
-        "record_status",
-        "recordStatus",
-        "RECORD_STATUS",
         "deleted",
         "DELETED",
         "date_created",
@@ -46,9 +43,6 @@ _READ_ONLY_RECORD_COLUMNS: frozenset[str] = frozenset(
         "last_updated",
         "lastUpdated",
         "LAST_UPDATED",
-        "visit_id",
-        "visitId",
-        "VISIT_ID",
         "VISITNUM",
         "parent_record_id",
         "parentRecordId",
@@ -77,6 +71,15 @@ _IDENTIFIER_COLUMNS: frozenset[str] = frozenset(
         "record_oid",
         "recordOid",
         "RECORD_OID",
+        "visit_id",
+        "visitId",
+        "VISIT_ID",
+        "record_status",
+        "recordStatus",
+        "RECORD_STATUS",
+        "reason_for_change",
+        "reasonForChange",
+        "REASON_FOR_CHANGE",
         "form_key",
         "formKey",
         "FORM_KEY",
@@ -109,13 +112,32 @@ _IDENTIFIER_COLUMNS: frozenset[str] = frozenset(
 )
 
 _RECORD_ID_KEYS: frozenset[str] = frozenset(
-    {"record_id", "recordId", "RECORD_ID", "record_oid", "recordOid", "RECORD_OID"}
+    {
+        "record_id",
+        "recordId",
+        "RECORD_ID",
+        "record_oid",
+        "recordOid",
+        "RECORD_OID",
+        "visit_id",
+        "visitId",
+        "VISIT_ID",
+        "record_status",
+        "recordStatus",
+        "RECORD_STATUS",
+        "reason_for_change",
+        "reasonForChange",
+        "REASON_FOR_CHANGE",
+    }
 )
 
 _CANONICAL_WRITE_ENVELOPE_KEYS: frozenset[str] = frozenset(
     {
         "recordId",
         "recordOid",
+        "visitId",
+        "recordStatus",
+        "reasonForChange",
         "formKey",
         "formId",
         "subjectKey",
@@ -135,6 +157,9 @@ _SIMULATION_PASSTHROUGH_KEYS: frozenset[str] = frozenset(
         "record_status",
         "reasonForChange",
         "reason_for_change",
+        "keywords",
+        "subjectStatus",
+        "subject_status",
         "user",
         "role",
         "dateModified",
@@ -479,7 +504,7 @@ def normalize_tabular_row(
 
     envelope: JsonDict = {}
 
-    # 2. Map identifier columns according to REST create/update-records payload contract
+    # 2. Map identifier and update-envelope columns according to REST create-records contract
     if not create_only:
         record_id_pair = _first_present("recordId", "record_id", "RECORD_ID")
         if record_id_pair is not None:
@@ -489,6 +514,17 @@ def normalize_tabular_row(
         record_oid_pair = _first_present("recordOid", "record_oid", "RECORD_OID")
         if record_oid_pair is not None:
             envelope["recordOid"] = _coerce_str_identifier(record_oid_pair[1])
+        visit_id_pair = _first_present("visitId", "visit_id", "VISIT_ID")
+        if visit_id_pair is not None:
+            envelope["visitId"] = _coerce_int_identifier(
+                visit_id_pair[1], row_index=row_index, column_name=visit_id_pair[0]
+            )
+        rec_status_pair = _first_present("recordStatus", "record_status", "RECORD_STATUS")
+        if rec_status_pair is not None:
+            envelope["recordStatus"] = _coerce_str_identifier(rec_status_pair[1])
+        reason_pair = _first_present("reasonForChange", "reason_for_change", "REASON_FOR_CHANGE")
+        if reason_pair is not None:
+            envelope["reasonForChange"] = _coerce_str_identifier(reason_pair[1])
 
     form_key_pair = _first_present("formKey", "form_key", "FORM_KEY")
     form_id_pair = _first_present("formId", "form_id", "FORM_ID")

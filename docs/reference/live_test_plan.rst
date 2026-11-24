@@ -9,28 +9,37 @@ so failures are easy to diagnose.
 Endpoints
 ---------
 
-For every endpoint the ``list`` and ``get`` operations should be verified:
+Live endpoint tests reflect each EDC resource's supported operations:
 
-- ``StudiesEndpoint``
-- ``SitesEndpoint``
-- ``SubjectsEndpoint``
-- ``RecordsEndpoint``
-- ``IntervalsEndpoint``
-- ``VisitsEndpoint``
-- ``VariablesEndpoint``
-- ``FormsEndpoint``
-- ``QueriesEndpoint``
-- ``RecordRevisionsEndpoint``
-- ``UsersEndpoint``
-- ``JobsEndpoint``
-- ``CodingsEndpoint``
-- ``JobsEndpoint.get`` should also be validated independently using a known batch ID.
-- ``RecordsEndpoint.create`` should be exercised to confirm record submission and that
-  ``JobsEndpoint.get`` retrieves the resulting job status.
+**List-and-get endpoints** (verify both ``list`` and ``get``):
 
-Every synchronous test should have an asynchronous counterpart using
-``AsyncImednetSDK``. For example, ``AsyncImednetSDK.studies.list()`` mirrors
-``ImednetSDK.studies.list()`` and should verify the same behaviors.
+- ``StudiesEndpoint`` (``studies.list()`` and ``studies.get(None, study_key)``)
+- ``SitesEndpoint`` (``sites.list`` and ``sites.get``)
+- ``SubjectsEndpoint`` (``subjects.list`` and ``subjects.get``)
+- ``RecordsEndpoint`` (``records.list`` and ``records.get``)
+- ``FormsEndpoint`` (``forms.list`` and ``forms.get``)
+- ``IntervalsEndpoint`` (``intervals.list`` and ``intervals.get``)
+- ``VariablesEndpoint`` (``variables.list`` and ``variables.get``)
+- ``RecordRevisionsEndpoint`` (``record_revisions.list`` and ``record_revisions.get``)
+
+**List-only endpoints** (verify ``list`` and confirm no ``get`` method is exposed):
+
+- ``VisitsEndpoint`` (``visits.list``)
+- ``QueriesEndpoint`` (``queries.list``)
+- ``UsersEndpoint`` (``users.list``)
+- ``CodingsEndpoint`` (``codings.list``)
+
+**Job status and Record submission endpoints**:
+
+- ``JobsEndpoint`` does not expose ``list``; validate ``JobsEndpoint.get(study_key, batch_id)`` independently using a known batch ID (``generated_batch_id``), alongside ``JobsEndpoint.poll`` / ``poll_many`` helpers.
+- ``RecordsEndpoint.create`` (when ``IMEDNET_ALLOW_MUTATION=1``) exercises ``register``, ``scheduled``, and ``new`` Record payloads and confirms ``JobsEndpoint.get`` retrieves the resulting ``Job`` status.
+
+Study-scoped synchronous tests have asynchronous counterparts on
+``AsyncImednetSDK`` (while ``AsyncStudiesEndpoint`` also provides ``list`` and
+``get``). Synchronous ``list(...)`` methods return an ``Iterator`` whereas
+``AsyncImednetSDK`` ``list(...)`` methods return an ``AsyncIterator`` consumed with
+``async for``, and ``await async_sdk.<endpoint>.get(...)`` awaits single-entity
+lookups on list-and-get endpoints.
 
 SDK Utilities
 -------------
@@ -78,20 +87,21 @@ non-destructive calls. Each bullet corresponds to a separate live test.
 CLI Commands
 ------------
 
-Live tests should execute the CLI via ``typer.testing.CliRunner``.
-Run each command with minimal arguments and verify a successful exit code:
+Live tests execute the ``argparse``-based CLI entrypoint (``imednet.cli.app``) via the
+in-process ``CliRunner`` helper in ``tests/live/test_cli_live.py``, capturing ``stdout``,
+``stderr``, and ``SystemExit`` codes. Run each command and verify a zero exit code:
 
 - ``imednet studies list``
 - ``imednet sites list <STUDY_KEY>``
 - ``imednet subjects list <STUDY_KEY>``
 - ``imednet records list <STUDY_KEY>``
 - ``imednet jobs status <STUDY_KEY> <BATCH_ID>``
-- ``imednet jobs wait <STUDY_KEY> <BATCH_ID>``
-- ``imednet export parquet <STUDY_KEY> tmp.parquet``
-- ``imednet export csv <STUDY_KEY> tmp.csv``
-- ``imednet export excel <STUDY_KEY> tmp.xlsx``
-- ``imednet export json <STUDY_KEY> tmp.json``
-- ``imednet export sql <STUDY_KEY> TABLE sqlite:///test.db``
+- ``imednet jobs wait <STUDY_KEY> <BATCH_ID> --interval 1 --timeout 60``
+- ``imednet export parquet <STUDY_KEY> data.parquet``
+- ``imednet export csv <STUDY_KEY> data.csv``
+- ``imednet export excel <STUDY_KEY> data.xlsx``
+- ``imednet export json <STUDY_KEY> data.json``
+- ``imednet export sql <STUDY_KEY> table sqlite:///test.db --single-table``
 - ``imednet workflows extract-records <STUDY_KEY>``
 
 Integrations
