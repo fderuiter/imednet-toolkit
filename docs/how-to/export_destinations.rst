@@ -25,19 +25,28 @@ Destination decision matrix
      - Operational constraints
    * - MongoDB
      - Application-facing document reads, schema-preserving archival
-     - Keeps nested ``record_data`` as document fields and stores record metadata
-       envelope fields (study/form/visit/subject)
-     - Requires ``pymongo`` and a MongoDB URI. Graph traversal and relationship
-       analytics are weaker than a native graph store.
+     - Keeps nested ``record_data`` as document fields and stores ``Record`` metadata
+       envelope fields (``Study``/``Form``/``Visit``/``Subject`` aligned to
+       ``naming_convention``) or emits flat CDISC SDTM domain documents when
+       ``as_sdtm=True``. Encodes pure ``date`` scalars as ISO-8601 strings, preserves
+       ``datetime`` values natively, and encodes ``Decimal`` values as ``bson.Decimal128``.
+     - Requires ``pymongo`` and a MongoDB URI. Idempotent upserts key ``_id`` on
+       ``<study_key>/<record_id>`` (falling back to ``<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>``,
+       with ``*SEQ`` defaulting to ``1``, when ``as_sdtm=True`` and ``record_id`` is absent).
+       Graph traversal and relationship analytics are weaker than a native graph store.
        See :class:`~imednet_sinks.document.MongoDbExportSink` and :func:`~imednet_sinks.document.export_to_mongodb`.
    * - Neo4j
      - Relationship-heavy exploration and lineage queries
      - Preserves the hierarchy ``Study → Subject → Visit → Record`` for scheduled
-       visits and links unscheduled ``Record`` nodes directly via
+       ``Visit`` items and normalizes non-positive ``visit_id <= 0`` markers to ``None``
+       so unscheduled ``Record`` nodes link directly via
        ``(:Subject)-[:HAS_RECORD]->(:Record)``, with ``record_data`` attached to
-       ``Record`` nodes
+       ``Record`` nodes (or flat CDISC SDTM domain properties when ``as_sdtm=True``)
      - Requires ``neo4j`` driver and Bolt/Neo4j endpoint credentials.
-       Idempotent mode uses ``MERGE`` for safe re-runs.
+       Idempotent mode uses ``MERGE`` keyed on ``(record_id, study_key)`` (aligned to
+       ``naming_convention``) or ``(STUDYID, DOMAIN, USUBJID, *SEQ)`` when
+       ``as_sdtm=True`` (``(STUDYID, DOMAIN, USUBJID)`` for domains without ``*SEQ``
+       such as ``DM``).
        See :class:`~imednet_sinks.graph.Neo4jExportSink` and :func:`~imednet_sinks.graph.export_to_neo4j`.
    * - Snowflake
      - Warehouse-native analytics and bulk loading at scale
@@ -129,14 +138,19 @@ Snowflake (warehouse-native export):
 Incremental streaming checkpoints
 ---------------------------------
 
-Warehouse, document, graph, and tabular exports share eight streaming checkpoint
-and filter options on :class:`~imednet.spi.sink_base.SinkConfig`,
-:func:`~imednet.spi.sink_base.run_streaming_export`, tabular helpers
+Warehouse, document, graph, and all 10 tabular exporters in :mod:`imednet.integrations`
 (:func:`~imednet.integrations.export_to_parquet`,
 :func:`~imednet.integrations.export_to_csv`,
+:func:`~imednet.integrations.export_to_excel`,
+:func:`~imednet.integrations.export_to_json`,
+:func:`~imednet.integrations.export_to_sql`,
+:func:`~imednet.integrations.export_to_sql_by_form`,
+:func:`~imednet.integrations.export_to_long_sql`,
 :func:`~imednet.integrations.export_to_duckdb`,
-:func:`~imednet.integrations.export_to_duckdb_by_form`,
-:func:`~imednet.integrations.export_to_hive_parquet`), and
+:func:`~imednet.integrations.export_to_duckdb_by_form`, and
+:func:`~imednet.integrations.export_to_hive_parquet`) share eight streaming checkpoint
+and filter options on :class:`~imednet.spi.sink_base.SinkConfig`,
+:func:`~imednet.spi.sink_base.run_streaming_export`, and
 ``ImednetExportOperator``:
 
 * ``incremental`` (``bool``) – Enable transactional high-water mark reads and commits.
@@ -148,9 +162,45 @@ and filter options on :class:`~imednet.spi.sink_base.SinkConfig`,
 * ``record_data_filter`` (``str | None``) – ``Variable`` payload filter expression (``recordDataFilter``).
 * ``include_deleted`` (``bool``) – Include voided (``deleted=True``) ``Record`` items directly in batches instead of reconciling deletes separately.
 
+When ``incremental=True`` (or ``modified_since`` / ``state_provider`` is supplied),
+``idempotent=True``, and ``include_deleted=False``, all 10 tabular helpers perform
+keyed ``recordId`` (``recordId``, ``record_id``, or ``RECORD_ID``) upserts and prune
+newly voided (``deleted=True``) ``Record`` items without duplicating history:
+
+* **CSV and Parquet** (:func:`~imednet.integrations.export_to_csv`,
+  :func:`~imednet.integrations.export_to_parquet`): stage incoming batches and voided
+  IDs via ``reconcile_deleted``, deduplicate deltas by canonical ``recordId``, unify
+  columns or Arrow schemas while streaming non-superseded rows to a ``.tmp`` file, and
+  atomically replace the destination file on ``flush()``.
+* **Excel and JSON** (:func:`~imednet.integrations.export_to_excel`,
+  :func:`~imednet.integrations.export_to_json`): deduplicate delta rows by ``recordId``,
+  prune superseded and ``deleted=True`` ``Record`` entries across Excel workbooks, flat
+  JSON arrays, and hierarchical ``Subject → Visit → Form`` JSON archives
+  (``hierarchical=True``), and atomically rewrite the target file.
+* **SQL and DuckDB** (:func:`~imednet.integrations.export_to_sql`,
+  :func:`~imednet.integrations.export_to_sql_by_form`,
+  :func:`~imednet.integrations.export_to_long_sql`,
+  :func:`~imednet.integrations.export_to_duckdb`,
+  :func:`~imednet.integrations.export_to_duckdb_by_form`): delete superseded
+  ``recordId`` / ``record_id`` rows before appending updated batches (chunked
+  ``DELETE FROM ... WHERE ... IN (...)`` on SQLAlchemy targets; ``DELETE FROM`` plus
+  ``INSERT INTO ... BY NAME`` in DuckDB) and delete newly voided ``deleted=True``
+  ``Record`` IDs via ``reconcile_deleted``.
+* **Hive Parquet** (:func:`~imednet.integrations.export_to_hive_parquet`): write new
+  per-``Form`` partition Parquet files under ``study_key=<study>/form_key=<form>`` and
+  rewrite pre-existing partition Parquet files to prune superseded and ``deleted=True``
+  ``recordId`` rows before committing per-``Form`` checkpoints.
+
 State providers registered under ``imednet.state_providers`` (``default``, ``file``, and
-``airflow``) commit the updated watermark only after every batch and ``sink.flush()``
-complete cleanly. Below is a resumable ``run_streaming_export`` example using
+``airflow``) commit the updated watermark only after every batch, delete reconciliation,
+and ``sink.flush()`` complete cleanly. When ``quality_gate_enabled=True`` and
+:func:`~imednet.spi.sink_base.apply_quality_gate` drops low-readiness ``Record`` items,
+both :func:`~imednet.spi.sink_base.run_streaming_export` and multi-``Form`` tabular
+streaming cap the committed ``max_ts`` watermark at ``min_rejected_ts`` (selecting the
+highest exported ``Record`` timestamp ``<= min_rejected_ts``, or holding back watermark
+advancement when no exported timestamp precedes ``min_rejected_ts`` or any rejected
+``Record`` lacks a timestamp) so remediated ``Record`` items are re-evaluated on
+subsequent incremental runs. Below is a resumable ``run_streaming_export`` example using
 ``ExtractionStateLedger`` with ``mask_phi=True`` preserved by default:
 
 .. testcode::
@@ -220,9 +270,15 @@ mapper ingress **by default** (``mask_phi=True``):
   JSON, DuckDB, SQL, warehouse, document, and graph exports). Setting
   ``quality_gate_enabled=True`` (and optional ``min_schema_readiness_score``)
   on ``SnowflakeSinkConfig``, ``MongoDbSinkConfig``, ``Neo4jSinkConfig``, or
-  tabular exports runs ``apply_quality_gate`` before batch writes to drop
-  empty drafts or invalid ``Record`` items while retaining sparse ``Record``
-  payloads that omit optional ``Variable`` fields.
+  tabular exports runs :func:`~imednet.spi.sink_base.apply_quality_gate` before
+  batch writes to drop empty drafts or invalid ``Record`` items while retaining
+  sparse ``Record`` payloads that omit optional ``Variable`` fields across
+  warehouse, document, graph, and tabular targets. On incremental runs,
+  ``run_streaming_export`` and multi-``Form`` tabular streaming cap ``max_ts``
+  at ``min_rejected_ts`` whenever ``apply_quality_gate`` drops ``Record`` items
+  (or leave ``max_ts`` uncommitted when no exported timestamp is
+  ``<= min_rejected_ts`` or a rejected ``Record`` has no timestamp) so dropped
+  ``Record`` items are re-fetched after remediation.
 * **Study-specific rules**: Study-level ``StudyConfiguration(phiFields=[...])``
   rules normalize camelCase, PascalCase, uppercase acronyms, and ``snake_case``
   field names automatically across both ``document`` and ``tabular`` mapper

@@ -22,6 +22,7 @@ from imednet.utils.batch_coordinator import (
     _submit_records_batch_sync,
 )
 from imednet.utils.job_poller import JobProgressHandler
+from imednet.utils.record_filter_eval import RECORDS_FILTER_ATTRIBUTES
 from imednet.utils.tabular import normalize_records_input
 from imednet.utils.typing import RecordsInput
 from imednet.validation.cache import ValidationSchemaProtocol
@@ -69,27 +70,7 @@ class RecordsOperationDef:
             "recordDataFilter": "recordDataFilter",
         }
     )
-    FILTER_ATTRIBUTES = frozenset(
-        {
-            "intervalId",
-            "formId",
-            "formKey",
-            "siteId",
-            "recordId",
-            "recordOid",
-            "recordType",
-            "recordStatus",
-            "deleted",
-            "dateCreated",
-            "dateModified",
-            "lastUpdated",
-            "subjectId",
-            "subjectOid",
-            "subjectKey",
-            "visitId",
-            "parentRecordId",
-        }
-    )
+    FILTER_ATTRIBUTES = RECORDS_FILTER_ATTRIBUTES
 
     @execute_operation
     def create(

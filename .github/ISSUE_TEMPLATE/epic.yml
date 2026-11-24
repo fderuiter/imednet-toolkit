@@ -17,22 +17,37 @@ body:
         - auth
         - pagination
         - cli
-        - docs
-        - tests
-        - ci
-        - release
-        - workflows-plugin
-        - airflow-provider
-        - tui
-        - mcp
-        - datadict
+        - workflows
+        - airflow
         - records
         - mapping
         - standards
+        - dashboard
+        - review-workbench
         - terminology
         - governance
         - performance
+        - docs
+        - tests
         - testing
+        - ci
+        - release
+        - github
+    validations:
+      required: true
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected package(s)
+      options:
+        - multi-package
+        - core
+        - plugins-workflows
+        - plugins-sinks
+        - plugins-tui
+        - providers-airflow
+        - docs
+        - ci
     validations:
       required: true
   - type: dropdown

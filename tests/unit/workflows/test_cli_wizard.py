@@ -51,13 +51,32 @@ def run_cli_command(
     app_fn, args: list[str], stdin_input: str = "", *, tty_stdin: bool = True
 ) -> CliResult:
     """Invoke CLI entry point with redirected stdin, stdout, and stderr."""
-    from contextlib import redirect_stderr, redirect_stdout
+    import logging
+    from contextlib import nullcontext, redirect_stderr, redirect_stdout
 
     out = io.StringIO()
     err = io.StringIO()
     stdin_stream = _TTYStringIO(stdin_input) if tty_stdin else io.StringIO(stdin_input)
     exit_code = 0
-    with redirect_stdout(out), redirect_stderr(err), patch("sys.stdin", stdin_stream):
+    capture_manager = next(
+        (
+            getattr(handler, "capture_manager", None)
+            for handler in logging.getLogger().handlers
+            if getattr(handler, "capture_manager", None) is not None
+        ),
+        None,
+    )
+    suspend_ctx = (
+        capture_manager.global_and_fixture_disabled()
+        if capture_manager is not None
+        else nullcontext()
+    )
+    with (
+        suspend_ctx,
+        redirect_stdout(out),
+        redirect_stderr(err),
+        patch("sys.stdin", stdin_stream),
+    ):
         try:
             app_fn(args)
         except SystemExit as exc:
