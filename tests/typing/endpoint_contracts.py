@@ -249,6 +249,10 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.workflows, SyncWorkflowsNamespaceProtocol)
     assert_type(sdk.workflows.data_extraction.extract_records_by_criteria('S'), list[Record])
     assert_type(sdk.workflows.duckdb_centralizer.ingest_revisions('S'), int)
+    sdk.workflows.duckdb_centralizer.build_silver_view('S', include_deleted=True)
+    sdk.workflows.duckdb_centralizer.close()
+    with sdk.workflows.duckdb_centralizer as centralizer_ctx:
+        assert_type(centralizer_ctx.ingest_revisions('S'), int)
     assert_type(sdk.workflows.query_management.get_open_queries('S'), list[Query])
     assert_type(sdk.workflows.query_management.sync_queries_to_triage('S'), list[TriageItem])
     assert_type(sdk.workflows.record_mapper.dataframe('S'), pd.DataFrame)
