@@ -11,11 +11,13 @@ from imednet.spi.utils import (
     BatchSubmissionSummary,
     JobProgressHandler,
     RecordsInput,
+    extract_single_submitted_job,
     normalize_records_input,
     poll_facade_many_async,
     poll_facade_many_sync,
     poll_facade_single_async,
     poll_facade_single_sync,
+    validate_single_job_preflight,
 )
 from imednet.spi.validation import (
     AsyncSchemaValidator,
@@ -198,17 +200,27 @@ class RecordUpdateWorkflow:
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and return a batch summary."""
         self._ensure_sync_mode(
             "create_or_update_records_batch", "async_create_or_update_records_batch"
         )
+        effective_chunk_size = chunk_size or self._batch_size
         active_schema, is_offline = self._resolve_active_schema(schema)
         normalized = normalize_records_input(records_data, schema=active_schema)
+        if _single_job_method is not None:
+            validate_single_job_preflight(
+                normalized,
+                chunk_size=effective_chunk_size,
+                dry_run=dry_run,
+                method_name=_single_job_method[0],
+                batch_method_name=_single_job_method[1],
+            )
         if not is_offline:
             self._validate_form_key(study_key, normalized)
         sdk = cast("ImednetFacade", self._sdk)
-        coordinator = BatchCoordinator(chunk_size=chunk_size or self._batch_size, sdk=sdk)
+        coordinator = BatchCoordinator(chunk_size=effective_chunk_size, sdk=sdk)
 
         def _submit_chunk(chunk: list[dict[str, Any]]) -> Job:
             if email_notify is not None:
@@ -265,7 +277,7 @@ class RecordUpdateWorkflow:
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
-        """Submit records for creation or update and optionally wait for completion."""
+        """Submit a single-chunk record payload and return its Job."""
         self._ensure_sync_mode("create_or_update_records", "async_create_or_update_records")
         summary = self.create_or_update_records_batch(
             study_key=study_key,
@@ -278,10 +290,13 @@ class RecordUpdateWorkflow:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            _single_job_method=("create_or_update_records", "create_or_update_records_batch"),
         )
-        if summary.last_job is not None:
-            return summary.last_job
-        return Job.model_validate({"state": "COMPLETED"})
+        return extract_single_submitted_job(
+            summary,
+            method_name="create_or_update_records",
+            batch_method_name="create_or_update_records_batch",
+        )
 
     async def async_create_or_update_records_batch(
         self,
@@ -297,14 +312,24 @@ class RecordUpdateWorkflow:
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once, submit chunks, and return a batch summary."""
+        effective_chunk_size = chunk_size or self._batch_size
         active_schema, is_offline = self._resolve_active_schema(schema)
         normalized = normalize_records_input(records_data, schema=active_schema)
+        if _single_job_method is not None:
+            validate_single_job_preflight(
+                normalized,
+                chunk_size=effective_chunk_size,
+                dry_run=dry_run,
+                method_name=_single_job_method[0],
+                batch_method_name=_single_job_method[1],
+            )
         if not is_offline:
             await self._async_validate_form_key(study_key, normalized)
         sdk = cast("AsyncImednetFacade", self._sdk)
-        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size or self._batch_size, sdk=sdk)
+        coordinator = AsyncBatchCoordinator(chunk_size=effective_chunk_size, sdk=sdk)
 
         async def _submit_chunk_async(chunk: list[dict[str, Any]]) -> Job:
             if email_notify is not None:
@@ -373,10 +398,16 @@ class RecordUpdateWorkflow:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            _single_job_method=(
+                "async_create_or_update_records",
+                "async_create_or_update_records_batch",
+            ),
         )
-        if summary.last_job is not None:
-            return summary.last_job
-        return Job.model_validate({"state": "COMPLETED"})
+        return extract_single_submitted_job(
+            summary,
+            method_name="async_create_or_update_records",
+            batch_method_name="async_create_or_update_records_batch",
+        )
 
     def _build_record_payload(
         self,

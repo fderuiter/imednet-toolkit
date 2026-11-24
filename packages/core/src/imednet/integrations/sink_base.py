@@ -174,6 +174,15 @@ class StateProviderProtocol(Protocol):
         """Execute a checkpoint transaction committing only on clean exit."""
         ...
 
+    def batch_transaction(
+        self,
+        study_key: str,
+        stream_names: Sequence[str],
+        fallback_timestamp: datetime | None = None,
+    ) -> AbstractContextManager[dict[str, dict[str, Any]]]:
+        """Execute a batched checkpoint transaction across multiple streams in one study."""
+        ...
+
     def read_state(self) -> Any:
         """Read full ledger state."""
         ...

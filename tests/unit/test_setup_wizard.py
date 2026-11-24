@@ -108,7 +108,10 @@ def test_workspace_manifest_and_readme_include_tui() -> None:
     assert "imednet-tui" in locked_dep_names
 
     readme_content = (repo_root / "README.md").read_text(encoding="utf-8")
-    assert 'pip install "imednet[tui]"' in readme_content
+    assert "imednet-tui" in readme_content
+    assert "imednet[tui]" in readme_content
+    assert "./packages/plugins-tui" in readme_content
+    assert 'pip install "imednet[tui]"' not in readme_content
     assert readme_content.count("uv sync --locked --all-packages --all-extras") >= 2
     assert "uv sync --extra dev --extra docs" not in readme_content
     assert "uv sync --all-packages --extra dev --extra docs" not in readme_content

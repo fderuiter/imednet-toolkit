@@ -40,10 +40,12 @@ if TYPE_CHECKING:
         BatchCoordinator,
         BatchSubmissionSummary,
         chunk_records,
+        extract_single_submitted_job,
         poll_facade_many_async,
         poll_facade_many_sync,
         poll_facade_single_async,
         poll_facade_single_sync,
+        validate_single_job_preflight,
     )
     from imednet.utils.dates import (
         format_iso_datetime,
@@ -105,6 +107,8 @@ if TYPE_CHECKING:
         global_sensitivity_registry,
         mask_clinical_phi,
         sanitize_csv_formula,
+        sanitize_diagnostic_payload,
+        sanitize_diagnostic_text,
         validate_partition_key,
     )
     from imednet.utils.serialization import flatten
@@ -186,6 +190,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "extract_candidate_subject_key",
     ),
     "extract_sdk_security_key": ("imednet.core.context", "extract_sdk_security_key"),
+    "extract_single_submitted_job": (
+        "imednet.utils.batch_coordinator",
+        "extract_single_submitted_job",
+    ),
     "fetch_terminal_job_result": ("imednet.utils.job_poller", "fetch_terminal_job_result"),
     "filter_existing_subject_registrations": (
         "imednet.utils.enrollment",
@@ -250,6 +258,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     ),
     "sanitize_base_url": ("imednet.utils.url", "sanitize_base_url"),
     "sanitize_csv_formula": ("imednet.utils.security", "sanitize_csv_formula"),
+    "sanitize_diagnostic_payload": ("imednet.utils.security", "sanitize_diagnostic_payload"),
+    "sanitize_diagnostic_text": ("imednet.utils.security", "sanitize_diagnostic_text"),
     "sdk_governance_context": ("imednet.core.context", "sdk_governance_context"),
     "security_key_context": ("imednet.core.context", "security_key_context"),
     "set_base_url_context": ("imednet.core.context", "set_base_url_context"),
@@ -259,6 +269,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "validate_filter_key": ("imednet.utils.filters", "validate_filter_key"),
     "validate_partition_key": ("imednet.utils.security", "validate_partition_key"),
     "validate_path_segment": ("imednet.utils.url", "validate_path_segment"),
+    "validate_single_job_preflight": (
+        "imednet.utils.batch_coordinator",
+        "validate_single_job_preflight",
+    ),
     "validate_subject_registration_sites": (
         "imednet.utils.enrollment",
         "validate_subject_registration_sites",
@@ -329,6 +343,7 @@ __all__ = [
     "evaluate_job_state",
     "extract_candidate_subject_key",
     "extract_sdk_security_key",
+    "extract_single_submitted_job",
     "fetch_terminal_job_result",
     "filter_existing_subject_registrations",
     "flatten",
@@ -372,6 +387,8 @@ __all__ = [
     "resolve_study_configuration",
     "sanitize_base_url",
     "sanitize_csv_formula",
+    "sanitize_diagnostic_payload",
+    "sanitize_diagnostic_text",
     "sdk_governance_context",
     "security_key_context",
     "set_base_url_context",
@@ -381,5 +398,6 @@ __all__ = [
     "validate_filter_key",
     "validate_partition_key",
     "validate_path_segment",
+    "validate_single_job_preflight",
     "validate_subject_registration_sites",
 ]

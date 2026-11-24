@@ -22,6 +22,7 @@ from scripts.build_docs import (
 from scripts.validate_docs import (
     RETIRED_GITHUB_LABELS,
     WORKSPACE_PACKAGE_IDS,
+    _verify_api_reference_parity,
     _verify_core_html,
     _verify_pagination_html,
     _verify_sdk_html,
@@ -34,9 +35,12 @@ from scripts.validate_docs import (
     check_env_vars_documented,
     check_examples_index_parity,
     check_governance_and_issue_templates,
+    check_no_autodoc_typehints_dependency,
     check_no_duplicate_suppression,
     check_package_docs,
     check_packages_registered,
+    check_pypi_install_tags,
+    check_readme_github_pages_routes,
     check_release_please_parity,
     check_rendered_api_reference,
     check_sdtm_and_phi_parity,
@@ -477,6 +481,253 @@ def test_generate_api_reference_preserves_existing_docs_on_staging_failure(
         require_sphinx_tools("sphinx-apidoc", "sphinx-build")
 
 
+def _load_api_reference_ext():
+    """Load docs/_ext/api_reference.py directly for isolated helper testing."""
+    ext_path = Path(__file__).resolve().parents[2] / "docs" / "_ext" / "api_reference.py"
+    spec = importlib.util.spec_from_file_location("_test_api_reference_ext", ext_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_test_api_reference_ext"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_no_autodoc_typehints_dependency_check(tmp_path: Path) -> None:
+    """sphinx-autodoc-typehints is uninstalled and flagged if re-added to pyproject.toml or conf.py."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert importlib.util.find_spec("sphinx_autodoc_typehints") is None
+    assert check_no_autodoc_typehints_dependency(repo_root) is False
+
+    bad_root = tmp_path / "bad_pyproject"
+    (bad_root / "docs").mkdir(parents=True)
+    (bad_root / "pyproject.toml").write_text(
+        '[dependency-groups]\ndocs = ["sphinx>=8.0", "sphinx-autodoc-typehints>=2.0"]\n',
+        encoding="utf-8",
+    )
+    (bad_root / "docs" / "conf.py").write_text(
+        'extensions = ["sphinx.ext.autodoc"]\n', encoding="utf-8"
+    )
+    assert check_no_autodoc_typehints_dependency(bad_root) is True
+
+    bad_conf_root = tmp_path / "bad_conf"
+    (bad_conf_root / "docs").mkdir(parents=True)
+    (bad_conf_root / "pyproject.toml").write_text(
+        '[dependency-groups]\ndocs = ["sphinx>=8.0"]\n',
+        encoding="utf-8",
+    )
+    (bad_conf_root / "docs" / "conf.py").write_text(
+        'extensions = ["sphinx.ext.autodoc", "sphinx_autodoc_typehints"]\n',
+        encoding="utf-8",
+    )
+    assert check_no_autodoc_typehints_dependency(bad_conf_root) is True
+
+
+def test_api_reference_ast_type_checking_and_formatting_helpers() -> None:
+    """AST TYPE_CHECKING resolution, PEP 604 unions, TypeVar/ParamSpec, factories, and BaseModel.__init__ skipping."""
+    import imednet.plugins as plugins_mod
+    from imednet.cli.decorators import P
+    from imednet.utils.validators import T
+    from imednet_sinks.warehouse import SnowflakeSinkConfig
+
+    api_ext = _load_api_reference_ext()
+    conf = _load_docs_conf()
+
+    before_keys = set(plugins_mod.__dict__.keys())
+    ns = api_ext.resolve_module_type_checking_ns("imednet.plugins")
+    assert set(plugins_mod.__dict__.keys()) == before_keys
+    assert "Record" in ns
+
+    rendered_union = conf._format_rst_annotation(str | int | None)
+    assert rendered_union == "str | int | None"
+    assert "UnionType" not in rendered_union
+
+    assert conf._format_rst_annotation(P) == "P"
+    assert conf._format_rst_annotation(T) == "T"
+    assert conf._format_rst_annotation(list[T]) == "list[T]"
+
+    assert api_ext.format_factory_call(dict) == "dict()"
+    sample_lambda = lambda: ["default"]  # noqa: E731
+    assert api_ext.format_factory_call(sample_lambda) == "['default']"
+
+    import inspect
+
+    api_ext.prepare_dataclass_init_signature(SnowflakeSinkConfig)
+    sig = inspect.signature(SnowflakeSinkConfig.__init__)
+    sig_str = api_ext.format_clean_signature(sig)
+    assert "<factory>" not in sig_str
+    assert "extra: dict[str, Any] = dict()" in sig_str
+    assert "password: str = ..." in sig_str
+    assert "password: str = ''" not in sig_str
+
+    fake_app = SimpleNamespace(
+        env=SimpleNamespace(
+            temp_data={"autodoc:module": "imednet.models.records", "autodoc:class": "Record"}
+        )
+    )
+    assert (
+        conf._skip_non_canonical_or_internal(
+            fake_app, "class", "__init__", Record.__init__, False, SimpleNamespace()
+        )
+        is True
+    )
+
+
+def test_sphinx_html_renders_overloads_enums_dataclasses_typeddicts_protocols_and_models(
+    tmp_path: Path,
+) -> None:
+    """Strict Sphinx HTML build renders overloads, Enums, dataclasses, TypedDicts, Protocols, and BaseModels."""
+    repo_root = Path(__file__).resolve().parents[2]
+    src_dir = tmp_path / "docs"
+    api_dir = src_dir / "reference" / "api"
+    api_dir.mkdir(parents=True)
+    html_dir = tmp_path / "_build" / "html"
+
+    (src_dir / "index.rst").write_text(
+        "Test Docs\n=========\n\n"
+        ".. meta::\n   :description: Test docs\n\n"
+        ".. toctree::\n   :maxdepth: 2\n\n"
+        "   reference/api/sample\n",
+        encoding="utf-8",
+    )
+    (src_dir / "404.rst").write_text(":orphan:\n\nNot Found\n=========\n", encoding="utf-8")
+    target_modules = (
+        "imednet.models.jobs",
+        "imednet.orchestration.types",
+        "imednet.plugins",
+        "imednet.validation.cache",
+        "imednet.cli.decorators",
+        "imednet.utils.validators",
+        "imednet_sinks.warehouse",
+        "imednet_sinks.plugin",
+        "imednet_workflows.uat.inspector",
+    )
+    rst_blocks = ["Sample API\n==========\n"]
+    for mod_name in target_modules:
+        rst_blocks.append(
+            f".. automodule:: {mod_name}\n"
+            f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
+            "   :members:\n"
+            "   :show-inheritance:\n"
+        )
+    (api_dir / "sample.rst").write_text("\n".join(rst_blocks), encoding="utf-8")
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sphinx",
+            "-b",
+            "html",
+            "-W",
+            "--keep-going",
+            "-c",
+            str(repo_root / "docs"),
+            str(src_dir),
+            str(html_dir),
+        ],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, f"Strict Sphinx failed:\n{res.stdout}\n{res.stderr}"
+
+    built_api = html_dir / "reference" / "api"
+    assert _verify_api_reference_parity(built_api, repo_root) is False
+
+
+@pytest.mark.parametrize(
+    ("case_name", "html_body"),
+    [
+        (
+            "empty_class_shell",
+            '<dl class="py class"><dt id="pkg.EmptyShell">class pkg.EmptyShell</dt>'
+            "<dd><p>Bases: <code>object</code></p></dd></dl>",
+        ),
+        (
+            "missing_enum_member",
+            '<dl class="py class"><dt id="imednet.models.jobs.JobState">class JobState</dt>'
+            '<dd><dl class="py attribute"><dt id="imednet.models.jobs.JobState.OPEN">'
+            "OPEN: str = 'OPEN'</dt><dd></dd></dl></dd></dl>",
+        ),
+        (
+            "leaked_repr_false_password_default",
+            '<dl class="py class">'
+            '<dt id="imednet_sinks.warehouse.SnowflakeSinkConfig">'
+            "class SnowflakeSinkConfig(study_key, password='')</dt>"
+            '<dd><dl class="py attribute">'
+            '<dt id="imednet_sinks.warehouse.SnowflakeSinkConfig.password">'
+            "password: str = ''</dt><dd></dd></dl></dd></dl>",
+        ),
+        (
+            "missing_typeddict_key",
+            '<dl class="py class">'
+            '<dt id="imednet.orchestration.types.OrchestratorResult">class OrchestratorResult</dt>'
+            '<dd><dl class="py attribute">'
+            '<dt id="imednet.orchestration.types.OrchestratorResult.study_key">'
+            "study_key: str</dt><dd><p>Optional.</p></dd></dl></dd></dl>",
+        ),
+        (
+            "missing_protocol_attribute",
+            '<dl class="py class">'
+            '<dt id="imednet.plugins.MongoDbSinkConfigProtocol">class MongoDbSinkConfigProtocol</dt>'
+            "<dd><p>Protocol docs.</p></dd></dl>",
+        ),
+        (
+            "missing_callable_protocol_call",
+            '<dl class="py class">'
+            '<dt id="imednet.plugins.PluginProtocol">class PluginProtocol</dt>'
+            "<dd><p>Callable protocol without __call__.</p></dd></dl>",
+        ),
+        (
+            "collapsed_single_dt_overload",
+            '<dl class="py method">'
+            '<dt id="imednet_sinks.plugin.SinksNamespace.export_to_mongodb">'
+            "export_to_mongodb(*args, **kwargs)</dt><dd><p>Export.</p></dd></dl>",
+        ),
+        (
+            "inherited_basemodel_init_leak",
+            '<dl class="py class"><dt id="imednet.models.records.Record">class Record</dt>'
+            '<dd><dl class="py method"><dt id="imednet.models.records.Record.__init__">'
+            "__init__(**data)</dt><dd></dd></dl></dd></dl>",
+        ),
+        (
+            "forbidden_pydantic_validation_error",
+            "<p>Raises pydantic_core.ValidationError when invalid.</p>",
+        ),
+        (
+            "forbidden_union_type_token",
+            "<p>Returns UnionType[str, int, None].</p>",
+        ),
+        (
+            "forbidden_factory_token",
+            "<p>extra=&lt;factory&gt;</p>",
+        ),
+        (
+            "forbidden_tilde_paramspec",
+            '<dl class="py function"><dt id="pkg.fn">fn(*args: ~P.args)</dt><dd><p>Doc.</p></dd></dl>',
+        ),
+        (
+            "forbidden_tilde_typevar",
+            '<dl class="py function"><dt id="pkg.fn2">fn2(items: list[~T])</dt><dd><p>Doc.</p></dd></dl>',
+        ),
+    ],
+)
+def test_verify_api_reference_parity_rejects_regressions(
+    tmp_path: Path, case_name: str, html_body: str
+) -> None:
+    """_verify_api_reference_parity and check_rendered_api_reference fail on every regression pattern."""
+    repo_root = Path(__file__).resolve().parents[2]
+    api_dir = tmp_path / case_name / "reference" / "api"
+    api_dir.mkdir(parents=True)
+    (api_dir / "imednet.html").write_text(
+        f"<html><body>{html_body}</body></html>\n",
+        encoding="utf-8",
+    )
+    assert _verify_api_reference_parity(api_dir, repo_root) is True
+    assert check_rendered_api_reference(tmp_path / case_name) is True
+
+
 def test_repo_package_docs_and_governance_validators_pass() -> None:
     """Repository manifests, docs, and issue templates pass check_package_docs and governance checks."""
     repo_root = Path(__file__).resolve().parents[2]
@@ -535,6 +786,67 @@ def test_check_package_docs_detects_manifest_and_changelog_drift(tmp_path: Path)
     # Missing readme / license / classifiers in pyproject.toml
     (pkg_dir / "pyproject.toml").write_text(
         '[project]\nname = "imednet-sample"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+    assert check_package_docs(tmp_path) is True
+
+
+def test_check_package_docs_enforces_wheel_metadata_and_absolute_links(tmp_path: Path) -> None:
+    """check_package_docs requires readme/license/classifiers in pyproject.toml and rejects relative links in package READMEs."""
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n- [demo](packages/demo-pkg/CHANGELOG.md)\n",
+        encoding="utf-8",
+    )
+    changelogs_dir = tmp_path / "docs" / "reference" / "changelogs"
+    changelogs_dir.mkdir(parents=True)
+    (changelogs_dir / "index.rst").write_text(
+        "Changelogs\n==========\n\n.. toctree::\n\n   demo-pkg\n",
+        encoding="utf-8",
+    )
+    (changelogs_dir / "demo-pkg.md").write_text(
+        "# demo-pkg\n\n```{include} ../../../packages/demo-pkg/CHANGELOG.md\n```\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs" / "reference" / "compatibility.rst").write_text(
+        "Compatibility\n=============\n\nSee :doc:`changelogs/index`.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs" / "reference" / "contributing.rst").write_text(
+        "Contributing\n============\n\nSee :doc:`changelogs/index`.\n",
+        encoding="utf-8",
+    )
+    pkg_dir = tmp_path / "packages" / "demo-pkg"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "CHANGELOG.md").write_text("# Demo Changelog\n", encoding="utf-8")
+    (pkg_dir / "README.md").write_text(
+        "# demo-pkg\n\nSee [Docs](https://fderuiter.github.io/imednet-toolkit/).\n",
+        encoding="utf-8",
+    )
+    valid_manifest = (
+        '[project]\nname = "demo"\nreadme = "README.md"\nlicense = "MIT"\n'
+        "classifiers = [\n"
+        '  "Programming Language :: Python :: 3.11",\n'
+        '  "Programming Language :: Python :: 3.12",\n'
+        '  "Programming Language :: Python :: 3.13",\n'
+        "]\n"
+    )
+    (pkg_dir / "pyproject.toml").write_text(valid_manifest, encoding="utf-8")
+    assert check_package_docs(tmp_path) is False
+
+    # Relative link in package README fails
+    (pkg_dir / "README.md").write_text(
+        "# demo-pkg\n\nSee [Example](../../examples/quick_start.py).\n",
+        encoding="utf-8",
+    )
+    assert check_package_docs(tmp_path) is True
+
+    # Restore valid README, remove license -> fails
+    (pkg_dir / "README.md").write_text(
+        "# demo-pkg\n\nSee [Docs](https://fderuiter.github.io/imednet-toolkit/).\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nreadme = "README.md"\n',
         encoding="utf-8",
     )
     assert check_package_docs(tmp_path) is True
@@ -609,6 +921,118 @@ def test_check_governance_and_issue_templates_detects_retired_urls_labels_and_dr
     assert check_governance_and_issue_templates(tmp_path) is True
 
 
+def test_check_readme_github_pages_routes_resolves_pages_and_fragments(tmp_path: Path) -> None:
+    """check_readme_github_pages_routes rejects raw .rst links and verifies HTML files and #fragments."""
+    repo = tmp_path / "repo"
+    pkg_dir = repo / "packages" / "core"
+    html_dir = tmp_path / "html"
+    (html_dir / "tutorials").mkdir(parents=True)
+    pkg_dir.mkdir(parents=True)
+
+    (html_dir / "index.html").write_text(
+        '<html><body><section id="interactive-showcase"></section>'
+        '<div id="documentation-overview"></div></body></html>',
+        encoding="utf-8",
+    )
+    (html_dir / "tutorials" / "quick_start.html").write_text(
+        '<html><body><h1 id="quick-start">Quick Start</h1></body></html>',
+        encoding="utf-8",
+    )
+
+    (repo / "README.md").write_text(
+        "# Root\n\n"
+        "- [Showcase](https://fderuiter.github.io/imednet-toolkit/#interactive-showcase)\n"
+        "- [Tutorials](https://fderuiter.github.io/imednet-toolkit/#documentation-overview)\n"
+        "- [Quick Start](https://fderuiter.github.io/imednet-toolkit/tutorials/quick_start.html#quick-start)\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "README.md").write_text(
+        "# Core\n\nFull docs: <https://fderuiter.github.io/imednet-toolkit/>\n",
+        encoding="utf-8",
+    )
+
+    assert check_readme_github_pages_routes(html_dir, require_exists=True, repo_root=repo) is False
+
+    # Broken #fragment fails
+    (pkg_dir / "README.md").write_text(
+        "# Core\n\n[Missing Anchor](https://fderuiter.github.io/imednet-toolkit/#nonexistent)\n",
+        encoding="utf-8",
+    )
+    assert check_readme_github_pages_routes(html_dir, require_exists=True, repo_root=repo) is True
+
+    # Raw .rst link fails even without HTML dir
+    (pkg_dir / "README.md").write_text(
+        "# Core\n\n[Raw RST](docs/tutorials/quick_start.rst)\n",
+        encoding="utf-8",
+    )
+    assert check_readme_github_pages_routes(None, repo_root=repo) is True
+
+
+def test_check_pypi_install_tags_enforces_git_release_tags(tmp_path: Path) -> None:
+    """check_pypi_install_tags allows published packages/extras in PyPI blocks and requires source checkout for untagged ones."""
+    repo = tmp_path / "git_repo"
+    core_dir = repo / "packages" / "core"
+    tui_dir = repo / "packages" / "plugins-tui"
+    core_dir.mkdir(parents=True)
+    tui_dir.mkdir(parents=True)
+
+    (core_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet"\nversion = "1.1.0"\n'
+        "[project.optional-dependencies]\nexport = []\n",
+        encoding="utf-8",
+    )
+    (tui_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet-tui"\nversion = "1.0.0"\n',
+        encoding="utf-8",
+    )
+
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "tag", "imednet-v1.1.0"], cwd=repo, check=True, capture_output=True)
+
+    # Add unreleased extra 'tui' on HEAD after imednet-v1.1.0 tag
+    (core_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet"\nversion = "1.1.0"\n'
+        "[project.optional-dependencies]\nexport = []\ntui = []\n",
+        encoding="utf-8",
+    )
+    (repo / "README.md").write_text(
+        "## Installation\n\n### Published PyPI Releases\n\n"
+        '```bash\npip install imednet\npip install "imednet[export]"\n```\n\n'
+        "### Source Checkouts\n\n"
+        '```bash\npip install -e ./packages/plugins-tui -e "./packages/core[tui]"\n```\n',
+        encoding="utf-8",
+    )
+    assert check_pypi_install_tags(repo) is False
+
+    # Advertising unreleased imednet[tui] in PyPI block fails
+    (repo / "README.md").write_text(
+        '## Installation\n\n```bash\npip install "imednet[tui]"\n```\n',
+        encoding="utf-8",
+    )
+    assert check_pypi_install_tags(repo) is True
+
+    # Advertising untagged imednet-tui in PyPI block fails
+    (repo / "README.md").write_text(
+        "## Installation\n\n```bash\npip install imednet-tui\n```\n",
+        encoding="utf-8",
+    )
+    assert check_pypi_install_tags(repo) is True
+
+
 def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_dirs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -620,6 +1044,8 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_packages_registered() is False
     assert check_package_docs() is False
     assert check_governance_and_issue_templates() is False
+    assert check_pypi_install_tags() is False
+    assert check_readme_github_pages_routes(None) is False
     assert check_release_please_parity() is False
     assert check_examples_index_parity() is False
     assert check_diataxis_sidebar_isolation() is False
@@ -636,6 +1062,8 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_packages_registered(empty_root) is True
     assert check_package_docs(empty_root) is True
     assert check_governance_and_issue_templates(empty_root) is True
+    assert check_pypi_install_tags(empty_root) is True
+    assert check_readme_github_pages_routes(None, repo_root=empty_root) is True
     assert check_release_please_parity(empty_root) is True
     assert check_examples_index_parity(empty_root) is True
     assert check_diataxis_sidebar_isolation(empty_root) is True

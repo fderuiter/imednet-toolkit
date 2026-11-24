@@ -27,8 +27,8 @@ JOB_SUMMARY_FIELDS: list[str] = [
     "batch_id",
     "job_id",
     "state",
-    "progress",
     "date_created",
+    "date_started",
     "date_finished",
 ]
 

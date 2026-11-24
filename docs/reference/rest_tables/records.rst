@@ -70,7 +70,7 @@ List records
      - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
-     - None
+     - ``recordId,asc``
      - Sorting expression (e.g. ``recordId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String

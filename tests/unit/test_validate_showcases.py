@@ -1408,3 +1408,31 @@ def test_showcase_js_syntax_and_workspace_import_errors_detected(tmp_path: Path)
     errors = validate_landing_showcase(docs_dir, repo_root)
     assert any("SNIPPETS.sdk.studies" in e and "MissingShowcaseSymbol" in e for e in errors)
     assert any("SNIPPETS.sdk.forms" in e and "Syntax error" in e for e in errors)
+
+
+def test_validate_all_package_readmes_and_sdk_security_key_gate(tmp_path: Path) -> None:
+    """Verify all five packages/*/README.md execute cleanly and missing security_key is rejected."""
+    from scripts.validate_showcases import (
+        validate_all_package_readmes,
+        validate_export_examples_require_security_key,
+        validate_package_readme_blocks,
+    )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    all_errors = validate_all_package_readmes(repo_root / "packages", repo_root)
+    assert not all_errors, f"Expected all 5 packages/*/README.md to pass, got: {all_errors}"
+
+    sec_errors = validate_export_examples_require_security_key(repo_root / "examples", repo_root)
+    assert not sec_errors, f"Expected export examples security_key check to pass, got: {sec_errors}"
+
+    missing_sec_readme = tmp_path / "README_missing_sec.md"
+    missing_sec_readme.write_text(
+        "```python\n"
+        "import os\n"
+        "from imednet import ImednetSDK\n"
+        "sdk = ImednetSDK(api_key=os.environ['IMEDNET_API_KEY'])\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    errs = validate_package_readme_blocks(missing_sec_readme, repo_root)
+    assert any("without 'security_key'" in e for e in errs), errs

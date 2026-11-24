@@ -430,6 +430,261 @@ def test_cli_subjects_register_skip_existing_and_json_output(
     assert len(state.get_subjects("STUDY")) == before_subjects + 1
 
 
+def test_cli_write_commands_exit_nonzero_and_scrub_phi_and_secrets_on_job_failures(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """AC 6: records create/update/import and subjects register exit 1 on failed jobs and scrub PHI/secrets."""
+    from imednet.errors import ServerError
+    from imednet.models.jobs import JobStatus
+    from imednet.utils.batch_coordinator import BatchSubmissionSummary
+    from imednet.utils.job_poller import JobFailedError, JobPollSummary
+
+    sdk, _state, _requests = sim_sdk_and_requests
+    monkeypatch.setattr(sdk, "close", lambda: None)
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda **_kwargs: sdk)
+    failed_status = JobStatus(
+        jobId="JOB-FAIL",
+        batchId="BATCH-FAIL",
+        state="FAILED",
+        progress=100,
+        results=[
+            {
+                "recordId": 10,
+                "status": "FAILED",
+                "error": "Constraint failure api_key=sk-secret-999 ssn=123-45-6789",  # pragma: allowlist secret
+                "patient_name": "John Doe",
+                "token": "tok-super-secret",  # pragma: allowlist secret
+            }
+        ],
+    )
+    failed_summary = BatchSubmissionSummary(
+        study_key="STUDY",
+        jobs=[failed_status],
+        chunk_sizes=[1],
+        total_records=1,
+        poll_summary=JobPollSummary(
+            study_key="STUDY",
+            results={},
+            failures={
+                "BATCH-FAIL": JobFailedError("Job BATCH-FAIL ended in state FAILED", failed_status)
+            },
+            elapsed_total=0.1,
+        ),
+        wait_for_completion=True,
+    )
+
+    monkeypatch.setattr(sdk.records, "create_batch", lambda *_a, **_kw: failed_summary)
+
+    # 1. records create (JSON mode + table mode) exits 1 when summary.all_successful is False
+    res_create_json = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--json",
+            '{"formKey": "F_DM", "subjectKey": "SUB1", "siteName": "SITE", "data": {"V_AGE": 40}}',
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_create_json.exit_code == 1
+    parsed = json.loads(res_create_json.stdout)
+    assert parsed["items"][0]["allSuccessful"] is False
+    assert "sk-secret-999" not in res_create_json.stdout
+    assert "tok-super-secret" not in res_create_json.stdout
+    assert "123-45-6789" not in res_create_json.stdout
+    assert "John Doe" not in res_create_json.stdout
+
+    res_create_table = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--json",
+            '{"formKey": "F_DM", "subjectKey": "SUB1", "siteName": "SITE", "data": {"V_AGE": 40}}',
+            "--no-interactive",
+        ],
+    )
+    assert res_create_table.exit_code == 1
+    assert "Batch write failed" in res_create_table.stderr
+    assert "sk-secret-999" not in res_create_table.stderr
+    assert "123-45-6789" not in res_create_table.stderr
+    assert "John Doe" not in res_create_table.stderr
+
+    # 1b. records update, records import, & subjects register also exit 1 against a FAILED Job summary
+    res_update_json = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--record-id",
+            "601",
+            "-d",
+            "V_AGE=40",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_update_json.exit_code == 1
+    update_parsed = json.loads(res_update_json.stdout)
+    assert update_parsed["items"][0]["allSuccessful"] is False
+    assert "sk-secret-999" not in res_update_json.stdout
+    assert "John Doe" not in res_update_json.stdout
+
+    json_file = tmp_path / "records.json"
+    json_file.write_text(
+        json.dumps(
+            [{"formKey": "F_DM", "subjectKey": "SUB1", "siteName": "SITE", "data": {"V_AGE": 40}}]
+        ),
+        encoding="utf-8",
+    )
+    res_import_summary = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "import",
+            "STUDY",
+            str(json_file),
+            "--no-interactive",
+        ],
+    )
+    assert res_import_summary.exit_code == 1
+    assert "Batch write failed" in res_import_summary.stderr
+    assert "sk-secret-999" not in res_import_summary.stderr
+    assert "123-45-6789" not in res_import_summary.stderr
+
+    res_subj_summary = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--site-name",
+            "SITE",
+            "-d",
+            "V_AGE=35",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_subj_summary.exit_code == 1
+    subj_parsed = json.loads(res_subj_summary.stdout)
+    assert subj_parsed["items"][0]["allSuccessful"] is False
+    assert "sk-secret-999" not in res_subj_summary.stdout
+    assert "John Doe" not in res_subj_summary.stdout
+
+    # 2. records import & records update when --wait raises JobFailedError exit 1 with scrubbed stderr
+    def raise_job_failed(*_a: object, **_kw: object) -> BatchSubmissionSummary:
+        err = JobFailedError(
+            "Job BATCH-FAIL ended in state FAILED",
+            failed_status,
+            poll_summary=failed_summary.poll_summary,
+            partial_summary=failed_summary,
+        )
+        raise err
+
+    monkeypatch.setattr(sdk.records, "create_batch", raise_job_failed)
+    res_import = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "import",
+            "STUDY",
+            str(json_file),
+            "--wait",
+            "--no-interactive",
+        ],
+    )
+    assert res_import.exit_code == 1
+    assert "Job Error:" in res_import.stderr
+    assert "accepted_batches=['BATCH-FAIL']" in res_import.stderr
+    assert "sk-secret-999" not in res_import.stderr
+    assert "123-45-6789" not in res_import.stderr
+    assert "John Doe" not in res_import.stderr
+
+    res_update_wait = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--record-id",
+            "601",
+            "-d",
+            "V_AGE=40",
+            "--wait",
+            "--no-interactive",
+        ],
+    )
+    assert res_update_wait.exit_code == 1
+    assert "Job Error:" in res_update_wait.stderr
+    assert "accepted_batches=['BATCH-FAIL']" in res_update_wait.stderr
+    assert "sk-secret-999" not in res_update_wait.stderr
+    assert "John Doe" not in res_update_wait.stderr
+
+    # 3. subjects register when chunk 2 raises HTTP 503 mid-batch exits 1 with accepted batch context
+    settled_b1 = JobStatus(jobId="J-1", batchId="BATCH-OK-1", state="COMPLETED", progress=100)
+    mid_partial = BatchSubmissionSummary(
+        study_key="STUDY",
+        jobs=[settled_b1],
+        chunk_sizes=[1],
+        total_records=2,
+        poll_summary=JobPollSummary(
+            study_key="STUDY",
+            results={"BATCH-OK-1": settled_b1},
+            failures={},
+            elapsed_total=0.05,
+        ),
+        unsubmitted_chunks=[
+            [{"formKey": "F_DM", "siteName": "SITE", "data": {"ssn": "***MASKED***"}}]
+        ],
+        wait_for_completion=True,
+    )
+
+    def raise_mid_batch(*_a: object, **_kw: object) -> BatchSubmissionSummary:
+        srv_err = ServerError(
+            "503 Service Unavailable token=sec-tok dob=1990-01-01",
+            status_code=503,
+        )
+        srv_err.partial_summary = mid_partial  # type: ignore[attr-defined]
+        raise srv_err
+
+    monkeypatch.setattr(sdk.records, "create_batch", raise_mid_batch)
+    res_subj = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--site-name",
+            "SITE",
+            "-d",
+            "V_AGE=35",
+            "--wait",
+            "--no-interactive",
+        ],
+    )
+    assert res_subj.exit_code == 1
+    assert "API Error:" in res_subj.stderr
+    assert "BATCH-OK-1" in res_subj.stderr
+    assert "unsubmitted_records=1" in res_subj.stderr
+    assert "sec-tok" not in res_subj.stderr
+    assert "1990-01-01" not in res_subj.stderr
+
+
 def test_cli_records_update_targets_by_id_oid_visit_and_interval_with_reason(
     capsys: pytest.CaptureFixture[str],
     sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],

@@ -112,3 +112,101 @@ def test_validate_existing_file(tmp_path: Path) -> None:
 
     # Str
     assert validate(str(data_file)) == []
+
+
+def test_validate_catches_duplicate_keys_broken_references_and_inverted_bounds() -> None:
+    """datadict.schema.validate catches duplicate keys, broken references, and inverted bounds."""
+    from imednet.datadict.logic import parse_logic_xml
+    from imednet.datadict.models import BusinessLogicRule, Choice
+
+    # 1. Duplicate formKey, formId, variableName, choiceValue, and rule id
+    dup_dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="DM",
+                formId="10",
+                variables=[
+                    Variable(
+                        variableName="SEX",
+                        choices=[
+                            Choice(choiceValue="M", choiceText="Male"),
+                            Choice(choiceValue="M", choiceText="Duplicate Male"),
+                        ],
+                    ),
+                    Variable(variableName="SEX"),
+                ],
+                businessLogic=[BusinessLogicRule(id="R1", name="Rule 1", form="DM")],
+            ),
+            Form(
+                formKey="DM",
+                formId="10",
+                variables=[],
+                businessLogic=[BusinessLogicRule(id="R1", name="Rule 1 Dup", form="DM")],
+            ),
+        ]
+    )
+    dup_errors = "\n".join(validate(dup_dd))
+    assert "Duplicate formKey 'DM'" in dup_errors
+    assert "Duplicate formId '10'" in dup_errors
+    assert "Duplicate variableName 'SEX'" in dup_errors
+    assert "Duplicate choiceValue 'M'" in dup_errors
+    assert "Duplicate business logic rule id 'R1'" in dup_errors
+
+    # 2. Broken form, variable, methodOid, and condition references
+    broken_dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="VS",
+                extraAttributes={"collectionExceptionConditionOid": "MISSING_COND"},
+                variables=[
+                    Variable(
+                        variableName="SYSBP",
+                        extraAttributes={"methodOid": "MISSING_METH"},
+                    )
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="R_BROKEN_VAR",
+                        name="Broken Var Ref",
+                        form="VS",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition><variable>NONEXISTENT_VAR</variable>"
+                            "<operator>==</operator><value>1</value></condition></conditions></rule>"
+                        ),
+                    )
+                ],
+            )
+        ],
+        unassignedBusinessLogic=[
+            BusinessLogicRule(id="R_BROKEN_FORM", name="Missing Form", form="NO_SUCH_FORM")
+        ],
+    )
+    broken_errors = "\n".join(validate(broken_dd, schema=get_schema()))
+    assert "MISSING_COND" in broken_errors
+    assert "MISSING_METH" in broken_errors
+    assert "NONEXISTENT_VAR" in broken_errors
+    assert "NO_SUCH_FORM" in broken_errors
+
+    # 3. Inverted numeric bounds (minValue > maxValue) and length bounds (minLength > maxLength)
+    inverted_dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="LB",
+                variables=[
+                    Variable(
+                        variableName="GLUC",
+                        variableType="Float",
+                        extraAttributes={"minValue": 200, "maxValue": 50},
+                    ),
+                    Variable(
+                        variableName="SUBJID",
+                        variableType="Text",
+                        extraAttributes={"minLength": 12, "maxLength": 6},
+                    ),
+                ],
+            )
+        ]
+    )
+    inv_errors = "\n".join(validate(inverted_dd, schema=get_schema()))
+    assert "minValue (200.0) > maxValue (50.0)" in inv_errors
+    assert "minLength (12) > maxLength (6)" in inv_errors

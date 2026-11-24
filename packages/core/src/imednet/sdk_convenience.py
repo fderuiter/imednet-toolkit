@@ -476,7 +476,7 @@ class SyncSDKConvenienceMixin:
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
-        """Poll multiple jobs concurrently and fetch terminal resultUrl payloads."""
+        """Poll multiple jobs concurrently until they reach terminal states."""
         return self.jobs.poll_many(
             study_key,
             batch_ids,
@@ -629,7 +629,7 @@ class AsyncSDKConvenienceMixin:
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
     ) -> JobPollSummary:
-        """Asynchronously poll multiple jobs concurrently and fetch resultUrl payloads."""
+        """Asynchronously poll multiple jobs concurrently until they reach terminal states."""
         return await self.jobs.poll_many(
             study_key,
             batch_ids,

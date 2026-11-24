@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
 import defusedxml.ElementTree as ET  # noqa: N817
 from defusedxml.common import DefusedXmlException
 
+from ..logic import parse_logic_xml
 from ..models import (
     BusinessLogicRule,
     Choice,
@@ -19,7 +21,9 @@ from ..models import (
 from ..normalize import (
     _is_file_target,
     _safe_is_file,
+    normalize_form_id,
     normalize_form_type,
+    normalize_variable_type,
     to_camel_case,
 )
 
@@ -36,6 +40,10 @@ KNOWN_FORM_ATTRIBUTES = {
     "formtype",
 }
 
+KNOWN_IMEDNET_FORM_ATTRIBUTES = {
+    "formid",
+}
+
 KNOWN_ITEM_GROUP_ATTRIBUTES = {
     "oid",
     "name",
@@ -44,6 +52,7 @@ KNOWN_ITEM_GROUP_ATTRIBUTES = {
     "isreferencedata",
     "sasdatasetname",
     "domain",
+    "purpose",
 }
 
 KNOWN_ITEM_ATTRIBUTES = {
@@ -61,6 +70,7 @@ KNOWN_ITEM_ATTRIBUTES = {
 
 KNOWN_IMEDNET_ITEM_ATTRIBUTES = {
     "variablename",
+    "variabletype",
     "format",
     "precision",
 }
@@ -72,6 +82,7 @@ KNOWN_ITEM_REF_ATTRIBUTES = {
     "keysequence",
     "methodoid",
     "role",
+    "rolecodelistoid",
     "collectionexceptionconditionoid",
     "controltype",
 }
@@ -92,6 +103,15 @@ KNOWN_CODELIST_ATTRIBUTES = {
     "name",
     "datatype",
     "sasformatname",
+}
+
+KNOWN_IMEDNET_CODELIST_ATTRIBUTES = {
+    "syntheticrolecodelist",
+}
+
+KNOWN_ORIGIN_ATTRIBUTES = {
+    "type",
+    "source",
 }
 
 KNOWN_CODELIST_ITEM_ATTRIBUTES = {
@@ -141,6 +161,19 @@ KNOWN_CONDITION_DEF_ATTRIBUTES = {
     "name",
 }
 
+KNOWN_IMEDNET_CONDITION_DEF_ATTRIBUTES = {
+    "rulesource",
+    "ruleid",
+    "ruleidtype",
+    "rulename",
+    "ruletype",
+    "status",
+    "formkey",
+    "containerform",
+    "sequence",
+    "extraattributes",
+}
+
 KNOWN_METHOD_DEF_ATTRIBUTES = {
     "oid",
     "name",
@@ -160,12 +193,31 @@ SUPPORTED_DATA_TYPES = {
     "double",
     "decimal",
     "date",
+    "partialdate",
+    "incompletedate",
     "datetime",
     "durationdatetime",
     "intervaldatetime",
+    "partialdatetime",
+    "incompletedatetime",
     "time",
+    "partialtime",
+    "incompletetime",
     "boolean",
     "bool",
+    "uri",
+}
+
+_PRESERVED_ODM_RAW_DATA_TYPES = {
+    "partialdate",
+    "incompletedate",
+    "partialdatetime",
+    "incompletedatetime",
+    "partialtime",
+    "incompletetime",
+    "durationdatetime",
+    "intervaldatetime",
+    "uri",
 }
 
 
@@ -328,7 +380,7 @@ def _get_translated_text(elem: ET.Element | None) -> str | None:
     return None
 
 
-def _extract_item_sdtm_attributes(it_def: ET.Element) -> dict[str, Any]:
+def _extract_item_sdtm_attributes(it_def: ET.Element, record_warning: Any) -> dict[str, Any]:
     """Extract SDSVarName, SASFieldName, Origin, and Comment from ItemDef element."""
     sdtm: dict[str, Any] = {}
     if (sds_var := _get_attr(it_def, "SDSVarName")) and sds_var.strip():
@@ -337,6 +389,27 @@ def _extract_item_sdtm_attributes(it_def: ET.Element) -> dict[str, Any]:
         sdtm["SASFieldName"] = sas_field.strip()
     if (origin := _get_attr(it_def, "Origin")) and origin.strip():
         sdtm["Origin"] = origin.strip()
+    else:
+        origin_elem = _find_first_child(it_def, "Origin")
+        if origin_elem is not None:
+            origin_extra = _extract_unmapped_attributes(
+                origin_elem,
+                KNOWN_ORIGIN_ATTRIBUTES,
+                "Origin",
+                record_warning,
+            )
+            origin_type = (_get_attr(origin_elem, "Type") or "").strip()
+            origin_source = (_get_attr(origin_elem, "Source") or "").strip()
+            origin_desc = _get_translated_text(_find_first_child(origin_elem, "Description"))
+            if not origin_type and not origin_desc:
+                origin_type = _get_translated_text(origin_elem) or ""
+            if origin_type:
+                sdtm["Origin"] = origin_type
+            if origin_source:
+                sdtm["originSource"] = origin_source
+            if origin_desc:
+                sdtm["originDescription"] = origin_desc
+            sdtm.update(origin_extra)
     comment_val = _get_attr(it_def, "Comment")
     if not comment_val:
         c_elem = _find_first_child(it_def, "Comment")
@@ -355,10 +428,17 @@ def _map_datatype(
     has_choices: bool,
     control_type: str | None,
     record_warning: Any,
+    *,
+    imednet_variable_type: str | None = None,
 ) -> str:
     """Map CDISC ODM DataType and ControlType to canonical iMednet variableType."""
+    if imednet_variable_type and imednet_variable_type.strip():
+        vt_norm = normalize_variable_type(imednet_variable_type.strip())
+        if vt_norm:
+            return vt_norm
+
     if control_type:
-        ct_lower = control_type.lower()
+        ct_lower = control_type.strip().lower()
         if ct_lower in ("radio", "radiobutton"):
             return "Radio"
         if ct_lower in ("dropdown", "dropdownlist", "select", "singleselect"):
@@ -367,28 +447,44 @@ def _map_datatype(
             return "Multi Select"
         if ct_lower in ("datetime", "datetime_precision"):
             return "DateTime"
+        if ct_lower in ("calculation", "calculated", "calc"):
+            return "Calculation"
+        if ct_lower == "slider":
+            return "Slider"
+        if ct_lower in ("file", "fileupload", "file_upload", "upload"):
+            return "File"
+        if ct_lower in ("descriptive", "label"):
+            return "Descriptive"
         if ct_lower == "text":
             return "Text"
 
     if raw_datatype:
-        dt_lower = raw_datatype.lower()
+        dt_lower = raw_datatype.strip().lower()
         if dt_lower in ("integer", "int"):
             return "Integer"
         if dt_lower in ("float", "double", "decimal"):
             return "Float"
-        if dt_lower == "date":
+        if dt_lower in ("date", "partialdate", "incompletedate"):
             return "Date"
-        if dt_lower in ("datetime", "durationdatetime", "intervaldatetime"):
+        if dt_lower in (
+            "datetime",
+            "durationdatetime",
+            "intervaldatetime",
+            "partialdatetime",
+            "incompletedatetime",
+        ):
             return "DateTime"
-        if dt_lower == "time":
+        if dt_lower in ("time", "partialtime", "incompletetime"):
             return "Time"
         if dt_lower in ("boolean", "bool"):
             return "Boolean"
+        if dt_lower == "uri":
+            return "File"
         if dt_lower in ("text", "string"):
             return "Radio" if has_choices else "Text"
 
         record_warning(
-            f"Unsupported data type '{raw_datatype}' on item '{item_oid}'; defaulted to 'Text'."
+            f"Unsupported data type '{raw_datatype}' on item '{item_oid}'. Defaulted to 'Text'."
         )
         return "Text"
 
@@ -550,6 +646,99 @@ def _extract_item_units_and_ranges(
             range_checks.append(rc_entry)
 
     return item_units, range_checks
+
+
+def _parse_imednet_condition_rule(
+    elem: ET.Element,
+    fallback_seq: int,
+    no_raw_xml: bool,
+    record_warning: Any,
+) -> tuple[str | None, BusinessLogicRule]:
+    """Reconstruct a round-tripped iMednet BusinessLogicRule from ConditionDef."""
+    extra = _extract_unmapped_attributes(
+        elem,
+        KNOWN_CONDITION_DEF_ATTRIBUTES,
+        "ConditionDef",
+        record_warning,
+        known_imednet=KNOWN_IMEDNET_CONDITION_DEF_ATTRIBUTES,
+    )
+    extra_json = _get_imednet_attr(elem, "ExtraAttributes")
+    if extra_json:
+        try:
+            loaded_extra = json.loads(extra_json)
+            if isinstance(loaded_extra, dict):
+                loaded_extra.update(extra)
+                extra = loaded_extra
+        except json.JSONDecodeError as exc:
+            record_warning(f"Malformed imednet:ExtraAttributes JSON on ConditionDef: {exc}")
+
+    raw_rule_id = _get_imednet_attr(elem, "RuleId")
+    rule_id_type = (_get_imednet_attr(elem, "RuleIdType") or "str").strip().lower()
+    rule_id: str | int | None
+    if raw_rule_id is None:
+        rule_id = None
+    elif rule_id_type == "int" and raw_rule_id.lstrip("-").isdigit():
+        rule_id = int(raw_rule_id)
+    else:
+        rule_id = raw_rule_id
+
+    rule_name = _get_imednet_attr(elem, "RuleName")
+    if rule_name is None:
+        rule_name = (_get_attr(elem, "Name") or "").strip() or None
+    rule_type = _get_imednet_attr(elem, "RuleType")
+    rule_status = _get_imednet_attr(elem, "Status")
+    rule_form = _get_imednet_attr(elem, "FormKey")
+    container_form = _get_imednet_attr(elem, "ContainerForm")
+    raw_seq = _get_imednet_attr(elem, "Sequence")
+    seq: int | None
+    if raw_seq is not None and raw_seq.strip().lstrip("-").isdigit():
+        seq = int(raw_seq.strip())
+    elif raw_seq is None:
+        seq = None
+    else:
+        seq = fallback_seq
+
+    raw_logic_xml: str | None = None
+    parsed_logic: dict[str, Any] | None = None
+    for fe in _find_children(elem, "FormalExpression"):
+        _extract_unmapped_attributes(
+            fe,
+            KNOWN_FORMAL_EXPRESSION_ATTRIBUTES,
+            "FormalExpression",
+            record_warning,
+        )
+        ctx = (_get_attr(fe, "Context") or "").strip()
+        body = fe.text if fe.text is not None else ""
+        if ctx == "imednet:logicRawXml":
+            raw_logic_xml = body
+        elif ctx == "imednet:logicJson" and body.strip():
+            try:
+                loaded_logic = json.loads(body)
+                if isinstance(loaded_logic, dict):
+                    parsed_logic = loaded_logic
+            except json.JSONDecodeError as exc:
+                record_warning(f"Malformed imednet:logicJson on ConditionDef: {exc}")
+
+    if parsed_logic is None and raw_logic_xml and raw_logic_xml.strip():
+        try:
+            parsed_logic = parse_logic_xml(raw_logic_xml)
+        except ValueError as exc:
+            record_warning(f"Malformed logic XML on ConditionDef '{rule_id}': {exc}")
+
+    return (
+        container_form,
+        BusinessLogicRule(
+            id=rule_id,
+            name=rule_name,
+            type=rule_type,
+            status=rule_status,
+            form=rule_form,
+            sequence=seq,
+            logic=parsed_logic,
+            logicRawXml=None if no_raw_xml else raw_logic_xml,
+            extraAttributes=extra,
+        ),
+    )
 
 
 def _parse_formal_rule_element(
@@ -951,9 +1140,20 @@ def load_from_cdisc_odm(
 
     # 4. Parse CodeLists into Choice collections
     parsed_codelists: dict[str, list[Choice]] = {}
+    synthetic_role_codelists: set[str] = set()
+    referenced_item_codelists: set[str] = set()
+    referenced_role_codelists: set[str] = set()
     for cl_oid, cl_elem in codelist_elems.items():
         choices: list[Choice] = []
-        _extract_unmapped_attributes(cl_elem, KNOWN_CODELIST_ATTRIBUTES, "CodeList", record_warning)
+        _extract_unmapped_attributes(
+            cl_elem,
+            KNOWN_CODELIST_ATTRIBUTES,
+            "CodeList",
+            record_warning,
+            known_imednet=KNOWN_IMEDNET_CODELIST_ATTRIBUTES,
+        )
+        if (_get_imednet_attr(cl_elem, "SyntheticRoleCodeList") or "").strip().lower() == "yes":
+            synthetic_role_codelists.add(cl_oid)
 
         pos_idx = 1
         for child in cl_elem:
@@ -1029,7 +1229,7 @@ def load_from_cdisc_odm(
         if inherited_sas_dataset and inherited_sas_dataset.strip():
             it_extra["SASDatasetName"] = inherited_sas_dataset.strip()
 
-        it_extra.update(_extract_item_sdtm_attributes(it_def))
+        it_extra.update(_extract_item_sdtm_attributes(it_def, record_warning))
 
         item_units, range_checks = _extract_item_units_and_ranges(
             it_def,
@@ -1061,6 +1261,20 @@ def load_from_cdisc_odm(
             else:
                 record_warning(
                     f"MethodOID '{method_oid}' on ItemRef '{it_oid}' was not found in MetaDataVersion."
+                )
+
+        role_val = (_get_attr(item_ref, "Role") or "").strip()
+        if role_val:
+            it_extra["Role"] = role_val
+        role_cl_oid = (_get_attr(item_ref, "RoleCodeListOID") or "").strip()
+        if role_cl_oid:
+            it_extra["RoleCodeListOID"] = role_cl_oid
+            if role_cl_oid in parsed_codelists:
+                referenced_role_codelists.add(role_cl_oid)
+            else:
+                record_warning(
+                    f"RoleCodeListOID '{role_cl_oid}' on ItemRef '{it_oid}' "
+                    "was not found in MetaDataVersion."
                 )
 
         cond_oid = (_get_attr(item_ref, "CollectionExceptionConditionOID") or "").strip()
@@ -1095,13 +1309,17 @@ def load_from_cdisc_odm(
             req = _normalize_mandatory(mand_val)
 
         raw_datatype = _get_attr(it_def, "DataType")
+        if raw_datatype and raw_datatype.strip().lower() in _PRESERVED_ODM_RAW_DATA_TYPES:
+            it_extra["odmDataType"] = raw_datatype.strip()
         control_type = _get_attr(it_def, "ControlType") or _get_attr(item_ref, "ControlType")
+        imednet_var_type = _get_imednet_attr(it_def, "VariableType")
 
         cl_ref = _find_first_child(it_def, "CodeListRef")
         var_choices: list[Choice] = []
         if cl_ref is not None:
             cl_oid = _get_attr(cl_ref, "CodeListOID") or ""
             if cl_oid in parsed_codelists:
+                referenced_item_codelists.add(cl_oid)
                 var_choices = [c.model_copy() for c in parsed_codelists[cl_oid]]
             else:
                 record_warning(
@@ -1114,6 +1332,7 @@ def load_from_cdisc_odm(
             has_choices=bool(var_choices),
             control_type=control_type,
             record_warning=record_warning,
+            imednet_variable_type=imednet_var_type,
         )
 
         return Variable(
@@ -1137,11 +1356,14 @@ def load_from_cdisc_odm(
         f_oid = _get_attr(form_elem, "OID") or ""
         f_name = _get_attr(form_elem, "Name") or f_oid
         f_type = normalize_form_type(_get_attr(form_elem, "FormType"), default="Subject")
+        raw_form_id = _get_imednet_attr(form_elem, "FormId")
+        f_id = normalize_form_id(raw_form_id, form_key=f_oid)
         f_extra = _extract_unmapped_attributes(
             form_elem,
             KNOWN_FORM_ATTRIBUTES,
             "FormDef",
             record_warning,
+            known_imednet=KNOWN_IMEDNET_FORM_ATTRIBUTES,
         )
         if (repeating := _get_attr(form_elem, "Repeating")) and repeating.strip().lower() == "yes":
             f_extra.setdefault("repeating", repeating.strip())
@@ -1177,6 +1399,7 @@ def load_from_cdisc_odm(
             )
             ig_cond_oid = (_get_attr(ig_ref, "CollectionExceptionConditionOID") or "").strip()
             if ig_cond_oid:
+                f_extra.setdefault("collectionExceptionConditionOid", ig_cond_oid)
                 if ig_cond_oid in condition_def_elems:
                     if f_oid:
                         condition_form_refs[ig_cond_oid].add(f_oid)
@@ -1205,10 +1428,13 @@ def load_from_cdisc_odm(
 
             ig_domain = _get_attr(ig_def, "Domain")
             ig_sas_dataset = _get_attr(ig_def, "SASDatasetName")
+            ig_purpose = _get_attr(ig_def, "Purpose")
             if ig_domain and ig_domain.strip() and "Domain" not in f_extra:
                 f_extra["Domain"] = ig_domain.strip()
             if ig_sas_dataset and ig_sas_dataset.strip() and "SASDatasetName" not in f_extra:
                 f_extra["SASDatasetName"] = ig_sas_dataset.strip()
+            if ig_purpose and ig_purpose.strip() and "Purpose" not in f_extra:
+                f_extra["Purpose"] = ig_purpose.strip()
 
             item_refs = _find_children(ig_def, "ItemRef")
             item_refs.sort(key=lambda r: _parse_order(r, 0))
@@ -1247,7 +1473,7 @@ def load_from_cdisc_odm(
         form = Form(
             formKey=f_oid,
             formName=f_name,
-            formId=None,
+            formId=f_id,
             formType=f_type,
             variables=variables,
             extraAttributes=f_extra,
@@ -1256,11 +1482,50 @@ def load_from_cdisc_odm(
         if f_oid:
             forms_by_oid[f_oid] = form
 
+    standalone_role_cls: list[dict[str, Any]] = []
+    for rcl_oid in referenced_role_codelists:
+        if rcl_oid in referenced_item_codelists or rcl_oid in synthetic_role_codelists:
+            continue
+        rcl_elem = codelist_elems.get(rcl_oid)
+        if rcl_elem is None:
+            continue
+        standalone_role_cls.append(
+            {
+                "oid": rcl_oid,
+                "name": (_get_attr(rcl_elem, "Name") or rcl_oid).strip(),
+                "dataType": (_get_attr(rcl_elem, "DataType") or "text").strip(),
+                "items": [
+                    {
+                        "choiceValue": c.choiceValue,
+                        "choiceText": c.choiceText,
+                        "position": c.position,
+                    }
+                    for c in parsed_codelists.get(rcl_oid, [])
+                ],
+            }
+        )
+    if standalone_role_cls:
+        extra_meta["roleCodeLists"] = standalone_role_cls
+
     # 5b. Map ConditionDef and MethodDef elements into BusinessLogicRule entries
     unassigned_logic: list[BusinessLogicRule] = []
     rule_seq = 1
 
     for cond_oid, cond_elem in condition_def_elems.items():
+        if (_get_imednet_attr(cond_elem, "RuleSource") or "").strip().lower() == "imednet":
+            container_form, rule = _parse_imednet_condition_rule(
+                cond_elem,
+                rule_seq,
+                no_raw_xml,
+                record_warning,
+            )
+            rule_seq += 1
+            if container_form and container_form in forms_by_oid:
+                forms_by_oid[container_form].businessLogic.append(rule)
+            else:
+                unassigned_logic.append(rule)
+            continue
+
         rule = _parse_formal_rule_element(
             cond_elem,
             "ConditionDef",

@@ -22,7 +22,7 @@ Environment variables
 .. code-block:: bash
 
    export IMEDNET_API_KEY=...
-   export IMEDNET_SECURITY_KEY=...      # if required by your environment
+   export IMEDNET_SECURITY_KEY=...      # required outside simulation mode
    export MONGODB_URI=mongodb://localhost:27017
    export MONGODB_DATABASE=imednet
    export MONGODB_COLLECTION=records

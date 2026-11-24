@@ -21,7 +21,7 @@ Environment variables
 .. code-block:: bash
 
    export IMEDNET_API_KEY=...
-   export IMEDNET_SECURITY_KEY=...      # if required by your environment
+   export IMEDNET_SECURITY_KEY=...      # required outside simulation mode
    export SNOWFLAKE_ACCOUNT=myorg-myaccount
    export SNOWFLAKE_USER=loader
    export SNOWFLAKE_PASSWORD=...        # never hardcode

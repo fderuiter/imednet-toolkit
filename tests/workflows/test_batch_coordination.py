@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from imednet import AsyncImednetSDK, ImednetSDK
+from imednet.errors import ValidationError
 from imednet.models.records import RegisterSubjectRequest
 from imednet.simulation import SimulationState, create_simulation_transport
 from imednet.validation import cache as validation_cache_mod
@@ -87,12 +88,23 @@ def test_record_update_550_records_sends_six_chunks_and_validates_once() -> None
         wf = RecordUpdateWorkflow(sdk)
         records = [{"formKey": "F1", "data": {"age": i % 90}} for i in range(550)]
 
+        # Single-Job helper rejects multi-chunk payloads without sending POSTs
+        with pytest.raises(ValidationError, match="create_or_update_records_batch"):
+            wf.create_or_update_records(
+                "STUDY",
+                records,
+                wait_for_completion=True,
+                poll_interval=0,
+                timeout=10,
+            )
+        assert posted_chunks == []
+
         with patch.object(
             validation_cache_mod,
             "validate_record_data",
             wraps=validation_cache_mod.validate_record_data,
         ) as spy_validate:
-            job = wf.create_or_update_records(
+            summary = wf.create_or_update_records_batch(
                 "STUDY",
                 records,
                 wait_for_completion=True,
@@ -103,17 +115,6 @@ def test_record_update_550_records_sends_six_chunks_and_validates_once() -> None
         assert len(posted_chunks) == 6
         assert [len(c) for c in posted_chunks] == [100, 100, 100, 100, 100, 50]
         assert spy_validate.call_count == 550
-        assert job.state == "COMPLETED"
-
-        # Verify batch summary helper as well
-        posted_chunks.clear()
-        summary = wf.create_or_update_records_batch(
-            "STUDY",
-            records,
-            wait_for_completion=True,
-            poll_interval=0,
-            timeout=10,
-        )
         assert isinstance(summary, BatchSubmissionSummary)
         assert summary.chunk_count == 6
         assert summary.total_records == 550
@@ -262,8 +263,19 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
             for i in range(550)
         ]
 
-        # Default path (no explicit schema passed): get_sites called once and 6 chunked POSTs sent
-        default_job = wf.register_subjects(
+        # Single-Job helper rejects multi-chunk payloads before sending POSTs
+        with pytest.raises(ValidationError, match="register_subjects_batch"):
+            wf.register_subjects(
+                "STUDY",
+                requests,
+                wait_for_completion=True,
+                poll_interval=0,
+                timeout=10,
+            )
+        assert posted_chunks == []
+
+        # Default batch path (no explicit schema passed): get_sites called once and 6 chunked POSTs sent
+        default_summary = wf.register_subjects_batch(
             "STUDY",
             requests,
             wait_for_completion=True,
@@ -272,7 +284,7 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
         )
         assert len(posted_chunks) == 6
         assert [len(c) for c in posted_chunks] == [100, 100, 100, 100, 100, 50]
-        assert default_job.state == "COMPLETED"
+        assert default_summary.all_successful is True
 
         # Explicit schema path: BatchCoordinator validates 550 items once and skips duplicate endpoint validation
         posted_chunks.clear()
@@ -284,7 +296,7 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
             "validate_record_data",
             wraps=validation_cache_mod.validate_record_data,
         ) as spy_validate:
-            job = wf.register_subjects(
+            schema_summary = wf.register_subjects_batch(
                 "STUDY",
                 requests,
                 schema=validator.schema,
@@ -296,7 +308,7 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
         assert len(posted_chunks) == 6
         assert [len(c) for c in posted_chunks] == [100, 100, 100, 100, 100, 50]
         assert spy_validate.call_count == 550
-        assert job.state == "COMPLETED"
+        assert schema_summary.all_successful is True
 
         # Optional filtering of already enrolled Subjects and duplicate candidate keys
         posted_chunks.clear()
@@ -326,15 +338,23 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
         assert len(posted_chunks) == 1
         assert posted_chunks[0][0]["data"]["SUBJ_ID"] == "NEW-002"
 
-        # When every requested Subject is already enrolled, no POST is issued
+        # When every requested Subject is already enrolled, single-Job helper rejects zero-Job outcome
+        # while register_subjects_batch returns an empty summary with skipped_count=1
         posted_chunks.clear()
-        noop_job = wf.register_subjects(
+        with pytest.raises(ValidationError, match="register_subjects_batch"):
+            wf.register_subjects(
+                "STUDY",
+                [{"formKey": "ENROLL", "siteName": "SITE-1", "subjectKey": "EXISTING-001"}],
+                skip_existing=True,
+            )
+        noop_summary = wf.register_subjects_batch(
             "STUDY",
             [{"formKey": "ENROLL", "siteName": "SITE-1", "subjectKey": "EXISTING-001"}],
             skip_existing=True,
         )
         assert posted_chunks == []
-        assert noop_job.state == "COMPLETED"
+        assert noop_summary.jobs == []
+        assert noop_summary.skipped_count == 1
     finally:
         sdk.close()
 
@@ -470,9 +490,11 @@ def test_uat_workflow_run_simulation_enrolls_without_subject_key_and_resolves_ph
         sdk.close()
 
 
-def test_uat_workflow_fetches_result_url_and_flags_partial_failures() -> None:
-    """UATWorkflow resolves Subject keys from resultUrl and fails monitor on nonzero failed_records."""
+def test_uat_workflow_skips_result_url_and_flags_batch_failures() -> None:
+    """UATWorkflow resolves Subject keys via EDC records/subjects without polling resultUrl."""
     submitted_batches: list[list[dict[str, Any]]] = []
+    enrolled_subjects: list[dict[str, Any]] = []
+    stored_records: list[dict[str, Any]] = []
     result_url_calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -545,45 +567,55 @@ def test_uat_workflow_fetches_result_url_and_flags_partial_failures() -> None:
                 },
             )
         if request.method == "GET" and path.endswith("/subjects"):
-            return httpx.Response(200, json={"data": []})
+            return httpx.Response(200, json={"data": list(enrolled_subjects)})
+        if request.method == "GET" and path.endswith("/records"):
+            return httpx.Response(200, json={"data": list(stored_records)})
         if request.method == "POST" and path.endswith("/records"):
             body = json.loads(request.content.decode("utf-8"))
             submitted_batches.append(body)
             bid = f"B{len(submitted_batches)}"
+            if bid == "B1":
+                for idx, item in enumerate(body, start=101):
+                    subj_key = f"ASSIGNED-{idx}"
+                    enrolled_subjects.append(
+                        {
+                            "studyKey": "S",
+                            "subjectId": idx,
+                            "subjectKey": subj_key,
+                            "siteId": 1,
+                            "siteName": "Site1",
+                        }
+                    )
+                    stored_records.append(
+                        {
+                            "studyKey": "S",
+                            "recordId": idx,
+                            "formKey": item["formKey"],
+                            "subjectId": idx,
+                            "subjectKey": subj_key,
+                            "siteId": 1,
+                            "siteName": item.get("siteName", "Site1"),
+                            "recordData": dict(item.get("data", {})),
+                        }
+                    )
             return httpx.Response(
                 200, json={"jobId": f"J-{bid}", "batchId": bid, "state": "QUEUED"}
             )
         if request.method == "GET" and "/jobs/B" in path and not path.endswith("/results"):
             bid = path.rsplit("/", 1)[-1]
+            state = "COMPLETED" if bid == "B1" else "FAILED"
             return httpx.Response(
                 200,
                 json={
                     "jobId": f"J-{bid}",
                     "batchId": bid,
-                    "state": "COMPLETED",
-                    "progress": 100,
+                    "state": state,
                     "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/S/jobs/{bid}/results",
                 },
             )
         if request.method == "GET" and path.endswith("/results"):
             result_url_calls.append(str(request.url))
-            bid = path.split("/")[-2]
-            if bid == "B1":
-                return httpx.Response(
-                    200,
-                    json=[
-                        {"subjectKey": "ASSIGNED-101", "status": "SUCCESS"},
-                        {"subjectKey": "ASSIGNED-102", "status": "SUCCESS"},
-                    ],
-                )
-            # B2 has one failed record -> partial failure must mark UAT overall_success False
-            return httpx.Response(
-                200,
-                json=[
-                    {"subjectKey": "ASSIGNED-101", "status": "SUCCESS"},
-                    {"subjectKey": "ASSIGNED-102", "status": "FAILED", "error": "Invalid visit"},
-                ],
-            )
+            return httpx.Response(500, json={"error": "resultUrl should not be polled"})
         return httpx.Response(404)
 
     sdk = ImednetSDK(
@@ -599,13 +631,13 @@ def test_uat_workflow_fetches_result_url_and_flags_partial_failures() -> None:
         assert len(submitted_batches) == 2
         # Phase 1 registration omitted subjectKey
         assert all("subjectKey" not in rec for rec in submitted_batches[0])
-        # Phase 2 used server-assigned Subject keys from B1's resultUrl
+        # Phase 2 resolved server-assigned Subject keys via EDC endpoints without resultUrl
         assert [rec["subjectKey"] for rec in submitted_batches[1]] == [
             "ASSIGNED-101",
             "ASSIGNED-102",
         ]
-        assert len(result_url_calls) >= 2
-        # Because B2 had 1 failed record in its resultUrl payload, overall_success is False
+        assert result_url_calls == []
+        # Because B2 reached FAILED terminal state, overall_success is False
         assert res.overall_success is False
         assert res.poll_summary.all_successful is False
         assert "B2" in res.poll_summary.failures
@@ -660,7 +692,7 @@ async def test_record_update_workflow_concurrent_submissions_sharing_cache_valid
         pause_on_post = True
 
         task1 = asyncio.create_task(
-            wf.async_create_or_update_records(
+            wf.async_create_or_update_records_batch(
                 "STUDY",
                 [
                     {"formKey": "F1", "data": {"age": 30}},
@@ -687,8 +719,9 @@ async def test_record_update_workflow_concurrent_submissions_sharing_cache_valid
             )
 
         allow_first_post.set()
-        job = await task1
-        assert job.state == "COMPLETED"
+        summary = await task1
+        assert summary.all_successful is True
+        assert [j.state for j in summary.jobs] == ["COMPLETED", "COMPLETED"]
         assert [[r["data"]["age"] for r in b] for b in posted_batches] == [[30, 31], [32]]
 
 

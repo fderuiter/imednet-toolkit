@@ -521,3 +521,71 @@ async def test_register_subjects_workflow_supports_both_sync_and_async_facades()
             "STUDY",
             [{"formKey": "F_DM", "siteName": "CLOSED_SITE", "subjectKey": "S1", "data": {}}],
         )
+
+
+@pytest.mark.asyncio
+async def test_standalone_dry_run_and_skip_validation_never_fabricate_valid_counts() -> None:
+    """AC 5: Standalone dry_run=True returns invalid report cleanly; skip_validation=True never claims valid counts."""
+    schema = _build_dd_schema()
+    invalid_records = [
+        {"formKey": "F_VITALS", "subjectKey": "S1", "data": {"AGE": 5}},
+        {"formKey": "F_VITALS", "subjectKey": "S2", "data": {}},
+    ]
+
+    submit_spy = MagicMock()
+    coord = BatchCoordinator(chunk_size=1)
+
+    # Standalone dry_run=True (collect_errors=False) returns invalid report without raising
+    dry_summary = coord.submit(
+        "STUDY",
+        invalid_records,
+        submit_chunk=submit_spy,
+        schema=schema,
+        dry_run=True,
+    )
+    assert dry_summary.dry_run is True
+    assert dry_summary.all_successful is False
+    assert dry_summary.validation_report is not None
+    assert dry_summary.validation_report.is_valid is False
+    assert dry_summary.validation_report.error_count == 4
+    submit_spy.assert_not_called()
+
+    # skip_validation=True never fabricates a BatchValidationReport claiming valid_records > 0
+    skipped_dry = coord.submit(
+        "STUDY",
+        invalid_records,
+        submit_chunk=submit_spy,
+        schema=schema,
+        skip_validation=True,
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert skipped_dry.validation_report is None
+    submit_spy.assert_not_called()
+
+    # Async parity for standalone dry_run=True and skip_validation=True
+    async_submit_spy = AsyncMock()
+    acoord = AsyncBatchCoordinator(chunk_size=1)
+    async_dry = await acoord.submit(
+        "STUDY",
+        invalid_records,
+        submit_chunk=async_submit_spy,
+        schema=schema,
+        dry_run=True,
+    )
+    assert async_dry.validation_report is not None
+    assert async_dry.validation_report.is_valid is False
+    assert async_dry.all_successful is False
+    async_submit_spy.assert_not_called()
+
+    async_skipped = await acoord.submit(
+        "STUDY",
+        invalid_records,
+        submit_chunk=async_submit_spy,
+        schema=schema,
+        skip_validation=True,
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert async_skipped.validation_report is None
+    async_submit_spy.assert_not_called()

@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 from scripts.validate_docs import REQUIRED_PYTHON_CLASSIFIERS, check_sphinx_html_baseurl
-from scripts.validate_package_consumption import build_wheels, verify_wheel_metadata
+from scripts.validate_package_consumption import (
+    build_wheels,
+    validate_wheel_metadata,
+    verify_wheel_metadata,
+)
 
 import imednet
 
@@ -282,3 +286,58 @@ def test_verify_wheel_metadata_rejects_missing_description_or_license(tmp_path: 
         "# Sample README\n",
     )
     verify_wheel_metadata(dist_dir, packages_dir=pkgs_dir)
+
+
+def test_validate_wheel_metadata_enforces_license_markdown_and_body(tmp_path: Path) -> None:
+    """Verify validate_wheel_metadata checks License/License-Expression, Description-Content-Type, and non-empty body."""
+    pkgs_dir = tmp_path / "packages" / "demo"
+    pkgs_dir.mkdir(parents=True)
+    (pkgs_dir / "pyproject.toml").write_text('[project]\nname = "demo-pkg"\n', encoding="utf-8")
+
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir(parents=True)
+    wheel_path = dist_dir / "demo_pkg-1.0.0-py3-none-any.whl"
+
+    def _write_wheel(metadata_text: str) -> None:
+        with zipfile.ZipFile(wheel_path, "w") as zf:
+            zf.writestr("demo_pkg-1.0.0.dist-info/METADATA", metadata_text)
+
+    _write_wheel(
+        "Metadata-Version: 2.4\n"
+        "Name: demo-pkg\n"
+        "Version: 1.0.0\n"
+        "License: MIT\n"
+        "Description-Content-Type: text/markdown\n\n"
+        "# demo-pkg\n\nRendered package documentation.\n"
+    )
+    validate_wheel_metadata(dist_dir, packages_dir=tmp_path / "packages")
+
+    # Missing License
+    _write_wheel(
+        "Metadata-Version: 2.4\n"
+        "Name: demo-pkg\n"
+        "Version: 1.0.0\n"
+        "Description-Content-Type: text/markdown\n\n"
+        "# demo-pkg\n"
+    )
+    with pytest.raises(ValueError, match="License"):
+        validate_wheel_metadata(dist_dir, packages_dir=tmp_path / "packages")
+
+    # Missing Description-Content-Type: text/markdown
+    _write_wheel(
+        "Metadata-Version: 2.4\nName: demo-pkg\nVersion: 1.0.0\nLicense: MIT\n\n# demo-pkg\n"
+    )
+    with pytest.raises(ValueError, match="Description-Content-Type"):
+        validate_wheel_metadata(dist_dir, packages_dir=tmp_path / "packages")
+
+    # Empty METADATA body
+    _write_wheel(
+        "Metadata-Version: 2.4\n"
+        "Name: demo-pkg\n"
+        "Version: 1.0.0\n"
+        "License: MIT\n"
+        "Description-Content-Type: text/markdown\n\n"
+        "   \n"
+    )
+    with pytest.raises(ValueError, match="empty"):
+        validate_wheel_metadata(dist_dir, packages_dir=tmp_path / "packages")

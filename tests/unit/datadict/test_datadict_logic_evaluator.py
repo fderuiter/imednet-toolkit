@@ -1047,6 +1047,155 @@ def test_nested_and_or_not_explicit_group_combinations() -> None:
     )
 
 
+def test_rules_for_form_scopes_unassigned_form_none_rules_by_defined_variables() -> None:
+    """DataDictionary.rules_for_form attaches form=None rules only to Forms defining referenced Variables."""
+    ae_rule = BusinessLogicRule(
+        id="R_AE_UNASSIGNED",
+        name="AE Severity Required",
+        type="Query",
+        status="Active",
+        form=None,
+        logic=parse_logic_xml(
+            "<rule><conditions><condition><variable>AETERM</variable>"
+            "<operator>not_empty</operator><value/></condition>"
+            "<condition><variable>AESEV</variable><operator>empty</operator><value/></condition>"
+            "</conditions><actions><action><type>query</type>"
+            "<message>Severity missing</message></action></actions></rule>"
+        ),
+    )
+    dm_rule = BusinessLogicRule(
+        id="R_DM_UNASSIGNED",
+        name="Underage Check",
+        type="Query",
+        status="Active",
+        form=None,
+        logic=parse_logic_xml(
+            "<rule><conditions><condition><variable>BRTHDAT</variable>"
+            "<operator>empty</operator><value/></condition></conditions></rule>"
+        ),
+    )
+    cross_form_rule = BusinessLogicRule(
+        id="R_CROSS",
+        name="AE Before Consent",
+        type="Query",
+        status="Active",
+        form=None,
+        logic=parse_logic_xml(
+            "<rule><conditions><condition><variable>AE.AESTDTC</variable>"
+            "<operator>&lt;</operator><compareVariable>DM.RFICDTC</compareVariable>"
+            "</condition></conditions></rule>"
+        ),
+    )
+
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formKey="AE",
+                variables=[
+                    Variable(variableName="AETERM"),
+                    Variable(variableName="AESEV"),
+                    Variable(variableName="AESTDTC"),
+                ],
+            ),
+            Form(
+                formKey="DM",
+                variables=[
+                    Variable(variableName="SUBJID"),
+                    Variable(variableName="BRTHDAT"),
+                    Variable(variableName="RFICDTC"),
+                ],
+            ),
+            Form(
+                formKey="VS",
+                variables=[Variable(variableName="SYSBP")],
+            ),
+        ],
+        unassignedBusinessLogic=[ae_rule, dm_rule, cross_form_rule],
+    )
+
+    assert [r.id for r in dd.rules_for_form("AE")] == ["R_AE_UNASSIGNED"]
+    assert [r.id for r in dd.rules_for_form("DM")] == ["R_DM_UNASSIGNED"]
+    assert dd.rules_for_form("VS") == []
+
+
+def test_logic_evaluator_chronological_mdy_blank_value_bool_and_cross_scope_compare_var() -> None:
+    """LogicTreeEvaluator compares MM-DD-YYYY chronologically, maps <value/> to '' on bools, and skips cross-Form compareVariable when form_key=None."""
+    evaluator = LogicTreeEvaluator()
+
+    # 1. Chronological MM-DD-YYYY comparison: "02-01-2026" < "12-31-2025" is False
+    date_rule = BusinessLogicRule(
+        id="R_DATE",
+        name="Visit Before Cutoff",
+        type="Form",
+        status="Active",
+        logic=parse_logic_xml(
+            "<rule><conditions><condition><variable>VISDAT</variable>"
+            "<operator>&lt;</operator><value>12-31-2025</value>"
+            "</condition></conditions></rule>"
+        ),
+    )
+    res_after = evaluator.evaluate_rule(date_rule, {"VISDAT": "02-01-2026"})
+    assert res_after.triggered is False
+    res_before = evaluator.evaluate_rule(date_rule, {"VISDAT": "11-15-2025"})
+    assert res_before.triggered is True
+
+    # 2. Self-closing <value/> parsed as True must map to "" rather than matching boolean True
+    blank_val_rule = BusinessLogicRule(
+        id="R_BLANK_BOOL",
+        name="Empty Value Tag Comparison",
+        type="Form",
+        status="Active",
+        logic=parse_logic_xml(
+            "<rule><conditions><condition><variable>CONSENT</variable>"
+            "<operator>==</operator><value/></condition></conditions></rule>"
+        ),
+    )
+    assert evaluator.evaluate_rule(blank_val_rule, {"CONSENT": True}).triggered is False
+    assert evaluator.evaluate_rule(blank_val_rule, {"CONSENT": False}).triggered is False
+    assert evaluator.evaluate_rule(blank_val_rule, {"CONSENT": ""}).triggered is True
+
+    # 3. Cross-Form compareVariable with form_key=None sets is_cross_scope=True and skipped=True
+    cross_rule = BusinessLogicRule(
+        id="R_CROSS_CMP",
+        name="AE Before Consent Date",
+        type="Form",
+        status="Active",
+        logic=parse_logic_xml(
+            "<rule><conditions><condition><variable>AE.AESTDTC</variable>"
+            "<operator>&lt;</operator><compareVariable>DM.RFICDTC</compareVariable>"
+            "</condition></conditions></rule>"
+        ),
+    )
+    cross_res = evaluator.evaluate_rule(
+        cross_rule,
+        {"AESTDTC": "2026-01-01", "RFICDTC": "2026-02-01"},
+        form_key=None,
+    )
+    assert cross_res.is_cross_scope is True
+    assert cross_res.skipped is True
+    assert cross_res.triggered is False
+
+    # Attribute-style @compareVariable also sets is_cross_scope=True and skipped=True
+    attr_cross_rule = BusinessLogicRule(
+        id="R_CROSS_ATTR",
+        name="AE Before Consent Date Attr",
+        type="Form",
+        status="Active",
+        logic=parse_logic_xml(
+            '<rule><conditions><condition variable="AE.AESTDTC" operator="&lt;" '
+            'compareVariable="DM.RFICDTC"/></conditions></rule>'
+        ),
+    )
+    attr_res = evaluator.evaluate_rule(
+        attr_cross_rule,
+        {"AESTDTC": "2026-01-01", "RFICDTC": "2026-02-01"},
+        form_key=None,
+    )
+    assert attr_res.is_cross_scope is True
+    assert attr_res.skipped is True
+    assert attr_res.triggered is False
+
+
 def test_regex_redos_backtracking_guarded_in_validate_record_data() -> None:
     """Nested quantifier regex rules skip safely without stalling validate_record_data."""
     xml_rule = (

@@ -4310,8 +4310,21 @@ def _stream_records_across_forms(
         )
 
     with contextlib.ExitStack() as tx_stack:
-        for ctx in contexts:
-            if provider is not None:
+        batch_tx_fn = getattr(provider, "batch_transaction", None) if provider is not None else None
+        inst_dict = getattr(provider, "__dict__", {}) if provider is not None else {}
+        has_custom_instance_tx = "transaction" in inst_dict and "batch_transaction" not in inst_dict
+        if provider is not None and callable(batch_tx_fn) and not has_custom_instance_tx:
+            tx_map = tx_stack.enter_context(
+                batch_tx_fn(
+                    study_key,
+                    [ctx.stream_name for ctx in contexts],
+                    fallback_timestamp=opts["modified_since"],
+                )
+            )
+            for ctx in contexts:
+                ctx.tx = tx_map[ctx.stream_name]
+        elif provider is not None:
+            for ctx in contexts:
                 ctx.tx = tx_stack.enter_context(
                     provider.transaction(
                         study_key,
@@ -4319,6 +4332,9 @@ def _stream_records_across_forms(
                         fallback_timestamp=opts["modified_since"],
                     )
                 )
+
+        for ctx in contexts:
+            if ctx.tx is not None:
                 raw_last = ctx.tx.get("last_timestamp")
                 ctx.watermark = (
                     normalize_watermark_datetime(raw_last)

@@ -22,7 +22,10 @@ from imednet.models.jobs import (
     normalize_job_state,
     validate_job_transition,
 )
-from imednet.utils.secrets import redact_sensitive_payload
+from imednet.utils.security import (
+    sanitize_diagnostic_payload,
+    sanitize_diagnostic_text,
+)
 from imednet.utils.url import validate_path_segment
 
 logger = logging.getLogger(__name__)
@@ -115,7 +118,7 @@ class JobPollSummary:
         """Return True if all jobs were successful with zero failed records."""
         return not self.failures and all(
             cast(Any, s).is_successful
-            and getattr(s, "failed_records", 0) == 0
+            and (getattr(s, "failed_records", None) or 0) == 0
             and not getattr(s, "result_error", None)
             for s in self.results.values()
         )
@@ -125,10 +128,20 @@ class JobPollSummary:
         """Return True if any job failed, timed out, or reported failed records."""
         return bool(self.failures) or any(
             cast(Any, s).is_failed
-            or getattr(s, "failed_records", 0) > 0
+            or (getattr(s, "failed_records", None) or 0) > 0
             or bool(getattr(s, "result_error", None))
             for s in self.results.values()
         )
+
+    @property
+    def terminal_statuses(self) -> dict[str, JobStatus]:
+        """Return all terminal JobStatus objects across completed results and failed batches."""
+        combined: dict[str, JobStatus] = dict(self.results)
+        for batch_id, err in self.failures.items():
+            status = getattr(err, "status", None)
+            if isinstance(status, JobStatus) and batch_id not in combined:
+                combined[batch_id] = status
+        return combined
 
 
 class JobTimeoutError(TimeoutError):
@@ -146,17 +159,17 @@ def _extract_record_errors(status: JobStatus | Any) -> list[dict[str, Any]]:
             item_status = str(item.get("status") or "").upper()
             has_err_key = bool(item.get("error") or item.get("errors"))
             if item_status in {"FAIL", "FAILED", "ERROR"} or (not item_status and has_err_key):
-                extracted.append(cast(dict[str, Any], redact_sensitive_payload(item)))
+                extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(item)))
     elif isinstance(results, dict):
         nested_errors = results.get("errors")
         if isinstance(nested_errors, list):
             for err_item in nested_errors:
                 if isinstance(err_item, dict):
-                    extracted.append(cast(dict[str, Any], redact_sensitive_payload(err_item)))
+                    extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(err_item)))
                 elif err_item is not None:
-                    extracted.append({"error": str(redact_sensitive_payload(err_item))})
+                    extracted.append({"error": sanitize_diagnostic_text(str(err_item))})
         elif results.get("error"):
-            extracted.append(cast(dict[str, Any], redact_sensitive_payload(results)))
+            extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(results)))
     return extracted
 
 
@@ -210,21 +223,26 @@ class JobFailedError(Exception):
         *,
         record_errors: list[dict[str, Any]] | None = None,
         result_error: str | None = None,
+        poll_summary: JobPollSummary | None = None,
+        partial_summary: Any | None = None,
     ) -> None:
-        """Initialize the JobFailedError with attached record diagnostics."""
+        """Initialize the JobFailedError with attached record and batch diagnostics."""
         resolved_errors = (
-            record_errors if record_errors is not None else _extract_record_errors(status)
+            cast(list[dict[str, Any]], sanitize_diagnostic_payload(record_errors))
+            if record_errors is not None
+            else _extract_record_errors(status)
         )
         raw_res_err = (
             result_error if result_error is not None else getattr(status, "result_error", None)
         )
         resolved_result_error = (
-            str(redact_sensitive_payload(raw_res_err))
+            sanitize_diagnostic_text(raw_res_err)
             if isinstance(raw_res_err, str) and raw_res_err
             else None
         )
+        sanitized_base = sanitize_diagnostic_text(message)
         formatted_message = _format_job_failure_details(
-            message,
+            sanitized_base,
             status,
             resolved_errors,
             resolved_result_error,
@@ -233,6 +251,8 @@ class JobFailedError(Exception):
         self.status = status
         self.record_errors = resolved_errors
         self.result_error = resolved_result_error
+        self.poll_summary = poll_summary
+        self.partial_summary = partial_summary
 
 
 def evaluate_job_state(
@@ -317,8 +337,8 @@ def _raise_fetch_result_error(
     status: JobStatus | Any,
     exc: Exception,
 ) -> NoReturn:
-    """Redact credentials, record ``result_error``, log, and raise :class:`JobFailedError`."""
-    redacted_err = str(redact_sensitive_payload(str(exc)))
+    """Redact credentials and PHI, record ``result_error``, log, and raise :class:`JobFailedError`."""
+    redacted_err = sanitize_diagnostic_text(str(exc))
     status.result_error = redacted_err
     logger.error(
         "[JobPoller] batch_id=%s FAILED fetching resultUrl: %s",

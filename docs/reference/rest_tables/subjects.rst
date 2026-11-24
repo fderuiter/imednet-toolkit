@@ -70,8 +70,8 @@ List subjects
      - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
-     - None
-     - Sorting expression (e.g. ``subjectKey,asc`` or ``dateCreated,desc``).
+     - ``subjectId,asc``
+     - Sorting expression (e.g. ``subjectId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String
      - None
