@@ -140,12 +140,25 @@ def reset_strict_mode_context(token: contextvars.Token[bool | None]) -> None:
     _active_strict_mode.reset(token)
 
 
+_CACHED_STRICT_ENV_RAW: str | None = None
+_CACHED_STRICT_ENV_VAL: bool = False
+
+
 def is_strict_mode() -> bool:
     """Return whether strict validation mode is enabled in the active context or environment."""
+    global _CACHED_STRICT_ENV_RAW, _CACHED_STRICT_ENV_VAL
     active = _active_strict_mode.get()
     if active is not None:
         return active
-    return parse_bool(os.getenv("IMEDNET_STRICT_MODE", "false"), strict=False)
+    raw = os.environ.get("IMEDNET_STRICT_MODE")
+    if raw is None:
+        return False
+    if raw == _CACHED_STRICT_ENV_RAW:
+        return _CACHED_STRICT_ENV_VAL
+    val = parse_bool(raw, strict=False)
+    _CACHED_STRICT_ENV_RAW = raw
+    _CACHED_STRICT_ENV_VAL = val
+    return val
 
 
 @contextmanager

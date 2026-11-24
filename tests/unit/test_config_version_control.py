@@ -970,6 +970,21 @@ def test_resolve_committed_config_fast_path_and_mock_fallback(
     with study_context("STUDY-CTX"):
         assert ConfigVersionStore.resolve_committed_config("STUDY-CTX") is None
 
+    # Existing base directory without host subdir or flat DB short-circuits cleanly; flat legacy DB still resolves
+    empty_base_db = tmp_path / "existing_base" / "versions.sqlite3"
+    empty_base_db.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(empty_base_db))
+    assert ConfigVersionStore.resolve_committed_config("STUDY-01") is None
+    assert ConfigVersionStore.resolve_legacy_committed_config("STUDY-01") is None
+
+    import shutil
+
+    shutil.copy2(store.db_path, empty_base_db)
+    flat_resolved = ConfigVersionStore.resolve_committed_config("STUDY-01")
+    assert flat_resolved is not None
+    assert flat_resolved.phi_fields == ["custom_mrn"]
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(active_db))
+
     # Mocked get_history / rollback_config fallback path
     with (
         patch.object(ConfigVersionStore, "get_history", return_value=[{"commit_id": "abc123"}]),

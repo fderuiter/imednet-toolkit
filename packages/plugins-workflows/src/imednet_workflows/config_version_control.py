@@ -7,6 +7,7 @@ diff capability, and safe rollback.  History blocks are read-only once written.
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import json
 import os
@@ -37,6 +38,7 @@ _DEFAULT_DB_PATH = Path(
     os.environ.get("IMEDNET_CONFIG_DB_PATH", Path.home() / ".imednet" / "config_versions.sqlite3")
 )
 _DEFAULT_DB_PATH_STR = str(Path.home() / ".imednet" / "config_versions.sqlite3")
+_DEFAULT_DB_PATH_OBJ = Path(_DEFAULT_DB_PATH_STR)
 _READ_STORE_CACHE: dict[Path, ConfigVersionStore] = {}
 _DYNAMIC_PATH_CACHE: dict[tuple[str, str], Path] = {}
 _HEAD_INDEX_CACHE: dict[tuple[Path, int, int, int], dict[str, str]] = {}
@@ -54,6 +56,7 @@ def _compute_chained_commit_id(content_hash: str, parent_commit_id: str | None) 
     return _sha256_of(f"{parent_commit_id}:{content_hash}")
 
 
+@functools.lru_cache(maxsize=64)
 def _sanitize_base_url_for_path(url: str) -> str:
     """Extract and sanitize host from URL to create a safe path name."""
     try:
@@ -194,19 +197,31 @@ class ConfigVersionStore:
     def _get_legacy_db_paths_no_create(base_db_path: Path, study_key: str) -> list[Path]:
         """Return legacy study_context-partitioned and flat candidate SQLite paths without creating dirs."""
         validate_partition_key(study_key)
+        base_dir = base_db_path.parent
+        if not os.path.isdir(base_dir):
+            return []
         base_url = (
             get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
         )
         sanitized_url = _sanitize_base_url_for_path(base_url)
-        base_dir = base_db_path.parent
-        resolved_base = base_dir.resolve()
+        db_name = base_db_path.name
+        legacy_db_str = (
+            f"{base_dir}{os.sep}{sanitized_url}{os.sep}{study_key}{os.sep}{db_name}"
+            if study_key
+            else ""
+        )
+        has_legacy_db = bool(legacy_db_str and os.path.exists(legacy_db_str))
+        has_flat_db = os.path.exists(base_db_path)
+        if not has_legacy_db and not has_flat_db:
+            return []
 
+        resolved_base = base_dir.resolve()
         candidates: list[Path] = []
-        if study_key:
+        if has_legacy_db:
             legacy_study_dir = base_dir / sanitized_url / study_key
             if legacy_study_dir.resolve().is_relative_to(resolved_base):
-                candidates.append(legacy_study_dir / base_db_path.name)
-        if base_db_path.resolve().is_relative_to(resolved_base):
+                candidates.append(legacy_study_dir / db_name)
+        if has_flat_db and base_db_path.resolve().is_relative_to(resolved_base):
             candidates.append(base_db_path)
         return candidates
 
@@ -328,7 +343,7 @@ class ConfigVersionStore:
         """Read latest committed StudyConfiguration from legacy study-partitioned SQLite paths."""
         validate_partition_key(study_key)
         raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
-        raw_db_path = Path(raw_env).expanduser() if raw_env else Path(_DEFAULT_DB_PATH_STR)
+        raw_db_path = Path(raw_env).expanduser() if raw_env else _DEFAULT_DB_PATH_OBJ
         canonical_path = cls._get_dynamic_db_path_no_create(raw_db_path)
         for legacy_path in cls._get_legacy_db_paths_no_create(raw_db_path, study_key):
             if legacy_path == canonical_path:
@@ -354,8 +369,10 @@ class ConfigVersionStore:
             return cfg if isinstance(cfg, StudyConfiguration) else None
 
         raw_env = os.environ.get("IMEDNET_CONFIG_DB_PATH")
-        raw_db_path = Path(raw_env).expanduser() if raw_env else Path(_DEFAULT_DB_PATH_STR)
+        raw_db_path = Path(raw_env).expanduser() if raw_env else _DEFAULT_DB_PATH_OBJ
         candidate_path = cls._get_dynamic_db_path_no_create(raw_db_path)
+        if not os.path.isdir(candidate_path.parent) and not os.path.exists(raw_db_path):
+            return None
         resolved = cls._read_committed_from_sqlite_path(
             candidate_path,
             study_key,
