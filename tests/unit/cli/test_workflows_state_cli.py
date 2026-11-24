@@ -978,3 +978,41 @@ def test_headless_state_set_recovers_airflow_variable_streams(
         airflow.settings.configure_orm()
         root_logger.handlers = saved_handlers
         root_logger.setLevel(saved_level)
+
+
+def test_interactive_state_set_reads_ledger_once_and_reuses_wizard_state(
+    runner: CliRunner,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interactive workflows state set reuses wizard LedgerState instead of calling read_state twice."""
+    import sys
+
+    ledger_path = str(tmp_path / "ledger.json")
+    existing_state = _make_ledger_state("STUDY-ONCE", "records")
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    monkeypatch.setattr(sys, "stdin", _InteractiveStringIO("15\ny\n"))
+
+    with patch("imednet_workflows.cli.get_state_provider") as mock_ledger:
+        mock_ledger.return_value.read_state.return_value = existing_state
+        res = runner.invoke(
+            state_app,
+            [
+                "set",
+                "--interactive",
+                "-s",
+                "STUDY-ONCE",
+                "-m",
+                "records",
+                "-t",
+                "2026-06-01T00:00:00Z",
+                "-l",
+                ledger_path,
+            ],
+        )
+
+    assert res.exit_code == 0
+    assert mock_ledger.call_count == 1
+    assert mock_ledger.return_value.read_state.call_count == 1
+    assert "Current Status:    success (timestamp: 2026-05-22T12:00:00+00:00)" in res.stderr
+    mock_ledger.return_value.set_last_timestamp.assert_called_once()

@@ -70,12 +70,8 @@ List intervals
      - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
-     - None
+     - ``intervalId,asc``
      - Sorting expression (e.g. ``intervalId,asc`` or ``dateCreated,desc``).
-   * - ``filter``
-     - String
-     - None
-     - Attribute query filter expression (see :ref:`filter_syntax`).
 
 .. rubric:: Status Codes
 
@@ -159,7 +155,13 @@ List intervals
                "windowCalculationDate": "",
                "windowCalculationForm": "",
                "lastUpdated": "<string>",
-               "forms": []
+               "forms": [
+                   {
+                       "formId": "<integer>",
+                       "formKey": "<string>",
+                       "formName": "<string>"
+                   }
+               ]
            },
            {
                "studyKey": "<string>",

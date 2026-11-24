@@ -525,8 +525,14 @@ def _raise_from_poll_summary(poll_summary: JobPollSummary) -> None:
     if poll_summary.failures:
         raise next(iter(poll_summary.failures.values()))
     for batch_id, status in poll_summary.results.items():
-        if getattr(status, "is_failed", False) or getattr(status, "failed_records", 0) > 0:
-            raise JobFailedError(f"Job {batch_id} ended in state {status.state}", status)
+        if (
+            getattr(status, "is_failed", False)
+            or (getattr(status, "failed_records", None) or 0) > 0
+        ):
+            raise JobFailedError(
+                f"Job {batch_id} ended in state {status.state}",
+                status,
+            )
 
 
 def _handle_validation_report(

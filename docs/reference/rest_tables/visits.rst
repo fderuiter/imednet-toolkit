@@ -70,7 +70,7 @@ List visits
      - Maximum number of records to return per page (maximum ``500``).
    * - ``sort``
      - String
-     - None
+     - ``visitId,asc``
      - Sorting expression (e.g. ``visitId,asc`` or ``dateCreated,desc``).
    * - ``filter``
      - String

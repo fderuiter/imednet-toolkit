@@ -7,23 +7,28 @@ import pytest
 from imednet.core.context import set_study_context
 from imednet.endpoints import intervals
 from imednet.errors import NotFoundError
+from imednet.errors.validation import ConfigurationError
 from imednet.models.intervals import Interval
 
 
-def test_list_uses_default_study_and_page_size(dummy_client, paginator_factory, patch_build_filter):
-    """Test that list uses default study and page size."""
+def test_list_uses_default_study_and_page_size_and_rejects_filters(dummy_client, paginator_factory):
+    """Test that list uses default study and page size and rejects unbacked filter attributes."""
     set_study_context("S1")
     ep = intervals.IntervalsEndpoint(dummy_client)
     captured = paginator_factory(intervals, [{"intervalId": 1}])
-    filter_capture = patch_build_filter(intervals)
 
-    result = ep.list(interval_name="Baseline")
+    result = list(ep.list(sort="intervalId,asc"))
 
     assert captured["path"] == "/api/v1/edc/studies/S1/intervals"
     assert captured["page_size"] == 500
-    assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"interval_name": "Baseline"}
+    assert captured["params"] == {"sort": "intervalId,asc"}
     assert isinstance(result[0], Interval)
+
+    with pytest.raises(ConfigurationError, match="Allowed filter attributes: none"):
+        list(ep.list(interval_name="Baseline"))
+
+    with pytest.raises(ConfigurationError, match="Allowed filter attributes: none"):
+        list(ep.list(filter="intervalName==Baseline"))
 
 
 def test_get_not_found(monkeypatch, dummy_client):
@@ -87,21 +92,22 @@ def test_to_dataframe_success(dummy_client, paginator_factory):
     assert forms_list[0]["form_id"] == 10
 
 
-def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory, patch_build_filter):
-    """Test that to_dataframe forwards filters and study key to list."""
+def test_to_dataframe_parameter_forwarding(dummy_client, paginator_factory):
+    """Test that to_dataframe forwards sort/pagination and rejects filters."""
     ep = intervals.IntervalsEndpoint(dummy_client)
     captured = paginator_factory(intervals, [{"intervalId": 1}])
-    filter_capture = patch_build_filter(intervals)
 
     df = ep.to_dataframe(
         study_key="S1",
-        interval_name="Baseline",
+        sort="intervalId,asc",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/intervals"
-    assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"interval_name": "Baseline"}
+    assert captured["params"] == {"sort": "intervalId,asc"}
     assert len(df) == 1
+
+    with pytest.raises(ConfigurationError, match="Allowed filter attributes: none"):
+        ep.to_dataframe(study_key="S1", interval_name="Baseline")
 
 
 def test_to_dataframe_empty_results(dummy_client, paginator_factory):
@@ -156,23 +162,22 @@ async def test_async_to_dataframe_success(dummy_client, async_paginator_factory)
 
 
 @pytest.mark.asyncio
-async def test_async_to_dataframe_parameter_forwarding(
-    dummy_client, async_paginator_factory, patch_build_filter
-):
-    """Test that async to_dataframe forwards filters and study key to list."""
+async def test_async_to_dataframe_parameter_forwarding(dummy_client, async_paginator_factory):
+    """Test that async to_dataframe forwards sort/pagination and rejects filters."""
     ep = intervals.AsyncIntervalsEndpoint(dummy_client)
     captured = async_paginator_factory(intervals, [{"intervalId": 1}])
-    filter_capture = patch_build_filter(intervals)
 
     df = await ep.to_dataframe(
         study_key="S1",
-        interval_name="Baseline",
+        sort="intervalId,asc",
     )
 
     assert captured["path"] == "/api/v1/edc/studies/S1/intervals"
-    assert captured["params"] == {"filter": "FILTERED"}
-    assert filter_capture["filters"] == {"interval_name": "Baseline"}
+    assert captured["params"] == {"sort": "intervalId,asc"}
     assert len(df) == 1
+
+    with pytest.raises(ConfigurationError, match="Allowed filter attributes: none"):
+        await ep.to_dataframe(study_key="S1", interval_name="Baseline")
 
 
 @pytest.mark.asyncio

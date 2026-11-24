@@ -2,9 +2,9 @@
 
 from typing import Any
 
-from imednet.core.endpoint.dispatch import execute_operation
+from imednet.core.endpoint.dispatch import execute_get
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
-from imednet.core.endpoint.operations.get import PathGetOperation
+from imednet.core.endpoint.operations.filter_get import FilterGetOperation
 from imednet.models.studies import Study
 from imednet.utils.typing import ItemId
 from imednet.utils.url import validate_path_segment
@@ -31,14 +31,14 @@ class StudiesOperationDef:
         }
     )
 
-    @execute_operation  # type: ignore
+    @execute_get
     def get(
         self,
         study_key: str | None = None,
         item_id: ItemId | None = None,
         *args: Any,
-    ) -> PathGetOperation[Study]:
-        """Retrieve a single study by key via direct path.
+    ) -> FilterGetOperation[Study]:
+        """Retrieve a single study by key via ``GET /api/v1/edc/studies?filter=studyKey==<key>``.
 
         Supports both the preferred single-argument signature ``get("STUDY")``
         and the legacy two-argument signature ``get(None, "STUDY")``.
@@ -61,12 +61,14 @@ class StudiesOperationDef:
         if resolved_key is None:
             raise TypeError("Missing required argument: study_key")
 
-        validate_path_segment(resolved_key, name="study_key")
-        path = self._get_endpoint_path(None, resolved_key)  # type: ignore[attr-defined]
-        return PathGetOperation[Study](
-            path=path,
-            parse_func=self._parse_item,  # type: ignore[attr-defined]
-            not_found_func=lambda: self._raise_not_found(None, resolved_key),  # type: ignore[attr-defined]
+        validated_key = validate_path_segment(resolved_key, name="study_key")
+        return FilterGetOperation[Study](
+            study_key=None,
+            item_id=validated_key,
+            filters={self._id_param: validated_key},
+            validate_func=self._validate_get_result,  # type: ignore[attr-defined]
+            list_sync_func=self._list_sync,  # type: ignore[attr-defined]
+            list_async_func=self._list_async,  # type: ignore[attr-defined]
         )
 
 

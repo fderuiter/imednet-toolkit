@@ -1739,6 +1739,14 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
     assert idx_wrapper_levels == ["3", "3", "3", "3", "3"], (
         f"Expected five aria-level='3' toctree captions under <h2> on index.html, got {idx_wrapper_levels}"
     )
+    contrib_wrapper_levels = [
+        lvl
+        for zone, lvl in page_headings.get("reference/contributing.html", [])
+        if zone == "toctree-wrapper"
+    ]
+    assert contrib_wrapper_levels == [], (
+        f"Expected zero duplicate toctree captions on reference/contributing.html, got {contrib_wrapper_levels}"
+    )
     contrib_sidebar_levels = [
         lvl
         for zone, lvl in page_headings.get("reference/contributing.html", [])
@@ -2159,7 +2167,9 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         });
                     }"""
                 )
-                assert len(idx_heading_audit) >= 8
+                assert len(idx_heading_audit) >= 10
+                idx_wrapper_texts = [h["text"] for h in idx_heading_audit if h["inToctreeWrapper"]]
+                assert "Maintainer & Contributor:" in idx_wrapper_texts
                 for h_item in idx_heading_audit:
                     assert h_item["ariaLevel"] in {"1", "2", "3", "4", "5", "6"}, (
                         f"index.html [role='heading'] ({h_item['text']!r}) has invalid aria-level={h_item['ariaLevel']!r}"
@@ -2191,6 +2201,8 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         });
                     }"""
                 )
+                contrib_wrapper = [h for h in contrib_heading_audit if h["inToctreeWrapper"]]
+                assert contrib_wrapper == []
                 contrib_sidebar = [h for h in contrib_heading_audit if h["inSidebar"]]
                 assert len(contrib_sidebar) == 5
                 assert any("Maintainer & Contributor" in h["text"] for h in contrib_sidebar)
@@ -2199,6 +2211,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     assert h_item["borderBottomWidth"] == 0.0
                     if h_item["inSidebar"]:
                         assert h_item["ariaLevel"] == "2"
+                        assert h_item["borderBottomWidth"] == 0.0
                 contrib_page.close()
 
                 sc_253_checks = idx_page.evaluate(

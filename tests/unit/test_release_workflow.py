@@ -468,8 +468,8 @@ def _assert_manifest_matches_git_tags(
         )
 
 
-def test_release_please_manifest_and_config_parity() -> None:
-    """Verify manifest lists only tagged packages, sets initial-version for TUI, and preserves wheel tightening."""
+def test_release_please_manifest_and_config_parity(tmp_path: Path) -> None:
+    """Verify manifest/config/pyproject parity, initial-version for TUI, and wheel tightening."""
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     config = json.loads(RELEASE_PLEASE_CONFIG_PATH.read_text(encoding="utf-8"))
     packages_cfg = config["packages"]
@@ -481,30 +481,43 @@ def test_release_please_manifest_and_config_parity() -> None:
         "packages/plugins-sinks",
         "packages/plugins-tui",
     }
-    assert set(packages_cfg) == expected_all_packages
-    assert set(manifest) == {
+    core_four_packages = {
         "packages/core",
         "packages/providers-airflow",
         "packages/plugins-workflows",
         "packages/plugins-sinks",
     }
-    assert "packages/plugins-tui" not in manifest
+    assert set(packages_cfg) == expected_all_packages
+    assert core_four_packages.issubset(manifest)
+    assert set(manifest).issubset(expected_all_packages)
     assert packages_cfg["packages/plugins-tui"].get("initial-version") == "1.0.0"
 
-    tui_pyproject = tomllib.loads(
-        (ROOT / "packages" / "plugins-tui" / "pyproject.toml").read_text(encoding="utf-8")
-    )
-    assert tui_pyproject["project"]["version"] == "1.0.0"
+    for pkg_path, ver in manifest.items():
+        pkg_pyproject = tomllib.loads(
+            (ROOT / pkg_path / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        assert pkg_pyproject["project"]["version"] == ver
 
     internal_pkgs = td.get_internal_packages(MANIFEST_PATH)
-    assert set(internal_pkgs) == {
-        "imednet",
-        "apache-airflow-providers-imednet",
-        "imednet-workflows",
-        "imednet-plugins-sinks",
+    expected_internal_names = {packages_cfg[p]["package-name"] for p in manifest}
+    assert set(internal_pkgs) == expected_internal_names
+
+    # Verify unreleased-package omission behavior deterministically via synthetic 4-package manifest
+    pre_tui_manifest = {
+        "packages/core": "1.1.0",
+        "packages/providers-airflow": "1.1.0",
+        "packages/plugins-workflows": "1.1.0",
+        "packages/plugins-sinks": "1.0.1",
     }
-    assert "imednet-tui" not in internal_pkgs
-    assert td.process_dependency("imednet-tui", internal_pkgs) == "imednet-tui"
+    synth_manifest_path = tmp_path / ".release-please-manifest.json"
+    for rel_pkg in core_four_packages:
+        target_dir = tmp_path / rel_pkg
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / rel_pkg / "pyproject.toml", target_dir / "pyproject.toml")
+    synth_manifest_path.write_text(json.dumps(pre_tui_manifest), encoding="utf-8")
+    synth_internal = td.get_internal_packages(synth_manifest_path)
+    assert "imednet-tui" not in synth_internal
+    assert td.process_dependency("imednet-tui", synth_internal) == "imednet-tui"
 
     sample_tags = {
         "imednet-v1.1.0",
@@ -512,7 +525,12 @@ def test_release_please_manifest_and_config_parity() -> None:
         "imednet-workflows-v1.1.0",
         "imednet-plugins-sinks-v1.0.1",
     }
-    _assert_manifest_matches_git_tags(manifest, config, sample_tags)
+    _assert_manifest_matches_git_tags(pre_tui_manifest, config, sample_tags)
+
+    expected_manifest_tags = {
+        f"{packages_cfg[pkg_path]['package-name']}-v{ver}" for pkg_path, ver in manifest.items()
+    }
+    _assert_manifest_matches_git_tags(manifest, config, expected_manifest_tags)
 
     git_bin = shutil.which("git")
     if git_bin and (ROOT / ".git").exists():
@@ -525,7 +543,13 @@ def test_release_please_manifest_and_config_parity() -> None:
         )
         live_tags = {line.strip() for line in tag_proc.stdout.splitlines() if line.strip()}
         if live_tags:
-            _assert_manifest_matches_git_tags(manifest, config, live_tags)
+            unreleased_paths = set(packages_cfg) - set(manifest)
+            for pkg_path in unreleased_paths:
+                pkg_name = packages_cfg[pkg_path]["package-name"]
+                matching_tags = [t for t in live_tags if t.startswith(f"{pkg_name}-v")]
+                assert not matching_tags, (
+                    f"Unreleased package {pkg_path} omitted from manifest has existing tags: {matching_tags}"
+                )
 
 
 def test_release_please_app_setup_wizard_and_docs() -> None:

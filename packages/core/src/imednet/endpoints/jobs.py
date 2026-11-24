@@ -62,7 +62,7 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
 
         self._validate_study_key(study_key)
         validate_path_segment(batch_id, name="batch_id")
-        poller = JobPoller(self.get, fetch_result=self.fetch_result)
+        poller = JobPoller(self.get)
         if on_progress is None:
             return poller.run(study_key, batch_id, interval, timeout)
         return poller.run(study_key, batch_id, interval, timeout, on_progress=on_progress)
@@ -83,7 +83,7 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
         self._validate_study_key(study_key)
         for batch_id in batch_ids:
             validate_path_segment(batch_id, name="batch_id")
-        return JobPoller(self.get, fetch_result=self.fetch_result).poll_many(
+        return JobPoller(self.get).poll_many(
             study_key, batch_ids, interval, timeout, on_progress=on_progress, fail_fast=fail_fast
         )
 
@@ -119,7 +119,7 @@ class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # ty
 
         self._validate_study_key(study_key)
         validate_path_segment(batch_id, name="batch_id")
-        poller = AsyncJobPoller(self.get, fetch_result=self.fetch_result)
+        poller = AsyncJobPoller(self.get)
         if on_progress is None:
             return await poller.run(study_key, batch_id, interval, timeout)
         return await poller.run(study_key, batch_id, interval, timeout, on_progress=on_progress)
@@ -140,6 +140,6 @@ class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # ty
         self._validate_study_key(study_key)
         for batch_id in batch_ids:
             validate_path_segment(batch_id, name="batch_id")
-        return await AsyncJobPoller(self.get, fetch_result=self.fetch_result).async_poll_many(
+        return await AsyncJobPoller(self.get).async_poll_many(
             study_key, batch_ids, interval, timeout, on_progress=on_progress, fail_fast=fail_fast
         )

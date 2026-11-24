@@ -500,7 +500,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             return coerce_batch_summary(
                 raw_summary,
                 study_key=args.study_key,
-                total_records=getattr(raw_summary, "total_records", 0),
+                total_records=getattr(raw_summary, "total_records", None) or 0,
                 dry_run=args.dry_run,
             )
 

@@ -4,27 +4,26 @@ Apache Airflow provider for iMednet data workflows.
 
 ## Install
 
-Install the package via standard pip using the public package distribution name:
+### Published PyPI Releases
+
+Install the provider and published companion packages or destination extras from PyPI:
 
 ```bash
-pip install apache-airflow-providers-imednet
+pip install "apache-airflow>=3.2.0,<4.0.0" apache-airflow-providers-imednet
+pip install "imednet[export]"
+pip install "imednet[duckdb]"
+pip install "imednet-plugins-sinks[snowflake,mongodb,neo4j]"
 ```
 
-Install optional destination, lineage, or cloud extras as needed:
+### Source Checkout (Pre-Release Provider Extras)
+
+Optional dependency extras on `apache-airflow-providers-imednet` (`export`, `duckdb`, `sinks`, `snowflake`, `mongodb`, `neo4j`, `openlineage`, `workflows`, `all`) were added after `apache-airflow-providers-imednet-v1.1.0` and can be installed from a source checkout until the next provider release tag is published:
 
 ```bash
-pip install "apache-airflow-providers-imednet[export]"
-pip install "apache-airflow-providers-imednet[duckdb]"
-pip install "apache-airflow-providers-imednet[sinks]"
-pip install "apache-airflow-providers-imednet[snowflake,mongodb,neo4j]"
-pip install "apache-airflow-providers-imednet[openlineage,amazon]"
-pip install "apache-airflow-providers-imednet[all]"
-```
-
-Or using the workspace-relative path install command:
-
-```bash
-pip install ./packages/providers-airflow
+git clone https://github.com/fderuiter/imednet-toolkit.git
+cd imednet-toolkit
+pip install -e ./packages/providers-airflow
+pip install -e "./packages/providers-airflow[export,duckdb,sinks,openlineage,all]"
 ```
 
 **Required Dependencies:**
@@ -35,7 +34,7 @@ This package uses Hatchling as its build backend, targeting `src/apache_airflow_
 
 ## Usage Guide
 
-You can integrate iMednet hooks, operators, deferrable sensors, and triggers directly within your Airflow 3 DAGs (see `examples/airflow/airflow_multi_study_pipeline.py` for a full dynamic-mapping reference):
+You can integrate iMednet hooks, operators, deferrable sensors, and triggers directly within your Airflow 3 DAGs (see [`examples/airflow/airflow_multi_study_pipeline.py`](https://github.com/fderuiter/imednet-toolkit/blob/main/examples/airflow/airflow_multi_study_pipeline.py) for a full dynamic-mapping reference):
 
 ```python
 from datetime import datetime
@@ -95,6 +94,23 @@ def my_task_logic() -> None:
     print(len(studies))
 ```
 
+When instantiating `ImednetSDK` directly inside custom `@task` callables without an Airflow connection, pass both `api_key` and `security_key` (or `simulation_mode=True` for offline DAG verification):
+
+```python
+import os
+
+from imednet import ImednetSDK
+
+with ImednetSDK(
+    api_key=os.environ["IMEDNET_API_KEY"],
+    security_key=os.environ["IMEDNET_SECURITY_KEY"],
+) as sdk:
+    print(len(list(sdk.studies.list())))
+
+with ImednetSDK(simulation_mode=True) as sim_sdk:
+    print(len(list(sim_sdk.studies.list())))
+```
+
 ## Features
 
 - **Airflow 3 Provider Metadata & UI Form**: Registers the `imednet` connection type with typed UI form widgets (`base_url`, password-masked `oidc_token`, `timeout`, `strict_mode`, `simulation_mode`), `get_ui_field_behaviour()`, and redacted `test_connection()`.
@@ -113,3 +129,10 @@ def my_task_logic() -> None:
 | `ImednetJobSensor` | Monitors asynchronous iMednet `Job` runs and verifies terminal `resultUrl` payloads in poke/reschedule or deferrable triggerer mode. |
 | `ImednetJobTrigger` | Async Airflow trigger polling iMednet `Job` runs via `AsyncImednetSDK` and `AsyncJobPoller`. |
 | `_airflow_compat` | Compatibility layer for Airflow 3 Task SDK and offline unit testing environments. |
+
+## Links
+
+- Documentation: <https://fderuiter.github.io/imednet-toolkit/>
+- Airflow Pipeline Example: <https://github.com/fderuiter/imednet-toolkit/blob/main/examples/airflow/airflow_multi_study_pipeline.py>
+- Repository: <https://github.com/fderuiter/imednet-toolkit>
+- License: [MIT](https://github.com/fderuiter/imednet-toolkit/blob/main/LICENSE)

@@ -159,10 +159,12 @@ async def test_async_batch_coordinator_single_and_multi_chunk() -> None:
 
 
 def test_sdk_create_records_batch_and_poll_jobs_with_transport() -> None:
-    """ImednetSDK.create_records_batch chunks at 100 Records and poll_jobs fetches resultUrl."""
+    """ImednetSDK.create_records_batch chunks at 100 Records and poll_jobs skips resultUrl."""
     post_payloads: list[list[dict[str, Any]]] = []
+    results_fetched = False
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal results_fetched
         path = request.url.path
         if request.method == "GET" and path.endswith("/variables"):
             return httpx.Response(
@@ -204,16 +206,12 @@ def test_sdk_create_records_batch_and_poll_jobs_with_transport() -> None:
                     "jobId": f"J-{batch_id}",
                     "batchId": batch_id,
                     "state": "COMPLETED",
-                    "progress": 100,
                     "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/STUDY/jobs/{batch_id}/results",
                 },
             )
         if request.method == "GET" and path.endswith("/results"):
-            batch_id = path.split("/")[-2]
-            return httpx.Response(
-                200,
-                json=[{"batchId": batch_id, "status": "SUCCESS"}],
-            )
+            results_fetched = True
+            return httpx.Response(500, json={"error": "resultUrl should not be polled"})
         return httpx.Response(404, json={"error": "Not found"})
 
     sdk = ImednetSDK(
@@ -230,20 +228,22 @@ def test_sdk_create_records_batch_and_poll_jobs_with_transport() -> None:
 
         poll_summary = sdk.poll_jobs("STUDY", [j.batch_id for j in jobs], interval=0)
         assert poll_summary.all_successful is True
+        assert results_fetched is False
         for job in jobs:
-            assert poll_summary.results[job.batch_id].results == [
-                {"batchId": job.batch_id, "status": "SUCCESS"}
-            ]
+            assert poll_summary.results[job.batch_id].state == "COMPLETED"
+            assert poll_summary.results[job.batch_id].results is None
     finally:
         sdk.close()
 
 
 @pytest.mark.asyncio
 async def test_async_sdk_create_records_batch_and_async_poll_jobs() -> None:
-    """AsyncImednetSDK.async_create_records_batch chunks at 100 and async_poll_jobs fetches results."""
+    """AsyncImednetSDK.async_create_records_batch chunks at 100 and skips resultUrl polling."""
     post_counts: list[int] = []
+    results_fetched = False
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal results_fetched
         path = request.url.path
         if request.method == "POST" and path.endswith("/records"):
             body = json.loads(request.content.decode("utf-8"))
@@ -261,13 +261,12 @@ async def test_async_sdk_create_records_batch_and_async_poll_jobs() -> None:
                     "jobId": f"AJ-{batch_id}",
                     "batchId": batch_id,
                     "state": "COMPLETED",
-                    "progress": 100,
                     "resultUrl": f"https://mock.imednet.test/api/v1/edc/studies/STUDY/jobs/{batch_id}/results",
                 },
             )
         if request.method == "GET" and path.endswith("/results"):
-            batch_id = path.split("/")[-2]
-            return httpx.Response(200, json=[{"batchId": batch_id, "status": "SUCCESS"}])
+            results_fetched = True
+            return httpx.Response(500, json={"error": "resultUrl should not be polled"})
         return httpx.Response(404)
 
     async with AsyncImednetSDK(
@@ -283,7 +282,9 @@ async def test_async_sdk_create_records_batch_and_async_poll_jobs() -> None:
 
         summary = await sdk.async_poll_jobs("STUDY", [j.batch_id for j in jobs], interval=0)
         assert summary.all_successful is True
-        assert summary.results["ABATCH-1"].results == [{"batchId": "ABATCH-1", "status": "SUCCESS"}]
+        assert results_fetched is False
+        assert summary.results["ABATCH-1"].state == "COMPLETED"
+        assert summary.results["ABATCH-1"].results is None
 
 
 @pytest.mark.asyncio

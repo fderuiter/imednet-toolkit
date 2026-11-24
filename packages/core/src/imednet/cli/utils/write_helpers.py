@@ -74,8 +74,8 @@ def add_write_common_args(
         dest="schema_source",
         default=None,
         help=(
-            "Validation schema path (.json DataDictionary, .xml ODM, .csv REDCap, or CSV dir) "
-            "or 'api' to fetch live study variables."
+            "Validation schema path (.json DataDictionary, .xml ODM, .csv REDCap, .zip CSV archive, "
+            "or CSV dir) or 'api' to fetch live study variables."
         ),
     )
     parser.add_argument(
@@ -182,7 +182,7 @@ def guard_stdin_dash_tty(file_arg: str | None) -> None:
 
 
 def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSchemaProtocol:
-    """Load an offline :class:`DataDictionary` from JSON, ODM XML, REDCap CSV, or CSV dir/zip."""
+    """Load an offline :class:`DataDictionary` from JSON, ODM XML, REDCap CSV, ZIP, or CSV dir."""
     path = Path(schema_source)
     if not path.exists():
         raise ValueError(f"Schema path not found: '{schema_source}'")
@@ -198,7 +198,8 @@ def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSche
     if suffix == ".csv":
         return load_from_redcap(path, study_key=study_key)
     raise ValueError(
-        f"Unsupported schema file format '{path.suffix}'. Expected .json, .xml, .csv, .zip, or directory."
+        f"Unsupported schema file format '{path.suffix}'. "
+        "Expected .json, .xml, .csv, .zip, or directory."
     )
 
 

@@ -112,9 +112,8 @@ Collection list endpoints return a JSON object containing ``metadata``,
      "data": []
    }
 
-Single-resource and batch job endpoints— specifically
-``GET /api/v1/edc/studies/{studyKey}``,
-``POST /api/v1/edc/studies/{studyKey}/records``, and
+Batch job endpoints—specifically
+``POST /api/v1/edc/studies/{studyKey}/records`` and
 ``GET /api/v1/edc/studies/{studyKey}/jobs/{batchId}``—return flat JSON objects
 directly without ``metadata``, ``pagination``, or ``data`` wrappers.
 
@@ -127,10 +126,11 @@ Supported list endpoints accept a ``filter`` query string composed of key,
 operator, and value segments. ``recordDataFilter`` targets dynamic question data
 within a record on ``GET /api/v1/edc/studies/{studyKey}/records``.
 
-Not all endpoints support query filtering: ``GET /api/v1/edc/studies/{studyKey}/users``
-(``/users``) and ``GET /api/v1/edc/studies/{studyKey}/jobs/{batchId}``
-(``/jobs/{batchId}``)—as well as single-study retrieval and ``POST`` endpoints—do
-not accept ``filter`` or ``recordDataFilter``.
+Not all endpoints support query filtering:
+``GET /api/v1/edc/studies/{studyKey}/intervals`` (``/intervals``),
+``GET /api/v1/edc/studies/{studyKey}/users`` (``/users``), and
+``GET /api/v1/edc/studies/{studyKey}/jobs/{batchId}`` (``/jobs/{batchId}``)—as
+well as ``POST`` endpoints—do not accept ``filter`` or ``recordDataFilter``.
 
 Attributes
 ~~~~~~~~~~
