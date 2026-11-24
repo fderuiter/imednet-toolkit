@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 
 from imednet.simulation.state import SimulationState, get_default_simulation_state
-from imednet.utils.filters import ORDERED_FILTER_OPERATORS, validate_filter_key
+from imednet.utils.filters import ORDERED_FILTER_OPERATORS, _snake_to_camel, validate_filter_key
 
 _ISO_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}|\b|$)")
 _TWO_CHAR_OPS = frozenset(op for op in ORDERED_FILTER_OPERATORS if len(op) == 2)
@@ -211,6 +211,19 @@ def _split_filter_clauses(filter_str: str, *, attribute: str) -> tuple[str, list
         _parse_single_clause(tok, attribute=attribute, full_expr=filter_str) for tok in tokens
     ]
     connector = "or" if has_or else "and"
+    if connector == "and":
+        seen_and_attrs: set[str] = set()
+        for clause in clauses:
+            dedup_attr = (
+                clause.field if attribute == "recordDataFilter" else _snake_to_camel(clause.field)
+            )
+            if dedup_attr in seen_and_attrs:
+                raise _FilterParseError(
+                    f"Duplicate filter attribute '{dedup_attr}' in AND clause",
+                    attribute=attribute,
+                    value=filter_str,
+                )
+            seen_and_attrs.add(dedup_attr)
     return connector, clauses
 
 

@@ -51,7 +51,10 @@ Usage
     from imednet.spi.sink_base import iter_batches
     from imednet_sinks import SnowflakeExportSink, SnowflakeSinkConfig
 
-    sdk = ImednetSDK(api_key=os.environ["IMEDNET_API_KEY"])
+    sdk = ImednetSDK(
+        api_key=os.environ["IMEDNET_API_KEY"],
+        security_key=os.environ["IMEDNET_SECURITY_KEY"],
+    )
     records = list(sdk.records.list(study_key="MYSTUDY"))
 
     config = SnowflakeSinkConfig(
@@ -1388,14 +1391,27 @@ class SnowflakeExportSink(ExportSink):
                     )
                     non_key_cols = [col for col in merge_columns if col not in merge_keys]
                     if non_key_cols:
+                        sdtm_seq_col: str | None = None
+                        if cfg.as_sdtm:
+                            sample_dom = (
+                                resolve_sdtm_domain(cfg.sdtm_domain)
+                                if isinstance(cfg.sdtm_domain, str) and cfg.sdtm_domain.strip()
+                                else None
+                            )
+                            if (
+                                sample_dom is None
+                                and arrow_table.num_rows > 0
+                                and "DOMAIN" in arrow_table.column_names
+                            ):
+                                dom_val = arrow_table.column("DOMAIN")[0].as_py()
+                                if isinstance(dom_val, str) and dom_val.strip():
+                                    sample_dom = dom_val.strip().upper()
+                            if sample_dom and sample_dom != "DM":
+                                sdtm_seq_col = f"{sample_dom}SEQ"
                         update_assignments: list[str] = []
                         for col in non_key_cols:
                             q_col = _quote_identifier(col.upper())
-                            if (
-                                cfg.as_sdtm
-                                and col.endswith("SEQ")
-                                and col not in ("STUDYID", "DOMAIN", "USUBJID", "RECORD_ID")
-                            ):
+                            if sdtm_seq_col is not None and col.upper() == sdtm_seq_col:
                                 update_assignments.append(
                                     f"target.{q_col} = COALESCE(target.{q_col}, source.{q_col})"
                                 )

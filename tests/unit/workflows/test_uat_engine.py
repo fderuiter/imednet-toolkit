@@ -685,3 +685,664 @@ def test_uat_engine_async_job_polling_enforces_100_rule_cap():
     assert report.total_rules == 100
     assert report.passed_rules == 100
     assert report.failed_rules == 0
+
+
+def test_uat_engine_resolves_site_interval_and_registers_or_reuses_uat_subject():
+    """UATExecutionEngine inspects metadata, resolves open Site and active Interval, and reuses/registers one UAT Subject."""
+    import pytest
+
+    from imednet.datadict import DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+    from imednet.models.forms import Form as APIForm
+    from imednet.models.intervals import Interval
+    from imednet.models.sites import Site
+    from imednet.models.subjects import Subject, SubjectKeyword
+    from imednet.models.variables import Variable as APIVariable
+    from imednet.spi.models import Job, JobStatus
+
+    dd = DataDictionary(
+        business_logic=[
+            {
+                "Name": "BP_Rule",
+                "Status": "Active",
+                "Form": "F_VS",
+                "Variable": "SYSBP",
+                "Operator": ">=",
+                "Value": "80",
+            },
+            {
+                "Name": "HR_Rule",
+                "Status": "Active",
+                "Form": "F_VS",
+                "Variable": "HR",
+                "Operator": ">=",
+                "Value": "40",
+            },
+            {
+                "Name": "AE_Rule",
+                "Status": "Active",
+                "Form": "F_AE",
+                "Variable": "SEV",
+                "Operator": "==",
+                "Value": "Mild",
+            },
+        ],
+        forms=[
+            DDForm(
+                formKey="F_DM",
+                variables=[DDVariable(variableName="AGE", variableType="Integer", required="Yes")],
+            ),
+            DDForm(
+                formKey="F_VS",
+                variables=[
+                    DDVariable(variableName="SYSBP", variableType="Integer"),
+                    DDVariable(variableName="HR", variableType="Integer"),
+                ],
+            ),
+            DDForm(
+                formKey="F_AE",
+                variables=[DDVariable(variableName="SEV", variableType="Text")],
+            ),
+        ],
+    )
+
+    forms = [
+        APIForm(
+            form_key="F_DM",
+            form_name="Demographics",
+            form_type="Subject",
+            subject_record_report=True,
+        ),
+        APIForm(form_key="F_VS", form_name="Vital Signs", form_type="Subject"),
+        APIForm(
+            form_key="F_AE",
+            form_name="Adverse Events",
+            form_type="Subject",
+            unscheduled_visit=True,
+        ),
+    ]
+    intervals = [
+        Interval(
+            interval_name="DisabledVisit",
+            disabled=True,
+            forms=[{"form_id": 2, "form_key": "F_VS", "form_name": "Vital Signs"}],
+        ),
+        Interval(
+            interval_name="ActiveVisit1",
+            disabled=False,
+            forms=[{"form_id": 2, "form_key": "F_VS", "form_name": "Vital Signs"}],
+        ),
+    ]
+
+    # 1. Closed site raises ValueError
+    sdk_closed = Mock()
+    sdk_closed.get_forms.return_value = forms
+    sdk_closed.get_variables.return_value = [
+        APIVariable(form_key="F_DM", variable_name="AGE", variable_type="Number")
+    ]
+    sdk_closed.get_intervals.return_value = intervals
+    sdk_closed.get_sites.return_value = [
+        Site(site_name="ClosedSite", site_enrollment_status="Closed")
+    ]
+    engine_closed = UATExecutionEngine(sdk_closed, dd)
+    with pytest.raises(ValueError, match="open sites"):
+        engine_closed.run_verification("STUDY1")
+    with pytest.raises(ValueError, match="not eligible"):
+        engine_closed.run_verification("STUDY1", site_name="ClosedSite")
+
+    # 2. No UAT subject exists yet -> registers 1 UAT subject and reuses it across all 3 rules
+    sdk_reg = Mock()
+    sdk_reg.get_forms.return_value = forms
+    sdk_reg.get_variables.return_value = [
+        APIVariable(form_key="F_DM", variable_name="AGE", variable_type="Number")
+    ]
+    sdk_reg.get_intervals.return_value = intervals
+    sdk_reg.get_sites.return_value = [Site(site_name="OpenSite", site_enrollment_status="Active")]
+    sdk_reg.get_subjects.return_value = []
+    submitted_payloads: list[dict] = []
+
+    def create_record_reg_then_rules(_study_key, payloads):
+        submitted_payloads.append(payloads[0])
+        idx = len(submitted_payloads)
+        if idx == 1:
+            return Job(batch_id="reg-batch", state="PENDING")
+        return Job(batch_id=f"rule-batch-{idx - 1}", state="PENDING")
+
+    def get_job_reg_then_rules(_study_key, batch_id):
+        if batch_id == "reg-batch":
+            return JobStatus(
+                batch_id=batch_id,
+                state="COMPLETED",
+                results=[{"subjectKey": "SUBJ-ENROLLED-1", "status": "SUCCESS"}],
+            )
+        return JobStatus(batch_id=batch_id, state="COMPLETED", failed_records=1)
+
+    sdk_reg.create_record.side_effect = create_record_reg_then_rules
+    sdk_reg.get_job.side_effect = get_job_reg_then_rules
+    sdk_reg.poll_jobs = None
+
+    report_reg = UATExecutionEngine(sdk_reg, dd, poll_interval=0.01).run_verification(
+        "STUDY1", site_name="OpenSite"
+    )
+    assert report_reg.total_rules == 3
+    assert report_reg.passed_rules == 3
+    assert len(submitted_payloads) == 4  # 1 prerequisite registration + 3 rules
+    assert submitted_payloads[0]["formKey"] == "F_DM"
+    assert submitted_payloads[0]["siteName"] == "OpenSite"
+    assert submitted_payloads[0]["keywords"] == [{"keywordName": "UAT", "keywordKey": "UAT"}]
+
+    # Scheduled form payloads include enrolled subjectKey, siteName, and active intervalName
+    assert submitted_payloads[1]["subjectKey"] == "SUBJ-ENROLLED-1"
+    assert submitted_payloads[1]["siteName"] == "OpenSite"
+    assert submitted_payloads[1]["intervalName"] == "ActiveVisit1"
+    assert submitted_payloads[2]["subjectKey"] == "SUBJ-ENROLLED-1"
+    assert submitted_payloads[2]["intervalName"] == "ActiveVisit1"
+    # Unscheduled form omits intervalName while keeping enrolled subjectKey and siteName
+    assert submitted_payloads[3]["subjectKey"] == "SUBJ-ENROLLED-1"
+    assert submitted_payloads[3]["siteName"] == "OpenSite"
+    assert "intervalName" not in submitted_payloads[3]
+
+    # 3. Existing UAT subject at site_name is reused with 0 registrations
+    sdk_reuse = Mock()
+    sdk_reuse.get_forms.return_value = forms
+    sdk_reuse.get_variables.return_value = []
+    sdk_reuse.get_intervals.return_value = intervals
+    sdk_reuse.get_sites.return_value = [Site(site_name="OpenSite", site_enrollment_status="Active")]
+    sdk_reuse.get_subjects.return_value = [
+        Subject(
+            subject_key="SUBJ-REUSED-99",
+            site_name="OpenSite",
+            deleted=False,
+            keywords=[SubjectKeyword(keyword_key="UAT", keyword_name="UAT")],
+        )
+    ]
+    reused_payloads: list[dict] = []
+
+    def create_record_reuse(_study_key, payloads):
+        reused_payloads.append(payloads[0])
+        return Job(batch_id=f"r-{len(reused_payloads)}", state="PENDING")
+
+    sdk_reuse.create_record.side_effect = create_record_reuse
+    sdk_reuse.get_job.side_effect = lambda _s, bid: JobStatus(
+        batch_id=bid, state="FAILED", failed_records=1
+    )
+    sdk_reuse.poll_jobs = None
+
+    report_reuse = UATExecutionEngine(sdk_reuse, dd, poll_interval=0.01).run_verification(
+        "STUDY1", site_name="OpenSite"
+    )
+    assert report_reuse.passed_rules == 3
+    assert len(reused_payloads) == 3
+    assert all(p["subjectKey"] == "SUBJ-REUSED-99" for p in reused_payloads)
+
+
+def test_uat_engine_classifies_http_401_403_404_409_429_and_preserves_diagnostics():
+    """AuthenticationError, AuthorizationError, NotFoundError, ConflictError, and RateLimitError report ERROR."""
+    import httpx
+    import respx
+
+    from imednet import ImednetSDK
+    from imednet.spi.errors import (
+        AuthenticationError,
+        AuthorizationError,
+        ConflictError,
+        DiagnosticContext,
+        NotFoundError,
+        RateLimitError,
+    )
+
+    rules = [
+        {
+            "Name": f"Rule_{code}",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": f"V_{code}",
+            "Operator": ">=",
+            "Value": "18",
+        }
+        for code in (401, 403, 404, 409, 429, 400)
+    ]
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+
+    diag = DiagnosticContext(
+        method="POST",
+        url="https://api.test/api/v1/edc/studies/STUDY1/records",
+        retry_after=12.0,
+        attempt_count=2,
+    )
+    err_map = {
+        "V_401": AuthenticationError(
+            "Unauthorized key",
+            status_code=401,
+            diagnostic_context=diag,
+        ),
+        "V_403": AuthorizationError("Forbidden study", status_code=403),
+        "V_404": NotFoundError("Study not found", status_code=404),
+        "V_409": ConflictError("Record lock conflict", status_code=409),
+        "V_429": RateLimitError("Too many requests", status_code=429),
+        "V_400": ValidationError("Value below minimum"),
+    }
+
+    sdk = Mock()
+
+    def create_side_effect(_study_key, payloads):
+        var_name = next(iter(payloads[0]["data"].keys()))
+        raise err_map[var_name]
+
+    sdk.create_record.side_effect = create_side_effect
+    report = UATExecutionEngine(sdk, dd).run_verification("STUDY1")
+
+    by_rule = {r["rule_name"]: r for r in report.results}
+    for code in (401, 403, 404, 409, 429):
+        assert by_rule[f"Rule_{code}"]["status"] == EditCheckResultStatus.ERROR
+    assert by_rule["Rule_401"]["diagnostic_context"] == diag
+    assert "HTTP 401" in by_rule["Rule_401"]["actual_response"]
+    assert (
+        "https://api.test/api/v1/edc/studies/STUDY1/records"
+        in by_rule["Rule_401"]["actual_response"]
+    )
+    assert by_rule["Rule_400"]["status"] == EditCheckResultStatus.PASS
+    assert report.passed_rules == 1
+    assert report.failed_rules == 5
+
+    # Also verify real HTTP 401/403/404/429 responses via ImednetSDK mark ERROR instead of crashing
+    single_dd = DataDictionary(business_logic=[rules[0]], choices=[], forms=[], questions=[])
+    for http_code in (401, 403, 404, 429):
+        with respx.mock(assert_all_called=False) as router:
+            router.route().mock(return_value=httpx.Response(http_code, json={"message": "err"}))
+            real_sdk = ImednetSDK(
+                api_key="k",
+                security_key="s",
+                base_url="https://api.test",
+                retries=0,
+            )
+            http_report = UATExecutionEngine(real_sdk, single_dd).run_verification("STUDY1")
+            assert http_report.total_rules == 1
+            assert http_report.results[0]["status"] == EditCheckResultStatus.ERROR
+
+
+def test_uat_engine_classifies_cancelled_and_structural_job_errors_as_error():
+    """CANCELLED jobs and structural Subject/Site/Interval errors in JobStatus.results report ERROR."""
+    from imednet.spi.models import Job, JobStatus
+
+    rules = [
+        {
+            "Name": name,
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": f"V_{i}",
+            "Operator": ">=",
+            "Value": "18",
+        }
+        for i, name in enumerate(
+            [
+                "CancelledJob",
+                "UnknownSubjectFailed",
+                "MissingIntervalCompleted",
+                "UnknownSiteCompleted",
+                "LegitEditCheckReject",
+            ],
+            start=1,
+        )
+    ]
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+    sdk = Mock()
+    sdk.create_record.side_effect = [
+        Job(batch_id="b-cancel", state="PENDING"),
+        Job(batch_id="b-unk-subj", state="PENDING"),
+        Job(batch_id="b-miss-int", state="PENDING"),
+        Job(batch_id="b-unk-site", state="PENDING"),
+        Job(batch_id="b-edit-check", state="PENDING"),
+    ]
+    job_statuses = {
+        "b-cancel": JobStatus(batch_id="b-cancel", state="CANCELLED"),
+        "b-unk-subj": JobStatus(
+            batch_id="b-unk-subj",
+            state="FAILED",
+            failed_records=1,
+            results=[{"error": "Subject UAT-SUBJ-0 not found in study"}],
+        ),
+        "b-miss-int": JobStatus(
+            batch_id="b-miss-int",
+            state="COMPLETED",
+            failed_records=1,
+            results=[{"message": "Missing required intervalName for scheduled form F1"}],
+        ),
+        "b-unk-site": JobStatus(
+            batch_id="b-unk-site",
+            state="COMPLETED",
+            failed_records=1,
+            results={"records": [{"errors": ["Unknown site TestSite"]}]},
+        ),
+        "b-edit-check": JobStatus(
+            batch_id="b-edit-check",
+            state="COMPLETED",
+            failed_records=1,
+            results=[{"error": "Edit check violation: V_5 must be >= 18"}],
+        ),
+    }
+    sdk.get_job.side_effect = lambda _study, bid: job_statuses[bid]
+    sdk.poll_jobs = None
+
+    report = UATExecutionEngine(sdk, dd, poll_interval=0.01).run_verification("STUDY1")
+    statuses = {r["rule_name"]: r["status"] for r in report.results}
+    assert statuses == {
+        "CancelledJob": EditCheckResultStatus.ERROR,
+        "UnknownSubjectFailed": EditCheckResultStatus.ERROR,
+        "MissingIntervalCompleted": EditCheckResultStatus.ERROR,
+        "UnknownSiteCompleted": EditCheckResultStatus.ERROR,
+        "LegitEditCheckReject": EditCheckResultStatus.PASS,
+    }
+    assert report.passed_rules == 1
+    assert report.failed_rules == 4
+
+
+def test_uat_engine_verifies_soft_warning_and_query_rules_via_get_queries():
+    """Soft warning / Query / Auto Query rules expect 'Query Opened' and check open Queries via sdk.get_queries."""
+    from imednet.datadict import (
+        BusinessLogicRule,
+        DataDictionary,
+        Form,
+        Variable,
+        parse_logic_xml,
+    )
+    from imednet.models.queries import Query, QueryComment
+    from imednet.spi.models import Job, JobStatus
+
+    dd = DataDictionary(
+        business_logic=[
+            {
+                "Name": "TabularQueryPass",
+                "Status": "Active",
+                "Form": "F_VS",
+                "Variable": "TEMP",
+                "Operator": "<=",
+                "Value": "38",
+                "Check Type": "Query",
+            },
+            {
+                "Name": "TabularAutoQueryClosedFail",
+                "Status": "Active",
+                "Form": "F_VS",
+                "Variable": "RESP",
+                "Operator": "<=",
+                "Value": "24",
+                "Check Type": "Auto Query",
+            },
+        ],
+        forms=[
+            Form(
+                formKey="F_VS",
+                variables=[
+                    Variable(variableName="TEMP", variableType="Float"),
+                    Variable(variableName="RESP", variableType="Integer"),
+                    Variable(variableName="HR", variableType="Integer"),
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="XML_WARN_PASS",
+                        name="XMLWarningOpenQuery",
+                        type="Form",
+                        status="Active",
+                        logic=parse_logic_xml(
+                            "<rule><conditions><condition>"
+                            "<variable>HR</variable><operator>&gt;</operator><value>110</value>"
+                            "</condition></conditions>"
+                            "<actions><action><type>warning</type><message>High HR</message></action></actions></rule>"
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+
+    sdk = Mock()
+    submitted_by_batch: dict[str, tuple[str, str]] = {}
+
+    def create_soft_record(_study, payloads):
+        payload = payloads[0]
+        subj = payload["subjectKey"]
+        data = payload["data"]
+        if "TEMP" in data:
+            bid = "b-temp"
+            var_name = "TEMP"
+        elif "RESP" in data:
+            bid = "b-resp"
+            var_name = "RESP"
+        else:
+            bid = "b-hr"
+            var_name = "HR"
+        submitted_by_batch[bid] = (subj, var_name)
+        return Job(batch_id=bid, state="PENDING")
+
+    sdk.create_record.side_effect = create_soft_record
+    sdk.get_job.side_effect = lambda _study, bid: JobStatus(
+        batch_id=bid,
+        state="COMPLETED",
+        failed_records=0,
+        results=[
+            {
+                "recordId": {"b-temp": 901, "b-resp": 902, "b-hr": 903}[bid],
+                "status": "SUCCESS",
+            }
+        ],
+    )
+    sdk.poll_jobs = None
+
+    def get_queries_for_subject(_study, subject_key=None):
+        all_queries = [
+            Query(
+                study_key="STUDY1",
+                subject_key=submitted_by_batch["b-temp"][0],
+                record_id=901,
+                variable="TEMP",
+                query_comments=[QueryComment(sequence=1, closed=False, comment="Check temp")],
+            ),
+            Query(
+                study_key="STUDY1",
+                subject_key=submitted_by_batch["b-resp"][0],
+                record_id=902,
+                variable="RESP",
+                query_comments=[QueryComment(sequence=1, closed=True, comment="Resolved")],
+            ),
+            Query(
+                study_key="STUDY1",
+                subject_key=submitted_by_batch["b-hr"][0],
+                record_id=903,
+                variable="HR",
+                query_comments=[QueryComment(sequence=1, closed=False, comment="High HR warning")],
+            ),
+        ]
+        if subject_key:
+            return [q for q in all_queries if q.subject_key == subject_key]
+        return all_queries
+
+    sdk.get_queries.side_effect = get_queries_for_subject
+
+    engine = UATExecutionEngine(sdk, dd, poll_interval=0.01)
+    report = engine.run_verification("STUDY1")
+
+    assert sdk.get_queries.call_count == 3
+    by_name = {r["rule_name"]: r for r in report.results}
+    assert all(r["expected_response"] == "Query Opened" for r in report.results)
+
+    assert by_name["TabularQueryPass"]["status"] == EditCheckResultStatus.PASS
+    assert by_name["TabularQueryPass"]["actual_response"] == "Query Opened"
+
+    assert by_name["TabularAutoQueryClosedFail"]["status"] == EditCheckResultStatus.FAIL
+    assert by_name["TabularAutoQueryClosedFail"]["actual_response"] == "Accepted (No Open Query)"
+
+    assert by_name["XMLWarningOpenQuery"]["status"] == EditCheckResultStatus.PASS
+    assert by_name["XMLWarningOpenQuery"]["actual_response"] == "Query Opened"
+    assert report.passed_rules == 2
+    assert report.failed_rules == 1
+
+
+def test_uat_engine_degrades_gracefully_on_404_metadata_and_registers_typed_prerequisites():
+    """UATExecutionEngine handles unmocked 404 metadata endpoints cleanly and synthesizes typed registration data."""
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.datadict import DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+    from imednet.models.forms import Form as APIForm
+    from imednet.models.sites import Site
+    from imednet.models.subjects import Subject, SubjectKeyword
+    from imednet.models.variables import Variable as APIVariable
+    from imednet.spi.errors import NotFoundError
+    from imednet.spi.models import Job, JobStatus
+
+    # 1. Partial HTTP transport returning 404 on metadata/subjects still executes records + poll_jobs
+    def partial_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            return httpx.Response(
+                200,
+                json={"jobId": "J-1", "batchId": "B-1", "state": "PROCESSING"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/jobs/B-1"):
+            return httpx.Response(
+                200,
+                json={
+                    "jobId": "J-1",
+                    "batchId": "B-1",
+                    "state": "COMPLETED",
+                    "failedRecords": 1,
+                },
+            )
+        return httpx.Response(404, json={"message": "unmocked"})
+
+    dd_partial = DataDictionary(
+        business_logic=[
+            {
+                "Name": "AGE_MIN",
+                "Status": "Active",
+                "Form": "F_VS",
+                "Variable": "AGE",
+                "Operator": ">=",
+                "Value": "18",
+            }
+        ],
+        forms=[
+            DDForm(
+                formKey="F_DM",
+                subjectRecordReport=True,
+                variables=[DDVariable(variableName="SUBJ", variableType="Text", required="Yes")],
+            )
+        ],
+    )
+    with ImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        base_url="https://edc.synthetic.test",
+        transport=httpx.MockTransport(partial_handler),
+        retries=0,
+    ) as partial_sdk:
+        partial_report = UATExecutionEngine(
+            partial_sdk,
+            dd_partial,
+            poll_interval=0.0,
+            poll_timeout=2.0,
+        ).run_verification("STUDY1")
+    assert partial_report.passed_rules == 1
+    assert partial_report.results[0]["status"] == EditCheckResultStatus.PASS
+
+    # 2. If study metadata succeeds (snapshot present) and get_subjects raises NotFoundError, record ERROR
+    sdk_subj_404 = Mock()
+    sdk_subj_404.get_forms.return_value = [
+        APIForm(form_key="F_DM", form_name="DM", form_type="Subject", subject_record_report=True)
+    ]
+    sdk_subj_404.get_variables.return_value = []
+    sdk_subj_404.get_intervals.return_value = []
+    sdk_subj_404.get_sites.return_value = [
+        Site(site_name="OpenSite", site_enrollment_status="Active")
+    ]
+    sdk_subj_404.get_subjects.side_effect = NotFoundError(
+        "Subjects endpoint missing", status_code=404
+    )
+    err_report = UATExecutionEngine(sdk_subj_404, dd_partial).run_verification(
+        "STUDY1", site_name="OpenSite"
+    )
+    assert err_report.failed_rules == 1
+    assert err_report.results[0]["status"] == EditCheckResultStatus.ERROR
+
+    # 3. Typed registration variable synthesis + post-registration get_subjects lookup when job omits subjectKey
+    sdk_typed = Mock()
+    sdk_typed.get_forms.return_value = [
+        APIForm(form_key="F_DM", form_name="DM", form_type="Subject", subject_record_report=True),
+        APIForm(form_key="F_VS", form_name="VS", form_type="Subject"),
+    ]
+    sdk_typed.get_variables.return_value = [
+        APIVariable(form_key="F_DM", variable_name="V_INT", variable_type="Integer", required=True),
+        APIVariable(form_key="F_DM", variable_name="V_FLT", variable_type="Float", required=True),
+        APIVariable(
+            form_key="F_DM", variable_name="V_BOOL", variable_type="Boolean", required=True
+        ),
+        APIVariable(form_key="F_DM", variable_name="V_DATE", variable_type="Date", required=True),
+        APIVariable(form_key="F_DM", variable_name="V_TXT", variable_type="Text", required=True),
+        APIVariable(form_key="F_DM", variable_name="V_OPT", variable_type="Text", required=False),
+        APIVariable(
+            form_key="F_DM",
+            variable_name="V_DEL",
+            variable_type="Text",
+            required=True,
+            deleted=True,
+        ),
+    ]
+    sdk_typed.get_intervals.return_value = []
+    sdk_typed.get_sites.return_value = [Site(site_name="OpenSite", site_enrollment_status="Active")]
+
+    subj_calls = 0
+
+    def list_subjects_before_and_after(_study, **_kwargs):
+        nonlocal subj_calls
+        subj_calls += 1
+        if subj_calls == 1:
+            return [{"subjectKey": "OLD-SUBJ", "siteName": "OpenSite", "deleted": False}]
+        return [
+            {"subjectKey": "OLD-SUBJ", "siteName": "OpenSite", "deleted": False},
+            Subject(
+                subject_key="NEW-SERVER-SUBJ",
+                site_name="OtherSite",
+                deleted=False,
+                keywords=[SubjectKeyword(keyword_key="OTHER", keyword_name="OTHER")],
+            ),
+        ]
+
+    sdk_typed.get_subjects.side_effect = list_subjects_before_and_after
+    recorded_payloads: list[dict] = []
+
+    def create_typed(_study, payloads):
+        recorded_payloads.append(payloads[0])
+        return Job(batch_id=f"b-{len(recorded_payloads)}", state="PENDING")
+
+    sdk_typed.create_record.side_effect = create_typed
+    sdk_typed.get_job.side_effect = lambda _s, bid: (
+        JobStatus(batch_id=bid, state="COMPLETED", results=[{"status": "SUCCESS"}])
+        if bid == "b-1"
+        else JobStatus(batch_id=bid, state="COMPLETED", failed_records=1)
+    )
+    sdk_typed.poll_jobs = None
+
+    typed_report = UATExecutionEngine(sdk_typed, dd_partial, poll_interval=0.0).run_verification(
+        "STUDY1", site_name="OpenSite"
+    )
+    assert typed_report.passed_rules == 1
+    reg_data = recorded_payloads[0]["data"]
+    assert reg_data["V_INT"] == 18
+    assert reg_data["V_FLT"] == 50.0
+    assert reg_data["V_BOOL"] is True
+    assert reg_data["V_DATE"] == "2026-01-01"
+    assert reg_data["V_TXT"] == "UAT"
+    assert "V_OPT" not in reg_data
+    assert "V_DEL" not in reg_data
+    assert recorded_payloads[1]["subjectKey"] == "NEW-SERVER-SUBJ"
+
+    # 4. _is_query_open handles explicit status strings and empty/non-empty comment lists
+    assert UATExecutionEngine._is_query_open({"status": "OPEN"}) is True
+    assert UATExecutionEngine._is_query_open({"status": "CLOSED"}) is False
+    assert UATExecutionEngine._is_query_open({"queryComments": []}) is True
+    assert UATExecutionEngine._is_query_open({"queryComments": [{"closed": False}]}) is True
+    assert UATExecutionEngine._is_query_open({"queryComments": [{"closed": True}]}) is False
+    assert UATExecutionEngine._is_query_open({}) is False

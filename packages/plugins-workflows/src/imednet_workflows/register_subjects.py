@@ -28,13 +28,22 @@ from imednet.spi.utils import (
     poll_facade_single_sync,
     validate_subject_registration_sites,
 )
-from imednet.spi.validation import ValidationSchemaProtocol
+from imednet.spi.validation import BaseSchemaCache, ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
 SubjectInputs = Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput
+
+
+def _is_offline_schema_dry_run(
+    *,
+    dry_run: bool,
+    schema: ValidationSchemaProtocol | None,
+) -> bool:
+    """Return True when dry_run uses an offline DataDictionary / non-cache schema."""
+    return bool(dry_run and schema is not None and not isinstance(schema, BaseSchemaCache))
 
 
 def _is_async_facade(sdk: object) -> bool:
@@ -182,18 +191,23 @@ class RegisterSubjectsWorkflow:
         """Validate sites once, optionally filter enrolled subjects, and submit in bounded chunks."""
         self._ensure_sync_mode("register_subjects_batch", "async_register_subjects_batch")
         sdk = cast("ImednetFacade", self._sdk)
-        sites = sdk.get_sites(study_key=study_key)
+        offline_dry_run = _is_offline_schema_dry_run(dry_run=dry_run, schema=schema)
+        sites = None if offline_dry_run else sdk.get_sites(study_key=study_key)
         normalized_pairs = normalize_subject_registration_inputs(subjects, schema=schema)
         validate_subject_registration_sites(normalized_pairs, sites)
 
         should_filter = (
             self._filter_enrolled if filter_enrolled is None else filter_enrolled
         ) or skip_existing
-        existing_subjects = sdk.get_subjects(study_key=study_key) if should_filter else None
+        existing_subjects = (
+            sdk.get_subjects(study_key=study_key)
+            if (should_filter and not offline_dry_run)
+            else None
+        )
         subjects_data, skipped_count = filter_existing_subject_registrations(
             normalized_pairs,
             existing_subjects,
-            should_filter=should_filter,
+            should_filter=should_filter and not offline_dry_run,
             subject_key_field=subject_key_field,
         )
 
@@ -211,7 +225,7 @@ class RegisterSubjectsWorkflow:
                 email_notify=email_notify,
             )
 
-        coordinator = BatchCoordinator(chunk_size=chunk_size or self._batch_size)
+        coordinator = BatchCoordinator(chunk_size=chunk_size or self._batch_size, sdk=sdk)
         return coordinator.submit(
             study_key,
             subjects_data,
@@ -317,7 +331,8 @@ class RegisterSubjectsWorkflow:
             return await asyncio.to_thread(sync_call)
 
         sdk = cast("AsyncImednetFacade", self._sdk)
-        sites = await sdk.async_get_sites(study_key=study_key)
+        offline_dry_run = _is_offline_schema_dry_run(dry_run=dry_run, schema=schema)
+        sites = None if offline_dry_run else await sdk.async_get_sites(study_key=study_key)
         normalized_pairs = normalize_subject_registration_inputs(subjects, schema=schema)
         validate_subject_registration_sites(normalized_pairs, sites)
 
@@ -325,12 +340,14 @@ class RegisterSubjectsWorkflow:
             self._filter_enrolled if filter_enrolled is None else filter_enrolled
         ) or skip_existing
         existing_subjects = (
-            await sdk.async_get_subjects(study_key=study_key) if should_filter else None
+            await sdk.async_get_subjects(study_key=study_key)
+            if (should_filter and not offline_dry_run)
+            else None
         )
         subjects_data, skipped_count = filter_existing_subject_registrations(
             normalized_pairs,
             existing_subjects,
-            should_filter=should_filter,
+            should_filter=should_filter and not offline_dry_run,
             subject_key_field=subject_key_field,
         )
 
@@ -348,7 +365,7 @@ class RegisterSubjectsWorkflow:
                 email_notify=email_notify,
             )
 
-        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size or self._batch_size)
+        coordinator = AsyncBatchCoordinator(chunk_size=chunk_size or self._batch_size, sdk=sdk)
         return await coordinator.submit(
             study_key,
             subjects_data,

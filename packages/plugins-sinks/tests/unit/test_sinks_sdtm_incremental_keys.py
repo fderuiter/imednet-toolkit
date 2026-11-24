@@ -103,7 +103,7 @@ def test_snowflake_sdtm_incremental_merge_seq_seeding_and_reconcile_deleted(
             form_id=10,
             form_key="AE",
             subject_key="SUBJ-01",
-            record_data={"aeTerm": "Updated Nausea", "aeSerious": "Yes"},
+            record_data={"aeTerm": "Updated Nausea", "aeSerious": "Yes", "PRIORSEQ": 9},
         ),
         Record(
             study_key="STUDY_SF",
@@ -156,6 +156,7 @@ def test_snowflake_sdtm_incremental_merge_seq_seeding_and_reconcile_deleted(
         in sql_texts
     )
     assert 'target."AESEQ" = COALESCE(target."AESEQ", source."AESEQ")' in sql_texts
+    assert 'target."PRIORSEQ" = source."PRIORSEQ"' in sql_texts
 
     delete_calls = [(q, p) for q, p in queries if q.startswith("DELETE FROM")]
     assert len(delete_calls) == 1

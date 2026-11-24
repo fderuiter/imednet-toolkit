@@ -835,3 +835,56 @@ def test_incremental_sdtm_preserves_seq_seeds_max_and_deletes_voided_across_tabu
             for _, row in df.iterrows()
         }
         assert actual == expected_by_id, f"Mismatch in {sink_name}: {actual}"
+
+
+def test_record_mapper_sdtm_dataframe_uses_cached_loader_with_sequence_sort() -> None:
+    """RecordMapper.iter_sdtm_dataframes recognizes multi-key sequence _SDTM_RECORDS_SORT as cache-compatible."""
+    cached_records = [
+        Record(
+            study_key="STUDY_CACHE",
+            record_id=2,
+            form_id=10,
+            form_key="AE",
+            subject_key="SUBJ-01",
+            record_data={"aeTerm": "Nausea"},
+        ),
+        Record(
+            study_key="STUDY_CACHE",
+            record_id=1,
+            form_id=10,
+            form_key="AE",
+            subject_key="SUBJ-01",
+            record_data={"aeTerm": "Headache"},
+        ),
+    ]
+
+    class _StubCachedLoader:
+        def __init__(self) -> None:
+            self.synced_studies: list[str] = []
+            self.iter_calls: list[tuple[str, bool, int]] = []
+
+        def sync_records(self, study_key: str) -> None:
+            self.synced_studies.append(study_key)
+
+        def iter_cached_records(
+            self,
+            study_key: str,
+            *,
+            chunk_size: int = 1000,
+            order_by_subject: bool = False,
+        ) -> list[Record]:
+            self.iter_calls.append((study_key, order_by_subject, chunk_size))
+            return list(cached_records)
+
+    sdk = MagicMock()
+    sdk.records.list.side_effect = AssertionError("SDK records.list should not be called")
+    loader = _StubCachedLoader()
+    mapper = RecordMapper(sdk, loader=loader)  # type: ignore[arg-type]
+
+    df = mapper.sdtm_dataframe("STUDY_CACHE", "AE", include_record_id=True)
+    assert loader.synced_studies == ["STUDY_CACHE"]
+    assert len(loader.iter_calls) == 1
+    assert loader.iter_calls[0][0] == "STUDY_CACHE"
+    assert loader.iter_calls[0][1] is True
+    assert list(df["RECORD_ID"]) == [1, 2]
+    assert list(df["AESEQ"]) == [1, 2]

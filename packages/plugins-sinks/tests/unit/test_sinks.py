@@ -3672,3 +3672,176 @@ class TestPluginSinksSdtmAndNamingConventionParity:
             assert sf_sink.reconcile_deleted([voided], batch_id="del/0") == 1
         sf_sql = cursor.execute.call_args.args[0]
         assert expected_sf_where in sf_sql
+
+    def test_neo4j_sdtm_validates_cypher_keys_and_binds_seq_prop_to_domain(self, monkeypatch):
+        """Neo4j SDTM exports reject unsafe row/builder keys, omit *SEQ from DM MERGE, and sanitize form_key domains."""
+        import imednet_sinks.graph as graph_mod
+        from imednet.errors import ExportConfigurationError
+        from imednet.models.records import Record
+        from imednet_sinks import Neo4jExportSink, Neo4jSinkConfig
+        from imednet_sinks.graph import (
+            _build_convention_cypher,
+            _build_sdtm_cypher,
+            _post_process_graph_sdtm,
+        )
+
+        neo4j_mod, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+        run_mock = driver.session.return_value.__enter__.return_value.run
+
+        # 1. DM and non-DM records with malicious *SEQ key raise ExportConfigurationError before session.run
+        dm_rec = Record(
+            record_id=101,
+            study_key="STUDY_CLI_DM",
+            form_key="DM",
+            subject_key="SUBJ-DM-1",
+            record_data={"SEX": "F", "canary: 1}) //SEQ": 1},
+        )
+        dm_cfg = Neo4jSinkConfig(
+            study_key="STUDY_CLI_DM",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "pass"),
+            as_sdtm=True,
+            sdtm_domain="DM",
+        )
+        with Neo4jExportSink(config=dm_cfg) as dm_sink:
+            with pytest.raises(ExportConfigurationError, match="invalid characters"):
+                dm_sink.write_batch([dm_rec], batch_id="dm/bad")
+        ae_bad_rec = Record(
+            record_id=101,
+            study_key="STUDY_CLI_DM",
+            form_key="AE",
+            subject_key="SUBJ-DM-1",
+            record_data={"AETERM": "Headache", "canary: 1}) //SEQ": 1},
+        )
+        ae_cfg = Neo4jSinkConfig(
+            study_key="STUDY_CLI_DM",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "pass"),
+            as_sdtm=True,
+            sdtm_domain="AE",
+        )
+        with Neo4jExportSink(config=ae_cfg) as ae_sink:
+            with pytest.raises(ExportConfigurationError, match="invalid characters"):
+                ae_sink.write_batch([ae_bad_rec], batch_id="ae/bad")
+        run_mock.assert_not_called()
+
+        # 2. DM record with benign alphanumeric *SEQ keys keeps seq_prop=None in MERGE/SET
+        dm_benign = Record(
+            record_id=102,
+            study_key="STUDY_CLI_DM",
+            form_key="DM",
+            subject_key="SUBJ-DM-2",
+            record_data={"SEX": "M", "CUSTOMSEQ": 1, "PRIORSEQ": 7},
+        )
+        with Neo4jExportSink(config=dm_cfg) as dm_sink:
+            assert dm_sink.write_batch([dm_benign], batch_id="dm/ok") == 1
+        dm_cypher = run_mock.call_args.args[0]
+        dm_rows = run_mock.call_args.kwargs["rows"]
+        assert "MERGE (r:Record   {STUDYID: row.STUDYID, RECORD_ID: row.RECORD_ID})" in dm_cypher
+        assert "coalesce(_prev_seq" not in dm_cypher
+        assert "CUSTOMSEQ" not in dm_cypher
+        assert "PRIORSEQ" not in dm_cypher
+        assert dm_rows[0]["RECORD_ID"] == 102
+        assert dm_rows[0]["CUSTOMSEQ"] == 1
+        assert dm_rows[0]["PRIORSEQ"] == 7
+
+        # 3. Unaliased punctured form_key is sanitized in resolve_sdtm_domain and never injects MERGE clauses
+        run_mock.reset_mock()
+        dom_rec = Record(
+            record_id=103,
+            study_key="STUDY_AF_DOM",
+            form_key="ZZ: 1}) //",
+            subject_key="SUBJ-DOM-1",
+            record_data={"note": "unaliased_form_domain"},
+        )
+        dom_cfg = Neo4jSinkConfig(
+            study_key="STUDY_AF_DOM",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "pass"),
+            as_sdtm=True,
+        )
+        with Neo4jExportSink(config=dom_cfg) as dom_sink:
+            assert dom_sink.write_batch([dom_rec], batch_id="dom/0") == 1
+        dom_cypher = run_mock.call_args.args[0]
+        dom_rows = run_mock.call_args.kwargs["rows"]
+        assert dom_rows[0]["DOMAIN"] == "ZZ1"
+        assert dom_rows[0]["RECORD_ID"] == 103
+        assert dom_rows[0]["ZZ1SEQ"] == 1
+        assert "MERGE (r:Record   {STUDYID: row.STUDYID, RECORD_ID: row.RECORD_ID})" in dom_cypher
+        assert "SET r += row, r.ZZ1SEQ = coalesce(_prev_seq, row.ZZ1SEQ)" in dom_cypher
+        assert all("//" not in c.args[0] for c in run_mock.call_args_list)
+        assert dom_cypher.count("MERGE (r:Record") == 1
+
+        # Keyless SDTM payload falls back to sanitized {STUDYID, DOMAIN, USUBJID, ZZ1SEQ} MERGE key
+        run_mock.reset_mock()
+        keyless_dom_rec = {
+            "studyKey": "STUDY_AF_DOM",
+            "formKey": "ZZ: 1}) //",
+            "subjectKey": "SUBJ-DOM-2",
+            "recordData": {"note": "keyless_unaliased_domain"},
+        }
+        with Neo4jExportSink(config=dom_cfg) as dom_sink:
+            assert dom_sink.write_batch([keyless_dom_rec], batch_id="dom/keyless") == 1
+        keyless_cypher = run_mock.call_args.args[0]
+        assert (
+            "MERGE (r:Record   {STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, ZZ1SEQ: row.ZZ1SEQ})"
+            in keyless_cypher
+        )
+        assert "//" not in keyless_cypher
+
+        # 4. Custom SDTM domains (FA, SUPPAE) bind seq_prop to f"{domain}SEQ" even with extra *SEQ keys
+        for custom_dom, expected_seq in (("FA", "FASEQ"), ("SUPPAE", "SUPPAESEQ")):
+            run_mock.reset_mock()
+            custom_rec = Record(
+                record_id=104,
+                study_key="STUDY_CUSTOM_DOM",
+                form_key=custom_dom,
+                subject_key="SUBJ-CUST-1",
+                record_data={"PRIORSEQ": 99, "FAOBJ": "Pain"},
+            )
+            custom_cfg = Neo4jSinkConfig(
+                study_key="STUDY_CUSTOM_DOM",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "pass"),
+                as_sdtm=True,
+                sdtm_domain=custom_dom,
+            )
+            with Neo4jExportSink(config=custom_cfg) as custom_sink:
+                assert custom_sink.write_batch([custom_rec], batch_id=f"{custom_dom}/0") == 1
+            custom_cypher = run_mock.call_args.args[0]
+            assert (
+                f"SET r += row, r.{expected_seq} = coalesce(_prev_seq, row.{expected_seq})"
+                in custom_cypher
+            )
+            assert "PRIORSEQ" not in custom_cypher
+
+        # 5. Direct validation in _post_process_graph_sdtm, _build_sdtm_cypher, and _build_convention_cypher
+        with pytest.raises(ExportConfigurationError, match="invalid characters"):
+            _post_process_graph_sdtm({"canary: 1}) //SEQ": None})
+
+        merge_none, _ = _build_sdtm_cypher(None, False)
+        assert (
+            "MERGE (r:Record   {STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID})"
+            in merge_none
+        )
+        merge_ae, _ = _build_sdtm_cypher("AESEQ", True)
+        assert "AESEQ: row.AESEQ" in merge_ae
+        merge_ae_rid, _ = _build_sdtm_cypher("AESEQ", True, has_record_id=True)
+        assert "MERGE (r:Record   {STUDYID: row.STUDYID, RECORD_ID: row.RECORD_ID})" in merge_ae_rid
+        assert "SET r += row, r.AESEQ = coalesce(_prev_seq, row.AESEQ)" in merge_ae_rid
+
+        for bad_seq in ("", "SEQ", "aeseq", "1AESEQ", "canary: 1}) //SEQ", "AESEQ\n"):
+            with pytest.raises(ExportConfigurationError, match="invalid characters"):
+                _build_sdtm_cypher(bad_seq, False)
+            with pytest.raises(ExportConfigurationError, match="invalid characters"):
+                _build_sdtm_cypher(bad_seq, False, has_record_id=True)
+
+        for bad_args in (
+            ("study: 1}", "subject_key", "record_id", "visit_id"),
+            ("study_key", "1subject", "record_id", "visit_id"),
+            ("study_key", "subject_key", "record-id", "visit_id"),
+            ("study_key", "subject_key", "record_id", "visit_id\n"),
+        ):
+            with pytest.raises(ExportConfigurationError, match="invalid characters"):
+                _build_convention_cypher(*bad_args)

@@ -16,11 +16,10 @@ from imednet.models.reporting import (
     ProtocolDeviation,
     VitalSigns,
 )
+from imednet.models.sdtm import _get_model_field_aliases, _normalize_key
 from imednet.models.variables import Variable
 from imednet_workflows.record_mapper import (
     RecordMapper,
-    _get_model_field_aliases,
-    _normalize_key,
     format_iso8601_dtc,
     transform_records_to_sdtm,
 )
@@ -70,9 +69,15 @@ def test_dataframe_builds_expected_structure() -> None:
 
     expected_columns = [
         "recordId",
+        "recordOid",
         "subjectKey",
         "visitId",
+        "intervalId",
+        "intervalName",
         "formId",
+        "formKey",
+        "siteId",
+        "siteName",
         "recordStatus",
         "dateCreated",
         "Label1",
@@ -137,9 +142,15 @@ def test_dataframe_whitelists_variables_and_forms() -> None:
     )
     assert list(df.columns) == [
         "recordId",
+        "recordOid",
         "subjectKey",
         "visitId",
+        "intervalId",
+        "intervalName",
         "formId",
+        "formKey",
+        "siteId",
+        "siteName",
         "recordStatus",
         "dateCreated",
         "Label1",
@@ -272,9 +283,15 @@ def test_dataframe_multi_form_and_variable_whitelists_batch_without_mixed_connec
         assert rec_calls[1]["filter"] == "formId==20"
         assert list(df.columns) == [
             "recordId",
+            "recordOid",
             "subjectKey",
             "visitId",
+            "intervalId",
+            "intervalName",
             "formId",
+            "formKey",
+            "siteId",
+            "siteName",
             "recordStatus",
             "dateCreated",
             "AGE",
@@ -1863,3 +1880,276 @@ def test_sdtm_variable_whitelist_projection_and_custom_domain_phi(
     )
     assert ae_df.iloc[0]["AESER"] == "***MASKED***"
     assert ae_df.iloc[0]["AESTDTC"] is None
+
+
+def test_record_mapper_hydrates_site_interval_and_form_maps(tmp_path) -> None:
+    """Req 1: RecordMapper hydrates recordOid, formKey, intervalId/Name, and siteId/Name."""
+    import pandas as pd
+
+    from imednet.core.client import Client
+    from imednet.integrations.export import _RECORD_META_CONTRACT_TYPES, export_to_csv
+    from imednet.models.forms import Form
+    from imednet.models.intervals import Interval
+    from imednet.models.sites import Site
+    from imednet.models.visits import Visit
+    from imednet.sdk import ImednetSDK
+    from imednet.simulation import SimulationState, SimulationTransport
+    from imednet.utils.pandas import import_records_csv
+
+    assert tuple(name for name, _ in _RECORD_META_CONTRACT_TYPES) == (
+        "recordId",
+        "recordOid",
+        "subjectKey",
+        "visitId",
+        "intervalId",
+        "intervalName",
+        "formId",
+        "formKey",
+        "siteId",
+        "siteName",
+        "recordStatus",
+        "dateCreated",
+    )
+
+    # Unit check: visitId fallback hydrates intervalId and intervalName when record.interval_id is None
+    mock_sdk = MagicMock()
+    mock_sdk.get_variables.return_value = [
+        Variable(variable_name="V_AGE", label="Age", form_id=301, form_key="")
+    ]
+    mock_sdk.get_forms.return_value = [Form(form_id=301, form_key="F_DM", form_name="Demographics")]
+    mock_sdk.get_sites.return_value = [Site(site_id=101, site_name="SITE-ALPHA")]
+    mock_sdk.get_intervals.return_value = [Interval(interval_id=501, interval_name="Baseline")]
+    mock_sdk.get_visits.return_value = [
+        Visit(visit_id=401, interval_id=501, interval_name="Baseline")
+    ]
+    mock_sdk.get_records.return_value = [
+        Record(
+            record_id=601,
+            record_oid="REC-601",
+            subject_key="SUB1",
+            visit_id=401,
+            interval_id=None,
+            form_id=301,
+            form_key="",
+            site_id=101,
+            record_status="Complete",
+            date_created=datetime(2026, 1, 1),
+            record_data={"V_AGE": 42},
+        )
+    ]
+
+    mapper = RecordMapper(mock_sdk)
+    df = mapper.dataframe("STUDY", use_labels_as_columns=False)
+    row = df.iloc[0]
+    assert row["recordOid"] == "REC-601"
+    assert row["formKey"] == "F_DM"
+    assert row["intervalId"] == 501
+    assert row["intervalName"] == "Baseline"
+    assert row["siteId"] == 101
+    assert row["siteName"] == "SITE-ALPHA"
+
+    # End-to-end symmetric round-trip: export_to_csv -> import_records_csv updates scheduled & unscheduled records
+    state = SimulationState()
+    transport = SimulationTransport(state=state)
+    sdk = ImednetSDK(
+        client=Client(
+            api_key="sim-key",  # pragma: allowlist secret
+            security_key="sim-secret",  # pragma: allowlist secret
+            base_url="https://edc.sim.imednet.com",
+            transport=transport,
+        )
+    )
+    # Seed an unscheduled record (no visitId / intervalId) alongside the scheduled seeded records
+    sdk.records.create_batch(
+        "STUDY",
+        [
+            {
+                "formKey": "F_VS",
+                "subjectKey": "SUB1",
+                "siteName": "SITE",
+                "data": {"V_WEIGHT": 81.5},
+            }
+        ],
+    )
+    before_records = state.get_records("STUDY")
+    before_count = len(before_records)
+    assert before_count == 3  # 2 scheduled + 1 unscheduled
+
+    csv_file = tmp_path / "study_records.csv"
+    export_to_csv(sdk, "STUDY", str(csv_file), mask_phi=False)
+    assert csv_file.exists()
+
+    # Modify clinical values in exported CSV and re-import via import_records_csv
+    exported_df = pd.read_csv(csv_file)
+    exported_df.loc[exported_df["recordId"] == 601, "V_AGE"] = 46
+    exported_df.loc[exported_df["visitId"].isna(), "V_WEIGHT"] = 82.5
+    exported_df.to_csv(csv_file, index=False)
+
+    import_records_csv(sdk, "STUDY", csv_file)
+
+    after_records = state.get_records("STUDY")
+    assert len(after_records) == before_count  # zero duplicate records!
+    rec_by_id = {r["recordId"]: r for r in after_records}
+    assert rec_by_id[601]["recordData"]["V_AGE"] == 46
+    unscheduled = [
+        r for r in after_records if r.get("visitId") is None and r.get("intervalId") is None
+    ]
+    assert len(unscheduled) == 1
+    assert unscheduled[0]["recordData"]["V_WEIGHT"] == 82.5
+
+
+def test_resolve_sdtm_domain_sanitizes_unaliased_domains_and_keeps_seq_var_safe() -> None:
+    """resolve_sdtm_domain strips non-alphanumeric characters and falls back when no valid domain code remains."""
+    from imednet.models.sdtm import resolve_sdtm_domain, transform_records_to_sdtm_rows
+
+    assert resolve_sdtm_domain("ZZ: 1}) //") == "ZZ1"
+    assert resolve_sdtm_domain("F_AE: 1}) //") == "AE"
+    assert resolve_sdtm_domain("FA") == "FA"
+    assert resolve_sdtm_domain("SUPPAE") == "SUPPAE"
+    assert resolve_sdtm_domain("!!! //", fallback="AE") == "AE"
+    assert resolve_sdtm_domain(": 1}) //", fallback="AE") == "AE"
+    assert resolve_sdtm_domain("123", fallback="VS") == "VS"
+    assert resolve_sdtm_domain("²", fallback="LB") == "LB"
+
+    dom_rec = Record(
+        record_id=103,
+        study_key="STUDY_AF_DOM",
+        form_key="ZZ: 1}) //",
+        subject_key="SUBJ-DOM-1",
+        record_data={"note": "unaliased_form_domain"},
+    )
+    rows = transform_records_to_sdtm_rows(
+        [dom_rec],
+        domain=dom_rec.form_key or "AE",
+        study_key="STUDY_AF_DOM",
+    )
+    assert len(rows) == 1
+    assert rows[0]["DOMAIN"] == "ZZ1"
+    assert rows[0]["ZZ1SEQ"] == 1
+    assert all(k.isalnum() or k == "_" for k in rows[0])
+
+    dm_rows = transform_records_to_sdtm_rows(
+        [
+            Record(
+                record_id=101,
+                study_key="STUDY_CLI_DM",
+                form_key="DM",
+                subject_key="SUBJ-DM-1",
+                record_data={"SEX": "F", "PRIORSEQ": 3},
+            )
+        ],
+        domain="DM",
+        study_key="STUDY_CLI_DM",
+    )
+    assert "DMSEQ" not in dm_rows[0]
+    assert dm_rows[0]["PRIORSEQ"] == 3
+
+
+def test_record_mapper_sdtm_incremental_record_id_and_cached_loader_sequence_sort() -> None:
+    """RecordMapper preserves RECORD_ID, seeded seq_counters, and cached loader reuse under SDTM sort."""
+    sdk = MagicMock()
+    recs = [
+        Record(
+            record_id=701,
+            subject_key="SUBJ-INC-1",
+            visit_id=10,
+            form_id=20,
+            deleted=False,
+            record_data={"aeTerm": "Headache", "aeSeverity": "MILD", "extraDrop": "x"},
+        ),
+        Record(
+            record_id=702,
+            subject_key="SUBJ-INC-1",
+            visit_id=10,
+            form_id=20,
+            deleted=True,
+            record_data={"aeTerm": "DeletedAE", "aeSeverity": "MILD"},
+        ),
+        Record(
+            record_id=703,
+            subject_key="SUBJ-INC-1",
+            visit_id=10,
+            form_id=99,
+            deleted=False,
+            record_data={"aeTerm": "OtherForm", "aeSeverity": "MILD"},
+        ),
+    ]
+
+    class _CachedLoader:
+        def __init__(self) -> None:
+            self.synced: list[str] = []
+            self.ordered_calls: list[bool] = []
+
+        def sync_records(self, study_key: str) -> None:
+            self.synced.append(study_key)
+
+        def iter_cached_records(
+            self,
+            study_key: str,
+            *,
+            chunk_size: int = 1000,
+            order_by_subject: bool = False,
+        ) -> list[Record]:
+            assert study_key == "STUDY_INC"
+            assert chunk_size > 0
+            self.ordered_calls.append(order_by_subject)
+            return list(recs)
+
+    loader = _CachedLoader()
+    mapper = RecordMapper(sdk, loader=loader)
+
+    df = mapper.sdtm_dataframe(
+        "STUDY_INC",
+        domain="AE",
+        visit_key="not-an-int",
+        variable_whitelist=["aeTerm", "aeSeverity"],
+        form_whitelist=[20],
+        include_record_id=True,
+    )
+    assert loader.synced == ["STUDY_INC"]
+    assert loader.ordered_calls == [True]
+    sdk.get_records.assert_not_called()
+    assert list(df["RECORD_ID"]) == [701]
+    assert list(df["AESEQ"]) == [1]
+
+    empty_df = mapper.sdtm_dataframe(
+        "STUDY_INC",
+        domain="AE",
+        form_whitelist=[],
+        include_record_id=True,
+    )
+    assert empty_df.empty
+    assert "RECORD_ID" in empty_df.columns
+
+    seeded_df = mapper.transform_to_sdtm(
+        [recs[0]],
+        domain="AE",
+        study_key="STUDY_INC",
+        seq_counters={"SUBJ-INC-1": 4},
+        include_record_id=True,
+    )
+    assert list(seeded_df["RECORD_ID"]) == [701]
+    assert list(seeded_df["AESEQ"]) == [5]
+
+    projected = list(
+        RecordMapper._project_record_whitelist(
+            [
+                recs[0],
+                {"recordId": 704, "recordData": {"aeTerm": "Fever", "dropMe": 1}},
+                "opaque-item",
+            ],
+            {"aeTerm"},
+        )
+    )
+    assert projected[0].record_data == {"aeTerm": "Headache"}
+    assert projected[1]["recordData"] == {"aeTerm": "Fever"}
+    assert projected[2] == "opaque-item"
+
+    mock_loader = MagicMock()
+    mock_loader.iter_cached_records = lambda study_key, chunk_size=1000: []
+    fn, supports_order = RecordMapper._resolve_loader_iter_callable(mock_loader)
+    assert callable(fn)
+    assert supports_order is False
+    none_fn, none_order = RecordMapper._resolve_loader_iter_callable(object())
+    assert none_fn is None
+    assert none_order is False
