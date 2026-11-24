@@ -196,7 +196,10 @@ def test_count_cached_records_counts_matching_study(tmp_path: Path) -> None:
     )
 
     with get_sqlite_connection(loader.db_path) as conn:
-        loader._upsert_records(conn, [record_study_a, record_study_a_2, record_study_b])
+        with loader.lock, conn:
+            loader._upsert_records_unlocked(
+                conn, [record_study_a, record_study_a_2, record_study_b]
+            )
 
     assert loader.count_cached_records("STUDY") == 2
     assert loader.count_cached_records("OTHER") == 1
@@ -206,23 +209,25 @@ def test_count_cached_records_counts_matching_study(tmp_path: Path) -> None:
         assert loader.count_cached_records("STUDY", conn=conn) == 2
 
 
-def test_fetch_active_record_ids_uses_lightweight_projection_without_record_data(
+def test_fetch_active_records_projection_uses_lightweight_projection_without_record_data(
     tmp_path: Path,
 ) -> None:
-    """Verify that _fetch_active_record_ids requests record_data_filter="none" and extracts IDs."""
+    """Verify _fetch_active_records_projection requests record_data_filter="none" and filters deleted."""
     sdk = MagicMock()
     # Projected record models returned by API omit clinical question data (record_data is None)
     projected_records = [
         Record(study_key="STUDY", record_id=101, form_key="DEMOG", record_data=None),
         Record(study_key="STUDY", record_id=102, form_key="VITALS", record_data=None),
+        Record(study_key="STUDY", record_id=103, form_key="VOID", deleted=True, record_data=None),
         Record(study_key="STUDY", record_id=None, form_key="EMPTY", record_data=None),
     ]
     sdk.get_records.return_value = projected_records
 
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
-    active_ids = loader._fetch_active_record_ids("STUDY")
+    fetched = loader._fetch_active_records_projection("STUDY")
 
-    assert active_ids == {101, 102}
+    assert [record.record_id for record in fetched] == [101, 102, None]
+    assert {record.record_id for record in fetched if record.record_id is not None} == {101, 102}
     sdk.get_records.assert_called_once_with(
         study_key="STUDY",
         record_data_filter="none",
@@ -240,7 +245,8 @@ def test_reconcile_cache_prunes_deleted_records_with_projected_id_set(tmp_path: 
     r3 = _record(3, "2024-01-03 00:00:00+00:00")
 
     with get_sqlite_connection(loader.db_path) as conn:
-        loader._upsert_records(conn, [r1, r2, r3])
+        with loader.lock, conn:
+            loader._upsert_records_unlocked(conn, [r1, r2, r3])
         assert loader.count_cached_records("STUDY", conn=conn) == 3
 
         # Projected active IDs set indicates record 2 was deleted upstream in EDC
@@ -352,25 +358,27 @@ def test_remote_fetches_execute_outside_file_lock(tmp_path: Path) -> None:
 
 
 def test_write_transactions_acquire_file_lock(tmp_path: Path) -> None:
-    """Verify that _upsert_records and reconcile_cache acquire file lock during execution."""
+    """Verify that sync_records and reconcile_cache acquire file lock during execution."""
     from unittest.mock import patch
 
     sdk = MagicMock()
+    r1 = _record(1, "2024-01-01 00:00:00+00:00")
+    projected = [Record(study_key="STUDY", record_id=1, form_key="FORM", record_data=None)]
+    sdk.get_records.side_effect = [[r1], projected]
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
 
-    lock_states_in_upsert = []
+    lock_states_in_sync = []
     original_acquire = loader.lock.acquire
 
     def _spy_acquire(*args, **kwargs):
         res = original_acquire(*args, **kwargs)
-        lock_states_in_upsert.append(loader.lock.is_locked)
+        lock_states_in_sync.append(loader.lock.is_locked)
         return res
 
     with patch.object(loader.lock, "acquire", side_effect=_spy_acquire):
-        with get_sqlite_connection(loader.db_path) as conn:
-            loader._upsert_records(conn, [_record(1, "2024-01-01 00:00:00+00:00")])
+        loader.sync_records("STUDY", reconcile=True)
 
-    assert lock_states_in_upsert == [True]
+    assert lock_states_in_sync == [True]
     assert loader.lock.is_locked is False
 
     lock_states_in_reconcile = []
@@ -389,14 +397,18 @@ def test_write_transactions_acquire_file_lock(tmp_path: Path) -> None:
 
 
 def test_lock_hold_duration_below_threshold(tmp_path: Path) -> None:
-    """Verify that file lock hold duration is well below 50ms for typical batch upsert operations."""
+    """Verify that file lock hold duration is well below 50ms for typical batch sync operations."""
     import time
     from unittest.mock import patch
 
     sdk = MagicMock()
-    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
-
     records = [_record(i, f"2024-01-{(i % 28) + 1:02d} 00:00:00+00:00") for i in range(1, 101)]
+    projected = [
+        Record(study_key="STUDY", record_id=i, form_key="FORM", record_data=None)
+        for i in range(1, 101)
+    ]
+    sdk.get_records.side_effect = [records, projected]
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
 
     hold_durations = []
     original_acquire = loader.lock.acquire
@@ -420,8 +432,7 @@ def test_lock_hold_duration_below_threshold(tmp_path: Path) -> None:
         patch.object(loader.lock, "acquire", side_effect=_tracking_acquire),
         patch.object(loader.lock, "release", side_effect=_tracking_release),
     ):
-        with get_sqlite_connection(loader.db_path) as conn:
-            loader._upsert_records(conn, records)
+        loader.sync_records("STUDY", reconcile=True)
 
     assert len(hold_durations) == 1
     # 50 milliseconds = 0.05 seconds
@@ -475,6 +486,7 @@ def test_cached_loader_http_contract_iso_timestamp_and_lowercase_bool(tmp_path: 
         assert calls[1]["filter"] == "deleted==false"
         assert calls[1]["recordDataFilter"] == "none"
         assert calls[2]["filter"] == "dateModified>=2024-01-02T00:00:00Z"
+        assert calls[3]["filter"] == "lastUpdated>=2024-01-02T00:00:00Z"
 
 
 def test_cached_loader_incremental_sync_with_simulation_transport(tmp_path: Path) -> None:
@@ -863,13 +875,15 @@ def test_reconcile_cache_epoch_fencing_retains_newer_upserts(tmp_path: Path) -> 
 
     with get_sqlite_connection(loader.db_path) as conn:
         # Epoch 1: r1 and r2_deleted are cached
-        loader._upsert_records(conn, [r1, r2_deleted])
+        with loader.lock, conn:
+            loader._upsert_records_unlocked(conn, [r1, r2_deleted])
         pre_reconcile_epoch = loader.get_study_sync_state("STUDY", conn=conn).sync_epoch
         assert pre_reconcile_epoch == 1
 
         # Simulate a stale upstream active-ID snapshot {1} captured at epoch 1,
         # while a concurrent sync cycle upserts r3_concurrent_insert at epoch 2.
-        loader._upsert_records(conn, [r3_concurrent_insert])
+        with loader.lock, conn:
+            loader._upsert_records_unlocked(conn, [r3_concurrent_insert])
         assert loader.get_study_sync_state("STUDY", conn=conn).sync_epoch == 2
 
         loader.reconcile_cache(conn, "STUDY", {1}, max_epoch=pre_reconcile_epoch)
@@ -926,7 +940,8 @@ def test_iter_cached_records_order_by_subject_groups_subjects_cleanly(tmp_path: 
         ),
     ]
     with get_sqlite_connection(loader.db_path) as conn:
-        loader._upsert_records(conn, interleaved)
+        with loader.lock, conn:
+            loader._upsert_records_unlocked(conn, interleaved)
 
     default_order = list(loader.iter_cached_records("STUDY", chunk_size=2))
     assert [r.record_id for r in default_order] == [10, 20, 30, 40, 50]
@@ -960,7 +975,6 @@ def test_sync_records_without_reconcile_captures_signed_records_via_last_updated
         form_key="AE",
         subject_key="SUBJ-01",
         record_status="Signed",
-        # dateModified predates the high_water_mark, only lastUpdated advanced on e-signature!
         date_modified="2026-02-01T09:00:00Z",
         last_updated="2026-02-05T16:45:00Z",
         record_data={"AETERM": "Headache"},
@@ -978,7 +992,6 @@ def test_sync_records_without_reconcile_captures_signed_records_via_last_updated
     )
 
     sdk.get_records.side_effect = [[initial_rec]]
-    # Branch 1 (dateModified >= wm) returns only edited_rec; Branch 2 (lastUpdated >= wm) returns both!
     sdk.records.list.side_effect = [[edited_rec], [signed_rec, edited_rec]]
 
     loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "sig-cache")

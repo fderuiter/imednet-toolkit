@@ -1,49 +1,42 @@
-"""Workflow for registering subjects in iMednet via the Records API.
-
-This workflow is self-contained and does not borrow from record_update.py.
-It provides a simple, robust interface for registering one or more subjects
-synchronously or asynchronously across both ImednetFacade and AsyncImednetFacade.
-"""
+"""Workflow for registering subjects in iMedNet via the Records API."""
 
 import asyncio
 import functools
 import inspect
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Union, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from imednet.spi.models import Job, RegisterSubjectRequest
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
-    AsyncBatchCoordinator,
-    BatchCoordinator,
     BatchSubmissionSummary,
-    JobPollSummary,
     JobProgressHandler,
     RecordsInput,
-    extract_single_submitted_job,
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
-    poll_facade_many_async,
-    poll_facade_many_sync,
-    poll_facade_single_async,
-    poll_facade_single_sync,
-    validate_single_job_preflight,
     validate_subject_registration_sites,
 )
 from imednet.spi.validation import BaseSchemaCache, ValidationSchemaProtocol
 
+from ._workflow_helpers import (
+    FacadeLike,
+    WorkflowBatchSpec,
+    build_keyword_record_chunk_submitter,
+    enforce_single_job_records,
+    ensure_sync_workflow_mode,
+    prepare_batch_preflight,
+    submit_workflow_batch_async,
+    submit_workflow_batch_sync,
+    unwrap_single_submitted_job,
+)
+
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
-FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
 SubjectInputs = Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput
 
 
-def _is_offline_schema_dry_run(
-    *,
-    dry_run: bool,
-    schema: ValidationSchemaProtocol | None,
-) -> bool:
+def _is_offline_schema_dry_run(dry_run: bool, schema: ValidationSchemaProtocol | None) -> bool:
     """Return True when dry_run uses an offline DataDictionary / non-cache schema."""
     return bool(dry_run and schema is not None and not isinstance(schema, BaseSchemaCache))
 
@@ -91,89 +84,32 @@ class RegisterSubjectsWorkflow:
 
     def _ensure_sync_mode(self, method_name: str, async_counterpart: str) -> None:
         """Raise TypeError when synchronous registration methods are called on an async SDK."""
-        if _is_async_facade(self._sdk):
-            raise TypeError(
-                f"RegisterSubjectsWorkflow.{method_name}() requires a synchronous ImednetSDK "
-                f"(ImednetFacade). With AsyncImednetSDK, await "
-                f"workflow.{async_counterpart}(...) instead."
-            )
-
-    def _poll_single(
-        self,
-        study_key: str,
-        batch_id: str,
-        *,
-        timeout: int,
-        poll_interval: int,
-        on_progress: JobProgressHandler | None = None,
-    ) -> Any:
-        return poll_facade_single_sync(
-            self._sdk,
-            study_key,
-            batch_id,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            on_progress=on_progress,
+        ensure_sync_workflow_mode(
+            _is_async_facade(self._sdk), "RegisterSubjectsWorkflow", method_name, async_counterpart
         )
 
-    def _poll_many(
+    def _prepare_registration_batch(
         self,
-        study_key: str,
-        batch_ids: list[str],
-        *,
-        timeout: int,
-        poll_interval: int,
-        on_progress: JobProgressHandler | None = None,
-    ) -> JobPollSummary:
-        """Poll multiple registration chunk jobs via poll_jobs with fallback to poll_job."""
-        return poll_facade_many_sync(
-            self._sdk,
-            study_key,
-            batch_ids,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            on_progress=on_progress,
+        chunk_size: int | None,
+        filter_enrolled: bool | None,
+        skip_existing: bool,
+        schema: ValidationSchemaProtocol | None,
+        dry_run: bool,
+        single_job_method: tuple[str, str] | None,
+    ) -> tuple[int, bool, bool]:
+        """Resolve chunk size, offline dry-run flag, and active enrolled-subject filter flag."""
+        eff_chunk = prepare_batch_preflight(
+            chunk_size, self._batch_size, dry_run, single_job_method
         )
+        offline_dry_run = _is_offline_schema_dry_run(dry_run, schema)
+        should_filter = (
+            (self._filter_enrolled if filter_enrolled is None else filter_enrolled) or skip_existing
+        ) and not offline_dry_run
+        return eff_chunk, offline_dry_run, should_filter
 
-    async def _async_poll_single(
-        self,
+    @staticmethod
+    def _build_registration_spec(
         study_key: str,
-        batch_id: str,
-        *,
-        timeout: int,
-        poll_interval: int,
-        on_progress: JobProgressHandler | None = None,
-    ) -> Any:
-        return await poll_facade_single_async(
-            self._sdk,
-            study_key,
-            batch_id,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            on_progress=on_progress,
-        )
-
-    async def _async_poll_many(
-        self,
-        study_key: str,
-        batch_ids: list[str],
-        *,
-        timeout: int,
-        poll_interval: int,
-        on_progress: JobProgressHandler | None = None,
-    ) -> JobPollSummary:
-        """Asynchronously poll multiple registration chunk jobs with fallback."""
-        return await poll_facade_many_async(
-            self._sdk,
-            study_key,
-            batch_ids,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            on_progress=on_progress,
-        )
-
-    def _finalize_prepared_subjects(
-        self,
         normalized_pairs: Sequence[
             tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]
         ],
@@ -182,10 +118,13 @@ class RegisterSubjectsWorkflow:
         *,
         should_filter: bool,
         subject_key_field: str | None,
-        effective_chunk_size: int,
-        dry_run: bool,
+        chunk_size: int,
+        schema: ValidationSchemaProtocol | None,
+        options: tuple[bool, int, int, JobProgressHandler | None, bool, bool],
         single_job_method: tuple[str, str] | None,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> WorkflowBatchSpec:
+        """Validate sites, filter enrolled subjects, and assemble a batch submission spec."""
+        wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors = options
         validate_subject_registration_sites(normalized_pairs, sites)
         subjects_data, skipped_count = filter_existing_subject_registrations(
             normalized_pairs,
@@ -193,15 +132,21 @@ class RegisterSubjectsWorkflow:
             should_filter=should_filter,
             subject_key_field=subject_key_field,
         )
-        if single_job_method is not None:
-            validate_single_job_preflight(
-                subjects_data,
-                chunk_size=effective_chunk_size,
-                dry_run=dry_run,
-                method_name=single_job_method[0],
-                batch_method_name=single_job_method[1],
-            )
-        return subjects_data, skipped_count
+        enforce_single_job_records(subjects_data, chunk_size, dry_run, single_job_method)
+        return WorkflowBatchSpec(
+            study_key,
+            subjects_data,
+            chunk_size,
+            wait_for_completion,
+            timeout,
+            poll_interval,
+            wait_for_completion,
+            schema=schema,
+            skipped_count=skipped_count,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
+        )
 
     def register_subjects_batch(
         self,
@@ -224,83 +169,30 @@ class RegisterSubjectsWorkflow:
     ) -> BatchSubmissionSummary:
         """Validate sites once, optionally filter enrolled subjects, and submit in bounded chunks."""
         self._ensure_sync_mode("register_subjects_batch", "async_register_subjects_batch")
-        effective_chunk_size = chunk_size or self._batch_size
-        if _single_job_method is not None and dry_run:
-            validate_single_job_preflight(
-                [],
-                chunk_size=effective_chunk_size,
-                dry_run=True,
-                method_name=_single_job_method[0],
-                batch_method_name=_single_job_method[1],
-            )
+        eff_chunk, offline_dry_run, should_filter = self._prepare_registration_batch(
+            chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
+        )
         sdk = cast("ImednetFacade", self._sdk)
-        offline_dry_run = _is_offline_schema_dry_run(dry_run=dry_run, schema=schema)
         sites = None if offline_dry_run else sdk.get_sites(study_key=study_key)
-        normalized_pairs = normalize_subject_registration_inputs(
-            subjects,
-            schema=schema,
-            study_key=study_key,
-        )
-        should_filter = (
-            self._filter_enrolled if filter_enrolled is None else filter_enrolled
-        ) or skip_existing
-        existing_subjects = (
-            sdk.get_subjects(study_key=study_key)
-            if (should_filter and not offline_dry_run)
-            else None
-        )
-        subjects_data, skipped_count = self._finalize_prepared_subjects(
-            normalized_pairs,
+        pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
+        existing = sdk.get_subjects(study_key=study_key) if should_filter else None
+        opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
+        spec = self._build_registration_spec(
+            study_key,
+            pairs,
             sites,
-            existing_subjects,
-            should_filter=should_filter and not offline_dry_run,
+            existing,
+            should_filter=should_filter,
             subject_key_field=subject_key_field,
-            effective_chunk_size=effective_chunk_size,
-            dry_run=dry_run,
+            chunk_size=eff_chunk,
+            schema=schema,
+            options=opts,
             single_job_method=_single_job_method,
         )
-
-        def _submit_chunk(chunk: list[dict[str, Any]]) -> Job:
-            if schema is not None:
-                return sdk.create_record(
-                    study_key=study_key,
-                    records_data=chunk,
-                    email_notify=email_notify,
-                    schema=schema,
-                )
-            return sdk.create_record(
-                study_key=study_key,
-                records_data=chunk,
-                email_notify=email_notify,
-            )
-
-        coordinator = BatchCoordinator(chunk_size=effective_chunk_size, sdk=sdk)
-        return coordinator.submit(
-            study_key,
-            subjects_data,
-            _submit_chunk,
-            schema=schema,
-            skipped_count=skipped_count,
-            wait_for_completion=wait_for_completion,
-            poll_single=lambda bid, *, on_progress=None: self._poll_single(
-                study_key,
-                bid,
-                timeout=timeout,
-                poll_interval=poll_interval,
-                on_progress=on_progress,
-            ),
-            poll_many=lambda bids, *, on_progress=None: self._poll_many(
-                study_key,
-                bids,
-                timeout=timeout,
-                poll_interval=poll_interval,
-                on_progress=on_progress,
-            ),
-            on_progress=on_progress,
-            require_batch_id=wait_for_completion,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
+        submitter = build_keyword_record_chunk_submitter(
+            sdk.create_record, study_key, email_notify=email_notify, schema=schema
         )
+        return submit_workflow_batch_sync(sdk, spec, submitter)
 
     def register_subjects(
         self,
@@ -321,13 +213,14 @@ class RegisterSubjectsWorkflow:
     ) -> Job:
         """Register a single-chunk batch of subjects synchronously and return its Job."""
         self._ensure_sync_mode("register_subjects", "async_register_subjects")
+        pair = ("register_subjects", "register_subjects_batch")
         summary = self.register_subjects_batch(
-            study_key=study_key,
-            subjects=subjects,
-            email_notify=email_notify,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
+            study_key,
+            subjects,
+            email_notify,
+            wait_for_completion,
+            timeout,
+            poll_interval,
             filter_enrolled=filter_enrolled,
             skip_existing=skip_existing,
             subject_key_field=subject_key_field,
@@ -335,13 +228,9 @@ class RegisterSubjectsWorkflow:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
-            _single_job_method=("register_subjects", "register_subjects_batch"),
+            _single_job_method=pair,
         )
-        return extract_single_submitted_job(
-            summary,
-            method_name="register_subjects",
-            batch_method_name="register_subjects_batch",
-        )
+        return unwrap_single_submitted_job(summary, pair)
 
     async def async_register_subjects_batch(
         self,
@@ -368,10 +257,10 @@ class RegisterSubjectsWorkflow:
                 self.register_subjects_batch,
                 study_key,
                 subjects,
-                email_notify=email_notify,
-                wait_for_completion=wait_for_completion,
-                timeout=timeout,
-                poll_interval=poll_interval,
+                email_notify,
+                wait_for_completion,
+                timeout,
+                poll_interval,
                 chunk_size=chunk_size,
                 filter_enrolled=filter_enrolled,
                 skip_existing=skip_existing,
@@ -384,83 +273,30 @@ class RegisterSubjectsWorkflow:
             )
             return await asyncio.to_thread(sync_call)
 
-        effective_chunk_size = chunk_size or self._batch_size
-        if _single_job_method is not None and dry_run:
-            validate_single_job_preflight(
-                [],
-                chunk_size=effective_chunk_size,
-                dry_run=True,
-                method_name=_single_job_method[0],
-                batch_method_name=_single_job_method[1],
-            )
+        eff_chunk, offline_dry_run, should_filter = self._prepare_registration_batch(
+            chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
+        )
         sdk = cast("AsyncImednetFacade", self._sdk)
-        offline_dry_run = _is_offline_schema_dry_run(dry_run=dry_run, schema=schema)
         sites = None if offline_dry_run else await sdk.async_get_sites(study_key=study_key)
-        normalized_pairs = normalize_subject_registration_inputs(
-            subjects,
-            schema=schema,
-            study_key=study_key,
-        )
-        should_filter = (
-            self._filter_enrolled if filter_enrolled is None else filter_enrolled
-        ) or skip_existing
-        existing_subjects = (
-            await sdk.async_get_subjects(study_key=study_key)
-            if (should_filter and not offline_dry_run)
-            else None
-        )
-        subjects_data, skipped_count = self._finalize_prepared_subjects(
-            normalized_pairs,
+        pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
+        existing = await sdk.async_get_subjects(study_key=study_key) if should_filter else None
+        opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
+        spec = self._build_registration_spec(
+            study_key,
+            pairs,
             sites,
-            existing_subjects,
-            should_filter=should_filter and not offline_dry_run,
+            existing,
+            should_filter=should_filter,
             subject_key_field=subject_key_field,
-            effective_chunk_size=effective_chunk_size,
-            dry_run=dry_run,
+            chunk_size=eff_chunk,
+            schema=schema,
+            options=opts,
             single_job_method=_single_job_method,
         )
-
-        async def _submit_chunk_async(chunk: list[dict[str, Any]]) -> Job:
-            if schema is not None:
-                return await sdk.async_create_record(
-                    study_key=study_key,
-                    records_data=chunk,
-                    email_notify=email_notify,
-                    schema=schema,
-                )
-            return await sdk.async_create_record(
-                study_key=study_key,
-                records_data=chunk,
-                email_notify=email_notify,
-            )
-
-        coordinator = AsyncBatchCoordinator(chunk_size=effective_chunk_size, sdk=sdk)
-        return await coordinator.submit(
-            study_key,
-            subjects_data,
-            _submit_chunk_async,
-            schema=schema,
-            skipped_count=skipped_count,
-            wait_for_completion=wait_for_completion,
-            poll_single=lambda bid, *, on_progress=None: self._async_poll_single(
-                study_key,
-                bid,
-                timeout=timeout,
-                poll_interval=poll_interval,
-                on_progress=on_progress,
-            ),
-            poll_many=lambda bids, *, on_progress=None: self._async_poll_many(
-                study_key,
-                bids,
-                timeout=timeout,
-                poll_interval=poll_interval,
-                on_progress=on_progress,
-            ),
-            on_progress=on_progress,
-            require_batch_id=wait_for_completion,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
+        submitter = build_keyword_record_chunk_submitter(
+            sdk.async_create_record, study_key, email_notify=email_notify, schema=schema
         )
+        return await submit_workflow_batch_async(sdk, spec, submitter)
 
     async def async_register_subjects(
         self,
@@ -480,13 +316,14 @@ class RegisterSubjectsWorkflow:
         collect_errors: bool = False,
     ) -> Job:
         """Asynchronously register a single-chunk batch of subjects and return its Job."""
+        pair = ("async_register_subjects", "async_register_subjects_batch")
         summary = await self.async_register_subjects_batch(
-            study_key=study_key,
-            subjects=subjects,
-            email_notify=email_notify,
-            wait_for_completion=wait_for_completion,
-            timeout=timeout,
-            poll_interval=poll_interval,
+            study_key,
+            subjects,
+            email_notify,
+            wait_for_completion,
+            timeout,
+            poll_interval,
             filter_enrolled=filter_enrolled,
             skip_existing=skip_existing,
             subject_key_field=subject_key_field,
@@ -494,10 +331,6 @@ class RegisterSubjectsWorkflow:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
-            _single_job_method=("async_register_subjects", "async_register_subjects_batch"),
+            _single_job_method=pair,
         )
-        return extract_single_submitted_job(
-            summary,
-            method_name="async_register_subjects",
-            batch_method_name="async_register_subjects_batch",
-        )
+        return unwrap_single_submitted_job(summary, pair)

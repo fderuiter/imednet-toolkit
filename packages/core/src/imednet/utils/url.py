@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import NonCallableMock
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlsplit, urlunparse
 
 from imednet.constants import DEFAULT_BASE_URL
 from imednet.errors.validation import PathTraversalValidationError
+
+if TYPE_CHECKING:
+    from imednet.utils.security import SensitivityRegistry
 
 __all__ = [
     "build_safe_path",
@@ -23,9 +26,18 @@ __all__ = [
 
 _FORBIDDEN_SEGMENT_CHARS = frozenset({"/", "\\", "?", "#"})
 _FORBIDDEN_RAW_PATH_CHARS = frozenset({"\\", "?", "#"})
+_URI_AUTH_PASSWORD_RE = re.compile(r"(://[^\s/:?#@]+:)[^\s/?#@]+(@)")
+_URL_IN_TEXT_RE = re.compile(
+    r"""(?:[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'<>\x00]*[^\s"'<>.,;:!?\)\]\}\x00]|(?<![A-Za-z0-9_:/.-])/[A-Za-z0-9_.~%@/-]*\?[^\s"'<>\x00]*[^\s"'<>.,;:!?\)\]\}\x00])"""
+)
 
 
-def redact_sensitive_text(text: Any) -> str:
+def redact_sensitive_text(
+    text: Any,
+    *,
+    registry: SensitivityRegistry | None = None,
+    _depth: int = 0,
+) -> str:
     """Scan and redact sensitive URIs, connection strings, and query parameters in text."""
     if not isinstance(text, str):
         try:
@@ -36,16 +48,14 @@ def redact_sensitive_text(text: Any) -> str:
         text_str = text
 
     # Redact passwords in connection strings: e.g., mongodb://user:password@host  # pragma: allowlist secret
-    text_str = re.sub(r"(://[^:]+:)[^@]+(@)", r"\g<1>***\g<2>", text_str)
+    text_str = _URI_AUTH_PASSWORD_RE.sub(r"\g<1>***\g<2>", text_str)
 
-    # Redact query parameters in any URLs
+    # Redact query parameters and PHI filter clauses in scheme or relative URLs
     def replace_url(match: re.Match[str]) -> str:
         """Redact query parameters in the matched URL string."""
-        return redact_url_query(match.group(0))
+        return redact_url_query(match.group(0), registry=registry, _depth=_depth)
 
-    text_str = re.sub(
-        r'''[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'>]*[^\s"'>.,;:!?\)\]]''', replace_url, text_str
-    )
+    text_str = _URL_IN_TEXT_RE.sub(replace_url, text_str)
 
     return str(text_str)
 
@@ -125,16 +135,27 @@ def resolve_sdk_base_url(sdk: Any) -> str:
     return normalize_cache_origin(DEFAULT_BASE_URL)
 
 
-def redact_url_query(url: str, sensitive_params: set[str] | None = None) -> str:
-    """Return URL with sensitive query parameters redacted."""
+def redact_url_query(
+    url: str,
+    sensitive_params: set[str] | None = None,
+    *,
+    registry: SensitivityRegistry | None = None,
+    _depth: int = 0,
+) -> str:
+    """Return URL with sensitive credential and clinical PHI query parameters redacted."""
     from imednet.utils.secrets import is_sensitive_key
+    from imednet.utils.security import global_sensitivity_registry, sanitize_diagnostic_text
 
     default_params = {"api_key", "security_key", "token", "secret", "password"}
+    active_registry = global_sensitivity_registry if registry is None else registry
 
     parsed = urlparse(url)
+    if not parsed.query:
+        return urlunparse(parsed)
+
     query_params = parse_qsl(parsed.query, keep_blank_values=True)
 
-    new_query_params = []
+    new_query_params: list[tuple[str, str]] = []
     for key, value in query_params:
         is_secret = (
             key in sensitive_params
@@ -143,6 +164,25 @@ def redact_url_query(url: str, sensitive_params: set[str] | None = None) -> str:
         )
         if is_secret:
             new_query_params.append((key, "***"))
+        elif sensitive_params is None and active_registry.is_sensitive(key):
+            new_query_params.append((key, "***MASKED***"))
+        elif value and _depth < 4:
+            sanitized_val = sanitize_diagnostic_text(
+                value,
+                registry=active_registry,
+                _depth=_depth + 1,
+            )
+            if "%" in value:
+                unquoted_val = unquote(value)
+                if unquoted_val != value:
+                    sanitized_unquoted = sanitize_diagnostic_text(
+                        unquoted_val,
+                        registry=active_registry,
+                        _depth=_depth + 1,
+                    )
+                    if sanitized_unquoted != unquoted_val:
+                        sanitized_val = sanitized_unquoted
+            new_query_params.append((key, sanitized_val))
         else:
             new_query_params.append((key, value))
 

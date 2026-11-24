@@ -402,6 +402,9 @@ def normalize_variable_bounds(extra_attrs: dict[str, Any] | None) -> list[dict[s
     return bounds
 
 
+_CSV_INLINE_DELIMITERS = (",", "|", "\t", ";")
+
+
 def _is_file_target(target: Any) -> bool:
     """Determine whether the target was intended as a file path.
 
@@ -422,6 +425,25 @@ def _is_file_target(target: Any) -> bool:
         if target_str.lower().endswith((".json", ".xml", ".csv", ".zip")):
             return True
         if "/" in target_str or "\\" in target_str:
+            return True
+    return False
+
+
+def _is_csv_file_target(target: Any) -> bool:
+    """Determine whether *target* should be treated as a CSV file path.
+
+    Single-line non-empty strings without CSV delimiters are treated as file
+    targets so bare filenames raise ``FileNotFoundError`` when missing.
+    """
+    if _is_file_target(target):
+        return True
+    if isinstance(target, str):
+        if "\n" in target or "\r" in target:
+            return False
+        stripped = target.strip()
+        if not stripped:
+            return False
+        if not any(delim in stripped for delim in _CSV_INLINE_DELIMITERS):
             return True
     return False
 

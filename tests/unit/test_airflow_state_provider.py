@@ -920,7 +920,6 @@ def test_airflow_state_provider_escapes_sql_like_wildcards_on_list_read_and_dele
     for sk in ("STUDY_1", "STUDY-1", "STUDYX1", "STUDY_10", "STUDY%1"):
         provider.set_last_timestamp(sk, "records", ts, records_processed=5)
 
-    # Also plant a legacy per-stream key for STUDY_1 and a wildcard-collision decoy legacy key for STUDYX1
     ModelVariable.set(
         "imednet_wild_1:STUDY_1:legacy_ae",
         {"study_key": "STUDY_1", "stream_name": "legacy_ae", "status": "success"},
@@ -931,7 +930,6 @@ def test_airflow_state_provider_escapes_sql_like_wildcards_on_list_read_and_dele
         {"study_key": "STUDYX1", "stream_name": "legacy_ae", "status": "success"},
         serialize_json=True,
     )
-    # Decoy variable prefix where '_' in variable_prefix would match 'X' if unescaped
     ModelVariable.set(
         "imednetXwildX1:STUDY_1",
         {"study_key": "STUDY_1", "streams": {"records": {"status": "success"}}},
@@ -949,7 +947,6 @@ def test_airflow_state_provider_escapes_sql_like_wildcards_on_list_read_and_dele
     assert ModelVariable.get("imednet_wild_1:STUDYX1:legacy_ae", default_var=None) is not None
     assert ModelVariable.get("imednetXwildX1:STUDY_1", default_var=None) is not None
 
-    # Also verify Task SDK Variable.keys path filters exact prefix when backend ignores LIKE escaping
     class _UnescapedSdkVar:
         @staticmethod
         def keys(prefix: str = "") -> list[str]:
@@ -1002,7 +999,8 @@ def test_airflow_state_provider_retains_metadata_and_reclaims_retry_lease(
     assert loaded.last_timestamp == datetime(2026, 7, 2, tzinfo=timezone.utc)
     assert loaded.metadata == meta
 
-    # Simulate crashed cross-host RUNNING lease in Airflow Variable via SIGKILL on try_number=1
+    # Simulate crashed cross-host RUNNING lease in Airflow Variable via SIGKILL on try_number=1,
+    # including mid-transaction record_sdtm_lineage preserving the active lease attempt!
     import socket
 
     provider.set_last_timestamp(
@@ -1020,6 +1018,12 @@ def test_airflow_state_provider_retains_metadata_and_reclaims_retry_lease(
         worker_a.setattr("os.getpid", lambda: 77777)
         tx_cm = provider.transaction("STUDY_CRASH", "records")
         tx_cm.__enter__()
+        provider.record_sdtm_lineage(
+            "STUDY_CRASH",
+            "records",
+            lineage_updates={"domain": "AE"},
+            seq_watermarks={"DOB": 4},
+        )
         tx_cm.gen.close()
 
     assert provider.get_last_status("STUDY_CRASH", "records") == StreamExecutionStatus.RUNNING
@@ -1041,3 +1045,7 @@ def test_airflow_state_provider_retains_metadata_and_reclaims_retry_lease(
 
     assert provider.get_last_status("STUDY_CRASH", "records") == StreamExecutionStatus.SUCCESS
     assert provider.get_last_timestamp("STUDY_CRASH", "records") == recovered_ts
+    assert provider.get_sdtm_lineage("STUDY_CRASH", "records") == {
+        "sdtm_lineage": {"domain": "AE"},
+        "sdtm_seq_watermarks": {"DOB": 4},
+    }

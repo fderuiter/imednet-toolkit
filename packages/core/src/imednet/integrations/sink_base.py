@@ -1304,12 +1304,29 @@ def _extract_record_for_standards(
         raw_data = dict(rd) if isinstance(rd, Mapping) else {}
 
     mapped_domain: str | None = None
-    if form_domain_map and not configured_domain:
+    if form_domain_map:
         if raw_domain is not None and raw_domain in form_domain_map:
             mapped_domain = form_domain_map[raw_domain]
+        elif (
+            isinstance(raw_domain, str)
+            and raw_domain.strip()
+            and raw_domain.strip() in form_domain_map
+        ):
+            mapped_domain = form_domain_map[raw_domain.strip()]
         elif form_id_val is not None and form_id_val in form_domain_map:
             mapped_domain = form_domain_map[form_id_val]
-    domain = resolve_sdtm_domain(configured_domain or mapped_domain or raw_domain, fallback="AE")
+
+    raw_resolved = (
+        resolve_sdtm_domain(str(raw_domain), fallback="")
+        if isinstance(raw_domain, str) and raw_domain.strip()
+        else ""
+    )
+    if mapped_domain:
+        domain = resolve_sdtm_domain(mapped_domain, fallback="AE")
+    elif raw_resolved and (raw_resolved in SDTM_DOMAIN_SPECS or form_domain_map is not None):
+        domain = raw_resolved
+    else:
+        domain = resolve_sdtm_domain(configured_domain or raw_domain, fallback="AE")
     canonical: dict[str, Any] = dict(raw_data)
 
     resolved_subject = (
@@ -1385,6 +1402,11 @@ def evaluate_standards_readiness(
     profile = resolve_standards_profile(raw_prof)
     validator = StandardsReadinessValidator(profile=profile)
 
+    target_dom = (
+        resolve_sdtm_domain(cfg_domain, fallback="")
+        if isinstance(cfg_domain, str) and cfg_domain.strip()
+        else ""
+    )
     records_by_domain: dict[str, list[dict[str, Any]]] = {}
     cdash_warnings: list[str] = []
     seen_cdash: set[tuple[str, str]] = set()
@@ -1395,6 +1417,8 @@ def evaluate_standards_readiness(
             configured_domain=cfg_domain,
             form_domain_map=form_domain_map,
         )
+        if target_dom and domain != target_dom:
+            continue
         records_by_domain.setdefault(domain, []).append(canonical)
         for field_key in raw_data:
             pair = (domain, str(field_key))
@@ -1404,6 +1428,9 @@ def evaluate_standards_readiness(
             valid_cdash, cdash_msg = validate_cdash_variable(str(field_key), domain)
             if not valid_cdash and cdash_msg:
                 cdash_warnings.append(cdash_msg)
+
+    if target_dom and not records_by_domain:
+        records_by_domain[target_dom] = []
 
     report = validator.score_records(
         records_by_domain=records_by_domain,

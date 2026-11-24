@@ -1142,6 +1142,11 @@ def test_validate_showcase_mock_data_schemas_rejects_non_contract_keys(tmp_path:
             1,
         )
         .replace(
+            'recordId: 601,\n                    recordOid: "REC-601",',
+            'recordId: 601,\n                    V_SYSBP: 122,\n                    recordOid: "REC-601",',
+            1,
+        )
+        .replace(
             "annotationId: 701,",
             'annotationId: 701,\n                status: "OPEN",',
             1,
@@ -1162,6 +1167,9 @@ def test_validate_showcase_mock_data_schemas_rejects_non_contract_keys(tmp_path:
         for e in errors
     )
     assert any("MOCK_DATA.forms.VS contains non-contract keys ['domain']" in e for e in errors)
+    assert any(
+        "MOCK_DATA.records.VS[0] contains non-contract keys ['V_SYSBP']" in e for e in errors
+    )
     assert any("MOCK_DATA.queries[0] contains non-contract keys ['status']" in e for e in errors)
     assert any("MOCK_DATA.audits[0] contains non-contract keys ['auditId']" in e for e in errors)
 

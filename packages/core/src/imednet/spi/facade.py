@@ -5,7 +5,7 @@ allowing for easier mocking and decoupling in dependent packages.
 """
 
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any, Protocol, Self
+from typing import TYPE_CHECKING, Protocol, Self
 
 from imednet.auth import AuthStrategy
 from imednet.models.codings import Coding
@@ -90,17 +90,6 @@ class ImednetFacade(Protocol):
 
         Returns:
             A JobStatus model.
-        """
-        ...
-
-    def fetch_job_result(self, result_url: str) -> Any:
-        """Fetch the result payload for a terminal background job ``resultUrl``.
-
-        Args:
-            result_url: Relative EDC path or external HTTPS ``resultUrl`` for the job.
-
-        Returns:
-            The HTTP response or decoded payload returned by the jobs endpoint.
         """
         ...
 
@@ -355,17 +344,6 @@ class AsyncImednetFacade(Protocol):
 
         Returns:
             A JobStatus model.
-        """
-        ...
-
-    async def async_fetch_job_result(self, result_url: str) -> Any:
-        """Asynchronously fetch the result payload for a terminal background job ``resultUrl``.
-
-        Args:
-            result_url: Relative EDC path or external HTTPS ``resultUrl`` for the job.
-
-        Returns:
-            The HTTP response or decoded payload returned by the async jobs endpoint.
         """
         ...
 

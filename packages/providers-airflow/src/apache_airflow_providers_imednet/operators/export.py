@@ -544,7 +544,11 @@ class ImednetExportOperator(BaseOperator):
     def _canonicalize_qualifier_value(cls, value: Any) -> Any:
         """Convert arbitrary filter/target values into deterministic JSON-serializable structures."""
         if value is None or isinstance(value, (str, int, float, bool)):
-            return redact_uri(value) if isinstance(value, str) and "://" in value else value
+            return (
+                _sanitize_lineage_text(value)
+                if isinstance(value, str) and "://" in value
+                else value
+            )
         if isinstance(value, Path):
             return str(value)
         if isinstance(value, Mapping):
@@ -582,16 +586,17 @@ class ImednetExportOperator(BaseOperator):
         readable_parts: list[str] = []
         needs_digest = False
 
-        # 1. Destination target qualifiers (output_path, table, collection, stage prefix, db/dir)
+        # 1. Destination target qualifiers (output_path, table, collection, stage prefix, db/dir/conn)
         target_entries: list[tuple[str, str]] = []
         raw_out = getattr(self, "output_path", None)
         if raw_out is None:
             raw_out = kw.get("output_path")
         if raw_out is not None and str(raw_out).strip():
-            safe_out = redact_uri(str(raw_out).strip())
+            safe_out = _sanitize_lineage_text(str(raw_out).strip())
             target_entries.append(("output_path", safe_out))
 
         for target_key in (
+            "output_dir",
             "table",
             "table_name",
             "collection",
@@ -601,12 +606,17 @@ class ImednetExportOperator(BaseOperator):
             "db_path",
             "path",
             "database",
+            "conn_str",
         ):
             raw_val = kw.get(target_key)
             if raw_val is not None and str(raw_val).strip():
-                safe_val = redact_uri(str(raw_val).strip())
+                safe_val = _sanitize_lineage_text(str(raw_val).strip())
                 if not target_entries or target_entries[0][1] != safe_val:
                     target_entries.append((target_key, safe_val))
+
+        raw_dest_conn = kw.get("destination_conn_id", getattr(self, "destination_conn_id", None))
+        if isinstance(raw_dest_conn, str) and raw_dest_conn.strip():
+            target_entries.append(("destination_conn_id", raw_dest_conn.strip()))
 
         if target_entries:
             canonical_qualifiers["targets"] = target_entries

@@ -1248,7 +1248,6 @@ class TestDualWatermarkAndLedgerRouting:
 
         from imednet.models.records import Record
 
-        # 1. Signed Record model where last_updated > date_modified
         signed_model = Record(
             record_id=1,
             date_modified="2026-06-01T10:00:00Z",
@@ -1258,7 +1257,6 @@ class TestDualWatermarkAndLedgerRouting:
             2026, 6, 4, 15, 30, tzinfo=UTC
         )
 
-        # 2. Edited Record model where date_modified > last_updated
         edited_model = Record(
             record_id=2,
             date_modified="2026-06-05T08:00:00Z",
@@ -1268,7 +1266,6 @@ class TestDualWatermarkAndLedgerRouting:
             2026, 6, 5, 8, 0, tzinfo=UTC
         )
 
-        # 3. Dict payloads with camelCase and snake_case keys and naive datetime normalization
         assert sink_base_mod.extract_record_timestamp(
             {
                 "dateModified": "2026-06-01T09:00:00Z",
@@ -1378,8 +1375,6 @@ class TestDualWatermarkAndLedgerRouting:
             2026, 6, 1, 10, 0, tzinfo=UTC
         )
 
-        # Upstream: record 101 is e-signed without data edit (dateModified stays < watermark, lastUpdated advances),
-        # and record 102 is edited (both dateModified and lastUpdated >= watermark -> overlaps both branches!)
         upstream[101] = upstream[101].model_copy(
             update={
                 "record_status": "Signed",

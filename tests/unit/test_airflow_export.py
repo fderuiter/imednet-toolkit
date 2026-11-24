@@ -1904,7 +1904,6 @@ def test_operator_explicit_ledger_path_uses_local_file_provider_under_airflow_ct
     monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
     monkeypatch.setenv("IMEDNET_CACHE_DIR", str(tmp_path / "op_cache"))
 
-    # Guard: AirflowStateProvider must never be instantiated when ledger_path is explicitly provided
     def _forbid_airflow_provider(*_a: object, **_kw: object) -> object:
         raise AssertionError("AirflowStateProvider must not be used when ledger_path is explicit")
 
@@ -2002,7 +2001,7 @@ def test_operator_default_stream_names_isolate_targets_and_form_filters() -> Non
         output_path="/tmp/s1/ae.parquet",
         incremental=True,
     )
-    # Path separator vs underscore collision resistance
+    # Path separator vs underscore + destination_conn_id isolation
     op_slash = ImednetExportOperator(
         task_id="mapped_export",
         study_key="S1",
@@ -2015,6 +2014,22 @@ def test_operator_default_stream_names_isolate_targets_and_form_filters() -> Non
         study_key="S1",
         destination="csv",
         output_path="/data/a_b.csv",
+        incremental=True,
+    )
+    op_conn_a = ImednetExportOperator(
+        task_id="sql_export",
+        study_key="S1",
+        destination="sql",
+        export_kwargs={"table_name": "RECORDS"},
+        destination_conn_id="pg_warehouse_a",
+        incremental=True,
+    )
+    op_conn_b = ImednetExportOperator(
+        task_id="sql_export",
+        study_key="S1",
+        destination="sql",
+        export_kwargs={"table_name": "RECORDS"},
+        destination_conn_id="pg_warehouse_b",
         incremental=True,
     )
 
@@ -2073,6 +2088,9 @@ def test_operator_default_stream_names_isolate_targets_and_form_filters() -> Non
     ) != op_ae_file._default_airflow_stream_name("parquet")
     assert op_slash._default_airflow_stream_name("csv") != op_under._default_airflow_stream_name(
         "csv"
+    )
+    assert op_conn_a._default_airflow_stream_name("sql") != op_conn_b._default_airflow_stream_name(
+        "sql"
     )
     assert op_fw_dm._default_airflow_stream_name(
         "snowflake"

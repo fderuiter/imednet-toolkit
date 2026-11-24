@@ -1520,8 +1520,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             validate_cdash_variable,
         )
         from imednet.spi.sink_base import (
+            build_form_sdtm_domain_map,
             evaluate_standards_readiness,
-            filter_forms_by_sdtm_domain,
             redact_batch_records,
         )
 
@@ -1570,74 +1570,43 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             if fid is not None and fkey:
                 form_id_to_key[fid] = str(fkey)
 
+        form_domain_map = build_form_sdtm_domain_map(raw_forms)
+
+        def _resolve_item_domain(item: Any) -> str:
+            fid = (
+                item.get("form_id", item.get("formId"))
+                if isinstance(item, Mapping)
+                else getattr(item, "form_id", getattr(item, "formId", None))
+            )
+            fkey = (
+                item.get("form_key", item.get("formKey"))
+                if isinstance(item, Mapping)
+                else getattr(item, "form_key", getattr(item, "formKey", None))
+            )
+            if not fkey and fid is not None:
+                fkey = form_id_to_key.get(fid)
+            if isinstance(fkey, str) and fkey in form_domain_map:
+                return form_domain_map[fkey]
+            if isinstance(fkey, str) and fkey.strip() in form_domain_map:
+                return form_domain_map[fkey.strip()]
+            if fid is not None and fid in form_domain_map:
+                return form_domain_map[fid]
+            if isinstance(fkey, str) and fkey.strip():
+                return resolve_sdtm_domain(fkey, fallback="")
+            raw_dom = (
+                item.get("DOMAIN") or item.get("domain")
+                if isinstance(item, Mapping)
+                else getattr(item, "domain", None)
+            )
+            if isinstance(raw_dom, str) and raw_dom.strip():
+                return resolve_sdtm_domain(raw_dom, fallback="")
+            return ""
+
         if target_domain is not None:
-            if raw_forms:
-                matching_forms = filter_forms_by_sdtm_domain(raw_forms, target_domain)
-                allowed_form_ids = {
-                    f_obj.get("form_id", f_obj.get("formId"))
-                    if isinstance(f_obj, Mapping)
-                    else getattr(f_obj, "form_id", getattr(f_obj, "formId", None))
-                    for f_obj in matching_forms
-                } - {None}
-                allowed_form_keys = {
-                    str(
-                        f_obj.get("form_key", f_obj.get("formKey"))
-                        if isinstance(f_obj, Mapping)
-                        else getattr(f_obj, "form_key", getattr(f_obj, "formKey", ""))
-                    )
-                    for f_obj in matching_forms
-                } - {""}
-                raw_variables = [
-                    var
-                    for var in raw_variables
-                    if (
-                        (
-                            var.get("form_id", var.get("formId"))
-                            if isinstance(var, Mapping)
-                            else getattr(var, "form_id", getattr(var, "formId", None))
-                        )
-                        in allowed_form_ids
-                        or str(
-                            var.get("form_key", var.get("formKey"))
-                            if isinstance(var, Mapping)
-                            else getattr(var, "form_key", getattr(var, "formKey", ""))
-                        )
-                        in allowed_form_keys
-                    )
-                ]
-                raw_records = [
-                    rec
-                    for rec in raw_records
-                    if (
-                        (
-                            rec.get("form_id", rec.get("formId"))
-                            if isinstance(rec, Mapping)
-                            else getattr(rec, "form_id", getattr(rec, "formId", None))
-                        )
-                        in allowed_form_ids
-                        or str(
-                            rec.get("form_key", rec.get("formKey"))
-                            if isinstance(rec, Mapping)
-                            else getattr(rec, "form_key", getattr(rec, "formKey", ""))
-                        )
-                        in allowed_form_keys
-                    )
-                ]
-            else:
-                raw_records = [
-                    rec
-                    for rec in raw_records
-                    if resolve_sdtm_domain(
-                        (
-                            rec.get("form_key", rec.get("formKey"))
-                            if isinstance(rec, Mapping)
-                            else getattr(rec, "form_key", getattr(rec, "formKey", None))
-                        )
-                        or target_domain,
-                        fallback="",
-                    )
-                    == target_domain
-                ]
+            raw_variables = [
+                var for var in raw_variables if _resolve_item_domain(var) == target_domain
+            ]
+            raw_records = [rec for rec in raw_records if _resolve_item_domain(rec) == target_domain]
 
         serialized_records = _to_serializable(raw_records)
         if mask_phi:
@@ -1659,19 +1628,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             )
             if not var_name:
                 continue
-            fkey = (
-                var.get("form_key", var.get("formKey"))
-                if isinstance(var, Mapping)
-                else getattr(var, "form_key", getattr(var, "formKey", None))
-            )
-            if not fkey:
-                fid = (
-                    var.get("form_id", var.get("formId"))
-                    if isinstance(var, Mapping)
-                    else getattr(var, "form_id", getattr(var, "formId", None))
-                )
-                fkey = form_id_to_key.get(fid)
-            inferred_dom = resolve_sdtm_domain(target_domain or fkey, fallback="")
+            inferred_dom = _resolve_item_domain(var)
             if inferred_dom:
                 valid_cdash, warning = validate_cdash_variable(str(var_name), inferred_dom)
                 if not valid_cdash and warning and warning not in cdash_warnings:
@@ -1682,31 +1639,17 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             study_key=study_key,
             standards_profile=standards_profile,
             sdtm_domain=target_domain,
-            form_domain_map=(
-                {
-                    str(
-                        f_obj.get("form_key", f_obj.get("formKey"))
-                        if isinstance(f_obj, Mapping)
-                        else getattr(f_obj, "form_key", getattr(f_obj, "formKey", ""))
-                    ): resolve_sdtm_domain(
-                        (
-                            f_obj.get("form_key", f_obj.get("formKey"))
-                            if isinstance(f_obj, Mapping)
-                            else getattr(f_obj, "form_key", getattr(f_obj, "formKey", None))
-                        ),
-                        fallback="",
-                    )
-                    for f_obj in raw_forms
-                }
-                if raw_forms and target_domain is None
-                else None
-            ),
+            form_domain_map=form_domain_map if raw_forms else None,
         )
         all_warnings = list(dict.fromkeys([*report.warnings, *cdash_warnings]))
         threshold = 100.0 if min_standards_score is None else float(min_standards_score)
+        has_domain_level_error = any(
+            v.severity.upper() == "ERROR" and v.field in {*report.domain_scores, "study"}
+            for v in report.violations
+        )
         passed = (
             False
-            if (report.checked_records == 0 or report.checked_fields == 0)
+            if (report.checked_records == 0 or report.checked_fields == 0 or has_domain_level_error)
             else (report.is_ready if min_standards_score is None else report.score >= threshold)
         )
         serialized_violations = [

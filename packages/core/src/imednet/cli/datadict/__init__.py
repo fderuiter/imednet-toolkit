@@ -49,9 +49,12 @@ def _handle_to_odm(args: argparse.Namespace) -> None:
     try:
         if args.output:
             to_odm_file(dd, args.output, file_oid=getattr(args, "file_oid", None))
-            print(f"Successfully wrote CDISC ODM XML to '{args.output}'")
+            print(f"Successfully wrote CDISC ODM XML to '{args.output}'", file=sys.stderr)
         else:
             print(to_odm_xml(dd, file_oid=getattr(args, "file_oid", None)), end="")
+    except OSError as exc:
+        print_error(redact_cli_secrets(f"Error writing CDISC ODM XML to '{args.output}': {exc}"))
+        sys.exit(1)
     except Exception as exc:
         print_error(redact_cli_secrets(f"Error exporting to CDISC ODM XML: {exc}"))
         sys.exit(1)
@@ -70,8 +73,14 @@ def _handle_from_csv(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     if args.output:
-        to_file(dd, args.output)
-        print(f"Successfully wrote data dictionary to '{args.output}'")
+        try:
+            to_file(dd, args.output)
+            print(f"Successfully wrote data dictionary to '{args.output}'", file=sys.stderr)
+        except OSError as exc:
+            print_error(
+                redact_cli_secrets(f"Error writing data dictionary to '{args.output}': {exc}")
+            )
+            sys.exit(1)
     else:
         print(to_json(dd), end="")
 
@@ -90,8 +99,14 @@ def _handle_from_odm(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     if args.output:
-        to_file(dd, args.output)
-        print(f"Successfully wrote data dictionary to '{args.output}'")
+        try:
+            to_file(dd, args.output)
+            print(f"Successfully wrote data dictionary to '{args.output}'", file=sys.stderr)
+        except OSError as exc:
+            print_error(
+                redact_cli_secrets(f"Error writing data dictionary to '{args.output}': {exc}")
+            )
+            sys.exit(1)
     else:
         print(to_json(dd), end="")
 
@@ -100,7 +115,7 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
     """Handle `imednet datadict from-redcap` command."""
     try:
         dd = load_from_redcap(
-            args.path,
+            Path(args.path),
             study_key=getattr(args, "study_key", None),
             strict=args.strict,
             no_raw_xml=args.no_raw_xml,
@@ -110,8 +125,14 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     if args.output:
-        to_file(dd, args.output)
-        print(f"Successfully wrote data dictionary to '{args.output}'")
+        try:
+            to_file(dd, args.output)
+            print(f"Successfully wrote data dictionary to '{args.output}'", file=sys.stderr)
+        except OSError as exc:
+            print_error(
+                redact_cli_secrets(f"Error writing data dictionary to '{args.output}': {exc}")
+            )
+            sys.exit(1)
     else:
         print(to_json(dd), end="")
 
@@ -126,8 +147,12 @@ def _from_api(
     """Load data dictionary from live API with managed SDK lifecycle and error redaction."""
     dd = load_from_api(sdk, study_key, no_raw_xml=no_raw_xml)
     if output:
-        to_file(dd, output)
-        print(f"Successfully wrote data dictionary to '{output}'")
+        try:
+            to_file(dd, output)
+            print(f"Successfully wrote data dictionary to '{output}'", file=sys.stderr)
+        except OSError as exc:
+            print_error(redact_cli_secrets(f"Error writing data dictionary to '{output}': {exc}"))
+            sys.exit(1)
     else:
         print(to_json(dd), end="")
 
@@ -149,18 +174,41 @@ def _handle_from_api(args: argparse.Namespace) -> None:
         )
 
 
+def _emit_validate_json(file_path: str, errors: list[str]) -> None:
+    """Emit dedicated single-document JSON validation payload on stdout."""
+    payload = {
+        "schemaVersion": "1.0",
+        "file": redact_cli_secrets(str(file_path)),
+        "valid": len(errors) == 0,
+        "error_count": len(errors),
+        "errors": [redact_cli_secrets(err) for err in errors],
+    }
+    print(json.dumps(payload, indent=2) + "\n", end="")
+
+
 def _handle_validate(args: argparse.Namespace) -> None:
     """Handle `imednet datadict validate` command."""
+    output_format = resolve_output_format(getattr(args, "format", None), default="text")
     schema_dict = None
     if args.schema:
         try:
             schema_text = Path(args.schema).read_text(encoding="utf-8")
             schema_dict = json.loads(schema_text)
         except Exception as exc:
-            print_error(redact_cli_secrets(f"Error reading schema file '{args.schema}': {exc}"))
+            err_msg = f"Error reading schema file '{args.schema}': {exc}"
+            if output_format == "json":
+                _emit_validate_json(args.file, [err_msg])
+            else:
+                print_error(redact_cli_secrets(err_msg))
             sys.exit(1)
 
     errors = validate(args.file, schema=schema_dict)
+    if output_format == "json":
+        _emit_validate_json(args.file, errors)
+        if errors:
+            sys.exit(1)
+        return
+
     if errors:
         print_error(f"Validation failed with {len(errors)} error(s):")
         for err in errors:
@@ -207,7 +255,7 @@ def _handle_schema(args: argparse.Namespace) -> None:
     if args.output:
         try:
             Path(args.output).write_text(json_text, encoding="utf-8")
-            print(f"Successfully wrote schema to '{args.output}'")
+            print(f"Successfully wrote schema to '{args.output}'", file=sys.stderr)
         except Exception as exc:
             print_error(redact_cli_secrets(f"Error writing schema to '{args.output}': {exc}"))
             sys.exit(1)
@@ -365,6 +413,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     val_parser.add_argument(
         "--schema",
         help="Optional path to custom JSON schema file for validation.",
+    )
+    val_parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default=None,
+        help="Output format: text or json (default: text).",
     )
     val_parser.set_defaults(func=_handle_validate)
 

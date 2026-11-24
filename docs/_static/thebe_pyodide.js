@@ -52,12 +52,42 @@
     return prefix.endsWith("/") ? prefix : `${prefix}/`;
   }
 
+  function resolveWheelUrl(w, docRootUrl, wheelManifestUrl) {
+    try {
+      const str = String(w || "");
+      if (str.startsWith("http://") || str.startsWith("https://") || str.startsWith("/")) {
+        return new URL(str, docRootUrl).href;
+      }
+      const cleanedRel = str.startsWith("./") ? str.slice(2) : str;
+      if (!cleanedRel.includes("/") && wheelManifestUrl) {
+        return new URL(cleanedRel, wheelManifestUrl).href;
+      }
+      return new URL(cleanedRel, docRootUrl).href;
+    } catch (e) {
+      return w;
+    }
+  }
+
+  async function fetchManifestWheels(config) {
+    const manifestUrl = config && config.wheelManifestUrl;
+    if (!manifestUrl || typeof fetch !== "function") return [];
+    const response = await fetch(manifestUrl);
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch wheel manifest ${manifestUrl}: HTTP ${response.status}`
+      );
+    }
+    const payload = await response.json();
+    const entries = Array.isArray(payload)
+      ? payload
+      : (payload && (payload.wheels || payload.wheel_paths)) || [];
+    const baseRootUrl = (config && config.docRootUrl) || manifestUrl;
+    return entries
+      .filter(isAllowedBrowserWheel)
+      .map((entry) => resolveWheelUrl(entry, baseRootUrl, manifestUrl));
+  }
+
   function getConfig() {
-    const defaultWheels = [
-      "_static/wheels/imednet-1.2.0-py3-none-any.whl", // x-release-please-version
-      "_static/wheels/imednet_workflows-1.2.0-py3-none-any.whl",
-      "_static/wheels/imednet_plugins_sinks-1.1.0-py3-none-any.whl",
-    ];
     const defaultPyodidePackages = [
       "micropip",
       "pydantic",
@@ -111,8 +141,12 @@
       rawConfig = window.thebe_config;
     }
 
-    const rawWheels =
-      (rawConfig && (rawConfig.wheels || rawConfig.wheel_paths)) || defaultWheels;
+    const hasInlineWheels = Boolean(
+      rawConfig && (Array.isArray(rawConfig.wheels) || Array.isArray(rawConfig.wheel_paths))
+    );
+    const rawWheels = hasInlineWheels
+      ? rawConfig.wheels || rawConfig.wheel_paths
+      : [];
     const wheels = rawWheels.filter(isAllowedBrowserWheel);
     const pyodidePackages =
       (rawConfig && rawConfig.pyodide_packages) || defaultPyodidePackages;
@@ -144,21 +178,21 @@
         ? window.location.href
         : "http://localhost/";
 
-    const resolvedWheels = wheels.map((w) => {
-      try {
-        if (w.startsWith("http://") || w.startsWith("https://") || w.startsWith("/")) {
-          return new URL(w, baseHref).href;
-        }
-        const cleanedRel = w.replace(/^\.\//, "");
-        return new URL(docRoot + cleanedRel, baseHref).href;
-      } catch (e) {
-        return w;
-      }
-    });
+    const docRootUrl = new URL(docRoot || "./", baseHref).href;
+    const rawManifestUrl =
+      rawConfig && (rawConfig.wheelManifestUrl || rawConfig.wheel_manifest_url);
+    const wheelManifestUrl = rawManifestUrl
+      ? new URL(String(rawManifestUrl), docRootUrl).href
+      : new URL("_static/wheels/manifest.json", docRootUrl).href;
+
+    const resolvedWheels = wheels.map((w) => resolveWheelUrl(w, docRootUrl));
 
     return {
       selector: selector,
       wheels: resolvedWheels,
+      hasInlineWheels: hasInlineWheels,
+      docRootUrl: docRootUrl,
+      wheelManifestUrl: wheelManifestUrl,
       pyodidePackages: pyodidePackages,
       requirements: requirements,
       env: env,
@@ -181,6 +215,47 @@
     let initPromise = null;
     let execQueue = Promise.resolve();
     const installedWheels = new Set();
+    const EXCLUDED_WHEEL_PREFIXES = ${JSON.stringify(EXCLUDED_WHEEL_PREFIXES)};
+
+    function isAllowedBrowserWheel(wheelPath) {
+      const filename = String(wheelPath || "").split("/").pop() || "";
+      return !EXCLUDED_WHEEL_PREFIXES.some((prefix) => filename.startsWith(prefix));
+    }
+
+    function resolveWheelUrl(w, docRootUrl, wheelManifestUrl) {
+      try {
+        const str = String(w || "");
+        if (str.startsWith("http://") || str.startsWith("https://") || str.startsWith("/")) {
+          return new URL(str, docRootUrl).href;
+        }
+        const cleanedRel = str.startsWith("./") ? str.slice(2) : str;
+        if (!cleanedRel.includes("/") && wheelManifestUrl) {
+          return new URL(cleanedRel, wheelManifestUrl).href;
+        }
+        return new URL(cleanedRel, docRootUrl).href;
+      } catch (e) {
+        return w;
+      }
+    }
+
+    async function fetchManifestWheels(config) {
+      const manifestUrl = config && config.wheelManifestUrl;
+      if (!manifestUrl || typeof fetch !== "function") return [];
+      const response = await fetch(manifestUrl);
+      if (!response.ok) {
+        throw new Error(
+          "Failed to fetch wheel manifest " + manifestUrl + ": HTTP " + response.status
+        );
+      }
+      const payload = await response.json();
+      const entries = Array.isArray(payload)
+        ? payload
+        : (payload && (payload.wheels || payload.wheel_paths)) || [];
+      const baseRootUrl = (config && config.docRootUrl) || manifestUrl;
+      return entries
+        .filter(isAllowedBrowserWheel)
+        .map((entry) => resolveWheelUrl(entry, baseRootUrl, manifestUrl));
+    }
 
     async function initRuntime(config) {
       if (ready) return;
@@ -208,7 +283,12 @@ del __pyodide_init_env__
 \`);
       envProxy.destroy();
 
-      const wheels = (config && config.wheels) || [];
+      let wheels = Array.isArray(config && config.wheels)
+        ? config.wheels.filter(isAllowedBrowserWheel)
+        : [];
+      if (wheels.length === 0 && !(config && config.hasInlineWheels)) {
+        wheels = await fetchManifestWheels(config);
+      }
       const requirements = (config && config.requirements) || [];
 
       if (requirements && requirements.length > 0) {
@@ -484,7 +564,14 @@ await micropip.install(_reqs)
           }
         }
 
-        for (const wheelUrl of config.wheels) {
+        let wheels = Array.isArray(config.wheels)
+          ? config.wheels.filter(isAllowedBrowserWheel)
+          : [];
+        if (wheels.length === 0 && !config.hasInlineWheels) {
+          wheels = await fetchManifestWheels(config);
+        }
+
+        for (const wheelUrl of wheels) {
           if (!installedMainWheels.has(wheelUrl)) {
             try {
               await mainThreadPyodide.runPythonAsync(`

@@ -1,22 +1,36 @@
 """Security utilities."""
 
 import functools
+import json
 import re
 from typing import Any
 
 from imednet.errors import ClientError, PathTraversalValidationError
-from imednet.utils.secrets import redact_sensitive_payload
+from imednet.utils.secrets import is_sensitive_key, redact_sensitive_payload
 
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
 _CAMEL_TO_SNAKE_RE1 = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_TO_SNAKE_RE2 = re.compile(r"([a-z\d])([A-Z])")
 _DELIMITER_RE = re.compile(r"[^a-zA-Z0-9]+")
-_INLINE_QUOTED_KV_RE = re.compile(
-    r"([\"']?)([A-Za-z][A-Za-z0-9_-]{1,63})\1(\s*[:=]\s*)([\"'])([^\"'\r\n]*)\4"
+_JSON_OR_KEY_BLOCK_START_RE = re.compile(
+    r"""(?<![A-Za-z0-9_<:/.-])(?P<q1>['"]?)(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})(?P=q1)"""
+    r"""(?P<op>\s*[:=]\s*)(?P<b1>[{\[])|(?P<b2>[{\[])"""
 )
-_INLINE_EQUALS_KV_RE = re.compile(
-    r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{1,63})(\s*=\s*)([^\s,;\"')\]}]+)"
+_DIAGNOSTIC_QUOTED_KV_RE = re.compile(
+    r"""(?<![A-Za-z0-9_<:/.-])(?P<q1>['"]?)(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})(?P=q1)"""
+    r"""(?P<op>\s*(?:==|!=|=~|<=|>=|<|>|=|:)\s*)"""
+    r"""(?P<q2>['"])(?P<val>(?:\\[\s\S]|(?!(?P=q2))[^\\])*)(?P=q2)"""
 )
+_DIAGNOSTIC_PLAIN_KV_RE = re.compile(
+    r"""(?<![A-Za-z0-9_<:/.-])(?P<q1>['"]?)(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})(?P=q1)"""
+    r"""(?P<op>\s*(?:==|!=|=~|<=|>=|<|>|=|:)\s*)"""
+    r"""(?P<val>[^'"\s,;&\)\]\}\r\n\x00]"""
+    r"""(?:[^\r\n,;&\)\]\}\x00]*?(?=(?:\s+(?:(?:and|or|AND|OR)\s+)?[A-Za-z][A-Za-z0-9_.-]*\s*(?:==|!=|=~|<=|>=|<|>|=|:))|[,;&\)\]\}\r\n\x00]|$))?)"""
+)
+_JSON_ARRAY_ELEM_START_CHARS = frozenset(
+    {'"', "{", "[", "]", "-", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "t", "f", "n"}
+)
+_JSON_DECODER = json.JSONDecoder()
 
 
 def _normalize_key_uncached(key: Any) -> str:
@@ -249,41 +263,256 @@ def mask_clinical_phi(
     return _mask_clinical_phi_synced(value, active_registry, active_registry._key_cache.get)
 
 
+def _find_balanced_bracket_end(text: str, open_pos: int) -> int:
+    """Return index immediately after matching ``}`` or ``]`` from ``open_pos`` (or ``len(text)``)."""
+    n = len(text)
+    stack = ["}" if text[open_pos] == "{" else "]"]
+    idx = open_pos + 1
+    in_quote: str | None = None
+    while idx < n and stack:
+        ch = text[idx]
+        if in_quote is not None:
+            if ch == "\\":
+                idx += 2
+                continue
+            if ch == in_quote:
+                in_quote = None
+        elif ch in {'"', "'"}:
+            in_quote = ch
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch == stack[-1]:
+            stack.pop()
+        idx += 1
+    return idx
+
+
+def _try_raw_decode_json_container(text: str, brace_pos: int) -> tuple[Any, int] | None:
+    """Attempt fast JSON decoding of a ``dict`` or ``list`` starting at ``brace_pos``."""
+    n = len(text)
+    probe = brace_pos + 1
+    while probe < n and text[probe] in " \t\r\n":
+        probe += 1
+    if probe >= n:
+        return None
+    next_ch = text[probe]
+    if text[brace_pos] == "{":
+        if next_ch not in {'"', "}"}:
+            return None
+    elif next_ch not in _JSON_ARRAY_ELEM_START_CHARS:
+        return None
+    try:
+        parsed, end_idx = _JSON_DECODER.raw_decode(text, brace_pos)
+    except ValueError:
+        return None
+    if isinstance(parsed, (dict, list)):
+        return parsed, end_idx
+    return None
+
+
+def _extract_and_sanitize_json_blocks(
+    text: str,
+    *,
+    active_registry: SensitivityRegistry,
+    placeholders: dict[str, str],
+    sentinel: str,
+) -> str:
+    """Sanitize embedded single-line/multiline JSON containers and sensitive structured blocks."""
+    if "{" not in text and "[" not in text:
+        return text
+
+    parts: list[str] = []
+    idx = 0
+    n = len(text)
+    while idx < n:
+        match = _JSON_OR_KEY_BLOCK_START_RE.search(text, idx)
+        if match is None:
+            parts.append(text[idx:])
+            break
+
+        if match.group("b1") is not None:
+            brace_pos = match.start("b1")
+            key = match.group("key")
+            q1 = match.group("q1")
+            op = match.group("op")
+            if active_registry.is_sensitive(key) or is_sensitive_key(key):
+                parts.append(text[idx : match.start()])
+                end_pos = _find_balanced_bracket_end(text, brace_pos)
+                mask_literal = "***MASKED***" if active_registry.is_sensitive(key) else "***"
+                quote_ch = q1 if q1 else ('"' if ":" in op else "")
+                rendered = f"{q1}{key}{q1}{op}{quote_ch}{mask_literal}{quote_ch}"
+                tok = f"{sentinel}IMNBLK{len(placeholders)}{sentinel}"
+                placeholders[tok] = rendered
+                parts.append(tok)
+                idx = end_pos
+                continue
+
+            decoded = _try_raw_decode_json_container(text, brace_pos)
+            if decoded is not None:
+                parsed, end_idx = decoded
+                parts.append(text[idx:brace_pos])
+                sanitized_obj = sanitize_diagnostic_payload(parsed, registry=active_registry)
+                raw_span = text[brace_pos:end_idx]
+                if sanitized_obj != parsed:
+                    rendered = (
+                        json.dumps(sanitized_obj, indent=2, ensure_ascii=False)
+                        if "\n" in raw_span
+                        else json.dumps(sanitized_obj, ensure_ascii=False)
+                    )
+                else:
+                    rendered = raw_span
+                tok = f"{sentinel}IMNBLK{len(placeholders)}{sentinel}"
+                placeholders[tok] = rendered
+                parts.append(tok)
+                idx = end_idx
+                continue
+
+            parts.append(text[idx : brace_pos + 1])
+            idx = brace_pos + 1
+            continue
+
+        brace_pos = match.start("b2")
+        decoded = _try_raw_decode_json_container(text, brace_pos)
+        if decoded is not None:
+            parsed, end_idx = decoded
+            parts.append(text[idx:brace_pos])
+            sanitized_obj = sanitize_diagnostic_payload(parsed, registry=active_registry)
+            raw_span = text[brace_pos:end_idx]
+            if sanitized_obj != parsed:
+                rendered = (
+                    json.dumps(sanitized_obj, indent=2, ensure_ascii=False)
+                    if "\n" in raw_span
+                    else json.dumps(sanitized_obj, ensure_ascii=False)
+                )
+            else:
+                rendered = raw_span
+            tok = f"{sentinel}IMNBLK{len(placeholders)}{sentinel}"
+            placeholders[tok] = rendered
+            parts.append(tok)
+            idx = end_idx
+        else:
+            parts.append(text[idx : brace_pos + 1])
+            idx = brace_pos + 1
+
+    return "".join(parts)
+
+
 def sanitize_diagnostic_text(
-    value: str,
+    value: Any,
     *,
     registry: SensitivityRegistry | None = None,
+    _depth: int = 0,
 ) -> str:
-    """Redact credentials and mask inline clinical PHI key-value pairs in text."""
+    """Redact credentials, URL filters, multiline JSON, and inline PHI expressions in text."""
+    from imednet.utils.url import redact_sensitive_text
+
     active_registry = global_sensitivity_registry if registry is None else registry
-    redacted = str(redact_sensitive_payload(value))
+    if isinstance(value, BaseException):
+        if len(value.args) == 1 and isinstance(value.args[0], _CONTAINER_TYPES):
+            return str(sanitize_diagnostic_payload(value.args[0], registry=active_registry))
+        raw_text = str(value)
+    elif isinstance(value, _CONTAINER_TYPES):
+        return str(sanitize_diagnostic_payload(value, registry=active_registry))
+    elif isinstance(value, str):
+        raw_text = value
+    else:
+        raw_text = str(value)
+
+    if not raw_text or raw_text in {"[REDACTED]", "***MASKED***", "***"}:
+        return raw_text
+
+    sentinel = "\x00"
+    if sentinel in raw_text:
+        sentinel = "\x01\x02"
+        while sentinel in raw_text:
+            sentinel += "\x02"
+
+    placeholders: dict[str, str] = {}
+    staged = _extract_and_sanitize_json_blocks(
+        raw_text,
+        active_registry=active_registry,
+        placeholders=placeholders,
+        sentinel=sentinel,
+    )
+    url_sanitized = redact_sensitive_text(staged, registry=active_registry, _depth=_depth)
+    redacted = str(redact_sensitive_payload(url_sanitized))
 
     def _mask_quoted(match: re.Match[str]) -> str:
-        key = match.group(2)
+        key = match.group("key")
+        q1 = match.group("q1")
+        op = match.group("op")
+        q2 = match.group("q2")
+        val = match.group("val")
         if active_registry.is_sensitive(key):
-            quote_key = match.group(1)
-            sep = match.group(3)
-            quote_val = match.group(4)
-            return f"{quote_key}{key}{quote_key}{sep}{quote_val}***MASKED***{quote_val}"
+            return f"{q1}{key}{q1}{op}{q2}***MASKED***{q2}"
+        if is_sensitive_key(key):
+            return f"{q1}{key}{q1}{op}{q2}***{q2}"
+        if val and _depth < 3 and val not in {"***MASKED***", "***", "[REDACTED]"}:
+            esc_seq = f"\\{q2}"
+            unescaped = val.replace(esc_seq, q2) if esc_seq in val else val
+            inner = sanitize_diagnostic_text(
+                unescaped,
+                registry=active_registry,
+                _depth=_depth + 1,
+            )
+            if inner != unescaped:
+                reescaped = inner.replace(q2, esc_seq) if esc_seq in val else inner
+                return f"{q1}{key}{q1}{op}{q2}{reescaped}{q2}"
         return match.group(0)
 
-    def _mask_equals(match: re.Match[str]) -> str:
-        key = match.group(1)
-        if active_registry.is_sensitive(key):
-            return f"{key}{match.group(2)}***MASKED***"
-        return match.group(0)
+    def _mask_plain(match: re.Match[str]) -> str:
+        key = match.group("key")
+        is_phi = active_registry.is_sensitive(key)
+        is_sec = False if is_phi else is_sensitive_key(key)
+        if not is_phi and not is_sec:
+            return match.group(0)
+        raw_val = match.group("val")
+        stripped = raw_val.rstrip()
+        if not stripped or stripped in {"***MASKED***", "***", "[REDACTED]"}:
+            return match.group(0)
+        trailing = raw_val[len(stripped) :]
+        q1 = match.group("q1")
+        op = match.group("op")
+        replacement = "***MASKED***" if is_phi else "***"
+        return f"{q1}{key}{q1}{op}{replacement}{trailing}"
 
-    masked = _INLINE_QUOTED_KV_RE.sub(_mask_quoted, redacted)
-    return _INLINE_EQUALS_KV_RE.sub(_mask_equals, masked)
+    masked = _DIAGNOSTIC_QUOTED_KV_RE.sub(_mask_quoted, redacted)
+    masked = _DIAGNOSTIC_PLAIN_KV_RE.sub(_mask_plain, masked)
+
+    if placeholders:
+        for tok, rendered in placeholders.items():
+            masked = masked.replace(tok, rendered)
+    return masked
+
+
+def _has_phi_field_target(data: dict[Any, Any], registry: SensitivityRegistry) -> bool:
+    """Return True when an indirect ``{'variable': '<phi>', 'value': ...}`` dict targets PHI."""
+    if "value" not in data:
+        return False
+    for target_key in ("attribute", "variable", "name", "field"):
+        raw_target = data.get(target_key)
+        if isinstance(raw_target, str) and registry.is_sensitive(raw_target):
+            return True
+    return False
 
 
 def _scrub_diagnostic_leaves(value: Any, *, registry: SensitivityRegistry) -> Any:
     if isinstance(value, str):
-        if value in {"[REDACTED]", "***MASKED***"}:
+        if value in {"[REDACTED]", "***MASKED***", "***"}:
             return value
         return sanitize_diagnostic_text(value, registry=registry)
     if isinstance(value, dict):
-        return {k: _scrub_diagnostic_leaves(v, registry=registry) for k, v in value.items()}
+        mask_target_value = _has_phi_field_target(value, registry)
+        return {
+            k: (
+                "***MASKED***"
+                if (mask_target_value and k == "value")
+                else _scrub_diagnostic_leaves(v, registry=registry)
+            )
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [_scrub_diagnostic_leaves(v, registry=registry) for v in value]
     if isinstance(value, tuple):

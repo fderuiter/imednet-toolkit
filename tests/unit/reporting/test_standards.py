@@ -401,3 +401,77 @@ def test_core_sdtm_transform_enforces_pre_usubjid_phi_masking_and_cross_batch_se
     )
     assert ready_report.score == 100.0
     assert ready_report.is_ready is True
+
+
+def test_all_five_profiles_validate_lb_cm_ex_mh_and_aliases() -> None:
+    """All 5 registered profiles validate LB, CM, EX, and MH using SDTM_DOMAIN_SPECS aliases."""
+    from imednet.models.standards import (
+        BiologicSafetyProfile,
+        VaccineSafetyProfile,
+    )
+
+    assert isinstance(PROFILE_REGISTRY.get("biologic"), BiologicSafetyProfile)
+    assert isinstance(PROFILE_REGISTRY.get("vaccine"), VaccineSafetyProfile)
+
+    for alias, canonical in [
+        ("Laboratory", "LB"),
+        ("labs", "LB"),
+        ("Concomitant Medications", "CM"),
+        ("conmeds", "CM"),
+        ("Exposure", "EX"),
+        ("Medical History", "MH"),
+        ("medhist", "MH"),
+        ("DV", "PD"),
+    ]:
+        assert _canonical_domain(alias) == canonical
+
+    for profile_name in ("general", "drug", "device", "biologic", "vaccine"):
+        profile = PROFILE_REGISTRY.get(profile_name)
+        for dom in ("LB", "CM", "EX", "MH"):
+            assert len(profile.expected_fields(dom)) > 0
+            # Empty record triggers required ERROR violations
+            missing = profile.validate(dom, {"subjectKey": "S1"})
+            assert any(v.severity == "ERROR" for v in missing), (profile_name, dom)
+
+    # Biologic and Vaccine profiles enforce EX/LB/CM/MH required fields and value constraints
+    bio = BiologicSafetyProfile()
+    ex_missing = bio.validate(
+        "EX",
+        {
+            "subjectKey": "S1",
+            "exTrt": "mAb-101",
+            "exRoute": "IV",
+            "exStartDate": "2026-01-01",
+        },
+    )
+    assert {(v.field, v.severity) for v in ex_missing} == {
+        ("exDose", "ERROR"),
+        ("exDoseUnit", "ERROR"),
+    }
+
+    ex_ok = bio.validate(
+        "Exposure",
+        {
+            "subjectKey": "S1",
+            "exTrt": "mAb-101",
+            "exDose": 200,
+            "exDoseUnit": "mg",
+            "exRoute": "IV",
+            "exStartDate": "2026-01-01",
+        },
+    )
+    assert ex_ok == []
+
+    vax = VaccineSafetyProfile()
+    lb_ok = vax.validate(
+        "Laboratory",
+        {
+            "subjectKey": "S1",
+            "lbTest": "Neutralizing Ab",
+            "lbTestCd": "NAB",
+            "lbResult": "128.5",
+            "lbUnit": "IU/mL",
+            "lbDate": "2026-02-01",
+        },
+    )
+    assert lb_ok == []

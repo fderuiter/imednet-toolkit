@@ -68,7 +68,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -440,6 +440,11 @@ class Neo4jExportSink(ExportSink):
         self._seq_counters: dict[str, int] = {}
         self._domain_seq_counters: dict[str, dict[str, int]] = {}
         self._record_seqs: dict[str, int] = {}
+        self._form_domain_map_ref: dict[Any, str] = {}
+        self._seq_overrides_ref: dict[str, int] = {}
+        self._lineage_out_ref: dict[str, dict[str, Any]] = {}
+        self._mapper: CentralizedMapper | None = None
+        self._mapper_key: tuple[Any, ...] | None = None
         self._driver: Any = None
         self._connect()
 
@@ -467,12 +472,58 @@ class Neo4jExportSink(ExportSink):
     # ExportSink interface
     # ------------------------------------------------------------------
 
+    def _get_mapper(
+        self,
+        post_proc: Any,
+        seq_overrides: Mapping[str, int] | None,
+    ) -> CentralizedMapper:
+        """Return a reusable sink-scoped mapper synchronized for the active Neo4j batch."""
+        graph_cfg = self.config
+        self._form_domain_map_ref.clear()
+        active_map = getattr(self, "_active_form_domain_map", None)
+        if isinstance(active_map, Mapping):
+            self._form_domain_map_ref.update(active_map)
+        self._seq_overrides_ref.clear()
+        if seq_overrides:
+            self._seq_overrides_ref.update(seq_overrides)
+        self._lineage_out_ref.clear()
+
+        extra = graph_cfg.extra if isinstance(graph_cfg.extra, dict) else {}
+        key = (
+            bool(graph_cfg.mask_phi),
+            bool(graph_cfg.as_sdtm),
+            graph_cfg.sdtm_domain,
+            graph_cfg.naming_convention,
+            is_incremental_sink_config(graph_cfg),
+            id(extra.get("study_config")),
+            id(extra.get("enrichment_pipeline")),
+        )
+        if self._mapper is None or self._mapper_key != key:
+            self._mapper = build_sink_mapper(
+                graph_cfg,
+                mode="document",
+                post_processor=post_proc,
+                seq_counters=(
+                    self._seq_counters
+                    if (not graph_cfg.as_sdtm or graph_cfg.sdtm_domain is not None)
+                    else None
+                ),
+                domain_seq_counters=self._domain_seq_counters if graph_cfg.as_sdtm else None,
+                form_domain_map=self._form_domain_map_ref,
+                seq_overrides=self._seq_overrides_ref if graph_cfg.as_sdtm else None,
+                lineage_out=self._lineage_out_ref if graph_cfg.as_sdtm else None,
+                record_seqs=self._record_seqs,
+            )
+            self._mapper_key = key
+        else:
+            self._mapper.post_processor = post_proc
+        return self._mapper
+
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
         if not records:
             return 0
 
-        lineage_out: dict[str, dict[str, Any]] = {}
         seq_overrides: dict[str, int] | None = None
         if self.config.as_sdtm:
             rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
@@ -482,21 +533,8 @@ class Neo4jExportSink(ExportSink):
                     local_map[subj_key] = max(local_map.get(subj_key, 0), wm_val)
 
         post_proc = _post_process_graph_sdtm if self.config.as_sdtm else _post_process_graph
-        mapper = build_sink_mapper(
-            self.config,
-            mode="document",
-            post_processor=post_proc,
-            seq_counters=(
-                self._seq_counters
-                if (not self.config.as_sdtm or self.config.sdtm_domain is not None)
-                else None
-            ),
-            domain_seq_counters=self._domain_seq_counters if self.config.as_sdtm else None,
-            form_domain_map=getattr(self, "_active_form_domain_map", None),
-            seq_overrides=seq_overrides,
-            lineage_out=lineage_out if self.config.as_sdtm else None,
-            record_seqs=self._record_seqs,
-        )
+        mapper = self._get_mapper(post_proc, seq_overrides)
+        lineage_out = self._lineage_out_ref
         database = getattr(self.config, "database", "neo4j")
         try:
             if self.config.as_sdtm:

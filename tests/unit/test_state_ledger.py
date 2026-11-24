@@ -1132,7 +1132,7 @@ def test_get_state_provider_accepts_path_and_cli_renders_none_watermark(
 def test_sanitize_metadata_preserves_integer_sdtm_maps_across_phi_and_secret_keys(
     tmp_path: Path,
 ) -> None:
-    """_sanitize_metadata preserves integer values in SDTM maps across PHI and secret-like keys."""
+    """_sanitize_metadata preserves integer values in SDTM maps across PHI and secret-like keys while delegating residuals to sanitize_diagnostic_payload."""
     from imednet.integrations.sink_base import bind_sdtm_stream_metadata
     from imednet_workflows.state_ledger import _sanitize_metadata
 
@@ -1146,6 +1146,11 @@ def test_sanitize_metadata_preserves_integer_sdtm_maps_across_phi_and_secret_key
             "PASSWORD_1": 3,
             "BOOL_BAD": True,
             "birth_date": "1980-04-12",
+            "NESTED_DOMAIN": {
+                "DOB": 6,
+                "API_KEY": 8,
+                "birth_date": "1980-04-12",
+            },
         },
         "sdtm_record_seqs": {
             "DOB::REC_1": 1,
@@ -1159,6 +1164,11 @@ def test_sanitize_metadata_preserves_integer_sdtm_maps_across_phi_and_secret_key
         },
         "DOB": "1985-07-19",
         "api_token": "plain-secret-value",  # pragma: allowlist secret
+        "indirect_phi": {
+            "variable": "DOB",
+            "value": "1985-07-19",
+        },
+        "inline_phi_note": 'Validation failed for patientName="Alice Smith" at https://edc.example/api?ssn=123-45-6789',
         "nested": {
             "patientName": "Alice Smith",
             "client_secret": "s3cr3t",  # pragma: allowlist secret
@@ -1172,8 +1182,11 @@ def test_sanitize_metadata_preserves_integer_sdtm_maps_across_phi_and_secret_key
     assert sanitized["sdtm_seq_counters"]["API_TOKEN"] == 9
     assert sanitized["sdtm_seq_counters"]["SECRET_SUBJ"] == 11
     assert sanitized["sdtm_seq_counters"]["PASSWORD_1"] == 3
+    assert sanitized["sdtm_seq_counters"]["NESTED_DOMAIN"]["DOB"] == 6
+    assert sanitized["sdtm_seq_counters"]["NESTED_DOMAIN"]["API_KEY"] == 8
     # Non-integer entries inside SDTM maps do not bypass sanitization
     assert sanitized["sdtm_seq_counters"]["birth_date"] == "***MASKED***"
+    assert sanitized["sdtm_seq_counters"]["NESTED_DOMAIN"]["birth_date"] == "***MASKED***"
 
     assert sanitized["sdtm_record_seqs"]["DOB::REC_1"] == 1
     assert sanitized["sdtm_record_seqs"]["SSN::API_KEY_99"] == 2
@@ -1182,9 +1195,12 @@ def test_sanitize_metadata_preserves_integer_sdtm_maps_across_phi_and_secret_key
 
     assert sanitized["sdtm_seq_watermarks"] == {"DOB": 4, "TOKEN_SUBJ": 9}
 
-    # Outside integer SDTM maps, PHI and secret keys remain masked/redacted
+    # Outside integer SDTM maps, direct/indirect/inline PHI and secret keys remain masked/redacted
     assert sanitized["DOB"] == "***MASKED***"
     assert sanitized["api_token"] == "***"
+    assert sanitized["indirect_phi"]["value"] == "***MASKED***"
+    assert "Alice Smith" not in sanitized["inline_phi_note"]
+    assert "123-45-6789" not in sanitized["inline_phi_note"]
     assert sanitized["nested"]["patientName"] != "Alice Smith"
     assert sanitized["nested"]["client_secret"] == "***"
 
@@ -1281,16 +1297,22 @@ def test_cross_host_retry_reclaims_running_lease_without_waiting_one_hour(
         records_processed=10,
     )
 
-    # Simulate Worker Pod A entering transaction on try_number=1 and crashing (SIGKILL -> GeneratorExit)
+    # Simulate Worker Pod A entering transaction on try_number=1, recording mid-run SDTM lineage, and crashing
     monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "clinical_dag")
     monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_records")
     monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled__2026-06-02")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_MAP_INDEX", "0")
     monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
     with monkeypatch.context() as worker_a:
         worker_a.setattr(socket, "gethostname", lambda: "k8s-worker-pod-crashed")
         worker_a.setattr("os.getpid", lambda: 88888)
         tx_cm = ledger.transaction("STUDY-RETRY", "records")
         tx_cm.__enter__()
+        ledger.record_sdtm_lineage(
+            "STUDY-RETRY",
+            "records",
+            {"domain": "AE", "spec_hash": "hash1"},
+        )
         # Simulate SIGKILL: close underlying generator without normal __exit__ rollback
         tx_cm.gen.close()
 
@@ -1306,8 +1328,18 @@ def test_cross_host_retry_reclaims_running_lease_without_waiting_one_hour(
         with ledger.transaction("STUDY-RETRY", "records"):
             pass
 
-    # 2. Same task at same try_number=1 on another host is also blocked (duplicate dispatch guard)
+    # 2. Same task but different mapped task index is also blocked!
     monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_records")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_MAP_INDEX", "1")
+    with pytest.raises(
+        InvalidStateTransitionError,
+        match="Cannot transition stream state from 'running' to 'running'",
+    ):
+        with ledger.transaction("STUDY-RETRY", "records"):
+            pass
+
+    # 3. Same task + map_index at same try_number=1 on another host is also blocked (duplicate dispatch guard)
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_MAP_INDEX", "0")
     monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
     with pytest.raises(
         InvalidStateTransitionError,
@@ -1316,7 +1348,7 @@ def test_cross_host_retry_reclaims_running_lease_without_waiting_one_hour(
         with ledger.transaction("STUDY-RETRY", "records"):
             pass
 
-    # 3. Retry attempt (try_number=2 > 1) for the same task instance reclaims immediately!
+    # 4. Retry attempt (try_number=2 > 1) for the exact same task instance reclaims immediately!
     monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "2")
     new_ts = datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)
     with ledger.transaction("STUDY-RETRY", "records") as tx:
@@ -1329,7 +1361,7 @@ def test_cross_host_retry_reclaims_running_lease_without_waiting_one_hour(
     assert committed.last_timestamp == new_ts
     assert "_lease_attempt" not in committed.metadata
 
-    # 4. Forced set_last_timestamp(metadata=None) on a crashed RUNNING stream preserves user metadata
+    # 5. Forced set_last_timestamp(metadata=None) on a crashed RUNNING stream preserves user metadata
     #    while stripping transient _lease_attempt metadata.
     ledger.set_last_timestamp(
         "STUDY-RETRY",

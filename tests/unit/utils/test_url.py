@@ -153,3 +153,60 @@ def test_validate_path_segment_rejects_unsafe(unsafe_segment: object) -> None:
     """Test validate_path_segment raises PathTraversalValidationError on unsafe tokens."""
     with pytest.raises(PathTraversalValidationError):
         validate_path_segment(unsafe_segment)
+
+
+def test_redact_url_query_decodes_and_masks_phi_in_filter_and_record_data_filter() -> None:
+    """Decode and mask PHI inside URL filter/recordDataFilter params while keeping exempt IDs."""
+    from urllib.parse import urlencode
+
+    from imednet.utils.security import SensitivityRegistry, global_sensitivity_registry
+    from imednet.utils.url import redact_sensitive_text
+
+    custom_reg = SensitivityRegistry()
+    custom_reg.add_sensitive_key("customChartNumber")
+
+    query = urlencode(
+        {
+            "api_key": "raw-api-secret",  # pragma: allowlist secret
+            "study_key": "STUDY-01",
+            "subject_key": "SUBJ-01",
+            "record_id": "99",
+            "usubjid": "STUDY-01-SUBJ-01",
+            "subjid": "SUBJ-01",
+            "studyid": "STUDY-01",
+            "ssn": "123-45-6789",
+            "filter": 'subjectKey==SUBJ-01;ssn==123-45-6789;patientName=="Jane Doe"',
+            "recordDataFilter": "email=~jane@example.com;customChartNumber!=CHART-7788;record_id>=99",
+        }
+    )
+    raw_url = f"https://edc.example.com/api/v1/edc/studies/STUDY-01/records?{query}"
+
+    sanitized_url = redact_url_query(raw_url, registry=custom_reg)
+    assert "api_key=***" in sanitized_url
+    assert "ssn=***MASKED***" in sanitized_url
+    assert "***MASKED***" in sanitized_url
+    for leaked in (
+        "raw-api-secret",
+        "123-45-6789",
+        "Jane",
+        "Doe",
+        "jane%40example.com",
+        "jane@example.com",
+        "CHART-7788",
+    ):
+        assert leaked not in sanitized_url
+    for exempt_val in ("STUDY-01", "SUBJ-01", "99", "STUDY-01-SUBJ-01"):
+        assert exempt_val in sanitized_url
+    assert not global_sensitivity_registry.is_sensitive("customChartNumber")
+
+    # Relative path URLs and URI user:password@host coexist cleanly with @ in email filters
+    prose = (
+        "Failed mongodb://svc:dbpass123@mongo.internal:27017/edc and "  # pragma: allowlist secret
+        f"GET /api/v1/edc/studies/STUDY-01/records?{query} HTTP/1.1"
+    )
+    sanitized_prose = redact_sensitive_text(prose, registry=custom_reg)
+    assert "mongodb://svc:***@mongo.internal:27017/edc" in sanitized_prose
+    assert "dbpass123" not in sanitized_prose
+    assert "123-45-6789" not in sanitized_prose
+    assert "CHART-7788" not in sanitized_prose
+    assert "STUDY-01-SUBJ-01" in sanitized_prose

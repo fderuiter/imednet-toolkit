@@ -20,31 +20,76 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from imednet.spi.sinks import redact_uri
-from imednet.spi.utils import mask_clinical_phi, redact_sensitive_payload, redact_sensitive_text
+from imednet.spi.utils import (
+    redact_sensitive_payload,
+    redact_sensitive_text,
+    sanitize_diagnostic_payload,
+)
 
 _PRESERVED_SDTM_INT_MAPS: frozenset[str] = frozenset(
     {"sdtm_seq_counters", "sdtm_record_seqs", "sdtm_seq_watermarks"}
 )
 
 
+def _extract_preserved_sdtm_ints(
+    raw_map: Mapping[Any, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split an SDTM sequence mapping into preserved integer entries and non-integer residuals."""
+    preserved: dict[str, Any] = {}
+    residual: dict[str, Any] = {}
+    for sub_key, sub_val in raw_map.items():
+        sub_key_str = str(sub_key)
+        if isinstance(sub_val, int) and not isinstance(sub_val, bool):
+            preserved[sub_key_str] = sub_val
+        elif isinstance(sub_val, Mapping) and sub_val:
+            nested_ints: dict[str, int] = {}
+            nested_other: dict[str, Any] = {}
+            for inner_k, inner_v in sub_val.items():
+                inner_k_str = str(inner_k)
+                if isinstance(inner_v, int) and not isinstance(inner_v, bool):
+                    nested_ints[inner_k_str] = inner_v
+                else:
+                    nested_other[inner_k_str] = inner_v
+            if nested_ints:
+                if nested_other:
+                    scrubbed_other = sanitize_diagnostic_payload(nested_other)
+                    merged_nested = dict(scrubbed_other) if isinstance(scrubbed_other, dict) else {}
+                    merged_nested.update(nested_ints)
+                    preserved[sub_key_str] = merged_nested
+                else:
+                    preserved[sub_key_str] = nested_ints
+            else:
+                residual[sub_key_str] = nested_other
+        else:
+            residual[sub_key_str] = sub_val
+    return preserved, residual
+
+
+def _merge_sdtm_int_entries(target: dict[str, Any], preserved: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge preserved flat and 2-level integer SDTM sequence entries over sanitized residuals."""
+    merged = dict(target)
+    for k, v in preserved.items():
+        existing = merged.get(k)
+        if isinstance(v, dict) and isinstance(existing, dict):
+            combined_inner = dict(existing)
+            combined_inner.update(v)
+            merged[k] = combined_inner
+        else:
+            merged[k] = copy.deepcopy(v)
+    return merged
+
+
 def _sanitize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
-    """Redact credentials and mask clinical PHI keys while preserving integer SDTM counters."""
+    """Redact credentials and mask clinical PHI while preserving integer SDTM counters."""
     if not isinstance(metadata, dict) or not metadata:
         return {}
 
-    preserved_int_maps: dict[str, dict[str, int]] = {}
+    preserved_int_maps: dict[str, dict[str, Any]] = {}
     residual_payload: dict[str, Any] = {}
     for key, value in metadata.items():
         key_str = str(key)
         if key_str in _PRESERVED_SDTM_INT_MAPS and isinstance(value, Mapping):
-            int_entries: dict[str, int] = {}
-            non_int_entries: dict[str, Any] = {}
-            for sub_key, sub_val in value.items():
-                sub_key_str = str(sub_key)
-                if isinstance(sub_val, int) and not isinstance(sub_val, bool):
-                    int_entries[sub_key_str] = sub_val
-                else:
-                    non_int_entries[sub_key_str] = sub_val
+            int_entries, non_int_entries = _extract_preserved_sdtm_ints(value)
             preserved_int_maps[key_str] = int_entries
             if non_int_entries:
                 residual_payload[key_str] = non_int_entries
@@ -53,19 +98,16 @@ def _sanitize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
 
     sanitized: dict[str, Any] = {}
     if residual_payload:
-        masked = mask_clinical_phi(residual_payload)
-        redacted = redact_sensitive_payload(masked)
-        if isinstance(redacted, dict):
-            sanitized = dict(redacted)
+        scrubbed = sanitize_diagnostic_payload(residual_payload)
+        if isinstance(scrubbed, dict):
+            sanitized = dict(scrubbed)
 
     for map_key, int_entries in preserved_int_maps.items():
         existing_sanitized = sanitized.get(map_key)
         if isinstance(existing_sanitized, dict):
-            merged_map = dict(existing_sanitized)
-            merged_map.update(int_entries)
-            sanitized[map_key] = merged_map
+            sanitized[map_key] = _merge_sdtm_int_entries(existing_sanitized, int_entries)
         else:
-            sanitized[map_key] = dict(int_entries)
+            sanitized[map_key] = copy.deepcopy(int_entries)
     return sanitized
 
 
@@ -447,7 +489,9 @@ def _resolve_airflow_task_lease_context() -> tuple[str | None, int | None]:
         or os.environ.get("AIRFLOW_CTX_EXECUTION_DATE")
         or os.environ.get("AIRFLOW_CTX_LOGICAL_DATE")
     )
-    map_index = os.environ.get("AIRFLOW_CTX_MAP_INDEX")
+    map_index = os.environ.get("AIRFLOW_CTX_MAP_INDEX") or os.environ.get(
+        "AIRFLOW_CTX_TASK_MAP_INDEX"
+    )
     raw_try: Any = os.environ.get("AIRFLOW_CTX_TRY_NUMBER")
 
     if not task_id or raw_try is None or map_index is None:
@@ -749,6 +793,12 @@ class FileStateProvider(BaseStateProvider):
             state = self.read_state()
             study = state.studies.setdefault(study_key, StudyState())
             current_stream = study.streams.get(stream_name)
+            lease_task_k, lease_try_n = (
+                _extract_lease_attempt(current_stream.metadata)
+                if current_stream is not None
+                and current_stream.last_run_status == StreamExecutionStatus.RUNNING
+                else (None, None)
+            )
             prior_meta = _strip_lease_attempt(current_stream.metadata) if current_stream else {}
             incoming: dict[str, Any] = {}
             if lineage_updates:
@@ -759,6 +809,8 @@ class FileStateProvider(BaseStateProvider):
                 _merge_preserved_lineage_metadata(prior_meta, incoming)
             )
             if current_stream is not None:
+                if current_stream.last_run_status == StreamExecutionStatus.RUNNING:
+                    merged_meta = _attach_lease_attempt(merged_meta, lease_task_k, lease_try_n)
                 current_stream.metadata = merged_meta
             else:
                 study.streams[stream_name] = StreamState(
@@ -1021,7 +1073,7 @@ class FileStateProvider(BaseStateProvider):
                     running_stream = study_entry.streams.get(stream_name)
                     base_meta = _merge_preserved_lineage_metadata(
                         prior_meta_map[stream_name],
-                        running_stream.metadata if running_stream else None,
+                        _strip_lease_attempt(running_stream.metadata) if running_stream else None,
                     )
                     commit_meta = _merge_preserved_lineage_metadata(
                         base_meta,
@@ -1641,7 +1693,15 @@ class AirflowStateProvider(BaseStateProvider):
             return
         resolved_study, streams, legacy_keys = self._load_study_state(study_key)
         existing = streams.get(stream_name)
-        prior_meta = existing.get("metadata") if isinstance(existing, dict) else {}
+        lease_task_k, lease_try_n = (
+            _extract_lease_attempt(existing.get("metadata"))
+            if isinstance(existing, dict)
+            and self._parse_status(existing) == StreamExecutionStatus.RUNNING
+            else (None, None)
+        )
+        prior_meta = (
+            _strip_lease_attempt(existing.get("metadata")) if isinstance(existing, dict) else {}
+        )
         incoming: dict[str, Any] = {}
         if lineage_updates:
             incoming["sdtm_lineage"] = dict(lineage_updates)
@@ -1653,7 +1713,12 @@ class AirflowStateProvider(BaseStateProvider):
         )
         if isinstance(existing, dict):
             updated = dict(existing)
-            updated["metadata"] = _sanitize_metadata(merged_meta)
+            sanitized_existing_meta = _sanitize_metadata(merged_meta)
+            if self._parse_status(existing) == StreamExecutionStatus.RUNNING:
+                sanitized_existing_meta = _attach_lease_attempt(
+                    sanitized_existing_meta, lease_task_k, lease_try_n
+                )
+            updated["metadata"] = sanitized_existing_meta
             streams[stream_name] = updated
         else:
             streams[stream_name] = self._build_stream_payload(
@@ -1696,7 +1761,7 @@ class AirflowStateProvider(BaseStateProvider):
             validate_transition(current_status, validated_status)
 
         prior_meta = (
-            existing_payload.get("metadata")
+            _strip_lease_attempt(existing_payload.get("metadata"))
             if _preserve_existing_lineage and isinstance(existing_payload, dict)
             else None
         )

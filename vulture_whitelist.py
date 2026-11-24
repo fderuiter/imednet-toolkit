@@ -172,8 +172,6 @@ async_get_subjects  # unused variable (packages/core/src/imednet/sdk_convenience
 async_get_users  # unused variable (packages/core/src/imednet/sdk_convenience.py:202)
 async_get_visits  # unused variable (packages/core/src/imednet/sdk_convenience.py:206)
 _.async_get_job  # unused method (packages/core/src/imednet/sdk_convenience.py:208)
-_.fetch_job_result  # SPI facade & SDKConvenienceMixin protocol method
-_.async_fetch_job_result  # SPI facade & SDKConvenienceMixin protocol method
 _.committed_jobs  # BatchCoordinator exception context attribute
 _.committed_batch_ids  # BatchCoordinator exception context attribute
 SDKConvenienceMixin  # unused variable (packages/core/src/imednet/sdk_convenience.py:247)

@@ -291,6 +291,7 @@ The ``imednet datadict`` command group exposes eight subcommands for Study metad
 
    # 7. Validate a Data Dictionary JSON file against model and JSON Schema rules
    imednet datadict validate study_dd.json --schema data-dictionary.schema.json
+   imednet datadict validate study_dd.json --format json
 
    # 8. Compare two Study Data Dictionary revisions in text, Markdown, or JSON format
    imednet datadict diff baseline_dd.json study_dd.json --format md
