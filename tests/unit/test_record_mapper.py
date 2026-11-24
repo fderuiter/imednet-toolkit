@@ -2038,3 +2038,273 @@ def test_resolve_sdtm_domain_sanitizes_unaliased_domains_and_keeps_seq_var_safe(
     )
     assert "DMSEQ" not in dm_rows[0]
     assert dm_rows[0]["PRIORSEQ"] == 3
+
+
+def test_record_mapper_single_pass_stamping_nested_cells_labels_and_hierarchy_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify single-pass ingress stamping, nested container masking, sensitive labels, and custom _parse_record fallbacks."""
+    from unittest.mock import patch
+
+    import imednet.spi.utils as spi_utils
+    import imednet.utils.security as security_mod
+    import imednet_workflows.record_mapper as rm_mod
+    from imednet.integrations.enrichment import EnrichmentPipeline
+    from imednet.models.study_config import StudyConfiguration
+    from imednet.utils.security import global_sensitivity_registry
+
+    cfg = StudyConfiguration(study_key="STUDY-SP", phi_fields=["custom_phi_tag"])
+    monkeypatch.setattr(
+        rm_mod,
+        "resolve_enrichment_pipeline",
+        lambda sk: EnrichmentPipeline(cfg) if sk == "STUDY-SP" else None,
+    )
+
+    variables = [
+        Variable(variable_name="SAFE_NOTE", label="Safe Note", form_id=10, form_key="F_DM"),
+        Variable(variable_name="OPAQUE_NAME", label="Patient Name", form_id=10, form_key="F_DM"),
+        Variable(variable_name="NESTED_OBJ", label="Nested Obj", form_id=10, form_key="F_DM"),
+        Variable(variable_name="MISSING_COL", label="Missing Col", form_id=10, form_key="F_DM"),
+    ]
+    records = [
+        Record(
+            record_id=1,
+            study_key="STUDY-SP",
+            subject_key="SUBJ-1",
+            visit_id=10,
+            form_id=10,
+            form_key="F_DM",
+            record_data={
+                "SAFE_NOTE": "normal",
+                "OPAQUE_NAME": "Alice Doe",
+                "NESTED_OBJ": [
+                    {"ok": 1, "DOB": "1980-01-01", "custom_phi_tag": "PHI-1"},
+                    "plain-scalar",
+                ],
+            },
+        ),
+        Record(
+            record_id=2,
+            study_key="STUDY-SP",
+            subject_key="SUBJ-2",
+            visit_id=10,
+            form_id=10,
+            form_key="F_DM",
+            record_data={
+                "SAFE_NOTE": "stable",
+                "OPAQUE_NAME": "Bob Roe",
+                "NESTED_OBJ": "scalar-row",
+            },
+        ),
+    ]
+
+    sdk = MagicMock()
+    sdk.get_variables.return_value = variables
+    sdk.records.list.side_effect = lambda **_kw: iter(records)
+
+    scalar_calls = 0
+    orig_mask = security_mod.mask_clinical_phi
+
+    def spy_mask(val: Any, *, registry: Any = None) -> Any:
+        nonlocal scalar_calls
+        if not isinstance(val, (dict, list, tuple)):
+            scalar_calls += 1
+        return orig_mask(val, registry=registry)
+
+    mapper = RecordMapper(sdk, chunk_size=1, mask_phi=True)
+    with (
+        patch.object(security_mod, "mask_clinical_phi", new=spy_mask),
+        patch.object(rm_mod, "mask_clinical_phi", new=spy_mask),
+    ):
+        df = mapper.dataframe("STUDY-SP", use_labels_as_columns=True)
+
+    assert scalar_calls == 0
+    assert list(df["Patient Name"]) == ["***MASKED***", "***MASKED***"]
+    assert list(df["Safe Note"]) == ["normal", "stable"]
+    assert df["Nested Obj"].iloc[0] == [
+        {"ok": 1, "DOB": "***MASKED***", "custom_phi_tag": "***MASKED***"},
+        "plain-scalar",
+    ]
+    assert df["Nested Obj"].iloc[1] == "scalar-row"
+    assert spi_utils.has_valid_tabular_batch_stamp(
+        df,
+        mask_phi=True,
+        phi_keys={"custom_phi_tag"},
+        require_sanitized=False,
+    )
+
+    # _parse_records multi-chunk aggregation & empty-input path
+    rec_model = mapper._build_record_model(
+        ["SAFE_NOTE", "OPAQUE_NAME", "NESTED_OBJ"],
+        {"SAFE_NOTE": "Safe Note", "OPAQUE_NAME": "Patient Name", "NESTED_OBJ": "Nested Obj"},
+    )
+    empty_rows, empty_errs = mapper._parse_records([], rec_model)
+    assert empty_rows == []
+    assert empty_errs == 0
+    assert isinstance(empty_rows, rm_mod._IngressPreparedRows)
+
+    multi_rows, multi_errs = mapper._parse_records(records, rec_model)
+    assert len(multi_rows) == 2
+    assert multi_errs == 0
+    assert isinstance(multi_rows, rm_mod._IngressPreparedRows)
+    assert multi_rows.has_nested_containers is True
+
+    # _build_dataframe with missing column backfill, sensitive meta col, and unstamped plain rows
+    try:
+        global_sensitivity_registry.add_sensitive_key("siteName")
+        plain_rows = [
+            {
+                "recordId": 9,
+                "recordOid": "OID-9",
+                "subjectKey": "SUBJ-9",
+                "visitId": 10,
+                "intervalId": 1,
+                "intervalName": "Base",
+                "formId": 10,
+                "formKey": "F_DM",
+                "siteId": 1,
+                "siteName": "General Hospital",
+                "recordStatus": "Complete",
+                "dateCreated": "2026-01-01",
+                "SAFE_NOTE": "plain",
+                "NESTED_OBJ": {"SSN": "123-45-6789", "custom_phi_tag": "X"},
+            }
+        ]
+        built = mapper._build_dataframe(
+            plain_rows,
+            ["SAFE_NOTE", "NESTED_OBJ", "EXTRA_UNPOPULATED"],
+            {
+                "SAFE_NOTE": "Safe Note",
+                "NESTED_OBJ": "Nested Obj",
+                "EXTRA_UNPOPULATED": "Extra Unpopulated",
+            },
+            False,
+            study_key="STUDY-SP",
+        )
+        assert built["siteName"].iloc[0] == "***MASKED***"
+        assert built["NESTED_OBJ"].iloc[0] == {
+            "SSN": "***MASKED***",
+            "custom_phi_tag": "***MASKED***",
+        }
+        assert built["EXTRA_UNPOPULATED"].isna().iloc[0]
+    finally:
+        global_sensitivity_registry.remove_sensitive_key("siteName")
+
+    # build_hierarchy with monkeypatched _parse_record fallback, sensitive label, and ValidationError
+    mock_struct = MagicMock()
+    form_obj = MagicMock()
+    form_obj.form_id = 10
+    form_obj.variables = variables
+    interval_obj = MagicMock()
+    interval_obj.forms = [form_obj]
+    mock_struct.forms = []
+    mock_struct.intervals = [interval_obj]
+
+    custom_mapper = RecordMapper(sdk, mask_phi=True)
+    call_idx = 0
+
+    def custom_parse(rec: Any, _model: Any, **_kw: Any) -> dict[str, Any]:
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx == 2:
+            raise TypeError("bad row")
+        return {
+            "recordId": rec.record_id,
+            "subjectKey": rec.subject_key,
+            "visitId": rec.visit_id,
+            "formId": rec.form_id,
+            "OPAQUE_NAME": "Cleartext Name",
+            "SAFE_NOTE": {"SSN": "123-45-6789", "custom_phi_tag": "TAG"},
+            "parentRecordId": None,
+        }
+
+    custom_mapper._parse_record = custom_parse  # type: ignore[method-assign]
+    skip_form_rec = Record(record_id=99, subject_key="SUBJ-9", visit_id=10, form_id=999)
+    with patch("imednet_workflows.study_structure.get_study_structure", return_value=mock_struct):
+        hier = custom_mapper.build_hierarchy(
+            "STUDY-SP",
+            use_labels_as_keys=True,
+            records=[records[0], records[1], skip_form_rec],
+        )
+    assert len(hier) == 1
+    h_rec = hier[0]["visits"][0]["forms"][0]["records"][0]
+    assert h_rec["Patient Name"] == "***MASKED***"
+    assert h_rec["Safe Note"] == {"SSN": "***MASKED***", "custom_phi_tag": "***MASKED***"}
+
+
+def test_record_mapper_endpoint_fallbacks_and_cached_loader_predicates() -> None:
+    """Verify non-mock endpoint lookup fallbacks, interval resolution, and cached loader edge cases."""
+
+    class _ListEndpoint:
+        def __init__(self, items: list[Any]) -> None:
+            self._items = items
+
+        def list(self, **_kw: Any) -> list[Any]:
+            return list(self._items)
+
+    class _MinimalEndpointSdk:
+        def __init__(self) -> None:
+            self.sites = _ListEndpoint([{"siteId": 5, "siteName": "Site Five"}])
+            self.intervals = _ListEndpoint([{"intervalId": 200, "intervalName": "Day 14"}])
+            self.visits = _ListEndpoint(
+                [
+                    {"visitId": 50, "intervalId": 200, "intervalName": None},
+                    {"visitId": 51, "intervalId": 201, "intervalName": "Unlisted Interval"},
+                    {"visitId": 52, "intervalId": 202, "intervalName": None},
+                ]
+            )
+            self.forms = None
+
+        def get_variables(self, **_kw: Any) -> list[Variable]:
+            return [Variable(variable_name="HR", label="HR", form_id=10, form_key="F_VS")]
+
+    sdk = _MinimalEndpointSdk()
+    mapper = RecordMapper(sdk)  # type: ignore[arg-type]
+    assert mapper._fetch_variable_metadata("S1", variable_whitelist=[]) == ([], {})
+    assert mapper._fetch_variable_metadata("S1", form_whitelist=[]) == ([], {})
+    vkeys, _ = mapper._fetch_variable_metadata("S1", variable_whitelist=["HR"])
+    assert vkeys == ["HR"]
+    assert mapper._resolve_form_key("S1", 10) == "F_VS"
+    assert mapper._resolve_form_key("S1", 99) is None
+    assert mapper._resolve_site_name("S1", 5) == "Site Five"
+    # Interval 201 missing from intervals endpoint -> resolved via visit fallback
+    assert mapper._resolve_interval_name("S1", 201, visit_id=51) == "Unlisted Interval"
+    # Visit 50 has intervalId=200 and intervalName=None -> resolves "Day 14" via intervals
+    assert mapper._resolve_visit_interval("S1", 50) == (200, "Day 14")
+    assert mapper._resolve_interval_name("S1", 999, visit_id=52) is None
+
+    # Loader edge cases: instance attribute callable, empty formId, always_empty predicate, invalid visit_key
+    cached_items = [
+        Record(record_id=1, subject_key="S1", visit_id=10, form_id=10, deleted=True),
+        Record(record_id=2, subject_key="S1", visit_id=10, form_id=20, deleted=False),
+        Record(record_id=3, subject_key="S1", visit_id=10, form_id=10, deleted=False),
+    ]
+
+    class _CustomAttrLoader:
+        def __init__(self) -> None:
+            self.synced: list[str] = []
+            self.iter_cached_records = lambda _sk, **_kw: iter(cached_items)
+
+        def sync_records(self, sk: str) -> None:
+            self.synced.append(sk)
+
+    loader = _CustomAttrLoader()
+    loader_mapper = RecordMapper(MagicMock(), loader=loader)  # type: ignore[arg-type]
+    assert list(loader_mapper._iter_records("S1", extra_filters={"formId": []})) == []
+    assert (
+        list(
+            loader_mapper._iter_records(
+                "S1",
+                extra_filters={"recordId": []},
+            )
+        )
+        == []
+    )
+    filtered = list(
+        loader_mapper._iter_records(
+            "S1",
+            visit_key="not-an-int",
+            extra_filters={"formId": [10]},
+        )
+    )
+    assert [r.record_id for r in filtered] == [3]
