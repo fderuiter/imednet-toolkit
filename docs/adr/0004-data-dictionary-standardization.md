@@ -22,9 +22,10 @@ We decided to establish a canonical `imednet.datadict` module with the following
 8. **Deterministic JSON Emission & Equality**: Sort forms by `formKey`, variables by `sequence` then `variableName`, choices by `position`, and rules by `sequence` then `id`. Exclude `generatedAt` during fixture and model equality comparisons.
 9. **Backward-Compatible Shims**: Refactor `imednet.validation.data_dictionary` to re-export `DataDictionary` and provide deprecated `DataDictionaryLoader` methods issuing `FutureWarning`.
 10. **Argparse CLI Integration**: Integrate `imednet datadict` subcommands (`from-csv`, `from-api`, `validate`, `diff`, `schema`) into the core CLI framework.
+11. **CDISC ODM 1.3.2 & Dataset-JSON v1.1 Exchange Extension**: Extend `imednet.datadict` and `imednet.spi.cdisc` beyond metadata-only dictionaries with immutable (`frozen=True`), read-only Pydantic v2 exchange models (`OdmArchive`, `OdmAdminData`, `OdmReferenceData`, `OdmClinicalData`, `OdmAuditRecord`, `OdmAnnotation`, `DatasetJsonDataset`, `DatasetJsonClinicalData`), bounded-memory ODM XML streaming (`stream_odm_xml`), strict non-metadata loader validation (`load_from_cdisc_odm(..., strict=True)` and `load_odm_archive`), and official CDISC ODM 1.3.2 XSD / Dataset-JSON v1.1.0 JSON Schema verification.
 
 ## Consequences
 
-- All tools, pipelines, and agents share a single canonical JSON representation and JSON Schema (`resources/data-dictionary-1.0.0.schema.json`) for clinical study metadata.
+- All tools, pipelines, and agents share a single canonical JSON representation and JSON Schema (`resources/data-dictionary-1.0.0.schema.json`) for clinical study metadata, alongside schema-validated CDISC ODM 1.3.2 (`resources/odm-1.3.2.xsd`) and Dataset-JSON v1.1 (`resources/dataset-json-1.1.0.schema.json`) clinical data, audit-trail, and query exchange.
 - Automated diffing, migration testing, and CI validation can deterministically detect changes in study configurations across environments.
 - Full backward compatibility is preserved for existing tests and consumers, including `UATExecutionEngine`.

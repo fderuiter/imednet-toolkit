@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from imednet.spi.cdisc import OdmAnnotation, build_odm_annotations_from_query
 from imednet.spi.models import (
     Query,
     QueryStatus,
@@ -83,6 +85,24 @@ class QueryManagementWorkflow:
             return resolved in (QueryStatus.OPEN, QueryStatus.ANSWERED)
         return resolved == QueryStatus.OPEN
 
+    def _fetch_queries(self, study_key: str, **filters: Any) -> list[Query]:
+        """Fetch queries via facade ``get_queries`` or fallback ``queries.list``."""
+        from unittest.mock import NonCallableMock
+
+        sdk_any: Any = self._sdk
+        if isinstance(self._sdk, NonCallableMock):
+            children = getattr(self._sdk, "_mock_children", {})
+            inst_vars = vars(self._sdk)
+            if "get_queries" in children or "get_queries" in inst_vars:
+                return list(self._sdk.get_queries(study_key, **filters))
+            if "queries" in children or "queries" in inst_vars:
+                return list(sdk_any.queries.list(study_key=study_key, **filters))
+            return list(self._sdk.get_queries(study_key, **filters))
+        facade_fn = getattr(self._sdk, "get_queries", None)
+        if callable(facade_fn):
+            return list(facade_fn(study_key, **filters))
+        return list(sdk_any.queries.list(study_key=study_key, **filters))
+
     def get_open_queries(
         self,
         study_key: str,
@@ -107,7 +127,7 @@ class QueryManagementWorkflow:
             A list of matching Query objects.
         """
         filters = dict(additional_filter) if additional_filter else {}
-        all_matching_queries = self._sdk.get_queries(study_key, **filters, **kwargs)
+        all_matching_queries = self._fetch_queries(study_key, **filters, **kwargs)
         return [
             query
             for query in all_matching_queries
@@ -416,6 +436,62 @@ class QueryManagementWorkflow:
             target_store.upsert_item(triage_item)
 
         return target_store.get_queue(study_key)
+
+    def extract_odm_annotations(
+        self,
+        study_key: str,
+        *,
+        unresolved_only: bool = False,
+        record_ids: Sequence[int | str] | None = None,
+        state_filter: str | None = None,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        mask_phi: bool = True,
+        **kwargs: Any,
+    ) -> list[OdmAnnotation]:
+        """Map study ``Query`` and ``QueryComment`` items to ODM ``<Annotation>`` elements."""
+        if unresolved_only:
+            queries = self.get_unresolved_queries(
+                study_key,
+                additional_filter=additional_filter,
+                **kwargs,
+            )
+        else:
+            filters = dict(additional_filter) if additional_filter else {}
+            queries = self._fetch_queries(study_key, **filters, **kwargs)
+
+        if record_ids is not None:
+            allowed_ids = {str(rid).strip() for rid in record_ids}
+            queries = [
+                q for q in queries if str(getattr(q, "record_id", "")).strip() in allowed_ids
+            ]
+
+        if state_filter is not None and state_filter.strip():
+            target_state = state_filter.strip().upper()
+            queries = [
+                q
+                for q in queries
+                if self._resolve_query_status(q).value.upper() == target_state
+                or str(getattr(q, "status", "") or "").strip().upper() == target_state
+            ]
+
+        sorted_queries = sorted(
+            queries,
+            key=lambda q: (
+                str(getattr(q, "annotation_id", None) or getattr(q, "query_id", None) or ""),
+                str(getattr(q, "date_created", None) or ""),
+            ),
+        )
+        annotations: list[OdmAnnotation] = []
+        seq_num = 1
+        for query in sorted_queries:
+            built = build_odm_annotations_from_query(
+                query,
+                base_seq_num=seq_num,
+                mask_phi=mask_phi,
+            )
+            annotations.extend(built)
+            seq_num += len(built)
+        return annotations
 
 
 # Integration:

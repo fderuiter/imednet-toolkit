@@ -19,7 +19,9 @@ def _setup_airflow(monkeypatch):
 
 EXPORT_FUNCTIONS = [
     "export_to_csv",
+    "export_to_dataset_json",
     "export_to_duckdb",
+    "export_to_odm",
     "export_to_parquet",
     "export_to_excel",
     "export_to_json",

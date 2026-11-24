@@ -9,19 +9,27 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from .exchange import DatasetJsonDataset
 from .logic import LogicTreeEvaluator, extract_variable_constraints
 from .models import BusinessLogicRule, DataDictionary, Form
 from .normalize import _is_file_target, _safe_is_file, normalize_form_id
 
 SCHEMA_PATH = Path(__file__).parent / "resources" / "data-dictionary-1.0.0.schema.json"
+ODM_SCHEMA_PATH = Path(__file__).parent / "resources" / "odm-1.3.2.xsd"
+DATASET_JSON_SCHEMA_PATH = Path(__file__).parent / "resources" / "dataset-json-1.1.0.schema.json"
 _RULE_VALIDATOR = LogicTreeEvaluator()
 
 __all__ = [
+    "DATASET_JSON_SCHEMA_PATH",
+    "ODM_SCHEMA_PATH",
     "SCHEMA_PATH",
     "_is_file_target",
     "_safe_is_file",
+    "get_dataset_json_schema",
     "get_schema",
     "validate",
+    "validate_dataset_json",
+    "validate_odm_xml",
 ]
 
 
@@ -414,3 +422,157 @@ def validate(
     errors.extend(_validate_business_logic_regexes(dd))
     errors.extend(_validate_semantics(dd))
     return errors
+
+
+def get_dataset_json_schema() -> dict[str, Any]:
+    """Load the bundled official CDISC Dataset-JSON v1.1.0 JSON Schema."""
+    return dict(json.loads(DATASET_JSON_SCHEMA_PATH.read_text(encoding="utf-8")))
+
+
+def validate_dataset_json(
+    target: dict[str, Any] | str | Path | DatasetJsonDataset,
+    *,
+    raise_on_error: bool = True,
+) -> list[str]:
+    """Validate a CDISC Dataset-JSON v1.1.0 payload against the official schema and model."""
+    errors: list[str] = []
+
+    def _finish(errs: list[str]) -> list[str]:
+        if errs and raise_on_error:
+            raise ValueError("Dataset-JSON v1.1.0 schema validation failed: " + "; ".join(errs))
+        return errs
+
+    data: Any
+    if isinstance(target, DatasetJsonDataset):
+        data = target.to_json_dict()
+    elif isinstance(target, Path):
+        if not _safe_is_file(target):
+            return _finish([f"FileNotFoundError: Target file '{target}' does not exist"])
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return _finish([f"Failed to read JSON file '{target}': {exc}"])
+    elif isinstance(target, str):
+        stripped = target.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                data = json.loads(stripped)
+            except Exception as exc:
+                return _finish([f"Failed to parse JSON string: {exc}"])
+        else:
+            p = Path(target)
+            if not _safe_is_file(p):
+                return _finish([f"FileNotFoundError: Target file '{target}' does not exist"])
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return _finish([f"Failed to read JSON file '{target}': {exc}"])
+    elif isinstance(target, dict):
+        data = target
+    else:
+        return _finish([f"Unsupported target type for Dataset-JSON validation: {type(target)}"])
+
+    schema = get_dataset_json_schema()
+    try:
+        import jsonschema
+
+        validator = jsonschema.Draft202012Validator(
+            schema, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER
+        )
+        for err in validator.iter_errors(data):
+            loc = ".".join(str(p) for p in err.absolute_path)
+            prefix = f"[{loc}] " if loc else ""
+            errors.append(f"{prefix}{err.message}")
+    except ImportError:
+        pass
+
+    try:
+        DatasetJsonDataset.model_validate(data)
+    except ValidationError as val_err:
+        for err in val_err.errors():
+            loc = ".".join(str(p) for p in err.get("loc", ()))
+            msg = err.get("msg", "Validation error")
+            formatted = f"[{loc}] {msg}" if loc else msg
+            if formatted not in errors:
+                errors.append(formatted)
+
+    # Validate ISO-8601 timestamp format for datasetJSONCreationDateTime
+    if isinstance(data, dict):
+        raw_created = data.get("datasetJSONCreationDateTime")
+        if isinstance(raw_created, str):
+            from datetime import datetime
+
+            try:
+                datetime.fromisoformat(raw_created)
+            except ValueError:
+                errors.append(
+                    f"[datasetJSONCreationDateTime] Invalid ISO-8601 timestamp: {raw_created!r}"
+                )
+
+    return _finish(errors)
+
+
+def validate_odm_xml(
+    target: str | bytes | Path,
+    *,
+    xsd_path: Path | None = None,
+    raise_on_error: bool = True,
+) -> list[str]:
+    """Validate an ODM 1.3.2 XML string, bytes, or file against the CDISC ODM 1.3.2 XSD.
+
+    Uses ``defusedxml`` first to block XML entity / DTD expansion attacks before
+    applying offline ``lxml.etree.XMLSchema`` validation when ``lxml`` is installed.
+    """
+    import defusedxml.ElementTree as DefusedET
+
+    def _finish(errs: list[str]) -> list[str]:
+        if errs and raise_on_error:
+            raise ValueError("ODM 1.3.2 XSD validation failed: " + "; ".join(errs))
+        return errs
+
+    xml_bytes: bytes
+    if isinstance(target, bytes):
+        xml_bytes = target
+    elif isinstance(target, Path):
+        if not _safe_is_file(target):
+            return _finish([f"FileNotFoundError: Target file '{target}' does not exist"])
+        xml_bytes = target.read_bytes()
+    elif isinstance(target, str):
+        stripped = target.lstrip()
+        if stripped.startswith("<"):
+            xml_bytes = target.encode("utf-8")
+        else:
+            p = Path(target)
+            if not _safe_is_file(p):
+                return _finish([f"FileNotFoundError: Target file '{target}' does not exist"])
+            xml_bytes = p.read_bytes()
+    else:
+        return _finish([f"Unsupported target type for ODM XML validation: {type(target)}"])
+
+    try:
+        root = DefusedET.fromstring(xml_bytes)
+    except Exception as exc:
+        return _finish([f"Invalid or unsafe ODM XML: {exc}"])
+
+    local_tag = root.tag.split("}", 1)[1] if "}" in root.tag else root.tag
+    if local_tag != "ODM":
+        return _finish([f"Root element must be 'ODM', got '{local_tag}'"])
+
+    schema_file = xsd_path or ODM_SCHEMA_PATH
+    try:
+        from lxml import etree  # type: ignore[import-untyped]  # nosemgrep
+
+        parser = etree.XMLParser(resolve_entities=False, no_network=True)
+        xsd_doc = etree.parse(str(schema_file), parser=parser)  # nosec B320
+        xml_schema = etree.XMLSchema(xsd_doc)
+        doc = etree.fromstring(xml_bytes, parser=parser)  # nosec B320
+        if not xml_schema.validate(doc):
+            return _finish(
+                [f"[line {entry.line}] {entry.message}" for entry in xml_schema.error_log]
+            )
+    except ImportError:
+        pass
+    except Exception as exc:
+        return _finish([f"ODM XSD validation error: {exc}"])
+
+    return []

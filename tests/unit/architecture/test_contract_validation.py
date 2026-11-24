@@ -924,7 +924,7 @@ def test_workflow_interactions_sections_have_prose_mermaid_and_testcode() -> Non
 
 
 def test_tabular_exporters_and_streaming_router_narrative_parity() -> None:
-    """Assert all 10 ExportRegistry tabular exporters and BoundedFormBufferRouter are documented."""
+    """Assert all 12 ExportRegistry tabular exporters and BoundedFormBufferRouter are documented."""
     registry = export_dispatcher._registry
     assert isinstance(registry, export_dispatcher.ExportRegistry)
     registered_tabular_funcs = {func.__name__ for func in registry._tabular_targets.values()}
@@ -932,7 +932,7 @@ def test_tabular_exporters_and_streaming_router_narrative_parity() -> None:
         name for name in core_integrations.__all__ if name.startswith("export_to_")
     }
     assert registered_tabular_funcs == public_export_funcs
-    assert len(registered_tabular_funcs) == 10
+    assert len(registered_tabular_funcs) == 12
 
     router_sig = inspect.signature(BoundedFormBufferRouter.__init__)
     router_params = [
@@ -999,13 +999,13 @@ def test_sink_schemas_and_keys_narrative_parity() -> None:
 
 
 def test_airflow_export_and_connection_targets_narrative_parity() -> None:
-    """Assert Airflow 10-helper export surface and connection targets match narrative docs."""
+    """Assert Airflow 12-helper export surface and connection targets match narrative docs."""
     from apache_airflow_providers_imednet import export as airflow_export
     from apache_airflow_providers_imednet.hooks import ImednetHook
     from apache_airflow_providers_imednet.operators.export import _TABULAR_EXPORTS
 
     airflow_helpers = list(airflow_export.__all__)
-    assert len(airflow_helpers) == 10
+    assert len(airflow_helpers) == 12
     assert {fn.__name__ for fn in _TABULAR_EXPORTS.values()} == set(airflow_helpers)
 
     conn_targets = _extract_airflow_connection_targets(ImednetHook.resolve_destination_connection)
