@@ -27,8 +27,11 @@ from scripts.validate_docs import (
     _verify_sdk_html,
     check_adr_records,
     check_cli_snippets,
+    check_compliance_html_links,
     check_diataxis_sidebar_isolation,
     check_documented_extras,
+    check_duckdb_relations_parity,
+    check_env_vars_documented,
     check_examples_index_parity,
     check_governance_and_issue_templates,
     check_no_duplicate_suppression,
@@ -36,6 +39,7 @@ from scripts.validate_docs import (
     check_packages_registered,
     check_release_please_parity,
     check_rendered_api_reference,
+    check_sdtm_and_phi_parity,
     check_todos_in_init,
 )
 
@@ -645,6 +649,9 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_examples_index_parity() is False
     assert check_diataxis_sidebar_isolation() is False
     assert check_adr_records() is False
+    assert check_env_vars_documented() is False
+    assert check_sdtm_and_phi_parity() is False
+    assert check_duckdb_relations_parity() is False
 
     empty_root = tmp_path / "empty_workspace"
     empty_root.mkdir()
@@ -658,6 +665,9 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_examples_index_parity(empty_root) is True
     assert check_diataxis_sidebar_isolation(empty_root) is True
     assert check_adr_records(empty_root) is True
+    assert check_env_vars_documented(empty_root) is True
+    assert check_sdtm_and_phi_parity(empty_root) is True
+    assert check_duckdb_relations_parity(empty_root) is True
 
 
 def test_check_examples_index_parity_detects_unindexed_script(tmp_path: Path) -> None:
@@ -755,3 +765,218 @@ def test_check_diataxis_sidebar_isolation_rejects_internal_leak_and_duplicate_to
     )
     (docs_dir / "contributing.rst").write_text("Contributing\n============\n", encoding="utf-8")
     assert check_diataxis_sidebar_isolation(tmp_path) is True
+
+
+def test_check_env_vars_documented_passes_repo_and_detects_missing_var(tmp_path: Path) -> None:
+    """check_env_vars_documented passes on repo and fails fast when a runtime IMEDNET_* var is undocumented."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_env_vars_documented(repo_root) is False
+
+    pkg_src = tmp_path / "packages" / "core" / "src" / "imednet"
+    pkg_src.mkdir(parents=True)
+    (pkg_src / "sample.py").write_text(
+        'import os\nEXTRA_ENV = "IMEDNET_SYNTHETIC_EXTRA"\n'
+        'val_a = os.getenv("IMEDNET_OIDC_ISSUER")\n'
+        "val_b = os.environ.get(EXTRA_ENV)\n",
+        encoding="utf-8",
+    )
+    conf_rst = tmp_path / "docs" / "reference" / "configuration.rst"
+    conf_rst.parent.mkdir(parents=True)
+    conf_rst.write_text("Configuration\n=============\n\nIMEDNET_OIDC_ISSUER\n", encoding="utf-8")
+
+    assert check_env_vars_documented(tmp_path) is True
+
+    conf_rst.write_text(
+        "Configuration\n=============\n\nIMEDNET_OIDC_ISSUER\nIMEDNET_SYNTHETIC_EXTRA\n",
+        encoding="utf-8",
+    )
+    assert check_env_vars_documented(tmp_path) is False
+
+
+def test_check_sdtm_and_phi_parity_passes_repo_and_rejects_omissions(tmp_path: Path) -> None:
+    """check_sdtm_and_phi_parity passes on repo and rejects missing SDTM domains or PHI keys."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_sdtm_and_phi_parity(repo_root) is False
+
+    real_text = (repo_root / "docs" / "how-to" / "record_mapping.rst").read_text(encoding="utf-8")
+    target_rst = tmp_path / "docs" / "how-to" / "record_mapping.rst"
+    target_rst.parent.mkdir(parents=True)
+
+    # Removing an SDTM domain fails parity
+    target_rst.write_text(real_text.replace("``MH``", "``XX``"), encoding="utf-8")
+    assert check_sdtm_and_phi_parity(tmp_path) is True
+
+    # Removing a SensitivityRegistry PHI key fails parity
+    target_rst.write_text(real_text.replace("``subjinit``", "``other_field``"), encoding="utf-8")
+    assert check_sdtm_and_phi_parity(tmp_path) is True
+
+    # Removing an exempt structural key fails parity
+    target_rst.write_text(real_text.replace("``usubjid``", "``other_id``"), encoding="utf-8")
+    assert check_sdtm_and_phi_parity(tmp_path) is True
+
+
+def test_check_duckdb_relations_parity_passes_repo_and_rejects_stale_names(tmp_path: Path) -> None:
+    """check_duckdb_relations_parity enforces bronze_revisions/silver_current_state and rejects stale names."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_duckdb_relations_parity(repo_root) is False
+
+    centralizer_dst = (
+        tmp_path
+        / "packages"
+        / "plugins-workflows"
+        / "src"
+        / "imednet_workflows"
+        / "duckdb_centralizer.py"
+    )
+    centralizer_dst.parent.mkdir(parents=True)
+    centralizer_dst.write_text(
+        (
+            repo_root
+            / "packages"
+            / "plugins-workflows"
+            / "src"
+            / "imednet_workflows"
+            / "duckdb_centralizer.py"
+        ).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    audit_dst = tmp_path / "docs" / "how-to" / "audit_compliance.rst"
+    audit_dst.parent.mkdir(parents=True)
+    security_dst = tmp_path / "docs" / "reference" / "security_exceptions.rst"
+    security_dst.parent.mkdir(parents=True)
+
+    real_audit = (repo_root / "docs" / "how-to" / "audit_compliance.rst").read_text(
+        encoding="utf-8"
+    )
+    real_security = (repo_root / "docs" / "reference" / "security_exceptions.rst").read_text(
+        encoding="utf-8"
+    )
+
+    security_dst.write_text(real_security, encoding="utf-8")
+    audit_dst.write_text(
+        real_audit.replace("``silver_records_history``", "``legacy_history``"),
+        encoding="utf-8",
+    )
+    assert check_duckdb_relations_parity(tmp_path) is True
+
+    audit_dst.write_text(
+        real_audit + "\nStale ``record_revisions`` table wording.\n",
+        encoding="utf-8",
+    )
+    assert check_duckdb_relations_parity(tmp_path) is True
+
+    audit_dst.write_text(real_audit, encoding="utf-8")
+    security_dst.write_text(real_security + "\nRun uvx hatch run lint:audit\n", encoding="utf-8")
+    assert check_duckdb_relations_parity(tmp_path) is True
+
+
+def test_sphinx_shadowed_methods_and_spi_compliance_html_links(tmp_path: Path) -> None:
+    """Sphinx renders RecordRevision.validate_chain and resolves imednet.spi.* links verified by check_compliance_html_links."""
+    repo_root = Path(__file__).resolve().parents[2]
+    src_dir = tmp_path / "docs_src"
+    html_dir = tmp_path / "html_out"
+    for sub in ("how-to", "explanation", "reference/api"):
+        (src_dir / sub).mkdir(parents=True)
+
+    (src_dir / "index.rst").write_text(
+        "Index\n=====\n\n.. toctree::\n\n"
+        "   how-to/audit_compliance\n"
+        "   how-to/record_mapping\n"
+        "   explanation/architecture\n"
+        "   explanation/api_overview\n"
+        "   reference/governance\n"
+        "   reference/api/imednet.models\n"
+        "   reference/api/imednet.integrations\n"
+        "   reference/api/imednet.auth\n"
+        "   reference/api/imednet_workflows\n",
+        encoding="utf-8",
+    )
+    (src_dir / "404.rst").write_text(":orphan:\n\nNot Found\n=========\n", encoding="utf-8")
+
+    (src_dir / "how-to" / "audit_compliance.rst").write_text(
+        "Audit\n=====\n\n"
+        "See :meth:`RecordRevision.validate_chain <imednet.models.record_revisions.RecordRevision.validate_chain>`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "explanation" / "architecture.rst").write_text(
+        "Architecture\n============\n\n"
+        "Use :func:`~imednet.spi.models.transform_records_to_sdtm_rows` and "
+        ":func:`~imednet.spi.sink_base.evaluate_standards_readiness`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "how-to" / "record_mapping.rst").write_text(
+        "Record Mapping\n==============\n\n"
+        "Call :func:`~imednet.spi.models.transform_records_to_sdtm_rows` and "
+        ":func:`~imednet.spi.sink_base.evaluate_standards_readiness`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "governance.rst").write_text(
+        "Governance\n==========\n\n"
+        "See :meth:`~imednet_workflows.config_version_control.ConfigVersionStore.rollback_config`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "explanation" / "api_overview.rst").write_text(
+        "API Overview\n============\n\n"
+        "Use :class:`~imednet.auth.strategy.AuthStrategy`, "
+        ":class:`~imednet.auth.oidc.OIDCAuth`, and "
+        ":class:`~imednet.auth.credentials.MemoryCredentialStore`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "api" / "imednet.models.rst").write_text(
+        "imednet.models\n==============\n\n"
+        ".. automodule:: imednet.models.record_revisions\n"
+        f"   :inherited-members: {SCOPED_INHERITED_MEMBERS}\n"
+        "   :members:\n   :show-inheritance:\n\n"
+        ".. automodule:: imednet.models.sdtm\n"
+        "   :members:\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "api" / "imednet.integrations.rst").write_text(
+        "imednet.integrations\n====================\n\n"
+        ".. automodule:: imednet.integrations.sink_base\n"
+        "   :members:\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "api" / "imednet.auth.rst").write_text(
+        "imednet.auth\n============\n\n"
+        ".. automodule:: imednet.auth.strategy\n   :members:\n\n"
+        ".. automodule:: imednet.auth.oidc\n   :members:\n\n"
+        ".. automodule:: imednet.auth.credentials\n   :members:\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "api" / "imednet_workflows.rst").write_text(
+        "imednet_workflows\n=================\n\n"
+        ".. automodule:: imednet_workflows.config_version_control\n"
+        "   :members:\n",
+        encoding="utf-8",
+    )
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sphinx",
+            "-b",
+            "html",
+            "-c",
+            str(repo_root / "docs"),
+            str(src_dir),
+            str(html_dir),
+        ],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, f"Sphinx failed:\n{res.stdout}\n{res.stderr}"
+    assert check_compliance_html_links(html_dir, require_exists=True) is False
+
+    # Corrupting an anchor must fail check_compliance_html_links
+    arch_html = html_dir / "explanation" / "architecture.html"
+    arch_html.write_text(
+        arch_html.read_text(encoding="utf-8").replace(
+            "#imednet.models.sdtm.transform_records_to_sdtm_rows", "#broken.anchor"
+        ),
+        encoding="utf-8",
+    )
+    assert check_compliance_html_links(html_dir, require_exists=True) is True
