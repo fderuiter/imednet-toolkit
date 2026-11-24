@@ -24,7 +24,7 @@
     ].join(", ");
 
     function isElementVisible(el) {
-        if (!el || typeof window.getComputedStyle !== "function") {
+        if (!el || typeof globalThis.getComputedStyle !== "function") {
             return false;
         }
         let cur = el;
@@ -32,7 +32,7 @@
             if (cur.hasAttribute("hidden") || cur.inert) {
                 return false;
             }
-            const style = window.getComputedStyle(cur);
+            const style = globalThis.getComputedStyle(cur);
             if (style.display === "none" || style.visibility === "hidden") {
                 return false;
             }
@@ -136,12 +136,12 @@
         };
 
         const sidebarMql =
-            typeof window.matchMedia === "function"
-                ? window.matchMedia("(max-width: 63em)")
+            typeof globalThis.matchMedia === "function"
+                ? globalThis.matchMedia("(max-width: 63em)")
                 : { matches: false };
         const tocMql =
-            typeof window.matchMedia === "function"
-                ? window.matchMedia("(max-width: 82em)")
+            typeof globalThis.matchMedia === "function"
+                ? globalThis.matchMedia("(max-width: 82em)")
                 : { matches: false };
 
         function upgradeTrigger(trigger, kind, toggleInput, drawerEl, fallbackLabel) {
@@ -323,7 +323,7 @@
                     tocInput.checked = false;
                     syncDrawers();
                     restoreTriggerFocus("toc", true);
-                    window.setTimeout(function () {
+                    globalThis.setTimeout(function () {
                         restoreTriggerFocus("toc", true);
                     }, 0);
                 }
@@ -339,13 +339,55 @@
             }
         }
 
+        function getOpenModalDrawer() {
+            const isNoToc = Boolean(tocDrawer && tocDrawer.classList.contains("no-toc"));
+            if (tocDrawer && !isNoToc && tocInput && tocInput.checked && tocMql && tocMql.matches) {
+                return tocDrawer;
+            }
+            if (sidebarDrawer && navInput && navInput.checked && sidebarMql && sidebarMql.matches) {
+                return sidebarDrawer;
+            }
+            return null;
+        }
+
         if (!document.documentElement.hasAttribute("data-nav-escape-bound")) {
             document.documentElement.setAttribute("data-nav-escape-bound", "true");
             bindMediaQuery(sidebarMql, syncDrawers);
             bindMediaQuery(tocMql, syncDrawers);
-            window.addEventListener("resize", syncDrawers);
+            if (typeof globalThis.addEventListener === "function") {
+                globalThis.addEventListener("resize", syncDrawers);
+            }
 
             document.addEventListener("keydown", function (event) {
+                if (event.key === "Tab" && !event.altKey && !event.ctrlKey && !event.metaKey) {
+                    const activeDrawer = getOpenModalDrawer();
+                    if (!activeDrawer) {
+                        return;
+                    }
+                    const focusables = Array.from(
+                        activeDrawer.querySelectorAll(FOCUSABLE_SELECTOR)
+                    ).filter(isElementVisible);
+                    if (!focusables.length) {
+                        event.preventDefault();
+                        focusInsideDrawer(activeDrawer);
+                        return;
+                    }
+                    const first = focusables[0];
+                    const last = focusables[focusables.length - 1];
+                    const active = document.activeElement;
+                    if (!active || !activeDrawer.contains(active)) {
+                        event.preventDefault();
+                        (event.shiftKey ? last : first).focus();
+                    } else if (event.shiftKey && active === first) {
+                        event.preventDefault();
+                        last.focus();
+                    } else if (!event.shiftKey && active === last) {
+                        event.preventDefault();
+                        first.focus();
+                    }
+                    return;
+                }
+
                 if (event.key !== "Escape") {
                     return;
                 }

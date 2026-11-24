@@ -339,27 +339,342 @@
         },
         records: {
             VS: [
-                { recordId: 601, studyKey: "STUDY", subjectKey: "SUB1", formKey: "F_VS", visitId: 401, V_SYSBP: 122, V_DIABP: 78, V_PULSE: 68, V_WEIGHT: 68.5, recordStatus: "Complete" },
-                { recordId: 602, studyKey: "STUDY", subjectKey: "SUB2", formKey: "F_VS", visitId: 401, V_SYSBP: 138, V_DIABP: 86, V_PULSE: 74, V_WEIGHT: 74.2, recordStatus: "Complete" },
-                { recordId: 603, studyKey: "STUDY", subjectKey: "SUB3", formKey: "F_VS", visitId: 402, V_SYSBP: 118, V_DIABP: 74, V_PULSE: 62, V_WEIGHT: 64.0, recordStatus: "Verified" },
-                { recordId: 604, studyKey: "STUDY", subjectKey: "SUB4", formKey: "F_VS", visitId: 401, V_SYSBP: 144, V_DIABP: 92, V_PULSE: 82, V_WEIGHT: 81.3, recordStatus: "Complete" }
+                {
+                    recordId: 601,
+                    recordOid: "REC-601",
+                    studyKey: "STUDY",
+                    subjectId: 201,
+                    subjectOid: "SE_SUB1",
+                    subjectKey: "SUB1",
+                    siteId: 101,
+                    formId: 302,
+                    formKey: "F_VS",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Complete",
+                    deleted: false,
+                    dateCreated: "2026-01-10T09:35:00Z",
+                    dateModified: "2026-01-10T09:35:00Z",
+                    lastUpdated: "2026-01-10T09:35:00Z",
+                    keywords: [],
+                    recordData: { V_SYSBP: 122, V_DIABP: 78, V_PULSE: 68, V_WEIGHT: 68.5 }
+                },
+                {
+                    recordId: 602,
+                    recordOid: "REC-602",
+                    studyKey: "STUDY",
+                    subjectId: 202,
+                    subjectOid: "SE_SUB2",
+                    subjectKey: "SUB2",
+                    siteId: 101,
+                    formId: 302,
+                    formKey: "F_VS",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Complete",
+                    deleted: false,
+                    dateCreated: "2026-01-11T10:15:00Z",
+                    dateModified: "2026-01-11T10:15:00Z",
+                    lastUpdated: "2026-01-11T10:15:00Z",
+                    keywords: [],
+                    recordData: { V_SYSBP: 138, V_DIABP: 86, V_PULSE: 74, V_WEIGHT: 74.2 }
+                },
+                {
+                    recordId: 603,
+                    recordOid: "REC-603",
+                    studyKey: "STUDY",
+                    subjectId: 203,
+                    subjectOid: "SE_SUB3",
+                    subjectKey: "SUB3",
+                    siteId: 102,
+                    formId: 302,
+                    formKey: "F_VS",
+                    intervalId: 502,
+                    visitId: 402,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Verified",
+                    deleted: false,
+                    dateCreated: "2026-01-12T14:20:00Z",
+                    dateModified: "2026-01-12T14:50:00Z",
+                    lastUpdated: "2026-01-12T14:50:00Z",
+                    keywords: [],
+                    recordData: { V_SYSBP: 118, V_DIABP: 74, V_PULSE: 62, V_WEIGHT: 64.0 }
+                },
+                {
+                    recordId: 604,
+                    recordOid: "REC-604",
+                    studyKey: "STUDY",
+                    subjectId: 204,
+                    subjectOid: "SE_SUB4",
+                    subjectKey: "SUB4",
+                    siteId: 102,
+                    formId: 302,
+                    formKey: "F_VS",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Complete",
+                    deleted: false,
+                    dateCreated: "2026-01-13T08:40:00Z",
+                    dateModified: "2026-01-13T08:40:00Z",
+                    lastUpdated: "2026-01-13T08:40:00Z",
+                    keywords: [],
+                    recordData: { V_SYSBP: 144, V_DIABP: 92, V_PULSE: 82, V_WEIGHT: 81.3 }
+                }
             ],
             DM: [
-                { recordId: 611, studyKey: "STUDY", subjectKey: "SUB1", formKey: "F_DM", V_AGE: 45, V_GENDER: "Female", V_RACE: "WHITE", V_ARM: "ARM-A", recordStatus: "Locked" },
-                { recordId: 612, studyKey: "STUDY", subjectKey: "SUB2", formKey: "F_DM", V_AGE: 61, V_GENDER: "Male", V_RACE: "ASIAN", V_ARM: "ARM-B", recordStatus: "Locked" },
-                { recordId: 613, studyKey: "STUDY", subjectKey: "SUB3", formKey: "F_DM", V_AGE: 47, V_GENDER: "Female", V_RACE: "BLACK", V_ARM: "PLACEBO", recordStatus: "Locked" },
-                { recordId: 614, studyKey: "STUDY", subjectKey: "SUB4", formKey: "F_DM", V_AGE: 58, V_GENDER: "Male", V_RACE: "WHITE", V_ARM: "ARM-A", recordStatus: "Locked" }
+                {
+                    recordId: 611,
+                    recordOid: "REC-611",
+                    studyKey: "STUDY",
+                    subjectId: 201,
+                    subjectOid: "SE_SUB1",
+                    subjectKey: "SUB1",
+                    siteId: 101,
+                    formId: 301,
+                    formKey: "F_DM",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Locked",
+                    deleted: false,
+                    dateCreated: "2026-01-10T09:30:00Z",
+                    dateModified: "2026-01-10T09:30:00Z",
+                    lastUpdated: "2026-01-10T09:30:00Z",
+                    keywords: [],
+                    recordData: { V_AGE: 45, V_GENDER: "Female", V_RACE: "WHITE", V_ARM: "ARM-A" }
+                },
+                {
+                    recordId: 612,
+                    recordOid: "REC-612",
+                    studyKey: "STUDY",
+                    subjectId: 202,
+                    subjectOid: "SE_SUB2",
+                    subjectKey: "SUB2",
+                    siteId: 101,
+                    formId: 301,
+                    formKey: "F_DM",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Locked",
+                    deleted: false,
+                    dateCreated: "2026-01-11T10:00:00Z",
+                    dateModified: "2026-01-11T10:00:00Z",
+                    lastUpdated: "2026-01-11T10:00:00Z",
+                    keywords: [],
+                    recordData: { V_AGE: 61, V_GENDER: "Male", V_RACE: "ASIAN", V_ARM: "ARM-B" }
+                },
+                {
+                    recordId: 613,
+                    recordOid: "REC-613",
+                    studyKey: "STUDY",
+                    subjectId: 203,
+                    subjectOid: "SE_SUB3",
+                    subjectKey: "SUB3",
+                    siteId: 102,
+                    formId: 301,
+                    formKey: "F_DM",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Locked",
+                    deleted: false,
+                    dateCreated: "2026-01-12T14:00:00Z",
+                    dateModified: "2026-01-12T14:00:00Z",
+                    lastUpdated: "2026-01-12T14:00:00Z",
+                    keywords: [],
+                    recordData: { V_AGE: 47, V_GENDER: "Female", V_RACE: "BLACK", V_ARM: "PLACEBO" }
+                },
+                {
+                    recordId: 614,
+                    recordOid: "REC-614",
+                    studyKey: "STUDY",
+                    subjectId: 204,
+                    subjectOid: "SE_SUB4",
+                    subjectKey: "SUB4",
+                    siteId: 102,
+                    formId: 301,
+                    formKey: "F_DM",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Locked",
+                    deleted: false,
+                    dateCreated: "2026-01-13T08:15:00Z",
+                    dateModified: "2026-01-13T08:15:00Z",
+                    lastUpdated: "2026-01-13T08:15:00Z",
+                    keywords: [],
+                    recordData: { V_AGE: 58, V_GENDER: "Male", V_RACE: "WHITE", V_ARM: "ARM-A" }
+                }
             ],
             AE: [
-                { recordId: 621, studyKey: "STUDY", subjectKey: "SUB2", formKey: "F_AE", V_AETERM: "Headache mild", V_AESTDTC: "2026-10-18", V_AESEV: "MILD", V_AESER: false, V_AEREL: "POSSIBLE", recordStatus: "Verified" },
-                { recordId: 622, studyKey: "STUDY", subjectKey: "SUB4", formKey: "F_AE", V_AETERM: "Nausea grade 1", V_AESTDTC: "2026-11-06", V_AESEV: "MILD", V_AESER: false, V_AEREL: "RELATED", recordStatus: "Verified" },
-                { recordId: 623, studyKey: "STUDY", subjectKey: "SUB1", formKey: "F_AE", V_AETERM: "Fatigue transient", V_AESTDTC: "2026-10-25", V_AESEV: "MODERATE", V_AESER: false, V_AEREL: "UNRELATED", recordStatus: "Verified" }
+                {
+                    recordId: 621,
+                    recordOid: "REC-621",
+                    studyKey: "STUDY",
+                    subjectId: 202,
+                    subjectOid: "SE_SUB2",
+                    subjectKey: "SUB2",
+                    siteId: 101,
+                    formId: 303,
+                    formKey: "F_AE",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Verified",
+                    deleted: false,
+                    dateCreated: "2026-01-14T09:10:00Z",
+                    dateModified: "2026-01-14T09:30:00Z",
+                    lastUpdated: "2026-01-14T09:30:00Z",
+                    keywords: [],
+                    recordData: { V_AETERM: "Headache mild", V_AESTDTC: "2026-10-18", V_AESEV: "MILD", V_AESER: false, V_AEREL: "POSSIBLE" }
+                },
+                {
+                    recordId: 622,
+                    recordOid: "REC-622",
+                    studyKey: "STUDY",
+                    subjectId: 204,
+                    subjectOid: "SE_SUB4",
+                    subjectKey: "SUB4",
+                    siteId: 102,
+                    formId: 303,
+                    formKey: "F_AE",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Verified",
+                    deleted: false,
+                    dateCreated: "2026-01-14T13:05:00Z",
+                    dateModified: "2026-01-14T13:20:00Z",
+                    lastUpdated: "2026-01-14T13:20:00Z",
+                    keywords: [],
+                    recordData: { V_AETERM: "Nausea grade 1", V_AESTDTC: "2026-11-06", V_AESEV: "MILD", V_AESER: false, V_AEREL: "RELATED" }
+                },
+                {
+                    recordId: 623,
+                    recordOid: "REC-623",
+                    studyKey: "STUDY",
+                    subjectId: 201,
+                    subjectOid: "SE_SUB1",
+                    subjectKey: "SUB1",
+                    siteId: 101,
+                    formId: 303,
+                    formKey: "F_AE",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Verified",
+                    deleted: false,
+                    dateCreated: "2026-01-15T11:00:00Z",
+                    dateModified: "2026-01-15T11:15:00Z",
+                    lastUpdated: "2026-01-15T11:15:00Z",
+                    keywords: [],
+                    recordData: { V_AETERM: "Fatigue transient", V_AESTDTC: "2026-10-25", V_AESEV: "MODERATE", V_AESER: false, V_AEREL: "UNRELATED" }
+                }
             ],
             LB: [
-                { recordId: 631, studyKey: "STUDY", subjectKey: "SUB1", formKey: "F_LB", V_LBTEST: "HEMOGLOBIN", V_LBORRES: 14.2, V_LBORRESU: "g/dL", V_LBNRIND: "NORMAL", recordStatus: "Verified" },
-                { recordId: 632, studyKey: "STUDY", subjectKey: "SUB2", formKey: "F_LB", V_LBTEST: "POTASSIUM", V_LBORRES: 4.1, V_LBORRESU: "mmol/L", V_LBNRIND: "NORMAL", recordStatus: "Verified" },
-                { recordId: 633, studyKey: "STUDY", subjectKey: "SUB3", formKey: "F_LB", V_LBTEST: "ALT", V_LBORRES: 32.0, V_LBORRESU: "U/L", V_LBNRIND: "NORMAL", recordStatus: "Verified" },
-                { recordId: 634, studyKey: "STUDY", subjectKey: "SUB4", formKey: "F_LB", V_LBTEST: "CREATININE", V_LBORRES: 1.05, V_LBORRESU: "mg/dL", V_LBNRIND: "NORMAL", recordStatus: "Verified" }
+                {
+                    recordId: 631,
+                    recordOid: "REC-631",
+                    studyKey: "STUDY",
+                    subjectId: 201,
+                    subjectOid: "SE_SUB1",
+                    subjectKey: "SUB1",
+                    siteId: 101,
+                    formId: 304,
+                    formKey: "F_LB",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Verified",
+                    deleted: false,
+                    dateCreated: "2026-01-10T10:00:00Z",
+                    dateModified: "2026-01-10T10:20:00Z",
+                    lastUpdated: "2026-01-10T10:20:00Z",
+                    keywords: [],
+                    recordData: { V_LBTEST: "HEMOGLOBIN", V_LBORRES: 14.2, V_LBORRESU: "g/dL", V_LBNRIND: "NORMAL" }
+                },
+                {
+                    recordId: 632,
+                    recordOid: "REC-632",
+                    studyKey: "STUDY",
+                    subjectId: 202,
+                    subjectOid: "SE_SUB2",
+                    subjectKey: "SUB2",
+                    siteId: 101,
+                    formId: 304,
+                    formKey: "F_LB",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Verified",
+                    deleted: false,
+                    dateCreated: "2026-01-11T10:45:00Z",
+                    dateModified: "2026-01-11T11:00:00Z",
+                    lastUpdated: "2026-01-11T11:00:00Z",
+                    keywords: [],
+                    recordData: { V_LBTEST: "POTASSIUM", V_LBORRES: 4.1, V_LBORRESU: "mmol/L", V_LBNRIND: "NORMAL" }
+                },
+                {
+                    recordId: 633,
+                    recordOid: "REC-633",
+                    studyKey: "STUDY",
+                    subjectId: 203,
+                    subjectOid: "SE_SUB3",
+                    subjectKey: "SUB3",
+                    siteId: 102,
+                    formId: 304,
+                    formKey: "F_LB",
+                    intervalId: 502,
+                    visitId: 402,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Verified",
+                    deleted: false,
+                    dateCreated: "2026-01-12T15:00:00Z",
+                    dateModified: "2026-01-12T15:15:00Z",
+                    lastUpdated: "2026-01-12T15:15:00Z",
+                    keywords: [],
+                    recordData: { V_LBTEST: "ALT", V_LBORRES: 32.0, V_LBORRESU: "U/L", V_LBNRIND: "NORMAL" }
+                },
+                {
+                    recordId: 634,
+                    recordOid: "REC-634",
+                    studyKey: "STUDY",
+                    subjectId: 204,
+                    subjectOid: "SE_SUB4",
+                    subjectKey: "SUB4",
+                    siteId: 102,
+                    formId: 304,
+                    formKey: "F_LB",
+                    intervalId: 501,
+                    visitId: 401,
+                    parentRecordId: null,
+                    recordType: "Subject",
+                    recordStatus: "Verified",
+                    deleted: false,
+                    dateCreated: "2026-01-13T09:10:00Z",
+                    dateModified: "2026-01-13T09:30:00Z",
+                    lastUpdated: "2026-01-13T09:30:00Z",
+                    keywords: [],
+                    recordData: { V_LBTEST: "CREATININE", V_LBORRES: 1.05, V_LBORRESU: "mg/dL", V_LBNRIND: "NORMAL" }
+                }
             ]
         },
         queries: [
@@ -368,7 +683,7 @@
                 subjectId: 201,
                 annotationId: 701,
                 description: "Please verify demographic details.",
-                recordId: 601,
+                recordId: 611,
                 variable: "V_AGE",
                 subjectKey: "SUB1",
                 dateCreated: "2026-01-12T10:00:00Z",
@@ -682,6 +997,18 @@
     // -------------------------------------------------------------------------
     // Helper: Copy text safely with button status reset and polite ARIA status
     // -------------------------------------------------------------------------
+    function rememberBaselineBadge(badge, message) {
+        if (!badge) return;
+        if (badge._copyResetTimer) {
+            globalThis.clearTimeout(badge._copyResetTimer);
+            badge._copyResetTimer = null;
+        }
+        if (badge.classList && typeof badge.classList.remove === "function") {
+            badge.classList.remove("explorer-metric-badge--danger");
+        }
+        badge._baselineText = message;
+    }
+
     function bindCopyButton(btn, getText, defaultLabel, statusBadge) {
         if (!btn) return;
         let resetTimer = null;
@@ -689,29 +1016,49 @@
         function setTemporaryLabel(tempLabel) {
             btn.textContent = tempLabel;
             if (resetTimer) {
-                clearTimeout(resetTimer);
+                globalThis.clearTimeout(resetTimer);
             }
-            resetTimer = setTimeout(function () {
+            resetTimer = globalThis.setTimeout(function () {
                 btn.textContent = defaultLabel;
                 resetTimer = null;
             }, 1500);
         }
 
-        function announceCopyStatus(message) {
-            if (statusBadge) {
-                statusBadge.textContent = message;
+        function announceCopyStatus(message, isDanger) {
+            if (!statusBadge) {
+                return;
             }
+            if (!statusBadge._copyResetTimer && statusBadge._baselineText === undefined) {
+                statusBadge._baselineText = statusBadge.textContent;
+            }
+            if (statusBadge._copyResetTimer) {
+                globalThis.clearTimeout(statusBadge._copyResetTimer);
+            }
+            statusBadge.textContent = message;
+            if (statusBadge.classList && typeof statusBadge.classList.toggle === "function") {
+                statusBadge.classList.toggle("explorer-metric-badge--danger", Boolean(isDanger));
+            }
+            statusBadge._copyResetTimer = globalThis.setTimeout(function () {
+                if (statusBadge.classList && typeof statusBadge.classList.remove === "function") {
+                    statusBadge.classList.remove("explorer-metric-badge--danger");
+                }
+                if (statusBadge._baselineText !== undefined) {
+                    statusBadge.textContent = statusBadge._baselineText;
+                }
+                statusBadge._copyResetTimer = null;
+            }, 1500);
         }
 
         function handleCopySuccess() {
             setTemporaryLabel("Copied!");
-            announceCopyStatus(defaultLabel + " succeeded — Copied to clipboard.");
+            announceCopyStatus(defaultLabel + " succeeded — Copied to clipboard.", false);
         }
 
         function handleCopyFailure() {
             setTemporaryLabel("Copy failed");
             announceCopyStatus(
-                defaultLabel + " failed — Clipboard unavailable; select and copy text manually."
+                defaultLabel + " failed — Clipboard unavailable; select and copy text manually.",
+                true
             );
         }
 
@@ -872,6 +1219,35 @@
     // -------------------------------------------------------------------------
     let codeBlocksRaf = null;
 
+    function resolveTableRegionLabel(wrapper) {
+        if (!wrapper) return "Scrollable data table";
+        if (typeof wrapper.querySelector === "function") {
+            const captionEl = wrapper.querySelector("caption");
+            if (captionEl && captionEl.textContent && captionEl.textContent.trim()) {
+                return captionEl.textContent.trim();
+            }
+        }
+        let cur = wrapper.previousElementSibling;
+        while (cur) {
+            if (/^H[1-6]$/i.test(cur.tagName || "") && cur.textContent && cur.textContent.trim()) {
+                return cur.textContent.trim() + " table";
+            }
+            cur = cur.previousElementSibling;
+        }
+        const section =
+            typeof wrapper.closest === "function" ? wrapper.closest("section") : null;
+        if (section && typeof section.querySelector === "function") {
+            const heading = section.querySelector("h1, h2, h3, h4, h5, h6");
+            if (heading && heading.textContent) {
+                const cleaned = heading.textContent.replace(/¶|#$/g, "").trim();
+                if (cleaned) {
+                    return cleaned + " table";
+                }
+            }
+        }
+        return "Scrollable data table";
+    }
+
     function checkCodeBlocks() {
         const blocks = document.querySelectorAll("pre");
         blocks.forEach(function (block) {
@@ -926,6 +1302,30 @@
                     diagram.removeAttribute("role");
                     diagram.removeAttribute("aria-label");
                     diagram.removeAttribute("data-mermaid-region");
+                }
+            }
+        });
+
+        const tableWrappers = document.querySelectorAll(".table-wrapper");
+        tableWrappers.forEach(function (wrapper) {
+            const isOverflowing =
+                wrapper.clientWidth > 0 && wrapper.scrollWidth > wrapper.clientWidth;
+            if (isOverflowing) {
+                const tableLabel = resolveTableRegionLabel(wrapper);
+                wrapper.setAttribute("tabindex", "0");
+                wrapper.setAttribute("role", "region");
+                if (!wrapper.getAttribute("aria-label") || wrapper.hasAttribute("data-table-region")) {
+                    wrapper.setAttribute("aria-label", tableLabel);
+                    wrapper.setAttribute("data-table-region", "true");
+                }
+            } else {
+                if (wrapper.hasAttribute("tabindex")) {
+                    wrapper.removeAttribute("tabindex");
+                }
+                if (wrapper.hasAttribute("data-table-region")) {
+                    wrapper.removeAttribute("role");
+                    wrapper.removeAttribute("aria-label");
+                    wrapper.removeAttribute("data-table-region");
                 }
             }
         });
@@ -1083,9 +1483,27 @@
                 e.preventDefault();
                 const target = trigger.getAttribute("data-persona-target");
                 switchPersona(target);
+                const mql =
+                    typeof globalThis.matchMedia === "function"
+                        ? globalThis.matchMedia("(prefers-reduced-motion: reduce)")
+                        : null;
+                const prefersReducedMotion = Boolean(mql && mql.matches);
                 const el = document.getElementById("interactive-showcase-root");
-                if (el && el.scrollIntoView) {
-                    el.scrollIntoView({ behavior: "smooth", block: "start" });
+                if (el && typeof el.scrollIntoView === "function") {
+                    el.scrollIntoView({
+                        behavior: prefersReducedMotion ? "auto" : "smooth",
+                        block: "start"
+                    });
+                }
+                const activeId = isValidPanel(target) ? target : "panel-integration";
+                let activeTab = null;
+                personaTabs.forEach(function (tab) {
+                    if (tab.getAttribute("data-target") === activeId) {
+                        activeTab = tab;
+                    }
+                });
+                if (activeTab && typeof activeTab.focus === "function") {
+                    activeTab.focus({ preventScroll: true });
                 }
             });
         });
@@ -1117,36 +1535,116 @@
             scheduleCheckCodeBlocks();
         }
 
+        function flattenRecordForDataFrame(rec) {
+            if (!rec || typeof rec !== "object") return rec;
+            const flat = {
+                recordId: rec.recordId,
+                studyKey: rec.studyKey,
+                subjectKey: rec.subjectKey,
+                formKey: rec.formKey,
+                visitId: rec.visitId
+            };
+            if (rec.recordData && typeof rec.recordData === "object") {
+                Object.keys(rec.recordData).forEach(function (varKey) {
+                    flat[varKey] = rec.recordData[varKey];
+                });
+            }
+            flat.recordStatus = rec.recordStatus;
+            return flat;
+        }
+
+        function buildRestEnvelope(path, items, pageSize) {
+            const size = pageSize || 25;
+            const list = Array.isArray(items) ? items : [];
+            const totalElements = list.length;
+            const totalPages = totalElements > 0 ? Math.ceil(totalElements / size) : 0;
+            return {
+                metadata: {
+                    status: "OK",
+                    method: "GET",
+                    path: path,
+                    timestamp: "2026-01-15T17:00:00Z",
+                    error: {}
+                },
+                pagination: {
+                    currentPage: 0,
+                    size: size,
+                    totalPages: totalPages,
+                    totalElements: totalElements,
+                    sort: []
+                },
+                data: list.slice(0, size)
+            };
+        }
+
         function executeIntegrationQuery() {
             const datasetKey = ieSelectDataset ? ieSelectDataset.value : "records";
-            let data = [];
+            const isRest = currentIeMode === "rest";
+            let tableData = [];
+            let jsonPayload = [];
             let caption = "STUDY Records (Vital Signs Form)";
 
             if (datasetKey === "records") {
-                data = MOCK_DATA.records.VS;
-                caption = "pandas.DataFrame: STUDY / F_VS (Vital Signs Records)";
+                if (isRest) {
+                    const allRecords = [].concat(
+                        MOCK_DATA.records.VS,
+                        MOCK_DATA.records.DM,
+                        MOCK_DATA.records.AE,
+                        MOCK_DATA.records.LB
+                    );
+                    tableData = allRecords.slice(0, 10);
+                    caption = "REST Response: /api/v1/edc/studies/STUDY/records";
+                    jsonPayload = buildRestEnvelope(
+                        "/api/v1/edc/studies/STUDY/records",
+                        allRecords,
+                        10
+                    );
+                } else {
+                    tableData = MOCK_DATA.records.VS.map(flattenRecordForDataFrame);
+                    caption = "pandas.DataFrame: STUDY / F_VS (Vital Signs Records)";
+                    jsonPayload = tableData;
+                }
             } else if (datasetKey === "studies") {
-                data = MOCK_DATA.studies;
+                tableData = MOCK_DATA.studies;
                 caption = "Clinical Studies Catalog";
+                jsonPayload = isRest
+                    ? buildRestEnvelope("/api/v1/edc/studies", tableData, 25)
+                    : tableData;
             } else if (datasetKey === "forms") {
-                data = MOCK_DATA.formsCatalog;
+                tableData = MOCK_DATA.formsCatalog;
                 caption = "Study Forms Catalog (STUDY)";
+                jsonPayload = isRest
+                    ? buildRestEnvelope("/api/v1/edc/studies/STUDY/forms", tableData, 25)
+                    : tableData;
             } else if (datasetKey === "queries") {
-                data = MOCK_DATA.queries.filter(isOpenQuery);
-                caption = "Study Queries Ledger (STUDY)";
+                if (isRest) {
+                    tableData = MOCK_DATA.queries;
+                    caption = "Study Queries Ledger (STUDY)";
+                    jsonPayload = buildRestEnvelope(
+                        "/api/v1/edc/studies/STUDY/queries",
+                        tableData,
+                        25
+                    );
+                } else {
+                    tableData = MOCK_DATA.queries.filter(isOpenQuery);
+                    caption = "Study Queries Ledger (STUDY)";
+                    jsonPayload = tableData;
+                }
             }
 
             if (ieMetricBadge) {
-                ieMetricBadge.textContent = `Simulation Preview (Deterministic Fixture) — ${caption} (${data.length} items)`;
+                const ieBadgeMsg = `Simulation Preview (Deterministic Fixture) — ${caption} (${tableData.length} items)`;
+                rememberBaselineBadge(ieMetricBadge, ieBadgeMsg);
+                ieMetricBadge.textContent = ieBadgeMsg;
                 ieMetricBadge.classList.add("active");
             }
 
             if (ieViewTable) {
-                ieViewTable.innerHTML = renderDataFrameTable(data, caption);
+                ieViewTable.innerHTML = renderDataFrameTable(tableData, caption);
             }
 
             if (ieJsonPre) {
-                ieJsonPre.textContent = JSON.stringify(data, null, 2);
+                ieJsonPre.textContent = JSON.stringify(jsonPayload, null, 2);
             }
             scheduleCheckCodeBlocks();
         }
@@ -1230,13 +1728,27 @@
         const cdmJsonPre = root.querySelector("#cdm-json-pre code");
         const cdmCopyBtn = root.querySelector("#cdm-copy-btn");
 
-        function executeCdmValidation() {
+        let cdmValidationCount = 0;
+
+        function executeCdmValidation(isInteractive) {
             const formKey = cdmSelectForm ? cdmSelectForm.value : "VS";
             const formDef = MOCK_DATA.forms[formKey] || MOCK_DATA.forms.VS;
             const ruleCount = Array.isArray(formDef.businessLogic) ? formDef.businessLogic.length : 0;
+            let cdmBadgeMsg = "";
+
+            if (isInteractive === true) {
+                cdmValidationCount += 1;
+                const runSuffix =
+                    cdmValidationCount > 1 ? ` (Check #${cdmValidationCount})` : "";
+                cdmBadgeMsg = `Form Validation Complete${runSuffix} — ${formDef.formName} (${formDef.variables.length} Variables, ${ruleCount} BusinessLogicRules) | CDISC ODM Compliant`;
+            } else {
+                cdmValidationCount = 0;
+                cdmBadgeMsg = `Simulation Preview (Deterministic Fixture) — ${formDef.formName} (${formDef.variables.length} Variables, ${ruleCount} BusinessLogicRules) | CDISC ODM Compliant`;
+            }
 
             if (cdmMetricBadge) {
-                cdmMetricBadge.textContent = `Simulation Preview (Deterministic Fixture) — ${formDef.formName} (${formDef.variables.length} Variables, ${ruleCount} BusinessLogicRules) | CDISC ODM Compliant`;
+                rememberBaselineBadge(cdmMetricBadge, cdmBadgeMsg);
+                cdmMetricBadge.textContent = cdmBadgeMsg;
                 cdmMetricBadge.classList.add("active");
             }
 
@@ -1251,10 +1763,14 @@
         }
 
         if (cdmValidateBtn) {
-            cdmValidateBtn.addEventListener("click", executeCdmValidation);
+            cdmValidateBtn.addEventListener("click", function () {
+                executeCdmValidation(true);
+            });
         }
         if (cdmSelectForm) {
-            cdmSelectForm.addEventListener("change", executeCdmValidation);
+            cdmSelectForm.addEventListener("change", function () {
+                executeCdmValidation(false);
+            });
         }
 
         function switchCdmView(view) {
@@ -1303,7 +1819,9 @@
         const audJsonPre = root.querySelector("#aud-json-pre code");
         const audCopyBtn = root.querySelector("#aud-copy-btn");
 
-        function executeAuditorVerification() {
+        let audVerificationCount = 0;
+
+        function executeAuditorVerification(isInteractive) {
             const scenario = audScenarioSelect ? audScenarioSelect.value : "part11";
             if (scenario !== "part11" && scenario !== "vpat") {
                 // Selecting an unmapped scenario must preserve existing table contents and avoid throwing script exceptions.
@@ -1317,14 +1835,43 @@
             if (scenario === "part11") {
                 data = MOCK_DATA.audits;
                 caption = "21 CFR Part 11 Audit Trail & Accessibility Log";
-                metricText = "Simulation Preview (Deterministic Fixture) — 21 CFR Part 11 Electronic Signature & VPAT Verified";
+                if (audOutputTabTable) {
+                    audOutputTabTable.textContent = "Audit Trail Records";
+                }
+                if (audOutputTabJson) {
+                    audOutputTabJson.textContent = "Signed Audit JSON";
+                }
+                if (isInteractive === true) {
+                    audVerificationCount += 1;
+                    const runSuffix =
+                        audVerificationCount > 1 ? ` (Check #${audVerificationCount})` : "";
+                    metricText = `Audit Verification Complete${runSuffix} — ${data.length} Record Revisions & Electronic Signatures Verified (21 CFR Part 11)`;
+                } else {
+                    audVerificationCount = 0;
+                    metricText = "Simulation Preview (Deterministic Fixture) — 21 CFR Part 11 Electronic Signature & VPAT Verified";
+                }
             } else if (scenario === "vpat") {
                 data = MOCK_DATA.vpat;
                 caption = "WCAG 2.1 AA Accessibility Conformance Verification";
-                metricText = "Simulation Preview (Deterministic Fixture) — WCAG 2.1 AA Accessibility Conformance (VPAT) Verified";
+                if (audOutputTabTable) {
+                    audOutputTabTable.textContent = "VPAT Conformance Criteria";
+                }
+                if (audOutputTabJson) {
+                    audOutputTabJson.textContent = "VPAT Conformance JSON";
+                }
+                if (isInteractive === true) {
+                    audVerificationCount += 1;
+                    const runSuffix =
+                        audVerificationCount > 1 ? ` (Check #${audVerificationCount})` : "";
+                    metricText = `Accessibility Verification Complete${runSuffix} — ${data.length} WCAG 2.1 Level AA Criteria Verified (VPAT)`;
+                } else {
+                    audVerificationCount = 0;
+                    metricText = "Simulation Preview (Deterministic Fixture) — WCAG 2.1 AA Accessibility Conformance (VPAT) Verified";
+                }
             }
 
             if (audMetricBadge) {
+                rememberBaselineBadge(audMetricBadge, metricText);
                 audMetricBadge.textContent = metricText;
                 audMetricBadge.classList.add("active");
             }
@@ -1340,10 +1887,14 @@
         }
 
         if (audVerifyBtn) {
-            audVerifyBtn.addEventListener("click", executeAuditorVerification);
+            audVerifyBtn.addEventListener("click", function () {
+                executeAuditorVerification(true);
+            });
         }
         if (audScenarioSelect) {
-            audScenarioSelect.addEventListener("change", executeAuditorVerification);
+            audScenarioSelect.addEventListener("change", function () {
+                executeAuditorVerification(false);
+            });
         }
 
         function switchAudView(view) {

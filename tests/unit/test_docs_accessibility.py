@@ -161,13 +161,19 @@ def test_code_block_keyboard_accessibility() -> None:
     js_content = (REPO_ROOT / "docs/_static/showcase.js").read_text(encoding="utf-8")
     code_blocks_js = (REPO_ROOT / "docs/_static/code_blocks.js").read_text(encoding="utf-8")
 
-    # Verify CSS focus-visible rule for preformatted code blocks
+    # Verify CSS focus-visible rule for preformatted code blocks and scrollable table wrappers
     assert "pre:focus-visible" in css_content
+    assert ".table-wrapper:focus-visible" in css_content
+    assert ".explorer-table-wrapper:focus-visible" in css_content
     assert "outline: 2px solid var(--color-brand-primary)" in css_content
+    assert "window." not in code_blocks_js
 
-    # Verify script logic detects pre elements and tests horizontal overflow in both global and showcase scripts
+    # Verify script logic detects pre and .table-wrapper elements and tests horizontal overflow
     for script_src in (js_content, code_blocks_js):
         assert "querySelectorAll" in script_src and "pre" in script_src
+        assert ".table-wrapper" in script_src
+        assert "data-table-region" in script_src
+        assert "Scrollable data table" in script_src
         assert "scrollWidth >" in script_src and "clientWidth" in script_src
         assert "tabindex" in script_src and '"0"' in script_src
         assert "role" in script_src and '"region"' in script_src
@@ -219,12 +225,15 @@ def test_navigation_keyboard_css_and_controller_contracts() -> None:
     assert ".toc-header-icon:focus-visible" in css_content
     assert ".toc-content-icon:focus-visible" in css_content
 
-    # 4. Global #furo-main-content tabindex='-1' & a.back-to-top focus transfer across non-index pages
+    # 4. Global #furo-main-content tabindex='-1', modal drawer focus trap, & globalThis purity
     assert "code_blocks.js" in docs_conf.html_js_files
     assert "furo-main-content" in nav_js
     assert "a.back-to-top" in nav_js
     assert "data-btt-bound" in nav_js
     assert "preventScroll: true" in nav_js
+    assert "getOpenModalDrawer" in nav_js
+    assert '"Tab"' in nav_js and "shiftKey" in nav_js
+    assert "window." not in nav_js
 
 
 @pytest.mark.unit
@@ -1476,6 +1485,21 @@ def test_high_contrast_and_mermaid_conf_tokens() -> None:
         assert note_ratio >= 7.0, (
             f"{mode} high-contrast diagram note contrast {note_ratio:.2f}:1 < 7:1"
         )
+        code_ratio = contrast_ratio(
+            tokens["color-code-foreground"], tokens["color-code-background"]
+        )
+        assert code_ratio >= 7.0, f"{mode} high-contrast code contrast {code_ratio:.2f}:1 < 7:1"
+        for synced_key in (
+            "color-background-border",
+            "color-brand-visited",
+            "color-brand-button-text",
+            "color-badge-success",
+            "color-badge-warning",
+            "color-badge-danger",
+            "color-badge-required",
+            "color-badge-optional",
+        ):
+            assert synced_key in tokens, f"{mode} high-contrast conf missing {synced_key}"
 
     init_js = docs_conf.mermaid_init_js
     assert init_js.startswith("mermaid.initialize(") and init_js.endswith(");")
@@ -2074,28 +2098,51 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 assert focus_outline["style"] == "solid"
                 assert focus_outline["width"] == "2px"
 
-                # Verify @media (prefers-contrast: more) reaches >= 7:1 in light and dark modes
+                # Verify @media (prefers-contrast: more) reaches >= 7:1 across auto, light, and dark
+                # on UI controls AND div.highlight syntax tokens
                 tut_page.emulate_media(contrast="more")
-                for theme in ("light", "dark"):
-                    tut_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                for color_scheme, theme_attr in (
+                    ("light", "auto"),
+                    ("dark", "auto"),
+                    ("light", "light"),
+                    ("dark", "dark"),
+                ):
+                    tut_page.emulate_media(contrast="more", color_scheme=color_scheme)
+                    tut_page.evaluate(f"document.body.setAttribute('data-theme', '{theme_attr}')")
                     tut_page.locator(".thebelab-run-button").first.hover()
                     hc_ratios = tut_page.evaluate(
                         """() => {
                             const h = window.__wcagHelpers;
+                            const tokenRatios = [];
+                            document.querySelectorAll('div.highlight').forEach((hl) => {
+                                if (hl.getClientRects().length === 0) return;
+                                const pre = hl.querySelector('pre');
+                                if (pre) tokenRatios.push(h.elementContrast(pre));
+                                hl.querySelectorAll('span[class]').forEach((sp) => {
+                                    if (!(sp.textContent || '').trim()) return;
+                                    tokenRatios.push(h.elementContrast(sp));
+                                });
+                            });
                             return {
                                 launch: h.elementContrast(document.querySelector('.thebe-launch-button:not(.thebe-status-ready)')),
                                 ready: h.elementContrast(document.getElementById('test-ready-launch-btn')),
                                 statusSpan: h.elementContrast(document.querySelector('#test-ready-launch-btn span.status')),
                                 runHover: h.elementContrast(document.querySelector('.thebelab-run-button')),
-                                cellStatus: h.elementContrast(document.querySelector('.thebelab-cell-status'))
+                                cellStatus: h.elementContrast(document.querySelector('.thebelab-cell-status')),
+                                minHighlightToken: tokenRatios.length ? Math.min(...tokenRatios) : 0,
+                                tokenCount: tokenRatios.length
                             };
                         }"""
                     )
+                    assert hc_ratios["tokenCount"] > 0
                     for ctrl_name, val in hc_ratios.items():
+                        if ctrl_name == "tokenCount":
+                            continue
                         assert val >= 7.0, (
-                            f"prefers-contrast: more ({theme}) {ctrl_name} contrast {val:.2f}:1 < 7.0:1"
+                            f"prefers-contrast: more (scheme={color_scheme}, data-theme={theme_attr}) "
+                            f"{ctrl_name} contrast {val:.2f}:1 < 7.0:1"
                         )
-                tut_page.emulate_media(contrast="no-preference")
+                tut_page.emulate_media(contrast="no-preference", color_scheme="light")
 
                 # Verify @media (forced-colors: active) preserves button borders & focus rings
                 tut_page.emulate_media(forced_colors="active")
@@ -2364,8 +2411,10 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             str.replace(/^[^A-Za-z0-9]+/, '').replace(/\\s+/g, ' ').trim();
                         const ids = [
                             'ie-dataset-select',
+                            'cdm-form-select',
                             'cdm-validate-btn',
                             'cdm-copy-btn',
+                            'aud-scenario-select',
                             'aud-verify-btn',
                             'aud-copy-btn'
                         ];
@@ -2701,11 +2750,91 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     "style": "solid",
                     "width": "2px",
                 }
+                fc_selects = idx_page.evaluate(
+                    """() => ['#ie-dataset-select', '#cdm-form-select', '#aud-scenario-select'].map((sel) => {
+                        const el = document.querySelector(sel);
+                        const cs = getComputedStyle(el);
+                        return {
+                            sel,
+                            appearance: cs.appearance,
+                            bgImage: cs.backgroundImage,
+                            borderSolid: cs.borderTopStyle === 'solid' && parseFloat(cs.borderTopWidth) >= 1
+                        };
+                    })"""
+                )
+                for sel_info in fc_selects:
+                    assert sel_info["appearance"] != "none", (
+                        f"forced-colors {sel_info['sel']} appearance stayed 'none' (hides native chevron)"
+                    )
+                    assert sel_info["bgImage"] == "none", (
+                        f"forced-colors {sel_info['sel']} retained custom background-image"
+                    )
+                    assert sel_info["borderSolid"] is True
                 idx_page.emulate_media(forced_colors="none")
 
-                # 4c. @media (prefers-contrast: more) >= 7.0:1 across light and dark modes on index.html
-                idx_page.emulate_media(contrast="more")
-                for theme in ("light", "dark"):
+                # 4b-2. .explorer-select SVG chevron contrast >= 4.5:1 in dark & auto-dark modes
+                for scheme, theme_attr in (("light", "light"), ("dark", "dark"), ("dark", "auto")):
+                    idx_page.emulate_media(color_scheme=scheme, contrast="no-preference")
+                    idx_page.evaluate(f"document.body.setAttribute('data-theme', '{theme_attr}')")
+                    chevron_audit = idx_page.evaluate(
+                        """async () => {
+                            const h = window.__wcagHelpers;
+                            const el = document.getElementById('ie-dataset-select');
+                            const cs = getComputedStyle(el);
+                            const bg = h.effectiveBg(el);
+                            const m = cs.backgroundImage.match(/^url\\("?(data:image\\/svg\\+xml[^")]+)"?\\)$/);
+                            if (!m) return { ok: false, reason: cs.backgroundImage };
+                            const commaIdx = m[1].indexOf(',');
+                            const decoded = decodeURIComponent(m[1].slice(commaIdx + 1));
+                            const strokeMatch = decoded.match(/stroke=['"](#[0-9a-fA-F]{6})['"]/);
+                            if (!strokeMatch) return { ok: false, reason: decoded };
+                            const hex = strokeMatch[1];
+                            const fg = {
+                                r: parseInt(hex.slice(1, 3), 16),
+                                g: parseInt(hex.slice(3, 5), 16),
+                                b: parseInt(hex.slice(5, 7), 16),
+                                a: 1
+                            };
+                            // Also rasterize onto a canvas to verify rendered non-transparent chevron pixels
+                            const img = new Image();
+                            img.src = m[1];
+                            await new Promise((res, rej) => { img.onload = res; img.onerror = rej; });
+                            const canvas = document.createElement('canvas');
+                            canvas.width = 24;
+                            canvas.height = 24;
+                            const ctx = canvas.getContext('2d');
+                            ctx.fillStyle = `rgb(${Math.round(bg.r)}, ${Math.round(bg.g)}, ${Math.round(bg.b)})`;
+                            ctx.fillRect(0, 0, 24, 24);
+                            ctx.drawImage(img, 0, 0, 24, 24);
+                            const data = ctx.getImageData(0, 0, 24, 24).data;
+                            let maxPixelContrast = 1;
+                            for (let i = 0; i < data.length; i += 4) {
+                                const px = { r: data[i], g: data[i + 1], b: data[i + 2], a: 1 };
+                                maxPixelContrast = Math.max(maxPixelContrast, h.ratio(px, bg));
+                            }
+                            return {
+                                ok: true,
+                                strokeRatio: h.ratio(fg, bg),
+                                maxPixelContrast
+                            };
+                        }"""
+                    )
+                    assert chevron_audit["ok"] is True, f"Invalid select SVG: {chevron_audit}"
+                    assert chevron_audit["strokeRatio"] >= 4.5, (
+                        f"Select chevron stroke contrast {chevron_audit['strokeRatio']:.2f}:1 < 4.5:1 "
+                        f"for scheme={scheme}, data-theme={theme_attr}"
+                    )
+                    assert chevron_audit["maxPixelContrast"] >= 4.5
+                idx_page.emulate_media(color_scheme="light", contrast="no-preference")
+
+                # 4c. @media (prefers-contrast: more) >= 7.0:1 across auto, light, and dark modes on index.html
+                for color_scheme, theme in (
+                    ("light", "auto"),
+                    ("dark", "auto"),
+                    ("light", "light"),
+                    ("dark", "dark"),
+                ):
+                    idx_page.emulate_media(contrast="more", color_scheme=color_scheme)
                     idx_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
                     idx_page.locator("#tab-integration").click()
                     idx_page.locator("#ie-tab-table").click()
@@ -2738,23 +2867,173 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     cdm_hc = idx_page.evaluate(
                         """() => {
                             const h = window.__wcagHelpers;
+                            const hlSpans = Array.from(document.querySelectorAll('div.highlight span[class]'))
+                                .filter((sp) => sp.getClientRects().length > 0 && (sp.textContent || '').trim());
                             return {
                                 cdmMetricBadge: h.elementContrast(document.getElementById('cdm-metric-badge')),
                                 crfTag: h.elementContrast(document.querySelector('#cdm-view-crf .crf-tag')),
                                 crfRequired: h.elementContrast(document.querySelector('#cdm-view-crf .crf-badge-required')),
-                                crfOptional: h.elementContrast(document.querySelector('#cdm-view-crf .crf-badge-optional'))
+                                crfOptional: h.elementContrast(document.querySelector('#cdm-view-crf .crf-badge-optional')),
+                                activeTab: h.elementContrast(document.getElementById('tab-datamanager')),
+                                inactiveTab: h.elementContrast(document.getElementById('tab-integration')),
+                                validateBtn: h.elementContrast(document.getElementById('cdm-validate-btn')),
+                                selectCtrl: h.elementContrast(document.getElementById('cdm-form-select')),
+                                minHighlightSpan: hlSpans.length ? Math.min(...hlSpans.map((sp) => h.elementContrast(sp))) : 7.5
                             };
                         }"""
                     )
                     combined_hc = {**ie_records_hc, **ie_queries_hc, **cdm_hc}
                     for badge_name, ratio_val in combined_hc.items():
                         assert ratio_val >= 7.0, (
-                            f"index.html prefers-contrast: more ({theme}) {badge_name} "
-                            f"contrast {ratio_val:.2f}:1 < 7.0:1"
+                            f"index.html prefers-contrast: more (scheme={color_scheme}, theme={theme}) "
+                            f"{badge_name} contrast {ratio_val:.2f}:1 < 7.0:1"
                         )
 
-                idx_page.emulate_media(contrast="no-preference")
+                idx_page.emulate_media(contrast="no-preference", color_scheme="light")
                 idx_page.evaluate("document.body.setAttribute('data-theme', 'light')")
+
+                # 4c-2. Role card order parity, reduced-motion instant launch + focus into showcase,
+                #       REST envelope + 4 queries + nested recordData, live button announcements, and VPAT tabs
+                role_order_audit = idx_page.evaluate(
+                    """() => ({
+                        cards: Array.from(document.querySelectorAll('.role-card-launch-btn')).map(
+                            (b) => b.getAttribute('data-persona-target')
+                        ),
+                        tabs: Array.from(document.querySelectorAll('.showcase-persona-tab')).map(
+                            (t) => t.getAttribute('data-target')
+                        )
+                    })"""
+                )
+                assert role_order_audit["cards"] == [
+                    "panel-integration",
+                    "panel-datamanager",
+                    "panel-auditor",
+                ]
+                assert role_order_audit["cards"] == role_order_audit["tabs"]
+
+                idx_page.emulate_media(reduced_motion="reduce")
+                rm_transitions = idx_page.evaluate(
+                    """() => ({
+                        roleCard: getComputedStyle(document.querySelector('.role-card')).transitionDuration,
+                        personaTab: getComputedStyle(document.getElementById('tab-integration')).transitionDuration,
+                        runBtn: getComputedStyle(document.getElementById('cdm-validate-btn')).transitionDuration,
+                        copyBtn: getComputedStyle(document.getElementById('ie-copy-btn')).transitionDuration
+                    })"""
+                )
+                assert rm_transitions == {
+                    "roleCard": "0s",
+                    "personaTab": "0s",
+                    "runBtn": "0s",
+                    "copyBtn": "0s",
+                }
+                idx_page.evaluate("globalThis.scrollTo({ top: 0, behavior: 'auto' })")
+                cdm_launch_btn = idx_page.locator(
+                    '.role-card-launch-btn[data-persona-target="panel-datamanager"]'
+                )
+                cdm_launch_btn.focus()
+                idx_page.keyboard.press("Enter")
+                after_enter = idx_page.evaluate(
+                    """() => ({
+                        activeId: document.activeElement && document.activeElement.id,
+                        inShowcase: !!(
+                            document.activeElement &&
+                            document.activeElement.closest('#interactive-showcase-root')
+                        ),
+                        scrollY: window.scrollY
+                    })"""
+                )
+                assert after_enter["activeId"] == "tab-datamanager"
+                assert after_enter["inShowcase"] is True
+                assert after_enter["scrollY"] > 0
+                idx_page.keyboard.press("Tab")
+                after_tab = idx_page.evaluate(
+                    """() => ({
+                        activeId: document.activeElement && document.activeElement.id,
+                        inShowcase: !!(
+                            document.activeElement &&
+                            document.activeElement.closest('#interactive-showcase-root')
+                        ),
+                        inRoleCard: !!(
+                            document.activeElement &&
+                            document.activeElement.closest('.role-card')
+                        )
+                    })"""
+                )
+                assert after_tab["inShowcase"] is True
+                assert after_tab["inRoleCard"] is False
+                idx_page.emulate_media(reduced_motion="no-preference")
+
+                # REST mode envelope, nested recordData, and 4 Queries verification
+                idx_page.locator("#tab-integration").click()
+                idx_page.locator("#ie-dataset-select").select_option("records")
+                idx_page.locator("#ie-mode-rest").click()
+                rest_records_payload = json.loads(
+                    idx_page.evaluate("document.querySelector('#ie-json-pre code').textContent")
+                )
+                assert set(rest_records_payload.keys()) == {"metadata", "pagination", "data"}
+                assert rest_records_payload["pagination"]["size"] == 10
+                assert rest_records_payload["pagination"]["totalElements"] == 15
+                assert isinstance(rest_records_payload["data"][0]["recordData"], dict)
+
+                idx_page.locator("#ie-dataset-select").select_option("queries")
+                rest_queries_payload = json.loads(
+                    idx_page.evaluate("document.querySelector('#ie-json-pre code').textContent")
+                )
+                assert set(rest_queries_payload.keys()) == {"metadata", "pagination", "data"}
+                assert rest_queries_payload["pagination"]["size"] == 25
+                assert len(rest_queries_payload["data"]) == 4
+                assert rest_queries_payload["data"][0]["annotationId"] == 701
+                assert rest_queries_payload["data"][0]["recordId"] == 611
+                idx_page.locator("#ie-mode-sdk").click()
+                idx_page.locator("#ie-dataset-select").select_option("records")
+
+                # Live button announcements & VPAT sub-tab labels
+                idx_page.locator("#tab-datamanager").click()
+                cdm_b0 = idx_page.evaluate(
+                    "document.getElementById('cdm-metric-badge').textContent"
+                )
+                idx_page.locator("#cdm-validate-btn").click()
+                cdm_b1 = idx_page.evaluate(
+                    "document.getElementById('cdm-metric-badge').textContent"
+                )
+                idx_page.locator("#cdm-validate-btn").click()
+                cdm_b2 = idx_page.evaluate(
+                    "document.getElementById('cdm-metric-badge').textContent"
+                )
+                assert cdm_b1 != cdm_b0
+                assert cdm_b2 != cdm_b1
+
+                idx_page.locator("#tab-auditor").click()
+                aud_b0 = idx_page.evaluate(
+                    "document.getElementById('aud-metric-badge').textContent"
+                )
+                idx_page.locator("#aud-verify-btn").click()
+                aud_b1 = idx_page.evaluate(
+                    "document.getElementById('aud-metric-badge').textContent"
+                )
+                assert aud_b1 != aud_b0
+                idx_page.locator("#aud-scenario-select").select_option("vpat")
+                vpat_tabs = idx_page.evaluate(
+                    """() => ({
+                        table: document.getElementById('aud-tab-table').textContent,
+                        json: document.getElementById('aud-tab-json').textContent
+                    })"""
+                )
+                assert vpat_tabs == {
+                    "table": "VPAT Conformance Criteria",
+                    "json": "VPAT Conformance JSON",
+                }
+                idx_page.locator("#aud-scenario-select").select_option("part11")
+                part11_tabs = idx_page.evaluate(
+                    """() => ({
+                        table: document.getElementById('aud-tab-table').textContent,
+                        json: document.getElementById('aud-tab-json').textContent
+                    })"""
+                )
+                assert part11_tabs == {
+                    "table": "Audit Trail Records",
+                    "json": "Signed Audit JSON",
+                }
 
                 # 4d. Mobile 375x812 viewport: wrapped tabs, non-overlapping JSON copy buttons, >= 44px targets
                 idx_page.set_viewport_size({"width": 375, "height": 812})
@@ -2983,11 +3262,15 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     )
                     fail_state = idx_page.evaluate(
                         f"""() => {{
+                            const h = window.__wcagHelpers;
                             const r = document.getElementById('{copy_id}').getBoundingClientRect();
+                            const badgeEl = document.getElementById('{badge_id}');
                             return {{
                                 width: r.width,
                                 height: r.height,
-                                badge: document.getElementById('{badge_id}').textContent
+                                badge: badgeEl.textContent,
+                                hasDangerClass: badgeEl.classList.contains('explorer-metric-badge--danger'),
+                                dangerContrast: h.elementContrast(badgeEl)
                             }};
                         }}"""
                     )
@@ -2995,6 +3278,24 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     assert abs(fail_state["height"] - pre_click_rect["height"]) < 0.5
                     assert "Copy JSON failed" in fail_state["badge"]
                     assert "Clipboard unavailable" in fail_state["badge"]
+                    assert fail_state["hasDangerClass"] is True
+                    assert fail_state["dangerContrast"] >= 4.5
+
+                # Verify prefers-contrast: more danger badge contrast >= 7.0:1 and 1500ms reset to baseline
+                idx_page.emulate_media(contrast="more")
+                hc_danger_contrast = idx_page.evaluate(
+                    "window.__wcagHelpers.elementContrast(document.getElementById('aud-metric-badge'))"
+                )
+                assert hc_danger_contrast >= 7.0
+                idx_page.emulate_media(contrast="no-preference")
+                idx_page.wait_for_function(
+                    """() => {
+                        const b = document.getElementById('aud-metric-badge');
+                        return !b.classList.contains('explorer-metric-badge--danger') &&
+                            !b.textContent.includes('Copy JSON failed');
+                    }""",
+                    timeout=3000,
+                )
 
                 # Missing navigator.clipboard API fallback check
                 idx_page.evaluate(
@@ -3239,6 +3540,41 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     "expanded": "true",
                     "focusInside": True,
                 }
+                # Verify Tab and Shift+Tab wrap inside open modal .toc-drawer at 1280x900
+                toc_bounds_1280 = nav_page.evaluate(
+                    """() => {
+                        const td = document.querySelector('.toc-drawer');
+                        const items = Array.from(td.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                            .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
+                        items[items.length - 1].focus();
+                        return { count: items.length };
+                    }"""
+                )
+                assert toc_bounds_1280["count"] >= 2
+                nav_page.keyboard.press("Tab")
+                assert (
+                    nav_page.evaluate(
+                        """() => {
+                            const td = document.querySelector('.toc-drawer');
+                            const items = Array.from(td.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                                .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
+                            return document.activeElement === items[0];
+                        }"""
+                    )
+                    is True
+                )
+                nav_page.keyboard.press("Shift+Tab")
+                assert (
+                    nav_page.evaluate(
+                        """() => {
+                            const td = document.querySelector('.toc-drawer');
+                            const items = Array.from(td.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                                .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
+                            return document.activeElement === items[items.length - 1];
+                        }"""
+                    )
+                    is True
+                )
                 nav_page.keyboard.press("Escape")
                 nav_page.wait_for_timeout(280)
                 toc_closed_state = nav_page.evaluate(
@@ -3342,6 +3678,39 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             "expanded": "true",
                             "focusInside": True,
                         }
+                        # Verify Tab and Shift+Tab wrap inside open modal drawer on mobile
+                        nav_page.evaluate(
+                            f"""() => {{
+                                const dr = document.querySelector('{drawer_sel}');
+                                const items = Array.from(dr.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                                    .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
+                                items[items.length - 1].focus();
+                            }}"""
+                        )
+                        nav_page.keyboard.press("Tab")
+                        assert (
+                            nav_page.evaluate(
+                                f"""() => {{
+                                    const dr = document.querySelector('{drawer_sel}');
+                                    const items = Array.from(dr.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                                        .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
+                                    return document.activeElement === items[0];
+                                }}"""
+                            )
+                            is True
+                        )
+                        nav_page.keyboard.press("Shift+Tab")
+                        assert (
+                            nav_page.evaluate(
+                                f"""() => {{
+                                    const dr = document.querySelector('{drawer_sel}');
+                                    const items = Array.from(dr.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                                        .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
+                                    return document.activeElement === items[items.length - 1];
+                                }}"""
+                            )
+                            is True
+                        )
                         nav_page.keyboard.press("Escape")
                         assert (
                             nav_page.evaluate(f"document.getElementById('{input_id}').checked")
@@ -3618,6 +3987,54 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     assert res["matches"] is True
                     assert res["style"] == "solid" and res["width"] == "2px"
                     assert res["color"] == sys_hl_idx
+                nav_page.emulate_media(forced_colors="none")
+
+                # 5e. Overflowing .table-wrapper focusable region & :focus-visible outline on mobile
+                nav_page.set_viewport_size({"width": 375, "height": 812})
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/reference/configuration.html",
+                    wait_until="load",
+                )
+                nav_page.add_script_tag(content=contrast_helper_js)
+                nav_page.add_script_tag(content=outline_helper_js)
+                table_region_audit = nav_page.evaluate(
+                    """() => {
+                        const wrappers = Array.from(document.querySelectorAll('.table-wrapper'));
+                        const overflowing = wrappers.filter((w) => w.clientWidth > 0 && w.scrollWidth > w.clientWidth);
+                        if (!overflowing.length) return { count: 0 };
+                        const first = overflowing[0];
+                        first.id = 'test-overflow-table-wrapper';
+                        return {
+                            count: overflowing.length,
+                            tabindex: first.getAttribute('tabindex'),
+                            role: first.getAttribute('role'),
+                            label: first.getAttribute('aria-label') || ''
+                        };
+                    }"""
+                )
+                assert table_region_audit["count"] >= 1, (
+                    "Expected >= 1 overflowing .table-wrapper on reference/configuration.html at 375px"
+                )
+                assert table_region_audit["tabindex"] == "0"
+                assert table_region_audit["role"] == "region"
+                assert table_region_audit["label"]
+                nav_page.locator("#test-overflow-table-wrapper").focus()
+                nav_page.keyboard.press("Shift")
+                tbl_focus_std = nav_page.evaluate(
+                    "window.__checkToggleOutline('#test-overflow-table-wrapper')"
+                )
+                assert tbl_focus_std["matches"] is True
+                assert tbl_focus_std["style"] == "solid" and tbl_focus_std["width"] == "2px"
+                assert tbl_focus_std["contrast"] >= 4.5
+
+                nav_page.emulate_media(forced_colors="active")
+                nav_page.locator("#test-overflow-table-wrapper").focus()
+                nav_page.keyboard.press("Shift")
+                tbl_focus_fc = nav_page.evaluate(
+                    "window.__checkToggleOutline('#test-overflow-table-wrapper')"
+                )
+                assert tbl_focus_fc["matches"] is True
+                assert tbl_focus_fc["style"] == "solid" and tbl_focus_fc["width"] == "2px"
                 nav_page.emulate_media(forced_colors="none")
 
                 nav_page.close()
