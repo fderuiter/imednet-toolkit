@@ -1685,6 +1685,7 @@ with contextlib.suppress(ImportError):
     from airflow.sdk.bases.operator import ExecutorSafeguard
     ExecutorSafeguard.test_mode = True
 
+logging.basicConfig(level=logging.WARNING, stream=sys.stderr, force=True)
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
 logging.getLogger("py.warnings").setLevel(logging.ERROR)
@@ -1716,13 +1717,6 @@ _neo4j_driver_patcher.start()
 logging.getLogger("snowflake").setLevel(logging.WARNING)
 _snowflake_connect_patcher = patch("snowflake.connector.connect", return_value=MagicMock())
 _snowflake_connect_patcher.start()
-
-try:
-    from airflow.sdk.bases.operator import ExecutorSafeguard
-
-    ExecutorSafeguard.test_mode = True
-except Exception:
-    pass
 
 _original_print = builtins.print
 
