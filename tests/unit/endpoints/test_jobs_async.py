@@ -72,3 +72,72 @@ async def test_async_poll_and_poll_many_do_not_fetch_result_url(response_factory
     assert summary.all_successful is True
     assert summary.any_failed is False
     async_client.get.assert_called_once_with("/api/v1/edc/studies/S1/jobs/B1")
+
+
+@pytest.mark.asyncio
+async def test_async_poll_and_poll_many_resolve_results_fetches_result_url_and_raises() -> None:
+    """Async poll, poll_many, async_poll_job, and async_poll_jobs inspect resultUrl when resolve_results=True."""
+    import httpx
+
+    from imednet import AsyncImednetSDK
+    from imednet.core.async_client import AsyncClient
+    from imednet.utils.job_poller import JobFailedError
+
+    result_hits: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/jobs/AB-FAIL"):
+            return httpx.Response(
+                200,
+                json={
+                    "jobId": "AJ-FAIL",
+                    "batchId": "AB-FAIL",
+                    "state": "COMPLETED",
+                    "progress": 100,
+                    "resultUrl": "/api/v1/edc/studies/S1/jobs/AB-FAIL/results",
+                },
+            )
+        if request.url.path.endswith("/jobs/AB-FAIL/results"):
+            result_hits.append("AB-FAIL")
+            return httpx.Response(
+                200,
+                json=[{"recordId": 9, "status": "FAILED", "error": "Invalid V_AGE"}],
+            )
+        return httpx.Response(404)
+
+    async with AsyncImednetSDK(
+        async_client=AsyncClient(
+            api_key="sim-k",  # pragma: allowlist secret
+            security_key="sim-s",  # pragma: allowlist secret
+            base_url="https://edc.sim.imednet.com",
+            transport=httpx.MockTransport(handler),
+        )
+    ) as async_sdk:
+        default_status = await async_sdk.async_poll_job("S1", "AB-FAIL", interval=0, timeout=2.0)
+        assert default_status.state == "COMPLETED"
+        assert result_hits == []
+
+        with pytest.raises(JobFailedError):
+            await async_sdk.jobs.poll(
+                "S1", "AB-FAIL", interval=0, timeout=2.0, resolve_results=True
+            )
+        with pytest.raises(JobFailedError):
+            await async_sdk.async_poll_job(
+                "S1", "AB-FAIL", interval=0, timeout=2.0, resolve_results=True
+            )
+
+        summary = await async_sdk.async_poll_jobs(
+            "S1", ["AB-FAIL"], interval=0, timeout=2.0, resolve_results=True
+        )
+        assert summary.all_successful is False
+        assert isinstance(summary.failures["AB-FAIL"], JobFailedError)
+
+        with pytest.raises(JobFailedError):
+            await async_sdk.jobs.poll_many(
+                "S1", ["AB-FAIL"], interval=0, timeout=2.0, fail_fast=True, resolve_results=True
+            )
+        with pytest.raises(JobFailedError):
+            await async_sdk.async_poll_jobs(
+                "S1", ["AB-FAIL"], interval=0, timeout=2.0, fail_fast=True, resolve_results=True
+            )
+        assert len(result_hits) == 5

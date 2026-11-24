@@ -118,9 +118,11 @@ summaries for ``records create``, ``records update``, ``records import``, and
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
 ``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands,
 ``datadict validate``, and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it), while
-write commands emit ``status: "failed"`` with exit code ``1`` when pre-write validation,
-a mid-batch chunk ``POST``, or ``--wait`` polling fails after validating or committing
-earlier chunks. Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
+write commands emit ``status: "failed"`` with exit code ``1`` (including
+``unsubmittedChunks`` when a batch write stops mid-submission) when schema/input
+validation, a chunk ``POST``, or ``--wait`` polling fails; API or path-validation errors
+occurring before chunk writes start leave ``stdout`` empty and report redacted diagnostics
+on ``stderr``. Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
 JSON aliases; the JSON view includes model fields beyond the human summary table.
 Progress and diagnostics use stderr. A retrieval or serialization failure emits
 no success response and exits 1; partial iterators are not reported as complete.
