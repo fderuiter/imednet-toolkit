@@ -29,6 +29,51 @@ REQUIRED_PYTHON_CLASSIFIERS = (
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 )
+TYPED_CLASSIFIER = "Typing :: Typed"
+_CONSUMER_TYPING_CHECK = """from __future__ import annotations
+
+import apache_airflow_providers_imednet
+import imednet
+import imednet_sinks
+import imednet_tui
+import imednet_workflows
+from apache_airflow_providers_imednet import get_provider_info
+from apache_airflow_providers_imednet.hooks import ImednetHook
+from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+from imednet import AsyncImednetSDK, Config, ImednetSDK
+from imednet.models.records import Record
+from imednet.models.studies import Study
+from imednet_sinks.plugin import SinksNamespace, create_sinks
+from imednet_tui.cli import setup_parser as setup_tui_parser
+from imednet_workflows import DataExtractionWorkflow, StudySchemaInspector, UATWorkflow
+
+
+def verify_typed_consumer(
+    sdk: ImednetSDK,
+    async_sdk: AsyncImednetSDK,
+    cfg: Config,
+) -> tuple[type[Study], type[Record], dict[str, object]]:
+    info = get_provider_info()
+    _ = (
+        apache_airflow_providers_imednet,
+        imednet,
+        imednet_sinks,
+        imednet_tui,
+        imednet_workflows,
+        ImednetHook,
+        ImednetExportOperator,
+        SinksNamespace,
+        create_sinks,
+        setup_tui_parser,
+        DataExtractionWorkflow,
+        StudySchemaInspector,
+        UATWorkflow,
+        sdk,
+        async_sdk,
+        cfg,
+    )
+    return Study, Record, info
+"""
 
 
 class ConsumptionValidationError(RuntimeError):
@@ -120,6 +165,7 @@ def build_wheels(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
         _build_single_wheel(uv_bin, pkg_path, dist_dir)
 
     verify_wheel_metadata(dist_dir, packages_dir=packages_dir)
+    verify_wheel_py_typed(dist_dir, packages_dir=packages_dir)
 
 
 def discover_workspace_packages(packages_dir: Path = PACKAGES_DIR) -> list[tuple[Path, str]]:
@@ -132,6 +178,73 @@ def discover_workspace_packages(packages_dir: Path = PACKAGES_DIR) -> list[tuple
             pkg_name = data["project"]["name"]
             discovered.append((pkg_path, pkg_name))
     return discovered
+
+
+def discover_workspace_import_packages(
+    packages_dir: Path = PACKAGES_DIR,
+) -> list[tuple[Path, str, str]]:
+    """Return sorted ``(package_dir, project_name, import_package)`` tuples for workspace packages."""
+    discovered: list[tuple[Path, str, str]] = []
+    for pkg_path, pkg_name in discover_workspace_packages(packages_dir):
+        data = tomllib.loads((pkg_path / "pyproject.toml").read_text(encoding="utf-8"))
+        wheel_pkgs = (
+            data.get("tool", {})
+            .get("hatch", {})
+            .get("build", {})
+            .get("targets", {})
+            .get("wheel", {})
+            .get("packages", [])
+        )
+        if wheel_pkgs:
+            import_pkg = Path(wheel_pkgs[0]).name
+        else:
+            src_dir = pkg_path / "src"
+            src_pkgs = (
+                sorted(
+                    p.name
+                    for p in src_dir.iterdir()
+                    if p.is_dir() and (p / "__init__.py").is_file()
+                )
+                if src_dir.is_dir()
+                else []
+            )
+            import_pkg = src_pkgs[0] if src_pkgs else _normalize_wheel_prefix(pkg_name)
+        discovered.append((pkg_path, pkg_name, import_pkg))
+    return discovered
+
+
+def verify_wheel_py_typed(
+    dist_dir: Path,
+    packages_dir: Path = PACKAGES_DIR,
+) -> None:
+    """Verify every built workspace wheel embeds PEP 561 ``py.typed`` and ``Typing :: Typed``."""
+    for _, pkg_name, import_pkg in discover_workspace_import_packages(packages_dir):
+        wheel_path = _find_wheel_for_package(dist_dir, pkg_name)
+        if wheel_path is None:
+            raise ConsumptionValidationError(
+                f"Missing built wheel for workspace package '{pkg_name}' in {dist_dir}"
+            )
+
+        expected_marker = f"{import_pkg}/py.typed"
+        with zipfile.ZipFile(wheel_path) as zf:
+            names = set(zf.namelist())
+            if expected_marker not in names:
+                raise ConsumptionValidationError(
+                    f"Wheel '{wheel_path.name}' is missing PEP 561 marker '{expected_marker}'"
+                )
+            meta_entries = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
+            if len(meta_entries) != 1:
+                raise ConsumptionValidationError(
+                    f"Wheel '{wheel_path.name}' is missing .dist-info/METADATA (found {meta_entries})"
+                )
+            msg = email.message_from_bytes(zf.read(meta_entries[0]))
+
+        classifiers = set(msg.get_all("Classifier", []))
+        if TYPED_CLASSIFIER not in classifiers:
+            raise ConsumptionValidationError(
+                f"Wheel '{wheel_path.name}' is missing classifier {TYPED_CLASSIFIER!r}"
+            )
+        print(f"Verified PEP 561 py.typed marker in {wheel_path.name} ({expected_marker}).")
 
 
 def collect_manifest_extras(packages_dir: Path = PACKAGES_DIR) -> dict[str, set[str]]:
@@ -387,6 +500,120 @@ def _install_into_venv(
         run([*unlocked_cmd, "--offline"], cwd=tmpdir)
     except subprocess.CalledProcessError:
         run(unlocked_cmd, cwd=tmpdir)
+
+
+def _resolve_host_mypy() -> Path | None:
+    exe_name = "mypy.exe" if os.name == "nt" else "mypy"
+    sibling = Path(sys.executable).with_name(exe_name)
+    if sibling.is_file():
+        return sibling
+    which_mypy = shutil.which("mypy")
+    return Path(which_mypy) if which_mypy is not None else None
+
+
+def verify_wheel_mypy_strict(
+    dist_dir: Path,
+    *,
+    packages_dir: Path = PACKAGES_DIR,
+    uv_lock_path: Path = UV_LOCK_PATH,
+    consumer_source: str = _CONSUMER_TYPING_CHECK,
+) -> None:
+    """Install all workspace wheels into an isolated venv and run ``mypy --strict``."""
+    uv_bin = _resolve_uv()
+    discovered = discover_workspace_import_packages(packages_dir)
+    print("\n>>> Validating PEP 561 Consumer Typing (mypy --strict)")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        venv_dir = Path(tmpdir) / "venv"
+        run([uv_bin, "venv", "--python", sys.executable, str(venv_dir)], cwd=tmpdir)
+
+        if os.name == "nt":
+            python_bin = venv_dir / "Scripts" / "python.exe"
+            venv_mypy = venv_dir / "Scripts" / "mypy.exe"
+        else:
+            python_bin = venv_dir / "bin" / "python"
+            venv_mypy = venv_dir / "bin" / "mypy"
+
+        workspace_wheels = _resolve_workspace_wheels(dist_dir, packages_dir)
+        missing_wheels = [
+            pkg_name for _, pkg_name, _ in discovered if pkg_name not in workspace_wheels
+        ]
+        if missing_wheels:
+            raise ConsumptionValidationError(
+                f"Missing built wheels for mypy strict validation: {missing_wheels}"
+            )
+
+        constraints_file = Path(tmpdir) / "workspace-constraints.txt"
+        constraints_file.write_text(
+            "\n".join(
+                f"{pkg_name} @ {wheel_path.resolve().as_uri()}"
+                for pkg_name, wheel_path in sorted(workspace_wheels.items())
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        locked_constraints_file = _write_locked_registry_constraints(
+            Path(tmpdir) / "locked-constraints.txt",
+            set(workspace_wheels.keys()),
+            uv_lock_path=uv_lock_path,
+        )
+
+        install_specs = [
+            f"{pkg_name} @ {wheel_path.resolve().as_uri()}"
+            for pkg_name, wheel_path in sorted(workspace_wheels.items())
+        ]
+        mypy_bin = _resolve_host_mypy()
+        if mypy_bin is None:
+            install_specs.append("mypy")
+            mypy_bin = venv_mypy
+
+        _install_into_venv(
+            uv_bin,
+            python_bin,
+            dist_dir,
+            constraints_file,
+            locked_constraints_file,
+            install_specs,
+            tmpdir,
+        )
+
+        clean_env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "MYPYPATH"}}
+
+        import_names = [import_pkg for _, _, import_pkg in discovered]
+        origin_probe = (
+            "import importlib, pathlib; "
+            f"venv_root = pathlib.Path({str(venv_dir)!r}).resolve(); "
+            f"pkgs = {import_names!r}; "
+            "mods = [importlib.import_module(p) for p in pkgs]; "
+            "bad = [m.__name__ for m in mods if not pathlib.Path(m.__file__).resolve().is_relative_to(venv_root)]; "
+            "assert not bad, f'Packages did not resolve from installed wheels: {bad}'; "
+            "missing_typed = [m.__name__ for m in mods if not (pathlib.Path(m.__file__).parent / 'py.typed').is_file()]; "
+            "assert not missing_typed, f'Installed wheels missing py.typed on disk: {missing_typed}'"
+        )
+        run([str(python_bin), "-c", origin_probe], cwd=tmpdir, env=clean_env)
+
+        consumer_file = Path(tmpdir) / "consumer_typing.py"
+        consumer_file.write_text(consumer_source, encoding="utf-8")
+
+        try:
+            res = run(
+                [
+                    str(mypy_bin),
+                    "--strict",
+                    "--python-executable",
+                    str(python_bin),
+                    str(consumer_file),
+                ],
+                cwd=tmpdir,
+                env=clean_env,
+            )
+        except subprocess.CalledProcessError as e:
+            output = (e.stdout or "") + (e.stderr or "")
+            raise ConsumptionValidationError(
+                f"mypy --strict failed against installed workspace wheels:\n{output}"
+            ) from e
+
+        print(res.stdout.strip())
 
 
 def validate_scenario(
@@ -1055,6 +1282,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             dist_dir = Path(tmp_wheels)
             prepare_wheels(dist_dir, args.wheel_dir)
             verify_wheel_metadata(dist_dir, PACKAGES_DIR)
+            verify_wheel_py_typed(dist_dir, PACKAGES_DIR)
+            verify_wheel_mypy_strict(
+                dist_dir,
+                packages_dir=PACKAGES_DIR,
+                uv_lock_path=UV_LOCK_PATH,
+            )
 
             for scenario in scenarios:
                 try:

@@ -115,8 +115,9 @@ def test_providers_does_not_import_sinks():
 
 def test_extensions_use_spi():
     """Ensure extension packages use the SPI or top-level public API and not core internals."""
-    app_dir = Path(imednet.__file__).parent.parent.parent.parent
-    packages_dir = app_dir
+    packages_dir = Path(imednet.__file__).resolve().parents[3]
+    if not (packages_dir / "plugins-workflows" / "src").is_dir():
+        packages_dir = Path(__file__).resolve().parents[3] / "packages"
 
     extension_dirs = [
         packages_dir / "plugins-workflows" / "src",
@@ -125,11 +126,13 @@ def test_extensions_use_spi():
         packages_dir / "providers-airflow" / "src",
     ]
 
+    scanned_files = 0
     for ext_dir in extension_dirs:
         if not ext_dir.exists():
             continue
 
         for file in get_all_python_files(ext_dir):
+            scanned_files += 1
             imports = get_imports_from_file(file)
             for imp in imports:
                 # If they import imednet, it must be the top level (e.g. `imednet` itself)
@@ -174,6 +177,8 @@ def test_extensions_use_spi():
                         f"Architectural violation: {file} imports '{imp}'. "
                         "Extensions must use the SPI ('imednet.spi') instead of core internals."
                     )
+
+    assert scanned_files > 0, f"No extension files found to test in {packages_dir}"
 
 
 @pytest.mark.parametrize(

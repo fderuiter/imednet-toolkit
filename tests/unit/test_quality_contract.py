@@ -1,8 +1,12 @@
 """Guard shared verification tasks and public package metadata against drift."""
 
+import os
+import shutil
+import subprocess
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,6 +69,11 @@ def test_ci_uses_canonical_full_verification():
     run_tests_step = next(s for s in test_steps if s.get("name") == "Run Tests")
     assert "tests/integration/test_airflow*.py" in run_tests_step["run"]
     assert "tests/integration/test_workflows*.py" in run_tests_step["run"]
+    assert ".venv/bin/pytest" in run_tests_step["run"]
+    assert "IMEDNET_TEST_WHEELS=1" in run_tests_step["run"]
+    assert "hatch run" not in run_tests_step["run"]
+    assert "Passing gracefully" not in run_tests_step["run"]
+    assert "-eq 5" not in run_tests_step["run"]
 
 
 def test_ci_docs_job_enforces_clean_working_tree_and_validation():
@@ -195,3 +204,74 @@ def test_copilot_and_consumption_workflows_use_canonical_uv_sync():
         "scripts/validate_package_consumption.py --wheel-dir dist" in r for r in consumption_runs
     )
     assert not any("pip install" in r for r in consumption_runs)
+
+
+def test_ci_export_filter_includes_sinks_and_schedules_integration_sandbox():
+    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+    plan_job = pipeline["jobs"]["plan"]
+    assert plan_job["outputs"]["run_integration"] == "${{ steps.filter.outputs.export_logic }}"
+
+    filter_step = next(s for s in plan_job["steps"] if s.get("id") == "filter")
+    filters = yaml.safe_load(filter_step["with"]["filters"])
+    export_patterns = filters["export_logic"]
+    assert "packages/plugins-sinks/**" in export_patterns
+
+    sink_file = PurePosixPath("packages/plugins-sinks/src/imednet_sinks/warehouse.py")
+    assert any(
+        sink_file.match(pattern) or str(sink_file).startswith("packages/plugins-sinks/")
+        for pattern in export_patterns
+        if pattern == "packages/plugins-sinks/**"
+    )
+
+    sandbox_job = pipeline["jobs"]["integration-sandbox"]
+    assert "needs.plan.outputs.run_integration == 'true'" in sandbox_job["if"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is needed for workflow scripts")
+def test_ci_build_builds_all_five_wheels_and_run_tests_propagates_exit_code_5(tmp_path: Path):
+    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+
+    build_steps = pipeline["jobs"]["build"]["steps"]
+    build_step = next(s for s in build_steps if s.get("name") == "Build Workspace Packages")
+    assert "Skipping" not in build_step["run"]
+
+    upload_steps = [
+        s for s in build_steps if str(s.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert {s["with"]["name"] for s in upload_steps} == {
+        "dist-core",
+        "dist-workflows",
+        "dist-providers",
+        "dist-sinks",
+        "dist-tui",
+    }
+    for up in upload_steps:
+        assert up.get("if") == "needs.plan.outputs.build_matrix != '[]'"
+
+    run_tests_step = next(
+        s for s in pipeline["jobs"]["test"]["steps"] if s.get("name") == "Run Tests"
+    )
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    (dist_dir / "imednet-1.2.0-py3-none-any.whl").write_bytes(b"wheel")
+    marker_file = tmp_path / "wheel_mode.txt"
+
+    stub_pytest = venv_bin / "pytest"
+    stub_pytest.write_text(
+        f'#!/bin/sh\nprintf "%s" "${{IMEDNET_TEST_WHEELS:-unset}}" > "{marker_file}"\nexit 5\n',
+        encoding="utf-8",
+    )
+    stub_pytest.chmod(0o755)
+
+    res = subprocess.run(
+        [shutil.which("bash"), "-e", "-c", run_tests_step["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "PACKAGE": "core"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 5
+    assert marker_file.read_text(encoding="utf-8") == "1"

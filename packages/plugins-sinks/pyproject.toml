@@ -54,8 +54,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/imednet_sinks"]
+artifacts = ["src/imednet_sinks/py.typed"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/src/imednet_sinks"
+    "/src/imednet_sinks",
+    "/src/imednet_sinks/py.typed",
 ]

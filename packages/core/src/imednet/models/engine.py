@@ -852,19 +852,26 @@ def get_contract() -> APIContract:
                     builder.ingest_postman(str(bundled_path))
             else:
                 # Local dev checkout fallback
-                local_dev_path = os.path.join(
-                    os.path.dirname(
+                local_dev_candidates = (
+                    os.path.join(
                         os.path.dirname(
                             os.path.dirname(
                                 os.path.dirname(
-                                    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                                    os.path.dirname(
+                                        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                                    )
                                 )
                             )
-                        )
+                        ),
+                        "imednet.postman_collection.json",
                     ),
-                    "imednet.postman_collection.json",
+                    os.path.join(os.getcwd(), "imednet.postman_collection.json"),
                 )
-                if os.path.exists(local_dev_path):
+                local_dev_path = next(
+                    (candidate for candidate in local_dev_candidates if os.path.exists(candidate)),
+                    None,
+                )
+                if local_dev_path is not None:
                     builder.ingest_postman(local_dev_path)
                 else:
                     raise FileNotFoundError(

@@ -119,6 +119,7 @@ jobs:
             export_logic:
               - 'packages/**/integrations/**'
               - 'packages/**/tests/integration/**'
+              - 'packages/plugins-sinks/**'
               - 'docker-compose.yml'
 
       - name: Get changed files
@@ -270,23 +271,21 @@ jobs:
         env:
           BUILD_MATRIX: ${{ needs.plan.outputs.build_matrix }}
         run: |
-          IMPACTED=$(echo "$BUILD_MATRIX" | jq -r '.[]')
-          for package in packages/*; do
-            if [ -f "$package/pyproject.toml" ]; then
-              PKG_NAME=$(basename "$package")
-              if echo "$IMPACTED" | grep -qx "$PKG_NAME"; then
+          if echo "$BUILD_MATRIX" | jq -e 'length > 0' > /dev/null; then
+            for package in packages/*; do
+              if [ -f "$package/pyproject.toml" ]; then
                 (
                   cd "$package"
                   hatch build
                 )
-              else
-                echo "Skipping $PKG_NAME as it is not impacted by this change plan."
               fi
-            fi
-          done
+            done
+          else
+            echo "No package sources changed; skipping wheel builds."
+          fi
 
       - name: Upload Core Artifact
-        if: contains(fromJSON(needs.plan.outputs.build_matrix), 'core')
+        if: needs.plan.outputs.build_matrix != '[]'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-core
@@ -294,7 +293,7 @@ jobs:
           retention-days: 1
 
       - name: Upload Workflows Artifact
-        if: contains(fromJSON(needs.plan.outputs.build_matrix), 'plugins-workflows')
+        if: needs.plan.outputs.build_matrix != '[]'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-workflows
@@ -302,7 +301,7 @@ jobs:
           retention-days: 1
 
       - name: Upload Providers Artifact
-        if: contains(fromJSON(needs.plan.outputs.build_matrix), 'providers-airflow')
+        if: needs.plan.outputs.build_matrix != '[]'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-providers
@@ -310,7 +309,7 @@ jobs:
           retention-days: 1
 
       - name: Upload Sinks Artifact
-        if: contains(fromJSON(needs.plan.outputs.build_matrix), 'plugins-sinks')
+        if: needs.plan.outputs.build_matrix != '[]'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-sinks
@@ -318,7 +317,7 @@ jobs:
           retention-days: 1
 
       - name: Upload TUI Artifact
-        if: contains(fromJSON(needs.plan.outputs.build_matrix), 'plugins-tui')
+        if: needs.plan.outputs.build_matrix != '[]'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-tui
@@ -404,15 +403,11 @@ jobs:
             COV_ARGS="--cov=imednet_tui"
           fi
 
-          hatch run test -q $COV_ARGS --cov-report=xml --cov-fail-under=90 -m "not live" --ignore=tests/live/ $TEST_ARGS || {
-            RET=$?
-            if [ $RET -eq 5 ]; then
-              echo "No tests collected for $PACKAGE. Passing gracefully."
-              exit 0
-            else
-              exit $RET
-            fi
-          }
+          if ls dist/*.whl 1> /dev/null 2>&1; then
+            export IMEDNET_TEST_WHEELS=1
+          fi
+
+          .venv/bin/pytest -q $COV_ARGS --cov-report=xml --cov-fail-under=90 -m "not live" --ignore=tests/live/ $TEST_ARGS
 
   # ------------------------------------------------------------------
   # JOB 3.5: INTEGRATION SANDBOX (Hermetic testing for localizable sinks)
