@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .logic import LogicTreeEvaluator, extract_variable_constraints
+from .logic import LogicTreeEvaluator, extract_variable_constraints, parse_logic_xml
 from .models import BusinessLogicRule, DataDictionary, Form
 from .normalize import _is_file_target, _safe_is_file, normalize_form_id
 
@@ -55,6 +55,10 @@ def get_schema() -> dict[str, Any]:
     schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
     schema["title"] = "iMednet Data Dictionary Schema"
     schema["version"] = "1.0.0"
+    required = list(schema.get("required", []))
+    if "forms" not in required:
+        required.append("forms")
+    schema["required"] = required
     return schema
 
 
@@ -121,11 +125,33 @@ def _validate_rule_semantics(
                 f"'{container_form_key}'"
             )
 
-    if not isinstance(rule.logic, dict) or rule.logic.get("odmElement"):
+    logic_dict: dict[str, Any] | None = rule.logic if isinstance(rule.logic, dict) else None
+    if logic_dict is None:
+        broken_marker = (
+            rule.extraAttributes.get("malformedLogicXml")
+            or rule.extraAttributes.get("logicXmlError")
+            or rule.extraAttributes.get("brokenLogicXml")
+        )
+        if isinstance(rule.logicRawXml, str) and rule.logicRawXml.strip():
+            try:
+                parsed_raw = parse_logic_xml(rule.logicRawXml)
+                if isinstance(parsed_raw, dict):
+                    logic_dict = parsed_raw
+            except ValueError as exc:
+                errors.append(f"[{loc_prefix}.logicRawXml] {exc}")
+                return
+        elif broken_marker:
+            marker_msg = (
+                broken_marker if isinstance(broken_marker, str) else "Malformed business logic XML"
+            )
+            errors.append(f"[{loc_prefix}.logic] {marker_msg}")
+            return
+
+    if not isinstance(logic_dict, dict) or logic_dict.get("odmElement"):
         return
 
     default_form = rule_form or container_form_key
-    for cond in _collect_condition_nodes(rule.logic.get("conditions", rule.logic)):
+    for cond in _collect_condition_nodes(logic_dict.get("conditions", logic_dict)):
         for ref_key in _SCHEMA_COND_REF_KEYS:
             raw_ref = cond.get(ref_key)
             if not isinstance(raw_ref, str) or not raw_ref.strip():
@@ -401,6 +427,9 @@ def validate(
             )
 
     # 3. Model validation via Pydantic
+    if not isinstance(target, DataDictionary) and isinstance(data, dict) and "forms" not in data:
+        errors.append("[forms] Field required")
+
     try:
         dd = DataDictionary.model_validate(data)
     except ValidationError as val_err:
@@ -408,6 +437,9 @@ def validate(
             loc = ".".join(str(p) for p in err.get("loc", ()))
             msg = err.get("msg", "Validation error")
             errors.append(f"[{loc}] {msg}")
+        return errors
+
+    if errors:
         return errors
 
     # 4. Regex safety and semantic validation (duplicate keys, broken references, inverted bounds)

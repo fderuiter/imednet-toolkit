@@ -15,7 +15,7 @@ from ..models import (
     Variable,
 )
 from ..normalize import (
-    _is_file_target,
+    _is_csv_file_target,
     _safe_is_file,
     normalize_form_type,
     normalize_variable_type,
@@ -142,7 +142,7 @@ def _read_source_text(source: Path | str | TextIO | BinaryIO) -> str:
     if isinstance(source, str):
         if "\n" in source or "\r" in source:
             return source.lstrip("\ufeff")
-        if _is_file_target(source):
+        if _is_csv_file_target(source):
             p = Path(source)
             if not _safe_is_file(p):
                 raise FileNotFoundError(f"Target file '{source}' does not exist")
