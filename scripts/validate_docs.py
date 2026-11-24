@@ -3,7 +3,10 @@
 import argparse
 import ast
 import contextlib
+import dataclasses
+import functools
 import importlib
+import inspect
 import io
 import json
 import re
@@ -12,7 +15,9 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import typing
 from collections.abc import Sequence
+from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -1322,16 +1327,58 @@ def check_sphinx_html_baseurl() -> bool:
     return True
 
 
+class _DlFrame:
+    """Mutable stack frame tracking a <dl> block while parsing Sphinx API HTML."""
+
+    __slots__ = (
+        "child_dl_count",
+        "chunks",
+        "classes",
+        "dd_depth",
+        "dd_non_p_chunks",
+        "dd_p_chunks",
+        "dd_paragraphs",
+        "dt_ids",
+        "dt_texts",
+        "in_dd_p",
+    )
+
+    def __init__(self, classes: set[str]) -> None:
+        self.classes = classes
+        self.dt_ids: list[str] = []
+        self.dt_texts: list[str] = []
+        self.chunks: list[str] = []
+        self.child_dl_count = 0
+        self.dd_depth = 0
+        self.in_dd_p = False
+        self.dd_p_chunks: list[str] = []
+        self.dd_paragraphs: list[str] = []
+        self.dd_non_p_chunks: list[str] = []
+
+    @property
+    def has_non_bases_dd_content(self) -> bool:
+        if self.child_dl_count > 0:
+            return True
+        if any(p and not p.startswith("Bases:") for p in self.dd_paragraphs):
+            return True
+        return bool(" ".join("".join(self.dd_non_p_chunks).split()))
+
+
 class _ApiHtmlExtractor(HTMLParser):
-    """Lightweight stdlib HTML parser collecting IDs, dl blocks, dt text, and viewcode backlinks."""
+    """Lightweight stdlib HTML parser collecting IDs, dl blocks, multi-dt headers, and links."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.ids: set[str] = set()
         self.dt_text: dict[str, str] = {}
+        self.dt_list_by_id: dict[str, list[str]] = {}
         self.dl_text_by_dt_id: dict[str, str] = {}
+        self.dl_classes_by_id: dict[str, set[str]] = {}
+        self.empty_class_ids: list[str] = []
         self.backlinks: list[str] = []
-        self._dl_stack: list[tuple[list[str], list[str]]] = []
+        self.internal_hrefs: dict[str, list[str]] = {}
+        self._dl_stack: list[_DlFrame] = []
+        self._in_dt = False
         self._cur_dt_id: str | None = None
         self._cur_dt_chunks: list[str] = []
 
@@ -1342,34 +1389,76 @@ class _ApiHtmlExtractor(HTMLParser):
             self.ids.add(elem_id)
 
         if tag == "dl":
-            self._dl_stack.append(([], []))
+            if self._dl_stack:
+                self._dl_stack[-1].child_dl_count += 1
+            dl_classes = set((attr_map.get("class") or "").split())
+            self._dl_stack.append(_DlFrame(dl_classes))
         elif tag == "dt":
+            self._in_dt = True
             self._cur_dt_id = elem_id
             self._cur_dt_chunks = []
             if elem_id and self._dl_stack:
-                self._dl_stack[-1][0].append(elem_id)
+                self._dl_stack[-1].dt_ids.append(elem_id)
+        elif tag == "dd":
+            if self._dl_stack:
+                self._dl_stack[-1].dd_depth += 1
+        elif tag == "p":
+            if self._dl_stack and self._dl_stack[-1].dd_depth > 0 and not self._in_dt:
+                self._dl_stack[-1].in_dd_p = True
+                self._dl_stack[-1].dd_p_chunks = []
         elif tag == "a":
             classes = (attr_map.get("class") or "").split()
             href = attr_map.get("href")
             if "viewcode-back" in classes and href:
                 self.backlinks.append(href)
+            if "reference" in classes and "internal" in classes and href and self._dl_stack:
+                for dt_id in self._dl_stack[-1].dt_ids:
+                    self.internal_hrefs.setdefault(dt_id, []).append(href)
 
     def handle_data(self, data: str) -> None:
-        if self._cur_dt_id is not None:
+        if self._in_dt:
             self._cur_dt_chunks.append(data)
-        for _dt_ids, chunks in self._dl_stack:
-            chunks.append(data)
+        for frame in self._dl_stack:
+            frame.chunks.append(data)
+        if self._dl_stack and not self._in_dt:
+            top = self._dl_stack[-1]
+            if top.dd_depth > 0:
+                if top.in_dd_p:
+                    top.dd_p_chunks.append(data)
+                else:
+                    top.dd_non_p_chunks.append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag == "dt" and self._cur_dt_id is not None:
-            self.dt_text[self._cur_dt_id] = " ".join("".join(self._cur_dt_chunks).split())
+        if tag == "dt" and self._in_dt:
+            dt_norm = " ".join("".join(self._cur_dt_chunks).split())
+            if self._cur_dt_id is not None:
+                self.dt_text[self._cur_dt_id] = dt_norm
+            if self._dl_stack and dt_norm:
+                self._dl_stack[-1].dt_texts.append(dt_norm)
+            self._in_dt = False
             self._cur_dt_id = None
             self._cur_dt_chunks = []
+        elif tag == "p":
+            if self._dl_stack and self._dl_stack[-1].in_dd_p:
+                top = self._dl_stack[-1]
+                p_norm = " ".join("".join(top.dd_p_chunks).split())
+                if p_norm:
+                    top.dd_paragraphs.append(p_norm)
+                top.in_dd_p = False
+                top.dd_p_chunks = []
+        elif tag == "dd":
+            if self._dl_stack and self._dl_stack[-1].dd_depth > 0:
+                self._dl_stack[-1].dd_depth -= 1
         elif tag == "dl" and self._dl_stack:
-            dt_ids, chunks = self._dl_stack.pop()
-            text = " ".join("".join(chunks).split())
-            for dt_id in dt_ids:
+            frame = self._dl_stack.pop()
+            text = " ".join("".join(frame.chunks).split())
+            is_py_class = "py" in frame.classes and "class" in frame.classes
+            for dt_id in frame.dt_ids:
                 self.dl_text_by_dt_id.setdefault(dt_id, text)
+                self.dt_list_by_id.setdefault(dt_id, list(frame.dt_texts))
+                self.dl_classes_by_id.setdefault(dt_id, set(frame.classes))
+                if is_py_class and not frame.has_non_bases_dd_content:
+                    self.empty_class_ids.append(dt_id)
 
 
 def _parse_html_file(path: Path) -> _ApiHtmlExtractor:
@@ -1568,13 +1657,580 @@ def _verify_core_html(core_page: Path) -> bool:
     return has_errors
 
 
+_FORBIDDEN_API_HTML_TOKENS = (
+    "pydantic_core.ValidationError",
+    "UnionType",
+    "<factory>",
+    "&lt;factory&gt;",
+)
+_TILDE_TYPEVAR_RE = re.compile(r"~[PT]\b")
+_EXPECTED_PROTOCOL_ALIASES = {
+    "imednet.plugins.RegisterSubjectsWorkflowProtocol": (
+        "imednet.plugins.SyncRegisterSubjectsWorkflowProtocol"
+    ),
+    "imednet.plugins.WorkflowsNamespaceProtocol": (
+        "imednet.plugins.SyncWorkflowsNamespaceProtocol"
+    ),
+    "imednet.plugins.SyncSinksNamespaceProtocol": "imednet.plugins.SinksNamespaceProtocol",
+}
+_EXPECTED_OVERLOAD_TARGETS = (
+    "imednet_sinks.plugin.SinksNamespace.export_to_mongodb",
+    "imednet_sinks.plugin.SinksNamespace.export_to_neo4j",
+    "imednet_sinks.plugin.SinksNamespace.export_to_snowflake",
+    "imednet.plugins.BoundExportToMongoDbProtocol.__call__",
+    "imednet.plugins.BoundExportToNeo4jProtocol.__call__",
+    "imednet.plugins.BoundExportToSnowflakeProtocol.__call__",
+    "imednet.validation.cache.validate_record_data",
+    "imednet.validation.cache.validate_record_entry",
+    "imednet.validation.cache.SchemaValidator.validate_batch",
+    "imednet.validation.cache.AsyncSchemaValidator.validate_batch",
+)
+_EXPECTED_FACTORY_DATACLASSES = {
+    "imednet.core.RetryConfig": "DefaultRetryPolicy()",
+    "imednet.integrations.sink_base.SinkConfig": "dict()",
+    "imednet.integrations.export.TabularSinkConfig": "dict()",
+    "imednet_sinks.document.MongoDbSinkConfig": "dict()",
+    "imednet_sinks.graph.Neo4jSinkConfig": "dict()",
+    "imednet_sinks.warehouse.SnowflakeSinkConfig": "dict()",
+}
+
+
+def _ensure_workspace_src_on_path(repo_root: Path) -> None:
+    """Ensure all workspace package src/ directories are importable."""
+    for pkg_sub in (
+        "packages/core/src",
+        "packages/plugins-workflows/src",
+        "packages/plugins-sinks/src",
+        "packages/plugins-tui/src",
+        "packages/providers-airflow/src",
+    ):
+        src_dir = (repo_root / pkg_sub).resolve()
+        if src_dir.is_dir() and str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
+
+
+def _is_typeddict_cls(cls: type) -> bool:
+    """Return True for both typing.TypedDict and typing_extensions.TypedDict classes."""
+    if typing.is_typeddict(cls):
+        return True
+    return (
+        isinstance(cls, type)
+        and issubclass(cls, dict)
+        and isinstance(getattr(cls, "__required_keys__", None), frozenset)
+        and isinstance(getattr(cls, "__optional_keys__", None), frozenset)
+    )
+
+
+def _is_protocol_cls(cls: Any) -> bool:
+    """Return True if cls is a typing.Protocol subclass other than Protocol itself."""
+    return (
+        isinstance(cls, type)
+        and bool(getattr(cls, "_is_protocol", False))
+        and cls.__name__ != "Protocol"
+    )
+
+
+@functools.cache
+def _parse_source_ast(file_path: str) -> ast.Module | None:
+    """Parse a Python source file once for AST class attribute inspection."""
+    try:
+        src = Path(file_path).read_text(encoding="utf-8")
+        return ast.parse(src, filename=file_path)
+    except (OSError, SyntaxError):
+        return None
+
+
+def _collect_class_ann_names(stmts: Sequence[ast.stmt], out: list[str]) -> None:
+    """Collect bare AnnAssign attribute names from class body statements (including TYPE_CHECKING)."""
+    for stmt in stmts:
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            out.append(stmt.target.id)
+        elif isinstance(stmt, ast.If):
+            _collect_class_ann_names(stmt.body, out)
+            _collect_class_ann_names(stmt.orelse, out)
+
+
+def _get_protocol_bare_attr_names(cls: type) -> list[str]:
+    """Return public bare attribute annotations across a Protocol's MRO (excluding methods/properties)."""
+    collected: list[str] = []
+    for ancestor in reversed(cls.__mro__):
+        if not _is_protocol_cls(ancestor):
+            continue
+        ancestor_names: list[str] = list((ancestor.__dict__.get("__annotations__") or {}).keys())
+        src_file = None
+        with contextlib.suppress(TypeError, OSError):
+            src_file = inspect.getsourcefile(ancestor)
+        if src_file:
+            tree = _parse_source_ast(src_file)
+            if tree is not None:
+                for node in tree.body:
+                    if isinstance(node, ast.ClassDef) and node.name == ancestor.__name__:
+                        _collect_class_ann_names(node.body, ancestor_names)
+                        break
+        for name in ancestor_names:
+            if name.startswith("_") or name in ancestor.__dict__:
+                continue
+            if any(name in sub.__dict__ for sub in cls.__mro__ if sub is not object):
+                continue
+            if name not in collected:
+                collected.append(name)
+    return collected
+
+
+def _resolve_dotted_symbol(dotted: str) -> tuple[str, Any] | None:
+    """Resolve a dotted HTML id into (module_name, runtime_object) if importable."""
+    parts = dotted.split(".")
+    for idx in range(len(parts) - 1, 0, -1):
+        mod_candidate = ".".join(parts[:idx])
+        try:
+            mod = importlib.import_module(mod_candidate)
+        except Exception:
+            continue
+        cur: Any = mod
+        found = True
+        for attr in parts[idx:]:
+            if inspect.ismodule(cur):
+                cur = getattr(cur, attr, None)
+            else:
+                cur = inspect.getattr_static(cur, attr, None)
+            if cur is None:
+                found = False
+                break
+        if found:
+            return mod_candidate, cur
+    return None
+
+
+def check_no_autodoc_typehints_dependency(repo_root: Path | None = None) -> bool:
+    """Verify sphinx-autodoc-typehints is absent from pyproject.toml and docs/conf.py."""
+    root = repo_root or Path(__file__).resolve().parents[1]
+    has_errors = False
+    pyproject_path = root / "pyproject.toml"
+    if pyproject_path.is_file():
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        docs_group = data.get("dependency-groups", {}).get("docs", [])
+        if any("sphinx-autodoc-typehints" in str(dep) for dep in docs_group):
+            print(
+                "Error: sphinx-autodoc-typehints must not appear in pyproject.toml [dependency-groups].docs."
+            )
+            has_errors = True
+    conf_path = root / "docs" / "conf.py"
+    if conf_path.is_file():
+        conf_text = conf_path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(conf_text, filename=str(conf_path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and node.value == "sphinx_autodoc_typehints":
+                    print(
+                        "Error: 'sphinx_autodoc_typehints' must not be configured in docs/conf.py."
+                    )
+                    has_errors = True
+                    break
+        except SyntaxError as exc:
+            print(f"Error parsing {conf_path}: {exc}")
+            has_errors = True
+    return has_errors
+
+
+def _verify_api_reference_parity(api_html_dir: Path, repo_root: Path | None = None) -> bool:
+    """Verify rendered API HTML parity across Enums, dataclasses, TypedDicts, Protocols, BaseModels, and @overloads."""
+    root = repo_root or Path(__file__).resolve().parents[1]
+    _ensure_workspace_src_on_path(root)
+
+    from pydantic import BaseModel, RootModel
+
+    has_errors = check_no_autodoc_typehints_dependency(root)
+    html_files = sorted(api_html_dir.glob("*.html"))
+    if not html_files:
+        print(f"Error: No API HTML files found in {api_html_dir}.")
+        return True
+
+    parsed_pages: dict[Path, _ApiHtmlExtractor] = {}
+    page_by_id: dict[str, Path] = {}
+
+    for html_file in html_files:
+        raw_html = html_file.read_text(encoding="utf-8")
+        for bad_token in _FORBIDDEN_API_HTML_TOKENS:
+            if bad_token in raw_html:
+                print(f"Error: Forbidden token '{bad_token}' found in {html_file.name}.")
+                has_errors = True
+
+        parsed = _parse_html_file(html_file)
+        parsed_pages[html_file] = parsed
+
+        for empty_cid in parsed.empty_class_ids:
+            print(f"Error: Empty class shell '{empty_cid}' found in {html_file.name}.")
+            has_errors = True
+
+        for dt_id, dl_text in parsed.dl_text_by_dt_id.items():
+            match = _TILDE_TYPEVAR_RE.search(dl_text)
+            if match:
+                print(
+                    f"Error: Unresolved TypeVar/ParamSpec prefix '{match.group(0)}' in '{dt_id}' ({html_file.name})."
+                )
+                has_errors = True
+
+        for elem_id in parsed.ids:
+            page_by_id.setdefault(elem_id, html_file)
+
+    enum_classes = 0
+    enum_values = 0
+    dataclass_classes = 0
+    dataclass_fields = 0
+    typeddict_classes = 0
+    typeddict_keys = 0
+    protocol_sink_attrs = 0
+    callable_protocols = 0
+    basemodel_classes = 0
+    basemodel_fields = 0
+    overload_callables = 0
+    overload_headers = 0
+    seen_qnames: set[str] = set()
+
+    for html_file, parsed in parsed_pages.items():
+        for dt_id, dl_classes in sorted(parsed.dl_classes_by_id.items()):
+            if "py" not in dl_classes or dt_id in seen_qnames:
+                continue
+
+            if "class" in dl_classes or "exception" in dl_classes:
+                resolved = _resolve_dotted_symbol(dt_id)
+                if resolved is None:
+                    continue
+                _mod_name, obj = resolved
+                if not isinstance(obj, type):
+                    continue
+                sym_tail = dt_id.rsplit(".", 1)[-1]
+                if sym_tail != obj.__name__:
+                    continue
+                seen_qnames.add(dt_id)
+
+                # 1. Enum classes and literal values
+                if issubclass(obj, Enum) and obj is not Enum:
+                    enum_classes += 1
+                    for mname, member in obj.__members__.items():
+                        mid = f"{dt_id}.{mname}"
+                        if mid not in parsed.ids:
+                            print(f"Error: Enum member '{mid}' missing from {html_file.name}.")
+                            has_errors = True
+                            continue
+                        m_dt = parsed.dt_text.get(mid, "")
+                        expected_lit = repr(member.value)
+                        if "=" not in m_dt or expected_lit not in m_dt:
+                            print(
+                                f"Error: Enum member '{mid}' missing literal value {expected_lit} in {html_file.name}."
+                            )
+                            has_errors = True
+                        else:
+                            enum_values += 1
+
+                # 2. First-party @dataclass classes, readable factories, and repr=False masking
+                if "__dataclass_params__" in obj.__dict__:
+                    dataclass_classes += 1
+                    cls_dt = parsed.dt_text.get(dt_id, "")
+                    init_dt = parsed.dt_text.get(f"{dt_id}.__init__", "")
+                    sig_surfaces = [s for s in (cls_dt, init_dt) if "(" in s]
+                    for fld in dataclasses.fields(obj):
+                        if fld.name.startswith("_"):
+                            continue
+                        fid = f"{dt_id}.{fld.name}"
+                        if fid not in parsed.ids:
+                            print(f"Error: Dataclass field '{fid}' missing from {html_file.name}.")
+                            has_errors = True
+                            continue
+                        f_dt = parsed.dt_text.get(fid, "")
+                        f_dl = parsed.dl_text_by_dt_id.get(fid, "")
+                        if ":" not in f_dt:
+                            print(
+                                f"Error: Dataclass field '{fid}' missing type annotation in {html_file.name}."
+                            )
+                            has_errors = True
+                        is_req = (
+                            fld.default is dataclasses.MISSING
+                            and fld.default_factory is dataclasses.MISSING
+                        )
+                        if is_req:
+                            if "Required." not in f_dl:
+                                print(
+                                    f"Error: Required dataclass field '{fid}' missing 'Required.' marker in {html_file.name}."
+                                )
+                                has_errors = True
+                            else:
+                                dataclass_fields += 1
+                        elif not fld.repr:
+                            if "= ..." not in f_dt:
+                                print(
+                                    f"Error: repr=False dataclass field '{fid}' must mask default with '= ...' in {html_file.name}."
+                                )
+                                has_errors = True
+                            elif (
+                                fld.default is not dataclasses.MISSING
+                                and fld.default is not None
+                                and f"= {fld.default!r}" in f_dt
+                            ):
+                                print(
+                                    f"Error: repr=False dataclass field '{fid}' leaked default {fld.default!r} in {html_file.name}."
+                                )
+                                has_errors = True
+                            else:
+                                dataclass_fields += 1
+                            if fld.init:
+                                for surf in sig_surfaces:
+                                    if (
+                                        fld.default is not dataclasses.MISSING
+                                        and f"{fld.name}={fld.default!r}" in surf
+                                    ):
+                                        print(
+                                            f"Error: repr=False parameter '{fld.name}' on '{dt_id}' leaked default {fld.default!r} in constructor signature ({html_file.name})."
+                                        )
+                                        has_errors = True
+                                    elif f"{fld.name}=..." not in surf:
+                                        print(
+                                            f"Error: repr=False parameter '{fld.name}' on '{dt_id}' must render '{fld.name}=...' in constructor signature ({html_file.name})."
+                                        )
+                                        has_errors = True
+                        elif "=" not in f_dt:
+                            print(
+                                f"Error: Dataclass field '{fid}' missing default value in {html_file.name}."
+                            )
+                            has_errors = True
+                        else:
+                            dataclass_fields += 1
+
+                # 3. TypedDict classes and Required/Optional keys
+                if _is_typeddict_cls(obj):
+                    typeddict_classes += 1
+                    req_keys: frozenset[str] = getattr(obj, "__required_keys__", frozenset())
+                    opt_keys: frozenset[str] = getattr(obj, "__optional_keys__", frozenset())
+                    for kname in sorted(req_keys | opt_keys):
+                        kid = f"{dt_id}.{kname}"
+                        if kid not in parsed.ids:
+                            print(f"Error: TypedDict key '{kid}' missing from {html_file.name}.")
+                            has_errors = True
+                            continue
+                        k_dt = parsed.dt_text.get(kid, "")
+                        k_dl = parsed.dl_text_by_dt_id.get(kid, "")
+                        expected_marker = "Required." if kname in req_keys else "Optional."
+                        if ":" not in k_dt or expected_marker not in k_dl:
+                            print(
+                                f"Error: TypedDict key '{kid}' missing type or '{expected_marker}' marker in {html_file.name}."
+                            )
+                            has_errors = True
+                        else:
+                            typeddict_keys += 1
+
+                # 4. Protocol bare attributes and callable __call__ methods
+                if _is_protocol_cls(obj):
+                    bare_attrs = _get_protocol_bare_attr_names(obj)
+                    for aname in bare_attrs:
+                        aid = f"{dt_id}.{aname}"
+                        if aid not in parsed.ids:
+                            print(
+                                f"Error: Protocol attribute '{aid}' missing from {html_file.name}."
+                            )
+                            has_errors = True
+                        elif ":" not in parsed.dt_text.get(aid, ""):
+                            print(
+                                f"Error: Protocol attribute '{aid}' missing type annotation in {html_file.name}."
+                            )
+                            has_errors = True
+                        elif dt_id in (
+                            "imednet.plugins.MongoDbSinkConfigProtocol",
+                            "imednet.plugins.Neo4jSinkConfigProtocol",
+                            "imednet.plugins.SnowflakeSinkConfigProtocol",
+                        ):
+                            protocol_sink_attrs += 1
+
+                    has_proto_call = any(
+                        _is_protocol_cls(ancestor) and "__call__" in ancestor.__dict__
+                        for ancestor in obj.__mro__
+                    )
+                    if has_proto_call:
+                        cid = f"{dt_id}.__call__"
+                        if cid not in parsed.ids:
+                            print(
+                                f"Error: Callable Protocol '{dt_id}' missing '__call__' in {html_file.name}."
+                            )
+                            has_errors = True
+                        else:
+                            callable_protocols += 1
+
+                # 5. Pydantic BaseModel fields, defaults/Required markers, and skipped __init__
+                if issubclass(obj, BaseModel) and obj is not BaseModel:
+                    basemodel_classes += 1
+                    if "__init__" not in obj.__dict__ and f"{dt_id}.__init__" in parsed.ids:
+                        print(
+                            f"Error: Inherited BaseModel.__init__ must be skipped on '{dt_id}' in {html_file.name}."
+                        )
+                        has_errors = True
+                    if not issubclass(obj, RootModel):
+                        for fname in obj.model_fields:
+                            if fname.startswith("_"):
+                                continue
+                            fid = f"{dt_id}.{fname}"
+                            if fid not in parsed.ids:
+                                print(
+                                    f"Error: BaseModel field '{fid}' missing from {html_file.name}."
+                                )
+                                has_errors = True
+                                continue
+                            f_dt = parsed.dt_text.get(fid, "")
+                            f_dl = parsed.dl_text_by_dt_id.get(fid, "")
+                            if ":" not in f_dt or ("=" not in f_dt and "Required." not in f_dl):
+                                print(
+                                    f"Error: BaseModel field '{fid}' missing type/default/'Required.' in {html_file.name}."
+                                )
+                                has_errors = True
+                            else:
+                                basemodel_fields += 1
+
+            elif "function" in dl_classes or "method" in dl_classes:
+                resolved = _resolve_dotted_symbol(dt_id)
+                if resolved is None:
+                    continue
+                _mod_name, raw_fn = resolved
+                fn = raw_fn.__func__ if isinstance(raw_fn, (staticmethod, classmethod)) else raw_fn
+                try:
+                    overloads = typing.get_overloads(fn)
+                except Exception:
+                    overloads = []
+                if overloads:
+                    seen_qnames.add(dt_id)
+                    dt_headers = parsed.dt_list_by_id.get(dt_id, [])
+                    if len(dt_headers) < len(overloads):
+                        print(
+                            f"Error: Overloaded callable '{dt_id}' rendered {len(dt_headers)} <dt> signature(s), expected {len(overloads)} in {html_file.name}."
+                        )
+                        has_errors = True
+                    elif any("(*args, **kwargs)" in hdr for hdr in dt_headers):
+                        print(
+                            f"Error: Overloaded callable '{dt_id}' collapsed to (*args, **kwargs) in {html_file.name}."
+                        )
+                        has_errors = True
+                    else:
+                        overload_callables += 1
+                        overload_headers += len(dt_headers)
+
+    # Full-build inventory & cross-link verification when full package reference is present
+    is_full_build = (
+        (api_html_dir / "imednet_sinks.html").exists()
+        and (api_html_dir / "imednet_workflows.html").exists()
+        and (api_html_dir / "imednet.validation.html").exists()
+    )
+    if is_full_build:
+        if enum_classes < 15 or enum_values < 90:
+            print(
+                f"Error: Expected >=15 Enum classes and >=90 Enum values, got {enum_classes} classes and {enum_values} values."
+            )
+            has_errors = True
+        if "imednet.models.jobs.JobState" not in page_by_id:
+            print("Error: imednet.models.jobs.JobState missing from rendered API HTML.")
+            has_errors = True
+
+        if dataclass_classes < 25 or dataclass_fields < 224:
+            print(
+                f"Error: Expected >=25 @dataclass classes and >=224 fields, got {dataclass_classes} classes and {dataclass_fields} fields."
+            )
+            has_errors = True
+
+        for dc_qname, expected_factory in _EXPECTED_FACTORY_DATACLASSES.items():
+            dc_page = page_by_id.get(dc_qname)
+            if dc_page is None:
+                print(f"Error: Expected dataclass '{dc_qname}' missing from rendered API HTML.")
+                has_errors = True
+                continue
+            dc_parsed = parsed_pages[dc_page]
+            dc_sig = (
+                dc_parsed.dt_text.get(f"{dc_qname}.__init__", "")
+                + " "
+                + dc_parsed.dl_text_by_dt_id.get(dc_qname, "")
+            )
+            if expected_factory not in dc_sig:
+                print(
+                    f"Error: Dataclass '{dc_qname}' missing readable default_factory '{expected_factory}'."
+                )
+                has_errors = True
+
+        for td_qname in (
+            "imednet.orchestration.types.OrchestratorResult",
+            "imednet_workflows.uat.inspector.FormVariableMap",
+        ):
+            if td_qname not in page_by_id:
+                print(f"Error: Expected TypedDict '{td_qname}' missing from rendered API HTML.")
+                has_errors = True
+        if typeddict_classes < 2 or typeddict_keys < 6:
+            print(
+                f"Error: Expected >=2 TypedDict classes and >=6 keys, got {typeddict_classes} classes and {typeddict_keys} keys."
+            )
+            has_errors = True
+
+        if protocol_sink_attrs < 41:
+            print(
+                f"Error: Expected >=41 *SinkConfigProtocol attributes, got {protocol_sink_attrs}."
+            )
+            has_errors = True
+        if callable_protocols < 13:
+            print(
+                f"Error: Expected >=13 callable Protocol.__call__ signatures, got {callable_protocols}."
+            )
+            has_errors = True
+
+        for alias_qname, target_qname in _EXPECTED_PROTOCOL_ALIASES.items():
+            alias_page = page_by_id.get(alias_qname)
+            if alias_page is None:
+                print(f"Error: Protocol TypeAlias '{alias_qname}' missing from rendered API HTML.")
+                has_errors = True
+                continue
+            alias_parsed = parsed_pages[alias_page]
+            alias_dl = alias_parsed.dl_text_by_dt_id.get(alias_qname, "")
+            target_short = target_qname.rsplit(".", 1)[-1]
+            if "TypeAlias" not in alias_dl or target_short not in alias_dl:
+                print(
+                    f"Error: Protocol TypeAlias '{alias_qname}' must render as TypeAlias referencing '{target_short}'."
+                )
+                has_errors = True
+            hrefs = alias_parsed.internal_hrefs.get(alias_qname, [])
+            if not any(h.endswith(f"#{target_qname}") for h in hrefs):
+                print(
+                    f"Error: Protocol TypeAlias '{alias_qname}' missing internal link to '#{target_qname}'."
+                )
+                has_errors = True
+
+        if basemodel_classes < 100 or basemodel_fields < 850:
+            print(
+                f"Error: Expected >=100 BaseModel classes and >=850 fields, got {basemodel_classes} classes and {basemodel_fields} fields."
+            )
+            has_errors = True
+
+        for ov_qname in _EXPECTED_OVERLOAD_TARGETS:
+            if ov_qname not in page_by_id:
+                print(
+                    f"Error: Expected @overload callable '{ov_qname}' missing from rendered API HTML."
+                )
+                has_errors = True
+        if overload_callables < 10 or overload_headers < 24:
+            print(
+                f"Error: Expected >=10 @overload callables and >=24 <dt> headers, got {overload_callables} callables and {overload_headers} headers."
+            )
+            has_errors = True
+
+        if not has_errors:
+            print(
+                f"API parity gates passed ({enum_classes} Enums/{enum_values} values, "
+                f"{dataclass_classes} dataclasses/{dataclass_fields} fields, "
+                f"{typeddict_classes} TypedDicts/{typeddict_keys} keys, "
+                f"{protocol_sink_attrs} SinkConfigProtocol attrs, {callable_protocols} callable Protocols, "
+                f"{basemodel_classes} BaseModels/{basemodel_fields} fields, "
+                f"{overload_callables} @overload callables/{overload_headers} headers)."
+            )
+
+    return has_errors
+
+
 def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
     """Verify rendered HTML model fields, endpoint methods, _modules/index.html, and [docs] backlinks."""
     print("Checking rendered Sphinx HTML API reference and viewcode backlinks...")
     repo_root = Path(__file__).resolve().parents[1]
-    core_src = str(repo_root / "packages" / "core" / "src")
-    if core_src not in sys.path:
-        sys.path.insert(0, core_src)
+    _ensure_workspace_src_on_path(repo_root)
 
     if html_dir is None:
         html_dir = repo_root / "docs" / "_build" / "html"
@@ -1591,6 +2247,10 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
                 return True
 
     api_html_dir = html_dir / "reference" / "api"
+    parity_failed = False
+    if api_html_dir.is_dir() and any(api_html_dir.glob("*.html")):
+        parity_failed = _verify_api_reference_parity(api_html_dir, repo_root)
+
     models_page = api_html_dir / "imednet.models.html"
     endpoints_page = api_html_dir / "imednet.endpoints.html"
     sdk_page = api_html_dir / "imednet.html"
@@ -1610,7 +2270,7 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
             print(f"Error: Expected rendered HTML page {required_page} does not exist.")
             return True
 
-    has_errors = False
+    has_errors = parity_failed
 
     forbidden_internal_pages = (
         "imednet.http.html",
@@ -2615,6 +3275,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     baseurl_failed = check_sphinx_html_baseurl()
     seo_config_failed = check_sphinx_seo_configuration()
     suppression_failed = check_no_duplicate_suppression()
+    typehints_dep_failed = check_no_autodoc_typehints_dependency()
     api_html_dir = args.html_dir if args.require_html or args.html_dir != DEFAULT_HTML_DIR else None
     api_html_failed = check_rendered_api_reference(api_html_dir)
     compliance_links_failed = check_compliance_html_links(
@@ -2640,6 +3301,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         or baseurl_failed
         or seo_config_failed
         or suppression_failed
+        or typehints_dep_failed
         or api_html_failed
         or compliance_links_failed
         or html_seo_failed
