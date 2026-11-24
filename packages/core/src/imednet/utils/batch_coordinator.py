@@ -571,15 +571,38 @@ def _finalize_submission_summary(
     return summary
 
 
+def _resolve_failed_batch_id(batch_ids: list[str], exc: Exception) -> str:
+    status_bid = getattr(getattr(exc, "status", None), "batch_id", None)
+    if isinstance(status_bid, str) and status_bid:
+        return status_bid
+    exc_bid = getattr(exc, "batch_id", None)
+    if isinstance(exc_bid, str) and exc_bid:
+        return exc_bid
+    return batch_ids[0]
+
+
 def _poll_many_failure_summary(
     study_key: str,
     batch_ids: list[str],
     exc: Exception,
 ) -> JobPollSummary:
+    attached = getattr(exc, "poll_summary", None)
+    fail_bid = _resolve_failed_batch_id(batch_ids, exc)
+    if isinstance(attached, JobPollSummary):
+        results = dict(attached.results)
+        failures = dict(attached.failures)
+        if not failures:
+            failures[fail_bid] = exc
+        return JobPollSummary(
+            study_key=attached.study_key or study_key,
+            results=results,
+            failures=failures,
+            elapsed_total=attached.elapsed_total,
+        )
     return JobPollSummary(
         study_key=study_key,
         results={},
-        failures={batch_ids[0]: exc},
+        failures={fail_bid: exc},
         elapsed_total=0.0,
     )
 
@@ -635,6 +658,42 @@ async def _poll_sequential_async(
     return _build_sequential_poll_summary(study_key, results, failures)
 
 
+def _settle_unpolled_siblings_sync(
+    batch_ids: list[str],
+    summary: JobPollSummary,
+    poll_single: Callable[..., JobStatus] | None,
+    on_progress: JobProgressHandler | None,
+) -> JobPollSummary:
+    if poll_single is None:
+        return summary
+    for bid in batch_ids:
+        if bid in summary.results or bid in summary.failures:
+            continue
+        try:
+            summary.results[bid] = _invoke_poll_single_sync(poll_single, bid, on_progress)
+        except Exception as sibling_exc:
+            summary.failures[bid] = sibling_exc
+    return summary
+
+
+async def _settle_unpolled_siblings_async(
+    batch_ids: list[str],
+    summary: JobPollSummary,
+    poll_single: Callable[..., Awaitable[JobStatus]] | None,
+    on_progress: JobProgressHandler | None,
+) -> JobPollSummary:
+    if poll_single is None:
+        return summary
+    for bid in batch_ids:
+        if bid in summary.results or bid in summary.failures:
+            continue
+        try:
+            summary.results[bid] = await _invoke_poll_single_async(poll_single, bid, on_progress)
+        except Exception as sibling_exc:
+            summary.failures[bid] = sibling_exc
+    return summary
+
+
 def _settle_batches_sync(
     study_key: str,
     batch_ids: list[str],
@@ -642,15 +701,17 @@ def _settle_batches_sync(
     poll_single: Callable[..., JobStatus] | None,
     poll_many: Callable[..., JobPollSummary] | None,
     on_progress: JobProgressHandler | None,
+    prefer_poll_many: bool = False,
 ) -> JobPollSummary | None:
     """Settle all ``batch_ids`` synchronously without aborting sibling batches on failure."""
     if not batch_ids:
         return None
-    if len(batch_ids) > 1 and poll_many is not None:
+    if (len(batch_ids) > 1 or prefer_poll_many) and poll_many is not None:
         try:
             return _invoke_poll_many_sync(poll_many, batch_ids, on_progress)
         except Exception as exc:
-            return _poll_many_failure_summary(study_key, batch_ids, exc)
+            summary = _poll_many_failure_summary(study_key, batch_ids, exc)
+            return _settle_unpolled_siblings_sync(batch_ids, summary, poll_single, on_progress)
     if poll_single is not None:
         return _poll_sequential_sync(
             study_key,
@@ -673,15 +734,19 @@ async def _settle_batches_async(
     poll_single: Callable[..., Awaitable[JobStatus]] | None,
     poll_many: Callable[..., Awaitable[JobPollSummary]] | None,
     on_progress: JobProgressHandler | None,
+    prefer_poll_many: bool = False,
 ) -> JobPollSummary | None:
     """Settle all ``batch_ids`` asynchronously without aborting sibling batches on failure."""
     if not batch_ids:
         return None
-    if len(batch_ids) > 1 and poll_many is not None:
+    if (len(batch_ids) > 1 or prefer_poll_many) and poll_many is not None:
         try:
             return await _invoke_poll_many_async(poll_many, batch_ids, on_progress)
         except Exception as exc:
-            return _poll_many_failure_summary(study_key, batch_ids, exc)
+            summary = _poll_many_failure_summary(study_key, batch_ids, exc)
+            return await _settle_unpolled_siblings_async(
+                batch_ids, summary, poll_single, on_progress
+            )
     if poll_single is not None:
         return await _poll_sequential_async(
             study_key,
@@ -875,6 +940,7 @@ class BatchCoordinator:
         dry_run: bool = False,
         collect_errors: bool = False,
         sdk: Any = None,
+        prefer_poll_many: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, submit in bounded chunks, and optionally poll to completion."""
         effective_sdk = sdk if sdk is not None else self._sdk
@@ -950,6 +1016,7 @@ class BatchCoordinator:
                         poll_single=poll_single,
                         poll_many=poll_many,
                         on_progress=on_progress,
+                        prefer_poll_many=prefer_poll_many,
                     )
                     _apply_poll_summary_to_jobs(jobs, settled_poll)
                 _attach_mid_batch_error(
@@ -992,6 +1059,7 @@ class BatchCoordinator:
                 poll_single=poll_single,
                 poll_many=poll_many,
                 on_progress=on_progress,
+                prefer_poll_many=prefer_poll_many,
             )
 
         return _finalize_submission_summary(
@@ -1039,6 +1107,7 @@ class AsyncBatchCoordinator:
         dry_run: bool = False,
         collect_errors: bool = False,
         sdk: Any = None,
+        prefer_poll_many: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit bounded chunks, and optionally poll."""
         effective_sdk = sdk if sdk is not None else self._sdk
@@ -1111,6 +1180,7 @@ class AsyncBatchCoordinator:
                         poll_single=poll_single,
                         poll_many=poll_many,
                         on_progress=on_progress,
+                        prefer_poll_many=prefer_poll_many,
                     )
                     _apply_poll_summary_to_jobs(jobs, settled_poll)
                 _attach_mid_batch_error(
@@ -1153,6 +1223,7 @@ class AsyncBatchCoordinator:
                 poll_single=poll_single,
                 poll_many=poll_many,
                 on_progress=on_progress,
+                prefer_poll_many=prefer_poll_many,
             )
 
         return _finalize_submission_summary(
@@ -1207,6 +1278,8 @@ def _prepare_records_batch_execution(
     poll_single_fn: Callable[..., Any] | None,
     poll_many_fn: Callable[..., Any] | None,
     options: _RecordsBatchOptions,
+    *,
+    prefer_poll_many: bool = False,
 ) -> tuple[int, list[dict[str, Any]], Callable[[list[dict[str, Any]]], Any], dict[str, Any]]:
     if validate_study_key_fn is not None:
         validate_study_key_fn(study_key)
@@ -1231,6 +1304,7 @@ def _prepare_records_batch_execution(
         "require_batch_id": wait,
         "dry_run": options.get("dry_run", False),
         "collect_errors": options.get("collect_errors", False),
+        "prefer_poll_many": prefer_poll_many,
     }
     return (
         options.get("chunk_size", DEFAULT_BATCH_CHUNK_SIZE),
@@ -1250,6 +1324,7 @@ def _submit_records_batch_sync(
     poll_single_fn: Callable[..., JobStatus] | None = None,
     poll_many_fn: Callable[..., JobPollSummary] | None = None,
     sdk: Any = None,
+    prefer_poll_many: bool = False,
     **options: Unpack[_RecordsBatchOptions],
 ) -> BatchSubmissionSummary:
     chunk_size, normalized, submit_chunk, submit_kwargs = _prepare_records_batch_execution(
@@ -1261,6 +1336,7 @@ def _submit_records_batch_sync(
         poll_single_fn,
         poll_many_fn,
         options,
+        prefer_poll_many=prefer_poll_many,
     )
     return BatchCoordinator(chunk_size=chunk_size, sdk=sdk).submit(
         study_key, normalized, submit_chunk, **submit_kwargs
@@ -1277,6 +1353,7 @@ async def _submit_records_batch_async(
     poll_single_fn: Callable[..., Awaitable[JobStatus]] | None = None,
     poll_many_fn: Callable[..., Awaitable[JobPollSummary]] | None = None,
     sdk: Any = None,
+    prefer_poll_many: bool = False,
     **options: Unpack[_RecordsBatchOptions],
 ) -> BatchSubmissionSummary:
     chunk_size, normalized, submit_chunk, submit_kwargs = _prepare_records_batch_execution(
@@ -1288,6 +1365,7 @@ async def _submit_records_batch_async(
         poll_single_fn,
         poll_many_fn,
         options,
+        prefer_poll_many=prefer_poll_many,
     )
     return await AsyncBatchCoordinator(chunk_size=chunk_size, sdk=sdk).submit(
         study_key, normalized, submit_chunk, **submit_kwargs

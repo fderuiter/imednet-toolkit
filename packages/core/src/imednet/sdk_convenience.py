@@ -350,6 +350,76 @@ class _ListOperation(Generic[T, R_co]):
         )
 
 
+def _validate_convenience_study_key(records_endpoint: Any, study_key: str) -> None:
+    """Validate ``study_key`` using the endpoint validator or URL path segment guard."""
+    from unittest.mock import NonCallableMock
+
+    from imednet.core.context import _safe_context_attr
+    from imednet.errors.validation import ConfigurationError
+    from imednet.utils.url import validate_path_segment
+
+    validate_fn = _safe_context_attr(records_endpoint, "_validate_study_key")
+    if callable(validate_fn) and not isinstance(validate_fn, NonCallableMock):
+        validate_fn(study_key)
+        return
+    if study_key is None:
+        raise ConfigurationError(
+            "No study key provided. You must either pass 'study_key' explicitly "
+            "to the endpoint method or set it using ImednetSDK.study_context(...)."
+        )
+    validate_path_segment(study_key, name="study_key")
+
+
+def _resolve_convenience_schema_adapter(instance: Any, *, is_async: bool) -> Any:
+    """Resolve a forms/variables Data Dictionary adapter for convenience batch dry-runs."""
+    from unittest.mock import NonCallableMock
+
+    from imednet.core.context import _safe_context_attr
+    from imednet.endpoints.records import (
+        _build_async_schema_adapter,
+        _build_sync_schema_adapter,
+        _EndpointSchemaAdapter,
+    )
+
+    client_attr = "_async_client" if is_async else "_client"
+    raw_client = _safe_context_attr(instance, client_attr)
+    forms_ep = _safe_context_attr(instance, "forms")
+    variables_ep = _safe_context_attr(instance, "variables")
+    if (
+        forms_ep is not None
+        and variables_ep is not None
+        and not isinstance(raw_client, NonCallableMock)
+        and not isinstance(forms_ep, NonCallableMock)
+        and not isinstance(variables_ep, NonCallableMock)
+    ):
+        return _EndpointSchemaAdapter(forms=forms_ep, variables=variables_ep)
+    if is_async:
+        return _build_async_schema_adapter(raw_client)
+    return _build_sync_schema_adapter(raw_client)
+
+
+def _should_prefer_convenience_poll_many(instance: Any, *, is_async: bool) -> bool:
+    """Prefer ``poll_jobs``/``async_poll_jobs`` unless single-job polling was explicitly mocked."""
+    from imednet.core.context import _safe_context_attr
+
+    many_attr = "async_poll_jobs" if is_async else "poll_jobs"
+    single_attr = "async_poll_job" if is_async else "poll_job"
+    if not callable(_safe_context_attr(instance, many_attr)):
+        return False
+    try:
+        inst_dict = object.__getattribute__(instance, "__dict__")
+    except AttributeError:
+        inst_dict = {}
+    if single_attr in inst_dict and many_attr not in inst_dict:
+        return False
+    jobs_obj = _safe_context_attr(instance, "jobs")
+    try:
+        jobs_dict = object.__getattribute__(jobs_obj, "__dict__") if jobs_obj is not None else {}
+    except AttributeError:
+        jobs_dict = {}
+    return not ("poll" in jobs_dict and "poll_many" not in jobs_dict and many_attr not in inst_dict)
+
+
 class SyncSDKConvenienceMixin:
     """Synchronous SDK convenience methods."""
 
@@ -431,14 +501,29 @@ class SyncSDKConvenienceMixin:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Validate once and submit records in bounded chunks (default 100 per POST)."""
+        from imednet.core.context import _safe_context_attr
         from imednet.utils.batch_coordinator import _submit_records_batch_sync
 
+        poll_single_fn = (
+            (lambda *args, **kwargs: self.poll_job(*args, **kwargs))
+            if callable(_safe_context_attr(self, "poll_job"))
+            else None
+        )
+        poll_many_fn = (
+            (lambda *args, **kwargs: self.poll_jobs(*args, **kwargs))
+            if callable(_safe_context_attr(self, "poll_jobs"))
+            else None
+        )
         return _submit_records_batch_sync(
             study_key,
             records_data,
             email_notify,
+            validate_study_key_fn=lambda sk: _validate_convenience_study_key(self.records, sk),
             create_records_fn=lambda *args, **kwargs: self.records.create(*args, **kwargs),
-            poll_many_fn=lambda *args, **kwargs: self.poll_jobs(*args, **kwargs),
+            poll_single_fn=poll_single_fn,
+            poll_many_fn=poll_many_fn,
+            sdk=_resolve_convenience_schema_adapter(self, is_async=False),
+            prefer_poll_many=_should_prefer_convenience_poll_many(self, is_async=False),
             schema=schema,
             chunk_size=chunk_size,
             skip_validation=skip_validation,
@@ -459,8 +544,18 @@ class SyncSDKConvenienceMixin:
         interval: float = 5,
         timeout: float = 300,
         on_progress: JobProgressHandler | None = None,
+        resolve_results: bool = False,
     ) -> JobStatus:
-        """Poll a job until it reaches a terminal state."""
+        """Poll a job until it reaches a terminal state, optionally resolving ``resultUrl`` payloads."""
+        if resolve_results:
+            return self.jobs.poll(
+                study_key,
+                batch_id,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+                resolve_results=True,
+            )
         return self.jobs.poll(
             study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
         )
@@ -475,8 +570,19 @@ class SyncSDKConvenienceMixin:
         timeout: float = 300.0,
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
+        resolve_results: bool = False,
     ) -> JobPollSummary:
-        """Poll multiple jobs concurrently until they reach terminal states."""
+        """Poll multiple jobs concurrently until terminal states, optionally resolving ``resultUrl`` payloads."""
+        if resolve_results:
+            return self.jobs.poll_many(
+                study_key,
+                batch_ids,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+                fail_fast=fail_fast,
+                resolve_results=True,
+            )
         return self.jobs.poll_many(
             study_key,
             batch_ids,
@@ -584,14 +690,29 @@ class AsyncSDKConvenienceMixin:
         collect_errors: bool = False,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once and submit records in bounded chunks."""
+        from imednet.core.context import _safe_context_attr
         from imednet.utils.batch_coordinator import _submit_records_batch_async
 
+        poll_single_fn = (
+            (lambda *args, **kwargs: self.async_poll_job(*args, **kwargs))
+            if callable(_safe_context_attr(self, "async_poll_job"))
+            else None
+        )
+        poll_many_fn = (
+            (lambda *args, **kwargs: self.async_poll_jobs(*args, **kwargs))
+            if callable(_safe_context_attr(self, "async_poll_jobs"))
+            else None
+        )
         return await _submit_records_batch_async(
             study_key,
             records_data,
             email_notify,
+            validate_study_key_fn=lambda sk: _validate_convenience_study_key(self.records, sk),
             create_records_fn=lambda *args, **kwargs: self.records.create(*args, **kwargs),
-            poll_many_fn=lambda *args, **kwargs: self.async_poll_jobs(*args, **kwargs),
+            poll_single_fn=poll_single_fn,
+            poll_many_fn=poll_many_fn,
+            sdk=_resolve_convenience_schema_adapter(self, is_async=True),
+            prefer_poll_many=_should_prefer_convenience_poll_many(self, is_async=True),
             schema=schema,
             chunk_size=chunk_size,
             skip_validation=skip_validation,
@@ -612,8 +733,18 @@ class AsyncSDKConvenienceMixin:
         interval: float = 5,
         timeout: float = 300,
         on_progress: JobProgressHandler | None = None,
+        resolve_results: bool = False,
     ) -> JobStatus:
-        """Asynchronously poll a job until it reaches a terminal state."""
+        """Asynchronously poll a job until terminal state, optionally resolving ``resultUrl`` payloads."""
+        if resolve_results:
+            return await self.jobs.poll(
+                study_key,
+                batch_id,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+                resolve_results=True,
+            )
         return await self.jobs.poll(
             study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
         )
@@ -628,8 +759,19 @@ class AsyncSDKConvenienceMixin:
         timeout: float = 300.0,
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
+        resolve_results: bool = False,
     ) -> JobPollSummary:
-        """Asynchronously poll multiple jobs concurrently until they reach terminal states."""
+        """Asynchronously poll multiple jobs concurrently, optionally resolving ``resultUrl`` payloads."""
+        if resolve_results:
+            return await self.jobs.poll_many(
+                study_key,
+                batch_ids,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+                fail_fast=fail_fast,
+                resolve_results=True,
+            )
         return await self.jobs.poll_many(
             study_key,
             batch_ids,

@@ -252,6 +252,7 @@ class ImednetFacade(Protocol):
         interval: float = 5,
         timeout: float = 300,
         on_progress: JobProgressHandler | None = None,
+        resolve_results: bool = False,
     ) -> JobStatus:
         """Wait for a background job to reach a terminal state.
 
@@ -261,6 +262,7 @@ class ImednetFacade(Protocol):
             interval: Time between poll attempts in seconds.
             timeout: Maximum time to wait in seconds.
             on_progress: Optional callback invoked on each poll cycle.
+            resolve_results: Whether to fetch and validate terminal ``resultUrl`` payloads.
 
         Returns:
             The final JobStatus of the operation.
@@ -276,8 +278,9 @@ class ImednetFacade(Protocol):
         timeout: float = 300.0,
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
+        resolve_results: bool = False,
     ) -> JobPollSummary:
-        """Wait for multiple background jobs concurrently until terminal states."""
+        """Wait for multiple background jobs concurrently, optionally resolving ``resultUrl`` payloads."""
         ...
 
     @property
@@ -520,6 +523,7 @@ class AsyncImednetFacade(Protocol):
         interval: float = 5,
         timeout: float = 300,
         on_progress: JobProgressHandler | None = None,
+        resolve_results: bool = False,
     ) -> JobStatus:
         """Asynchronously wait for a background job to reach a terminal state.
 
@@ -529,6 +533,7 @@ class AsyncImednetFacade(Protocol):
             interval: Time between poll attempts in seconds.
             timeout: Maximum time to wait in seconds.
             on_progress: Optional callback invoked on each poll cycle.
+            resolve_results: Whether to fetch and validate terminal ``resultUrl`` payloads.
 
         Returns:
             The final JobStatus of the operation.
@@ -544,8 +549,9 @@ class AsyncImednetFacade(Protocol):
         timeout: float = 300.0,
         on_progress: JobProgressHandler | None = None,
         fail_fast: bool = False,
+        resolve_results: bool = False,
     ) -> JobPollSummary:
-        """Asynchronously wait for multiple background jobs until terminal states."""
+        """Asynchronously wait for multiple background jobs, optionally resolving ``resultUrl`` payloads."""
         ...
 
     @property
