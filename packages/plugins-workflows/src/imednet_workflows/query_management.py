@@ -17,6 +17,7 @@ from imednet.spi.models import (
 )
 from imednet.spi.utils import normalize_iso_date, parse_iso_datetime
 
+from ._filter_bounds import filter_queries_by_subject_keys, plan_site_subject_query_filters
 from .triage_store import TriageStore
 
 if TYPE_CHECKING:
@@ -182,21 +183,18 @@ class QueryManagementWorkflow:
             A list of Query objects for the specified site.
         """
         subjects = self._sdk.get_subjects(study_key, site_name=site_key)
-        subject_keys = [
-            key
-            for s in subjects
-            if getattr(s, "is_deleted", False) is not True
-            and isinstance(s.subject_key, str)
-            and (key := s.subject_key.strip())
-        ]
+        subject_keys, final_filter_dict, filter_locally = plan_site_subject_query_filters(
+            subjects,
+            additional_filter,
+            kwargs,
+        )
         if not subject_keys:
             return []
 
-        final_filter_dict: dict[str, Any] = {"subject_key": subject_keys}
-        if additional_filter:
-            final_filter_dict.update(additional_filter)
-
-        return list(self._sdk.get_queries(study_key, **final_filter_dict, **kwargs))
+        queries = self._sdk.get_queries(study_key, **final_filter_dict, **kwargs)
+        if not filter_locally:
+            return list(queries)
+        return filter_queries_by_subject_keys(queries, subject_keys)
 
     def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
         """Counts queries grouped by their current QueryStatus values.

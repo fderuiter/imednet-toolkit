@@ -11,6 +11,7 @@ class VisitsOperationDef:
     MODEL = Visit
     FILTER_ATTRIBUTES = frozenset(
         {
+            "visitId",
             "intervalId",
             "intervalName",
             "subjectId",

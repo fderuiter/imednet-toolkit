@@ -47,9 +47,11 @@ def test_parse_filter_args_rejects_unknown_or_unallowlisted_visit_attribute(
     assert parse_filter_args(["interval_name=Screening"], model=Visit) == {
         "interval_name": "Screening"
     }
+    assert parse_filter_args(["visit_id=1"], model=Visit) == {"visit_id": 1}
+    assert parse_filter_args(["visitId==401"], model=Visit) == {"visitId": ("==", 401)}
     for bad_expr, expected_msg in (
         ("visit_key=SCREENING", "Unknown filter attribute 'visit_key' for Visit"),
-        ("visit_id=1", "Unknown filter attribute 'visit_id' for Visit"),
+        ("status=open", "Unknown filter attribute 'status' for Visit"),
     ):
         with pytest.raises(SystemExit) as exc_info:
             parse_filter_args([bad_expr], model=Visit)
@@ -57,6 +59,7 @@ def test_parse_filter_args_rejects_unknown_or_unallowlisted_visit_attribute(
         captured = capfd.readouterr()
         assert expected_msg in captured.err
         assert "Valid attributes:" in captured.err
+        assert "visitId" in captured.err
 
 
 def test_parse_filter_args_invalid():

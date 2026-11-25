@@ -49,17 +49,19 @@ def parse_iso_datetime(date_str: str) -> datetime:
 
 
 def format_iso_datetime(dt: datetime) -> str:
-    """Format a datetime object into an ISO 8601 string ending with 'Z'.
+    """Format a datetime object into a whole-second UTC ISO 8601 string ending with 'Z'.
+
+    Fractional seconds are truncated toward the floor second so inclusive ``>=``
+    bounds never skip records modified within the boundary second.
 
     Args:
         dt: datetime object (naive or timezone-aware).
 
     Returns:
-        A string representing the datetime in ISO 8601 format.
+        A string representing the UTC datetime in ``YYYY-MM-DDTHH:MM:SSZ`` format.
     """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    utc_dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+    return utc_dt.replace(microsecond=0).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def normalize_iso_date(value: Any, *, date_order: Literal["MDY", "DMY"] | None = None) -> Any:

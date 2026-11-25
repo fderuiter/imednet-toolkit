@@ -69,16 +69,21 @@ def test_get_query_state_counts_aggregates_states() -> None:
 
 
 def test_get_queries_by_site_filters_using_subjects() -> None:
-    """Test that get queries by site filters using subjects."""
+    """Multi-Subject Sites send extra filter once and filter subject keys locally."""
     sdk = MagicMock()
     sdk.get_subjects.return_value = [Subject(subject_key="S1"), Subject(subject_key="S2")]
+    q1 = Query(annotation_id=1, subject_key="S1", variable="AE_TERM")
+    q2 = Query(annotation_id=2, subject_key="S2", variable="AE_TERM")
+    q_other = Query(annotation_id=3, subject_key="S3", variable="AE_TERM")
+    sdk.get_queries.return_value = [q1, q_other, q2]
     wf = QueryManagementWorkflow(sdk)
 
-    wf.get_queries_by_site("STUDY", "SITE", additional_filter={"state": "open"})
+    result = wf.get_queries_by_site("STUDY", "SITE", additional_filter={"variable": "AE_TERM"})
 
     sdk.get_subjects.assert_called_once_with("STUDY", site_name="SITE")
-    sdk.get_queries.assert_called_once_with("STUDY", subject_key=["S1", "S2"], state="open")
-    assert sdk.get_queries.call_args.kwargs == {"subject_key": ["S1", "S2"], "state": "open"}
+    sdk.get_queries.assert_called_once_with("STUDY", variable="AE_TERM")
+    assert sdk.get_queries.call_args.kwargs == {"variable": "AE_TERM"}
+    assert result == [q1, q2]
 
 
 def test_get_queries_by_site_returns_empty_if_no_subjects() -> None:
@@ -95,16 +100,19 @@ def test_get_queries_by_site_returns_empty_if_no_subjects() -> None:
 
 
 def test_get_queries_by_site_with_space_in_name() -> None:
-    """Test that get queries by site with space in name."""
+    """Single-Subject Sites pass scalar subject_key upstream (including deduplicated keys)."""
     sdk = MagicMock()
-    sdk.get_subjects.return_value = [Subject(subject_key="S1")]
+    sdk.get_subjects.return_value = [Subject(subject_key="S1"), Subject(subject_key=" S1 ")]
+    q1 = Query(annotation_id=1, subject_key="S1")
+    sdk.get_queries.return_value = [q1]
     wf = QueryManagementWorkflow(sdk)
 
-    wf.get_queries_by_site("STUDY", "Mock Site")
+    result = wf.get_queries_by_site("STUDY", "Mock Site", additional_filter={"variable": "VSORRES"})
 
     sdk.get_subjects.assert_called_once_with("STUDY", site_name="Mock Site")
-    sdk.get_queries.assert_called_once_with("STUDY", subject_key=["S1"])
-    assert sdk.get_queries.call_args.kwargs == {"subject_key": ["S1"]}
+    sdk.get_queries.assert_called_once_with("STUDY", variable="VSORRES", subject_key="S1")
+    assert sdk.get_queries.call_args.kwargs == {"variable": "VSORRES", "subject_key": "S1"}
+    assert result == [q1]
 
 
 def test_query_state_counts_dict_lookups() -> None:
@@ -144,7 +152,7 @@ def test_query_management_duck_typed_objects_fallback() -> None:
 
 
 def test_get_queries_by_site_multi_subject_http_contract() -> None:
-    """Verify multi-Subject Site query lookup emits OR filter without studyKey predicate."""
+    """Verify multi-Subject Site query lookup sends one request with additional_filter and filters locally."""
     import respx
 
     from imednet.sdk import ImednetSDK
@@ -165,11 +173,19 @@ def test_get_queries_by_site_multi_subject_http_contract() -> None:
                     {
                         "annotationId": 10,
                         "subjectKey": "SUB1",
+                        "variable": "AETERM",
                         "queryComments": [{"sequence": 1, "closed": False}],
                     },
                     {
                         "annotationId": 11,
                         "subjectKey": "SUB2",
+                        "variable": "AETERM",
+                        "queryComments": [{"sequence": 1, "closed": False}],
+                    },
+                    {
+                        "annotationId": 12,
+                        "subjectKey": "OTHER_SITE_SUB",
+                        "variable": "AETERM",
                         "queryComments": [{"sequence": 1, "closed": False}],
                     },
                 ]
@@ -177,16 +193,20 @@ def test_get_queries_by_site_multi_subject_http_contract() -> None:
         )
 
         wf = QueryManagementWorkflow(sdk)
-        queries = wf.get_queries_by_site("STUDY", "General Hospital")
+        queries = wf.get_queries_by_site(
+            "STUDY",
+            "General Hospital",
+            additional_filter={"variable": "AETERM", "record_id": (">=", 100)},
+        )
 
-        assert len(queries) == 2
+        assert [q.annotation_id for q in queries] == [10, 11]
         assert (
             subjects_route.calls.last.request.url.params["filter"] == 'siteName=="General Hospital"'
         )
-        assert (
-            queries_route.calls.last.request.url.params["filter"]
-            == "subjectKey==SUB1,subjectKey==SUB2"
-        )
+        assert queries_route.call_count == 1
+        sent_query_filter = queries_route.calls.last.request.url.params["filter"]
+        assert "subjectKey" not in sent_query_filter
+        assert sent_query_filter == "variable==AETERM;recordId>=100"
 
 
 def test_get_open_queries_include_answered_and_get_unresolved_queries() -> None:
@@ -209,7 +229,7 @@ def test_get_open_queries_include_answered_and_get_unresolved_queries() -> None:
 
 
 def test_get_queries_by_site_excludes_deleted_and_unkeyed_subjects() -> None:
-    """Verify soft-deleted and unkeyed/blank subjects are excluded before querying."""
+    """Verify soft-deleted and unkeyed/blank subjects are excluded before local filtering."""
     sdk = MagicMock()
     sdk.get_subjects.return_value = [
         Subject(subject_key="ACTIVE-1"),
@@ -219,10 +239,16 @@ def test_get_queries_by_site_excludes_deleted_and_unkeyed_subjects() -> None:
         Subject(subject_key="   "),
         Subject(subject_key=" ACTIVE-2 "),
     ]
-    wf = QueryManagementWorkflow(sdk)
-    wf.get_queries_by_site("STUDY", "Site 1")
+    q_a1 = Query(annotation_id=1, subject_key="ACTIVE-1")
+    q_del = Query(annotation_id=2, subject_key="DELETED-FLAG")
+    q_a2 = Query(annotation_id=3, subject_key="ACTIVE-2")
+    sdk.get_queries.return_value = [q_a1, q_del, q_a2]
 
-    sdk.get_queries.assert_called_once_with("STUDY", subject_key=["ACTIVE-1", "ACTIVE-2"])
+    wf = QueryManagementWorkflow(sdk)
+    result = wf.get_queries_by_site("STUDY", "Site 1")
+
+    sdk.get_queries.assert_called_once_with("STUDY")
+    assert result == [q_a1, q_a2]
 
 
 def test_get_queries_by_site_returns_empty_when_only_deleted_or_unkeyed_subjects() -> None:

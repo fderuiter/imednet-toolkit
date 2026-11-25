@@ -84,7 +84,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
@@ -117,11 +117,6 @@ from imednet.models.standards import (
     resolve_standards_profile,
     validate_cdash_variable,
 )
-from imednet.utils.dates import (
-    format_iso_datetime,
-    normalize_utc_timestamp_bound,
-    parse_iso_datetime,
-)
 from imednet.utils.filters import (
     _parse_clause_operator,
     _snake_to_camel,
@@ -140,6 +135,13 @@ from imednet.utils.security import (
 )
 from imednet.utils.tabular import MASKED_SENTINEL
 from imednet.utils.url import redact_url_query
+
+from ._record_timestamp_bounds import (
+    RECORD_TIMESTAMP_ATTRIBUTES,
+    _combine_branch_with_watermark,
+    _merge_and_condition,
+    normalize_watermark_datetime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,29 +216,6 @@ class StateProviderProtocol(Protocol):
     ) -> None:
         """Persist SDTM sidecar lineage and monotonic sequence watermarks."""
         ...
-
-
-def normalize_watermark_datetime(value: datetime | str | None) -> datetime | None:
-    """Normalize a datetime or ISO-8601 date/timestamp string into UTC."""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=UTC)
-        return value.astimezone(UTC)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return None
-        try:
-            parsed = parse_iso_datetime(stripped)
-        except ValueError:
-            normalized_iso = normalize_utc_timestamp_bound(stripped, is_end=False)
-            parsed = parse_iso_datetime(normalized_iso)
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC)
-    raise ValueError(f"Watermark must be a datetime or ISO-8601 string, got {type(value).__name__}")
 
 
 def get_state_provider(
@@ -1878,167 +1857,6 @@ def _split_top_level(expr: str, sep: str) -> list[str]:
     return raw_parts
 
 
-def _merge_and_condition(target: dict[str, Any], key: str, condition: Any) -> None:
-    """Merge an AND filter condition onto ``target``, rejecting duplicate AND attributes."""
-    camel_key = _snake_to_camel(key)
-    for existing in target:
-        if _snake_to_camel(existing) == camel_key:
-            raise ValueError(f"Duplicate filter attribute '{camel_key}' in AND clause")
-    target[key] = condition
-
-
-def _coerce_date_modified_clauses(raw_cond: Any) -> list[tuple[str, datetime]]:
-    """Normalize a branch's ``dateModified`` value into ``[(operator, utc_datetime), ...]``."""
-    raw_items: list[tuple[str, Any]]
-    if isinstance(raw_cond, list):
-        raw_items = []
-        for item in raw_cond:
-            if isinstance(item, tuple) and len(item) == 2:
-                raw_items.append((item[0], item[1]))
-            else:
-                raw_items.append(("==", item))
-    elif isinstance(raw_cond, tuple):
-        if len(raw_cond) != 2:
-            raise ValueError(
-                f"Filter tuple for 'dateModified' must have 2 elements, got {len(raw_cond)}"
-            )
-        raw_items = [(raw_cond[0], raw_cond[1])]
-    else:
-        raw_items = [("==", raw_cond)]
-
-    parsed: list[tuple[str, datetime]] = []
-    for op, val in raw_items:
-        validate_filter_operator(op, allow_regex=False)
-        dt = normalize_watermark_datetime(val)
-        if dt is None:
-            raise ValueError(f"Invalid dateModified filter value: {val!r}")
-        parsed.append((op, dt))
-    return parsed
-
-
-def _combine_branch_with_watermark(
-    branch: dict[str, Any],
-    norm_wm: datetime | None,
-) -> tuple[dict[str, Any], Callable[[Any], bool] | None] | None:
-    """Combine a branch filter dict with ``norm_wm`` using at most one ``dateModified`` key.
-
-    Returns ``None`` when the combined ``dateModified`` bounds are unsatisfiable
-    so callers can skip issuing an upstream request for an empty intersection.
-    """
-    out = dict(branch)
-    dm_keys = [k for k in out if _snake_to_camel(k) == "dateModified"]
-    if len(dm_keys) > 1:
-        raise ValueError("Duplicate filter attribute 'dateModified' in AND clause")
-
-    clauses: list[tuple[str, datetime]] = []
-    if dm_keys:
-        raw_existing = out.pop(dm_keys[0])
-        # Preserve original non-list condition directly when watermark is absent
-        if norm_wm is None and not isinstance(raw_existing, list):
-            _coerce_date_modified_clauses(raw_existing)
-            out["dateModified"] = raw_existing
-            return out, None
-        clauses.extend(_coerce_date_modified_clauses(raw_existing))
-
-    if norm_wm is not None:
-        clauses.append((">=", norm_wm))
-
-    if not clauses:
-        return out, None
-
-    lower: tuple[datetime, bool] | None = None
-    upper: tuple[datetime, bool] | None = None
-    exact: datetime | None = None
-    excluded: set[datetime] = set()
-
-    for op, dt in clauses:
-        if op == "==":
-            if exact is not None and exact != dt:
-                return None
-            exact = dt
-        elif op in (">=", ">"):
-            strict = op == ">"
-            if lower is None or dt > lower[0] or (dt == lower[0] and strict and not lower[1]):
-                lower = (dt, strict)
-        elif op in ("<=", "<"):
-            strict = op == "<"
-            if upper is None or dt < upper[0] or (dt == upper[0] and strict and not upper[1]):
-                upper = (dt, strict)
-        elif op == "!=":
-            excluded.add(dt)
-
-    if lower is not None:
-        for ex in list(excluded):
-            if ex < lower[0] or (ex == lower[0] and lower[1]):
-                excluded.discard(ex)
-            elif ex == lower[0] and not lower[1]:
-                lower = (lower[0], True)
-                excluded.discard(ex)
-
-    if upper is not None:
-        for ex in list(excluded):
-            if ex > upper[0] or (ex == upper[0] and upper[1]):
-                excluded.discard(ex)
-            elif ex == upper[0] and not upper[1]:
-                upper = (upper[0], True)
-                excluded.discard(ex)
-
-    if exact is not None:
-        if exact in excluded:
-            return None
-        if lower is not None and (exact < lower[0] or (exact == lower[0] and lower[1])):
-            return None
-        if upper is not None and (exact > upper[0] or (exact == upper[0] and upper[1])):
-            return None
-        out["dateModified"] = ("==", format_iso_datetime(exact))
-        return out, None
-
-    if lower is not None and upper is not None:
-        if lower[0] > upper[0]:
-            return None
-        if lower[0] == upper[0]:
-            if lower[1] or upper[1] or lower[0] in excluded:
-                return None
-            out["dateModified"] = ("==", format_iso_datetime(lower[0]))
-            return out, None
-
-    residual_upper: tuple[datetime, bool] | None = None
-    if lower is not None:
-        out["dateModified"] = (
-            ">" if lower[1] else ">=",
-            format_iso_datetime(lower[0]),
-        )
-        residual_upper = upper
-    elif upper is not None:
-        out["dateModified"] = (
-            "<" if upper[1] else "<=",
-            format_iso_datetime(upper[0]),
-        )
-    elif excluded:
-        first_ex = min(excluded)
-        excluded.discard(first_ex)
-        out["dateModified"] = ("!=", format_iso_datetime(first_ex))
-
-    if residual_upper is None and not excluded:
-        return out, None
-
-    frozen_excluded = frozenset(excluded)
-
-    def _post_predicate(record: Any) -> bool:
-        rec_ts = extract_record_timestamp(record)
-        if rec_ts is None:
-            return False
-        if residual_upper is not None:
-            bound_dt, is_strict = residual_upper
-            if is_strict and not (rec_ts < bound_dt):
-                return False
-            if not is_strict and not (rec_ts <= bound_dt):
-                return False
-        return rec_ts not in frozen_excluded
-
-    return out, _post_predicate
-
-
 def _expand_scalar_list_branches(base: dict[str, Any]) -> list[dict[str, Any]]:
     """Expand scalar list/set values into separate AND-safe filter dicts."""
     list_keys: list[str] = []
@@ -2108,6 +1926,7 @@ def _resolve_record_query_branches(
                         and_parts,
                         model=Record,
                         allowed_attributes=allowed_attrs,
+                        multi_bound_attributes=RECORD_TIMESTAMP_ATTRIBUTES,
                     )
                 ]
     elif isinstance(record_filter, Mapping):
@@ -2183,6 +2002,7 @@ def _resolve_record_query_branches(
                         flat_and,
                         model=Record,
                         allowed_attributes=allowed_attrs,
+                        multi_bound_attributes=RECORD_TIMESTAMP_ATTRIBUTES,
                     )
                 ]
 

@@ -1049,7 +1049,7 @@ def test_wizard_filter_validation_preserves_zero_padded_and_superscripts_and_mat
 @pytest.mark.parametrize(
     ("extra_flags", "expected_err"),
     [
-        (["--visit-filter", "visit_id=1"], "Valid attributes:"),
+        (["--visit-filter", "visit_key=V1"], "Valid attributes:"),
         (["--record-filter", "study_key=STUDY"], "'study_key' and 'studyKey' cannot be used"),
         (["--subject-filter", "keywords=vip"], "Valid attributes:"),
         (
@@ -1081,11 +1081,20 @@ def test_extract_records_headless_preflight_enforces_allowlists_before_sdk(
 
 
 def test_wizard_validate_filter_syntax_enforces_endpoint_allowlists() -> None:
-    """Interactive wizard validate_filter_syntax rejects non-allowlisted fields and study_key."""
-    ok_visit, _, _, visit_err = validate_filter_syntax("visit_id=1", model=Visit)
+    """Interactive wizard validate_filter_syntax accepts visit_id/visitId and rejects non-allowlisted fields."""
+    assert validate_filter_syntax("visit_id=1", model=Visit) == (True, "visit_id", 1, None)
+    assert validate_filter_syntax("visitId==401", model=Visit) == (
+        True,
+        "visitId",
+        ("==", 401),
+        None,
+    )
+
+    ok_visit, _, _, visit_err = validate_filter_syntax("visit_key=V1", model=Visit)
     assert ok_visit is False
     assert visit_err is not None
     assert "Valid attributes:" in visit_err
+    assert "visitId" in visit_err
 
     ok_study, _, _, study_err = validate_filter_syntax("study_key=STUDY", model=Record)
     assert ok_study is False

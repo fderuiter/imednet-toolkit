@@ -1126,9 +1126,9 @@ def test_studies_list_preserves_study_key_and_study_key_camel_filters(
 @pytest.mark.parametrize(
     ("argv", "expected_attr"),
     [
-        (["queries", "list", "STUDY", "-f", "status=Open"], "annotationType"),
-        (["visits", "list", "STUDY", "-f", "visit_id=1"], "intervalName"),
-        (["codings", "list", "STUDY", "-f", "coding_id=1"], "dictionaryName"),
+        (["queries", "list", "STUDY", "-f", "status=Open"], "annotationId"),
+        (["visits", "list", "STUDY", "-f", "visit_key=V1"], "visitId"),
+        (["codings", "list", "STUDY", "-f", "status=Open"], "codingId"),
         (["records", "list", "STUDY", "-f", "keywords=urgent"], "formKey"),
         (["subjects", "list", "STUDY", "-f", "keywords=vip"], "subjectStatus"),
     ],

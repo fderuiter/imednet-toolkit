@@ -70,20 +70,25 @@ def test_get_query_state_counts_aggregates_states() -> None:
 
 
 def test_get_queries_by_site_filters_using_subjects() -> None:
-    """Test that get queries by site filters using subjects."""
+    """Test that get queries by site filters multi-subject sites locally."""
     sdk = MagicMock()
     s1 = Subject.from_json(fake_data.fake_subject())
     s2 = Subject.from_json(fake_data.fake_subject())
     s1.subject_key = "S1"
     s2.subject_key = "S2"
     sdk.get_subjects.return_value = [s1, s2]
+    q1 = Query(annotation_id=1, subject_key="S1")
+    q2 = Query(annotation_id=2, subject_key="S2")
+    q_other = Query(annotation_id=3, subject_key="S3")
+    sdk.get_queries.return_value = [q1, q_other, q2]
     wf = QueryManagementWorkflow(sdk)
 
-    wf.get_queries_by_site("STUDY", "SITE", additional_filter={"state": "open"})
+    result = wf.get_queries_by_site("STUDY", "SITE", additional_filter={"state": "open"})
 
     sdk.get_subjects.assert_called_once_with("STUDY", site_name="SITE")
-    sdk.get_queries.assert_called_once_with("STUDY", subject_key=["S1", "S2"], state="open")
-    assert sdk.get_queries.call_args.kwargs == {"subject_key": ["S1", "S2"], "state": "open"}
+    sdk.get_queries.assert_called_once_with("STUDY", state="open")
+    assert sdk.get_queries.call_args.kwargs == {"state": "open"}
+    assert result == [q1, q2]
 
 
 def test_get_queries_by_site_returns_empty_if_no_subjects() -> None:
@@ -100,15 +105,18 @@ def test_get_queries_by_site_returns_empty_if_no_subjects() -> None:
 
 
 def test_get_queries_by_site_with_space_in_name() -> None:
-    """Test that get queries by site with space in name."""
+    """Test that get queries by site with space in name passes scalar subject_key."""
     sdk = MagicMock()
     s = Subject.from_json(fake_data.fake_subject())
     s.subject_key = "S1"
     sdk.get_subjects.return_value = [s]
+    q1 = Query(annotation_id=1, subject_key="S1")
+    sdk.get_queries.return_value = [q1]
     wf = QueryManagementWorkflow(sdk)
 
-    wf.get_queries_by_site("STUDY", "Mock Site")
+    result = wf.get_queries_by_site("STUDY", "Mock Site")
 
     sdk.get_subjects.assert_called_once_with("STUDY", site_name="Mock Site")
-    sdk.get_queries.assert_called_once_with("STUDY", subject_key=["S1"])
-    assert sdk.get_queries.call_args.kwargs == {"subject_key": ["S1"]}
+    sdk.get_queries.assert_called_once_with("STUDY", subject_key="S1")
+    assert sdk.get_queries.call_args.kwargs == {"subject_key": "S1"}
+    assert result == [q1]
