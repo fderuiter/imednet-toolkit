@@ -39,7 +39,7 @@ Unified, Python-tailored skill portfolio merging [obra/superpowers](https://gith
 ### Review, Verification & Branch Closure
 - **`requesting-code-review`**: Per-task plan review or parallel two-axis Standards (12 Fowler smells + repo overrides) & Spec diff review.
 - **`receiving-code-review`**: Technical evaluation and evidence-backed pushback on feedback.
-- **`verification-before-completion`**: Requires fresh output from `uvx pre-commit run --all-files`, `hatch run verify`, `hatch run docs`, and `uvx hatch run quality:all packages`.
+- **`verification-before-completion`**: Requires fresh output from `uvx pre-commit run --all-files`, `hatch run verify`, `hatch run docs`, and `uvx hatch run quality:all`.
 - **`finishing-a-development-branch`**: Verification gate + Conventional Commit PR creation (`.github/PULL_REQUEST_TEMPLATE.md`, Squash & merge, `release-please`).
 
 ---

@@ -5892,6 +5892,7 @@ def _stream_records_across_forms(
                     standards_profile=opts["standards_profile"],
                     min_standards_score=opts["min_standards_score"],
                     sdtm_domain=ctx.sdtm_domain or opts["sdtm_domain"],
+                    form_domain_map=ctx._active_form_domain_map or None,
                 )
             written = on_active_batch(ctx, batch, batch_idx)
             ctx.total_written += written

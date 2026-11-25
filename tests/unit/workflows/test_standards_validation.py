@@ -18,7 +18,7 @@ from imednet_workflows.standards_validation import (
 
 def test_categorical_normalizer_translates_lookup_values_and_yes_no_booleans() -> None:
     """Test that categorical normalizer translates lookup values and yes no booleans."""
-    normalizer = CategoricalNormalizer()
+    normalizer = CategoricalNormalizer(boolean_fields={"aeSerious"})
     result = normalizer.normalize_record(
         {
             "subjectKey": "S004",
@@ -75,7 +75,7 @@ def test_standards_readiness_validator_scores_records() -> None:
 
 def test_categorical_normalizer_precomputed_lookups_match_legacy_lookups() -> None:
     """Test that precomputed lookups produce identical results to legacy terminology_lookups."""
-    normalizer = CategoricalNormalizer()
+    normalizer = CategoricalNormalizer(boolean_fields={"aeSerious"})
     record = {
         "subjectKey": "S005",
         "AE_SEV": " 2 ",
@@ -101,7 +101,7 @@ def test_categorical_normalizer_precomputed_lookups_match_legacy_lookups() -> No
 
 def test_categorical_normalizer_handles_none_and_empty_lookups() -> None:
     """Test that normalizer handles None and empty lookups gracefully."""
-    normalizer = CategoricalNormalizer()
+    normalizer = CategoricalNormalizer(boolean_fields={"aeSerious"})
     record = {"subjectKey": "S006", "aeSerious": "NO", "rawField": "ABC"}
 
     assert normalizer._normalize_lookups(None) == {}
@@ -720,3 +720,112 @@ def test_evaluate_standards_readiness_filters_by_form_domain_without_relabeling(
     assert single_report is not None
     assert single_report.score == 100.0
     assert single_report.is_ready is True
+
+
+def test_validate_standards_cli_mask_phi_parity_and_form_name_domain_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """validate-standards CLI resolves Form.formName to DM, applies lookups, matches --no-mask-phi scores, and scrubs PHI."""
+    import io
+    import json
+    from contextlib import redirect_stderr, redirect_stdout
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import imednet_workflows.cli as wf_cli
+    from imednet import cli as root_cli
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.study_config import StudyConfiguration
+    from imednet.models.variables import Variable
+
+    def _invoke(args: list[str]) -> SimpleNamespace:
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                root_cli.app(args)
+        except SystemExit as exc:
+            code = int(exc.code or 0)
+        return SimpleNamespace(exit_code=code, stdout=out.getvalue(), stderr=err.getvalue())
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [Form(formId=42, formKey="CRF_01", formName="Demographics")]
+    sdk.variables.list.return_value = [
+        Variable(variableId=1, formId=42, variableName="BRTHDAT"),
+        Variable(variableId=2, formId=42, variableName="SEX"),
+    ]
+    sdk.records.list.return_value = [
+        Record(
+            recordId=1,
+            studyKey="STUDY_WF_CLI",
+            formId=42,
+            subjectKey="SUBJ-PHI-778899",
+            recordData={
+                "SEX": "F_CODE",
+                "BRTHDAT": "1979-11-23",
+                "AGE": "46",
+                "RACE": "WHITE",
+                "ETHNIC": "NOT HISPANIC OR LATINO",
+                "dmNotes": "patient.phi@clinic.example",
+            },
+        )
+    ]
+    study_cfg = StudyConfiguration(
+        studyKey="STUDY_WF_CLI",
+        version="1.0.0",
+        reportingProfile="drug",
+        phiFields=["subjectKey", "dmNotes"],
+        terminologyLookups={"sex": {"F_CODE": "F"}},
+        mappings=[],
+    )
+    monkeypatch.setenv("IMEDNET_API_KEY", "dummy-key")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "dummy-sec")
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda *_a, **_kw: sdk)
+    monkeypatch.setattr(wf_cli, "resolve_study_configuration", lambda _sk: study_cfg)
+    monkeypatch.setattr(
+        "imednet.integrations.enrichment.resolve_study_configuration",
+        lambda _sk: study_cfg,
+    )
+
+    masked = _invoke(
+        ["workflows", "validate-standards", "STUDY_WF_CLI", "--profile", "drug", "--mask-phi"]
+    )
+    unmasked = _invoke(
+        ["workflows", "validate-standards", "STUDY_WF_CLI", "--profile", "drug", "--no-mask-phi"]
+    )
+    assert masked.exit_code == unmasked.exit_code == 0
+    assert "DM: 100.00" in masked.stdout
+
+    sdk.records.list.return_value[0].record_data["SEX"] = "UNKNOWN_SEX_TOKEN"
+    masked_fail = _invoke(
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_WF_CLI",
+            "--profile",
+            "drug",
+            "--mask-phi",
+            "--format",
+            "json",
+        ]
+    )
+    unmasked_fail = _invoke(
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_WF_CLI",
+            "--profile",
+            "drug",
+            "--no-mask-phi",
+            "--format",
+            "json",
+        ]
+    )
+    assert masked_fail.exit_code == unmasked_fail.exit_code == 1
+    assert (
+        json.loads(masked_fail.stdout)["items"][0]["score"]
+        == json.loads(unmasked_fail.stdout)["items"][0]["score"]
+    )
+    for secret in ("SUBJ-PHI-778899", "1979-11-23", "patient.phi@clinic.example"):
+        assert secret not in masked_fail.stdout

@@ -68,6 +68,11 @@ def _assert_guardrail_contract(
     assert typos_pin in lint_deps
     assert "typos" not in lint_deps
 
+    detect_secrets_pin = next((d for d in lint_deps if d.startswith("detect-secrets==")), None)
+    assert detect_secrets_pin == "detect-secrets==1.5.0"  # pragma: allowlist secret
+    detect_secrets_version = detect_secrets_pin.split("==", 1)[1]
+    assert "detect-secrets" not in lint_deps
+
     extend_words = typos_cfg.get("default", {}).get("extend-words", {})
     assert extend_words.get("VAS") == "VAS"
     assert extend_words.get("SOID") == "SOID"
@@ -86,6 +91,11 @@ def _assert_guardrail_contract(
     assert typos_hook_args == ["--force-exclude"]
     assert "--write-changes" not in typos_hook_args
     assert "--diff" not in typos_hook_args
+
+    secrets_repo = next(repo for repo in hooks["repos"] if "Yelp/detect-secrets" in repo["repo"])
+    assert secrets_repo["rev"] == f"v{detect_secrets_version}"
+    assert [h["id"] for h in secrets_repo["hooks"]] == ["detect-secrets"]
+    assert secrets_repo["hooks"][0].get("args") == ["--baseline", ".secrets.baseline"]
 
     ruff_lint = project["tool"]["ruff"]["lint"]
     assert set(ruff_lint["select"]) == EXPECTED_RUFF_SELECT
@@ -106,6 +116,11 @@ def _assert_guardrail_contract(
     assert lint_scripts["ruff-check"] == "ruff check {args:.}"
     assert lint_scripts["typos-check"] == "typos --force-exclude {args:.}"
     assert "--diff" not in lint_scripts["typos-check"]
+    assert lint_scripts["secrets"] == (
+        "python scripts/run_secret_scan.py {args:.}"  # pragma: allowlist secret
+    )
+    assert "detect-secrets-hook" not in lint_scripts["secrets"]
+    assert "secrets" in lint_scripts["all"]
     assert lint_scripts["mypy-check"] == "mypy {args:packages}"
     for pkg_scoped_task in ("semgrep-check", "vulture-check", "pylint-sim", "symilar-check"):
         assert "{args:packages}" in lint_scripts[pkg_scoped_task]
@@ -153,6 +168,11 @@ def _assert_guardrail_contract(
     assert "pre-commit" in set(quality_needs)
 
     quality_runs = [s.get("run", "") for s in jobs["quality"]["steps"] if "run" in s]
+    assert any(
+        f'uvx --from "{detect_secrets_pin}" python scripts/run_secret_scan.py .' in r
+        for r in quality_runs
+    )
+    assert not any("detect-secrets-hook" in r for r in quality_runs)
     assert any(
         "uv run ruff format --check ." in r
         and "uv run ruff check ." in r
@@ -234,7 +254,13 @@ def test_ci_uses_canonical_full_verification():
         "--cov=imednet_sinks" in r and "--cov=imednet_tui" in r and "--cov-fail-under=90" in r
         for r in run_blocks
     )
-    assert any("semgrep scan" in r and "vulture" in r and "pylint" in r for r in run_blocks)
+    assert any(
+        'uvx --from "detect-secrets==1.5.0" python scripts/run_secret_scan.py .' in r
+        and "semgrep scan" in r
+        and "vulture" in r
+        and "pylint" in r
+        for r in run_blocks
+    )
     assert not any("pip install" in r for r in run_blocks)
     assert not any("hatch run" in r for r in run_blocks)
     assert not any("build_docs.py" in r for r in run_blocks)
@@ -959,12 +985,84 @@ def _mutate_test_exit_code_5_bypass(
     run_step["run"] += '\n|| { RET=$?; if [ $RET -eq 5 ]; then exit 0; fi; exit $RET; }'
 
 
+def _mutate_detect_secrets_rev(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    secrets_repo = next(repo for repo in hooks["repos"] if "Yelp/detect-secrets" in repo["repo"])
+    secrets_repo["rev"] = "v1.4.0"
+
+
+def _mutate_unpinned_lint_detect_secrets(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    deps = project["tool"]["hatch"]["envs"]["lint"]["dependencies"]
+    project["tool"]["hatch"]["envs"]["lint"]["dependencies"] = [
+        "detect-secrets" if d.startswith("detect-secrets==") else d for d in deps
+    ]
+
+
+def _mutate_lint_detect_secrets_version_drift(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    deps = project["tool"]["hatch"]["envs"]["lint"]["dependencies"]
+    project["tool"]["hatch"]["envs"]["lint"]["dependencies"] = [
+        "detect-secrets==1.4.0" if d.startswith("detect-secrets==") else d for d in deps
+    ]
+
+
+def _mutate_lint_secrets_raw_hook_directory(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    project["tool"]["hatch"]["envs"]["lint"]["scripts"]["secrets"] = (
+        "detect-secrets-hook --baseline .secrets.baseline {args:.}"
+    )
+
+
+def _mutate_lint_secrets_package_scoped(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    project["tool"]["hatch"]["envs"]["lint"]["scripts"]["secrets"] = (
+        "python scripts/run_secret_scan.py {args:packages}"
+    )
+
+
+def _mutate_lint_all_missing_secrets(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    project["tool"]["hatch"]["envs"]["lint"]["scripts"]["all"].remove("secrets")
+
+
+def _mutate_quality_missing_secret_scan(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    for step in pipeline["jobs"]["quality"]["steps"]:
+        if "run" in step:
+            step["run"] = step["run"].replace(
+                'uvx --from "detect-secrets==1.5.0" python scripts/run_secret_scan.py .\n', ""
+            )
+
+
+def _mutate_quality_raw_detect_secrets_hook(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    for step in pipeline["jobs"]["quality"]["steps"]:
+        if "run" in step:
+            step["run"] = step["run"].replace(
+                "python scripts/run_secret_scan.py .",
+                "detect-secrets-hook --baseline .secrets.baseline .",
+            )
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
         _mutate_ruff_rev,
         _mutate_typos_rev,
         _mutate_unpinned_lint_typos,
+        _mutate_detect_secrets_rev,
+        _mutate_unpinned_lint_detect_secrets,
+        _mutate_lint_detect_secrets_version_drift,
+        _mutate_lint_secrets_raw_hook_directory,
+        _mutate_lint_secrets_package_scoped,
+        _mutate_lint_all_missing_secrets,
         _mutate_legacy_ruff_hook_id,
         _mutate_up038_ignore,
         _mutate_mutating_typos_hook,
@@ -981,6 +1079,8 @@ def _mutate_test_exit_code_5_bypass(
         _mutate_pre_commit_unpinned_uvx,
         _mutate_quality_missing_needs,
         _mutate_quality_missing_typos,
+        _mutate_quality_missing_secret_scan,
+        _mutate_quality_raw_detect_secrets_hook,
         _mutate_missing_sinks_export_filter,
         _mutate_build_selective_upload,
         _mutate_test_hatch_run,
@@ -992,3 +1092,22 @@ def test_guardrail_manifest_contract_rejects_simulated_drift(mutator) -> None:
     mutator(project, hooks, typos_cfg, pipeline)
     with pytest.raises(AssertionError):
         _assert_guardrail_contract(project, hooks, typos_cfg, pipeline)
+
+
+def test_verification_docs_and_skills_specify_workspace_quality_all() -> None:
+    checked_paths = [
+        ROOT / "docs/how-to/verification.rst",
+        ROOT / ".agents/skills/README.md",
+        ROOT / ".agents/skills/verification-before-completion/SKILL.md",
+        ROOT / ".agents/skills/workflow-guide/SKILL.md",
+    ]
+    for path in checked_paths:
+        text = path.read_text(encoding="utf-8")
+        assert "uvx hatch run quality:all" in text, f"Missing workspace quality:all in {path}"
+        assert "quality:all packages" not in text, f"Stale package-scoped quality:all in {path}"
+
+    for skill_doc in sorted((ROOT / ".agents/skills").rglob("*.md")):
+        text = skill_doc.read_text(encoding="utf-8")
+        assert "quality:all packages" not in text, (
+            f"Stale package-scoped quality:all in {skill_doc}"
+        )
