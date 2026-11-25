@@ -38,6 +38,8 @@ _BRONZE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
     ("record_id", "Int64"),
     ("record_oid", "object"),
     ("form_key", "object"),
+    ("subject_id", "Int64"),
+    ("subject_oid", "object"),
     ("subject_key", "object"),
     ("site_id", "Int64"),
     ("interval_id", "Int64"),
@@ -51,6 +53,87 @@ _BRONZE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
     ("date_created", "object"),
     ("last_updated", "object"),
 )
+_BRONZE_SQL_CASTS: tuple[tuple[str, str], ...] = (
+    ("study_key", "CAST({src}.study_key AS VARCHAR)"),
+    ("record_revision_id", "CAST({src}.record_revision_id AS BIGINT)"),
+    ("record_id", "CAST({src}.record_id AS BIGINT)"),
+    ("record_oid", "CAST({src}.record_oid AS VARCHAR)"),
+    ("form_key", "CAST({src}.form_key AS VARCHAR)"),
+    ("subject_id", "CAST({src}.subject_id AS BIGINT)"),
+    ("subject_oid", "CAST({src}.subject_oid AS VARCHAR)"),
+    ("subject_key", "CAST({src}.subject_key AS VARCHAR)"),
+    ("site_id", "CAST({src}.site_id AS BIGINT)"),
+    ("interval_id", "CAST({src}.interval_id AS BIGINT)"),
+    ("record_status", "CAST({src}.record_status AS VARCHAR)"),
+    ("record_revision", "CAST({src}.record_revision AS INTEGER)"),
+    ("data_revision", "CAST({src}.data_revision AS INTEGER)"),
+    ('"user"', 'CAST({src}."user" AS VARCHAR)'),
+    ("role", "CAST({src}.role AS VARCHAR)"),
+    ("reason_for_change", "CAST({src}.reason_for_change AS VARCHAR)"),
+    ("deleted", "CAST({src}.deleted AS BOOLEAN)"),
+    ("date_created", "CAST(CAST({src}.date_created AS VARCHAR) AS TIMESTAMP)"),
+    ("last_updated", "CAST(CAST({src}.last_updated AS VARCHAR) AS TIMESTAMP)"),
+)
+_BRONZE_COLUMN_LIST_SQL = ",\n                        ".join(
+    col_sql for col_sql, _ in _BRONZE_SQL_CASTS
+)
+
+
+def _row_dedup_key(row: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Build an intra-batch deduplication key for both keyed and unkeyed revision rows."""
+    study_key = row[0]
+    rev_id = row[1]
+    if rev_id is not None:
+        return ("id", study_key, rev_id)
+    rec_id = row[2]
+    rec_oid = row[3]
+    rec_rev = row[11]
+    if rec_rev is not None and (rec_id is not None or bool(rec_oid)):
+        record_ident = ("id", rec_id) if rec_id is not None else ("oid", rec_oid)
+        return ("natural", study_key, record_ident, rec_rev)
+    return ("tuple", row)
+
+
+def _overlap_match_predicate_sql(existing_alias: str, staged_alias: str) -> str:
+    """Build SQL predicate matching keyed revisions and unkeyed natural/exact tuples."""
+    exact_tuple_terms = " AND ".join(
+        f"{existing_alias}.{col_sql} IS NOT DISTINCT FROM {cast_tpl.format(src=staged_alias)}"
+        for col_sql, cast_tpl in _BRONZE_SQL_CASTS
+    )
+    return f"""(
+        (
+            {staged_alias}.record_revision_id IS NOT NULL
+            AND {existing_alias}.record_revision_id IS NOT NULL
+            AND {existing_alias}.study_key = CAST({staged_alias}.study_key AS VARCHAR)
+            AND {existing_alias}.record_revision_id = CAST(
+                {staged_alias}.record_revision_id AS BIGINT
+            )
+        )
+        OR (
+            {staged_alias}.record_revision_id IS NULL
+            AND {existing_alias}.record_revision_id IS NULL
+            AND {existing_alias}.study_key = CAST({staged_alias}.study_key AS VARCHAR)
+            AND CAST({staged_alias}.record_revision AS INTEGER) IS NOT NULL
+            AND {existing_alias}.record_revision = CAST({staged_alias}.record_revision AS INTEGER)
+            AND (
+                (
+                    CAST({staged_alias}.record_id AS BIGINT) IS NOT NULL
+                    AND {existing_alias}.record_id = CAST({staged_alias}.record_id AS BIGINT)
+                )
+                OR (
+                    CAST({staged_alias}.record_id AS BIGINT) IS NULL
+                    AND {existing_alias}.record_id IS NULL
+                    AND NULLIF(CAST({staged_alias}.record_oid AS VARCHAR), '') IS NOT NULL
+                    AND {existing_alias}.record_oid = CAST({staged_alias}.record_oid AS VARCHAR)
+                )
+            )
+        )
+        OR (
+            {staged_alias}.record_revision_id IS NULL
+            AND {existing_alias}.record_revision_id IS NULL
+            AND {exact_tuple_terms}
+        )
+    )"""
 
 
 class DuckDBIngestionWorkflow:
@@ -116,18 +199,13 @@ class DuckDBIngestionWorkflow:
 
     @staticmethod
     def _deduplicate_rows(rows: Iterable[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
-        """Deduplicate staged rows on non-null (study_key, record_revision_id) keeping last."""
+        """Deduplicate staged rows on keyed or unkeyed revision identity keeping last."""
         materialized = list(rows)
-        last_index_by_key: dict[tuple[str, int], int] = {}
-        for idx, row in enumerate(materialized):
-            rev_id = row[1]
-            if rev_id is not None:
-                last_index_by_key[(row[0], rev_id)] = idx
-        return [
-            row
-            for idx, row in enumerate(materialized)
-            if row[1] is None or last_index_by_key[(row[0], row[1])] == idx
-        ]
+        keys = [_row_dedup_key(row) for row in materialized]
+        last_index_by_key: dict[tuple[Any, ...], int] = {}
+        for idx, key in enumerate(keys):
+            last_index_by_key[key] = idx
+        return [row for idx, row in enumerate(materialized) if last_index_by_key[keys[idx]] == idx]
 
     def ingest_revisions(
         self,
@@ -181,80 +259,41 @@ class DuckDBIngestionWorkflow:
                         "DELETE FROM bronze_revisions WHERE study_key = ?",
                         [study_key],
                     )
-                has_keyed_rows = any(row[1] is not None for row in rows)
-                if has_keyed_rows and (
-                    mode == "append" or any(row[0] != study_key for row in rows)
-                ):
+                if mode == "append" or any(row[0] != study_key for row in rows):
+                    match_existing_sql = _overlap_match_predicate_sql("existing", "staged")
                     overlap_query = f"""
                         SELECT COUNT(*)
                         FROM "{view_name}" AS staged
-                        WHERE staged.record_revision_id IS NOT NULL
-                          AND EXISTS (
-                              SELECT 1
-                              FROM bronze_revisions AS existing
-                              WHERE existing.study_key = CAST(staged.study_key AS VARCHAR)
-                                AND existing.record_revision_id = CAST(
-                                    staged.record_revision_id AS BIGINT
-                                )
-                          )
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM bronze_revisions AS existing
+                            WHERE {match_existing_sql}
+                        )
                         """
                     overlap_row = self._connection.execute(overlap_query).fetchone()  # nosem
                     existing_overlap_count = int(overlap_row[0]) if overlap_row is not None else 0
 
+                    match_delete_sql = _overlap_match_predicate_sql("bronze_revisions", "staged")
                     delete_query = f"""
                         DELETE FROM bronze_revisions
-                        WHERE record_revision_id IS NOT NULL
-                          AND EXISTS (
-                              SELECT 1
-                              FROM "{view_name}" AS staged
-                              WHERE staged.record_revision_id IS NOT NULL
-                                AND bronze_revisions.study_key = CAST(staged.study_key AS VARCHAR)
-                                AND bronze_revisions.record_revision_id = CAST(
-                                    staged.record_revision_id AS BIGINT
-                                )
-                          )
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM "{view_name}" AS staged
+                            WHERE {match_delete_sql}
+                        )
                         """
                     self._connection.execute(delete_query)  # nosem
 
+                select_casts_sql = ",\n                        ".join(
+                    cast_tpl.format(src="staged") for _, cast_tpl in _BRONZE_SQL_CASTS
+                )
                 insert_query = f"""
                     INSERT INTO bronze_revisions (
-                        study_key,
-                        record_revision_id,
-                        record_id,
-                        record_oid,
-                        form_key,
-                        subject_key,
-                        site_id,
-                        interval_id,
-                        record_status,
-                        record_revision,
-                        data_revision,
-                        "user",
-                        role,
-                        reason_for_change,
-                        deleted,
-                        date_created,
-                        last_updated
+                        {_BRONZE_COLUMN_LIST_SQL}
                     )
                     SELECT
-                        CAST(study_key AS VARCHAR),
-                        CAST(record_revision_id AS BIGINT),
-                        CAST(record_id AS BIGINT),
-                        CAST(record_oid AS VARCHAR),
-                        CAST(form_key AS VARCHAR),
-                        CAST(subject_key AS VARCHAR),
-                        CAST(site_id AS BIGINT),
-                        CAST(interval_id AS BIGINT),
-                        CAST(record_status AS VARCHAR),
-                        CAST(record_revision AS INTEGER),
-                        CAST(data_revision AS INTEGER),
-                        CAST("user" AS VARCHAR),
-                        CAST(role AS VARCHAR),
-                        CAST(reason_for_change AS VARCHAR),
-                        CAST(deleted AS BOOLEAN),
-                        CAST(CAST(date_created AS VARCHAR) AS TIMESTAMP),
-                        CAST(CAST(last_updated AS VARCHAR) AS TIMESTAMP)
-                    FROM "{view_name}"
+                        {select_casts_sql}
+                    FROM "{view_name}" AS staged
                     """
                 self._connection.execute(insert_query)  # nosem
                 self._connection.execute("COMMIT")
@@ -319,42 +358,10 @@ class DuckDBIngestionWorkflow:
         per_study_query = f"""
             CREATE OR REPLACE VIEW "{per_study_view}" AS
             SELECT
-                study_key,
-                record_revision_id,
-                record_id,
-                record_oid,
-                form_key,
-                subject_key,
-                site_id,
-                interval_id,
-                record_status,
-                record_revision,
-                data_revision,
-                "user",
-                role,
-                reason_for_change,
-                deleted,
-                date_created,
-                last_updated
+                {_BRONZE_COLUMN_LIST_SQL}
             FROM (
                 SELECT
-                    study_key,
-                    record_revision_id,
-                    record_id,
-                    record_oid,
-                    form_key,
-                    subject_key,
-                    site_id,
-                    interval_id,
-                    record_status,
-                    record_revision,
-                    data_revision,
-                    "user",
-                    role,
-                    reason_for_change,
-                    deleted,
-                    date_created,
-                    last_updated
+                    {_BRONZE_COLUMN_LIST_SQL}
                 FROM bronze_revisions
                 WHERE study_key = '{escaped_study_key}'
                 QUALIFY ROW_NUMBER() OVER (
@@ -381,23 +388,7 @@ class DuckDBIngestionWorkflow:
         per_study_history_query = f"""
             CREATE OR REPLACE VIEW "{per_study_history_view}" AS
             SELECT
-                study_key,
-                record_revision_id,
-                record_id,
-                record_oid,
-                form_key,
-                subject_key,
-                site_id,
-                interval_id,
-                record_status,
-                record_revision,
-                data_revision,
-                "user",
-                role,
-                reason_for_change,
-                deleted,
-                date_created,
-                last_updated,
+                {_BRONZE_COLUMN_LIST_SQL},
                 prev_record_status,
                 prev_data_revision,
                 prev_deleted,
@@ -414,23 +405,7 @@ class DuckDBIngestionWorkflow:
                 is_current
             FROM (
                 SELECT
-                    study_key,
-                    record_revision_id,
-                    record_id,
-                    record_oid,
-                    form_key,
-                    subject_key,
-                    site_id,
-                    interval_id,
-                    record_status,
-                    record_revision,
-                    data_revision,
-                    "user",
-                    role,
-                    reason_for_change,
-                    deleted,
-                    date_created,
-                    last_updated,
+                    {_BRONZE_COLUMN_LIST_SQL},
                     LAG(1) OVER rev_window IS NOT NULL AS _has_prev,
                     LAG(record_status) OVER rev_window AS prev_record_status,
                     LAG(data_revision) OVER rev_window AS prev_data_revision,
@@ -442,8 +417,12 @@ class DuckDBIngestionWorkflow:
                     COALESCE(date_created, last_updated) AS valid_from,
                     LEAD(COALESCE(date_created, last_updated)) OVER rev_window AS valid_to,
                     LEAD(1) OVER rev_window IS NULL AS is_current
-                FROM bronze_revisions
-                WHERE study_key = '{escaped_study_key}'
+                FROM (
+                    SELECT DISTINCT
+                        {_BRONZE_COLUMN_LIST_SQL}
+                    FROM bronze_revisions
+                    WHERE study_key = '{escaped_study_key}'
+                ) AS deduped_bronze
                 WINDOW rev_window AS (
                     PARTITION BY {record_partition_expr}
                     ORDER BY
@@ -473,6 +452,8 @@ class DuckDBIngestionWorkflow:
                 record_id BIGINT,
                 record_oid VARCHAR,
                 form_key VARCHAR,
+                subject_id BIGINT,
+                subject_oid VARCHAR,
                 subject_key VARCHAR,
                 site_id BIGINT,
                 interval_id BIGINT,
@@ -488,26 +469,16 @@ class DuckDBIngestionWorkflow:
                 UNIQUE (study_key, record_revision_id)
             )
             """)
-        self._connection.execute("""
+        self._connection.execute(
+            "ALTER TABLE bronze_revisions ADD COLUMN IF NOT EXISTS subject_id BIGINT"
+        )
+        self._connection.execute(
+            "ALTER TABLE bronze_revisions ADD COLUMN IF NOT EXISTS subject_oid VARCHAR"
+        )
+        self._connection.execute(f"""
             CREATE OR REPLACE VIEW record_revisions AS
             SELECT
-                study_key,
-                record_revision_id,
-                record_id,
-                record_oid,
-                form_key,
-                subject_key,
-                site_id,
-                interval_id,
-                record_status,
-                record_revision,
-                data_revision,
-                "user",
-                role,
-                reason_for_change,
-                deleted,
-                date_created,
-                last_updated
+                {_BRONZE_COLUMN_LIST_SQL}
             FROM bronze_revisions
             """)
 
@@ -577,6 +548,8 @@ class DuckDBIngestionWorkflow:
 
             record_oid = self._optional_str(getattr(revision, "record_oid", None))
             form_key = self._optional_str(getattr(revision, "form_key", None))
+            subject_id = self._optional_int(getattr(revision, "subject_id", None))
+            subject_oid = self._optional_str(getattr(revision, "subject_oid", None))
             subject_key = self._optional_str(getattr(revision, "subject_key", None))
             record_status = self._optional_str(getattr(revision, "record_status", None))
             user_val = self._optional_str(getattr(revision, "user", None))
@@ -585,11 +558,14 @@ class DuckDBIngestionWorkflow:
 
             if effective_mask_phi:
                 custom_phi_keys, active_registry = _resolve_phi_context(rev_study_str)
+                if subject_id is not None and active_registry.is_sensitive("subject_id"):
+                    subject_id = None
                 raw_str_map: dict[str, Any] = {
                     k: v
                     for k, v in (
                         ("record_oid", record_oid),
                         ("form_key", form_key),
+                        ("subject_oid", subject_oid),
                         ("subject_key", subject_key),
                         ("record_status", record_status),
                         ("user", user_val),
@@ -604,6 +580,7 @@ class DuckDBIngestionWorkflow:
                         masked_map = mask_custom_phi_recursive(masked_map, custom_phi_keys)
                     record_oid = masked_map.get("record_oid")
                     form_key = masked_map.get("form_key")
+                    subject_oid = masked_map.get("subject_oid")
                     subject_key = masked_map.get("subject_key")
                     record_status = masked_map.get("record_status")
                     user_val = masked_map.get("user")
@@ -618,6 +595,8 @@ class DuckDBIngestionWorkflow:
                 self._optional_int(getattr(revision, "record_id", None)),
                 record_oid,
                 form_key,
+                subject_id,
+                subject_oid,
                 subject_key,
                 self._optional_int(getattr(revision, "site_id", None)),
                 self._optional_int(getattr(revision, "interval_id", None)),

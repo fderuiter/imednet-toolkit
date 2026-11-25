@@ -705,3 +705,82 @@ def test_duplicate_and_attribute_normalization_across_casing_and_syntax() -> Non
     validate_record_filter("age>=18;AGE<=65")
     with pytest.raises(ValueError, match="Duplicate filter attribute 'AGE'"):
         validate_record_filter("AGE>=18;AGE<=65")
+
+
+def test_parse_utc_timestamp_bound_empty_lists_and_revision_filter_splitting() -> None:
+    """Verify subsecond bound parsing, empty list rejection, and revision OR/raw date splitting."""
+    from datetime import UTC, date, datetime
+
+    from imednet.utils import is_date_only_bound, parse_utc_timestamp_bound
+    from imednet.utils.filters import matches_revision_date_bounds, split_revision_date_bounds
+
+    assert is_date_only_bound("2026-01-31") is True
+    assert is_date_only_bound(date(2026, 1, 31)) is True
+    assert is_date_only_bound("2026-01-31T00:00:00Z") is False
+    assert is_date_only_bound(datetime(2026, 1, 31, tzinfo=UTC)) is False
+    assert is_date_only_bound("2026-02-30") is False
+    assert is_date_only_bound("") is False
+    assert is_date_only_bound(123) is False
+
+    assert parse_utc_timestamp_bound("2026-01-31", is_end=False) == datetime(
+        2026, 1, 31, 0, 0, 0, 0, tzinfo=UTC
+    )
+    assert parse_utc_timestamp_bound("2026-01-31", is_end=True) == datetime(
+        2026, 1, 31, 23, 59, 59, 999999, tzinfo=UTC
+    )
+    assert parse_utc_timestamp_bound(date(2026, 1, 31), is_end=False) == datetime(
+        2026, 1, 31, 0, 0, 0, 0, tzinfo=UTC
+    )
+    assert parse_utc_timestamp_bound(date(2026, 1, 31), is_end=True) == datetime(
+        2026, 1, 31, 23, 59, 59, 999999, tzinfo=UTC
+    )
+    assert parse_utc_timestamp_bound(datetime(2026, 1, 31, 12, 0), is_end=True) == datetime(
+        2026, 1, 31, 12, 0, tzinfo=UTC
+    )
+    assert parse_utc_timestamp_bound("2026-01-31T23:59:59.750000+00:00", is_end=True) == datetime(
+        2026, 1, 31, 23, 59, 59, 750000, tzinfo=UTC
+    )
+    with pytest.raises(ValueError):
+        parse_utc_timestamp_bound("")
+
+    with pytest.raises(ValueError, match="Filter list for 'user' cannot be empty"):
+        build_filter_string({"user": []})
+
+    # Subsecond explicit end_date widens upstream to next whole second and filters exact bound locally
+    up_sub, local_sub = split_revision_date_bounds(
+        {"end_date": "2026-01-31T23:59:59.500000Z"},
+    )
+    assert up_sub == {"dateCreated": ("<", "2026-02-01T00:00:00Z")}
+    assert matches_revision_date_bounds({"date_created": "2026-01-31T23:59:59.500000Z"}, local_sub)
+    assert not matches_revision_date_bounds(
+        {"date_created": "2026-01-31T23:59:59.750000Z"}, local_sub
+    )
+
+    for op_in, val_in, expected_up in (
+        (">=", "2026-01-15T10:00:00.250000Z", (">=", "2026-01-15T10:00:00Z")),
+        ("==", "2026-01-15T10:00:00.250000Z", (">=", "2026-01-15T10:00:00Z")),
+        ("!=", "2026-01-15T10:00:00.250000Z", ("!=", "2026-01-15T10:00:00Z")),
+        ("<=", "9999-12-31", ("<=", "9999-12-31T23:59:59Z")),
+    ):
+        up_res, loc_res = split_revision_date_bounds({"dateCreated": (op_in, val_in)})
+        assert up_res == {"dateCreated": expected_up}
+        assert len(loc_res) == 1
+
+    # Raw OR filter with equality dateCreated + start_date evaluates locally
+    up_or, loc_or = split_revision_date_bounds(
+        {"filter": "dateCreated==2026-01-10,dateCreated==2026-01-20T00:00:00.500000Z"},
+        start_date="2026-01-01",
+        always_evaluate_locally=True,
+    )
+    assert up_or["filter"] == "dateCreated==2026-01-10T00:00:00Z,dateCreated>=2026-01-20T00:00:00Z"
+    assert matches_revision_date_bounds({"date_created": "2026-01-10T00:00:00Z"}, loc_or)
+    assert not matches_revision_date_bounds({"date_created": "2026-01-15T00:00:00Z"}, loc_or)
+
+    for bad_filter_dict in (
+        {"start_date": True},
+        {"dateCreated": 12345},
+        {"dateCreated": ("==",)},
+        {"dateCreated": [(">=",)]},
+    ):
+        with pytest.raises(ValueError):
+            split_revision_date_bounds(bad_filter_dict)

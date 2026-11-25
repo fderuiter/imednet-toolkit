@@ -155,6 +155,7 @@ class DataExtractionWorkflow:
             final_filter_dict,
             start_date=start_date,
             end_date=end_date,
+            always_evaluate_locally=True,
         )
 
         revisions = list(

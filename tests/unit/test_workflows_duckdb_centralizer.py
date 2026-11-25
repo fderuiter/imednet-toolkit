@@ -183,6 +183,8 @@ def test_ingest_revisions_and_build_silver_view() -> None:
         "record_id",
         "record_oid",
         "form_key",
+        "subject_id",
+        "subject_oid",
         "subject_key",
         "site_id",
         "interval_id",
@@ -196,6 +198,7 @@ def test_ingest_revisions_and_build_silver_view() -> None:
         "date_created",
         "last_updated",
     ]
+    assert set(expected_columns) == set(RecordRevision.model_fields)
     bronze_cols = [
         desc[0]
         for desc in workflow._connection.execute(
@@ -537,8 +540,8 @@ def test_ingest_revisions_normalizes_enums_and_timestamps() -> None:
     ]
 
     row_tuples = list(workflow._to_rows("STUDY", revisions))
-    assert type(row_tuples[0][8]) is str
-    assert row_tuples[0][8] == "Record Complete"
+    assert type(row_tuples[0][10]) is str
+    assert row_tuples[0][10] == "Record Complete"
     assert row_tuples[0][3] == "12345"
 
     with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=revisions):
@@ -603,6 +606,8 @@ def test_ingest_revisions_falls_back_to_pandas_without_pyarrow(
     assert isinstance(empty_df, pd.DataFrame)
     assert len(empty_df) == 0
     assert str(empty_df["record_revision_id"].dtype) == "Int64"
+    assert str(empty_df["subject_id"].dtype) == "Int64"
+    assert str(empty_df["subject_oid"].dtype) == "object"
     assert str(empty_df["record_revision"].dtype) == "Int32"
     assert str(empty_df["deleted"].dtype) == "bool"
     assert str(empty_df["study_key"].dtype) == "object"
@@ -1372,12 +1377,15 @@ def test_ingest_revisions_deduplicates_keyed_appends_and_preserves_unkeyed() -> 
             user="crc1",
             date_created="2026-11-15T18:10:00Z",
         ),
-        SimpleNamespace(
+        RecordRevision(
             study_key="STUDY",
             record_revision_id=None,
             record_id=99,
             record_oid="UNKEYED-99",
             form_key="F_DM",
+            subject_id=501,
+            subject_oid="SUBJ-OID-99",
+            subject_key="SUBJ-99",
             record_revision=1,
             data_revision=1,
             user="system",
@@ -1412,12 +1420,15 @@ def test_ingest_revisions_deduplicates_keyed_appends_and_preserves_unkeyed() -> 
             date_created="2026-11-15T18:35:45Z",
         ),
         # Second unkeyed fixture should still be staged
-        SimpleNamespace(
+        RecordRevision(
             study_key="STUDY",
             record_revision_id=None,
             record_id=99,
             record_oid="UNKEYED-99",
             form_key="F_DM",
+            subject_id=501,
+            subject_oid="SUBJ-OID-99",
+            subject_key="SUBJ-99",
             record_revision=2,
             data_revision=2,
             user="system",
@@ -1553,3 +1564,153 @@ def test_build_silver_view_creates_record_revisions_and_scd2_history_views_with_
             True,
         ),
     ]
+
+
+def test_subject_id_subject_oid_across_all_relations_phi_masking_and_unkeyed_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify 19-column RecordRevision schema, PHI masking on subject_id/subject_oid, and unkeyed append deduplication."""
+    pytest.importorskip("duckdb")
+    from imednet.models.study_config import StudyConfiguration
+
+    big_subject_id = (1 << 54) + 77
+    rev_id_unkeyed = RecordRevision(
+        study_key="STUDY",
+        record_revision_id=None,
+        record_id=404,
+        record_oid="REC-404",
+        form_key="F_DM",
+        subject_id=big_subject_id,
+        subject_oid="SUBJ-OID-404",
+        subject_key="SUBJ-404",
+        site_id=12,
+        interval_id=3,
+        record_status="Record Incomplete",
+        record_revision=1,
+        data_revision=1,
+        user="crc1",
+        role="CRC",
+        reason_for_change="Initial unkeyed revision",
+        deleted=False,
+        date_created="2026-01-31T23:59:59.750000Z",
+        last_updated="2026-01-31T23:59:59.750000Z",
+    )
+    rev_oid_unkeyed = RecordRevision(
+        study_key="STUDY",
+        record_revision_id=None,
+        record_id=None,
+        record_oid="OID-UNKEYED-ONLY",
+        form_key="F_VS",
+        subject_id=505,
+        subject_oid="SUBJ-OID-505",
+        subject_key="SUBJ-505",
+        record_status="Record Complete",
+        record_revision=1,
+        data_revision=1,
+        user="crc2",
+        deleted=False,
+        date_created="2026-01-31T23:59:59.500000Z",
+    )
+    rev_all_null_unkeyed = RecordRevision(
+        study_key="STUDY",
+        record_revision_id=None,
+        record_id=None,
+        record_oid=None,
+        form_key="F_NOTE",
+        subject_id=606,
+        subject_oid="SUBJ-OID-606",
+        subject_key="SUBJ-606",
+        record_revision=None,
+        data_revision=None,
+        user="system",
+        deleted=False,
+        date_created="2026-01-31T12:00:00Z",
+    )
+
+    with DuckDBIngestionWorkflow(MagicMock(), ":memory:") as workflow:
+        # First append contains intra-batch duplicates of unkeyed rows
+        first_batch = [
+            rev_id_unkeyed,
+            rev_id_unkeyed.model_copy(update={"reason_for_change": "Updated unkeyed revision"}),
+            rev_oid_unkeyed,
+            rev_oid_unkeyed,
+            rev_all_null_unkeyed,
+            rev_all_null_unkeyed,
+        ]
+        # Second append repeats the exact same unkeyed items across overlapping date windows
+        second_batch = [
+            rev_id_unkeyed.model_copy(update={"reason_for_change": "Updated unkeyed revision"}),
+            rev_oid_unkeyed,
+            rev_all_null_unkeyed,
+        ]
+        with patch.object(
+            DataExtractionWorkflow,
+            "extract_audit_trail",
+            side_effect=[first_batch, second_batch],
+        ):
+            assert workflow.ingest_revisions("STUDY", mode="append") == 3
+            assert workflow.ingest_revisions("STUDY", mode="append") == 0
+
+        workflow.build_silver_view("STUDY")
+
+        for relation in (
+            "bronze_revisions",
+            "record_revisions",
+            '"silver_current_state_STUDY"',
+            "silver_current_state",
+        ):
+            cols = [
+                desc[0]
+                for desc in workflow._connection.execute(
+                    f"SELECT * FROM {relation} LIMIT 0"
+                ).description
+            ]
+            assert set(cols) == set(RecordRevision.model_fields)
+
+        for hist_relation in ('"silver_records_history_STUDY"', "silver_records_history"):
+            hist_cols = {
+                desc[0]
+                for desc in workflow._connection.execute(
+                    f"SELECT * FROM {hist_relation} LIMIT 0"
+                ).description
+            }
+            assert set(RecordRevision.model_fields).issubset(hist_cols)
+
+        current_rows = workflow._connection.execute(
+            "SELECT record_id, record_oid, subject_id, subject_oid, subject_key, reason_for_change "
+            "FROM silver_current_state ORDER BY subject_id"
+        ).fetchall()
+        assert current_rows == [
+            (None, "OID-UNKEYED-ONLY", 505, "SUBJ-OID-505", "SUBJ-505", None),
+            (None, None, 606, "SUBJ-OID-606", "SUBJ-606", None),
+            (
+                404,
+                "REC-404",
+                big_subject_id,
+                "SUBJ-OID-404",
+                "SUBJ-404",
+                "Updated unkeyed revision",
+            ),
+        ]
+
+        history_count = workflow._connection.execute(
+            "SELECT COUNT(*) FROM silver_records_history WHERE study_key = 'STUDY'"
+        ).fetchone()[0]
+        assert history_count == 3
+
+    # Verify Study-configured PHI masking on subject_id and subject_oid
+    study_cfg = StudyConfiguration(studyKey="STUDY_PHI_SUBJ", phiFields=["subjectId", "subjectOid"])
+    monkeypatch.setattr(
+        "imednet.integrations.enrichment.resolve_study_configuration",
+        lambda sk: study_cfg if sk == "STUDY_PHI_SUBJ" else None,
+    )
+    phi_rev = rev_id_unkeyed.model_copy(
+        update={"study_key": "STUDY_PHI_SUBJ", "record_revision_id": 88}
+    )
+    with DuckDBIngestionWorkflow(MagicMock(), ":memory:") as phi_wf:
+        with patch.object(DataExtractionWorkflow, "extract_audit_trail", return_value=[phi_rev]):
+            assert phi_wf.ingest_revisions("STUDY_PHI_SUBJ", mode="replace") == 1
+        masked_row = phi_wf._connection.execute(
+            "SELECT subject_id, subject_oid, subject_key FROM bronze_revisions"
+        ).fetchone()
+        assert masked_row == (None, "***MASKED***", "SUBJ-404")

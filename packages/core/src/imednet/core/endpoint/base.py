@@ -279,6 +279,8 @@ class _ListEndpointBase(GenericEndpoint[T]):
 
         if processed_filters:
             built_filter = build_filter_string(processed_filters)
+            if not built_filter or not built_filter.strip():
+                raise ValueError("Filter expression contains an empty clause")
             if (
                 isinstance(raw_filter, str)
                 and raw_filter.strip()
@@ -288,6 +290,7 @@ class _ListEndpointBase(GenericEndpoint[T]):
                 validate_filter_syntax(combined_filter)
                 params["filter"] = combined_filter
             else:
+                validate_filter_syntax(built_filter)
                 params["filter"] = built_filter
 
         if "size" in params and params["size"] is not None:

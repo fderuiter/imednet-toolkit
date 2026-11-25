@@ -216,7 +216,9 @@ across the toolkit:
 
 1. **DuckDB Lakehouse Lineage** (:doc:`duckdb_integration`): Load deduplicated,
    PHI-masked (``mask_phi=True`` by default, with Study-scoped ``mode="replace"``
-   refreshes) ``(study_key, record_revision_id)`` audit metadata (with
+   refreshes) ``RecordRevision`` audit metadata across all 19 attributes
+   (including ``subject_id``, ``subject_oid``, and ``subject_key``, deduplicating
+   both ``(study_key, record_revision_id)`` rows and unkeyed revisions with
    UTC-normalized timestamps) into the ``bronze_revisions`` table (with a
    ``record_revisions`` compatibility view) via
    ``DuckDBIngestionWorkflow.ingest_revisions``, and materialize per-Study

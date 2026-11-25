@@ -8,9 +8,11 @@ from importlib import import_module
 
 from .dates import (
     format_iso_datetime,
+    is_date_only_bound,
     normalize_iso_date,
     normalize_utc_timestamp_bound,
     parse_iso_datetime,
+    parse_utc_timestamp_bound,
 )
 from .filters import (
     ALLOWED_OPERATORS,
@@ -151,6 +153,7 @@ __all__ = [
     "forms_to_dataframe",
     "import_records_csv",
     "intervals_to_dataframe",
+    "is_date_only_bound",
     "is_site_enrollment_eligible",
     "normalize_iso_date",
     "normalize_records_input",
@@ -167,6 +170,7 @@ __all__ = [
     "parse_iso_datetime",
     "parse_list_or_default",
     "parse_str_or_default",
+    "parse_utc_timestamp_bound",
     "poll_facade_many_async",
     "poll_facade_many_sync",
     "poll_facade_single_async",

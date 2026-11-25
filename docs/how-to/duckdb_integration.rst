@@ -154,7 +154,8 @@ For incremental bronze/silver ``Record`` revision ingestion, use
 
    conn = duckdb.connect("./centralized.duckdb", read_only=True)
    silver_rows = conn.execute(
-       'SELECT record_id, form_key, record_revision, "user", reason_for_change, date_created '
+       "SELECT record_id, form_key, subject_id, subject_oid, subject_key, "
+       'record_revision, "user", reason_for_change, date_created '
        "FROM silver_current_state ORDER BY record_id LIMIT 10"
    ).fetchall()
    assert len(silver_rows) > 0
@@ -163,16 +164,19 @@ For incremental bronze/silver ``Record`` revision ingestion, use
 
 The key methods are
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.ingest_revisions`
-for incremental ``bronze_revisions`` (and ``record_revisions`` view) loads (defaulting
-to ``mask_phi=True`` and scoping ``mode="replace"`` refreshes to the target
-``study_key``),
+for incremental ``bronze_revisions`` (and ``record_revisions`` view) loads across all
+19 :class:`~imednet.models.record_revisions.RecordRevision` attributes (including
+``subject_id``, ``subject_oid``, and ``subject_key``, defaulting to ``mask_phi=True``,
+deduplicating both keyed ``(study_key, record_revision_id)`` rows and unkeyed
+``record_revision_id IS NULL`` tuples, and scoping ``mode="replace"`` refreshes to the
+target ``study_key``),
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.build_silver_view`
 for current-state and SCD Type 2 history materialization (per-Study
 ``"silver_current_state_{study_key}"`` / ``"silver_records_history_{study_key}"`` and
-combined ``silver_current_state`` / ``silver_records_history``, including ``valid_from``,
-``valid_to``, ``is_current``, and ``LAG()`` transition diff columns
-``prev_record_status``, ``prev_data_revision``, ``prev_deleted``, ``data_changed``,
-and ``change_type``), and
+combined ``silver_current_state`` / ``silver_records_history``, projecting all 19
+``RecordRevision`` columns alongside ``valid_from``, ``valid_to``, ``is_current``, and
+``LAG()`` transition diff columns ``prev_record_status``, ``prev_data_revision``,
+``prev_deleted``, ``data_changed``, and ``change_type``), and
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.close`
 (or a ``with`` block) to release the DuckDB connection cleanly.
 

@@ -339,3 +339,158 @@ def test_data_extraction_date_helpers_and_progress_callbacks() -> None:
         dateCreated=("<=", "2026-02-01T00:00:00Z"),
     )
     assert [r.record_revision_id for r in revs] == [1]
+
+
+def test_extract_audit_trail_fractional_end_date_missing_dates_and_or_lists() -> None:
+    """Verify fractional-second end_date retention, missing date_created exclusion, OR lists, and raw filters."""
+    import pytest
+    import respx
+
+    from imednet import ImednetSDK
+    from imednet.simulation import SimulationState, SimulationTransport
+    from imednet.utils.filters import validate_filter_syntax
+
+    sdk = MagicMock()
+    revisions = [
+        RecordRevision(
+            studyKey="STUDY",
+            recordRevisionId=10,
+            recordId=1,
+            subjectId=100,
+            subjectOid="SUBJ-OID-100",
+            subjectKey="SUBJ-100",
+            role="CRC",
+            dateCreated="2026-01-10T00:00:00Z",
+        ),
+        RecordRevision(
+            studyKey="STUDY",
+            recordRevisionId=11,
+            recordId=1,
+            subjectId=100,
+            subjectOid="SUBJ-OID-100",
+            subjectKey="SUBJ-100",
+            role="CRC",
+            dateCreated="2026-01-31T23:59:59.750000Z",
+        ),
+        RecordRevision(
+            studyKey="STUDY",
+            recordRevisionId=12,
+            recordId=1,
+            role="CRC",
+            dateCreated="2026-02-01T00:00:00Z",
+        ),
+        RecordRevision(
+            studyKey="STUDY",
+            recordRevisionId=13,
+            recordId=1,
+            role="CRC",
+            dateCreated=None,
+        ),
+        RecordRevision(
+            studyKey="STUDY",
+            recordRevisionId=14,
+            recordId=1,
+            role="CRC",
+            dateCreated="   ",
+        ),
+    ]
+    sdk.get_record_revisions.return_value = revisions
+    wf = DataExtractionWorkflow(sdk)
+
+    # 1. Dual start_date + end_date retains 23:59:59.750000Z and excludes None/blank/Feb 1
+    bounded = wf.extract_audit_trail("STUDY", start_date="2026-01-01", end_date="2026-01-31")
+    assert [r.record_revision_id for r in bounded] == [10, 11]
+
+    # 2. Single end_date alone also excludes missing date_created and retains fractional end_date
+    end_only = wf.extract_audit_trail("STUDY", end_date="2026-01-31")
+    assert [r.record_revision_id for r in end_only] == [10, 11]
+    assert sdk.get_record_revisions.call_args.kwargs == {
+        "dateCreated": ("<", "2026-02-01T00:00:00Z")
+    }
+
+    # 3. Single start_date alone also excludes missing date_created locally
+    start_only = wf.extract_audit_trail("STUDY", start_date="2026-01-31")
+    assert [r.record_revision_id for r in start_only] == [11, 12]
+
+    # 4. Scalar OR list on date_created works alone, with role AND kwarg, and with start_date/end_date
+    or_alone = wf.extract_audit_trail(
+        "STUDY",
+        date_created=["2026-01-10T00:00:00Z", "2026-02-01T00:00:00Z"],
+    )
+    assert [r.record_revision_id for r in or_alone] == [10, 12]
+
+    or_with_role_and_bounds = wf.extract_audit_trail(
+        "STUDY",
+        start_date="2026-01-01",
+        end_date="2026-01-31",
+        role="CRC",
+        dateCreated=["2026-01-10T00:00:00Z", "2026-02-01T00:00:00Z"],
+    )
+    assert [r.record_revision_id for r in or_with_role_and_bounds] == [10]
+
+    # 5. Raw filter clauses with dateCreated (AND ';' and OR ',') normalize to UTC and exclude None
+    raw_and = wf.extract_audit_trail(
+        "STUDY",
+        filter="role==CRC;dateCreated>=2026-01-01;dateCreated<=2026-01-31",
+    )
+    assert [r.record_revision_id for r in raw_and] == [10, 11]
+    assert sdk.get_record_revisions.call_args.kwargs == {
+        "filter": "role==CRC;dateCreated>=2026-01-01T00:00:00Z"
+    }
+
+    raw_or = wf.extract_audit_trail(
+        "STUDY",
+        filter="dateCreated<=2026-01-31,dateCreated==2026-02-01T00:00:00Z",
+    )
+    assert [r.record_revision_id for r in raw_or] == [10, 11, 12]
+    assert sdk.get_record_revisions.call_args.kwargs == {
+        "filter": "dateCreated<2026-02-01T00:00:00Z,dateCreated==2026-02-01T00:00:00Z"
+    }
+
+    # 6. Empty list filters are rejected
+    with pytest.raises(ValueError, match="cannot be empty"):
+        wf.extract_audit_trail("STUDY", date_created=[])
+
+    with respx.mock(assert_all_called=False):
+        live_sdk = ImednetSDK(
+            api_key="test-key",  # pragma: allowlist secret
+            security_key="test-sec",  # pragma: allowlist secret
+            base_url="https://api.test",
+        )
+        live_wf = DataExtractionWorkflow(live_sdk)
+        with pytest.raises(ValueError, match="Filter list for 'user' cannot be empty"):
+            live_wf.extract_audit_trail("STUDY", user=[])
+
+    # 7. End-to-end SimulationTransport verification with fractional-second revision on end_date
+    sim_state = SimulationState()
+    sim_state.record_revisions.append(
+        {
+            "studyKey": "SIM_AUDIT",
+            "recordRevisionId": 555,
+            "recordId": 9,
+            "recordOid": "REC-9",
+            "formKey": "F_VS",
+            "subjectId": 999,
+            "subjectOid": "SUBJ-OID-999",
+            "subjectKey": "SUBJ-999",
+            "recordRevision": 1,
+            "dataRevision": 1,
+            "recordStatus": "Record Complete",
+            "user": "sim_crc",
+            "deleted": False,
+            "dateCreated": "2026-01-31T23:59:59.750000Z",
+            "lastUpdated": "2026-01-31T23:59:59.750000Z",
+        }
+    )
+    with ImednetSDK(
+        api_key="sim-key",  # pragma: allowlist secret
+        security_key="sim-sec",  # pragma: allowlist secret
+        transport=SimulationTransport(state=sim_state),
+    ) as sim_sdk:
+        sim_wf = DataExtractionWorkflow(sim_sdk)
+        sim_res = sim_wf.extract_audit_trail(
+            "SIM_AUDIT",
+            end_date="2026-01-31",
+        )
+        assert any(r.record_revision_id == 555 for r in sim_res)
+        validate_filter_syntax("dateCreated<2026-02-01T00:00:00Z")

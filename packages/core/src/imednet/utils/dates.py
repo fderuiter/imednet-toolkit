@@ -164,6 +164,77 @@ def normalize_iso_date(value: Any, *, date_order: Literal["MDY", "DMY"] | None =
     return value
 
 
+def is_date_only_bound(value: Any) -> bool:
+    """Return True when *value* represents a calendar date without a time component."""
+    if isinstance(value, datetime):
+        return False
+    if isinstance(value, date):
+        return True
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not stripped:
+        return False
+    normalized = normalize_iso_date(stripped)
+    candidate = normalized if isinstance(normalized, str) else stripped
+    if not _ISO_DATE_REGEX.fullmatch(candidate):
+        return False
+    try:
+        date.fromisoformat(candidate)
+    except ValueError:
+        return False
+    return True
+
+
+def parse_utc_timestamp_bound(value: Any, *, is_end: bool = False) -> datetime:
+    """Parse a date, datetime, or timestamp string into an exact UTC ``datetime`` bound.
+
+    Date-only inputs expand to ``00:00:00.000000Z`` when ``is_end`` is ``False``
+    and ``23:59:59.999999Z`` when ``is_end`` is ``True`` so inclusive upper bounds
+    retain fractional-second revisions on ``end_date``. Explicit timestamps preserve
+    their subsecond precision and normalize to UTC.
+    """
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    if isinstance(value, date):
+        if is_end:
+            return datetime(value.year, value.month, value.day, 23, 59, 59, 999999, tzinfo=UTC)
+        return datetime(value.year, value.month, value.day, 0, 0, 0, 0, tzinfo=UTC)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Date filter bound must be a non-empty ISO 8601 date or timestamp string")
+
+    stripped = value.strip()
+    normalized = normalize_iso_date(stripped)
+    candidate = normalized if isinstance(normalized, str) else stripped
+
+    if _ISO_DATE_REGEX.fullmatch(candidate):
+        parsed_date = date.fromisoformat(candidate)
+        if is_end:
+            return datetime(
+                parsed_date.year,
+                parsed_date.month,
+                parsed_date.day,
+                23,
+                59,
+                59,
+                999999,
+                tzinfo=UTC,
+            )
+        return datetime(
+            parsed_date.year,
+            parsed_date.month,
+            parsed_date.day,
+            0,
+            0,
+            0,
+            0,
+            tzinfo=UTC,
+        )
+
+    dt = parse_iso_datetime(candidate)
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
 def normalize_utc_timestamp_bound(value: str, *, is_end: bool = False) -> str:
     """Normalize a date or timestamp string to an ISO 8601 UTC timestamp bound.
 

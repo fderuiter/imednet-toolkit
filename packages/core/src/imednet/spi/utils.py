@@ -50,9 +50,11 @@ if TYPE_CHECKING:
     )
     from imednet.utils.dates import (
         format_iso_datetime,
+        is_date_only_bound,
         normalize_iso_date,
         normalize_utc_timestamp_bound,
         parse_iso_datetime,
+        parse_utc_timestamp_bound,
     )
     from imednet.utils.db import get_db_init_lock, get_sqlite_connection, sqlite_connection
     from imednet.utils.enrollment import (
@@ -228,6 +230,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     ),
     "import_records_csv": ("imednet.utils.pandas", "import_records_csv"),
     "is_boolean_token": ("imednet.utils.validators", "is_boolean_token"),
+    "is_date_only_bound": ("imednet.utils.dates", "is_date_only_bound"),
     "is_missing_value": ("imednet.utils.validators", "is_missing_value"),
     "is_site_enrollment_eligible": ("imednet.utils.enrollment", "is_site_enrollment_eligible"),
     "mask_clinical_phi": ("imednet.utils.security", "mask_clinical_phi"),
@@ -256,6 +259,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "parse_filter_expressions": ("imednet.utils.filters", "parse_filter_expressions"),
     "parse_iso_datetime": ("imednet.utils.dates", "parse_iso_datetime"),
     "parse_revision_timestamp_utc": ("imednet.utils.filters", "parse_revision_timestamp_utc"),
+    "parse_utc_timestamp_bound": ("imednet.utils.dates", "parse_utc_timestamp_bound"),
     "poll_facade_many_async": ("imednet.utils.batch_coordinator", "poll_facade_many_async"),
     "poll_facade_many_sync": ("imednet.utils.batch_coordinator", "poll_facade_many_sync"),
     "poll_facade_single_async": ("imednet.utils.batch_coordinator", "poll_facade_single_async"),
@@ -381,6 +385,7 @@ __all__ = [
     "has_valid_tabular_batch_stamp",
     "import_records_csv",
     "is_boolean_token",
+    "is_date_only_bound",
     "is_missing_value",
     "is_site_enrollment_eligible",
     "mask_clinical_phi",
@@ -400,6 +405,7 @@ __all__ = [
     "parse_filter_expressions",
     "parse_iso_datetime",
     "parse_revision_timestamp_utc",
+    "parse_utc_timestamp_bound",
     "poll_facade_many_async",
     "poll_facade_many_sync",
     "poll_facade_single_async",

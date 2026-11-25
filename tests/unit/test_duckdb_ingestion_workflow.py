@@ -264,6 +264,8 @@ def test_ingest_revisions_bigint_aware_timestamps_and_pandas_fallback(
             record_id=big_id + 1,
             record_oid="OID-BIG",
             form_key="VITALS",
+            subject_id=big_id + 4,
+            subject_oid="SUBJ-OID-9",
             subject_key="SUBJ-9",
             site_id=big_id + 2,
             interval_id=big_id + 3,
@@ -287,12 +289,14 @@ def test_ingest_revisions_bigint_aware_timestamps_and_pandas_fallback(
         assert workflow.ingest_revisions("STUDY", mode="replace") == 1
 
     result = workflow._connection.execute(
-        "SELECT record_revision_id, record_id, site_id, interval_id, "
+        "SELECT record_revision_id, record_id, subject_id, subject_oid, site_id, interval_id, "
         "record_status, date_created, last_updated FROM bronze_revisions"
     ).fetchone()
     assert result == (
         big_id,
         big_id + 1,
+        big_id + 4,
+        "SUBJ-OID-9",
         big_id + 2,
         big_id + 3,
         "Locked",
@@ -642,3 +646,116 @@ def test_duckdb_replace_study_isolation_phi_masking_and_history_transition_diffs
         finally:
             workflow.close()
             workflow.close()  # Idempotent close()
+
+
+def test_ingest_revisions_fractional_end_date_and_unkeyed_append_dedup() -> None:
+    """Verify date-only end_date retains subsecond revisions and unkeyed revisions deduplicate across appends."""
+    pytest.importorskip("duckdb")
+
+    sdk = MagicMock()
+    fractional_keyed = RecordRevision(
+        studyKey="STUDY",
+        recordRevisionId=7001,
+        recordId=71,
+        recordOid="REC-71",
+        formKey="F_VS",
+        subjectId=8801,
+        subjectOid="SUBJ-OID-8801",
+        subjectKey="SUBJ-88",
+        siteId=10,
+        intervalId=20,
+        recordStatus="Record Complete",
+        recordRevision=1,
+        dataRevision=1,
+        user="crc_user",
+        role="CRC",
+        reasonForChange="Late-night fractional-second save",
+        deleted=False,
+        dateCreated="2026-01-31T23:59:59.750000Z",
+        lastUpdated="2026-01-31T23:59:59.750000Z",
+    )
+    unkeyed_rev = RecordRevision(
+        studyKey="STUDY",
+        recordRevisionId=None,
+        recordId=72,
+        recordOid="REC-72",
+        formKey="F_DM",
+        subjectId=8802,
+        subjectOid="SUBJ-OID-8802",
+        subjectKey="SUBJ-89",
+        recordStatus="Verified",
+        recordRevision=1,
+        dataRevision=1,
+        user="pi_user",
+        role="PI",
+        reasonForChange="Unkeyed sign-off",
+        deleted=False,
+        dateCreated="2026-01-31T23:59:59.250000Z",
+        lastUpdated="2026-01-31T23:59:59.250000Z",
+    )
+    missing_date_rev = RecordRevision(
+        studyKey="STUDY",
+        recordRevisionId=7002,
+        recordId=73,
+        recordOid="REC-73",
+        formKey="F_AE",
+        recordRevision=1,
+        dataRevision=1,
+        dateCreated=None,
+    )
+    out_of_range_rev = RecordRevision(
+        studyKey="STUDY",
+        recordRevisionId=7003,
+        recordId=74,
+        recordOid="REC-74",
+        formKey="F_AE",
+        recordRevision=1,
+        dataRevision=1,
+        dateCreated="2026-02-01T00:00:00Z",
+    )
+
+    sdk.get_record_revisions.side_effect = [
+        [fractional_keyed, unkeyed_rev, missing_date_rev, out_of_range_rev],
+        [fractional_keyed, unkeyed_rev],
+    ]
+
+    with DuckDBIngestionWorkflow(sdk, ":memory:") as workflow:
+        assert (
+            workflow.ingest_revisions(
+                "STUDY",
+                start_date="2026-01-01",
+                end_date="2026-01-31",
+                mode="append",
+            )
+            == 2
+        )
+        assert (
+            workflow.ingest_revisions(
+                "STUDY",
+                end_date="2026-01-31",
+                mode="append",
+            )
+            == 0
+        )
+        workflow.build_silver_view("STUDY")
+
+        rows = workflow._connection.execute(
+            "SELECT record_id, subject_id, subject_oid, subject_key, date_created "
+            "FROM silver_current_state ORDER BY record_id"
+        ).fetchall()
+        assert rows == [
+            (
+                71,
+                8801,
+                "SUBJ-OID-8801",
+                "SUBJ-88",
+                datetime(2026, 1, 31, 23, 59, 59, 750000),
+            ),
+            (
+                72,
+                8802,
+                "SUBJ-OID-8802",
+                "SUBJ-89",
+                datetime(2026, 1, 31, 23, 59, 59, 250000),
+            ),
+        ]

@@ -895,7 +895,9 @@ def _build_filter_part(
         validate_filter_operator(op)
         return f"{camel_key}{op}{_format_filter_value(val)}"
     if isinstance(value, list):
-        if value and any(isinstance(item, tuple) for item in value):
+        if not value:
+            raise ValueError(f"Filter list for '{key}' cannot be empty")
+        if any(isinstance(item, tuple) for item in value):
             if not all(isinstance(item, tuple) for item in value):
                 raise ValueError(
                     f"Filter list for '{key}' cannot mix operator tuples and scalar values"
