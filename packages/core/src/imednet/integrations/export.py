@@ -30,10 +30,11 @@ from imednet.integrations._export_contracts import (
 )
 from imednet.integrations.enrichment import (
     EnrichmentPipeline,
+    _extract_record_study_keys,
     _matches_custom_phi_key,
     mask_custom_phi_recursive,
-    resolve_enrichment_pipeline,
-    resolve_study_configuration,
+    resolve_sink_enrichment_pipeline,
+    resolve_sink_phi_keys,
 )
 from imednet.integrations.sink_base import (
     _SDTM_RECORDS_SORT,
@@ -539,6 +540,33 @@ def _records_df(
     return df
 
 
+def _seed_mapper_enrichment(
+    mapper: Any,
+    study_key: str | None,
+    pipeline: Any | None,
+    config: SinkConfig | None = None,
+    *,
+    records: Any = None,
+) -> None:
+    """Bind *study_key* and any *config*-resolved enrichment *pipeline* onto *mapper*."""
+    if isinstance(mapper, NonCallableMock):
+        return
+    if isinstance(study_key, str) and study_key and hasattr(mapper, "_active_study_key"):
+        mapper._active_study_key = study_key
+    cache = getattr(mapper, "_enrichment_cache", None)
+    if not isinstance(cache, dict):
+        return
+    extra = getattr(config, "extra", None) if config is not None else None
+    has_extra_override = isinstance(extra, Mapping) and (
+        extra.get("enrichment_pipeline") is not None or extra.get("study_config") is not None
+    )
+    if isinstance(study_key, str) and study_key and (pipeline is not None or has_extra_override):
+        cache[study_key] = pipeline
+    if has_extra_override and records is not None:
+        for rec_sk in _extract_record_study_keys(records):
+            cache[rec_sk] = pipeline
+
+
 def _prepare_export_df(
     sdk: ImednetSDK,
     study_key: str,
@@ -549,9 +577,13 @@ def _prepare_export_df(
     sanitize: bool = False,
     mask_phi: bool = True,
     _mapper: Any = None,
+    config: SinkConfig | None = None,
 ) -> pd.DataFrame:
     """Prepare a DataFrame for export by fetching records and optionally sanitizing."""
     with sdk_governance_context(sdk):
+        pipeline = resolve_sink_enrichment_pipeline(study_key, config=config)
+        if _mapper is not None:
+            _seed_mapper_enrichment(_mapper, study_key, pipeline, config=config)
         df = _records_df(
             sdk,
             study_key,
@@ -561,8 +593,16 @@ def _prepare_export_df(
             mask_phi=mask_phi,
             _mapper=_mapper,
         )
-        pipeline = resolve_enrichment_pipeline(study_key)
-    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+        phi_keys = (
+            resolve_sink_phi_keys(
+                study_key,
+                config=config,
+                records=df,
+                phi_keys=getattr(pipeline, "phi_keys", None),
+            )
+            if mask_phi
+            else None
+        )
     if mask_phi:
         df = _mask_df(df, phi_keys=phi_keys)
     if sanitize:
@@ -777,14 +817,14 @@ def _coerce_sdtm_integer_columns(df: pd.DataFrame) -> pd.DataFrame:
     return adjusted if adjusted is not None else df
 
 
-def _resolve_study_phi_keys(study_key: str | None) -> set[str] | None:
-    """Resolve custom normalized PHI keys from committed StudyConfiguration when present."""
-    if not study_key:
-        return None
-    pipeline = resolve_enrichment_pipeline(study_key)
-    if pipeline is None or not pipeline.phi_keys:
-        return None
-    return set(pipeline.phi_keys)
+def _resolve_study_phi_keys(
+    study_key: str | None,
+    *,
+    config: SinkConfig | None = None,
+    records: Any = None,
+) -> set[str] | None:
+    """Resolve custom normalized PHI keys from ``SinkConfig.extra``, store, or Records."""
+    return resolve_sink_phi_keys(study_key, config=config, records=records)
 
 
 def _prepare_tabular_batch_df(
@@ -794,11 +834,13 @@ def _prepare_tabular_batch_df(
     sanitize: bool,
     study_key: str | None = None,
     as_sdtm: bool = False,
+    config: SinkConfig | None = None,
 ) -> pd.DataFrame:
     """Convert ``records`` into a DataFrame with single-pass PHI masking and CSV sanitization."""
-    phi_keys = _resolve_study_phi_keys(study_key) if mask_phi else None
-
     if isinstance(records, pd.DataFrame):
+        phi_keys = (
+            _resolve_study_phi_keys(study_key, config=config, records=records) if mask_phi else None
+        )
         was_sdtm_redacted = bool(records.attrs.get("imednet_sdtm_redacted"))
         effective_sdtm = bool(as_sdtm or was_sdtm_redacted)
         if len(records) == 0:
@@ -844,6 +886,9 @@ def _prepare_tabular_batch_df(
     items = list(records) if not isinstance(records, Sequence) else records
     if not items:
         return pd.DataFrame()
+    phi_keys = (
+        _resolve_study_phi_keys(study_key, config=config, records=items) if mask_phi else None
+    )
     normalized = [_normalize_tabular_batch_item(item) for item in items]
     df = pd.DataFrame(normalized)
     if len(df) == 0:
@@ -1400,6 +1445,7 @@ class TabularCSVSink(ExportSink):
             sanitize=self._cfg.sanitize,
             as_sdtm=self._cfg.as_sdtm,
             study_key=self._cfg.study_key,
+            config=self._cfg,
         )
         if len(df) == 0:
             return 0
@@ -2507,6 +2553,7 @@ class TabularParquetSink(ExportSink):
             sanitize=self._cfg.sanitize,
             as_sdtm=self._cfg.as_sdtm,
             study_key=self._cfg.study_key,
+            config=self._cfg,
         )
         if len(df) == 0:
             return 0
@@ -3129,6 +3176,7 @@ class TabularSQLSink(ExportSink):
             sanitize=self._cfg.sanitize,
             study_key=self._cfg.study_key,
             as_sdtm=self._cfg.as_sdtm,
+            config=self._cfg,
         )
         if len(df) == 0:
             return 0
@@ -3394,6 +3442,7 @@ class TabularDuckDBSink(ExportSink):
             sanitize=self._cfg.sanitize,
             study_key=self._cfg.study_key,
             as_sdtm=self._cfg.as_sdtm,
+            config=self._cfg,
         )
         if len(df) == 0:
             return 0
@@ -3644,8 +3693,13 @@ class _TabularTransformSink(ExportSink):
         self._cfg = config
         self._sanitize = bool(sanitize or config.sanitize)
         self._pipeline = pipeline
-        self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+        self._phi_keys = resolve_sink_phi_keys(
+            config.study_key,
+            config=config,
+            phi_keys=getattr(pipeline, "phi_keys", None),
+        )
         self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
+        _seed_mapper_enrichment(mapper, config.study_key, pipeline, config=config)
         self._domain_seq_counters: dict[str, dict[str, int]] = {}
         self._seq_counters: dict[str, int] = {}
         self._record_seqs: dict[str, int] = {}
@@ -3801,6 +3855,23 @@ class _TabularTransformSink(ExportSink):
             return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
 
         self._maybe_refresh_added_variables(records)
+        _seed_mapper_enrichment(
+            self._mapper,
+            self._cfg.study_key,
+            self._pipeline,
+            config=self._cfg,
+            records=records,
+        )
+        batch_phi_keys = (
+            resolve_sink_phi_keys(
+                self._cfg.study_key,
+                config=self._cfg,
+                records=records,
+                phi_keys=self._phi_keys,
+            )
+            if self._cfg.mask_phi
+            else None
+        )
         rows, _ = self._mapper._parse_records(records, self._record_model)
         if self._pipeline is not None and not self._has_native_enrichment:
             rows = [self._pipeline.process(r, mask_phi=self._cfg.mask_phi) for r in rows]
@@ -3815,7 +3886,7 @@ class _TabularTransformSink(ExportSink):
         df = _dedup_case_insensitive_columns(df, ensure_str_columns=True)
 
         if self._cfg.mask_phi:
-            df = _mask_df(df, phi_keys=self._phi_keys)
+            df = _mask_df(df, phi_keys=batch_phi_keys)
         if not self._cfg.use_labels_as_columns and self._cfg.naming_convention is not None:
             df = _apply_naming_convention_to_df(
                 df,
@@ -3825,7 +3896,7 @@ class _TabularTransformSink(ExportSink):
                 study_key=self._cfg.study_key,
             )
             if self._cfg.mask_phi:
-                df = _mask_df(df, phi_keys=self._phi_keys)
+                df = _mask_df(df, phi_keys=batch_phi_keys)
             else:
                 stamp_tabular_batch(df, mask_phi=False, sanitized=False)
         if self._sanitize:
@@ -4084,7 +4155,8 @@ def _tabular_export_impl(
             domains=inferred_domains or None,
             preserve_record_id=should_preserve_sdtm_record_id(config),
         )
-        pipeline = resolve_enrichment_pipeline(study_key)
+        pipeline = resolve_sink_enrichment_pipeline(study_key, config=config)
+        _seed_mapper_enrichment(mapper, study_key, pipeline, config=config)
         record_model: Any = None
     else:
         if no_matching_domain:
@@ -4102,7 +4174,8 @@ def _tabular_export_impl(
             return
 
         raw_variables = mapper._last_variables if hasattr(mapper, "_last_variables") else None
-        pipeline = resolve_enrichment_pipeline(study_key)
+        pipeline = resolve_sink_enrichment_pipeline(study_key, config=config)
+        _seed_mapper_enrichment(mapper, study_key, pipeline, config=config)
         contract_types = _build_tabular_contract_types(
             variable_keys,
             label_map,
@@ -4406,6 +4479,7 @@ def _resolve_non_streaming_export_df(
         sanitize=sanitize,
         mask_phi=config.mask_phi,
         _mapper=pre_mapper,
+        config=config,
     )
 
 
@@ -4696,7 +4770,7 @@ def export_to_excel(
                 prev_kept = _filter_df_excluding_sdtm_keys(prev_df, delta_sdtm | voided_sdtm)
 
             if not prev_kept.empty and config.mask_phi:
-                phi_keys = _resolve_study_phi_keys(study_key)
+                phi_keys = _resolve_study_phi_keys(study_key, config=config, records=prev_kept)
                 copied_prev = False
                 if config.as_sdtm:
                     for col in prev_kept.columns:
@@ -4765,21 +4839,23 @@ def export_to_excel(
     _tabular_export(sdk, study_key, sink, config, sanitize=config.sanitize, stream_name="excel")
 
 
-def _apply_json_enrichment(study_key: str, data: Any, *, mask_phi: bool = True) -> Any:
-    """Apply ConfigVersionStore EnrichmentPipeline when installed."""
+def _apply_json_enrichment(
+    study_key: str,
+    data: Any,
+    *,
+    mask_phi: bool = True,
+    config: SinkConfig | None = None,
+) -> Any:
+    """Apply SinkConfig.extra or ConfigVersionStore EnrichmentPipeline when present."""
     import logging
 
     logger = logging.getLogger(__name__)
     try:
-        study_cfg = resolve_study_configuration(study_key)
-        if study_cfg is not None:
-            pipeline = EnrichmentPipeline(study_cfg)
-            if pipeline._has_rules:
-                logger.info("Enrichment pipeline triggered")
-                data = (
-                    pipeline.process(data) if mask_phi else pipeline.process(data, mask_phi=False)
-                )
-                logger.info("Enrichment pipeline completed successfully")
+        pipeline = resolve_sink_enrichment_pipeline(study_key, config=config, records=data)
+        if pipeline is not None and getattr(pipeline, "_has_rules", True):
+            logger.info("Enrichment pipeline triggered")
+            data = pipeline.process(data) if mask_phi else pipeline.process(data, mask_phi=False)
+            logger.info("Enrichment pipeline completed successfully")
     except Exception as e:
         logger.warning(f"Could not apply EnrichmentPipeline: {e}")
     return data
@@ -5176,6 +5252,18 @@ class _HierarchicalJSONSink(ExportSink):
             return 0
 
         if active_records:
+            hier_pipeline = resolve_sink_enrichment_pipeline(
+                self._study_key,
+                config=self._cfg,
+                records=active_records,
+            )
+            _seed_mapper_enrichment(
+                self._mapper,
+                self._study_key,
+                hier_pipeline,
+                config=self._cfg,
+                records=active_records,
+            )
             call_kwargs = dict(self._hier_kwargs)
             if not self._is_mock_hier_mapper:
                 call_kwargs["records"] = active_records
@@ -5190,6 +5278,7 @@ class _HierarchicalJSONSink(ExportSink):
                 self._study_key,
                 delta_data,
                 mask_phi=self._cfg.mask_phi,
+                config=self._cfg,
             )
 
         if self._is_incremental_sync and self._cfg.idempotent and dest_exists:
@@ -5204,7 +5293,15 @@ class _HierarchicalJSONSink(ExportSink):
                 existing_tree = []
 
             exclude_ids = set(self._records_by_cid) | self._voided_ids
-            phi_keys = _resolve_study_phi_keys(self._study_key) if self._cfg.mask_phi else None
+            phi_keys = (
+                _resolve_study_phi_keys(
+                    self._study_key,
+                    config=self._cfg,
+                    records=active_records,
+                )
+                if self._cfg.mask_phi
+                else None
+            )
             final_data: Any = _merge_hierarchical_archives(
                 existing_tree,
                 delta_sanitized if isinstance(delta_sanitized, list) else [],
@@ -5293,7 +5390,12 @@ def export_to_json(
                 data = mapper.build_hierarchy(study_key, **hier_kwargs)
                 if config.mask_phi:
                     data = mask_clinical_phi(data)
-                data = _apply_json_enrichment(study_key, data, mask_phi=config.mask_phi)
+                data = _apply_json_enrichment(
+                    study_key,
+                    data,
+                    mask_phi=config.mask_phi,
+                    config=config,
+                )
             with _TabularCallableSink(
                 config,
                 "export_json",
@@ -5301,6 +5403,10 @@ def export_to_json(
             ) as legacy_hier_sink:
                 legacy_hier_sink.write_batch([1], batch_id=f"{study_key}/json/0")
             return
+
+        with sdk_governance_context(sdk):
+            hier_pipeline = resolve_sink_enrichment_pipeline(study_key, config=config)
+            _seed_mapper_enrichment(mapper, study_key, hier_pipeline, config=config)
 
         hier_sink = _HierarchicalJSONSink(
             path,
@@ -5328,7 +5434,12 @@ def export_to_json(
     if df_mock is not None:
         mock_data = _dataframe_to_json_records(df_mock)
         with sdk_governance_context(sdk):
-            mock_data = _apply_json_enrichment(study_key, mock_data, mask_phi=config.mask_phi)
+            mock_data = _apply_json_enrichment(
+                study_key,
+                mock_data,
+                mask_phi=config.mask_phi,
+                config=config,
+            )
         with _TabularCallableSink(
             config,
             "export_json",
@@ -5340,7 +5451,11 @@ def export_to_json(
     is_incremental_json = _is_incremental_config(config)
 
     def _write_or_reconcile_json(combined: pd.DataFrame, voided_ids: set[str]) -> None:
-        phi_keys = _resolve_study_phi_keys(study_key) if config.mask_phi else None
+        phi_keys = (
+            _resolve_study_phi_keys(study_key, config=config, records=combined)
+            if config.mask_phi
+            else None
+        )
         if not (is_incremental_json and config.idempotent):
             combined_stamped = (not config.mask_phi) or has_valid_tabular_batch_stamp(
                 combined,
@@ -5350,7 +5465,14 @@ def export_to_json(
             records_out: Any = _dataframe_to_json_records(combined)
             if config.mask_phi and not combined_stamped:
                 if config.as_sdtm:
-                    records_out = redact_batch_records(records_out, mask_phi=True, as_sdtm=True)
+                    records_out = redact_batch_records(
+                        records_out,
+                        mask_phi=True,
+                        as_sdtm=True,
+                        study_key=study_key,
+                        config=config,
+                        phi_keys=phi_keys,
+                    )
                 else:
                     records_out = mask_clinical_phi(records_out)
                 if phi_keys:
@@ -5386,7 +5508,14 @@ def export_to_json(
             if config.as_sdtm:
                 delta_records = cast(
                     list[dict[str, Any]],
-                    redact_batch_records(delta_records, mask_phi=True, as_sdtm=True),
+                    redact_batch_records(
+                        delta_records,
+                        mask_phi=True,
+                        as_sdtm=True,
+                        study_key=study_key,
+                        config=config,
+                        phi_keys=phi_keys,
+                    ),
                 )
             else:
                 delta_records = cast(list[dict[str, Any]], mask_clinical_phi(delta_records))
@@ -6081,10 +6210,13 @@ def _prepare_form_export_state(
     """Initialize the RecordMapper, enrichment pipeline, and mock-fetch flag for per-form exports."""
     with sdk_governance_context(sdk):
         mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-        if hasattr(mapper, "_active_study_key"):
-            mapper._active_study_key = study_key
-        pipeline = resolve_enrichment_pipeline(study_key)
-    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+        pipeline = resolve_sink_enrichment_pipeline(study_key, config=config)
+        _seed_mapper_enrichment(mapper, study_key, pipeline, config=config)
+        phi_keys = resolve_sink_phi_keys(
+            study_key,
+            config=config,
+            phi_keys=getattr(pipeline, "phi_keys", None),
+        )
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
     return _FormExportState(
@@ -6616,7 +6748,11 @@ class _LongSQLSink(ExportSink):
         self._cfg = config
         self._chunk_size = max(1, chunk_size)
         self._pipeline = pipeline
-        self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+        self._phi_keys = resolve_sink_phi_keys(
+            config.study_key,
+            config=config,
+            phi_keys=getattr(pipeline, "phi_keys", None),
+        )
         self._variable_whitelist = (
             variable_whitelist if variable_whitelist is not None else config.variable_whitelist
         )
@@ -6660,11 +6796,30 @@ class _LongSQLSink(ExportSink):
             return 0
         filtered_records = filter_records_by_form_whitelist(records, self._form_whitelist)
         incoming_ids = [rid for r in filtered_records if (rid := extract_record_id(r)) is not None]
+        active_pipeline = (
+            self._pipeline
+            if self._pipeline is not None
+            else resolve_sink_enrichment_pipeline(
+                self._cfg.study_key,
+                config=self._cfg,
+                records=filtered_records,
+            )
+        )
+        active_phi_keys = (
+            resolve_sink_phi_keys(
+                self._cfg.study_key,
+                config=self._cfg,
+                records=filtered_records,
+                phi_keys=self._phi_keys,
+            )
+            if self._cfg.mask_phi
+            else None
+        )
         long_rows = _unpack_long_sql_rows(
             filtered_records,
             mask_phi=self._cfg.mask_phi,
-            pipeline=self._pipeline,
-            phi_keys=self._phi_keys,
+            pipeline=active_pipeline,
+            phi_keys=active_phi_keys,
             naming_convention=self._cfg.naming_convention,
             sdtm_domain=self._cfg.sdtm_domain,
             variable_whitelist=self._variable_whitelist,
@@ -6765,8 +6920,13 @@ def export_to_long_sql(
     engine = create_engine(conn_str)
     with sdk_governance_context(sdk):
         mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-        pipeline = resolve_enrichment_pipeline(study_key)
-    phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+        pipeline = resolve_sink_enrichment_pipeline(study_key, config=config)
+        _seed_mapper_enrichment(mapper, study_key, pipeline, config=config)
+        phi_keys = resolve_sink_phi_keys(
+            study_key,
+            config=config,
+            phi_keys=getattr(pipeline, "phi_keys", None),
+        )
 
     if _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config):
         try:

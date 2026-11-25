@@ -7,10 +7,12 @@ data using configured mappings, terminology lookups, and PHI masking rules.
 import functools
 import logging
 import re
-from collections.abc import Callable, Mapping, Sequence
+import sys
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from typing import Any
+from unittest.mock import NonCallableMock
 
 from imednet.models.engine import ResourceRegistry
 from imednet.models.sdtm import (
@@ -254,6 +256,236 @@ def resolve_enrichment_pipeline(study_key: str | None) -> "EnrichmentPipeline | 
         return None
     pipeline = EnrichmentPipeline(study_cfg)
     return pipeline if pipeline._has_rules else None
+
+
+_RECORD_STUDY_COLUMNS = ("study_key", "studyKey", "STUDYID", "studyid")
+
+
+def _clean_study_key(value: Any) -> str | None:
+    """Return stripped *value* when it is a valid non-placeholder Study key."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or stripped == "UNKNOWN":
+        return None
+    return stripped
+
+
+def _extract_single_item_study_key(item: Any) -> str | None:
+    """Extract a Study key from a single Record model or mapping envelope."""
+    if item is None or isinstance(item, (str, bytes, NonCallableMock)):
+        return None
+    if isinstance(item, Mapping):
+        for col in _RECORD_STUDY_COLUMNS:
+            if (sk := _clean_study_key(item.get(col))) is not None:
+                return sk
+        for nested_name in ("record_data", "recordData"):
+            nested = item.get(nested_name)
+            if isinstance(nested, Mapping):
+                for col in _RECORD_STUDY_COLUMNS:
+                    if (sk := _clean_study_key(nested.get(col))) is not None:
+                        return sk
+        return None
+    for attr in ("study_key", "studyKey", "STUDYID"):
+        if (sk := _clean_study_key(getattr(item, attr, None))) is not None:
+            return sk
+    rec_data = getattr(item, "record_data", None)
+    if isinstance(rec_data, Mapping):
+        for col in _RECORD_STUDY_COLUMNS:
+            if (sk := _clean_study_key(rec_data.get(col))) is not None:
+                return sk
+    return None
+
+
+def _extract_record_study_keys(records: Any) -> list[str]:
+    """Extract ordered unique Study keys from a DataFrame, Mapping, or Record collection."""
+    if records is None or isinstance(records, (str, bytes, NonCallableMock)):
+        return []
+    pd_mod = sys.modules.get("pandas")
+    if pd_mod is not None and isinstance(records, pd_mod.DataFrame):
+        if len(records) == 0:
+            return []
+        found_df: list[str] = []
+        seen_df: set[str] = set()
+        for col in _RECORD_STUDY_COLUMNS:
+            if col in records.columns:
+                target = records[col]
+                vals = target.dropna().unique().tolist() if hasattr(target, "dropna") else []
+                for raw_v in vals:
+                    sk = _clean_study_key(raw_v)
+                    if sk is not None and sk not in seen_df:
+                        seen_df.add(sk)
+                        found_df.append(sk)
+        return found_df
+    if isinstance(records, Mapping):
+        single_sk = _extract_single_item_study_key(records)
+        return [single_sk] if single_sk is not None else []
+    if isinstance(records, Collection):
+        found_items: list[str] = []
+        seen_items: set[str] = set()
+        for item in records:
+            sk = _extract_single_item_study_key(item)
+            if sk is not None and sk not in seen_items:
+                seen_items.add(sk)
+                found_items.append(sk)
+        return found_items
+    return []
+
+
+class _CustomEnrichmentPipelineAdapter:
+    """Normalize custom ``SinkConfig.extra['enrichment_pipeline']`` objects across mappers."""
+
+    def __init__(self, delegate: Any, *, phi_keys: Iterable[str] | None = None) -> None:
+        self._delegate = delegate
+        merged_phi: set[str] = set()
+        raw_phi = getattr(delegate, "phi_keys", None)
+        if isinstance(raw_phi, Iterable) and not isinstance(raw_phi, (str, bytes)):
+            for k in raw_phi:
+                _expand_phi_key(k, merged_phi)
+        if phi_keys is not None:
+            for k in phi_keys:
+                _expand_phi_key(k, merged_phi)
+        self.phi_keys: set[str] = merged_phi
+        raw_mappings = getattr(delegate, "mappings", None)
+        self.mappings: dict[str, Any] = (
+            dict(raw_mappings) if isinstance(raw_mappings, Mapping) else {}
+        )
+        raw_all = getattr(delegate, "all_mappings", None)
+        self.all_mappings: list[Any] = list(raw_all) if isinstance(raw_all, list) else []
+        raw_term = getattr(delegate, "terminology", None)
+        self.terminology: dict[str, dict[str, str]] = (
+            dict(raw_term) if isinstance(raw_term, Mapping) else {}
+        )
+        self.config: Any = getattr(delegate, "config", None)
+        self._has_rules: bool = True
+
+    def process(
+        self,
+        data: Any,
+        *,
+        mask_phi: bool = True,
+        _skip_default_phi: bool = False,
+        domain: str | None = None,
+        form_key: str | None = None,
+    ) -> Any:
+        try:
+            out = self._delegate.process(
+                data,
+                mask_phi=mask_phi,
+                _skip_default_phi=_skip_default_phi,
+                domain=domain,
+                form_key=form_key,
+            )
+        except TypeError:
+            try:
+                out = self._delegate.process(data, mask_phi=mask_phi)
+            except TypeError:
+                out = self._delegate.process(data)
+        if mask_phi and self.phi_keys:
+            from imednet.utils.security import build_study_sensitivity_registry
+
+            out = mask_clinical_phi(out, registry=build_study_sensitivity_registry(self.phi_keys))
+        return out
+
+
+def resolve_sink_enrichment_pipeline(
+    study_key: str | None = None,
+    *,
+    config: Any | None = None,
+    records: Any = None,
+) -> Any | None:
+    """Resolve an enrichment pipeline from ``SinkConfig.extra``, ``study_key``, or Record ``study_key``s."""
+    extra = getattr(config, "extra", None) if config is not None else None
+    extra_map = extra if isinstance(extra, Mapping) else None
+    if extra_map is not None:
+        extra_study_cfg = _coerce_resolved_study_config(extra_map.get("study_config"))
+        extra_cfg_phi = (
+            EnrichmentPipeline(extra_study_cfg).phi_keys if extra_study_cfg is not None else None
+        )
+        custom_pipeline = extra_map.get("enrichment_pipeline")
+        if custom_pipeline is not None and callable(getattr(custom_pipeline, "process", None)):
+            if isinstance(custom_pipeline, EnrichmentPipeline):
+                if extra_cfg_phi and not extra_cfg_phi.issubset(custom_pipeline.phi_keys):
+                    return _CustomEnrichmentPipelineAdapter(
+                        custom_pipeline,
+                        phi_keys=extra_cfg_phi,
+                    )
+                return custom_pipeline
+            return _CustomEnrichmentPipelineAdapter(custom_pipeline, phi_keys=extra_cfg_phi)
+        if extra_study_cfg is not None:
+            pipeline = EnrichmentPipeline(extra_study_cfg)
+            return pipeline if pipeline._has_rules else None
+
+    effective_sk = _clean_study_key(study_key)
+    if effective_sk is None and config is not None:
+        effective_sk = _clean_study_key(getattr(config, "study_key", None))
+    if effective_sk is not None:
+        return resolve_enrichment_pipeline(effective_sk)
+
+    for rec_sk in _extract_record_study_keys(records):
+        resolved = resolve_enrichment_pipeline(rec_sk)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _expand_phi_key(raw_key: Any, target: set[str]) -> None:
+    """Add normalized and snake_case forms of a non-exempt PHI Variable key to *target*."""
+    if not isinstance(raw_key, str) or global_sensitivity_registry.is_exempt(raw_key):
+        return
+    norm_key = _normalize_key(raw_key)
+    if norm_key:
+        target.add(norm_key)
+        target.add(norm_key.replace("_", ""))
+    snake_norm = _normalize_key(_to_snake_case(raw_key))
+    if snake_norm:
+        target.add(snake_norm)
+        target.add(snake_norm.replace("_", ""))
+
+
+def resolve_sink_phi_keys(
+    study_key: str | None = None,
+    *,
+    config: Any | None = None,
+    records: Any = None,
+    phi_keys: Iterable[str] | None = None,
+) -> set[str] | None:
+    """Resolve normalized custom PHI Variable keys from ``SinkConfig.extra``, store, and Records."""
+    collected: set[str] = set()
+    if phi_keys is not None and not isinstance(phi_keys, (str, bytes)):
+        for raw_k in phi_keys:
+            _expand_phi_key(raw_k, collected)
+
+    has_extra_study_cfg = False
+    extra = getattr(config, "extra", None) if config is not None else None
+    if isinstance(extra, Mapping):
+        custom_pipeline = extra.get("enrichment_pipeline")
+        if custom_pipeline is not None:
+            raw_pipe_phi = getattr(custom_pipeline, "phi_keys", None)
+            if isinstance(raw_pipe_phi, Iterable) and not isinstance(raw_pipe_phi, (str, bytes)):
+                for raw_k in raw_pipe_phi:
+                    _expand_phi_key(raw_k, collected)
+            pipe_cfg = _coerce_resolved_study_config(getattr(custom_pipeline, "config", None))
+            if pipe_cfg is not None and pipe_cfg.phi_fields:
+                collected.update(EnrichmentPipeline(pipe_cfg).phi_keys)
+        extra_study_cfg = _coerce_resolved_study_config(extra.get("study_config"))
+        if extra_study_cfg is not None:
+            has_extra_study_cfg = True
+            collected.update(EnrichmentPipeline(extra_study_cfg).phi_keys)
+
+    if not has_extra_study_cfg:
+        effective_sk = _clean_study_key(study_key)
+        if effective_sk is None and config is not None:
+            effective_sk = _clean_study_key(getattr(config, "study_key", None))
+        candidate_study_keys = (
+            [effective_sk] if effective_sk is not None else _extract_record_study_keys(records)
+        )
+        for cand_sk in candidate_study_keys:
+            committed_pipe = resolve_enrichment_pipeline(cand_sk)
+            if committed_pipe is not None and committed_pipe.phi_keys:
+                collected.update(committed_pipe.phi_keys)
+
+    return collected if collected else None
 
 
 class CentralizedMapper:
@@ -718,16 +950,7 @@ class EnrichmentPipeline:
         raw_phi_fields = getattr(config, "phi_fields", []) or []
         self.phi_keys: set[str] = set()
         for raw_key in raw_phi_fields:
-            if global_sensitivity_registry.is_exempt(raw_key):
-                continue
-            norm_key = _normalize_key(raw_key)
-            if norm_key:
-                self.phi_keys.add(norm_key)
-                self.phi_keys.add(norm_key.replace("_", ""))
-            snake_norm = _normalize_key(_to_snake_case(str(raw_key)))
-            if snake_norm:
-                self.phi_keys.add(snake_norm)
-                self.phi_keys.add(snake_norm.replace("_", ""))
+            _expand_phi_key(str(raw_key), self.phi_keys)
 
         self.terminology = config.terminology_lookups or {}
         self._snake_terminology: dict[str, dict[str, str]] = {}
