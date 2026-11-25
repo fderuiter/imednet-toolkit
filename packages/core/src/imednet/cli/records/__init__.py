@@ -24,7 +24,12 @@ from ..utils.args import (
     resolve_output_format,
     resolve_study_key,
 )
-from ..utils.export import export_list_to_file, resolve_records_export_target
+from ..utils.export import (
+    export_list_to_file,
+    mask_cli_records,
+    resolve_cli_phi_fields,
+    resolve_records_export_target,
+)
 from ..utils.write_helpers import (
     add_write_common_args,
     assemble_cli_write_records,
@@ -155,9 +160,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 effective_limit,
             )
 
-        if resolved_format == "json":
-            display_list(records, "records", output_format="json")
-        elif output:
+        if output:
             export_list_to_file(
                 records,
                 "records",
@@ -165,11 +168,34 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 study_key=study_key,
                 mask_phi=mask_phi,
             )
+            return
+
+        custom_phi_fields = (
+            resolve_cli_phi_fields(study_key, sdk=sdk)
+            if mask_phi and (records or load_remaining is not None)
+            else None
+        )
+        records = mask_cli_records(
+            records,
+            study_key=study_key,
+            mask_phi=mask_phi,
+            sdk=sdk,
+            custom_phi_fields=custom_phi_fields,
+        )
+        if resolved_format == "json":
+            display_list(records, "records", output_format="json")
         else:
             view_models = [_record_view_model(r) for r in records]
 
             def _load_more_records() -> tuple[list[dict[str, Any]], list[Any]]:
                 more = load_remaining() if load_remaining is not None else []
+                more = mask_cli_records(
+                    more,
+                    study_key=study_key,
+                    mask_phi=mask_phi,
+                    sdk=sdk,
+                    custom_phi_fields=custom_phi_fields,
+                )
                 return [_record_view_model(r) for r in more], more
 
             display_list(

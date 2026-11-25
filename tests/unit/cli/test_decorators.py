@@ -118,3 +118,68 @@ def test_get_sdk_redacts_secrets_on_init_failure(
     err = capsys.readouterr().err
     assert oidc_val not in err
     assert "********" in err
+
+
+@pytest.mark.parametrize(
+    ("raised_exc", "expected_prefix", "forbidden_prefix"),
+    [
+        (
+            "local_validation",
+            "Validation Error: Offline field V_AGE is required",
+            "API Error:",
+        ),
+        (
+            "unknown_var",
+            "Validation Error: CustomClinicalWidget",
+            "API Error:",
+        ),
+        (
+            "local_client",
+            "Error: Local client configuration invalid",
+            "API Error:",
+        ),
+        (
+            "http_bad_request",
+            "API Error: Invalid filter expression (Status Code: 400",
+            "Validation Error:",
+        ),
+    ],
+)
+def test_with_sdk_distinguishes_local_client_errors_from_http_api_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    raised_exc: str,
+    expected_prefix: str,
+    forbidden_prefix: str,
+) -> None:
+    """with_sdk reports local ClientError/ValidationError (status_code=None) without HTTP API labels."""
+    from imednet.cli.decorators import with_sdk
+    from imednet.errors import (
+        BadRequestError,
+        ClientError,
+        UnknownVariableTypeError,
+        ValidationError,
+    )
+
+    fake_sdk = MagicMock()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: fake_sdk)
+
+    exc_map = {
+        "local_validation": ValidationError("Offline field V_AGE is required"),
+        "unknown_var": UnknownVariableTypeError("CustomClinicalWidget"),
+        "local_client": ClientError("Local client configuration invalid", status_code=None),
+        "http_bad_request": BadRequestError({"message": "Invalid filter expression"}),
+    }
+
+    @with_sdk
+    def cmd(_sdk: object) -> None:
+        raise exc_map[raised_exc]
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd()
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert expected_prefix in err
+    assert forbidden_prefix not in err
+    assert "Unexpected error:" not in err

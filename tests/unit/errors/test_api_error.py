@@ -8,9 +8,12 @@ from imednet.errors import (
     ApiError,
     AuthenticationError,
     BadRequestError,
+    ClientError,
     ForbiddenError,
     NotFoundError,
     ServerError,
+    UnauthorizedError,
+    UnknownVariableTypeError,
     ValidationError,
     get_error_class,
 )
@@ -103,9 +106,10 @@ def test_api_error_nested_validation_envelope():
         }
     }
     err_cls = get_error_class(400, payload)
-    assert err_cls is ValidationError
+    assert err_cls is BadRequestError
 
     err = err_cls(payload, status_code=400)
+    assert isinstance(err, BadRequestError)
     assert isinstance(err, ValidationError)
     assert err.code == 1000
     assert err.status == "BAD_REQUEST"
@@ -119,7 +123,7 @@ def test_api_error_nested_validation_envelope():
 @pytest.mark.parametrize(
     ("status_code", "error_code", "meta_status", "description", "expected_cls"),
     [
-        (400, "1000", "BAD_REQUEST", "Field raised validation errors", ValidationError),
+        (400, "1000", "BAD_REQUEST", "Field raised validation errors", BadRequestError),
         (
             500,
             "9000",
@@ -139,7 +143,7 @@ def test_api_error_nested_validation_envelope():
             "9001",
             "UNAUTHORIZED",
             "Unauthorized error. Insufficient permission to retrieve data.",
-            AuthenticationError,
+            UnauthorizedError,
         ),
         (
             403,
@@ -184,12 +188,18 @@ def test_get_error_class_metadata_status_and_fallbacks():
         is BadRequestError
     )
     assert get_error_class(200, {"metadata": {"status": "UNAUTHORIZED"}}) is AuthenticationError
+    assert get_error_class(401, {"metadata": {"status": "UNAUTHORIZED"}}) is UnauthorizedError
+    assert (
+        get_error_class(401, {"metadata": {"status": "AUTHENTICATION_FAILED"}}) is UnauthorizedError
+    )
+    assert get_error_class(400, {"metadata": {"status": "VALIDATION_ERROR"}}) is BadRequestError
+    assert get_error_class(422, {"metadata": {"status": "VALIDATION_ERROR"}}) is ValidationError
     assert get_error_class(200, {"metadata": {"status": "FORBIDDEN"}}) is ForbiddenError
     assert get_error_class(200, {"metadata": {"status": "NOT_FOUND"}}) is NotFoundError
 
     # Legacy flat status overrides
-    assert get_error_class(400, {"status": "validation_error"}) is ValidationError
-    assert get_error_class(401, {"status": "authentication_failed"}) is AuthenticationError
+    assert get_error_class(400, {"status": "validation_error"}) is BadRequestError
+    assert get_error_class(401, {"status": "authentication_failed"}) is UnauthorizedError
 
     # Top-level flat fallback attributes
     flat_err = ValidationError(
@@ -286,7 +296,7 @@ def test_api_error_nested_variable_details_and_sensitive_field_value_redaction()
         }
     }
     err_cls = get_error_class(400, payload)
-    assert err_cls is ValidationError
+    assert err_cls is BadRequestError
 
     err = err_cls(payload, status_code=400)
     assert err.code == 1000
@@ -402,7 +412,7 @@ def test_clinical_variables_and_prose_preserved_while_credentials_redacted(monke
     }
 
     err_cls = get_error_class(400, clinical_payload)
-    assert err_cls is ValidationError
+    assert err_cls is BadRequestError
     api_err = err_cls(clinical_payload, status_code=400)
     assert api_err.code == 1000
     assert api_err.description is not None
@@ -545,7 +555,7 @@ def test_diagnostic_context_immutability_retry_after_and_cli_forbidden(
                 }
             },
         )
-        is AuthenticationError
+        is UnauthorizedError
     )
 
     # CLI @with_sdk prints Permission Denied: when SDK raises 403 + 9001
@@ -569,3 +579,27 @@ def test_diagnostic_context_immutability_retry_after_and_cli_forbidden(
     captured = capsys.readouterr()
     assert "Permission Denied:" in captured.err
     assert "Authentication Failed:" not in captured.err
+
+
+def test_local_validation_errors_bridge_client_and_api_error_without_status_code():
+    """Local ValidationError and UnknownVariableTypeError subclass ClientError and ApiError with status_code=None."""
+    local_val = ValidationError("invalid")
+    assert isinstance(local_val, ClientError)
+    assert isinstance(local_val, ApiError)
+    assert local_val.status_code is None
+    assert local_val.status == "validation_error"
+    assert str(local_val) == "invalid"
+
+    unknown_var = UnknownVariableTypeError("CustomType")
+    assert isinstance(unknown_var, ValidationError)
+    assert isinstance(unknown_var, ClientError)
+    assert isinstance(unknown_var, ApiError)
+    assert unknown_var.status_code is None
+    assert str(unknown_var) == "CustomType"
+
+    bad_req = BadRequestError({"error": "invalid filter"})
+    assert isinstance(bad_req, ValidationError)
+    assert isinstance(bad_req, ClientError)
+    assert isinstance(bad_req, ApiError)
+    assert bad_req.status_code == 400
+    assert "Status Code: 400" in str(bad_req)

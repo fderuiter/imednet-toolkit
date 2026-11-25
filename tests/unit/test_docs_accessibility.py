@@ -217,9 +217,43 @@ def test_navigation_keyboard_css_and_controller_contracts() -> None:
     assert "aria-expanded" in nav_js
     assert '"Escape"' in nav_js
 
-    # 3. py-modindex img.toggler upgrade & focus-visible / forced-colors rules
+    # 3. py-modindex img.toggler upgrade, WCAG 2.5.8 C42 target size, & focus-visible / forced-colors rules
     assert "img.toggler" in nav_js
     assert "plus.png" in nav_js
+    toggler_css_match = re.search(
+        r"(?m)^img\.toggler\s*\{([^}]*)\}",
+        css_content,
+    )
+    assert toggler_css_match is not None, "Missing base img.toggler rule in custom.css"
+    toggler_css_body = toggler_css_match.group(1)
+    for expected_decl in (
+        "display: inline-block;",
+        "box-sizing: content-box;",
+        "width: 11px;",
+        "height: 11px;",
+        "min-width: 11px;",
+        "min-height: 11px;",
+        "max-width: none;",
+        "padding: 7px;",
+    ):
+        assert expected_decl in toggler_css_body
+    assert "display: inline-block !important" not in toggler_css_body
+
+    domainindex_col_match = re.search(
+        r"table\.domainindex-table\s+td:first-child\s*\{([^}]*)\}",
+        css_content,
+    )
+    assert domainindex_col_match is not None, (
+        "Missing table.domainindex-table td:first-child column floor in custom.css"
+    )
+    domainindex_col_body = domainindex_col_match.group(1)
+    for expected_col_decl in (
+        "width: 28px;",
+        "min-width: 28px;",
+        "white-space: nowrap;",
+    ):
+        assert expected_col_decl in domainindex_col_body
+
     assert "img.toggler:focus-visible" in css_content
     assert ".nav-overlay-icon:focus-visible" in css_content
     assert ".toc-header-icon:focus-visible" in css_content
@@ -3855,6 +3889,189 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         "alt": "-",
                         "allVisible": True,
                     }
+
+                # WCAG 2.2 SC 2.5.8 target size (>= 24x24, C42 25x25 box), link spacing,
+                # and pointer click toggling across desktop and mobile viewports
+                for mod_vp_w, mod_vp_h in ((1280, 900), (375, 667), (320, 640)):
+                    nav_page.set_viewport_size({"width": mod_vp_w, "height": mod_vp_h})
+                    nav_page.evaluate("globalThis.scrollTo({ top: 0, behavior: 'auto' })")
+                    nav_page.wait_for_timeout(50)
+
+                    viewport_geometry = nav_page.evaluate(
+                        """() => {
+                            const togglers = Array.from(document.querySelectorAll('img.toggler'));
+                            const visibleLinks = Array.from(
+                                document.querySelectorAll('table.domainindex-table a[href]')
+                            ).filter((a) => a.getClientRects().length > 0);
+
+                            return togglers.map((img) => {
+                                const rect = img.getBoundingClientRect();
+                                const cs = getComputedStyle(img);
+                                const cell = img.closest('td');
+                                const cellRect = cell.getBoundingClientRect();
+                                const cellCs = getComputedStyle(cell);
+                                const row = img.closest('tr');
+                                const rowLink = row.querySelector('td:nth-of-type(2) a');
+                                const rowLinkRect = rowLink.getBoundingClientRect();
+
+                                const overlapsAnyLink = visibleLinks.some((a) => {
+                                    const ar = a.getBoundingClientRect();
+                                    return (
+                                        rect.right > ar.left + 0.01 &&
+                                        rect.left < ar.right - 0.01 &&
+                                        rect.bottom > ar.top + 0.01 &&
+                                        rect.top < ar.bottom - 0.01
+                                    );
+                                });
+                                const overlapsOtherToggler = togglers.some((other) => {
+                                    if (other === img) return false;
+                                    const or = other.getBoundingClientRect();
+                                    return (
+                                        rect.right > or.left + 0.01 &&
+                                        rect.left < or.right - 0.01 &&
+                                        rect.bottom > or.top + 0.01 &&
+                                        rect.top < or.bottom - 0.01
+                                    );
+                                });
+
+                                return {
+                                    id: img.id,
+                                    width: rect.width,
+                                    height: rect.height,
+                                    display: cs.display,
+                                    boxSizing: cs.boxSizing,
+                                    contentWidth: cs.width,
+                                    contentHeight: cs.height,
+                                    paddingTop: cs.paddingTop,
+                                    paddingLeft: cs.paddingLeft,
+                                    cellWidth: cellRect.width,
+                                    cellWhiteSpace: cellCs.whiteSpace,
+                                    linkGap: rowLinkRect.left - rect.right,
+                                    overlapsAnyLink,
+                                    overlapsOtherToggler
+                                };
+                            });
+                        }"""
+                    )
+                    assert len(viewport_geometry) == 5
+                    for geo in viewport_geometry:
+                        assert geo["width"] >= 24.0 and geo["height"] >= 24.0, (
+                            f"{mod_vp_w}x{mod_vp_h} {geo['id']} target box {geo['width']}x{geo['height']} < 24x24"
+                        )
+                        assert abs(geo["width"] - 25.0) < 0.5 and abs(geo["height"] - 25.0) < 0.5, (
+                            f"{mod_vp_w}x{mod_vp_h} {geo['id']} expected 25x25 box, got {geo['width']}x{geo['height']}"
+                        )
+                        assert geo["display"] == "inline-block"
+                        assert geo["boxSizing"] == "content-box"
+                        assert geo["contentWidth"] == "11px" and geo["contentHeight"] == "11px"
+                        assert geo["paddingTop"] == "7px" and geo["paddingLeft"] == "7px"
+                        assert geo["cellWidth"] >= 28.0, (
+                            f"{mod_vp_w}x{mod_vp_h} {geo['id']} cell width {geo['cellWidth']} < 28px"
+                        )
+                        assert geo["cellWhiteSpace"] == "nowrap"
+                        assert geo["linkGap"] >= 2.0, (
+                            f"{mod_vp_w}x{mod_vp_h} {geo['id']} link gap {geo['linkGap']}px too tight"
+                        )
+                        assert geo["overlapsAnyLink"] is False, (
+                            f"{mod_vp_w}x{mod_vp_h} {geo['id']} overlaps adjacent link"
+                        )
+                        assert geo["overlapsOtherToggler"] is False, (
+                            f"{mod_vp_w}x{mod_vp_h} {geo['id']} overlaps another toggler"
+                        )
+
+                    for item in togglers_meta:
+                        tid = item["id"]
+                        num = tid.replace("toggle-", "")
+                        toggler_loc = nav_page.locator(f"#{tid}")
+                        toggler_loc.click()
+                        click_collapsed = nav_page.evaluate(
+                            f"""() => {{
+                                const img = document.getElementById('{tid}');
+                                const rect = img.getBoundingClientRect();
+                                const rowLink = img.closest('tr').querySelector('td:nth-of-type(2) a');
+                                const rowLinkRect = rowLink.getBoundingClientRect();
+                                const rows = Array.from(document.querySelectorAll('tr.cg-{num}'));
+                                return {{
+                                    width: rect.width,
+                                    height: rect.height,
+                                    linkGap: rowLinkRect.left - rect.right,
+                                    expanded: img.getAttribute('aria-expanded'),
+                                    alt: img.getAttribute('alt'),
+                                    endsWithPlus: (img.getAttribute('src') || '').endsWith('plus.png'),
+                                    allHidden: rows.length > 0 && rows.every((r) => getComputedStyle(r).display === 'none')
+                                }};
+                            }}"""
+                        )
+                        assert (
+                            click_collapsed["width"] >= 24.0 and click_collapsed["height"] >= 24.0
+                        )
+                        assert click_collapsed["linkGap"] >= 2.0
+                        assert click_collapsed["expanded"] == "false"
+                        assert click_collapsed["alt"] == "+"
+                        assert click_collapsed["endsWithPlus"] is True
+                        assert click_collapsed["allHidden"] is True
+
+                        toggler_loc.click()
+                        click_expanded = nav_page.evaluate(
+                            f"""() => {{
+                                const img = document.getElementById('{tid}');
+                                const rect = img.getBoundingClientRect();
+                                const rows = Array.from(document.querySelectorAll('tr.cg-{num}'));
+                                return {{
+                                    width: rect.width,
+                                    height: rect.height,
+                                    expanded: img.getAttribute('aria-expanded'),
+                                    alt: img.getAttribute('alt'),
+                                    endsWithMinus: (img.getAttribute('src') || '').endsWith('minus.png'),
+                                    allVisible: rows.length > 0 && rows.every((r) => getComputedStyle(r).display !== 'none')
+                                }};
+                            }}"""
+                        )
+                        assert click_expanded["width"] >= 24.0 and click_expanded["height"] >= 24.0
+                        assert click_expanded["expanded"] == "true"
+                        assert click_expanded["alt"] == "-"
+                        assert click_expanded["endsWithMinus"] is True
+                        assert click_expanded["allVisible"] is True
+
+                nav_page.set_viewport_size({"width": 1280, "height": 900})
+                nav_page.evaluate("globalThis.scrollTo({ top: 0, behavior: 'auto' })")
+
+                # Verify inline style="display: none" hides dead toggles (no !important on display)
+                inline_hide_check = nav_page.evaluate(
+                    """() => {
+                        const img = document.getElementById('toggle-1');
+                        img.style.display = 'none';
+                        const hiddenDisplay = getComputedStyle(img).display;
+                        img.style.display = '';
+                        const restoredDisplay = getComputedStyle(img).display;
+                        return { hiddenDisplay, restoredDisplay };
+                    }"""
+                )
+                assert inline_hide_check == {
+                    "hiddenDisplay": "none",
+                    "restoredDisplay": "inline-block",
+                }
+
+                # Verify forced-colors 1px border expands content-box target to 27x27 without shrinking 11x11 icon
+                nav_page.emulate_media(forced_colors="active")
+                fc_toggler_box = nav_page.evaluate(
+                    """() => {
+                        const img = document.getElementById('toggle-1');
+                        const rect = img.getBoundingClientRect();
+                        const cs = getComputedStyle(img);
+                        return {
+                            width: rect.width,
+                            height: rect.height,
+                            contentWidth: cs.width,
+                            contentHeight: cs.height
+                        };
+                    }"""
+                )
+                assert abs(fc_toggler_box["width"] - 27.0) < 0.5
+                assert abs(fc_toggler_box["height"] - 27.0) < 0.5
+                assert fc_toggler_box["contentWidth"] == "11px"
+                assert fc_toggler_box["contentHeight"] == "11px"
+                nav_page.emulate_media(forced_colors="none")
 
                 # 5d. 4-mode :focus-visible outlines (light, dark, prefers-contrast: more, forced-colors)
                 outline_helper_js = """
