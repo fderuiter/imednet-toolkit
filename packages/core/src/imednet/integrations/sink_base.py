@@ -126,9 +126,7 @@ from imednet.utils.filters import (
     _parse_clause_operator,
     _snake_to_camel,
     _split_filter_clauses,
-    parse_filter_expressions,
-    validate_connector_exclusivity,
-    validate_filter_key,
+    expand_filter_branches,
     validate_filter_operator,
     validate_record_filter,
 )
@@ -1878,15 +1876,6 @@ def _split_top_level(expr: str, sep: str) -> list[str]:
     return raw_parts
 
 
-def _merge_and_condition(target: dict[str, Any], key: str, condition: Any) -> None:
-    """Merge an AND filter condition onto ``target``, rejecting duplicate AND attributes."""
-    camel_key = _snake_to_camel(key)
-    for existing in target:
-        if _snake_to_camel(existing) == camel_key:
-            raise ValueError(f"Duplicate filter attribute '{camel_key}' in AND clause")
-    target[key] = condition
-
-
 def _coerce_date_modified_clauses(raw_cond: Any) -> list[tuple[str, datetime]]:
     """Normalize a branch's ``dateModified`` value into ``[(operator, utc_datetime), ...]``."""
     raw_items: list[tuple[str, Any]]
@@ -2041,35 +2030,11 @@ def _combine_branch_with_watermark(
 
 def _expand_scalar_list_branches(base: dict[str, Any]) -> list[dict[str, Any]]:
     """Expand scalar list/set values into separate AND-safe filter dicts."""
-    list_keys: list[str] = []
-    list_values: list[list[Any]] = []
-    fixed: dict[str, Any] = {}
-
-    for k, v in base.items():
-        if isinstance(v, set):
-            vals = list(v)
-            if not vals:
-                return []
-            list_keys.append(k)
-            list_values.append(vals)
-        elif isinstance(v, list) and (not v or not any(isinstance(item, tuple) for item in v)):
-            if not v:
-                return []
-            list_keys.append(k)
-            list_values.append(list(dict.fromkeys(v)))
-        else:
-            fixed[k] = v
-
-    if not list_keys:
-        return [fixed]
-
-    branches: list[dict[str, Any]] = []
-    for combo in itertools.product(*list_values):
-        branch = dict(fixed)
-        for k, scalar in zip(list_keys, combo, strict=True):
-            branch[k] = scalar
-        branches.append(branch)
-    return branches
+    return expand_filter_branches(
+        base,
+        passthrough_keys=(),
+        multi_bound_attributes=("dateModified",),
+    )
 
 
 def _resolve_record_query_branches(
@@ -2083,108 +2048,15 @@ def _resolve_record_query_branches(
     from imednet.models.records import Record
 
     allowed_attrs = RecordsEndpoint.FILTER_ATTRIBUTES
-    base_branches: list[dict[str, Any]] = [{}]
-
-    if isinstance(record_filter, str):
-        stripped = record_filter.strip()
-        if not stripped:
-            raise ValueError("Filter expression cannot be empty")
-        if stripped.lower() != "none":
-            validate_connector_exclusivity(stripped)
-            or_parts = _split_top_level(stripped, ",")
-            if len(or_parts) > 1:
-                base_branches = [
-                    parse_filter_expressions(
-                        [part],
-                        model=Record,
-                        allowed_attributes=allowed_attrs,
-                    )
-                    for part in or_parts
-                ]
-            else:
-                and_parts = _split_top_level(stripped, ";")
-                base_branches = [
-                    parse_filter_expressions(
-                        and_parts,
-                        model=Record,
-                        allowed_attributes=allowed_attrs,
-                    )
-                ]
-    elif isinstance(record_filter, Mapping):
-        raw_dict = dict(record_filter)
-        inline_filter = raw_dict.pop("filter", None)
-        seen_dict_keys: set[str] = set()
-        for dict_key, dict_val in raw_dict.items():
-            validate_filter_key(dict_key, model=Record, allowed_attributes=allowed_attrs)
-            camel_dk = _snake_to_camel(dict_key)
-            if camel_dk in seen_dict_keys:
-                raise ValueError(f"Duplicate filter attribute '{camel_dk}' in AND clause")
-            seen_dict_keys.add(camel_dk)
-            if isinstance(dict_val, tuple):
-                if len(dict_val) != 2:
-                    raise ValueError(
-                        f"Filter tuple for '{dict_key}' must have 2 elements, got {len(dict_val)}"
-                    )
-                validate_filter_operator(dict_val[0], allow_regex=False)
-        expanded = _expand_scalar_list_branches(raw_dict)
-        if not expanded:
-            return []
-        if inline_filter is not None:
-            if not isinstance(inline_filter, str) or not inline_filter.strip():
-                raise ValueError("Inline 'filter' expression cannot be empty")
-            inline_branches = [
-                b
-                for b, _ in _resolve_record_query_branches(
-                    record_filter=inline_filter,
-                    watermark=None,
-                    exclude_deleted_upstream=False,
-                )
-            ]
-            merged_branches: list[dict[str, Any]] = []
-            for left in expanded:
-                for right in inline_branches:
-                    combined = dict(left)
-                    for rk, rv in right.items():
-                        _merge_and_condition(combined, rk, rv)
-                    merged_branches.append(combined)
-            base_branches = merged_branches
-        else:
-            base_branches = expanded
-    elif isinstance(record_filter, Sequence):
-        if not record_filter:
-            base_branches = [{}]
-        else:
-            exprs: list[str] = []
-            for item in record_filter:
-                text = str(item).strip()
-                if not text:
-                    raise ValueError("Filter expression cannot be empty")
-                validate_connector_exclusivity(text)
-                exprs.append(text)
-            if len(exprs) == 1 and len(_split_top_level(exprs[0], ",")) > 1:
-                base_branches = [
-                    parse_filter_expressions(
-                        [p],
-                        model=Record,
-                        allowed_attributes=allowed_attrs,
-                    )
-                    for p in _split_top_level(exprs[0], ",")
-                ]
-            else:
-                flat_and: list[str] = []
-                for expr in exprs:
-                    if len(_split_top_level(expr, ",")) > 1:
-                        raise ValueError(
-                            "Filter expression cannot combine both ';' (AND) and ',' (OR) connectors"
-                        )
-                    flat_and.extend(_split_top_level(expr, ";"))
-                base_branches = [
-                    parse_filter_expressions(
-                        flat_and,
-                        model=Record,
-                        allowed_attributes=allowed_attrs,
-                    )
-                ]
+    base_branches = expand_filter_branches(
+        record_filter,
+        model=Record,
+        allowed_attributes=allowed_attrs,
+        passthrough_keys=(),
+        multi_bound_attributes=("dateModified",),
+    )
+    if not base_branches:
+        return []
 
     norm_wm = normalize_watermark_datetime(watermark)
 
@@ -2224,6 +2096,32 @@ def build_record_query_branches(
     ]
 
 
+def _resolve_sdk_records_fetcher(sdk: Any) -> tuple[Callable[..., Iterable[Any]], bool]:
+    """Return ``(fetch_fn, is_endpoint_list)`` for ``sdk.records.list`` or facade ``sdk.get_records``."""
+    if isinstance(sdk, NonCallableMock):
+        mock_children = getattr(sdk, "_mock_children", {})
+        obj_vars = vars(sdk)
+        if "records" in mock_children or "records" in obj_vars:
+            records_ep = getattr(sdk, "records", None)
+            if records_ep is not None and callable(getattr(records_ep, "list", None)):
+                return records_ep.list, True
+        if "get_records" in mock_children or "get_records" in obj_vars:
+            get_records_fn = getattr(sdk, "get_records", None)
+            if callable(get_records_fn):
+                return get_records_fn, False
+        return sdk.records.list, True
+
+    records_ep = getattr(sdk, "records", None)
+    if records_ep is not None and callable(getattr(records_ep, "list", None)):
+        return records_ep.list, True
+
+    get_records_fn = getattr(sdk, "get_records", None)
+    if callable(get_records_fn):
+        return get_records_fn, False
+
+    raise AttributeError("SDK object must provide either 'records.list' or 'get_records'")
+
+
 def iter_filtered_sdk_records(
     sdk: Any,
     study_key: str,
@@ -2234,7 +2132,7 @@ def iter_filtered_sdk_records(
     exclude_deleted_upstream: bool = True,
     sort: str | None = None,
 ) -> Iterator[Any]:
-    """Lazily yield records from ``sdk.records.list`` across one or more AND-safe branches."""
+    """Lazily yield records from ``sdk.records.list`` or ``sdk.get_records`` across AND-safe branches."""
     validated_rdf = (
         _validate_record_data_filter_input(record_data_filter)
         if record_data_filter is not None
@@ -2249,6 +2147,7 @@ def iter_filtered_sdk_records(
     if not resolved:
         return
 
+    fetch_fn, is_endpoint_list = _resolve_sdk_records_fetcher(sdk)
     deduplicate = len(resolved) > 1
     seen_ids: set[Any] = set()
 
@@ -2256,11 +2155,16 @@ def iter_filtered_sdk_records(
         call_kwargs = dict(branch)
         if sort and "sort" not in call_kwargs:
             call_kwargs["sort"] = sort
-        page_iter = sdk.records.list(
-            study_key=study_key,
-            record_data_filter=validated_rdf,
-            **call_kwargs,
-        )
+        if is_endpoint_list:
+            page_iter = fetch_fn(
+                study_key=study_key,
+                record_data_filter=validated_rdf,
+                **call_kwargs,
+            )
+        else:
+            if validated_rdf is not None:
+                call_kwargs["record_data_filter"] = validated_rdf
+            page_iter = fetch_fn(study_key, **call_kwargs)
         for record in page_iter:
             if post_predicate is not None and not post_predicate(record):
                 continue
@@ -2472,12 +2376,18 @@ def _try_fetch_study_forms(sdk: Any, study_key: str) -> list[Any]:
 
     forms_ep = getattr(sdk, "forms", None)
     list_fn = getattr(forms_ep, "list", None) if forms_ep is not None else None
-    if not callable(list_fn):
-        return []
-    try:
-        return [f for f in list_fn(study_key=study_key) if f is not None]
-    except Exception:
-        return []
+    if callable(list_fn):
+        try:
+            return [f for f in list_fn(study_key=study_key) if f is not None]
+        except Exception:
+            return []
+    get_forms_fn = getattr(sdk, "get_forms", None)
+    if callable(get_forms_fn):
+        try:
+            return [f for f in get_forms_fn(study_key) if f is not None]
+        except Exception:
+            return []
+    return []
 
 
 def extract_sdtm_composite_key(

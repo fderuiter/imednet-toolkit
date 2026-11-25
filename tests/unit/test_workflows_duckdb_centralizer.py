@@ -1553,3 +1553,139 @@ def test_build_silver_view_creates_record_revisions_and_scd2_history_views_with_
             True,
         ),
     ]
+
+
+def test_ingest_revisions_combines_or_branching_with_date_bounds_and_dedup(tmp_path) -> None:
+    """Verify ingest_revisions branches OR filters alongside single-bound date filters and deduplicates."""
+    pytest.importorskip("duckdb")
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+    from imednet.utils.filters import validate_filter_syntax
+
+    base_url = "https://api.example.com"
+    sent_filters: list[str] = []
+
+    def _revisions_handler(request: httpx.Request) -> httpx.Response:
+        flt = request.url.params.get("filter", "")
+        validate_filter_syntax(flt)
+        assert not (";" in flt and "," in flt)
+        assert flt.count("dateCreated") == 1
+        sent_filters.append(flt)
+        if "F_DM" in flt:
+            rows = [
+                {
+                    "studyKey": "STUDY",
+                    "recordRevisionId": 701,
+                    "recordId": 10,
+                    "recordOid": "REC-10",
+                    "formKey": "F_DM",
+                    "subjectKey": "SUB1",
+                    "recordRevision": 1,
+                    "dataRevision": 1,
+                    "recordStatus": "Complete",
+                    "user": "crc1",
+                    "deleted": False,
+                    "dateCreated": "2026-11-10T09:00:00Z",
+                },
+                {
+                    "studyKey": "STUDY",
+                    "recordRevisionId": 799,
+                    "recordId": 99,
+                    "recordOid": "REC-99",
+                    "formKey": "F_DM",
+                    "subjectKey": "SUB9",
+                    "recordRevision": 1,
+                    "dataRevision": 1,
+                    "recordStatus": "Complete",
+                    "user": "crc1",
+                    "deleted": False,
+                    "dateCreated": "2026-12-05T09:00:00Z",
+                },
+            ]
+        else:
+            rows = [
+                {
+                    "studyKey": "STUDY",
+                    "recordRevisionId": 701,
+                    "recordId": 10,
+                    "recordOid": "REC-10",
+                    "formKey": "F_DM",
+                    "subjectKey": "SUB1",
+                    "recordRevision": 1,
+                    "dataRevision": 1,
+                    "recordStatus": "Complete",
+                    "user": "crc1",
+                    "deleted": False,
+                    "dateCreated": "2026-11-10T09:00:00Z",
+                },
+                {
+                    "studyKey": "STUDY",
+                    "recordRevisionId": 702,
+                    "recordId": 20,
+                    "recordOid": "REC-20",
+                    "formKey": "F_VS",
+                    "subjectKey": "SUB2",
+                    "recordRevision": 1,
+                    "dataRevision": 1,
+                    "recordStatus": "Verified",
+                    "user": "pi1",
+                    "deleted": False,
+                    "dateCreated": "2026-11-20T12:00:00Z",
+                },
+            ]
+        return httpx.Response(
+            200,
+            json={
+                "metadata": {"status": "OK"},
+                "pagination": {
+                    "currentPage": 0,
+                    "size": 25,
+                    "totalPages": 1,
+                    "totalElements": len(rows),
+                },
+                "data": rows,
+            },
+        )
+
+    db_file = tmp_path / "branched_audit.duckdb"
+    with respx.mock(base_url=base_url, assert_all_called=False) as router:
+        rev_route = router.get("/api/v1/edc/studies/STUDY/recordRevisions").mock(
+            side_effect=_revisions_handler
+        )
+        with (
+            ImednetSDK(api_key="k", security_key="s", base_url=base_url, retries=0) as sdk,
+            DuckDBIngestionWorkflow(sdk, db_file) as workflow,
+        ):
+            # Empty OR list short-circuits without sending HTTP requests
+            assert (
+                workflow.ingest_revisions(
+                    "STUDY",
+                    start_date="2026-11-01",
+                    end_date="2026-11-30",
+                    user_filter={"form_key": []},
+                )
+                == 0
+            )
+            assert rev_route.call_count == 0
+
+            inserted = workflow.ingest_revisions(
+                "STUDY",
+                start_date="2026-11-01",
+                end_date="2026-11-30",
+                user_filter={"form_key": ["F_DM", "F_VS"]},
+                deleted=False,
+            )
+            assert inserted == 2
+            assert sent_filters == [
+                "deleted==false;formKey==F_DM;dateCreated>=2026-11-01T00:00:00Z",
+                "deleted==false;formKey==F_VS;dateCreated>=2026-11-01T00:00:00Z",
+            ]
+            stored_ids = [
+                r[0]
+                for r in workflow._connection.execute(
+                    "SELECT record_revision_id FROM bronze_revisions ORDER BY record_revision_id"
+                ).fetchall()
+            ]
+            assert stored_ids == [701, 702]

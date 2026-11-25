@@ -181,18 +181,15 @@ def test_invalid_visit_key_logs_warning(caplog) -> None:
     sdk.get_records.assert_called_once_with(study_key="S", record_data_filter=None)
 
 
-def test_records_fetch_error_returns_empty(caplog) -> None:
-    """Test that records fetch error returns empty."""
+def test_records_fetch_error_returns_empty() -> None:
+    """Test that records fetch error propagates fail-closed instead of returning empty."""
     sdk = MagicMock()
     sdk.get_variables.return_value = [Variable(variable_name="VAR", label="L", form_id=1)]
-    sdk.get_records.side_effect = Exception("boom")
+    sdk.get_records.side_effect = RuntimeError("boom")
     mapper = RecordMapper(sdk)
 
-    with caplog.at_level("ERROR"):
-        df = mapper.dataframe("S")
-
-    assert df.empty
-    assert "Failed to fetch records" in caplog.text
+    with pytest.raises(RuntimeError, match="boom"):
+        mapper.dataframe("S")
 
 
 def test_fetch_records_propagates_value_error() -> None:
@@ -2393,3 +2390,119 @@ def test_record_mapper_endpoint_fallbacks_and_cached_loader_predicates() -> None
         )
     )
     assert [r.record_id for r in filtered] == [3]
+
+
+def test_record_mapper_fail_closed_mid_stream_and_preserves_malformed_warnings(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RecordMapper propagates mid-stream HTTP 503 errors while preserving optional lookup fallbacks and warnings."""
+    import httpx
+    import respx
+
+    from imednet.errors import ServerError
+    from imednet.sdk import ImednetSDK
+
+    base_url = "https://api.example.com"
+
+    def _records_page_responder(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", "0"))
+        if page == 0:
+            return httpx.Response(
+                200,
+                json={
+                    "metadata": {"status": "OK"},
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 1,
+                        "totalPages": 2,
+                        "totalElements": 2,
+                    },
+                    "data": [
+                        {
+                            "studyKey": "STUDY",
+                            "recordId": 101,
+                            "recordOid": "REC-101",
+                            "subjectKey": "SUBJ-01",
+                            "visitId": 1,
+                            "formId": 10,
+                            "formKey": "F_DM",
+                            "recordStatus": "Complete",
+                            "deleted": False,
+                            "recordData": {"AGE": 42},
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            503,
+            json={"metadata": {"status": "ERROR", "message": "Upstream service unavailable"}},
+        )
+
+    with respx.mock(base_url=base_url, assert_all_called=False) as router:
+        router.get("/api/v1/edc/studies/STUDY/forms").respond(
+            200,
+            json={"data": [{"studyKey": "STUDY", "formId": 10, "formKey": "F_DM"}]},
+        )
+        router.get("/api/v1/edc/studies/STUDY/variables").respond(
+            200,
+            json={
+                "data": [{"variableName": "AGE", "label": "Age", "formId": 10, "formKey": "F_DM"}]
+            },
+        )
+        router.get("/api/v1/edc/studies/STUDY/sites").respond(200, json={"data": []})
+        router.get("/api/v1/edc/studies/STUDY/intervals").respond(200, json={"data": []})
+        router.get("/api/v1/edc/studies/STUDY/visits").respond(200, json={"data": []})
+        router.get("/api/v1/edc/studies/STUDY/records").mock(side_effect=_records_page_responder)
+
+        with ImednetSDK(api_key="k", security_key="s", base_url=base_url, retries=0) as sdk:
+            mapper = RecordMapper(sdk)
+            with pytest.raises(ServerError):
+                mapper.dataframe("STUDY")
+            with pytest.raises(ServerError):
+                mapper.sdtm_dataframe("STUDY", domain="DM")
+            with pytest.raises(ServerError):
+                mapper.build_hierarchy("STUDY")
+
+    # Verify optional lookup fallback (unmocked sites/visits/intervals/forms) and malformed record warning remain intact
+    with respx.mock(base_url=base_url, assert_all_called=False) as router:
+        router.get("/api/v1/edc/studies/STUDY/variables").respond(
+            200,
+            json={"data": [{"variableName": "AGE", "label": "Age", "formId": 10}]},
+        )
+        router.get("/api/v1/edc/studies/STUDY/records").respond(
+            200,
+            json={
+                "data": [
+                    {
+                        "recordId": 1,
+                        "subjectKey": "S1",
+                        "visitId": 1,
+                        "formId": 10,
+                        "recordStatus": "Complete",
+                        "recordData": {"AGE": 33},
+                    }
+                ]
+            },
+        )
+        with ImednetSDK(api_key="k", security_key="s", base_url=base_url, retries=0) as sdk:
+            mapper = RecordMapper(sdk)
+            df = mapper.dataframe("STUDY")
+            assert len(df) == 1
+            assert df.iloc[0]["Age"] == 33
+
+            from pydantic import BaseModel, create_model
+
+            strict_model = create_model("StrictRecordData", __base__=BaseModel, AGE=(int, ...))
+            bad_rec = Record.model_construct(
+                record_id=2,
+                subject_key="S1",
+                visit_id=1,
+                form_id=10,
+                record_status="Complete",
+                record_data={"AGE": "not-an-int"},
+            )
+            with caplog.at_level("WARNING"):
+                rows, errors = mapper._parse_records([bad_rec], strict_model)
+            assert rows == []
+            assert errors == 1
+            assert "Failed to parse record data" in caplog.text

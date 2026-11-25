@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -15,7 +16,12 @@ from imednet.spi.models import (
     TriageStatus,
     calculate_legacy_status,
 )
-from imednet.spi.utils import normalize_iso_date, parse_iso_datetime
+from imednet.spi.utils import (
+    expand_filter_branches,
+    iter_branched_results,
+    normalize_iso_date,
+    parse_iso_datetime,
+)
 
 from .triage_store import TriageStore
 
@@ -51,6 +57,10 @@ class QueryManagementWorkflow:
         sdk: An instance of the ImednetSDK.
     """
 
+    _PASSTHROUGH_QUERY_KEYS: frozenset[str] = frozenset(
+        {"page", "size", "limit", "sort", "include_inactive"}
+    )
+
     def __init__(self, sdk: ImednetFacade):
         """Initialize the query management workflow.
 
@@ -58,6 +68,114 @@ class QueryManagementWorkflow:
             sdk: An instance of the iMednet SDK facade.
         """
         self._sdk = sdk
+
+    @staticmethod
+    def _query_dedup_key(query: Any) -> Any:
+        """Extract ``annotation_id`` for ordered cross-branch Query deduplication."""
+        return getattr(query, "annotation_id", None)
+
+    @staticmethod
+    def _merge_filter_inputs(
+        additional_filter: Mapping[str, Any] | str | None,
+        kwargs: Mapping[str, Any],
+    ) -> dict[str, Any] | str:
+        """Combine ``additional_filter`` and keyword arguments for branch expansion."""
+        if isinstance(additional_filter, str):
+            if not kwargs:
+                return additional_filter
+            merged_str: dict[str, Any] = {"filter": additional_filter}
+            merged_str.update(kwargs)
+            return merged_str
+        merged: dict[str, Any] = dict(additional_filter) if additional_filter else {}
+        merged.update(kwargs)
+        return merged
+
+    def _fetch_branched_queries(
+        self,
+        study_key: str,
+        filters: Mapping[str, Any] | str | None = None,
+    ) -> list[Query]:
+        """Expand ``filters`` into AND-safe branches and deduplicate Queries by ``annotation_id``."""
+        branches = expand_filter_branches(filters)
+        if not branches:
+            return []
+        return list(
+            iter_branched_results(
+                lambda **branch: self._sdk.get_queries(study_key, **branch),
+                branches,
+                dedup_key=self._query_dedup_key,
+            )
+        )
+
+    @staticmethod
+    def _subject_matches_condition(subject_key: str, op: str, raw_val: Any) -> bool:
+        """Evaluate a comparison operator on ``subject_key`` for local branch intersection."""
+        target = raw_val.strip() if isinstance(raw_val, str) else str(raw_val)
+        if op == "==":
+            return subject_key == target
+        if op == "!=":
+            return subject_key != target
+        if op == "<":
+            return subject_key < target
+        if op == "<=":
+            return subject_key <= target
+        if op == ">":
+            return subject_key > target
+        if op == ">=":
+            return subject_key >= target
+        return False
+
+    @classmethod
+    def _build_subject_scoped_branches(
+        cls,
+        subject_keys: Sequence[str],
+        extra_filters: Mapping[str, Any] | str | None,
+        *,
+        allow_list_when_unfiltered: bool,
+    ) -> list[dict[str, Any]]:
+        """Intersect ``subject_keys`` with ``extra_filters`` into valid upstream query branches."""
+        ordered_subjects = list(dict.fromkeys(subject_keys))
+        if not ordered_subjects:
+            return []
+
+        extra_branches = expand_filter_branches(extra_filters)
+        if not extra_branches:
+            return []
+
+        if (
+            len(extra_branches) == 1
+            and set(extra_branches[0].keys()) <= cls._PASSTHROUGH_QUERY_KEYS
+        ):
+            passthrough_only = extra_branches[0]
+            if allow_list_when_unfiltered:
+                return [{"subject_key": ordered_subjects, **passthrough_only}]
+            return [{"subject_key": sk, **passthrough_only} for sk in ordered_subjects]
+
+        subject_set = set(ordered_subjects)
+        intersected: list[dict[str, Any]] = []
+        for branch in extra_branches:
+            subj_attr = next(
+                (k for k in branch if k in ("subject_key", "subjectKey")),
+                None,
+            )
+            if subj_attr is None:
+                for sk in ordered_subjects:
+                    intersected.append({"subject_key": sk, **branch})
+                continue
+
+            cond = branch[subj_attr]
+            rest = {k: v for k, v in branch.items() if k != subj_attr}
+            op, val = cond if isinstance(cond, tuple) else ("==", cond)
+            if op == "==":
+                candidate = val.strip() if isinstance(val, str) else str(val)
+                if candidate in subject_set:
+                    intersected.append({"subject_key": candidate, **rest})
+            else:
+                for sk in ordered_subjects:
+                    if cls._subject_matches_condition(sk, op, val):
+                        intersected.append({"subject_key": sk, **rest})
+
+        return intersected
 
     @staticmethod
     def _resolve_query_status(query: Any) -> QueryStatus:
@@ -86,7 +204,7 @@ class QueryManagementWorkflow:
     def get_open_queries(
         self,
         study_key: str,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | str | None = None,
         include_answered: bool = False,
         **kwargs: Any,
     ) -> list[Query]:
@@ -106,8 +224,8 @@ class QueryManagementWorkflow:
         Returns:
             A list of matching Query objects.
         """
-        filters = dict(additional_filter) if additional_filter else {}
-        all_matching_queries = self._sdk.get_queries(study_key, **filters, **kwargs)
+        merged_filters = self._merge_filter_inputs(additional_filter, kwargs)
+        all_matching_queries = self._fetch_branched_queries(study_key, merged_filters)
         return [
             query
             for query in all_matching_queries
@@ -117,7 +235,7 @@ class QueryManagementWorkflow:
     def get_unresolved_queries(
         self,
         study_key: str,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | str | None = None,
         **kwargs: Any,
     ) -> list[Query]:
         """Retrieves all unresolved (``OPEN`` and ``ANSWERED``) queries for a given study.
@@ -140,65 +258,129 @@ class QueryManagementWorkflow:
     def get_queries_for_subject(
         self,
         study_key: str,
-        subject_key: str,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        subject_key: str | Sequence[str] | set[str],
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | str | None = None,
         **kwargs: Any,
     ) -> list[Query]:
-        """Retrieves all queries for a specific subject within a study.
+        """Retrieves all queries for a specific subject (or subjects) within a study.
 
         Args:
             study_key: The key identifying the study.
-            subject_key: The key identifying the subject.
-            additional_filter: An optional dictionary of conditions to combine
-                with the subject filter.
+            subject_key: The key (or collection of keys) identifying the subject(s).
+            additional_filter: An optional dictionary or filter string of conditions to
+                combine with the subject filter.
             **kwargs: Additional keyword arguments passed directly to `sdk.queries.list`.
 
         Returns:
-            A list of Query objects for the specified subject.
+            A list of deduplicated Query objects for the specified subject(s).
         """
-        # Build filter dictionary
-        final_filter_dict: dict[str, Any] = {"subject_key": subject_key}
-        if additional_filter:
-            final_filter_dict.update(additional_filter)
+        if isinstance(subject_key, str):
+            stripped_key = subject_key.strip()
+            target_subjects = [stripped_key] if stripped_key else []
+            allow_list = False
+        else:
+            target_subjects = [
+                key for raw in subject_key if isinstance(raw, str) and (key := raw.strip())
+            ]
+            allow_list = len(target_subjects) > 1
 
-        return list(self._sdk.get_queries(study_key, **final_filter_dict, **kwargs))
+        if not target_subjects:
+            return []
+
+        merged_extra = self._merge_filter_inputs(additional_filter, kwargs)
+        branches = self._build_subject_scoped_branches(
+            target_subjects,
+            merged_extra,
+            allow_list_when_unfiltered=allow_list,
+        )
+        if not branches:
+            return []
+
+        return list(
+            iter_branched_results(
+                lambda **branch: self._sdk.get_queries(study_key, **branch),
+                branches,
+                dedup_key=self._query_dedup_key,
+            )
+        )
 
     def get_queries_by_site(
         self,
         study_key: str,
-        site_key: str,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        site_key: str | Sequence[str] | set[str],
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | str | None = None,
+        *,
+        subject_filter: dict[str, Any | tuple[str, Any] | list[Any]] | str | None = None,
         **kwargs: Any,
     ) -> list[Query]:
         """Retrieves all queries for active, keyed subjects at a specific site within a study.
 
         Args:
             study_key: The key identifying the study.
-            site_key: The name of the site.
+            site_key: The name (or collection of names) of the site(s).
             additional_filter: Extra conditions to combine with the subject filter.
+            subject_filter: Optional filter conditions applied when resolving site subjects.
             **kwargs: Additional keyword arguments passed directly to `sdk.queries.list`.
 
         Returns:
-            A list of Query objects for the specified site.
+            A list of deduplicated Query objects for the specified site.
         """
-        subjects = self._sdk.get_subjects(study_key, site_name=site_key)
-        subject_keys = [
-            key
-            for s in subjects
-            if getattr(s, "is_deleted", False) is not True
-            and isinstance(s.subject_key, str)
-            and (key := s.subject_key.strip())
-        ]
+        merged_extra = self._merge_filter_inputs(additional_filter, kwargs)
+        if not expand_filter_branches(merged_extra):
+            return []
+
+        if isinstance(site_key, str) and not site_key.strip():
+            return []
+
+        raw_subject_filters: dict[str, Any] = {"site_name": site_key}
+        if isinstance(subject_filter, str):
+            raw_subject_filters["filter"] = subject_filter
+        elif subject_filter is not None:
+            raw_subject_filters.update(subject_filter)
+
+        subject_branches = expand_filter_branches(raw_subject_filters)
+        if not subject_branches:
+            return []
+
+        subjects = iter_branched_results(
+            lambda **branch: self._sdk.get_subjects(study_key, **branch),
+            subject_branches,
+            dedup_key=lambda s: getattr(s, "subject_key", None),
+        )
+        subject_keys = list(
+            dict.fromkeys(
+                key
+                for s in subjects
+                if getattr(s, "is_deleted", False) is not True
+                and isinstance(s.subject_key, str)
+                and (key := s.subject_key.strip())
+            )
+        )
         if not subject_keys:
             return []
 
-        final_filter_dict: dict[str, Any] = {"subject_key": subject_keys}
-        if additional_filter:
-            final_filter_dict.update(additional_filter)
+        query_branches = self._build_subject_scoped_branches(
+            subject_keys,
+            merged_extra,
+            allow_list_when_unfiltered=True,
+        )
+        if not query_branches:
+            return []
 
-        return list(self._sdk.get_queries(study_key, **final_filter_dict, **kwargs))
+        return list(
+            iter_branched_results(
+                lambda **branch: self._sdk.get_queries(study_key, **branch),
+                query_branches,
+                dedup_key=self._query_dedup_key,
+            )
+        )
 
-    def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
+    def get_query_state_counts(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, int]:
         """Counts queries grouped by their current QueryStatus values.
 
         The discrepancy lifecycle state is evaluated in linear time directly from
@@ -206,13 +388,15 @@ class QueryManagementWorkflow:
 
         Args:
             study_key: The key identifying the study.
+            additional_filter: Optional API filter conditions passed to query retrieval.
             **kwargs: Additional keyword arguments passed directly to `sdk.queries.list`
                       (e.g., for initial filtering before counting).
 
         Returns:
             A dictionary with QueryStatus values as keys and their respective counts.
         """
-        all_queries = self._sdk.get_queries(study_key, **kwargs)
+        merged_filters = self._merge_filter_inputs(additional_filter, kwargs)
+        all_queries = self._fetch_branched_queries(study_key, merged_filters)
         state_counts = QueryStateCounts({s.value: 0 for s in QueryStatus})
 
         for query in all_queries:
@@ -373,7 +557,7 @@ class QueryManagementWorkflow:
         study_key: str,
         store: TriageStoreProtocol | str | Path | None = None,
         *,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | str | None = None,
         unresolved_only: bool = False,
         default_severity: str = "medium",
         **kwargs: Any,
@@ -400,8 +584,8 @@ class QueryManagementWorkflow:
                 **kwargs,
             )
         else:
-            filters = dict(additional_filter) if additional_filter else {}
-            queries = list(self._sdk.get_queries(study_key, **filters, **kwargs))
+            merged_filters = self._merge_filter_inputs(additional_filter, kwargs)
+            queries = self._fetch_branched_queries(study_key, merged_filters)
 
         for idx, query in enumerate(queries, start=1):
             item_id = self._build_triage_item_id(query, study_key, idx)

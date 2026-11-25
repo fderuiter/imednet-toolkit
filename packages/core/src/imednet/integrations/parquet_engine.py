@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from errno import ENOENT, ENOTEMPTY
 from importlib import import_module
@@ -56,6 +56,12 @@ class PyArrowDatasetPartitionedStorageEngine(PartitionedStorageEngine):
     use_dictionary: bool = True
     existing_data_behavior: str = "overwrite_or_ignore"
     staging_dir_name: str = ".imednet_staging"
+    _committed_batches: list[Path] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def _table_with_metadata(
         self,
@@ -172,6 +178,7 @@ class PyArrowDatasetPartitionedStorageEngine(PartitionedStorageEngine):
             # os.replace ensures readers observe a fully committed batch dir.
             os.replace(staged_partition_dir, committed_batch_dir)
             commit_succeeded = True
+            self._committed_batches.append(committed_batch_dir)
         finally:
             shutil.rmtree(staging_base_dir, ignore_errors=True)
             if not commit_succeeded:
@@ -192,6 +199,36 @@ class PyArrowDatasetPartitionedStorageEngine(PartitionedStorageEngine):
                 except OSError as error:
                     if error.errno not in (ENOENT, ENOTEMPTY):
                         raise
+
+    def rollback_batches(self, *, base_dir: str, remove_empty_base: bool = False) -> None:
+        """Remove ``_batch_<commit_id>`` directories created by this engine instance on run failure."""
+        base_path = Path(base_dir)
+        staging_root = base_path / self.staging_dir_name
+        try:
+            for batch_dir in reversed(self._committed_batches):
+                if not batch_dir.name.startswith("_batch_"):
+                    continue
+                shutil.rmtree(batch_dir, ignore_errors=True)
+                current_path = batch_dir.parent
+                while current_path != base_path:
+                    try:
+                        current_path.rmdir()
+                    except OSError as error:
+                        if error.errno in (ENOENT, ENOTEMPTY):
+                            break
+                        raise
+                    current_path = current_path.parent
+        finally:
+            self._committed_batches.clear()
+
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+        if remove_empty_base and base_path.exists():
+            try:
+                base_path.rmdir()
+            except OSError as error:
+                if error.errno not in (ENOENT, ENOTEMPTY):
+                    raise
 
 
 __all__ = ["PartitionedStorageEngine", "PyArrowDatasetPartitionedStorageEngine"]

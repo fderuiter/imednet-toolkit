@@ -694,3 +694,139 @@ def test_duplicate_and_attribute_normalization_across_casing_and_syntax() -> Non
     validate_record_filter("age>=18;AGE<=65")
     with pytest.raises(ValueError, match="Duplicate filter attribute 'AGE'"):
         validate_record_filter("AGE>=18;AGE<=65")
+
+
+def test_spi_expand_filter_branches_and_iter_branched_results() -> None:
+    """Verify SPI re-exports, OR/AND branching, short-circuiting, validation, and ordered dedup."""
+    import imednet.spi.utils as spi_utils
+    from imednet.integrations.sink_base import _expand_scalar_list_branches
+    from imednet.utils.filters import (
+        build_filter_string,
+        expand_filter_branches,
+        iter_branched_results,
+    )
+
+    assert "expand_filter_branches" in spi_utils.__all__
+    assert "iter_branched_results" in spi_utils.__all__
+    assert spi_utils.expand_filter_branches is expand_filter_branches
+    assert spi_utils.iter_branched_results is iter_branched_results
+
+    # None, empty dict, empty sequence, and "none" literal
+    assert expand_filter_branches(None) == [{}]
+    assert expand_filter_branches({}) == [{}]
+    assert expand_filter_branches([]) == [{}]
+    assert expand_filter_branches("none") == [{}]
+
+    # Empty OR lists/sets short-circuit to [] immediately
+    assert expand_filter_branches({"form_key": []}) == []
+    assert expand_filter_branches({"form_key": set()}) == []
+    assert expand_filter_branches({"form_key": frozenset(), "deleted": False}) == []
+    assert _expand_scalar_list_branches({"form_key": []}) == []
+
+    # Multi-value OR lists/sets + AND scalar + passthrough keys + inline comma-OR string
+    branches = expand_filter_branches(
+        {
+            "subject_key": ["SUB1", "SUB2", "SUB1"],
+            "deleted": False,
+            "filter": 'variable=="AGE,YRS",variable==WT',
+            "sort": "recordId,asc",
+            "size": 50,
+        }
+    )
+    assert branches == [
+        {
+            "subject_key": "SUB1",
+            "deleted": False,
+            "variable": ("==", "AGE,YRS"),
+            "sort": "recordId,asc",
+            "size": 50,
+        },
+        {
+            "subject_key": "SUB1",
+            "deleted": False,
+            "variable": ("==", "WT"),
+            "sort": "recordId,asc",
+            "size": 50,
+        },
+        {
+            "subject_key": "SUB2",
+            "deleted": False,
+            "variable": ("==", "AGE,YRS"),
+            "sort": "recordId,asc",
+            "size": 50,
+        },
+        {
+            "subject_key": "SUB2",
+            "deleted": False,
+            "variable": ("==", "WT"),
+            "sort": "recordId,asc",
+            "size": 50,
+        },
+    ]
+    for b in branches:
+        filter_only = {k: v for k, v in b.items() if k not in ("sort", "size")}
+        rendered = build_filter_string(filter_only)
+        assert "," not in rendered or '"AGE,YRS"' in rendered
+
+    # Sequence[str] handling for OR and AND
+    assert expand_filter_branches(["formKey==DEMO,formKey==VITALS"]) == [
+        {"formKey": ("==", "DEMO")},
+        {"formKey": ("==", "VITALS")},
+    ]
+    assert expand_filter_branches(["formKey==DEMO", "deleted==false"]) == [
+        {"formKey": ("==", "DEMO"), "deleted": ("==", False)}
+    ]
+
+    # Validation rejections: mixed connectors, duplicate AND attributes, bad tuples, empty inline
+    with pytest.raises(ValueError, match="cannot combine both ';' \\(AND\\) and ',' \\(OR\\)"):
+        expand_filter_branches("formKey==DEMO;subjectKey==S1,subjectKey==S2")
+    with pytest.raises(ValueError, match="cannot combine both ';' \\(AND\\) and ',' \\(OR\\)"):
+        expand_filter_branches(["formKey==DEMO", "subjectKey==S1,subjectKey==S2"])
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'formKey' in AND clause"):
+        expand_filter_branches({"form_key": "DEMO", "formKey": "VITALS"})
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'formKey' in AND clause"):
+        expand_filter_branches({"form_key": "DEMO", "filter": "formKey==VITALS"})
+    with pytest.raises(ValueError, match="Duplicate filter attribute 'age' in AND clause"):
+        expand_filter_branches({"age": [(">", 18), ("<", 65)]})
+    with pytest.raises(ValueError, match="Inline 'filter' expression cannot be empty"):
+        expand_filter_branches({"filter": "   "})
+    with pytest.raises(ValueError, match="Filter expression cannot be empty"):
+        expand_filter_branches("   ")
+    with pytest.raises(ValueError, match="empty clause"):
+        expand_filter_branches("a==1,")
+
+    # iter_branched_results: empty branches never invoke fetch_fn; ordered dedup keeps unkeyed
+    calls: list[dict[str, object]] = []
+
+    def _never_called(**kwargs: object) -> list[dict[str, object]]:
+        calls.append(kwargs)
+        raise AssertionError("fetch_fn must not be invoked on empty branches")
+
+    assert list(iter_branched_results(_never_called, [])) == []
+    assert calls == []
+
+    payload_by_branch = {
+        "B1": [{"id": 10, "v": "first"}, {"id": None, "v": "unkeyed-1"}, {"id": 20, "v": "b1-20"}],
+        "B2": [{"id": 20, "v": "dup-20"}, {"id": None, "v": "unkeyed-2"}, {"id": 30, "v": "b2-30"}],
+    }
+    executed: list[str] = []
+
+    def _fetch(tag: str) -> list[dict[str, object]]:
+        executed.append(tag)
+        return payload_by_branch[tag]
+
+    deduped = list(
+        iter_branched_results(
+            _fetch,
+            [{"tag": "B1"}, {"tag": "B2"}],
+            dedup_key=lambda item: item["id"],
+        )
+    )
+    assert executed == ["B1", "B2"]
+    assert deduped == [
+        {"id": 10, "v": "first"},
+        {"id": None, "v": "unkeyed-1"},
+        {"id": 20, "v": "b1-20"},
+        {"id": None, "v": "unkeyed-2"},
+        {"id": 30, "v": "b2-30"},
+    ]

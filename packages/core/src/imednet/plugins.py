@@ -122,9 +122,9 @@ class DataExtractionWorkflowProtocol(Protocol):
     def extract_records_by_criteria(
         self,
         study_key: str,
-        record_filter: dict[str, Any] | None = None,
-        subject_filter: dict[str, Any] | None = None,
-        visit_filter: dict[str, Any] | None = None,
+        record_filter: dict[str, Any] | str | None = None,
+        subject_filter: dict[str, Any] | str | None = None,
+        visit_filter: dict[str, Any] | str | None = None,
         on_progress: Callable[[str], None] | None = None,
         *,
         include_deleted: bool = False,
@@ -138,7 +138,7 @@ class DataExtractionWorkflowProtocol(Protocol):
         study_key: str,
         start_date: str | None = None,
         end_date: str | None = None,
-        user_filter: dict[str, Any] | None = None,
+        user_filter: dict[str, Any] | str | None = None,
         **filters: Any,
     ) -> list[RecordRevision]:
         """Extract record revisions bounded by optional UTC dates and filters."""
@@ -156,6 +156,8 @@ class DuckDBIngestionWorkflowProtocol(Protocol):
         end_date: str | None = None,
         mode: Literal["append", "replace"] = "append",
         mask_phi: bool | None = None,
+        user_filter: dict[str, Any] | str | None = None,
+        **filters: Any,
     ) -> int:
         """Ingest study record revisions into the DuckDB bronze table."""
         ...
@@ -204,7 +206,7 @@ class QueryManagementWorkflowProtocol(Protocol):
     def get_open_queries(
         self,
         study_key: str,
-        additional_filter: dict[str, Any] | None = None,
+        additional_filter: dict[str, Any] | str | None = None,
         include_answered: bool = False,
         **kwargs: Any,
     ) -> list[Query]:
@@ -214,7 +216,7 @@ class QueryManagementWorkflowProtocol(Protocol):
     def get_unresolved_queries(
         self,
         study_key: str,
-        additional_filter: dict[str, Any] | None = None,
+        additional_filter: dict[str, Any] | str | None = None,
         **kwargs: Any,
     ) -> list[Query]:
         """Retrieve all unresolved (OPEN and ANSWERED) queries for a study."""
@@ -223,24 +225,31 @@ class QueryManagementWorkflowProtocol(Protocol):
     def get_queries_for_subject(
         self,
         study_key: str,
-        subject_key: str,
-        additional_filter: dict[str, Any] | None = None,
+        subject_key: str | Sequence[str] | set[str],
+        additional_filter: dict[str, Any] | str | None = None,
         **kwargs: Any,
     ) -> list[Query]:
-        """Retrieve queries associated with a specific subject."""
+        """Retrieve queries associated with a specific subject or subjects."""
         ...
 
     def get_queries_by_site(
         self,
         study_key: str,
-        site_key: str,
-        additional_filter: dict[str, Any] | None = None,
+        site_key: str | Sequence[str] | set[str],
+        additional_filter: dict[str, Any] | str | None = None,
+        *,
+        subject_filter: dict[str, Any] | str | None = None,
         **kwargs: Any,
     ) -> list[Query]:
-        """Retrieve queries associated with a specific site."""
+        """Retrieve queries associated with a specific site or sites."""
         ...
 
-    def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
+    def get_query_state_counts(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any] | str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, int]:
         """Count queries grouped by query status."""
         ...
 
@@ -249,7 +258,7 @@ class QueryManagementWorkflowProtocol(Protocol):
         study_key: str,
         store: TriageStoreProtocol | str | Path | None = None,
         *,
-        additional_filter: dict[str, Any] | None = None,
+        additional_filter: dict[str, Any] | str | None = None,
         unresolved_only: bool = False,
         default_severity: str = "medium",
         **kwargs: Any,

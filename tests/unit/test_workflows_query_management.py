@@ -69,7 +69,9 @@ def test_get_query_state_counts_aggregates_states() -> None:
 
 
 def test_get_queries_by_site_filters_using_subjects() -> None:
-    """Test that get queries by site filters using subjects."""
+    """Test that get queries by site branches multi-subject OR with state AND filter."""
+    from unittest.mock import call
+
     sdk = MagicMock()
     sdk.get_subjects.return_value = [Subject(subject_key="S1"), Subject(subject_key="S2")]
     wf = QueryManagementWorkflow(sdk)
@@ -77,8 +79,10 @@ def test_get_queries_by_site_filters_using_subjects() -> None:
     wf.get_queries_by_site("STUDY", "SITE", additional_filter={"state": "open"})
 
     sdk.get_subjects.assert_called_once_with("STUDY", site_name="SITE")
-    sdk.get_queries.assert_called_once_with("STUDY", subject_key=["S1", "S2"], state="open")
-    assert sdk.get_queries.call_args.kwargs == {"subject_key": ["S1", "S2"], "state": "open"}
+    assert sdk.get_queries.call_args_list == [
+        call("STUDY", subject_key="S1", state="open"),
+        call("STUDY", subject_key="S2", state="open"),
+    ]
 
 
 def test_get_queries_by_site_returns_empty_if_no_subjects() -> None:
@@ -378,3 +382,260 @@ def test_sync_queries_to_triage_with_simulation_sdk(tmp_path: Any) -> None:
         )
         assert len(queue) >= 1
         assert all(item.status in (TriageStatus.NEW, TriageStatus.UNDER_REVIEW) for item in queue)
+
+
+def test_query_management_methods_branch_or_and_deduplicate_over_http(tmp_path: Any) -> None:
+    """Verify all 6 QueryManagementWorkflow methods branch OR+AND filters without mixed connectors."""
+    import httpx
+    import respx
+
+    from imednet.models.triage import TriageStatus
+    from imednet.sdk import ImednetSDK
+    from imednet.utils.filters import validate_filter_syntax
+    from imednet_workflows.triage_store import TriageStore
+
+    base_url = "https://api.example.com"
+    seen_subject_filters: list[str] = []
+    seen_query_filters: list[str] = []
+
+    def _subjects_handler(request: httpx.Request) -> httpx.Response:
+        flt = request.url.params.get("filter", "")
+        validate_filter_syntax(flt)
+        seen_subject_filters.append(flt)
+        rows = []
+        if "Site A" in flt:
+            rows.extend(
+                [
+                    {
+                        "studyKey": "STUDY",
+                        "subjectKey": "SUB1",
+                        "siteName": "Site A",
+                        "status": "Active",
+                    },
+                    {
+                        "studyKey": "STUDY",
+                        "subjectKey": "SUB2",
+                        "siteName": "Site A",
+                        "status": "Active",
+                    },
+                ]
+            )
+        if "Site B" in flt:
+            rows.extend(
+                [
+                    {
+                        "studyKey": "STUDY",
+                        "subjectKey": "SUB2",
+                        "siteName": "Site B",
+                        "status": "Active",
+                    },
+                    {
+                        "studyKey": "STUDY",
+                        "subjectKey": "SUB3",
+                        "siteName": "Site B",
+                        "status": "Active",
+                    },
+                ]
+            )
+        return httpx.Response(
+            200,
+            json={
+                "metadata": {"status": "OK"},
+                "pagination": {
+                    "currentPage": 0,
+                    "size": 25,
+                    "totalPages": 1,
+                    "totalElements": len(rows),
+                },
+                "data": rows,
+            },
+        )
+
+    def _queries_handler(request: httpx.Request) -> httpx.Response:
+        flt = request.url.params.get("filter", "")
+        validate_filter_syntax(flt)
+        assert not (";" in flt and "," in flt)
+        seen_query_filters.append(flt)
+        # Return overlapping annotationId=501 across branches plus branch-specific and unkeyed items
+        data = [
+            {
+                "studyKey": "STUDY",
+                "annotationId": 501,
+                "subjectKey": "SUB1",
+                "variable": "AGE",
+                "queryComments": [
+                    {
+                        "sequence": 1,
+                        "closed": False,
+                        "annotationStatus": "Monitor Open",
+                        "comment": "Check AGE",
+                    }
+                ],
+            },
+            {
+                "studyKey": "STUDY",
+                "annotationId": 502 if "WT" in flt or "SUB2" in flt else 503,
+                "subjectKey": "SUB2",
+                "variable": "WT",
+                "queryComments": [
+                    {
+                        "sequence": 1,
+                        "closed": False,
+                        "annotationStatus": "Monitor Open",
+                        "comment": "Check WT",
+                    },
+                    {
+                        "sequence": 2,
+                        "closed": False,
+                        "annotationStatus": "Subject Answered",
+                        "comment": "Updated",
+                    },
+                ],
+            },
+            {
+                "studyKey": "STUDY",
+                "annotationId": None,
+                "subjectKey": "SUB1",
+                "recordId": 88,
+                "variable": "UNKEYED",
+                "queryComments": [
+                    {
+                        "sequence": 1,
+                        "closed": True,
+                        "annotationStatus": "Closed",
+                        "comment": "Closed",
+                    }
+                ],
+            },
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "metadata": {"status": "OK"},
+                "pagination": {
+                    "currentPage": 0,
+                    "size": 25,
+                    "totalPages": 1,
+                    "totalElements": len(data),
+                },
+                "data": data,
+            },
+        )
+
+    with respx.mock(base_url=base_url, assert_all_called=False) as router:
+        subj_route = router.get("/api/v1/edc/studies/STUDY/subjects").mock(
+            side_effect=_subjects_handler
+        )
+        q_route = router.get("/api/v1/edc/studies/STUDY/queries").mock(side_effect=_queries_handler)
+
+        with ImednetSDK(api_key="k", security_key="s", base_url=base_url, retries=0) as sdk:
+            wf = sdk.workflows.query_management
+
+            # 1. Empty OR list & disjoint subject_key intersections short-circuit with zero HTTP calls
+            assert wf.get_open_queries("STUDY", additional_filter={"variable": []}) == []
+            assert wf.get_unresolved_queries("STUDY", additional_filter={"variable": set()}) == []
+            assert (
+                wf.get_queries_for_subject("STUDY", "SUB1", additional_filter={"variable": []})
+                == []
+            )
+            assert (
+                wf.get_queries_for_subject(
+                    "STUDY", "SUB1", additional_filter={"subject_key": ["SUB2", "SUB3"]}
+                )
+                == []
+            )
+            assert wf.get_queries_for_subject("STUDY", "") == []
+            assert wf.get_queries_by_site("STUDY", [], additional_filter={"variable": "AGE"}) == []
+            assert (
+                wf.get_queries_by_site("STUDY", "Site A", additional_filter={"variable": []}) == []
+            )
+            assert wf.get_query_state_counts("STUDY", variable=[]) == {
+                s.value: 0 for s in QueryStatus
+            }
+            empty_store = TriageStore(tmp_path / "empty.sqlite3")
+            assert (
+                wf.sync_queries_to_triage(
+                    "STUDY", store=empty_store, additional_filter={"variable": []}
+                )
+                == []
+            )
+            assert subj_route.call_count == 0
+            assert q_route.call_count == 0
+
+            # Disjoint site subject intersection calls get_subjects once, then skips get_queries
+            assert (
+                wf.get_queries_by_site(
+                    "STUDY",
+                    "Site A",
+                    additional_filter={"subject_key": ["SUB99"], "variable": "AGE"},
+                )
+                == []
+            )
+            assert subj_route.call_count == 1
+            assert q_route.call_count == 0
+
+            # 2. get_queries_by_site with multi-site OR, subject_filter, subject_key intersection, and OR+AND query filters
+            seen_subject_filters.clear()
+            seen_query_filters.clear()
+            site_queries = wf.get_queries_by_site(
+                "STUDY",
+                ["Site A", "Site B"],
+                subject_filter={"subject_status": "Active"},
+                additional_filter={"subject_key": ["SUB2", "SUB99"], "variable": ["AGE", "WT"]},
+            )
+            assert len(seen_subject_filters) == 2
+            assert seen_query_filters == [
+                "subjectKey==SUB2;variable==AGE",
+                "subjectKey==SUB2;variable==WT",
+            ]
+            # annotationId 501 and 502 deduplicated across the 2 branches while unkeyed items remain
+            assert [q.annotation_id for q in site_queries] == [501, 502, None, None]
+
+            # 3. get_queries_for_subject with comma-separated OR string + AND kwarg and != subject intersection
+            seen_query_filters.clear()
+            subj_queries = wf.get_queries_for_subject(
+                "STUDY",
+                ["SUB1", "SUB2"],
+                additional_filter="variable==AGE,variable==WT",
+                subjectKey=("!=", "SUB2"),
+            )
+            assert seen_query_filters == [
+                "subjectKey==SUB1;variable==AGE",
+                "subjectKey==SUB1;variable==WT",
+            ]
+            assert [q.annotation_id for q in subj_queries] == [501, 503, None, 502, None]
+
+            # 4. get_open_queries & get_unresolved_queries deduplicate by annotation_id
+            open_qs = wf.get_open_queries(
+                "STUDY",
+                additional_filter={"variable": ["AGE", "WT"], "subject_key": "SUB1"},
+            )
+            assert [q.annotation_id for q in open_qs] == [501]
+
+            unresolved_qs = wf.get_unresolved_queries(
+                "STUDY",
+                additional_filter={"variable": ["AGE", "WT"], "subject_key": "SUB1"},
+            )
+            assert [q.annotation_id for q in unresolved_qs] == [501, 503, 502]
+
+            # 5. get_query_state_counts deduplicates annotation_id across branches before counting
+            counts = wf.get_query_state_counts(
+                "STUDY",
+                additional_filter={"variable": ["AGE", "WT"], "subject_key": "SUB1"},
+            )
+            assert counts[QueryStatus.OPEN] == 1
+            assert counts[QueryStatus.ANSWERED] == 2
+            assert counts[QueryStatus.CLOSED] == 2  # 2 unkeyed items preserved
+
+            # 6. sync_queries_to_triage deduplicates branched queries into TriageStore
+            triage_store = TriageStore(tmp_path / "branched.sqlite3")
+            synced = wf.sync_queries_to_triage(
+                "STUDY",
+                store=triage_store,
+                additional_filter={"variable": ["AGE", "WT"], "subject_key": "SUB1"},
+                unresolved_only=True,
+            )
+            assert [item.item_id for item in synced] == ["STUDY:501", "STUDY:503", "STUDY:502"]
+            assert all(
+                item.status in (TriageStatus.NEW, TriageStatus.UNDER_REVIEW) for item in synced
+            )

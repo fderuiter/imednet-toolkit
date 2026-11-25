@@ -583,76 +583,70 @@ class RecordMapper:
             else self.sdk.get_records
         )
 
-        try:
-            if form_id_list is not None:
-                if group_by_subject and len(form_id_list) > 1:
-                    yield from self._merge_form_record_streams(
-                        fetch_fn,
-                        study_key=study_key,
-                        form_id_list=form_id_list,
-                        record_data_filter=record_data_filter,
-                        filters=filters,
-                        include_deleted=effective_include_deleted,
-                    )
-                    return
-                for fid in form_id_list:
-                    raw_form_records = fetch_fn(
-                        study_key=study_key,
-                        record_data_filter=record_data_filter,
-                        **filters,
-                        formId=fid,
-                    )
-                    if group_by_subject and (
-                        isinstance(raw_form_records, (list, tuple))
-                        or (
-                            self._is_mock_sdk_or_callable(fetch_fn)
-                            and not isinstance(raw_form_records, types.GeneratorType)
-                        )
-                    ):
-                        materialized_form = [
-                            rec
-                            for rec in raw_form_records
-                            if effective_include_deleted or not is_record_deleted(rec)
-                        ]
-                        materialized_form.sort(key=lambda r: _extract_stream_usubjid_and_id(r))
-                        yield from materialized_form
-                        continue
-                    for rec in raw_form_records:
-                        if not effective_include_deleted and is_record_deleted(rec):
-                            continue
-                        yield rec
-                return
-
-            raw_records = fetch_fn(
-                study_key=study_key,
-                record_data_filter=record_data_filter,
-                **filters,
-            )
-            if group_by_subject and (
-                isinstance(raw_records, (list, tuple))
-                or (
-                    self._is_mock_sdk_or_callable(fetch_fn)
-                    and not isinstance(raw_records, types.GeneratorType)
+        if form_id_list is not None:
+            if group_by_subject and len(form_id_list) > 1:
+                yield from self._merge_form_record_streams(
+                    fetch_fn,
+                    study_key=study_key,
+                    form_id_list=form_id_list,
+                    record_data_filter=record_data_filter,
+                    filters=filters,
+                    include_deleted=effective_include_deleted,
                 )
-            ):
-                materialized = [
-                    rec
-                    for rec in raw_records
-                    if effective_include_deleted or not is_record_deleted(rec)
-                ]
-                materialized.sort(key=lambda r: _extract_stream_usubjid_and_id(r))
-                yield from materialized
                 return
-
-            for rec in raw_records:
-                if not effective_include_deleted and is_record_deleted(rec):
+            for fid in form_id_list:
+                raw_form_records = fetch_fn(
+                    study_key=study_key,
+                    record_data_filter=record_data_filter,
+                    **filters,
+                    formId=fid,
+                )
+                if group_by_subject and (
+                    isinstance(raw_form_records, (list, tuple))
+                    or (
+                        self._is_mock_sdk_or_callable(fetch_fn)
+                        and not isinstance(raw_form_records, types.GeneratorType)
+                    )
+                ):
+                    materialized_form = [
+                        rec
+                        for rec in raw_form_records
+                        if effective_include_deleted or not is_record_deleted(rec)
+                    ]
+                    materialized_form.sort(key=lambda r: _extract_stream_usubjid_and_id(r))
+                    yield from materialized_form
                     continue
-                yield rec
-        except ValueError:
-            raise
-        except Exception as exc:  # pragma: no cover - unexpected
-            logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
+                for rec in raw_form_records:
+                    if not effective_include_deleted and is_record_deleted(rec):
+                        continue
+                    yield rec
             return
+
+        raw_records = fetch_fn(
+            study_key=study_key,
+            record_data_filter=record_data_filter,
+            **filters,
+        )
+        if group_by_subject and (
+            isinstance(raw_records, (list, tuple))
+            or (
+                self._is_mock_sdk_or_callable(fetch_fn)
+                and not isinstance(raw_records, types.GeneratorType)
+            )
+        ):
+            materialized = [
+                rec
+                for rec in raw_records
+                if effective_include_deleted or not is_record_deleted(rec)
+            ]
+            materialized.sort(key=lambda r: _extract_stream_usubjid_and_id(r))
+            yield from materialized
+            return
+
+        for rec in raw_records:
+            if not effective_include_deleted and is_record_deleted(rec):
+                continue
+            yield rec
 
     def _fetch_records(
         self,

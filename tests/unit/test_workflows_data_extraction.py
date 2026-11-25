@@ -339,3 +339,185 @@ def test_data_extraction_date_helpers_and_progress_callbacks() -> None:
         dateCreated=("<=", "2026-02-01T00:00:00Z"),
     )
     assert [r.record_revision_id for r in revs] == [1]
+
+
+def test_data_extraction_or_branching_date_bounds_and_ordered_dedup_over_http() -> None:
+    """Verify extract_records_by_criteria and extract_audit_trail branch OR+AND filters safely."""
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+    from imednet.utils.filters import validate_filter_syntax
+
+    base_url = "https://api.example.com"
+    record_filters_sent: list[str] = []
+    revision_filters_sent: list[str] = []
+
+    def _subjects_handler(request: httpx.Request) -> httpx.Response:
+        flt = request.url.params.get("filter", "")
+        validate_filter_syntax(flt)
+        assert not (";" in flt and "," in flt)
+        data = [
+            {"studyKey": "STUDY", "subjectKey": "SUB1", "siteName": "Site A", "status": "Active"},
+            {"studyKey": "STUDY", "subjectKey": "SUB2", "siteName": "Site B", "status": "Active"},
+        ]
+        return httpx.Response(200, json={"data": data})
+
+    def _visits_handler(request: httpx.Request) -> httpx.Response:
+        flt = request.url.params.get("filter", "")
+        validate_filter_syntax(flt)
+        assert not (";" in flt and "," in flt)
+        data = [
+            {"studyKey": "STUDY", "visitId": 10, "subjectKey": "SUB1", "intervalName": "Baseline"},
+            {"studyKey": "STUDY", "visitId": 20, "subjectKey": "SUB2", "intervalName": "Week 4"},
+        ]
+        return httpx.Response(200, json={"data": data})
+
+    def _records_handler(request: httpx.Request) -> httpx.Response:
+        flt = request.url.params.get("filter", "")
+        validate_filter_syntax(flt)
+        assert not (";" in flt and "," in flt)
+        record_filters_sent.append(flt)
+        if "DEMO" in flt:
+            data = [
+                {
+                    "studyKey": "STUDY",
+                    "recordId": 1001,
+                    "subjectKey": "SUB1",
+                    "visitId": 10,
+                    "formKey": "DEMO",
+                    "deleted": False,
+                },
+                {
+                    "studyKey": "STUDY",
+                    "recordId": 1002,
+                    "subjectKey": "SUB2",
+                    "visitId": 20,
+                    "formKey": "DEMO",
+                    "deleted": False,
+                },
+            ]
+        else:
+            data = [
+                {
+                    "studyKey": "STUDY",
+                    "recordId": 1002,
+                    "subjectKey": "SUB2",
+                    "visitId": 20,
+                    "formKey": "VITALS",
+                    "deleted": False,
+                },
+                {
+                    "studyKey": "STUDY",
+                    "recordId": 1003,
+                    "subjectKey": "SUB1",
+                    "visitId": 10,
+                    "formKey": "VITALS",
+                    "deleted": False,
+                },
+            ]
+        return httpx.Response(200, json={"data": data})
+
+    def _revisions_handler(request: httpx.Request) -> httpx.Response:
+        flt = request.url.params.get("filter", "")
+        validate_filter_syntax(flt)
+        assert not (";" in flt and "," in flt)
+        assert flt.count("dateCreated") == 1
+        revision_filters_sent.append(flt)
+        if "DEMO" in flt:
+            data = [
+                {
+                    "studyKey": "STUDY",
+                    "recordRevisionId": 901,
+                    "recordId": 1001,
+                    "formKey": "DEMO",
+                    "user": "alice",
+                    "dateCreated": "2026-01-10T10:00:00Z",
+                },
+                {
+                    "studyKey": "STUDY",
+                    "recordRevisionId": 902,
+                    "recordId": 1002,
+                    "formKey": "DEMO",
+                    "user": "alice",
+                    "dateCreated": "2026-02-15T10:00:00Z",
+                },  # out of upper bound
+            ]
+        else:
+            data = [
+                {
+                    "studyKey": "STUDY",
+                    "recordRevisionId": 901,
+                    "recordId": 1001,
+                    "formKey": "DEMO",
+                    "user": "alice",
+                    "dateCreated": "2026-01-10T10:00:00Z",
+                },  # duplicate across branch
+                {
+                    "studyKey": "STUDY",
+                    "recordRevisionId": 903,
+                    "recordId": 1003,
+                    "formKey": "VITALS",
+                    "user": "bob",
+                    "dateCreated": "2026-01-20T15:00:00Z",
+                },
+            ]
+        return httpx.Response(200, json={"data": data})
+
+    with respx.mock(base_url=base_url, assert_all_called=False) as router:
+        subj_route = router.get("/api/v1/edc/studies/STUDY/subjects").mock(
+            side_effect=_subjects_handler
+        )
+        vis_route = router.get("/api/v1/edc/studies/STUDY/visits").mock(side_effect=_visits_handler)
+        rec_route = router.get("/api/v1/edc/studies/STUDY/records").mock(
+            side_effect=_records_handler
+        )
+        rev_route = router.get("/api/v1/edc/studies/STUDY/recordRevisions").mock(
+            side_effect=_revisions_handler
+        )
+
+        with ImednetSDK(api_key="k", security_key="s", base_url=base_url, retries=0) as sdk:
+            wf = sdk.workflows.data_extraction
+
+            # Empty OR lists short-circuit with zero HTTP calls
+            assert wf.extract_records_by_criteria("STUDY", subject_filter={"site_name": []}) == []
+            assert wf.extract_records_by_criteria("STUDY", visit_filter={"interval_name": []}) == []
+            assert wf.extract_records_by_criteria("STUDY", record_filter={"form_key": []}) == []
+            assert (
+                wf.extract_audit_trail(
+                    "STUDY", start_date="2026-01-01", user_filter={"form_key": []}
+                )
+                == []
+            )
+            assert subj_route.call_count == 0
+            assert vis_route.call_count == 0
+            assert rec_route.call_count == 0
+            assert rev_route.call_count == 0
+
+            # Branched subject, visit, and record extraction with ordered record_id deduplication
+            records = wf.extract_records_by_criteria(
+                "STUDY",
+                subject_filter={"site_name": ["Site A", "Site B"], "subject_status": "Active"},
+                visit_filter={"interval_name": ["Baseline", "Week 4"]},
+                record_filter={"form_key": ["DEMO", "VITALS"]},
+                deleted=False,
+            )
+            assert [r.record_id for r in records] == [1001, 1002, 1003]
+            assert record_filters_sent == [
+                "deleted==false;formKey==DEMO",
+                "deleted==false;formKey==VITALS",
+            ]
+
+            # Branched audit trail with start_date + end_date + OR lists + ordered record_revision_id dedup
+            revisions = wf.extract_audit_trail(
+                "STUDY",
+                start_date="2026-01-01",
+                end_date="2026-01-31",
+                user_filter={"form_key": ["DEMO", "VITALS"]},
+                deleted=False,
+            )
+            assert [r.record_revision_id for r in revisions] == [901, 903]
+            assert revision_filters_sent == [
+                "deleted==false;formKey==DEMO;dateCreated>=2026-01-01T00:00:00Z",
+                "deleted==false;formKey==VITALS;dateCreated>=2026-01-01T00:00:00Z",
+            ]

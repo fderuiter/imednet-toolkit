@@ -5,10 +5,11 @@ for iMednet API endpoints based on the reference documentation.
 """
 
 import functools
+import itertools
 import re
 import types
 import weakref
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from datetime import date, datetime
 from enum import Enum
 from typing import Annotated, Any, Literal, TypeVar, Union, get_args, get_origin
@@ -956,6 +957,277 @@ def build_filter_string(
     return result
 
 
+_DEFAULT_PASSTHROUGH_KEYS: frozenset[str] = frozenset(
+    {
+        "page",
+        "size",
+        "limit",
+        "sort",
+        "record_data_filter",
+        "recordDataFilter",
+        "include_inactive",
+    }
+)
+
+
+def _dedup_branch_scalars(values: Iterable[Any]) -> list[Any]:
+    """Deduplicate branch scalar values while preserving first-seen order and exact types."""
+    deduped: list[Any] = []
+    seen_typed: set[tuple[type[Any], Any]] = set()
+    for val in values:
+        try:
+            typed_key = (type(val), val)
+            if typed_key in seen_typed:
+                continue
+            seen_typed.add(typed_key)
+            deduped.append(val)
+        except TypeError:
+            if not any(type(existing) is type(val) and existing == val for existing in deduped):
+                deduped.append(val)
+    return deduped
+
+
+def _split_non_empty_clauses(expr: str, separator: str) -> list[str]:
+    """Split ``expr`` by ``separator`` outside double quotes and reject empty clauses."""
+    raw_parts = [part.strip() for part in _split_outside_quotes(expr, separator)]
+    if len(raw_parts) == 1:
+        return [raw_parts[0]] if raw_parts[0] else []
+    if any(not part for part in raw_parts):
+        raise ValueError("Filter expression contains an empty clause")
+    return raw_parts
+
+
+def expand_filter_branches(
+    filters: Mapping[str, Any] | str | Sequence[str] | None = None,
+    *,
+    model: type[Any] | None = None,
+    allowed_attributes: Collection[str] | None = None,
+    passthrough_keys: Collection[str] = _DEFAULT_PASSTHROUGH_KEYS,
+    multi_bound_attributes: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Expand OR lists/sets and comma-separated OR strings into valid AND-only filter branches.
+
+    Splits multi-value ``list``/``set`` entries and top-level comma-separated OR
+    filter strings (``"a==1,b==2"``) into separate ``dict[str, Any]`` query branches
+    so ``;`` (AND) and ``,`` (OR) connectors are never mixed in a single upstream
+    request. Rejects mixed connectors within an expression and duplicate attributes
+    within an AND branch, and returns ``[]`` immediately when any OR list/set is empty.
+    """
+    if filters is None:
+        return [{}]
+
+    if isinstance(filters, str):
+        stripped = filters.strip()
+        if not stripped:
+            raise ValueError("Filter expression cannot be empty")
+        if stripped.lower() == "none":
+            return [{}]
+        validate_connector_exclusivity(stripped)
+        or_parts = _split_non_empty_clauses(stripped, ",")
+        if len(or_parts) > 1:
+            return [
+                parse_filter_expressions(
+                    [part],
+                    model=model,
+                    allowed_attributes=allowed_attributes,
+                    multi_bound_attributes=multi_bound_attributes,
+                )
+                for part in or_parts
+            ]
+        and_parts = _split_non_empty_clauses(stripped, ";")
+        return [
+            parse_filter_expressions(
+                and_parts,
+                model=model,
+                allowed_attributes=allowed_attributes,
+                multi_bound_attributes=multi_bound_attributes,
+            )
+        ]
+
+    if isinstance(filters, Mapping):
+        if not filters:
+            return [{}]
+
+        passthrough_set = set(passthrough_keys)
+        multi_bound_set = (
+            frozenset(_snake_to_camel(attr) for attr in multi_bound_attributes)
+            if multi_bound_attributes
+            else frozenset()
+        )
+        passthrough: dict[str, Any] = {}
+        raw_dict: dict[str, Any] = {}
+        has_inline_filter = False
+        inline_filter: Any = None
+
+        for key, val in filters.items():
+            if key in passthrough_set:
+                passthrough[key] = val
+            elif key == "filter":
+                if val is not None:
+                    has_inline_filter = True
+                    inline_filter = val
+            else:
+                raw_dict[key] = val
+
+        seen_dict_keys: set[str] = set()
+        list_keys: list[str] = []
+        list_values: list[list[Any]] = []
+        fixed: dict[str, Any] = {}
+
+        for dict_key, dict_val in raw_dict.items():
+            validate_filter_key(dict_key, model=model, allowed_attributes=allowed_attributes)
+            camel_dk = _snake_to_camel(dict_key)
+            if camel_dk in seen_dict_keys:
+                raise ValueError(f"Duplicate filter attribute '{camel_dk}' in AND clause")
+            seen_dict_keys.add(camel_dk)
+
+            if isinstance(dict_val, tuple):
+                if len(dict_val) != 2:
+                    raise ValueError(
+                        f"Filter tuple for '{dict_key}' must have 2 elements, got {len(dict_val)}"
+                    )
+                validate_filter_operator(dict_val[0], allow_regex=False)
+                fixed[dict_key] = dict_val
+            elif isinstance(dict_val, (set, frozenset)):
+                vals = _dedup_branch_scalars(dict_val)
+                if not vals:
+                    return []
+                list_keys.append(dict_key)
+                list_values.append(vals)
+            elif isinstance(dict_val, list):
+                if not dict_val:
+                    return []
+                if any(isinstance(item, tuple) for item in dict_val):
+                    if not all(isinstance(item, tuple) for item in dict_val):
+                        raise ValueError(
+                            f"Filter list for '{dict_key}' cannot mix operator tuples and scalar values"
+                        )
+                    for item in dict_val:
+                        if len(item) != 2:
+                            raise ValueError(
+                                f"Filter tuple for '{dict_key}' must have 2 elements, got {len(item)}"
+                            )
+                        validate_filter_operator(item[0], allow_regex=False)
+                    if len(dict_val) > 1 and camel_dk not in multi_bound_set:
+                        raise ValueError(f"Duplicate filter attribute '{camel_dk}' in AND clause")
+                    fixed[dict_key] = dict_val if camel_dk in multi_bound_set else dict_val[0]
+                else:
+                    list_keys.append(dict_key)
+                    list_values.append(_dedup_branch_scalars(dict_val))
+            else:
+                fixed[dict_key] = dict_val
+
+        if not list_keys:
+            expanded: list[dict[str, Any]] = [dict(fixed)]
+        else:
+            expanded = []
+            for combo in itertools.product(*list_values):
+                branch = dict(fixed)
+                for k, scalar in zip(list_keys, combo, strict=True):
+                    branch[k] = scalar
+                expanded.append(branch)
+
+        if has_inline_filter:
+            if not isinstance(inline_filter, str) or not inline_filter.strip():
+                raise ValueError("Inline 'filter' expression cannot be empty")
+            inline_branches = expand_filter_branches(
+                inline_filter,
+                model=model,
+                allowed_attributes=allowed_attributes,
+                passthrough_keys=(),
+                multi_bound_attributes=multi_bound_attributes,
+            )
+            if not inline_branches:
+                return []
+            merged_branches: list[dict[str, Any]] = []
+            for left in expanded:
+                left_camels = {_snake_to_camel(k) for k in left}
+                for right in inline_branches:
+                    combined = dict(left)
+                    for rk, rv in right.items():
+                        camel_rk = _snake_to_camel(rk)
+                        if camel_rk in left_camels:
+                            raise ValueError(
+                                f"Duplicate filter attribute '{camel_rk}' in AND clause"
+                            )
+                        combined[rk] = rv
+                    merged_branches.append(combined)
+            expanded = merged_branches
+
+        if passthrough:
+            for branch in expanded:
+                branch.update(passthrough)
+        return expanded
+
+    if isinstance(filters, Sequence) and not isinstance(filters, (bytes, bytearray)):
+        if not filters:
+            return [{}]
+        exprs: list[str] = []
+        for item in filters:
+            text = str(item).strip()
+            if not text:
+                raise ValueError("Filter expression cannot be empty")
+            validate_connector_exclusivity(text)
+            exprs.append(text)
+        if len(exprs) == 1:
+            or_parts = _split_non_empty_clauses(exprs[0], ",")
+            if len(or_parts) > 1:
+                return [
+                    parse_filter_expressions(
+                        [part],
+                        model=model,
+                        allowed_attributes=allowed_attributes,
+                        multi_bound_attributes=multi_bound_attributes,
+                    )
+                    for part in or_parts
+                ]
+        flat_and: list[str] = []
+        for expr in exprs:
+            if len(_split_non_empty_clauses(expr, ",")) > 1:
+                raise ValueError(
+                    "Filter expression cannot combine both ';' (AND) and ',' (OR) connectors"
+                )
+            flat_and.extend(_split_non_empty_clauses(expr, ";"))
+        return [
+            parse_filter_expressions(
+                flat_and,
+                model=model,
+                allowed_attributes=allowed_attributes,
+                multi_bound_attributes=multi_bound_attributes,
+            )
+        ]
+
+    raise ValueError(f"Unsupported filters type: {type(filters).__name__}")
+
+
+def iter_branched_results(
+    fetch_fn: Callable[..., Iterable[T]],
+    branches: Sequence[Mapping[str, Any]],
+    *,
+    dedup_key: Callable[[T], Any] | None = None,
+) -> Iterator[T]:
+    """Execute ``fetch_fn(**branch)`` across branches with optional ordered deduplication.
+
+    Yields nothing without invoking ``fetch_fn`` when ``branches`` is empty. When
+    ``dedup_key`` is supplied, items whose extracted key is non-``None`` are
+    deduplicated in first-seen order while unkeyed items (``key is None``) are
+    always yielded.
+    """
+    if not branches:
+        return
+
+    seen_keys: set[Any] = set()
+    for branch in branches:
+        for item in fetch_fn(**branch):
+            if dedup_key is not None:
+                key = dedup_key(item)
+                if key is not None:
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+            yield item
+
+
 from ._revision_filters import (
     REVISION_DATE_ATTRIBUTES,
     matches_revision_date_bound,
@@ -970,7 +1242,9 @@ __all__ = [
     "RECORD_DATA_OPERATORS",
     "REVISION_DATE_ATTRIBUTES",
     "build_filter_string",
+    "expand_filter_branches",
     "extract_filter_attributes",
+    "iter_branched_results",
     "matches_revision_date_bound",
     "matches_revision_date_bounds",
     "parse_filter_expression",

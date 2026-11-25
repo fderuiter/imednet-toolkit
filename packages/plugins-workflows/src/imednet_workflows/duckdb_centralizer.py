@@ -137,6 +137,8 @@ class DuckDBIngestionWorkflow:
         end_date: str | None = None,
         mode: Literal["append", "replace"] = "append",
         mask_phi: bool | None = None,
+        user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | str | None = None,
+        **filters: Any,
     ) -> int:
         """Fetch RecordRevisions and write to the bronze_revisions table."""
         self._validate_study_key(study_key)
@@ -144,10 +146,17 @@ class DuckDBIngestionWorkflow:
             raise ValueError("mode must be one of: 'append', 'replace'")
         effective_mask_phi = self._mask_phi if mask_phi is None else bool(mask_phi)
 
+        extract_kwargs: dict[str, Any] = {
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        if user_filter is not None:
+            extract_kwargs["user_filter"] = user_filter
+        extract_kwargs.update(filters)
+
         revisions = self._extractor.extract_audit_trail(
             study_key,
-            start_date=start_date,
-            end_date=end_date,
+            **extract_kwargs,
         )
         rows = self._deduplicate_rows(
             self._to_rows(study_key, revisions, mask_phi=effective_mask_phi)

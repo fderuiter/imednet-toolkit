@@ -13,6 +13,7 @@ import math
 import numbers
 import os
 import re
+import shutil
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
@@ -1280,6 +1281,34 @@ class TabularCSVSink(ExportSink):
         self._staged_frames: list[pd.DataFrame] = []
         self._voided_ids: set[str] = set()
         self._voided_sdtm_keys: set[SdtmKeyTuple] = set()
+        self._staging_path: str | None = None
+        self._dest_existed_before = Path(self.path).exists()
+        self._wrote_direct_dest = False
+        self._committed = False
+        self._pending_manifest_entries: list[tuple[str, int, str]] = []
+
+    def _ensure_staging_path(self) -> str:
+        if self._staging_path is None:
+            dest = Path(self.path)
+            self._staging_path = str(
+                dest.parent / f".{dest.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.csv.tmp"
+            )
+        return self._staging_path
+
+    def _flush_pending_manifest(self) -> None:
+        if not self._pending_manifest_entries:
+            return
+        try:
+            for batch_id, row_count, checksum in self._pending_manifest_entries:
+                _append_jsonl_manifest(
+                    self._cfg.manifest_path,
+                    batch_id=batch_id,
+                    destination=self.path,
+                    row_count=row_count,
+                    checksum=checksum,
+                )
+        finally:
+            self._pending_manifest_entries.clear()
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -1303,13 +1332,7 @@ class TabularCSVSink(ExportSink):
                 )
                 checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
                 rows_loaded = len(df)
-                _append_jsonl_manifest(
-                    self._cfg.manifest_path,
-                    batch_id=batch_id,
-                    destination=self.path,
-                    row_count=rows_loaded,
-                    checksum=checksum,
-                )
+                self._pending_manifest_entries.append((batch_id, rows_loaded, checksum))
                 id_col = _find_df_record_id_col(df)
                 study_col = _find_df_study_col(df)
                 if id_col is not None:
@@ -1335,31 +1358,33 @@ class TabularCSVSink(ExportSink):
             return loaded
 
         def execute_export() -> int:
-            if self._is_first_batch:
-                if self._cfg.idempotent or not Path(self.path).exists():
+            if self._dest_existed_before:
+                write_target = self._ensure_staging_path()
+                if self._is_first_batch:
                     mode = "w"
-                    header = True
+                    header = (
+                        True
+                        if self._cfg.idempotent or not Path(self.path).exists()
+                        else Path(self.path).stat().st_size == 0
+                    )
                 else:
                     mode = "a"
-                    header = Path(self.path).stat().st_size == 0
+                    header = False
             else:
-                mode = "a"
-                header = False
+                write_target = self.path
+                mode = "w" if self._is_first_batch else "a"
+                header = self._is_first_batch
 
             csv_str = df.to_csv(index=False, header=header, **self._cfg.pandas_kwargs)
-            checksum = hashlib.sha256(csv_str.encode('utf-8')).hexdigest()
+            checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
 
-            with open(self.path, mode=mode, encoding="utf-8") as f:
+            with open(write_target, mode=mode, encoding="utf-8") as f:
                 f.write(csv_str)
 
+            if write_target == self.path:
+                self._wrote_direct_dest = True
             rows_loaded = len(df)
-            _append_jsonl_manifest(
-                self._cfg.manifest_path,
-                batch_id=batch_id,
-                destination=self.path,
-                row_count=rows_loaded,
-                checksum=checksum,
-            )
+            self._pending_manifest_entries.append((batch_id, rows_loaded, checksum))
             return rows_loaded
 
         loaded = self._execute_with_retry("export_csv", batch_id, execute_export)
@@ -1470,8 +1495,38 @@ class TabularCSVSink(ExportSink):
         _atomic_replace_file(self.path, _stream_merge, suffix=".csv.tmp")
         return len(delta_rows)
 
+    def _commit_staged_csv(self) -> None:
+        if self._staging_path is None:
+            return
+        staged_file = Path(self._staging_path)
+        if not staged_file.exists():
+            self._staging_path = None
+            return
+        try:
+            dest_file = Path(self.path)
+            if not self._cfg.idempotent and dest_file.exists() and dest_file.stat().st_size > 0:
+
+                def _append_staged(tmp_path: str) -> None:
+                    with (
+                        open(self.path, "rb") as prev_f,
+                        open(staged_file, "rb") as delta_f,
+                        open(tmp_path, "wb") as out_f,
+                    ):
+                        shutil.copyfileobj(prev_f, out_f)
+                        shutil.copyfileobj(delta_f, out_f)
+
+                _atomic_replace_file(self.path, _append_staged, suffix=".csv.tmp")
+                staged_file.unlink(missing_ok=True)
+            else:
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(self._staging_path, self.path)
+        finally:
+            self._staging_path = None
+
     def flush(self) -> None:
-        """Finalize staged incremental CSV updates and voided deletions atomically."""
+        """Finalize staged CSV writes, incremental updates, and voided deletions atomically."""
+        self._commit_staged_csv()
+
         has_voided = bool(self._voided_ids or self._voided_sdtm_keys)
         should_reconcile = False
         if self._is_incremental_sync and self._cfg.idempotent:
@@ -1484,18 +1539,26 @@ class TabularCSVSink(ExportSink):
         ):
             should_reconcile = True
 
-        if not should_reconcile:
-            return
+        if should_reconcile:
+            try:
+                self._reconcile_csv_to_disk()
+            finally:
+                self._staged_frames.clear()
+                self._voided_ids.clear()
+                self._voided_sdtm_keys.clear()
 
-        try:
-            self._reconcile_csv_to_disk()
-        finally:
-            self._staged_frames.clear()
-            self._voided_ids.clear()
-            self._voided_sdtm_keys.clear()
+        self._committed = True
+        self._flush_pending_manifest()
 
     def close(self) -> None:
-        """Clear any staged state."""
+        """Clear any staged state and remove uncommitted staging files."""
+        if self._staging_path is not None:
+            Path(self._staging_path).unlink(missing_ok=True)
+            self._staging_path = None
+        if self._wrote_direct_dest and not self._committed:
+            Path(self.path).unlink(missing_ok=True)
+            self._wrote_direct_dest = False
+        self._pending_manifest_entries.clear()
         self._staged_frames.clear()
         self._voided_ids.clear()
         self._voided_sdtm_keys.clear()
@@ -2219,6 +2282,7 @@ class TabularParquetSink(ExportSink):
         self._voided_sdtm_keys: set[SdtmKeyTuple] = set()
         self._delta_sdtm_key_counts: dict[SdtmKeyTuple, int] = {}
         self._delta_path: str | None = None
+        self._staging_path: str | None = None
 
     def set_contract_types(self, contract_types: Mapping[str, str | None]) -> None:
         """Configure contract-derived column types prior to streaming batches."""
@@ -2236,7 +2300,13 @@ class TabularParquetSink(ExportSink):
                     dest.parent / f".{dest.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.delta.parquet"
                 )
             return self._delta_path
-        return self.path
+        if self._staging_path is None:
+            dest = Path(self.path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            self._staging_path = str(
+                dest.parent / f".{dest.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.parquet.tmp"
+            )
+        return self._staging_path
 
     def _align_batch_table(self, pa: Any, df: pd.DataFrame) -> tuple[Any, bool]:
         """Convert ``df`` into an Arrow table aligned with contract or active writer schema."""
@@ -2601,6 +2671,15 @@ class TabularParquetSink(ExportSink):
             self._writer.close()
             self._writer = None
 
+        if self._staging_path is not None:
+            staged_file = Path(self._staging_path)
+            try:
+                if staged_file.exists():
+                    Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(self._staging_path, self.path)
+            finally:
+                self._staging_path = None
+
         has_voided = bool(self._voided_ids or self._voided_sdtm_keys)
         if self._use_staged_delta() or (self._cfg.idempotent and has_voided):
             try:
@@ -2625,6 +2704,9 @@ class TabularParquetSink(ExportSink):
                 self._writer.close()
             finally:
                 self._writer = None
+        if self._staging_path is not None:
+            Path(self._staging_path).unlink(missing_ok=True)
+            self._staging_path = None
         if self._delta_path is not None:
             Path(self._delta_path).unlink(missing_ok=True)
             self._delta_path = None
@@ -3497,10 +3579,10 @@ def _make_mapper_records_source(
                     ),
                 )
             )
-        if (
-            getattr(mapper, "_loader", None) is not None
-            or not mapper._can_stream_via_records_endpoint()
-        ):
+        has_sdk_records_fetcher = bool(
+            mapper._can_stream_via_records_endpoint() or callable(getattr(sdk, "get_records", None))
+        )
+        if getattr(mapper, "_loader", None) is not None or not has_sdk_records_fetcher:
             iter_filters = dict(extra_filters)
             if isinstance(config.record_filter, Mapping):
                 iter_filters.update(config.record_filter)
@@ -5163,16 +5245,24 @@ def _build_form_export_contexts(
     preserve_record_id: bool = False,
 ) -> tuple[list[_FormExportContext], list[Any]]:
     """Fetch study forms and variables once and build per-form export contexts."""
-    forms = list(sdk.forms.list(study_key=study_key))
+    forms_ep = getattr(sdk, "forms", None)
+    forms = (
+        list(forms_ep.list(study_key=study_key))
+        if forms_ep is not None and callable(getattr(forms_ep, "list", None))
+        else list(sdk.get_forms(study_key))
+    )
     if sdtm_domain is not None and forms:
         forms = filter_forms_by_sdtm_domain(forms, sdtm_domain, study_key=study_key)
     form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
-    all_variables = (
-        []
-        if (form_whitelist is not None and len(form_whitelist) == 0)
-        or (sdtm_domain is not None and not forms)
-        else list(sdk.variables.list(study_key=study_key, **form_filter))
-    )
+    variables_ep = getattr(sdk, "variables", None)
+    if (form_whitelist is not None and len(form_whitelist) == 0) or (
+        sdtm_domain is not None and not forms
+    ):
+        all_variables = []
+    elif variables_ep is not None and callable(getattr(variables_ep, "list", None)):
+        all_variables = list(variables_ep.list(study_key=study_key, **form_filter))
+    else:
+        all_variables = list(sdk.get_variables(study_key, **form_filter))
     variables_by_form: dict[int, list[Any]] = {}
     for var in all_variables:
         if var.form_id is not None:

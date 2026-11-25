@@ -370,6 +370,25 @@ def export_to_hive_parquet(
     effective_use_labels = config.use_labels_as_columns
     effective_var_whitelist = config.variable_whitelist
     effective_form_whitelist = config.form_whitelist
+    base_path = Path(base_dir)
+    base_existed_before = base_path.exists()
+    manifest_file = Path(config.manifest_path) if config.manifest_path else None
+    manifest_existed_before = manifest_file.exists() if manifest_file is not None else False
+    manifest_initial_size = (
+        manifest_file.stat().st_size if manifest_existed_before and manifest_file is not None else 0
+    )
+
+    def _rollback_failed_hive_run() -> None:
+        storage_engine.rollback_batches(
+            base_dir=base_dir,
+            remove_empty_base=not base_existed_before,
+        )
+        if manifest_file is not None:
+            if not manifest_existed_before:
+                manifest_file.unlink(missing_ok=True)
+            elif manifest_file.exists() and manifest_file.stat().st_size > manifest_initial_size:
+                with open(manifest_file, "r+b") as mf:
+                    mf.truncate(manifest_initial_size)
 
     if _config_has_streaming_options(config) or config.quality_gate_enabled or config.as_sdtm:
         preserve_rec_id = should_preserve_sdtm_record_id(config)
@@ -692,28 +711,39 @@ def export_to_hive_parquet(
                                 with contextlib.suppress(OSError):
                                     pf.parent.rmdir()
 
-        _stream_records_across_forms(
-            sdk,
-            study_key,
-            config,
-            contexts,
-            all_variables,
-            on_active_batch=_on_hive_active,
-            on_voided_batch=_on_hive_voided,
-            on_before_checkpoints=_reconcile_partitions_before_checkpoints,
-        )
+        try:
+            _stream_records_across_forms(
+                sdk,
+                study_key,
+                config,
+                contexts,
+                all_variables,
+                on_active_batch=_on_hive_active,
+                on_voided_batch=_on_hive_voided,
+                on_before_checkpoints=_reconcile_partitions_before_checkpoints,
+            )
+        except BaseException:
+            _rollback_failed_hive_run()
+            raise
         return
 
-    forms = list(sdk.forms.list(study_key=study_key))
+    forms_ep = getattr(sdk, "forms", None)
+    forms = (
+        list(forms_ep.list(study_key=study_key))
+        if forms_ep is not None and callable(getattr(forms_ep, "list", None))
+        else list(sdk.get_forms(study_key))
+    )
 
     form_filter: dict[str, Any] = (
         {"formId": effective_form_whitelist} if effective_form_whitelist else {}
     )
-    all_variables = (
-        []
-        if effective_form_whitelist is not None and len(effective_form_whitelist) == 0
-        else list(sdk.variables.list(study_key=study_key, **form_filter))
-    )
+    variables_ep = getattr(sdk, "variables", None)
+    if effective_form_whitelist is not None and len(effective_form_whitelist) == 0:
+        all_variables = []
+    elif variables_ep is not None and callable(getattr(variables_ep, "list", None)):
+        all_variables = list(variables_ep.list(study_key=study_key, **form_filter))
+    else:
+        all_variables = list(sdk.get_variables(study_key, **form_filter))
     variables_by_form: dict[int, list[Any]] = {}
     for variable in all_variables:
         if variable.form_id is not None:
@@ -773,75 +803,14 @@ def export_to_hive_parquet(
         and callable(getattr(mapper, "_parse_records", None))
         and callable(getattr(mapper, "_parse_record", None))
     )
-    if can_stream_single_pass and callable(iter_records):
-        by_form_id = {spec["form_id"]: spec for spec in form_specs}
-        by_form_key = {spec["form_key"]: spec for spec in form_specs}
+    try:
+        if can_stream_single_pass and callable(iter_records):
+            by_form_id = {spec["form_id"]: spec for spec in form_specs}
+            by_form_key = {spec["form_key"]: spec for spec in form_specs}
 
-        def _flush_hive_batch(form_key: str, batch: list[Any], batch_idx: int) -> None:
-            spec = by_form_key[form_key]
-            parsed_rows, _ = mapper._parse_records(batch, spec["record_model"])
-            rows = (
-                [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
-                if pipeline is not None and not has_native_enrichment
-                else parsed_rows
-            )
-            _write_hive_form_rows(
-                rows,
-                mapper=mapper,
-                variable_keys=spec["variable_keys"],
-                label_map=spec["label_map"],
-                use_labels_as_columns=effective_use_labels,
-                mask_phi=effective_mask_phi,
-                phi_keys=phi_keys,
-                pyarrow_module=pyarrow_module,
-                storage_engine=storage_engine,
-                base_dir=base_dir,
-                study_key=study_key,
-                form_key=form_key,
-                skip_empty=True,
-                manifest_path=config.manifest_path,
-                batch_id=f"{study_key}/{form_key}/{batch_idx}",
-            )
-
-        router = BoundedFormBufferRouter(
-            [spec["form_key"] for spec in form_specs],
-            batch_size=config.batch_size,
-            max_buffered_records=config.max_buffered_records,
-            on_flush_active=_flush_hive_batch,
-        )
-        study_extra_filters = (
-            {"formId": [spec["form_id"] for spec in form_specs]}
-            if effective_form_whitelist is not None
-            else None
-        )
-        for rec in iter_records(study_key, extra_filters=study_extra_filters):
-            fid, fk = extract_record_form_ref(rec)
-            matched = (
-                by_form_id.get(fid)
-                if fid is not None and fid in by_form_id
-                else (by_form_key.get(fk) if fk is not None else None)
-            )
-            if matched is not None:
-                router.add_active(matched["form_key"], rec)
-        router.flush_all()
-        if config.idempotent:
-            delete_superseded_hive_files(
-                full_preexisting_files,
-                base_dir=base_dir,
-                study_key=study_key,
-            )
-        return
-
-    iter_parsed_rows = getattr(mapper, "_iter_parsed_rows", None)
-    for spec in form_specs:
-        if callable(iter_records) and callable(iter_parsed_rows):
-            records = iter_records(
-                study_key,
-                extra_filters={"formId": spec["form_id"]},
-            )
-            for batch_idx, (parsed_rows, _) in enumerate(
-                iter_parsed_rows(records, spec["record_model"])
-            ):
+            def _flush_hive_batch(form_key: str, batch: list[Any], batch_idx: int) -> None:
+                spec = by_form_key[form_key]
+                parsed_rows, _ = mapper._parse_records(batch, spec["record_model"])
                 rows = (
                     [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
                     if pipeline is not None and not has_native_enrichment
@@ -859,40 +828,105 @@ def export_to_hive_parquet(
                     storage_engine=storage_engine,
                     base_dir=base_dir,
                     study_key=study_key,
-                    form_key=spec["form_key"],
+                    form_key=form_key,
                     skip_empty=True,
                     manifest_path=config.manifest_path,
-                    batch_id=f"{study_key}/{spec['form_key']}/{batch_idx}",
+                    batch_id=f"{study_key}/{form_key}/{batch_idx}",
                 )
-            continue
 
-        records = mapper._fetch_records(
-            study_key,
-            extra_filters={"formId": spec["form_id"]},
-        )
-        parsed_rows, _ = mapper._parse_records(records, spec["record_model"])
-        rows = (
-            [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
-            if pipeline is not None and not has_native_enrichment
-            else parsed_rows
-        )
-        _write_hive_form_rows(
-            rows,
-            mapper=mapper,
-            variable_keys=spec["variable_keys"],
-            label_map=spec["label_map"],
-            use_labels_as_columns=effective_use_labels,
-            mask_phi=effective_mask_phi,
-            phi_keys=phi_keys,
-            pyarrow_module=pyarrow_module,
-            storage_engine=storage_engine,
-            base_dir=base_dir,
-            study_key=study_key,
-            form_key=spec["form_key"],
-            skip_empty=False,
-            manifest_path=config.manifest_path,
-            batch_id=f"{study_key}/{spec['form_key']}/0",
-        )
+            router = BoundedFormBufferRouter(
+                [spec["form_key"] for spec in form_specs],
+                batch_size=config.batch_size,
+                max_buffered_records=config.max_buffered_records,
+                on_flush_active=_flush_hive_batch,
+            )
+            study_extra_filters = (
+                {"formId": [spec["form_id"] for spec in form_specs]}
+                if effective_form_whitelist is not None
+                else None
+            )
+            for rec in iter_records(study_key, extra_filters=study_extra_filters):
+                fid, fk = extract_record_form_ref(rec)
+                matched = (
+                    by_form_id.get(fid)
+                    if fid is not None and fid in by_form_id
+                    else (by_form_key.get(fk) if fk is not None else None)
+                )
+                if matched is not None:
+                    router.add_active(matched["form_key"], rec)
+            router.flush_all()
+            if config.idempotent:
+                delete_superseded_hive_files(
+                    full_preexisting_files,
+                    base_dir=base_dir,
+                    study_key=study_key,
+                )
+            return
+
+        iter_parsed_rows = getattr(mapper, "_iter_parsed_rows", None)
+        for spec in form_specs:
+            if callable(iter_records) and callable(iter_parsed_rows):
+                records = iter_records(
+                    study_key,
+                    extra_filters={"formId": spec["form_id"]},
+                )
+                for batch_idx, (parsed_rows, _) in enumerate(
+                    iter_parsed_rows(records, spec["record_model"])
+                ):
+                    rows = (
+                        [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
+                        if pipeline is not None and not has_native_enrichment
+                        else parsed_rows
+                    )
+                    _write_hive_form_rows(
+                        rows,
+                        mapper=mapper,
+                        variable_keys=spec["variable_keys"],
+                        label_map=spec["label_map"],
+                        use_labels_as_columns=effective_use_labels,
+                        mask_phi=effective_mask_phi,
+                        phi_keys=phi_keys,
+                        pyarrow_module=pyarrow_module,
+                        storage_engine=storage_engine,
+                        base_dir=base_dir,
+                        study_key=study_key,
+                        form_key=spec["form_key"],
+                        skip_empty=True,
+                        manifest_path=config.manifest_path,
+                        batch_id=f"{study_key}/{spec['form_key']}/{batch_idx}",
+                    )
+                continue
+
+            records = mapper._fetch_records(
+                study_key,
+                extra_filters={"formId": spec["form_id"]},
+            )
+            parsed_rows, _ = mapper._parse_records(records, spec["record_model"])
+            rows = (
+                [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
+                if pipeline is not None and not has_native_enrichment
+                else parsed_rows
+            )
+            _write_hive_form_rows(
+                rows,
+                mapper=mapper,
+                variable_keys=spec["variable_keys"],
+                label_map=spec["label_map"],
+                use_labels_as_columns=effective_use_labels,
+                mask_phi=effective_mask_phi,
+                phi_keys=phi_keys,
+                pyarrow_module=pyarrow_module,
+                storage_engine=storage_engine,
+                base_dir=base_dir,
+                study_key=study_key,
+                form_key=spec["form_key"],
+                skip_empty=False,
+                manifest_path=config.manifest_path,
+                batch_id=f"{study_key}/{spec['form_key']}/0",
+            )
+    except BaseException:
+        _rollback_failed_hive_run()
+        raise
 
     if config.idempotent:
         delete_superseded_hive_files(
