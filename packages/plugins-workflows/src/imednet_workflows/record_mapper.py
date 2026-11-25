@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import heapq
 import inspect
+import itertools
 import logging
 import types
 from collections.abc import Iterable, Iterator
@@ -1700,6 +1701,17 @@ class RecordMapper:
         )
         if normalizer.remaps_usubjid:
             source_is_ordered = False
+        elif (
+            not source_is_ordered
+            and self._loader is None
+            and not force_drain_ungrouped_loader
+            and self._is_mock_sdk_or_callable()
+        ):
+            records, source_is_ordered = self._peek_mock_sdtm_stream_order(
+                records,
+                normalizer,
+                chunk_size=self._pipeline.chunk_size,
+            )
         seq_counters: dict[str, int] = {}
         for df in _iter_sorted_sdtm_frames(
             records,
@@ -1710,6 +1722,42 @@ class RecordMapper:
         ):
             if not df.empty:
                 yield df
+
+    @staticmethod
+    def _peek_mock_sdtm_stream_order(
+        records: Iterable[Any],
+        normalizer: _SdtmNormalizer,
+        *,
+        chunk_size: int,
+    ) -> tuple[Iterable[Any], bool]:
+        """Peek up to the first chunk boundary on mock SDK streams to detect Subject order."""
+        rec_iter = iter(records)
+        peeked: list[Any] = []
+        last_usubjid: str | None = None
+        current_subj_rows = 0
+        completed_rows = 0
+
+        for idx, rec in enumerate(rec_iter):
+            peeked.append(rec)
+            prepared = normalizer.prepare_record(rec, idx)
+            if prepared is None:
+                continue
+            if last_usubjid is None:
+                last_usubjid = prepared.usubjid
+                current_subj_rows = 1
+                continue
+            if prepared.usubjid == last_usubjid:
+                current_subj_rows += 1
+                continue
+            if prepared.usubjid < last_usubjid:
+                return itertools.chain(peeked, rec_iter), False
+            completed_rows += current_subj_rows
+            last_usubjid = prepared.usubjid
+            current_subj_rows = 1
+            if completed_rows >= chunk_size:
+                break
+
+        return itertools.chain(peeked, rec_iter), True
 
     def _try_fetch_study_forms_for_sdtm(self, study_key: str) -> list[Any]:
         """Return concrete Study Forms when ``self.sdk.forms.list`` yields non-mock Form entries."""

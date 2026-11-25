@@ -470,7 +470,11 @@ class CentralizedMapper:
                 else (
                     rec.get("study_key") or rec.get("studyKey") or rec.get("STUDYID")
                     if is_mapping
-                    else getattr(rec, "study_key", None)
+                    else (
+                        getattr(rec, "study_key", None)
+                        or getattr(rec, "studyKey", None)
+                        or getattr(rec, "STUDYID", None)
+                    )
                 )
             ) or "UNKNOWN"
             dom = self._resolve_record_sdtm_domain(rec, study_key=str(resolved_sk))
@@ -537,7 +541,7 @@ class CentralizedMapper:
             else (
                 record.get("study_key") or record.get("studyKey")
                 if is_mapping
-                else getattr(record, "study_key", None)
+                else getattr(record, "study_key", None) or getattr(record, "studyKey", None)
             )
         )
         sk = resolved_study_key or "UNKNOWN"
@@ -607,6 +611,12 @@ class CentralizedMapper:
                         val = record.get(sdtm_f)
             else:
                 val = getattr(record, f, None)
+                if val is None and snake_key != f:
+                    val = getattr(record, snake_key, None)
+                if val is None:
+                    camel_f = format_variable_name(snake_key, "camelCase")
+                    if camel_f not in {f, snake_key}:
+                        val = getattr(record, camel_f, None)
 
             if f == "record_data":
                 val = dict(val or {})
@@ -744,7 +754,9 @@ class EnrichmentPipeline:
         self.indexed_mappings: dict[tuple[str, str, str], Any] = {}
         self._indexed_snake_mappings: dict[tuple[str, str, str], Any] = {}
         self._domain_var_mappings: dict[tuple[str, str], Any] = {}
+        self._domain_var_counts: dict[tuple[str, str], int] = {}
         self._domain_snake_mappings: dict[tuple[str, str], Any] = {}
+        self._domain_snake_counts: dict[tuple[str, str], int] = {}
         self._form_var_mappings: dict[tuple[str, str], Any] = {}
         self._form_snake_mappings: dict[tuple[str, str], Any] = {}
 
@@ -775,8 +787,14 @@ class EnrichmentPipeline:
 
                 if norm_dom:
                     self._domain_var_mappings.setdefault((norm_dom, src_var), mapping)
+                    self._domain_var_counts[(norm_dom, src_var)] = (
+                        self._domain_var_counts.get((norm_dom, src_var), 0) + 1
+                    )
                     if snake_src:
                         self._domain_snake_mappings.setdefault((norm_dom, snake_src), mapping)
+                        self._domain_snake_counts[(norm_dom, snake_src)] = (
+                            self._domain_snake_counts.get((norm_dom, snake_src), 0) + 1
+                        )
                 if norm_fk:
                     self._form_var_mappings.setdefault((norm_fk, src_var), mapping)
                     if snake_src:
@@ -805,19 +823,48 @@ class EnrichmentPipeline:
                 rule = self._indexed_snake_mappings.get((norm_domain, norm_form_key, snake_key))
             if rule is not None:
                 return rule
-            # Fall back to domain-scoped rule when form_key is a generic/study form alias for norm_domain
-            # and no conflicting form-specific rule matched.
+            # Check form-matched rule if its domain is unset or matches norm_domain
+            fk_rule = self._form_var_mappings.get((norm_form_key, key))
+            if fk_rule is None and snake_key:
+                fk_rule = self._form_snake_mappings.get((norm_form_key, snake_key))
+            if fk_rule is not None:
+                fk_dom = (
+                    resolve_sdtm_domain(fk_rule.domain, fallback="")
+                    if getattr(fk_rule, "domain", None)
+                    else ""
+                )
+                if not fk_dom or fk_dom == norm_domain:
+                    return fk_rule
+                return None
+            # Only fall back to a domain-level rule when the rule has no specific source_form_key
+            # OR norm_form_key is merely the bare domain code (e.g. "ae") and the domain rule is unambiguous.
+            bare_dom_fk = _normalize_key(norm_domain).replace("_", "")
+            dom_count = self._domain_var_counts.get((norm_domain, key), 0)
             dom_rule = self._domain_var_mappings.get((norm_domain, key))
             if dom_rule is None and snake_key:
                 dom_rule = self._domain_snake_mappings.get((norm_domain, snake_key))
+                dom_count = self._domain_snake_counts.get((norm_domain, snake_key), 0)
             if dom_rule is not None:
                 rule_fk = getattr(dom_rule, "source_form_key", "") or ""
                 rule_fk_norm = _normalize_key(rule_fk).replace("_", "") if rule_fk else ""
-                if not rule_fk_norm or resolve_sdtm_domain(rule_fk, fallback="") == norm_domain:
+                if not rule_fk_norm or (norm_form_key == bare_dom_fk and dom_count == 1):
                     return dom_rule
             return None
 
         if norm_domain:
+            if self._domain_var_counts.get((norm_domain, key), 0) == 1:
+                return self._domain_var_mappings.get((norm_domain, key))
+            if (
+                self._domain_var_counts.get((norm_domain, key), 0) == 0
+                and snake_key
+                and self._domain_snake_counts.get((norm_domain, snake_key), 0) == 1
+            ):
+                return self._domain_snake_mappings.get((norm_domain, snake_key))
+            # If multiple forms in the same domain map this variable without form_key context,
+            # prefer a form-unscoped rule if one exists; otherwise fall back to first domain rule.
+            unscoped = self.indexed_mappings.get((norm_domain, "", key))
+            if unscoped is not None:
+                return unscoped
             rule = self._domain_var_mappings.get((norm_domain, key))
             if rule is None and snake_key:
                 rule = self._domain_snake_mappings.get((norm_domain, snake_key))
@@ -835,29 +882,41 @@ class EnrichmentPipeline:
                 norm_form_key, study_config=self.config, fallback=""
             )
             if inferred_dom:
+                bare_dom_fk = _normalize_key(inferred_dom).replace("_", "")
+                dom_count = self._domain_var_counts.get((inferred_dom, key), 0)
                 dom_rule = self._domain_var_mappings.get((inferred_dom, key))
                 if dom_rule is None and snake_key:
                     dom_rule = self._domain_snake_mappings.get((inferred_dom, snake_key))
+                    dom_count = self._domain_snake_counts.get((inferred_dom, snake_key), 0)
                 if dom_rule is not None:
                     rule_fk = getattr(dom_rule, "source_form_key", "") or ""
                     rule_fk_norm = _normalize_key(rule_fk).replace("_", "") if rule_fk else ""
-                    if (
-                        not rule_fk_norm
-                        or rule_fk_norm == norm_form_key
-                        or resolve_sdtm_domain(rule_fk, fallback="") == inferred_dom
-                    ):
+                    if not rule_fk_norm or (norm_form_key == bare_dom_fk and dom_count == 1):
                         return dom_rule
             # In non-SDTM mode (norm_domain is None), allow unambiguous single-variable rules
             if self._var_rule_counts.get(key, 0) == 1:
                 return self.mappings.get(key)
-            if snake_key and self._snake_rule_counts.get(snake_key, 0) == 1:
+            if (
+                self._var_rule_counts.get(key, 0) == 0
+                and snake_key is not None
+                and self._snake_rule_counts.get(snake_key, 0) == 1
+            ):
                 return self._snake_mappings.get(snake_key)
             return None
 
-        rule = self.mappings.get(key)
-        if rule is None and snake_key is not None:
-            rule = self._snake_mappings.get(snake_key)
-        return rule
+        if self._var_rule_counts.get(key, 0) == 1:
+            return self.mappings.get(key)
+        if (
+            self._var_rule_counts.get(key, 0) == 0
+            and snake_key is not None
+            and self._snake_rule_counts.get(snake_key, 0) == 1
+        ):
+            return self._snake_mappings.get(snake_key)
+        if self._var_rule_counts.get(key, 0) > 1 or (
+            snake_key is not None and self._snake_rule_counts.get(snake_key, 0) > 1
+        ):
+            return None
+        return None
 
     def _applicable_fallback_rules(
         self,
@@ -866,7 +925,18 @@ class EnrichmentPipeline:
         norm_form_key: str | None,
     ) -> list[Any]:
         """Return rules with ``fallback_value`` applicable to ``(norm_domain, norm_form_key)``."""
+        if norm_domain is None and norm_form_key is None:
+            # Without form or domain context, only unambiguous single-rule variables can apply
+            return [
+                rule
+                for rule in self.all_mappings
+                if rule.fallback_value is not None
+                and not (rule.source_form_key or "").strip()
+                and self._var_rule_counts.get(rule.source_variable_name, 0) <= 1
+            ]
+
         candidates: list[Any] = []
+        bare_dom_fk = _normalize_key(norm_domain).replace("_", "") if norm_domain else ""
         for rule in self.all_mappings:
             if rule.fallback_value is None:
                 continue
@@ -880,7 +950,20 @@ class EnrichmentPipeline:
                 norm_form_key
                 and r_fk
                 and r_fk != norm_form_key
-                and not (norm_domain and resolve_sdtm_domain(r_fk_raw, fallback="") == norm_domain)
+                and not (
+                    norm_domain
+                    and norm_form_key == bare_dom_fk
+                    and r_dom == norm_domain
+                    and self._domain_var_counts.get((norm_domain, rule.source_variable_name), 0)
+                    == 1
+                )
+            ):
+                continue
+            if (
+                not norm_form_key
+                and norm_domain
+                and r_fk
+                and self._domain_var_counts.get((norm_domain, rule.source_variable_name), 0) > 1
             ):
                 continue
             candidates.append(rule)
@@ -953,6 +1036,13 @@ class EnrichmentPipeline:
             _skip_default_phi=_skip_default_phi,
             norm_domain=norm_dom,
             norm_form_key=norm_fk,
+            apply_missing_fallbacks=not (
+                isinstance(data, Mapping)
+                and (
+                    isinstance(data.get("recordData"), dict)
+                    or isinstance(data.get("record_data"), dict)
+                )
+            ),
         )
 
     def _evaluate_business_logic(self, expr: str, value: Any) -> Any:
@@ -983,6 +1073,7 @@ class EnrichmentPipeline:
         _skip_default_phi: bool = False,
         norm_domain: str | None = None,
         norm_form_key: str | None = None,
+        apply_missing_fallbacks: bool = False,
     ) -> Any:
         """Recursively transform data structures."""
         if isinstance(data, dict):
@@ -998,6 +1089,7 @@ class EnrichmentPipeline:
                     new_dict[new_key] = _MASKED_VALUE
                     continue
 
+                is_record_payload_child = depth == 0 and k in {"recordData", "record_data"}
                 new_val = (
                     self._transform_recursive(
                         v,
@@ -1006,6 +1098,7 @@ class EnrichmentPipeline:
                         _skip_default_phi=_skip_default_phi,
                         norm_domain=norm_domain,
                         norm_form_key=norm_form_key,
+                        apply_missing_fallbacks=is_record_payload_child,
                     )
                     if isinstance(v, (dict, list, tuple))
                     else v
@@ -1068,9 +1161,15 @@ class EnrichmentPipeline:
                     if is_phi_key or target_is_phi:
                         new_val = _MASKED_VALUE
 
+                    if (
+                        used_fallback
+                        and new_key in new_dict
+                        and not self._is_empty_input(new_dict[new_key])
+                    ):
+                        continue
                 new_dict[new_key] = new_val
 
-            if depth == 0 and self.all_mappings:
+            if apply_missing_fallbacks and self.all_mappings:
                 for fb_rule in self._applicable_fallback_rules(
                     norm_domain=norm_domain,
                     norm_form_key=norm_form_key,

@@ -351,7 +351,7 @@ class TestNeo4jExportSink:
         [
             ("snake_case", "study_key", "subject_key", "visit_id", "visit_id"),
             ("camelCase", "studyKey", "subjectKey", "visitId", "visitId"),
-            ("sdtm", "STUDYID", "USUBJID", "VISIT_ID", "VISITNUM"),
+            ("sdtm", "STUDYID", "USUBJID", "VISITNUM", "VISITNUM"),
         ],
     )
     def test_write_batch_null_subject_key_guards_subject_and_visit_merges(

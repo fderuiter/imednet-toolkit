@@ -1960,15 +1960,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             validate_cdash_variable,
         )
         from imednet.spi.sink_base import (
+            SinkConfig,
             build_form_sdtm_domain_map,
             evaluate_standards_readiness,
             filter_forms_by_sdtm_domain,
             merge_form_ids_into_record_filter,
             record_matches_sdtm_domain,
-            redact_batch_records,
             resolve_form_sdtm_domain,
         )
-        from imednet.spi.sinks import resolve_study_configuration
 
         validate_path_segment(study_key, name="study_key")
         if min_standards_score is not None and not 0.0 <= min_standards_score <= 100.0:
@@ -2013,9 +2012,17 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             with fetching_status("standards readiness", study_key):
                 raw_forms, raw_variables, raw_records = _fetch_inputs()
 
-        form_id_to_key: dict[Any, str] = {}
+        def _positive_fid(val: Any) -> int | None:
+            if isinstance(val, int) and not isinstance(val, bool):
+                return val if val > 0 else None
+            if isinstance(val, str) and val.strip().isdigit():
+                parsed = int(val.strip())
+                return parsed if parsed > 0 else None
+            return None
+
+        form_id_to_key: dict[int, str] = {}
         for f_obj in raw_forms:
-            fid = (
+            fid = _positive_fid(
                 f_obj.get("form_id", f_obj.get("formId"))
                 if isinstance(f_obj, Mapping)
                 else getattr(f_obj, "form_id", getattr(f_obj, "formId", None))
@@ -2033,7 +2040,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             study_config=study_cfg,
         )
         for f_obj in raw_forms:
-            fid = (
+            fid = _positive_fid(
                 f_obj.get("form_id", f_obj.get("formId"))
                 if isinstance(f_obj, Mapping)
                 else getattr(f_obj, "form_id", getattr(f_obj, "formId", None))
@@ -2051,7 +2058,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                         cli_form_map[fid] = fallback_dom
 
         def _resolve_item_domain(item: Any) -> str:
-            fid = (
+            fid = _positive_fid(
                 item.get("form_id", item.get("formId"))
                 if isinstance(item, Mapping)
                 else getattr(item, "form_id", getattr(item, "formId", None))
@@ -2061,14 +2068,21 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 if isinstance(item, Mapping)
                 else getattr(item, "form_key", getattr(item, "formKey", None))
             )
-            if not fkey and fid is not None:
-                fkey = form_id_to_key.get(fid)
             resolved_dom = resolve_form_sdtm_domain(
-                item if fkey is None else fkey,
+                item,
                 study_config=study_cfg,
                 form_domain_map=cli_form_map or None,
                 fallback="",
             )
+            if not resolved_dom and not fkey and fid is not None:
+                mapped_fk = form_id_to_key.get(fid)
+                if mapped_fk:
+                    resolved_dom = resolve_form_sdtm_domain(
+                        mapped_fk,
+                        study_config=study_cfg,
+                        form_domain_map=cli_form_map or None,
+                        fallback="",
+                    )
             if not resolved_dom and fid is not None and fid in cli_form_map:
                 resolved_dom = cli_form_map[fid]
             if resolved_dom:
@@ -2099,17 +2113,6 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 )
             ]
 
-        serialized_records = _to_serializable(raw_records)
-        if mask_phi:
-            sanitized_records: Any = redact_batch_records(
-                serialized_records, mask_phi=True, as_sdtm=True
-            )
-            custom_phi = _resolve_custom_phi_fields(study_key)
-            if custom_phi:
-                sanitized_records = mask_custom_phi_recursive(sanitized_records, custom_phi)
-        else:
-            sanitized_records = serialized_records
-
         cdash_warnings: list[str] = []
         for var in raw_variables:
             var_name = (
@@ -2125,14 +2128,112 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 if not valid_cdash and warning and warning not in cdash_warnings:
                     cdash_warnings.append(warning)
 
-        report = evaluate_standards_readiness(
-            sanitized_records,
+        cfg_lookups: dict[str, dict[str, str]] | None = None
+        raw_cfg_lookups = getattr(study_cfg, "terminology_lookups", None)
+        if isinstance(raw_cfg_lookups, Mapping) and raw_cfg_lookups:
+            cfg_lookups = {
+                str(tbl_name): {str(k): str(v) for k, v in tbl_vals.items()}
+                for tbl_name, tbl_vals in raw_cfg_lookups.items()
+                if isinstance(tbl_vals, Mapping)
+            } or None
+
+        eval_config = SinkConfig(
             study_key=study_key,
+            mask_phi=mask_phi,
             standards_profile=standards_profile,
             sdtm_domain=target_domain,
+            extra={"study_config": study_cfg} if study_cfg is not None else {},
+        )
+        report = evaluate_standards_readiness(
+            raw_records,
+            study_key=study_key,
+            config=eval_config,
+            standards_profile=standards_profile,
+            sdtm_domain=target_domain,
+            terminology_lookups=cfg_lookups,
             form_domain_map=cli_form_map if (cli_form_map or raw_forms) else None,
         )
-        all_warnings = list(dict.fromkeys([*report.warnings, *cdash_warnings]))
+
+        custom_phi = _resolve_custom_phi_fields(study_key) if mask_phi else []
+        if mask_phi and study_cfg is not None:
+            cfg_phi = getattr(study_cfg, "phi_fields", None) or []
+            if cfg_phi:
+                custom_phi = list(dict.fromkeys([*custom_phi, *(str(f) for f in cfg_phi)]))
+        active_registry = (
+            build_study_sensitivity_registry(custom_phi)
+            if mask_phi
+            else global_sensitivity_registry
+        )
+        sensitive_literals: list[str] = []
+        if mask_phi:
+            seen_literals: set[str] = set()
+
+            def _collect_record_phi_literals(obj: Any) -> None:
+                if isinstance(obj, Mapping):
+                    for k, v in obj.items():
+                        k_str = str(k)
+                        if isinstance(v, (Mapping, list, tuple)):
+                            _collect_record_phi_literals(v)
+                        elif v is not None and not isinstance(v, bool):
+                            k_norm = re.sub(r"[^a-z0-9]", "", k_str.lower())
+                            is_birth = k_norm in {"birthdate", "brthdtc", "brthdat", "dob"}
+                            if (
+                                is_birth
+                                or (
+                                    not active_registry.is_exempt(k_str)
+                                    and active_registry.is_sensitive(k_str)
+                                )
+                                or any(
+                                    re.sub(r"[^a-z0-9]", "", cp.lower()) == k_norm
+                                    for cp in custom_phi
+                                )
+                            ):
+                                lit = str(v).strip()
+                                if len(lit) >= 2 and lit not in seen_literals:
+                                    seen_literals.add(lit)
+                                    sensitive_literals.append(lit)
+                elif isinstance(obj, (list, tuple)):
+                    for elem in obj:
+                        _collect_record_phi_literals(elem)
+
+            _collect_record_phi_literals(_to_serializable(raw_records))
+            sensitive_literals.sort(key=len, reverse=True)
+
+        def _scrub_cli_diagnostic(text: str) -> str:
+            if not mask_phi or not text:
+                return text
+            scrubbed = redact_sensitive_text(text)
+            scrubbed = str(mask_clinical_phi(scrubbed))
+            scrubbed = sanitize_diagnostic_text(scrubbed, registry=active_registry)
+            scrubbed = re.sub(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                "***MASKED***",
+                scrubbed,
+            )
+            scrubbed = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "***MASKED***", scrubbed)
+            for lit in sensitive_literals:
+                if lit not in scrubbed:
+                    continue
+                if len(lit) <= 3:
+                    scrubbed = re.sub(
+                        rf"(?<=Subject ){re.escape(lit)}(?= record )",
+                        "***MASKED***",
+                        scrubbed,
+                    )
+                else:
+                    scrubbed = re.sub(
+                        rf"(?<![A-Za-z0-9]){re.escape(lit)}(?![A-Za-z0-9])",
+                        "***MASKED***",
+                        scrubbed,
+                    )
+            return scrubbed
+
+        raw_all_warnings = list(dict.fromkeys([*report.warnings, *cdash_warnings]))
+        all_warnings = (
+            list(dict.fromkeys(_scrub_cli_diagnostic(w) for w in raw_all_warnings))
+            if mask_phi
+            else raw_all_warnings
+        )
         threshold = 100.0 if min_standards_score is None else float(min_standards_score)
         has_domain_level_error = any(
             v.severity.upper() == "ERROR" and v.field in {*report.domain_scores, "study"}
@@ -2143,9 +2244,15 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             if (report.checked_records == 0 or report.checked_fields == 0 or has_domain_level_error)
             else (report.is_ready if min_standards_score is None else report.score >= threshold)
         )
-        serialized_violations = [
-            v.model_dump() if hasattr(v, "model_dump") else str(v) for v in report.violations
-        ]
+        serialized_violations: list[Any] = []
+        for v in report.violations:
+            if hasattr(v, "model_dump"):
+                dumped_v = dict(v.model_dump())
+                if mask_phi and isinstance(dumped_v.get("message"), str):
+                    dumped_v["message"] = _scrub_cli_diagnostic(dumped_v["message"])
+                serialized_violations.append(dumped_v)
+            else:
+                serialized_violations.append(_scrub_cli_diagnostic(str(v)))
 
         payload = {
             "study_key": study_key,
@@ -2184,14 +2291,13 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 _emit_line(f"Warnings ({len(all_warnings)}):")
                 for warn_msg in all_warnings:
                     _emit_line(f"  - {warn_msg}")
-            if report.violations:
-                _emit_line(f"Violations ({len(report.violations)}):")
-                for violation in report.violations:
-                    v_msg = (
-                        f"[{violation.severity}] {violation.field}: {violation.message}"
-                        if hasattr(violation, "message")
-                        else str(violation)
-                    )
+            if serialized_violations:
+                _emit_line(f"Violations ({len(serialized_violations)}):")
+                for v_entry in serialized_violations:
+                    if isinstance(v_entry, Mapping):
+                        v_msg = f"[{v_entry.get('severity', 'ERROR')}] {v_entry.get('field', '')}: {v_entry.get('message', '')}"
+                    else:
+                        v_msg = str(v_entry)
                     _emit_line(f"  - {v_msg}")
 
         if not passed:
