@@ -3,16 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import sys
-from typing import Any
 
 from ...sdk import ImednetSDK
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import (
     fetching_status,
-    format_job_progress,
     simulation_mode_context,
-    supports_live_status,
 )
 from ..utils.args import (
     add_output_format,
@@ -22,6 +18,7 @@ from ..utils.args import (
     resolve_study_key,
 )
 from ..utils.output import display_list
+from ..utils.write_helpers import make_job_progress_callback
 
 JOB_SUMMARY_FIELDS: list[str] = [
     "batch_id",
@@ -95,24 +92,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     ) -> None:
         resolved_format = resolve_output_format(output_format)
         with fetching_status("job result", study_key) as status_ctrl:
-
-            def on_progress(event: Any) -> None:
-                msg = format_job_progress(event)
-                if status_ctrl is not None and hasattr(status_ctrl, "update"):
-                    status_ctrl.update(msg)
-                elif supports_live_status(sys.stderr):
-                    try:
-                        sys.stderr.write(f"\r\033[K{msg}")
-                        sys.stderr.flush()
-                    except (BrokenPipeError, OSError, ValueError):
-                        pass
-
             job = sdk.poll_job(
                 study_key,
                 batch_id,
                 interval=interval,
                 timeout=timeout,
-                on_progress=on_progress,
+                on_progress=make_job_progress_callback(status_ctrl),
             )
         display_list(
             [job],
