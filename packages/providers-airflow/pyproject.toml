@@ -7,6 +7,7 @@ authors = [
 ]
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -76,6 +77,9 @@ artifacts = ["src/apache_airflow_providers_imednet/py.typed"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/README.md",
     "/src/apache_airflow_providers_imednet",
     "/src/apache_airflow_providers_imednet/py.typed",
 ]

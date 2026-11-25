@@ -49,10 +49,13 @@ Canonical tasks
 non-mutating ``typos --force-exclude .`` spell checking, and the
 typing targets), ``hatch run verify-tests`` (offline workspace tests and
 90% coverage), ``hatch run docs`` (strict documentation checks), and
-``hatch run validate-package-consumption`` (isolated clean-venv wheel,
-PEP 561 ``py.typed`` / ``mypy --strict`` consumer typing, and
+``hatch run validate-package-consumption`` (isolated clean-venv wheel and
+``--no-binary`` source-distribution ``.tar.gz`` installs, PEP 639
+``License-File: LICENSE`` metadata, sdist archive contents and offline PEP 517
+wheel rebuilds, PEP 561 ``py.typed`` / ``mypy --strict`` consumer typing, and
 optional-dependency smoke checks across all workspace packages and 21 extras;
-pass ``--wheel-dir <dir>`` to reuse prebuilt wheels). Set ``IMEDNET_TEST_WHEELS=1``
+pass ``--dist-dir <dir>`` to validate prebuilt ``.whl`` and ``.tar.gz``
+distributions, or ``--wheel-dir <dir>`` to reuse prebuilt wheels). Set ``IMEDNET_TEST_WHEELS=1``
 after installing built wheels into ``.venv`` to replicate CI wheel-mode ``pytest`` runs.
 ``hatch run verify`` runs ``verify-static`` and ``verify-tests`` in order; the
 Pipeline ``docs`` job runs ``uv run python scripts/build_docs.py`` once on the

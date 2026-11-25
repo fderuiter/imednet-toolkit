@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 import email
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 import zipfile
+import zlib
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
@@ -101,9 +104,10 @@ def verify_wheel_metadata(
     packages_dir: Path = PACKAGES_DIR,
     *,
     require_classifiers: bool = True,
+    require_license_file: bool = True,
 ) -> None:
-    """Verify built workspace wheels expose Markdown descriptions, MIT license, and Python 3.11-3.13 classifiers."""
-    for _, pkg_name in discover_workspace_packages(packages_dir):
+    """Verify built workspace wheels expose Markdown descriptions, MIT license, License-File, and Python 3.11-3.13 classifiers."""
+    for pkg_path, pkg_name in discover_workspace_packages(packages_dir):
         wheel_path = _find_wheel_for_package(dist_dir, pkg_name)
         if wheel_path is None:
             raise ValueError(
@@ -111,12 +115,37 @@ def verify_wheel_metadata(
             )
 
         with zipfile.ZipFile(wheel_path) as zf:
+            names = set(zf.namelist())
             meta_entries = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
             if len(meta_entries) != 1:
                 raise ValueError(
                     f"Wheel '{wheel_path.name}' is missing .dist-info/METADATA (found {meta_entries})"
                 )
+            dist_info_dir = meta_entries[0].rsplit("/", 1)[0]
             msg = email.message_from_bytes(zf.read(meta_entries[0]))
+
+            if require_license_file:
+                license_files = [v.strip() for v in msg.get_all("License-File", []) if v.strip()]
+                if "LICENSE" not in license_files:
+                    raise ValueError(
+                        f"Wheel '{wheel_path.name}' expected 'License-File: LICENSE' in METADATA, "
+                        f"got {license_files!r}"
+                    )
+                license_entry = f"{dist_info_dir}/licenses/LICENSE"
+                if license_entry not in names:
+                    raise ValueError(
+                        f"Wheel '{wheel_path.name}' is missing bundled license file '{license_entry}'"
+                    )
+                bundled_license = zf.read(license_entry)
+                if not bundled_license.strip():
+                    raise ValueError(
+                        f"Wheel '{wheel_path.name}' has an empty bundled license file '{license_entry}'"
+                    )
+                source_license = pkg_path / "LICENSE"
+                if source_license.is_file() and bundled_license != source_license.read_bytes():
+                    raise ValueError(
+                        f"Wheel '{wheel_path.name}' bundled '{license_entry}' does not match {source_license}"
+                    )
 
         content_type = (msg.get("Description-Content-Type") or "").split(";")[0].strip().lower()
         if content_type != "text/markdown":
@@ -152,7 +181,12 @@ def validate_wheel_metadata(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -
     """Verify every built wheel in dist_dir declares License/License-Expression, text/markdown, and a non-empty body."""
     if not any(dist_dir.glob("*.whl")):
         raise ValueError(f"No built wheels (.whl) found in {dist_dir}")
-    verify_wheel_metadata(dist_dir, packages_dir=packages_dir, require_classifiers=False)
+    verify_wheel_metadata(
+        dist_dir,
+        packages_dir=packages_dir,
+        require_classifiers=False,
+        require_license_file=False,
+    )
 
 
 def build_wheels(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
@@ -166,6 +200,22 @@ def build_wheels(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
 
     verify_wheel_metadata(dist_dir, packages_dir=packages_dir)
     verify_wheel_py_typed(dist_dir, packages_dir=packages_dir)
+
+
+def build_distributions(dist_dir: Path, packages_dir: Path = PACKAGES_DIR) -> None:
+    """Build both wheels and sdists for all workspace packages and verify archive metadata."""
+    uv_bin = _resolve_uv()
+    if dist_dir.exists():
+        shutil.rmtree(dist_dir)
+    dist_dir.mkdir(parents=True)
+
+    for pkg_path, _ in discover_workspace_packages(packages_dir):
+        _build_single_wheel(uv_bin, pkg_path, dist_dir)
+        _build_single_sdist(uv_bin, pkg_path, dist_dir)
+
+    verify_wheel_metadata(dist_dir, packages_dir=packages_dir)
+    verify_wheel_py_typed(dist_dir, packages_dir=packages_dir)
+    verify_sdist_archives(dist_dir, packages_dir=packages_dir)
 
 
 def discover_workspace_packages(packages_dir: Path = PACKAGES_DIR) -> list[tuple[Path, str]]:
@@ -339,6 +389,17 @@ def _find_wheel_for_package(wheel_dir: Path, pkg_name: str) -> Path | None:
     return max(matching) if matching else None
 
 
+def _find_sdist_for_package(dist_dir: Path, pkg_name: str) -> Path | None:
+    expected_norm = _normalize_wheel_prefix(pkg_name)
+    matching: list[Path] = []
+    for candidate in sorted(dist_dir.glob("*.tar.gz")):
+        stem = candidate.name[: -len(".tar.gz")]
+        match = re.match(r"^(.+)-(\d.*)$", stem)
+        if match and _normalize_wheel_prefix(match.group(1)) == expected_norm:
+            matching.append(candidate)
+    return max(matching) if matching else None
+
+
 def _build_single_wheel(uv_bin: str, pkg_path: Path, dist_dir: Path) -> None:
     print(f"Building wheel for {pkg_path.name}...")
     build_cmd = [
@@ -354,6 +415,49 @@ def _build_single_wheel(uv_bin: str, pkg_path: Path, dist_dir: Path) -> None:
         run([*build_cmd, "--offline"])
     except subprocess.CalledProcessError:
         run(build_cmd)
+
+
+def _build_single_sdist(uv_bin: str, pkg_path: Path, dist_dir: Path) -> None:
+    print(f"Building sdist for {pkg_path.name}...")
+    build_cmd = [
+        uv_bin,
+        "build",
+        "--sdist",
+        "--no-create-gitignore",
+        "--out-dir",
+        str(dist_dir),
+        str(pkg_path),
+    ]
+    try:
+        run([*build_cmd, "--offline"])
+    except subprocess.CalledProcessError:
+        run(build_cmd)
+
+
+def _tighten_and_run_builds(
+    packages_to_build: Sequence[Path],
+    manifest_path: Path,
+    build_fn: Any,
+) -> None:
+    internal_packages = (
+        tighten_dependencies.get_internal_packages(manifest_path) if manifest_path.exists() else {}
+    )
+    try:
+        if internal_packages:
+            for pkg_path in packages_to_build:
+                tighten_dependencies.tighten_file(pkg_path / "pyproject.toml", internal_packages)
+        for pkg_path in packages_to_build:
+            build_fn(pkg_path)
+    finally:
+        if internal_packages:
+            tighten_dependencies.restore_files(internal_packages)
+        for pkg_path in packages_to_build:
+            pyproject_path = pkg_path / "pyproject.toml"
+            backup_path = pyproject_path.with_suffix(".toml.bak")
+            if backup_path.exists():
+                shutil.copy2(backup_path, pyproject_path)
+                backup_path.unlink()
+                print(f"Restored {pyproject_path} from backup")
 
 
 def prepare_wheels(
@@ -388,30 +492,90 @@ def prepare_wheels(
         return []
 
     uv_bin = _resolve_uv()
-    internal_packages = (
-        tighten_dependencies.get_internal_packages(manifest_path) if manifest_path.exists() else {}
-    )
-
     built_names: list[str] = []
-    try:
-        if internal_packages:
-            for pkg_path, _ in missing_packages:
-                tighten_dependencies.tighten_file(pkg_path / "pyproject.toml", internal_packages)
 
-        for pkg_path, _ in missing_packages:
+    def _build_pkg_wheel(pkg_path: Path) -> None:
+        _build_single_wheel(uv_bin, pkg_path, dist_dir)
+        built_names.append(pkg_path.name)
+
+    _tighten_and_run_builds([p for p, _ in missing_packages], manifest_path, _build_pkg_wheel)
+    return built_names
+
+
+def prepare_distributions(
+    dist_dir: Path,
+    source_dir: Path | None = None,
+    *,
+    allow_build_missing: bool = True,
+    packages_dir: Path = PACKAGES_DIR,
+    manifest_path: Path = MANIFEST_PATH,
+) -> list[str]:
+    """Populate *dist_dir* with both ``.whl`` and ``.tar.gz`` distributions.
+
+    When *allow_build_missing* is ``False`` (used for ``--dist-dir``), *source_dir*
+    must exist and already contain both ``.whl`` and ``.tar.gz`` archives for every
+    workspace package, raising :class:`ConsumptionValidationError` otherwise.
+    """
+    if not allow_build_missing and (source_dir is None or not source_dir.is_dir()):
+        raise ConsumptionValidationError(f"Distribution directory does not exist: {source_dir}")
+
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    workspace_packages = discover_workspace_packages(packages_dir)
+
+    missing_wheels: set[Path] = set()
+    missing_sdists: set[Path] = set()
+    packages_needing_build: list[Path] = []
+
+    for pkg_path, pkg_name in workspace_packages:
+        prebuilt_wheel = (
+            _find_wheel_for_package(source_dir, pkg_name)
+            if source_dir is not None and source_dir.is_dir()
+            else None
+        )
+        prebuilt_sdist = (
+            _find_sdist_for_package(source_dir, pkg_name)
+            if source_dir is not None and source_dir.is_dir()
+            else None
+        )
+
+        if prebuilt_wheel is not None:
+            print(f"Reusing prebuilt wheel for {pkg_path.name}: {prebuilt_wheel.name}")
+            shutil.copy2(prebuilt_wheel, dist_dir / prebuilt_wheel.name)
+        elif not allow_build_missing:
+            raise ConsumptionValidationError(
+                f"Missing built wheel (.whl) for workspace package '{pkg_name}' in {source_dir}"
+            )
+        else:
+            missing_wheels.add(pkg_path)
+
+        if prebuilt_sdist is not None:
+            print(f"Reusing prebuilt sdist for {pkg_path.name}: {prebuilt_sdist.name}")
+            shutil.copy2(prebuilt_sdist, dist_dir / prebuilt_sdist.name)
+        elif not allow_build_missing:
+            raise ConsumptionValidationError(
+                f"Missing built sdist (.tar.gz) for workspace package '{pkg_name}' in {source_dir}"
+            )
+        else:
+            missing_sdists.add(pkg_path)
+
+        if pkg_path in missing_wheels or pkg_path in missing_sdists:
+            packages_needing_build.append(pkg_path)
+
+    if not packages_needing_build:
+        print("All workspace wheels and sdists found in prebuilt directory; skipping builds.")
+        return []
+
+    uv_bin = _resolve_uv()
+    built_names: list[str] = []
+
+    def _build_pkg_artifacts(pkg_path: Path) -> None:
+        if pkg_path in missing_wheels:
             _build_single_wheel(uv_bin, pkg_path, dist_dir)
-            built_names.append(pkg_path.name)
-    finally:
-        if internal_packages:
-            tighten_dependencies.restore_files(internal_packages)
-        for pkg_path, _ in missing_packages:
-            pyproject_path = pkg_path / "pyproject.toml"
-            backup_path = pyproject_path.with_suffix(".toml.bak")
-            if backup_path.exists():
-                shutil.copy2(backup_path, pyproject_path)
-                backup_path.unlink()
-                print(f"Restored {pyproject_path} from backup")
+        if pkg_path in missing_sdists:
+            _build_single_sdist(uv_bin, pkg_path, dist_dir)
+        built_names.append(pkg_path.name)
 
+    _tighten_and_run_builds(packages_needing_build, manifest_path, _build_pkg_artifacts)
     return built_names
 
 
@@ -463,6 +627,209 @@ def _resolve_workspace_wheels(
     return workspace_wheels
 
 
+def _resolve_workspace_sdists(
+    dist_dir: Path,
+    packages_dir: Path = PACKAGES_DIR,
+) -> dict[str, Path]:
+    workspace_sdists: dict[str, Path] = {}
+    for _, pkg_name in discover_workspace_packages(packages_dir):
+        matched = _find_sdist_for_package(dist_dir, pkg_name)
+        if matched is not None:
+            workspace_sdists[pkg_name] = matched
+    return workspace_sdists
+
+
+def verify_sdist_archives(
+    dist_dir: Path,
+    packages_dir: Path = PACKAGES_DIR,
+    *,
+    require_classifiers: bool = True,
+) -> None:
+    """Verify every built workspace sdist contains compliant metadata, docs, license, and py.typed."""
+    for pkg_path, pkg_name, import_pkg in discover_workspace_import_packages(packages_dir):
+        sdist_path = _find_sdist_for_package(dist_dir, pkg_name)
+        if sdist_path is None:
+            raise ConsumptionValidationError(
+                f"Missing built sdist (.tar.gz) for workspace package '{pkg_name}' in {dist_dir}"
+            )
+
+        try:
+            with tarfile.open(sdist_path, "r:gz") as tf:
+                file_bytes_by_rel: dict[str, bytes] = {}
+                top_dirs: set[str] = set()
+                for member in tf.getmembers():
+                    norm_name = member.name.replace("\\", "/").lstrip("./")
+                    parts = [p for p in norm_name.split("/") if p]
+                    if (
+                        not parts
+                        or member.name.startswith("/")
+                        or ".." in parts
+                        or member.issym()
+                        or member.islnk()
+                    ):
+                        raise ConsumptionValidationError(
+                            f"Sdist '{sdist_path.name}' contains unsafe archive member '{member.name}'"
+                        )
+                    top_dirs.add(parts[0])
+                    if member.isfile():
+                        if len(parts) < 2:
+                            raise ConsumptionValidationError(
+                                f"Sdist '{sdist_path.name}' places file '{member.name}' outside top-level directory"
+                            )
+                        extracted = tf.extractfile(member)
+                        if extracted is None:
+                            raise ConsumptionValidationError(
+                                f"Sdist '{sdist_path.name}' member '{member.name}' could not be extracted"
+                            )
+                        rel_path = "/".join(parts[1:])
+                        file_bytes_by_rel[rel_path] = extracted.read()
+        except ConsumptionValidationError:
+            raise
+        except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
+            raise ConsumptionValidationError(
+                f"Corrupt or unreadable sdist archive '{sdist_path.name}': {exc}"
+            ) from exc
+
+        if len(top_dirs) != 1 or not file_bytes_by_rel:
+            raise ConsumptionValidationError(
+                f"Sdist '{sdist_path.name}' must contain a single non-empty top-level directory (found {sorted(top_dirs)})"
+            )
+
+        required_non_empty = (
+            "PKG-INFO",
+            "LICENSE",
+            "CHANGELOG.md",
+            "README.md",
+            "pyproject.toml",
+        )
+        for req_rel in required_non_empty:
+            if req_rel not in file_bytes_by_rel:
+                raise ConsumptionValidationError(
+                    f"Sdist '{sdist_path.name}' is missing required file '{req_rel}'"
+                )
+            if not file_bytes_by_rel[req_rel].strip():
+                raise ConsumptionValidationError(
+                    f"Sdist '{sdist_path.name}' contains an empty '{req_rel}' file"
+                )
+
+        py_typed_rel = f"src/{import_pkg}/py.typed"
+        if py_typed_rel not in file_bytes_by_rel:
+            raise ConsumptionValidationError(
+                f"Sdist '{sdist_path.name}' is missing PEP 561 marker '{py_typed_rel}'"
+            )
+
+        for synced_doc in ("LICENSE", "CHANGELOG.md", "README.md"):
+            disk_file = pkg_path / synced_doc
+            if disk_file.is_file() and file_bytes_by_rel[synced_doc] != disk_file.read_bytes():
+                raise ConsumptionValidationError(
+                    f"Sdist '{sdist_path.name}' file '{synced_doc}' does not match {disk_file}"
+                )
+
+        msg = email.message_from_bytes(file_bytes_by_rel["PKG-INFO"])
+        content_type = (msg.get("Description-Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "text/markdown":
+            raise ConsumptionValidationError(
+                f"Sdist '{sdist_path.name}' expected Description-Content-Type 'text/markdown', "
+                f"got {msg.get('Description-Content-Type')!r}"
+            )
+        payload = msg.get_payload()
+        if not isinstance(payload, str) or not payload.strip():
+            raise ConsumptionValidationError(
+                f"Sdist '{sdist_path.name}' has an empty PKG-INFO description body"
+            )
+
+        license_val = (msg.get("License-Expression") or msg.get("License") or "").strip()
+        if license_val != "MIT":
+            raise ConsumptionValidationError(
+                f"Sdist '{sdist_path.name}' expected License-Expression 'MIT', got {license_val!r}"
+            )
+
+        license_files = [v.strip() for v in msg.get_all("License-File", []) if v.strip()]
+        if "LICENSE" not in license_files:
+            raise ConsumptionValidationError(
+                f"Sdist '{sdist_path.name}' expected 'License-File: LICENSE' in PKG-INFO, "
+                f"got {license_files!r}"
+            )
+
+        if require_classifiers:
+            classifiers = set(msg.get_all("Classifier", []))
+            missing_classifiers = [
+                c for c in (*REQUIRED_PYTHON_CLASSIFIERS, TYPED_CLASSIFIER) if c not in classifiers
+            ]
+            if missing_classifiers:
+                raise ConsumptionValidationError(
+                    f"Sdist '{sdist_path.name}' PKG-INFO is missing classifiers: {missing_classifiers}"
+                )
+
+        print(f"Verified sdist archive contents and PKG-INFO for {sdist_path.name}.")
+
+
+def verify_sdist_offline_wheel_rebuilds(
+    dist_dir: Path,
+    packages_dir: Path = PACKAGES_DIR,
+    *,
+    require_classifiers: bool = True,
+) -> None:
+    """Rebuild wheels offline via PEP 517 from all workspace sdists inside an OS temp dir."""
+    uv_bin = _resolve_uv()
+    discovered = discover_workspace_packages(packages_dir)
+    print("\n>>> Validating Offline PEP 517 Wheel Rebuilds from Sdist Archives")
+
+    clean_env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "MYPYPATH"}}
+
+    with tempfile.TemporaryDirectory(prefix="imednet-sdist-rebuilds-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        staged_sdists_dir = tmp_root / "sdists"
+        rebuilt_wheels_dir = tmp_root / "rebuilt_wheels"
+        staged_sdists_dir.mkdir(parents=True, exist_ok=True)
+        rebuilt_wheels_dir.mkdir(parents=True, exist_ok=True)
+
+        for _, pkg_name in discovered:
+            sdist_path = _find_sdist_for_package(dist_dir, pkg_name)
+            if sdist_path is None:
+                raise ConsumptionValidationError(
+                    f"Missing built sdist (.tar.gz) for offline PEP 517 rebuild of '{pkg_name}' in {dist_dir}"
+                )
+
+            staged_sdist = staged_sdists_dir / sdist_path.name
+            shutil.copy2(sdist_path, staged_sdist)
+            try:
+                run(
+                    [
+                        uv_bin,
+                        "build",
+                        "--wheel",
+                        "--offline",
+                        "--no-create-gitignore",
+                        "--out-dir",
+                        str(rebuilt_wheels_dir),
+                        str(staged_sdist),
+                    ],
+                    cwd=tmpdir,
+                    env=clean_env,
+                )
+            except subprocess.CalledProcessError as exc:
+                output = (exc.stdout or "") + (exc.stderr or "")
+                raise ConsumptionValidationError(
+                    f"Offline PEP 517 wheel rebuild failed for '{sdist_path.name}':\n{output}"
+                ) from exc
+
+        try:
+            verify_wheel_metadata(
+                rebuilt_wheels_dir,
+                packages_dir=packages_dir,
+                require_classifiers=require_classifiers,
+                require_license_file=True,
+            )
+        except ValueError as exc:
+            raise ConsumptionValidationError(
+                f"Rebuilt wheel metadata validation failed: {exc}"
+            ) from exc
+
+        if require_classifiers:
+            verify_wheel_py_typed(rebuilt_wheels_dir, packages_dir=packages_dir)
+
+
 def _install_into_venv(
     uv_bin: str,
     python_bin: Path,
@@ -471,6 +838,8 @@ def _install_into_venv(
     locked_constraints_file: Path | None,
     install_specs: Sequence[str],
     tmpdir: str,
+    *,
+    extra_pip_args: Sequence[str] = (),
 ) -> None:
     base_cmd = [
         uv_bin,
@@ -482,6 +851,7 @@ def _install_into_venv(
         str(dist_dir),
         "-c",
         str(constraints_file),
+        *extra_pip_args,
     ]
     if locked_constraints_file is not None:
         locked_cmd = [*base_cmd, "-c", str(locked_constraints_file), *install_specs]
@@ -500,6 +870,155 @@ def _install_into_venv(
         run([*unlocked_cmd, "--offline"], cwd=tmpdir)
     except subprocess.CalledProcessError:
         run(unlocked_cmd, cwd=tmpdir)
+
+
+def verify_sdist_clean_venv_install(
+    dist_dir: Path,
+    *,
+    packages_dir: Path = PACKAGES_DIR,
+    uv_lock_path: Path = UV_LOCK_PATH,
+) -> None:
+    """Install all workspace ``.tar.gz`` archives with ``--no-binary`` into a clean venv and smoke-test."""
+    uv_bin = _resolve_uv()
+    discovered = discover_workspace_import_packages(packages_dir)
+    print("\n>>> Validating Clean-Venv Sdist Installation (--no-binary for workspace packages)")
+
+    with tempfile.TemporaryDirectory(prefix="imednet-sdist-venv-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        venv_dir = tmp_root / "venv"
+        sdist_only_dir = tmp_root / "sdists"
+        sdist_only_dir.mkdir(parents=True, exist_ok=True)
+
+        run([uv_bin, "venv", "--python", sys.executable, str(venv_dir)], cwd=tmpdir)
+
+        if os.name == "nt":
+            python_bin = venv_dir / "Scripts" / "python.exe"
+            imednet_bin = venv_dir / "Scripts" / "imednet.exe"
+        else:
+            python_bin = venv_dir / "bin" / "python"
+            imednet_bin = venv_dir / "bin" / "imednet"
+
+        workspace_sdists = _resolve_workspace_sdists(dist_dir, packages_dir)
+        missing_sdists = [
+            pkg_name for _, pkg_name, _ in discovered if pkg_name not in workspace_sdists
+        ]
+        if missing_sdists:
+            raise ConsumptionValidationError(
+                f"Missing built sdists (.tar.gz) for clean-venv sdist install: {missing_sdists}"
+            )
+
+        staged_sdists: dict[str, Path] = {}
+        has_imednet_script = False
+        expected_entry_points: list[tuple[str, str, str]] = []
+        for pkg_path, pkg_name, _ in discovered:
+            src_sdist = workspace_sdists[pkg_name]
+            dst_sdist = sdist_only_dir / src_sdist.name
+            shutil.copy2(src_sdist, dst_sdist)
+            staged_sdists[pkg_name] = dst_sdist
+
+            manifest_data = tomllib.loads((pkg_path / "pyproject.toml").read_text(encoding="utf-8"))
+            project_tbl = manifest_data.get("project", {})
+            if "imednet" in project_tbl.get("scripts", {}):
+                has_imednet_script = True
+            for group_name, group_entries in project_tbl.get("entry-points", {}).items():
+                if isinstance(group_entries, dict):
+                    for ep_name, ep_value in group_entries.items():
+                        expected_entry_points.append((group_name, ep_name, str(ep_value)))
+
+        constraints_file = tmp_root / "workspace-sdist-constraints.txt"
+        constraints_file.write_text(
+            "\n".join(
+                f"{pkg_name} @ {sdist_path.resolve().as_uri()}"
+                for pkg_name, sdist_path in sorted(staged_sdists.items())
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        locked_constraints_file = _write_locked_registry_constraints(
+            tmp_root / "locked-constraints.txt",
+            set(staged_sdists.keys()),
+            uv_lock_path=uv_lock_path,
+        )
+
+        no_binary_args: list[str] = []
+        install_specs: list[str] = []
+        for pkg_name, sdist_path in sorted(staged_sdists.items()):
+            no_binary_args.extend(["--no-binary", pkg_name])
+            install_specs.append(f"{pkg_name} @ {sdist_path.resolve().as_uri()}")
+
+        try:
+            _install_into_venv(
+                uv_bin,
+                python_bin,
+                sdist_only_dir,
+                constraints_file,
+                locked_constraints_file,
+                install_specs,
+                tmpdir,
+                extra_pip_args=no_binary_args,
+            )
+        except subprocess.CalledProcessError as exc:
+            output = (exc.stdout or "") + (exc.stderr or "")
+            raise ConsumptionValidationError(
+                f"Clean-venv sdist installation failed:\n{output}"
+            ) from exc
+
+        clean_env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "MYPYPATH"}}
+        dist_import_specs = [(pkg_name, import_pkg) for _, pkg_name, import_pkg in discovered]
+        probe_payload = json.dumps(
+            {
+                "venv_root": str(venv_dir.resolve()),
+                "packages": dist_import_specs,
+                "entry_points": expected_entry_points,
+            }
+        )
+        probe_file = tmp_root / "sdist_smoke_probe.py"
+        probe_file.write_text(
+            "import importlib\n"
+            "import importlib.metadata as md\n"
+            "import json\n"
+            "import pathlib\n\n"
+            f"cfg = json.loads({probe_payload!r})\n"
+            "venv_root = pathlib.Path(cfg['venv_root']).resolve()\n"
+            "bad_origins = []\n"
+            "missing_typed = []\n"
+            "bad_meta = []\n"
+            "bad_direct = []\n"
+            "for dist_name, import_pkg in cfg['packages']:\n"
+            "    mod = importlib.import_module(import_pkg)\n"
+            "    mod_file = pathlib.Path(mod.__file__).resolve()\n"
+            "    if not mod_file.is_relative_to(venv_root):\n"
+            "        bad_origins.append(import_pkg)\n"
+            "    if not (mod_file.parent / 'py.typed').is_file():\n"
+            "        missing_typed.append(import_pkg)\n"
+            "    dist = md.distribution(dist_name)\n"
+            "    lic = (dist.metadata.get('License-Expression') or dist.metadata.get('License') or '').strip()\n"
+            "    lic_files = [v.strip() for v in (dist.metadata.get_all('License-File') or []) if v.strip()]\n"
+            "    if lic != 'MIT' or 'LICENSE' not in lic_files:\n"
+            "        bad_meta.append((dist_name, lic, lic_files))\n"
+            "    direct_text = dist.read_text('direct_url.json')\n"
+            "    if direct_text:\n"
+            "        url = json.loads(direct_text).get('url', '')\n"
+            "        if not url.endswith('.tar.gz'):\n"
+            "            bad_direct.append((dist_name, url))\n"
+            "assert not bad_origins, f'Sdist modules resolved outside clean venv: {bad_origins}'\n"
+            "assert not missing_typed, f'Installed sdists missing py.typed: {missing_typed}'\n"
+            "assert not bad_meta, f'Installed sdists missing MIT/License-File metadata: {bad_meta}'\n"
+            "assert not bad_direct, f'Installed workspace packages did not originate from .tar.gz: {bad_direct}'\n"
+            "for group_name, ep_name, ep_value in cfg['entry_points']:\n"
+            "    matches = [ep for ep in md.entry_points(group=group_name) if ep.name == ep_name and ep.value == ep_value]\n"
+            "    assert len(matches) == 1 and matches[0].load() is not None, f'Failed loading entry point {group_name}:{ep_name}'\n",
+            encoding="utf-8",
+        )
+        try:
+            run([str(python_bin), str(probe_file)], cwd=tmpdir, env=clean_env)
+            if has_imednet_script:
+                run([str(imednet_bin), "--help"], cwd=tmpdir, env=clean_env)
+        except subprocess.CalledProcessError as exc:
+            output = (exc.stdout or "") + (exc.stderr or "")
+            raise ConsumptionValidationError(
+                f"Clean-venv sdist smoke check failed:\n{output}"
+            ) from exc
 
 
 def _resolve_host_mypy() -> Path | None:
@@ -1262,27 +1781,53 @@ def build_scenarios() -> list[dict[str, Any]]:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate clean-environment package and extras consumption."
+        description="Validate clean-environment wheel, sdist, and extras consumption."
+    )
+    parser.add_argument(
+        "--dist-dir",
+        type=Path,
+        default=None,
+        help="Optional directory containing prebuilt workspace wheels (.whl) and sdists (.tar.gz) to validate.",
     )
     parser.add_argument(
         "--wheel-dir",
         type=Path,
         default=None,
-        help="Optional directory containing prebuilt workspace wheels to reuse.",
+        help="Compatible alias for a directory containing prebuilt workspace wheels (missing sdists are built).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if (
+        args.dist_dir is not None
+        and args.wheel_dir is not None
+        and args.dist_dir.resolve() != args.wheel_dir.resolve()
+    ):
+        parser.error("Cannot specify different paths for --dist-dir and --wheel-dir.")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     scenarios = build_scenarios()
+    source_dir = args.dist_dir if args.dist_dir is not None else args.wheel_dir
+    allow_build_missing = args.dist_dir is None
     try:
         verify_manifest_extra_coverage(scenarios, PACKAGES_DIR)
-        with tempfile.TemporaryDirectory(prefix="imednet-consumption-wheels-") as tmp_wheels:
-            dist_dir = Path(tmp_wheels)
-            prepare_wheels(dist_dir, args.wheel_dir)
+        with tempfile.TemporaryDirectory(prefix="imednet-consumption-dists-") as tmp_dists:
+            dist_dir = Path(tmp_dists)
+            prepare_distributions(
+                dist_dir,
+                source_dir,
+                allow_build_missing=allow_build_missing,
+            )
             verify_wheel_metadata(dist_dir, PACKAGES_DIR)
             verify_wheel_py_typed(dist_dir, PACKAGES_DIR)
+            verify_sdist_archives(dist_dir, PACKAGES_DIR)
+            verify_sdist_offline_wheel_rebuilds(dist_dir, PACKAGES_DIR)
+            verify_sdist_clean_venv_install(
+                dist_dir,
+                packages_dir=PACKAGES_DIR,
+                uv_lock_path=UV_LOCK_PATH,
+            )
             verify_wheel_mypy_strict(
                 dist_dir,
                 packages_dir=PACKAGES_DIR,

@@ -7,6 +7,7 @@ authors = [
 ]
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -43,6 +44,9 @@ artifacts = ["src/imednet_tui/py.typed"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/README.md",
     "/src/imednet_tui",
     "/src/imednet_tui/py.typed",
 ]

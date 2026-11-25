@@ -50,7 +50,27 @@ def test_is_ignored_path_exempts_agents_docs_examples_and_markdown():
     assert is_ignored_path("docs/agents/issue-tracker.md") is True
     assert is_ignored_path("examples/demo.py") is True
     assert is_ignored_path("AGENTS.md") is True
+    assert is_ignored_path("README.md") is True
+    assert is_ignored_path("CHANGELOG.md") is True
+    assert is_ignored_path("packages/core/README.md") is False
+    assert is_ignored_path("packages/plugins-tui/CHANGELOG.md") is False
+    assert is_ignored_path("./packages/plugins-sinks/README.md") is False
+    assert is_ignored_path(r"packages\providers-airflow\CHANGELOG.md") is False
     assert is_ignored_path("scripts/setup_agent_harnesses.py") is False
+
+
+def test_plan_ci_impact_builds_packages_on_package_readme_or_changelog_changes():
+    packages = {
+        "core": {"name": "imednet", "deps": []},
+        "plugins-tui": {"name": "imednet-tui", "deps": ["imednet"]},
+        "plugins-workflows": {"name": "imednet-workflows", "deps": ["imednet"]},
+    }
+    tui_doc_change = plan_ci_impact(["packages/plugins-tui/README.md"], packages)
+    assert tui_doc_change == {"build": ["plugins-tui"], "test": ["plugins-tui"]}
+
+    core_changelog_change = plan_ci_impact(["packages/core/CHANGELOG.md"], packages)
+    assert core_changelog_change["build"] == ["core"]
+    assert core_changelog_change["test"] == ["core", "plugins-tui", "plugins-workflows"]
 
 
 def test_plan_ci_impact_skips_packages_for_agents_only_changes():

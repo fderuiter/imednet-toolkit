@@ -86,6 +86,10 @@ def _assert_guardrail_contract(
     assert "--write-changes" not in typos_hook_args
     assert "--diff" not in typos_hook_args
 
+    local_repo = next(repo for repo in hooks["repos"] if repo["repo"] == "local")
+    local_hook_ids = {h["id"] for h in local_repo["hooks"]}
+    assert {"check-root-sanitization", "check-package-license-parity"} <= local_hook_ids
+
     ruff_lint = project["tool"]["ruff"]["lint"]
     assert set(ruff_lint["select"]) == EXPECTED_RUFF_SELECT
     per_file_ignores = ruff_lint["per-file-ignores"]
@@ -383,7 +387,7 @@ def test_copilot_and_consumption_workflows_use_canonical_uv_sync():
     assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in consumption_steps)
     assert any("uv sync --locked --all-packages --all-extras" in r for r in consumption_runs)
     assert any(
-        "scripts/validate_package_consumption.py --wheel-dir dist" in r for r in consumption_runs
+        "scripts/validate_package_consumption.py --dist-dir dist" in r for r in consumption_runs
     )
     assert not any("pip install" in r for r in consumption_runs)
 

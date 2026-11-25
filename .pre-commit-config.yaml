@@ -52,3 +52,23 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: check-package-license-parity
+        name: Verify Package LICENSE Parity with Root LICENSE
+        entry: >-
+          python -c "from pathlib import Path; import sys;
+          root = Path('LICENSE');
+          expected = root.read_bytes();
+          pkgs = sorted(p.parent for p in Path('packages').glob('*/pyproject.toml'));
+          bad = [
+          f'{p / \"LICENSE\"} (symlink)' if (p / 'LICENSE').is_symlink()
+          else f'{p / \"LICENSE\"} (missing)' if not (p / 'LICENSE').is_file()
+          else f'{p / \"LICENSE\"} (drift)'
+          for p in pkgs
+          if (p / 'LICENSE').is_symlink() or not (p / 'LICENSE').is_file() or (p / 'LICENSE').read_bytes() != expected
+          ];
+          assert len(pkgs) == 5, f'Expected 5 workspace packages, found {len(pkgs)}';
+          sys.stderr.write('\n'.join(f'LICENSE parity error: {b}' for b in bad) + ('\n' if bad else ''));
+          sys.exit(1 if bad else 0)"
+        language: system
+        pass_filenames: false
+        always_run: true

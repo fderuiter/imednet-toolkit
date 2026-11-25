@@ -600,7 +600,14 @@ jobs:
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Validate Package Consumption
-        run: python scripts/validate_package_consumption.py --wheel-dir dist
+        env:
+          BUILD_MATRIX: ${{ needs.plan.outputs.build_matrix }}
+        run: |
+          if [ "$BUILD_MATRIX" != "[]" ]; then
+            python scripts/validate_package_consumption.py --dist-dir dist
+          else
+            python scripts/validate_package_consumption.py
+          fi
 
   # ------------------------------------------------------------------
   # JOB 4: DOCS (Build & Prepare for Deploy)

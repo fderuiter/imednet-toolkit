@@ -48,9 +48,20 @@ def _normalize_path(file_path: str) -> str:
     return normalized
 
 
+_PACKAGE_DIST_MARKDOWN_FILES = frozenset({"README.md", "CHANGELOG.md"})
+
+
 def is_ignored_path(file_path: str) -> bool:
     """Return True when a changed path requires no package build or test run."""
     normalized = _normalize_path(file_path)
+    parts = normalized.split("/")
+    if (
+        len(parts) == 3
+        and parts[0] == "packages"
+        and bool(parts[1])
+        and parts[2] in _PACKAGE_DIST_MARKDOWN_FILES
+    ):
+        return False
     return normalized.startswith(_IGNORED_PREFIXES) or normalized.endswith(".md")
 
 
