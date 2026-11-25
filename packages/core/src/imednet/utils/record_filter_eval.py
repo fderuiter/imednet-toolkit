@@ -162,12 +162,12 @@ def _compare_values(op: str, left: Any, right: Any) -> bool:
 
 def _evaluate_clause_value(actual: Any, clause: _CompiledClause) -> bool:
     """Evaluate one compiled clause against an extracted Python value."""
+    op = clause.operator
     if actual is None:
-        return False
+        return op == "!="
     if isinstance(actual, Enum):
         actual = actual.value
 
-    op = clause.operator
     expected = clause.expected
 
     if op == "=~":
@@ -181,26 +181,24 @@ def _evaluate_clause_value(actual: Any, clause: _CompiledClause) -> bool:
         return op == "!="
 
     if isinstance(actual, bool):
-        lowered = expected.strip().lower()
-        if lowered == "true":
-            return _compare_values(op, actual, True)
-        if lowered == "false":
-            return _compare_values(op, actual, False)
+        if not clause.was_quoted and expected in ("true", "false"):
+            return _compare_values(op, actual, expected == "true")
         return op == "!="
 
-    if isinstance(actual, (int, float)):
-        exp_num = _try_float(expected)
-        if exp_num is None:
-            return op == "!="
-        return _compare_values(op, float(actual), exp_num)
+    if not clause.was_quoted:
+        if isinstance(actual, (int, float)):
+            exp_num = _try_float(expected)
+            if exp_num is None:
+                return op == "!="
+            return _compare_values(op, float(actual), exp_num)
 
-    expected_dt = _try_utc_datetime(expected)
-    if expected_dt is not None:
-        actual_dt = _try_utc_datetime(actual)
-        if actual_dt is not None:
-            return _compare_values(op, actual_dt, expected_dt)
-        if not clause.was_quoted and op in ("<", "<=", ">", ">="):
-            return False
+        expected_dt = _try_utc_datetime(expected)
+        if expected_dt is not None:
+            actual_dt = _try_utc_datetime(actual)
+            if actual_dt is not None:
+                return _compare_values(op, actual_dt, expected_dt)
+            if op in ("<", "<=", ">", ">="):
+                return False
 
     actual_str = actual.isoformat() if isinstance(actual, (datetime, date)) else str(actual)
     if not clause.was_quoted and op in ("<", "<=", ">", ">="):
@@ -214,57 +212,27 @@ def _evaluate_clause_value(actual: Any, clause: _CompiledClause) -> bool:
     return _compare_values(op, actual_str, expected)
 
 
-def _name_variants(name: str) -> tuple[str, ...]:
-    """Return distinct field name candidates across original, camelCase, snake_case, and UPPER_SNAKE."""
-    camel = _snake_to_camel(name)
-    snake = _camel_to_snake(name)
-    return tuple(dict.fromkeys((name, camel, snake, snake.upper())))
-
-
 def _lookup_mapping_value(data: Mapping[str, Any], field: str) -> tuple[bool, Any]:
-    """Resolve a field or dotted path against a dictionary across naming variants."""
-    for candidate in _name_variants(field):
-        if candidate in data:
-            return True, data[candidate]
-
-    if "." not in field:
-        return False, None
-
-    segments = field.split(".")
-    current: Any = data
-    for idx, seg in enumerate(segments):
-        if not isinstance(current, Mapping):
-            return False, None
-        if idx > 0:
-            remainder = ".".join(segments[idx:])
-            for candidate in _name_variants(remainder):
-                if candidate in current:
-                    return True, current[candidate]
-        found_seg = False
-        for candidate in _name_variants(seg):
-            if candidate in current:
-                current = current[candidate]
-                found_seg = True
-                break
-        if not found_seg:
-            return False, None
-    return True, current
+    """Resolve a recordData variable key by exact case-sensitive membership."""
+    if field in data:
+        return True, data[field]
+    return False, None
 
 
 def _lookup_record_attribute(record: Record, field: str) -> tuple[bool, Any]:
     """Resolve a top-level Record attribute across camelCase and snake_case aliases."""
     canonical = _snake_to_camel(field)
     if canonical == "deleted":
-        return True, bool(record.is_deleted)
+        return True, record.deleted
 
-    for candidate in _name_variants(field):
+    for candidate in dict.fromkeys((field, _camel_to_snake(field), canonical)):
         val = getattr(record, candidate, _MISSING)
         if val is not _MISSING:
             return True, val
 
     extra = getattr(record, "__pydantic_extra__", None)
-    if isinstance(extra, Mapping):
-        return _lookup_mapping_value(extra, field)
+    if isinstance(extra, Mapping) and field in extra:
+        return True, extra[field]
     return False, None
 
 
@@ -279,8 +247,8 @@ def _evaluate_group(
 
     def _check(clause: _CompiledClause) -> bool:
         found, actual = lookup_fn(clause.field)
-        if not found:
-            return False
+        if not found or actual is None:
+            return clause.operator == "!="
         return _evaluate_clause_value(actual, clause)
 
     if connector == "or":
@@ -313,12 +281,11 @@ class CompiledRecordPredicate:
 
         if self.data_clauses:
             raw_data = record.record_data
-            if not isinstance(raw_data, Mapping):
-                return False
+            mapping_data: Mapping[str, Any] = raw_data if isinstance(raw_data, Mapping) else {}
             if not _evaluate_group(
                 self.data_connector,
                 self.data_clauses,
-                lambda f: _lookup_mapping_value(raw_data, f),
+                lambda f: _lookup_mapping_value(mapping_data, f),
             ):
                 return False
 

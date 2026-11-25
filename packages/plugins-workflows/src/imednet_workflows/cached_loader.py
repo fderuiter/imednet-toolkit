@@ -84,7 +84,6 @@ class _LocalRecordMeta:
     date_modified: str | None
     form_key: str
     record_status: str
-    revision: int | None
     last_updated: str | None
 
 
@@ -104,19 +103,6 @@ def _normalize_status_token(value: Any) -> str:
     return str(raw).strip()
 
 
-def _normalize_optional_int(value: Any) -> int | None:
-    """Return integer value when positive/non-boolean, otherwise None."""
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    try:
-        parsed = int(str(value).strip())
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
 def _is_projected_record_updated(projected: Record, local_meta: _LocalRecordMeta) -> bool:
     """Return True when upstream lightweight projection metadata supersedes cached metadata."""
     proj_dm = _serialize_date_modified(projected.date_modified)
@@ -129,10 +115,6 @@ def _is_projected_record_updated(projected: Record, local_meta: _LocalRecordMeta
 
     proj_form_key = (projected.form_key or "").strip()
     if proj_form_key and proj_form_key != local_meta.form_key:
-        return True
-
-    proj_rev = _normalize_optional_int(getattr(projected, "revision", None))
-    if proj_rev is not None and proj_rev != local_meta.revision:
         return True
 
     proj_last_updated = _serialize_date_modified(getattr(projected, "last_updated", None))
@@ -1000,7 +982,6 @@ class CachedRecordsLoader:
                     json_extract(payload, '$.recordStatus'),
                     json_extract(payload, '$.record_status')
                 ) AS record_status,
-                json_extract(payload, '$.revision') AS revision,
                 COALESCE(
                     json_extract(payload, '$.lastUpdated'),
                     json_extract(payload, '$.last_updated')
@@ -1017,7 +998,6 @@ class CachedRecordsLoader:
                 date_modified=_serialize_date_modified(row["date_modified"]),
                 form_key=str(row["form_key"] or "").strip(),
                 record_status=_normalize_status_token(row["record_status"]),
-                revision=_normalize_optional_int(row["revision"]),
                 last_updated=_serialize_date_modified(row["last_updated"]),
             )
         return metadata

@@ -11,6 +11,7 @@ from pydantic import (
     Field,
     RootModel,
     SerializerFunctionWrapHandler,
+    ValidatorFunctionWrapHandler,
     field_validator,
     model_serializer,
 )
@@ -143,9 +144,11 @@ class Record(ImednetBaseModel):
         last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
-    @field_validator("record_status", mode="before")
+    @field_validator("record_status", mode="wrap")
     @classmethod
-    def _validate_record_status(cls, value: Any) -> RecordStatus | str | None: ...
+    def _validate_record_status(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> RecordStatus | str | None: ...
     @property
     def is_deleted(self) -> bool: ...
     @property

@@ -8,8 +8,15 @@ from datetime import UTC, datetime
 from itertools import pairwise
 from typing import Any
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    Field,
+    ValidationError,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+    model_validator,
+)
 
+from imednet.models._lifecycle import coerce_field_status
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
 from imednet.models.records import RecordStatus, normalize_record_status
@@ -94,13 +101,15 @@ class RecordRevision(ImednetBaseModel):
             _validate_revision_bounds(rec_rev, data_rev)
         return data
 
-    @field_validator("record_status", mode="before")
+    @field_validator("record_status", mode="wrap")
     @classmethod
-    def _validate_record_status(cls, value: Any) -> RecordStatus | str | None:
-        """Normalize known record statuses and preserve custom study strings."""
-        if value is None or isinstance(value, (RecordStatus, str)):
-            return normalize_record_status(value)
-        return normalize_record_status(str(value))
+    def _validate_record_status(
+        cls,
+        value: Any,
+        handler: ValidatorFunctionWrapHandler,
+    ) -> RecordStatus | str | None:
+        """Preserve verbatim record statuses unless matching an exact RecordStatus value."""
+        return coerce_field_status(RecordStatus, value, handler)
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Enforce revision bounds and status normalization on direct attribute mutation."""

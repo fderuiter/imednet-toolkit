@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidatorFunctionWrapHandler, field_validator
 
 from imednet.models._lifecycle import (
     coerce_field_status,
@@ -73,14 +73,15 @@ class Site(ImednetBaseModel):
         alias="siteEnrollmentStatus",
     )
 
-    @field_validator("site_enrollment_status", mode="before")
+    @field_validator("site_enrollment_status", mode="wrap")
     @classmethod
     def _validate_site_enrollment_status(
         cls,
         value: Any,
+        handler: ValidatorFunctionWrapHandler,
     ) -> SiteEnrollmentStatus | str | None:
-        """Normalize known site enrollment statuses and preserve unknown strings."""
-        return coerce_field_status(SiteEnrollmentStatus, value)
+        """Preserve verbatim site enrollment statuses unless matching an exact enum value."""
+        return coerce_field_status(SiteEnrollmentStatus, value, handler)
 
     @property
     def is_enrollment_open(self) -> bool:
