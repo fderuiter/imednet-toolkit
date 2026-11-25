@@ -256,6 +256,37 @@ def resolve_enrichment_pipeline(study_key: str | None) -> "EnrichmentPipeline | 
     return pipeline if pipeline._has_rules else None
 
 
+def resolve_sink_enrichment_pipeline(
+    config: Any,
+    *,
+    study_key: str | None = None,
+) -> "EnrichmentPipeline | None":
+    """Resolve an :class:`EnrichmentPipeline` honoring ``SinkConfig.extra`` overrides first."""
+    extra = getattr(config, "extra", None)
+    if isinstance(extra, Mapping):
+        custom_pipeline = extra.get("enrichment_pipeline")
+        if custom_pipeline is not None and callable(getattr(custom_pipeline, "process", None)):
+            return custom_pipeline  # type: ignore[no-any-return]
+        raw_study_cfg = extra.get("study_config")
+        if raw_study_cfg is not None:
+            try:
+                coerced = _coerce_resolved_study_config(raw_study_cfg)
+            except Exception as exc:
+                logger.debug("Invalid SinkConfig.extra['study_config']: %s", exc)
+                coerced = None
+            if coerced is not None:
+                pipeline = EnrichmentPipeline(coerced)
+                return pipeline if pipeline._has_rules else None
+
+    cfg_study_key = getattr(config, "study_key", None)
+    effective_study_key = (
+        study_key
+        if isinstance(study_key, str) and study_key
+        else (cfg_study_key if isinstance(cfg_study_key, str) else None)
+    )
+    return resolve_enrichment_pipeline(effective_study_key)
+
+
 class CentralizedMapper:
     """Unified Mapper with Enrichment Engine for data sinks."""
 

@@ -97,6 +97,12 @@ from tenacity import wait_exponential
 from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
+from imednet.integrations.enrichment import (
+    EnrichmentPipeline,
+    _matches_custom_phi_key,
+    mask_custom_phi_recursive,
+    resolve_sink_enrichment_pipeline,
+)
 from imednet.models.standards import (
     PROFILE_REGISTRY,
     SDTM_DOMAIN_SPECS,
@@ -551,17 +557,70 @@ def has_valid_tabular_batch_stamp(
     return not (require_sanitized and not stamp.sanitized)
 
 
-def _mask_series_containers_default_phi(series: Any) -> Any:
+def _normalize_custom_phi_keys(phi_keys: Iterable[str] | None) -> set[str] | None:
+    """Normalize optional study PHI keys into a lookup set matching EnrichmentPipeline."""
+    if not phi_keys:
+        return None
+    normalized: set[str] = set()
+    for raw_key in phi_keys:
+        if (
+            not isinstance(raw_key, str)
+            or not raw_key
+            or global_sensitivity_registry.is_exempt(raw_key)
+        ):
+            continue
+        norm = _normalize_key(raw_key)
+        if norm:
+            normalized.add(norm)
+            normalized.add(norm.replace("_", ""))
+    return normalized or None
+
+
+def _mask_container_default_and_custom_phi(
+    value: Any,
+    phi_keys: set[str] | None = None,
+) -> Any:
+    """Redact global and optional custom PHI keys across a container or scalar value."""
+    masked = mask_clinical_phi(value)
+    if phi_keys and isinstance(masked, _CONTAINER_CELL_TYPES):
+        masked = mask_custom_phi_recursive(masked, phi_keys)
+    return masked
+
+
+def _mask_mapping_default_and_custom_phi(
+    mapping_val: Mapping[Any, Any],
+    phi_keys: set[str] | None = None,
+) -> dict[Any, Any]:
+    """Redact global and optional custom PHI keys on a shallow copy of *mapping_val*."""
+    masked = cast(dict[Any, Any], mask_clinical_phi(dict(mapping_val)))
+    if phi_keys:
+        masked = cast(dict[Any, Any], mask_custom_phi_recursive(masked, phi_keys))
+    return masked
+
+
+def _mask_series_containers_default_phi(
+    series: Any,
+    phi_keys: set[str] | None = None,
+) -> Any:
     """Mask nested container cells in a pandas Series without invoking scalar mask_clinical_phi."""
     values = series.tolist()
     if not any(isinstance(v, _CONTAINER_CELL_TYPES) for v in values):
         return series
     pd_mod = sys.modules.get("pandas")
-    new_vals = [mask_clinical_phi(v) if isinstance(v, _CONTAINER_CELL_TYPES) else v for v in values]
+    new_vals = [
+        _mask_container_default_and_custom_phi(v, phi_keys)
+        if isinstance(v, _CONTAINER_CELL_TYPES)
+        else v
+        for v in values
+    ]
     if pd_mod is not None:
         return pd_mod.Series(new_vals, index=series.index, dtype=object)
     return series.apply(
-        lambda v: mask_clinical_phi(v) if isinstance(v, _CONTAINER_CELL_TYPES) else v
+        lambda v: (
+            _mask_container_default_and_custom_phi(v, phi_keys)
+            if isinstance(v, _CONTAINER_CELL_TYPES)
+            else v
+        )
     )
 
 
@@ -573,29 +632,35 @@ def _is_sdtm_birth_date_key(raw_key: str) -> bool:
     return norm in _SDTM_BIRTH_SOURCE_KEYS or norm.endswith("brthdtc")
 
 
-def _redact_mapping_for_sdtm(mapping_val: Mapping[Any, Any]) -> dict[Any, Any]:
+def _redact_mapping_for_sdtm(
+    mapping_val: Mapping[Any, Any],
+    *,
+    phi_keys: set[str] | None = None,
+) -> dict[Any, Any]:
     """Redact PHI across a mapping while truncating birth-date fields to ISO year or None."""
     out: dict[Any, Any] = {}
     for k, v in mapping_val.items():
         key_str = str(k)
         if _is_sdtm_birth_date_key(key_str) and not global_sensitivity_registry.is_exempt(key_str):
             out[k] = format_iso8601_dtc(v, mask_phi=True)
-        elif global_sensitivity_registry.is_sensitive(key_str):
+        elif global_sensitivity_registry.is_sensitive(key_str) or (
+            bool(phi_keys) and _matches_custom_phi_key(key_str, phi_keys)  # type: ignore[arg-type]
+        ):
             out[k] = MASKED_SENTINEL
         elif isinstance(v, Mapping):
-            out[k] = _redact_mapping_for_sdtm(v)
+            out[k] = _redact_mapping_for_sdtm(v, phi_keys=phi_keys)
         elif isinstance(v, list):
             out[k] = [
-                _redact_mapping_for_sdtm(elem)
+                _redact_mapping_for_sdtm(elem, phi_keys=phi_keys)
                 if isinstance(elem, Mapping)
-                else mask_clinical_phi(elem)
+                else _mask_container_default_and_custom_phi(elem, phi_keys)
                 for elem in v
             ]
         elif isinstance(v, tuple):
             out[k] = tuple(
-                _redact_mapping_for_sdtm(elem)
+                _redact_mapping_for_sdtm(elem, phi_keys=phi_keys)
                 if isinstance(elem, Mapping)
-                else mask_clinical_phi(elem)
+                else _mask_container_default_and_custom_phi(elem, phi_keys)
                 for elem in v
             )
         else:
@@ -603,9 +668,17 @@ def _redact_mapping_for_sdtm(mapping_val: Mapping[Any, Any]) -> dict[Any, Any]:
     return out
 
 
-def _redact_dataframe_batch(df: Any, pd_mod: Any, *, as_sdtm: bool = False) -> Any:
+def _redact_dataframe_batch(
+    df: Any,
+    pd_mod: Any,
+    *,
+    as_sdtm: bool = False,
+    phi_keys: set[str] | None = None,
+) -> Any:
     """Return a PHI-redacted copy of a pandas DataFrame without mutating caller state."""
-    if getattr(df, "attrs", {}).get("imednet_sdtm_redacted") is True:
+    if getattr(df, "attrs", {}).get("imednet_sdtm_redacted") is True and (
+        not phi_keys or has_valid_tabular_batch_stamp(df, mask_phi=True, phi_keys=phi_keys)
+    ):
         return df
 
     masked = df.copy()
@@ -628,7 +701,13 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any, *, as_sdtm: bool = False) -> A
         dict.fromkeys(
             col
             for col in masked.columns
-            if col not in birth_col_set and global_sensitivity_registry.is_sensitive(str(col))
+            if col not in birth_col_set
+            and (
+                global_sensitivity_registry.is_sensitive(str(col))
+                or (
+                    bool(phi_keys) and _matches_custom_phi_key(str(col), phi_keys)  # type: ignore[arg-type]
+                )
+            )
         )
     )
     for col in sensitive_cols:
@@ -650,20 +729,25 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any, *, as_sdtm: bool = False) -> A
     for col in object_cols:
         target = masked[col]
         if hasattr(target, "columns"):
-            masked[col] = target.apply(_mask_series_containers_default_phi)
+            masked[col] = target.apply(lambda s: _mask_series_containers_default_phi(s, phi_keys))
         else:
-            masked[col] = _mask_series_containers_default_phi(target)
+            masked[col] = _mask_series_containers_default_phi(target, phi_keys)
     if as_sdtm:
         masked.attrs["imednet_sdtm_redacted"] = True
     return masked
 
 
-def _redact_single_record(item: Any, *, as_sdtm: bool = False) -> Any:
+def _redact_single_record(
+    item: Any,
+    *,
+    as_sdtm: bool = False,
+    phi_keys: set[str] | None = None,
+) -> Any:
     """Redact PHI on a single Mapping, Pydantic model, or record-like object."""
     if isinstance(item, Mapping):
         if as_sdtm:
-            return _redact_mapping_for_sdtm(item)
-        return mask_clinical_phi(dict(item))
+            return _redact_mapping_for_sdtm(item, phi_keys=phi_keys)
+        return _mask_mapping_default_and_custom_phi(item, phi_keys)
     if isinstance(item, NonCallableMock):
         return item
 
@@ -674,7 +758,9 @@ def _redact_single_record(item: Any, *, as_sdtm: bool = False) -> Any:
         record_data = getattr(item, "record_data", None)
         if isinstance(record_data, dict):
             masked_rd = (
-                _redact_mapping_for_sdtm(record_data) if as_sdtm else mask_clinical_phi(record_data)
+                _redact_mapping_for_sdtm(record_data, phi_keys=phi_keys)
+                if as_sdtm
+                else _mask_mapping_default_and_custom_phi(record_data, phi_keys)
             )
             if masked_rd != record_data:
                 updates["record_data"] = masked_rd
@@ -686,7 +772,9 @@ def _redact_single_record(item: Any, *, as_sdtm: bool = False) -> Any:
                 redacted_year = format_iso8601_dtc(val, mask_phi=True)
                 if redacted_year != val:
                     updates[field_name] = redacted_year
-            elif global_sensitivity_registry.is_sensitive(field_name):
+            elif global_sensitivity_registry.is_sensitive(field_name) or (
+                bool(phi_keys) and _matches_custom_phi_key(field_name, phi_keys)  # type: ignore[arg-type]
+            ):
                 val = getattr(item, field_name, None)
                 if val is not None and val != MASKED_SENTINEL:
                     updates[field_name] = MASKED_SENTINEL
@@ -695,7 +783,9 @@ def _redact_single_record(item: Any, *, as_sdtm: bool = False) -> Any:
     record_data = getattr(item, "record_data", None)
     if isinstance(record_data, dict):
         masked_rd = (
-            _redact_mapping_for_sdtm(record_data) if as_sdtm else mask_clinical_phi(record_data)
+            _redact_mapping_for_sdtm(record_data, phi_keys=phi_keys)
+            if as_sdtm
+            else _mask_mapping_default_and_custom_phi(record_data, phi_keys)
         )
         if masked_rd != record_data:
             copied = copy.copy(item)
@@ -709,25 +799,39 @@ def redact_batch_records(
     *,
     mask_phi: bool = True,
     as_sdtm: bool = False,
+    phi_keys: Iterable[str] | None = None,
 ) -> Any:
-    """Apply default SensitivityRegistry PHI redaction across a batch of records or DataFrame."""
+    """Apply SensitivityRegistry and optional StudyConfiguration PHI redaction across a batch."""
     if not mask_phi or records is None:
         return records
 
+    active_phi_keys = _normalize_custom_phi_keys(phi_keys)
+
     pd_mod = sys.modules.get("pandas")
     if pd_mod is not None and isinstance(records, pd_mod.DataFrame):
-        return _redact_dataframe_batch(records, pd_mod, as_sdtm=as_sdtm)
+        return _redact_dataframe_batch(
+            records,
+            pd_mod,
+            as_sdtm=as_sdtm,
+            phi_keys=active_phi_keys,
+        )
 
     if isinstance(records, Mapping):
         if as_sdtm:
-            return _redact_mapping_for_sdtm(records)
-        return mask_clinical_phi(dict(records))
+            return _redact_mapping_for_sdtm(records, phi_keys=active_phi_keys)
+        return _mask_mapping_default_and_custom_phi(records, active_phi_keys)
     if isinstance(records, (str, bytes)):
         return records
     if isinstance(records, tuple):
-        return tuple(_redact_single_record(item, as_sdtm=as_sdtm) for item in records)
+        return tuple(
+            _redact_single_record(item, as_sdtm=as_sdtm, phi_keys=active_phi_keys)
+            for item in records
+        )
     if isinstance(records, Iterable):
-        return [_redact_single_record(item, as_sdtm=as_sdtm) for item in records]
+        return [
+            _redact_single_record(item, as_sdtm=as_sdtm, phi_keys=active_phi_keys)
+            for item in records
+        ]
     return records
 
 
@@ -777,6 +881,7 @@ class ExportSink(ABC):
         self._circuit_breaker: CircuitBreaker = CircuitBreaker()
         self._sdtm_lineage: dict[str, dict[str, Any]] = {}
         self._sdtm_seq_watermarks: dict[str, int] = {}
+        self._enrichment_pipeline_cache: dict[tuple[str, int, int], EnrichmentPipeline | None] = {}
 
     reconciles_deleted_on_full_sync: bool = False
 
@@ -792,16 +897,86 @@ class ExportSink(ABC):
             self._circuit_breaker = breaker
         return breaker
 
+    def _enrichment_cache_key(self, study_key: str | None = None) -> tuple[str, int, int]:
+        """Build a stable per-study cache key incorporating active ``SinkConfig.extra`` overrides."""
+        cfg = getattr(self, "config", None)
+        raw_sk = (
+            study_key
+            if isinstance(study_key, str) and study_key
+            else getattr(self, "_active_study_key", None) or getattr(cfg, "study_key", None)
+        )
+        resolved_sk = raw_sk if isinstance(raw_sk, str) else ""
+        extra = getattr(cfg, "extra", None)
+        if isinstance(extra, Mapping):
+            sc_obj = extra.get("study_config")
+            ep_obj = extra.get("enrichment_pipeline")
+            return (
+                resolved_sk,
+                id(sc_obj) if sc_obj is not None else 0,
+                id(ep_obj) if ep_obj is not None else 0,
+            )
+        return (resolved_sk, 0, 0)
+
+    def _seed_enrichment_pipeline(
+        self,
+        study_key: str | None,
+        pipeline: EnrichmentPipeline | None,
+    ) -> None:
+        """Seed this sink's cached :class:`EnrichmentPipeline` for *study_key*."""
+        cache = getattr(self, "_enrichment_pipeline_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._enrichment_pipeline_cache = cache
+        cache[self._enrichment_cache_key(study_key)] = pipeline
+
+    def _resolve_enrichment_pipeline(
+        self,
+        study_key: str | None = None,
+    ) -> EnrichmentPipeline | None:
+        """Resolve and cache ``StudyConfiguration`` enrichment rules per Study key."""
+        cfg = getattr(self, "config", None)
+        if cfg is None and not (isinstance(study_key, str) and study_key):
+            active_sk = getattr(self, "_active_study_key", None)
+            if not (isinstance(active_sk, str) and active_sk):
+                return None
+        raw_cache = getattr(self, "_enrichment_pipeline_cache", None)
+        if isinstance(raw_cache, dict):
+            cache: dict[tuple[str, int, int], EnrichmentPipeline | None] = raw_cache
+        else:
+            cache = {}
+            self._enrichment_pipeline_cache = cache
+        cache_key = self._enrichment_cache_key(study_key)
+        if cache_key not in cache:
+            try:
+                cache[cache_key] = resolve_sink_enrichment_pipeline(
+                    cfg,
+                    study_key=cache_key[0] or None,
+                )
+            except Exception as exc:
+                logger.debug("Sink StudyConfiguration resolution failed closed: %s", exc)
+                cache[cache_key] = None
+        return cache[cache_key]
+
     def redact_batch(self, records: Sequence[Any]) -> Any:
         """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
-        should_mask = getattr(self.config, "mask_phi", True) is not False
-        raw_domain = getattr(self.config, "sdtm_domain", None)
-        is_sdtm = getattr(self.config, "as_sdtm", False) is True or (
+        cfg = getattr(self, "config", None)
+        should_mask = getattr(cfg, "mask_phi", True) is not False
+        raw_domain = getattr(cfg, "sdtm_domain", None)
+        is_sdtm = getattr(cfg, "as_sdtm", False) is True or (
             isinstance(raw_domain, str) and bool(raw_domain.strip())
         )
+        if not should_mask:
+            return redact_batch_records(records, mask_phi=False, as_sdtm=is_sdtm)
         if is_sdtm and getattr(self, "_delegates_sdtm_redaction", False):
             return records
-        return redact_batch_records(records, mask_phi=should_mask, as_sdtm=is_sdtm)
+        pipeline = self._resolve_enrichment_pipeline()
+        phi_keys = pipeline.phi_keys if pipeline is not None else None
+        return redact_batch_records(
+            records,
+            mask_phi=should_mask,
+            as_sdtm=is_sdtm,
+            phi_keys=phi_keys,
+        )
 
     # ------------------------------------------------------------------
     # Abstract interface

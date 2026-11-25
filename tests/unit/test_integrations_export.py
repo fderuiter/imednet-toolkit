@@ -2896,3 +2896,164 @@ def test_incremental_reconciliation_with_sdtm_naming_convention(tmp_path: Path) 
         engine.dispose()
     assert sql_df["RECORD_ID"].tolist() == [1]
     assert sql_df["SYSBP"].tolist() == [135]
+
+
+def test_procedural_tabular_exports_enforce_study_config_once_without_double_enrichment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Procedural export_to_* helpers apply MappingRule once and honor SinkConfig.extra overrides."""
+    import duckdb
+    from sqlalchemy import create_engine
+
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.study_config import MappingRule, StudyConfiguration
+    from imednet.models.variables import Variable
+    from imednet_workflows.config_version_control import ConfigVersionStore
+
+    db_file = tmp_path / "proc_gov" / "versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv(
+        "IMEDNET_ENCRYPTION_KEY", "proc-export-test-secret"
+    )  # pragma: allowlist secret
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    admin_sdk = MagicMock()
+    admin_sdk.auth.get_user_roles.return_value = ["admin"]
+    admin_sdk.auth.get_user_id.return_value = "proc-tester"
+
+    committed_cfg = StudyConfiguration(
+        study_key="PROC_SINGLE_PASS",
+        phi_fields=["customChartId"],
+        terminology_lookups={"vitalStatus": {"1": "ALIVE"}},
+        mappings=[
+            MappingRule(
+                domain="AE",
+                targetField="doseMg",
+                sourceFormKey="AE",
+                sourceVariableName="doseMg",
+                businessLogic="value * 2",
+            ),
+            MappingRule(
+                domain="AE",
+                targetField="mappedTerm",
+                sourceFormKey="AE",
+                sourceVariableName="rawTerm",
+                businessLogic="'NORM_' + str(value)",
+            ),
+        ],
+    )
+    store = ConfigVersionStore(db_path=db_file)
+    store.commit_config("PROC_SINGLE_PASS", committed_cfg, "Single-pass test", sdk=admin_sdk)
+
+    sdk = MagicMock()
+    sdk.forms.list.return_value = [Form(form_id=1, form_key="AE", form_name="Adverse Events")]
+    vars_list = [
+        Variable(variable_id=1, form_id=1, form_key="AE", variable_name="customChartId"),
+        Variable(variable_id=2, form_id=1, form_key="AE", variable_name="vitalStatus"),
+        Variable(
+            variable_id=3, form_id=1, form_key="AE", variable_name="doseMg", variable_type="int"
+        ),
+        Variable(variable_id=4, form_id=1, form_key="AE", variable_name="rawTerm"),
+    ]
+    sdk.variables.list.return_value = vars_list
+    sdk.get_variables.return_value = vars_list
+
+    recs = [
+        Record(
+            record_id=1,
+            study_key="PROC_SINGLE_PASS",
+            subject_key="S1",
+            visit_id=1,
+            form_id=1,
+            form_key="AE",
+            record_data={
+                "customChartId": "CH-001",
+                "vitalStatus": "1",
+                "doseMg": 15,
+                "rawTerm": "rash",
+            },
+        )
+    ]
+
+    resolve_calls: list[str] = []
+    orig_resolve = ConfigVersionStore.resolve_committed_config
+
+    @classmethod  # type: ignore[misc]
+    def _spy_resolve(cls: Any, sk: str) -> Any:
+        resolve_calls.append(sk)
+        return orig_resolve(sk)
+
+    monkeypatch.setattr(ConfigVersionStore, "resolve_committed_config", _spy_resolve)
+
+    csv_file = tmp_path / "proc.csv"
+    pq_file = tmp_path / "proc.parquet"
+    ddb_file = tmp_path / "proc.duckdb"
+    sql_url = f"sqlite:///{tmp_path / 'proc.sqlite'}"
+
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in recs])
+    resolve_calls.clear()
+    export_mod.export_to_csv(sdk, "PROC_SINGLE_PASS", str(csv_file))
+    assert resolve_calls == ["PROC_SINGLE_PASS"]
+
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in recs])
+    resolve_calls.clear()
+    export_mod.export_to_parquet(sdk, "PROC_SINGLE_PASS", str(pq_file))
+    assert resolve_calls == ["PROC_SINGLE_PASS"]
+
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in recs])
+    resolve_calls.clear()
+    export_mod.export_to_duckdb(sdk, "PROC_SINGLE_PASS", str(ddb_file), "ae_tbl")
+    assert resolve_calls == ["PROC_SINGLE_PASS"]
+
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in recs])
+    resolve_calls.clear()
+    export_mod.export_to_sql(sdk, "PROC_SINGLE_PASS", "ae_tbl", sql_url, quality_gate_enabled=False)
+    assert resolve_calls == ["PROC_SINGLE_PASS"]
+
+    csv_df = pd.read_csv(csv_file)
+    pq_df = pd.read_parquet(pq_file)
+    with duckdb.connect(str(ddb_file)) as conn:
+        ddb_df = conn.execute("SELECT * FROM ae_tbl").df()
+    engine = create_engine(sql_url)
+    try:
+        sql_df = pd.read_sql_table("ae_tbl", engine)
+    finally:
+        engine.dispose()
+
+    for df in (csv_df, pq_df, ddb_df, sql_df):
+        assert df["customChartId"].tolist() == ["***MASKED***"]
+        assert df["vitalStatus"].tolist() == ["ALIVE"]
+        # Single-pass guarantee: 15 * 2 == 30 (NOT 60 from double enrichment)
+        assert df["doseMg"].tolist() == [30]
+        assert df["mappedTerm"].tolist() == ["NORM_rash"]
+
+    # SinkConfig.extra override takes precedence without querying ConfigVersionStore
+    extra_cfg = StudyConfiguration(
+        study_key="PROC_SINGLE_PASS",
+        phi_fields=[],
+        mappings=[
+            MappingRule(
+                domain="AE",
+                targetField="doseMg",
+                sourceFormKey="AE",
+                sourceVariableName="doseMg",
+                businessLogic="value + 5",
+            )
+        ],
+    )
+    override_csv = tmp_path / "proc_override.csv"
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in recs])
+    resolve_calls.clear()
+    export_mod.export_to_csv(
+        sdk,
+        "PROC_SINGLE_PASS",
+        str(override_csv),
+        mask_phi=False,
+        extra={"study_config": extra_cfg},
+    )
+    assert resolve_calls == []
+    override_df = pd.read_csv(override_csv)
+    assert override_df["customChartId"].tolist() == ["CH-001"]
+    assert override_df["doseMg"].tolist() == [20]

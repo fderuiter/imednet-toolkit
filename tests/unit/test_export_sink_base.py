@@ -1237,3 +1237,457 @@ class TestQualityGatePrefetchedVariablesAndBufferRouter:
         router.flush_all()
         assert active_flushes == [("F1", [101, 102], 0), ("F2", [201], 0)]
         assert router.total_buffered == 0
+
+
+class TestStudyConfigurationEnforcementInTabularAndBaseSinks:
+    """Regression suite for StudyConfiguration enforcement in Tabular*Sink and ExportSink."""
+
+    @staticmethod
+    def _commit_study_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Any, cfg: Any) -> Any:
+        from imednet_workflows.config_version_control import ConfigVersionStore
+
+        db_file = tmp_path / "config_store" / "versions.sqlite3"
+        monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+        monkeypatch.setenv(
+            "IMEDNET_ENCRYPTION_KEY", "test-sink-study-cfg-secret"
+        )  # pragma: allowlist secret
+        monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+        admin_sdk = MagicMock()
+        admin_sdk.auth.get_user_roles.return_value = ["admin"]
+        admin_sdk.auth.get_user_id.return_value = "governance-tester"
+
+        store = ConfigVersionStore(db_path=db_file)
+        store.commit_config(cfg.study_key, cfg, "Commit test study rules", sdk=admin_sdk)
+        return store
+
+    def test_tabular_sinks_enforce_committed_study_config_across_all_input_shapes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Any,
+    ) -> None:
+        """All four Tabular*Sink classes enforce phi_fields, terminology, and mappings."""
+        import duckdb
+        from sqlalchemy import create_engine
+
+        from imednet.integrations.export import TabularDuckDBSink, TabularParquetSink
+        from imednet.models.records import Record
+        from imednet.models.study_config import MappingRule, StudyConfiguration
+
+        study_cfg = StudyConfiguration(
+            study_key="STUDY_TAB_GOV",
+            phi_fields=["customChartId", "medicalRecordNumber", "subject_key"],
+            terminology_lookups={
+                "AESEV": {"1": "MILD", "2": "MODERATE"},
+                "vitalStatus": {"1": "ALIVE", "2": "DECEASED"},
+            },
+            mappings=[
+                MappingRule(
+                    domain="AE",
+                    targetField="normalizedTerm",
+                    sourceFormKey="AE",
+                    sourceVariableName="rawTerm",
+                    businessLogic="str(value).strip().upper()",
+                ),
+                MappingRule(
+                    domain="AE",
+                    targetField="doseMg",
+                    sourceFormKey="AE",
+                    sourceVariableName="doseMg",
+                    businessLogic="value * 2",
+                ),
+                MappingRule(
+                    domain="VS",
+                    targetField="record_id",
+                    sourceFormKey="VS",
+                    sourceVariableName="collidingField",
+                ),
+            ],
+        )
+        self._commit_study_config(monkeypatch, tmp_path, study_cfg)
+
+        rec_model = Record(
+            record_id=101,
+            study_key="STUDY_TAB_GOV",
+            subject_key="SUBJ-101",
+            visit_id=1,
+            form_id=10,
+            record_data={
+                "customChartId": "CH-101",
+                "medicalRecordNumber": "MRN-101",
+                "SSN": "123-45-6789",
+                "AESEV": "1",
+                "vitalStatus": "2",
+                "rawTerm": "  headache ",
+                "doseMg": 25,
+                "collidingField": 99999,
+            },
+        )
+        envelope_dict = {
+            "record_id": 102,
+            "study_key": "STUDY_TAB_GOV",
+            "subject_key": "SUBJ-102",
+            "visit_id": 2,
+            "form_id": 10,
+            "recordData": {
+                "customChartId": "CH-102",
+                "medicalRecordNumber": "MRN-102",
+                "SSN": "999-00-1111",
+                "AESEV": "2",
+                "vitalStatus": "1",
+                "rawTerm": " nausea ",
+                "doseMg": 10,
+                "collidingField": 88888,
+            },
+        }
+        flat_dict = {
+            "record_id": 103,
+            "study_key": "STUDY_TAB_GOV",
+            "subject_key": "SUBJ-103",
+            "visit_id": 3,
+            "form_id": 10,
+            "customChartId": "CH-103",
+            "medicalRecordNumber": "MRN-103",
+            "SSN": "555-55-5555",
+            "AESEV": "1",
+            "vitalStatus": "1",
+            "rawTerm": "rash",
+            "doseMg": 15,
+            "collidingField": 77777,
+        }
+        raw_df = pd.DataFrame([dict(flat_dict, record_id=104, subject_key="SUBJ-104", doseMg=30)])
+
+        cfg = TabularSinkConfig(study_key="STUDY_TAB_GOV")
+
+        csv_rec_path = tmp_path / "out_records.csv"
+        with TabularCSVSink(csv_rec_path, cfg) as csv_sink:
+            assert csv_sink.write_batch([rec_model, envelope_dict, flat_dict], batch_id="b0") == 3
+        csv_df_path = tmp_path / "out_df.csv"
+        with TabularCSVSink(csv_df_path, cfg) as csv_df_sink:
+            assert csv_df_sink.write_batch(raw_df, batch_id="b1") == 1
+
+        pq_path = tmp_path / "out.parquet"
+        with TabularParquetSink(pq_path, cfg) as pq_sink:
+            assert pq_sink.write_batch([rec_model, envelope_dict, flat_dict], batch_id="b0") == 3
+            assert pq_sink.write_batch(raw_df, batch_id="b1") == 1
+
+        sql_engine = create_engine(f"sqlite:///{tmp_path / 'out.sqlite'}")
+        try:
+            with TabularSQLSink("ae_out", sql_engine, cfg) as sql_sink:
+                assert (
+                    sql_sink.write_batch([rec_model, envelope_dict, flat_dict], batch_id="b0") == 3
+                )
+                assert sql_sink.write_batch(raw_df, batch_id="b1") == 1
+            sql_df = pd.read_sql_table("ae_out", sql_engine)
+        finally:
+            sql_engine.dispose()
+
+        ddb_path = tmp_path / "out.duckdb"
+        with TabularDuckDBSink(ddb_path, "ae_out", cfg) as ddb_sink:
+            assert ddb_sink.write_batch([rec_model, envelope_dict, flat_dict], batch_id="b0") == 3
+            assert ddb_sink.write_batch(raw_df, batch_id="b1") == 1
+        with duckdb.connect(str(ddb_path)) as conn:
+            ddb_df = conn.execute("SELECT * FROM ae_out ORDER BY record_id").df()
+
+        csv_df = pd.concat(
+            [pd.read_csv(csv_rec_path), pd.read_csv(csv_df_path)],
+            ignore_index=True,
+        )
+        pq_df = pd.read_parquet(pq_path)
+
+        for out_df in (csv_df, pq_df, sql_df, ddb_df):
+            ordered = out_df.sort_values("record_id").reset_index(drop=True)
+            assert ordered["record_id"].tolist() == [101, 102, 103, 104]
+            assert ordered["subject_key"].tolist() == [
+                "SUBJ-101",
+                "SUBJ-102",
+                "SUBJ-103",
+                "SUBJ-104",
+            ]
+            assert ordered["study_key"].tolist() == ["STUDY_TAB_GOV"] * 4
+            assert ordered["customChartId"].tolist() == ["***MASKED***"] * 4
+            assert ordered["medicalRecordNumber"].tolist() == ["***MASKED***"] * 4
+            assert ordered["SSN"].tolist() == ["***MASKED***"] * 4
+            assert ordered["AESEV"].tolist() == ["MILD", "MODERATE", "MILD", "MILD"]
+            assert ordered["vitalStatus"].tolist() == ["DECEASED", "ALIVE", "ALIVE", "ALIVE"]
+            assert ordered["normalizedTerm"].tolist() == ["HEADACHE", "NAUSEA", "RASH", "RASH"]
+            assert ordered["doseMg"].tolist() == [50, 20, 30, 60]
+            assert "rawTerm" not in ordered.columns
+
+        # Caller inputs remain completely unmutated
+        assert rec_model.record_data["customChartId"] == "CH-101"
+        assert rec_model.record_data["rawTerm"] == "  headache "
+        assert envelope_dict["recordData"]["medicalRecordNumber"] == "MRN-102"  # type: ignore[index]
+        assert flat_dict["customChartId"] == "CH-103"
+        assert raw_df["customChartId"].iloc[0] == "CH-103"
+        assert raw_df["doseMg"].iloc[0] == 30
+        assert "_imednet_tabular_prepared" not in raw_df.attrs
+
+    def test_tabular_streaming_export_and_mask_phi_false_keeps_enrichment_active(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Any,
+    ) -> None:
+        """run_streaming_export enforces StudyConfiguration and mask_phi=False keeps mappings/lookups."""
+        from imednet.integrations.sink_base import run_streaming_export
+        from imednet.models.records import Record
+        from imednet.models.study_config import MappingRule, StudyConfiguration
+
+        study_cfg = StudyConfiguration(
+            study_key="STUDY_OPT_OUT",
+            phi_fields=["customChartId", "medicalRecordNumber"],
+            terminology_lookups={"AESEV": {"2": "MODERATE"}},
+            mappings=[
+                MappingRule(
+                    domain="AE",
+                    targetField="cleanTerm",
+                    sourceFormKey="AE",
+                    sourceVariableName="rawTerm",
+                    businessLogic="str(value).upper()",
+                )
+            ],
+        )
+        self._commit_study_config(monkeypatch, tmp_path, study_cfg)
+
+        stream_records = [
+            Record(
+                record_id=1,
+                study_key="STUDY_OPT_OUT",
+                subject_key="SUBJ-1",
+                form_id=1,
+                record_data={
+                    "customChartId": "CH-777",
+                    "medicalRecordNumber": "MRN-888",
+                    "SSN": "123-45-6789",
+                    "AESEV": "2",
+                    "rawTerm": "dizziness",
+                },
+            )
+        ]
+
+        sdk = MagicMock()
+        masked_csv = tmp_path / "stream_masked.csv"
+        masked_cfg = TabularSinkConfig(study_key="STUDY_OPT_OUT", batch_size=1)
+        run_streaming_export(
+            sdk,
+            "STUDY_OPT_OUT",
+            TabularCSVSink(masked_csv, masked_cfg),
+            masked_cfg,
+            stream_name="csv_masked",
+            batch_id_prefix="STUDY_OPT_OUT/csv",
+            records_source=lambda _wm, _excl: iter(stream_records),
+            quality_gate_fn=sink_base_mod.apply_quality_gate,
+            iter_batches_fn=iter_batches,
+        )
+        masked_df = pd.read_csv(masked_csv)
+        assert masked_df["customChartId"].tolist() == ["***MASKED***"]
+        assert masked_df["medicalRecordNumber"].tolist() == ["***MASKED***"]
+        assert masked_df["SSN"].tolist() == ["***MASKED***"]
+        assert masked_df["AESEV"].tolist() == ["MODERATE"]
+        assert masked_df["cleanTerm"].tolist() == ["DIZZINESS"]
+
+        unmasked_csv = tmp_path / "stream_unmasked.csv"
+        unmasked_cfg = TabularSinkConfig(study_key="STUDY_OPT_OUT", mask_phi=False, batch_size=1)
+        run_streaming_export(
+            sdk,
+            "STUDY_OPT_OUT",
+            TabularCSVSink(unmasked_csv, unmasked_cfg),
+            unmasked_cfg,
+            stream_name="csv_unmasked",
+            batch_id_prefix="STUDY_OPT_OUT/csv_unmasked",
+            records_source=lambda _wm, _excl: iter(stream_records),
+            quality_gate_fn=sink_base_mod.apply_quality_gate,
+            iter_batches_fn=iter_batches,
+        )
+        unmasked_df = pd.read_csv(unmasked_csv)
+        assert unmasked_df["customChartId"].tolist() == ["CH-777"]
+        assert unmasked_df["medicalRecordNumber"].tolist() == ["MRN-888"]
+        assert unmasked_df["SSN"].tolist() == ["123-45-6789"]
+        assert unmasked_df["AESEV"].tolist() == ["MODERATE"]
+        assert unmasked_df["cleanTerm"].tolist() == ["DIZZINESS"]
+
+    def test_unconfigured_study_queries_config_version_store_once_per_sink(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Any,
+    ) -> None:
+        """Per-sink caching ensures unconfigured studies query resolve_committed_config once."""
+        from imednet.models.study_config import StudyConfiguration
+        from imednet_workflows.config_version_control import ConfigVersionStore
+
+        # Commit a config for ANOTHER study so the SQLite store file exists on disk
+        other_cfg = StudyConfiguration(study_key="OTHER_STUDY", phi_fields=["secretField"])
+        self._commit_study_config(monkeypatch, tmp_path, other_cfg)
+
+        calls: list[str] = []
+        orig_resolve = ConfigVersionStore.resolve_committed_config
+
+        @classmethod  # type: ignore[misc]
+        def _spy_resolve(cls: Any, study_key: str) -> Any:
+            calls.append(study_key)
+            return orig_resolve(study_key)
+
+        monkeypatch.setattr(ConfigVersionStore, "resolve_committed_config", _spy_resolve)
+
+        csv_sink = TabularCSVSink(
+            tmp_path / "unconfigured.csv",
+            TabularSinkConfig(study_key="UNCONFIGURED_STUDY"),
+        )
+        with csv_sink:
+            for idx in range(5):
+                csv_sink.write_batch(
+                    [{"record_id": idx + 1, "subject_key": f"S{idx}", "HR": 70 + idx}],
+                    batch_id=f"b/{idx}",
+                )
+        assert calls == ["UNCONFIGURED_STUDY"]
+
+        calls.clear()
+        custom_sink = _StubSink(SinkConfig(study_key="UNCONFIGURED_CUSTOM"))
+        for idx in range(5):
+            custom_sink.write_batch(
+                [{"record_id": idx + 1, "SSN": "123-45-6789", "HR": 65}],
+                batch_id=f"c/{idx}",
+            )
+        assert calls == ["UNCONFIGURED_CUSTOM"]
+        assert custom_sink.batches[0][0][0]["SSN"] == "***MASKED***"
+
+    def test_sink_config_extra_overrides_and_base_redact_batch_fail_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Any,
+    ) -> None:
+        """SinkConfig.extra overrides work without store and ExportSink.redact_batch fails closed."""
+        from types import SimpleNamespace
+
+        from imednet.integrations.enrichment import (
+            EnrichmentPipeline,
+            resolve_sink_enrichment_pipeline,
+        )
+        from imednet.integrations.export import TabularParquetSink
+        from imednet.models.records import Record
+        from imednet.models.study_config import MappingRule, StudyConfiguration
+        from imednet.spi import sink_base as spi_sink_base
+
+        override_cfg = StudyConfiguration(
+            study_key="STUDY_EXTRA",
+            phi_fields=["customChartId", "record_id"],
+            terminology_lookups={"vitalStatus": {"1": "ALIVE"}},
+            mappings=[
+                MappingRule(
+                    domain="DM",
+                    targetField="mappedStatus",
+                    sourceFormKey="DM",
+                    sourceVariableName="vitalStatus",
+                )
+            ],
+        )
+
+        # 1. Extra study_config override on TabularParquetSink
+        pq_path = tmp_path / "extra.parquet"
+        pq_cfg = TabularSinkConfig(
+            study_key="STUDY_EXTRA",
+            extra={"study_config": override_cfg.model_dump(by_alias=True)},
+        )
+        with TabularParquetSink(pq_path, pq_cfg) as pq_sink:
+            pq_sink.write_batch(
+                [
+                    {
+                        "record_id": 11,
+                        "subject_key": "S11",
+                        "customChartId": "C11",
+                        "vitalStatus": "1",
+                    }
+                ],
+                batch_id="pq/0",
+            )
+        pq_df = pd.read_parquet(pq_path)
+        assert pq_df["record_id"].tolist() == [11]
+        assert pq_df["subject_key"].tolist() == ["S11"]
+        assert pq_df["customChartId"].tolist() == ["***MASKED***"]
+        assert pq_df["mappedStatus"].tolist() == ["ALIVE"]
+
+        # 2. Extra enrichment_pipeline override on custom ExportSink
+        custom_pipeline = EnrichmentPipeline(override_cfg)
+        assert (
+            resolve_sink_enrichment_pipeline(
+                SinkConfig(study_key="STUDY_EXTRA", extra={"enrichment_pipeline": custom_pipeline})
+            )
+            is custom_pipeline
+        )
+
+        clean_rec = Record(record_id=1, subject_key="S1", record_data={"HR": 72})
+        phi_rec = Record(
+            record_id=2,
+            subject_key="S2",
+            record_data={"customChartId": "CH-2", "SSN": "123-45-6789", "HR": 80},
+        )
+        ns_rec = SimpleNamespace(
+            record_id=3,
+            subject_key="S3",
+            record_data={"customChartId": "CH-3", "nested": [{"customChartId": "CH-3B", "ok": 1}]},
+        )
+
+        audit_sink = _StubSink(
+            SinkConfig(study_key="STUDY_EXTRA", extra={"study_config": override_cfg})
+        )
+        audit_sink.write_batch([clean_rec, phi_rec, ns_rec], batch_id="a/0")
+        out_batch = audit_sink.batches[0][0]
+        assert out_batch[0] is clean_rec
+        assert out_batch[1].record_id == 2
+        assert out_batch[1].subject_key == "S2"
+        assert out_batch[1].record_data == {
+            "customChartId": "***MASKED***",
+            "SSN": "***MASKED***",
+            "HR": 80,
+        }
+        assert out_batch[2].record_data == {
+            "customChartId": "***MASKED***",
+            "nested": [{"customChartId": "***MASKED***", "ok": 1}],
+        }
+        # Caller inputs untouched
+        assert phi_rec.record_data["customChartId"] == "CH-2"
+        assert ns_rec.record_data["customChartId"] == "CH-3"
+
+        # 3. Direct SPI redact_batch_records accepts optional phi_keys across DataFrames & SDTM dicts
+        df_in = pd.DataFrame(
+            [
+                {
+                    "study_key": "STUDY_EXTRA",
+                    "customChartId": "CH-DF",
+                    "payload": {"customChartId": "CH-NESTED"},
+                }
+            ]
+        )
+        df_redacted = spi_sink_base.redact_batch_records(df_in, phi_keys=["customChartId"])
+        assert df_redacted["study_key"].iloc[0] == "STUDY_EXTRA"
+        assert df_redacted["customChartId"].iloc[0] == "***MASKED***"
+        assert df_redacted["payload"].iloc[0] == {"customChartId": "***MASKED***"}
+        assert df_in["customChartId"].iloc[0] == "CH-DF"
+
+        sdtm_dict = spi_sink_base.redact_batch_records(
+            {"USUBJID": "U1", "BRTHDTC": "1984-07-19", "customChartId": "CH-SDTM"},
+            as_sdtm=True,
+            phi_keys={"customChartId"},
+        )
+        assert sdtm_dict == {"USUBJID": "U1", "BRTHDTC": "1984", "customChartId": "***MASKED***"}
+
+        # 4. Fail-closed on ExportSink(config=None), missing encryption key, or missing store plugin
+        none_cfg_sink = _StubSink(config=None)
+        none_cfg_sink.write_batch(
+            [{"SSN": "123-45-6789", "customChartId": "CH-RAW"}], batch_id="n/0"
+        )
+        assert none_cfg_sink.batches[0][0][0] == {
+            "SSN": "***MASKED***",
+            "customChartId": "CH-RAW",
+        }
+
+        self._commit_study_config(monkeypatch, tmp_path, override_cfg)
+        monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+        no_key_sink = _StubSink(SinkConfig(study_key="STUDY_EXTRA"))
+        no_key_sink.write_batch(
+            [{"SSN": "123-45-6789", "customChartId": "CH-RAW"}], batch_id="nk/0"
+        )
+        assert no_key_sink.batches[0][0][0] == {
+            "SSN": "***MASKED***",
+            "customChartId": "CH-RAW",
+        }

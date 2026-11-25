@@ -26,6 +26,7 @@ from imednet.integrations.enrichment import (
     _matches_custom_phi_key,
     mask_custom_phi_recursive,
     resolve_enrichment_pipeline,
+    resolve_sink_enrichment_pipeline,
     resolve_study_configuration,
 )
 from imednet.integrations.sink_base import (
@@ -189,6 +190,7 @@ def _dedup_case_insensitive_columns(
         return df
     prior_stamp = get_tabular_batch_stamp(df)
     was_sdtm_redacted = bool(df.attrs.get("imednet_sdtm_redacted"))
+    was_tabular_prepared = bool(df.attrs.get("_imednet_tabular_prepared"))
     all_str = all(isinstance(c, str) for c in df.columns)
     has_any_str = all_str or any(isinstance(c, str) for c in df.columns)
 
@@ -220,6 +222,8 @@ def _dedup_case_insensitive_columns(
 
     if was_sdtm_redacted:
         out.attrs["imednet_sdtm_redacted"] = True
+    if was_tabular_prepared:
+        out.attrs["_imednet_tabular_prepared"] = True
     if (
         prior_stamp is not None
         and get_tabular_batch_stamp(out) is None
@@ -250,6 +254,9 @@ def _mask_df(
         return df
 
     was_sdtm_redacted = isinstance(df, pd.DataFrame) and bool(df.attrs.get("imednet_sdtm_redacted"))
+    was_tabular_prepared = isinstance(df, pd.DataFrame) and bool(
+        df.attrs.get("_imednet_tabular_prepared")
+    )
     effective_sdtm = bool(as_sdtm or was_sdtm_redacted)
     prior_stamp = get_tabular_batch_stamp(df)
     was_sanitized = bool(prior_stamp.sanitized) if prior_stamp is not None else False
@@ -290,6 +297,8 @@ def _mask_df(
     if len(df) == 0:
         if effective_sdtm:
             df.attrs["imednet_sdtm_redacted"] = True
+        if was_tabular_prepared:
+            df.attrs["_imednet_tabular_prepared"] = True
         stamp_tabular_batch(df, mask_phi=True, phi_keys=phi_keys, sanitized=was_sanitized)
         return df
 
@@ -308,6 +317,8 @@ def _mask_df(
 
     if effective_sdtm:
         df.attrs["imednet_sdtm_redacted"] = True
+    if was_tabular_prepared:
+        df.attrs["_imednet_tabular_prepared"] = True
     stamp_tabular_batch(df, mask_phi=True, phi_keys=phi_keys, sanitized=was_sanitized)
     return df
 
@@ -444,6 +455,9 @@ def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
 
     prior_stamp = get_tabular_batch_stamp(df)
     was_sdtm_redacted = isinstance(df, pd.DataFrame) and bool(df.attrs.get("imednet_sdtm_redacted"))
+    was_tabular_prepared = isinstance(df, pd.DataFrame) and bool(
+        df.attrs.get("_imednet_tabular_prepared")
+    )
 
     # Explicitly include "str" to avoid Pandas 3.0 warning about object dtype
     # including strings implicitly. Use a try/except block to handle older Pandas versions
@@ -477,6 +491,8 @@ def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
 
     if was_sdtm_redacted:
         df.attrs["imednet_sdtm_redacted"] = True
+    if was_tabular_prepared:
+        df.attrs["_imednet_tabular_prepared"] = True
     if prior_stamp is not None and (
         not prior_stamp.mask_phi
         or prior_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
@@ -527,13 +543,97 @@ def _unpack_record_envelope_mapping(
     return row
 
 
-def _normalize_tabular_batch_item(item: Any) -> Any:
+_UNSET_TABULAR_ARG: Any = object()
+_PROTECTED_TABULAR_IDENTITY_KEYS = _ENVELOPE_IDENTITY_KEYS | frozenset(
+    {"STUDYID", "DOMAIN", "USUBJID", "SUBJID", "RECORD_ID"}
+)
+
+
+def _enrich_flat_mapping(
+    mapping: Mapping[Any, Any],
+    pipeline: EnrichmentPipeline,
+    *,
+    mask_phi: bool,
+) -> dict[Any, Any]:
+    """Run ``pipeline.process`` on *mapping* while preserving protected identity keys."""
+    protected = {
+        k: v for k, v in mapping.items() if k in _PROTECTED_TABULAR_IDENTITY_KEYS and v is not None
+    }
+    payload = {k: v for k, v in mapping.items() if k not in protected}
+    enriched = pipeline.process(payload, mask_phi=mask_phi)
+    if not isinstance(enriched, Mapping):
+        return dict(mapping)
+    if not protected:
+        return dict(enriched)
+    enriched_iter = iter(enriched.items())
+    out: dict[Any, Any] = {}
+    for orig_k in mapping:
+        if orig_k in protected:
+            out[orig_k] = protected[orig_k]
+        else:
+            for ek, ev in enriched_iter:
+                if ek in _PROTECTED_TABULAR_IDENTITY_KEYS and protected.get(ek) is not None:
+                    continue
+                out[ek] = ev
+                break
+    for ek, ev in enriched_iter:
+        if ek in _PROTECTED_TABULAR_IDENTITY_KEYS and protected.get(ek) is not None:
+            continue
+        out[ek] = ev
+    return out
+
+
+def _enrich_dataframe_rows(
+    df: pd.DataFrame,
+    pipeline: EnrichmentPipeline,
+    *,
+    mask_phi: bool,
+) -> pd.DataFrame:
+    """Run ``pipeline.process`` across unenriched DataFrame rows without mutating *df*."""
+    deduped = _dedup_case_insensitive_columns(
+        df.copy(),
+        ensure_str_columns=False,
+        in_place_allowed=True,
+    )
+    raw_rows = deduped.to_dict(orient="records")
+    enriched_rows: list[dict[Any, Any]] = []
+    for raw_row in raw_rows:
+        cleaned_row = {
+            k: (v if k in _PROTECTED_TABULAR_IDENTITY_KEYS or not _is_missing_scalar(v) else None)
+            for k, v in raw_row.items()
+        }
+        enriched_rows.append(_enrich_flat_mapping(cleaned_row, pipeline, mask_phi=mask_phi))
+    out = pd.DataFrame(enriched_rows, index=deduped.index)
+    out.attrs["_imednet_tabular_prepared"] = True
+    return out
+
+
+def _normalize_tabular_batch_item(
+    item: Any,
+    *,
+    pipeline: EnrichmentPipeline | None = None,
+    mask_phi: bool = True,
+) -> Any:
     """Normalize a single Record model or record-envelope dict for DataFrame construction."""
     if isinstance(item, Mapping):
         if isinstance(item.get("record_data"), Mapping):
-            return _unpack_record_envelope_mapping(item, item["record_data"])
+            raw_payload = item["record_data"]
+            payload = (
+                pipeline.process(dict(raw_payload), mask_phi=mask_phi)
+                if pipeline is not None
+                else raw_payload
+            )
+            return _unpack_record_envelope_mapping(item, payload)
         if isinstance(item.get("recordData"), Mapping):
-            return _unpack_record_envelope_mapping(item, item["recordData"])
+            raw_payload = item["recordData"]
+            payload = (
+                pipeline.process(dict(raw_payload), mask_phi=mask_phi)
+                if pipeline is not None
+                else raw_payload
+            )
+            return _unpack_record_envelope_mapping(item, payload)
+        if pipeline is not None:
+            return _enrich_flat_mapping(item, pipeline, mask_phi=mask_phi)
         return dict(item)
 
     if isinstance(item, NonCallableMock):
@@ -545,8 +645,16 @@ def _normalize_tabular_batch_item(item: Any) -> Any:
         if isinstance(dumped, Mapping):
             payload = dumped.get("record_data")
             if isinstance(payload, Mapping):
-                return _unpack_record_envelope_mapping(dumped, payload)
-            return {k: v for k, v in dumped.items() if not isinstance(v, (dict, list))}
+                enriched_payload = (
+                    pipeline.process(dict(payload), mask_phi=mask_phi)
+                    if pipeline is not None
+                    else payload
+                )
+                return _unpack_record_envelope_mapping(dumped, enriched_payload)
+            flat_dumped = {k: v for k, v in dumped.items() if not isinstance(v, (dict, list))}
+            if pipeline is not None:
+                return _enrich_flat_mapping(flat_dumped, pipeline, mask_phi=mask_phi)
+            return flat_dumped
 
     record_data = getattr(item, "record_data", None)
     if isinstance(record_data, Mapping):
@@ -555,7 +663,12 @@ def _normalize_tabular_batch_item(item: Any) -> Any:
             val = getattr(item, attr, None)
             if val is not None:
                 envelope[attr] = val
-        return _unpack_record_envelope_mapping(envelope, record_data)
+        enriched_rd = (
+            pipeline.process(dict(record_data), mask_phi=mask_phi)
+            if pipeline is not None
+            else record_data
+        )
+        return _unpack_record_envelope_mapping(envelope, enriched_rd)
 
     return item
 
@@ -564,6 +677,8 @@ def _preserve_df_stamp_and_sdtm_attr(src: pd.DataFrame, dst: pd.DataFrame) -> pd
     """Copy ``imednet_sdtm_redacted`` and valid ``TabularBatchStamp`` from ``src`` to ``dst``."""
     if bool(src.attrs.get("imednet_sdtm_redacted")):
         dst.attrs["imednet_sdtm_redacted"] = True
+    if bool(src.attrs.get("_imednet_tabular_prepared")):
+        dst.attrs["_imednet_tabular_prepared"] = True
     prior_stamp = get_tabular_batch_stamp(src)
     if prior_stamp is not None and (
         not prior_stamp.mask_phi
@@ -605,11 +720,17 @@ def _coerce_sdtm_integer_columns(df: pd.DataFrame) -> pd.DataFrame:
     return adjusted if adjusted is not None else df
 
 
-def _resolve_study_phi_keys(study_key: str | None) -> set[str] | None:
-    """Resolve custom normalized PHI keys from committed StudyConfiguration when present."""
-    if not study_key:
-        return None
-    pipeline = resolve_enrichment_pipeline(study_key)
+def _resolve_study_phi_keys(
+    study_key: str | None,
+    *,
+    config: SinkConfig | None = None,
+) -> set[str] | None:
+    """Resolve custom normalized PHI keys from SinkConfig overrides or StudyConfiguration."""
+    pipeline = (
+        resolve_sink_enrichment_pipeline(config, study_key=study_key)
+        if config is not None
+        else resolve_enrichment_pipeline(study_key)
+    )
     if pipeline is None or not pipeline.phi_keys:
         return None
     return set(pipeline.phi_keys)
@@ -622,15 +743,46 @@ def _prepare_tabular_batch_df(
     sanitize: bool,
     study_key: str | None = None,
     as_sdtm: bool = False,
+    pipeline: EnrichmentPipeline | None = _UNSET_TABULAR_ARG,
+    phi_keys: set[str] | None = _UNSET_TABULAR_ARG,
 ) -> pd.DataFrame:
-    """Convert ``records`` into a DataFrame with single-pass PHI masking and CSV sanitization."""
-    phi_keys = _resolve_study_phi_keys(study_key) if mask_phi else None
+    """Convert ``records`` into a DataFrame with single-pass enrichment, masking, and sanitization."""
+    active_pipeline: EnrichmentPipeline | None = (
+        resolve_enrichment_pipeline(study_key) if pipeline is _UNSET_TABULAR_ARG else pipeline
+    )
+    if not mask_phi:
+        active_phi_keys: set[str] | None = None
+    elif phi_keys is not _UNSET_TABULAR_ARG:
+        active_phi_keys = set(phi_keys) if phi_keys else None
+    elif active_pipeline is not None and active_pipeline.phi_keys:
+        active_phi_keys = set(active_pipeline.phi_keys)
+    else:
+        active_phi_keys = None
 
     if isinstance(records, pd.DataFrame):
         was_sdtm_redacted = bool(records.attrs.get("imednet_sdtm_redacted"))
+        was_tabular_prepared = bool(records.attrs.get("_imednet_tabular_prepared"))
         effective_sdtm = bool(as_sdtm or was_sdtm_redacted)
         if len(records) == 0:
             return records
+        needs_df_enrichment = (
+            not was_tabular_prepared
+            and not was_sdtm_redacted
+            and active_pipeline is not None
+            and bool(active_pipeline.terminology or active_pipeline.mappings)
+        )
+        if needs_df_enrichment and active_pipeline is not None:
+            df = _enrich_dataframe_rows(records, active_pipeline, mask_phi=mask_phi)
+            df = _dedup_case_insensitive_columns(df, ensure_str_columns=False)
+            if mask_phi:
+                df = _mask_df(df, phi_keys=active_phi_keys, as_sdtm=effective_sdtm)
+            if sanitize:
+                df = _sanitize_df(df)
+            if effective_sdtm:
+                df = _coerce_sdtm_integer_columns(df)
+            df.attrs["_imednet_tabular_prepared"] = True
+            return df
+
         has_dup_cols = False
         if any(isinstance(c, str) for c in records.columns):
             lower_cols = [c.lower() if isinstance(c, str) else c for c in records.columns]
@@ -638,7 +790,7 @@ def _prepare_tabular_batch_df(
         already_masked = (not mask_phi) or has_valid_tabular_batch_stamp(
             records,
             mask_phi=True,
-            phi_keys=phi_keys,
+            phi_keys=active_phi_keys,
         )
         already_sanitized = (not sanitize) or has_valid_tabular_batch_stamp(
             records,
@@ -654,7 +806,7 @@ def _prepare_tabular_batch_df(
             already_masked = (not mask_phi) or has_valid_tabular_batch_stamp(
                 df,
                 mask_phi=True,
-                phi_keys=phi_keys,
+                phi_keys=active_phi_keys,
             )
             already_sanitized = (not sanitize) or has_valid_tabular_batch_stamp(
                 df,
@@ -662,28 +814,33 @@ def _prepare_tabular_batch_df(
                 require_sanitized=True,
             )
         if mask_phi and not already_masked:
-            df = _mask_df(df, phi_keys=phi_keys, as_sdtm=effective_sdtm)
+            df = _mask_df(df, phi_keys=active_phi_keys, as_sdtm=effective_sdtm)
         if sanitize and not already_sanitized:
             df = _sanitize_df(df)
         if effective_sdtm:
             df = _coerce_sdtm_integer_columns(df)
+        df.attrs["_imednet_tabular_prepared"] = True
         return df
 
     items = list(records) if not isinstance(records, Sequence) else records
     if not items:
         return pd.DataFrame()
-    normalized = [_normalize_tabular_batch_item(item) for item in items]
+    normalized = [
+        _normalize_tabular_batch_item(item, pipeline=active_pipeline, mask_phi=mask_phi)
+        for item in items
+    ]
     df = pd.DataFrame(normalized)
     if len(df) == 0:
         return df
 
     df = _dedup_case_insensitive_columns(df, ensure_str_columns=False)
     if mask_phi:
-        df = _mask_df(df, phi_keys=phi_keys, as_sdtm=as_sdtm)
+        df = _mask_df(df, phi_keys=active_phi_keys, as_sdtm=as_sdtm)
     if sanitize:
         df = _sanitize_df(df)
     if as_sdtm:
         df = _coerce_sdtm_integer_columns(df)
+    df.attrs["_imednet_tabular_prepared"] = True
     return df
 
 
@@ -1013,12 +1170,17 @@ def _concat_tabular_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
     all_sdtm_redacted = bool(non_empty) and all(
         bool(f.attrs.get("imednet_sdtm_redacted")) for f in non_empty
     )
+    all_tabular_prepared = bool(non_empty) and all(
+        bool(f.attrs.get("_imednet_tabular_prepared")) for f in non_empty
+    )
     if not non_empty:
         return frames[0].copy() if frames else pd.DataFrame()
     if len(non_empty) == 1:
         single = _preserve_df_stamp_and_sdtm_attr(non_empty[0], non_empty[0].reset_index(drop=True))
         if all_sdtm_redacted:
             single.attrs["imednet_sdtm_redacted"] = True
+        if all_tabular_prepared:
+            single.attrs["_imednet_tabular_prepared"] = True
         if all_sdtm_redacted or {"STUDYID", "DOMAIN", "USUBJID"} <= set(single.columns):
             single = _coerce_sdtm_integer_columns(single)
         return single
@@ -1060,6 +1222,8 @@ def _concat_tabular_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
     reindexed = merged.reindex(columns=unified_cols)
     if all_sdtm_redacted:
         reindexed.attrs["imednet_sdtm_redacted"] = True
+    if all_tabular_prepared:
+        reindexed.attrs["_imednet_tabular_prepared"] = True
     first_stamp = stamps[0] if stamps else None
     if (
         first_stamp is not None
@@ -1198,12 +1362,16 @@ class TabularCSVSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
+        pipeline = self._resolve_enrichment_pipeline()
+        phi_keys = set(pipeline.phi_keys) if (pipeline is not None and pipeline.phi_keys) else None
         df = _prepare_tabular_batch_df(
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
             as_sdtm=self._cfg.as_sdtm,
             study_key=self._cfg.study_key,
+            pipeline=pipeline,
+            phi_keys=phi_keys,
         )
         if len(df) == 0:
             return 0
@@ -1598,6 +1766,8 @@ def _apply_naming_convention_to_df(
     dup_mask = out.columns.astype(str).str.lower().duplicated()
     if bool(dup_mask.any()):
         out = out.loc[:, ~dup_mask]
+    if bool(df.attrs.get("_imednet_tabular_prepared")):
+        out.attrs["_imednet_tabular_prepared"] = True
     return out
 
 
@@ -2231,12 +2401,16 @@ class TabularParquetSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a DataFrame or sequence batch to the open ParquetWriter."""
+        pipeline = self._resolve_enrichment_pipeline()
+        phi_keys = set(pipeline.phi_keys) if (pipeline is not None and pipeline.phi_keys) else None
         df = _prepare_tabular_batch_df(
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
             as_sdtm=self._cfg.as_sdtm,
             study_key=self._cfg.study_key,
+            pipeline=pipeline,
+            phi_keys=phi_keys,
         )
         if len(df) == 0:
             return 0
@@ -2686,12 +2860,16 @@ class TabularSQLSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
+        pipeline = self._resolve_enrichment_pipeline()
+        phi_keys = set(pipeline.phi_keys) if (pipeline is not None and pipeline.phi_keys) else None
         df = _prepare_tabular_batch_df(
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
             study_key=self._cfg.study_key,
             as_sdtm=self._cfg.as_sdtm,
+            pipeline=pipeline,
+            phi_keys=phi_keys,
         )
         if len(df) == 0:
             return 0
@@ -2933,12 +3111,16 @@ class TabularDuckDBSink(ExportSink):
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records into DuckDB."""
+        pipeline = self._resolve_enrichment_pipeline()
+        phi_keys = set(pipeline.phi_keys) if (pipeline is not None and pipeline.phi_keys) else None
         df = _prepare_tabular_batch_df(
             records,
             mask_phi=self._cfg.mask_phi,
             sanitize=self._cfg.sanitize,
             study_key=self._cfg.study_key,
             as_sdtm=self._cfg.as_sdtm,
+            pipeline=pipeline,
+            phi_keys=phi_keys,
         )
         if len(df) == 0:
             return 0
@@ -3168,6 +3350,8 @@ class _TabularTransformSink(ExportSink):
         self._pipeline = pipeline
         self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
         self._has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
+        if isinstance(inner, ExportSink):
+            inner._seed_enrichment_pipeline(config.study_key, pipeline)
         self._domain_seq_counters: dict[str, dict[str, int]] = {}
         self._seq_counters: dict[str, int] = {}
         self._record_seqs: dict[str, int] = {}
@@ -3286,6 +3470,7 @@ class _TabularTransformSink(ExportSink):
             )
             if self._sanitize:
                 df = _sanitize_df(df)
+            df.attrs["_imednet_tabular_prepared"] = True
             commit_sdtm_lineage(self, lineage_out)
             self._sync_active_context_to_inner()
             return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
@@ -3322,6 +3507,7 @@ class _TabularTransformSink(ExportSink):
         elif not self._cfg.mask_phi:
             stamp_tabular_batch(df, mask_phi=False, sanitized=False)
 
+        df.attrs["_imednet_tabular_prepared"] = True
         return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
 
     def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
@@ -3546,7 +3732,7 @@ def _tabular_export_impl(
             domains=inferred_domains or None,
             preserve_record_id=_is_incremental_config(config),
         )
-        pipeline = resolve_enrichment_pipeline(study_key)
+        pipeline = resolve_sink_enrichment_pipeline(config, study_key=study_key)
         record_model: Any = None
     else:
         if no_matching_domain:
@@ -3564,7 +3750,9 @@ def _tabular_export_impl(
             return
 
         raw_variables = mapper._last_variables if hasattr(mapper, "_last_variables") else None
-        pipeline = resolve_enrichment_pipeline(study_key)
+        pipeline = resolve_sink_enrichment_pipeline(config, study_key=study_key)
+        if isinstance(getattr(mapper, "_enrichment_cache", None), dict):
+            mapper._enrichment_cache[study_key] = pipeline
         contract_types = _build_tabular_contract_types(
             variable_keys,
             label_map,
@@ -3734,6 +3922,10 @@ def _config_has_streaming_options(config: TabularSinkConfig) -> bool:
         or config.standards_profile is not None
         or config.min_standards_score is not None
         or config.naming_convention is not None
+        or (
+            isinstance(config.extra, Mapping)
+            and ("study_config" in config.extra or "enrichment_pipeline" in config.extra)
+        )
     )
 
 
@@ -4080,7 +4272,7 @@ def export_to_excel(
                 prev_kept = _filter_df_excluding_sdtm_keys(prev_df, delta_sdtm | voided_sdtm)
 
             if not prev_kept.empty and config.mask_phi:
-                phi_keys = _resolve_study_phi_keys(study_key)
+                phi_keys = _resolve_study_phi_keys(study_key, config=config)
                 copied_prev = False
                 if config.as_sdtm:
                     for col in prev_kept.columns:
@@ -4585,7 +4777,11 @@ class _HierarchicalJSONSink(ExportSink):
                 existing_tree = []
 
             exclude_ids = set(self._records_by_cid) | self._voided_ids
-            phi_keys = _resolve_study_phi_keys(self._study_key) if self._cfg.mask_phi else None
+            phi_keys = (
+                _resolve_study_phi_keys(self._study_key, config=self._cfg)
+                if self._cfg.mask_phi
+                else None
+            )
             final_data: Any = _merge_hierarchical_archives(
                 existing_tree,
                 delta_sanitized if isinstance(delta_sanitized, list) else [],
@@ -4750,7 +4946,7 @@ def export_to_json(
     is_incremental_json = _is_incremental_config(config)
 
     def _write_or_reconcile_json(combined: pd.DataFrame, voided_ids: set[str]) -> None:
-        phi_keys = _resolve_study_phi_keys(study_key) if config.mask_phi else None
+        phi_keys = _resolve_study_phi_keys(study_key, config=config) if config.mask_phi else None
         if not (is_incremental_json and config.idempotent):
             combined_stamped = (not config.mask_phi) or has_valid_tabular_batch_stamp(
                 combined,
@@ -5544,7 +5740,9 @@ def export_to_duckdb_by_form(
         mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
         if hasattr(mapper, "_active_study_key"):
             mapper._active_study_key = study_key
-        pipeline = resolve_enrichment_pipeline(study_key)
+        pipeline = resolve_sink_enrichment_pipeline(config, study_key=study_key)
+        if isinstance(getattr(mapper, "_enrichment_cache", None), dict):
+            mapper._enrichment_cache[study_key] = pipeline
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)
@@ -5702,7 +5900,9 @@ def export_to_sql_by_form(
         mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
         if hasattr(mapper, "_active_study_key"):
             mapper._active_study_key = study_key
-        pipeline = resolve_enrichment_pipeline(study_key)
+        pipeline = resolve_sink_enrichment_pipeline(config, study_key=study_key)
+        if isinstance(getattr(mapper, "_enrichment_cache", None), dict):
+            mapper._enrichment_cache[study_key] = pipeline
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     engine = create_engine(conn_str)
@@ -6050,7 +6250,7 @@ def export_to_long_sql(
     engine = create_engine(conn_str)
     with sdk_governance_context(sdk):
         mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
-        pipeline = resolve_enrichment_pipeline(study_key)
+        pipeline = resolve_sink_enrichment_pipeline(config, study_key=study_key)
     phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
 
     if _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config):
