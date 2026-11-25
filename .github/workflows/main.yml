@@ -202,9 +202,9 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-3.11-
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
@@ -258,20 +258,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
-          path: |
-            ~/.cache/uv
-            .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
-      - name: Install Dependencies
-        run: |
-          python -m pip install uv hatch
-          uv sync --locked --all-packages --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
+          enable-cache: "false"
 
       - name: Tighten Internal Dependencies
         run: python scripts/tighten_dependencies.py --rewrite
@@ -283,10 +273,7 @@ jobs:
           if echo "$BUILD_MATRIX" | jq -e 'length > 0' > /dev/null; then
             for package in packages/*; do
               if [ -f "$package/pyproject.toml" ]; then
-                (
-                  cd "$package"
-                  hatch build
-                )
+                uv build --no-create-gitignore --out-dir "$package/dist" "$package"
               fi
             done
           else
@@ -360,8 +347,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Workspace Dependencies
+        id: cache-uv
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
@@ -369,6 +357,25 @@ jobs:
           key: uv-venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
           restore-keys: |
             uv-venv-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
+
+      - name: Install Dependencies
+        run: |
+          uv sync --locked --all-packages --all-extras
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Save Workspace Dependencies
+        if: steps.cache-uv.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: uv-venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
 
       - name: Download Built Artifacts
         if: needs.plan.outputs.build_matrix != '[]'
@@ -378,12 +385,8 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Install Dependencies
+      - name: Install Built Wheels
         run: |
-          python -m pip install uv hatch
-          uv sync --locked --all-packages --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
-
           if ls dist/*.whl 1> /dev/null 2>&1; then
             uv pip install --force-reinstall --no-deps dist/*.whl
           fi
@@ -443,15 +446,19 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-3.11-
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
 
       - name: Install Dependencies
         run: |
-          python -m pip install uv hatch
           uv sync --locked --all-packages --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Run Hermetic Integration Sandbox
         env:
@@ -492,9 +499,9 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-3.12-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.12"-
+            uv-venv-${{ runner.os }}-3.12-
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
@@ -513,7 +520,7 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-3.12-${{ hashFiles('uv.lock') }}
 
       - name: Restore Fuzzing Corpus Cache
         id: restore-fuzz-corpus
@@ -571,15 +578,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache Workspace Dependencies
+      - name: Cache uv Packages
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/.cache/uv
-            .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          path: ~/.cache/uv
+          key: uv-cache-${{ runner.os }}-3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-cache-${{ runner.os }}-3.11-
 
       - name: Download Built Artifacts
         if: needs.plan.outputs.build_matrix != '[]'
@@ -593,11 +598,6 @@ jobs:
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: "false"
-
-      - name: Install Dependencies
-        run: |
-          uv sync --locked --all-packages --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Validate Package Consumption
         run: python scripts/validate_package_consumption.py --wheel-dir dist
@@ -626,9 +626,9 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-3.11-
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0

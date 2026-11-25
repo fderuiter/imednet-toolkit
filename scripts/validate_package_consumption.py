@@ -502,13 +502,23 @@ def _install_into_venv(
         run(unlocked_cmd, cwd=tmpdir)
 
 
-def _resolve_host_mypy() -> Path | None:
-    exe_name = "mypy.exe" if os.name == "nt" else "mypy"
-    sibling = Path(sys.executable).with_name(exe_name)
-    if sibling.is_file():
-        return sibling
-    which_mypy = shutil.which("mypy")
-    return Path(which_mypy) if which_mypy is not None else None
+def _locked_package_spec(pkg_name: str, uv_lock_path: Path = UV_LOCK_PATH) -> str:
+    """Resolve a pinned ``pkg==version`` spec from ``uv.lock`` when uniquely locked."""
+    if not uv_lock_path.is_file():
+        return pkg_name
+
+    normalized_target = _normalize_wheel_prefix(pkg_name)
+    lock_data = tomllib.loads(uv_lock_path.read_text(encoding="utf-8"))
+    matches = [
+        pkg.get("version")
+        for pkg in lock_data.get("package", [])
+        if _normalize_wheel_prefix(pkg.get("name", "")) == normalized_target
+        and pkg.get("version")
+        and "registry" in pkg.get("source", {})
+    ]
+    if len(matches) == 1 and isinstance(matches[0], str):
+        return f"{pkg_name}=={matches[0]}"
+    return pkg_name
 
 
 def verify_wheel_mypy_strict(
@@ -559,13 +569,12 @@ def verify_wheel_mypy_strict(
         )
 
         install_specs = [
-            f"{pkg_name} @ {wheel_path.resolve().as_uri()}"
-            for pkg_name, wheel_path in sorted(workspace_wheels.items())
+            *(
+                f"{pkg_name} @ {wheel_path.resolve().as_uri()}"
+                for pkg_name, wheel_path in sorted(workspace_wheels.items())
+            ),
+            _locked_package_spec("mypy", uv_lock_path),
         ]
-        mypy_bin = _resolve_host_mypy()
-        if mypy_bin is None:
-            install_specs.append("mypy")
-            mypy_bin = venv_mypy
 
         _install_into_venv(
             uv_bin,
@@ -598,7 +607,7 @@ def verify_wheel_mypy_strict(
         try:
             res = run(
                 [
-                    str(mypy_bin),
+                    str(venv_mypy),
                     "--strict",
                     "--python-executable",
                     str(python_bin),

@@ -13,6 +13,23 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SHA_SETUP_UV_RE = re.compile(r"^astral-sh/setup-uv@[0-9a-f]{40}$")
+UNQUOTED_VENV_KEY_RE = re.compile(
+    r"^uv-venv-\$\{\{\s*runner\.os\s*\}\}-"
+    r"(?:3\.11|3\.12|3\.13|\$\{\{\s*matrix\.python-version\s*\}\})-"
+    r"\$\{\{\s*hashFiles\('uv\.lock'\)\s*\}\}$"
+)
+UNQUOTED_VENV_RESTORE_RE = re.compile(
+    r"^uv-venv-\$\{\{\s*runner\.os\s*\}\}-"
+    r"(?:3\.11|3\.12|3\.13|\$\{\{\s*matrix\.python-version\s*\}\})-$"
+)
+UNPINNED_PIP_INSTALL_RE = re.compile(r"(?<!uv\s)pip\s+install")
+VENV_WORKFLOW_PATHS = (
+    ".github/workflows/main.yml",
+    ".github/workflows/fuzzing-deep.yml",
+    ".github/workflows/performance.yml",
+    ".github/workflows/live-tests.yml",
+    ".github/workflows/copilot-setup-steps.yml",
+)
 EXPECTED_RUFF_SELECT = {
     "PL",
     "PIE",
@@ -187,6 +204,141 @@ def _assert_guardrail_contract(
     assert "Passing gracefully" not in run_tests_step["run"]
     assert "-eq 5" not in run_tests_step["run"]
 
+    _assert_workflow_venv_cache_contract({".github/workflows/main.yml": pipeline})
+
+
+def _cache_step_paths(step: dict) -> list[str]:
+    raw_path = str(step.get("with", {}).get("path", ""))
+    return [line.strip() for line in raw_path.splitlines() if line.strip()]
+
+
+def _is_cache_step(step: dict) -> bool:
+    uses = str(step.get("uses", ""))
+    return uses.startswith(("actions/cache@", "actions/cache/restore@", "actions/cache/save@"))
+
+
+def _assert_workflow_venv_cache_contract(workflows: dict[str, dict]) -> None:
+    for wf_path, wf_doc in workflows.items():
+        for job_key, job in wf_doc.get("jobs", {}).items():
+            steps = job.get("steps", [])
+            job_runs = [str(s.get("run", "")) for s in steps if "run" in s]
+
+            assert not any(UNPINNED_PIP_INSTALL_RE.search(r) for r in job_runs), (
+                f"Unpinned pip install found in {wf_path}:{job_key}"
+            )
+            if any(
+                tok in r for r in job_runs for tok in ("uv ", "uvx ", "pytest", "validate_package")
+            ):
+                assert any(SHA_SETUP_UV_RE.match(str(s.get("uses", ""))) for s in steps), (
+                    f"Missing SHA-pinned astral-sh/setup-uv in {wf_path}:{job_key}"
+                )
+
+            restores_venv = False
+            for step in steps:
+                if not _is_cache_step(step):
+                    continue
+                uses = str(step.get("uses", ""))
+                with_cfg = step.get("with", {})
+                key = str(with_cfg.get("key", "")).strip()
+                restore_keys = [
+                    line.strip()
+                    for line in str(with_cfg.get("restore-keys", "")).splitlines()
+                    if line.strip()
+                ]
+                assert '"' not in key, f"Quoted cache key in {wf_path}:{job_key}: {key}"
+                assert all('"' not in rk for rk in restore_keys), (
+                    f"Quoted restore-keys in {wf_path}:{job_key}: {restore_keys}"
+                )
+
+                paths = _cache_step_paths(step)
+                if ".venv" in paths:
+                    assert UNQUOTED_VENV_KEY_RE.match(key), (
+                        f"Non-canonical .venv cache key in {wf_path}:{job_key}: {key}"
+                    )
+                    if uses.startswith(("actions/cache@", "actions/cache/restore@")):
+                        restores_venv = True
+                        assert restore_keys and all(
+                            UNQUOTED_VENV_RESTORE_RE.match(rk) for rk in restore_keys
+                        ), (
+                            f"Non-canonical .venv restore-keys in {wf_path}:{job_key}: "
+                            f"{restore_keys}"
+                        )
+                else:
+                    assert not key.startswith("uv-venv-"), (
+                        f"Non-.venv cache step must not use uv-venv- prefix in {wf_path}:{job_key}"
+                    )
+
+            if restores_venv:
+                assert job_key not in {"build", "validate-package-consumption"}, (
+                    f"Unused .venv restore in {wf_path}:{job_key}"
+                )
+                assert any("uv sync --locked --all-packages --all-extras" in r for r in job_runs), (
+                    f"Job restoring .venv must sync locked workspace in {wf_path}:{job_key}"
+                )
+                if job_key != "copilot-setup-steps":
+                    assert any(
+                        tok in r for r in job_runs for tok in ("uv run", ".venv/bin", "pytest")
+                    ), f"Unused .venv restore without consumer command in {wf_path}:{job_key}"
+
+    main_wf = workflows.get(".github/workflows/main.yml")
+    if main_wf is None:
+        return
+
+    main_jobs = main_wf["jobs"]
+
+    build_steps = main_jobs["build"]["steps"]
+    build_runs = [str(s.get("run", "")) for s in build_steps if "run" in s]
+    assert not any(".venv" in _cache_step_paths(s) for s in build_steps if _is_cache_step(s))
+    assert not any("uv sync" in r for r in build_runs)
+    assert not any("hatch build" in r for r in build_runs)
+    assert any("uv build" in r for r in build_runs)
+
+    test_steps = main_jobs["test"]["steps"]
+    assert not any(
+        str(s.get("uses", "")).startswith("actions/cache@") and ".venv" in _cache_step_paths(s)
+        for s in test_steps
+    ), "Unified actions/cache in test would save wheel-mutated .venv at job teardown"
+
+    restore_idx = next(
+        i
+        for i, s in enumerate(test_steps)
+        if str(s.get("uses", "")).startswith("actions/cache/restore@")
+        and ".venv" in _cache_step_paths(s)
+    )
+    sync_idx = next(
+        i
+        for i, s in enumerate(test_steps)
+        if "uv sync --locked --all-packages --all-extras" in str(s.get("run", ""))
+    )
+    save_idx = next(
+        i
+        for i, s in enumerate(test_steps)
+        if str(s.get("uses", "")).startswith("actions/cache/save@")
+        and ".venv" in _cache_step_paths(s)
+    )
+    wheel_indices = [
+        i
+        for i, s in enumerate(test_steps)
+        if "uv pip install --force-reinstall --no-deps dist/*.whl" in str(s.get("run", ""))
+    ]
+    run_tests_idx = next(i for i, s in enumerate(test_steps) if s.get("name") == "Run Tests")
+
+    assert len(wheel_indices) == 1
+    wheel_idx = wheel_indices[0]
+    assert restore_idx < sync_idx < save_idx < wheel_idx < run_tests_idx
+    save_if = str(test_steps[save_idx].get("if", ""))
+    assert "cache-hit != 'true'" in save_if
+    assert not any(
+        "dist/*.whl" in str(s.get("run", "")) for s in test_steps[: save_idx + 1] if "run" in s
+    )
+
+    consumption_steps = main_jobs["validate-package-consumption"]["steps"]
+    consumption_runs = [str(s.get("run", "")) for s in consumption_steps if "run" in s]
+    consumption_caches = [s for s in consumption_steps if _is_cache_step(s)]
+    assert len(consumption_caches) == 1
+    assert _cache_step_paths(consumption_caches[0]) == ["~/.cache/uv"]
+    assert not any("uv sync" in r for r in consumption_runs)
+
 
 def test_ci_uses_canonical_full_verification():
     project, hooks, typos_cfg, pipeline = _load_guardrail_manifests()
@@ -357,15 +509,20 @@ def test_ci_quality_job_verifies_model_type_stubs():
 
 
 def test_copilot_and_consumption_workflows_use_canonical_uv_sync():
-    copilot = yaml.safe_load(
-        (ROOT / ".github/workflows/copilot-setup-steps.yml").read_text(encoding="utf-8")
-    )
-    copilot_runs = [
-        s.get("run", "") for s in copilot["jobs"]["copilot-setup-steps"]["steps"] if "run" in s
-    ]
-    assert any("uv sync --locked --all-packages --all-extras" in r for r in copilot_runs)
+    workflows = {
+        rel_path: yaml.safe_load((ROOT / rel_path).read_text(encoding="utf-8"))
+        for rel_path in VENV_WORKFLOW_PATHS
+    }
+    _assert_workflow_venv_cache_contract(workflows)
 
-    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+    copilot = workflows[".github/workflows/copilot-setup-steps.yml"]
+    copilot_steps = copilot["jobs"]["copilot-setup-steps"]["steps"]
+    copilot_runs = [s.get("run", "") for s in copilot_steps if "run" in s]
+    assert any(SHA_SETUP_UV_RE.match(str(s.get("uses", ""))) for s in copilot_steps)
+    assert any("uv sync --locked --all-packages --all-extras" in r for r in copilot_runs)
+    assert not any(UNPINNED_PIP_INSTALL_RE.search(r) for r in copilot_runs)
+
+    pipeline = workflows[".github/workflows/main.yml"]
     assert "validate-extras" not in pipeline["jobs"]
 
     consumption_job = pipeline["jobs"]["validate-package-consumption"]
@@ -380,12 +537,23 @@ def test_copilot_and_consumption_workflows_use_canonical_uv_sync():
     assert download_step.get("uses", "").startswith("actions/download-artifact@")
 
     consumption_runs = [s.get("run", "") for s in consumption_steps if "run" in s]
-    assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in consumption_steps)
-    assert any("uv sync --locked --all-packages --all-extras" in r for r in consumption_runs)
+    assert any(SHA_SETUP_UV_RE.match(str(s.get("uses", ""))) for s in consumption_steps)
+    assert not any("uv sync" in r for r in consumption_runs)
     assert any(
         "scripts/validate_package_consumption.py --wheel-dir dist" in r for r in consumption_runs
     )
     assert not any("pip install" in r for r in consumption_runs)
+
+    # Confirm quoted cache keys in non-main workflows are also rejected
+    mutated_deep = copy.deepcopy(workflows)
+    deep_restore = next(
+        s
+        for s in mutated_deep[".github/workflows/fuzzing-deep.yml"]["jobs"]["deep-fuzzing"]["steps"]
+        if str(s.get("uses", "")).startswith("actions/cache/restore@")
+    )
+    deep_restore["with"]["key"] = 'uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles(\'uv.lock\') }}'
+    with pytest.raises(AssertionError, match="Quoted cache key"):
+        _assert_workflow_venv_cache_contract(mutated_deep)
 
 
 def test_ci_export_filter_includes_sinks_and_schedules_integration_sandbox():
@@ -607,6 +775,69 @@ def _mutate_test_exit_code_5_bypass(
     run_step["run"] += '\n|| { RET=$?; if [ $RET -eq 5 ]; then exit 0; fi; exit $RET; }'
 
 
+def _mutate_quoted_venv_cache_key(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    cache_step = next(s for s in pipeline["jobs"]["quality"]["steps"] if _is_cache_step(s))
+    cache_step["with"]["key"] = 'uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles(\'uv.lock\') }}'
+
+
+def _mutate_test_post_wheel_venv_save(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    test_steps = pipeline["jobs"]["test"]["steps"]
+    save_idx = next(
+        i
+        for i, s in enumerate(test_steps)
+        if str(s.get("uses", "")).startswith("actions/cache/save@")
+    )
+    wheel_idx = next(
+        i
+        for i, s in enumerate(test_steps)
+        if "uv pip install --force-reinstall --no-deps dist/*.whl" in str(s.get("run", ""))
+    )
+    save_step = test_steps.pop(save_idx)
+    test_steps.insert(wheel_idx, save_step)
+
+
+def _mutate_test_unified_cache_post_wheel_save(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    test_steps = pipeline["jobs"]["test"]["steps"]
+    restore_step = next(
+        s for s in test_steps if str(s.get("uses", "")).startswith("actions/cache/restore@")
+    )
+    restore_step["uses"] = restore_step["uses"].replace("actions/cache/restore@", "actions/cache@")
+
+
+def _mutate_build_unused_venv_restore(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["build"]["steps"].insert(
+        2,
+        {
+            "name": "Cache Workspace Dependencies",
+            "uses": "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+            "with": {
+                "path": "~/.cache/uv\n.venv",
+                "key": "uv-venv-${{ runner.os }}-3.11-${{ hashFiles('uv.lock') }}",
+                "restore-keys": "uv-venv-${{ runner.os }}-3.11-",
+            },
+        },
+    )
+
+
+def _mutate_consumption_unused_venv_restore(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    cache_step = next(
+        s for s in pipeline["jobs"]["validate-package-consumption"]["steps"] if _is_cache_step(s)
+    )
+    cache_step["with"]["path"] = "~/.cache/uv\n.venv"
+    cache_step["with"]["key"] = "uv-venv-${{ runner.os }}-3.11-${{ hashFiles('uv.lock') }}"
+    cache_step["with"]["restore-keys"] = "uv-venv-${{ runner.os }}-3.11-"
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -633,6 +864,11 @@ def _mutate_test_exit_code_5_bypass(
         _mutate_build_selective_upload,
         _mutate_test_hatch_run,
         _mutate_test_exit_code_5_bypass,
+        _mutate_quoted_venv_cache_key,
+        _mutate_test_post_wheel_venv_save,
+        _mutate_test_unified_cache_post_wheel_save,
+        _mutate_build_unused_venv_restore,
+        _mutate_consumption_unused_venv_restore,
     ],
 )
 def test_guardrail_manifest_contract_rejects_simulated_drift(mutator) -> None:

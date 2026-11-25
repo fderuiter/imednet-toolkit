@@ -41,12 +41,16 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-3.11-
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
 
       - name: Install Workspace Dependencies
         run: |
-          python -m pip install uv hatch
           uv sync --locked --all-packages --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"

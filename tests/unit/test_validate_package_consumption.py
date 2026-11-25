@@ -404,6 +404,63 @@ def test_verify_wheel_mypy_strict_validates_typed_wheels_and_catches_type_errors
         )
 
 
+def test_verify_wheel_mypy_strict_installs_locked_mypy_into_isolated_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pkgs_dir = tmp_path / "packages" / "sample"
+    pkgs_dir.mkdir(parents=True)
+    (pkgs_dir / "pyproject.toml").write_text(
+        '[project]\nname = "imednet-sample"\nversion = "1.0.0"\n'
+        '[tool.hatch.build.targets.wheel]\npackages = ["src/imednet_sample"]\n',
+        encoding="utf-8",
+    )
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    wheel_path = dist_dir / "imednet_sample-1.0.0-py3-none-any.whl"
+    _write_typed_wheel(wheel_path, dist_name="imednet-sample", import_pkg="imednet_sample")
+
+    fake_lock = tmp_path / "uv.lock"
+    fake_lock.write_text(
+        '[[package]]\nname = "mypy"\nversion = "1.15.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n',
+        encoding="utf-8",
+    )
+
+    recorded_specs: list[list[str]] = []
+    recorded_cmds: list[list[str]] = []
+
+    monkeypatch.setattr(vpc, "_resolve_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(
+        vpc,
+        "_install_into_venv",
+        lambda uv_bin, python_bin, dist, constraints, locked_constraints, specs, tmpdir: (
+            recorded_specs.append(list(specs))
+        ),
+    )
+
+    def fake_run(cmd, **kwargs):
+        recorded_cmds.append([str(c) for c in cmd])
+        return subprocess.CompletedProcess(
+            list(cmd), 0, stdout="Success: no issues found\n", stderr=""
+        )
+
+    monkeypatch.setattr(vpc, "run", fake_run)
+
+    vpc.verify_wheel_mypy_strict(
+        dist_dir,
+        packages_dir=tmp_path / "packages",
+        uv_lock_path=fake_lock,
+        consumer_source="import imednet_sample\n",
+    )
+
+    assert len(recorded_specs) == 1
+    assert "mypy==1.15.0" in recorded_specs[0]
+    mypy_cmd = recorded_cmds[-1]
+    assert "--strict" in mypy_cmd
+    assert Path(mypy_cmd[0]).name in {"mypy", "mypy.exe"}
+    assert "venv" in Path(mypy_cmd[0]).parts
+
+
 def test_conftest_wheel_mode_gates_sys_path_and_architecture_resolves_repo_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
