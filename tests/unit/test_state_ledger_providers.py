@@ -917,3 +917,174 @@ def test_file_and_airflow_transaction_hydrate_persist_rollback_and_redact_sdtm_m
         assert batch_committed["ae_sdtm"].metadata["sdtm_seq_counters"]["AE:SUBJ-01"] == 4
         assert batch_committed["vs_sdtm"].metadata["sdtm_seq_counters"] == {"VS:SUBJ-01": 1}
         assert batch_committed["vs_sdtm"].metadata["patientName"] == "***MASKED***"
+
+
+def test_airflow_sdk_concurrent_transaction_lease_token_and_monotonic_watermarks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task SDK AirflowStateProvider.transaction verifies lease_token and enforces monotonic watermarks."""
+    store: dict[str, str] = {}
+    interject_competing_writer = {"enabled": False}
+
+    class RacingSdkVariable:
+        @staticmethod
+        def get(key: str, default: Any = None, deserialize_json: bool = False) -> Any:
+            if key not in store:
+                return default
+            raw = store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(
+            key: str,
+            value: Any,
+            description: str | None = None,
+            serialize_json: bool = False,
+        ) -> None:
+            _ = description
+            store[key] = json.dumps(value) if serialize_json else str(value)
+            if interject_competing_writer["enabled"]:
+                interject_competing_writer["enabled"] = False
+                hijacked = json.loads(store[key])
+                hijacked["streams"]["records"]["lease_token"] = "competing-worker-token"
+                store[key] = json.dumps(hijacked)
+
+        @staticmethod
+        def delete(key: str) -> None:
+            store.pop(key, None)
+
+        @staticmethod
+        def keys(prefix: str | None = None) -> list[str]:
+            if prefix is None:
+                return sorted(store)
+            return sorted(k for k in store if k.startswith(prefix))
+
+    airflow_mod = ModuleType("airflow")
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.Variable = RacingSdkVariable  # type: ignore[attr-defined]
+    airflow_mod.sdk = sdk_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
+    monkeypatch.delitem(sys.modules, "airflow.sdk.execution_time", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.sdk.execution_time.task_runner", raising=False)
+
+    provider = AirflowStateProvider()
+    t1 = datetime(2026, 8, 1, 10, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc)
+
+    # 1. Immediate lease_token overwrite race on acquisition raises InvalidStateTransitionError
+    interject_competing_writer["enabled"] = True
+    with pytest.raises(InvalidStateTransitionError, match="lease token mismatch"):
+        with provider.transaction("STUDY_RACE", "records"):
+            pass
+
+    # Clear hijacked state and commit t2 cleanly
+    store.clear()
+    with provider.transaction("STUDY_RACE", "records") as tx_init:
+        # Overlapping second caller while RUNNING raises InvalidStateTransitionError
+        with pytest.raises(InvalidStateTransitionError):
+            with provider.transaction("STUDY_RACE", "records"):
+                pass
+        tx_init["new_timestamp"] = t2
+        tx_init["records_processed"] = 10
+
+    assert provider.get_last_timestamp("STUDY_RACE", "records") == t2
+
+    # 2. Monotonic watermark enforcement: attempting to commit older t1 < t2 keeps t2
+    with provider.transaction("STUDY_RACE", "records") as tx_older:
+        assert tx_older["last_timestamp"] == t2
+        tx_older["new_timestamp"] = t1
+        tx_older["records_processed"] = 2
+
+    assert provider.get_last_timestamp("STUDY_RACE", "records") == t2
+    provider.set_last_timestamp("STUDY_RACE", "records", t1, force=False)
+    assert provider.get_last_timestamp("STUDY_RACE", "records") == t2
+
+    # 3. Pre-commit lease_token theft during yield raises InvalidStateTransitionError without regressing t2
+    study_var_key = provider._get_study_variable_key("STUDY_RACE")
+    with pytest.raises(InvalidStateTransitionError, match="lease token mismatch"):
+        with provider.transaction("STUDY_RACE", "records") as tx_stolen:
+            tx_stolen["new_timestamp"] = t1
+            stolen_doc = json.loads(store[study_var_key])
+            stolen_doc["streams"]["records"]["lease_token"] = "other-worker-lease"
+            store[study_var_key] = json.dumps(stolen_doc)
+
+    # Even if other worker committed t2, stolen lease never overwrote store with t1
+    recovered_doc = json.loads(store[study_var_key])
+    assert recovered_doc["streams"]["records"]["last_timestamp"] == t2.isoformat()
+
+
+def test_airflow_sdk_wildcard_prefix_and_exact_study_delete_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AirflowStateProvider escapes wildcards and verifies exact study_key matches in SDK mode."""
+    import fnmatch
+
+    store: dict[str, str] = {}
+
+    class UnescapedLikeSdkVariable:
+        """Simulates a SQL LIKE backend where '_' and '%' act as wildcards if unguarded."""
+
+        @staticmethod
+        def get(key: str, default: Any = None, deserialize_json: bool = False) -> Any:
+            if key not in store:
+                return default
+            raw = store[key]
+            return json.loads(raw) if deserialize_json else raw
+
+        @staticmethod
+        def set(
+            key: str,
+            value: Any,
+            description: str | None = None,
+            serialize_json: bool = False,
+        ) -> None:
+            _ = description
+            store[key] = json.dumps(value) if serialize_json else str(value)
+
+        @staticmethod
+        def delete(key: str) -> None:
+            store.pop(key, None)
+
+        @staticmethod
+        def keys(prefix: str | None = None) -> list[str]:
+            if prefix is None:
+                return sorted(store)
+            glob_pat = prefix.replace("_", "?").replace("%", "*") + "*"
+            return sorted(k for k in store if fnmatch.fnmatchcase(k, glob_pat))
+
+    airflow_mod = ModuleType("airflow")
+    sdk_mod = ModuleType("airflow.sdk")
+    sdk_mod.Variable = UnescapedLikeSdkVariable  # type: ignore[attr-defined]
+    airflow_mod.sdk = sdk_mod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "airflow", airflow_mod)
+    monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_mod)
+    monkeypatch.delitem(sys.modules, "airflow.sdk.execution_time", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.sdk.execution_time.task_runner", raising=False)
+
+    provider = AirflowStateProvider()
+    ts = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    provider.set_last_timestamp("STUDY_1", "records", ts)
+    provider.set_last_timestamp("STUDYA1", "records", ts)
+    provider.set_last_timestamp("STUDY%1", "records", ts)
+    # Also seed raw unencoded legacy key with '%'
+    store["imednet_state:STUDY%1:legacy_stream"] = json.dumps(
+        {
+            "study_key": "STUDY%1",
+            "stream_name": "legacy_stream",
+            "last_timestamp": ts.isoformat(),
+            "status": "success",
+        }
+    )
+
+    assert provider._list_variable_keys("imednet_state:STUDY_1") == ["imednet_state:STUDY_1"]
+    assert provider.delete_entry("STUDY_1") is True
+    assert provider.get_last_timestamp("STUDY_1", "records") is None
+    assert provider.get_last_timestamp("STUDYA1", "records") == ts
+    assert provider.get_last_timestamp("STUDY%1", "records") == ts
+    assert "imednet_state:STUDY%1:legacy_stream" in store
+
+    assert provider.delete_entry("STUDY%1") is True
+    assert provider.get_last_timestamp("STUDY%1", "records") is None
+    assert "imednet_state:STUDY%1:legacy_stream" not in store
+    assert provider.get_last_timestamp("STUDYA1", "records") == ts

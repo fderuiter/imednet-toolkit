@@ -343,10 +343,10 @@ Shared :class:`~imednet.spi.sink_base.SinkConfig` fields:
      - Enable transactional high-water mark reads and commits via a ``StateProviderProtocol`` ledger.
    * - ``stream_name``
      - ``None``
-     - Logical stream key inside the state ledger (defaults to ``"records"`` or a destination-specific stream identifier).
+     - Logical stream key inside the state ledger (defaults to ``"records"`` or a destination-specific identifier; ``ImednetExportOperator`` derives target-scoped defaults from ``dag_id``, ``task_id``, ``destination``, and sanitized target names while seeding from a matching pre-upgrade checkpoint when state is absent).
    * - ``ledger_path``
      - ``None``
-     - Filesystem path passed to file-backed checkpoint providers when ``state_provider`` is not supplied explicitly.
+     - Filesystem path passed to file-backed checkpoint providers when ``state_provider`` is not supplied explicitly (always resolving :class:`~imednet_workflows.state_ledger.FileStateProvider` ahead of Airflow ``Variable`` defaults).
    * - ``state_provider``
      - ``None``
      - Pre-configured :class:`~imednet.spi.sink_base.StateProviderProtocol` instance overriding entry-point discovery.
@@ -378,11 +378,13 @@ Incremental exports decouple destination sinks from checkpoint persistence throu
   ``set_last_timestamp(...)``, ``transaction(study_key, stream_name, fallback_timestamp=None)``,
   ``read_state()``, and ``delete_entry(study_key, stream_name=None)``.
 * ``get_state_provider(ledger_path=None, *, provider_name=None)`` resolves plugins registered
-  under the ``imednet.state_providers`` entry-point group (shipped by ``imednet-workflows``):
+  under the ``imednet.state_providers`` entry-point group (shipped by ``imednet-workflows``),
+  routing explicit ``ledger_path`` arguments directly to ``FileStateProvider`` even under
+  ``default`` or ``airflow`` provider settings:
 
-  - ``default`` → :func:`imednet_workflows.state_ledger.get_state_provider` (auto-detects Airflow task context vs file ledger).
+  - ``default`` → :func:`imednet_workflows.state_ledger.get_state_provider` (returns ``FileStateProvider`` for explicit custom paths before checking ``AIRFLOW_CTX_TASK_ID`` or ``USE_AIRFLOW_STATE_PROVIDER``).
   - ``file`` → :class:`imednet_workflows.state_ledger.FileStateProvider` (also exported as the backward-compatible alias :class:`imednet_workflows.ExtractionStateLedger`).
-  - ``airflow`` → :class:`imednet_workflows.state_ledger.AirflowStateProvider` (persists stream watermarks in Airflow ``Variable`` checkpoints).
+  - ``airflow`` → :class:`imednet_workflows.state_ledger.AirflowStateProvider` (persists consolidated per-``Study`` stream watermarks in Airflow ``Variable`` storage using optimistic SQL compare-and-swap outside ``RuntimeTaskInstance``, ``lease_token`` verification via ``airflow.sdk.Variable`` inside ``RuntimeTaskInstance``, monotonic watermarks, and wildcard-escaped exact ``Study`` deletes).
 
 * :func:`~imednet.spi.sink_base.run_streaming_export` orchestrates end-to-end streaming
   writes across every ``ExportSink``:

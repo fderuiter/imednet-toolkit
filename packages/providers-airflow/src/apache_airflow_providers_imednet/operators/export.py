@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import logging
+import os
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import closing
+from datetime import datetime
+from enum import Enum
 from typing import Any, cast
 from urllib.parse import quote_plus, urlsplit
 
@@ -14,6 +19,7 @@ from imednet import ImednetSDK
 from imednet.spi import sink_base
 from imednet.spi.sinks import redact_uri
 from imednet.spi.utils import (
+    redact_sensitive_payload,
     redact_sensitive_text,
     validate_path_segment,
 )
@@ -153,6 +159,24 @@ def _load_openlineage_types() -> tuple[Any, Any] | None:
 def _sanitize_lineage_text(value: str) -> str:
     """Redact credentials and sensitive query parameters from OpenLineage identifiers."""
     return redact_sensitive_text(redact_uri(value))
+
+
+def _sanitize_stream_segment(value: str, *, max_len: int = 80) -> str:
+    """Redact URI/inline secrets and normalize an identifier into a stream_name token."""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    redacted = redact_sensitive_text(str(redact_sensitive_payload(redact_uri(raw))))
+    cleaned = redacted.replace("***", "").replace("[REDACTED]", "")
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", cleaned).strip("_")
+    sanitized = re.sub(r"_+", "_", sanitized)
+    if not sanitized:
+        return ""
+    if len(sanitized) <= max_len:
+        return sanitized
+    digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()[:8]
+    half = max((max_len - 10) // 2, 8)
+    return f"{sanitized[:half]}_{sanitized[-half:]}_{digest}"
 
 
 def _lineage_authority(uri: str, *, normalize_sql_scheme: bool = False) -> str:
@@ -301,6 +325,8 @@ class ImednetExportOperator(BaseOperator):
         :param kwargs: Additional Airflow BaseOperator arguments.
         """
         super().__init__(**kwargs)
+        if not getattr(self, "task_id", None) and isinstance(kwargs.get("task_id"), str):
+            self.task_id = kwargs["task_id"]
         self.study_key = study_key
         self.destination = destination
         self.output_path = output_path
@@ -529,19 +555,360 @@ class ImednetExportOperator(BaseOperator):
             opts["naming_convention"] = str(resolved_convention)
         return opts
 
-    def _default_airflow_stream_name(self, dest: str, *, sink_prefix: bool = False) -> str:
-        """Return a task-scoped default stream name invariant across mapped task indexes."""
-        base = f"airflow_{dest}" if sink_prefix else dest
+    def _resolve_dag_id(self, context: Context | Mapping[str, Any] | None = None) -> str | None:
+        """Resolve the enclosing DAG identifier without touching unassigned ``self.dag``."""
+        if isinstance(context, Mapping):
+            for ctx_key in ("dag", "dag_run", "ti", "task_instance"):
+                ctx_obj = context.get(ctx_key)
+                ctx_dag_id = getattr(ctx_obj, "dag_id", None) if ctx_obj is not None else None
+                if isinstance(ctx_dag_id, str) and ctx_dag_id.strip():
+                    return ctx_dag_id.strip()
+            raw_ctx_dag_id = context.get("dag_id")
+            if isinstance(raw_ctx_dag_id, str) and raw_ctx_dag_id.strip():
+                return raw_ctx_dag_id.strip()
+
+        has_dag_fn = getattr(self, "has_dag", None)
+        if callable(has_dag_fn):
+            if has_dag_fn():
+                raw_dag_id = getattr(self, "dag_id", None)
+                if isinstance(raw_dag_id, str) and raw_dag_id.strip():
+                    return raw_dag_id.strip()
+        else:
+            raw_dag_id = getattr(self, "dag_id", None)
+            if (
+                isinstance(raw_dag_id, str)
+                and raw_dag_id.strip()
+                and raw_dag_id.strip() != "adhoc_airflow"
+            ):
+                return raw_dag_id.strip()
+
+        env_dag_id = os.environ.get("AIRFLOW_CTX_DAG_ID", "").strip()
+        return env_dag_id or None
+
+    def _resolve_export_target_identifier(
+        self,
+        dest: str,
+        runtime_kwargs: Mapping[str, Any],
+        conn_settings: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Extract and sanitize destination-specific target segments for ``stream_name``."""
+        conn = conn_settings or {}
+        raw_parts: list[Any] = []
+        if dest == "snowflake":
+            raw_parts.extend(
+                [
+                    runtime_kwargs.get("database") or conn.get("database"),
+                    runtime_kwargs.get("schema") or conn.get("schema"),
+                    runtime_kwargs.get("table") or conn.get("table") or self.output_path,
+                ]
+            )
+        elif dest == "mongodb":
+            raw_parts.extend(
+                [
+                    runtime_kwargs.get("database") or conn.get("database"),
+                    runtime_kwargs.get("collection") or conn.get("collection") or self.output_path,
+                ]
+            )
+        elif dest == "neo4j":
+            raw_parts.extend(
+                [
+                    runtime_kwargs.get("database") or conn.get("database"),
+                    runtime_kwargs.get("label") or conn.get("label") or self.output_path,
+                ]
+            )
+        elif dest == "duckdb":
+            raw_parts.extend(
+                [
+                    self.output_path
+                    or runtime_kwargs.get("db_path")
+                    or runtime_kwargs.get("path")
+                    or conn.get("db_path"),
+                    runtime_kwargs.get("table_name")
+                    or runtime_kwargs.get("table")
+                    or conn.get("table_name"),
+                ]
+            )
+        elif dest == "duckdb_by_form":
+            raw_parts.append(
+                self.output_path
+                or runtime_kwargs.get("db_path")
+                or runtime_kwargs.get("path")
+                or conn.get("db_path")
+            )
+        elif dest in ("sql", "long_sql"):
+            conn_str = (
+                conn.get("conn_str")
+                or runtime_kwargs.get("conn_str")
+                or (
+                    self.output_path
+                    if isinstance(self.output_path, str) and "://" in self.output_path
+                    else None
+                )
+            )
+            table_target = (
+                (
+                    self.output_path
+                    if isinstance(self.output_path, str) and "://" not in self.output_path
+                    else None
+                )
+                or runtime_kwargs.get("table")
+                or runtime_kwargs.get("table_name")
+                or conn.get("table")
+            )
+            raw_parts.extend([conn_str, table_target])
+        elif dest == "sql_by_form":
+            raw_parts.append(
+                self.output_path or runtime_kwargs.get("conn_str") or conn.get("conn_str")
+            )
+        elif dest == "hive_parquet":
+            raw_parts.append(
+                self.output_path or runtime_kwargs.get("base_dir") or runtime_kwargs.get("path")
+            )
+        else:
+            raw_parts.append(
+                self.output_path
+                or runtime_kwargs.get("output_path")
+                or runtime_kwargs.get("path")
+                or runtime_kwargs.get("table")
+                or runtime_kwargs.get("table_name")
+                or runtime_kwargs.get("collection")
+            )
+
+        sanitized_parts = [
+            seg
+            for part in raw_parts
+            if part is not None
+            and isinstance(part, (str, os.PathLike))
+            and str(part).strip()
+            and (seg := _sanitize_stream_segment(str(part), max_len=64))
+        ]
+        if not sanitized_parts:
+            return ""
+        return _sanitize_stream_segment("_".join(sanitized_parts), max_len=80)
+
+    def _default_airflow_stream_name(
+        self,
+        dest: str,
+        *,
+        sink_prefix: bool = False,
+        context: Context | Mapping[str, Any] | None = None,
+        runtime_kwargs: Mapping[str, Any] | None = None,
+        conn_settings: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Return a target-scoped default stream name invariant across mapped task indexes."""
+        clean_dest = _sanitize_stream_segment(dest, max_len=32) or "records"
+        base = f"airflow_{clean_dest}" if sink_prefix else clean_dest
+        segments: list[str] = [base]
+
+        dag_id = self._resolve_dag_id(context)
+        if dag_id:
+            dag_seg = _sanitize_stream_segment(dag_id, max_len=48)
+            if dag_seg:
+                segments.append(dag_seg)
+
         task_id = getattr(self, "task_id", None)
         if isinstance(task_id, str) and task_id.strip():
-            return f"{base}_{task_id.strip()}"
-        return base
+            task_seg = _sanitize_stream_segment(task_id.strip(), max_len=48)
+            if task_seg:
+                segments.append(task_seg)
+
+        effective_kwargs = (
+            runtime_kwargs if runtime_kwargs is not None else self._get_runtime_export_kwargs()
+        )
+        resolved_conn = conn_settings
+        if resolved_conn is None:
+            try:
+                resolved_conn = self._resolve_destination_connection(dest)
+            except Exception:
+                resolved_conn = {}
+        target_seg = self._resolve_export_target_identifier(
+            dest,
+            effective_kwargs,
+            resolved_conn,
+        )
+        if target_seg:
+            segments.append(target_seg)
+
+        return "_".join(segments)
+
+    def _pre_upgrade_candidate_streams(self, dest: str) -> list[str]:
+        """Return candidate pre-upgrade stream names for single-target checkpoint migration."""
+        candidates: list[str] = []
+        task_id = getattr(self, "task_id", None)
+        clean_task = task_id.strip() if isinstance(task_id, str) and task_id.strip() else None
+        if clean_task:
+            for cand in (f"{dest}_{clean_task}", f"airflow_{dest}_{clean_task}"):
+                if cand not in candidates:
+                    candidates.append(cand)
+        if dest in ("snowflake", "neo4j", "mongodb"):
+            sink_cand = f"airflow_{dest}"
+            if sink_cand not in candidates:
+                candidates.append(sink_cand)
+        return candidates
+
+    def _seed_pre_upgrade_watermark(
+        self,
+        *,
+        dest: str,
+        scoped_stream: str,
+        state_provider: Any,
+        ledger_path: Any,
+        default_provider_name: str,
+    ) -> datetime | None:
+        """Seed ``scoped_stream`` from one matching pre-upgrade checkpoint when state is absent."""
+        try:
+            provider = (
+                state_provider
+                if state_provider is not None
+                else sink_base.get_state_provider(
+                    ledger_path=ledger_path,
+                    provider_name=default_provider_name,
+                )
+            )
+        except Exception:
+            return None
+
+        if provider is None:
+            return None
+
+        task_id = getattr(self, "task_id", None)
+        clean_task = task_id.strip() if isinstance(task_id, str) and task_id.strip() else None
+        task_seg = _sanitize_stream_segment(clean_task, max_len=48) if clean_task else ""
+
+        try:
+            study_streams: Mapping[str, Any] | None = None
+            load_study_fn = getattr(provider, "_load_study_state", None)
+            if callable(load_study_fn):
+                loaded = load_study_fn(self.study_key)
+                if (
+                    isinstance(loaded, tuple)
+                    and len(loaded) >= 2
+                    and isinstance(loaded[1], Mapping)
+                ):
+                    study_streams = loaded[1]
+            else:
+                read_state_fn = getattr(provider, "read_state", None)
+                if callable(read_state_fn):
+                    ledger_state = read_state_fn()
+                    studies_map = getattr(ledger_state, "studies", None)
+                    if isinstance(studies_map, Mapping):
+                        study_obj = studies_map.get(self.study_key)
+                        streams_attr = getattr(study_obj, "streams", None)
+                        if isinstance(streams_attr, Mapping):
+                            study_streams = streams_attr
+
+            if dest in ("sql_by_form", "duckdb_by_form"):
+                if not clean_task or study_streams is None:
+                    return None
+                scoped_prefix = f"{scoped_stream}_"
+                if any(str(k).startswith(scoped_prefix) for k in study_streams):
+                    return None
+                legacy_prefix = f"{dest}_{clean_task}_"
+                seeded_any: datetime | None = None
+                for s_key, s_entry in list(study_streams.items()):
+                    if not str(s_key).startswith(legacy_prefix):
+                        continue
+                    form_suffix = str(s_key)[len(legacy_prefix) :]
+                    if not form_suffix:
+                        continue
+                    raw_val = (
+                        s_entry.get("last_timestamp")
+                        if isinstance(s_entry, Mapping)
+                        else getattr(s_entry, "last_timestamp", None)
+                    )
+                    if not isinstance(raw_val, (datetime, str)):
+                        continue
+                    norm_ts = sink_base.normalize_watermark_datetime(raw_val)
+                    if norm_ts is not None and callable(
+                        getattr(provider, "set_last_timestamp", None)
+                    ):
+                        provider.set_last_timestamp(
+                            self.study_key,
+                            f"{scoped_stream}_{form_suffix}",
+                            norm_ts,
+                            status="success",
+                        )
+                        seeded_any = norm_ts
+                return seeded_any
+
+            candidates = [
+                cand for cand in self._pre_upgrade_candidate_streams(dest) if cand != scoped_stream
+            ]
+            if not candidates:
+                return None
+
+            if study_streams is not None:
+                if scoped_stream in study_streams:
+                    return None
+                other_scoped_prefixes = [f"{dest}_", f"airflow_{dest}_"]
+                existing_other_scoped = [
+                    str(k)
+                    for k in study_streams
+                    if str(k) not in candidates
+                    and any(str(k).startswith(p) for p in other_scoped_prefixes)
+                    and (not task_seg or f"_{task_seg}_" in f"_{k}_")
+                ]
+                if existing_other_scoped:
+                    return None
+
+                matched_timestamps: list[tuple[str, datetime]] = []
+                for cand in candidates:
+                    if cand not in study_streams:
+                        continue
+                    entry = study_streams[cand]
+                    raw_ts = (
+                        entry.get("last_timestamp")
+                        if isinstance(entry, Mapping)
+                        else getattr(entry, "last_timestamp", None)
+                    )
+                    if isinstance(raw_ts, (datetime, str)):
+                        norm_ts = sink_base.normalize_watermark_datetime(raw_ts)
+                        if norm_ts is not None:
+                            matched_timestamps.append((cand, norm_ts))
+            else:
+                existing_ts = provider.get_last_timestamp(self.study_key, scoped_stream)
+                if (
+                    isinstance(existing_ts, (datetime, str))
+                    and sink_base.normalize_watermark_datetime(existing_ts) is not None
+                ):
+                    return None
+                get_status_fn = getattr(provider, "get_last_status", None)
+                if callable(get_status_fn):
+                    existing_status = get_status_fn(self.study_key, scoped_stream)
+                    if isinstance(existing_status, (str, Enum)):
+                        return None
+
+                matched_timestamps = []
+                for cand in candidates:
+                    raw_ts = provider.get_last_timestamp(self.study_key, cand)
+                    if isinstance(raw_ts, (datetime, str)):
+                        norm_ts = sink_base.normalize_watermark_datetime(raw_ts)
+                        if norm_ts is not None:
+                            matched_timestamps.append((cand, norm_ts))
+
+            if len(matched_timestamps) != 1:
+                return None
+
+            _, seed_ts = matched_timestamps[0]
+            set_ts_fn = getattr(provider, "set_last_timestamp", None)
+            if callable(set_ts_fn):
+                set_ts_fn(
+                    self.study_key,
+                    scoped_stream,
+                    seed_ts,
+                    status="success",
+                )
+            return seed_ts
+        except Exception:
+            return None
 
     def _build_tabular_kwargs(
         self,
         runtime_kwargs: dict[str, Any],
         *,
         dest: str = "records",
+        context: Context | Mapping[str, Any] | None = None,
+        conn_settings: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Merge operational parameters and deterministic quality-gate state into tabular kwargs."""
         merged = dict(runtime_kwargs)
@@ -560,14 +927,17 @@ class ImednetExportOperator(BaseOperator):
             merged["quality_gate_enabled"] = bool(getattr(self, "quality_gate_enabled", False))
         for key, val in self._collect_streaming_options(runtime_kwargs).items():
             merged.setdefault(key, val)
-        if (
-            merged.get("incremental")
-            and "state_provider" not in merged
-            and "ledger_path" not in merged
-        ):
-            merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
+        use_checkpoint = bool(merged.get("incremental") or merged.get("state_provider") is not None)
+        if use_checkpoint:
+            if "state_provider" not in merged and "ledger_path" not in merged:
+                merged["state_provider"] = sink_base.get_state_provider(provider_name="airflow")
             if "stream_name" not in merged:
-                merged["stream_name"] = self._default_airflow_stream_name(dest)
+                merged["stream_name"] = self._default_airflow_stream_name(
+                    dest,
+                    context=context,
+                    runtime_kwargs=merged,
+                    conn_settings=conn_settings,
+                )
         return merged
 
     @staticmethod
@@ -943,11 +1313,25 @@ class ImednetExportOperator(BaseOperator):
                     raw_run_id = context.get("run_id") or context.get("ts_nodash")
                     if isinstance(raw_run_id, str) and raw_run_id.strip():
                         run_token = f"{raw_run_id.strip()}/{uuid.uuid4().hex[:8]}"
-                default_sink_stream = (
-                    self._default_airflow_stream_name(dest, sink_prefix=True)
-                    if config.ledger_path is None and config.state_provider is None
-                    else f"airflow_{dest}"
+                default_sink_stream = self._default_airflow_stream_name(
+                    dest,
+                    sink_prefix=True,
+                    context=context,
+                    runtime_kwargs=runtime_kwargs,
                 )
+                default_provider_name = "file" if config.ledger_path is not None else "airflow"
+                if config.stream_name is None and (
+                    config.incremental or config.state_provider is not None
+                ):
+                    seeded_sink_ts = self._seed_pre_upgrade_watermark(
+                        dest=dest,
+                        scoped_stream=default_sink_stream,
+                        state_provider=config.state_provider,
+                        ledger_path=config.ledger_path,
+                        default_provider_name=default_provider_name,
+                    )
+                    if seeded_sink_ts is not None and config.modified_since is None:
+                        config.modified_since = seeded_sink_ts
                 sink_base.run_streaming_export(
                     sdk,
                     self.study_key,
@@ -956,7 +1340,7 @@ class ImednetExportOperator(BaseOperator):
                     stream_name=default_sink_stream,
                     batch_id_prefix=f"{self.study_key}/batch/{run_token}",
                     quality_gate_fn=sink_base.apply_quality_gate,
-                    default_provider_name="airflow",
+                    default_provider_name=default_provider_name,
                 )
             else:
                 # Execution path for tabular functions (dispatch via getattr so test mocks are preserved)
@@ -971,9 +1355,34 @@ class ImednetExportOperator(BaseOperator):
                     and "quality_gate_enabled" not in explicit_opts
                     and not bool(getattr(self, "quality_gate_enabled", False))
                 )
+                built_tabular_kwargs = self._build_tabular_kwargs(
+                    runtime_kwargs,
+                    dest=dest,
+                    context=context,
+                )
+                if (
+                    "stream_name" not in stream_opts
+                    and "stream_name" in built_tabular_kwargs
+                    and (
+                        built_tabular_kwargs.get("incremental")
+                        or built_tabular_kwargs.get("state_provider") is not None
+                    )
+                ):
+                    default_tab_provider = (
+                        "file" if built_tabular_kwargs.get("ledger_path") is not None else "airflow"
+                    )
+                    seeded_tab_ts = self._seed_pre_upgrade_watermark(
+                        dest=dest,
+                        scoped_stream=str(built_tabular_kwargs["stream_name"]),
+                        state_provider=built_tabular_kwargs.get("state_provider"),
+                        ledger_path=built_tabular_kwargs.get("ledger_path"),
+                        default_provider_name=default_tab_provider,
+                    )
+                    if seeded_tab_ts is not None and "modified_since" not in built_tabular_kwargs:
+                        built_tabular_kwargs["modified_since"] = seeded_tab_ts
                 tabular_kwargs = self._filter_callable_kwargs(
                     export_callable,
-                    self._build_tabular_kwargs(runtime_kwargs, dest=dest),
+                    built_tabular_kwargs,
                     implicit_quality_gate=implicit_gate,
                 )
                 if dest == "duckdb_by_form":

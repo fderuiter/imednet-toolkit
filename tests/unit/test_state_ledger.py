@@ -1111,3 +1111,26 @@ def test_get_state_provider_accepts_path_and_cli_renders_none_watermark(
     state_app(["show", "--ledger-path", str(ledger_file)])
     captured = capsys.readouterr()
     assert "STUDY-NONE" in captured.out
+
+
+def test_state_ledger_get_state_provider_custom_path_precedes_airflow_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit ledger_path returns FileStateProvider even when AIRFLOW_CTX_TASK_ID is set."""
+    from imednet_workflows.state_ledger import AirflowStateProvider
+
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "airflow_export_task")
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+
+    custom_path = tmp_path / "custom_airflow_override.json"
+    explicit_path_provider = get_state_provider(custom_path)
+    assert isinstance(explicit_path_provider, FileStateProvider)
+    assert Path(explicit_path_provider.ledger_path) == custom_path
+
+    explicit_str_provider = get_state_provider(str(custom_path))
+    assert isinstance(explicit_str_provider, FileStateProvider)
+    assert Path(explicit_str_provider.ledger_path) == custom_path
+
+    default_airflow_provider = get_state_provider()
+    assert isinstance(default_airflow_provider, AirflowStateProvider)
+    assert isinstance(get_state_provider(DEFAULT_LEDGER_PATH), AirflowStateProvider)
