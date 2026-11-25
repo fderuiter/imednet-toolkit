@@ -11,6 +11,7 @@ class CodingsOperationDef:
     MODEL = Coding
     FILTER_ATTRIBUTES = frozenset(
         {
+            "codingId",
             "siteName",
             "siteId",
             "subjectId",

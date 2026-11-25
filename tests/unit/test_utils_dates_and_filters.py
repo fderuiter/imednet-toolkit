@@ -598,29 +598,40 @@ def test_schema_guided_scalar_coercion_across_model_types() -> None:
 
 def test_validate_filter_key_allowed_attributes_and_sorted_listing() -> None:
     """validate_filter_key enforces endpoint FILTER_ATTRIBUTES and lists valid attributes."""
+    from imednet.endpoints.codings import CodingsEndpoint
     from imednet.endpoints.queries import QueriesEndpoint
     from imednet.endpoints.visits import VisitsEndpoint
+    from imednet.models.codings import Coding
     from imednet.models.queries import Query
 
-    validate_filter_key(
-        "interval_name",
-        model=Visit,
-        allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
-    )
-    validate_filter_key(
-        "intervalName",
-        model=Visit,
-        allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
-    )
-
-    with pytest.raises(ValueError) as visit_exc:
+    for visit_attr in ("interval_name", "intervalName", "visit_id", "visitId"):
         validate_filter_key(
-            "visit_id",
+            visit_attr,
             model=Visit,
             allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
         )
-    assert "Unknown filter attribute 'visit_id' for Visit." in str(visit_exc.value)
+    for query_attr in ("annotation_id", "annotationId"):
+        validate_filter_key(
+            query_attr,
+            model=Query,
+            allowed_attributes=QueriesEndpoint.FILTER_ATTRIBUTES,
+        )
+    for coding_attr in ("coding_id", "codingId"):
+        validate_filter_key(
+            coding_attr,
+            model=Coding,
+            allowed_attributes=CodingsEndpoint.FILTER_ATTRIBUTES,
+        )
+
+    with pytest.raises(ValueError) as visit_exc:
+        validate_filter_key(
+            "visit_key",
+            model=Visit,
+            allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
+        )
+    assert "Unknown filter attribute 'visit_key' for Visit." in str(visit_exc.value)
     assert "Valid attributes:" in str(visit_exc.value)
+    assert "visitId" in str(visit_exc.value)
     assert "intervalId" in str(visit_exc.value)
 
     with pytest.raises(ValueError) as query_exc:

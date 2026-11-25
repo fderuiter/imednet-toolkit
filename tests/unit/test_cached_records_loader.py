@@ -70,7 +70,7 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
     }
     assert second_delta_call.kwargs == {
         "study_key": "STUDY",
-        "filter": 'dateModified>="2024-01-02 00:00:00+00:00"',
+        "filter": "dateModified>=2024-01-02T00:00:00Z",
         "record_data_filter": None,
     }
     assert sdk.get_records.call_args_list[2].kwargs == {
@@ -154,7 +154,7 @@ def test_sync_records_handles_empty_delta_without_reconciliation(tmp_path: Path)
     assert sdk.records.list.call_count == 1
     assert sdk.records.list.call_args_list[0].kwargs == {
         "study_key": "STUDY",
-        "filter": 'dateModified>="2024-01-01 00:00:00+00:00"',
+        "filter": "dateModified>=2024-01-01T00:00:00Z",
         "record_data_filter": None,
     }
 
@@ -650,7 +650,7 @@ def test_study_with_only_null_timestamps_uses_lightweight_reconcile_after_initia
     }
     assert sdk.get_records.call_args_list[3].kwargs == {
         "study_key": "STUDY",
-        "record_id": [3],
+        "record_id": 3,
         "record_data_filter": None,
     }
     assert sdk.get_records.call_args_list[4].kwargs == {

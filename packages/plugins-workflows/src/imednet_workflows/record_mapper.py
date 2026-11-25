@@ -53,6 +53,7 @@ from imednet.spi.utils import (
     stamp_tabular_batch,
 )
 
+from ._filter_bounds import build_single_item_variable_filters
 from .cached_loader import CachedRecordsLoader
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE, ChunkedRecordPipeline, iter_chunks
 
@@ -391,21 +392,7 @@ class RecordMapper:
         if form_whitelist is not None and len(form_whitelist) == 0:
             return [], {}
 
-        filters: dict[str, Any] = {}
-        if form_whitelist is not None:
-            filters["formId"] = (
-                form_whitelist[0] if len(form_whitelist) == 1 else list(form_whitelist)
-            )
-            if (
-                variable_whitelist is not None
-                and len(variable_whitelist) == 1
-                and len(form_whitelist) == 1
-            ):
-                filters["variableName"] = variable_whitelist[0]
-        elif variable_whitelist is not None:
-            filters["variableName"] = (
-                variable_whitelist[0] if len(variable_whitelist) == 1 else list(variable_whitelist)
-            )
+        filters = build_single_item_variable_filters(form_whitelist, variable_whitelist)
 
         from unittest.mock import NonCallableMock
 
