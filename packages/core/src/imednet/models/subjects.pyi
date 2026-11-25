@@ -11,8 +11,6 @@ from pydantic import Field, field_validator
 
 from imednet.models.base import ImednetBaseModel
 
-def _normalize_subject_token(value: str) -> str: ...
-
 class SubjectStatus(str, Enum):
     """Normalized lifecycle statuses for clinical study subjects."""
 
@@ -36,7 +34,6 @@ class SubjectStatus(str, Enum):
     @property
     def allowed_transitions(self) -> set[SubjectStatus]: ...
 
-_NON_DELETED_SUBJECT_STATUSES: set[SubjectStatus]
 ALLOWED_SUBJECT_TRANSITIONS: dict[SubjectStatus, set[SubjectStatus]]
 
 def normalize_subject_status(value: SubjectStatus | str | None) -> SubjectStatus | str | None: ...
