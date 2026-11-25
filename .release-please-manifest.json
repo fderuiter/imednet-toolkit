@@ -3,5 +3,5 @@
   "packages/providers-airflow": "1.2.0",
   "packages/plugins-workflows": "1.2.0",
   "packages/plugins-sinks": "1.1.0",
-  "packages/plugins-tui": "0.1.0"
+  "packages/plugins-tui": "1.0.0"
 }

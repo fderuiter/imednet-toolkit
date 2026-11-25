@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 from collections import UserDict
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -41,19 +41,22 @@ from imednet.utils.filters import (
     validate_record_filter,
 )
 from imednet.utils.record_filter_eval import compile_model_predicate
+from imednet.utils.security import global_sensitivity_registry
 
 
-def _invoke_cli(argv: list[str]) -> tuple[int, str, str]:
-    """Run ``cli.app(argv)`` capturing ``(exit_code, stdout, stderr)``."""
-    out_buf = io.StringIO()
-    err_buf = io.StringIO()
+def _invoke_cli(
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+) -> tuple[int, str, str]:
+    """Run ``cli.app(argv)`` capturing ``(exit_code, stdout, stderr)`` cleanly under ``log_cli``."""
+    capsys.readouterr()
     code = 0
     try:
-        with redirect_stdout(out_buf), redirect_stderr(err_buf):
-            cli.app(argv)
+        cli.app(argv)
     except SystemExit as exc:
         code = int(exc.code) if isinstance(exc.code, int) else (0 if exc.code is None else 1)
-    return code, out_buf.getvalue(), err_buf.getvalue()
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
 
 
 def test_spi_cli_exports_shared_read_guards() -> None:
@@ -78,6 +81,7 @@ def test_spi_cli_exports_shared_read_guards() -> None:
 
 def test_records_list_json_masks_default_and_study_phi_unless_opted_out(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """AC 1 & Reqs 1-3: records list --format json --simulation masks PHI unless --no-mask-phi."""
     state = SimulationState()
@@ -123,7 +127,8 @@ def test_records_list_json_masks_default_and_study_phi_unless_opted_out(
     )
 
     code_masked, out_masked, err_masked = _invoke_cli(
-        ["records", "list", "DEMO-STUDY", "--format", "json", "--simulation"]
+        capsys,
+        ["records", "list", "DEMO-STUDY", "--format", "json", "--simulation"],
     )
     assert code_masked == 0, err_masked
     payload_masked = json.loads(out_masked)
@@ -142,6 +147,7 @@ def test_records_list_json_masks_default_and_study_phi_unless_opted_out(
     assert "CHART-7788" not in out_masked
 
     code_raw, out_raw, err_raw = _invoke_cli(
+        capsys,
         [
             "records",
             "list",
@@ -150,7 +156,7 @@ def test_records_list_json_masks_default_and_study_phi_unless_opted_out(
             "json",
             "--no-mask-phi",
             "--simulation",
-        ]
+        ],
     )
     assert code_raw == 0, err_raw
     payload_raw = json.loads(out_raw)
@@ -165,6 +171,7 @@ def test_records_list_json_masks_default_and_study_phi_unless_opted_out(
 
 def test_records_list_interactive_grid_and_load_all_mask_phi(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """AC 2 & Req 2: InteractiveDataGrid side panels and [a] load-more mask Record PHI."""
     from imednet.cli.utils.grid import InteractiveDataGrid
@@ -224,7 +231,7 @@ def test_records_list_interactive_grid_and_load_all_mask_phi(
 
     monkeypatch.setattr("imednet.cli.records.display_list", _capture_display_list)
 
-    code, _, err = _invoke_cli(["records", "list", "DEMO-STUDY", "--limit", "1"])
+    code, _, err = _invoke_cli(capsys, ["records", "list", "DEMO-STUDY", "--limit", "1"])
     assert code == 0, err
     assert len(captured_grid["details"]) == 1
 
@@ -258,6 +265,140 @@ def test_records_list_interactive_grid_and_load_all_mask_phi(
     assert "***MASKED***" in second_lines_text
     assert "1979-02-02" not in second_lines_text
     assert "CH-2" not in second_lines_text
+
+
+def test_encrypted_config_version_store_sdk_governance_masks_records_and_cli_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Upstream #2119 alignment: encrypted ConfigVersionStore phiFields resolve via SDK governance in CLI reads and errors without mutating global_sensitivity_registry."""
+    from imednet.core.context import sdk_governance_context
+    from imednet_workflows.config_version_control import ConfigVersionStore
+
+    db_path = tmp_path / "gov_store" / "config_versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_path))
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    state = SimulationState()
+    state.records.append(
+        {
+            "recordId": 7701,
+            "studyKey": "DEMO-STUDY",
+            "subjectKey": "SUBJ-001",
+            "formKey": "F_DM",
+            "recordStatus": "Complete",
+            "recordData": {
+                "customChartId": "ENCRYPTED-CHART-7701",
+                "V_AGE": 38,
+            },
+        }
+    )
+
+    scoped_base_url = "https://private-gov.imednet.test"
+
+    def _make_scoped_sdk() -> ImednetSDK:
+        return ImednetSDK(
+            api_key="gov-api-key",  # pragma: allowlist secret
+            security_key="gov-only-sdk-secret-key",  # pragma: allowlist secret
+            base_url=scoped_base_url,
+            transport=create_simulation_transport(state),
+        )
+
+    seed_sdk = _make_scoped_sdk()
+    try:
+        with sdk_governance_context(seed_sdk):
+            store = ConfigVersionStore()
+            store.commit_config(
+                "DEMO-STUDY",
+                StudyConfiguration(
+                    study_key="DEMO-STUDY",
+                    version="1.0",
+                    phi_fields=["customChartId"],
+                ),
+                "Commit encrypted customChartId PHI rule",
+                sdk=seed_sdk,
+            )
+    finally:
+        seed_sdk.close()
+
+    sens_before, exempt_before = global_sensitivity_registry.snapshot()
+
+    # 1) Direct sanitize_cli_records(..., sdk=...) resolves encrypted store without env security key
+    direct_sdk = _make_scoped_sdk()
+    try:
+        raw_record = Record(
+            record_id=7702,
+            study_key="DEMO-STUDY",
+            subject_key="SUBJ-001",
+            record_data={"customChartId": "DIRECT-CHART-7702", "V_AGE": 29},
+        )
+        masked_records = spi_cli.sanitize_cli_records(
+            [raw_record],
+            study_key="DEMO-STUDY",
+            mask_phi=True,
+            sdk=direct_sdk,
+        )
+        assert masked_records[0].record_data == {
+            "customChartId": "***MASKED***",
+            "V_AGE": 29,
+        }
+    finally:
+        direct_sdk.close()
+
+    # 2) records list --format json resolves encrypted store through with_sdk governance context
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _make_scoped_sdk)
+    code, out, err = _invoke_cli(capsys, ["records", "list", "DEMO-STUDY", "--format", "json"])
+    assert code == 0, err
+    rec_7701 = next(r for r in json.loads(out)["items"] if r["recordId"] == 7701)
+    assert rec_7701["recordData"]["customChartId"] == "***MASKED***"
+    assert rec_7701["recordData"]["V_AGE"] == 38
+    assert "ENCRYPTED-CHART-7701" not in out
+
+    # 3) Structured ApiError field + URL query + message custom phiFields masked in with_sdk
+    def _make_failing_scoped_sdk() -> ImednetSDK:
+        sdk_inst = _make_scoped_sdk()
+        sdk_inst.records.list = MagicMock(  # type: ignore[method-assign]
+            side_effect=ApiError(
+                {
+                    "metadata": {"status": "BAD_REQUEST"},
+                    "errors": [
+                        {
+                            "code": "400",
+                            "description": "Rejected customChartId=INLINE-CHART-11 for SUBJ-001",
+                            "field": {"variable": "customChartId", "value": "FIELD-CHART-22"},
+                        }
+                    ],
+                },
+                status_code=400,
+                diagnostic_context=DiagnosticContext(
+                    method="GET",
+                    url=(
+                        f"{scoped_base_url}/api/v1/edc/studies/DEMO-STUDY/records"
+                        "?filter=customChartId%3D%3DURL-CHART-33%3Bsubject_key%3D%3DSUBJ-001"
+                    ),
+                ),
+            )
+        )
+        return sdk_inst
+
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _make_failing_scoped_sdk)
+    err_code, err_out, err_stderr = _invoke_cli(
+        capsys,
+        ["records", "list", "DEMO-STUDY", "--format", "json"],
+    )
+    assert err_code == 1
+    assert err_out == ""
+    assert "field customChartId='***MASKED***'" in err_stderr
+    assert "INLINE-CHART-11" not in err_stderr
+    assert "FIELD-CHART-22" not in err_stderr
+    assert "URL-CHART-33" not in err_stderr
+    assert "SUBJ-001" in err_stderr
+
+    # Global sensitivity registry must remain completely untouched
+    assert global_sensitivity_registry.snapshot() == (sens_before, exempt_before)
+    assert not global_sensitivity_registry.is_sensitive("customChartId")
 
 
 def test_sanitize_cli_phi_handles_models_extras_mappings_tuples_and_identity() -> None:
@@ -313,12 +454,13 @@ def test_sanitize_cli_phi_handles_models_extras_mappings_tuples_and_identity() -
 def test_unsupported_pattern_operators_exit_one_with_common_api_guidance(
     bad_clause: str,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """AC 3 & Reqs 4-5: =@, =^, =$, !@, !^, !$ exit 1 citing allowed operators and =~."""
     not_called = MagicMock(side_effect=AssertionError("get_sdk should not run on bad operator"))
     monkeypatch.setattr("imednet.cli.utils.context.get_sdk", not_called)
 
-    code, out, err = _invoke_cli(["records", "list", "STUDY", "--filter", bad_clause])
+    code, out, err = _invoke_cli(capsys, ["records", "list", "STUDY", "--filter", bad_clause])
     assert code == 1
     assert out == ""
     for token in ("'<'", "'<='", "'>'", "'>='", "'=='", "'!='", "'=~'"):
@@ -356,9 +498,11 @@ def test_double_quoted_at_caret_dollar_literals_are_preserved(
 @respx.mock
 def test_intervals_list_simulation_and_upstream_client_side_filtering(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """AC 4, Req 6-7 & Guardrail 3: intervals list evaluates --filter locally without upstream filter param."""
     code, out, err = _invoke_cli(
+        capsys,
         [
             "intervals",
             "list",
@@ -368,7 +512,7 @@ def test_intervals_list_simulation_and_upstream_client_side_filtering(
             "--format",
             "json",
             "--simulation",
-        ]
+        ],
     )
     assert code == 0, err
     sim_payload = json.loads(out)
@@ -379,8 +523,8 @@ def test_intervals_list_simulation_and_upstream_client_side_filtering(
     monkeypatch.setattr(
         "imednet.cli.utils.context.get_sdk",
         lambda: ImednetSDK(
-            api_key="k",
-            security_key="s",
+            api_key="k",  # pragma: allowlist secret
+            security_key="s",  # pragma: allowlist secret
             base_url="https://api.test",
         ),
     )
@@ -405,6 +549,7 @@ def test_intervals_list_simulation_and_upstream_client_side_filtering(
     )
 
     code_http, out_http, err_http = _invoke_cli(
+        capsys,
         [
             "intervals",
             "list",
@@ -415,7 +560,7 @@ def test_intervals_list_simulation_and_upstream_client_side_filtering(
             "1",
             "--format",
             "json",
-        ]
+        ],
     )
     assert code_http == 0, err_http
     http_payload = json.loads(out_http)
@@ -436,7 +581,7 @@ def test_intervals_list_simulation_and_upstream_client_side_filtering(
         ["users", "list", "STUDY", "--limit", "0"],
         ["intervals", "list", "STUDY", "--filter", "unknown_field=1"],
     ):
-        c, _, e = _invoke_cli(cmd)
+        c, _, e = _invoke_cli(capsys, cmd)
         assert c == 1
         assert "IMEDNET_API_KEY" not in e
 
@@ -455,6 +600,7 @@ def test_compile_model_predicate_nested_and_or_semantics() -> None:
 def test_cwd_dotenv_bootstrap_preserves_shell_vars_and_applies_study_key_and_high_contrast(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """AC 5 & Reqs 8, 9, 10: cwd ./.env loads with override=False, IMEDNET_STUDY_KEY, and parse_bool."""
     from imednet.cli.utils.grid import InteractiveDataGrid
@@ -462,15 +608,15 @@ def test_cwd_dotenv_bootstrap_preserves_shell_vars_and_applies_study_key_and_hig
 
     dotenv_file = tmp_path / ".env"
     dotenv_file.write_text(
-        "IMEDNET_API_KEY=dotenv_api_key\n"
-        "IMEDNET_SECURITY_KEY=dotenv_sec_key\n"
+        "IMEDNET_API_KEY=dotenv_api_key\n"  # pragma: allowlist secret
+        "IMEDNET_SECURITY_KEY=dotenv_sec_key\n"  # pragma: allowlist secret
         "IMEDNET_STUDY_KEY=DEMO-STUDY\n"
         "IMEDNET_HIGH_CONTRAST=true\n"
         "IMEDNET_SIMULATION_MODE=yes\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("IMEDNET_API_KEY", "shell_api_key_wins")
+    monkeypatch.setenv("IMEDNET_API_KEY", "shell_api_key_wins")  # pragma: allowlist secret
     monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
     monkeypatch.delenv("IMEDNET_STUDY_KEY", raising=False)
     monkeypatch.delenv("IMEDNET_HIGH_CONTRAST", raising=False)
@@ -489,7 +635,7 @@ def test_cwd_dotenv_bootstrap_preserves_shell_vars_and_applies_study_key_and_hig
     monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _spy_get_sdk)
 
     # Omit study_key positional/flag: IMEDNET_STUDY_KEY=DEMO-STUDY from ./.env resolves it!
-    code, out, err = _invoke_cli(["sites", "list", "--format", "json"])
+    code, out, err = _invoke_cli(capsys, ["sites", "list", "--format", "json"])
     assert code == 0, err
     sites_payload = json.loads(out)
     assert sites_payload["items"][0]["studyKey"] == "DEMO-STUDY"
@@ -498,7 +644,7 @@ def test_cwd_dotenv_bootstrap_preserves_shell_vars_and_applies_study_key_and_hig
     assert observed_env["hc"] == "true"
 
     # Also verify subject-data hybrid resolver falls back to IMEDNET_STUDY_KEY
-    code_sd, out_sd, err_sd = _invoke_cli(["subject-data", "SUBJ-001", "--format", "json"])
+    code_sd, out_sd, err_sd = _invoke_cli(capsys, ["subject-data", "SUBJ-001", "--format", "json"])
     assert code_sd == 0, err_sd
     sd_payload = json.loads(out_sd)
     sd_item = sd_payload["items"][0]
@@ -572,6 +718,7 @@ def test_resolve_study_key_and_hybrid_study_key_env_and_conflicts(
 def test_tui_cli_bootstraps_cwd_dotenv_at_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Req 8 & 9: imednet tui loads ./.env early before reading IMEDNET_STUDY_KEY and contrast."""
     dotenv_file = tmp_path / ".env"
@@ -596,7 +743,7 @@ def test_tui_cli_bootstraps_cwd_dotenv_at_entry(
 
     monkeypatch.setattr("imednet_tui.app.run_tui", _fake_run_tui)
 
-    code, _, err = _invoke_cli(["tui", "--force"])
+    code, _, err = _invoke_cli(capsys, ["tui", "--force"])
     assert code == 0, err
     assert launched["study_key"] == "TUI-ENV-STUDY"
     assert launched["hc_env"] == "yes"
@@ -605,10 +752,14 @@ def test_tui_cli_bootstraps_cwd_dotenv_at_entry(
 
 def test_cli_error_presenter_simulation_job_and_structured_api_errors(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """AC 6, Req 11-12 & Guardrails 1, 5: plain-language CLI errors without raw dicts or prod URLs."""
     monkeypatch.setenv("IMEDNET_NON_INTERACTIVE", "1")
-    code, out, err = _invoke_cli(["jobs", "status", "STUDY", "UNKNOWN-JOB", "--simulation"])
+    code, out, err = _invoke_cli(
+        capsys,
+        ["jobs", "status", "STUDY", "UNKNOWN-JOB", "--simulation", "--format", "json"],
+    )
     assert code == 1
     assert out == ""
     err_lines = [ln for ln in err.strip().splitlines() if ln.strip()]
@@ -688,7 +839,7 @@ def test_cli_error_presenter_simulation_job_and_structured_api_errors(
         failing_sdk.config.simulation_mode = False
         failing_sdk.studies.list.side_effect = exc_obj
         monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda s=failing_sdk: s)
-        c, o, e = _invoke_cli(["studies", "list"])
+        c, o, e = _invoke_cli(capsys, ["studies", "list", "--format", "json"])
         assert c == 1
         assert o == ""
         lines = [ln for ln in e.strip().splitlines() if ln.strip()]
@@ -708,7 +859,7 @@ def test_network_retry_and_circuit_breaker_emit_single_stderr_line_in_subprocess
         "def _fail_transport(req):\n"
         "    raise httpx.ConnectError('connection refused', request=req)\n"
         "def _get_sdk():\n"
-        "    cfg = Config(api_key='k', security_key='s')\n"
+        "    cfg = Config(api_key='k', security_key='s')\n"  # pragma: allowlist secret
         "    return ImednetSDK(config=cfg, transport=httpx.MockTransport(_fail_transport), retries=2, backoff_factor=0.001)\n"
         "ctx.get_sdk = _get_sdk\n"
         "cli.app(['studies', 'list', '--format', 'json'])\n"
@@ -738,7 +889,7 @@ def test_network_retry_and_circuit_breaker_emit_single_stderr_line_in_subprocess
         "    return httpx.Response(503, json={'message': 'down'}, request=req)\n"
         "cb = CircuitBreaker(failure_threshold=1, recovery_timeout=60.0)\n"
         "def _get_sdk():\n"
-        "    cfg = Config(api_key='k', security_key='s')\n"
+        "    cfg = Config(api_key='k', security_key='s')\n"  # pragma: allowlist secret
         "    sdk = ImednetSDK(config=cfg, transport=httpx.MockTransport(_fail_503), retries=0)\n"
         "    sdk._client._executor.circuit_breaker = cb\n"
         "    try:\n"

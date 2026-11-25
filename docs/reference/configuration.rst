@@ -2,8 +2,9 @@ Configuration
 =============
 
 The SDK and CLI read settings from environment variables. They can be set in the
-shell or stored in a ``.env`` file that the CLI loads automatically via
-:func:`dotenv.load_dotenv`.
+shell or stored in a ``.env`` file discovered from the current working directory
+(loaded automatically at CLI startup with ``override=False``, so existing shell
+environment variables always take precedence).
 
 Environment Variables
 ---------------------
@@ -40,7 +41,7 @@ Environment Variables
      - Optional expected JWT ``iss`` claim enforced by ``OIDCAuth``.
      - None
    * - IMEDNET_SIMULATION_MODE
-     - Set to ``true`` / ``1`` (or pass ``--simulation``) to run offline against ``SimulationTransport``.
+     - Set to ``1`` / ``true`` / ``yes`` (or pass ``--simulation``) to run offline against ``SimulationTransport``.
      - ``false``
    * - IMEDNET_BASE_URL
      - Optional base URL for private Mednet EDC deployments (also scopes dynamic ``ConfigVersionStore`` host directories).
@@ -70,10 +71,10 @@ Environment Variables
      - Default output format (``table``, ``json``, or ``csv``) for ``imednet`` CLI commands when ``--format`` is omitted.
      - ``table``
    * - IMEDNET_HIGH_CONTRAST
-     - Set to ``1`` / ``true`` to enable WCAG AAA high-contrast rendering in CLI tables and the ``imednet-tui`` terminal dashboard.
+     - Set to ``1`` / ``true`` / ``yes`` to enable WCAG AAA high-contrast rendering in CLI tables, ``InteractiveDataGrid``, and the ``imednet-tui`` terminal dashboard.
      - ``false``
    * - IMEDNET_NON_INTERACTIVE
-     - Set to ``1`` / ``true`` to suppress interactive prompts and spinners in automated CI/CD shells.
+     - Set to ``1`` / ``true`` / ``yes`` to suppress interactive prompts, ``InteractiveDataGrid``, and spinners in automated CI/CD shells.
      - ``false``
    * - IMEDNET_OPENAPI_PATH
      - Optional filesystem path to an OpenAPI contract JSON override loaded by ``ModelEngine``.
@@ -111,8 +112,10 @@ Edit the file to add your keys::
     IMEDNET_SECURITY_KEY=your_security_key
     IMEDNET_BASE_URL=https://edc.prod.imednetapi.com
 
-The CLI loads this file automatically. Other scripts can call
-``dotenv.load_dotenv()`` to mimic this behaviour.
+The CLI discovers ``.env`` from the current working directory (walking parent
+directories when needed) and loads unset variables with ``override=False``. Other
+scripts can call ``dotenv.load_dotenv(dotenv.find_dotenv(usecwd=True), override=False)``
+to mimic this behaviour.
 
 Alternatively, run the interactive setup wizard to configure your ``.env`` file:
 

@@ -6,14 +6,11 @@ import csv
 import json
 import sys
 from collections.abc import Collection, Mapping, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
-from imednet.integrations.enrichment import (
-    _matches_custom_phi_key,
-    mask_custom_phi_recursive,
-    resolve_enrichment_pipeline,
-)
+from imednet.core.context import sdk_governance_context
 from imednet.utils import sanitize_csv_formula
 from imednet.utils.security import (
     _normalize_key,
@@ -26,6 +23,27 @@ from .output import print_error
 
 _MASKED_VALUE = "***MASKED***"
 _T = TypeVar("_T")
+
+
+def resolve_enrichment_pipeline(study_key: str | None) -> Any:
+    """Lazily resolve ``EnrichmentPipeline`` without importing ``integrations`` at CLI startup."""
+    from imednet.integrations.enrichment import resolve_enrichment_pipeline as _resolve
+
+    return _resolve(study_key)
+
+
+def _matches_custom_phi_key(key: str, custom_phi_keys: set[str]) -> bool:
+    """Lazily check whether *key* matches normalized custom ``phiFields``."""
+    from imednet.integrations.enrichment import _matches_custom_phi_key as _matches
+
+    return _matches(key, custom_phi_keys)
+
+
+def mask_custom_phi_recursive(value: Any, custom_phi_keys: set[str]) -> Any:
+    """Lazily mask custom ``phiFields`` recursively."""
+    from imednet.integrations.enrichment import mask_custom_phi_recursive as _mask_custom
+
+    return _mask_custom(value, custom_phi_keys)
 
 
 def _normalize_custom_phi_keys(raw_fields: Collection[str]) -> set[str]:
@@ -44,13 +62,17 @@ def _normalize_custom_phi_keys(raw_fields: Collection[str]) -> set[str]:
 def _resolve_study_phi_keys(
     study_key: str | None,
     pipelines: dict[str, Any],
+    *,
+    sdk: Any = None,
 ) -> set[str]:
     """Resolve and cache study-configured ``phiFields`` keys for *study_key*."""
     if not isinstance(study_key, str) or not study_key.strip():
         return set()
     sk = study_key.strip()
     if sk not in pipelines:
-        pipelines[sk] = resolve_enrichment_pipeline(sk)
+        ctx = sdk_governance_context(sdk) if sdk is not None else nullcontext()
+        with ctx:
+            pipelines[sk] = resolve_enrichment_pipeline(sk)
     active_pipeline = pipelines[sk]
     if active_pipeline is None:
         return set()
@@ -172,6 +194,7 @@ def sanitize_cli_phi(
     study_key: str | None = None,
     mask_phi: bool = True,
     custom_phi_fields: Collection[str] | None = None,
+    sdk: Any = None,
 ) -> _T:
     """Apply default ``mask_clinical_phi`` and ``StudyConfiguration`` ``phiFields`` to *payload*.
 
@@ -194,7 +217,7 @@ def sanitize_cli_phi(
     custom_keys = (
         _normalize_custom_phi_keys(custom_phi_fields)
         if custom_phi_fields is not None
-        else _resolve_study_phi_keys(effective_study, pipelines)
+        else _resolve_study_phi_keys(effective_study, pipelines, sdk=sdk)
     )
     return _sanitize_value_recursive(payload, custom_phi_keys=custom_keys)  # type: ignore[no-any-return]
 
@@ -204,12 +227,13 @@ def sanitize_cli_records(
     *,
     study_key: str | None = None,
     mask_phi: bool = True,
+    sdk: Any = None,
 ) -> list[_T]:
     """Sanitize a sequence of ``Record`` models or dicts for CLI JSON and interactive views."""
     if not mask_phi:
         return list(records)
     pipelines: dict[str, Any] = {}
-    base_phi_keys = _resolve_study_phi_keys(study_key, pipelines)
+    base_phi_keys = _resolve_study_phi_keys(study_key, pipelines, sdk=sdk)
     sanitized: list[_T] = []
     for item in records:
         item_phi_keys = base_phi_keys
@@ -220,7 +244,7 @@ def sanitize_cli_records(
                 else (getattr(item, "study_key", None) or getattr(item, "studyKey", None))
             )
             if isinstance(raw_sk, str):
-                item_phi_keys = _resolve_study_phi_keys(raw_sk, pipelines)
+                item_phi_keys = _resolve_study_phi_keys(raw_sk, pipelines, sdk=sdk)
         sanitized.append(_sanitize_value_recursive(item, custom_phi_keys=item_phi_keys))
     return sanitized
 

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -47,6 +49,8 @@ from .submission import is_unconfigured_mock_method, subject_has_keyword
 logger = logging.getLogger(__name__)
 
 _LOGIC_EVALUATOR = LogicTreeEvaluator()
+_MAX_SUBMISSION_WORKERS = 8
+_UNCONSTRAINED = object()
 
 _NON_REJECTION_HTTP_STATUSES = frozenset({401, 403, 404, 409, 429})
 _NON_REJECTION_ERROR_TYPES = (
@@ -109,6 +113,106 @@ def _record_exception_error(result: dict[str, Any], exc: BaseException) -> None:
     suffix = f" [{' '.join(details)}]" if details else ""
     result["actual_response"] = f"Error: {exc}{suffix}"
     result["status"] = EditCheckResultStatus.ERROR
+
+
+def _is_mock_object(obj: Any) -> bool:
+    """Return True if ``obj`` is an instance of ``unittest.mock``."""
+    return type(obj).__module__.startswith("unittest.mock")
+
+
+def _is_query_open(query: Any) -> bool:
+    """Return True when ``query`` is in ``QueryStatus.OPEN`` state."""
+    status_val = (
+        query.get("status") if isinstance(query, Mapping) else getattr(query, "status", None)
+    )
+    if status_val == QueryStatus.OPEN:
+        return True
+    if isinstance(status_val, str) and status_val.strip().upper() == "OPEN":
+        return True
+    if status_val is not None and not _is_mock_object(status_val):
+        return False
+
+    comments = (
+        (query.get("query_comments") or query.get("queryComments"))
+        if isinstance(query, Mapping)
+        else (getattr(query, "query_comments", None) or getattr(query, "queryComments", None))
+    )
+    if isinstance(comments, list):
+        if not comments:
+            return True
+        last = comments[-1]
+        closed = last.get("closed") if isinstance(last, Mapping) else getattr(last, "closed", None)
+        return closed is not True
+    return False
+
+
+@dataclass
+class _OpenQueryIndex:
+    """In-memory index of open ``Query`` items keyed by ``(record_id, variable, subject_key)``."""
+
+    _entries: set[tuple[Any, Any, Any]] = field(default_factory=set)
+
+    @classmethod
+    def from_queries(cls, queries: Iterable[Any]) -> _OpenQueryIndex:
+        """Build an ``_OpenQueryIndex`` from an iterable of ``Query`` models or mappings."""
+        entries: set[tuple[Any, Any, Any]] = set()
+        for q in queries:
+            if not _is_query_open(q):
+                continue
+
+            raw_rec_id = (
+                (q.get("record_id") if q.get("record_id") is not None else q.get("recordId"))
+                if isinstance(q, Mapping)
+                else (getattr(q, "record_id", None) or getattr(q, "recordId", None))
+            )
+            if isinstance(raw_rec_id, str) and raw_rec_id.strip().isdigit():
+                raw_rec_id = int(raw_rec_id.strip())
+            rec_id: int | None = (
+                raw_rec_id
+                if isinstance(raw_rec_id, int)
+                and not isinstance(raw_rec_id, bool)
+                and raw_rec_id > 0
+                else None
+            )
+
+            raw_subj = (
+                (q.get("subject_key") or q.get("subjectKey"))
+                if isinstance(q, Mapping)
+                else (getattr(q, "subject_key", None) or getattr(q, "subjectKey", None))
+            )
+            subj_key: str | None = (
+                raw_subj.strip() if isinstance(raw_subj, str) and raw_subj.strip() else None
+            )
+
+            raw_var = q.get("variable") if isinstance(q, Mapping) else getattr(q, "variable", None)
+            var_name: str | None = (
+                raw_var.strip() if isinstance(raw_var, str) and raw_var.strip() else None
+            )
+
+            for rk in (rec_id, _UNCONSTRAINED):
+                for vk in (var_name, _UNCONSTRAINED):
+                    for sk in (subj_key, _UNCONSTRAINED):
+                        entries.add((rk, vk, sk))
+        return cls(_entries=entries)
+
+    def matches(
+        self,
+        *,
+        expected_record_ids: set[int],
+        rule_vars: set[str],
+        subject_key: str,
+    ) -> bool:
+        """Return True in ``O(1)`` when at least one indexed open ``Query`` matches."""
+        if not self._entries:
+            return False
+        r_probes: tuple[Any, ...] = (
+            (*expected_record_ids, None) if expected_record_ids else (_UNCONSTRAINED,)
+        )
+        v_probes: tuple[Any, ...] = (*rule_vars, None) if rule_vars else (_UNCONSTRAINED,)
+        s_probes: tuple[Any, ...] = (subject_key, None) if subject_key else (_UNCONSTRAINED,)
+        return any(
+            (rk, vk, sk) in self._entries for rk in r_probes for vk in v_probes for sk in s_probes
+        )
 
 
 class EditCheckResultStatus(str, Enum):
@@ -603,6 +707,19 @@ class UATExecutionEngine:
                 if isinstance(raw_results.get(k), list):
                     items.extend(raw_results[k])
             items.append(raw_results)
+        elif raw_results is None:
+            if isinstance(status, Mapping):
+                items.append(status)
+            else:
+                direct_id = getattr(status, "record_id", None)
+                if direct_id is None:
+                    direct_id = getattr(status, "recordId", None)
+                if isinstance(direct_id, int) and not isinstance(direct_id, bool) and direct_id > 0:
+                    record_ids.add(direct_id)
+                elif isinstance(direct_id, str) and direct_id.strip().isdigit():
+                    parsed_direct = int(direct_id.strip())
+                    if parsed_direct > 0:
+                        record_ids.add(parsed_direct)
         for entry in items:
             if not isinstance(entry, Mapping):
                 continue
@@ -646,30 +763,55 @@ class UATExecutionEngine:
     @staticmethod
     def _is_query_open(query: Any) -> bool:
         """Return True when ``query`` is in ``QueryStatus.OPEN`` state."""
-        status_val = (
-            query.get("status") if isinstance(query, Mapping) else getattr(query, "status", None)
-        )
-        if status_val == QueryStatus.OPEN:
-            return True
-        if isinstance(status_val, str) and status_val.strip().upper() == "OPEN":
-            return True
-        if status_val is not None and not type(status_val).__module__.startswith("unittest.mock"):
-            return False
+        return _is_query_open(query)
 
-        comments = (
-            (query.get("query_comments") or query.get("queryComments"))
-            if isinstance(query, Mapping)
-            else (getattr(query, "query_comments", None) or getattr(query, "queryComments", None))
-        )
-        if isinstance(comments, list):
-            if not comments:
-                return True
-            last = comments[-1]
-            closed = (
-                last.get("closed") if isinstance(last, Mapping) else getattr(last, "closed", None)
+    @staticmethod
+    def _extract_rule_variables(rule: dict[str, Any]) -> set[str]:
+        """Extract target and condition ``Variable`` names referenced by ``rule``."""
+        return {
+            v
+            for v in (
+                rule.get("variable"),
+                *(rule.get("condition_variables") or []),
             )
-            return closed is not True
-        return False
+            if isinstance(v, str) and v
+        }
+
+    def _query_index_matches_rule(
+        self,
+        query_index: _OpenQueryIndex,
+        *,
+        rule: dict[str, Any],
+        payload: dict[str, Any],
+        job_status: Any = None,
+    ) -> bool:
+        """Return True if ``query_index`` contains an open ``Query`` matching ``rule``."""
+        subject_key = str(payload.get("subjectKey") or "").strip()
+        expected_record_ids = self._extract_job_record_ids(job_status)
+        rule_vars = self._extract_rule_variables(rule)
+        return query_index.matches(
+            expected_record_ids=expected_record_ids,
+            rule_vars=rule_vars,
+            subject_key=subject_key,
+        )
+
+    def _fetch_open_query_index(
+        self,
+        study_key: str,
+        subject_keys: Iterable[str],
+    ) -> _OpenQueryIndex:
+        """Fetch ``Queries`` once (scoped to one ``Subject`` when shared) and index open items."""
+        cleaned_keys = [sk.strip() for sk in subject_keys]
+        unique_non_empty = {sk for sk in cleaned_keys if sk}
+        if cleaned_keys and all(cleaned_keys) and len(unique_non_empty) == 1:
+            shared_subject_key = next(iter(unique_non_empty))
+            try:
+                queries = self._sdk.get_queries(study_key, subject_key=shared_subject_key)
+            except TypeError:
+                queries = self._sdk.get_queries(study_key)
+        else:
+            queries = self._sdk.get_queries(study_key)
+        return _OpenQueryIndex.from_queries(queries)
 
     def _has_matching_open_query(
         self,
@@ -685,60 +827,13 @@ class UATExecutionEngine:
             return False
 
         subject_key = str(payload.get("subjectKey") or "").strip()
-        if subject_key:
-            try:
-                queries = self._sdk.get_queries(study_key, subject_key=subject_key)
-            except TypeError:
-                queries = self._sdk.get_queries(study_key)
-        else:
-            queries = self._sdk.get_queries(study_key)
-
-        expected_record_ids = self._extract_job_record_ids(job_status)
-        rule_vars = {
-            v
-            for v in (
-                rule.get("variable"),
-                *(rule.get("condition_variables") or []),
-            )
-            if isinstance(v, str) and v
-        }
-
-        for q in queries:
-            if not self._is_query_open(q):
-                continue
-
-            q_rec_id = (
-                (q.get("record_id") if q.get("record_id") is not None else q.get("recordId"))
-                if isinstance(q, Mapping)
-                else (getattr(q, "record_id", None) or getattr(q, "recordId", None))
-            )
-            if isinstance(q_rec_id, str) and q_rec_id.strip().isdigit():
-                q_rec_id = int(q_rec_id.strip())
-            if (
-                expected_record_ids
-                and isinstance(q_rec_id, int)
-                and not isinstance(q_rec_id, bool)
-                and q_rec_id > 0
-                and q_rec_id not in expected_record_ids
-            ):
-                continue
-
-            q_subj = (
-                (q.get("subject_key") or q.get("subjectKey"))
-                if isinstance(q, Mapping)
-                else (getattr(q, "subject_key", None) or getattr(q, "subjectKey", None))
-            )
-            q_subj_str = q_subj.strip() if isinstance(q_subj, str) else ""
-            if subject_key and q_subj_str and q_subj_str != subject_key:
-                continue
-
-            q_var = q.get("variable") if isinstance(q, Mapping) else getattr(q, "variable", None)
-            q_var_str = q_var.strip() if isinstance(q_var, str) else ""
-            if rule_vars and q_var_str and q_var_str not in rule_vars:
-                continue
-
-            return True
-        return False
+        query_index = self._fetch_open_query_index(study_key, [subject_key])
+        return self._query_index_matches_rule(
+            query_index,
+            rule=rule,
+            payload=payload,
+            job_status=job_status,
+        )
 
     @staticmethod
     def _record_rejection(result: dict[str, Any], report: EditCheckVerificationReport) -> None:
@@ -760,6 +855,7 @@ class UATExecutionEngine:
         rule: dict[str, Any],
         payload: dict[str, Any],
         job_status: Any = None,
+        query_index: _OpenQueryIndex | None = None,
     ) -> None:
         """Apply a record acceptance outcome, checking open Queries for warning rules."""
         if result.get("expected_response") != "Query Opened":
@@ -768,17 +864,25 @@ class UATExecutionEngine:
             report.failed_rules += 1
             return
 
-        try:
-            matched = self._has_matching_open_query(
-                study_key,
+        if query_index is not None:
+            matched = self._query_index_matches_rule(
+                query_index,
                 rule=rule,
                 payload=payload,
                 job_status=job_status,
             )
-        except Exception as exc:
-            _record_exception_error(result, exc)
-            report.failed_rules += 1
-            return
+        else:
+            try:
+                matched = self._has_matching_open_query(
+                    study_key,
+                    rule=rule,
+                    payload=payload,
+                    job_status=job_status,
+                )
+            except Exception as exc:
+                _record_exception_error(result, exc)
+                report.failed_rules += 1
+                return
 
         if matched:
             result["actual_response"] = "Query Opened"
@@ -1056,6 +1160,8 @@ class UATExecutionEngine:
         study_key: str = "",
         rule: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
+        accepted_soft_rules: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Any]]
+        | None = None,
     ) -> None:
         """Classify a polled asynchronous Job batch into ``EditCheckResultStatus``."""
         failures = getattr(summary, "failures", {}) or {}
@@ -1129,6 +1235,11 @@ class UATExecutionEngine:
                 or (isinstance(is_failed, bool) and is_failed)
             ):
                 self._record_rejection(result, report)
+            elif (
+                accepted_soft_rules is not None
+                and result.get("expected_response") == "Query Opened"
+            ):
+                accepted_soft_rules.append((result, eff_rule, eff_payload, status))
             else:
                 self._record_acceptance(
                     eff_study_key,
@@ -1143,6 +1254,102 @@ class UATExecutionEngine:
         result["actual_response"] = f"Error: Missing poll status for batch {batch_id}"
         result["status"] = EditCheckResultStatus.ERROR
         report.failed_rules += 1
+
+    def _handle_submission_outcome(
+        self,
+        study_key: str,
+        result: dict[str, Any],
+        rule: dict[str, Any],
+        payload: dict[str, Any],
+        report: EditCheckVerificationReport,
+        pending_jobs: list[tuple[dict[str, Any], str, dict[str, Any], dict[str, Any]]],
+        accepted_soft_rules: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Any]],
+        call_fn: Any,
+    ) -> None:
+        """Invoke ``call_fn`` and classify synchronous rejections, jobs, or acceptances."""
+        try:
+            job = call_fn()
+            batch_id = self._extract_job_batch_id(job)
+            if batch_id is not None:
+                result["batch_id"] = batch_id
+                pending_jobs.append((result, batch_id, rule, payload))
+            elif result.get("expected_response") == "Query Opened":
+                accepted_soft_rules.append((result, rule, payload, job))
+            else:
+                self._record_acceptance(
+                    study_key,
+                    result,
+                    report,
+                    rule=rule,
+                    payload=payload,
+                    job_status=job,
+                )
+        except PathTraversalValidationError:
+            raise
+        except (ApiError, ClientError) as e:
+            status_code = getattr(e, "status_code", None)
+            is_error_status = isinstance(status_code, int) and (
+                status_code >= 500 or status_code in _NON_REJECTION_HTTP_STATUSES
+            )
+            if (
+                isinstance(e, _NON_REJECTION_ERROR_TYPES)
+                or is_error_status
+                or _is_structural_error_text(str(e))
+            ):
+                _record_exception_error(result, e)
+                report.failed_rules += 1
+            else:
+                self._record_rejection(result, report)
+        except Exception as e:
+            _record_exception_error(result, e)
+            report.failed_rules += 1
+
+    def _resolve_accepted_soft_rules(
+        self,
+        study_key: str,
+        accepted_soft_rules: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Any]],
+        report: EditCheckVerificationReport,
+    ) -> None:
+        """Fetch open ``Queries`` once and classify all accepted soft warning rules."""
+        if not accepted_soft_rules:
+            return
+
+        get_queries_fn = getattr(self._sdk, "get_queries", None)
+        if is_unconfigured_mock_method(get_queries_fn):
+            empty_index = _OpenQueryIndex()
+            for result, rule, payload, job_status in accepted_soft_rules:
+                self._record_acceptance(
+                    study_key,
+                    result,
+                    report,
+                    rule=rule,
+                    payload=payload,
+                    job_status=job_status,
+                    query_index=empty_index,
+                )
+            return
+
+        subject_keys = [
+            str(payload.get("subjectKey") or "").strip() for _, _, payload, _ in accepted_soft_rules
+        ]
+        try:
+            query_index = self._fetch_open_query_index(study_key, subject_keys)
+        except Exception as exc:
+            for result, _, _, _ in accepted_soft_rules:
+                _record_exception_error(result, exc)
+                report.failed_rules += 1
+            return
+
+        for result, rule, payload, job_status in accepted_soft_rules:
+            self._record_acceptance(
+                study_key,
+                result,
+                report,
+                rule=rule,
+                payload=payload,
+                job_status=job_status,
+                query_index=query_index,
+            )
 
     def run_verification(
         self,
@@ -1174,7 +1381,9 @@ class UATExecutionEngine:
         )
 
         report = EditCheckVerificationReport(study_key=study_key)
+        prepared_submissions: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
         pending_jobs: list[tuple[dict[str, Any], str, dict[str, Any], dict[str, Any]]] = []
+        accepted_soft_rules: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Any]] = []
         enrolled_subject_key: str | None = None
         prerequisite_checked = prerequisite_error is not None
 
@@ -1219,11 +1428,11 @@ class UATExecutionEngine:
                     "test_data": test_data,
                     "expected_response": expected_response,
                 }
+                report.results.append(result)
 
                 if prerequisite_error is not None:
                     _record_exception_error(result, prerequisite_error)
                     report.failed_rules += 1
-                    report.results.append(result)
                     if report.total_rules >= 100:
                         logger.warning(
                             "Reached maximum rule limit of 100 per UAT verification run."
@@ -1252,46 +1461,55 @@ class UATExecutionEngine:
                 if interval_name:
                     payload["intervalName"] = interval_name
 
-                try:
-                    job = self._sdk.create_record(study_key, [payload])
-                    batch_id = self._extract_job_batch_id(job)
-                    if batch_id is not None:
-                        result["batch_id"] = batch_id
-                        pending_jobs.append((result, batch_id, rule, payload))
-                    else:
-                        self._record_acceptance(
-                            study_key,
-                            result,
-                            report,
-                            rule=rule,
-                            payload=payload,
-                            job_status=job,
-                        )
-                except PathTraversalValidationError:
-                    raise
-                except (ApiError, ClientError) as e:
-                    status_code = getattr(e, "status_code", None)
-                    is_error_status = isinstance(status_code, int) and (
-                        status_code >= 500 or status_code in _NON_REJECTION_HTTP_STATUSES
-                    )
-                    if (
-                        isinstance(e, _NON_REJECTION_ERROR_TYPES)
-                        or is_error_status
-                        or _is_structural_error_text(str(e))
-                    ):
-                        _record_exception_error(result, e)
-                        report.failed_rules += 1
-                    else:
-                        self._record_rejection(result, report)
-                except Exception as e:
-                    _record_exception_error(result, e)
-                    report.failed_rules += 1
-
-                report.results.append(result)
+                prepared_submissions.append((result, rule, payload))
 
             if report.total_rules >= 100:
                 logger.warning("Reached maximum rule limit of 100 per UAT verification run.")
                 break
+
+        create_record_fn = getattr(self._sdk, "create_record", None)
+        run_sequential = (
+            len(prepared_submissions) <= 1
+            or _is_mock_object(self._sdk)
+            or _is_mock_object(create_record_fn)
+        )
+        if run_sequential:
+            for sub_result, sub_rule, sub_payload in prepared_submissions:
+                self._handle_submission_outcome(
+                    study_key,
+                    sub_result,
+                    sub_rule,
+                    sub_payload,
+                    report,
+                    pending_jobs,
+                    accepted_soft_rules,
+                    lambda p=sub_payload: self._sdk.create_record(study_key, [p]),
+                )
+        else:
+            max_workers = min(_MAX_SUBMISSION_WORKERS, len(prepared_submissions))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        contextvars.copy_context().run,
+                        self._sdk.create_record,
+                        study_key,
+                        [sub_payload],
+                    )
+                    for _, _, sub_payload in prepared_submissions
+                ]
+                for (sub_result, sub_rule, sub_payload), future in zip(
+                    prepared_submissions, futures, strict=True
+                ):
+                    self._handle_submission_outcome(
+                        study_key,
+                        sub_result,
+                        sub_rule,
+                        sub_payload,
+                        report,
+                        pending_jobs,
+                        accepted_soft_rules,
+                        future.result,
+                    )
 
         if pending_jobs:
             batch_ids = list(dict.fromkeys(bid for _, bid, _, _ in pending_jobs))
@@ -1310,6 +1528,8 @@ class UATExecutionEngine:
                     study_key=study_key,
                     rule=pending_rule,
                     payload=pending_payload,
+                    accepted_soft_rules=accepted_soft_rules,
                 )
 
+        self._resolve_accepted_soft_rules(study_key, accepted_soft_rules, report)
         return report

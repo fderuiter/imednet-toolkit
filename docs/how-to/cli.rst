@@ -6,8 +6,9 @@ reads authentication details from environment variables (or runs completely offl
 against synthetic ``SimulationTransport`` fixtures when ``--simulation`` or
 ``IMEDNET_SIMULATION_MODE=true`` is passed). Every Study-scoped command across core,
 ``datadict from-api``, ``export``, ``workflows``, and ``tui`` accepts either a
-positional ``STUDY`` argument or ``-s`` / ``--study-key STUDY`` (passing conflicting
-values exits with status code ``2``). See :doc:`/reference/configuration` for the full
+positional ``STUDY`` argument or ``-s`` / ``--study-key STUDY`` (falling back to
+``IMEDNET_STUDY_KEY`` when omitted, while passing conflicting explicit values exits
+with status code ``2``). See :doc:`/reference/configuration` for the full
 list of environment variables and details on using an ``.env`` file.
 
 .. argparse::
@@ -32,18 +33,26 @@ dashboard for browsing studies, sites, subjects, and background jobs:
 
 Within ``imednet tui``, use ``Tab`` / ``Shift+Tab`` and arrow keys to move across panels,
 ``Enter`` to select a study or site (re-selecting the active site clears the site filter)
-or to register validated batch IDs in the Jobs tab input, ``Enter`` or ``Space`` on the
-Jobs table to toggle the inline ``#job_detail_panel`` (displaying sanitized ``resultUrl``
-and per-``Record`` diagnostics), ``Esc`` to move focus from the Jobs batch input to the
-Jobs table, close an open ``#job_detail_panel``, or clear an active site filter, ``q`` to
-quit, ``d`` to toggle dark mode, ``h`` to toggle high-contrast mode, ``r`` to refresh
-active study data, and ``a`` to load all pages when a panel is truncated. Single-key
-shortcuts are suppressed automatically while typing batch IDs in the Jobs tab input, and
-``LogViewer`` masks ``Subject`` PHI fields to ``***MASKED***`` by default. Pass ``--study``
-and repeatable ``--batch`` flags at launch to open a study and monitor specific batch jobs
-immediately (or pass ``--batch`` without ``--study`` to stage ``QUEUED`` batches until a
-``Study`` is selected), and pass ``--force`` only when intentionally bypassing TTY stream
-checks.
+or to validate and stage/register batch IDs in ``#batch_id_input`` (staging ``QUEUED``
+entries when no ``Study`` is selected yet and preserving draft text if validation fails),
+``Enter`` or ``Space`` on ``#job_table`` to toggle the focusable split
+``#job_detail_panel`` alongside ``#job_table`` (displaying the six-field ``Job`` metadata
+``jobId``, ``batchId``, ``state``, ``dateCreated``, ``dateStarted``, and ``dateFinished``,
+plus sanitized ``resultUrl``, ``Record`` errors, and explicit ``NOT_FOUND`` or failure
+diagnostics, scrollable via ``Tab`` and ``Up`` / ``Down`` / ``PageUp`` / ``PageDown`` /
+``Home`` / ``End`` while keeping ``#job_table`` rows visible on ``80x24`` consoles),
+``Esc`` on the Jobs tab to exit ``#batch_id_input`` or close ``#job_detail_panel`` (and
+``Esc`` on the Logs tab or once ``#job_detail_panel`` is closed to clear an active site
+filter immediately), ``q`` to quit, ``d`` to toggle dark mode, ``h`` to toggle
+high-contrast mode, ``r`` to refresh active study data, and ``a`` to load all pages when a
+panel is truncated. Single-key shortcuts are suppressed automatically while typing batch
+IDs in ``#batch_id_input``, and ``LogViewer`` and ``#job_detail_panel`` mask default
+``Subject`` PHI and committed ``StudyConfiguration`` ``phiFields`` across URL filters,
+plain filter expressions, and multiline JSON to ``***MASKED***`` without masking exempt
+study/subject/record identifiers. Pass ``--study`` and repeatable ``--batch`` flags at
+launch to open a study and monitor specific batch jobs immediately (or pass ``--batch``
+without ``--study`` to stage ``QUEUED`` batches until a ``Study`` is selected), and pass
+``--force`` only when intentionally bypassing TTY stream checks.
 
 When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
 ``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
@@ -108,8 +117,8 @@ sites, forms, records, subjects, intervals, visits, codings, and users, alongsid
 summaries for ``records create``, ``records update``, ``records import``, and
 ``subjects register``). JSON reads emit one envelope
 with ``schemaVersion: "1.0"``, ``resource``, ``status: "complete"``, ``count`` and
-``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands
-and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it), while
+``items`` (set ``IMEDNET_CLI_OUTPUT_FORMAT=json`` to default ``--format`` commands,
+``datadict validate``, and ``datadict diff`` to JSON unless an explicit ``--format`` flag overrides it), while
 write commands emit ``status: "failed"`` with exit code ``1`` when pre-write validation,
 a mid-batch chunk ``POST``, or ``--wait`` polling fails after validating or committing
 earlier chunks. Empty list results use an empty items array, whereas ``subject-data`` exits ``1`` on ``stderr`` when the requested Subject does not exist in the Study. Item fields use the SDK models'
@@ -146,10 +155,14 @@ issuing HTTP requests, whereas ``--dry-run`` without ``--schema`` loads the live
 
 Legacy ``records list -o/--output`` accepts ``json``, ``csv``, or an explicit ``.json`` /
 ``.csv`` destination path (preserving ``./records.json`` and ``./records.csv`` for
-``-o json`` and ``-o csv``), flattens ``recordData`` variables, masks ``Subject`` PHI to
-``***MASKED***`` by default (``--mask-phi``; opt out with ``--no-mask-phi``), and emits a
-``stderr`` deprecation warning (prefer ``--format json`` for stdout or ``imednet export``
-for file exports); combining ``-o/--output`` with ``--format json`` is an error. Existing ``export``
+``-o json`` and ``-o csv``), flattens ``recordData`` variables, and emits a ``stderr``
+deprecation warning (prefer ``--format json`` for stdout or ``imednet export`` for file
+exports); combining ``-o/--output`` with ``--format json`` is an error. Across
+``records list --format json``, ``InteractiveDataGrid`` side inspection panels (including
+pages loaded via ``a``), and ``-o/--output``, ``records list`` masks default clinical PHI
+and committed ``StudyConfiguration`` ``phiFields`` to ``***MASKED***`` by default
+(``--mask-phi``; opt out with ``--no-mask-phi``), matching ``workflows extract-records``
+and ``imednet export``. Existing ``export``
 commands (which also accept ``--no-interactive`` to suppress live spinners) and ``datadict`` JSON/schema/diff outputs
 (see :doc:`/how-to/data_dictionary`) retain their own contracts. This is not a global JSON wrapper for arbitrary third-party plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
@@ -244,8 +257,13 @@ arguments using ``=`` or the standard iMednet comparison operators (``<``, ``<=`
 ``>``, ``>=``, ``==``, ``!=``) with exclusive ``;`` (AND) or ``,`` (OR) connectors.
 Filter attribute names (in ``snake_case`` or ``camelCase``) and scalar values are
 validated locally against each endpoint's documented filter allowlist and resource
-model before sending HTTP requests: string identifiers preserve leading zeros,
-double-quoted strings (including empty ``""``), and non-ASCII text (such as
+model before sending HTTP requests (for ``intervals list``, where the upstream REST
+endpoint omits a server ``filter`` parameter, validated ``--filter`` clauses are
+evaluated client-side before ``--limit`` truncation without forwarding ``filter``
+upstream, while unsupported pattern operators such as ``=@``, ``=^``, ``=$``, ``!@``,
+``!^``, and ``!$`` exit ``1`` with guidance toward ``records list --record-data-filter``
+``=~``): string identifiers preserve leading zeros,
+double-quoted strings (including empty ``""``, ``"@..."``, ``"^..."``, and ``"$..."``), and non-ASCII text (such as
 ``subject_key=001``, ``code=0042``, ``reason==""``, or ``value=²``), while integer
 and boolean attributes reject invalid values on ``stderr`` with exit code ``1``. Commands that take a positional
 ``study_key`` reject redundant ``study_key`` / ``studyKey`` attributes in

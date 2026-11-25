@@ -289,7 +289,7 @@ async def test_record_update_async_single_record_helpers_execute_and_poll() -> N
 
 @pytest.mark.asyncio
 async def test_record_update_single_record_helpers_forward_explicit_schema() -> None:
-    dd = DataDictionary(forms=[], variables=[])
+    dd = DataDictionary(forms=[])
 
     sdk = ImednetSDK(simulation_mode=True)
     try:

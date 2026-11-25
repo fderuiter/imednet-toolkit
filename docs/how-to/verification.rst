@@ -19,6 +19,7 @@ Before proposing any code change, execute and pass all CI quality gates locally.
       uvx pre-commit run --all-files
       hatch run ruff format --check .
       hatch run ruff check .
+      hatch run typos --force-exclude .
       hatch run mypy packages/core/src/imednet
       hatch run mypy packages/plugins-workflows/src/imednet_workflows
       hatch run mypy packages/providers-airflow/src/apache_airflow_providers_imednet
@@ -44,7 +45,8 @@ Before proposing any code change, execute and pass all CI quality gates locally.
 Canonical tasks
 ---------------
 
-``pyproject.toml`` defines ``hatch run verify-static`` (format, lint and the
+``pyproject.toml`` defines ``hatch run verify-static`` (format, lint,
+non-mutating ``typos --force-exclude .`` spell checking, and the
 typing targets), ``hatch run verify-tests`` (offline workspace tests and
 90% coverage), ``hatch run docs`` (strict documentation checks), and
 ``hatch run validate-package-consumption`` (isolated clean-venv wheel and
@@ -56,9 +58,11 @@ synced ``.venv`` workspace. The expanded commands above are useful for diagnosti
 
 Install with ``uv sync --locked --all-packages --all-extras`` or the setup wizard;
 no real credentials or live EDC access are required. Run pre-commit first and
-``uvx hatch run quality:all packages`` as well for the existing security, dead-code,
-spelling and similarity gates. The fast global Ruff check is an early subset;
-package/Python matrix jobs supplement the full workspace gate. Duplicate global
+``uvx hatch run quality:all`` as well for the full-workspace formatting, Ruff,
+and non-mutating ``typos --force-exclude`` checks alongside the package-scoped
+security, dead-code, and similarity gates. The ``global-lint`` job runs the
+same pinned Ruff and non-mutating ``typos --force-exclude .`` checks across the
+repository; package/Python matrix jobs supplement the full workspace gate. Duplicate global
 similarity execution is removed; the canonical ``lint:pylint-sim`` and
 ``duplication:check`` tasks retain their documented scopes and thresholds.
 

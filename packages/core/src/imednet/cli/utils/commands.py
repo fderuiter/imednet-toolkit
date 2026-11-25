@@ -144,6 +144,18 @@ def register_list_command(
     add_no_interactive(list_parser)
     add_simulation_arg(list_parser)
 
+    def _collect_filtered_items(
+        raw_stream: Any,
+        client_predicate: Any,
+        effective_limit: int | None,
+    ) -> tuple[list[Any], bool, Callable[[], list[Any]] | None]:
+        filtered_stream = (
+            (item for item in raw_stream if client_predicate.matches(item))
+            if client_predicate is not None
+            else raw_stream
+        )
+        return collect_list_items_with_remainder(filtered_stream, effective_limit)
+
     def _prepare_query(
         *,
         filter_values: list[str] | None,
@@ -245,14 +257,9 @@ def register_list_command(
             )
             call_kwargs = {**_extra_kwargs, **req_kwargs} if _extra_kwargs else req_kwargs
             with fetching_status(name, study_key):
-                raw_stream = getattr(sdk, attr).list(study_key, **call_kwargs)
-                filtered_stream = (
-                    (item for item in raw_stream if client_predicate.matches(item))
-                    if client_predicate is not None
-                    else raw_stream
-                )
-                items, truncated, load_remaining = collect_list_items_with_remainder(
-                    filtered_stream,
+                items, truncated, load_remaining = _collect_filtered_items(
+                    getattr(sdk, attr).list(study_key, **call_kwargs),
+                    client_predicate,
                     effective_limit,
                 )
             _render_list_results(
@@ -341,14 +348,9 @@ def register_list_command(
             )
             call_kwargs = {**_extra_kwargs, **req_kwargs} if _extra_kwargs else req_kwargs
             with fetching_status(name):
-                raw_stream = getattr(sdk, attr).list(**call_kwargs)
-                filtered_stream = (
-                    (item for item in raw_stream if client_predicate.matches(item))
-                    if client_predicate is not None
-                    else raw_stream
-                )
-                items, truncated, load_remaining = collect_list_items_with_remainder(
-                    filtered_stream,
+                items, truncated, load_remaining = _collect_filtered_items(
+                    getattr(sdk, attr).list(**call_kwargs),
+                    client_predicate,
                     effective_limit,
                 )
             _render_list_results(

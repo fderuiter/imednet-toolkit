@@ -275,6 +275,7 @@ def load_from_csv_files(
                 parsed_ast = parse_logic_xml(xml_content)
             except ValueError as exc:
                 record_warning(f"Malformed XML in business logic row {idx + 1}: {exc}")
+                extra["malformedLogicXml"] = str(exc)
 
         rule_type = known.get("type")
         rule_name = known.get("name")

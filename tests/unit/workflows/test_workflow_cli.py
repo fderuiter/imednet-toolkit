@@ -927,3 +927,167 @@ def test_workflows_validate_standards_reports_scores_and_enforces_min_score(
     assert res_gated.exit_code == 1
     assert "Standards Readiness Report" in res_gated.stdout
     assert "Violations" in res_gated.stdout
+
+
+def test_validate_standards_filters_multi_domain_forms_and_fails_unknown_or_empty(
+    runner: CliRunner,
+    sdk: MagicMock,
+) -> None:
+    """validate-standards resolves Record/Variable domains from Forms without cross-domain relabeling and exits 1 on unknown/empty domains."""
+    import json
+
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    sdk.forms.list.return_value = [
+        Form(form_id=1, form_key="F_AE", form_name="Adverse Events"),
+        Form(form_id=2, form_key="F_LB", form_name="Laboratory"),
+    ]
+    sdk.variables.list.return_value = [
+        Variable(variable_id=1, form_id=1, form_key="F_AE", variable_name="aeTerm"),
+        Variable(variable_id=2, form_id=2, form_key="F_LB", variable_name="lbTest"),
+        Variable(variable_id=3, form_id=2, form_key="F_LB", variable_name="lbResult"),
+    ]
+    sdk.records.list.return_value = [
+        Record(
+            record_id=1,
+            study_key="STUDY_MULTI",
+            form_id=1,
+            form_key="F_AE",
+            subject_key="S01",
+            record_data={"aeTerm": "Headache"},
+        ),
+        Record(
+            record_id=2,
+            study_key="STUDY_MULTI",
+            form_id=2,
+            form_key="F_LB",
+            subject_key="S01",
+            record_data={
+                "lbTest": "ALT",
+                "lbTestCd": "ALT",
+                "lbResult": "24",
+                "lbUnit": "U/L",
+                "lbDate": "2026-04-01",
+            },
+        ),
+    ]
+
+    # Filtering to --domain LB with biologic profile scores ONLY F_LB (100%, Ready: True, exit 0)
+    # and does NOT relabel F_AE records or variables as LB.
+    res_lb = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_MULTI",
+            "--profile",
+            "biologic",
+            "--domain",
+            "LB",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_lb.exit_code == 0, res_lb.stdout
+    lb_item = json.loads(res_lb.stdout)["items"][0]
+    assert lb_item["score"] == 100.0
+    assert lb_item["is_ready"] is True
+    assert lb_item["checked_records"] == 1
+    assert not any("aeTerm" in w for w in lb_item["warnings"])
+
+    # Also works when sdk.forms.list is empty by resolving Record.form_key / Variable.form_key directly
+    sdk.forms.list.return_value = []
+    sdk.variables.list.return_value = [
+        Variable(variable_id=1, form_id=1, form_key="AE", variable_name="aeTerm"),
+        Variable(variable_id=2, form_id=2, form_key="MH", variable_name="mhTerm"),
+    ]
+    sdk.records.list.return_value = [
+        Record(
+            record_id=1,
+            study_key="STUDY_MULTI",
+            form_id=1,
+            form_key="AE",
+            subject_key="S01",
+            record_data={"aeTerm": "Headache"},
+        ),
+        Record(
+            record_id=2,
+            study_key="STUDY_MULTI",
+            form_id=2,
+            form_key="MH",
+            subject_key="S01",
+            record_data={
+                "mhTerm": "Asthma",
+                "mhDecod": "ASTHMA",
+                "mhCategory": "RESPIRATORY",
+                "mhStartDate": "2020-01-01",
+                "mhOngoing": "YES",
+            },
+        ),
+    ]
+    res_mh = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_MULTI",
+            "--profile",
+            "vaccine",
+            "--domain",
+            "MH",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_mh.exit_code == 0, res_mh.stdout
+    mh_item = json.loads(res_mh.stdout)["items"][0]
+    assert mh_item["score"] == 100.0
+    assert mh_item["is_ready"] is True
+    assert mh_item["checked_records"] == 1
+    assert not any("aeTerm" in w for w in mh_item["warnings"])
+
+    # Unknown domain -> score 0.0, Ready: False, ERROR violation, exit 1 (even with --min-score 0)
+    res_unknown = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_MULTI",
+            "--profile",
+            "drug",
+            "--domain",
+            "UNKNOWN_XYZ",
+            "--min-score",
+            "0",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_unknown.exit_code == 1
+    unk_item = json.loads(res_unknown.stdout)["items"][0]
+    assert unk_item["score"] == 0.0
+    assert unk_item["is_ready"] is False
+    assert any(v["severity"] == "ERROR" for v in unk_item["violations"])
+
+    # Empty study -> score 0.0, Ready: False, ERROR violation, exit 1
+    sdk.records.list.return_value = []
+    sdk.variables.list.return_value = []
+    res_empty = runner.invoke(
+        cli.app,
+        [
+            "workflows",
+            "validate-standards",
+            "STUDY_EMPTY",
+            "--profile",
+            "drug",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_empty.exit_code == 1
+    empty_item = json.loads(res_empty.stdout)["items"][0]
+    assert empty_item["score"] == 0.0
+    assert empty_item["is_ready"] is False
+    assert any(v["severity"] == "ERROR" for v in empty_item["violations"])

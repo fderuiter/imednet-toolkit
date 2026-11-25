@@ -197,6 +197,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 records,
                 study_key=study_key,
                 mask_phi=mask_phi,
+                sdk=sdk,
             )
             display_list(sanitized_records, "records", output_format="json")
         elif output:
@@ -212,6 +213,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 records,
                 study_key=study_key,
                 mask_phi=mask_phi,
+                sdk=sdk,
             )
             view_models = [_record_view_model(r) for r in sanitized_records]
 
@@ -221,6 +223,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     more,
                     study_key=study_key,
                     mask_phi=mask_phi,
+                    sdk=sdk,
                 )
                 return [_record_view_model(r) for r in sanitized_more], sanitized_more
 

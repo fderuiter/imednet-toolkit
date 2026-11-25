@@ -616,3 +616,107 @@ def test_normalization_performance_under_two_milliseconds_per_record() -> None:
 
     # Constraint: under 2 ms per record
     assert ms_per_record < 2.0
+
+
+def test_validator_scores_unsupported_zero_rule_and_empty_domains_at_zero() -> None:
+    """Unsupported domains, zero-rule domains, empty domain lists, and empty studies score 0.0."""
+    from imednet.models.standards import StandardsProfile
+
+    validator = StandardsReadinessValidator(profile=DrugSafetyProfile())
+
+    # 1. Empty study
+    empty_study = validator.score_records(records_by_domain={})
+    assert empty_study.score == 0.0
+    assert empty_study.is_ready is False
+    assert any(v.severity == "ERROR" for v in empty_study.violations)
+
+    # 2. Unsupported domain
+    unknown_dom = validator.score_records(records_by_domain={"UNKNOWN_DOM": [{"subjectKey": "S1"}]})
+    assert unknown_dom.score == 0.0
+    assert unknown_dom.is_ready is False
+    assert any(v.severity == "ERROR" and v.field == "UNKNOWN_DOM" for v in unknown_dom.violations)
+
+    # 3. Configured domain with zero records
+    empty_dom = validator.score_records(records_by_domain={"LB": []})
+    assert empty_dom.score == 0.0
+    assert empty_dom.is_ready is False
+    assert any(v.severity == "ERROR" and v.field == "LB" for v in empty_dom.violations)
+
+    # 4. Zero-rule profile domain
+    zero_rule_validator = StandardsReadinessValidator(
+        profile=StandardsProfile(profile_name="zero_rules")
+    )
+    zero_rule_report = zero_rule_validator.score_records(
+        records_by_domain={"AE": [{"subjectKey": "S1"}]}
+    )
+    assert zero_rule_report.score == 0.0
+    assert zero_rule_report.is_ready is False
+    assert any(v.severity == "ERROR" for v in zero_rule_report.violations)
+
+
+def test_evaluate_standards_readiness_filters_by_form_domain_without_relabeling() -> None:
+    """evaluate_standards_readiness resolves form domains first and preserves single-form unmapped streams."""
+    from imednet.integrations.sink_base import evaluate_standards_readiness
+    from imednet.models.records import Record
+
+    records = [
+        Record(
+            record_id=1,
+            study_key="S1",
+            form_id=10,
+            form_key="F_DM",
+            subject_key="SUB1",
+            record_data={"sex": "F", "birthDate": "1990-01-01", "age": 36},
+        ),
+        Record(
+            record_id=2,
+            study_key="S1",
+            form_id=20,
+            form_key="F_LB",
+            subject_key="SUB1",
+            record_data={
+                "lbTest": "Hemoglobin",
+                "lbTestCd": "HGB",
+                "lbResult": 13.8,
+                "lbUnit": "g/dL",
+                "lbDate": "2026-03-01",
+            },
+        ),
+    ]
+    report = evaluate_standards_readiness(
+        records,
+        standards_profile="biologic",
+        sdtm_domain="LB",
+        study_key="S1",
+        form_domain_map={"10": "DM", "F_DM": "DM", "20": "LB", "F_LB": "LB"},
+    )
+    assert report is not None
+    assert report.score == 100.0
+    assert report.is_ready is True
+
+    # Single-form unmapped custom stream still maps to explicit sdtm_domain
+    custom_stream = [
+        Record(
+            record_id=3,
+            study_key="S1",
+            form_id=99,
+            form_key="CUSTOM_LAB_SHEET",
+            subject_key="SUB1",
+            record_data={
+                "lbTest": "Glucose",
+                "lbTestCd": "GLUC",
+                "lbResult": 92,
+                "lbUnit": "mg/dL",
+                "lbDate": "2026-03-01",
+            },
+        )
+    ]
+    single_report = evaluate_standards_readiness(
+        custom_stream,
+        standards_profile="vaccine",
+        sdtm_domain="LB",
+        study_key="S1",
+    )
+    assert single_report is not None
+    assert single_report.score == 100.0
+    assert single_report.is_ready is True

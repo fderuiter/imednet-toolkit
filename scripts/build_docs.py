@@ -1,10 +1,12 @@
 import contextlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -103,6 +105,57 @@ def build_and_stage_wheels(
     staged = sorted(wheels_dir.glob("*.whl"))
     print(f"Staged {len(staged)} wheel artifact(s) in {wheels_dir}: {[w.name for w in staged]}")
     return staged
+
+
+BROWSER_WHEEL_SPECS: tuple[tuple[str, str], ...] = (
+    ("imednet", "core"),
+    ("imednet_workflows", "plugins-workflows"),
+    ("imednet_plugins_sinks", "plugins-sinks"),
+)
+
+EXCLUDED_BROWSER_WHEEL_PREFIXES: tuple[str, ...] = (
+    "imednet_workspace-",
+    "imednet-workspace-",
+    "apache_airflow_providers_imednet-",
+    "apache-airflow-providers-imednet-",
+    "imednet_tui-",
+    "imednet-tui-",
+)
+
+
+def write_wheel_manifest(
+    html_wheels_dir: Path | None = None, repo_root: Path | None = None
+) -> Path:
+    """Write _static/wheels/manifest.json under built HTML output for standalone Pyodide pages."""
+    if repo_root is None:
+        repo_root = Path(__file__).resolve().parent.parent
+    if html_wheels_dir is None:
+        html_wheels_dir = repo_root / "docs" / "_build" / "html" / "_static" / "wheels"
+
+    html_wheels_dir.mkdir(parents=True, exist_ok=True)
+
+    wheels: list[str] = []
+    for dist_prefix, pkg_dir_name in BROWSER_WHEEL_SPECS:
+        staged_matches = sorted(
+            whl
+            for whl in html_wheels_dir.glob(f"{dist_prefix}-*.whl")
+            if not whl.name.startswith(EXCLUDED_BROWSER_WHEEL_PREFIXES)
+        )
+        if staged_matches:
+            wheels.append(f"_static/wheels/{staged_matches[-1].name}")
+            continue
+
+        pyproject_file = repo_root / "packages" / pkg_dir_name / "pyproject.toml"
+        pkg_version = "1.0.0"
+        if pyproject_file.is_file():
+            with pyproject_file.open("rb") as fh:
+                pkg_version = str(tomllib.load(fh).get("project", {}).get("version", pkg_version))
+        wheels.append(f"_static/wheels/{dist_prefix}-{pkg_version}-py3-none-any.whl")
+
+    manifest_path = html_wheels_dir / "manifest.json"
+    manifest_path.write_text(json.dumps({"wheels": wheels}, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote Pyodide wheel manifest at {manifest_path}: {wheels}")
+    return manifest_path
 
 
 SCOPED_INHERITED_MEMBERS = (
@@ -303,11 +356,17 @@ def main() -> None:
     static_wheels_dir = Path("docs/_static/wheels")
     if static_wheels_dir.exists():
         html_wheels_dir.mkdir(parents=True, exist_ok=True)
-        for whl in static_wheels_dir.glob("*.whl"):
-            target_whl = html_wheels_dir / whl.name
-            if not target_whl.exists():
-                shutil.copy2(whl, target_whl)
+        staged_wheels = list(static_wheels_dir.glob("*.whl"))
+        if staged_wheels:
+            staged_names = {whl.name for whl in staged_wheels}
+            for existing_whl in html_wheels_dir.glob("*.whl"):
+                if existing_whl.name not in staged_names:
+                    with contextlib.suppress(OSError):
+                        existing_whl.unlink()
+            for whl in staged_wheels:
+                shutil.copy2(whl, html_wheels_dir / whl.name)
         shutil.rmtree(static_wheels_dir, ignore_errors=True)
+    write_wheel_manifest(html_wheels_dir)
 
     print("Validating documentation, rendered API reference, and SEO artifacts...")
     run_command([sys.executable, "scripts/validate_docs.py", "--require-html"])

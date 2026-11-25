@@ -147,17 +147,17 @@ _QUOTED_SENSITIVE_PATTERN = re.compile(
 )
 _EQUALS_SENSITIVE_PATTERN = re.compile(
     rf"(?i)(?<![a-z0-9_])({_ALL_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])(\s*=\s*)"
-    r"(?:(?:bearer|basic)\s+)?([^\s,;\"')\]}]+)"
+    r"(?:(?:bearer|basic)\s+)?([^\s,;&\"')\]}\x00]+)"
 )
 _HEADER_COLON_SENSITIVE_PATTERN = re.compile(
     rf"(?i)(?<![a-z0-9_])({_EXPLICIT_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])(\s*:\s*)"
-    r"(?:(?:bearer|basic)\s+)?([^\s,;\"')\]}]+)"
+    r"(?:(?:bearer|basic)\s+)?([^\s,;&\"')\]}\x00]+)"
 )
 _STANDALONE_COLON_SENSITIVE_PATTERN = re.compile(
     rf"(?i)(?<![a-z0-9_])({_GENERIC_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])(\s*:\s*)"
-    r"([^\s,;\"')\]}]+)(?=\s*(?:[,;)\]}\r\n]|$))"
+    r"([^\s,;&\"')\]}\x00]+)(?=\s*(?:[,;&)\]}\r\n\x00]|$))"
 )
-_BEARER_PATTERN = re.compile(r"(?i)\b(bearer\s+)([^\s,;\"')\]}]+)")
+_BEARER_PATTERN = re.compile(r"(?i)\b(bearer\s+)([^\s,;&\"')\]}\x00]+)")
 
 
 def _tokenize_key(key: str) -> tuple[str, ...]:

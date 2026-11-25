@@ -232,17 +232,7 @@ def resolve_study_configuration(study_key: str | None) -> StudyConfiguration | N
             return None
         fast_resolve = getattr(store_cls, "resolve_committed_config", None)
         if callable(fast_resolve):
-            resolved = _coerce_resolved_study_config(fast_resolve(study_key))
-            if resolved is not None:
-                return resolved
-            legacy_resolve = getattr(store_cls, "resolve_legacy_committed_config", None)
-            if callable(legacy_resolve) and (
-                store_cls.__name__ != "ConfigVersionStore"
-                or hasattr(fast_resolve, "_mock_name")
-                or hasattr(legacy_resolve, "_mock_name")
-            ):
-                return _coerce_resolved_study_config(legacy_resolve(study_key))
-            return None
+            return _coerce_resolved_study_config(fast_resolve(study_key))
         from imednet.core.context import study_context
 
         store = store_cls()
@@ -330,7 +320,9 @@ class CentralizedMapper:
                 for subj, seq_val in existing.items():
                     seq_counters[subj] = max(seq_counters.get(subj, 0), seq_val)
             self._domain_seq_counters[self.sdtm_domain] = seq_counters
-        self._form_domain_map: Mapping[Any, str] = form_domain_map or {}
+        self._form_domain_map: Mapping[Any, str] = (
+            form_domain_map if form_domain_map is not None else {}
+        )
         self._seq_overrides: Mapping[str, int] | None = seq_overrides
         self._lineage_out: dict[str, dict[str, Any]] | None = lineage_out
         self._record_seqs: dict[str, int] | None = record_seqs

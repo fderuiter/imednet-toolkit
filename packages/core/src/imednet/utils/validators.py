@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -23,36 +24,36 @@ _FALSE_VARIANTS = _FALSE_LOWER | {"False", "FALSE"}
 _SENTINEL_DATETIME = datetime(1969, 4, 20, 16, 20)
 
 _drift_reported: set[str] = set()
-_IS_STRICT_MODE_FN: Callable[[], bool] | None = None
+_logger: logging.Logger = logging.getLogger(__name__)
+_drift_logger: logging.Logger = logging.getLogger("imednet.drift")
+_is_strict_mode_fn: Callable[[], bool] | None = None
 
 
 def _effective_strict(strict: bool | None) -> bool:
     """Resolve explicit strict override or active strict-mode context."""
-    global _IS_STRICT_MODE_FN
+    global _is_strict_mode_fn
     if strict is not None:
         return strict
-    fn = _IS_STRICT_MODE_FN
+    fn = _is_strict_mode_fn
     if fn is None:
         from imednet.core.context import is_strict_mode
 
-        _IS_STRICT_MODE_FN = is_strict_mode
-        fn = is_strict_mode
+        _is_strict_mode_fn = is_strict_mode
+        return is_strict_mode()
     return fn()
 
 
 def _report_drift(drift_key: str) -> None:
     """Emit a deduplicated type-only destructive drift warning."""
-    import logging
-
     msg = f"Drift detected (destructive): type-changed field. {drift_key}"
     if drift_key not in _drift_reported:
         _drift_reported.add(drift_key)
-        logging.getLogger("imednet.drift").warning(msg)
+        _drift_logger.warning(msg)
 
 
 def is_missing_value(value: Any) -> bool:
     """Check if a value is None or an empty/whitespace-only string."""
-    return value is None or (isinstance(value, str) and value.strip() == "")
+    return value is None or (isinstance(value, str) and (not value or value.isspace()))
 
 
 def is_boolean_token(value: str) -> bool:
@@ -76,8 +77,14 @@ def parse_datetime(
            Numeric values are assumed to be UTC timestamps.
         strict: Optional explicit strict-mode override.
     """
-    if isinstance(v, datetime):
+    if type(v) is datetime or isinstance(v, datetime):
         return v
+    if isinstance(v, str):
+        if not v or v.isspace():
+            if _effective_strict(strict):
+                raise ValueError(f"Expected non-empty timestamp, got {type(v).__name__}")
+            return _SENTINEL_DATETIME
+        return parse_iso_datetime(v.strip())
     use_strict = _effective_strict(strict)
     if isinstance(v, bool):
         if use_strict:
@@ -88,8 +95,6 @@ def parse_datetime(
         if use_strict:
             raise ValueError(f"Expected non-empty timestamp, got {type(v).__name__}")
         return _SENTINEL_DATETIME
-    if isinstance(v, str):
-        return parse_iso_datetime(v.strip())
     if isinstance(v, (int, float)):
         if isinstance(v, float) and not math.isfinite(v):
             if use_strict:
@@ -126,7 +131,7 @@ def parse_bool(v: Any, strict: bool | None = None) -> bool:
         >>> parse_bool(None)
         False
     """
-    if isinstance(v, bool):
+    if type(v) is bool:
         return v
     if isinstance(v, str):
         # Optimized path for common API responses to avoid string manipulation
@@ -135,10 +140,9 @@ def parse_bool(v: Any, strict: bool | None = None) -> bool:
         if v in _FALSE_VARIANTS:
             return False
 
-        use_strict = _effective_strict(strict)
         # Gracefully handle empty string in permissive mode; reject in strict mode
-        if not v or v.strip() == "":
-            if use_strict:
+        if not v or v.isspace():
+            if _effective_strict(strict):
                 raise ValueError("Expected bool, got empty str")
             return False
 
@@ -149,6 +153,7 @@ def parse_bool(v: Any, strict: bool | None = None) -> bool:
         if val in _FALSE_LOWER:
             return False
 
+        use_strict = _effective_strict(strict)
         # Check numeric / special float strings ("1.0", "inf", "nan")
         if val and (val[0].isdigit() or val[0] in ("-", "+", ".", "n", "i")):
             try:
@@ -199,32 +204,20 @@ def parse_int_or_default(v: Any, default: int = 0, strict: bool | None = None) -
     Rejects ``bool`` inputs across all modes, and raises ``ValueError`` (or
     ``OverflowError`` on string infinity) when ``strict=True`` or strict mode is active.
     """
+    if type(v) is int:
+        return v
     if isinstance(v, int) and not isinstance(v, bool):
         return v
-    use_strict = _effective_strict(strict)
-    if isinstance(v, bool):
-        if use_strict:
-            raise ValueError("Expected int, got bool")
-        _report_drift("Expected int, got bool")
-        return default
-    if is_missing_value(v):
-        if use_strict:
-            raise ValueError(f"Expected int, got {type(v).__name__}")
-        return default
-    if isinstance(v, int):
-        return v
-    if isinstance(v, float):
-        if use_strict:
-            raise ValueError("Float truncation is not allowed for int in strict mode")
-        if not math.isfinite(v):
-            _report_drift("Expected int, got non-finite float")
-            return default
-        return int(v)
     if isinstance(v, str):
-        s = v.strip()
+        if not v or v.isspace():
+            if _effective_strict(strict):
+                raise ValueError(f"Expected int, got {type(v).__name__}")
+            return default
         try:
-            return int(s)
+            return int(v)
         except ValueError:
+            use_strict = _effective_strict(strict)
+            s = v.strip()
             try:
                 num = float(s)
             except ValueError:
@@ -245,6 +238,23 @@ def parse_int_or_default(v: Any, default: int = 0, strict: bool | None = None) -
             if use_strict:
                 raise ValueError("Float truncation is not allowed for int in strict mode") from None
             return int(num)
+    use_strict = _effective_strict(strict)
+    if isinstance(v, bool):
+        if use_strict:
+            raise ValueError("Expected int, got bool")
+        _report_drift("Expected int, got bool")
+        return default
+    if v is None:
+        if use_strict:
+            raise ValueError("Expected int, got NoneType")
+        return default
+    if isinstance(v, float):
+        if use_strict:
+            raise ValueError("Float truncation is not allowed for int in strict mode")
+        if not math.isfinite(v):
+            _report_drift("Expected int, got non-finite float")
+            return default
+        return int(v)
     if use_strict:
         raise ValueError(f"Expected int, got {type(v).__name__}")
     _report_drift(f"Expected int, got {type(v).__name__}")
@@ -257,10 +267,8 @@ def _guard_str_container(
     strict: bool | None = None,
 ) -> None:
     """Emit a type-only drift warning for container values in string fields and raise in strict mode."""
-    import logging
-
     msg = f"Drift detected (destructive): type-changed field. Expected str, got {type(v).__name__}"
-    logging.getLogger("imednet.drift").warning(msg)
+    _drift_logger.warning(msg)
     if _effective_strict(strict):
         raise ValueError(msg)
 
@@ -271,6 +279,8 @@ def parse_str_or_default(v: Any, default: str = "", strict: bool | None = None) 
     Guards against list and dict container values by emitting a drift warning
     and raising ValueError when strict=True or IMEDNET_STRICT_MODE is enabled.
     """
+    if type(v) is str:
+        return v
     if v is None:
         return default
     if isinstance(v, (list, dict)):
@@ -289,16 +299,14 @@ def parse_list_or_default(
 
     Raises ``ValueError`` in strict mode when ``v`` is not a ``list``.
     """
-    if isinstance(v, list):
+    if type(v) is list or isinstance(v, list):
         return v
     use_strict = _effective_strict(strict)
     if use_strict:
         raise ValueError(f"Expected list, got {type(v).__name__}")
     if is_missing_value(v):
         return default_factory()
-    import logging
-
-    logging.getLogger(__name__).warning(
+    _logger.warning(
         "Structural shift detected: API returned an object where a list was expected. Coercing by wrapping in a list."
     )
     return [v]
@@ -314,7 +322,7 @@ def parse_dict_or_default(
 
     Raises ``ValueError`` in strict mode when ``v`` is not a ``dict``.
     """
-    if isinstance(v, dict):
+    if type(v) is dict or isinstance(v, dict):
         return v
     use_strict = _effective_strict(strict)
     if use_strict:
@@ -323,9 +331,7 @@ def parse_dict_or_default(
         return default_factory()
     if isinstance(v, list):
         if len(v) > 0 and isinstance(v[0], dict):
-            import logging
-
-            logging.getLogger(__name__).warning(
+            _logger.warning(
                 "Structural shift detected: API returned a list where an object was expected. Coercing by extracting the first item."
             )
             return v[0]
