@@ -110,7 +110,7 @@ Before claiming any branch/PR task is complete or ready for review, run the docu
 - **Formatting, lint, typos & root hygiene:** `uvx pre-commit run --all-files` (on Windows PowerShell use `pwsh` + `scripts/env.ps1` or `.venv`; note `scripts/check_root_files.py` blocks stray root files)
 - **Full workspace static, type, & coverage gates (`>=90%`):** `hatch run verify` (or `verify-static` + `verify-tests`)
 - **Documentation & ADR index generation:** `hatch run docs`
-- **Multi-package static/security audit:** `uvx hatch run quality:all packages`
+- **Multi-package static/security audit:** `uvx hatch run quality:all`
 
 If any required tool or gate cannot execute in your current environment, report the exact failure/blocker honestly instead of claiming it passed.
 
