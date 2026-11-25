@@ -930,3 +930,71 @@ async def test_postman_mock_transport_rejects_unbacked_routes_and_invalid_reques
     ) as sdk:
         with pytest.raises(ValidationError, match="undocumentedSyntheticField"):
             sdk.get_job("STUDY_1", "BATCH_1")
+
+
+@pytest.mark.asyncio
+async def test_simulation_transport_exact_parity_with_postman_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify SIMULATION_ROUTES matches the 14 Postman operations and executes cleanly in strict mode."""
+    from imednet import AsyncImednetSDK, ImednetSDK
+    from imednet.simulation import SimulationState, create_simulation_transport
+    from imednet.simulation.transport import SIMULATION_ROUTES
+
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "true")
+    collection = json.loads(COLLECTION.read_text(encoding="utf-8"))
+    operations = get_collection_operations(collection.get("item", []))
+    assert len(operations) == 14
+    assert len(SIMULATION_ROUTES) == 14
+
+    expected_specs = []
+    for op in operations:
+        req = op["request"]
+        url_obj = req["url"]
+        raw_segments = tuple(url_obj.get("path", []))
+        allowed_query_keys = frozenset(
+            q["key"] for q in url_obj.get("query", []) if isinstance(q, dict) and q.get("key")
+        )
+        expected_specs.append(
+            (
+                op["name"],
+                req["method"].upper(),
+                ("api", "v1", "edc", *raw_segments),
+                allowed_query_keys,
+            )
+        )
+
+    actual_specs = [
+        (route.name, route.method, route.segments, route.allowed_query_keys)
+        for route in SIMULATION_ROUTES
+    ]
+    assert actual_specs == expected_specs
+
+    state = SimulationState()
+    transport = create_simulation_transport(state)
+    with ImednetSDK(transport=transport, strict_mode=True) as sdk:
+        assert len(sdk.get_studies()) == 3
+        assert len(sdk.get_forms("STUDY")) == 3
+        assert len(sdk.get_variables("STUDY")) == 21
+        assert len(sdk.get_intervals("STUDY")) == 1
+        assert len(sdk.get_sites("STUDY")) == 1
+        assert len(sdk.get_subjects("STUDY")) == 1
+        assert len(sdk.get_records("STUDY")) == 3
+        created = sdk.create_record(
+            "STUDY",
+            [{"subjectKey": "SUB1", "formKey": "F_VS", "data": {"V_WEIGHT": 71.0}}],
+        )
+        assert created.batch_id is not None
+        assert len(sdk.get_record_revisions("STUDY")) == 4
+        assert len(sdk.get_codings("STUDY")) == 2
+        assert len(sdk.get_queries("STUDY")) == 2
+        assert len(sdk.get_visits("STUDY")) == 2
+        assert len(sdk.get_users("STUDY")) == 2
+        assert sdk.get_job("STUDY", "BATCH").batch_id == "BATCH"
+
+    async with AsyncImednetSDK(transport=transport, strict_mode=True) as async_sdk:
+        assert len(await async_sdk.async_get_studies()) == 3
+        assert len(await async_sdk.async_get_variables("STUDY")) == 21
+        assert len(await async_sdk.async_get_visits("STUDY")) == 2
+        assert len(await async_sdk.async_get_users("STUDY")) == 2
+        assert (await async_sdk.async_get_job("STUDY", "BATCH")).batch_id == "BATCH"

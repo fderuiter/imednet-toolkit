@@ -1,5 +1,6 @@
 """Unit tests for fake data."""
 
+import re
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -86,8 +87,12 @@ def test_fake_variable_parses() -> None:
 
 
 def test_fake_visit_parses() -> None:
-    """Test that fake visit parses."""
+    """Test that fake visit parses and formats calendar dates as YYYY-MM-DD."""
     data = fake_data.fake_visit()
+    for date_field in ("startDate", "endDate", "dueDate", "visitDate"):
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", data[date_field]), (
+            f"Expected YYYY-MM-DD for {date_field}, got {data[date_field]!r}"
+        )
     obj = Visit.from_json(data)
     assert isinstance(obj, Visit)
 

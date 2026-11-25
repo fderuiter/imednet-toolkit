@@ -18,12 +18,22 @@ if TYPE_CHECKING:
     from imednet.core.client import Client
 
 
-def _default_auth(config: Config, *, has_transport: bool = False) -> AuthStrategy:
+def _default_auth(
+    config: Config,
+    *,
+    has_transport: bool = False,
+    is_simulation_transport: bool = False,
+) -> AuthStrategy:
     """Resolve the existing OIDC-before-key default policy once."""
     if config.oidc_token:
         from imednet.auth.oidc import OIDCAuth
 
         return OIDCAuth(config.oidc_token)
+    if config.simulation_mode or is_simulation_transport:
+        return ApiKeyAuth(
+            config.api_key or "SIMULATED_KEY",
+            config.security_key or "SIMULATED_KEY",
+        )
     if has_transport and (not config.api_key or not config.security_key):
         return ApiKeyAuth(config.api_key or "", config.security_key or "")
     if not config.api_key and not config.security_key:
@@ -50,18 +60,20 @@ class ClientFactory:
         from imednet.core.client import Client
 
         if transport is None and config.simulation_mode:
-            from imednet.simulation import create_simulation_transport
+            from imednet.simulation.transport import create_simulation_transport
 
             transport = create_simulation_transport()
-            auth = (
-                auth
-                if auth is not None
-                else ApiKeyAuth(
-                    config.api_key or "SIMULATED_KEY", config.security_key or "SIMULATED_KEY"
-                )
-            )
         if auth is None:
-            auth = _default_auth(config, has_transport=transport is not None)
+            is_sim_transport = False
+            if transport is not None:
+                from imednet.simulation.transport import SimulationTransport
+
+                is_sim_transport = isinstance(transport, SimulationTransport)
+            auth = _default_auth(
+                config,
+                has_transport=transport is not None,
+                is_simulation_transport=is_sim_transport,
+            )
         effective_timeout = config.timeout if timeout is None else timeout
         client = Client(
             timeout=effective_timeout,
@@ -85,18 +97,20 @@ class ClientFactory:
         from imednet.core.async_client import AsyncClient
 
         if transport is None and config.simulation_mode:
-            from imednet.simulation import create_simulation_transport
+            from imednet.simulation.transport import create_simulation_transport
 
             transport = create_simulation_transport()
-            auth = (
-                auth
-                if auth is not None
-                else ApiKeyAuth(
-                    config.api_key or "SIMULATED_KEY", config.security_key or "SIMULATED_KEY"
-                )
-            )
         if auth is None:
-            auth = _default_auth(config, has_transport=transport is not None)
+            is_sim_transport = False
+            if transport is not None:
+                from imednet.simulation.transport import SimulationTransport
+
+                is_sim_transport = isinstance(transport, SimulationTransport)
+            auth = _default_auth(
+                config,
+                has_transport=transport is not None,
+                is_simulation_transport=is_sim_transport,
+            )
         effective_timeout = config.timeout if timeout is None else timeout
         async_client = AsyncClient(
             timeout=effective_timeout,

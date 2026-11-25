@@ -252,8 +252,8 @@ class SimulationState:
                     "intervalName": "Baseline",
                     "subjectId": 201,
                     "subjectKey": "SUB1",
-                    "startDate": "2026-01-10T09:00:00Z",
-                    "visitDate": "2026-01-10T09:00:00Z",
+                    "startDate": "2026-01-10",
+                    "visitDate": "2026-01-10",
                     "deleted": False,
                     "dateCreated": "2026-01-10T09:00:00Z",
                     "dateModified": "2026-01-10T09:00:00Z",
@@ -266,8 +266,8 @@ class SimulationState:
                     "intervalName": "Follow-Up Month 1",
                     "subjectId": 201,
                     "subjectKey": "SUB1",
-                    "startDate": "2026-02-10T09:00:00Z",
-                    "visitDate": "2026-02-10T09:00:00Z",
+                    "startDate": "2026-02-10",
+                    "visitDate": "2026-02-10",
                     "deleted": False,
                     "dateCreated": "2026-02-10T09:00:00Z",
                     "dateModified": "2026-02-10T09:00:00Z",
@@ -419,7 +419,6 @@ class SimulationState:
                 {
                     "variableId": 801,
                     "variableName": "V_AGE",
-                    "variableKey": "V_AGE",
                     "variableType": "Number",
                     "formId": 301,
                     "formKey": "F_DM",
@@ -429,7 +428,6 @@ class SimulationState:
                 {
                     "variableId": 802,
                     "variableName": "V_GENDER",
-                    "variableKey": "V_GENDER",
                     "variableType": "Coded",
                     "formId": 301,
                     "formKey": "F_DM",
@@ -439,7 +437,6 @@ class SimulationState:
                 {
                     "variableId": 803,
                     "variableName": "V_WEIGHT",
-                    "variableKey": "V_WEIGHT",
                     "variableType": "Float",
                     "formId": 302,
                     "formKey": "F_VS",
@@ -449,7 +446,6 @@ class SimulationState:
                 {
                     "variableId": 804,
                     "variableName": "sex",
-                    "variableKey": "sex",
                     "variableType": "Text",
                     "formId": 301,
                     "formKey": "F_DM",
@@ -459,7 +455,6 @@ class SimulationState:
                 {
                     "variableId": 805,
                     "variableName": "birthDate",
-                    "variableKey": "birthDate",
                     "variableType": "Date",
                     "formId": 301,
                     "formKey": "F_DM",
@@ -469,7 +464,6 @@ class SimulationState:
                 {
                     "variableId": 806,
                     "variableName": "age",
-                    "variableKey": "age",
                     "variableType": "Number",
                     "formId": 301,
                     "formKey": "F_DM",
@@ -479,7 +473,6 @@ class SimulationState:
                 {
                     "variableId": 807,
                     "variableName": "race",
-                    "variableKey": "race",
                     "variableType": "Text",
                     "formId": 301,
                     "formKey": "F_DM",
@@ -489,7 +482,6 @@ class SimulationState:
                 {
                     "variableId": 808,
                     "variableName": "ethnicity",
-                    "variableKey": "ethnicity",
                     "variableType": "Text",
                     "formId": 301,
                     "formKey": "F_DM",
@@ -499,7 +491,6 @@ class SimulationState:
                 {
                     "variableId": 809,
                     "variableName": "vsTest",
-                    "variableKey": "vsTest",
                     "variableType": "Text",
                     "formId": 302,
                     "formKey": "F_VS",
@@ -509,7 +500,6 @@ class SimulationState:
                 {
                     "variableId": 810,
                     "variableName": "vsTestCd",
-                    "variableKey": "vsTestCd",
                     "variableType": "Text",
                     "formId": 302,
                     "formKey": "F_VS",
@@ -519,7 +509,6 @@ class SimulationState:
                 {
                     "variableId": 811,
                     "variableName": "vsResult",
-                    "variableKey": "vsResult",
                     "variableType": "Float",
                     "formId": 302,
                     "formKey": "F_VS",
@@ -529,7 +518,6 @@ class SimulationState:
                 {
                     "variableId": 812,
                     "variableName": "vsUnit",
-                    "variableKey": "vsUnit",
                     "variableType": "Text",
                     "formId": 302,
                     "formKey": "F_VS",
@@ -539,7 +527,6 @@ class SimulationState:
                 {
                     "variableId": 813,
                     "variableName": "vsDate",
-                    "variableKey": "vsDate",
                     "variableType": "DateTime",
                     "formId": 302,
                     "formKey": "F_VS",
@@ -549,7 +536,6 @@ class SimulationState:
                 {
                     "variableId": 814,
                     "variableName": "aeTerm",
-                    "variableKey": "aeTerm",
                     "variableType": "Text",
                     "formId": 303,
                     "formKey": "F_AE",
@@ -559,7 +545,6 @@ class SimulationState:
                 {
                     "variableId": 815,
                     "variableName": "aeDecod",
-                    "variableKey": "aeDecod",
                     "variableType": "Text",
                     "formId": 303,
                     "formKey": "F_AE",
@@ -569,7 +554,6 @@ class SimulationState:
                 {
                     "variableId": 816,
                     "variableName": "aeSeverity",
-                    "variableKey": "aeSeverity",
                     "variableType": "Text",
                     "formId": 303,
                     "formKey": "F_AE",
@@ -579,7 +563,6 @@ class SimulationState:
                 {
                     "variableId": 817,
                     "variableName": "aeRelationship",
-                    "variableKey": "aeRelationship",
                     "variableType": "Text",
                     "formId": 303,
                     "formKey": "F_AE",
@@ -589,7 +572,6 @@ class SimulationState:
                 {
                     "variableId": 818,
                     "variableName": "aeActionTaken",
-                    "variableKey": "aeActionTaken",
                     "variableType": "Text",
                     "formId": 303,
                     "formKey": "F_AE",
@@ -599,7 +581,6 @@ class SimulationState:
                 {
                     "variableId": 819,
                     "variableName": "aeOutcome",
-                    "variableKey": "aeOutcome",
                     "variableType": "Text",
                     "formId": 303,
                     "formKey": "F_AE",
@@ -609,7 +590,6 @@ class SimulationState:
                 {
                     "variableId": 820,
                     "variableName": "aeSerious",
-                    "variableKey": "aeSerious",
                     "variableType": "Text",
                     "formId": 303,
                     "formKey": "F_AE",
@@ -619,7 +599,6 @@ class SimulationState:
                 {
                     "variableId": 821,
                     "variableName": "aeStartDate",
-                    "variableKey": "aeStartDate",
                     "variableType": "DateTime",
                     "formId": 303,
                     "formKey": "F_AE",
@@ -645,8 +624,8 @@ class SimulationState:
                             "type": "Study",
                             "inactive": False,
                             "communityId": 1,
-                            "dateCreated": "2026-01-01T00:00:00Z",
-                            "dateModified": "2026-01-01T00:00:00Z",
+                            "dateCreated": [2026, 1, 1, 0, 0, 0, 0],
+                            "dateModified": [2026, 1, 1, 0, 0, 0, 0],
                         }
                     ],
                 },
@@ -666,8 +645,8 @@ class SimulationState:
                             "type": "Study",
                             "inactive": False,
                             "communityId": 1,
-                            "dateCreated": "2026-01-01T00:00:00Z",
-                            "dateModified": "2026-01-01T00:00:00Z",
+                            "dateCreated": [2026, 1, 1, 0, 0, 0, 0],
+                            "dateModified": [2026, 1, 1, 0, 0, 0, 0],
                         }
                     ],
                 },
@@ -789,6 +768,15 @@ class SimulationState:
         """Return list of simulated studies."""
         with self._lock:
             return copy.deepcopy(self.studies)
+
+    def _is_registered_study_unlocked(self, study_key: str) -> bool:
+        """Return True when *study_key* is registered in ``self.studies``."""
+        return bool(study_key) and any(s.get("studyKey") == study_key for s in self.studies)
+
+    def is_registered_study(self, study_key: str) -> bool:
+        """Return True when *study_key* is registered in ``self.studies``."""
+        with self._lock:
+            return self._is_registered_study_unlocked(study_key)
 
     @staticmethod
     def _select_templates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -988,42 +976,52 @@ class SimulationState:
             self.record_revisions.extend(synth_revisions)
 
     def get_sites(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of sites, ensuring sites exist for the requested study."""
+        """Return list of sites, ensuring sites exist for a registered study."""
         with self._lock:
             if not study_key:
                 return copy.deepcopy(self.sites)
+            if not self._is_registered_study_unlocked(study_key):
+                return []
             return self._synthesize_sites_unlocked(study_key)
 
     def get_subjects(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of subjects for a study."""
+        """Return list of subjects for a registered study."""
         with self._lock:
             if not study_key:
                 return copy.deepcopy(self.subjects)
+            if not self._is_registered_study_unlocked(study_key):
+                return []
             return self._synthesize_subjects_unlocked(study_key)
 
     def get_forms(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of forms for a study."""
+        """Return list of forms for a registered study."""
         with self._lock:
             forms = copy.deepcopy(self.forms)
             if not study_key:
                 return forms
+            if not self._is_registered_study_unlocked(study_key):
+                return []
             matched = [f for f in forms if f.get("studyKey") == study_key]
             if matched:
                 return matched
             return [dict(f, studyKey=study_key) for f in forms]
 
     def get_visits(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of visits for a study."""
+        """Return list of visits for a registered study."""
         with self._lock:
             if not study_key:
                 return copy.deepcopy(self.visits)
+            if not self._is_registered_study_unlocked(study_key):
+                return []
             return self._synthesize_visits_unlocked(study_key)
 
     def get_records(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of records for a study."""
+        """Return list of records for a registered study."""
         with self._lock:
             if not study_key:
                 return copy.deepcopy(self.records)
+            if not self._is_registered_study_unlocked(study_key):
+                return []
             return self._synthesize_records_unlocked(study_key)
 
     @staticmethod
@@ -1291,6 +1289,8 @@ class SimulationState:
     ) -> dict[str, Any]:
         """Store or update records in memory, enroll subjects, append revisions, and return a Job."""
         with self._lock:
+            if not self._is_registered_study_unlocked(study_key):
+                raise ValueError(f"Unknown studyKey: {study_key}")
             self._materialize_study_fixtures_unlocked(study_key)
             job_results: list[dict[str, Any]] = []
 
@@ -1652,7 +1652,6 @@ class SimulationState:
                 "totalRecords": len(records_data),
                 "successfulRecords": len(records_data),
                 "failedRecords": 0,
-                "resultUrl": f"/api/v1/edc/studies/{study_key}/jobs/{batch_id}/results",
                 "results": job_results,
                 "dateCreated": "2026-11-15T00:00:00Z",
                 "dateStarted": "2026-11-15T00:00:00Z",
@@ -1670,10 +1669,12 @@ class SimulationState:
             }
 
     def get_queries(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of queries for a study."""
+        """Return list of queries for a registered study."""
         with self._lock:
             if not study_key:
                 return copy.deepcopy(self.queries)
+            if not self._is_registered_study_unlocked(study_key):
+                return []
             return self._synthesize_queries_unlocked(study_key)
 
     def _resolve_job_view_unlocked(
@@ -1702,6 +1703,8 @@ class SimulationState:
     def get_jobs(self, study_key: str | None = None) -> list[dict[str, Any]]:
         """Return list of visible jobs for *study_key* with private tracking keys stripped."""
         with self._lock:
+            if study_key is not None and not self._is_registered_study_unlocked(study_key):
+                return []
             visible: list[dict[str, Any]] = []
             for batch_id in self.jobs:
                 resolved = self._resolve_job_view_unlocked(study_key, batch_id)
@@ -1712,6 +1715,8 @@ class SimulationState:
     def get_job_results(self, study_key: str | None, batch_id: str) -> Any | None:
         """Return job results by batch ID without advancing poll count, or None if missing."""
         with self._lock:
+            if study_key is not None and not self._is_registered_study_unlocked(study_key):
+                return None
             resolved = self._resolve_job_view_unlocked(study_key, batch_id)
             if resolved is None:
                 return None
@@ -1720,6 +1725,8 @@ class SimulationState:
     def get_job(self, study_key: str | None, batch_id: str) -> dict[str, Any] | None:
         """Return job status by batch ID, governing per-study state transitions on polling."""
         with self._lock:
+            if study_key is not None and not self._is_registered_study_unlocked(study_key):
+                return None
             raw_job = self.jobs.get(batch_id)
             if raw_job is None:
                 return None
@@ -1835,41 +1842,57 @@ class SimulationState:
             return _strip_private_keys(copy.deepcopy(job))
 
     def get_intervals(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of intervals for a study."""
+        """Return list of intervals for a registered study."""
         with self._lock:
             intervals = copy.deepcopy(self.intervals)
             if not study_key:
                 return intervals
+            if not self._is_registered_study_unlocked(study_key):
+                return []
+            matched = [i for i in intervals if i.get("studyKey") == study_key]
+            if matched:
+                return matched
             return [dict(i, studyKey=study_key) for i in intervals]
 
     def get_variables(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of variables for a study."""
+        """Return list of variables for a registered study."""
         with self._lock:
             variables = copy.deepcopy(self.variables)
             if not study_key:
                 return variables
+            if not self._is_registered_study_unlocked(study_key):
+                return []
+            matched = [v for v in variables if v.get("studyKey") == study_key]
+            if matched:
+                return matched
             return [dict(v, studyKey=study_key) for v in variables]
 
     def get_codings(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of medical codings for a study."""
+        """Return list of medical codings for a registered study."""
         with self._lock:
             if not study_key:
                 return copy.deepcopy(self.codings)
+            if not self._is_registered_study_unlocked(study_key):
+                return []
             return self._synthesize_codings_unlocked(study_key)
 
     def get_record_revisions(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of record audit revisions for a study."""
+        """Return list of record audit revisions for a registered study."""
         with self._lock:
             if not study_key:
                 return copy.deepcopy(self.record_revisions)
+            if not self._is_registered_study_unlocked(study_key):
+                return []
             return self._synthesize_record_revisions_unlocked(study_key)
 
     def get_users(self, study_key: str | None = None) -> list[dict[str, Any]]:
-        """Return list of users for a study."""
+        """Return list of users for a registered study."""
         with self._lock:
             users = copy.deepcopy(self.users)
             if not study_key:
                 return users
+            if not self._is_registered_study_unlocked(study_key):
+                return []
             return [u for u in users if "studyKey" not in u or u.get("studyKey") == study_key]
 
 

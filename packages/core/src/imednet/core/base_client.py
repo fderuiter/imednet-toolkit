@@ -133,15 +133,21 @@ class BaseClient:
         )
         self.retry_config = retry_config or RetryConfig()
 
+        is_sim_transport = False
+        if not self.simulation_mode and self._transport is not None:
+            from imednet.simulation.transport import SimulationTransport
+
+            is_sim_transport = isinstance(self._transport, SimulationTransport)
+
         if auth is not None:
             self.auth = auth
-        elif self.simulation_mode:
+        elif resolved_config.oidc_token:
+            self.auth = OIDCAuth(resolved_config.oidc_token)
+        elif self.simulation_mode or is_sim_transport:
             self.auth = ApiKeyAuth(
                 resolved_config.api_key or "SIMULATED_KEY",
                 resolved_config.security_key or "SIMULATED_KEY",
             )
-        elif resolved_config.oidc_token:
-            self.auth = OIDCAuth(resolved_config.oidc_token)
         else:
             self.auth = ApiKeyAuth(
                 resolved_config.api_key or "", resolved_config.security_key or ""

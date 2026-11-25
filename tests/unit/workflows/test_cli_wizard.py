@@ -1295,7 +1295,7 @@ def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(
             "uat",
             "build-spec",
             "--study-key",
-            "SIM_STUDY",
+            "STUDY",
             "--subject-count",
             "2",
             "--seed",
@@ -1315,8 +1315,8 @@ def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(
 
     # Verify deterministic payloads from loaded_spec.seed
     with ImednetSDK(simulation_mode=True) as sim_sdk:
-        res_a = UATWorkflow(sim_sdk).run("SIM_STUDY", spec=loaded_spec, dry_run=True)
-        res_b = UATWorkflow(sim_sdk).run("SIM_STUDY", spec=loaded_spec, dry_run=True)
+        res_a = UATWorkflow(sim_sdk).run("STUDY", spec=loaded_spec, dry_run=True)
+        res_b = UATWorkflow(sim_sdk).run("STUDY", spec=loaded_spec, dry_run=True)
     assert [rs.payloads for rs in res_a.record_sets] == [rs.payloads for rs in res_b.record_sets]
 
     # 2. build-spec rejects unknown explicit site on stderr
@@ -1327,7 +1327,7 @@ def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(
             "uat",
             "build-spec",
             "--study-key",
-            "SIM_STUDY",
+            "STUDY",
             "--site-name",
             "NON_EXISTENT_SITE",
             "--simulation",
@@ -1378,7 +1378,7 @@ def test_uat_build_spec_and_run_spec_seed_dry_run_and_json_envelope(
     )
 
     strict_dd = DataDictionary(
-        metadata=Metadata.create(study_key="SIM_STUDY"),
+        metadata=Metadata.create(study_key="STUDY"),
         forms=[
             DDForm(
                 formKey=target_form.form_key,
@@ -1669,7 +1669,7 @@ def test_uat_run_spec_subject_count_override_and_wizard_defaults_and_clear(
             "workflows",
             "uat",
             "build-spec",
-            "SIM_STUDY",
+            "STUDY",
             "--subject-count",
             "3",
             "--seed",

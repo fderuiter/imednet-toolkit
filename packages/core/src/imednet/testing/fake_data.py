@@ -15,6 +15,7 @@ from imednet.validation.cache import (
     _validate_calculation,
     _validate_float,
     _validate_int,
+    _validate_uri,
 )
 
 from .data_generator import generator as faker
@@ -23,6 +24,11 @@ from .data_generator import generator as faker
 def _timestamp() -> str:
     """Return a formatted datetime string."""
     return faker.date_time().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _date() -> str:
+    """Return a formatted YYYY-MM-DD date string."""
+    return faker.date_time().strftime("%Y-%m-%d")
 
 
 def fake_subject() -> dict[str, Any]:
@@ -126,6 +132,8 @@ def _fake_value(var_type: str) -> Any:
             return faker.pyfloat(left_digits=2, right_digits=2, positive=True)
         if validator is _validate_bool:
             return faker.boolean()
+        if validator is _validate_uri:
+            return "https://example.com"
         if category in ("date", "date/time precision"):
             return faker.date_time().strftime("%Y-%m-%d")
         if category == "datetime":
@@ -291,10 +299,10 @@ def fake_visit() -> dict[str, Any]:
         "intervalName": faker.word().title(),
         "subjectId": faker.random_int(min=1, max=10000),
         "subjectKey": f"{faker.random_int(100, 999)}-{faker.random_int(100, 999)}",
-        "startDate": _timestamp(),
-        "endDate": _timestamp(),
-        "dueDate": _timestamp(),
-        "visitDate": _timestamp(),
+        "startDate": _date(),
+        "endDate": _date(),
+        "dueDate": _date(),
+        "visitDate": _date(),
         "visitDateForm": faker.word().title(),
         "visitDateQuestion": faker.word(),
         "deleted": False,

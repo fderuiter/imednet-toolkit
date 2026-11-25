@@ -12,12 +12,135 @@ from typing import Any
 
 import httpx
 
+from imednet.core.paginator import MAX_PAGE_SIZE, _parse_int_param
 from imednet.simulation.state import SimulationState, get_default_simulation_state
-from imednet.utils.filters import ORDERED_FILTER_OPERATORS, _snake_to_camel, validate_filter_key
+from imednet.utils.filters import (
+    _parse_clause_operator,
+    _unquote_filter_scalar,
+    validate_filter_key,
+    validate_filter_operator,
+    validate_filter_syntax,
+    validate_record_filter,
+)
+from imednet.utils.filters import (
+    _split_filter_clauses as _split_raw_filter_clauses,
+)
 
 _ISO_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}|\b|$)")
-_TWO_CHAR_OPS = frozenset(op for op in ORDERED_FILTER_OPERATORS if len(op) == 2)
-_ONE_CHAR_OPS = frozenset({*(op for op in ORDERED_FILTER_OPERATORS if len(op) == 1), "="})
+_STANDARD_LIST_QUERY_KEYS: frozenset[str] = frozenset({"page", "size", "sort", "filter"})
+
+
+@dataclass(frozen=True)
+class SimulationRouteSpec:
+    """Contract metadata for one documented iMednet EDC REST operation."""
+
+    name: str
+    method: str
+    path_template: str
+    segments: tuple[str, ...]
+    allowed_query_keys: frozenset[str]
+
+
+SIMULATION_ROUTES: tuple[SimulationRouteSpec, ...] = (
+    SimulationRouteSpec(
+        name="List studies",
+        method="GET",
+        path_template="/api/v1/edc/studies",
+        segments=("api", "v1", "edc", "studies"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS,
+    ),
+    SimulationRouteSpec(
+        name="List forms",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/forms",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "forms"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS,
+    ),
+    SimulationRouteSpec(
+        name="List variables",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/variables",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "variables"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS,
+    ),
+    SimulationRouteSpec(
+        name="List intervals",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/intervals",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "intervals"),
+        allowed_query_keys=frozenset({"page", "size", "sort"}),
+    ),
+    SimulationRouteSpec(
+        name="List sites",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/sites",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "sites"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS,
+    ),
+    SimulationRouteSpec(
+        name="List subjects",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/subjects",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "subjects"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS,
+    ),
+    SimulationRouteSpec(
+        name="List records",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/records",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "records"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS | {"recordDataFilter"},
+    ),
+    SimulationRouteSpec(
+        name="Create records",
+        method="POST",
+        path_template="/api/v1/edc/studies/{studyKey}/records",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "records"),
+        allowed_query_keys=frozenset(),
+    ),
+    SimulationRouteSpec(
+        name="List record revisions",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/recordRevisions",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "recordRevisions"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS,
+    ),
+    SimulationRouteSpec(
+        name="List codings",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/codings",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "codings"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS,
+    ),
+    SimulationRouteSpec(
+        name="List queries",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/queries",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "queries"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS,
+    ),
+    SimulationRouteSpec(
+        name="List visits",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/visits",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "visits"),
+        allowed_query_keys=_STANDARD_LIST_QUERY_KEYS,
+    ),
+    SimulationRouteSpec(
+        name="List users",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/users",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "users"),
+        allowed_query_keys=frozenset({"page", "size", "sort", "includeInactive"}),
+    ),
+    SimulationRouteSpec(
+        name="Retrieve job status",
+        method="GET",
+        path_template="/api/v1/edc/studies/{studyKey}/jobs/{batchId}",
+        segments=("api", "v1", "edc", "studies", ":studyKey", "jobs", ":batchId"),
+        allowed_query_keys=frozenset(),
+    ),
+)
 
 
 class _FilterParseError(ValueError):
@@ -74,235 +197,184 @@ def _parse_float(raw: str) -> float | None:
     return val
 
 
-def _unquote_filter_value(raw_value: str, *, attribute: str, full_expr: str) -> tuple[str, bool]:
-    """Unquote a filter scalar token, validating backslash escapes inside double quotes."""
-    if not raw_value:
-        raise _FilterParseError(
-            "Filter value cannot be empty", attribute=attribute, value=full_expr
-        )
-    if raw_value.startswith('"'):
-        if len(raw_value) < 2 or not raw_value.endswith('"'):
-            raise _FilterParseError(
-                "Filter expression contains unclosed quotation marks",
-                attribute=attribute,
-                value=full_expr,
-            )
-        inner = raw_value[1:-1]
-        chars: list[str] = []
-        idx = 0
-        while idx < len(inner):
-            ch = inner[idx]
-            if ch == "\\":
-                if idx + 1 >= len(inner):
-                    raise _FilterParseError(
-                        "Filter expression contains trailing escape in quotation marks",
-                        attribute=attribute,
-                        value=full_expr,
-                    )
-                chars.append(inner[idx + 1])
-                idx += 2
-                continue
-            if ch == '"':
-                raise _FilterParseError(
-                    "Filter expression contains unescaped quotation mark",
-                    attribute=attribute,
-                    value=full_expr,
-                )
-            chars.append(ch)
-            idx += 1
-        return "".join(chars), True
-
-    if '"' in raw_value:
-        raise _FilterParseError(
-            "Filter expression contains unexpected quotation mark",
-            attribute=attribute,
-            value=full_expr,
-        )
-    return raw_value, False
-
-
 def _split_filter_clauses(filter_str: str, *, attribute: str) -> tuple[str, list[_FilterClause]]:
-    """Tokenize a filter string into ('and'|'or', clauses), validating connectors and regexes."""
+    """Validate and parse a filter or recordDataFilter string using shared SDK syntax rules."""
+    allow_regex = attribute == "recordDataFilter"
+    try:
+        if allow_regex:
+            validate_record_filter(filter_str)
+        else:
+            validate_filter_syntax(filter_str)
+    except ValueError as exc:
+        raise _FilterParseError(str(exc), attribute=attribute, value=filter_str) from exc
+
     stripped = filter_str.strip()
     if not stripped or stripped.lower() == "none":
         return "and", []
 
-    tokens: list[str] = []
-    buf: list[str] = []
-    in_quotes = False
-    escape = False
-    has_and = False
-    has_or = False
-    idx = 0
-    length = len(filter_str)
-
-    while idx < length:
-        ch = filter_str[idx]
-        if escape:
-            buf.append(ch)
-            escape = False
-            idx += 1
-            continue
-        if ch == "\\" and in_quotes:
-            buf.append(ch)
-            escape = True
-            idx += 1
-            continue
-        if ch == '"':
-            in_quotes = not in_quotes
-            buf.append(ch)
-            idx += 1
-            continue
-
-        if not in_quotes:
-            if ch == ";":
-                has_and = True
-                tokens.append("".join(buf))
-                buf = []
-                idx += 1
-                continue
-            if ch == ",":
-                has_or = True
-                tokens.append("".join(buf))
-                buf = []
-                idx += 1
-                continue
-            if (
-                ch.isspace()
-                and idx + 4 < length
-                and filter_str[idx + 1 : idx + 4].lower() == "and"
-                and filter_str[idx + 4].isspace()
-            ):
-                has_and = True
-                tokens.append("".join(buf))
-                buf = []
-                idx += 5
-                continue
-            if (
-                ch.isspace()
-                and idx + 3 < length
-                and filter_str[idx + 1 : idx + 3].lower() == "or"
-                and filter_str[idx + 3].isspace()
-            ):
-                has_or = True
-                tokens.append("".join(buf))
-                buf = []
-                idx += 4
-                continue
-
-        buf.append(ch)
-        idx += 1
-
-    if in_quotes:
-        raise _FilterParseError(
-            "Filter expression contains unclosed quotation marks",
-            attribute=attribute,
-            value=filter_str,
-        )
-    if has_and and has_or:
-        raise _FilterParseError(
-            "Filter expression cannot combine both AND and OR connectors",
-            attribute=attribute,
-            value=filter_str,
-        )
-
-    tokens.append("".join(buf))
-    clauses = [
-        _parse_single_clause(tok, attribute=attribute, full_expr=filter_str) for tok in tokens
-    ]
-    connector = "or" if has_or else "and"
-    if connector == "and":
-        seen_and_attrs: set[str] = set()
-        for clause in clauses:
-            dedup_attr = (
-                clause.field if attribute == "recordDataFilter" else _snake_to_camel(clause.field)
+    raw_clauses, connector_char = _split_raw_filter_clauses(stripped)
+    clauses: list[_FilterClause] = []
+    for raw_clause in raw_clauses:
+        try:
+            parsed = _parse_clause_operator(raw_clause)
+        except ValueError as exc:
+            raise _FilterParseError(str(exc), attribute=attribute, value=filter_str) from exc
+        if parsed is None:
+            raise _FilterParseError(
+                f"Invalid filter clause '{raw_clause}': missing comparison operator",
+                attribute=attribute,
+                value=filter_str,
             )
-            if dedup_attr in seen_and_attrs:
+        raw_key, matched_op, raw_val = parsed
+        try:
+            validate_filter_operator(matched_op, allow_regex=allow_regex)
+            validate_filter_key(raw_key)
+        except ValueError as exc:
+            raise _FilterParseError(str(exc), attribute=attribute, value=filter_str) from exc
+
+        if "." in raw_key and any(not segment for segment in raw_key.split(".")):
+            raise _FilterParseError(
+                f"Invalid dotted filter key '{raw_key}': empty path segment",
+                attribute=attribute,
+                value=filter_str,
+            )
+
+        try:
+            unquoted_val, was_quoted = _unquote_filter_scalar(raw_val, filter_str)
+        except ValueError as exc:
+            raise _FilterParseError(str(exc), attribute=attribute, value=filter_str) from exc
+
+        compiled_re: re.Pattern[str] | None = None
+        if matched_op == "=~":
+            try:
+                compiled_re = re.compile(unquoted_val, re.IGNORECASE)
+            except re.error as exc:
                 raise _FilterParseError(
-                    f"Duplicate filter attribute '{dedup_attr}' in AND clause",
+                    f"Invalid regular expression '{unquoted_val}': {exc}",
                     attribute=attribute,
                     value=filter_str,
-                )
-            seen_and_attrs.add(dedup_attr)
+                ) from exc
+
+        clauses.append(
+            _FilterClause(
+                field=raw_key,
+                operator=matched_op,
+                value=unquoted_val,
+                was_quoted=was_quoted,
+                regex=compiled_re,
+            )
+        )
+
+    connector = "or" if connector_char == "," else "and"
     return connector, clauses
 
 
-def _parse_single_clause(raw_clause: str, *, attribute: str, full_expr: str) -> _FilterClause:
-    """Parse one `field<op>value` clause and pre-compile regex patterns for `=~`."""
-    clause = raw_clause.strip()
-    if not clause:
-        raise _FilterParseError(
-            "Empty filter clause in expression", attribute=attribute, value=full_expr
-        )
-
-    matched_op: str | None = None
-    op_idx = -1
-    for idx in range(len(clause)):
-        if clause[idx] == '"':
-            break
-        two_char = clause[idx : idx + 2]
-        if len(two_char) == 2 and two_char in _TWO_CHAR_OPS:
-            matched_op = two_char
-            op_idx = idx
-            break
-        one_char = clause[idx]
-        if one_char in _ONE_CHAR_OPS:
-            matched_op = one_char
-            op_idx = idx
-            break
-
-    if matched_op is None:
-        raise _FilterParseError(
-            f"Invalid filter clause '{clause}': missing comparison operator",
-            attribute=attribute,
-            value=full_expr,
-        )
-
-    raw_key = clause[:op_idx].strip()
-    raw_val = clause[op_idx + len(matched_op) :].strip()
-    if (matched_op == "==" and raw_val.startswith("=")) or (
-        matched_op == "<" and raw_val.startswith(">")
-    ):
-        raise _FilterParseError(
-            f"Unsupported operator in filter clause '{clause}'",
-            attribute=attribute,
-            value=full_expr,
-        )
-
-    try:
-        validate_filter_key(raw_key)
-    except ValueError as exc:
-        raise _FilterParseError(str(exc), attribute=attribute, value=full_expr) from exc
-    if "." in raw_key and any(not segment for segment in raw_key.split(".")):
-        raise _FilterParseError(
-            f"Invalid dotted filter key '{raw_key}': empty path segment",
-            attribute=attribute,
-            value=full_expr,
-        )
-
-    unquoted_val, was_quoted = _unquote_filter_value(
-        raw_val, attribute=attribute, full_expr=full_expr
-    )
-    normalized_op = "==" if matched_op == "=" else matched_op
-
-    compiled_re: re.Pattern[str] | None = None
-    if normalized_op == "=~":
-        try:
-            compiled_re = re.compile(unquoted_val, re.IGNORECASE)
-        except re.error as exc:
+def _parse_pagination_params(params: dict[str, str]) -> tuple[int, int]:
+    """Validate and parse ``page`` (>= 0) and ``size`` (1..MAX_PAGE_SIZE) via shared paginator rules."""
+    page = 0
+    if "page" in params:
+        raw_page = params["page"]
+        if not raw_page or raw_page != raw_page.strip():
             raise _FilterParseError(
-                f"Invalid regular expression '{unquoted_val}': {exc}",
-                attribute=attribute,
-                value=full_expr,
-            ) from exc
+                f"Pagination 'page' must be an integer, got {raw_page!r}.",
+                attribute="page",
+                value=raw_page,
+            )
+        try:
+            page = _parse_int_param("page", raw_page)
+        except ValueError as exc:
+            raise _FilterParseError(str(exc), attribute="page", value=raw_page) from exc
+        if page < 0:
+            raise _FilterParseError(
+                f"Pagination 'page' must be >= 0, got {page}.",
+                attribute="page",
+                value=raw_page,
+            )
 
-    return _FilterClause(
-        field=raw_key,
-        operator=normalized_op,
-        value=unquoted_val,
-        was_quoted=was_quoted,
-        regex=compiled_re,
-    )
+    size = 25
+    if "size" in params:
+        raw_size = params["size"]
+        if not raw_size or raw_size != raw_size.strip():
+            raise _FilterParseError(
+                f"Pagination 'size' must be an integer, got {raw_size!r}.",
+                attribute="size",
+                value=raw_size,
+            )
+        try:
+            size = _parse_int_param("size", raw_size)
+        except ValueError as exc:
+            raise _FilterParseError(str(exc), attribute="size", value=raw_size) from exc
+        if size < 1 or size > MAX_PAGE_SIZE:
+            raise _FilterParseError(
+                f"Pagination 'size' must be between 1 and {MAX_PAGE_SIZE}, got {size}.",
+                attribute="size",
+                value=raw_size,
+            )
+
+    return page, size
+
+
+def _match_route_segments(
+    template_segments: tuple[str, ...], actual_segments: tuple[str, ...]
+) -> dict[str, str] | None:
+    """Match decoded URL path segments against a route template, extracting `:param` bindings."""
+    if len(template_segments) != len(actual_segments):
+        return None
+    bindings: dict[str, str] = {}
+    for tmpl, actual in zip(template_segments, actual_segments, strict=True):
+        if tmpl.startswith(":"):
+            bindings[tmpl[1:]] = actual
+        elif tmpl != actual:
+            return None
+    return bindings
+
+
+def _parse_records_post_body(request: httpx.Request) -> list[dict[str, Any]]:
+    """Validate that a POST /records body is a non-empty JSON array of non-empty objects."""
+    raw_bytes = request.content
+    if not raw_bytes or not raw_bytes.strip():
+        raise _FilterParseError(
+            "Record creation request body cannot be empty",
+            attribute="body",
+            value="",
+        )
+    try:
+        parsed = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _FilterParseError(
+            f"Malformed JSON request body: {exc}",
+            attribute="body",
+            value="",
+        ) from exc
+
+    if not isinstance(parsed, list) or not parsed:
+        raise _FilterParseError(
+            "Record creation request body must be a non-empty JSON array of objects",
+            attribute="body",
+            value=type(parsed).__name__,
+        )
+
+    validated: list[dict[str, Any]] = []
+    for idx, entry in enumerate(parsed):
+        if not isinstance(entry, dict) or not entry:
+            raise _FilterParseError(
+                f"Record item at index {idx} must be a non-empty JSON object",
+                attribute=f"body[{idx}]",
+                value=type(entry).__name__,
+            )
+        for data_key in ("data", "recordData", "record_data"):
+            if (
+                data_key in entry
+                and entry[data_key] is not None
+                and not isinstance(entry[data_key], dict)
+            ):
+                raise _FilterParseError(
+                    f"Record item at index {idx} '{data_key}' must be a JSON object",
+                    attribute=f"body[{idx}].{data_key}",
+                    value=type(entry[data_key]).__name__,
+                )
+        validated.append(entry)
+    return validated
 
 
 def _apply_ordering_op(op: str, left: Any, right: Any) -> bool:
@@ -512,141 +584,161 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         await request.aread()
         return self._dispatch(request)
 
+    def _validate_headers(self, request: httpx.Request) -> httpx.Response | None:
+        """Validate authentication credentials (API keys or OIDC Bearer) and Accept header."""
+        auth_header = request.headers.get("authorization")
+        has_valid_bearer = False
+        if auth_header is not None:
+            stripped_auth = auth_header.strip()
+            if stripped_auth.lower().startswith("bearer "):
+                has_valid_bearer = bool(stripped_auth[7:].strip())
+
+        api_key = request.headers.get("x-api-key", "").strip()
+        security_key = request.headers.get("x-imn-security-key", "").strip()
+        has_valid_api_keys = bool(api_key) and bool(security_key)
+
+        if not (has_valid_api_keys or has_valid_bearer):
+            return self._error_response(
+                request,
+                401,
+                "UNAUTHORIZED",
+                "Missing or blank authentication credentials",
+                code="9001",
+            )
+
+        accept = request.headers.get("accept", "").lower()
+        if "application/json" not in accept:
+            return self._error_response(
+                request,
+                400,
+                "BAD_REQUEST",
+                "Accept header must include application/json",
+                code="1000",
+                field={"attribute": "Accept", "value": request.headers.get("accept", "")},
+            )
+        return None
+
     def _dispatch(self, request: httpx.Request) -> httpx.Response:
-        """Dispatch HTTP request to in-memory fixtures."""
+        """Dispatch HTTP request strictly against the 14 documented EDC operations."""
+        header_err = self._validate_headers(request)
+        if header_err is not None:
+            return header_err
+
         method = request.method.upper()
         raw_path = request.url.path
-        raw_segments = [urllib.parse.unquote(s) for s in raw_path.strip("/").split("/") if s]
+        if not raw_path.startswith("/"):
+            return self._not_found_response(request, f"Endpoint {raw_path} not found")
+        raw_parts = raw_path.split("/")[1:]
+        if not raw_parts or any(not part for part in raw_parts):
+            return self._not_found_response(request, f"Endpoint {raw_path} not found")
+        decoded_segments = tuple(urllib.parse.unquote(part) for part in raw_parts)
+        if any(not seg or "/" in seg for seg in decoded_segments):
+            return self._not_found_response(request, f"Endpoint {raw_path} not found")
 
-        # Strip prefixes like api/v1 or edc
-        segments = list(raw_segments)
-        if len(segments) >= 2 and segments[0].lower() == "api" and segments[1].lower() == "v1":
-            segments = segments[2:]
-        if len(segments) >= 1 and segments[0].lower() == "edc":
-            segments = segments[1:]
+        path_matches: list[tuple[SimulationRouteSpec, dict[str, str]]] = []
+        for spec in SIMULATION_ROUTES:
+            bindings = _match_route_segments(spec.segments, decoded_segments)
+            if bindings is not None:
+                path_matches.append((spec, bindings))
+
+        if not path_matches:
+            return self._not_found_response(request, f"Endpoint {raw_path} not found")
+
+        matched_pair = next(((spec, b) for spec, b in path_matches if spec.method == method), None)
+        if matched_pair is None:
+            allowed_methods = ", ".join(sorted({spec.method for spec, _ in path_matches}))
+            return self._error_response(
+                request,
+                405,
+                "METHOD_NOT_ALLOWED",
+                f"Method {method} not allowed for {raw_path}",
+                extra_headers={"Allow": allowed_methods},
+            )
+
+        route, bindings = matched_pair
+        study_key = bindings.get("studyKey")
+        if study_key is not None and not self.state.is_registered_study(study_key):
+            return self._not_found_response(request, f"Study {study_key} not found")
+
+        unexpected_keys = [key for key in request.url.params if key not in route.allowed_query_keys]
+        if unexpected_keys:
+            bad_key = unexpected_keys[0]
+            return self._bad_request_response(
+                request,
+                _FilterParseError(
+                    f"Unsupported query parameter(s) for {route.name}: {', '.join(unexpected_keys)}",
+                    attribute=bad_key,
+                    value=request.url.params.get(bad_key, ""),
+                ),
+            )
 
         params = dict(request.url.params)
 
-        # Route matching
-        # 1. Studies: /studies
-        if segments == ["studies"]:
-            items = self.state.get_studies()
-            return self._filter_and_paginate(request, items, params)
+        if route.name == "List studies":
+            return self._filter_and_paginate(request, self.state.get_studies(), params)
 
-        # 2. Study-level resources: /studies/{study_key}/...
-        if len(segments) >= 2 and segments[0] == "studies":
-            study_key = segments[1]
-            resource = segments[2] if len(segments) >= 3 else None
-            sub_id = segments[3] if len(segments) >= 4 else None
+        assert study_key is not None
 
-            if resource is None:
-                # Single study lookup
-                items = [s for s in self.state.get_studies() if s.get("studyKey") == study_key]
-                if not items:
-                    return httpx.Response(
-                        404, json={"detail": f"Study {study_key} not found"}, request=request
-                    )
-                return httpx.Response(200, json=items[0], request=request)
-
-            if resource == "sites":
-                items = self.state.get_sites(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "subjects":
-                items = self.state.get_subjects(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "forms":
-                items = self.state.get_forms(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "visits":
-                items = self.state.get_visits(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "records":
-                if method == "POST":
-                    records_data = []
-                    if request.content:
-                        try:
-                            parsed = json.loads(request.content)
-                            if isinstance(parsed, list):
-                                records_data = parsed
-                            elif isinstance(parsed, dict):
-                                records_data = [parsed]
-                        except Exception:
-                            records_data = []
-                    job_res = self.state.create_records(study_key, records_data)
-                    return httpx.Response(
-                        202,
-                        json=job_res,
-                        headers={"content-type": "application/json"},
-                        request=request,
-                    )
-
-                items = self.state.get_records(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "recordRevisions":
-                items = self.state.get_record_revisions(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "codings":
-                items = self.state.get_codings(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "queries":
-                items = self.state.get_queries(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "jobs":
-                if sub_id is not None:
-                    sub_action = segments[4] if len(segments) >= 5 else None
-                    if sub_action == "results":
-                        job_results = self.state.get_job_results(study_key, sub_id)
-                        if job_results is None:
-                            return self._not_found_response(request, f"Job {sub_id} not found")
-                        return httpx.Response(200, json=job_results, request=request)
-                    job_status = self.state.get_job(study_key, sub_id)
-                    if job_status is None:
-                        return self._not_found_response(request, f"Job {sub_id} not found")
-                    return httpx.Response(200, json=job_status, request=request)
-                # List jobs: JobsEndpoint uses JsonListPaginator which expects a raw JSON list
-                items = self.state.get_jobs(study_key)
-                return httpx.Response(200, json=items, request=request)
-
-            if resource == "intervals":
-                items = self.state.get_intervals(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "variables":
-                items = self.state.get_variables(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "users":
-                items = self.state.get_users(study_key)
-                include_inactive = params.get("includeInactive", "false").strip().lower() == "true"
-                if not include_inactive:
-                    items = [u for u in items if u.get("userActiveInStudy", True) is not False]
-                return self._filter_and_paginate(request, items, params)
-
-        # 3. Direct /jobs/{batch_id} path
-        if len(segments) >= 1 and segments[0] == "jobs":
-            if len(segments) == 1:
-                return httpx.Response(200, json=self.state.get_jobs(None), request=request)
-            batch_id = segments[1]
-            if len(segments) >= 3 and segments[2] == "results":
-                job_results = self.state.get_job_results(None, batch_id)
-                if job_results is None:
-                    return self._not_found_response(request, f"Job {batch_id} not found")
-                return httpx.Response(200, json=job_results, request=request)
-            job_status = self.state.get_job(None, batch_id)
+        if route.name == "Retrieve job status":
+            batch_id = bindings["batchId"]
+            job_status = self.state.get_job(study_key, batch_id)
             if job_status is None:
                 return self._not_found_response(request, f"Job {batch_id} not found")
-            return httpx.Response(200, json=job_status, request=request)
+            return httpx.Response(
+                200,
+                json=job_status,
+                headers={"content-type": "application/json"},
+                request=request,
+            )
 
-        # Fallback for unrecognized endpoints: return empty paginated response
-        return self._filter_and_paginate(request, [], params)
+        if route.name == "Create records":
+            try:
+                records_data = _parse_records_post_body(request)
+                job_res = self.state.create_records(study_key, records_data)
+            except _FilterParseError as exc:
+                return self._bad_request_response(request, exc)
+            except ValueError as exc:
+                return self._bad_request_response(
+                    request, _FilterParseError(str(exc), attribute="body", value="")
+                )
+            return httpx.Response(
+                202,
+                json=job_res,
+                headers={"content-type": "application/json"},
+                request=request,
+            )
+
+        if route.name == "List users":
+            raw_inactive = params.get("includeInactive", "false")
+            norm_inactive = raw_inactive.strip().lower()
+            if norm_inactive not in {"true", "false"}:
+                return self._bad_request_response(
+                    request,
+                    _FilterParseError(
+                        f"Query parameter 'includeInactive' must be 'true' or 'false', got {raw_inactive!r}",
+                        attribute="includeInactive",
+                        value=raw_inactive,
+                    ),
+                )
+            items = self.state.get_users(study_key)
+            if norm_inactive != "true":
+                items = [u for u in items if u.get("userActiveInStudy", True) is not False]
+            return self._filter_and_paginate(request, items, params)
+
+        study_getters = {
+            "List forms": self.state.get_forms,
+            "List variables": self.state.get_variables,
+            "List intervals": self.state.get_intervals,
+            "List sites": self.state.get_sites,
+            "List subjects": self.state.get_subjects,
+            "List records": self.state.get_records,
+            "List record revisions": self.state.get_record_revisions,
+            "List codings": self.state.get_codings,
+            "List queries": self.state.get_queries,
+            "List visits": self.state.get_visits,
+        }
+        items = study_getters[route.name](study_key)
+        return self._filter_and_paginate(request, items, params)
 
     def _error_response(
         self,
@@ -655,12 +747,21 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         status_text: str,
         message: str,
         *,
+        code: str | None = None,
         field: dict[str, str] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         """Build a contract-compliant HTTP error envelope."""
         now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resolved_code = (
+            code
+            if code is not None
+            else (
+                "1000" if status_code == 400 else "9001" if status_code == 401 else str(status_code)
+            )
+        )
         error_body: dict[str, Any] = {
-            "code": str(status_code),
+            "code": resolved_code,
             "description": message,
             "message": message,
         }
@@ -675,10 +776,13 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
                 "error": error_body,
             }
         }
+        headers = {"content-type": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
         return httpx.Response(
             status_code,
             json=payload,
-            headers={"content-type": "application/json"},
+            headers=headers,
             request=request,
         )
 
@@ -689,32 +793,35 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
     def _bad_request_response(
         self, request: httpx.Request, exc: _FilterParseError
     ) -> httpx.Response:
-        """Build a contract-compliant HTTP 400 error envelope."""
+        """Build a contract-compliant HTTP 400 error envelope with code '1000'."""
         return self._error_response(
             request,
             400,
             "BAD_REQUEST",
             str(exc),
+            code="1000",
             field={"attribute": exc.attribute, "value": exc.value},
         )
 
     def _filter_and_paginate(
         self, request: httpx.Request, items: list[dict[str, Any]], params: dict[str, str]
     ) -> httpx.Response:
-        """Apply filter, recordDataFilter, and sort parameters, then paginate."""
+        """Apply filter, recordDataFilter, sort, and shared pagination bounds."""
         try:
+            page, size = _parse_pagination_params(params)
+
             filter_str = params.get("filter")
-            if filter_str:
+            if filter_str is not None:
                 connector, clauses = _split_filter_clauses(filter_str, attribute="filter")
                 if clauses:
                     items = [item for item in items if _matches_clauses(item, connector, clauses)]
 
             rec_filter_str = params.get("recordDataFilter")
             project_none_record_data = False
-            if rec_filter_str is not None and rec_filter_str.strip():
+            if rec_filter_str is not None:
                 if rec_filter_str.strip().lower() == "none":
                     project_none_record_data = True
-                else:
+                elif rec_filter_str.strip():
                     rec_conn, rec_clauses = _split_filter_clauses(
                         rec_filter_str, attribute="recordDataFilter"
                     )
@@ -740,30 +847,18 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         except _FilterParseError as exc:
             return self._bad_request_response(request, exc)
 
-        return self._paginate_response(request, items, params, sort_specs=sort_specs)
+        return self._paginate_response(request, items, page=page, size=size, sort_specs=sort_specs)
 
     def _paginate_response(
         self,
         request: httpx.Request,
         items: list[dict[str, Any]],
-        params: dict[str, str],
         *,
+        page: int,
+        size: int,
         sort_specs: list[dict[str, str]] | None = None,
     ) -> httpx.Response:
         """Format items into standard iMedNet ApiResponse JSON envelope."""
-        try:
-            page = int(params.get("page", 0))
-        except (ValueError, TypeError):
-            page = 0
-
-        try:
-            size = int(params.get("size", 25))
-        except (ValueError, TypeError):
-            size = 25
-        if size <= 0:
-            size = 25
-        page = max(page, 0)
-
         total_elements = len(items)
         if total_elements == 0:
             total_pages = 0
