@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping
+import sys
+from collections.abc import Callable, Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
 from imednet.cli.decorators import validate_cli_path_segment, with_sdk
@@ -20,7 +21,7 @@ from .args import (
     resolve_study_key,
 )
 from .context import fetching_status, simulation_mode_context
-from .output import display_list
+from .output import display_list, print_error
 
 if TYPE_CHECKING:
     from imednet.sdk import ImednetSDK
@@ -103,6 +104,8 @@ def register_list_command(
     include_filter: bool = True,
     filter_dest: str = "filter_args",
     filter_help: str | None = None,
+    multi_bound_attributes: Collection[str] | None = None,
+    export_filename_prefix: str | None = None,
     extra_args_fn: Callable[[argparse.ArgumentParser], None] | None = None,
     extra_kwargs_fn: Callable[[argparse.Namespace], Mapping[str, Any]] | None = None,
     preflight_query: bool = True,
@@ -127,6 +130,21 @@ def register_list_command(
             metadata_resolved = True
         return resolved_model, allowed_attributes
 
+    def _validate_export_output(output: str | None, explicit_output_format: str | None) -> None:
+        if export_filename_prefix is None or output is None:
+            return
+        from .export import resolve_records_export_target
+
+        if output and explicit_output_format == "json":
+            print_error("Choose --format json for stdout or --output for a file.")
+            sys.exit(1)
+        if resolve_records_export_target(output, export_filename_prefix) is None:
+            print_error(
+                "Invalid output format. Use 'json' or 'csv'. "
+                "Explicit '.json' and '.csv' file paths are also supported."
+            )
+            sys.exit(1)
+
     subparsers: argparse._SubParsersAction[Any] | None = None
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
@@ -144,6 +162,24 @@ def register_list_command(
     add_no_interactive(list_parser)
     add_simulation_arg(list_parser)
 
+    def _add_export_args(target_parser: argparse.ArgumentParser) -> None:
+        if export_filename_prefix is None:
+            return
+        target_parser.add_argument(
+            "-o",
+            "--output",
+            dest="output",
+            default=None,
+            help=f"Save {name} to a CSV or JSON file (csv, json, or a .csv/.json path).",
+        )
+        target_parser.add_argument(
+            "--mask-phi",
+            dest="mask_phi",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Mask sensitive clinical PHI fields with ***MASKED*** (default: enabled).",
+        )
+
     def _prepare_query(
         *,
         filter_values: list[str] | None,
@@ -151,6 +187,7 @@ def register_list_command(
         limit: int | None,
         fetch_all: bool,
         resolved_format: str,
+        has_output_file: bool = False,
         no_interactive: bool,
         disallow_study_key: bool,
     ) -> tuple[dict[str, Any], int | None]:
@@ -161,14 +198,17 @@ def register_list_command(
             limit=limit,
             fetch_all=fetch_all,
             output_format=resolved_format,
+            has_output_file=has_output_file,
             no_interactive=no_interactive,
             model=target_model,
             allowed_attributes=target_allowed_attrs,
             disallow_study_key=disallow_study_key,
+            multi_bound_attributes=multi_bound_attributes,
         )
 
     if requires_study_key:
         add_study_key_args(list_parser)
+        _add_export_args(list_parser)
         if extra_args_fn is not None:
             extra_args_fn(list_parser)
         add_list_query_args(
@@ -182,35 +222,62 @@ def register_list_command(
         def list_cmd(
             sdk: ImednetSDK,
             study_key: str,
+            output: str | None = None,
             output_format: str | None = None,
             filter_args: list[str] | None = None,
             sort: str | None = None,
             limit: int | None = None,
             fetch_all: bool = False,
             no_interactive: bool = False,
+            mask_phi: bool = True,
             _prepared_query: tuple[dict[str, Any], int | None] | None = None,
             _extra_kwargs: Mapping[str, Any] | None = None,
         ) -> None:
             resolved_format = resolve_output_format(output_format)
-            req_kwargs, effective_limit = (
-                _prepared_query
-                if _prepared_query is not None
-                else _prepare_query(
+            if _prepared_query is None:
+                _validate_export_output(output, output_format)
+                req_kwargs, effective_limit = _prepare_query(
                     filter_values=filter_args,
                     sort=sort,
                     limit=limit,
                     fetch_all=fetch_all,
                     resolved_format=resolved_format,
+                    has_output_file=bool(output),
                     no_interactive=no_interactive,
                     disallow_study_key=True,
                 )
-            )
+            else:
+                req_kwargs, effective_limit = _prepared_query
             call_kwargs = {**_extra_kwargs, **req_kwargs} if _extra_kwargs else req_kwargs
             with fetching_status(name, study_key):
                 items, truncated, load_remaining = collect_list_items_with_remainder(
                     getattr(sdk, attr).list(study_key, **call_kwargs),
                     effective_limit,
                 )
+            if export_filename_prefix is not None and output:
+                from .export import export_list_to_file
+
+                export_list_to_file(
+                    items,
+                    export_filename_prefix,
+                    output,
+                    study_key=study_key,
+                    mask_phi=mask_phi,
+                )
+                return
+
+            if export_filename_prefix is not None and mask_phi:
+                from .export import mask_cli_models
+
+                items = mask_cli_models(items, study_key=study_key, mask_phi=True)
+                orig_loader = load_remaining
+                if orig_loader is not None:
+
+                    def _masked_loader() -> list[Any]:
+                        return mask_cli_models(orig_loader(), study_key=study_key, mask_phi=True)
+
+                    load_remaining = _masked_loader
+
             _render_list_results(
                 items,
                 name=name,
@@ -228,6 +295,9 @@ def register_list_command(
             assert study_key is not None
             validate_cli_path_segment(study_key, name="study_key")
             no_interactive = getattr(args, "no_interactive", False)
+            output = getattr(args, "output", None)
+            mask_phi = bool(getattr(args, "mask_phi", True))
+            _validate_export_output(output, args.output_format)
             resolved_format = resolve_output_format(args.output_format)
             filter_values = getattr(args, filter_dest, None) if include_filter else None
             extra_kwargs = dict(extra_kwargs_fn(args)) if extra_kwargs_fn is not None else None
@@ -238,6 +308,7 @@ def register_list_command(
                     limit=args.limit,
                     fetch_all=args.fetch_all,
                     resolved_format=resolved_format,
+                    has_output_file=bool(output),
                     no_interactive=no_interactive,
                     disallow_study_key=True,
                 )
@@ -247,12 +318,14 @@ def register_list_command(
             with simulation_mode_context(bool(getattr(args, "simulation", False))):
                 list_cmd(
                     study_key=study_key,
+                    output=output,
                     output_format=resolved_format,
                     filter_args=filter_values,
                     sort=args.sort,
                     limit=args.limit,
                     fetch_all=args.fetch_all,
                     no_interactive=no_interactive,
+                    mask_phi=mask_phi,
                     _prepared_query=prepared,
                     _extra_kwargs=extra_kwargs,
                 )

@@ -155,6 +155,7 @@ class DuckDBIngestionWorkflowProtocol(Protocol):
         start_date: str | None = None,
         end_date: str | None = None,
         mode: Literal["append", "replace"] = "append",
+        mask_phi: bool | None = None,
     ) -> int:
         """Ingest study record revisions into the DuckDB bronze table."""
         ...

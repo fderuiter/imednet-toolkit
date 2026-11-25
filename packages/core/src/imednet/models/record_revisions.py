@@ -114,8 +114,21 @@ class RecordRevision(ImednetBaseModel):
             value = normalize_record_status(value)
         super().__setattr__(name, value)
 
-    def validate_follows(self, previous: RecordRevision) -> bool:
-        """Validate that this revision contiguously and chronologically follows *previous*."""
+    def validate_follows(
+        self,
+        previous: RecordRevision,
+        *,
+        allow_partial: bool = False,
+    ) -> bool:
+        """Validate that this revision chronologically follows *previous*.
+
+        Args:
+            previous: Immediately preceding revision in the sequence.
+            allow_partial: When True, allow gaps > +1 in ``record_revision`` for
+                actor-filtered or date-bounded audit slices while still enforcing
+                strictly increasing ``record_revision``, non-decreasing ``data_revision``,
+                ordered ``date_created`` timestamps, and irreversible deletions.
+        """
         if previous.record_revision is None or self.record_revision is None:
             raise ValueError("RecordRevision chain validation requires non-null record_revision.")
         if self.record_revision <= previous.record_revision:
@@ -123,7 +136,7 @@ class RecordRevision(ImednetBaseModel):
                 f"Non-monotonic record_revision: {self.record_revision} must be greater than "
                 f"previous {previous.record_revision}."
             )
-        if self.record_revision != previous.record_revision + 1:
+        if not allow_partial and self.record_revision != previous.record_revision + 1:
             raise ValueError(
                 f"Missing record_revision in chain: expected {previous.record_revision + 1}, "
                 f"got {self.record_revision}."
@@ -144,19 +157,33 @@ class RecordRevision(ImednetBaseModel):
                 f"Backdated date_created: {getattr(self, 'date_created', None)!r} precedes "
                 f"previous {getattr(previous, 'date_created', None)!r}."
             )
+        if bool(getattr(previous, "deleted", False)) and not bool(getattr(self, "deleted", False)):
+            raise ValueError(
+                "Irreversible deletion violated: deleted record cannot revert to active state."
+            )
         return True
 
-    def can_follow(self, previous: RecordRevision) -> bool:
+    def can_follow(
+        self,
+        previous: RecordRevision,
+        *,
+        allow_partial: bool = False,
+    ) -> bool:
         """Return True if this revision monotonically follows *previous*."""
         try:
-            return self.validate_follows(previous)
+            return self.validate_follows(previous, allow_partial=allow_partial)
         except ValueError:
             return False
 
     @classmethod
-    def validate_chain(cls, revisions: Sequence[RevisionInput]) -> list[RecordRevision]:
+    def validate_chain(
+        cls,
+        revisions: Sequence[RevisionInput],
+        *,
+        allow_partial: bool = False,
+    ) -> list[RecordRevision]:
         """Validate a chronological sequence of record revisions for monotonicity."""
-        return validate_record_revision_chain(revisions)
+        return validate_record_revision_chain(revisions, allow_partial=allow_partial)
 
 
 RecordRevision = ModelEngine.get_model('RecordRevision', RecordRevision)
@@ -164,8 +191,12 @@ RecordRevision = ModelEngine.get_model('RecordRevision', RecordRevision)
 RevisionInput = RecordRevision | dict[str, Any]
 
 
-def validate_record_revision_chain(revisions: Sequence[RevisionInput]) -> list[RecordRevision]:
-    """Validate that *revisions* have strictly increasing ``record_revision`` and monotonic ``data_revision``."""
+def validate_record_revision_chain(
+    revisions: Sequence[RevisionInput],
+    *,
+    allow_partial: bool = False,
+) -> list[RecordRevision]:
+    """Validate strict or partial-slice 21 CFR Part 11 invariants across *revisions*."""
     parsed: list[RecordRevision] = [
         item if isinstance(item, RecordRevision) else RecordRevision.model_validate(item)
         for item in revisions
@@ -184,18 +215,28 @@ def validate_record_revision_chain(revisions: Sequence[RevisionInput]) -> list[R
         chains.setdefault(key, []).append(rev)
 
     for group in chains.values():
-        if group and group[0].record_revision is None:
+        if not group:
+            continue
+        if group[0].record_revision is None:
             raise ValueError("RecordRevision chain validation requires non-null record_revision.")
+        if not allow_partial and group[0].record_revision != 1:
+            raise ValueError(
+                f"Missing initial record_revision in chain: expected 1, got {group[0].record_revision}."
+            )
         for prev, curr in pairwise(group):
-            curr.validate_follows(prev)
+            curr.validate_follows(prev, allow_partial=allow_partial)
 
     return parsed
 
 
-def is_valid_record_revision_chain(revisions: Sequence[RevisionInput]) -> bool:
+def is_valid_record_revision_chain(
+    revisions: Sequence[RevisionInput],
+    *,
+    allow_partial: bool = False,
+) -> bool:
     """Return True if *revisions* satisfy bounds and monotonic chain invariants."""
     try:
-        validate_record_revision_chain(revisions)
+        validate_record_revision_chain(revisions, allow_partial=allow_partial)
         return True
     except (ValueError, ValidationError):
         return False

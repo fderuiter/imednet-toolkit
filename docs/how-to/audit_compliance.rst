@@ -37,41 +37,54 @@ values are served on ``/records`` via ``sdk.records``).
 CLI Inspection
 ~~~~~~~~~~~~~~
 
-Query ``RecordRevision`` records from the terminal in human-readable table or
-machine-consumable JSON formats using ``imednet record-revisions list``:
+Query ``RecordRevision`` records from the terminal in concise summary tables,
+versioned JSON envelopes, or PHI-masked CSV/JSON file exports using
+``imednet record-revisions list`` and the ``imednet workflows`` subcommands:
 
 .. code-block:: bash
 
    # Stream all RecordRevision items for a Study as versioned JSON
    imednet record-revisions list STUDY --format json --all
 
-   # Filter server-side by Record ID and sort chronologically by revision number
-   imednet record-revisions list STUDY --filter "recordId==601" --sort "recordRevision,asc"
+   # Bound by UTC date window and export a PHI-masked CSV file
+   imednet record-revisions list STUDY --start-date 2026-01-01 --end-date 2026-01-31 -o ./revisions.csv
+
+   # Filter server-side by Record ID and dual dateCreated bounds
+   imednet record-revisions list STUDY -f "recordId==601" -f "dateCreated>=2026-01-01" -f "dateCreated<=2026-01-31" --sort "recordRevision,asc"
+
+   # Extract a verified audit slice or ingest revisions into DuckDB via workflows CLI
+   imednet workflows extract-audit-trail STUDY --start-date 2026-01-01 --end-date 2026-01-31 --validate-chain -o ./audit_trail.json
+   imednet workflows ingest-revisions STUDY --db-path ./audit_lakehouse.duckdb --mode replace --validate-chain
 
 ``RecordRevisionsEndpoint.FILTER_ATTRIBUTES`` supports server-side filtering on
 all 18 revision-level attributes (``recordRevisionId``, ``recordId``,
 ``recordOid``, ``recordRevision``, ``dataRevision``, ``recordStatus``,
 ``subjectId``, ``subjectOid``, ``subjectKey``, ``siteId``, ``formKey``,
 ``intervalId``, ``role``, ``user``, ``reasonForChange``, ``deleted``,
-``dateCreated``, and ``lastUpdated``).
+``dateCreated``, and ``lastUpdated``). When both lower and upper bounds are
+supplied on ``dateCreated`` or ``lastUpdated`` (via ``start_date``/``end_date``,
+tuple lists, or ``filter="..."``), the SDK dispatches at most one upstream bound
+per timestamp attribute and evaluates secondary bounds locally.
 
 Verifying Monotonic 21 CFR Part 11 Chains
 -----------------------------------------
 
-Under 21 CFR Part 11, historical revisions for any ``Record`` (grouped by
-``studyKey`` and ``recordId`` or ``recordOid``) must maintain contiguous
-``record_revision`` counters (``>= 1``, incrementing by ``+1`` without gaps),
-monotonically non-decreasing ``data_revision`` counters
-(``0 <= data_revision <= record_revision``), and chronological ``date_created``
-timestamps (rejecting backdated revisions). When an
-investigator verifies or signs a ``Record`` without altering clinical
-``Variable`` values, ``record_revision`` increments while ``data_revision``
-remains unchanged.
+Under 21 CFR Part 11, full historical revisions for any ``Record`` (grouped by
+``studyKey`` and ``recordId`` or ``recordOid``) must start at
+``record_revision == 1``, maintain contiguous ``record_revision`` counters
+(incrementing by ``+1`` without gaps), maintain monotonically non-decreasing
+``data_revision`` counters (``0 <= data_revision <= record_revision``), preserve
+chronological ``date_created`` timestamps (rejecting backdated revisions), and
+treat ``deleted=True`` tombstones as irreversible (never reverting to
+``deleted=False``). When an investigator verifies or signs a ``Record`` without
+altering clinical ``Variable`` values, ``record_revision`` increments while
+``data_revision`` remains unchanged.
 
 Use :meth:`RecordRevision.validate_chain <imednet.models.record_revisions.RecordRevision.validate_chain>`,
-``validate_record_revision_chain``, or ``is_valid_record_revision_chain`` to
-verify chronological audit integrity and detect missing, out-of-order, or
-regressing revisions:
+``validate_record_revision_chain``, or ``is_valid_record_revision_chain`` in
+strict mode (``allow_partial=False``, default) for complete ``Record`` histories,
+or pass ``allow_partial=True`` when validating date-bounded or actor-filtered
+slices that may start above revision ``1`` or omit intermediate revisions:
 
 .. testcode::
 
@@ -130,8 +143,10 @@ regressing revisions:
    ]
 
    verified_chain = RecordRevision.validate_chain(revisions)
+   strict_slice_ok = is_valid_record_revision_chain(revisions[1:])
+   partial_slice_ok = is_valid_record_revision_chain(revisions[1:], allow_partial=True)
    reversed_ok = is_valid_record_revision_chain(list(reversed(revisions)))
-   assert len(verified_chain) == 2 and not reversed_ok
+   assert len(verified_chain) == 2 and not strict_slice_ok and partial_slice_ok and not reversed_ok
    print(f"Verified revisions: {len(verified_chain)}, Out-of-order valid: {reversed_ok}")
 
 Date-Bounded Audit Trail Extraction
@@ -140,7 +155,11 @@ Date-Bounded Audit Trail Extraction
 For regulatory inspection scopes spanning specific UTC date bounds, ``User``
 accounts, ``Site`` identifiers, or ``Form`` keys, use
 :meth:`DataExtractionWorkflow.extract_audit_trail <imednet_workflows.data_extraction.DataExtractionWorkflow.extract_audit_trail>`
-alongside synchronous or asynchronous SDK endpoints:
+alongside synchronous or asynchronous SDK endpoints. Pass ``allow_partial=True``
+when validating date- or actor-filtered slices so monotonic ordering,
+non-decreasing ``data_revision``, chronological ``date_created``, and
+irreversible deletion invariants are enforced without requiring revision ``1``
+or intermediate revisions authored outside the filter window:
 
 .. testcode::
 
@@ -161,7 +180,7 @@ alongside synchronous or asynchronous SDK endpoints:
                user="sim_user",
                sort="recordRevision,asc",
            )
-           return RecordRevision.validate_chain(revisions)
+           return RecordRevision.validate_chain(revisions, allow_partial=True)
 
 
    async def stream_form_revisions_async(study_key: str) -> list[RecordRevision]:
@@ -195,22 +214,28 @@ Analytical Lineage, PHI Controls & Governance
 Combine ``RecordRevision`` verification with downstream compliance controls
 across the toolkit:
 
-1. **DuckDB Lakehouse Lineage** (:doc:`duckdb_integration`): Load deduplicated
-   ``(study_key, record_revision_id)`` audit metadata (with UTC-normalized
-   timestamps) into the ``bronze_revisions`` table (with a ``record_revisions``
-   compatibility view) via ``DuckDBIngestionWorkflow.ingest_revisions``, and
-   materialize per-Study (``"silver_current_state_{study_key}"``,
+1. **DuckDB Lakehouse Lineage** (:doc:`duckdb_integration`): Load deduplicated,
+   PHI-masked (``mask_phi=True`` by default, with Study-scoped ``mode="replace"``
+   refreshes) ``(study_key, record_revision_id)`` audit metadata (with
+   UTC-normalized timestamps) into the ``bronze_revisions`` table (with a
+   ``record_revisions`` compatibility view) via
+   ``DuckDBIngestionWorkflow.ingest_revisions``, and materialize per-Study
+   (``"silver_current_state_{study_key}"``,
    ``"silver_records_history_{study_key}"``) and combined
    ``silver_current_state`` (selecting the latest revision per ``study_key``
    and ``COALESCE(CAST(record_id AS VARCHAR), NULLIF(record_oid, ''), CAST(record_revision_id AS VARCHAR))``
    ordered by ``record_revision``, ``data_revision``, ``date_created``, and
    ``record_revision_id``, excluding voided ``deleted=True`` records unless
    ``include_deleted=True``) and ``silver_records_history`` (an SCD Type 2
-   temporal view exposing ``valid_from``, ``valid_to``, and ``is_current``) via
-   ``DuckDBIngestionWorkflow.build_silver_view``.
-2. **PHI Masking & Redaction** (:doc:`export_destinations`): All sink plugins
-   default to ``mask_phi=True`` and support explicit ``StudyConfiguration`` PHI
-   ``Variable`` declarations so unredacted identifiers cannot leak accidentally.
+   temporal view exposing ``valid_from``, ``valid_to``, ``is_current``, and
+   ``LAG()`` transition diff columns ``prev_record_status``,
+   ``prev_data_revision``, ``prev_deleted``, ``data_changed``, and
+   ``change_type``) via ``DuckDBIngestionWorkflow.build_silver_view``.
+2. **PHI Masking & Redaction** (:doc:`export_destinations`): All sink plugins,
+   CLI revision exports, and ``DuckDBIngestionWorkflow`` default to
+   ``mask_phi=True`` and honor global ``SensitivityRegistry`` rules plus
+   ``StudyConfiguration`` PHI ``Variable`` declarations while preserving
+   ``deleted=True`` tombstones and unconfigured actor attribution.
 3. **Configuration Provenance** (:doc:`/reference/governance`): Record
    Fernet-encrypted, parent-chained SHA-256 digests, RBAC-verified actor
    attribution, and structural diffs for ``Study`` configuration updates with
@@ -251,7 +276,8 @@ across the toolkit:
            ).fetchone()
            history_row = conn.execute(
                "SELECT COUNT(*) FROM silver_records_history "
-               "WHERE study_key = ? AND valid_from IS NOT NULL AND is_current IS NOT NULL",
+               "WHERE study_key = ? AND valid_from IS NOT NULL "
+               "AND is_current IS NOT NULL AND change_type IS NOT NULL",
                ["STUDY"],
            ).fetchone()
            compat_row = conn.execute(
