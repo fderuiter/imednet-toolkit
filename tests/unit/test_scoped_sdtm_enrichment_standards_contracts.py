@@ -179,10 +179,10 @@ def test_validate_standards_cli_scores_unredacted_records_applies_lookups_and_ma
         Variable(variableId=2, formKey="CRF_01", variableName="SEX"),
     ]
     # Include PHI in subjectKey (custom phi_fields), birthDate, and dmPatientName/dmContactEmail, plus a raw sex code requiring terminology_lookups
-    secret_subject = "PAT-SSN-999-88-7777"
+    secret_subject = "PAT-SSN-999-88-7777"  # pragma: allowlist secret
     secret_dob = "1981-07-19"
-    secret_name = "Alice ClinicalSecret"
-    secret_email = "alice.secret@hospital.example"
+    secret_name = "Alice ClinicalSecret"  # pragma: allowlist secret
+    secret_email = "alice.secret@hospital.example"  # pragma: allowlist secret
     sdk.records.list.return_value = [
         Record(
             recordId=10,
