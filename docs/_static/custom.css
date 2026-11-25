@@ -24,6 +24,18 @@ html {
     outline-offset: 2px;
 }
 
+article h1:focus-visible,
+article h2:focus-visible,
+article h3:focus-visible,
+article h4:focus-visible,
+article h5:focus-visible,
+article h6:focus-visible,
+article dt:focus-visible {
+    outline: 2px solid var(--color-brand-primary);
+    outline-offset: 2px;
+    border-radius: 2px;
+}
+
 /* Typography & readability enhancements */
 body {
     letter-spacing: -0.01em;
@@ -112,9 +124,84 @@ input.toctree-checkbox {
     background: var(--color-sidebar-item-expander-background--hover);
 }
 
+button.nav-overlay-icon,
+button.toc-overlay-icon,
+button.toc-header-icon,
+button.toc-content-icon {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    line-height: inherit;
+}
+
+.drawer-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem 0.5rem 1rem;
+    border-bottom: 1px solid var(--color-sidebar-background-border, var(--color-background-border));
+    flex-shrink: 0;
+}
+
+.drawer-header[hidden],
+button.drawer-close-btn[hidden] {
+    display: none !important;
+}
+
+.drawer-header-title {
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--color-foreground-secondary);
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+button.drawer-close-btn {
+    -webkit-appearance: none;
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--color-foreground-secondary);
+    font-family: inherit;
+    font-size: 1.25rem;
+    line-height: 1;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+button.drawer-close-btn:hover {
+    background-color: var(--color-background-hover);
+    color: var(--color-foreground-primary);
+}
+
 @media (max-width: 82em) {
     .toc-drawer {
         transition: right 0.25s ease-in-out, visibility 0s linear 0s;
+    }
+
+    .toc-drawer .toc-title-container {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        padding-right: 0.5rem;
     }
 
     #__toc:not(:checked) ~ .page .toc-drawer {
@@ -128,6 +215,14 @@ input.toctree-checkbox {
 }
 
 @media (max-width: 63em) {
+    .mobile-header .header-left button.nav-overlay-icon,
+    .mobile-header .header-right button.toc-header-icon {
+        height: 100%;
+        width: 100%;
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
     .sidebar-drawer {
         transition: left 0.25s ease-in-out, visibility 0s linear 0s;
     }
@@ -164,11 +259,24 @@ input.toctree-checkbox {
     }
 }
 
+table.domainindex-table td:first-child {
+    width: 28px;
+    min-width: 28px;
+    white-space: nowrap;
+}
+
 img.toggler {
-    cursor: pointer;
-    padding: 4px;
+    display: inline-block;
+    box-sizing: content-box;
+    width: 11px;
+    height: 11px;
+    min-width: 11px;
+    min-height: 11px;
+    max-width: none;
+    padding: 7px;
     border-radius: 4px;
     vertical-align: middle;
+    cursor: pointer;
 }
 
 body[data-theme="dark"] img.toggler {
@@ -1419,6 +1527,7 @@ body[data-theme="dark"] .explorer-dataframe-table tbody tr:hover {
 .toc-overlay-icon:focus-visible,
 .toc-header-icon:focus-visible,
 .toc-content-icon:focus-visible,
+.drawer-close-btn:focus-visible,
 img.toggler:focus-visible,
 .theme-toggle:focus-visible,
 .skip-to-content:focus-visible,
@@ -1981,12 +2090,21 @@ img.toggler:focus-visible,
         background-color: var(--color-brand-primary-hover);
     }
 
+    #furo-main-content:focus-visible,
+    article h1:focus-visible,
+    article h2:focus-visible,
+    article h3:focus-visible,
+    article h4:focus-visible,
+    article h5:focus-visible,
+    article h6:focus-visible,
+    article dt:focus-visible,
     .toctree-checkbox:focus-visible,
     .sidebar-search:focus-visible,
     .nav-overlay-icon:focus-visible,
     .toc-overlay-icon:focus-visible,
     .toc-header-icon:focus-visible,
     .toc-content-icon:focus-visible,
+    .drawer-close-btn:focus-visible,
     img.toggler:focus-visible,
     .theme-toggle:focus-visible,
     .skip-to-content:focus-visible,
@@ -2243,10 +2361,18 @@ img.toggler:focus-visible,
     .nav-overlay-icon,
     .toc-header-icon:not(.no-toc),
     .toc-content-icon:not(.no-toc),
+    button.drawer-close-btn,
     img.toggler {
         forced-color-adjust: none;
         background-color: ButtonFace !important;
         color: ButtonText !important;
+        border: 1px solid ButtonText !important;
+    }
+
+    button.drawer-close-btn:hover {
+        forced-color-adjust: none;
+        background-color: Highlight !important;
+        color: HighlightText !important;
         border: 1px solid ButtonText !important;
     }
 
@@ -2277,6 +2403,13 @@ img.toggler:focus-visible,
     }
 
     #furo-main-content:focus-visible,
+    article h1:focus-visible,
+    article h2:focus-visible,
+    article h3:focus-visible,
+    article h4:focus-visible,
+    article h5:focus-visible,
+    article h6:focus-visible,
+    article dt:focus-visible,
     .thebe-editor:focus-visible,
     .thebe-launch-button:focus-visible,
     .thebelab-button:focus-visible,
@@ -2293,6 +2426,7 @@ img.toggler:focus-visible,
     .toc-overlay-icon:focus-visible,
     .toc-header-icon:focus-visible,
     .toc-content-icon:focus-visible,
+    .drawer-close-btn:focus-visible,
     img.toggler:focus-visible,
     .theme-toggle:focus-visible,
     .skip-to-content:focus-visible,

@@ -323,3 +323,96 @@ def test_sync_worker_sleep_tick_and_pre_stopped_run_forever(tmp_path: Path) -> N
     )
     idle_worker.run_forever()
     assert idle_worker.state == SyncWorkerState.STOPPED
+
+
+def test_sync_worker_reconcile_every_n_cycles_validation_and_cadence(tmp_path: Path) -> None:
+    """SyncWorker validates reconcile_every_n_cycles and gates reconciliation by cycle number."""
+    for invalid in (0, -1, -5, False, True, 1.5):
+        with pytest.raises(ValueError, match="reconcile_every_n_cycles must be at least 1"):
+            SyncWorkerConfig(
+                study_key="PROT-01",
+                reconcile_every_n_cycles=invalid,  # type: ignore[arg-type]
+            )
+
+    loader = MagicMock()
+    loader.db_path = tmp_path / "records_cache.sqlite3"
+    loader.count_cached_records.return_value = 4
+
+    worker = SyncWorker(
+        loader,
+        config=SyncWorkerConfig(
+            study_key="PROT-01",
+            interval_seconds=1,
+            reconcile=True,
+            reconcile_every_n_cycles=3,
+        ),
+    )
+
+    reconcile_flags: list[bool] = []
+    loader.sync_records.side_effect = lambda _study, *, reconcile: reconcile_flags.append(reconcile)
+
+    for _ in range(6):
+        worker.run_once()
+
+    assert reconcile_flags == [False, False, True, False, False, True]
+
+    # When reconcile=False, reconcile_every_n_cycles never forces reconciliation on
+    disabled_loader = MagicMock()
+    disabled_loader.db_path = tmp_path / "records_cache.sqlite3"
+    disabled_loader.count_cached_records.return_value = 4
+    disabled_flags: list[bool] = []
+    disabled_loader.sync_records.side_effect = lambda _study, *, reconcile: disabled_flags.append(
+        reconcile
+    )
+    disabled_worker = SyncWorker(
+        disabled_loader,
+        config=SyncWorkerConfig(
+            study_key="PROT-01",
+            interval_seconds=1,
+            reconcile=False,
+            reconcile_every_n_cycles=2,
+        ),
+    )
+    for _ in range(4):
+        disabled_worker.run_once()
+    assert disabled_flags == [False, False, False, False]
+
+
+def test_sync_worker_enforces_lock_timeout_seconds_per_acquire_without_mutating_loader_lock(
+    tmp_path: Path,
+) -> None:
+    """SyncWorker passes lock_timeout_seconds per FileLock acquire without mutating loader.lock.timeout."""
+    import time
+
+    from filelock import Timeout
+
+    from imednet.models.records import Record
+    from imednet_workflows.cached_loader import CachedRecordsLoader
+
+    sdk = MagicMock()
+    sdk.get_records.return_value = [
+        Record(study_key="PROT-01", record_id=1, form_key="FORM", record_data={"v": 1})
+    ]
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+    assert loader.lock.timeout == 30.0
+
+    worker = SyncWorker(
+        loader,
+        config=SyncWorkerConfig(
+            study_key="PROT-01",
+            interval_seconds=1,
+            lock_timeout_seconds=0.05,
+        ),
+    )
+    assert loader.lock.timeout == 30.0
+    assert not hasattr(worker, "_lock")
+
+    external_holder = FileLock(f"{loader.db_path}.lock")
+    with external_holder:
+        started = time.perf_counter()
+        with pytest.raises(Timeout):
+            worker.run_once()
+        elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.5
+    assert loader.lock.timeout == 30.0

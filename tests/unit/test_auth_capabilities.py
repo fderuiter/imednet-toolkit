@@ -1542,10 +1542,12 @@ async def test_client_and_async_client_compose_api_keys_with_oidc_and_reject_bad
     import base64
     import json
     import time
+    from types import SimpleNamespace
 
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+    from imednet.core.context import extract_sdk_security_key
     from imednet.errors import ImednetError, UnauthorizedError
 
     rsa_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -1599,6 +1601,8 @@ async def test_client_and_async_client_compose_api_keys_with_oidc_and_reject_bad
         base_url="https://edc.imednet.example",
         transport=httpx.MockTransport(sync_handler),
     ) as client:
+        assert extract_sdk_security_key(client) == "imn-sec-1"
+        assert extract_sdk_security_key(SimpleNamespace(auth=client.auth)) == "imn-sec-1"
         client.get("/api/v1/edc/studies")
         client.fetch_external_url("https://cdn.synthetic.example/results.json")
 

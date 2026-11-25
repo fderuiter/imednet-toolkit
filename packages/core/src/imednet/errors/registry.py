@@ -89,8 +89,9 @@ def get_error_class(status_code: int, response_body: Any = None) -> type[ApiErro
 
     Routes HTTP 400, 401, and 403 directly to ``BadRequestError``,
     ``UnauthorizedError``, and ``ForbiddenError`` regardless of nested error codes,
-    then inspects nested ``metadata.error`` and ``metadata.status`` for envelope or
-    other status codes, and finally falls back to HTTP status mappings.
+    then inspects nested ``metadata.error`` (dict or list), ``metadata.status``,
+    and legacy top-level keys for envelope or other status codes, and finally falls
+    back to HTTP status mappings.
     Defaults to generic ``ApiError`` for unmapped client/server errors.
     """
     if status_code in (400, 401, 403):

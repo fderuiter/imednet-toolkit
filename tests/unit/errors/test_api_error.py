@@ -8,10 +8,12 @@ from imednet.errors import (
     ApiError,
     AuthenticationError,
     BadRequestError,
+    ClientError,
     ForbiddenError,
     NotFoundError,
     ServerError,
     UnauthorizedError,
+    UnknownVariableTypeError,
     ValidationError,
     get_error_class,
 )
@@ -108,6 +110,7 @@ def test_api_error_nested_validation_envelope():
     assert issubclass(err_cls, ValidationError)
 
     err = err_cls(payload, status_code=400)
+    assert isinstance(err, BadRequestError)
     assert isinstance(err, ValidationError)
     assert err.code == 1000
     assert err.status == "BAD_REQUEST"
@@ -188,6 +191,11 @@ def test_get_error_class_metadata_status_and_fallbacks():
     assert get_error_class(200, {"metadata": {"status": "UNAUTHORIZED"}}) is AuthenticationError
     assert get_error_class(401, {"metadata": {"status": "UNAUTHORIZED"}}) is UnauthorizedError
     assert get_error_class(403, {"metadata": {"status": "UNAUTHORIZED"}}) is ForbiddenError
+    assert (
+        get_error_class(401, {"metadata": {"status": "AUTHENTICATION_FAILED"}}) is UnauthorizedError
+    )
+    assert get_error_class(400, {"metadata": {"status": "VALIDATION_ERROR"}}) is BadRequestError
+    assert get_error_class(422, {"metadata": {"status": "VALIDATION_ERROR"}}) is ValidationError
     assert get_error_class(200, {"metadata": {"status": "FORBIDDEN"}}) is ForbiddenError
     assert get_error_class(200, {"metadata": {"status": "NOT_FOUND"}}) is NotFoundError
 
@@ -590,3 +598,27 @@ def test_diagnostic_context_immutability_retry_after_and_cli_forbidden(
     captured = capsys.readouterr()
     assert "Permission Denied:" in captured.err
     assert "Authentication Failed:" not in captured.err
+
+
+def test_local_validation_errors_bridge_client_and_api_error_without_status_code():
+    """Local ValidationError and UnknownVariableTypeError subclass ClientError and ApiError with status_code=None."""
+    local_val = ValidationError("invalid")
+    assert isinstance(local_val, ClientError)
+    assert isinstance(local_val, ApiError)
+    assert local_val.status_code is None
+    assert local_val.status == "validation_error"
+    assert str(local_val) == "invalid"
+
+    unknown_var = UnknownVariableTypeError("CustomType")
+    assert isinstance(unknown_var, ValidationError)
+    assert isinstance(unknown_var, ClientError)
+    assert isinstance(unknown_var, ApiError)
+    assert unknown_var.status_code is None
+    assert str(unknown_var) == "CustomType"
+
+    bad_req = BadRequestError({"error": "invalid filter"})
+    assert isinstance(bad_req, ValidationError)
+    assert isinstance(bad_req, ClientError)
+    assert isinstance(bad_req, ApiError)
+    assert bad_req.status_code == 400
+    assert "Status Code: 400" in str(bad_req)

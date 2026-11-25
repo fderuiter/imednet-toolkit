@@ -14,11 +14,13 @@ from imednet.errors import (
     ApiError,
     AuthenticationError,
     AuthorizationError,
+    ClientError,
     ForbiddenError,
     NotFoundError,
     PathTraversalValidationError,
     RateLimitError,
     UnauthorizedError,
+    ValidationError,
 )
 from imednet.utils.security import sanitize_diagnostic_text
 from imednet.utils.url import validate_path_segment
@@ -144,6 +146,15 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
         except NotFoundError as exc:
             msg = _redact_secrets(str(exc))
             print_error(f"Not Found: {msg}")
+            sys.exit(1)
+        except ClientError as exc:
+            msg = _redact_secrets(str(exc))
+            if isinstance(exc, ApiError) and exc.status_code is not None:
+                print_error(f"API Error: {msg}")
+            elif isinstance(exc, ValidationError):
+                print_error(f"Validation Error: {msg}")
+            else:
+                print_error(f"Error: {msg}")
             sys.exit(1)
         except ApiError as exc:
             msg = _redact_secrets(str(exc))

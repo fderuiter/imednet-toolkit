@@ -972,6 +972,16 @@ class _ApiKeyOIDCAuth(OIDCAuth):
         self._api_key_auth = api_key_auth
         super().__init__(token, **kwargs)
 
+    @property
+    def api_key(self) -> str:
+        """Return the configured static API key."""
+        return self._api_key_auth.api_key
+
+    @property
+    def security_key(self) -> str:
+        """Return the configured static security key."""
+        return self._api_key_auth.security_key
+
     def get_headers(self) -> dict[str, str]:
         """Validate OIDC bearer token and combine with x-api-key and x-imn-security-key."""
         oidc_headers = super().get_headers()

@@ -31,6 +31,7 @@ from imednet.datadict.logic import (
     _MIN_BOUND_KEYS,
     LogicTreeEvaluator,
     RangeCheckConstraint,
+    _is_retired_variable_flag,
     _lookup_attr_or_extra,
     _parse_comparable_temporal,
     _to_finite_float,
@@ -117,14 +118,8 @@ class ValidationSchemaProtocol(Protocol):
 
 
 def _is_retired_variable(var: Any) -> bool:
-    """Return True if an API Variable is marked ``deleted=True`` or ``disabled=True``."""
-    for attr in ("deleted", "disabled"):
-        val = getattr(var, attr, None)
-        if isinstance(val, bool) and val:
-            return True
-        if isinstance(val, str) and val.strip().lower() in {"true", "yes", "y", "1"}:
-            return True
-    return False
+    """Return True if an API or DataDictionary Variable is marked ``deleted`` or ``disabled``."""
+    return _is_retired_variable_flag(var)
 
 
 class BaseSchemaCache(Generic[_TClient]):
@@ -138,6 +133,7 @@ class BaseSchemaCache(Generic[_TClient]):
         """
         self._is_async = is_async
         self._form_variables: dict[tuple[str, str] | str, dict[str, Variable]] = {}
+        self._retired_form_variables: dict[tuple[str, str] | str, dict[str, Variable]] = {}
         self._form_id_to_key: dict[tuple[str, int] | int, str] = {}
         self._known_forms: set[tuple[str, str] | str] = set()
         self._refreshed_studies: set[str] = set()
@@ -177,13 +173,17 @@ class BaseSchemaCache(Generic[_TClient]):
 
     def _clear_study_partition(self, study_key: str) -> None:
         """Remove existing cached entries belonging only to ``study_key``."""
-        for fv_key in [
-            k
-            for k in self._form_variables
-            if (isinstance(k, tuple) and k[0] == study_key)
-            or (study_key == "" and isinstance(k, str))
-        ]:
-            del self._form_variables[fv_key]
+        for store in (
+            self._form_variables,
+            getattr(self, "_retired_form_variables", None) or {},
+        ):
+            for fv_key in [
+                k
+                for k in store
+                if (isinstance(k, tuple) and k[0] == study_key)
+                or (study_key == "" and isinstance(k, str))
+            ]:
+                del store[fv_key]
         for fid_key in [
             k
             for k in self._form_id_to_key
@@ -201,6 +201,31 @@ class BaseSchemaCache(Generic[_TClient]):
             ]:
                 known_forms.discard(kf_key)
 
+    def _register_partition_variable(self, sk: str, var: Variable) -> None:
+        """Register ``var`` into active or retired form buckets while preserving form ID links."""
+        if var.form_key is None:
+            return
+        known_forms = getattr(self, "_known_forms", None)
+        if known_forms is None:
+            known_forms = set()
+            self._known_forms = known_forms
+        retired_map = getattr(self, "_retired_form_variables", None)
+        if retired_map is None:
+            retired_map = {}
+            self._retired_form_variables = retired_map
+        known_forms.add((sk, var.form_key))
+        form_bucket = self._form_variables.setdefault((sk, var.form_key), {})
+        retired_bucket = retired_map.setdefault((sk, var.form_key), {})
+        if var.form_id is not None:
+            self._form_id_to_key[(sk, var.form_id)] = var.form_key
+        if var.variable_name is not None:
+            if _is_retired_variable(var):
+                if var.variable_name not in form_bucket:
+                    retired_bucket[var.variable_name] = var
+            else:
+                retired_bucket.pop(var.variable_name, None)
+                form_bucket[var.variable_name] = var
+
     def populate(
         self,
         variables: Iterable[Variable],
@@ -208,21 +233,15 @@ class BaseSchemaCache(Generic[_TClient]):
     ) -> None:
         """Populate the cache with active ``variables``, isolated by ``study_key``."""
         vars_list = list(variables)
-        known_forms = getattr(self, "_known_forms", None)
-        if known_forms is None:
-            known_forms = set()
-            self._known_forms = known_forms
+        if getattr(self, "_known_forms", None) is None:
+            self._known_forms = set()
+        if getattr(self, "_retired_form_variables", None) is None:
+            self._retired_form_variables = {}
         if study_key is not None:
             self._clear_study_partition(study_key)
             self._refreshed_studies.add(study_key)
             for var in vars_list:
-                if var.form_key is not None:
-                    known_forms.add((study_key, var.form_key))
-                    form_bucket = self._form_variables.setdefault((study_key, var.form_key), {})
-                    if var.form_id is not None:
-                        self._form_id_to_key[(study_key, var.form_id)] = var.form_key
-                    if var.variable_name is not None and not _is_retired_variable(var):
-                        form_bucket[var.variable_name] = var
+                self._register_partition_variable(study_key, var)
             return
 
         target_studies = {var.study_key or "" for var in vars_list} or {""}
@@ -231,14 +250,7 @@ class BaseSchemaCache(Generic[_TClient]):
             if sk:
                 self._refreshed_studies.add(sk)
         for var in vars_list:
-            sk = var.study_key or ""
-            if var.form_key is not None:
-                known_forms.add((sk, var.form_key))
-                form_bucket = self._form_variables.setdefault((sk, var.form_key), {})
-                if var.form_id is not None:
-                    self._form_id_to_key[(sk, var.form_id)] = var.form_key
-                if var.variable_name is not None and not _is_retired_variable(var):
-                    form_bucket[var.variable_name] = var
+            self._register_partition_variable(var.study_key or "", var)
 
     async def _refresh_async(
         self,
@@ -302,42 +314,43 @@ class BaseSchemaCache(Generic[_TClient]):
             study_key,
         )
 
-    def variables_for_form(
+    def _lookup_partitioned_form_bucket(
         self,
+        store: Mapping[tuple[str, str] | str, dict[str, Variable]],
         form_key: str,
         study_key: str | None = None,
     ) -> dict[str, Variable]:
-        """Return the variables associated with ``form_key`` for ``study_key``."""
+        """Resolve ``form_key`` inside ``store`` honoring ``study_key`` and active context."""
         refreshed: set[str] = getattr(self, "_refreshed_studies", None) or set()
         if study_key is not None:
-            exact = self._form_variables.get((study_key, form_key))
+            exact = store.get((study_key, form_key))
             if exact is not None:
                 return exact
             if study_key not in refreshed:
-                unscoped = self._form_variables.get(("", form_key))
+                unscoped = store.get(("", form_key))
                 if unscoped is not None:
                     return unscoped
-                legacy = self._form_variables.get(form_key)
+                legacy = store.get(form_key)
                 if legacy is not None:
                     return legacy
             return {}
 
         ctx_study = get_study_context()
         if ctx_study:
-            ctx_exact = self._form_variables.get((ctx_study, form_key))
+            ctx_exact = store.get((ctx_study, form_key))
             if ctx_exact is not None:
                 return ctx_exact
             if ctx_study in refreshed:
                 return {}
 
-        if form_key in self._form_variables:
-            return self._form_variables[form_key]
-        if ("", form_key) in self._form_variables:
-            return self._form_variables[("", form_key)]
+        if form_key in store:
+            return store[form_key]
+        if ("", form_key) in store:
+            return store[("", form_key)]
 
         matches = [
             (k[0], v)
-            for k, v in self._form_variables.items()
+            for k, v in store.items()
             if isinstance(k, tuple) and k[0] != "" and k[1] == form_key
         ]
         if len(matches) == 1:
@@ -349,6 +362,25 @@ class BaseSchemaCache(Generic[_TClient]):
                 "specify study_key."
             )
         return {}
+
+    def variables_for_form(
+        self,
+        form_key: str,
+        study_key: str | None = None,
+    ) -> dict[str, Variable]:
+        """Return the variables associated with ``form_key`` for ``study_key``."""
+        return self._lookup_partitioned_form_bucket(
+            self._form_variables, form_key, study_key=study_key
+        )
+
+    def _retired_variables_for_form(
+        self,
+        form_key: str,
+        study_key: str | None = None,
+    ) -> dict[str, Variable]:
+        """Return retired variables associated with ``form_key`` for pre-retirement checks."""
+        retired_store = getattr(self, "_retired_form_variables", None) or {}
+        return self._lookup_partitioned_form_bucket(retired_store, form_key, study_key=study_key)
 
     def _has_form(self, form_key: str, study_key: str | None = None) -> bool:
         """Return True if ``form_key`` is registered (including forms with only retired vars)."""
@@ -1504,7 +1536,13 @@ def validate_record_data(
         if isinstance(schema, BaseSchemaCache)
         else schema.variables_for_form(form_key)
     )
-    if not variables:
+    retired_variables = (
+        schema._retired_variables_for_form(form_key, study_key=study_key)
+        if isinstance(schema, BaseSchemaCache)
+        else {}
+    )
+    known_variables = {**retired_variables, **variables}
+    if not known_variables:
         unknown_form = True
         if isinstance(schema, BaseSchemaCache):
             if schema._has_form(form_key, study_key=study_key):
@@ -1515,7 +1553,7 @@ def validate_record_data(
             _record_error(f"Unknown form {form_key}", rule_id="unknown_form")
             return _finish()
 
-    unknown = [k for k in data if k not in variables]
+    unknown = [k for k in data if k not in known_variables]
     if unknown:
         _record_error(
             f"Unknown variables for form {form_key}: {', '.join(unknown)}",
@@ -1535,9 +1573,9 @@ def validate_record_data(
                 rule_id="masked_phi",
             )
             continue
-        if name not in variables:
+        if name not in known_variables:
             continue
-        var_obj = variables[name]
+        var_obj = known_variables[name]
         vtype = _effective_variable_type(var_obj)
         try:
             _check_type(vtype, value, name=name, form_key=form_key)
@@ -1704,12 +1742,22 @@ def calculate_readiness_score(
     Returns:
         A tuple of (score, list of validation failure or warning reasons).
     """
-    variables = (
+    raw_variables = (
         schema.variables_for_form(form_key, study_key=study_key)
         if isinstance(schema, BaseSchemaCache)
         else schema.variables_for_form(form_key)
     )
-    if not variables:
+    cache_retired = (
+        schema._retired_variables_for_form(form_key, study_key=study_key)
+        if isinstance(schema, BaseSchemaCache)
+        else {}
+    )
+    variables = {k: v for k, v in raw_variables.items() if not _is_retired_variable(v)}
+    retired_variables = {
+        **cache_retired,
+        **{k: v for k, v in raw_variables.items() if _is_retired_variable(v)},
+    }
+    if not variables and not retired_variables:
         is_known = (
             schema._has_form(form_key, study_key=study_key)
             if isinstance(schema, BaseSchemaCache)
@@ -1725,33 +1773,58 @@ def calculate_readiness_score(
             return 0.0, [f"Unknown variables: {', '.join(data)}"]
         return 100.0, []
 
-    expected_count = len(variables)
-    if expected_count == 0:
-        return 100.0, []
-
     data_map: Mapping[str, Any] = data if isinstance(data, Mapping) else {}
     valid_count = 0
     reasons: list[str] = []
 
-    if not data_map:
-        for name, var in variables.items():
-            constraints = extract_variable_constraints(var)
-            if constraints.required_policy == "yes":
-                reasons.append(f"Missing required variable: {name}")
-            elif constraints.required_policy == "auto_query":
-                reasons.append(f"Auto Query warning for variable {name}: variable is missing")
-        if not reasons:
-            reasons.append("Empty record data")
-        return 0.0, reasons
+    if not variables:
+        if not data_map:
+            return 100.0, []
+        unknown_only = [k for k in data_map if k not in retired_variables]
+        present_retired_only = {
+            k: retired_variables[k]
+            for k, v in data_map.items()
+            if k in retired_variables and not _is_empty_value(v)
+        }
+        if not present_retired_only:
+            if unknown_only:
+                return 0.0, [f"Unknown variables: {', '.join(unknown_only)}"]
+            return 100.0, []
+        eval_variables: dict[str, Any] = present_retired_only
+        unknown = unknown_only
+    else:
+        if not data_map:
+            for name, var in variables.items():
+                constraints = extract_variable_constraints(var)
+                if constraints.required_policy == "yes":
+                    reasons.append(f"Missing required variable: {name}")
+                elif constraints.required_policy == "auto_query":
+                    reasons.append(f"Auto Query warning for variable {name}: variable is missing")
+            if not reasons:
+                reasons.append("Empty record data")
+            return 0.0, reasons
 
-    unknown = [k for k in data_map if k not in variables]
+        unknown = [k for k in data_map if k not in variables and k not in retired_variables]
+        present_retired = {
+            k: retired_variables[k]
+            for k, v in data_map.items()
+            if k in retired_variables and k not in variables and not _is_empty_value(v)
+        }
+        eval_variables = {**variables, **present_retired}
+
+    expected_count = len(eval_variables) + (len(unknown) if not variables else 0)
+    if expected_count == 0:
+        return 100.0, []
+
     if unknown:
         reasons.append(f"Unknown variables: {', '.join(unknown)}")
 
-    has_clinical_data = any(k in variables and not _is_empty_value(v) for k, v in data_map.items())
+    has_clinical_data = any(
+        k in eval_variables and not _is_empty_value(v) for k, v in data_map.items()
+    )
     is_cache = isinstance(schema, BaseSchemaCache)
 
-    for name, var in variables.items():
+    for name, var in eval_variables.items():
         if name not in data_map:
             constraints = extract_variable_constraints(var)
             if constraints.required_policy == "yes":

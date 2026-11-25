@@ -120,11 +120,6 @@ class BaseClient:
 
         self.base_url = sanitize_base_url(resolved_config.base_url or DEFAULT_BASE_URL)
         self._base_url = httpx.URL(self.base_url)
-        from imednet.core.context import set_base_url_context, set_security_key_context
-
-        set_base_url_context(self.base_url)
-        if isinstance(resolved_config.security_key, str) and resolved_config.security_key.strip():
-            set_security_key_context(resolved_config.security_key)
 
         self.timeout = (
             timeout
