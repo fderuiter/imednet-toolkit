@@ -70,7 +70,7 @@ def test_cached_loader_applies_delta_sync_and_reconciliation(tmp_path: Path) -> 
     }
     assert second_delta_call.kwargs == {
         "study_key": "STUDY",
-        "filter": 'dateModified>="2024-01-02 00:00:00+00:00"',
+        "filter": "dateModified>=2024-01-02T00:00:00Z",
         "record_data_filter": None,
     }
     assert sdk.get_records.call_args_list[2].kwargs == {
@@ -154,7 +154,7 @@ def test_sync_records_handles_empty_delta_without_reconciliation(tmp_path: Path)
     assert sdk.records.list.call_count == 1
     assert sdk.records.list.call_args_list[0].kwargs == {
         "study_key": "STUDY",
-        "filter": 'dateModified>="2024-01-01 00:00:00+00:00"',
+        "filter": "dateModified>=2024-01-01T00:00:00Z",
         "record_data_filter": None,
     }
 
@@ -650,7 +650,7 @@ def test_study_with_only_null_timestamps_uses_lightweight_reconcile_after_initia
     }
     assert sdk.get_records.call_args_list[3].kwargs == {
         "study_key": "STUDY",
-        "record_id": [3],
+        "record_id": 3,
         "record_data_filter": None,
     }
     assert sdk.get_records.call_args_list[4].kwargs == {
@@ -934,3 +934,76 @@ def test_iter_cached_records_order_by_subject_groups_subjects_cleanly(tmp_path: 
 
     subject_grouped = list(loader.iter_cached_records("STUDY", chunk_size=2, order_by_subject=True))
     assert [r.record_id for r in subject_grouped] == [40, 20, 50, 10, 30]
+
+
+def test_delta_and_missing_record_queries_emit_whole_second_utc_and_single_attribute_bounds(
+    tmp_path: Path,
+) -> None:
+    """_fetch_delta_records emits whole-second UTC and _fetch_missing_records uses == or >= with local filtering."""
+    import httpx
+    import respx
+
+    from imednet.sdk import ImednetSDK
+
+    with respx.mock(assert_all_called=True) as router:
+        seen_filters: list[str] = []
+
+        def _records_responder(request: httpx.Request) -> httpx.Response:
+            flt = request.url.params.get("filter", "")
+            seen_filters.append(flt)
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "studyKey": "STUDY",
+                            "recordId": 3,
+                            "formId": 10,
+                            "formKey": "FORM",
+                            "subjectKey": "S1",
+                            "dateModified": "2026-02-01T12:30:45Z",
+                            "recordData": {"v": 3},
+                        },
+                        {
+                            "studyKey": "STUDY",
+                            "recordId": 5,
+                            "formId": 10,
+                            "formKey": "FORM",
+                            "subjectKey": "S1",
+                            "dateModified": "2026-02-01T12:30:45Z",
+                            "recordData": {"v": 5},
+                        },
+                        {
+                            "studyKey": "STUDY",
+                            "recordId": 8,
+                            "formId": 10,
+                            "formKey": "FORM",
+                            "subjectKey": "S1",
+                            "dateModified": "2026-02-01T12:30:45Z",
+                            "recordData": {"v": 8},
+                        },
+                    ]
+                },
+            )
+
+        router.get("https://api.test/api/v1/edc/studies/STUDY/records").mock(
+            side_effect=_records_responder
+        )
+
+        with ImednetSDK(api_key="k", security_key="s", base_url="https://api.test") as sdk:
+            loader = CachedRecordsLoader(sdk, cache_dir=tmp_path / "http-contract-cache")
+
+            delta = loader._fetch_delta_records("STUDY", "2026-02-01T14:30:45.999999+02:00")
+            assert len(delta) == 3
+            assert seen_filters[-1] == "dateModified>=2026-02-01T12:30:45Z"
+
+            assert loader._fetch_missing_records("STUDY", set()) == []
+            assert len(seen_filters) == 1
+
+            single_missing = loader._fetch_missing_records("STUDY", {5})
+            assert [r.record_id for r in single_missing] == [5]
+            assert seen_filters[-1] == "recordId==5"
+
+            multi_missing = loader._fetch_missing_records("STUDY", {3, 8})
+            assert [r.record_id for r in multi_missing] == [3, 8]
+            assert seen_filters[-1] == "recordId>=3"

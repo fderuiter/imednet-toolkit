@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ...endpoints.records import RecordsEndpoint
-from ...integrations.sink_base import normalize_watermark_datetime
+from ...integrations.sink_base import RECORD_TIMESTAMP_ATTRIBUTES, normalize_watermark_datetime
 from ...models.records import Record
 from ...sdk import ImednetSDK
 from ...spi.models import PROFILE_REGISTRY
@@ -176,6 +176,7 @@ def _parse_export_filters(filters: list[str] | None) -> dict[str, Any] | str | N
         model=Record,
         allowed_attributes=RecordsEndpoint.FILTER_ATTRIBUTES,
         disallow_study_key=True,
+        multi_bound_attributes=RECORD_TIMESTAMP_ATTRIBUTES,
     )
     if (
         parsed is not None

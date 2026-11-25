@@ -182,21 +182,37 @@ class QueryManagementWorkflow:
             A list of Query objects for the specified site.
         """
         subjects = self._sdk.get_subjects(study_key, site_name=site_key)
-        subject_keys = [
-            key
-            for s in subjects
-            if getattr(s, "is_deleted", False) is not True
-            and isinstance(s.subject_key, str)
-            and (key := s.subject_key.strip())
-        ]
+        subject_keys = list(
+            dict.fromkeys(
+                key
+                for s in subjects
+                if getattr(s, "is_deleted", False) is not True
+                and isinstance(s.subject_key, str)
+                and (key := s.subject_key.strip())
+            )
+        )
         if not subject_keys:
             return []
 
-        final_filter_dict: dict[str, Any] = {"subject_key": subject_keys}
-        if additional_filter:
-            final_filter_dict.update(additional_filter)
+        final_filter_dict: dict[str, Any] = dict(additional_filter) if additional_filter else {}
+        has_caller_subject_filter = any(
+            k in ("subject_key", "subjectKey") for k in (*final_filter_dict, *kwargs)
+        ) or any(
+            isinstance(raw_flt, str) and ("subjectKey" in raw_flt or "subject_key" in raw_flt)
+            for raw_flt in (final_filter_dict.get("filter"), kwargs.get("filter"))
+        )
+        if len(subject_keys) == 1 and not has_caller_subject_filter:
+            final_filter_dict["subject_key"] = subject_keys[0]
+            return list(self._sdk.get_queries(study_key, **final_filter_dict, **kwargs))
 
-        return list(self._sdk.get_queries(study_key, **final_filter_dict, **kwargs))
+        subject_key_set = set(subject_keys)
+        queries = self._sdk.get_queries(study_key, **final_filter_dict, **kwargs)
+        return [
+            q
+            for q in queries
+            if isinstance(q_sub := getattr(q, "subject_key", None), str)
+            and q_sub.strip() in subject_key_set
+        ]
 
     def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
         """Counts queries grouped by their current QueryStatus values.

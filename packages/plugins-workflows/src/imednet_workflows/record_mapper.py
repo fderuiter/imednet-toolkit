@@ -392,19 +392,13 @@ class RecordMapper:
 
         filters: dict[str, Any] = {}
         if form_whitelist is not None:
-            filters["formId"] = (
-                form_whitelist[0] if len(form_whitelist) == 1 else list(form_whitelist)
-            )
-            if (
-                variable_whitelist is not None
-                and len(variable_whitelist) == 1
-                and len(form_whitelist) == 1
-            ):
-                filters["variableName"] = variable_whitelist[0]
-        elif variable_whitelist is not None:
-            filters["variableName"] = (
-                variable_whitelist[0] if len(variable_whitelist) == 1 else list(variable_whitelist)
-            )
+            unique_forms = list(dict.fromkeys(form_whitelist))
+            if len(unique_forms) == 1:
+                filters["formId"] = unique_forms[0]
+        if variable_whitelist is not None:
+            unique_vars = list(dict.fromkeys(variable_whitelist))
+            if len(unique_vars) == 1:
+                filters["variableName"] = unique_vars[0]
 
         from unittest.mock import NonCallableMock
 

@@ -276,8 +276,7 @@ def test_dataframe_multi_form_and_variable_whitelists_batch_without_mixed_connec
             form_whitelist=[10, 20],
         )
 
-        var_filter = var_route.calls.last.request.url.params["filter"]
-        assert var_filter == "formId==10,formId==20"
+        assert "filter" not in var_route.calls.last.request.url.params
         assert len(rec_calls) == 2
         assert rec_calls[0]["filter"] == "formId==10"
         assert rec_calls[1]["filter"] == "formId==20"
@@ -298,6 +297,25 @@ def test_dataframe_multi_form_and_variable_whitelists_batch_without_mixed_connec
             "WT",
         ]
         assert len(df) == 2
+
+        # Single-item variable_whitelist with multi-item form_whitelist still sends scalar variableName
+        var_route.calls.clear()
+        mapper._fetch_variable_metadata(
+            "STUDY",
+            variable_whitelist=["AGE"],
+            form_whitelist=[10, 20],
+        )
+        assert var_route.calls.last.request.url.params["filter"] == "variableName==AGE"
+
+        # Multi-item variable_whitelist without form_whitelist omits server filter and filters locally
+        var_route.calls.clear()
+        var_keys, _ = mapper._fetch_variable_metadata(
+            "STUDY",
+            variable_whitelist=["AGE", "WT"],
+            form_whitelist=None,
+        )
+        assert "filter" not in var_route.calls.last.request.url.params
+        assert var_keys == ["AGE", "WT"]
 
 
 def test_parsing_error_logs_warning(monkeypatch, caplog) -> None:

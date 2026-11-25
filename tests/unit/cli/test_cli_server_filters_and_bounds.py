@@ -1126,9 +1126,9 @@ def test_studies_list_preserves_study_key_and_study_key_camel_filters(
 @pytest.mark.parametrize(
     ("argv", "expected_attr"),
     [
-        (["queries", "list", "STUDY", "-f", "status=Open"], "annotationType"),
-        (["visits", "list", "STUDY", "-f", "visit_id=1"], "intervalName"),
-        (["codings", "list", "STUDY", "-f", "coding_id=1"], "dictionaryName"),
+        (["queries", "list", "STUDY", "-f", "status=Open"], "annotationId"),
+        (["visits", "list", "STUDY", "-f", "visit_key=V1"], "visitId"),
+        (["codings", "list", "STUDY", "-f", "status=Open"], "codingId"),
         (["records", "list", "STUDY", "-f", "keywords=urgent"], "formKey"),
         (["subjects", "list", "STUDY", "-f", "keywords=vip"], "subjectStatus"),
     ],
@@ -1155,6 +1155,65 @@ def test_list_commands_reject_non_allowlisted_attributes_and_list_valid_attribut
     assert "Valid attributes:" in captured.err
     assert expected_attr in captured.err
     assert "Unexpected error" not in captured.err
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("subcmd", "path_suffix", "camel_flag", "snake_flag", "expected_filter", "row"),
+    [
+        (
+            "queries",
+            "queries",
+            "annotationId==701",
+            "annotation_id=701",
+            "annotationId==701",
+            {"annotationId": 701, "subjectKey": "SUBJ-01", "type": "question"},
+        ),
+        (
+            "codings",
+            "codings",
+            "codingId==1101",
+            "coding_id=1101",
+            "codingId==1101",
+            {"codingId": 1101, "subjectKey": "SUBJ-01", "dictionaryName": "MedDRA"},
+        ),
+        (
+            "visits",
+            "visits",
+            "visitId==401",
+            "visit_id=401",
+            "visitId==401",
+            {"visitId": 401, "subjectKey": "SUBJ-01", "intervalName": "Baseline"},
+        ),
+    ],
+)
+def test_list_commands_accept_primary_ids_in_camel_and_snake_case(
+    subcmd: str,
+    path_suffix: str,
+    camel_flag: str,
+    snake_flag: str,
+    expected_filter: str,
+    row: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Queries, Codings, and Visits CLI list commands accept primary IDs in camelCase and snake_case."""
+    monkeypatch.setenv("IMEDNET_API_KEY", "k")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "s")
+    monkeypatch.setenv("IMEDNET_BASE_URL", "https://api.test")
+
+    route = respx.get(f"https://api.test/api/v1/edc/studies/STUDY/{path_suffix}").mock(
+        return_value=httpx.Response(200, json={"data": [row], "pagination": {"totalPages": 1}})
+    )
+
+    for flt in (camel_flag, snake_flag):
+        route.reset()
+        cli.app([subcmd, "list", "STUDY", "-f", flt, "--format", "json"])
+        out, err = capfd.readouterr()
+        assert err == ""
+        assert route.call_count == 1
+        assert dict(route.calls[0].request.url.params)["filter"] == expected_filter
+        assert json.loads(out) != []
 
 
 def test_help_text_and_preflight_enforce_table2_for_filter_and_table7_for_record_data_filter(

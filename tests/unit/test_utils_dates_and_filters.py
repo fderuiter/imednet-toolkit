@@ -114,6 +114,42 @@ def test_format_iso_datetime_naive() -> None:
     assert result == "2024-01-01T12:30:00Z"
 
 
+@pytest.mark.parametrize(
+    ("dt_input", "expected"),
+    [
+        (datetime(2026, 1, 15, 12, 30, 45, 999999), "2026-01-15T12:30:45Z"),
+        (datetime(2026, 1, 15, 12, 30, 45, 1, tzinfo=timezone.utc), "2026-01-15T12:30:45Z"),
+        (
+            datetime(2026, 1, 15, 14, 30, 45, 987654, tzinfo=timezone(timedelta(hours=2))),
+            "2026-01-15T12:30:45Z",
+        ),
+    ],
+)
+def test_format_iso_datetime_truncates_fractional_seconds_toward_floor(
+    dt_input: datetime, expected: str
+) -> None:
+    """format_iso_datetime truncates microseconds toward the floor second in UTC."""
+    assert format_iso_datetime(dt_input) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "is_end", "expected"),
+    [
+        ("2026-03-10", False, "2026-03-10T00:00:00Z"),
+        ("2026-03-10", True, "2026-03-10T23:59:59Z"),
+        ("2026-03-10T08:15:59.999999Z", False, "2026-03-10T08:15:59Z"),
+        ("2026-03-10T10:15:59.876543+02:00", True, "2026-03-10T08:15:59Z"),
+        ("2024-01-02 00:00:00.500000+00:00", False, "2024-01-02T00:00:00Z"),
+        ("2026-03-10T08:15:59.123456", False, "2026-03-10T08:15:59Z"),
+    ],
+)
+def test_normalize_utc_timestamp_bound_emits_whole_second_utc(
+    raw: str, is_end: bool, expected: str
+) -> None:
+    """normalize_utc_timestamp_bound expands date-only inputs and floors fractional timestamps."""
+    assert normalize_utc_timestamp_bound(raw, is_end=is_end) == expected
+
+
 def test_build_filter_string_simple() -> None:
     """Test that build filter string simple."""
     result = build_filter_string({"name": "Alice"})
@@ -598,29 +634,55 @@ def test_schema_guided_scalar_coercion_across_model_types() -> None:
 
 def test_validate_filter_key_allowed_attributes_and_sorted_listing() -> None:
     """validate_filter_key enforces endpoint FILTER_ATTRIBUTES and lists valid attributes."""
+    from imednet.endpoints.codings import CodingsEndpoint
     from imednet.endpoints.queries import QueriesEndpoint
     from imednet.endpoints.visits import VisitsEndpoint
+    from imednet.models.codings import Coding
     from imednet.models.queries import Query
 
-    validate_filter_key(
-        "interval_name",
+    for visit_attr in ("interval_name", "intervalName", "visit_id", "visitId"):
+        validate_filter_key(
+            visit_attr,
+            model=Visit,
+            allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
+        )
+    for query_attr in ("annotation_id", "annotationId"):
+        validate_filter_key(
+            query_attr,
+            model=Query,
+            allowed_attributes=QueriesEndpoint.FILTER_ATTRIBUTES,
+        )
+    for coding_attr in ("coding_id", "codingId"):
+        validate_filter_key(
+            coding_attr,
+            model=Coding,
+            allowed_attributes=CodingsEndpoint.FILTER_ATTRIBUTES,
+        )
+
+    # Visit date-only attributes remain YYYY-MM-DD when parsed and serialized
+    visit_dates = parse_filter_expressions(
+        [
+            "startDate>=2026-01-01",
+            "endDate<=2026-01-31",
+            "dueDate==2026-01-15",
+            "visitDate!=2026-01-20",
+        ],
         model=Visit,
         allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
     )
-    validate_filter_key(
-        "intervalName",
-        model=Visit,
-        allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
+    assert build_filter_string(visit_dates) == (
+        "startDate>=2026-01-01;endDate<=2026-01-31;dueDate==2026-01-15;visitDate!=2026-01-20"
     )
 
     with pytest.raises(ValueError) as visit_exc:
         validate_filter_key(
-            "visit_id",
+            "visit_key",
             model=Visit,
             allowed_attributes=VisitsEndpoint.FILTER_ATTRIBUTES,
         )
-    assert "Unknown filter attribute 'visit_id' for Visit." in str(visit_exc.value)
+    assert "Unknown filter attribute 'visit_key' for Visit." in str(visit_exc.value)
     assert "Valid attributes:" in str(visit_exc.value)
+    assert "visitId" in str(visit_exc.value)
     assert "intervalId" in str(visit_exc.value)
 
     with pytest.raises(ValueError) as query_exc:

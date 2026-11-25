@@ -2007,3 +2007,212 @@ def test_incremental_watermark_combines_date_modified_without_duplicate_attribut
             assert len(seen_filters) == 1
             assert seen_filters[0].count("dateModified") == 1
             assert "dateModified>=2026-06-01T00:00:00Z" in seen_filters[0]
+
+
+def test_record_export_normalizes_date_created_modified_and_last_updated_with_and_without_watermark(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Req 1-3 & Guardrail 1: normalize dateCreated/dateModified/lastUpdated and preserve idempotent guard."""
+    from imednet.errors import ExportConfigurationError
+    from imednet.integrations.sink_base import _combine_branch_with_watermark
+
+    # Guardrail 1: idempotent=False remains rejected for incremental or state_provider exports
+    with pytest.raises(ExportConfigurationError, match="idempotent"):
+        SinkConfig(study_key="S-GUARD", incremental=True, idempotent=False)
+
+    # 1. Watermark-free dateModified normalizes date-only <= to T23:59:59Z and >= to T00:00:00Z
+    dm_upper_only = _combine_branch_with_watermark({"date_modified": ("<=", "2026-06-10")}, None)
+    assert dm_upper_only == ({"dateModified": ("<=", "2026-06-10T23:59:59Z")}, None)
+
+    dm_scalar_offset = _combine_branch_with_watermark(
+        {"dateModified": "2026-06-10T14:30:15.987654+02:00"},
+        None,
+    )
+    assert dm_scalar_offset == ({"dateModified": ("==", "2026-06-10T12:30:15Z")}, None)
+
+    # 2. dateCreated and lastUpdated normalize date-only bounds and evaluate residual upper/!= locally
+    combined = _combine_branch_with_watermark(
+        {
+            "date_created": [(">=", "2026-05-01"), ("<=", "2026-05-10")],
+            "last_updated": [(">", "2026-05-02"), ("!=", "2026-05-05T00:00:00Z")],
+            "dateModified": ("<", "2026-06-20"),
+        },
+        normalize_wm := spi_sink_base.normalize_watermark_datetime("2026-06-01T08:15:30.999999Z"),
+    )
+    assert normalize_wm is not None
+    assert combined is not None
+    branch_dict, post_pred = combined
+    assert branch_dict == {
+        "dateModified": (">=", "2026-06-01T08:15:30Z"),
+        "dateCreated": (">=", "2026-05-01T00:00:00Z"),
+        "lastUpdated": (">", "2026-05-02T00:00:00Z"),
+    }
+    assert post_pred is not None
+    assert (
+        post_pred(
+            {
+                "dateCreated": "2026-05-10T23:59:59Z",
+                "lastUpdated": "2026-05-06T00:00:00Z",
+                "dateModified": "2026-06-19T23:59:59Z",
+            }
+        )
+        is True
+    )
+    # Fails dateCreated upper bound (> 2026-05-10T23:59:59Z)
+    assert (
+        post_pred(
+            {
+                "dateCreated": "2026-05-11T00:00:00Z",
+                "lastUpdated": "2026-05-06T00:00:00Z",
+                "dateModified": "2026-06-10T00:00:00Z",
+            }
+        )
+        is False
+    )
+    # Fails lastUpdated != exclusion
+    assert (
+        post_pred(
+            {
+                "dateCreated": "2026-05-05T00:00:00Z",
+                "lastUpdated": "2026-05-05T00:00:00Z",
+                "dateModified": "2026-06-10T00:00:00Z",
+            }
+        )
+        is False
+    )
+    # Fails dateModified < 2026-06-20T23:59:59Z strict upper bound
+    assert (
+        post_pred(
+            {
+                "dateCreated": "2026-05-05T00:00:00Z",
+                "lastUpdated": "2026-05-06T00:00:00Z",
+                "dateModified": "2026-06-20T23:59:59Z",
+            }
+        )
+        is False
+    )
+
+    # Unsatisfiable dateCreated or lastUpdated bounds prune the branch
+    assert (
+        _combine_branch_with_watermark(
+            {"dateCreated": [(">=", "2026-06-10"), ("<", "2026-06-01")]}, None
+        )
+        is None
+    )
+    assert (
+        _combine_branch_with_watermark(
+            {"lastUpdated": [("==", "2026-06-01"), ("!=", "2026-06-01")]}, None
+        )
+        is None
+    )
+
+    # Date object coercion, hybrid dict + inline filter merging, and validation errors
+    from datetime import date as dt_date
+
+    date_obj_branch = _combine_branch_with_watermark(
+        {"dateCreated": ("<=", dt_date(2026, 6, 15))}, None
+    )
+    assert date_obj_branch == ({"dateCreated": ("<=", "2026-06-15T23:59:59Z")}, None)
+
+    hybrid_branches = build_record_query_branches(
+        record_filter={
+            "date_created": (">=", "2026-05-01"),
+            "filter": "dateCreated<=2026-05-10",
+        }
+    )
+    assert hybrid_branches == [{"dateCreated": (">=", "2026-05-01T00:00:00Z"), "deleted": False}]
+
+    for bad_branch in (
+        {"dateCreated": ("==", None)},
+        {"dateCreated": ("==", True)},
+        {"dateCreated": ("==", "   ")},
+        {"dateCreated": ("==", 123)},
+        {"dateCreated": ("==",)},
+        {"dateCreated": [("==",)]},
+        {"dateCreated": "2026-06-01", "date_created": "2026-06-01"},
+    ):
+        with pytest.raises(ValueError):
+            _combine_branch_with_watermark(bad_branch, None)
+
+    # 3. End-to-end CLI export with repeatable --filter bounds on dateCreated + microsecond --since
+    seen_http_filters: list[str] = []
+    with respx.mock(assert_all_called=True) as router:
+
+        def _cli_records_handler(request: httpx.Request) -> httpx.Response:
+            flt = request.url.params.get("filter", "")
+            seen_http_filters.append(flt)
+            assert flt.count("dateCreated") == 1
+            assert flt.count("dateModified") == 1
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "recordId": 10,
+                            "subjectKey": "SUBJ-01",
+                            "visitId": 1,
+                            "formId": 10,
+                            "formKey": "AE",
+                            "deleted": False,
+                            "dateCreated": "2026-05-10T12:00:00Z",
+                            "dateModified": "2026-06-01T10:00:00Z",
+                            "recordData": {"AGE": 41},
+                        },
+                        {
+                            "recordId": 11,
+                            "subjectKey": "SUBJ-02",
+                            "visitId": 1,
+                            "formId": 10,
+                            "formKey": "AE",
+                            "deleted": False,
+                            "dateCreated": "2026-05-25T12:00:00Z",
+                            "dateModified": "2026-06-01T10:00:00Z",
+                            "recordData": {"AGE": 52},
+                        },
+                    ]
+                },
+            )
+
+        router.get("https://api.test/api/v1/edc/studies/S-CLI-BOUNDS/records").mock(
+            side_effect=_cli_records_handler
+        )
+        router.get("https://api.test/api/v1/edc/studies/S-CLI-BOUNDS/variables").respond(
+            200,
+            json={
+                "data": [
+                    {
+                        "variableName": "AGE",
+                        "variableType": "int",
+                        "label": "Age",
+                        "formId": 10,
+                        "formKey": "AE",
+                    }
+                ]
+            },
+        )
+
+        monkeypatch.setenv("IMEDNET_API_KEY", "k")
+        monkeypatch.setenv("IMEDNET_SECURITY_KEY", "s")
+        monkeypatch.setenv("IMEDNET_BASE_URL", "https://api.test")
+        cli_out = tmp_path / "cli_bounds.json"
+        code, _, stderr = _invoke_cli(
+            [
+                "export",
+                "json",
+                "S-CLI-BOUNDS",
+                str(cli_out),
+                "--since",
+                "2026-06-01T10:00:00.999999Z",
+                "--filter",
+                "dateCreated>=2026-05-01",
+                "--filter",
+                "dateCreated<=2026-05-15",
+            ]
+        )
+        assert code == 0, stderr
+        rows = json.loads(cli_out.read_text(encoding="utf-8"))
+        assert [r["recordId"] for r in rows] == [10]
+        assert len(seen_http_filters) == 1
+        assert "dateCreated>=2026-05-01T00:00:00Z" in seen_http_filters[0]
+        assert "dateModified>=2026-06-01T10:00:00Z" in seen_http_filters[0]

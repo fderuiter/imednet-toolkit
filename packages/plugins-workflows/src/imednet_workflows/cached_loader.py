@@ -33,6 +33,7 @@ from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import (
     build_filter_string,
     delegates_to_sdk_retry_policy,
+    normalize_utc_timestamp_bound,
     redact_sensitive_text,
     resolve_sdk_base_url,
 )
@@ -43,7 +44,6 @@ if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
 
 DEFAULT_CACHE_DIR = Path.home() / ".imednet" / "cache"
-_MISSING_ID_BATCH_SIZE = 100
 _EPOCH_FLOOR_WATERMARK = "1970-01-01T00:00:00Z"
 
 _T = TypeVar("_T")
@@ -986,7 +986,8 @@ class CachedRecordsLoader:
 
         # Use >= to avoid missing updates that share the high-water-mark timestamp.
         # _upsert_records_unlocked keeps refresh idempotent by deduplicating on (base_url, study_key, record_id).
-        delta_filter = build_filter_string({"date_modified": (">=", high_water_mark)})
+        normalized_hwm = normalize_utc_timestamp_bound(high_water_mark, is_end=False)
+        delta_filter = build_filter_string({"date_modified": (">=", normalized_hwm)})
         return self._list_records_with_filter_override(
             study_key=study_key,
             filter_string=delta_filter,
@@ -1001,18 +1002,15 @@ class CachedRecordsLoader:
         """Fetch full record payloads for upstream active IDs missing or stale in local cache."""
         if not missing_ids:
             return []
-        sorted_ids = sorted(missing_ids)
-        fetched: list[Record] = []
-        for idx in range(0, len(sorted_ids), _MISSING_ID_BATCH_SIZE):
-            batch_ids = sorted_ids[idx : idx + _MISSING_ID_BATCH_SIZE]
-            batch_set = set(batch_ids)
-            records = self._list_records(
-                study_key=study_key,
-                record_id=batch_ids,
-                record_data_filter=None,
-            )
-            fetched.extend(record for record in records if record.record_id in batch_set)
-        return fetched
+        record_id_bound: int | tuple[str, int] = (
+            next(iter(missing_ids)) if len(missing_ids) == 1 else (">=", min(missing_ids))
+        )
+        records = self._list_records(
+            study_key=study_key,
+            record_id=record_id_bound,
+            record_data_filter=None,
+        )
+        return [record for record in records if record.record_id in missing_ids]
 
     def _execute_with_retry_ownership(
         self,

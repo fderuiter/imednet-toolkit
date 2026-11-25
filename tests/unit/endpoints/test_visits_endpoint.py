@@ -25,8 +25,10 @@ def test_list_filters_and_path(dummy_client, paginator_factory, patch_build_filt
     assert isinstance(result[0], Visit)
 
 
-def test_visits_endpoint_is_list_only_and_rejects_undocumented_filters(dummy_client):
-    """Test that VisitsEndpoint exposes no get method and rejects visitId/status."""
+def test_visits_endpoint_is_list_only_and_rejects_undocumented_filters(
+    dummy_client, paginator_factory
+):
+    """Test that VisitsEndpoint exposes no get method, accepts visitId, and rejects status."""
     ep = visits.VisitsEndpoint(dummy_client)
     async_ep = visits.AsyncVisitsEndpoint(dummy_client)
 
@@ -34,8 +36,11 @@ def test_visits_endpoint_is_list_only_and_rejects_undocumented_filters(dummy_cli
     assert not hasattr(async_ep, "get")
     assert not hasattr(visits.VisitsOperationDef, "_id_param")
 
-    with pytest.raises(ConfigurationError, match="visitId"):
-        ep.list("S1", visitId=1)
+    capture = paginator_factory(visits, [{"visitId": 401}])
+    assert len(ep.list("S1", visitId=401)) == 1
+    assert capture["params"]["filter"] == "visitId==401"
+    assert len(ep.list("S1", visit_id=401)) == 1
+    assert capture["params"]["filter"] == "visitId==401"
 
     with pytest.raises(ConfigurationError, match="status"):
         ep.list("S1", status="open")
