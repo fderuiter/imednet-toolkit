@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import math
 import re
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -654,26 +654,416 @@ def normalize_naming_convention(convention: str | None) -> str | None:
 _SDTM_DOMAIN_NON_ALNUM_RE = re.compile(r"[^A-Z0-9]+")
 
 
-def resolve_sdtm_domain(domain: str | None, *, fallback: str = "AE") -> str:
-    """Canonicalize an SDTM domain code or form/domain alias (e.g. 'PD' -> 'DV')."""
-    if not domain or not isinstance(domain, str) or not domain.strip():
-        return fallback
-    upper = domain.strip().upper()
+def _match_known_sdtm_domain(text: str | None) -> str:
+    """Return canonical 2-letter SDTM domain if *text* matches a known domain or EDC form alias."""
+    if not text or not isinstance(text, str) or not text.strip():
+        return ""
+    upper = text.strip().upper()
     compact = _SDTM_DOMAIN_NON_ALNUM_RE.sub("", upper)
     if not compact:
-        return fallback
+        return ""
     if compact in _DOMAIN_NAME_ALIASES:
         return _DOMAIN_NAME_ALIASES[compact]
-    # Prefix heuristics for common EDC form keys (e.g. 'F_AE', 'AE1', 'AE_FORM', 'VS_VITALS')
+    if compact in SDTM_DOMAIN_SPECS:
+        return compact
     tokens = [tok for tok in _SDTM_DOMAIN_NON_ALNUM_RE.split(upper) if tok and tok != "F"]
     for tok in tokens:
         if tok in _DOMAIN_NAME_ALIASES:
             return _DOMAIN_NAME_ALIASES[tok]
+        if tok in SDTM_DOMAIN_SPECS:
+            return tok
         stripped_digits = tok.rstrip("0123456789")
         if stripped_digits and stripped_digits in _DOMAIN_NAME_ALIASES:
             return _DOMAIN_NAME_ALIASES[stripped_digits]
+        if stripped_digits and stripped_digits in SDTM_DOMAIN_SPECS:
+            return stripped_digits
+    return ""
+
+
+def resolve_sdtm_domain(domain: str | None, *, fallback: str = "AE") -> str:
+    """Canonicalize an SDTM domain code or form/domain alias (e.g. 'PD' -> 'DV')."""
+    if not domain or not isinstance(domain, str) or not domain.strip():
+        return fallback
+    known = _match_known_sdtm_domain(domain)
+    if known:
+        return known
+    upper = domain.strip().upper()
+    compact = _SDTM_DOMAIN_NON_ALNUM_RE.sub("", upper)
+    if not compact:
+        return fallback
     sanitized = compact.lstrip("0123456789")
     return sanitized if sanitized else fallback
+
+
+def _extract_study_config_form_domains(
+    *,
+    study_config: Any | None = None,
+    mappings: Iterable[Any] | None = None,
+    study_key: str | None = None,
+) -> dict[str, str]:
+    """Extract normalized ``source_form_key -> SDTM domain`` lookup from ``StudyConfiguration``."""
+    resolved_cfg = study_config
+    if resolved_cfg is None and mappings is None and study_key:
+        from imednet.integrations.enrichment import resolve_study_configuration
+
+        resolved_cfg = resolve_study_configuration(study_key)
+
+    raw_mappings: Iterable[Any] = ()
+    if mappings is not None:
+        raw_mappings = mappings
+    elif resolved_cfg is not None:
+        raw_mappings = getattr(resolved_cfg, "mappings", None) or ()
+
+    lookup: dict[str, str] = {}
+    for rule in raw_mappings:
+        if isinstance(rule, Mapping):
+            raw_fk = rule.get("source_form_key") or rule.get("sourceFormKey")
+            raw_dom = rule.get("domain") or rule.get("DOMAIN")
+        else:
+            raw_fk = getattr(rule, "source_form_key", None) or getattr(rule, "sourceFormKey", None)
+            raw_dom = getattr(rule, "domain", None) or getattr(rule, "DOMAIN", None)
+        if not raw_fk or not raw_dom:
+            continue
+        fk_str = str(raw_fk).strip()
+        dom_str = resolve_sdtm_domain(str(raw_dom), fallback="")
+        if not fk_str or not dom_str:
+            continue
+        lookup.setdefault(fk_str, dom_str)
+        lookup.setdefault(fk_str.upper(), dom_str)
+        lookup.setdefault(fk_str.lower(), dom_str)
+        collapsed = _collapse_alnum_key(fk_str)
+        if collapsed:
+            lookup.setdefault(f"__alnum__:{collapsed}", dom_str)
+    return lookup
+
+
+def _lookup_configured_form_domain(
+    candidate: Any,
+    cfg_lookup: Mapping[str, str],
+) -> str:
+    """Resolve *candidate* against pre-extracted ``StudyConfiguration`` form mappings."""
+    if not candidate or not cfg_lookup:
+        return ""
+    text = str(candidate).strip()
+    if not text:
+        return ""
+    for probe in (text, text.upper(), text.lower(), f"__alnum__:{_collapse_alnum_key(text)}"):
+        if probe in cfg_lookup:
+            return cfg_lookup[probe]
+    return ""
+
+
+def _coerce_form_id_int(raw_fid: Any) -> int | None:
+    if isinstance(raw_fid, bool) or raw_fid is None:
+        return None
+    if isinstance(raw_fid, int):
+        return raw_fid
+    if isinstance(raw_fid, str):
+        s = raw_fid.strip()
+        if s and (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            return int(s)
+    return None
+
+
+def extract_record_form_ref(rec: Any) -> tuple[int | None, str | None]:
+    """Extract ``(form_id, form_key)`` from a ``Record`` model or dictionary."""
+    if isinstance(rec, Mapping):
+        raw_fid = rec.get("formId") if "formId" in rec else rec.get("form_id")
+        raw_fk = rec.get("formKey") or rec.get("form_key")
+    else:
+        raw_fid = getattr(rec, "form_id", None)
+        if raw_fid is None:
+            raw_fid = getattr(rec, "formId", None)
+        raw_fk = getattr(rec, "form_key", None) or getattr(rec, "formKey", None)
+    fid = _coerce_form_id_int(raw_fid)
+    fk = (
+        str(raw_fk).strip()
+        if isinstance(raw_fk, str)
+        else (str(raw_fk).strip() if raw_fk else None)
+    )
+    return fid, fk or None
+
+
+def resolve_form_sdtm_domain(
+    form: Any,
+    *,
+    study_config: Any | None = None,
+    mappings: Iterable[Any] | None = None,
+    study_key: str | None = None,
+    form_domain_map: Mapping[Any, str] | None = None,
+    fallback: str = "AE",
+    _cfg_lookup: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the canonical SDTM domain for a ``Form``, mapping dict, or form key/name string."""
+    if form is None:
+        return fallback
+
+    fid: int | None = None
+    fkey: str | None = None
+    fname: str | None = None
+    explicit_dom: str | None = None
+
+    if isinstance(form, str):
+        fkey = form.strip() or None
+    elif isinstance(form, Mapping):
+        raw_fid = form.get("formId") if "formId" in form else form.get("form_id")
+        fid = _coerce_form_id_int(raw_fid)
+        raw_fk = form.get("formKey") or form.get("form_key")
+        fkey = str(raw_fk).strip() if raw_fk else None
+        raw_fn = form.get("formName") or form.get("form_name")
+        fname = str(raw_fn).strip() if raw_fn else None
+        raw_dom = form.get("domain") or form.get("DOMAIN")
+        explicit_dom = str(raw_dom).strip() if raw_dom else None
+    else:
+        raw_fid = getattr(form, "form_id", None)
+        if raw_fid is None:
+            raw_fid = getattr(form, "formId", None)
+        fid = _coerce_form_id_int(raw_fid)
+        raw_fk = getattr(form, "form_key", None) or getattr(form, "formKey", None)
+        fkey = str(raw_fk).strip() if raw_fk else None
+        raw_fn = getattr(form, "form_name", None) or getattr(form, "formName", None)
+        fname = str(raw_fn).strip() if raw_fn else None
+        raw_dom = getattr(form, "domain", None) or getattr(form, "DOMAIN", None)
+        explicit_dom = str(raw_dom).strip() if isinstance(raw_dom, str) and raw_dom else None
+
+    if explicit_dom:
+        resolved_explicit = resolve_sdtm_domain(explicit_dom, fallback="")
+        if resolved_explicit:
+            return resolved_explicit
+
+    if form_domain_map:
+        if fid is not None:
+            for cand_fid in (fid, str(fid)):
+                if cand_fid in form_domain_map:
+                    mapped = resolve_sdtm_domain(form_domain_map[cand_fid], fallback="")
+                    if mapped:
+                        return mapped
+        if fkey:
+            for cand_k in (fkey, fkey.upper(), fkey.lower()):
+                if cand_k in form_domain_map:
+                    mapped = resolve_sdtm_domain(form_domain_map[cand_k], fallback="")
+                    if mapped:
+                        return mapped
+
+    cfg_lookup = (
+        _cfg_lookup
+        if _cfg_lookup is not None
+        else _extract_study_config_form_domains(
+            study_config=study_config,
+            mappings=mappings,
+            study_key=study_key,
+        )
+    )
+    if cfg_lookup:
+        for cand in (fkey, fname):
+            cfg_dom = _lookup_configured_form_domain(cand, cfg_lookup)
+            if cfg_dom:
+                return cfg_dom
+
+    for cand in (fkey, fname):
+        known = _match_known_sdtm_domain(cand)
+        if known:
+            return known
+
+    return fallback
+
+
+def build_form_sdtm_domain_map(
+    forms: Iterable[Any] | None = None,
+    *,
+    study_config: Any | None = None,
+    mappings: Iterable[Any] | None = None,
+    study_key: str | None = None,
+) -> dict[Any, str]:
+    """Build a ``{form_id / form_key: SDTM_DOMAIN}`` map from ``Form`` metadata & ``StudyConfiguration``."""
+    cfg_lookup = _extract_study_config_form_domains(
+        study_config=study_config,
+        mappings=mappings,
+        study_key=study_key,
+    )
+    mapping: dict[Any, str] = {
+        k: v for k, v in cfg_lookup.items() if not k.startswith("__alnum__:")
+    }
+    if forms is None:
+        return mapping
+
+    for f in forms:
+        if isinstance(f, Mapping):
+            raw_fid = f.get("formId") if "formId" in f else f.get("form_id")
+            raw_fk = f.get("formKey") or f.get("form_key")
+        else:
+            raw_fid = getattr(f, "form_id", None)
+            if raw_fid is None:
+                raw_fid = getattr(f, "formId", None)
+            raw_fk = getattr(f, "form_key", None) or getattr(f, "formKey", None)
+
+        dom = resolve_form_sdtm_domain(f, _cfg_lookup=cfg_lookup, fallback="")
+        if not dom:
+            continue
+        coerced_fid = _coerce_form_id_int(raw_fid)
+        if coerced_fid is not None:
+            mapping[coerced_fid] = dom
+        if raw_fk:
+            fk_str = str(raw_fk).strip()
+            if fk_str:
+                mapping[fk_str] = dom
+                mapping[fk_str.upper()] = dom
+                mapping[fk_str.lower()] = dom
+    return mapping
+
+
+def filter_forms_by_sdtm_domain(
+    forms: Iterable[Any],
+    domain: str | None,
+    *,
+    study_config: Any | None = None,
+    mappings: Iterable[Any] | None = None,
+    study_key: str | None = None,
+) -> list[Any]:
+    """Return forms whose resolved SDTM domain matches ``domain``."""
+    if domain is None or not str(domain).strip():
+        return list(forms)
+    target = resolve_sdtm_domain(domain, fallback="")
+    if not target:
+        return []
+    cfg_lookup = _extract_study_config_form_domains(
+        study_config=study_config,
+        mappings=mappings,
+        study_key=study_key,
+    )
+    matched: list[Any] = []
+    for f in forms:
+        dom = resolve_form_sdtm_domain(f, _cfg_lookup=cfg_lookup, fallback="")
+        if not dom:
+            raw_fk = (
+                f.get("formKey") or f.get("form_key")
+                if isinstance(f, Mapping)
+                else getattr(f, "form_key", None) or getattr(f, "formKey", None)
+            )
+            if raw_fk:
+                dom = resolve_sdtm_domain(str(raw_fk), fallback="")
+        if dom == target:
+            matched.append(f)
+    return matched
+
+
+def record_matches_sdtm_domain(
+    rec: Any,
+    domain: str,
+    form_domain_map: Mapping[Any, str] | None = None,
+    *,
+    study_config: Any | None = None,
+    mappings: Iterable[Any] | None = None,
+    study_key: str | None = None,
+) -> bool:
+    """Return True when ``rec`` belongs to ``domain`` (via Form map, ``StudyConfiguration``, or key)."""
+    target = resolve_sdtm_domain(domain, fallback="")
+    if not target:
+        return True
+
+    if isinstance(rec, Mapping):
+        raw_dom = rec.get("DOMAIN") or rec.get("domain")
+    else:
+        raw_dom = getattr(rec, "domain", None) or getattr(rec, "DOMAIN", None)
+    if isinstance(raw_dom, str) and raw_dom.strip():
+        return resolve_sdtm_domain(raw_dom, fallback="") == target
+
+    fid, fk = extract_record_form_ref(rec)
+    if form_domain_map:
+        if fid is not None:
+            for cand_fid in (fid, str(fid)):
+                if cand_fid in form_domain_map:
+                    return resolve_sdtm_domain(form_domain_map[cand_fid], fallback="") == target
+        if fk:
+            mapped_fk = (
+                form_domain_map.get(fk)
+                or form_domain_map.get(fk.upper())
+                or form_domain_map.get(fk.lower())
+            )
+            if mapped_fk:
+                return mapped_fk == target
+
+    if fk and (study_config is not None or mappings is not None or study_key is not None):
+        cfg_lookup = _extract_study_config_form_domains(
+            study_config=study_config,
+            mappings=mappings,
+            study_key=study_key,
+        )
+        cfg_dom = _lookup_configured_form_domain(fk, cfg_lookup)
+        if cfg_dom:
+            return cfg_dom == target
+
+    if fk:
+        known_fk = _match_known_sdtm_domain(fk)
+        if known_fk:
+            return known_fk == target
+        return resolve_sdtm_domain(fk, fallback="") == target
+
+    if form_domain_map and fid is not None:
+        has_int_keys = any(isinstance(k, int) and not isinstance(k, bool) for k in form_domain_map)
+        if has_int_keys:
+            return False
+    return True
+
+
+def merge_form_ids_into_record_filter(
+    record_filter: Any,
+    form_ids: Sequence[Any] | None,
+) -> Any:
+    """Merge domain-matched ``formId`` values into an ``sdk.records.list`` filter."""
+    if form_ids is None:
+        return record_filter
+    clean_ids: list[int] = []
+    seen_ids: set[int] = set()
+    for item in form_ids:
+        coerced = _coerce_form_id_int(item)
+        if coerced is None:
+            if isinstance(item, Mapping):
+                coerced = _coerce_form_id_int(
+                    item.get("formId") if "formId" in item else item.get("form_id")
+                )
+            else:
+                coerced = _coerce_form_id_int(
+                    getattr(item, "form_id", None)
+                    if getattr(item, "form_id", None) is not None
+                    else getattr(item, "formId", None)
+                )
+        if coerced is not None and coerced not in seen_ids:
+            seen_ids.add(coerced)
+            clean_ids.append(coerced)
+
+    if not clean_ids and len(form_ids) > 0:
+        return record_filter
+
+    form_val: Any = clean_ids[0] if len(clean_ids) == 1 else list(clean_ids)
+    if record_filter is None:
+        return {"formId": form_val}
+    if isinstance(record_filter, str):
+        return {"formId": form_val, "filter": record_filter}
+    if isinstance(record_filter, Mapping):
+        merged = dict(record_filter)
+        existing = merged.get("formId")
+        if existing is None and "form_id" in merged:
+            existing = merged.pop("form_id")
+        if existing is None:
+            merged["formId"] = form_val
+            return merged
+        existing_int = _coerce_form_id_int(existing)
+        if existing_int is not None:
+            existing_set = {existing_int}
+        elif isinstance(existing, Iterable) and not isinstance(existing, (str, bytes)):
+            existing_set = {cid for x in existing if (cid := _coerce_form_id_int(x)) is not None}
+        else:
+            existing_set = None
+        if existing_set is not None:
+            intersected = [fid for fid in clean_ids if fid in existing_set]
+            merged["formId"] = intersected[0] if len(intersected) == 1 else intersected
+        else:
+            merged["formId"] = form_val
+        return merged
+    if isinstance(record_filter, Sequence):
+        return {"formId": form_val, "filter": ";".join(str(x) for x in record_filter)}
+    return {"formId": form_val}
 
 
 def format_variable_name(
@@ -920,6 +1310,29 @@ def _canonical_record_id_key(raw_id: Any) -> str | None:
     return text if text else None
 
 
+def _normalize_positive_visitnum(val: Any) -> int | None:
+    """Coerce positive integer visit identifiers to ``int``; normalize ``<= 0`` or invalid to ``None``."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val if val > 0 else None
+    if isinstance(val, float):
+        if val.is_integer():
+            ival = int(val)
+            return ival if ival > 0 else None
+        return None
+    if isinstance(val, str):
+        stripped = val.strip()
+        if not stripped:
+            return None
+        try:
+            ival = int(stripped)
+            return ival if ival > 0 else None
+        except ValueError:
+            return None
+    return None
+
+
 @dataclass
 class _PreparedSdtmRow:
     """Normalized SDTM row prior to final per-subject sequence number assignment."""
@@ -987,7 +1400,11 @@ class _SdtmNormalizer:
 
         self.has_enrichment_transforms = bool(
             pipeline is not None
-            and (getattr(pipeline, "terminology", None) or getattr(pipeline, "mappings", None))
+            and (
+                getattr(pipeline, "terminology", None)
+                or getattr(pipeline, "all_mappings", None)
+                or getattr(pipeline, "mappings", None)
+            )
         )
         self.terminology: dict[str, dict[str, str]] = (
             getattr(pipeline, "terminology", {}) if pipeline is not None else {}
@@ -1006,13 +1423,22 @@ class _SdtmNormalizer:
         self.sensitive_mapped_targets: frozenset[str] = frozenset()
         sensitive_targets: set[str] = set()
         remaps_usubjid = False
-        mappings = getattr(pipeline, "mappings", None) if pipeline is not None else None
-        if mappings:
-            for src_var, rule in mappings.items():
+        all_rules = getattr(pipeline, "all_mappings", None) if pipeline is not None else None
+        if all_rules is None and pipeline is not None:
+            mappings_dict = getattr(pipeline, "mappings", None)
+            if isinstance(mappings_dict, Mapping):
+                all_rules = list(mappings_dict.values())
+        if all_rules:
+            for rule in all_rules:
+                rule_dom = resolve_sdtm_domain(getattr(rule, "domain", None), fallback="")
+                if rule_dom and rule_dom != domain_clean:
+                    continue
+                src_var = getattr(rule, "source_variable_name", "") or ""
                 if rule.target_field and rule.target_field.strip().upper() == "USUBJID":
                     remaps_usubjid = True
                 if (
                     rule.target_field
+                    and src_var
                     and not self._is_exempt_key(rule.target_field)
                     and self._is_sensitive_key(src_var)
                 ):
@@ -1125,11 +1551,12 @@ class _SdtmNormalizer:
         else:
             rec_dict = dict(getattr(rec, "__dict__", {}))
 
-        if "record_data" in rec_dict and isinstance(rec_dict["record_data"], dict):
-            nested_data = dict(rec_dict.pop("record_data"))
-            for k, v in nested_data.items():
-                if k not in rec_dict:
-                    rec_dict[k] = v
+        for rd_attr in ("record_data", "recordData"):
+            if rd_attr in rec_dict and isinstance(rec_dict[rd_attr], dict):
+                nested_data = dict(rec_dict.pop(rd_attr))
+                for k, v in nested_data.items():
+                    if k not in rec_dict:
+                        rec_dict[k] = v
 
         if raw_record_id is None:
             if "recordId" in rec_dict:
@@ -1141,10 +1568,28 @@ class _SdtmNormalizer:
             else:
                 raw_record_id = getattr(rec, "record_oid", None)
 
+        raw_visit_id: Any = getattr(rec, "visit_id", None)
+        if raw_visit_id is None:
+            raw_visit_id = getattr(rec, "visitId", None)
+        if raw_visit_id is None:
+            for vk in ("VISITNUM", "visitnum", "visitId", "visit_id"):
+                if vk in rec_dict and rec_dict[vk] is not None:
+                    raw_visit_id = rec_dict[vk]
+                    break
+        _, rec_form_key = extract_record_form_ref(rec)
+
         if self.pipeline is not None and (
             self.has_enrichment_transforms or not hasattr(self.pipeline, "terminology")
         ):
-            rec_dict = self.pipeline.process(rec_dict, mask_phi=False)
+            try:
+                rec_dict = self.pipeline.process(
+                    rec_dict,
+                    mask_phi=False,
+                    domain=self.domain_clean,
+                    form_key=rec_form_key,
+                )
+            except TypeError:
+                rec_dict = self.pipeline.process(rec_dict, mask_phi=False)
 
         explicit_usubjid = rec_dict.get("USUBJID") or rec_dict.get("usubjid")
         usubjid_raw = (
@@ -1186,6 +1631,8 @@ class _SdtmNormalizer:
 
         consumed_keys: set[str] = set(base_consumed)
         consumed_keys.add("RECORD_ID")
+        consumed_keys.add("VISITNUM")
+        consumed_keys.add("visitnum")
         if not self.include_seq:
             consumed_keys.add("DMSEQ")
             consumed_keys.add("dmseq")
@@ -1341,6 +1788,16 @@ class _SdtmNormalizer:
                     row[k] = formatted_extra_dtc
                 else:
                     row[k] = extra_val
+
+        if self.domain_clean != "DM":
+            explicit_vnum = (
+                rec_dict.get("VISITNUM") if "VISITNUM" in rec_dict else rec_dict.get("visitnum")
+            )
+            norm_vnum = _normalize_positive_visitnum(
+                explicit_vnum if explicit_vnum is not None else raw_visit_id
+            )
+            if norm_vnum is not None:
+                row["VISITNUM"] = norm_vnum
 
         if self.preserve_record_id and raw_record_id is not None:
             row["RECORD_ID"] = raw_record_id
@@ -1613,6 +2070,177 @@ def _resolve_sdtm_pipeline(
     return resolve_enrichment_pipeline(study_key)
 
 
+def iter_subject_ordered_sdtm_records(
+    records: Iterable[Any],
+    *,
+    study_key: str,
+    sdtm_domain: str | None = None,
+    form_domain_map: Mapping[Any, str] | None = None,
+    study_config: Any | None = None,
+    pipeline: Any = _UNSET_PIPELINE,
+    mask_phi: bool = True,
+    source_is_ordered: bool = False,
+) -> Iterator[Any]:
+    """Yield active Study Records grouped by Subject and ordered chronologically per SDTM domain.
+
+    When ``source_is_ordered`` is ``True`` (upstream pagination uses ``_SDTM_RECORDS_SORT``
+    and ``StudyConfiguration`` does not remap ``USUBJID``), buffers at most one Subject's
+    Records in memory at a time so streaming ``batch_size=1`` / ``chunk_size=1`` exports
+    assign identical ``<DOM>SEQ`` values to full-batch runs.
+    """
+    resolved_pipeline = _resolve_sdtm_pipeline(study_key, pipeline)
+    resolved_cfg = study_config
+    if resolved_cfg is None and resolved_pipeline is not None:
+        resolved_cfg = getattr(resolved_pipeline, "config", None)
+    cfg_lookup = _extract_study_config_form_domains(
+        study_config=resolved_cfg,
+        study_key=study_key if resolved_cfg is None else None,
+    )
+    target_dom = (
+        resolve_sdtm_domain(sdtm_domain, fallback="")
+        if isinstance(sdtm_domain, str) and sdtm_domain.strip()
+        else ""
+    )
+
+    normalizers: dict[str, _SdtmNormalizer] = {}
+
+    def _get_normalizer(dom: str) -> _SdtmNormalizer:
+        norm = normalizers.get(dom)
+        if norm is None:
+            norm = _SdtmNormalizer(
+                domain=dom,
+                study_key=study_key,
+                include_deleted=True,
+                mask_phi=mask_phi,
+                pipeline=resolved_pipeline,
+            )
+            normalizers[dom] = norm
+        return norm
+
+    remaps_usubjid = False
+    all_rules = (
+        getattr(resolved_pipeline, "all_mappings", None) if resolved_pipeline is not None else None
+    )
+    if all_rules is None and resolved_pipeline is not None:
+        mappings_dict = getattr(resolved_pipeline, "mappings", None)
+        if isinstance(mappings_dict, Mapping):
+            all_rules = list(mappings_dict.values())
+    if all_rules:
+        for rule in all_rules:
+            if (
+                getattr(rule, "target_field", None)
+                and str(rule.target_field).strip().upper() == "USUBJID"
+            ):
+                remaps_usubjid = True
+                break
+
+    effective_ordered = bool(source_is_ordered and not remaps_usubjid)
+
+    def _resolve_rec_domain(rec: Any) -> str:
+        if target_dom:
+            return target_dom
+        dom = resolve_form_sdtm_domain(
+            rec,
+            form_domain_map=form_domain_map,
+            _cfg_lookup=cfg_lookup,
+            fallback="",
+        )
+        if dom:
+            return dom
+        _, fk = extract_record_form_ref(rec)
+        return resolve_sdtm_domain(fk, fallback="AE")
+
+    def _prepare_entry(rec: Any, idx: int) -> tuple[str, str, tuple[Any, ...], int, Any]:
+        dom = _resolve_rec_domain(rec)
+        norm = _get_normalizer(dom)
+        prepared = norm.prepare_record(rec, idx)
+        if prepared is not None:
+            return (prepared.usubjid, dom, prepared.sort_key, idx, rec)
+        usubj, rec_id_sk = _extract_stream_usubjid_and_id(rec)
+        fallback_sk = ((1, ""), (), rec_id_sk, idx)
+        return (usubj, dom, fallback_sk, idx, rec)
+
+    def _sort_subject_entries(
+        entries: list[tuple[str, str, tuple[Any, ...], int, Any]],
+    ) -> Iterator[Any]:
+        if len(entries) <= 1:
+            for item in entries:
+                yield item[4]
+            return
+        # Group per domain within Subject so each domain's records arrive in exact sort_key order
+        by_dom: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {}
+        dom_order: list[str] = []
+        for entry in entries:
+            d = entry[1]
+            if d not in by_dom:
+                by_dom[d] = []
+                dom_order.append(d)
+            by_dom[d].append(entry)
+        if len(dom_order) == 1:
+            single = by_dom[dom_order[0]]
+            single.sort(key=lambda e: e[2])
+            for item in single:
+                yield item[4]
+            return
+        for d in dom_order:
+            d_items = by_dom[d]
+            d_items.sort(key=lambda e: e[2])
+            for item in d_items:
+                yield item[4]
+
+    if not effective_ordered or isinstance(records, (list, tuple)):
+        grouped_all: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {}
+        for idx, rec in enumerate(records):
+            entry = _prepare_entry(rec, idx)
+            grouped_all.setdefault(entry[0], []).append(entry)
+        for usubjid in sorted(grouped_all):
+            yield from _sort_subject_entries(grouped_all[usubjid])
+        return
+
+    rec_iter = iter(records)
+    current_usubjid: str | None = None
+    current_entries: list[tuple[str, str, tuple[Any, ...], int, Any]] = []
+    yielded_any = False
+    idx = 0
+
+    for rec in rec_iter:
+        entry = _prepare_entry(rec, idx)
+        idx += 1
+        usubjid = entry[0]
+
+        if current_usubjid is None:
+            current_usubjid = usubjid
+            current_entries = [entry]
+            continue
+
+        if usubjid == current_usubjid:
+            current_entries.append(entry)
+            continue
+
+        if not yielded_any and usubjid < current_usubjid:
+            # Stream was not actually ordered by Subject: drain and sort all Subjects safely.
+            fallback_groups: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {
+                current_usubjid: current_entries,
+            }
+            fallback_groups.setdefault(usubjid, []).append(entry)
+            for tail_rec in rec_iter:
+                tail_entry = _prepare_entry(tail_rec, idx)
+                idx += 1
+                fallback_groups.setdefault(tail_entry[0], []).append(tail_entry)
+            for subj_key in sorted(fallback_groups):
+                yield from _sort_subject_entries(fallback_groups[subj_key])
+            return
+
+        finished = current_entries
+        current_usubjid = usubjid
+        current_entries = [entry]
+        yielded_any = True
+        yield from _sort_subject_entries(finished)
+
+    if current_entries:
+        yield from _sort_subject_entries(current_entries)
+
+
 def get_sdtm_domain_variables(domain: str) -> list[str]:
     """Return standard uppercase SDTM variable list for ``domain``."""
     domain_clean = resolve_sdtm_domain(domain)
@@ -1757,10 +2385,17 @@ __all__ = [
     "_collapse_alnum_key",
     "_extract_stream_usubjid_and_id",
     "_iter_sorted_sdtm_frames",
+    "build_form_sdtm_domain_map",
+    "extract_record_form_ref",
+    "filter_forms_by_sdtm_domain",
     "format_iso8601_dtc",
     "format_variable_name",
     "get_sdtm_domain_variables",
+    "iter_subject_ordered_sdtm_records",
+    "merge_form_ids_into_record_filter",
     "normalize_naming_convention",
+    "record_matches_sdtm_domain",
+    "resolve_form_sdtm_domain",
     "resolve_sdtm_domain",
     "transform_records_to_sdtm",
     "transform_records_to_sdtm_rows",

@@ -636,14 +636,15 @@ def test_sinks_incremental_sdtm_lineage_study_isolation_and_rollback(
     assert ("STUDY_A", 1) in neo_nodes and ("STUDY_B", 1) not in neo_nodes
     assert ("STUDY_A", 1) in sf_rows and ("STUDY_B", 1) not in sf_rows
 
-    # Boundary record 2 updated in place with stable AESEQ=2; new record 3 received monotonic AESEQ=3!
+    # Subject-sorted batch_size=1 orders "Fever" (RECORD_ID=2 -> AESEQ=1) before "Mild Rash"
+    # (RECORD_ID=1 -> AESEQ=2, voided in Run 2); boundary record 2 keeps AESEQ=1 and record 3 gets AESEQ=3!
     for store_row2, store_row3 in (
         (mongo_docs["STUDY_B/2"], mongo_docs["STUDY_B/3"]),
         (neo_nodes[("STUDY_B", 2)], neo_nodes[("STUDY_B", 3)]),
         (sf_rows[("STUDY_B", 2)], sf_rows[("STUDY_B", 3)]),
     ):
         assert store_row2["AETERM"] == "Moderate Fever"
-        assert int(store_row2["AESEQ"]) == 2
+        assert int(store_row2["AESEQ"]) == 1
         assert store_row3["AETERM"] == "Chills"
         assert int(store_row3["AESEQ"]) == 3
 

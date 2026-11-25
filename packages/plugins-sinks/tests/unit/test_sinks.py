@@ -3653,10 +3653,33 @@ class TestPluginSinksSdtmAndNamingConventionParity:
         assert t1[0]["AESTDTC"] == "2026-02-01T10:00:00"
         assert t1[0]["AESER"] == "Y"
         assert t1[0]["patientName"] == "***MASKED***"
+        assert t1[0]["RECORD_ID"] == 1
         assert "record_data" not in t1[0]
         assert t2[0]["AESEQ"] == 2
+        assert t2[0]["RECORD_ID"] == 2
         executed_sql = "\n".join(c.args[0] for c in cursor.execute.call_args_list)
-        assert 'PARTITION BY "STUDYID", "DOMAIN", "USUBJID", "AESEQ"' in executed_sql
+        assert 'PARTITION BY "STUDYID", "RECORD_ID"' in executed_sql
+
+        cursor.execute.reset_mock()
+        sf_strict_cfg = SnowflakeSinkConfig(
+            study_key="SDTM_STUDY",
+            account="acct",
+            user="usr",
+            password="pwd",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="AE",
+            local_staging_dir=str(tmp_path / "sf_sdtm_strict"),
+            as_sdtm=True,
+            sdtm_domain="AE",
+            preserve_record_id=False,
+        )
+        with SnowflakeExportSink(config=sf_strict_cfg) as sf_strict_sink:
+            sf_strict_sink.write_batch(batch_1, batch_id="b1_strict")
+        strict_sql = "\n".join(c.args[0] for c in cursor.execute.call_args_list)
+        assert 'PARTITION BY "STUDYID", "DOMAIN", "USUBJID", "AESEQ"' in strict_sql
 
         # 2. MongoDbExportSink
         pymongo_mod, _client, collection = _fake_pymongo_module()
@@ -3943,6 +3966,23 @@ class TestPluginSinksSdtmAndNamingConventionParity:
         )
         with Neo4jExportSink(config=dm_cfg) as dm_sink:
             assert dm_sink.write_batch([dm_benign], batch_id="dm/ok") == 1
+        dm_default_cypher = run_mock.call_args.args[0]
+        assert (
+            "MERGE (r:Record   {STUDYID: row.STUDYID, RECORD_ID: row.RECORD_ID})"
+            in dm_default_cypher
+        )
+
+        run_mock.reset_mock()
+        dm_strict_cfg = Neo4jSinkConfig(
+            study_key="STUDY_CLI_DM",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "pass"),
+            as_sdtm=True,
+            sdtm_domain="DM",
+            preserve_record_id=False,
+        )
+        with Neo4jExportSink(config=dm_strict_cfg) as dm_strict_sink:
+            assert dm_strict_sink.write_batch([dm_benign], batch_id="dm/strict") == 1
         dm_cypher = run_mock.call_args.args[0]
         dm_rows = run_mock.call_args.kwargs["rows"]
         assert (
@@ -3968,6 +4008,7 @@ class TestPluginSinksSdtmAndNamingConventionParity:
             uri="bolt://localhost:7687",
             auth=("neo4j", "pass"),
             as_sdtm=True,
+            preserve_record_id=False,
         )
         with Neo4jExportSink(config=dom_cfg) as dom_sink:
             assert dom_sink.write_batch([dom_rec], batch_id="dom/0") == 1
@@ -3998,6 +4039,7 @@ class TestPluginSinksSdtmAndNamingConventionParity:
                 auth=("neo4j", "pass"),
                 as_sdtm=True,
                 sdtm_domain=custom_dom,
+                preserve_record_id=False,
             )
             with Neo4jExportSink(config=custom_cfg) as custom_sink:
                 assert custom_sink.write_batch([custom_rec], batch_id=f"{custom_dom}/0") == 1

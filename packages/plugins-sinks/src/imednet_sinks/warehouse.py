@@ -106,12 +106,12 @@ from imednet.spi.sinks import (
     deduplicate_sdtm_rows,
     extract_record_id,
     format_variable_name,
-    is_incremental_sink_config,
     normalize_sink_value,
     redact_batch_records,
     rehydrate_sdtm_lineage,
     resolve_voided_sdtm_keys,
     run_streaming_export,
+    should_preserve_sdtm_record_id,
 )
 from imednet.spi.utils import flatten, global_sensitivity_registry, mask_clinical_phi
 
@@ -1038,17 +1038,22 @@ def _records_to_arrow_table(
             raw_sdtm = mapper.map_batch(records, study_key=study_key)
         else:
             raw_sdtm = [mapper.map_record(r, study_key=study_key) for r in records]
-        if raw_sdtm and "RECORD_ID" in raw_sdtm[0]:
+        if raw_sdtm and any("RECORD_ID" in r for r in raw_sdtm):
             dedup_by_rec: dict[tuple[Any, Any], int] = {}
             staged_sdtm: list[dict[str, Any] | None] = []
+            without_rid: list[dict[str, Any]] = []
             for r_row in raw_sdtm:
+                if "RECORD_ID" not in r_row or r_row.get("RECORD_ID") is None:
+                    without_rid.append(r_row)
+                    continue
                 rk = (r_row.get("STUDYID"), r_row.get("RECORD_ID"))
-                if rk[1] is not None and rk in dedup_by_rec:
+                if rk in dedup_by_rec:
                     staged_sdtm[dedup_by_rec[rk]] = None
-                if rk[1] is not None:
-                    dedup_by_rec[rk] = len(staged_sdtm)
+                dedup_by_rec[rk] = len(staged_sdtm)
                 staged_sdtm.append(r_row)
             mapped_rows = [r_row for r_row in staged_sdtm if r_row is not None]
+            if without_rid:
+                mapped_rows.extend(deduplicate_sdtm_rows(without_rid))
         else:
             mapped_rows = deduplicate_sdtm_rows(raw_sdtm)
         orig_post_proc = getattr(mapper, "post_processor", None)
@@ -1288,7 +1293,7 @@ class SnowflakeExportSink(ExportSink):
             bool(cfg.as_sdtm),
             cfg.sdtm_domain,
             cfg.naming_convention,
-            is_incremental_sink_config(cfg),
+            should_preserve_sdtm_record_id(cfg),
             id(extra.get("study_config")),
             id(extra.get("enrichment_pipeline")),
         )
@@ -1573,7 +1578,7 @@ class SnowflakeExportSink(ExportSink):
         )
 
         record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
-        if cfg.as_sdtm and (not is_incremental_sink_config(cfg) or not record_ids):
+        if cfg.as_sdtm and (not should_preserve_sdtm_record_id(cfg) or not record_ids):
             sdtm_entries = resolve_voided_sdtm_keys(
                 records,
                 self,
