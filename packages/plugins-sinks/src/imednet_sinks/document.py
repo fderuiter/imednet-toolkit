@@ -100,12 +100,12 @@ from imednet.spi.sinks import (
     commit_sdtm_lineage,
     extract_record_id,
     extract_sdtm_composite_key,
-    is_incremental_sink_config,
     normalize_sink_value,
     rehydrate_sdtm_lineage,
     require_optional_dep,
     resolve_voided_sdtm_keys,
     run_streaming_export,
+    should_preserve_sdtm_record_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -226,6 +226,13 @@ def _dedupe_sdtm_mongo_docs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     index_by_key: dict[tuple[Any, ...], int] = {}
     ordered: list[dict[str, Any] | None] = []
     for doc in docs:
+        if "_id" in doc and "RECORD_ID" in doc and doc.get("RECORD_ID") is not None:
+            comp_id: tuple[Any, ...] = ("_id", doc["_id"])
+            if comp_id in index_by_key:
+                ordered[index_by_key[comp_id]] = None
+            index_by_key[comp_id] = len(ordered)
+            ordered.append(doc)
+            continue
         comp = extract_sdtm_composite_key(doc)
         if comp is None or (comp[1] != "DM" and comp[4] is None):
             ordered.append(doc)
@@ -348,7 +355,7 @@ class MongoDbExportSink(ExportSink):
             bool(doc_cfg.as_sdtm),
             doc_cfg.sdtm_domain,
             doc_cfg.naming_convention,
-            is_incremental_sink_config(doc_cfg),
+            should_preserve_sdtm_record_id(doc_cfg),
             id(extra.get("study_config")),
             id(extra.get("enrichment_pipeline")),
         )

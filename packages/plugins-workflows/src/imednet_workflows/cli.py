@@ -1520,8 +1520,13 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         from imednet.spi.sink_base import (
             build_form_sdtm_domain_map,
             evaluate_standards_readiness,
+            filter_forms_by_sdtm_domain,
+            merge_form_ids_into_record_filter,
+            record_matches_sdtm_domain,
             redact_batch_records,
+            resolve_form_sdtm_domain,
         )
+        from imednet.spi.sinks import resolve_study_configuration
 
         validate_path_segment(study_key, name="study_key")
         if min_standards_score is not None and not 0.0 <= min_standards_score <= 100.0:
@@ -1532,13 +1537,26 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         target_domain = (
             resolve_sdtm_domain(sdtm_domain, fallback="") if sdtm_domain else ""
         ) or None
+        study_cfg = resolve_study_configuration(study_key)
 
         def _fetch_inputs() -> tuple[list[Any], list[Any], list[Any]]:
             forms = list(sdk.forms.list(study_key=study_key))
             variables = list(sdk.variables.list(study_key=study_key))
+            rec_kwargs: dict[str, Any] = {}
+            if target_domain is not None and forms:
+                matched_for_fetch = filter_forms_by_sdtm_domain(
+                    forms,
+                    target_domain,
+                    study_config=study_cfg,
+                )
+                if not matched_for_fetch:
+                    return forms, variables, []
+                merged_rec_filter = merge_form_ids_into_record_filter(None, matched_for_fetch)
+                if isinstance(merged_rec_filter, Mapping):
+                    rec_kwargs.update(merged_rec_filter)
             recs = [
                 rec
-                for rec in sdk.records.list(study_key=study_key)
+                for rec in sdk.records.list(study_key=study_key, **rec_kwargs)
                 if not bool(
                     rec.get("deleted")
                     if isinstance(rec, Mapping)
@@ -1568,7 +1586,27 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             if fid is not None and fkey:
                 form_id_to_key[fid] = str(fkey)
 
-        form_domain_map = build_form_sdtm_domain_map(raw_forms)
+        cli_form_map: dict[Any, str] = build_form_sdtm_domain_map(
+            raw_forms,
+            study_config=study_cfg,
+        )
+        for f_obj in raw_forms:
+            fid = (
+                f_obj.get("form_id", f_obj.get("formId"))
+                if isinstance(f_obj, Mapping)
+                else getattr(f_obj, "form_id", getattr(f_obj, "formId", None))
+            )
+            fkey = (
+                f_obj.get("form_key", f_obj.get("formKey"))
+                if isinstance(f_obj, Mapping)
+                else getattr(f_obj, "form_key", getattr(f_obj, "formKey", None))
+            )
+            if fkey and fkey not in cli_form_map:
+                fallback_dom = resolve_sdtm_domain(str(fkey), fallback="")
+                if fallback_dom:
+                    cli_form_map[str(fkey)] = fallback_dom
+                    if fid is not None and fid not in cli_form_map:
+                        cli_form_map[fid] = fallback_dom
 
         def _resolve_item_domain(item: Any) -> str:
             fid = (
@@ -1583,12 +1621,16 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             )
             if not fkey and fid is not None:
                 fkey = form_id_to_key.get(fid)
-            if isinstance(fkey, str) and fkey in form_domain_map:
-                return form_domain_map[fkey]
-            if isinstance(fkey, str) and fkey.strip() in form_domain_map:
-                return form_domain_map[fkey.strip()]
-            if fid is not None and fid in form_domain_map:
-                return form_domain_map[fid]
+            resolved_dom = resolve_form_sdtm_domain(
+                item if fkey is None else fkey,
+                study_config=study_cfg,
+                form_domain_map=cli_form_map or None,
+                fallback="",
+            )
+            if not resolved_dom and fid is not None and fid in cli_form_map:
+                resolved_dom = cli_form_map[fid]
+            if resolved_dom:
+                return resolved_dom
             if isinstance(fkey, str) and fkey.strip():
                 return resolve_sdtm_domain(fkey, fallback="")
             raw_dom = (
@@ -1604,7 +1646,16 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             raw_variables = [
                 var for var in raw_variables if _resolve_item_domain(var) == target_domain
             ]
-            raw_records = [rec for rec in raw_records if _resolve_item_domain(rec) == target_domain]
+            raw_records = [
+                rec
+                for rec in raw_records
+                if record_matches_sdtm_domain(
+                    rec,
+                    target_domain,
+                    form_domain_map=cli_form_map,
+                    study_config=study_cfg,
+                )
+            ]
 
         serialized_records = _to_serializable(raw_records)
         if mask_phi:
@@ -1637,7 +1688,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             study_key=study_key,
             standards_profile=standards_profile,
             sdtm_domain=target_domain,
-            form_domain_map=form_domain_map if raw_forms else None,
+            form_domain_map=cli_form_map if (cli_form_map or raw_forms) else None,
         )
         all_warnings = list(dict.fromkeys([*report.warnings, *cdash_warnings]))
         threshold = 100.0 if min_standards_score is None else float(min_standards_score)

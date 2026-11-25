@@ -10,6 +10,7 @@ from imednet.integrations.enrichment import (
     resolve_study_configuration,
 )
 from imednet.integrations.sink_base import (
+    _SDTM_RECORDS_SORT,
     DEFAULT_MAX_BUFFERED_RECORDS,
     STATE_PROVIDER_ENTRY_POINT_GROUP,
     BoundedFormBufferRouter,
@@ -34,13 +35,17 @@ from imednet.integrations.sink_base import (
     is_record_deleted,
     iter_batches,
     iter_filtered_sdk_records,
+    iter_subject_ordered_sdtm_records,
+    merge_form_ids_into_record_filter,
     normalize_sink_value,
+    record_matches_sdtm_domain,
     redact_batch_records,
     rehydrate_sdtm_lineage,
     resolve_form_sdtm_domain,
     resolve_max_buffered_records,
     resolve_voided_sdtm_keys,
     run_streaming_export,
+    should_preserve_sdtm_record_id,
     validate_max_buffered_records,
 )
 from imednet.models.sdtm import (
@@ -57,6 +62,7 @@ __all__ = [
     "DEFAULT_MAX_BUFFERED_RECORDS",
     "SDTM_DOMAIN_SPECS",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
+    "_SDTM_RECORDS_SORT",
     "BoundedFormBufferRouter",
     "CentralizedMapper",
     "EnrichmentPipeline",
@@ -82,8 +88,11 @@ __all__ = [
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
+    "iter_subject_ordered_sdtm_records",
+    "merge_form_ids_into_record_filter",
     "normalize_naming_convention",
     "normalize_sink_value",
+    "record_matches_sdtm_domain",
     "redact_batch_records",
     "redact_uri",
     "rehydrate_sdtm_lineage",
@@ -95,6 +104,7 @@ __all__ = [
     "resolve_study_configuration",
     "resolve_voided_sdtm_keys",
     "run_streaming_export",
+    "should_preserve_sdtm_record_id",
     "transform_records_to_sdtm",
     "transform_records_to_sdtm_rows",
     "validate_max_buffered_records",
@@ -117,11 +127,7 @@ def build_sink_mapper(
     """Create a CentralizedMapper configured with SinkConfig PHI, SDTM, and naming rules."""
     extra = getattr(config, "extra", None)
     extra_dict = extra if isinstance(extra, dict) else {}
-    effective_preserve_record_id = (
-        is_incremental_sink_config(config)
-        if preserve_record_id is None
-        else bool(preserve_record_id)
-    )
+    effective_preserve_record_id = should_preserve_sdtm_record_id(config, preserve_record_id)
     mapper = CentralizedMapper(
         mode=mode,
         post_processor=post_processor,

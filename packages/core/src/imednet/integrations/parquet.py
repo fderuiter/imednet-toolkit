@@ -46,6 +46,7 @@ from .sink_base import (
     extract_record_id,
     rehydrate_sdtm_lineage,
     resolve_voided_sdtm_keys,
+    should_preserve_sdtm_record_id,
     stamp_tabular_batch,
     validate_max_buffered_records,
 )
@@ -343,6 +344,7 @@ def export_to_hive_parquet(
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
 
     if _config_has_streaming_options(config) or config.quality_gate_enabled or config.as_sdtm:
+        preserve_rec_id = should_preserve_sdtm_record_id(config)
         contexts, all_variables = _build_form_export_contexts(
             sdk,
             study_key,
@@ -358,7 +360,7 @@ def export_to_hive_parquet(
             as_sdtm=config.as_sdtm,
             sdtm_domain=config.sdtm_domain,
             naming_convention=config.naming_convention,
-            preserve_record_id=_is_incremental_config(config),
+            preserve_record_id=preserve_rec_id,
         )
         if not contexts:
             return
@@ -372,6 +374,7 @@ def export_to_hive_parquet(
             ctx.form_key: set() for ctx in contexts
         }
         in_run_sdtm_keys: dict[str, set[SdtmKeyTuple]] = {ctx.form_key: set() for ctx in contexts}
+        in_run_record_ids: dict[str, set[str]] = {ctx.form_key: set() for ctx in contexts}
         if is_incremental and config.idempotent:
             for ctx in contexts:
                 part_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={ctx.form_key}"
@@ -409,7 +412,7 @@ def export_to_hive_parquet(
                     mask_phi=effective_mask_phi,
                     seq_counters=ctx.seq_counters,
                     record_seqs=ctx.record_seqs,
-                    preserve_record_id=is_incremental,
+                    preserve_record_id=preserve_rec_id,
                     phi_keys=phi_keys,
                     pipeline=pipeline,
                     seq_overrides=seq_overrides,
@@ -419,7 +422,8 @@ def export_to_hive_parquet(
                     dom_wm[subj_key] = max(dom_wm.get(subj_key, 0), wm_val)
                 if df.empty:
                     return 0
-                if is_incremental and config.idempotent:
+                has_rec_id_col = _find_df_record_id_col(df) is not None
+                if has_rec_id_col and config.idempotent:
                     df, batch_cids = _dedupe_df_by_record_id(df, study_key=study_key)
                     if df.empty:
                         return 0
@@ -430,26 +434,38 @@ def export_to_hive_parquet(
                     batch_cids = set()
 
                 batch_skeys = {skey for skey in _df_sdtm_keys(df) if skey is not None}
-                if not is_incremental:
+                if not is_incremental and config.idempotent:
                     part_dir = (
                         Path(base_dir) / f"study_key={study_key}" / f"form_key={ctx.form_key}"
                     )
+                    overlap_ids = batch_cids & in_run_record_ids[ctx.form_key]
                     overlap_in_run = batch_skeys & in_run_sdtm_keys[ctx.form_key]
-                    if overlap_in_run and part_dir.exists():
+                    if (overlap_ids or overlap_in_run) and part_dir.exists():
                         pre_set = set(preexisting_files.get(ctx.form_key, []))
                         current_run_files = [
                             p for p in sorted(part_dir.rglob("*.parquet")) if p not in pre_set
                         ]
                         if current_run_files:
-                            _prune_hive_partition_sdtm_keys(
-                                current_run_files,
-                                overlap_in_run,
-                                pyarrow_module=pyarrow_module,
-                                storage_engine=storage_engine,
-                                base_dir=base_dir,
-                                study_key=study_key,
-                                form_key=ctx.form_key,
-                            )
+                            if overlap_ids:
+                                _prune_hive_partition_record_ids(
+                                    current_run_files,
+                                    overlap_ids,
+                                    pyarrow_module=pyarrow_module,
+                                    storage_engine=storage_engine,
+                                    base_dir=base_dir,
+                                    study_key=study_key,
+                                    form_key=ctx.form_key,
+                                )
+                            elif overlap_in_run:
+                                _prune_hive_partition_sdtm_keys(
+                                    current_run_files,
+                                    overlap_in_run,
+                                    pyarrow_module=pyarrow_module,
+                                    storage_engine=storage_engine,
+                                    base_dir=base_dir,
+                                    study_key=study_key,
+                                    form_key=ctx.form_key,
+                                )
 
                 stamp_tabular_batch(
                     df,
@@ -471,6 +487,7 @@ def export_to_hive_parquet(
                     stream_name=ctx.stream_name,
                 )
                 in_run_sdtm_keys[ctx.form_key].update(batch_skeys)
+                in_run_record_ids[ctx.form_key].update(batch_cids)
                 written = len(df)
                 if is_incremental and config.idempotent and written > 0:
                     superseded_sdtm_keys[ctx.form_key].update(batch_skeys)

@@ -29,6 +29,7 @@ from imednet.integrations.enrichment import (
     resolve_study_configuration,
 )
 from imednet.integrations.sink_base import (
+    _SDTM_RECORDS_SORT,
     BoundedFormBufferRouter,
     ExportSink,
     SinkConfig,
@@ -36,6 +37,7 @@ from imednet.integrations.sink_base import (
     TabularBatchStamp,
     _enforce_batch_standards_readiness,
     _extract_safe_config_options,
+    _is_bound_real_records_endpoint,
     _try_fetch_study_forms,
     apply_quality_gate,
     bind_sdtm_stream_metadata,
@@ -51,12 +53,15 @@ from imednet.integrations.sink_base import (
     is_record_deleted,
     iter_batches,
     iter_filtered_sdk_records,
+    iter_subject_ordered_sdtm_records,
     normalize_watermark_datetime,
+    record_matches_sdtm_domain,
     redact_batch_records,
     rehydrate_sdtm_lineage,
     resolve_form_sdtm_domain,
     resolve_voided_sdtm_keys,
     run_streaming_export,
+    should_preserve_sdtm_record_id,
     stamp_tabular_batch,
 )
 from imednet.models.sdtm import format_iso8601_dtc
@@ -1503,6 +1508,7 @@ def _infer_study_sdtm_domains(
     *,
     sdtm_domain: str | None = None,
     form_whitelist: Sequence[int] | None = None,
+    study_key: str | None = None,
 ) -> list[str]:
     """Infer target SDTM domain codes in form order from concrete Study Forms."""
     if sdtm_domain is not None:
@@ -1521,10 +1527,15 @@ def _infer_study_sdtm_domains(
             )
             if fid not in allowed_ids:
                 continue
-        dom = resolve_form_sdtm_domain(form, fallback="")
+        dom = resolve_form_sdtm_domain(form, study_key=study_key, fallback="")
         if dom and dom not in seen:
             seen.add(dom)
             inferred.append(dom)
+    if not inferred and study_key and allowed_ids is None:
+        for cfg_dom in build_form_sdtm_domain_map(None, study_key=study_key).values():
+            if cfg_dom and cfg_dom not in seen:
+                seen.add(cfg_dom)
+                inferred.append(cfg_dom)
     return inferred
 
 
@@ -3117,22 +3128,32 @@ class _TabularCollectingSink(ExportSink):
 def _project_records_whitelist(records: Sequence[Any], whitelist: Sequence[str]) -> list[Any]:
     """Filter ``record_data`` / ``recordData`` keys to ``whitelist`` prior to SDTM mapping."""
     allowed = set(whitelist)
+    keep_visit = bool(allowed & {"VISITNUM", "visit_id", "visitId", "VISIT_ID"})
     projected: list[Any] = []
     for rec in records:
         rec_data = getattr(rec, "record_data", None)
         if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
-            projected.append(
-                rec.model_copy(
-                    update={"record_data": {k: v for k, v in rec_data.items() if k in allowed}}
-                )
-            )
+            updates: dict[str, Any] = {
+                "record_data": {k: v for k, v in rec_data.items() if k in allowed}
+            }
+            if not keep_visit and hasattr(rec, "visit_id"):
+                updates["visit_id"] = None
+            projected.append(rec.model_copy(update=updates))
         elif isinstance(rec, Mapping) and isinstance(rec.get("record_data"), Mapping):
             cloned = dict(rec)
             cloned["record_data"] = {k: v for k, v in rec["record_data"].items() if k in allowed}
+            if not keep_visit:
+                cloned.pop("visit_id", None)
+                cloned.pop("visitId", None)
+                cloned.pop("VISITNUM", None)
             projected.append(cloned)
         elif isinstance(rec, Mapping) and isinstance(rec.get("recordData"), Mapping):
             cloned = dict(rec)
             cloned["recordData"] = {k: v for k, v in rec["recordData"].items() if k in allowed}
+            if not keep_visit:
+                cloned.pop("visit_id", None)
+                cloned.pop("visitId", None)
+                cloned.pop("VISITNUM", None)
             projected.append(cloned)
         else:
             projected.append(rec)
@@ -3197,12 +3218,14 @@ class _TabularTransformSink(ExportSink):
         if self._cfg.sdtm_domain:
             return resolve_sdtm_domain(self._cfg.sdtm_domain, fallback="AE")
         active_map = getattr(self, "_active_form_domain_map", None) or self._form_domain_map
-        fid, fk = extract_record_form_ref(rec)
-        if isinstance(active_map, Mapping):
-            if fid is not None and fid in active_map:
-                return active_map[fid]
-            if fk is not None and fk in active_map:
-                return active_map[fk]
+        resolved = resolve_form_sdtm_domain(
+            rec,
+            study_key=self._cfg.study_key,
+            form_domain_map=active_map if isinstance(active_map, Mapping) else None,
+            fallback="",
+        )
+        if resolved:
+            return resolved
         raw_domain = (
             rec.get("DOMAIN") or rec.get("domain") or rec.get("form_key") or rec.get("formKey")
             if isinstance(rec, Mapping)
@@ -3236,7 +3259,7 @@ class _TabularTransformSink(ExportSink):
                 and len(self._domain_seq_counters) <= 1
                 and not rehydrated_counters
             )
-            preserve_rec_id = _is_incremental_config(self._cfg)
+            preserve_rec_id = should_preserve_sdtm_record_id(self._cfg)
             domain_frames: list[pd.DataFrame] = []
             lineage_out: dict[str, dict[str, Any]] = {}
             for dom, dom_records in grouped_by_domain.items():
@@ -3343,6 +3366,7 @@ def _make_mapper_records_source(
     *,
     effective_form_whitelist: list[int] | None = None,
     allowed_form_keys: set[str] | None = None,
+    form_domain_map: Mapping[Any, str] | None = None,
 ) -> Callable[[datetime | None, bool], Iterable[Any]]:
     """Build a streaming records source callback compatible with real and mock mappers."""
     active_whitelist = (
@@ -3354,23 +3378,36 @@ def _make_mapper_records_source(
     merged_filter = _merge_form_whitelist_into_filter(config.record_filter, active_whitelist)
     is_mock = _is_mock_mapper(mapper)
     allowed_id_set = set(active_whitelist) if active_whitelist is not None else None
+    target_sdtm_domain = config.sdtm_domain
+    sdtm_sort = _SDTM_RECORDS_SORT if config.as_sdtm else None
 
     def _filter_by_allowed_forms(stream: Iterable[Any]) -> Iterator[Any]:
-        if allowed_id_set is None and not allowed_form_keys:
+        has_form_allowlist = allowed_id_set is not None or bool(allowed_form_keys)
+        if not has_form_allowlist and target_sdtm_domain is None:
             yield from stream
             return
         for rec in stream:
-            fid, fk = extract_record_form_ref(rec)
-            if fid is not None and allowed_id_set is not None:
-                if fid in allowed_id_set:
-                    yield rec
+            if has_form_allowlist:
+                fid, fk = extract_record_form_ref(rec)
+                if fid is not None and allowed_id_set is not None:
+                    if fid not in allowed_id_set:
+                        continue
+                elif (
+                    fk is not None
+                    and allowed_form_keys
+                    and fk not in allowed_form_keys
+                    and fk.upper() not in allowed_form_keys
+                    and fk.lower() not in allowed_form_keys
+                ):
+                    continue
+            if target_sdtm_domain is not None and not record_matches_sdtm_domain(
+                rec,
+                target_sdtm_domain,
+                form_domain_map=form_domain_map,
+                study_key=study_key,
+            ):
                 continue
-            if fk is not None and allowed_form_keys:
-                if fk in allowed_form_keys:
-                    yield rec
-                continue
-            if fid is None and fk is None:
-                yield rec
+            yield rec
 
     def _records_source(
         watermark: datetime | None, exclude_deleted_upstream: bool
@@ -3421,9 +3458,18 @@ def _make_mapper_records_source(
                 record_filter=merged_filter,
                 record_data_filter=config.record_data_filter,
                 exclude_deleted_upstream=exclude_deleted_upstream,
+                sort=sdtm_sort,
             )
         )
 
+    can_stream_ep = (
+        not is_mock
+        and getattr(mapper, "_loader", None) is None
+        and callable(getattr(mapper, "_can_stream_via_records_endpoint", None))
+        and bool(mapper._can_stream_via_records_endpoint())
+        and _is_bound_real_records_endpoint(sdk)
+    )
+    _records_source._sdtm_source_is_ordered = bool(config.as_sdtm and can_stream_ep)  # type: ignore[attr-defined]
     return _records_source
 
 
@@ -3433,16 +3479,19 @@ def _resolve_study_forms_and_sdtm_filter(
     config: TabularSinkConfig,
 ) -> tuple[list[Any], dict[Any, str], list[int] | None, set[str] | None, bool]:
     """Return ``(study_forms, form_domain_map, effective_form_whitelist, allowed_form_keys, no_matching_domain)``."""
-    study_forms = (
-        _try_fetch_study_forms(sdk, study_key)
-        if (config.as_sdtm or config.sdtm_domain is not None)
-        else []
+    needs_forms = bool(config.as_sdtm or config.sdtm_domain is not None)
+    study_forms = _try_fetch_study_forms(sdk, study_key) if needs_forms else []
+    form_domain_map = (
+        build_form_sdtm_domain_map(study_forms, study_key=study_key) if needs_forms else {}
     )
-    form_domain_map = build_form_sdtm_domain_map(study_forms) if study_forms else {}
     effective_whitelist = config.form_whitelist
     allowed_keys: set[str] | None = None
     if config.sdtm_domain is not None and study_forms:
-        matched_forms = filter_forms_by_sdtm_domain(study_forms, config.sdtm_domain)
+        matched_forms = filter_forms_by_sdtm_domain(
+            study_forms,
+            config.sdtm_domain,
+            study_key=study_key,
+        )
         if config.form_whitelist is not None:
             wl_set = set(config.form_whitelist)
             matched_forms = [
@@ -3539,12 +3588,13 @@ def _tabular_export_impl(
             study_forms,
             sdtm_domain=config.sdtm_domain,
             form_whitelist=config.form_whitelist,
+            study_key=study_key,
         )
         contract_types = _build_sdtm_contract_types(
             config.sdtm_domain,
             variable_whitelist=config.variable_whitelist,
             domains=inferred_domains or None,
-            preserve_record_id=_is_incremental_config(config),
+            preserve_record_id=should_preserve_sdtm_record_id(config),
         )
         pipeline = resolve_enrichment_pipeline(study_key)
         record_model: Any = None
@@ -3587,6 +3637,7 @@ def _tabular_export_impl(
         config,
         effective_form_whitelist=effective_form_whitelist,
         allowed_form_keys=allowed_form_keys,
+        form_domain_map=form_domain_map,
     )
 
     transform_sink = _TabularTransformSink(
@@ -3710,6 +3761,7 @@ def _pop_sink_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         "standards_profile",
         "min_standards_score",
         "naming_convention",
+        "preserve_record_id",
     )
     domain_alias = kwargs.pop("domain", None)
     extracted = {k: kwargs.pop(k) for k in sink_keys if k in kwargs}
@@ -3995,6 +4047,7 @@ def export_to_excel(
             excel_study_forms,
             sdtm_domain=config.sdtm_domain,
             form_whitelist=config.form_whitelist,
+            study_key=study_key,
         )
         if config.as_sdtm
         else []
@@ -4004,7 +4057,7 @@ def export_to_excel(
             config.sdtm_domain,
             variable_whitelist=config.variable_whitelist,
             domains=excel_inferred_domains or None,
-            preserve_record_id=_is_incremental_config(config),
+            preserve_record_id=should_preserve_sdtm_record_id(config),
         )
         if config.as_sdtm
         else None
@@ -5099,7 +5152,7 @@ def _build_form_export_contexts(
     """Fetch study forms and variables once and build per-form export contexts."""
     forms = list(sdk.forms.list(study_key=study_key))
     if sdtm_domain is not None and forms:
-        forms = filter_forms_by_sdtm_domain(forms, sdtm_domain)
+        forms = filter_forms_by_sdtm_domain(forms, sdtm_domain, study_key=study_key)
     form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
     all_variables = (
         []
@@ -5134,7 +5187,11 @@ def _build_form_export_contexts(
         form_domain = (
             resolve_sdtm_domain(sdtm_domain, fallback="AE")
             if as_sdtm and sdtm_domain
-            else (resolve_form_sdtm_domain(form, fallback="AE") if as_sdtm else sdtm_domain)
+            else (
+                resolve_form_sdtm_domain(form, study_key=study_key, fallback="AE")
+                if as_sdtm
+                else sdtm_domain
+            )
         )
         record_model = None if as_sdtm else mapper._build_record_model(variable_keys, label_map)
         contract_types = (
@@ -5253,7 +5310,10 @@ def _stream_records_across_forms(
             ctx._active_stream_name = ctx.stream_name
             ctx._active_study_key = study_key
             ctx._active_tx = ctx.tx
-            ctx._active_form_domain_map = build_form_sdtm_domain_map([ctx.form])
+            ctx._active_form_domain_map = build_form_sdtm_domain_map(
+                [ctx.form],
+                study_key=study_key,
+            )
             if ctx.sink is not None:
                 for target_obj in (ctx.sink, getattr(ctx.sink, "_inner", None)):
                     if target_obj is not None:
@@ -5298,6 +5358,7 @@ def _stream_records_across_forms(
         merged_filter = _merge_form_whitelist_into_filter(
             opts["record_filter"], effective_form_whitelist
         )
+        sdtm_sort = _SDTM_RECORDS_SORT if config.as_sdtm else None
         raw_records = iter_filtered_sdk_records(
             sdk,
             study_key,
@@ -5305,6 +5366,7 @@ def _stream_records_across_forms(
             record_filter=merged_filter,
             record_data_filter=opts["record_data_filter"],
             exclude_deleted_upstream=exclude_deleted_upstream,
+            sort=sdtm_sort,
         )
 
         check_standards = (
@@ -5400,6 +5462,19 @@ def _stream_records_across_forms(
                 config,
             )
 
+        if config.as_sdtm:
+            combined_form_map: dict[Any, str] = {}
+            for ctx in contexts:
+                combined_form_map.update(ctx._active_form_domain_map)
+            gated_records = iter_subject_ordered_sdtm_records(
+                gated_records,
+                study_key=study_key,
+                sdtm_domain=opts["sdtm_domain"],
+                form_domain_map=combined_form_map or None,
+                mask_phi=config.mask_phi,
+                source_is_ordered=_is_bound_real_records_endpoint(sdk),
+            )
+
         for rec in gated_records:
             matched_ctx = _resolve_ctx(rec)
             if matched_ctx is not None:
@@ -5475,6 +5550,7 @@ def _make_form_sink_config(
         standards_profile=config.standards_profile,
         min_standards_score=config.min_standards_score,
         naming_convention=config.naming_convention,
+        preserve_record_id=config.preserve_record_id,
     )
 
 
@@ -5564,7 +5640,7 @@ def export_to_duckdb_by_form(
         as_sdtm=config.as_sdtm,
         sdtm_domain=config.sdtm_domain,
         naming_convention=config.naming_convention,
-        preserve_record_id=_is_incremental_config(config),
+        preserve_record_id=should_preserve_sdtm_record_id(config),
     )
 
     resolved_db_path = _coerce_path_str(db_path)
@@ -5721,7 +5797,7 @@ def export_to_sql_by_form(
         as_sdtm=config.as_sdtm,
         sdtm_domain=config.sdtm_domain,
         naming_convention=config.naming_convention,
-        preserve_record_id=_is_incremental_config(config),
+        preserve_record_id=should_preserve_sdtm_record_id(config),
     )
 
     use_mock_fetch = _uses_mock_fetch_records(mapper) and not _config_has_streaming_options(config)

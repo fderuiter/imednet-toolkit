@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -19,10 +19,17 @@ from imednet.models.sdtm import (
     _extract_stream_usubjid_and_id,
     _iter_sorted_sdtm_frames,
     _SdtmNormalizer,
+    build_form_sdtm_domain_map,
+    extract_record_form_ref,
+    filter_forms_by_sdtm_domain,
     format_iso8601_dtc,
     format_variable_name,
     get_sdtm_domain_variables,
+    iter_subject_ordered_sdtm_records,
+    merge_form_ids_into_record_filter,
     normalize_naming_convention,
+    record_matches_sdtm_domain,
+    resolve_form_sdtm_domain,
     resolve_sdtm_domain,
     transform_records_to_sdtm,
     transform_records_to_sdtm_rows,
@@ -98,6 +105,21 @@ _CANONICAL_DOMAINS: dict[str, str] = {
     "MEDHIST": "MH",
 }
 
+_STANDARD_AE_SEVERITY_VALUES: list[Any] = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "MILD",
+    "MODERATE",
+    "SEVERE",
+]
 _STANDARD_SEX_VALUES: list[str] = ["M", "F", "U", "UNDIFFERENTIATED"]
 _STANDARD_VITAL_SIGNS_UNITS: list[str] = [
     "mmHg",
@@ -121,6 +143,49 @@ def _canonical_domain(domain: str) -> str:
     """Normalize a clinical domain identifier to its standard 2-letter code."""
     normalized = domain.strip().upper().replace("-", "_")
     return _CANONICAL_DOMAINS.get(normalized, normalized)
+
+
+def _build_standard_field_aliases() -> dict[tuple[str, str], tuple[str, ...]]:
+    """Precompute equivalent SDTM/CDASH variable aliases per canonical domain."""
+    alias_lookup: dict[tuple[str, str], tuple[str, ...]] = {}
+    subj_aliases = ("subjectKey", "subject_key", "USUBJID", "usubjid")
+    for spec_dom, spec in SDTM_DOMAIN_SPECS.items():
+        dom_codes = (spec_dom, "PD") if spec_dom == "DV" else (spec_dom,)
+        for d_code in dom_codes:
+            for s_alias in subj_aliases:
+                alias_lookup[(d_code, s_alias)] = subj_aliases
+            for sdtm_var, aliases in spec["aliases"].items():
+                group = tuple(dict.fromkeys([sdtm_var, *aliases, sdtm_var.lower()]))
+                for member in group:
+                    alias_lookup[(d_code, member)] = group
+    return alias_lookup
+
+
+_STANDARD_FIELD_ALIASES: dict[tuple[str, str], tuple[str, ...]] = _build_standard_field_aliases()
+
+
+def _get_domain_field_value(domain_key: str, field_name: str, data: Mapping[str, Any]) -> Any:
+    """Retrieve *field_name* from *data*, consulting equivalent SDTM/CDASH aliases when needed."""
+    direct = data.get(field_name)
+    if not is_missing_value(direct):
+        return direct
+    candidates = _STANDARD_FIELD_ALIASES.get((domain_key, field_name))
+    if candidates:
+        for cand in candidates:
+            if cand != field_name and cand in data:
+                cand_val = data.get(cand)
+                if not is_missing_value(cand_val):
+                    return cand_val
+        lower_map = {str(k).lower(): v for k, v in data.items()}
+        for cand in candidates:
+            cand_lower = cand.lower()
+            if cand_lower in lower_map and not is_missing_value(lower_map[cand_lower]):
+                return lower_map[cand_lower]
+    elif field_name == "subjectKey":
+        for subj_k in ("subject_key", "USUBJID", "usubjid"):
+            if subj_k in data and not is_missing_value(data.get(subj_k)):
+                return data.get(subj_k)
+    return direct
 
 
 class _DomainDict(dict[str, Any]):
@@ -220,7 +285,7 @@ class StandardsProfile:
         violations: list[ValidationViolation] = []
 
         for field_name in self.required_fields.get(domain_key, []):
-            if is_missing_value(data.get(field_name)):
+            if is_missing_value(_get_domain_field_value(domain_key, field_name, data)):
                 violations.append(
                     ValidationViolation(
                         field=field_name,
@@ -232,7 +297,7 @@ class StandardsProfile:
                 )
 
         for field_name in self.recommended_fields.get(domain_key, []):
-            if is_missing_value(data.get(field_name)):
+            if is_missing_value(_get_domain_field_value(domain_key, field_name, data)):
                 violations.append(
                     ValidationViolation(
                         field=field_name,
@@ -251,10 +316,15 @@ class StandardsProfile:
             else:
                 field_name = constraint_key
 
-            value = data.get(field_name)
+            value = _get_domain_field_value(domain_key, field_name, data)
             if is_missing_value(value):
                 continue
-            if value not in allowed_values:
+            is_allowed = value in allowed_values or (
+                field_name in {"aeSeverity", "AESEV"}
+                and isinstance(value, str)
+                and value.strip().upper() in allowed_values
+            )
+            if not is_allowed:
                 violations.append(
                     ValidationViolation(
                         field=field_name,
@@ -327,7 +397,7 @@ class DrugSafetyProfile(StandardsProfile):
             },
             optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
             value_constraints={
-                "AE.aeSeverity": [1, 2, 3, 4, 5, "1", "2", "3", "4", "5"],
+                "AE.aeSeverity": _STANDARD_AE_SEVERITY_VALUES,
                 "DM.sex": _STANDARD_SEX_VALUES,
                 "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
             },
@@ -362,7 +432,7 @@ class BiologicSafetyProfile(StandardsProfile):
             },
             optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
             value_constraints={
-                "AE.aeSeverity": [1, 2, 3, 4, 5, "1", "2", "3", "4", "5"],
+                "AE.aeSeverity": _STANDARD_AE_SEVERITY_VALUES,
                 "DM.sex": _STANDARD_SEX_VALUES,
                 "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
             },
@@ -397,7 +467,7 @@ class VaccineSafetyProfile(StandardsProfile):
             },
             optional_fields={"DD": ["subjectKey", "ddTerm", "ddCategory", "ddDate", "ddSerious"]},
             value_constraints={
-                "AE.aeSeverity": [1, 2, 3, 4, 5, "1", "2", "3", "4", "5"],
+                "AE.aeSeverity": _STANDARD_AE_SEVERITY_VALUES,
                 "DM.sex": _STANDARD_SEX_VALUES,
                 "VS.vsUnit": _STANDARD_VITAL_SIGNS_UNITS,
             },
@@ -1054,9 +1124,11 @@ class StandardsReadinessReport(ImednetBaseModel):
 
     @property
     def is_ready(self) -> bool:
-        """Return True when score reaches 100 and no ERROR-severity violations exist."""
-        return self.score >= 100.0 and not any(
-            v.severity.upper() == "ERROR" for v in self.violations
+        """Return True when score reaches 100, all domains are ready, and no ERROR violations exist."""
+        return (
+            self.score >= 100.0
+            and all(s >= 100.0 for s in self.domain_scores.values())
+            and not any(v.severity.upper() == "ERROR" for v in self.violations)
         )
 
     @property
@@ -1110,18 +1182,26 @@ class StandardsReadinessValidator:
                 if domain.strip().upper() == "DV" and not self._profile.expected_fields("DV")
                 else domain
             )
+            domain_key = _canonical_domain(effective_domain)
             expected_fields = self._profile.expected_fields(effective_domain)
             if not expected_fields:
                 has_unconfigured_domain = True
                 checked_records += len(records)
                 domain_scores[domain] = 0.0
+                for record in records:
+                    normalization_result = self._normalizer.normalize_record(
+                        record, normalized_lookups=normalized_lookups
+                    )
+                    warnings.extend(normalization_result.warnings)
+                unconfigured_msg = (
+                    f"Domain '{domain}' has no configured standards rules in "
+                    f"profile '{self._profile.profile_name}'."
+                )
+                warnings.append(f"{unconfigured_msg} Readiness score is 0.0.")
                 violations.append(
                     ValidationViolation(
                         field=domain,
-                        message=(
-                            f"Domain '{domain}' has no configured standards rules in "
-                            f"profile '{self._profile.profile_name}'."
-                        ),
+                        message=unconfigured_msg,
                         severity="ERROR",
                     )
                 )
@@ -1157,7 +1237,11 @@ class StandardsReadinessValidator:
                     if violation.severity.upper() == "ERROR"
                 }
                 for field_name in expected_fields:
-                    val = normalization_result.normalized_record.get(field_name)
+                    val = _get_domain_field_value(
+                        domain_key,
+                        field_name,
+                        normalization_result.normalized_record,
+                    )
                     if is_missing_value(val):
                         continue
                     if (
@@ -1187,7 +1271,11 @@ class StandardsReadinessValidator:
                     if violation.severity.upper() == "ERROR"
                 }
                 for field_name in expected_fields:
-                    value = normalization_result.normalized_record.get(field_name)
+                    value = _get_domain_field_value(
+                        domain_key,
+                        field_name,
+                        normalization_result.normalized_record,
+                    )
                     if field_name in error_fields or is_missing_value(value):
                         continue
                     successfully_validated_fields += 1
@@ -1253,11 +1341,18 @@ __all__ = [
     "_collapse_alnum_key",
     "_extract_stream_usubjid_and_id",
     "_iter_sorted_sdtm_frames",
+    "build_form_sdtm_domain_map",
+    "extract_record_form_ref",
+    "filter_forms_by_sdtm_domain",
     "format_iso8601_dtc",
     "format_variable_name",
     "get_sdtm_domain_variables",
     "is_valid_cdash_variable",
+    "iter_subject_ordered_sdtm_records",
+    "merge_form_ids_into_record_filter",
     "normalize_naming_convention",
+    "record_matches_sdtm_domain",
+    "resolve_form_sdtm_domain",
     "resolve_sdtm_domain",
     "resolve_standards_profile",
     "transform_records_to_sdtm",

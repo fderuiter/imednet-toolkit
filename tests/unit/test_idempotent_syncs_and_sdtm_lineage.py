@@ -561,7 +561,9 @@ def test_tabular_and_hive_parquet_incremental_sdtm_syncs_lineage_isolation_and_q
         b_rows = df[df["STUDYID"] == "STUDY_B"].sort_values("RECORD_ID")
         assert list(b_rows["RECORD_ID"].astype(int)) == [2, 3]
         assert list(b_rows["AETERM"]) == ["Updated Nausea", "New Migraine"]
-        assert list(b_rows["AESEQ"].astype(int)) == [2, 3]
+        # Subject-sorted batch_size=1 orders "Initial Nausea" (RECORD_ID=2 -> AESEQ=1)
+        # before "Initial Rash" (RECORD_ID=1 -> AESEQ=2, voided in Run 2), so RECORD_ID=3 gets AESEQ=3.
+        assert list(b_rows["AESEQ"].astype(int)) == [1, 3]
         if "PATIENTNAME" in b_rows.columns:
             assert (b_rows["PATIENTNAME"] == "***MASKED***").all()
 
