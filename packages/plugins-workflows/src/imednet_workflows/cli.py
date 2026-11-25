@@ -55,6 +55,7 @@ from imednet.spi.models import PROFILE_REGISTRY
 from imednet.spi.utils import (
     PathTraversalValidationError,
     SensitivityRegistry,
+    build_study_sensitivity_registry,
     global_sensitivity_registry,
     mask_clinical_phi,
     mask_custom_phi_recursive,
@@ -64,6 +65,8 @@ from imednet.spi.utils import (
     validate_path_segment,
 )
 from imednet.spi.validation import DataDictionary, ValidationSchemaProtocol
+
+from ._audit_cli import setup_audit_parsers
 
 if TYPE_CHECKING:
     from imednet.sdk import ImednetSDK
@@ -75,6 +78,7 @@ DEFAULT_LEDGER_PATH: str = os.environ.get(
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "DataExtractionWorkflow": ("imednet_workflows.data_extraction", "DataExtractionWorkflow"),
+    "DuckDBIngestionWorkflow": ("imednet_workflows.duckdb_centralizer", "DuckDBIngestionWorkflow"),
     "SubjectDataWorkflow": ("imednet_workflows.subject_data", "SubjectDataWorkflow"),
     "SyncWorker": ("imednet_workflows.sync_worker", "SyncWorker"),
     "SyncWorkerConfig": ("imednet_workflows.sync_worker", "SyncWorkerConfig"),
@@ -178,16 +182,7 @@ def _sanitize_phi_issue_message(
     custom_phi_fields: set[str],
 ) -> str:
     """Redact credentials, sensitive URIs, and clinical PHI values in issue messages."""
-    active_registry = global_sensitivity_registry
-    if custom_phi_fields:
-        active_registry = SensitivityRegistry()
-        base_sens, base_exempt = global_sensitivity_registry.snapshot()
-        for k in base_exempt:
-            active_registry.add_exempt_key(k)
-        for k in base_sens:
-            active_registry.add_sensitive_key(k)
-        for k in custom_phi_fields:
-            active_registry.add_sensitive_key(k)
+    active_registry = build_study_sensitivity_registry(custom_phi_fields)
 
     sanitized = redact_cli_secrets(
         sanitize_diagnostic_text(redact_sensitive_text(message), registry=active_registry)
@@ -406,7 +401,12 @@ def _is_key_phi_sensitive(key: str, custom_phi_fields: set[str]) -> bool:
     return False
 
 
-def _mask_workflow_value(value: Any, *, custom_phi_fields: set[str]) -> Any:
+def _mask_workflow_value(
+    value: Any,
+    *,
+    custom_phi_fields: set[str],
+    registry: SensitivityRegistry | None = None,
+) -> Any:
     """Recursively mask clinical PHI across Pydantic models, mappings, and sequences.
 
     Preserves object identity when no field values require masking so downstream
@@ -415,16 +415,30 @@ def _mask_workflow_value(value: Any, *, custom_phi_fields: set[str]) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
 
+    active_registry = (
+        registry if registry is not None else build_study_sensitivity_registry(custom_phi_fields)
+    )
+
     if isinstance(value, Mapping):
         changed = False
         rebuilt: dict[Any, Any] = {}
         for k, v in value.items():
-            if _is_key_phi_sensitive(str(k), custom_phi_fields):
+            key_str = str(k)
+            if _is_key_phi_sensitive(key_str, custom_phi_fields):
                 rebuilt[k] = "***MASKED***"
                 if v != "***MASKED***":
                     changed = True
+            elif isinstance(v, str) and key_str in {"reason_for_change", "reasonForChange"}:
+                scrubbed = sanitize_diagnostic_text(v, registry=active_registry)
+                rebuilt[k] = scrubbed
+                if scrubbed != v:
+                    changed = True
             else:
-                masked_v = _mask_workflow_value(v, custom_phi_fields=custom_phi_fields)
+                masked_v = _mask_workflow_value(
+                    v,
+                    custom_phi_fields=custom_phi_fields,
+                    registry=active_registry,
+                )
                 rebuilt[k] = masked_v
                 if masked_v is not v and masked_v != v:
                     changed = True
@@ -434,7 +448,12 @@ def _mask_workflow_value(value: Any, *, custom_phi_fields: set[str]) -> Any:
 
     if isinstance(value, list):
         masked_list = [
-            _mask_workflow_value(item, custom_phi_fields=custom_phi_fields) for item in value
+            _mask_workflow_value(
+                item,
+                custom_phi_fields=custom_phi_fields,
+                registry=active_registry,
+            )
+            for item in value
         ]
         if all(
             new_item is old_item for new_item, old_item in zip(masked_list, value, strict=False)
@@ -444,7 +463,12 @@ def _mask_workflow_value(value: Any, *, custom_phi_fields: set[str]) -> Any:
 
     if isinstance(value, tuple):
         masked_tuple = tuple(
-            _mask_workflow_value(item, custom_phi_fields=custom_phi_fields) for item in value
+            _mask_workflow_value(
+                item,
+                custom_phi_fields=custom_phi_fields,
+                registry=active_registry,
+            )
+            for item in value
         )
         if all(
             new_item is old_item for new_item, old_item in zip(masked_tuple, value, strict=False)
@@ -467,14 +491,27 @@ def _mask_workflow_value(value: Any, *, custom_phi_fields: set[str]) -> Any:
                 if isinstance(raw_val, str) and raw_val != "***MASKED***":
                     updates[fname] = "***MASKED***"
                 continue
-            masked_val = _mask_workflow_value(raw_val, custom_phi_fields=custom_phi_fields)
+            if isinstance(raw_val, str) and fname == "reason_for_change":
+                scrubbed = sanitize_diagnostic_text(raw_val, registry=active_registry)
+                if scrubbed != raw_val:
+                    updates[fname] = scrubbed
+                continue
+            masked_val = _mask_workflow_value(
+                raw_val,
+                custom_phi_fields=custom_phi_fields,
+                registry=active_registry,
+            )
             if masked_val is not raw_val and masked_val != raw_val:
                 updates[fname] = masked_val
 
         extra = getattr(value, "__pydantic_extra__", None)
         masked_extra: dict[str, Any] | None = None
         if isinstance(extra, dict) and extra:
-            candidate_extra = _mask_workflow_value(extra, custom_phi_fields=custom_phi_fields)
+            candidate_extra = _mask_workflow_value(
+                extra,
+                custom_phi_fields=custom_phi_fields,
+                registry=active_registry,
+            )
             if candidate_extra is not extra and candidate_extra != extra:
                 masked_extra = dict(candidate_extra)
 
@@ -2177,6 +2214,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             )
 
     validate_std_parser.set_defaults(func=_handle_validate_standards)
+
+    setup_audit_parsers(
+        sub,
+        resolve_attr=_resolve_attr,
+        resolve_custom_phi_fields=_resolve_custom_phi_fields,
+        mask_workflow_item=_mask_workflow_item,
+        emit_line=_emit_line,
+    )
 
 
 def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
