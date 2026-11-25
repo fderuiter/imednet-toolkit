@@ -352,7 +352,9 @@ def test_sync_queries_to_triage_lifecycle_and_preservation(tmp_path: Any, monkey
         + [QueryComment(sequence=4, closed=False, user="dm-user", comment="Reopened")],
     )
     sdk.get_queries.return_value = [q1_reopened, q2_closed]
-    wf.sync_queries_to_triage("STUDY", store=store, unresolved_only=True)
+    active_queue = wf.sync_queries_to_triage("STUDY", store=store, unresolved_only=True)
+    assert [item.item_id for item in active_queue] == ["STUDY:701"]
+    assert all(item.status != TriageStatus.RESOLVED for item in active_queue)
     reopened = store.get_triage_item("STUDY:701")
     assert reopened is not None
     assert reopened.status == TriageStatus.UNDER_REVIEW
@@ -360,6 +362,76 @@ def test_sync_queries_to_triage_lifecycle_and_preservation(tmp_path: Any, monkey
         h.from_status == TriageStatus.RESOLVED and h.to_status == TriageStatus.UNDER_REVIEW
         for h in reopened.history
     )
+
+    # Now close q1 upstream and sync with unresolved_only=True -> q1 transitions to RESOLVED in store
+    # and is omitted from the returned active queue!
+    q1_closed_again = Query(
+        annotation_id=701,
+        subject_key="SUBJ-001",
+        status=QueryStatus.CLOSED,
+        query_comments=q1_reopened.query_comments
+        + [QueryComment(sequence=5, closed=True, user="dm-user", comment="Resolved upstream")],
+    )
+    sdk.get_queries.return_value = [q1_closed_again, q2_closed]
+    after_close_queue = wf.sync_queries_to_triage("STUDY", store=store, unresolved_only=True)
+    assert after_close_queue == []
+    resolved_in_store = store.get_triage_item("STUDY:701")
+    assert resolved_in_store is not None
+    assert resolved_in_store.status == TriageStatus.RESOLVED
+
+
+def test_sync_queries_to_triage_unresolved_only_reconciles_custom_protocol_store() -> None:
+    """Verify custom TriageStoreProtocol implementations reconcile closed/cancelled queries when unresolved_only=True."""
+    from imednet.models.triage import TriageItem, TriageStatus
+
+    class MinimalProtocolStore:
+        def __init__(self) -> None:
+            self.items: dict[str, TriageItem] = {}
+
+        def upsert_item(self, item: TriageItem) -> TriageItem:
+            self.items[item.item_id] = item
+            return item
+
+        def get_triage_item(self, item_id: str) -> TriageItem | None:
+            return self.items.get(item_id)
+
+        def get_queue(
+            self,
+            study_key: str | None = None,
+            status: TriageStatus | str | None = None,
+            assignee: str | None = None,
+        ) -> list[TriageItem]:
+            out = list(self.items.values())
+            if study_key is not None:
+                out = [i for i in out if i.study_key == study_key]
+            if status is not None:
+                target = TriageStatus(status)
+                out = [i for i in out if i.status == target]
+            if assignee is not None:
+                out = [i for i in out if i.assignee == assignee]
+            return out
+
+    custom_store = MinimalProtocolStore()
+    sdk = MagicMock()
+    sdk.get_queries.return_value = [
+        Query(annotation_id=10, subject_key="S1", status=QueryStatus.OPEN),
+        Query(annotation_id=11, subject_key="S2", status=QueryStatus.ANSWERED),
+    ]
+    wf = QueryManagementWorkflow(sdk)
+    initial = wf.sync_queries_to_triage("STUDY", store=custom_store, unresolved_only=True)  # type: ignore[arg-type]
+    assert {item.item_id for item in initial} == {"STUDY:10", "STUDY:11"}
+
+    # Upstream closes 10, cancels 11, and introduces brand-new already-closed 12
+    sdk.get_queries.return_value = [
+        Query(annotation_id=10, subject_key="S1", status=QueryStatus.CLOSED),
+        Query(annotation_id=11, subject_key="S2", status=QueryStatus.CANCELLED),
+        Query(annotation_id=12, subject_key="S3", status=QueryStatus.CLOSED),
+    ]
+    remaining = wf.sync_queries_to_triage("STUDY", store=custom_store, unresolved_only=True)  # type: ignore[arg-type]
+    assert remaining == []
+    assert custom_store.get_triage_item("STUDY:10").status == TriageStatus.RESOLVED  # type: ignore[union-attr]
+    assert custom_store.get_triage_item("STUDY:11").status == TriageStatus.RESOLVED  # type: ignore[union-attr]
+    assert custom_store.get_triage_item("STUDY:12") is None
 
 
 def test_sync_queries_to_triage_with_simulation_sdk(tmp_path: Any) -> None:

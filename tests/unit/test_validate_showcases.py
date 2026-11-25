@@ -1132,8 +1132,8 @@ def test_validate_showcase_mock_data_schemas_rejects_non_contract_keys(tmp_path:
             1,
         )
         .replace(
-            'formKey: "F_VS",\n                formName: "Vital Signs",\n                formType: "CRF",',
-            'formKey: "F_VS",\n                variableCount: 7,\n                formName: "Vital Signs",\n                formType: "CRF",',
+            'formId: 302,\n                formKey: "F_VS",\n                formName: "Vital Signs",\n                formType: "Subject",',
+            'formId: 302,\n                formKey: "F_VS",\n                variableCount: 7,\n                formName: "Vital Signs",\n                formType: "Subject",',
             1,
         )
         .replace(
@@ -1172,6 +1172,68 @@ def test_validate_showcase_mock_data_schemas_rejects_non_contract_keys(tmp_path:
     )
     assert any("MOCK_DATA.queries[0] contains non-contract keys ['status']" in e for e in errors)
     assert any("MOCK_DATA.audits[0] contains non-contract keys ['auditId']" in e for e in errors)
+
+
+def test_validate_showcase_mock_data_schemas_enforces_strict_models_and_enums(
+    tmp_path: Path,
+) -> None:
+    """Verify validate_showcase_mock_data_schemas rejects invalid formType, swapped Query fields, and strict model violations."""
+    repo_root = Path(__file__).resolve().parents[2]
+    postman_path = repo_root / "imednet.postman_collection.json"
+    valid_js = (repo_root / "docs" / "_static" / "showcase.js").read_text(encoding="utf-8")
+
+    import re
+
+    drifted_js = re.sub(
+        r'recordData:\s*\{\s*V_SYSBP:\s*122,[^}]+\}',
+        'recordData: "flattened"',
+        valid_js,
+        count=1,
+    )
+    drifted_js = re.sub(
+        r'recordData:\s*\{\s*V_SYSBP:\s*138,[^}]+\}',
+        "V_SYSBP: 138, V_DIABP: 88",
+        drifted_js,
+        count=1,
+    )
+    drifted_js = (
+        drifted_js.replace("studyId: 1003,", "studyId: true,", 1)
+        .replace(
+            'formId: 302,\n                formKey: "F_VS",\n                formName: "Vital Signs",\n                formType: "Subject",',
+            'formId: 302,\n                formKey: "F_VS",\n                formName: "Vital Signs",\n                formType: "CRF",',
+            1,
+        )
+        .replace(
+            'annotationType: "Query",\n                subjectOid: "SE_SUB1",\n                type: "subject",',
+            'annotationType: "subject",\n                subjectOid: "SE_SUB1",\n                type: "Query",',
+            1,
+        )
+    )
+    bad_showcase = tmp_path / "showcase_enum_drift.js"
+    bad_showcase.write_text(drifted_js, encoding="utf-8")
+
+    errors = validate_showcase_mock_data_schemas(bad_showcase, postman_path)
+    assert any("MOCK_DATA.studies[0] failed strict Study validation" in e for e in errors), errors
+    assert any(
+        "MOCK_DATA.formsCatalog[0].formType must be one of ['Site', 'Subject'], got 'CRF'" in e
+        for e in errors
+    ), errors
+    assert any("MOCK_DATA.records.VS[0] failed strict Record validation" in e for e in errors), (
+        errors
+    )
+    assert any(
+        "MOCK_DATA.records.VS[1].recordData must be a non-empty object" in e for e in errors
+    ), errors
+    assert any(
+        "MOCK_DATA.records.VS[1] contains non-contract keys ['V_DIABP', 'V_SYSBP']" in e
+        for e in errors
+    ), errors
+    assert any(
+        "MOCK_DATA.queries[0].type must be one of ['question', 'record', 'subject'], got 'Query'"
+        in e
+        for e in errors
+    ), errors
+    assert any("swapped with type" in e or "annotationType" in e for e in errors), errors
 
 
 def test_execute_showcases_in_simulation_rejects_empty_output(tmp_path: Path) -> None:

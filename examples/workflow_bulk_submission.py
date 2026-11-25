@@ -37,7 +37,6 @@ def main() -> None:
                 {
                     "formKey": "F_DM",
                     "siteName": "SITE",
-                    "subjectKey": "SUBJ-BULK-001",
                     "data": {"V_AGE": 45, "V_GENDER": "M"},
                 }
             ],
@@ -51,9 +50,7 @@ def main() -> None:
             payloads=[
                 {
                     "formKey": "F_VS",
-                    "siteName": "SITE",
                     "subjectKey": "SUBJ-BULK-001",
-                    "intervalName": "Baseline",
                     "data": {"V_WEIGHT": 72.5},
                 }
             ],

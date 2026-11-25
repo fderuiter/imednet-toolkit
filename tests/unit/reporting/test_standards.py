@@ -8,18 +8,17 @@ from imednet.models.standards import (
     StandardsProfile,
     _canonical_domain,
     is_valid_cdash_variable,
+    resolve_standards_profile,
     validate_cdash_variable,
 )
 
 
 def test_profile_registry_contains_general_drug_and_device_profiles() -> None:
-    """Test that profile registry contains all five standard safety profiles."""
+    """Test that profile registry exposes only backed clinical standards profiles."""
     assert PROFILE_REGISTRY.list_profiles() == [
-        "biologic",
         "device",
         "drug",
         "general",
-        "vaccine",
     ]
 
 
@@ -416,15 +415,15 @@ def test_core_sdtm_transform_enforces_pre_usubjid_phi_masking_and_cross_batch_se
     assert ready_report.is_ready is True
 
 
-def test_all_five_profiles_validate_lb_cm_ex_mh_and_aliases() -> None:
-    """All 5 registered profiles validate LB, CM, EX, and MH using SDTM_DOMAIN_SPECS aliases."""
-    from imednet.models.standards import (
-        BiologicSafetyProfile,
-        VaccineSafetyProfile,
-    )
+def test_supported_profiles_validate_lb_cm_ex_mh_and_reject_unknown_profiles() -> None:
+    """Backed profiles validate LB, CM, EX, and MH while unbacked names raise ValueError."""
+    import pytest
 
-    assert isinstance(PROFILE_REGISTRY.get("biologic"), BiologicSafetyProfile)
-    assert isinstance(PROFILE_REGISTRY.get("vaccine"), VaccineSafetyProfile)
+    for unbacked_name in ("biologic", "vaccine", "unknown_profile"):
+        with pytest.raises(ValueError, match="Unknown standards_profile"):
+            resolve_standards_profile(unbacked_name)
+        with pytest.raises(KeyError):
+            PROFILE_REGISTRY.get(unbacked_name)
 
     for alias, canonical in [
         ("Laboratory", "LB"),
@@ -438,7 +437,7 @@ def test_all_five_profiles_validate_lb_cm_ex_mh_and_aliases() -> None:
     ]:
         assert _canonical_domain(alias) == canonical
 
-    for profile_name in ("general", "drug", "device", "biologic", "vaccine"):
+    for profile_name in ("general", "drug", "device"):
         profile = PROFILE_REGISTRY.get(profile_name)
         for dom in ("LB", "CM", "EX", "MH"):
             assert len(profile.expected_fields(dom)) > 0
@@ -446,14 +445,13 @@ def test_all_five_profiles_validate_lb_cm_ex_mh_and_aliases() -> None:
             missing = profile.validate(dom, {"subjectKey": "S1"})
             assert any(v.severity == "ERROR" for v in missing), (profile_name, dom)
 
-    # Biologic and Vaccine profiles enforce EX/LB/CM/MH required fields and value constraints
-    bio = BiologicSafetyProfile()
-    ex_missing = bio.validate(
+    drug = DrugSafetyProfile()
+    ex_missing = drug.validate(
         "EX",
         {
             "subjectKey": "S1",
-            "exTrt": "mAb-101",
-            "exRoute": "IV",
+            "exTrt": "Drug-101",
+            "exRoute": "ORAL",
             "exStartDate": "2026-01-01",
         },
     )
@@ -462,28 +460,28 @@ def test_all_five_profiles_validate_lb_cm_ex_mh_and_aliases() -> None:
         ("exDoseUnit", "ERROR"),
     }
 
-    ex_ok = bio.validate(
+    ex_ok = drug.validate(
         "Exposure",
         {
             "subjectKey": "S1",
-            "exTrt": "mAb-101",
+            "exTrt": "Drug-101",
             "exDose": 200,
             "exDoseUnit": "mg",
-            "exRoute": "IV",
+            "exRoute": "ORAL",
             "exStartDate": "2026-01-01",
         },
     )
     assert ex_ok == []
 
-    vax = VaccineSafetyProfile()
-    lb_ok = vax.validate(
+    general = GeneralClinicalProfile()
+    lb_ok = general.validate(
         "Laboratory",
         {
             "subjectKey": "S1",
-            "lbTest": "Neutralizing Ab",
-            "lbTestCd": "NAB",
-            "lbResult": "128.5",
-            "lbUnit": "IU/mL",
+            "lbTest": "Hemoglobin",
+            "lbTestCd": "HGB",
+            "lbResult": "13.5",
+            "lbUnit": "g/dL",
             "lbDate": "2026-02-01",
         },
     )

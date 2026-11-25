@@ -642,3 +642,154 @@ def test_duckdb_replace_study_isolation_phi_masking_and_history_transition_diffs
         finally:
             workflow.close()
             workflow.close()  # Idempotent close()
+
+
+def test_duckdb_persists_all_19_record_revision_fields_and_migrates_legacy_17_col_db(
+    tmp_path: Any,
+) -> None:
+    """Verify subject_id/subject_oid persist across all tables/views and 17-column DBs migrate in place."""
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "legacy_audit.duckdb"
+
+    # Seed an existing 17-column bronze_revisions DuckDB file before opening DuckDBIngestionWorkflow
+    legacy_conn = duckdb.connect(str(db_path))
+    try:
+        legacy_conn.execute("""
+            CREATE TABLE bronze_revisions (
+                study_key VARCHAR,
+                record_revision_id BIGINT,
+                record_id BIGINT,
+                record_oid VARCHAR,
+                form_key VARCHAR,
+                subject_key VARCHAR,
+                site_id BIGINT,
+                interval_id BIGINT,
+                record_status VARCHAR,
+                record_revision BIGINT,
+                data_revision BIGINT,
+                "user" VARCHAR,
+                role VARCHAR,
+                reason_for_change VARCHAR,
+                deleted BOOLEAN,
+                date_created TIMESTAMP,
+                last_updated TIMESTAMP
+            )
+            """)
+        legacy_conn.execute("""
+            INSERT INTO bronze_revisions VALUES (
+                'STUDY_MIG', 1001, 501, 'REC-501', 'F_DM', 'SUBJ-001',
+                10, 20, 'Record Complete', 1, 1, 'legacy_crc', 'Coordinator',
+                'Legacy audit entry', FALSE, TIMESTAMP '2026-01-01 08:00:00',
+                TIMESTAMP '2026-01-01 08:00:00'
+            )
+            """)
+        legacy_conn.execute("""
+            CREATE VIEW "silver_current_state_STUDY_MIG" AS
+            SELECT * FROM bronze_revisions WHERE study_key = 'STUDY_MIG'
+              AND NOT COALESCE(deleted, FALSE)
+            """)
+        legacy_conn.execute("""
+            CREATE VIEW silver_current_state AS
+            SELECT * FROM "silver_current_state_STUDY_MIG"
+            """)
+    finally:
+        legacy_conn.close()
+
+    expected_model_fields = set(RecordRevision.model_fields.keys())
+    assert len(expected_model_fields) == 19
+    assert {"subject_id", "subject_oid"}.issubset(expected_model_fields)
+
+    new_revisions = [
+        RecordRevision(
+            studyKey="STUDY_MIG",
+            recordRevisionId=1002,
+            recordId=501,
+            recordOid="REC-501",
+            formKey="F_DM",
+            subjectId=9001,
+            subjectOid="SUBJ-OID-001",
+            subjectKey="SUBJ-001",
+            siteId=10,
+            intervalId=20,
+            recordStatus="Verified",
+            recordRevision=2,
+            dataRevision=1,
+            user="pi_user",
+            role="Investigator",
+            reasonForChange="Investigator verification",
+            deleted=False,
+            dateCreated="2026-01-02T09:30:00Z",
+            lastUpdated="2026-01-02T09:30:00Z",
+        )
+    ]
+
+    with DuckDBIngestionWorkflow(MagicMock(), str(db_path)) as workflow:
+        # Prior 17-column audit row is preserved in place with NULL subject_id/subject_oid
+        migrated_cols = {
+            desc[0]
+            for desc in workflow._connection.execute(
+                "SELECT * FROM bronze_revisions LIMIT 0"
+            ).description
+        }
+        assert migrated_cols == expected_model_fields
+        migrated_silver_cols = {
+            desc[0]
+            for desc in workflow._connection.execute(
+                "SELECT * FROM silver_current_state LIMIT 0"
+            ).description
+        }
+        assert migrated_silver_cols == expected_model_fields
+
+        legacy_row = workflow._connection.execute(
+            "SELECT record_revision_id, reason_for_change, subject_id, subject_oid "
+            "FROM bronze_revisions WHERE record_revision_id = 1001"
+        ).fetchone()
+        assert legacy_row == (1001, "Legacy audit entry", None, None)
+
+        with patch.object(
+            DataExtractionWorkflow,
+            "extract_audit_trail",
+            return_value=new_revisions,
+        ):
+            assert workflow.ingest_revisions("STUDY_MIG", mode="append") == 1
+
+        workflow.build_silver_view("STUDY_MIG")
+
+        for rel_name in (
+            "bronze_revisions",
+            "record_revisions",
+            "silver_current_state",
+            "silver_current_state_study_mig",
+            "silver_records_history",
+            "silver_records_history_study_mig",
+        ):
+            rel_cols = {
+                desc[0]
+                for desc in workflow._connection.execute(
+                    f"SELECT * FROM {rel_name} LIMIT 0"  # noqa: S608
+                ).description
+            }
+            assert expected_model_fields.issubset(rel_cols), rel_name
+
+        bronze_rows = workflow._connection.execute(
+            "SELECT record_revision_id, subject_id, subject_oid "
+            "FROM bronze_revisions ORDER BY record_revision_id"
+        ).fetchall()
+        assert bronze_rows == [
+            (1001, None, None),
+            (1002, 9001, "SUBJ-OID-001"),
+        ]
+
+        current_row = workflow._connection.execute(
+            "SELECT record_revision_id, subject_id, subject_oid FROM silver_current_state"
+        ).fetchone()
+        assert current_row == (1002, 9001, "SUBJ-OID-001")
+
+        history_rows = workflow._connection.execute(
+            "SELECT record_revision, subject_id, subject_oid, is_current "
+            "FROM silver_records_history ORDER BY record_revision"
+        ).fetchall()
+        assert history_rows == [
+            (1, None, None, False),
+            (2, 9001, "SUBJ-OID-001", True),
+        ]

@@ -189,20 +189,63 @@ def test_permissive_mode_rejects_bool_on_int_fields_while_preserving_other_fallb
     assert permissive_rec.keywords[0].keyword_id == 3
 
 
-def test_role_seven_int_timestamps_user_name_property_and_request_dict_data():
-    """Verify Role 7-element int timestamps, User.name @property/@computed_field, and dict request data."""
-    role = Role(
-        roleId="R-1",
-        communityId=5,
-        dateCreated=[2026, 5, 13, 14, 6, 50, 612000000],
-        dateModified=[2026, 5, 14, 9, 30, 0, 0],
-    )
-    assert role.date_created == datetime.datetime(
-        2026, 5, 13, 14, 6, 50, 612000, tzinfo=datetime.timezone.utc
-    )
-    assert role.date_modified == datetime.datetime(
-        2026, 5, 14, 9, 30, 0, 0, tzinfo=datetime.timezone.utc
-    )
+def test_role_timestamp_arrays_5_6_7_elements_user_name_property_and_request_dict_data():
+    """Verify Role 5-, 6-, and 7-element int timestamps, User.name @property/@computed_field, and dict request data."""
+    for strict in (False, True):
+        with strict_mode_context(strict):
+            role_5 = Role.from_json(
+                {
+                    "roleId": "R-5",
+                    "communityId": 5,
+                    "dateCreated": [2026, 5, 13, 14, 6],
+                    "dateModified": [2026, 5, 14, 9, 30],
+                }
+            )
+            assert role_5.date_created == datetime.datetime(
+                2026, 5, 13, 14, 6, 0, 0, tzinfo=datetime.timezone.utc
+            )
+            assert role_5.date_modified == datetime.datetime(
+                2026, 5, 14, 9, 30, 0, 0, tzinfo=datetime.timezone.utc
+            )
+
+            role_6 = Role.from_json(
+                {
+                    "roleId": "R-6",
+                    "communityId": 5,
+                    "dateCreated": [2026, 5, 13, 14, 6, 50],
+                    "dateModified": [2026, 5, 14, 9, 30, 15],
+                }
+            )
+            assert role_6.date_created == datetime.datetime(
+                2026, 5, 13, 14, 6, 50, 0, tzinfo=datetime.timezone.utc
+            )
+            assert role_6.date_modified == datetime.datetime(
+                2026, 5, 14, 9, 30, 15, 0, tzinfo=datetime.timezone.utc
+            )
+
+            role = Role.from_json(
+                {
+                    "roleId": "R-1",
+                    "communityId": 5,
+                    "dateCreated": [2026, 5, 13, 14, 6, 50, 612000000],
+                    "dateModified": [2026, 5, 14, 9, 30, 0, 0],
+                }
+            )
+            assert role.date_created == datetime.datetime(
+                2026, 5, 13, 14, 6, 50, 612000, tzinfo=datetime.timezone.utc
+            )
+            assert role.date_modified == datetime.datetime(
+                2026, 5, 14, 9, 30, 0, 0, tzinfo=datetime.timezone.utc
+            )
+
+    with strict_mode_context(True):
+        for bad_ts in (
+            [2026, 5, 13, 14],
+            [2026, 5, 13, 14, 6, 50, 0, 0],
+            [2026, True, 13, 14, 6],
+        ):
+            with pytest.raises(ValidationError):
+                Role.from_json({"roleId": "R-BAD", "dateCreated": bad_ts})
 
     user = User(userId="U-1", firstName="Ada", last_name="Lovelace", roles=[role])
     assert isinstance(User.name, property)

@@ -70,7 +70,6 @@ When ``Subject`` enrollment is already complete and you want schema-validated, c
        records_data=[
            {
                "formKey": "F_VS",
-               "siteName": "SITE",
                "subjectKey": "SUB1",
                "intervalName": "Baseline",
                "data": {"V_WEIGHT": 71.0},

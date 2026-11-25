@@ -99,7 +99,6 @@ from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
 from imednet.models.standards import (
     _SDTM_RECORDS_SORT,
-    PROFILE_REGISTRY,
     SDTM_DOMAIN_SPECS,
     StandardsProfile,
     StandardsReadinessReport,
@@ -424,14 +423,7 @@ class SinkConfig:
             self.sdtm_domain = resolve_sdtm_domain(self.sdtm_domain)
             self.as_sdtm = True
         if self.standards_profile is not None:
-            try:
-                resolved_prof = resolve_standards_profile(self.standards_profile)
-            except KeyError as exc:
-                available = ", ".join(f"'{p}'" for p in PROFILE_REGISTRY.list_profiles())
-                raise ValueError(
-                    f"Unknown standards_profile '{self.standards_profile}'. "
-                    f"Expected {available}, or a StandardsProfile instance."
-                ) from exc
+            resolved_prof = resolve_standards_profile(self.standards_profile)
             if isinstance(self.standards_profile, str):
                 self.standards_profile = resolved_prof.profile_name
         if self.min_standards_score is not None:

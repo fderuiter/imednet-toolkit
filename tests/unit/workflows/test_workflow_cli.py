@@ -974,7 +974,7 @@ def test_validate_standards_filters_multi_domain_forms_and_fails_unknown_or_empt
         ),
     ]
 
-    # Filtering to --domain LB with biologic profile scores ONLY F_LB (100%, Ready: True, exit 0)
+    # Filtering to --domain LB with drug profile scores ONLY F_LB (100%, Ready: True, exit 0)
     # and does NOT relabel F_AE records or variables as LB.
     res_lb = runner.invoke(
         cli.app,
@@ -983,7 +983,7 @@ def test_validate_standards_filters_multi_domain_forms_and_fails_unknown_or_empt
             "validate-standards",
             "STUDY_MULTI",
             "--profile",
-            "biologic",
+            "drug",
             "--domain",
             "LB",
             "--format",
@@ -1034,7 +1034,7 @@ def test_validate_standards_filters_multi_domain_forms_and_fails_unknown_or_empt
             "validate-standards",
             "STUDY_MULTI",
             "--profile",
-            "vaccine",
+            "general",
             "--domain",
             "MH",
             "--format",
@@ -1091,3 +1091,17 @@ def test_validate_standards_filters_multi_domain_forms_and_fails_unknown_or_empt
     assert empty_item["score"] == 0.0
     assert empty_item["is_ready"] is False
     assert any(v["severity"] == "ERROR" for v in empty_item["violations"])
+
+    # Unbacked profile names (biologic, vaccine, unknown) are rejected by CLI choices
+    for bad_profile in ("biologic", "vaccine", "unknown_profile"):
+        res_bad = runner.invoke(
+            cli.app,
+            [
+                "workflows",
+                "validate-standards",
+                "STUDY_MULTI",
+                "--profile",
+                bad_profile,
+            ],
+        )
+        assert res_bad.exit_code != 0

@@ -1515,6 +1515,7 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
         Study.model_validate(study)
     for rest_form in mock_data["formsCatalog"]:  # type: ignore[attr-defined]
         assert set(rest_form.keys()) == schemas["forms"]
+        assert rest_form["formType"] in {"Subject", "Site"}
         Form.model_validate(rest_form)
     records_by_domain = mock_data["records"]  # type: ignore[index]
     assert isinstance(records_by_domain, dict)
@@ -1530,6 +1531,8 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
                 dm_record_ids.add(rec["recordId"])
     for query in mock_data["queries"]:  # type: ignore[attr-defined]
         assert set(query.keys()) == schemas["queries"]
+        assert query["annotationType"] == "Query"
+        assert query["type"] in {"subject", "record", "question"}
         Query.model_validate(query)
     first_query = mock_data["queries"][0]  # type: ignore[index]
     assert first_query["annotationId"] == 701
@@ -1603,6 +1606,12 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
     }};
     eval(code);
     const formsJson = JSON.parse(els['#ie-json-pre code'].textContent);
+
+    els['#ie-dataset-select'].value = 'records';
+    els['#ie-dataset-select'].trigger('change');
+    const sdkRecordsHtml = els['#ie-view-table'].innerHTML;
+    const sdkRecordsJson = JSON.parse(els['#ie-json-pre code'].textContent);
+
     els['#ie-dataset-select'].value = 'queries';
     els['#ie-dataset-select'].trigger('change');
     const queriesTableHtml = els['#ie-view-table'].innerHTML;
@@ -1616,6 +1625,7 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
     els['#ie-dataset-select'].value = 'records';
     els['#ie-dataset-select'].trigger('change');
     const restRecordsEnvelope = JSON.parse(els['#ie-json-pre code'].textContent);
+    const restRecordsHtml = els['#ie-view-table'].innerHTML;
 
     // Verify CDM & Auditor interactive buttons mutate aria-live badges & VPAT renames Auditor sub-tabs
     const cdmInitialBadge = els['#cdm-metric-badge'].textContent;
@@ -1639,8 +1649,8 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
     const cdmJson = JSON.parse(els['#cdm-json-pre code'].textContent);
     const cdmHtml = els['#cdm-view-crf'].innerHTML;
     console.log(JSON.stringify({{
-        formsJson, queriesTableHtml, sdkQueriesJson,
-        restQueriesEnvelope, restQueriesHtml, restRecordsEnvelope,
+        formsJson, sdkRecordsHtml, sdkRecordsJson, queriesTableHtml, sdkQueriesJson,
+        restQueriesEnvelope, restQueriesHtml, restRecordsEnvelope, restRecordsHtml,
         cdmInitialBadge, cdmFirstClickBadge, cdmSecondClickBadge,
         audInitialBadge, audFirstClickBadge,
         vpatTabTable, vpatTabJson, part11TabTable, part11TabJson,
@@ -1654,6 +1664,18 @@ def test_showcase_mock_data_matches_postman_contract_schemas() -> None:
         assert "variableCount" not in form_item
         assert "ruleCount" not in form_item
         assert "domain" not in form_item
+
+    # SDK and REST records: tabular view flattens recordData while raw JSON keeps canonical REST format
+    assert '<th scope="col">recordData</th>' not in probe["sdkRecordsHtml"]
+    assert '<th scope="col">V_SYSBP</th>' in probe["sdkRecordsHtml"]
+    assert isinstance(probe["sdkRecordsJson"], list) and len(probe["sdkRecordsJson"]) > 0
+    assert set(probe["sdkRecordsJson"][0].keys()) == schemas["records"]
+    assert isinstance(probe["sdkRecordsJson"][0]["recordData"], dict)
+
+    assert '<th scope="col">recordData</th>' not in probe["restRecordsHtml"]
+    assert '<th scope="col">V_SYSBP</th>' in probe["restRecordsHtml"]
+    assert '<th scope="col">V_AGE</th>' in probe["restRecordsHtml"]
+    assert '<th scope="col">V_AETERM</th>' in probe["restRecordsHtml"]
     assert len(probe["sdkQueriesJson"]) == 2
     assert "[object Object]" not in probe["queriesTableHtml"]
     assert "Monitor Open" in probe["queriesTableHtml"]

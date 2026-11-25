@@ -50,6 +50,8 @@ _BRONZE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
     ("deleted", "bool"),
     ("date_created", "object"),
     ("last_updated", "object"),
+    ("subject_id", "Int64"),
+    ("subject_oid", "object"),
 )
 
 
@@ -82,6 +84,8 @@ class DuckDBIngestionWorkflow:
         self._extractor = DataExtractionWorkflow(sdk)
         self._mask_phi = bool(mask_phi)
         self._closed = False
+        if db_path != ":memory:":
+            self._migrate_existing_bronze_table(refresh_view=True)
 
     def close(self) -> None:
         """Close the underlying DuckDB connection idempotently."""
@@ -234,7 +238,9 @@ class DuckDBIngestionWorkflow:
                         reason_for_change,
                         deleted,
                         date_created,
-                        last_updated
+                        last_updated,
+                        subject_id,
+                        subject_oid
                     )
                     SELECT
                         CAST(study_key AS VARCHAR),
@@ -253,7 +259,9 @@ class DuckDBIngestionWorkflow:
                         CAST(reason_for_change AS VARCHAR),
                         CAST(deleted AS BOOLEAN),
                         CAST(CAST(date_created AS VARCHAR) AS TIMESTAMP),
-                        CAST(CAST(last_updated AS VARCHAR) AS TIMESTAMP)
+                        CAST(CAST(last_updated AS VARCHAR) AS TIMESTAMP),
+                        CAST(subject_id AS BIGINT),
+                        CAST(subject_oid AS VARCHAR)
                     FROM "{view_name}"
                     """
                 self._connection.execute(insert_query)  # nosem
@@ -294,7 +302,7 @@ class DuckDBIngestionWorkflow:
                 ),
             }
         )
-        return "\n            UNION ALL\n            ".join(
+        return "\n            UNION ALL BY NAME\n            ".join(
             f'SELECT * FROM "{prefix}{key}"' for key in built_study_keys
         )
 
@@ -335,7 +343,9 @@ class DuckDBIngestionWorkflow:
                 reason_for_change,
                 deleted,
                 date_created,
-                last_updated
+                last_updated,
+                subject_id,
+                subject_oid
             FROM (
                 SELECT
                     study_key,
@@ -354,7 +364,9 @@ class DuckDBIngestionWorkflow:
                     reason_for_change,
                     deleted,
                     date_created,
-                    last_updated
+                    last_updated,
+                    subject_id,
+                    subject_oid
                 FROM bronze_revisions
                 WHERE study_key = '{escaped_study_key}'
                 QUALIFY ROW_NUMBER() OVER (
@@ -398,6 +410,8 @@ class DuckDBIngestionWorkflow:
                 deleted,
                 date_created,
                 last_updated,
+                subject_id,
+                subject_oid,
                 prev_record_status,
                 prev_data_revision,
                 prev_deleted,
@@ -431,6 +445,8 @@ class DuckDBIngestionWorkflow:
                     deleted,
                     date_created,
                     last_updated,
+                    subject_id,
+                    subject_oid,
                     LAG(1) OVER rev_window IS NOT NULL AS _has_prev,
                     LAG(record_status) OVER rev_window AS prev_record_status,
                     LAG(data_revision) OVER rev_window AS prev_data_revision,
@@ -464,6 +480,96 @@ class DuckDBIngestionWorkflow:
             """
         self._connection.execute(combined_history_query)  # nosem
 
+    def _refresh_record_revisions_view(self) -> None:
+        """Create or replace the record_revisions view with all 19 canonical fields."""
+        self._connection.execute("""
+            CREATE OR REPLACE VIEW record_revisions AS
+            SELECT
+                study_key,
+                record_revision_id,
+                record_id,
+                record_oid,
+                form_key,
+                subject_key,
+                site_id,
+                interval_id,
+                record_status,
+                record_revision,
+                data_revision,
+                "user",
+                role,
+                reason_for_change,
+                deleted,
+                date_created,
+                last_updated,
+                subject_id,
+                subject_oid
+            FROM bronze_revisions
+            """)
+
+    def _refresh_existing_silver_views(self) -> None:
+        """Rebuild any pre-existing per-Study and combined silver views to expose all 19 columns."""
+        catalog_rows = self._connection.execute(
+            """
+            SELECT view_name, sql
+            FROM duckdb_views()
+            WHERE database_name = current_database()
+              AND schema_name = current_schema()
+              AND NOT internal
+              AND NOT temporary
+              AND (
+                  starts_with(view_name, 'silver_current_state_')
+                  OR starts_with(view_name, 'silver_records_history_')
+              )
+            ORDER BY view_name
+            """
+        ).fetchall()
+        include_deleted_by_study: dict[str, bool] = {}
+        for raw_name, raw_sql in catalog_rows:
+            if not isinstance(raw_name, str):
+                continue
+            if raw_name.startswith("silver_current_state_"):
+                candidate_key = raw_name.removeprefix("silver_current_state_")
+                if _SAFE_STUDY_KEY_PATTERN.fullmatch(candidate_key):
+                    sql_text = raw_sql if isinstance(raw_sql, str) else ""
+                    include_deleted_by_study[candidate_key] = (
+                        "WHERE NOT COALESCE(deleted, FALSE)" not in sql_text
+                    )
+            elif raw_name.startswith("silver_records_history_"):
+                candidate_key = raw_name.removeprefix("silver_records_history_")
+                if _SAFE_STUDY_KEY_PATTERN.fullmatch(candidate_key):
+                    include_deleted_by_study.setdefault(candidate_key, False)
+        for study_key, include_deleted in include_deleted_by_study.items():
+            self.build_silver_view(study_key, include_deleted=include_deleted)
+
+    def _migrate_existing_bronze_table(self, *, refresh_view: bool = False) -> bool:
+        """Add missing RecordRevision columns in place if bronze_revisions already exists."""
+        existing_columns = {
+            str(row[0])
+            for row in self._connection.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'bronze_revisions'
+                """
+            ).fetchall()
+        }
+        if not existing_columns:
+            return False
+        schema_migrated = False
+        if "subject_id" not in existing_columns:
+            self._connection.execute("ALTER TABLE bronze_revisions ADD COLUMN subject_id BIGINT")
+            schema_migrated = True
+        if "subject_oid" not in existing_columns:
+            self._connection.execute("ALTER TABLE bronze_revisions ADD COLUMN subject_oid VARCHAR")
+            schema_migrated = True
+        if refresh_view:
+            self._refresh_record_revisions_view()
+            if schema_migrated:
+                self._refresh_existing_silver_views()
+        return True
+
     def _ensure_bronze_table(self) -> None:
         """Ensure the bronze_revisions table and record_revisions view exist in DuckDB."""
         self._connection.execute("""
@@ -485,31 +591,12 @@ class DuckDBIngestionWorkflow:
                 deleted BOOLEAN,
                 date_created TIMESTAMP,
                 last_updated TIMESTAMP,
+                subject_id BIGINT,
+                subject_oid VARCHAR,
                 UNIQUE (study_key, record_revision_id)
             )
             """)
-        self._connection.execute("""
-            CREATE OR REPLACE VIEW record_revisions AS
-            SELECT
-                study_key,
-                record_revision_id,
-                record_id,
-                record_oid,
-                form_key,
-                subject_key,
-                site_id,
-                interval_id,
-                record_status,
-                record_revision,
-                data_revision,
-                "user",
-                role,
-                reason_for_change,
-                deleted,
-                date_created,
-                last_updated
-            FROM bronze_revisions
-            """)
+        self._migrate_existing_bronze_table(refresh_view=True)
 
     @staticmethod
     def _optional_int(value: Any) -> int | None:
@@ -578,6 +665,7 @@ class DuckDBIngestionWorkflow:
             record_oid = self._optional_str(getattr(revision, "record_oid", None))
             form_key = self._optional_str(getattr(revision, "form_key", None))
             subject_key = self._optional_str(getattr(revision, "subject_key", None))
+            subject_oid = self._optional_str(getattr(revision, "subject_oid", None))
             record_status = self._optional_str(getattr(revision, "record_status", None))
             user_val = self._optional_str(getattr(revision, "user", None))
             role_val = self._optional_str(getattr(revision, "role", None))
@@ -591,6 +679,7 @@ class DuckDBIngestionWorkflow:
                         ("record_oid", record_oid),
                         ("form_key", form_key),
                         ("subject_key", subject_key),
+                        ("subject_oid", subject_oid),
                         ("record_status", record_status),
                         ("user", user_val),
                         ("role", role_val),
@@ -605,6 +694,7 @@ class DuckDBIngestionWorkflow:
                     record_oid = masked_map.get("record_oid")
                     form_key = masked_map.get("form_key")
                     subject_key = masked_map.get("subject_key")
+                    subject_oid = masked_map.get("subject_oid")
                     record_status = masked_map.get("record_status")
                     user_val = masked_map.get("user")
                     role_val = masked_map.get("role")
@@ -630,6 +720,8 @@ class DuckDBIngestionWorkflow:
                 False if deleted_val is None else bool(deleted_val),
                 self._optional_timestamp(getattr(revision, "date_created", None)),
                 self._optional_timestamp(getattr(revision, "last_updated", None)),
+                self._optional_int(getattr(revision, "subject_id", None)),
+                subject_oid,
             )
 
     @staticmethod

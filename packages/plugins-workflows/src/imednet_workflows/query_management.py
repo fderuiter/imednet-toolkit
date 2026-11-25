@@ -393,19 +393,19 @@ class QueryManagementWorkflow:
             The synchronized list of ``TriageItem`` entries queued for ``study_key``.
         """
         target_store = self._resolve_triage_store(store)
-        if unresolved_only:
-            queries = self.get_unresolved_queries(
-                study_key,
-                additional_filter=additional_filter,
-                **kwargs,
-            )
-        else:
-            filters = dict(additional_filter) if additional_filter else {}
-            queries = list(self._sdk.get_queries(study_key, **filters, **kwargs))
+        filters = dict(additional_filter) if additional_filter else {}
+        queries = list(self._sdk.get_queries(study_key, **filters, **kwargs))
 
         for idx, query in enumerate(queries, start=1):
             item_id = self._build_triage_item_id(query, study_key, idx)
             existing = target_store.get_triage_item(item_id)
+            query_status = self._resolve_query_status(query)
+            if (
+                unresolved_only
+                and query_status in (QueryStatus.CLOSED, QueryStatus.CANCELLED)
+                and existing is None
+            ):
+                continue
             triage_item = self._query_to_triage_item(
                 query,
                 study_key=study_key,
@@ -415,6 +415,14 @@ class QueryManagementWorkflow:
             )
             target_store.upsert_item(triage_item)
 
+        if unresolved_only:
+            if isinstance(target_store, TriageStore):
+                return target_store.get_queue(study_key, include_resolved=False)
+            return [
+                item
+                for item in target_store.get_queue(study_key)
+                if item.status != TriageStatus.RESOLVED
+            ]
         return target_store.get_queue(study_key)
 
 

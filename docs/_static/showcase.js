@@ -53,7 +53,7 @@
                 formId: 302,
                 formKey: "F_VS",
                 formName: "Vital Signs",
-                formType: "CRF",
+                formType: "Subject",
                 revision: 1,
                 dateCreated: "2026-01-01T00:00:00Z",
                 dateModified: "2026-01-15T12:00:00Z",
@@ -73,7 +73,7 @@
                 formId: 301,
                 formKey: "F_DM",
                 formName: "Demographics",
-                formType: "CRF",
+                formType: "Subject",
                 revision: 1,
                 dateCreated: "2026-01-01T00:00:00Z",
                 dateModified: "2026-01-15T12:00:00Z",
@@ -93,7 +93,7 @@
                 formId: 303,
                 formKey: "F_AE",
                 formName: "Safety Observations",
-                formType: "CRF",
+                formType: "Subject",
                 revision: 1,
                 dateCreated: "2026-01-01T00:00:00Z",
                 dateModified: "2026-01-15T12:00:00Z",
@@ -113,7 +113,7 @@
                 formId: 304,
                 formKey: "F_LB",
                 formName: "Laboratory Findings",
-                formType: "CRF",
+                formType: "Subject",
                 revision: 1,
                 dateCreated: "2026-01-01T00:00:00Z",
                 dateModified: "2026-01-15T12:00:00Z",
@@ -688,9 +688,9 @@
                 subjectKey: "SUB1",
                 dateCreated: "2026-01-12T10:00:00Z",
                 dateModified: "2026-01-12T10:00:00Z",
-                annotationType: "subject",
+                annotationType: "Query",
                 subjectOid: "SE_SUB1",
-                type: "Query",
+                type: "subject",
                 lastUpdated: "2026-01-12T10:00:00Z",
                 queryComments: [
                     {
@@ -713,9 +713,9 @@
                 subjectKey: "SUB1",
                 dateCreated: "2026-01-12T10:00:00Z",
                 dateModified: "2026-01-12T10:00:00Z",
-                annotationType: "record",
+                annotationType: "Query",
                 subjectOid: "SE_SUB1",
-                type: "Query",
+                type: "record",
                 lastUpdated: "2026-01-12T10:00:00Z",
                 queryComments: [
                     {
@@ -738,9 +738,9 @@
                 subjectKey: "SUB2",
                 dateCreated: "2026-01-14T11:00:00Z",
                 dateModified: "2026-01-14T11:30:00Z",
-                annotationType: "record",
+                annotationType: "Query",
                 subjectOid: "SE_SUB2",
-                type: "Query",
+                type: "question",
                 lastUpdated: "2026-01-14T11:30:00Z",
                 queryComments: [
                     {
@@ -763,9 +763,9 @@
                 subjectKey: "SUB3",
                 dateCreated: "2026-01-15T16:20:00Z",
                 dateModified: "2026-01-15T16:45:00Z",
-                annotationType: "record",
+                annotationType: "Query",
                 subjectOid: "SE_SUB3",
-                type: "Query",
+                type: "question",
                 lastUpdated: "2026-01-15T16:45:00Z",
                 queryComments: [
                     {
@@ -1087,16 +1087,48 @@
     // -------------------------------------------------------------------------
     // Helper: Render Tabular DataFrame view
     // -------------------------------------------------------------------------
+    function flattenNestedRecordData(record) {
+        if (
+            !record ||
+            typeof record !== "object" ||
+            !record.recordData ||
+            typeof record.recordData !== "object" ||
+            Array.isArray(record.recordData)
+        ) {
+            return record;
+        }
+        const flat = {};
+        Object.keys(record).forEach(function (k) {
+            if (k === "recordData") {
+                Object.keys(record.recordData).forEach(function (varKey) {
+                    flat[varKey] = record.recordData[varKey];
+                });
+            } else {
+                flat[k] = record[k];
+            }
+        });
+        return flat;
+    }
+
     function renderDataFrameTable(items, captionText) {
         if (!items || !items.length) {
             return `<div class="explorer-empty-state">No records found.</div>`;
         }
 
-        const keys = Object.keys(items[0]);
+        const displayItems = items.map(flattenNestedRecordData);
+        const keySet = new Set();
+        displayItems.forEach(function (record) {
+            if (record && typeof record === "object") {
+                Object.keys(record).forEach(function (k) {
+                    keySet.add(k);
+                });
+            }
+        });
+        const keys = Array.from(keySet);
         let html = `<div class="explorer-table-wrapper" tabindex="0" role="region" aria-label="${escapeHtml(captionText)}">`;
         html += `<table class="explorer-dataframe-table">`;
         if (captionText) {
-            html += `<caption>${escapeHtml(captionText)} — ${items.length} items</caption>`;
+            html += `<caption>${escapeHtml(captionText)} — ${displayItems.length} items</caption>`;
         }
         html += `<thead><tr>`;
         html += `<th scope="col" class="index-cell">#</th>`;
@@ -1105,7 +1137,7 @@
         });
         html += `</tr></thead><tbody>`;
 
-        items.forEach(function (record, index) {
+        displayItems.forEach(function (record, index) {
             html += `<tr>`;
             html += `<td class="index-cell">${index}</td>`;
             keys.forEach(function (k) {
@@ -1121,7 +1153,11 @@
                         ? "badge-warning"
                         : "badge-neutral";
                     cellHtml = `<span class="status-badge ${commentBadge}">${escapeHtml(statusLabel)}</span> <code>(${val.length})</code>`;
-                } else if (k === "STATUS" || k === "status" || k === "recordStatus" || k === "wcagCompliance") {
+                } else if (
+                    (k === "STATUS" || k === "status" || k === "recordStatus" || k === "wcagCompliance") &&
+                    val !== null &&
+                    val !== undefined
+                ) {
                     const lowerVal = String(val).toLowerCase();
                     const badgeClass = lowerVal.includes("verified") || lowerVal.includes("pass") || lowerVal.includes("complete") || lowerVal.includes("locked")
                         ? "badge-success"
@@ -1131,7 +1167,7 @@
                     cellHtml = `<span class="status-badge ${badgeClass}">${cellHtml}</span>`;
                 } else if (typeof val === "boolean") {
                     cellHtml = val ? `<span class="status-badge badge-success">true</span>` : `<span class="status-badge badge-neutral">false</span>`;
-                } else if (val !== null && typeof val === "object") {
+                } else if (val !== null && val !== undefined && typeof val === "object") {
                     cellHtml = `<code>${escapeHtml(JSON.stringify(val))}</code>`;
                 }
                 html += `<td>${cellHtml}</td>`;
@@ -1602,7 +1638,7 @@
                 } else {
                     tableData = MOCK_DATA.records.VS.map(flattenRecordForDataFrame);
                     caption = "pandas.DataFrame: STUDY / F_VS (Vital Signs Records)";
-                    jsonPayload = tableData;
+                    jsonPayload = MOCK_DATA.records.VS;
                 }
             } else if (datasetKey === "studies") {
                 tableData = MOCK_DATA.studies;

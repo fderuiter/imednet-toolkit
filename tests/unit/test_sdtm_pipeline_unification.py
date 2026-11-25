@@ -850,12 +850,12 @@ def test_incremental_sdtm_sidecar_lineage_replay_and_void_reconciliation(
     _verify_reconciled(hive_rows, "hive_parquet")
 
 
-@pytest.mark.parametrize("profile_name", ["general", "drug", "biologic", "vaccine", "device"])
-def test_cli_validate_standards_simulation_succeeds_for_all_five_profiles(
+@pytest.mark.parametrize("profile_name", ["general", "drug", "device"])
+def test_cli_validate_standards_simulation_succeeds_for_backed_profiles(
     profile_name: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """AC 5: validate-standards STUDY --profile <name> --simulation exits 0 for all 5 profiles."""
+    """AC 5: validate-standards STUDY --profile <name> --simulation exits 0 for all backed profiles."""
     cli_mod.app(
         [
             "workflows",
@@ -918,24 +918,26 @@ def test_core_standards_profiles_domain_dict_and_normalizer_branches(
     """Cover StandardsProfile registry, _DomainDict resolution, and CategoricalNormalizer branches in core."""
     from imednet.models.standards import (
         PROFILE_REGISTRY,
-        BiologicSafetyProfile,
         CategoricalNormalizer,
+        DeviceSafetyProfile,
         DrugSafetyProfile,
+        GeneralClinicalProfile,
         StandardsReadinessValidator,
-        VaccineSafetyProfile,
         _coerce_float_or_default,
         _DomainDict,
+        resolve_standards_profile,
     )
 
     assert PROFILE_REGISTRY.list_profiles() == [
-        "biologic",
         "device",
         "drug",
         "general",
-        "vaccine",
     ]
-    assert isinstance(PROFILE_REGISTRY.get("biologic"), BiologicSafetyProfile)
-    assert isinstance(PROFILE_REGISTRY.get("vaccine"), VaccineSafetyProfile)
+    assert isinstance(PROFILE_REGISTRY.get("device"), DeviceSafetyProfile)
+    assert isinstance(PROFILE_REGISTRY.get("general"), GeneralClinicalProfile)
+    for unbacked in ("biologic", "vaccine", "unknown"):
+        with pytest.raises(ValueError, match="Unknown standards_profile"):
+            resolve_standards_profile(unbacked)
 
     dk = _DomainDict({"AE": ["aeTerm"], "AE.aeTerm": {"required": True}})
     assert "Adverse Events" in dk
@@ -1721,8 +1723,8 @@ def test_cli_export_ae_with_drug_profile_and_validate_standards_exit_codes(
     assert list(exported_df["DOMAIN"]) == ["AE"]
     assert list(exported_df["AESEV"]) == ["MODERATE"]
 
-    # Ready biologic & vaccine validation succeeds without KeyError
-    for profile_name in ("biologic", "vaccine"):
+    # Ready backed profile validation succeeds without KeyError
+    for profile_name in ("general", "drug", "device"):
         cli_mod.app(
             [
                 "workflows",
@@ -1785,7 +1787,7 @@ def test_drug_safety_profile_aesev_and_empty_cm_lb_ex_mh_and_unconfigured_domain
         assert res.score == 100.0
         assert res.is_ready is True
 
-    for profile_name in ("drug", "biologic", "vaccine"):
+    for profile_name in ("general", "drug", "device"):
         validator = StandardsReadinessValidator(profile=PROFILE_REGISTRY.get(profile_name))
         for domain in ("CM", "LB", "EX", "MH"):
             empty_record_res = validator.score_records(records_by_domain={domain: [{}]})

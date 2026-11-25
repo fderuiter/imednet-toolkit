@@ -13,14 +13,18 @@ from imednet.models.engine import ModelEngine
 
 
 def _normalize_role_timestamp(v: Any) -> Any:
-    """Normalize 7-element numeric timestamp arrays into UTC datetime objects."""
+    """Normalize 5- to 7-element numeric timestamp arrays into UTC datetime objects."""
     if isinstance(v, (list, tuple)):
-        if len(v) != 7 or any(isinstance(item, bool) or not isinstance(item, int) for item in v):
+        if not (5 <= len(v) <= 7) or any(
+            isinstance(item, bool) or not isinstance(item, int) for item in v
+        ):
             raise ValueError(
-                "Expected 7-element integer timestamp array [Y, M, D, h, m, s, ns], "
+                "Expected 5- to 7-element integer timestamp array [Y, M, D, h, m[, s[, ns]]], "
                 f"got {type(v).__name__} of length {len(v)}"
             )
-        year, month, day, hour, minute, second, nanosecond = v
+        year, month, day, hour, minute = v[:5]
+        second = v[5] if len(v) >= 6 else 0
+        nanosecond = v[6] if len(v) == 7 else 0
         if not (0 <= nanosecond < 1_000_000_000):
             raise ValueError("Nanosecond component out of range in Role timestamp")
         return datetime(year, month, day, hour, minute, second, nanosecond // 1000, tzinfo=UTC)
@@ -43,7 +47,7 @@ class Role(ImednetBaseModel):
     @field_validator("date_created", "date_modified", mode="before")
     @classmethod
     def _parse_timestamp_array(cls, v: Any) -> Any:
-        """Normalize 7-element numeric arrays before base datetime normalization."""
+        """Normalize 5- to 7-element numeric arrays before base datetime normalization."""
         return _normalize_role_timestamp(v)
 
 

@@ -1793,10 +1793,13 @@ CONTEXT_DISALLOWED_SYNONYMS: dict[str, tuple[str, ...]] = {
 _JS_BROWSER_GLOBALS_PATTERN = re.compile(
     r"\bwindow\.(?:location|history|addEventListener|dispatchEvent)\b"
 )
+_JS_QUERY_TYPE_ENUM_PATTERN = re.compile(r"""\btype\s*:\s*["']question["']""")
 
 _CANONICAL_QUERY_COMMENT_KEYS: frozenset[str] = frozenset(
     {"sequence", "annotationStatus", "user", "comment", "closed", "date"}
 )
+_ALLOWED_REST_FORM_TYPES: frozenset[str] = frozenset({"Subject", "Site"})
+_ALLOWED_QUERY_TYPES: frozenset[str] = frozenset({"subject", "record", "question"})
 
 
 def _extract_js_object_literal(js_content: str, const_name: str) -> str | None:
@@ -1970,6 +1973,8 @@ def validate_showcase_mock_data_schemas(
     if not showcase_js_path.exists():
         return [f"Showcase script not found: {showcase_js_path}"]
 
+    configure_sys_path(Path(__file__).resolve().parent.parent)
+
     schemas, schema_errors = load_postman_contract_schemas(postman_path)
     if schema_errors:
         return schema_errors
@@ -1983,116 +1988,202 @@ def validate_showcase_mock_data_schemas(
     if parse_err is not None or mock_data is None:
         return [f"{showcase_js_path}: {parse_err}"]
 
+    try:
+        from imednet.core.context import strict_mode_context
+        from imednet.datadict.models import Form as DatadictForm
+        from imednet.models.forms import Form
+        from imednet.models.queries import Query
+        from imednet.models.record_revisions import RecordRevision
+        from imednet.models.records import Record
+        from imednet.models.studies import Study
+    except Exception as exc:
+        return [f"{showcase_js_path}: Failed to import strict Pydantic models: {exc}"]
+
     errors: list[str] = []
 
-    section_specs: list[tuple[str, set[str], bool]] = [
-        ("studies", schemas["studies"], True),
-        ("formsCatalog", schemas["forms"], True),
-        ("queries", schemas["queries"], True),
-        ("audits", schemas["audits"], False),
+    section_specs: list[tuple[str, set[str], bool, type[object]]] = [
+        ("studies", schemas["studies"], True, Study),
+        ("formsCatalog", schemas["forms"], True, Form),
+        ("queries", schemas["queries"], True, Query),
+        ("audits", schemas["audits"], False, RecordRevision),
     ]
 
-    for section_name, allowed_keys, required in section_specs:
-        raw_section = mock_data.get(section_name)
-        if raw_section is None and not required:
-            continue
-        if not isinstance(raw_section, list):
-            errors.append(
-                f"{showcase_js_path}: MOCK_DATA.{section_name} is missing or has invalid container type"
-            )
-            continue
-        if not raw_section:
-            errors.append(f"{showcase_js_path}: MOCK_DATA.{section_name} must not be empty")
-            continue
-
-        for idx, item_val in enumerate(raw_section):
-            item_label = f"{section_name}[{idx}]"
-            if not isinstance(item_val, dict) or not item_val:
+    with strict_mode_context(True):
+        for section_name, allowed_keys, required, model_cls in section_specs:
+            raw_section = mock_data.get(section_name)
+            if raw_section is None and not required:
+                continue
+            if not isinstance(raw_section, list):
                 errors.append(
-                    f"{showcase_js_path}: MOCK_DATA.{item_label} must be a non-empty object"
+                    f"{showcase_js_path}: MOCK_DATA.{section_name} is missing or has invalid container type"
                 )
                 continue
-            item_keys = set(item_val.keys())
-            unexpected = sorted(item_keys - allowed_keys)
-            if unexpected:
-                errors.append(
-                    f"{showcase_js_path}: MOCK_DATA.{item_label} contains non-contract keys "
-                    f"{unexpected}; allowed Postman {section_name} keys: {sorted(allowed_keys)}"
-                )
-            if section_name == "queries" and "queryComments" in item_val:
-                comments = item_val["queryComments"]
-                if not isinstance(comments, list):
-                    errors.append(
-                        f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments must be a list"
-                    )
-                else:
-                    for c_idx, comment in enumerate(comments):
-                        if not isinstance(comment, dict):
-                            errors.append(
-                                f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments[{c_idx}] "
-                                "must be an object"
-                            )
-                            continue
-                        extra_comment_keys = sorted(
-                            set(comment.keys()) - _CANONICAL_QUERY_COMMENT_KEYS
-                        )
-                        if extra_comment_keys:
-                            errors.append(
-                                f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments[{c_idx}] "
-                                f"contains non-contract keys {extra_comment_keys}"
-                            )
-
-    raw_records = mock_data.get("records")
-    if isinstance(raw_records, dict) and raw_records:
-        allowed_record_keys = schemas["records"]
-        for rec_domain, domain_items in raw_records.items():
-            if not isinstance(domain_items, list) or not domain_items:
-                errors.append(
-                    f"{showcase_js_path}: MOCK_DATA.records.{rec_domain} must be a non-empty list"
-                )
+            if not raw_section:
+                errors.append(f"{showcase_js_path}: MOCK_DATA.{section_name} must not be empty")
                 continue
-            for r_idx, rec_val in enumerate(domain_items):
-                rec_label = f"records.{rec_domain}[{r_idx}]"
-                if not isinstance(rec_val, dict) or not rec_val:
+
+            parsed_audits: list[RecordRevision] = []
+            for idx, item_val in enumerate(raw_section):
+                item_label = f"{section_name}[{idx}]"
+                if not isinstance(item_val, dict) or not item_val:
                     errors.append(
-                        f"{showcase_js_path}: MOCK_DATA.{rec_label} must be a non-empty object"
+                        f"{showcase_js_path}: MOCK_DATA.{item_label} must be a non-empty object"
                     )
                     continue
-                unexpected_rec = sorted(set(rec_val.keys()) - allowed_record_keys)
-                if unexpected_rec:
+                item_keys = set(item_val.keys())
+                unexpected = sorted(item_keys - allowed_keys)
+                if unexpected:
                     errors.append(
-                        f"{showcase_js_path}: MOCK_DATA.{rec_label} contains non-contract keys "
-                        f"{unexpected_rec}; allowed Postman records keys: "
-                        f"{sorted(allowed_record_keys)}"
+                        f"{showcase_js_path}: MOCK_DATA.{item_label} contains non-contract keys "
+                        f"{unexpected}; allowed Postman {section_name} keys: {sorted(allowed_keys)}"
                     )
-                if "recordData" not in rec_val or not isinstance(rec_val.get("recordData"), dict):
-                    errors.append(
-                        f"{showcase_js_path}: MOCK_DATA.{rec_label}.recordData must be an object"
-                    )
-    else:
-        errors.append(
-            f"{showcase_js_path}: MOCK_DATA.records is missing or has invalid container type"
-        )
+                if section_name == "formsCatalog":
+                    form_type_val = item_val.get("formType")
+                    if not isinstance(form_type_val, str) or (
+                        form_type_val not in _ALLOWED_REST_FORM_TYPES
+                    ):
+                        errors.append(
+                            f"{showcase_js_path}: MOCK_DATA.{item_label}.formType must be one of "
+                            f"{sorted(_ALLOWED_REST_FORM_TYPES)}, got {form_type_val!r}"
+                        )
+                elif section_name == "queries":
+                    query_type_val = item_val.get("type")
+                    if not isinstance(query_type_val, str) or (
+                        query_type_val not in _ALLOWED_QUERY_TYPES
+                    ):
+                        errors.append(
+                            f"{showcase_js_path}: MOCK_DATA.{item_label}.type must be one of "
+                            f"{sorted(_ALLOWED_QUERY_TYPES)}, got {query_type_val!r}"
+                        )
+                    annotation_type_val = item_val.get("annotationType")
+                    if (
+                        isinstance(annotation_type_val, str)
+                        and annotation_type_val.strip().lower() in _ALLOWED_QUERY_TYPES
+                    ):
+                        errors.append(
+                            f"{showcase_js_path}: MOCK_DATA.{item_label}.annotationType has swapped "
+                            f"Query target type {annotation_type_val!r}"
+                        )
+                    if "queryComments" in item_val:
+                        comments = item_val["queryComments"]
+                        if not isinstance(comments, list):
+                            errors.append(
+                                f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments must be a list"
+                            )
+                        else:
+                            for c_idx, comment in enumerate(comments):
+                                if not isinstance(comment, dict):
+                                    errors.append(
+                                        f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments[{c_idx}] "
+                                        "must be an object"
+                                    )
+                                    continue
+                                extra_comment_keys = sorted(
+                                    set(comment.keys()) - _CANONICAL_QUERY_COMMENT_KEYS
+                                )
+                                if extra_comment_keys:
+                                    errors.append(
+                                        f"{showcase_js_path}: MOCK_DATA.{item_label}.queryComments[{c_idx}] "
+                                        f"contains non-contract keys {extra_comment_keys}"
+                                    )
 
-    raw_forms = mock_data.get("forms")
-    if isinstance(raw_forms, dict) and raw_forms:
-        for form_domain, form_val in raw_forms.items():
-            if not isinstance(form_val, dict) or not form_val:
-                errors.append(
-                    f"{showcase_js_path}: MOCK_DATA.forms.{form_domain} must be a non-empty object"
-                )
-                continue
-            unexpected_dd = sorted(set(form_val.keys()) - _CANONICAL_DATADICT_FORM_KEYS)
-            if unexpected_dd:
-                errors.append(
-                    f"{showcase_js_path}: MOCK_DATA.forms.{form_domain} contains non-contract keys "
-                    f"{unexpected_dd}; allowed DataDictionary Form keys: "
-                    f"{sorted(_CANONICAL_DATADICT_FORM_KEYS)}"
-                )
-    else:
-        errors.append(
-            f"{showcase_js_path}: MOCK_DATA.forms is missing or has invalid container type"
-        )
+                try:
+                    validated_obj = model_cls.from_json(item_val)  # type: ignore[attr-defined]
+                    if section_name == "audits" and isinstance(validated_obj, RecordRevision):
+                        parsed_audits.append(validated_obj)
+                except Exception as exc:
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.{item_label} failed strict "
+                        f"{model_cls.__name__} validation: {exc}"
+                    )
+
+            if section_name == "audits" and len(parsed_audits) == len(raw_section):
+                try:
+                    RecordRevision.validate_chain(parsed_audits)
+                except Exception as exc:
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.audits failed 21 CFR Part 11 chain validation: {exc}"
+                    )
+
+        raw_records = mock_data.get("records")
+        if isinstance(raw_records, dict) and raw_records:
+            allowed_record_keys = schemas["records"]
+            for rec_domain, domain_items in raw_records.items():
+                if not isinstance(domain_items, list) or not domain_items:
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.records.{rec_domain} must be a non-empty list"
+                    )
+                    continue
+                for r_idx, rec_val in enumerate(domain_items):
+                    rec_label = f"records.{rec_domain}[{r_idx}]"
+                    if not isinstance(rec_val, dict) or not rec_val:
+                        errors.append(
+                            f"{showcase_js_path}: MOCK_DATA.{rec_label} must be a non-empty object"
+                        )
+                        continue
+                    unexpected_rec = sorted(set(rec_val.keys()) - allowed_record_keys)
+                    if unexpected_rec:
+                        errors.append(
+                            f"{showcase_js_path}: MOCK_DATA.{rec_label} contains non-contract keys "
+                            f"{unexpected_rec}; allowed Postman records keys: "
+                            f"{sorted(allowed_record_keys)}"
+                        )
+                    rec_data = rec_val.get("recordData")
+                    if (
+                        "recordData" not in rec_val
+                        or not isinstance(rec_data, dict)
+                        or not rec_data
+                    ):
+                        errors.append(
+                            f"{showcase_js_path}: MOCK_DATA.{rec_label}.recordData must be a non-empty object"
+                        )
+                    try:
+                        Record.from_json(rec_val)
+                    except Exception as exc:
+                        errors.append(
+                            f"{showcase_js_path}: MOCK_DATA.{rec_label} failed strict "
+                            f"Record validation: {exc}"
+                        )
+        else:
+            errors.append(
+                f"{showcase_js_path}: MOCK_DATA.records is missing or has invalid container type"
+            )
+
+        raw_forms = mock_data.get("forms")
+        if isinstance(raw_forms, dict) and raw_forms:
+            for form_domain, form_val in raw_forms.items():
+                if not isinstance(form_val, dict) or not form_val:
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.forms.{form_domain} must be a non-empty object"
+                    )
+                    continue
+                unexpected_dd = sorted(set(form_val.keys()) - _CANONICAL_DATADICT_FORM_KEYS)
+                if unexpected_dd:
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.forms.{form_domain} contains non-contract keys "
+                        f"{unexpected_dd}; allowed DataDictionary Form keys: "
+                        f"{sorted(_CANONICAL_DATADICT_FORM_KEYS)}"
+                    )
+                dd_form_type = form_val.get("formType")
+                if dd_form_type is not None and (
+                    not isinstance(dd_form_type, str)
+                    or dd_form_type not in _ALLOWED_REST_FORM_TYPES
+                ):
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.forms.{form_domain}.formType must be one of "
+                        f"{sorted(_ALLOWED_REST_FORM_TYPES)}, got {dd_form_type!r}"
+                    )
+                try:
+                    DatadictForm.model_validate(form_val)
+                except Exception as exc:
+                    errors.append(
+                        f"{showcase_js_path}: MOCK_DATA.forms.{form_domain} failed DataDictionary "
+                        f"Form validation: {exc}"
+                    )
+        else:
+            errors.append(
+                f"{showcase_js_path}: MOCK_DATA.forms is missing or has invalid container type"
+            )
 
     return errors
 
@@ -2147,6 +2238,7 @@ def validate_canonical_showcase_terminology(file_path: Path) -> list[str]:
         scan_line = raw_line
         if file_path.suffix == ".js":
             scan_line = _JS_BROWSER_GLOBALS_PATTERN.sub("", scan_line)
+            scan_line = _JS_QUERY_TYPE_ENUM_PATTERN.sub("", scan_line)
 
         for canonical_term, disallowed_forms in CONTEXT_DISALLOWED_SYNONYMS.items():
             for synonym in disallowed_forms:

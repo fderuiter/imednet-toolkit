@@ -685,7 +685,7 @@ def test_evaluate_standards_readiness_filters_by_form_domain_without_relabeling(
     ]
     report = evaluate_standards_readiness(
         records,
-        standards_profile="biologic",
+        standards_profile="drug",
         sdtm_domain="LB",
         study_key="S1",
         form_domain_map={"10": "DM", "F_DM": "DM", "20": "LB", "F_LB": "LB"},
@@ -713,10 +713,18 @@ def test_evaluate_standards_readiness_filters_by_form_domain_without_relabeling(
     ]
     single_report = evaluate_standards_readiness(
         custom_stream,
-        standards_profile="vaccine",
+        standards_profile="general",
         sdtm_domain="LB",
         study_key="S1",
     )
     assert single_report is not None
     assert single_report.score == 100.0
     assert single_report.is_ready is True
+
+    with pytest.raises(ValueError, match="Unknown standards_profile"):
+        evaluate_standards_readiness(
+            custom_stream,
+            standards_profile="biologic",
+            sdtm_domain="LB",
+            study_key="S1",
+        )

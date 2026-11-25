@@ -14,29 +14,31 @@ from imednet import cli as cli_mod
 from imednet.models.forms import Form
 from imednet.models.standards import (
     PROFILE_REGISTRY,
-    BiologicSafetyProfile,
+    DeviceSafetyProfile,
     DrugSafetyProfile,
+    GeneralClinicalProfile,
     StandardsReadinessValidator,
-    VaccineSafetyProfile,
+    resolve_standards_profile,
 )
 from imednet.models.variables import Variable
 from imednet_workflows.record_mapper import RecordMapper
 from imednet_workflows.state_ledger import ExtractionStateLedger, FileStateProvider
 
 
-def test_five_profiles_registered_and_empty_study_scores_zero(
+def test_backed_profiles_registered_and_empty_study_scores_zero(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """PROFILE_REGISTRY registers biologic and vaccine, and empty studies score 0.0 (is_ready=False)."""
+    """PROFILE_REGISTRY registers only backed profiles, and empty studies score 0.0 (is_ready=False)."""
     assert PROFILE_REGISTRY.list_profiles() == [
-        "biologic",
         "device",
         "drug",
         "general",
-        "vaccine",
     ]
-    assert isinstance(PROFILE_REGISTRY.get("biologic"), BiologicSafetyProfile)
-    assert isinstance(PROFILE_REGISTRY.get("vaccine"), VaccineSafetyProfile)
+    assert isinstance(PROFILE_REGISTRY.get("device"), DeviceSafetyProfile)
+    assert isinstance(PROFILE_REGISTRY.get("general"), GeneralClinicalProfile)
+    for unknown_name in ("biologic", "vaccine", "unknown"):
+        with pytest.raises(ValueError, match="Unknown standards_profile"):
+            resolve_standards_profile(unknown_name)
 
     validator = StandardsReadinessValidator(profile=DrugSafetyProfile())
     report = validator.score_records(records_by_domain={})

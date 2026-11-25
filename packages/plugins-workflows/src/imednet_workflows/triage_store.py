@@ -329,20 +329,39 @@ class TriageStore:
                 history=history,
             )
 
-    def get_queue(self, study_key: str, status: TriageStatus | None = None) -> list[TriageItem]:
-        """Fetch the triage queue for a study, optionally filtered by status."""
+    def get_queue(
+        self,
+        study_key: str,
+        status: TriageStatus | None = None,
+        *,
+        include_resolved: bool = True,
+    ) -> list[TriageItem]:
+        """Fetch the triage queue for a study, optionally filtered by status or resolution state."""
         with self._connection() as conn:
             if status is None:
-                rows = conn.execute(
-                    """
-                    SELECT item_id, study_key, status, assignee, severity
-                    FROM triage_items
-                    WHERE study_key = ?
-                    ORDER BY updated_at ASC
-                    """,
-                    (study_key,),
-                ).fetchall()
+                if include_resolved:
+                    rows = conn.execute(
+                        """
+                        SELECT item_id, study_key, status, assignee, severity
+                        FROM triage_items
+                        WHERE study_key = ?
+                        ORDER BY updated_at ASC
+                        """,
+                        (study_key,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT item_id, study_key, status, assignee, severity
+                        FROM triage_items
+                        WHERE study_key = ? AND status != ?
+                        ORDER BY updated_at ASC
+                        """,
+                        (study_key, TriageStatus.RESOLVED.value),
+                    ).fetchall()
             else:
+                if not include_resolved and status == TriageStatus.RESOLVED:
+                    return []
                 rows = conn.execute(
                     """
                     SELECT item_id, study_key, status, assignee, severity

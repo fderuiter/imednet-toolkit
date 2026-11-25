@@ -195,6 +195,8 @@ def test_ingest_revisions_and_build_silver_view() -> None:
         "deleted",
         "date_created",
         "last_updated",
+        "subject_id",
+        "subject_oid",
     ]
     bronze_cols = [
         desc[0]

@@ -30,14 +30,12 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
        records_data=[
            {
                "formKey": "F_VS",
-               "siteName": "SITE",
                "subjectKey": "SUB1",
                "intervalName": "Baseline",
                "data": {"V_WEIGHT": 71.5},
            },
            {
                "formKey": "F_VS",
-               "siteName": "SITE",
                "subjectKey": "SUB1",
                "intervalName": "Baseline",
                "data": {"V_WEIGHT": 72.0},
@@ -57,7 +55,6 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
                [
                    {
                        "formKey": "F_VS",
-                       "siteName": "SITE",
                        "subjectKey": "SUB1",
                        "intervalName": "Baseline",
                        "data": {"V_WEIGHT": 73.0},

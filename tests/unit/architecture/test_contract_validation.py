@@ -20,6 +20,7 @@ import pytest
 
 import imednet.integrations as core_integrations
 import imednet.utils.evaluator as evaluator_mod
+from imednet.core.context import strict_mode_context
 from imednet.core.operations.circuit_breaker import CircuitBreaker, CircuitState, ProbeLease
 from imednet.errors import (
     ApiError,
@@ -33,6 +34,11 @@ from imednet.errors import (
 )
 from imednet.integrations import dispatcher as export_dispatcher
 from imednet.integrations.sink_base import BoundedFormBufferRouter, SinkConfig
+from imednet.models.records import (
+    CreateNewRecordRequest,
+    RegisterSubjectRequest,
+    UpdateScheduledRecordRequest,
+)
 from imednet.models.study_config import MappingRule
 from imednet.plugins import WorkflowsNamespaceProtocol
 from imednet.sdk import ImednetSDK
@@ -1138,3 +1144,258 @@ def test_narrative_parity_gates_fail_on_undocumented_additions(tmp_path: Path) -
         "Missing runnable '.. testcode::'" in err
         for err in validate_ast_evaluator_narrative_coverage(empty_docs)
     )
+
+
+_RECORD_BATCH_WRITE_CALLS: frozenset[str] = frozenset(
+    {
+        "create_or_update_records",
+        "async_create_or_update_records",
+        "create_or_update_records_batch",
+        "async_create_or_update_records_batch",
+        "create",
+        "async_create",
+        "create_batch",
+        "async_create_batch",
+    }
+)
+
+
+def _extract_rst_python_blocks(rst_path: Path) -> list[tuple[int, str]]:
+    """Extract indented Python ``.. testcode::`` and ``.. code-block:: python`` blocks from an RST file."""
+    lines = rst_path.read_text(encoding="utf-8").splitlines()
+    blocks: list[tuple[int, str]] = []
+    directive_re = re.compile(
+        r"^(\s*)\.\.\s+(?:testcode|code-block|sourcecode)::(?:\s+(python|py))?\s*$"
+    )
+    idx = 0
+    while idx < len(lines):
+        match = directive_re.match(lines[idx])
+        if not match:
+            idx += 1
+            continue
+        base_indent = len(match.group(1))
+        idx += 1
+        while idx < len(lines) and (not lines[idx].strip() or lines[idx].lstrip().startswith(":")):
+            idx += 1
+        block_start = idx + 1
+        collected: list[str] = []
+        while idx < len(lines):
+            raw = lines[idx]
+            if raw.strip() and (len(raw) - len(raw.lstrip())) <= base_indent:
+                break
+            collected.append(raw)
+            idx += 1
+        dedented = textwrap.dedent("\n".join(collected))
+        if dedented.strip():
+            blocks.append((block_start, dedented))
+    return blocks
+
+
+def _validate_single_record_write_payload(
+    payload: dict[str, object],
+    *,
+    source_label: str,
+    explicit_mode: str | None = None,
+) -> list[str]:
+    """Validate a Record write dictionary against strict Pydantic request models and mode rules."""
+    errors: list[str] = []
+    keys = set(payload.keys())
+    has_form_key = bool(payload.get("formKey") or payload.get("form_key"))
+    if not has_form_key:
+        errors.append(f"{source_label}: Missing required non-empty 'formKey'")
+
+    mode = explicit_mode
+    if mode is None:
+        if "intervalName" in keys or "interval_name" in keys:
+            mode = "UPDATE_SCHEDULED_RECORD"
+        elif "subjectKey" in keys or "subject_key" in keys:
+            mode = "CREATE_NEW_RECORD"
+        elif any(k in keys for k in ("siteName", "site_name", "siteId", "site_id")):
+            mode = "REGISTER_SUBJECT"
+        else:
+            return [f"{source_label}: Cannot determine Record write mode from keys {sorted(keys)}"]
+
+    with strict_mode_context(True):
+        if mode == "REGISTER_SUBJECT":
+            if "subjectKey" in keys or "subject_key" in keys:
+                errors.append(
+                    f"{source_label}: REGISTER_SUBJECT payload must not include 'subjectKey' "
+                    "(use GeneratedRecordSet.subject_keys for correlation or enrollment without subjectKey)"
+                )
+            has_site = bool(
+                payload.get("siteName")
+                or payload.get("site_name")
+                or payload.get("siteId") is not None
+                or payload.get("site_id") is not None
+            )
+            if not has_site:
+                errors.append(
+                    f"{source_label}: REGISTER_SUBJECT payload requires 'siteName' or 'siteId'"
+                )
+            try:
+                RegisterSubjectRequest.from_json(payload)
+            except Exception as exc:
+                errors.append(
+                    f"{source_label}: Strict RegisterSubjectRequest validation failed: {exc}"
+                )
+        elif mode == "UPDATE_SCHEDULED_RECORD":
+            if not (payload.get("subjectKey") or payload.get("subject_key")):
+                errors.append(
+                    f"{source_label}: UPDATE_SCHEDULED_RECORD payload requires non-empty 'subjectKey'"
+                )
+            if not (payload.get("intervalName") or payload.get("interval_name")):
+                errors.append(
+                    f"{source_label}: UPDATE_SCHEDULED_RECORD payload requires non-empty 'intervalName'"
+                )
+            try:
+                UpdateScheduledRecordRequest.from_json(payload)
+            except Exception as exc:
+                errors.append(
+                    f"{source_label}: Strict UpdateScheduledRecordRequest validation failed: {exc}"
+                )
+        elif mode == "CREATE_NEW_RECORD":
+            if not (payload.get("subjectKey") or payload.get("subject_key")):
+                errors.append(
+                    f"{source_label}: CREATE_NEW_RECORD payload requires non-empty 'subjectKey'"
+                )
+            try:
+                CreateNewRecordRequest.from_json(payload)
+            except Exception as exc:
+                errors.append(
+                    f"{source_label}: Strict CreateNewRecordRequest validation failed: {exc}"
+                )
+        else:
+            errors.append(f"{source_label}: Unsupported RecordTestType mode {mode!r}")
+
+    return errors
+
+
+def validate_record_write_examples_contracts(paths: Iterable[Path]) -> list[str]:
+    """Validate Record write dicts in Python scripts and RST guides against strict Record request models."""
+    errors: list[str] = []
+    for path in paths:
+        if not path.exists():
+            errors.append(f"Missing Record write example file: {path}")
+            continue
+
+        if path.suffix == ".py":
+            snippets = [(1, path.read_text(encoding="utf-8"))]
+        else:
+            snippets = _extract_rst_python_blocks(path)
+
+        checked_count = 0
+        for base_line, code in snippets:
+            try:
+                tree = ast.parse(code, filename=str(path))
+            except SyntaxError as exc:
+                errors.append(f"{path}:{base_line}: SyntaxError: {exc}")
+                continue
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func_name = (
+                    node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else None
+                )
+                if func_name == "GeneratedRecordSet":
+                    mode_name: str | None = None
+                    payloads_node: ast.AST | None = None
+                    for kw in node.keywords:
+                        if kw.arg == "test_type":
+                            if isinstance(kw.value, ast.Attribute):
+                                mode_name = kw.value.attr
+                            elif isinstance(kw.value, ast.Constant) and isinstance(
+                                kw.value.value, str
+                            ):
+                                mode_name = kw.value.value
+                        elif kw.arg == "payloads":
+                            payloads_node = kw.value
+                    if isinstance(payloads_node, (ast.List, ast.Tuple)):
+                        for idx, elt in enumerate(payloads_node.elts):
+                            lineno = base_line + getattr(elt, "lineno", 1) - 1
+                            raw_dict = ast.literal_eval(elt)
+                            if isinstance(raw_dict, dict):
+                                checked_count += 1
+                                errors.extend(
+                                    _validate_single_record_write_payload(
+                                        raw_dict,
+                                        source_label=f"{path}:{lineno}:payloads[{idx}]",
+                                        explicit_mode=mode_name,
+                                    )
+                                )
+                elif func_name in _RECORD_BATCH_WRITE_CALLS:
+                    records_node: ast.AST | None = None
+                    for kw in node.keywords:
+                        if kw.arg in {"records_data", "data"}:
+                            records_node = kw.value
+                    if records_node is None and len(node.args) >= 2:
+                        records_node = node.args[1]
+                    if isinstance(records_node, (ast.List, ast.Tuple)):
+                        for idx, elt in enumerate(records_node.elts):
+                            if not isinstance(elt, ast.Dict):
+                                continue
+                            lineno = base_line + getattr(elt, "lineno", 1) - 1
+                            raw_dict = ast.literal_eval(elt)
+                            if isinstance(raw_dict, dict):
+                                checked_count += 1
+                                errors.extend(
+                                    _validate_single_record_write_payload(
+                                        raw_dict,
+                                        source_label=f"{path}:{lineno}:records[{idx}]",
+                                    )
+                                )
+
+        if checked_count == 0:
+            errors.append(f"{path}: Expected at least one Record write payload dictionary")
+
+    return errors
+
+
+def test_record_write_examples_match_strict_request_models(tmp_path: Path) -> None:
+    """Verify bulk submission example and workflow RST guides conform to strict Record request models."""
+    target_paths = (
+        REPO_ROOT / "examples" / "workflow_bulk_submission.py",
+        DOCS_DIR / "how-to" / "workflows" / "record_update.rst",
+        DOCS_DIR / "how-to" / "workflows" / "bulk_submission.rst",
+    )
+    errors = validate_record_write_examples_contracts(target_paths)
+    assert not errors, f"Record write example contract violations: {errors}"
+
+    drifted_py = tmp_path / "drifted_bulk.py"
+    drifted_py.write_text(
+        "from imednet_workflows.uat import GeneratedRecordSet, RecordTestType\n"
+        "reg = GeneratedRecordSet(\n"
+        "    form_key='F_DM',\n"
+        "    test_type=RecordTestType.REGISTER_SUBJECT,\n"
+        "    payloads=[{'formKey': 'F_DM', 'siteName': 'SITE', 'subjectKey': 'SUB1', 'data': {}}],\n"
+        ")\n"
+        "create = GeneratedRecordSet(\n"
+        "    form_key='F_VS',\n"
+        "    test_type=RecordTestType.CREATE_NEW_RECORD,\n"
+        "    payloads=[{'formKey': 'F_VS', 'siteName': 'SITE', 'subjectKey': 'SUB1', 'intervalName': 'Baseline', 'data': {}}],\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    drifted_rst = tmp_path / "drifted_guide.rst"
+    drifted_rst.write_text(
+        "Record Update\n=============\n\n.. testcode::\n\n"
+        "   workflow.create_or_update_records_batch(\n"
+        "       study_key='STUDY',\n"
+        "       records_data=[{\n"
+        "           'formKey': 'F_VS',\n"
+        "           'siteName': 'SITE',\n"
+        "           'subjectKey': 'SUB1',\n"
+        "           'intervalName': 'Baseline',\n"
+        "           'data': {'V_WEIGHT': 71.5},\n"
+        "       }],\n"
+        "   )\n",
+        encoding="utf-8",
+    )
+    drifted_errs = validate_record_write_examples_contracts((drifted_py, drifted_rst))
+    assert any("REGISTER_SUBJECT payload must not include 'subjectKey'" in e for e in drifted_errs)
+    assert any("Strict CreateNewRecordRequest validation failed" in e for e in drifted_errs)
+    assert any("Strict UpdateScheduledRecordRequest validation failed" in e for e in drifted_errs)
