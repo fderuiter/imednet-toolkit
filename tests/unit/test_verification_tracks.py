@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -197,7 +200,27 @@ def test_postman_drift_checks_all_endpoints_and_records_every_mismatch(
 
 def test_verification_workflows_enforce_reports_caching_and_deep_fuzzing() -> None:
     perf = yaml.safe_load((WORKFLOWS / "performance.yml").read_text(encoding="utf-8"))
-    perf_steps = perf["jobs"]["benchmark"]["steps"]
+    perf_triggers = perf.get("on") or perf.get(True) or {}
+    assert {"push", "pull_request", "merge_group"} <= set(perf_triggers)
+    assert "paths-ignore" not in (perf_triggers.get("push") or {})
+    assert "paths-ignore" not in (perf_triggers.get("pull_request") or {})
+
+    filter_job = perf["jobs"]["filter"]
+    assert filter_job["permissions"] == {"contents": "read"}
+    assert filter_job["outputs"]["run_benchmarks"] == "${{ steps.evaluate.outputs.run_benchmarks }}"
+    for step in filter_job["steps"]:
+        if "uses" in step:
+            assert len(step["uses"].split("@", 1)[1]) == 40
+
+    benchmark_job = perf["jobs"]["benchmark"]
+    assert benchmark_job["needs"] == ["filter"]
+    assert benchmark_job["if"] == "needs.filter.outputs.run_benchmarks == 'true'"
+    assert benchmark_job["permissions"] == {"contents": "read"}
+
+    perf_steps = benchmark_job["steps"]
+    for step in perf_steps:
+        if "uses" in step:
+            assert len(step["uses"].split("@", 1)[1]) == 40
     assert any(
         "aggregate_verification.py --report-dir reports/verification --expect-track performance"
         in s.get("run", "")
@@ -206,6 +229,12 @@ def test_verification_workflows_enforce_reports_caching_and_deep_fuzzing() -> No
     perf_upload = next(s for s in perf_steps if s.get("name") == "Save Verification Artifact")
     assert perf_upload["with"]["path"] == "reports/verification/performance_report.json"
     assert perf_upload["with"]["if-no-files-found"] == "error"
+
+    perf_gate = perf["jobs"]["performance-gate"]
+    assert perf_gate["name"] == "Performance Gate"
+    assert perf_gate["if"] == "always()"
+    assert perf_gate["needs"] == ["filter", "benchmark"]
+    assert perf_gate["permissions"] == {}
 
     expected_restore_key = (
         "fuzz-corpus-${{ runner.os }}-sha256-restore-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -319,3 +348,118 @@ def test_verification_workflows_enforce_reports_caching_and_deep_fuzzing() -> No
     assert deep_upload["with"]["name"] == "deep-fuzzing-report"
     assert deep_upload["with"]["path"] == "reports/verification/fuzzing_report.json"
     assert deep_upload["with"]["if-no-files-found"] == "error"
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is needed for workflow scripts")
+def test_performance_workflow_path_filter_merge_group_and_gate_execution(tmp_path: Path) -> None:
+    perf = yaml.safe_load((WORKFLOWS / "performance.yml").read_text(encoding="utf-8"))
+    eval_step = next(s for s in perf["jobs"]["filter"]["steps"] if s.get("id") == "evaluate")
+    gate_step = perf["jobs"]["performance-gate"]["steps"][0]
+    assert gate_step["if"] == "always()"
+
+    def run_filter(
+        *,
+        all_changed: str = "",
+        event_name: str = "pull_request",
+        base_sha: str = "",
+        head_sha: str = "",
+        cwd: Path = tmp_path,
+    ) -> str:
+        out_file = tmp_path / "perf_filter_out.txt"
+        out_file.write_text("", encoding="utf-8")
+        subprocess.run(
+            [shutil.which("bash") or "bash", "-e", "-c", eval_step["run"]],
+            cwd=cwd,
+            env={
+                **os.environ,
+                "EVENT_NAME": event_name,
+                "MERGE_GROUP_BASE_SHA": base_sha,
+                "MERGE_GROUP_HEAD_SHA": head_sha,
+                "ALL_CHANGED_FILES": all_changed,
+                "GITHUB_OUTPUT": str(out_file),
+            },
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        outputs = dict(
+            line.split("=", 1)
+            for line in out_file.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+        return outputs["run_benchmarks"]
+
+    assert run_filter(all_changed="docs/index.rst,README.md,examples/demo.py") == "false"
+    assert run_filter(all_changed="./docs/guide.rst,AGENTS.md") == "false"
+    assert run_filter(all_changed="docs/index.rst,.github/workflows/performance.yml") == "true"
+    assert run_filter(all_changed="packages/core/src/imednet/client.py") == "true"
+    assert run_filter(all_changed="") == "true"
+
+    repo = tmp_path / "mg_perf"
+    repo.mkdir()
+    git_bin = shutil.which("git") or "git"
+    subprocess.run([git_bin, "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run([git_bin, "config", "user.email", "ci@example.com"], cwd=repo, check=True)
+    subprocess.run([git_bin, "config", "user.name", "CI"], cwd=repo, check=True)
+    (repo / "README.md").write_text("# Init\n", encoding="utf-8")
+    subprocess.run([git_bin, "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(
+        [git_bin, "commit", "-m", "chore: init"], cwd=repo, check=True, capture_output=True
+    )
+    base_sha = subprocess.check_output([git_bin, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    (repo / "docs").mkdir()
+    (repo / "docs" / "intro.rst").write_text("Intro\n=====\n", encoding="utf-8")
+    subprocess.run([git_bin, "add", "docs/intro.rst"], cwd=repo, check=True)
+    subprocess.run(
+        [git_bin, "commit", "-m", "docs: intro (#1)"], cwd=repo, check=True, capture_output=True
+    )
+    docs_sha = subprocess.check_output([git_bin, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    assert (
+        run_filter(
+            event_name="merge_group",
+            base_sha=base_sha,
+            head_sha=docs_sha,
+            cwd=repo,
+        )
+        == "false"
+    )
+
+    (repo / "packages").mkdir()
+    (repo / "packages" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run([git_bin, "add", "packages/mod.py"], cwd=repo, check=True)
+    subprocess.run(
+        [git_bin, "commit", "-m", "feat: add mod (#2)"], cwd=repo, check=True, capture_output=True
+    )
+    code_sha = subprocess.check_output([git_bin, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    assert (
+        run_filter(
+            event_name="merge_group",
+            base_sha=base_sha,
+            head_sha=code_sha,
+            cwd=repo,
+        )
+        == "true"
+    )
+
+    def run_perf_gate(filter_result: str, run_benchmarks: str, benchmark_result: str) -> int:
+        needs = {
+            "filter": {"result": filter_result, "outputs": {"run_benchmarks": run_benchmarks}},
+            "benchmark": {"result": benchmark_result, "outputs": {}},
+        }
+        proc = subprocess.run(
+            [shutil.which("bash") or "bash", "-e", "-c", gate_step["run"]],
+            cwd=tmp_path,
+            env={**os.environ, "NEEDS_JSON": json.dumps(needs)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.returncode
+
+    assert run_perf_gate("success", "false", "skipped") == 0
+    assert run_perf_gate("success", "true", "success") == 0
+    assert run_perf_gate("success", "true", "failure") == 1
+    assert run_perf_gate("success", "true", "cancelled") == 1
+    assert run_perf_gate("success", "true", "skipped") == 1
+    assert run_perf_gate("failure", "false", "skipped") == 1

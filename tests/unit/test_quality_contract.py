@@ -1,6 +1,7 @@
 """Guard shared verification tasks and public package metadata against drift."""
 
 import copy
+import json
 import os
 import re
 import shutil
@@ -286,7 +287,29 @@ def test_ci_deploy_docs_gates_and_manual_dispatch():
     triggers = _workflow_triggers(pipeline)
     assert "push" in triggers
     assert "pull_request" in triggers
+    assert "merge_group" in triggers
     assert "workflow_dispatch" in triggers
+
+    assert "semantic-pr-title" not in pipeline["jobs"]
+    assert pipeline["jobs"]["scorecard"]["if"] == "github.event_name != 'merge_group'"
+
+    ci_gate = pipeline["jobs"]["ci-gate"]
+    assert ci_gate["name"] == "CI Gate"
+    assert ci_gate["if"] == "always()"
+    assert ci_gate["permissions"] == {}
+    assert set(ci_gate["needs"]) == {
+        "global-lint",
+        "pre-commit",
+        "plan",
+        "scorecard",
+        "quality",
+        "build",
+        "test",
+        "integration-sandbox",
+        "fuzzing",
+        "validate-package-consumption",
+        "docs",
+    }
 
     deploy = pipeline["jobs"]["deploy-docs"]
     needs = set(deploy["needs"])
@@ -299,6 +322,335 @@ def test_ci_deploy_docs_gates_and_manual_dispatch():
     assert "github.ref == 'refs/heads/main'" in cond
     assert "github.event_name == 'push'" in cond
     assert "github.event_name == 'workflow_dispatch'" in cond
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is needed for workflow scripts")
+def test_ci_gate_executes_terminal_pass_skip_and_failure_semantics(tmp_path: Path) -> None:
+    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+    gate_step = pipeline["jobs"]["ci-gate"]["steps"][0]
+    assert gate_step["if"] == "always()"
+    script = gate_step["run"]
+
+    def make_needs(
+        *,
+        matrix: str = '["core"]',
+        run_integration: str = "true",
+        overrides: dict[str, str] | None = None,
+    ) -> dict:
+        base = {
+            job: {"result": "success", "outputs": {}}
+            for job in pipeline["jobs"]["ci-gate"]["needs"]
+        }
+        base["plan"]["outputs"] = {"matrix": matrix, "run_integration": run_integration}
+        if overrides:
+            for job, res in overrides.items():
+                base[job]["result"] = res
+        return base
+
+    def run_gate(
+        needs_payload: dict, event_name: str = "pull_request"
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [shutil.which("bash") or "bash", "-e", "-c", script],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "EVENT_NAME": event_name,
+                "NEEDS_JSON": json.dumps(needs_payload),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    # Full pass
+    assert run_gate(make_needs()).returncode == 0
+
+    # Docs/markdown PR where ci_plan.py returns empty matrix
+    docs_only_needs = make_needs(
+        matrix="[]",
+        run_integration="false",
+        overrides={
+            "build": "skipped",
+            "test": "skipped",
+            "integration-sandbox": "skipped",
+            "fuzzing": "skipped",
+            "validate-package-consumption": "skipped",
+        },
+    )
+    assert run_gate(docs_only_needs).returncode == 0
+
+    # Leaf-package PR where integration-sandbox is skipped
+    leaf_needs = make_needs(
+        matrix='["plugins-tui"]',
+        run_integration="false",
+        overrides={"integration-sandbox": "skipped"},
+    )
+    assert run_gate(leaf_needs).returncode == 0
+
+    # merge_group run where scorecard is guarded/skipped
+    mg_needs = make_needs(overrides={"scorecard": "skipped"})
+    assert run_gate(mg_needs, event_name="merge_group").returncode == 0
+    assert run_gate(mg_needs, event_name="pull_request").returncode == 1
+
+    # Upstream failure or cancellation fails CI Gate
+    assert run_gate(make_needs(overrides={"test": "failure"})).returncode == 1
+    assert run_gate(make_needs(overrides={"fuzzing": "cancelled"})).returncode == 1
+
+    # Unexpected skip of impacted job fails CI Gate
+    assert run_gate(make_needs(overrides={"test": "skipped"})).returncode == 1
+    assert run_gate(make_needs(overrides={"integration-sandbox": "skipped"})).returncode == 1
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("jq") is None,
+    reason="Bash and jq are needed for plan workflow script tests",
+)
+def test_plan_job_diffs_merge_group_base_and_head_sha(tmp_path: Path) -> None:
+    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+    plan_steps = pipeline["jobs"]["plan"]["steps"]
+    filter_step = next(s for s in plan_steps if s.get("id") == "filter")
+    assert "merge_group.base_sha" in filter_step["with"]["base"]
+    assert "merge_group.head_sha" in filter_step["with"]["ref"]
+
+    set_matrix_step = next(s for s in plan_steps if s.get("id") == "set-matrix")
+    assert (
+        set_matrix_step["env"]["MERGE_GROUP_BASE_SHA"] == "${{ github.event.merge_group.base_sha }}"
+    )
+    assert (
+        set_matrix_step["env"]["MERGE_GROUP_HEAD_SHA"] == "${{ github.event.merge_group.head_sha }}"
+    )
+
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "ci_plan.py", repo / "scripts" / "ci_plan.py")
+    for pkg_toml in (ROOT / "packages").glob("*/pyproject.toml"):
+        dest = repo / "packages" / pkg_toml.parent.name / "pyproject.toml"
+        dest.parent.mkdir(parents=True)
+        shutil.copy2(pkg_toml, dest)
+
+    git_bin = shutil.which("git") or "git"
+    subprocess.run([git_bin, "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run([git_bin, "config", "user.email", "ci@example.com"], cwd=repo, check=True)
+    subprocess.run([git_bin, "config", "user.name", "CI"], cwd=repo, check=True)
+    subprocess.run([git_bin, "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        [git_bin, "commit", "-m", "chore: initial"], cwd=repo, check=True, capture_output=True
+    )
+    base_sha = subprocess.check_output([git_bin, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    # Commit 1: docs-only queued change
+    (repo / "docs").mkdir()
+    (repo / "docs" / "guide.rst").write_text("Guide\n=====\n", encoding="utf-8")
+    subprocess.run([git_bin, "add", "docs/guide.rst"], cwd=repo, check=True)
+    subprocess.run(
+        [git_bin, "commit", "-m", "docs: add guide (#2160)"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    docs_head_sha = subprocess.check_output(
+        [git_bin, "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+
+    out_docs = tmp_path / "docs_output.txt"
+    out_docs.touch()
+    subprocess.run(
+        [shutil.which("bash") or "bash", "-e", "-c", set_matrix_step["run"]],
+        cwd=repo,
+        env={
+            **os.environ,
+            "EVENT_NAME": "merge_group",
+            "MERGE_GROUP_BASE_SHA": base_sha,
+            "MERGE_GROUP_HEAD_SHA": docs_head_sha,
+            "ALL_CHANGED_FILES": "",
+            "GITHUB_OUTPUT": str(out_docs),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    docs_lines = dict(
+        line.split("=", 1)
+        for line in out_docs.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+    assert json.loads(docs_lines["matrix"]) == []
+    assert json.loads(docs_lines["build_matrix"]) == []
+
+    # Commit 2: second PR in merge queue modifies plugins-sinks
+    sinks_src = repo / "packages" / "plugins-sinks" / "src" / "imednet_sinks"
+    sinks_src.mkdir(parents=True)
+    (sinks_src / "graph.py").write_text("# sink change\n", encoding="utf-8")
+    subprocess.run([git_bin, "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        [git_bin, "commit", "-m", "fix(sinks): align sdtm cypher (#2161)"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    sinks_head_sha = subprocess.check_output(
+        [git_bin, "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+
+    out_sinks = tmp_path / "sinks_output.txt"
+    out_sinks.touch()
+    subprocess.run(
+        [shutil.which("bash") or "bash", "-e", "-c", set_matrix_step["run"]],
+        cwd=repo,
+        env={
+            **os.environ,
+            "EVENT_NAME": "merge_group",
+            "MERGE_GROUP_BASE_SHA": base_sha,
+            "MERGE_GROUP_HEAD_SHA": sinks_head_sha,
+            "ALL_CHANGED_FILES": "",
+            "GITHUB_OUTPUT": str(out_sinks),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sinks_lines = dict(
+        line.split("=", 1)
+        for line in out_sinks.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+    assert json.loads(sinks_lines["matrix"]) == ["plugins-sinks"]
+    assert json.loads(sinks_lines["build_matrix"]) == ["plugins-sinks"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is needed for workflow scripts")
+def test_pr_title_workflow_enforces_edited_bots_isolated_concurrency_and_merge_group(
+    tmp_path: Path,
+) -> None:
+    pr_title_path = ROOT / ".github" / "workflows" / "pr-title.yml"
+    raw = pr_title_path.read_text(encoding="utf-8")
+    assert "[bot]" not in raw
+
+    wf = yaml.safe_load(raw)
+    triggers = _workflow_triggers(wf)
+    assert set(triggers["pull_request"]["types"]) >= {
+        "opened",
+        "edited",
+        "synchronize",
+        "reopened",
+    }
+    assert "merge_group" in triggers
+
+    main_wf = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+    perf_wf = yaml.safe_load(
+        (ROOT / ".github/workflows/performance.yml").read_text(encoding="utf-8")
+    )
+    pr_group = wf["concurrency"]["group"]
+    assert pr_group.startswith("pr-title-")
+    assert pr_group != main_wf["concurrency"]["group"]
+    assert pr_group != perf_wf["concurrency"]["group"]
+    assert wf["concurrency"]["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+    assert wf["permissions"] == {}
+
+    job = wf["jobs"]["semantic-pr-title"]
+    assert job["name"] == "Semantic PR Title"
+    steps = job["steps"]
+    for step in steps:
+        if "uses" in step:
+            assert len(step["uses"].split("@", 1)[1]) == 40
+
+    pr_step = next(s for s in steps if s.get("name") == "Validate PR title")
+    assert pr_step["if"] == "github.event_name == 'pull_request'"
+    assert pr_step["uses"].startswith("amannn/action-semantic-pull-request@")
+    allowed_types = [t.strip() for t in pr_step["with"]["types"].splitlines() if t.strip()]
+    assert allowed_types == [
+        "feat",
+        "fix",
+        "chore",
+        "docs",
+        "ci",
+        "test",
+        "refactor",
+        "perf",
+        "revert",
+    ]
+
+    mg_step = next(s for s in steps if s.get("name") == "Validate queued commit prefixes")
+    assert mg_step["if"] == "github.event_name == 'merge_group'"
+
+    repo = tmp_path / "mg_repo"
+    repo.mkdir()
+    git_bin = shutil.which("git") or "git"
+    subprocess.run([git_bin, "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run([git_bin, "config", "user.email", "ci@example.com"], cwd=repo, check=True)
+    subprocess.run([git_bin, "config", "user.name", "CI"], cwd=repo, check=True)
+    subprocess.run(
+        [git_bin, "commit", "--allow-empty", "-m", "chore: base"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    base_sha = subprocess.check_output([git_bin, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    subprocess.run(
+        [git_bin, "commit", "--allow-empty", "-m", "fix(sdtm): unify domain routing (#2135)"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [git_bin, "commit", "--allow-empty", "-m", "feat(ci)!: add merge queue gates (#2164)"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    valid_head = subprocess.check_output(
+        [git_bin, "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+
+    ok = subprocess.run(
+        [shutil.which("bash") or "bash", "-e", "-c", mg_step["run"]],
+        cwd=repo,
+        env={
+            **os.environ,
+            "BASE_SHA": base_sha,
+            "HEAD_SHA": valid_head,
+            "HEAD_COMMIT_MSG": "feat(ci)!: add merge queue gates (#2164)",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ok.returncode == 0, ok.stderr
+
+    subprocess.run(
+        [git_bin, "commit", "--allow-empty", "-m", "Update README without conventional prefix"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    bad_head = subprocess.check_output([git_bin, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    bad = subprocess.run(
+        [shutil.which("bash") or "bash", "-e", "-c", mg_step["run"]],
+        cwd=repo,
+        env={
+            **os.environ,
+            "BASE_SHA": base_sha,
+            "HEAD_SHA": bad_head,
+            "HEAD_COMMIT_MSG": "Update README without conventional prefix",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bad.returncode != 0
+    assert "Invalid Conventional Commit prefix" in bad.stderr
+
+
+def test_required_checks_documented_in_contributing_and_agents() -> None:
+    contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    for required_check in ("CI Gate", "Performance Gate", "Semantic PR Title", "merge_group"):
+        assert required_check in contributing
+        assert required_check in agents
+    assert "copilot-setup-steps.yml" in contributing
 
 
 def test_ruff_versions_and_metadata_are_consistent():

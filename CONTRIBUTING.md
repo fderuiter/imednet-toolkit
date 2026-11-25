@@ -160,8 +160,10 @@ Strict static typing (`strict = true` in `[tool.mypy]`) is enforced across all f
 Releases are fully automated and driven by merged PR titles:
 
 1. Ensure your PR title follows Conventional Commits. Supported prefixes are `feat:`, `fix:`,
-   `chore:`, `docs:`, `ci:`, `test:`, `refactor:`, `perf:`, and `revert:`. The CI
-   `Semantic PR Title` check enforces this.
+   `chore:`, `docs:`, `ci:`, `test:`, `refactor:`, `perf:`, and `revert:`. The isolated
+   `Semantic PR Title` workflow (`.github/workflows/pr-title.yml`) enforces this across all human
+   and `[bot]` pull requests (including `edited` title updates) as well as queued `merge_group`
+   commits.
 2. Ensure your branch is up to date and all validation checks pass:
    ```bash
    uvx pre-commit run --all-files
@@ -251,8 +253,12 @@ Configuration requirements:
   ```bash
   bash scripts/wizards/setup-ci-live-testing.sh
   ```
-- Configure branch protection on `main` to require pull request reviews and required status checks,
-  including `Semantic PR Title`.
+- Configure branch protection and GitHub Merge Queue (`merge_group`) on `main` to require pull
+  request reviews and the three always-reporting required status checks: `CI Gate`
+  (`.github/workflows/main.yml`), `Performance Gate` (`.github/workflows/performance.yml`), and
+  `Semantic PR Title` (`.github/workflows/pr-title.yml`). Exclude
+  `.github/workflows/copilot-setup-steps.yml` from required checks because GitHub Copilot scopes it
+  to workflow self-updates.
 
 ## Conventions
 - DRY + SOLID. Line length 100.

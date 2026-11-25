@@ -3,16 +3,9 @@ name: SDK Performance Suite
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - 'examples/**'
-      - '**/*.md'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - 'examples/**'
-      - '**/*.md'
+  merge_group: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,8 +14,74 @@ concurrency:
 permissions: {}
 
 jobs:
+  filter:
+    name: Filter Performance Paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run_benchmarks: ${{ steps.evaluate.outputs.run_benchmarks }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Get changed files
+        id: changed-files
+        if: github.event_name != 'merge_group'
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        with:
+          separator: ","
+
+      - name: Evaluate performance path filters
+        id: evaluate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          event_name = os.environ.get("EVENT_NAME", "")
+          base_sha = os.environ.get("MERGE_GROUP_BASE_SHA", "").strip()
+          head_sha = os.environ.get("MERGE_GROUP_HEAD_SHA", "").strip()
+
+          if event_name == "merge_group" and base_sha and head_sha:
+              raw = subprocess.check_output(
+                  ["git", "diff", "--name-only", base_sha, head_sha],
+                  text=True,
+              )
+              files = [line.strip() for line in raw.splitlines() if line.strip()]
+          else:
+              raw = os.environ.get("ALL_CHANGED_FILES", "")
+              files = [part.strip() for part in raw.split(",") if part.strip()]
+
+          def is_ignored(path: str) -> bool:
+              norm = path.strip().replace("\\", "/")
+              while norm.startswith("./"):
+                  norm = norm[2:]
+              return (
+                  norm.startswith("docs/")
+                  or norm.startswith("examples/")
+                  or norm.endswith(".md")
+              )
+
+          run_benchmarks = "false" if (files and all(is_ignored(f) for f in files)) else "true"
+          print(f"Changed files ({len(files)}): {files}")
+          print(f"run_benchmarks={run_benchmarks}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"run_benchmarks={run_benchmarks}\n")
+          PY
+
   benchmark:
     name: Run Performance Benchmarks
+    needs: [filter]
+    if: needs.filter.outputs.run_benchmarks == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -80,3 +139,60 @@ jobs:
           name: performance-report
           path: reports/verification/performance_report.json
           if-no-files-found: error
+
+  performance-gate:
+    name: Performance Gate
+    if: always()
+    needs: [filter, benchmark]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Evaluate performance suite results
+        if: always()
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          filter_result = needs.get("filter", {}).get("result")
+          run_benchmarks = (needs.get("filter", {}).get("outputs") or {}).get(
+              "run_benchmarks", "true"
+          )
+          benchmark_result = needs.get("benchmark", {}).get("result")
+
+          if filter_result != "success":
+              print(
+                  f"Performance Gate failed because filter job result was {filter_result!r}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if benchmark_result in {"failure", "cancelled"}:
+              print(
+                  f"Performance Gate failed because benchmark job result was {benchmark_result!r}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if run_benchmarks == "true" and benchmark_result != "success":
+              print(
+                  f"Performance Gate failed because benchmarks were required but result was {benchmark_result!r}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if benchmark_result not in {"success", "skipped"}:
+              print(
+                  f"Performance Gate failed due to unexpected benchmark result {benchmark_result!r}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(
+              f"filter: {filter_result}, benchmark: {benchmark_result} (run_benchmarks={run_benchmarks})"
+          )
+          PY

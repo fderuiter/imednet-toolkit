@@ -1,0 +1,73 @@
+name: Semantic PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  merge_group: {}
+
+concurrency:
+  group: pr-title-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  semantic-pr-title:
+    name: Semantic PR Title
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Validate PR title
+        if: github.event_name == 'pull_request'
+        uses: amannn/action-semantic-pull-request@2252a14e810aa9b85c2d560bd7070c802206ecf6 # v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            chore
+            docs
+            ci
+            test
+            refactor
+            perf
+            revert
+
+      - name: Checkout merge group commits
+        if: github.event_name == 'merge_group'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate queued commit prefixes
+        if: github.event_name == 'merge_group'
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          HEAD_COMMIT_MSG: ${{ github.event.merge_group.head_commit.message }}
+        run: |
+          set -euo pipefail
+          PATTERN='^(feat|fix|chore|docs|ci|test|refactor|perf|revert)(\([^)]+\))?!?: .+'
+          SUBJECTS=""
+          if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null && git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            SUBJECTS="$(git log --first-parent --no-merges --format=%s "${BASE_SHA}..${HEAD_SHA}")"
+          fi
+          if [ -z "$SUBJECTS" ] && [ -n "${HEAD_COMMIT_MSG:-}" ]; then
+            SUBJECTS="$(printf '%s\n' "$HEAD_COMMIT_MSG" | head -n 1)"
+          fi
+          if [ -z "$SUBJECTS" ]; then
+            echo "Unable to resolve merge_group commit subjects for prefix validation." >&2
+            exit 1
+          fi
+          while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            if ! printf '%s\n' "$subject" | grep -Eq "$PATTERN"; then
+              echo "Invalid Conventional Commit prefix in queued commit: $subject" >&2
+              exit 1
+            fi
+            echo "Validated queued commit: $subject"
+          done <<< "$SUBJECTS"

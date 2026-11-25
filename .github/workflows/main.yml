@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request: {}
+  merge_group: {}
   workflow_dispatch: {}
 
 concurrency:
@@ -13,36 +14,6 @@ concurrency:
 permissions: {}
 
 jobs:
-  # ------------------------------------------------------------------
-  # JOB 0: PR TITLE LINT (Pull requests only)
-  # ------------------------------------------------------------------
-  semantic-pr-title:
-    name: Semantic PR Title
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
-    steps:
-      - name: Validate PR title
-        if: ${{ !contains(github.event.pull_request.user.login, '[bot]') }}
-        uses: amannn/action-semantic-pull-request@2252a14e810aa9b85c2d560bd7070c802206ecf6 # v6
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          types: |
-            feat
-            fix
-            chore
-            docs
-            ci
-            test
-            refactor
-            perf
-            revert
-
-  # ------------------------------------------------------------------
-  # JOB 1: QUALITY GATE (Runs per package)
-  # ------------------------------------------------------------------
   # ------------------------------------------------------------------
   # JOB 0.1: GLOBAL LINTING (Runs unconditionally)
   # ------------------------------------------------------------------
@@ -122,6 +93,8 @@ jobs:
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
+          base: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || '' }}
+          ref: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || '' }}
           filters: |
             export_logic:
               - 'packages/**/integrations/**'
@@ -131,6 +104,7 @@ jobs:
 
       - name: Get changed files
         id: changed-files
+        if: github.event_name != 'merge_group'
         uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
         with:
           separator: ","
@@ -138,9 +112,15 @@ jobs:
       - name: Determine Impacted Packages
         id: set-matrix
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
         run: |
-          if [ -z "$ALL_CHANGED_FILES" ]; then
+          if [ "$EVENT_NAME" = "merge_group" ] && [ -n "$MERGE_GROUP_BASE_SHA" ] && [ -n "$MERGE_GROUP_HEAD_SHA" ]; then
+            CHANGED_FILES=$(git diff --name-only "$MERGE_GROUP_BASE_SHA" "$MERGE_GROUP_HEAD_SHA")
+            PLAN=$(printf '%s\n' "$CHANGED_FILES" | python3 scripts/ci_plan.py)
+          elif [ -z "$ALL_CHANGED_FILES" ]; then
             PLAN=$(echo "" | python3 scripts/ci_plan.py)
           else
             PLAN=$(echo "$ALL_CHANGED_FILES" | tr ',' '\n' | python3 scripts/ci_plan.py)
@@ -151,6 +131,7 @@ jobs:
 
   scorecard:
     name: OpenSSF Scorecard
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     permissions:
       security-events: write
@@ -690,6 +671,96 @@ jobs:
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: docs/_build/html
+
+  # ------------------------------------------------------------------
+  # JOB 4.5: AGGREGATE CI GATE (Always reports terminal status)
+  # ------------------------------------------------------------------
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs:
+      - global-lint
+      - pre-commit
+      - plan
+      - scorecard
+      - quality
+      - build
+      - test
+      - integration-sandbox
+      - fuzzing
+      - validate-package-consumption
+      - docs
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Evaluate upstream CI job results
+        if: always()
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          event_name = os.environ.get("EVENT_NAME", "")
+
+          failed_or_cancelled = [
+              job
+              for job, info in needs.items()
+              if info.get("result") in {"failure", "cancelled"}
+          ]
+          if failed_or_cancelled:
+              print(
+                  f"CI Gate failed due to upstream failure/cancellation: {', '.join(sorted(failed_or_cancelled))}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          required_always = ["global-lint", "pre-commit", "plan", "quality", "docs"]
+          if event_name != "merge_group":
+              required_always.append("scorecard")
+
+          missing_success = [
+              job for job in required_always if needs.get(job, {}).get("result") != "success"
+          ]
+          if missing_success:
+              print(
+                  f"CI Gate failed because required jobs did not succeed: {', '.join(missing_success)}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          plan_outputs = needs.get("plan", {}).get("outputs") or {}
+          matrix = plan_outputs.get("matrix", "[]")
+          run_integration = plan_outputs.get("run_integration", "false")
+
+          conditional_jobs = ["build", "test", "fuzzing", "validate-package-consumption"]
+          if matrix != "[]":
+              unexpected_skips = [
+                  job for job in conditional_jobs if needs.get(job, {}).get("result") != "success"
+              ]
+              if (
+                  run_integration == "true"
+                  and needs.get("integration-sandbox", {}).get("result") != "success"
+              ):
+                  unexpected_skips.append("integration-sandbox")
+              if unexpected_skips:
+                  print(
+                      f"CI Gate failed because impacted jobs did not succeed: {', '.join(unexpected_skips)}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+          for job, info in sorted(needs.items()):
+              result = info.get("result")
+              if result not in {"success", "skipped"}:
+                  print(f"CI Gate failed due to unexpected result {job}={result!r}", file=sys.stderr)
+                  sys.exit(1)
+              print(f"{job}: {result}")
+          PY
 
   # ------------------------------------------------------------------
   # JOB 5: DEPLOY DOCS (Only on main push or manual dispatch)
