@@ -227,6 +227,50 @@ def test_request_monitor_on_success() -> None:
     span.set_attribute.assert_called_once_with("status_code", 200)
 
 
+@pytest.mark.parametrize(
+    ("status_code", "expected_level"),
+    [
+        (200, "INFO"),
+        (204, "INFO"),
+        (302, "INFO"),
+        (400, "WARNING"),
+        (401, "WARNING"),
+        (429, "WARNING"),
+        (500, "WARNING"),
+        (503, "WARNING"),
+    ],
+)
+def test_request_monitor_sets_span_status_code_and_tiers_log_level(
+    status_code: int,
+    expected_level: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RequestMonitor sets status_code on spans for all responses and logs INFO on 2xx/3xx vs WARNING on 4xx/5xx."""
+    import logging
+
+    tracer = MagicMock()
+    span_cm = MagicMock()
+    span = MagicMock()
+    span_cm.__enter__.return_value = span
+    tracer.start_as_current_span.return_value = span_cm
+
+    monitor = RequestMonitor(tracer, "GET", "https://api.example.com/studies?api_key=secret")
+    with caplog.at_level(logging.INFO, logger="imednet.core.http.monitor"), monitor:
+        response = httpx.Response(
+            status_code,
+            request=httpx.Request("GET", "https://api.example.com/studies?api_key=secret"),
+        )
+        monitor.on_response(response)
+
+    span.set_attribute.assert_called_once_with("status_code", status_code)
+    records = [r for r in caplog.records if r.name == "imednet.core.http.monitor"]
+    assert len(records) == 1
+    assert records[0].levelname == expected_level
+    assert records[0].getMessage() == "http_request"
+    assert records[0].status_code == status_code
+    assert "secret" not in records[0].url
+
+
 def test_request_monitor_on_retry_error_with_last_attempt() -> None:
     """Test RequestMonitor on_retry_error raises RequestError wrapping last exception."""
     monitor = RequestMonitor(None, "POST", "https://api.example.com/submit")

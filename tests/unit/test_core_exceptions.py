@@ -22,6 +22,11 @@ def test_exception_hierarchy() -> None:
 
     # New check
     assert issubclass(errors.ClientError, errors.ImednetError)
+    assert issubclass(errors.ValidationError, errors.ClientError)
+    assert issubclass(errors.ValidationError, errors.ApiError)
+    assert issubclass(errors.UnknownVariableTypeError, errors.ClientError)
+    assert issubclass(errors.UnknownVariableTypeError, errors.ApiError)
+    assert issubclass(errors.BadRequestError, errors.ValidationError)
     assert issubclass(errors.PathTraversalValidationError, errors.ClientError)
     assert issubclass(errors.OrchestratorError, errors.ImednetError)
     assert issubclass(errors.FilterConflictError, errors.OrchestratorError)
