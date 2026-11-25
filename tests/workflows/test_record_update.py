@@ -52,13 +52,19 @@ def test_create_or_update_records_no_wait(schema: SchemaCache, async_mode: bool)
     wf._validator.schema = schema
     wf._schema = schema
     record = fake_data.fake_record(schema)
+    from imednet.utils.tabular import normalize_records_input
+
+    expected = normalize_records_input([record], schema=schema, study_key="S")
 
     if async_mode:
         result = asyncio.run(wf.async_create_or_update_records("S", [record]))
-        sdk.async_create_record.assert_awaited_once_with("S", [record], schema=schema)
+        sdk.async_create_record.assert_awaited_once_with("S", expected, schema=schema)
     else:
         result = wf.create_or_update_records("S", [record])
-        sdk.create_record.assert_called_once_with("S", [record], schema=schema)
+        sdk.create_record.assert_called_once_with("S", expected, schema=schema)
+    assert "data" in expected[0]
+    assert "recordData" not in expected[0]
+    assert "studyKey" not in expected[0]
     assert result == job
 
 

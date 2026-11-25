@@ -264,12 +264,35 @@ def import_records_csv(
     """
     records = csv_to_records(file_path, schema=schema, study_key=study_key)
     effective_schema = schema
-    if records and effective_schema is None and not skip_validation:
+    if records and not skip_validation:
         from imednet.datadict.loaders.api import can_load_from_api, load_from_api
+        from imednet.errors import NotFoundError
+        from imednet.validation.cache import BaseSchemaCache
 
-        if can_load_from_api(sdk):
-            effective_schema = load_from_api(sdk, study_key)
-            records = csv_to_records(file_path, schema=effective_schema, study_key=study_key)
+        from .tabular import schema_cache_needs_refresh
+
+        if effective_schema is None and can_load_from_api(sdk):
+            try:
+                effective_schema = load_from_api(sdk, study_key)
+            except NotFoundError:
+                if dry_run:
+                    raise
+            else:
+                records = csv_to_records(file_path, schema=effective_schema, study_key=study_key)
+        elif (
+            isinstance(effective_schema, BaseSchemaCache)
+            and schema_cache_needs_refresh(effective_schema, study_key, records)
+            and can_load_from_api(sdk)
+            and hasattr(sdk, "forms")
+            and hasattr(sdk, "variables")
+        ):
+            try:
+                effective_schema._refresh_sync(sdk.forms, sdk.variables, study_key=study_key)
+            except NotFoundError:
+                if dry_run:
+                    raise
+            else:
+                records = csv_to_records(file_path, schema=effective_schema, study_key=study_key)
     return sdk.records.create_batch(
         study_key,
         records,

@@ -2630,3 +2630,284 @@ def test_all_four_cli_write_commands_json_emit_unsubmitted_chunks_plain_states_a
             output_format="json",
         )
     assert capsys.readouterr().out == ""
+
+
+def test_cli_write_single_identifier_override_default_data_live_kv_coercion_and_strict_form_id(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sim_sdk_and_requests: tuple[ImednetSDK, SimulationState, list[httpx.Request]],
+) -> None:
+    """AC 3, AC 4, AC 5: CLI write identifier overrides, default data={}, live -d coercion, and --form-id."""
+    from imednet.cli.utils.write_helpers import assemble_cli_write_records
+
+    _sdk, state, captured = sim_sdk_and_requests
+    parser = cli.get_parser()
+
+    # 1. AC 3: assemble_cli_write_records replaces conflicting sibling identifiers across all 5 pairs
+    source_json = json.dumps(
+        [
+            {
+                "formId": 301,
+                "recordOid": "OID-OLD",
+                "subjectOid": "SUBJ-OID-OLD",
+                "subjectId": 999,
+                "siteId": 101,
+                "intervalId": 501,
+            }
+        ]
+    )
+    ns_overridden = parser.parse_args(
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--json",
+            source_json,
+            "--form-key",
+            "F_DM",
+            "--record-id",
+            "601",
+            "--subject-key",
+            "SUB1",
+            "--site-name",
+            "SITE",
+            "--interval-name",
+            "Baseline",
+            "--record-status",
+            "Complete",
+        ]
+    )
+    overridden = assemble_cli_write_records(ns_overridden)
+    assert overridden == [
+        {
+            "formKey": "F_DM",
+            "recordId": 601,
+            "subjectKey": "SUB1",
+            "siteName": "SITE",
+            "intervalName": "Baseline",
+            "recordStatus": "Complete",
+            "data": {},
+        }
+    ]
+    for sibling in ("formId", "recordOid", "subjectOid", "subjectId", "siteId", "intervalId"):
+        assert sibling not in overridden[0]
+
+    # Reverse direction: ID/OID flags replace conflicting Key/Name keys from --file
+    file_path = tmp_path / "conflicting.json"
+    file_path.write_text(
+        json.dumps(
+            [
+                {
+                    "formKey": "F_OLD",
+                    "recordId": 111,
+                    "subjectKey": "SUB-OLD",
+                    "siteName": "SITE-OLD",
+                    "intervalName": "INT-OLD",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ns_overridden_rev = parser.parse_args(
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--file",
+            str(file_path),
+            "--form-id",
+            "302",
+            "--record-oid",
+            "REC-OID-NEW",
+            "--subject-oid",
+            "SUBJ-OID-NEW",
+            "--site-id",
+            "102",
+            "--interval-id",
+            "502",
+        ]
+    )
+    overridden_rev = assemble_cli_write_records(ns_overridden_rev)
+    assert overridden_rev == [
+        {
+            "formId": 302,
+            "recordOid": "REC-OID-NEW",
+            "subjectOid": "SUBJ-OID-NEW",
+            "siteId": 102,
+            "intervalId": 502,
+            "data": {},
+        }
+    ]
+
+    # 2. Add a Checkbox + Text form to SimulationState to test live -d coercion without --schema
+    state.forms.append(
+        {
+            "formId": 77,
+            "formKey": "F_CHK",
+            "formName": "Checkbox Form",
+            "formType": "Standard",
+            "studyKey": "STUDY",
+            "revision": 1,
+            "disabled": False,
+            "eproForm": False,
+            "allowCopy": False,
+        }
+    )
+    state.variables.extend(
+        [
+            {
+                "variableId": 701,
+                "variableName": "CB_CODE",
+                "variableKey": "CB_CODE",
+                "variableType": "Checkbox",
+                "formId": 77,
+                "formKey": "F_CHK",
+                "studyKey": "STUDY",
+                "label": "Checkbox Code",
+            },
+            {
+                "variableId": 702,
+                "variableName": "TXT_CODE",
+                "variableKey": "TXT_CODE",
+                "variableType": "Text",
+                "formId": 77,
+                "formKey": "F_CHK",
+                "studyKey": "STUDY",
+                "label": "Text Code",
+            },
+        ]
+    )
+
+    # AC 3: Status-only CLI update emits "data": {}
+    captured.clear()
+    res_status = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "update",
+            "STUDY",
+            "--record-id",
+            "601",
+            "--record-status",
+            "Complete",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_status.exit_code == 0, res_status.stderr
+    post_reqs = [r for r in captured if r.method == "POST"]
+    assert len(post_reqs) == 1
+    assert json.loads(post_reqs[0].content) == [
+        {"recordId": 601, "recordStatus": "Complete", "data": {}}
+    ]
+
+    # AC 5: parse_key_value_pairs without --schema uses live schema so coercion matches --dry-run
+    captured.clear()
+    res_live_kv = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--form-key",
+            "F_CHK",
+            "--subject-key",
+            "SUB1",
+            "--site-name",
+            "SITE",
+            "-d",
+            "CB_CODE=1",
+            "-d",
+            "TXT_CODE=007",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_live_kv.exit_code == 0, res_live_kv.stderr
+    post_reqs = [r for r in captured if r.method == "POST"]
+    assert len(post_reqs) == 1
+    assert json.loads(post_reqs[0].content)[0]["data"] == {"CB_CODE": "1", "TXT_CODE": "007"}
+
+    # Offline --schema + --dry-run makes zero network calls
+    offline_dd = tmp_path / "offline_dd.json"
+    offline_dd.write_text(
+        json.dumps(
+            {
+                "forms": [
+                    {
+                        "formId": 77,
+                        "formKey": "F_CHK",
+                        "variables": [
+                            {"variableName": "CB_CODE", "variableType": "Checkbox"},
+                            {"variableName": "TXT_CODE", "variableType": "Text"},
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured.clear()
+    res_offline_dry = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--form-key",
+            "F_CHK",
+            "--subject-key",
+            "SUB1",
+            "-d",
+            "CB_CODE=1",
+            "-d",
+            "TXT_CODE=007",
+            "--schema",
+            str(offline_dd),
+            "--dry-run",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_offline_dry.exit_code == 0, res_offline_dry.stderr
+    assert captured == []
+
+    # AC 4: subjects register --form-id succeeds under IMEDNET_STRICT_MODE=1
+    for var_dict in state.variables:
+        var_dict.pop("variableKey", None)
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "1")
+    dm_form_id = next(
+        f["formId"]
+        for f in state.forms
+        if f.get("studyKey") == "STUDY" and f.get("formKey") == "F_DM"
+    )
+    captured.clear()
+    res_subj_form_id = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--form-id",
+            str(dm_form_id),
+            "--site-name",
+            "SITE",
+            "--subject-key",
+            "SUB-STRICT-1",
+            "-d",
+            "age=44",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_subj_form_id.exit_code == 0, res_subj_form_id.stderr
+    subj_posts = [r for r in captured if r.method == "POST"]
+    assert len(subj_posts) == 1
+    sent_subj = json.loads(subj_posts[0].content)[0]
+    assert sent_subj["formKey"] == "F_DM"
+    assert "formId" not in sent_subj

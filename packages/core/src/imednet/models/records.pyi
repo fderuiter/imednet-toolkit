@@ -179,16 +179,29 @@ class BaseRecordRequest(ImednetBaseModel):
     """Base class for record creation/update requests."""
 
     form_key: str = Field("", alias="formKey")
+    form_id: int | None = Field(default=None, alias="formId")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
 
     def __init__(
-        self, *, form_key: str = "", formKey: str = "", data: RecordData | dict[str, Any] = ...
+        self,
+        *,
+        form_key: str = "",
+        formKey: str = "",
+        form_id: int | None = None,
+        formId: int | None = None,
+        data: RecordData | dict[str, Any] = ...,
     ) -> None: ...
+    def _strip_unset_form_fields(self, serialized: dict[str, Any]) -> dict[str, Any]: ...
+    @model_serializer(mode="wrap")
+    def _serialize_omitting_unset_form_fields(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]: ...
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]: ...
 
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
+    Requires ``formKey`` (or ``formId``) and a site identifier (``siteName`` or ``siteId``).
     Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
     ``None`` so server-assigned subject keys continue working by default; when
     explicitly supplied, they are preserved for enrollment and deduplication.
@@ -214,6 +227,8 @@ class RegisterSubjectRequest(BaseRecordRequest):
         *,
         form_key: str = "",
         formKey: str = "",
+        form_id: int | None = None,
+        formId: int | None = None,
         data: RecordData | dict[str, Any] = ...,
         site_name: str = "",
         siteName: str = "",
@@ -244,6 +259,8 @@ class UpdateScheduledRecordRequest(BaseRecordRequest):
         *,
         form_key: str = "",
         formKey: str = "",
+        form_id: int | None = None,
+        formId: int | None = None,
         data: RecordData | dict[str, Any] = ...,
         subject_key: str = "",
         subjectKey: str = "",
@@ -261,6 +278,8 @@ class CreateNewRecordRequest(BaseRecordRequest):
         *,
         form_key: str = "",
         formKey: str = "",
+        form_id: int | None = None,
+        formId: int | None = None,
         data: RecordData | dict[str, Any] = ...,
         subject_key: str = "",
         subjectKey: str = "",

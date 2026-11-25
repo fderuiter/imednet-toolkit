@@ -126,7 +126,7 @@ def test_create_sends_headers_and_parses_job(dummy_client, response_factory, mon
 
     dummy_client.post.assert_called_once_with(
         "/api/v1/edc/studies/S1/records",
-        json=[{"foo": "bar"}],
+        json=[{"foo": "bar", "data": {}}],
         headers={"x-email-notify": "true"},
     )
     assert called["data"] == {"jobId": "1"}

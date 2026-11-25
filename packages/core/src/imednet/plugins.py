@@ -446,6 +446,28 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         """Create a new unscheduled record for an existing subject."""
         ...
 
+    def update_unscheduled_record(
+        self,
+        study_key: str,
+        record_identifier: int | str,
+        data: dict[str, Any] | None = None,
+        record_identifier_type: Literal["id", "oid"] = "id",
+        form_identifier: str | int | None = None,
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier: str | int | None = None,
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        record_status: str | None = None,
+        reason_for_change: str | None = None,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> Job:
+        """Update an existing unscheduled record by ``recordId`` or ``recordOid``."""
+        ...
+
 
 class AsyncRecordUpdateWorkflowProtocol(Protocol):
     """Asynchronous contract for ``sdk.workflows.record_update`` on ``AsyncImednetSDK``."""
@@ -541,6 +563,28 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         """Asynchronously create a new unscheduled record for an existing subject."""
         ...
 
+    async def async_update_unscheduled_record(
+        self,
+        study_key: str,
+        record_identifier: int | str,
+        data: dict[str, Any] | None = None,
+        record_identifier_type: Literal["id", "oid"] = "id",
+        form_identifier: str | int | None = None,
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier: str | int | None = None,
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        record_status: str | None = None,
+        reason_for_change: str | None = None,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> Job:
+        """Asynchronously update an existing unscheduled record by ``recordId`` or ``recordOid``."""
+        ...
+
     @deprecated(
         "create_or_update_records_batch() is synchronous and raises TypeError on AsyncImednetSDK; "
         "use await async_create_or_update_records_batch(...) instead."
@@ -579,6 +623,14 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
     )
     def create_new_record(self, *args: Any, **kwargs: Any) -> Never:
         """Rejected synchronous unscheduled record creation stub on AsyncImednetSDK."""
+        ...
+
+    @deprecated(
+        "update_unscheduled_record() is synchronous and raises TypeError on AsyncImednetSDK; "
+        "use await async_update_unscheduled_record(...) instead."
+    )
+    def update_unscheduled_record(self, *args: Any, **kwargs: Any) -> Never:
+        """Rejected synchronous unscheduled record update stub on AsyncImednetSDK."""
         ...
 
 

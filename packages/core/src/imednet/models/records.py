@@ -210,13 +210,55 @@ class BaseRecordRequest(ImednetBaseModel):
     """Base class for record creation/update requests."""
 
     form_key: str = Field("", alias="formKey")
+    form_id: int | None = Field(default=None, alias="formId")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
+
+    def _strip_unset_form_fields(self, serialized: dict[str, Any]) -> dict[str, Any]:
+        """Omit unset ``formId`` or empty ``formKey`` so only one form identifier is emitted."""
+        if self.form_key:
+            serialized.pop("form_id", None)
+            serialized.pop("formId", None)
+        elif self.form_id is not None:
+            serialized.pop("form_key", None)
+            serialized.pop("formKey", None)
+        else:
+            serialized.pop("form_id", None)
+            serialized.pop("formId", None)
+        return serialized
+
+    @model_serializer(mode="wrap")
+    def _serialize_omitting_unset_form_fields(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        serialized: dict[str, Any] = handler(self)
+        return self._strip_unset_form_fields(serialized)
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        """Serialize request payload, omitting ``None`` and redundant form identifiers."""
+        kwargs.setdefault("exclude_none", True)
+        exclude_fields: set[str] = set()
+        if self.form_key and self.form_id is not None:
+            exclude_fields.add("form_id")
+        elif not self.form_key and self.form_id is not None:
+            exclude_fields.add("form_key")
+        if exclude_fields:
+            raw_exclude = kwargs.get("exclude")
+            if raw_exclude is None:
+                kwargs["exclude"] = exclude_fields
+            elif isinstance(raw_exclude, set):
+                kwargs["exclude"] = raw_exclude | exclude_fields
+            elif isinstance(raw_exclude, dict):
+                merged = dict(raw_exclude)
+                for field_name in exclude_fields:
+                    merged[field_name] = True
+                kwargs["exclude"] = merged
+        return super().model_dump(**kwargs)
 
 
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
+    Requires ``formKey`` (or ``formId``) and a site identifier (``siteName`` or ``siteId``).
     Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
     ``None`` so server-assigned subject keys continue working by default; when
     explicitly supplied, they are preserved for enrollment and deduplication.
@@ -254,6 +296,7 @@ class RegisterSubjectRequest(BaseRecordRequest):
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, Any]:
         serialized: dict[str, Any] = handler(self)
+        self._strip_unset_form_fields(serialized)
         if self.site_id is None:
             serialized.pop("site_id", None)
             serialized.pop("siteId", None)

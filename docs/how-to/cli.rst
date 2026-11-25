@@ -145,10 +145,13 @@ connections):
        --reason-for-change "Chart correction" --wait --format json
    cat batch.csv | imednet records import STUDY - --schema api --wait --format json
    imednet subjects register STUDY --file subjects.csv --skip-existing --wait
+   imednet subjects register STUDY --form-id 1 --site-name SITE -d V_AGE=42 --wait
 
 Passing ``--schema`` (``api``, canonical ``DataDictionary`` JSON, CDISC ODM XML, REDCap
-CSV, or a 4-file CSV directory/ZIP) preserves string values on ``text``, ``string``, and
-``memo`` Variables for both CSV cells and ``-d KEY=VALUE`` overrides, while double-quoted
+CSV, or a 4-file CSV directory/ZIP) or omitting ``--schema`` on live runs (which resolves
+the live Study ``Variable`` definitions when available) preserves string values on ``text``,
+``string``, ``memo``, ``Checkbox``, and ``Multi Select`` Variables for both CSV cells and
+``-d KEY=VALUE`` overrides, while double-quoted
 ``-d 'KEY="90210"'`` values always remain strings even without ``--schema``. Offline
 ``--dry-run`` runs with an offline ``--schema`` perform local validation only without
 issuing HTTP requests, whereas ``--dry-run`` without ``--schema`` loads the live Study

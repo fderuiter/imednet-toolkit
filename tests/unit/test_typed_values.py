@@ -30,6 +30,7 @@ def test_typed_values_canonical_taxonomy_and_loader_parity() -> None:
     from imednet.models.forms import Form as ApiForm
     from imednet.models.variables import Variable as ApiVariable
     from imednet.testing import fake_data
+    from imednet.utils.tabular import normalize_records_input
     from imednet.validation.cache import (
         _TYPE_VALIDATORS,
         SchemaCache,
@@ -58,7 +59,7 @@ def test_typed_values_canonical_taxonomy_and_loader_parity() -> None:
         validate_record_data(cache, "F_TAX", {f"V_{idx}": sample})
 
         generated = fake_data.fake_record(cache)
-        validate_record_entry(cache, generated)
+        validate_record_entry(cache, normalize_records_input([generated])[0])
 
     # 2. Normalization of whitespace and casing in typed_values, plus None for unknown types
     assert typed_values.canonical_type("  Single   Select  ") == "single select"

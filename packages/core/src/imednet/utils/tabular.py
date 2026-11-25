@@ -11,14 +11,15 @@ import math
 import os
 import re
 from collections.abc import Mapping, Sequence
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from imednet.errors import ValidationError
 from imednet.utils.typing import JsonDict, RecordsInput
 
 if TYPE_CHECKING:
-    from imednet.validation.cache import ValidationSchemaProtocol
+    from imednet.validation.cache import BaseSchemaCache, ValidationSchemaProtocol
 
 MASKED_SENTINEL: str = "***MASKED***"
 
@@ -43,6 +44,10 @@ _READ_ONLY_RECORD_COLUMNS: frozenset[str] = frozenset(
         "parentRecordId",
         "keywords",
     }
+)
+_READ_ONLY_NON_KEYWORD_COLUMNS: frozenset[str] = _READ_ONLY_RECORD_COLUMNS - {"keywords"}
+_READ_ONLY_KEYWORD_ITEM_KEYS: frozenset[str] = frozenset(
+    {"keyword_id", "keywordId", "date_added", "dateAdded"}
 )
 
 _NESTED_DATA_COLUMNS: frozenset[str] = frozenset({"record_data", "recordData", "data"})
@@ -117,6 +122,9 @@ _INT_LIKE_TYPES: frozenset[str] = frozenset({"int", "integer", "number"})
 _FLOAT_LIKE_TYPES: frozenset[str] = frozenset({"float", "decimal", "double", "numeric"})
 _NUMERIC_LIKE_TYPES: frozenset[str] = _INT_LIKE_TYPES | _FLOAT_LIKE_TYPES
 _BOOL_LIKE_TYPES: frozenset[str] = frozenset({"bool", "boolean"})
+_CHOICE_CODE_MULTI_TYPES: frozenset[str] = frozenset(
+    {"checkbox", "check box", "multi select", "multiselect"}
+)
 _COMPUTED_FLEX_TYPES: frozenset[str] = frozenset({"calculation", "calc", "calculated", "slider"})
 
 
@@ -188,6 +196,46 @@ def ensure_no_masked_sentinel(records: Sequence[Mapping[str, Any]]) -> None:
                 )
 
 
+def _find_non_finite_float(value: Any) -> float | None:
+    """Return the first non-finite float (``NaN``, ``Inf``, ``-Inf``) inside *value*, if any."""
+    unwrapped = _unwrap_scalar(value)
+    if isinstance(unwrapped, float) and not math.isfinite(unwrapped):
+        return unwrapped
+    if isinstance(unwrapped, Mapping):
+        for nested_val in unwrapped.values():
+            found = _find_non_finite_float(nested_val)
+            if found is not None:
+                return found
+    elif isinstance(unwrapped, (list, tuple, set, frozenset)):
+        for item in unwrapped:
+            found = _find_non_finite_float(item)
+            if found is not None:
+                return found
+    return None
+
+
+def ensure_no_non_finite_floats(records: Sequence[Mapping[str, Any]]) -> None:
+    """Raise :class:`ValidationError` if any record contains ``NaN``, ``Inf``, or ``-Inf``."""
+    for row_idx, rec in enumerate(records):
+        if not isinstance(rec, Mapping):
+            continue
+        for key, value in rec.items():
+            if key in _NESTED_DATA_COLUMNS and isinstance(value, Mapping):
+                for var_name, var_val in value.items():
+                    bad = _find_non_finite_float(var_val)
+                    if bad is not None:
+                        raise ValidationError(
+                            f"Row {row_idx}: variable '{var_name}' contains non-finite float "
+                            f"value '{bad}'."
+                        )
+            else:
+                bad = _find_non_finite_float(value)
+                if bad is not None:
+                    raise ValidationError(
+                        f"Row {row_idx}: field '{key}' contains non-finite float value '{bad}'."
+                    )
+
+
 def _is_missing_cell(value: Any) -> bool:
     """Return True when a tabular cell represents a null, NaN, or blank value."""
     unwrapped = _unwrap_scalar(value)
@@ -195,8 +243,13 @@ def _is_missing_cell(value: Any) -> bool:
         return True
     if isinstance(unwrapped, (dict, list, tuple, set, frozenset)):
         return False
-    if isinstance(unwrapped, float) and math.isnan(unwrapped):
-        return True
+    if isinstance(unwrapped, float):
+        if math.isinf(unwrapped):
+            raise ValidationError(
+                f"Non-finite float value '{unwrapped}' is not supported in record payloads."
+            )
+        if math.isnan(unwrapped):
+            return True
     if isinstance(unwrapped, str):
         return unwrapped.strip() == ""
     cls_name = type(unwrapped).__name__
@@ -263,6 +316,15 @@ def _lookup_variables_for_form(
     return schema.variables_for_form(form_key)
 
 
+def _normalize_var_type_string(raw_type: Any) -> str | None:
+    if not isinstance(raw_type, str) or not raw_type.strip():
+        return None
+    cleaned = re.sub(r"[\s_-]+", " ", raw_type.strip().lower())
+    if "/" in cleaned:
+        cleaned = _SLASH_SPACE_RE.sub("/", cleaned)
+    return cleaned
+
+
 def _resolve_expected_var_type(
     schema: ValidationSchemaProtocol | None,
     form_key: str | None,
@@ -277,19 +339,47 @@ def _resolve_expected_var_type(
     resolved_fk = form_key
     if not resolved_fk and form_id is not None:
         resolved_fk = _lookup_form_key_from_id(schema, form_id, study_key=study_key)
-    if not resolved_fk:
+    if resolved_fk:
+        variables = _lookup_variables_for_form(schema, resolved_fk, study_key=study_key)
+        if not variables or var_name not in variables:
+            return None
+        var_obj = variables[var_name]
+        raw_type = getattr(var_obj, "variable_type", None) or getattr(var_obj, "variableType", None)
+        return _normalize_var_type_string(raw_type)
+    if form_id is not None:
         return None
-    variables = _lookup_variables_for_form(schema, resolved_fk, study_key=study_key)
-    if not variables or var_name not in variables:
-        return None
-    var_obj = variables[var_name]
-    raw_type = getattr(var_obj, "variable_type", None) or getattr(var_obj, "variableType", None)
-    if not isinstance(raw_type, str):
-        return None
-    cleaned = re.sub(r"[\s_-]+", " ", raw_type.strip().lower())
-    if "/" in cleaned:
-        cleaned = _SLASH_SPACE_RE.sub("/", cleaned)
-    return cleaned
+
+    # Form-less update fallback: resolve when variable has a single unambiguous type across forms
+    forms_for_study_fn = getattr(schema, "forms_for_study", None)
+    candidate_fks: Sequence[str]
+    if callable(forms_for_study_fn) and study_key:
+        candidate_fks = list(forms_for_study_fn(study_key))
+    else:
+        forms_attr = getattr(schema, "forms", None)
+        if isinstance(forms_attr, Mapping):
+            candidate_fks = list(forms_attr.keys())
+        elif isinstance(forms_attr, Sequence):
+            candidate_fks = [
+                str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
+                for f in forms_attr
+                if getattr(f, "form_key", None) or getattr(f, "formKey", None)
+            ]
+        else:
+            candidate_fks = []
+
+    matched_types: set[str] = set()
+    for fk in candidate_fks:
+        form_vars = _lookup_variables_for_form(schema, fk, study_key=study_key)
+        if form_vars and var_name in form_vars:
+            raw_t = getattr(form_vars[var_name], "variable_type", None) or getattr(
+                form_vars[var_name], "variableType", None
+            )
+            norm_t = _normalize_var_type_string(raw_t)
+            if norm_t:
+                matched_types.add(norm_t)
+    if len(matched_types) == 1:
+        return next(iter(matched_types))
+    return None
 
 
 def _coerce_clinical_value(
@@ -351,7 +441,9 @@ def _coerce_clinical_value(
                 return unwrapped
             if isinstance(unwrapped, float) and math.isfinite(unwrapped):
                 return str(int(unwrapped)) if unwrapped.is_integer() else str(unwrapped)
-            if expected_var_type in _TEXT_LIKE_TYPES:
+            if expected_var_type in _TEXT_LIKE_TYPES or (
+                expected_var_type in _CHOICE_CODE_MULTI_TYPES and isinstance(unwrapped, int)
+            ):
                 return str(unwrapped)
             return unwrapped
 
@@ -444,13 +536,12 @@ def normalize_tabular_row(
 
     # 2. Map identifier and update-envelope columns according to REST create-records contract
     rec_id_pair = _first_present("recordId", "record_id")
+    rec_oid_pair = _first_present("recordOid", "record_oid")
     if rec_id_pair is not None:
         envelope["recordId"] = _coerce_int_identifier(
             rec_id_pair[1], row_index=row_index, column_name=rec_id_pair[0]
         )
-
-    rec_oid_pair = _first_present("recordOid", "record_oid")
-    if rec_oid_pair is not None:
+    elif rec_oid_pair is not None:
         envelope["recordOid"] = _coerce_str_identifier(rec_oid_pair[1])
 
     visit_id_pair = _first_present("visitId", "visit_id")
@@ -531,6 +622,12 @@ def normalize_tabular_row(
                     )
                 if _is_missing_cell(var_val):
                     continue
+                bad_nested = _find_non_finite_float(var_val)
+                if bad_nested is not None:
+                    raise ValidationError(
+                        f"Row {row_index}: variable '{var_key}' contains non-finite float "
+                        f"value '{bad_nested}'."
+                    )
                 vtype = _resolve_expected_var_type(
                     schema,
                     resolved_form_key,
@@ -550,6 +647,12 @@ def normalize_tabular_row(
             or _is_missing_cell(raw_val)
         ):
             continue
+        bad_cell = _find_non_finite_float(raw_val)
+        if bad_cell is not None:
+            raise ValidationError(
+                f"Row {row_index}: column '{col_name}' contains non-finite float "
+                f"value '{bad_cell}'."
+            )
         vtype = _resolve_expected_var_type(
             schema,
             resolved_form_key,
@@ -643,6 +746,52 @@ def _is_dataframe_instance(obj: object) -> bool:
     return cls.__name__ == "DataFrame" and cls.__module__.startswith("pandas")
 
 
+def is_tabular_records_input(records_data: object) -> bool:
+    """Return True when *records_data* is a CSV file path or ``pandas.DataFrame``."""
+    return isinstance(records_data, (str, os.PathLike)) or _is_dataframe_instance(records_data)
+
+
+def schema_cache_needs_refresh(
+    cache: BaseSchemaCache[Any],
+    study_key: str,
+    records: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Return True if *cache* is missing ``study_key`` forms or any referenced form/variable."""
+    if not records:
+        return False
+    study_forms = cache.forms_for_study(study_key)
+    if not study_forms:
+        return True
+
+    for rec in records:
+        raw_fk = rec.get("formKey") or rec.get("form_key")
+        fk = str(raw_fk).strip() if isinstance(raw_fk, str) and raw_fk.strip() else None
+        if fk is None and raw_fk:
+            fk = str(raw_fk)
+        raw_fid = rec.get("formId") if rec.get("formId") is not None else rec.get("form_id")
+        fid = None if raw_fid == "" else raw_fid
+
+        if fk:
+            if not cache.variables_for_form(fk, study_key=study_key):
+                return True
+        elif fid is not None:
+            if isinstance(fid, bool):
+                continue
+            resolved = cache.form_key_from_id(fid, study_key=study_key)
+            if not resolved or not cache.variables_for_form(resolved, study_key=study_key):
+                return True
+        else:
+            data_obj = rec.get("data")
+            if isinstance(data_obj, Mapping):
+                for var_name in data_obj:
+                    if not any(
+                        var_name in cache.variables_for_form(form_key, study_key=study_key)
+                        for form_key in study_forms
+                    ):
+                        return True
+    return False
+
+
 def dataframe_rows_to_records(
     df: Any,
     *,
@@ -672,6 +821,274 @@ def dataframe_rows_to_records(
     return records
 
 
+def _is_present_dict_identifier(value: Any) -> bool:
+    """Return True when a dictionary identifier field has a non-null, non-blank value."""
+    unwrapped = _unwrap_scalar(value)
+    if unwrapped is None:
+        return False
+    if isinstance(unwrapped, str):
+        return unwrapped.strip() != ""
+    return True
+
+
+def _normalize_dict_str_identifier(value: Any) -> str:
+    """Normalize a dictionary string identifier (including ``Enum`` values)."""
+    if isinstance(value, Enum):
+        return str(value.value).strip()
+    return _coerce_str_identifier(value)
+
+
+def _normalize_dict_int_identifier(value: Any, *, row_index: int, field_name: str) -> Any:
+    """Normalize a dictionary integer identifier while preserving booleans for schema errors."""
+    unwrapped = _unwrap_scalar(value)
+    if isinstance(unwrapped, bool):
+        return unwrapped
+    return _coerce_int_identifier(unwrapped, row_index=row_index, column_name=field_name)
+
+
+def _normalize_dict_clinical_value(
+    value: Any,
+    *,
+    expected_var_type: str | None,
+) -> Any:
+    """Unwrap scalar wrappers and coerce integer Checkbox/Multi Select codes in dict ``data``."""
+    unwrapped = _unwrap_scalar(value)
+    if isinstance(unwrapped, bool) or unwrapped is None:
+        return unwrapped
+    if expected_var_type is not None:
+        if expected_var_type in _CHOICE_CODE_MULTI_TYPES and isinstance(unwrapped, int):
+            return str(unwrapped)
+        if (
+            expected_var_type in _INT_LIKE_TYPES
+            and isinstance(unwrapped, float)
+            and math.isfinite(unwrapped)
+            and unwrapped.is_integer()
+        ):
+            return int(unwrapped)
+    return unwrapped
+
+
+def _should_preserve_write_keywords(raw_record: Mapping[str, Any]) -> bool:
+    """Return True when ``raw_record['keywords']`` is an explicit write tag list rather than a ``Record`` dump."""
+    if "keywords" not in raw_record:
+        return False
+    raw_kw = raw_record["keywords"]
+    if not isinstance(raw_kw, Sequence) or isinstance(raw_kw, (str, bytes)) or not raw_kw:
+        return False
+    if "recordData" in raw_record or "record_data" in raw_record:
+        return False
+    if any(col in raw_record for col in _READ_ONLY_NON_KEYWORD_COLUMNS):
+        return False
+    return all(
+        isinstance(entry, Mapping)
+        and not any(ro_key in entry for ro_key in _READ_ONLY_KEYWORD_ITEM_KEYS)
+        for entry in raw_kw
+    )
+
+
+def normalize_record_dict(
+    raw_record: Mapping[str, Any],
+    *,
+    row_index: int = 0,
+    schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+    _skip_guards: bool = False,
+) -> JsonDict:
+    """Normalize a single record mapping or JSON object into a REST create-records dict.
+
+    Checks masked PHI sentinels and non-finite floats first, strips read-only
+    :class:`~imednet.models.records.Record` attributes, maps ``snake_case``
+    identifiers to camelCase with one identifier per resource, converts
+    ``recordData`` and ``record_data`` into ``data``, and defaults ``data`` to ``{}``.
+    """
+    if not _skip_guards:
+        ensure_no_masked_sentinel([raw_record])
+        ensure_no_non_finite_floats([raw_record])
+
+    def _first_present(*names: str) -> tuple[str, Any] | None:
+        for name in names:
+            if name in raw_record and _is_present_dict_identifier(raw_record[name]):
+                return name, raw_record[name]
+        return None
+
+    eff_study_key = study_key
+    if not eff_study_key:
+        study_pair = _first_present("studyKey", "study_key")
+        if study_pair is not None:
+            eff_study_key = _normalize_dict_str_identifier(study_pair[1])
+
+    envelope: JsonDict = {}
+
+    rec_id_pair = _first_present("recordId", "record_id")
+    rec_oid_pair = _first_present("recordOid", "record_oid")
+    if rec_id_pair is not None:
+        envelope["recordId"] = _normalize_dict_int_identifier(
+            rec_id_pair[1], row_index=row_index, field_name=rec_id_pair[0]
+        )
+    elif rec_oid_pair is not None:
+        envelope["recordOid"] = _normalize_dict_str_identifier(rec_oid_pair[1])
+
+    visit_id_pair = _first_present("visitId", "visit_id")
+    if visit_id_pair is not None:
+        envelope["visitId"] = _normalize_dict_int_identifier(
+            visit_id_pair[1], row_index=row_index, field_name=visit_id_pair[0]
+        )
+
+    rec_status_pair = _first_present("recordStatus", "record_status")
+    if rec_status_pair is not None:
+        envelope["recordStatus"] = _normalize_dict_str_identifier(rec_status_pair[1])
+
+    reason_pair = _first_present("reasonForChange", "reason_for_change")
+    if reason_pair is not None:
+        envelope["reasonForChange"] = _normalize_dict_str_identifier(reason_pair[1])
+
+    form_key_pair = _first_present("formKey", "form_key")
+    form_id_pair = _first_present("formId", "form_id")
+    resolved_form_key: str | None = None
+    resolved_form_id: int | None = None
+    if form_key_pair is not None:
+        resolved_form_key = _normalize_dict_str_identifier(form_key_pair[1])
+        envelope["formKey"] = resolved_form_key
+    elif form_id_pair is not None:
+        norm_fid = _normalize_dict_int_identifier(
+            form_id_pair[1], row_index=row_index, field_name=form_id_pair[0]
+        )
+        envelope["formId"] = norm_fid
+        if isinstance(norm_fid, int) and not isinstance(norm_fid, bool):
+            resolved_form_id = norm_fid
+    elif default_form_key:
+        resolved_form_key = default_form_key
+        envelope["formKey"] = default_form_key
+    elif default_form_id is not None:
+        resolved_form_id = default_form_id
+        envelope["formId"] = default_form_id
+
+    subj_key_pair = _first_present("subjectKey", "subject_key")
+    subj_oid_pair = _first_present("subjectOid", "subject_oid")
+    subj_id_pair = _first_present("subjectId", "subject_id")
+    if subj_key_pair is not None:
+        envelope["subjectKey"] = _normalize_dict_str_identifier(subj_key_pair[1])
+    elif subj_oid_pair is not None:
+        envelope["subjectOid"] = _normalize_dict_str_identifier(subj_oid_pair[1])
+    elif subj_id_pair is not None:
+        envelope["subjectId"] = _normalize_dict_int_identifier(
+            subj_id_pair[1], row_index=row_index, field_name=subj_id_pair[0]
+        )
+
+    site_name_pair = _first_present("siteName", "site_name")
+    site_id_pair = _first_present("siteId", "site_id")
+    if site_name_pair is not None:
+        envelope["siteName"] = _normalize_dict_str_identifier(site_name_pair[1])
+    elif site_id_pair is not None:
+        envelope["siteId"] = _normalize_dict_int_identifier(
+            site_id_pair[1], row_index=row_index, field_name=site_id_pair[0]
+        )
+
+    interval_name_pair = _first_present("intervalName", "interval_name")
+    interval_id_pair = _first_present("intervalId", "interval_id")
+    if interval_name_pair is not None:
+        envelope["intervalName"] = _normalize_dict_str_identifier(interval_name_pair[1])
+    elif interval_id_pair is not None:
+        envelope["intervalId"] = _normalize_dict_int_identifier(
+            interval_id_pair[1], row_index=row_index, field_name=interval_id_pair[0]
+        )
+
+    for key, val in raw_record.items():
+        if key == "keywords":
+            if _should_preserve_write_keywords(raw_record):
+                envelope["keywords"] = val
+            continue
+        if (
+            key not in _READ_ONLY_RECORD_COLUMNS
+            and key not in _IDENTIFIER_COLUMNS
+            and key not in _NESTED_DATA_COLUMNS
+        ):
+            envelope[key] = val
+
+    clinical_data: JsonDict = {}
+    non_mapping_data: Any = None
+    has_non_mapping_data = False
+    for nested_col in ("record_data", "recordData", "data"):
+        if nested_col not in raw_record:
+            continue
+        raw_nested = raw_record[nested_col]
+        if raw_nested is None:
+            continue
+        if isinstance(raw_nested, Mapping):
+            has_non_mapping_data = False
+            for var_key, var_val in raw_nested.items():
+                key_str = str(var_key)
+                vtype = _resolve_expected_var_type(
+                    schema,
+                    resolved_form_key,
+                    resolved_form_id,
+                    key_str,
+                    study_key=eff_study_key,
+                )
+                clinical_data[key_str] = _normalize_dict_clinical_value(
+                    var_val, expected_var_type=vtype
+                )
+        else:
+            non_mapping_data = raw_nested
+            has_non_mapping_data = True
+
+    envelope["data"] = non_mapping_data if has_non_mapping_data else clinical_data
+    return envelope
+
+
+def _values_equal_exact_type(left: Any, right: Any) -> bool:
+    """Return True when ``left`` and ``right`` have identical runtime types and values."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return _dicts_equal_exact_types(left, right)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _values_equal_exact_type(x, y) for x, y in zip(left, right, strict=False)
+        )
+    return bool(left == right)
+
+
+def _dicts_equal_exact_types(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Return True when two dicts have identical keys and exact-type values."""
+    if len(left) != len(right) or left.keys() != right.keys():
+        return False
+    return all(_values_equal_exact_type(left[k], right[k]) for k in left)
+
+
+def normalize_record_dicts(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+) -> list[JsonDict]:
+    """Normalize a sequence of record mappings into REST create-records payload dicts."""
+    ensure_no_masked_sentinel(records)
+    ensure_no_non_finite_floats(records)
+    normalized: list[JsonDict] = []
+    for idx, item in enumerate(records):
+        if not isinstance(item, Mapping):
+            raise TypeError("All items in records_data sequence must be mappings.")
+        norm_item = normalize_record_dict(
+            item,
+            row_index=idx,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+            _skip_guards=True,
+        )
+        if type(item) is dict and _dicts_equal_exact_types(item, norm_item):
+            normalized.append(item)
+        else:
+            normalized.append(norm_item)
+    return normalized
+
+
 def normalize_records_input(
     records_data: RecordsInput,
     *,
@@ -680,7 +1097,7 @@ def normalize_records_input(
     default_form_key: str | None = None,
     default_form_id: int | None = None,
 ) -> list[JsonDict]:
-    """Normalize ``DataFrame``, CSV path, or ``list[JsonDict]`` into record payload dicts."""
+    """Normalize ``DataFrame``, CSV path, or ``Sequence[Mapping]`` into record payload dicts."""
     if isinstance(records_data, (str, os.PathLike)):
         return csv_to_records(
             records_data,
@@ -697,15 +1114,16 @@ def normalize_records_input(
             default_form_key=default_form_key,
             default_form_id=default_form_id,
         )
-    if isinstance(records_data, list):
-        ensure_no_masked_sentinel(records_data)
-        return records_data
     if isinstance(records_data, Sequence) and not isinstance(records_data, (str, bytes)):
-        materialized = [dict(item) for item in records_data if isinstance(item, Mapping)]
-        if len(materialized) != len(records_data):
+        if not all(isinstance(item, Mapping) for item in records_data):
             raise TypeError("All items in records_data sequence must be mappings.")
-        ensure_no_masked_sentinel(materialized)
-        return materialized
+        return normalize_record_dicts(
+            cast(Sequence[Mapping[str, Any]], records_data),
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
     raise TypeError(
         "records_data must be a list of dicts, pandas.DataFrame, or CSV path; "
         f"got {type(records_data).__name__}."
@@ -718,6 +1136,11 @@ __all__ = [
     "csv_to_records",
     "dataframe_rows_to_records",
     "ensure_no_masked_sentinel",
+    "ensure_no_non_finite_floats",
+    "is_tabular_records_input",
+    "normalize_record_dict",
+    "normalize_record_dicts",
     "normalize_records_input",
     "normalize_tabular_row",
+    "schema_cache_needs_refresh",
 ]

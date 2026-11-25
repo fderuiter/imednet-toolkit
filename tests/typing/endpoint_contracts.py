@@ -274,6 +274,10 @@ def sync_contract(sdk: ImednetSDK) -> None:
         sdk.workflows.record_update.update_scheduled_record('S', 'F_VS', 'SUBJ', 'V1', {}),
         Job,
     )
+    assert_type(
+        sdk.workflows.record_update.update_unscheduled_record('S', 100, {}),
+        Job,
+    )
     assert_type(sdk.workflows.record_update.create_new_record('S', 'F_VS', 'SUBJ', {}), Job)
     assert_type(sdk.workflows.register_subjects, SyncRegisterSubjectsWorkflowProtocol)
     assert_type(sdk.workflows.register_subjects.register_subjects('S', []), Job)
@@ -443,6 +447,10 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
         Job,
     )
     assert_type(
+        await sdk.workflows.record_update.async_update_unscheduled_record('S', 'OID-1', {}),
+        Job,
+    )
+    assert_type(
         await sdk.workflows.record_update.async_create_new_record('S', 'F_VS', 'SUBJ', {}),
         Job,
     )
@@ -603,6 +611,24 @@ def aliased_model_constructor_contracts() -> None:
     payload = RecordData({'AGE': 42})
     assert_type(BaseRecordRequest(form_key='DM', data=payload), BaseRecordRequest)
     assert_type(BaseRecordRequest(formKey='DM', data=payload), BaseRecordRequest)
+    assert_type(BaseRecordRequest(form_id=10, data=payload), BaseRecordRequest)
+    assert_type(BaseRecordRequest(formId=10, data=payload), BaseRecordRequest)
+    assert_type(
+        RegisterSubjectRequest(
+            form_id=10,
+            site_name='SITE-01',
+            data=payload,
+        ),
+        RegisterSubjectRequest,
+    )
+    assert_type(
+        RegisterSubjectRequest(
+            formId=10,
+            siteName='SITE-01',
+            data=payload,
+        ),
+        RegisterSubjectRequest,
+    )
     assert_type(
         RegisterSubjectRequest(
             form_key='DM',

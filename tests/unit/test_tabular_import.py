@@ -110,7 +110,7 @@ def test_flattened_dataframe_roundtrip_succeeds_in_simulation_transport() -> Non
         assert "data" in item
         assert isinstance(item["data"], dict)
         assert "recordId" in item
-        assert "recordOid" in item
+        assert "recordOid" not in item
         assert "visitId" in item
         assert "recordStatus" in item
         for envelope_preserved_key in ("recordId", "recordOid", "visitId", "recordStatus"):
@@ -241,7 +241,6 @@ def test_dataframe_to_records_identifier_mapping_nan_drop_and_float_coercion() -
     rec = records[0]
     assert rec == {
         "recordId": 900,
-        "recordOid": "OID-900",
         "visitId": 401,
         "recordStatus": "Complete",
         "formId": 301,
@@ -658,3 +657,393 @@ async def test_dry_run_without_schema_loads_study_datadict_in_endpoint_and_impor
     assert async_summary.validation_report is not None
     assert async_summary.validation_report.is_valid is False
     assert not any(r.method == "POST" for r in async_captured)
+
+
+def test_normalize_records_input_and_parse_json_map_record_model_dumps_and_guard_masked() -> None:
+    """AC 1 & AC 2: normalize_records_input and parse_json_records_text map Record dumps cleanly."""
+    from types import MappingProxyType
+
+    from imednet.cli.utils.write_helpers import parse_json_records_text
+    from imednet.models.records import Keyword, Record
+    from imednet.utils.tabular import normalize_records_input
+
+    record = Record(
+        study_key="STUDY",
+        interval_id=10,
+        form_id=1,
+        form_key="F_DM",
+        site_id=100,
+        subject_id=200,
+        subject_oid="SUBJ-OID-1",
+        subject_key="SUB-001",
+        record_id=601,
+        record_oid="REC-OID-601",
+        record_type="SUBJECT",
+        record_status="Record Complete",
+        deleted=False,
+        date_created="2026-01-01 00:00:00",
+        date_modified="2026-01-02 00:00:00",
+        visit_id=401,
+        parent_record_id=500,
+        keywords=[Keyword(keyword_name="K", keyword_key="KK", keyword_id=1)],
+        record_data={"V_AGE": 42},
+    )
+
+    expected = [
+        {
+            "formKey": "F_DM",
+            "recordId": 601,
+            "subjectKey": "SUB-001",
+            "siteId": 100,
+            "intervalId": 10,
+            "visitId": 401,
+            "recordStatus": "Record Complete",
+            "data": {"V_AGE": 42},
+        }
+    ]
+
+    for raw_dump in (record.model_dump(), record.model_dump(by_alias=True)):
+        assert normalize_records_input([raw_dump]) == expected
+        assert normalize_records_input((MappingProxyType(raw_dump),)) == expected
+        json_text = json.dumps([raw_dump], default=str)
+        assert parse_json_records_text(json_text) == expected
+
+    # Dual identifiers across all 5 resource pairs resolve to preferred single identifier
+    dual_dict = {
+        "form_key": "F_DM",
+        "form_id": 1,
+        "record_id": 601,
+        "record_oid": "REC-OID-601",
+        "subject_key": "SUB-001",
+        "subject_oid": "SUBJ-OID-1",
+        "subject_id": 200,
+        "site_name": "SITE-01",
+        "site_id": 100,
+        "interval_name": "Baseline",
+        "interval_id": 10,
+        "record_data": {"V_AGE": 42},
+    }
+    assert normalize_records_input([dual_dict]) == [
+        {
+            "formKey": "F_DM",
+            "recordId": 601,
+            "subjectKey": "SUB-001",
+            "siteName": "SITE-01",
+            "intervalName": "Baseline",
+            "data": {"V_AGE": 42},
+        }
+    ]
+
+    # Empty data defaults to {}
+    status_only = normalize_records_input([{"record_id": 601, "record_status": "Complete"}])
+    assert status_only == [{"recordId": 601, "recordStatus": "Complete", "data": {}}]
+
+    # Explicit write keyword tags are preserved, while empty/read-only keyword lists are stripped
+    uat_tagged = {
+        "formKey": "F_DM",
+        "siteName": "SITE",
+        "data": {"V_AGE": 40},
+        "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+    }
+    assert normalize_records_input([uat_tagged]) == [uat_tagged]
+    assert normalize_records_input([{"formKey": "F_DM", "keywords": []}]) == [
+        {"formKey": "F_DM", "data": {}}
+    ]
+
+    # Masked sentinel is checked BEFORE stripping read-only columns
+    with pytest.raises(ValidationError, match=r"\*\*\*MASKED\*\*\*"):
+        normalize_records_input([{"studyKey": MASKED_SENTINEL, "formKey": "F_DM"}])
+    with pytest.raises(ValidationError, match=r"\*\*\*MASKED\*\*\*"):
+        parse_json_records_text(
+            json.dumps([{"formKey": "F_DM", "recordData": {"V_NOTES": MASKED_SENTINEL}}])
+        )
+
+
+def test_subject_registration_form_id_without_schema_and_strict_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 4: normalize_subject_registration_inputs preserves formId without schema and passes strict mode."""
+    from imednet.datadict import DataDictionary, Form, Metadata, Variable
+    from imednet.models.records import BaseRecordRequest, RegisterSubjectRequest
+    from imednet.models.subjects import Subject
+    from imednet.utils.enrollment import (
+        filter_existing_subject_registrations,
+        normalize_subject_registration_inputs,
+    )
+
+    base_req = BaseRecordRequest(formId=301)
+    assert base_req.model_dump(by_alias=True) == {"formId": 301, "data": {}}
+
+    reg_req = RegisterSubjectRequest(formId=301, siteName="SITE")
+    assert reg_req.model_dump(by_alias=True) == {"formId": 301, "siteName": "SITE", "data": {}}
+
+    dd = DataDictionary(
+        metadata=Metadata.create(study_key="STUDY"),
+        forms=[
+            Form(
+                formId=301,
+                formKey="F_DM",
+                variables=[
+                    Variable(variableName="V_AGE", variableType="integer"),
+                    Variable(variableName="CB_CONSENT", variableType="Checkbox"),
+                ],
+            )
+        ],
+    )
+
+    for strict_val in ("0", "1"):
+        monkeypatch.setenv("IMEDNET_STRICT_MODE", strict_val)
+
+        # Without schema: keeps formId, does NOT emit empty formKey
+        no_schema_pairs = normalize_subject_registration_inputs(
+            [{"site_name": "SITE", "subject_key": "SUB-1", "record_data": {"V_AGE": 35}}],
+            default_form_id=301,
+            schema=None,
+            study_key="STUDY",
+        )
+        assert len(no_schema_pairs) == 1
+        raw_no_schema = no_schema_pairs[0][0]
+        assert isinstance(raw_no_schema, dict)
+        assert raw_no_schema == {
+            "formId": 301,
+            "siteName": "SITE",
+            "subjectKey": "SUB-1",
+            "data": {"V_AGE": 35},
+        }
+        assert "formKey" not in raw_no_schema
+        assert no_schema_pairs[0][1].model_dump(by_alias=True) == raw_no_schema
+
+        # With schema: resolves formId -> formKey, coerces Checkbox int, and strips formId
+        with_schema_pairs = normalize_subject_registration_inputs(
+            [
+                {
+                    "formId": 301,
+                    "siteName": "SITE",
+                    "subjectKey": "SUB-1",
+                    "data": {"V_AGE": 35.0, "CB_CONSENT": 1},
+                }
+            ],
+            schema=dd,
+            study_key="STUDY",
+        )
+        assert len(with_schema_pairs) == 1
+        raw_with_schema = with_schema_pairs[0][0]
+        assert isinstance(raw_with_schema, dict)
+        assert raw_with_schema == {
+            "formKey": "F_DM",
+            "siteName": "SITE",
+            "subjectKey": "SUB-1",
+            "data": {"V_AGE": 35, "CB_CONSENT": "1"},
+        }
+        assert "formId" not in raw_with_schema
+        assert with_schema_pairs[0][1].model_dump(by_alias=True) == raw_with_schema
+
+    # Single subject identifier preserved when filtering existing subjects
+    dual_subj_req = RegisterSubjectRequest(
+        formKey="F_DM",
+        siteName="SITE",
+        subjectKey="SUB-NEW",
+        subjectOid="OID-NEW",
+        data={"V_AGE": 40},
+    )
+    pairs = normalize_subject_registration_inputs([dual_subj_req])
+    filtered, skipped = filter_existing_subject_registrations(
+        pairs, [Subject(studyKey="STUDY", subjectKey="SUB-EXISTING")]
+    )
+    assert skipped == 0
+    assert filtered == [
+        {
+            "formKey": "F_DM",
+            "siteName": "SITE",
+            "subjectKey": "SUB-NEW",
+            "data": {"V_AGE": 40},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_batch_and_import_csv_match_dry_run_coercion_and_refresh_partial_schema_cache(
+    tmp_path: Path,
+) -> None:
+    """AC 5: sdk.records.create_batch and import_records_csv refresh missing Form schemas before coercion."""
+    from imednet.models.variables import Variable as ApiVariable
+    from imednet.validation.cache import AsyncSchemaCache, SchemaCache
+
+    def _add_checkbox_form(st: SimulationState) -> None:
+        st.forms.append(
+            {
+                "formId": 99,
+                "formKey": "F_CHK",
+                "formName": "Check Form",
+                "formType": "Standard",
+                "studyKey": "STUDY",
+                "revision": 1,
+                "disabled": False,
+                "eproForm": False,
+                "allowCopy": False,
+            }
+        )
+        st.variables.extend(
+            [
+                {
+                    "variableId": 901,
+                    "variableName": "CB_CODE",
+                    "variableKey": "CB_CODE",
+                    "variableType": "Checkbox",
+                    "formId": 99,
+                    "formKey": "F_CHK",
+                    "studyKey": "STUDY",
+                    "label": "Checkbox Code",
+                },
+                {
+                    "variableId": 902,
+                    "variableName": "TXT_CODE",
+                    "variableKey": "TXT_CODE",
+                    "variableType": "Text",
+                    "formId": 99,
+                    "formKey": "F_CHK",
+                    "studyKey": "STUDY",
+                    "label": "Text Code",
+                },
+            ]
+        )
+
+    sdk, sync_state, sync_captured = _make_sim_sdk()
+    _add_checkbox_form(sync_state)
+
+    df = pd.DataFrame(
+        [
+            {
+                "formKey": "F_CHK",
+                "subjectKey": "SUB1",
+                "siteName": "SITE",
+                "CB_CODE": 1,
+                "TXT_CODE": 7,
+            }
+        ]
+    )
+
+    # 1. Dry-run without schema vs live create_batch without schema produce identical coercion
+    dry_summary = sdk.records.create_batch("STUDY", df, dry_run=True)
+    assert dry_summary.dry_run is True
+    assert dry_summary.validation_report is not None and dry_summary.validation_report.is_valid
+
+    sync_captured.clear()
+    live_summary = sdk.records.create_batch("STUDY", df)
+    assert len(live_summary.batch_ids) == 1
+    post_reqs = [r for r in sync_captured if r.method == "POST"]
+    assert len(post_reqs) == 1
+    assert json.loads(post_reqs[0].content)[0]["data"] == {"CB_CODE": "1", "TXT_CODE": "7"}
+
+    # 2. Partial SchemaCache (populated only with F_DM, missing F_CHK) refreshes before coercion
+    dm_vars = [
+        ApiVariable.model_validate(v)
+        for v in sync_state.variables
+        if v.get("studyKey") == "STUDY" and v.get("formKey") == "F_DM"
+    ]
+    partial_cache = SchemaCache()
+    partial_cache.populate(dm_vars, study_key="STUDY")
+    assert partial_cache.variables_for_form("F_CHK", study_key="STUDY") == {}
+
+    sync_captured.clear()
+    sdk.records.create_batch("STUDY", df, schema=partial_cache)
+    post_reqs = [r for r in sync_captured if r.method == "POST"]
+    assert len(post_reqs) == 1
+    assert json.loads(post_reqs[0].content)[0]["data"] == {"CB_CODE": "1", "TXT_CODE": "7"}
+
+    # 3. import_records_csv with partial SchemaCache refreshes before CSV coercion
+    partial_csv_cache = SchemaCache()
+    partial_csv_cache.populate(dm_vars, study_key="STUDY")
+    csv_path = tmp_path / "chk.csv"
+    csv_path.write_text(
+        "formKey,subjectKey,siteName,CB_CODE,TXT_CODE\nF_CHK,SUB1,SITE,1,007\n",
+        encoding="utf-8",
+    )
+    sync_captured.clear()
+    import_records_csv(sdk, "STUDY", csv_path, schema=partial_csv_cache)
+    post_reqs = [r for r in sync_captured if r.method == "POST"]
+    assert len(post_reqs) == 1
+    assert json.loads(post_reqs[0].content)[0]["data"] == {"CB_CODE": "1", "TXT_CODE": "007"}
+
+    # 4. Async create_batch with partial AsyncSchemaCache refreshes before coercion
+    async_sdk, async_state, async_captured = _make_async_sim_sdk()
+    _add_checkbox_form(async_state)
+    partial_async_cache = AsyncSchemaCache()
+    partial_async_cache.populate(dm_vars, study_key="STUDY")
+    await async_sdk.records.create_batch("STUDY", df, schema=partial_async_cache)
+    async_posts = [r for r in async_captured if r.method == "POST"]
+    assert len(async_posts) == 1
+    assert json.loads(async_posts[0].content)[0]["data"] == {"CB_CODE": "1", "TXT_CODE": "7"}
+
+
+def test_checkbox_multiselect_int_coercion_and_inf_nan_rejection(tmp_path: Path) -> None:
+    """AC 6: Checkbox & Multi Select coerce non-bool ints to strings; Inf/-Inf/NaN raise ValidationError."""
+    from imednet.datadict import Choice, DataDictionary, Form, Metadata, Variable
+    from imednet.utils.tabular import normalize_records_input
+
+    dd = DataDictionary(
+        metadata=Metadata.create(study_key="STUDY"),
+        forms=[
+            Form(
+                formId=10,
+                formKey="F_CHOICE",
+                variables=[
+                    Variable(
+                        variableName="CB_VAR",
+                        variableType="Checkbox",
+                        choices=[
+                            Choice(choiceValue="0", choiceText="No"),
+                            Choice(choiceValue="1", choiceText="Yes"),
+                        ],
+                    ),
+                    Variable(
+                        variableName="MS_VAR",
+                        variableType="Multi Select",
+                        choices=[
+                            Choice(choiceValue="1", choiceText="Opt 1"),
+                            Choice(choiceValue="2", choiceText="Opt 2"),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    df = pd.DataFrame(
+        [
+            {"formKey": "F_CHOICE", "subjectKey": "S1", "CB_VAR": 1, "MS_VAR": 2},
+            {"formKey": "F_CHOICE", "subjectKey": "S2", "CB_VAR": True, "MS_VAR": "1,2"},
+        ]
+    )
+    coerced = dataframe_to_records(df, schema=dd, study_key="STUDY")
+    assert coerced[0]["data"] == {"CB_VAR": "1", "MS_VAR": "2"}
+    assert coerced[1]["data"] == {"CB_VAR": True, "MS_VAR": "1,2"}
+    assert isinstance(coerced[1]["data"]["CB_VAR"], bool)
+
+    dict_coerced = normalize_records_input(
+        [{"formKey": "F_CHOICE", "subjectKey": "S1", "data": {"CB_VAR": 0, "MS_VAR": 1}}],
+        schema=dd,
+        study_key="STUDY",
+    )
+    assert dict_coerced == [
+        {"formKey": "F_CHOICE", "subjectKey": "S1", "data": {"CB_VAR": "0", "MS_VAR": "1"}}
+    ]
+
+    # Inf and -Inf in DataFrame cells raise ValidationError (while NaN drops cleanly)
+    for non_finite in (float("inf"), float("-inf")):
+        bad_df = pd.DataFrame([{"formKey": "F_DM", "subjectKey": "S1", "V_AGE": non_finite}])
+        with pytest.raises(ValidationError, match="finite"):
+            dataframe_to_records(bad_df)
+
+    # Inf, -Inf, and NaN in dict inputs and RecordCreateOperation raise ValidationError before HTTP
+    sdk, _state, captured = _make_sim_sdk()
+    for bad_val in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValidationError, match="finite"):
+            normalize_records_input([{"formKey": "F_DM", "data": {"V_AGE": bad_val}}])
+        with pytest.raises(ValidationError, match="finite"):
+            sdk.records.create(
+                "STUDY",
+                [{"recordId": 601, "data": {"V_AGE": bad_val}}],
+                skip_validation=True,
+            )
+    assert captured == []

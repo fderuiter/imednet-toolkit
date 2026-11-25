@@ -215,7 +215,7 @@ async def test_async_create_record(dummy_client, response_factory, monkeypatch):
 
     dummy_client.post.assert_awaited_once_with(
         "/api/v1/edc/studies/S1/records",
-        json=[{"foo": "bar"}],
+        json=[{"foo": "bar", "data": {}}],
         headers={"x-email-notify": "user@test"},
     )
     assert job == {"jobId": "1"}

@@ -21,6 +21,9 @@ from imednet.utils.tabular import (
     csv_to_records,
     dataframe_rows_to_records,
     ensure_no_masked_sentinel,
+    ensure_no_non_finite_floats,
+    normalize_record_dict,
+    normalize_record_dicts,
 )
 from imednet.utils.typing import JsonDict
 
@@ -60,17 +63,32 @@ def _apply_registration_defaults(
     records: list[JsonDict],
     *,
     default_form_key: str | None = None,
+    default_form_id: int | None = None,
     default_site_name: str | None = None,
     default_site_id: int | None = None,
 ) -> list[JsonDict]:
-    """Fill missing ``formKey`` / ``siteName`` / ``siteId`` from optional defaults."""
-    if not default_form_key and not default_site_name and default_site_id is None:
+    """Fill missing ``formKey`` / ``formId`` / ``siteName`` / ``siteId`` from optional defaults."""
+    if (
+        not default_form_key
+        and default_form_id is None
+        and not default_site_name
+        and default_site_id is None
+    ):
         return records
     resolved: list[JsonDict] = []
     for item in records:
         copied = dict(item)
-        if default_form_key and not (copied.get("formKey") or copied.get("form_key")):
-            copied["formKey"] = default_form_key
+        has_form = bool(
+            copied.get("formKey")
+            or copied.get("form_key")
+            or copied.get("formId") is not None
+            or copied.get("form_id") is not None
+        )
+        if not has_form:
+            if default_form_key:
+                copied["formKey"] = default_form_key
+            elif default_form_id is not None:
+                copied["formId"] = default_form_id
         has_site_name = bool(copied.get("siteName") or copied.get("site_name"))
         has_site_id = copied.get("siteId") is not None or copied.get("site_id") is not None
         if default_site_name and not has_site_name and not has_site_id:
@@ -85,6 +103,7 @@ def normalize_subject_registration_inputs(
     subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | Any,
     *,
     default_form_key: str | None = None,
+    default_form_id: int | None = None,
     default_site_name: str | None = None,
     default_site_id: int | None = None,
     schema: ValidationSchemaProtocol | None = None,
@@ -106,18 +125,25 @@ def normalize_subject_registration_inputs(
                     "not a Subject registration payload."
                 )
             items = raw_json if isinstance(raw_json, list) else [raw_json]
-            records = [dict(x) for x in items]
-            ensure_no_masked_sentinel(records)
+            records = normalize_record_dicts(
+                [dict(x) for x in items],
+                schema=schema,
+                study_key=study_key,
+                default_form_key=default_form_key,
+                default_form_id=default_form_id,
+            )
         else:
             records = csv_to_records(
                 file_path,
                 schema=schema,
                 study_key=study_key,
                 default_form_key=default_form_key,
+                default_form_id=default_form_id,
             )
         raw_items = _apply_registration_defaults(
             records,
             default_form_key=default_form_key,
+            default_form_id=default_form_id,
             default_site_name=default_site_name,
             default_site_id=default_site_id,
         )
@@ -127,10 +153,12 @@ def normalize_subject_registration_inputs(
             schema=schema,
             study_key=study_key,
             default_form_key=default_form_key,
+            default_form_id=default_form_id,
         )
         raw_items = _apply_registration_defaults(
             records,
             default_form_key=default_form_key,
+            default_form_id=default_form_id,
             default_site_name=default_site_name,
             default_site_id=default_site_id,
         )
@@ -143,16 +171,39 @@ def normalize_subject_registration_inputs(
         normalized_raw: RegisterSubjectRequest | dict[str, Any]
         if isinstance(raw_subj, RegisterSubjectRequest):
             model_subj = raw_subj
-            needs_form = bool(default_form_key and not model_subj.form_key)
+            resolved_model_fk: str | None = None
+            if not model_subj.form_key and model_subj.form_id is not None and schema is not None:
+                resolved_model_fk = _lookup_form_key_from_id(
+                    schema, model_subj.form_id, study_key=study_key
+                )
+            needs_form = bool(
+                (default_form_key or default_form_id is not None)
+                and not model_subj.form_key
+                and model_subj.form_id is None
+            )
             needs_site = bool(
                 (default_site_name or default_site_id is not None)
                 and not model_subj.site_name
                 and model_subj.site_id is None
             )
-            if needs_form or needs_site:
+            if resolved_model_fk or needs_form or needs_site:
                 patched = model_subj.model_dump(by_alias=True, exclude_none=True)
-                if needs_form and default_form_key:
-                    patched["formKey"] = default_form_key
+                if resolved_model_fk:
+                    patched["formKey"] = resolved_model_fk
+                    patched.pop("formId", None)
+                    patched.pop("form_id", None)
+                elif needs_form:
+                    if default_form_key:
+                        patched["formKey"] = default_form_key
+                    elif default_form_id is not None:
+                        if schema is not None and (
+                            def_fk := _lookup_form_key_from_id(
+                                schema, default_form_id, study_key=study_key
+                            )
+                        ):
+                            patched["formKey"] = def_fk
+                        else:
+                            patched["formId"] = default_form_id
                 if needs_site:
                     if default_site_name:
                         patched["siteName"] = default_site_name
@@ -161,25 +212,44 @@ def normalize_subject_registration_inputs(
                 model_subj = RegisterSubjectRequest.model_validate(patched)
             normalized_raw = model_subj
         elif isinstance(raw_subj, Mapping):
-            raw_dict = dict(raw_subj)
-            if not (raw_dict.get("formKey") or raw_dict.get("form_key")):
-                raw_fid = raw_dict.get("formId")
-                if raw_fid is None:
-                    raw_fid = raw_dict.get("form_id")
-                if raw_fid is not None and schema is not None:
-                    resolved_fk = _lookup_form_key_from_id(
-                        schema, int(raw_fid), study_key=study_key
-                    )
-                    if resolved_fk:
-                        raw_dict["formKey"] = resolved_fk
-            if default_form_key and not (raw_dict.get("formKey") or raw_dict.get("form_key")):
-                raw_dict["formKey"] = default_form_key
-            has_site_name = bool(raw_dict.get("siteName") or raw_dict.get("site_name"))
-            has_site_id = raw_dict.get("siteId") is not None or raw_dict.get("site_id") is not None
-            if default_site_name and not has_site_name and not has_site_id:
-                raw_dict["siteName"] = default_site_name
-            elif default_site_id is not None and not has_site_name and not has_site_id:
-                raw_dict["siteId"] = default_site_id
+            raw_dict = normalize_record_dict(
+                raw_subj,
+                schema=schema,
+                study_key=study_key,
+                default_form_key=default_form_key,
+                default_form_id=default_form_id,
+            )
+            if (
+                not raw_dict.get("formKey")
+                and raw_dict.get("formId") is not None
+                and not isinstance(raw_dict.get("formId"), bool)
+                and schema is not None
+            ):
+                resolved_fk = _lookup_form_key_from_id(
+                    schema, int(raw_dict["formId"]), study_key=study_key
+                )
+                if resolved_fk:
+                    raw_dict["formKey"] = resolved_fk
+                    raw_dict.pop("formId", None)
+
+            if "siteName" not in raw_dict and "siteId" not in raw_dict:
+                if default_site_name:
+                    raw_dict["siteName"] = default_site_name
+                elif default_site_id is not None:
+                    raw_dict["siteId"] = default_site_id
+
+            for non_reg_key in (
+                "recordId",
+                "recordOid",
+                "visitId",
+                "recordStatus",
+                "reasonForChange",
+                "intervalName",
+                "intervalId",
+                "subjectId",
+            ):
+                raw_dict.pop(non_reg_key, None)
+
             normalized_raw = raw_dict
             model_subj = RegisterSubjectRequest.model_validate(raw_dict)
         else:
@@ -188,9 +258,11 @@ def normalize_subject_registration_inputs(
                 f"got {type(raw_subj).__name__}."
             )
         pairs.append((normalized_raw, model_subj))
-        dumped_for_check.append(model_subj.model_dump(by_alias=True, exclude_none=True))
+        dumped_elem = model_subj.model_dump(by_alias=True, exclude_none=True)
+        dumped_for_check.append(dumped_elem)
 
     ensure_no_masked_sentinel(dumped_for_check)
+    ensure_no_non_finite_floats(dumped_for_check)
     return pairs
 
 
@@ -303,11 +375,18 @@ def filter_existing_subject_registrations(
                     dumped.pop(key_alias, None)
         if isinstance(raw_subj, Mapping):
             raw_sk = raw_subj.get("subjectKey") or raw_subj.get("subject_key")
+            raw_oid = raw_subj.get("subjectOid") or raw_subj.get("subject_oid")
             if isinstance(raw_sk, str) and raw_sk.strip():
                 dumped["subjectKey"] = raw_sk.strip()
-            raw_oid = raw_subj.get("subjectOid") or raw_subj.get("subject_oid")
-            if isinstance(raw_oid, str) and raw_oid.strip():
+                dumped.pop("subjectOid", None)
+            elif isinstance(raw_oid, str) and raw_oid.strip():
                 dumped["subjectOid"] = raw_oid.strip()
+        if dumped.get("formKey"):
+            dumped.pop("formId", None)
+        if dumped.get("siteName"):
+            dumped.pop("siteId", None)
+        if dumped.get("subjectKey"):
+            dumped.pop("subjectOid", None)
         if should_filter:
             cand_id = extract_candidate_subject_key(
                 raw_subj, payload=dumped, subject_key_field=subject_key_field

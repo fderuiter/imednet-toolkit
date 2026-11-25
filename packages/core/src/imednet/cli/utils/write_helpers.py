@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -41,7 +40,6 @@ from imednet.utils.job_poller import (
 from imednet.utils.security import sanitize_diagnostic_payload
 from imednet.utils.tabular import (
     _INT_LITERAL_RE,
-    _SLASH_SPACE_RE,
     _TEXT_LIKE_TYPES,
     MASKED_SENTINEL,
     _coerce_clinical_value,
@@ -50,8 +48,10 @@ from imednet.utils.tabular import (
     csv_text_to_records,
     csv_to_records,
     ensure_no_masked_sentinel,
+    ensure_no_non_finite_floats,
+    normalize_record_dicts,
 )
-from imednet.validation.cache import BaseSchemaCache, SchemaCache, ValidationSchemaProtocol
+from imednet.validation.cache import SchemaCache, ValidationSchemaProtocol
 
 from ..decorators import _redact_secrets
 from .args import add_output_format, add_simulation_arg, resolve_output_format
@@ -228,8 +228,13 @@ def resolve_cli_schema(
 ) -> ValidationSchemaProtocol | None:
     """Resolve ``--schema`` from disk or live study API variables."""
     if not schema_source:
-        if dry_run and can_load_from_api(sdk):
-            return load_from_api(sdk, study_key)
+        if can_load_from_api(sdk):
+            try:
+                return load_from_api(sdk, study_key)
+            except NotFoundError:
+                if dry_run:
+                    raise
+                return None
         return None
     if schema_source.strip().lower() == "api":
         cache = SchemaCache()
@@ -261,52 +266,13 @@ def _resolve_cli_var_type(
     study_key: str | None = None,
 ) -> str | None:
     """Resolve normalized variable type from *schema* and optional form context."""
-    if schema is None:
-        return None
-    direct = _resolve_expected_var_type(
+    return _resolve_expected_var_type(
         schema,
         form_key,
         form_id,
         var_name,
         study_key=study_key,
     )
-    if direct is not None:
-        return direct
-    if form_key or form_id is not None:
-        return None
-
-    # Form-less update fallback: check if variable has a single unambiguous type across forms
-    candidate_fks: Sequence[str]
-    if isinstance(schema, BaseSchemaCache):
-        candidate_fks = list(schema.forms_for_study(study_key) if study_key else schema.forms)
-    else:
-        forms_attr = getattr(schema, "forms", None)
-        if isinstance(forms_attr, Sequence):
-            candidate_fks = [
-                str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
-                for f in forms_attr
-                if getattr(f, "form_key", None) or getattr(f, "formKey", None)
-            ]
-        else:
-            candidate_fks = []
-
-    matched_types: set[str] = set()
-    for fk in candidate_fks:
-        form_vars: Mapping[str, Any] = (
-            schema.variables_for_form(fk, study_key=study_key)
-            if isinstance(schema, BaseSchemaCache)
-            else schema.variables_for_form(fk)
-        )
-        if form_vars and var_name in form_vars:
-            raw = getattr(form_vars[var_name], "variable_type", None) or getattr(
-                form_vars[var_name], "variableType", None
-            )
-            if isinstance(raw, str) and raw.strip():
-                normalized = re.sub(r"[\s_-]+", " ", raw.strip().lower())
-                matched_types.add(_SLASH_SPACE_RE.sub("/", normalized))
-    if len(matched_types) == 1:
-        return next(iter(matched_types))
-    return None
 
 
 def parse_key_value_pairs(
@@ -375,8 +341,16 @@ def parse_key_value_pairs(
     return parsed
 
 
-def parse_json_records_text(raw_text: str, *, source_label: str) -> list[dict[str, Any]]:
-    """Parse a JSON object or JSON array of record payload dicts."""
+def parse_json_records_text(
+    raw_text: str,
+    *,
+    source_label: str = "JSON",
+    schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Parse and normalize a JSON object or JSON array of record payload dicts."""
     try:
         loaded = json.loads(raw_text)
     except ValueError as exc:
@@ -398,8 +372,13 @@ def parse_json_records_text(raw_text: str, *, source_label: str) -> list[dict[st
         raise ValueError(
             f"JSON payload in {source_label} must be a JSON object or array of objects."
         )
-    ensure_no_masked_sentinel(items)
-    return items
+    return normalize_record_dicts(
+        items,
+        schema=schema,
+        study_key=study_key,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+    )
 
 
 def parse_stdin_records_text(
@@ -416,7 +395,14 @@ def parse_stdin_records_text(
     if not stripped:
         raise ValueError("Empty input received from stdin ('-').")
     if stripped[0] in {"{", "["}:
-        return parse_json_records_text(cleaned, source_label="stdin")
+        return parse_json_records_text(
+            cleaned,
+            source_label="stdin",
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
     if "\n" not in stripped.rstrip():
         try:
             json.loads(stripped)
@@ -433,6 +419,18 @@ def parse_stdin_records_text(
     )
 
 
+def read_cli_stdin_if_dash(file_arg: str | None) -> str | None:
+    """Read and return buffered stdin text once when *file_arg* is ``'-'``."""
+    if file_arg != "-":
+        return None
+    if is_tty(sys.stdin):
+        raise ValueError(
+            "Cannot read '-' from an interactive terminal (TTY) stdin; "
+            "pipe JSON or CSV data into stdin or pass a file path."
+        )
+    return sys.stdin.read()
+
+
 def load_records_from_path_or_stdin(
     file_arg: str,
     *,
@@ -440,16 +438,14 @@ def load_records_from_path_or_stdin(
     study_key: str | None = None,
     default_form_key: str | None = None,
     default_form_id: int | None = None,
+    stdin_text: str | None = None,
 ) -> list[dict[str, Any]]:
     """Load record payloads from ``'-'`` (piped stdin JSON or CSV), ``.json``, or ``.csv``."""
     if file_arg == "-":
-        if is_tty(sys.stdin):
-            raise ValueError(
-                "Cannot read '-' from an interactive terminal (TTY) stdin; "
-                "pipe JSON or CSV data into stdin or pass a file path."
-            )
+        raw_stdin = read_cli_stdin_if_dash(file_arg) if stdin_text is None else stdin_text
+        assert raw_stdin is not None
         return parse_stdin_records_text(
-            sys.stdin.read(),
+            raw_stdin,
             schema=schema,
             study_key=study_key,
             default_form_key=default_form_key,
@@ -460,7 +456,12 @@ def load_records_from_path_or_stdin(
         raise ValueError(f"Input file not found: '{file_arg}'")
     if file_path.suffix.lower() == ".json":
         return parse_json_records_text(
-            file_path.read_text(encoding="utf-8"), source_label=str(file_path)
+            file_path.read_text(encoding="utf-8"),
+            source_label=str(file_path),
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
         )
     return csv_to_records(
         file_path,
@@ -511,6 +512,7 @@ def assemble_cli_write_records(
     study_key: str | None = None,
     is_subject_registration: bool = False,
     is_update: bool = False,
+    stdin_text: str | None = None,
 ) -> list[dict[str, Any]]:
     """Unify CLI payload assembly for ``records create/update`` and ``subjects register``."""
     if args.input_file and args.json_payload:
@@ -521,6 +523,7 @@ def assemble_cli_write_records(
     if data_pairs:
         parse_key_value_pairs(data_pairs)
 
+    form_key_arg: str | None = getattr(args, "form_key", None)
     form_id_arg: int | None = getattr(args, "form_id", None)
     record_id_arg: int | None = getattr(args, "record_id", None)
     record_oid_arg: str | None = getattr(args, "record_oid", None)
@@ -542,17 +545,26 @@ def assemble_cli_write_records(
             args.input_file,
             schema=schema,
             study_key=resolved_study_key,
-            default_form_key=args.form_key,
+            default_form_key=form_key_arg,
             default_form_id=form_id_arg,
+            stdin_text=stdin_text,
         )
     elif args.json_payload:
-        records = parse_json_records_text(args.json_payload, source_label="--json")
+        records = parse_json_records_text(
+            args.json_payload,
+            source_label="--json",
+            schema=schema,
+            study_key=resolved_study_key,
+            default_form_key=form_key_arg,
+            default_form_id=form_id_arg,
+        )
     elif is_subject_registration:
-        if (not args.form_key and form_id_arg is None) or (
+        if (not form_key_arg and form_id_arg is None) or (
             not site_name_arg and site_id_arg is None
         ):
             raise ValueError(
-                "Provide --file, --json, or both --form-key and --site-name to register a subject."
+                "Provide --file, --json, or both --form-key / --form-id and "
+                "--site-name / --site-id to register a subject."
             )
         records = [{"data": {}}]
     elif is_update:
@@ -572,73 +584,95 @@ def assemble_cli_write_records(
             raise ValueError(
                 "Provide -d/--data, --record-status, or --reason-for-change to update a record."
             )
-        records = [{}]
+        records = [{"data": {}}]
     else:
-        if not args.form_key and form_id_arg is None:
+        if not form_key_arg and form_id_arg is None:
             raise ValueError(
                 "Provide --file, --json, or at least --form-key / --form-id to create a record."
             )
         records = [{"data": {}}]
 
-    if subject_key_arg and len(records) > 1:
+    if (subject_key_arg or subject_oid_arg or subject_id_arg is not None) and len(records) > 1:
         existing_subjects = {
             sid for r in records if (sid := _extract_subject_identifier(r)) is not None
         }
         missing_count = sum(1 for r in records if _extract_subject_identifier(r) is None)
-        if missing_count > 0 and (is_subject_registration or len(existing_subjects) > 1):
-            raise ValueError(
-                "Cannot apply --subject-key across multi-Subject inputs lacking subject keys."
+        if (
+            is_subject_registration
+            or len(existing_subjects) > 1
+            or (missing_count > 0 and len(existing_subjects) > 1)
+        ):
+            flag_label = (
+                "--subject-key"
+                if subject_key_arg
+                else ("--subject-oid" if subject_oid_arg else "--subject-id")
             )
+            raise ValueError(f"Cannot apply {flag_label} across multi-Subject inputs.")
 
     resolved: list[dict[str, Any]] = []
-    for item in records:
-        rec = dict(item)
-        if args.form_key and not (rec.get("formKey") or rec.get("form_key")):
-            rec["formKey"] = args.form_key
-        elif form_id_arg is not None and rec.get("formId") is None and rec.get("form_id") is None:
+    for idx, item in enumerate(records):
+        rec = normalize_record_dicts(
+            [item],
+            schema=schema,
+            study_key=resolved_study_key,
+        )[0]
+        _ = idx
+
+        if form_key_arg:
+            rec["formKey"] = form_key_arg
+            rec.pop("formId", None)
+        elif form_id_arg is not None:
             rec["formId"] = form_id_arg
+            rec.pop("formKey", None)
 
-        if (
-            record_id_arg is not None
-            and rec.get("recordId") is None
-            and rec.get("record_id") is None
-        ):
+        if record_id_arg is not None:
             rec["recordId"] = record_id_arg
-        elif record_oid_arg and not (rec.get("recordOid") or rec.get("record_oid")):
+            rec.pop("recordOid", None)
+        elif record_oid_arg:
             rec["recordOid"] = record_oid_arg
+            rec.pop("recordId", None)
 
-        if visit_id_arg is not None and rec.get("visitId") is None and rec.get("visit_id") is None:
+        if visit_id_arg is not None:
             rec["visitId"] = visit_id_arg
 
-        if _extract_subject_identifier(rec) is None:
-            if subject_key_arg:
-                rec["subjectKey"] = subject_key_arg
-            elif subject_oid_arg:
-                rec["subjectOid"] = subject_oid_arg
-            elif subject_id_arg is not None:
-                rec["subjectId"] = subject_id_arg
+        if subject_key_arg:
+            rec["subjectKey"] = subject_key_arg
+            rec.pop("subjectOid", None)
+            rec.pop("subjectId", None)
+        elif subject_oid_arg:
+            rec["subjectOid"] = subject_oid_arg
+            rec.pop("subjectKey", None)
+            rec.pop("subjectId", None)
+        elif subject_id_arg is not None:
+            rec["subjectId"] = subject_id_arg
+            rec.pop("subjectKey", None)
+            rec.pop("subjectOid", None)
 
-        if site_name_arg and not (rec.get("siteName") or rec.get("site_name")):
+        if site_name_arg:
             rec["siteName"] = site_name_arg
-        elif site_id_arg is not None and rec.get("siteId") is None and rec.get("site_id") is None:
+            rec.pop("siteId", None)
+        elif site_id_arg is not None:
             rec["siteId"] = site_id_arg
+            rec.pop("siteName", None)
 
-        if interval_name_arg and not (rec.get("intervalName") or rec.get("interval_name")):
+        if interval_name_arg:
             rec["intervalName"] = interval_name_arg
-        elif (
-            interval_id_arg is not None
-            and rec.get("intervalId") is None
-            and rec.get("interval_id") is None
-        ):
+            rec.pop("intervalId", None)
+        elif interval_id_arg is not None:
             rec["intervalId"] = interval_id_arg
+            rec.pop("intervalName", None)
 
         if record_status_arg:
             rec["recordStatus"] = record_status_arg
         if reason_for_change_arg:
             rec["reasonForChange"] = reason_for_change_arg
 
+        existing_data = rec.get("data")
+        if existing_data is None:
+            rec["data"] = {}
+
         if data_pairs:
-            raw_fk = rec.get("formKey") or rec.get("form_key")
+            raw_fk = rec.get("formKey")
             rec_form_key = (
                 str(raw_fk).strip() if isinstance(raw_fk, str) and raw_fk.strip() else None
             )
@@ -650,13 +684,14 @@ def assemble_cli_write_records(
                 form_id=rec_form_id,
                 study_key=resolved_study_key,
             )
-            existing_data = dict(rec.get("data") or rec.get("recordData") or {})
-            existing_data.update(coerced_inline)
-            rec["data"] = existing_data
+            merged_data = dict(rec.get("data") or {})
+            merged_data.update(coerced_inline)
+            rec["data"] = merged_data
 
         resolved.append(rec)
 
     ensure_no_masked_sentinel(resolved)
+    ensure_no_non_finite_floats(resolved)
     return resolved
 
 

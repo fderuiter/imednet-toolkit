@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
 _ResultT = TypeVar("_ResultT")
 
+_FORM_ID_FIELDS = {"key": "formKey", "id": "formId"}
+_RECORD_ID_FIELDS = {"id": "recordId", "oid": "recordOid"}
 _SUBJECT_ID_FIELDS = {"key": "subjectKey", "id": "subjectId", "oid": "subjectOid"}
 _SITE_ID_FIELDS = {"name": "siteName", "id": "siteId"}
 _INTERVAL_ID_FIELDS = {"name": "intervalName", "id": "intervalId"}
@@ -141,25 +143,40 @@ def build_keyword_record_chunk_submitter(
 
 
 def build_record_payload(
-    form_id: str | int,
-    form_type: Literal["key", "id"],
-    data: dict[str, Any],
+    form_id: str | int | None = None,
+    form_type: Literal["key", "id"] = "key",
+    data: dict[str, Any] | None = None,
     *,
+    record_id: int | str | None = None,
+    record_type: Literal["id", "oid"] = "id",
     subject_id: str | int | None = None,
     subject_type: Literal["key", "id", "oid"] = "key",
     site_id: str | int | None = None,
     site_type: Literal["name", "id"] = "name",
     interval_id: str | int | None = None,
     interval_type: Literal["name", "id"] = "name",
+    record_status: str | None = None,
+    reason_for_change: str | None = None,
 ) -> dict[str, Any]:
-    """Build a single record payload dictionary from form, subject, site, and interval refs."""
-    record: dict[str, Any] = {"formKey" if form_type == "key" else "formId": form_id, "data": data}
+    """Build a single record payload dictionary from form, record, subject, site, and interval refs."""
+    if form_id is None and record_id is None:
+        raise ValueError("Either form_identifier or record_identifier must be provided.")
+    record: dict[str, Any] = {}
+    if form_id is not None:
+        record[_FORM_ID_FIELDS[form_type]] = form_id
+    if record_id is not None:
+        record[_RECORD_ID_FIELDS[record_type]] = record_id
     if subject_id is not None:
         record[_SUBJECT_ID_FIELDS[subject_type]] = subject_id
     if site_id is not None:
         record[_SITE_ID_FIELDS[site_type]] = site_id
     if interval_id is not None:
         record[_INTERVAL_ID_FIELDS[interval_type]] = interval_id
+    if record_status is not None:
+        record["recordStatus"] = record_status
+    if reason_for_change is not None:
+        record["reasonForChange"] = reason_for_change
+    record["data"] = dict(data) if data is not None else {}
     return record
 
 

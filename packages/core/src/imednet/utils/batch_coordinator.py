@@ -8,7 +8,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, TypedDict, Unpack, cast
 
-from imednet.errors import ValidationError
+from imednet.errors import NotFoundError, ValidationError
 from imednet.models.jobs import Job, JobStatus
 from imednet.utils.job_poller import (
     BaseJobPoller,
@@ -18,10 +18,15 @@ from imednet.utils.job_poller import (
     JobStatusEvent,
 )
 from imednet.utils.security import sanitize_diagnostic_payload, sanitize_diagnostic_text
-from imednet.utils.tabular import ensure_no_masked_sentinel, normalize_records_input
+from imednet.utils.tabular import (
+    ensure_no_masked_sentinel,
+    normalize_records_input,
+    schema_cache_needs_refresh,
+)
 from imednet.utils.typing import RecordsInput
 from imednet.validation._base import _extract_form_ref
 from imednet.validation.cache import (
+    BaseSchemaCache,
     BatchValidationReport,
     RecordValidationIssue,
     ValidationSchemaProtocol,
@@ -1280,14 +1285,19 @@ def _prepare_records_batch_execution(
     options: _RecordsBatchOptions,
     *,
     prefer_poll_many: bool = False,
+    pre_normalized: list[dict[str, Any]] | None = None,
 ) -> tuple[int, list[dict[str, Any]], Callable[[list[dict[str, Any]]], Any], dict[str, Any]]:
-    if validate_study_key_fn is not None:
+    if validate_study_key_fn is not None and pre_normalized is None:
         validate_study_key_fn(study_key)
     schema = options.get("schema")
     wait = options.get("wait_for_completion", False)
     timeout = options.get("timeout", 300.0)
     interval = options.get("interval", 5.0)
-    normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
+    normalized = (
+        pre_normalized
+        if pre_normalized is not None
+        else normalize_records_input(records_data, schema=schema, study_key=study_key)
+    )
 
     def _submit_chunk(chunk: list[dict[str, Any]]) -> Any:
         return create_records_fn(
@@ -1314,6 +1324,92 @@ def _prepare_records_batch_execution(
     )
 
 
+def _resolve_batch_schema_sync(
+    study_key: str,
+    records_data: RecordsInput,
+    initial_records: list[dict[str, Any]],
+    sdk: Any,
+    options: _RecordsBatchOptions,
+) -> tuple[_RecordsBatchOptions, list[dict[str, Any]]]:
+    if not initial_records or options.get("skip_validation", False) or sdk is None:
+        return options, initial_records
+    from imednet.datadict.loaders.api import can_load_from_api, load_from_api
+
+    schema = options.get("schema")
+    is_dry_run = bool(options.get("dry_run", False))
+    if schema is None and can_load_from_api(sdk):
+        try:
+            loaded_schema = load_from_api(sdk, study_key)
+        except NotFoundError:
+            if is_dry_run:
+                raise
+            return options, initial_records
+        coerced = normalize_records_input(records_data, schema=loaded_schema, study_key=study_key)
+        if is_dry_run:
+            updated = cast(_RecordsBatchOptions, dict(options))
+            updated["schema"] = loaded_schema
+            return updated, coerced
+        return options, coerced
+    if (
+        isinstance(schema, BaseSchemaCache)
+        and schema_cache_needs_refresh(schema, study_key, initial_records)
+        and can_load_from_api(sdk)
+        and hasattr(sdk, "forms")
+        and hasattr(sdk, "variables")
+    ):
+        try:
+            schema._refresh_sync(sdk.forms, sdk.variables, study_key=study_key)
+        except NotFoundError:
+            if is_dry_run:
+                raise
+            return options, initial_records
+        return options, normalize_records_input(records_data, schema=schema, study_key=study_key)
+    return options, initial_records
+
+
+async def _resolve_batch_schema_async(
+    study_key: str,
+    records_data: RecordsInput,
+    initial_records: list[dict[str, Any]],
+    sdk: Any,
+    options: _RecordsBatchOptions,
+) -> tuple[_RecordsBatchOptions, list[dict[str, Any]]]:
+    if not initial_records or options.get("skip_validation", False) or sdk is None:
+        return options, initial_records
+    from imednet.datadict.loaders.api import async_load_from_api, can_load_from_api
+
+    schema = options.get("schema")
+    is_dry_run = bool(options.get("dry_run", False))
+    if schema is None and can_load_from_api(sdk):
+        try:
+            loaded_schema = await async_load_from_api(sdk, study_key)
+        except NotFoundError:
+            if is_dry_run:
+                raise
+            return options, initial_records
+        coerced = normalize_records_input(records_data, schema=loaded_schema, study_key=study_key)
+        if is_dry_run:
+            updated = cast(_RecordsBatchOptions, dict(options))
+            updated["schema"] = loaded_schema
+            return updated, coerced
+        return options, coerced
+    if (
+        isinstance(schema, BaseSchemaCache)
+        and schema_cache_needs_refresh(schema, study_key, initial_records)
+        and can_load_from_api(sdk)
+        and hasattr(sdk, "forms")
+        and hasattr(sdk, "variables")
+    ):
+        try:
+            await schema._refresh_async(sdk.forms, sdk.variables, study_key=study_key)
+        except NotFoundError:
+            if is_dry_run:
+                raise
+            return options, initial_records
+        return options, normalize_records_input(records_data, schema=schema, study_key=study_key)
+    return options, initial_records
+
+
 def _submit_records_batch_sync(
     study_key: str,
     records_data: RecordsInput,
@@ -1327,16 +1423,25 @@ def _submit_records_batch_sync(
     prefer_poll_many: bool = False,
     **options: Unpack[_RecordsBatchOptions],
 ) -> BatchSubmissionSummary:
+    if validate_study_key_fn is not None:
+        validate_study_key_fn(study_key)
+    initial_records = normalize_records_input(
+        records_data, schema=options.get("schema"), study_key=study_key
+    )
+    resolved_options, normalized = _resolve_batch_schema_sync(
+        study_key, records_data, initial_records, sdk, options
+    )
     chunk_size, normalized, submit_chunk, submit_kwargs = _prepare_records_batch_execution(
         study_key,
         records_data,
         email_notify,
-        validate_study_key_fn,
+        None,
         create_records_fn,
         poll_single_fn,
         poll_many_fn,
-        options,
+        resolved_options,
         prefer_poll_many=prefer_poll_many,
+        pre_normalized=normalized,
     )
     return BatchCoordinator(chunk_size=chunk_size, sdk=sdk).submit(
         study_key, normalized, submit_chunk, **submit_kwargs
@@ -1356,16 +1461,25 @@ async def _submit_records_batch_async(
     prefer_poll_many: bool = False,
     **options: Unpack[_RecordsBatchOptions],
 ) -> BatchSubmissionSummary:
+    if validate_study_key_fn is not None:
+        validate_study_key_fn(study_key)
+    initial_records = normalize_records_input(
+        records_data, schema=options.get("schema"), study_key=study_key
+    )
+    resolved_options, normalized = await _resolve_batch_schema_async(
+        study_key, records_data, initial_records, sdk, options
+    )
     chunk_size, normalized, submit_chunk, submit_kwargs = _prepare_records_batch_execution(
         study_key,
         records_data,
         email_notify,
-        validate_study_key_fn,
+        None,
         create_records_fn,
         poll_single_fn,
         poll_many_fn,
-        options,
+        resolved_options,
         prefer_poll_many=prefer_poll_many,
+        pre_normalized=normalized,
     )
     return await AsyncBatchCoordinator(chunk_size=chunk_size, sdk=sdk).submit(
         study_key, normalized, submit_chunk, **submit_kwargs

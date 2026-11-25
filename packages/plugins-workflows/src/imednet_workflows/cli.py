@@ -1598,7 +1598,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             resolved_schema = (
                 preloaded_schema
                 if preloaded_schema is not None
-                else resolve_cli_schema(sdk, study_key, schema_source)
+                else (resolve_cli_schema(sdk, study_key, schema_source) if schema_source else None)
             )
         except Exception as exc:
             if json_mode:

@@ -26,6 +26,7 @@ from ..utils.write_helpers import (
     assemble_cli_write_records,
     execute_cli_write,
     guard_stdin_dash_tty,
+    read_cli_stdin_if_dash,
     resolve_cli_schema,
     submit_cli_records_batch,
     validate_write_numeric_flags,
@@ -36,6 +37,7 @@ def _load_cli_subject_inputs(
     args: argparse.Namespace,
     *,
     schema: Any = None,
+    stdin_text: str | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve CLI subject registration inputs from ``--file``, ``--json``, or inline flags."""
     return assemble_cli_write_records(
@@ -43,6 +45,7 @@ def _load_cli_subject_inputs(
         schema=schema,
         study_key=getattr(args, "study_key", None),
         is_subject_registration=True,
+        stdin_text=stdin_text,
     )
 
 
@@ -103,6 +106,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         help="Registration form key (formKey) for inline registration or file default.",
     )
     register_parser.add_argument(
+        "--form-id",
+        type=int,
+        default=None,
+        help="Registration form ID (formId) for inline registration or file default.",
+    )
+    register_parser.add_argument(
         "--site-name",
         default=None,
         help="Enrollment site name (siteName) for inline registration or file default.",
@@ -154,16 +163,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         )
 
         def _run() -> BatchSubmissionSummary:
+            stdin_text = read_cli_stdin_if_dash(args.input_file)
+            _load_cli_subject_inputs(args, schema=None, stdin_text=stdin_text)
             resolved_schema = resolve_cli_schema(
                 sdk,
                 args.study_key,
                 args.schema_source,
                 dry_run=args.dry_run,
             )
-            raw_inputs = _load_cli_subject_inputs(args, schema=resolved_schema)
+            raw_inputs = _load_cli_subject_inputs(
+                args, schema=resolved_schema, stdin_text=stdin_text
+            )
             normalized_pairs = normalize_subject_registration_inputs(
                 raw_inputs,
                 default_form_key=args.form_key,
+                default_form_id=args.form_id,
                 default_site_name=args.site_name,
                 default_site_id=args.site_id,
                 schema=resolved_schema,
@@ -183,12 +197,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 should_filter=args.skip_existing,
                 subject_key_field=args.subject_key_field,
             )
+            validation_schema = resolved_schema if (args.schema_source or args.dry_run) else None
             return submit_cli_records_batch(
                 sdk,
                 args,
                 subjects_data,
                 action_label="subject registration",
-                schema=resolved_schema,
+                schema=validation_schema,
                 skipped_count=skipped_count,
             )
 
@@ -216,10 +231,14 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if (
             not args.input_file
             and not args.json_payload
-            and (not args.form_key or (not args.site_name and args.site_id is None))
+            and (
+                (not args.form_key and args.form_id is None)
+                or (not args.site_name and args.site_id is None)
+            )
         ):
             print_error(
-                "Error: Provide --file, --json, or both --form-key and --site-name to register subjects."
+                "Error: Provide --file, --json, or both --form-key / --form-id and "
+                "--site-name / --site-id to register subjects."
             )
             sys.exit(1)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):

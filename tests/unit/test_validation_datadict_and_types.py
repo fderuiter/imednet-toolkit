@@ -988,3 +988,81 @@ def test_load_offline_schema_supports_zip_archive_and_is_file_target(tmp_path: P
     assert isinstance(dd, DataDictionary)
     assert dd.metadata.studyKey == "ZIP_STUDY"
     assert {f.formKey for f in dd.forms} == {"AE", "AEACTEL", "AESDC"}
+
+
+def test_validate_record_entry_rejects_unnormalized_record_data_and_non_finite_floats() -> None:
+    """AC 2 & AC 6: validate_record_entry rejects recordData/record_data and non-finite floats across all paths."""
+    from imednet.validation.cache import validate_record_entry, validate_records_batch
+
+    cache = SchemaCache()
+    cache.populate(
+        [
+            ApiVariable(
+                variable_name="V_AGE",
+                variable_type="integer",
+                form_id=1,
+                form_key="F_DM",
+            ),
+            # Ambiguous variable name across two forms with different types
+            ApiVariable(
+                variable_name="SHARED_VAL",
+                variable_type="Text",
+                form_id=1,
+                form_key="F_DM",
+            ),
+            ApiVariable(
+                variable_name="SHARED_VAL",
+                variable_type="float",
+                form_id=2,
+                form_key="F_LAB",
+            ),
+        ],
+        study_key="STUDY",
+    )
+
+    # AC 2: Unnormalized recordData / record_data rejected in both fail-fast and collect_errors modes
+    for unnormalized_key in ("recordData", "record_data"):
+        bad_entry = {"formKey": "F_DM", unnormalized_key: {"V_AGE": 30}}
+        with pytest.raises(ValidationError, match=unnormalized_key):
+            validate_record_entry(cache, bad_entry, study_key="STUDY")
+        report = validate_records_batch(cache, [bad_entry], study_key="STUDY", collect_errors=True)
+        assert report is not None
+        assert report.is_valid is False
+        assert any(unnormalized_key in err.message for err in report.errors)
+
+    # AC 6: Inf, -Inf, and NaN rejected across form-referenced, form-less, ambiguous, and empty schemas
+    empty_dd = DataDictionary()
+    for non_finite in (float("inf"), float("-inf"), float("nan")):
+        # Form-referenced on SchemaCache
+        with pytest.raises(ValidationError, match="finite"):
+            validate_record_entry(
+                cache, {"formKey": "F_DM", "data": {"V_AGE": non_finite}}, study_key="STUDY"
+            )
+        # Form-less update on SchemaCache (single-form variable, collect_errors=False & True)
+        with pytest.raises(ValidationError, match="finite"):
+            validate_record_entry(
+                cache, {"recordId": 601, "data": {"V_AGE": non_finite}}, study_key="STUDY"
+            )
+        rep_formless = validate_records_batch(
+            cache,
+            [{"recordId": 601, "data": {"V_AGE": non_finite}}],
+            study_key="STUDY",
+            collect_errors=True,
+        )
+        assert rep_formless is not None and not rep_formless.is_valid
+
+        # Form-less update on ambiguous multi-form variable in SchemaCache
+        with pytest.raises(ValidationError, match="finite"):
+            validate_record_entry(
+                cache, {"recordId": 601, "data": {"SHARED_VAL": non_finite}}, study_key="STUDY"
+            )
+
+        # Form-less update on empty DataDictionary
+        with pytest.raises(ValidationError, match="finite"):
+            validate_record_entry(empty_dd, {"recordId": 601, "data": {"ANY_VAR": non_finite}})
+
+    # Valid form-less update on SchemaCache with collect_errors=False also validates type
+    with pytest.raises(ValidationError):
+        validate_record_entry(
+            cache, {"recordId": 601, "data": {"V_AGE": "not-an-int"}}, study_key="STUDY"
+        )

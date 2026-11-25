@@ -33,7 +33,7 @@ def test_create_or_update_records_no_wait() -> None:
     wf = RecordUpdateWorkflow(sdk)
     result = wf.create_or_update_records("STUDY", [{"a": 1}])
 
-    sdk.create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.create_record.assert_called_once_with("STUDY", [{"a": 1, "data": {}}], schema=wf._schema)
     assert result == job
 
 
@@ -57,7 +57,7 @@ def test_create_or_update_records_wait_for_completion(monkeypatch) -> None:
         timeout=5,
     )
 
-    sdk.create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.create_record.assert_called_once_with("STUDY", [{"a": 1, "data": {}}], schema=wf._schema)
     sdk.poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0)
     assert result.state == "COMPLETED"
 
@@ -351,7 +351,9 @@ async def test_async_create_or_update_records_no_wait() -> None:
     wf = RecordUpdateWorkflow(sdk)
     result = await wf.async_create_or_update_records("STUDY", [{"a": 1}])
 
-    sdk.async_create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.async_create_record.assert_called_once_with(
+        "STUDY", [{"a": 1, "data": {}}], schema=wf._schema
+    )
     assert result == job
 
 
@@ -377,7 +379,9 @@ async def test_async_create_or_update_records_wait_for_completion(monkeypatch) -
         timeout=5,
     )
 
-    sdk.async_create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.async_create_record.assert_called_once_with(
+        "STUDY", [{"a": 1, "data": {}}], schema=wf._schema
+    )
     sdk.async_poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0)
     assert result.state == "COMPLETED"
 
@@ -1030,3 +1034,242 @@ async def test_record_update_workflow_email_notify_across_all_ten_methods() -> N
         "false",
         "async-alerts@example.com",
     ]
+
+
+@pytest.mark.asyncio
+async def test_build_record_payload_and_update_unscheduled_record_sync_and_async() -> None:
+    """AC 7: _build_record_payload, update_unscheduled_record, and async_update_unscheduled_record emit recordId/recordOid."""
+    # 1. Direct _build_record_payload checks
+    by_id = RecordUpdateWorkflow._build_record_payload(
+        data={"V_AGE": 50},
+        record_identifier=601,
+        record_identifier_type="id",
+        record_status="Record Complete",
+        reason_for_change="Per protocol",
+    )
+    assert by_id == {
+        "recordId": 601,
+        "recordStatus": "Record Complete",
+        "reasonForChange": "Per protocol",
+        "data": {"V_AGE": 50},
+    }
+
+    by_oid = RecordUpdateWorkflow._build_record_payload(
+        data=None,
+        record_identifier="REC-OID-9",
+        record_identifier_type="oid",
+        form_identifier="F_VS",
+        form_identifier_type="key",
+    )
+    assert by_oid == {
+        "formKey": "F_VS",
+        "recordOid": "REC-OID-9",
+        "data": {},
+    }
+
+    with pytest.raises(ValueError, match="form_identifier or record_identifier"):
+        RecordUpdateWorkflow._build_record_payload(data={"V_AGE": 1})
+
+    with pytest.raises(KeyError):
+        RecordUpdateWorkflow._build_record_payload(
+            data={"V_AGE": 1},
+            record_identifier=601,
+            record_identifier_type="invalid",  # type: ignore[arg-type]
+        )
+
+    # 2. Sync update_unscheduled_record
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_wf = RecordUpdateWorkflow(sync_sdk)
+    sync_wf.create_or_update_records = MagicMock(return_value="sync_job")  # type: ignore[method-assign]
+
+    res_sync = sync_wf.update_unscheduled_record(
+        "STUDY",
+        601,
+        {"V_WEIGHT": 75.5},
+        record_identifier_type="id",
+        record_status="Record Complete",
+        reason_for_change="Correction",
+        email_notify="notify@example.com",
+    )
+    assert res_sync == "sync_job"
+    sync_wf.create_or_update_records.assert_called_once_with(
+        study_key="STUDY",
+        records_data=[
+            {
+                "recordId": 601,
+                "recordStatus": "Record Complete",
+                "reasonForChange": "Correction",
+                "data": {"V_WEIGHT": 75.5},
+            }
+        ],
+        wait_for_completion=False,
+        timeout=300,
+        poll_interval=5,
+        email_notify="notify@example.com",
+    )
+
+    # Sync method called on async SDK raises TypeError
+    async_sdk = MagicMock()
+    async_sdk._async_client = True
+    async_wf = RecordUpdateWorkflow(async_sdk)
+    with pytest.raises(TypeError, match="async_update_unscheduled_record"):
+        async_wf.update_unscheduled_record("STUDY", 601, {"V_WEIGHT": 75.5})
+
+    # 3. Async async_update_unscheduled_record (by OID)
+    async_wf.async_create_or_update_records = AsyncMock(return_value="async_job")  # type: ignore[method-assign]
+    res_async = await async_wf.async_update_unscheduled_record(
+        "STUDY",
+        "REC-OID-77",
+        {"V_WEIGHT": 80.0},
+        record_identifier_type="oid",
+        form_identifier=20,
+        form_identifier_type="id",
+        wait_for_completion=True,
+    )
+    assert res_async == "async_job"
+    async_wf.async_create_or_update_records.assert_awaited_once_with(
+        study_key="STUDY",
+        records_data=[{"formId": 20, "recordOid": "REC-OID-77", "data": {"V_WEIGHT": 80.0}}],
+        wait_for_completion=True,
+        timeout=300,
+        poll_interval=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_refreshes_partial_schema_cache_before_coercion() -> None:
+    """AC 5: RecordUpdateWorkflow with partial SchemaCache refreshes missing forms before tabular coercion."""
+    import json
+
+    import httpx
+    import pandas as pd
+
+    from imednet import AsyncImednetSDK, ImednetSDK
+    from imednet.core.async_client import AsyncClient
+    from imednet.core.client import Client
+    from imednet.models.variables import Variable as ApiVariable
+    from imednet.simulation import SimulationState, SimulationTransport
+    from imednet.validation.cache import AsyncSchemaCache, SchemaCache
+
+    def _make_state() -> SimulationState:
+        st = SimulationState()
+        st.forms.append(
+            {
+                "formId": 88,
+                "formKey": "F_CHK",
+                "formName": "Check Form",
+                "formType": "Standard",
+                "studyKey": "STUDY",
+                "revision": 1,
+                "disabled": False,
+                "eproForm": False,
+                "allowCopy": False,
+            }
+        )
+        st.variables.extend(
+            [
+                {
+                    "variableId": 801,
+                    "variableName": "CB_CODE",
+                    "variableKey": "CB_CODE",
+                    "variableType": "Checkbox",
+                    "formId": 88,
+                    "formKey": "F_CHK",
+                    "studyKey": "STUDY",
+                    "label": "Checkbox Code",
+                },
+                {
+                    "variableId": 802,
+                    "variableName": "TXT_CODE",
+                    "variableKey": "TXT_CODE",
+                    "variableType": "Text",
+                    "formId": 88,
+                    "formKey": "F_CHK",
+                    "studyKey": "STUDY",
+                    "label": "Text Code",
+                },
+            ]
+        )
+        return st
+
+    df = pd.DataFrame(
+        [
+            {
+                "formKey": "F_CHK",
+                "subjectKey": "SUB1",
+                "siteName": "SITE",
+                "CB_CODE": 1,
+                "TXT_CODE": 7,
+            }
+        ]
+    )
+
+    # Sync workflow with partial SchemaCache (only F_DM populated initially)
+    sync_state = _make_state()
+    sync_captured: list[httpx.Request] = []
+    sync_sim = SimulationTransport(state=sync_state)
+
+    class SpySyncTransport(httpx.BaseTransport):
+        def handle_request(self, req: httpx.Request) -> httpx.Response:
+            sync_captured.append(req)
+            return sync_sim.handle_request(req)
+
+    sync_sdk = ImednetSDK(
+        client=Client(
+            api_key="sim-key",  # pragma: allowlist secret
+            security_key="sim-secret",  # pragma: allowlist secret
+            base_url="https://edc.sim.imednet.com",
+            transport=SpySyncTransport(),
+        )
+    )
+    dm_vars = [
+        ApiVariable.model_validate(v)
+        for v in sync_state.variables
+        if v.get("studyKey") == "STUDY" and v.get("formKey") == "F_DM"
+    ]
+    sync_wf = RecordUpdateWorkflow(sync_sdk)
+    assert isinstance(sync_wf._schema, SchemaCache)
+    sync_wf._schema.populate(dm_vars, study_key="STUDY")
+    assert sync_wf._schema.variables_for_form("F_CHK", study_key="STUDY") == {}
+
+    sync_wf.create_or_update_records("STUDY", df)
+    sync_posts = [r for r in sync_captured if r.method == "POST"]
+    assert len(sync_posts) == 1
+    assert json.loads(sync_posts[0].content)[0]["data"] == {"CB_CODE": "1", "TXT_CODE": "7"}
+
+    # Explicit partial SchemaCache passed via schema= parameter also refreshes before coercion
+    explicit_partial = SchemaCache()
+    explicit_partial.populate(dm_vars, study_key="STUDY")
+    sync_captured.clear()
+    sync_wf.create_or_update_records("STUDY", df, schema=explicit_partial)
+    sync_posts = [r for r in sync_captured if r.method == "POST"]
+    assert len(sync_posts) == 1
+    assert json.loads(sync_posts[0].content)[0]["data"] == {"CB_CODE": "1", "TXT_CODE": "7"}
+
+    # Async workflow with partial AsyncSchemaCache
+    async_state = _make_state()
+    async_captured: list[httpx.Request] = []
+    async_sim = SimulationTransport(state=async_state)
+
+    class SpyAsyncTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, req: httpx.Request) -> httpx.Response:
+            async_captured.append(req)
+            return async_sim.handle_request(req)
+
+    async_sdk = AsyncImednetSDK(
+        async_client=AsyncClient(
+            api_key="sim-key",  # pragma: allowlist secret
+            security_key="sim-secret",  # pragma: allowlist secret
+            base_url="https://edc.sim.imednet.com",
+            transport=SpyAsyncTransport(),
+        )
+    )
+    async_wf = RecordUpdateWorkflow(async_sdk)
+    assert isinstance(async_wf._schema, AsyncSchemaCache)
+    async_wf._schema.populate(dm_vars, study_key="STUDY")
+
+    await async_wf.async_create_or_update_records("STUDY", df)
+    async_posts = [r for r in async_captured if r.method == "POST"]
+    assert len(async_posts) == 1
+    assert json.loads(async_posts[0].content)[0]["data"] == {"CB_CODE": "1", "TXT_CODE": "7"}

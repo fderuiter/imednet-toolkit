@@ -121,8 +121,13 @@ if TYPE_CHECKING:
     from imednet.utils.tabular import (
         MASKED_SENTINEL,
         ensure_no_masked_sentinel,
+        ensure_no_non_finite_floats,
+        is_tabular_records_input,
+        normalize_record_dict,
+        normalize_record_dicts,
         normalize_records_input,
         normalize_tabular_row,
+        schema_cache_needs_refresh,
     )
     from imednet.utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
     from imednet.utils.url import (
@@ -195,6 +200,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "delegates_to_sdk_retry_policy",
     ),
     "ensure_no_masked_sentinel": ("imednet.utils.tabular", "ensure_no_masked_sentinel"),
+    "ensure_no_non_finite_floats": ("imednet.utils.tabular", "ensure_no_non_finite_floats"),
     "evaluate_expression": ("imednet.utils.evaluator", "evaluate_expression"),
     "evaluate_job_state": ("imednet.utils.job_poller", "evaluate_job_state"),
     "extract_candidate_subject_key": (
@@ -227,6 +233,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "is_boolean_token": ("imednet.utils.validators", "is_boolean_token"),
     "is_missing_value": ("imednet.utils.validators", "is_missing_value"),
     "is_site_enrollment_eligible": ("imednet.utils.enrollment", "is_site_enrollment_eligible"),
+    "is_tabular_records_input": ("imednet.utils.tabular", "is_tabular_records_input"),
     "mask_clinical_phi": ("imednet.utils.security", "mask_clinical_phi"),
     "mask_custom_phi_recursive": (
         "imednet.integrations.enrichment",
@@ -240,6 +247,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "imednet.integrations.sink_base",
         "normalize_phi_keys_snapshot",
     ),
+    "normalize_record_dict": ("imednet.utils.tabular", "normalize_record_dict"),
+    "normalize_record_dicts": ("imednet.utils.tabular", "normalize_record_dicts"),
     "normalize_records_input": ("imednet.utils.tabular", "normalize_records_input"),
     "normalize_subject_registration_inputs": (
         "imednet.utils.enrollment",
@@ -276,6 +285,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "sanitize_csv_formula": ("imednet.utils.security", "sanitize_csv_formula"),
     "sanitize_diagnostic_payload": ("imednet.utils.security", "sanitize_diagnostic_payload"),
     "sanitize_diagnostic_text": ("imednet.utils.security", "sanitize_diagnostic_text"),
+    "schema_cache_needs_refresh": ("imednet.utils.tabular", "schema_cache_needs_refresh"),
     "sdk_governance_context": ("imednet.core.context", "sdk_governance_context"),
     "security_key_context": ("imednet.core.context", "security_key_context"),
     "set_base_url_context": ("imednet.core.context", "set_base_url_context"),
@@ -358,6 +368,7 @@ __all__ = [
     "dataframe_to_records",
     "delegates_to_sdk_retry_policy",
     "ensure_no_masked_sentinel",
+    "ensure_no_non_finite_floats",
     "evaluate_expression",
     "evaluate_job_state",
     "extract_candidate_subject_key",
@@ -378,6 +389,7 @@ __all__ = [
     "is_boolean_token",
     "is_missing_value",
     "is_site_enrollment_eligible",
+    "is_tabular_records_input",
     "mask_clinical_phi",
     "mask_custom_phi_recursive",
     "matches_revision_date_bound",
@@ -385,6 +397,8 @@ __all__ = [
     "normalize_cache_origin",
     "normalize_iso_date",
     "normalize_phi_keys_snapshot",
+    "normalize_record_dict",
+    "normalize_record_dicts",
     "normalize_records_input",
     "normalize_subject_registration_inputs",
     "normalize_tabular_row",
@@ -412,6 +426,7 @@ __all__ = [
     "sanitize_csv_formula",
     "sanitize_diagnostic_payload",
     "sanitize_diagnostic_text",
+    "schema_cache_needs_refresh",
     "sdk_governance_context",
     "security_key_context",
     "set_base_url_context",

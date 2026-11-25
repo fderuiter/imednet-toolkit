@@ -605,9 +605,11 @@ def test_spi_load_offline_schema_supports_json_odm_redcap_and_csv_dir(tmp_path: 
     loaded_redcap = spi_cli.load_offline_schema(str(redcap_path), study_key="STUDY")
     assert len(loaded_redcap.forms) >= 1  # type: ignore[attr-defined]
 
-    # 5. resolve_cli_schema with 'api' and None
+    # 5. resolve_cli_schema with 'api' and None (live schema resolution when --schema omitted)
     with ImednetSDK(simulation_mode=True) as sdk:
-        assert spi_cli.resolve_cli_schema(sdk, "STUDY", None) is None
+        default_cache = spi_cli.resolve_cli_schema(sdk, "STUDY", None)
+        assert default_cache is not None
+        assert len(default_cache.variables_for_form("F_DM")) >= 1
         api_cache = spi_cli.resolve_cli_schema(sdk, "STUDY", "api")
         assert api_cache is not None
         assert len(api_cache.variables_for_form("F_DM", study_key="STUDY")) >= 1

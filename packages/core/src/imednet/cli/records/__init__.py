@@ -33,6 +33,7 @@ from ..utils.write_helpers import (
     guard_stdin_dash_tty,
     load_records_from_path_or_stdin,
     parse_email_notify,
+    read_cli_stdin_if_dash,
     resolve_cli_schema,
     submit_cli_records_batch,
     validate_write_numeric_flags,
@@ -65,6 +66,7 @@ def _assemble_records_payload(
     *,
     schema: Any = None,
     is_update: bool = False,
+    stdin_text: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build record create/update payload(s) from ``--file``, ``--json``, or inline flags."""
     return assemble_cli_write_records(
@@ -73,6 +75,7 @@ def _assemble_records_payload(
         study_key=getattr(args, "study_key", None),
         is_subject_registration=False,
         is_update=is_update,
+        stdin_text=stdin_text,
     )
 
 
@@ -80,9 +83,10 @@ def _assemble_create_records_payload(
     args: argparse.Namespace,
     *,
     schema: Any = None,
+    stdin_text: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build record creation payload(s) from ``--file``, ``--json``, or inline flags."""
-    return _assemble_records_payload(args, schema=schema, is_update=False)
+    return _assemble_records_payload(args, schema=schema, is_update=False, stdin_text=stdin_text)
 
 
 def _record_view_model(r: Any) -> dict[str, Any]:
@@ -328,19 +332,24 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     @with_sdk
     def create_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
         def _run() -> BatchSubmissionSummary:
+            stdin_text = read_cli_stdin_if_dash(args.input_file)
+            _assemble_create_records_payload(args, schema=None, stdin_text=stdin_text)
             resolved_schema = resolve_cli_schema(
                 sdk,
                 args.study_key,
                 args.schema_source,
                 dry_run=args.dry_run,
             )
-            payload = _assemble_create_records_payload(args, schema=resolved_schema)
+            payload = _assemble_create_records_payload(
+                args, schema=resolved_schema, stdin_text=stdin_text
+            )
+            validation_schema = resolved_schema if (args.schema_source or args.dry_run) else None
             return submit_cli_records_batch(
                 sdk,
                 args,
                 payload,
                 action_label="record submission",
-                schema=resolved_schema,
+                schema=validation_schema,
             )
 
         execute_cli_write(
@@ -389,19 +398,24 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     @with_sdk
     def update_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
         def _run() -> BatchSubmissionSummary:
+            stdin_text = read_cli_stdin_if_dash(args.input_file)
+            _assemble_records_payload(args, schema=None, is_update=True, stdin_text=stdin_text)
             resolved_schema = resolve_cli_schema(
                 sdk,
                 args.study_key,
                 args.schema_source,
                 dry_run=args.dry_run,
             )
-            payload = _assemble_records_payload(args, schema=resolved_schema, is_update=True)
+            payload = _assemble_records_payload(
+                args, schema=resolved_schema, is_update=True, stdin_text=stdin_text
+            )
+            validation_schema = resolved_schema if (args.schema_source or args.dry_run) else None
             return submit_cli_records_batch(
                 sdk,
                 args,
                 payload,
                 action_label="record update",
-                schema=resolved_schema,
+                schema=validation_schema,
             )
 
         execute_cli_write(
@@ -460,24 +474,33 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         input_path = Path(args.file)
 
         def _run() -> BatchSubmissionSummary:
+            stdin_text = read_cli_stdin_if_dash(args.file)
+            load_records_from_path_or_stdin(
+                args.file,
+                schema=None,
+                study_key=args.study_key,
+                stdin_text=stdin_text,
+            )
             resolved_schema = resolve_cli_schema(
                 sdk,
                 args.study_key,
                 args.schema_source,
                 dry_run=args.dry_run,
             )
+            validation_schema = resolved_schema if (args.schema_source or args.dry_run) else None
             if args.file == "-" or input_path.suffix.lower() == ".json":
                 payload = load_records_from_path_or_stdin(
                     args.file,
                     schema=resolved_schema,
                     study_key=args.study_key,
+                    stdin_text=stdin_text,
                 )
                 return submit_cli_records_batch(
                     sdk,
                     args,
                     payload,
                     action_label="record import",
-                    schema=resolved_schema,
+                    schema=validation_schema,
                 )
             email_notify = parse_email_notify(args.email_notify)
             with write_progress_context(

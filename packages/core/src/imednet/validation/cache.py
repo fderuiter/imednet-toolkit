@@ -39,7 +39,11 @@ from imednet.datadict.logic import (
 from imednet.datadict.models import DataDictionary
 from imednet.errors import UnknownVariableTypeError, ValidationError
 from imednet.utils.security import global_sensitivity_registry
-from imednet.utils.tabular import MASKED_SENTINEL, _contains_masked_sentinel
+from imednet.utils.tabular import (
+    MASKED_SENTINEL,
+    _contains_masked_sentinel,
+    _find_non_finite_float,
+)
 
 from ..models.variables import Variable
 from ._base import _extract_form_ref, _ValidatorMixin
@@ -1535,6 +1539,15 @@ def validate_record_data(
                 rule_id="masked_phi",
             )
             continue
+        bad_float = _find_non_finite_float(value)
+        if bad_float is not None:
+            type_failed_vars.add(name)
+            _record_error(
+                f"Variable '{name}' on form '{form_key}' contains non-finite float value '{bad_float}'",
+                variable_name=name,
+                rule_id="non_finite_float",
+            )
+            continue
         if name not in variables:
             continue
         var_obj = variables[name]
@@ -1886,6 +1899,53 @@ def validate_record_entry(
     """
     raw_study = study_key or record.get("studyKey") or record.get("study_key")
     eff_study_key = str(raw_study) if raw_study else None
+
+    for legacy_key in ("recordData", "record_data"):
+        if legacy_key in record:
+            msg = (
+                f"Unnormalized '{legacy_key}' key is not accepted in write payloads; "
+                "use 'data' instead."
+            )
+            if not collect_errors:
+                raise ValidationError(msg)
+            return BatchValidationReport(
+                total_records=1,
+                valid_records=0,
+                invalid_records=1,
+                errors=[
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=None,
+                        variable_name=None,
+                        message=msg,
+                        rule_id="unnormalized_record_data",
+                    )
+                ],
+            )
+
+    for env_key, env_val in record.items():
+        if env_key == "data":
+            continue
+        bad_env = _find_non_finite_float(env_val)
+        if bad_env is not None:
+            msg = f"Field '{env_key}' contains non-finite float value '{bad_env}'"
+            if not collect_errors:
+                raise ValidationError(msg)
+            return BatchValidationReport(
+                total_records=1,
+                valid_records=0,
+                invalid_records=1,
+                errors=[
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=None,
+                        variable_name=None,
+                        message=msg,
+                        rule_id="non_finite_float",
+                    )
+                ],
+            )
+
     fk, fid = _extract_form_ref(record)
     if not fk and fid is not None:
         if isinstance(fid, bool):
@@ -1930,10 +1990,29 @@ def validate_record_entry(
                 ],
             )
     if fk:
+        raw_fk_data = record.get("data", {})
+        if not isinstance(raw_fk_data, Mapping):
+            msg = "Record 'data' field must be a mapping"
+            if not collect_errors:
+                raise ValidationError(msg)
+            return BatchValidationReport(
+                total_records=1,
+                valid_records=0,
+                invalid_records=1,
+                errors=[
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=fk,
+                        variable_name=None,
+                        message=msg,
+                        rule_id="invalid_data_mapping",
+                    )
+                ],
+            )
         return validate_record_data(
             schema,
             fk,
-            record.get("recordData", record.get("data", {})),
+            dict(raw_fk_data),
             study_key=eff_study_key,
             collect_errors=collect_errors,
             record_index=record_index,
@@ -1957,88 +2036,132 @@ def validate_record_entry(
             ],
         )
 
-    raw_data = record.get("recordData", record.get("data", {}))
+    raw_data = record.get("data", {})
+    if raw_data is not None and not isinstance(raw_data, Mapping):
+        msg = "Record 'data' field must be a mapping"
+        if not collect_errors:
+            raise ValidationError(msg)
+        return BatchValidationReport(
+            total_records=1,
+            valid_records=0,
+            invalid_records=1,
+            errors=[
+                RecordValidationIssue(
+                    record_index=record_index,
+                    form_key=None,
+                    variable_name=None,
+                    message=msg,
+                    rule_id="invalid_data_mapping",
+                )
+            ],
+        )
     if isinstance(raw_data, Mapping) and raw_data:
         forms_attr = getattr(schema, "forms", None)
-        is_datadict_like = isinstance(forms_attr, Sequence) and not isinstance(
-            schema, BaseSchemaCache
-        )
-        if is_datadict_like or collect_errors:
-            form_keys: Iterable[str]
-            if isinstance(schema, BaseSchemaCache):
-                form_keys = schema.forms_for_study(eff_study_key) if eff_study_key else schema.forms
-            elif isinstance(forms_attr, Sequence):
-                form_keys = [
-                    str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
-                    for f in forms_attr
-                    if getattr(f, "form_key", None) or getattr(f, "formKey", None)
-                ]
-            else:
-                form_keys = ()
+        form_keys: Iterable[str]
+        if isinstance(schema, BaseSchemaCache):
+            form_keys = schema.forms_for_study(eff_study_key) if eff_study_key else schema.forms
+        elif isinstance(forms_attr, Sequence):
+            form_keys = [
+                str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
+                for f in forms_attr
+                if getattr(f, "form_key", None) or getattr(f, "formKey", None)
+            ]
+        else:
+            form_keys = ()
 
-            known_vars: dict[str, list[Any]] = {}
-            for candidate_fk in form_keys:
-                f_vars = (
-                    schema.variables_for_form(candidate_fk, study_key=eff_study_key)
-                    if isinstance(schema, BaseSchemaCache)
-                    else schema.variables_for_form(candidate_fk)
+        known_vars: dict[str, list[Any]] = {}
+        for candidate_fk in form_keys:
+            f_vars = (
+                schema.variables_for_form(candidate_fk, study_key=eff_study_key)
+                if isinstance(schema, BaseSchemaCache)
+                else schema.variables_for_form(candidate_fk)
+            )
+            for v_name, v_obj in f_vars.items():
+                known_vars.setdefault(v_name, []).append(v_obj)
+
+        formless_errors: list[RecordValidationIssue] = []
+        for var_name, var_val in raw_data.items():
+            if _contains_masked_sentinel(var_val):
+                msg = f"Variable '{var_name}' contains masked PHI sentinel '{MASKED_SENTINEL}'"
+                if not collect_errors:
+                    raise ValidationError(msg)
+                formless_errors.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=None,
+                        variable_name=var_name,
+                        message=msg,
+                        rule_id="masked_phi",
+                    )
                 )
-                for v_name, v_obj in f_vars.items():
-                    known_vars.setdefault(v_name, []).append(v_obj)
-
-            if known_vars:
-                formless_errors: list[RecordValidationIssue] = []
-                for var_name, var_val in raw_data.items():
-                    candidates = known_vars.get(var_name)
-                    if not candidates:
-                        msg = f"Unknown variable {var_name}"
+                continue
+            bad_val_float = _find_non_finite_float(var_val)
+            if bad_val_float is not None:
+                msg = f"Variable '{var_name}' contains non-finite float value '{bad_val_float}'"
+                if not collect_errors:
+                    raise ValidationError(msg)
+                formless_errors.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=None,
+                        variable_name=var_name,
+                        message=msg,
+                        rule_id="non_finite_float",
+                    )
+                )
+                continue
+            if not known_vars:
+                continue
+            candidates = known_vars.get(var_name)
+            if not candidates:
+                msg = f"Unknown variable {var_name}"
+                if not collect_errors:
+                    raise ValidationError(msg)
+                formless_errors.append(
+                    RecordValidationIssue(
+                        record_index=record_index,
+                        form_key=None,
+                        variable_name=var_name,
+                        message=msg,
+                        rule_id="unknown_variable",
+                    )
+                )
+                continue
+            if not _is_empty_value(var_val):
+                distinct_types = {
+                    str(getattr(vo, "variable_type", getattr(vo, "variableType", "")) or "")
+                    .strip()
+                    .lower()
+                    for vo in candidates
+                }
+                distinct_types.discard("")
+                if len(distinct_types) == 1:
+                    vtype = getattr(
+                        candidates[0],
+                        "variable_type",
+                        getattr(candidates[0], "variableType", None),
+                    )
+                    try:
+                        _check_type(vtype, var_val)
+                    except ValidationError as exc:
                         if not collect_errors:
-                            raise ValidationError(msg)
+                            raise
                         formless_errors.append(
                             RecordValidationIssue(
                                 record_index=record_index,
                                 form_key=None,
                                 variable_name=var_name,
-                                message=msg,
-                                rule_id="unknown_variable",
+                                message=str(exc),
+                                rule_id="invalid_type",
                             )
                         )
-                        continue
-                    if not _is_empty_value(var_val):
-                        distinct_types = {
-                            str(getattr(vo, "variable_type", getattr(vo, "variableType", "")) or "")
-                            .strip()
-                            .lower()
-                            for vo in candidates
-                        }
-                        distinct_types.discard("")
-                        if len(distinct_types) == 1:
-                            vtype = getattr(
-                                candidates[0],
-                                "variable_type",
-                                getattr(candidates[0], "variableType", None),
-                            )
-                            try:
-                                _check_type(vtype, var_val)
-                            except ValidationError as exc:
-                                if not collect_errors:
-                                    raise
-                                formless_errors.append(
-                                    RecordValidationIssue(
-                                        record_index=record_index,
-                                        form_key=None,
-                                        variable_name=var_name,
-                                        message=str(exc),
-                                        rule_id="invalid_type",
-                                    )
-                                )
-                if formless_errors:
-                    return BatchValidationReport(
-                        total_records=1,
-                        valid_records=0,
-                        invalid_records=1,
-                        errors=formless_errors,
-                    )
+        if formless_errors:
+            return BatchValidationReport(
+                total_records=1,
+                valid_records=0,
+                invalid_records=1,
+                errors=formless_errors,
+            )
 
     if collect_errors:
         return BatchValidationReport(total_records=1, valid_records=1, invalid_records=0)

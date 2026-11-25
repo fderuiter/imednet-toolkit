@@ -173,8 +173,8 @@ class RegisterSubjectsWorkflow:
             chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
         )
         sdk = cast("ImednetFacade", self._sdk)
-        sites = None if offline_dry_run else sdk.get_sites(study_key=study_key)
         pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
+        sites = None if offline_dry_run else sdk.get_sites(study_key=study_key)
         existing = sdk.get_subjects(study_key=study_key) if should_filter else None
         opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
         spec = self._build_registration_spec(
@@ -277,8 +277,8 @@ class RegisterSubjectsWorkflow:
             chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
         )
         sdk = cast("AsyncImednetFacade", self._sdk)
-        sites = None if offline_dry_run else await sdk.async_get_sites(study_key=study_key)
         pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
+        sites = None if offline_dry_run else await sdk.async_get_sites(study_key=study_key)
         existing = await sdk.async_get_subjects(study_key=study_key) if should_filter else None
         opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
         spec = self._build_registration_spec(

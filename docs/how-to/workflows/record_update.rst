@@ -96,6 +96,9 @@ submitted ``Job`` (along with ``async_*`` counterparts for ``AsyncImednetSDK``):
 * :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.create_new_record` /
   :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.async_create_new_record`:
   Creates an unscheduled ``Form`` ``Record`` for an enrolled ``Subject``.
+* :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.update_unscheduled_record` /
+  :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.async_update_unscheduled_record`:
+  Updates an existing unscheduled ``Record`` by ``recordId`` or ``recordOid``.
 
 .. testcode::
 
