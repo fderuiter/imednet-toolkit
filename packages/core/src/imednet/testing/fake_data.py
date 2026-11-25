@@ -16,6 +16,7 @@ from imednet.validation.cache import (
     _validate_float,
     _validate_int,
     _validate_text,
+    _validate_uri,
 )
 
 from .data_generator import generator as faker
@@ -127,6 +128,8 @@ def _fake_value(var_type: str) -> Any:
             return faker.pyfloat(left_digits=2, right_digits=2, positive=True)
         if validator is _validate_bool:
             return faker.boolean()
+        if validator is _validate_uri:
+            return f"https://example.com/{faker.lexify(text='????').lower()}"
         if category in ("date", "date/time precision"):
             return faker.date_time().strftime("%Y-%m-%d")
         if category == "datetime":

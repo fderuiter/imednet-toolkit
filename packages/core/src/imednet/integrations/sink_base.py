@@ -137,6 +137,7 @@ from imednet.utils.security import (
     _normalize_key,
     global_sensitivity_registry,
     mask_clinical_phi,
+    sanitize_diagnostic_text,
 )
 from imednet.utils.tabular import MASKED_SENTINEL
 from imednet.utils.url import redact_url_query
@@ -1255,6 +1256,7 @@ def _extract_record_for_standards(
     form_domain_map: Mapping[Any, str] | None = None,
     study_config: Any = None,
     pipeline: Any = None,
+    lookup_keys_lower: frozenset[str] = frozenset(),
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """Return ``(domain, raw_data, canonical_data)`` without mutating ``record``."""
     raw_domain: str | None = None
@@ -1264,8 +1266,8 @@ def _extract_record_for_standards(
     if hasattr(record, "record_data") and getattr(record, "record_data", None) is not None:
         rd = getattr(record, "record_data", None)
         raw_data = dict(rd) if isinstance(rd, Mapping) else {}
-        raw_domain = getattr(record, "form_key", None)
-        subject_val = getattr(record, "subject_key", None)
+        raw_domain = getattr(record, "form_key", None) or getattr(record, "formKey", None)
+        subject_val = getattr(record, "subject_key", None) or getattr(record, "subjectKey", None)
     elif isinstance(record, Mapping):
         raw_domain = (
             record.get("DOMAIN")
@@ -1379,6 +1381,7 @@ def _extract_record_for_standards(
                 continue
             primary_key = aliases[0]
             found_val: Any = None
+            matched_cand: str | None = None
             has_val = False
             if primary_key in canonical and canonical[primary_key] is not None:
                 found_val = canonical[primary_key]
@@ -1387,17 +1390,33 @@ def _extract_record_for_standards(
                 for cand in [sdtm_var, *aliases]:
                     if cand in source_data:
                         found_val = source_data[cand]
+                        matched_cand = cand
                         has_val = True
                         break
                     if cand.lower() in lower_raw:
                         found_val = lower_raw[cand.lower()]
+                        matched_cand = cand
                         has_val = True
                         break
             if has_val:
-                canonical.setdefault(primary_key, found_val)
+                cand_governed_by_lookup = (
+                    matched_cand is not None
+                    and matched_cand.lower() in lookup_keys_lower
+                    and primary_key.lower() not in lookup_keys_lower
+                )
+                if not cand_governed_by_lookup:
+                    canonical.setdefault(primary_key, found_val)
                 if domain == "DM" and sdtm_var == "BRTHDTC":
                     canonical.setdefault("birthDate", found_val)
-                elif domain == "DM" and sdtm_var == "ETHNIC":
+                elif (
+                    domain == "DM"
+                    and sdtm_var == "ETHNIC"
+                    and not (
+                        matched_cand is not None
+                        and matched_cand.lower() in lookup_keys_lower
+                        and "ethnicity" not in lookup_keys_lower
+                    )
+                ):
                     canonical.setdefault("ethnicity", found_val)
 
     return domain, raw_data, canonical
@@ -1438,10 +1457,18 @@ def evaluate_standards_readiness(
 
     merged_lookups: dict[str, dict[str, str]] = {}
     cfg_lookups = getattr(study_cfg, "terminology_lookups", None)
+    pipeline_has_terminology = bool(pipeline is not None and getattr(pipeline, "terminology", None))
     if isinstance(cfg_lookups, Mapping):
         for tbl_name, tbl_vals in cfg_lookups.items():
             if isinstance(tbl_vals, Mapping):
-                merged_lookups[str(tbl_name)] = {str(k): str(v) for k, v in tbl_vals.items()}
+                copied_tbl = {str(k): str(v) for k, v in tbl_vals.items()}
+                if pipeline_has_terminology:
+                    upper_keys = {k.strip().upper() for k in copied_tbl}
+                    for mapped_val in list(copied_tbl.values()):
+                        if mapped_val.strip() and mapped_val.strip().upper() not in upper_keys:
+                            copied_tbl.setdefault(mapped_val, mapped_val)
+                            upper_keys.add(mapped_val.strip().upper())
+                merged_lookups[str(tbl_name)] = copied_tbl
     extra_lookups = (
         extra.get("terminology_lookups")
         if isinstance(extra, Mapping) and isinstance(extra.get("terminology_lookups"), Mapping)
@@ -1452,8 +1479,22 @@ def evaluate_standards_readiness(
             for tbl_name, tbl_vals in explicit_map.items():
                 if isinstance(tbl_vals, Mapping):
                     dest_tbl = merged_lookups.setdefault(str(tbl_name), {})
-                    dest_tbl.update({str(k): str(v) for k, v in tbl_vals.items()})
+                    explicit_pairs = {str(k): str(v) for k, v in tbl_vals.items()}
+                    dest_tbl.update(explicit_pairs)
+                    if (
+                        pipeline_has_terminology
+                        and isinstance(cfg_lookups, Mapping)
+                        and tbl_name in cfg_lookups
+                    ):
+                        upper_keys = {k.strip().upper() for k in dest_tbl}
+                        for mapped_val in list(explicit_pairs.values()):
+                            if mapped_val.strip() and mapped_val.strip().upper() not in upper_keys:
+                                dest_tbl.setdefault(mapped_val, mapped_val)
+                                upper_keys.add(mapped_val.strip().upper())
     lookups: dict[str, dict[str, str]] | None = merged_lookups or None
+    lookup_keys_lower: frozenset[str] = (
+        frozenset(k.lower() for k in lookups) if lookups is not None else frozenset()
+    )
 
     effective_form_map: dict[Any, str] = build_form_sdtm_domain_map(None, study_config=study_cfg)
     if form_domain_map:
@@ -1478,6 +1519,7 @@ def evaluate_standards_readiness(
             form_domain_map=effective_form_map or None,
             study_config=study_cfg,
             pipeline=pipeline,
+            lookup_keys_lower=lookup_keys_lower,
         )
         if target_dom and domain != target_dom:
             continue
@@ -1501,7 +1543,7 @@ def evaluate_standards_readiness(
     if cdash_warnings:
         report.warnings = [*report.warnings, *cdash_warnings]
     if config is not None and getattr(config, "mask_phi", True) is True and report.warnings:
-        report.warnings = [mask_clinical_phi(w) for w in report.warnings]
+        report.warnings = [sanitize_diagnostic_text(mask_clinical_phi(w)) for w in report.warnings]
     return report
 
 
@@ -2437,6 +2479,7 @@ def _enforce_batch_standards_readiness(
     standards_profile: Any,
     min_standards_score: float | None,
     sdtm_domain: str | None,
+    form_domain_map: Mapping[Any, str] | None = None,
 ) -> None:
     """Evaluate batch standards readiness, log masked warnings, and enforce min_standards_score."""
     report = evaluate_standards_readiness(
@@ -2445,13 +2488,16 @@ def _enforce_batch_standards_readiness(
         config=config,
         standards_profile=standards_profile,
         sdtm_domain=sdtm_domain,
+        form_domain_map=form_domain_map,
     )
     profile_obj = resolve_standards_profile(standards_profile)
     for warning_msg in report.warnings:
         logger.warning(
             "Standards readiness warning in batch %s: %s",
             batch_id,
-            mask_clinical_phi(warning_msg) if config.mask_phi else warning_msg,
+            sanitize_diagnostic_text(mask_clinical_phi(warning_msg))
+            if config.mask_phi
+            else warning_msg,
         )
     if min_standards_score is not None and report.score < min_standards_score:
         error_fields = sorted({v.field for v in report.violations if v.severity.upper() == "ERROR"})
@@ -2655,6 +2701,63 @@ def _read_provider_lineage_payload(
     return lineage, watermarks
 
 
+class _ScopedSeqOverrides(dict[str, int]):
+    """Scoped ``domain:usubjid:record_id -> seq_val`` overrides compatible with ``dict[str, int]``.
+
+    Dictionary iteration and ``dict.update(...)`` expose only scoped string keys so
+    downstream sinks (`warehouse`, `document`, `graph`) preserve per-`(domain, usubjid, record_id)`
+    isolation without modifying caller contracts, while direct indexing also accepts
+    ``(domain, usubjid, record_id)`` tuples and unambiguous legacy ``record_id`` lookups.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._by_record_id: dict[str, int | None] = {}
+
+    def set_scoped(self, domain: str, usubjid: str, record_id: str, seq_val: int) -> None:
+        from imednet.models.sdtm import format_scoped_seq_override_key
+
+        scoped_key = format_scoped_seq_override_key(domain, usubjid, record_id)
+        super().__setitem__(scoped_key, seq_val)
+        if record_id not in self._by_record_id:
+            self._by_record_id[record_id] = seq_val
+        elif self._by_record_id[record_id] != seq_val:
+            self._by_record_id[record_id] = None
+
+    def _resolve_lookup_key(self, key: Any) -> str | None:
+        if isinstance(key, tuple) and len(key) == 3:
+            from imednet.models.sdtm import format_scoped_seq_override_key
+
+            cand = format_scoped_seq_override_key(str(key[0]), str(key[1]), str(key[2]))
+            return cand if super().__contains__(cand) else None
+        if isinstance(key, str) and super().__contains__(key):
+            return key
+        return None
+
+    def __contains__(self, key: object) -> bool:
+        if self._resolve_lookup_key(key) is not None:
+            return True
+        if isinstance(key, str) and ":" not in key:
+            return self._by_record_id.get(key) is not None
+        return False
+
+    def __getitem__(self, key: Any) -> int:
+        resolved = self._resolve_lookup_key(key)
+        if resolved is not None:
+            return super().__getitem__(resolved)
+        if isinstance(key, str) and ":" not in key:
+            legacy_val = self._by_record_id.get(key)
+            if legacy_val is not None:
+                return legacy_val
+        raise KeyError(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:  # type: ignore[override]
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+
 def rehydrate_sdtm_lineage(
     sink_or_config: Any,
     *,
@@ -2699,7 +2802,7 @@ def rehydrate_sdtm_lineage(
                 watermarks[str(wk)] = max(watermarks.get(str(wk), 0), wv)
 
     domain_seq_counters: dict[str, dict[str, int]] = {}
-    seq_overrides: dict[str, int] = {}
+    seq_overrides = _ScopedSeqOverrides()
 
     for wk, wv in watermarks.items():
         dom_part, sep, subj_part = wk.partition(":")
@@ -2712,7 +2815,7 @@ def rehydrate_sdtm_lineage(
         usubjid = str(entry.get("usubjid") or "")
         seq_val = entry.get("seq_val")
         if dom and dom != "DM" and isinstance(seq_val, int) and not isinstance(seq_val, bool):
-            seq_overrides[rec_id_str] = seq_val
+            seq_overrides.set_scoped(dom, usubjid, rec_id_str, seq_val)
             dom_map = domain_seq_counters.setdefault(dom, {})
             dom_map[usubjid] = max(dom_map.get(usubjid, 0), seq_val)
 
@@ -2997,18 +3100,18 @@ def run_streaming_export(
         )
         exclude_deleted_upstream = (not opts["include_deleted"]) and (not reconcile_voided)
 
-        study_forms = (
-            _try_fetch_study_forms(sdk, study_key)
-            if (opts["as_sdtm"] or opts["sdtm_domain"] is not None)
-            else []
+        check_standards = (
+            opts["standards_profile"] is not None or opts["min_standards_score"] is not None
         )
+        need_form_map = bool(opts["as_sdtm"] or opts["sdtm_domain"] is not None or check_standards)
+        study_forms = _try_fetch_study_forms(sdk, study_key) if need_form_map else []
         active_form_map: dict[Any, str] = (
             build_form_sdtm_domain_map(
                 study_forms,
                 study_config=study_cfg_override,
                 study_key=study_key,
             )
-            if (opts["as_sdtm"] or opts["sdtm_domain"] is not None)
+            if need_form_map
             else {}
         )
         if active_form_map:
@@ -3143,9 +3246,18 @@ def run_streaming_export(
                     exported_timestamps.append(rec_ts)
                 yield rec
 
-        filtered_records: Iterable[Any] = _track_accepted(
-            gate_fn(sdk, study_key, _observe_and_route(), config)
+        gated_stream = (
+            apply_quality_gate(
+                sdk,
+                study_key,
+                _observe_and_route(),
+                config,
+                forms=study_forms or None,
+            )
+            if gate_fn is apply_quality_gate
+            else gate_fn(sdk, study_key, _observe_and_route(), config)
         )
+        filtered_records: Iterable[Any] = _track_accepted(gated_stream)
         if opts["as_sdtm"]:
             filtered_records = iter_subject_ordered_sdtm_records(
                 filtered_records,
@@ -3156,9 +3268,6 @@ def run_streaming_export(
                 mask_phi=getattr(config, "mask_phi", True) is not False,
                 source_is_ordered=source_is_ordered,
             )
-        check_standards = (
-            opts["standards_profile"] is not None or opts["min_standards_score"] is not None
-        )
         for index, batch in enumerate(batches_fn(filtered_records, opts["batch_size"])):
             batch_id = f"{prefix}/{index}"
             if check_standards and batch:
@@ -3170,6 +3279,7 @@ def run_streaming_export(
                     standards_profile=opts["standards_profile"],
                     min_standards_score=opts["min_standards_score"],
                     sdtm_domain=opts["sdtm_domain"],
+                    form_domain_map=active_form_map or None,
                 )
             total_written += sink_obj.write_batch(batch, batch_id=batch_id)
 

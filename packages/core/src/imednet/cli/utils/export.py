@@ -5,18 +5,23 @@ from __future__ import annotations
 import csv
 import json
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
+import imednet.integrations.enrichment as _enrichment
+from imednet.core.context import sdk_governance_context
 from imednet.integrations.enrichment import (
     _matches_custom_phi_key,
+    _to_snake_case,
     mask_custom_phi_recursive,
     resolve_enrichment_pipeline,
+    resolve_study_configuration,
 )
 from imednet.utils import sanitize_csv_formula
 from imednet.utils.security import (
     SensitivityRegistry,
+    _normalize_key,
     build_study_sensitivity_registry,
     global_sensitivity_registry,
     mask_clinical_phi,
@@ -27,6 +32,8 @@ from imednet.utils.serialization import flatten
 from .output import print_error
 
 _MASKED_VALUE = "***MASKED***"
+_ORIG_RESOLVE_STUDY_CONFIG = resolve_study_configuration
+_ORIG_RESOLVE_PIPELINE = resolve_enrichment_pipeline
 
 
 class Model(Protocol):
@@ -174,6 +181,235 @@ def export_list_to_file(
     print(f"Saved {len(items)} {filename_prefix} to {path}")
 
 
+def _normalize_custom_phi_keys(phi_fields: Collection[str] | None) -> set[str]:
+    """Normalize study-configured ``phi_fields`` into canonical and collapsed keys."""
+    if not phi_fields:
+        return set()
+    phi_keys: set[str] = set()
+    for raw_key in phi_fields:
+        if global_sensitivity_registry.is_exempt(raw_key):
+            continue
+        for candidate in (_normalize_key(raw_key), _normalize_key(_to_snake_case(str(raw_key)))):
+            if candidate:
+                phi_keys.add(candidate)
+                phi_keys.add(candidate.replace("_", ""))
+    return phi_keys
+
+
+def resolve_cli_phi_fields(
+    study_key: str | None,
+    *,
+    sdk: Any = None,
+) -> set[str]:
+    """Resolve normalized ``StudyConfiguration.phi_fields`` under *sdk* governance context."""
+    if not isinstance(study_key, str) or not study_key.strip():
+        return set()
+    sk = study_key.strip()
+    with sdk_governance_context(sdk):
+        cfg = (
+            resolve_study_configuration(sk)
+            if resolve_study_configuration is not _ORIG_RESOLVE_STUDY_CONFIG
+            else _enrichment.resolve_study_configuration(sk)
+        )
+        if cfg is not None:
+            return _normalize_custom_phi_keys(getattr(cfg, "phi_fields", None))
+        if resolve_enrichment_pipeline is not _ORIG_RESOLVE_PIPELINE:
+            pipe = resolve_enrichment_pipeline(sk)
+            if pipe is not None and getattr(pipe, "phi_keys", None):
+                return set(pipe.phi_keys)
+    return set()
+
+
+def _copy_model_with_masked_extra(
+    item: Any,
+    model_copy: Any,
+    updates: dict[str, Any],
+    *,
+    active_registry: SensitivityRegistry,
+    custom_phi_keys: set[str],
+) -> Any:
+    """Copy *item* with *updates* and masked ``__pydantic_extra__``, keeping identity if clean."""
+    extra = getattr(item, "__pydantic_extra__", None)
+    masked_extra: dict[str, Any] | None = None
+    if isinstance(extra, dict) and extra:
+        cand = mask_clinical_phi(extra, registry=active_registry)
+        if custom_phi_keys:
+            cand = mask_custom_phi_recursive(cand, custom_phi_keys)
+        for rkey in ("reasonForChange", "reason_for_change"):
+            rval = cand.get(rkey)
+            if isinstance(rval, str) and rval != _MASKED_VALUE:
+                cand[rkey] = sanitize_diagnostic_text(rval, registry=active_registry)
+        if cand != extra:
+            masked_extra = dict(cand)
+
+    if not updates and masked_extra is None:
+        return item
+
+    copied = model_copy(update=updates)
+    if masked_extra is not None:
+        copied_extra = getattr(copied, "__pydantic_extra__", None)
+        if isinstance(copied_extra, dict):
+            object.__setattr__(copied, "__pydantic_extra__", {**copied_extra, **masked_extra})
+    return copied
+
+
+def _is_field_phi_sensitive(
+    fname: str,
+    alias: Any,
+    *,
+    active_registry: SensitivityRegistry,
+    custom_phi_keys: set[str],
+) -> bool:
+    """Return True if a Pydantic field name or alias matches active PHI rules."""
+    return bool(
+        active_registry.is_sensitive(fname)
+        or (isinstance(alias, str) and active_registry.is_sensitive(alias))
+        or _matches_custom_phi_key(fname, custom_phi_keys)
+        or (isinstance(alias, str) and _matches_custom_phi_key(alias, custom_phi_keys))
+    )
+
+
+def _mask_record_tree(
+    value: Any,
+    *,
+    custom_phi_keys: set[str],
+    active_registry: SensitivityRegistry,
+) -> Any:
+    """Mask PHI across nested record mappings, sequences, and models without flattening."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, Mapping):
+        rebuilt: dict[Any, Any] = {}
+        changed = False
+        for k, v in value.items():
+            key_str = str(k)
+            if global_sensitivity_registry.is_sensitive(key_str) or _matches_custom_phi_key(
+                key_str, custom_phi_keys
+            ):
+                rebuilt[k] = _MASKED_VALUE
+                if type(v) is not str or v != _MASKED_VALUE:
+                    changed = True
+            elif isinstance(v, str) and key_str in {"reason_for_change", "reasonForChange"}:
+                scrubbed = sanitize_diagnostic_text(v, registry=active_registry)
+                rebuilt[k] = scrubbed
+                if scrubbed != v:
+                    changed = True
+            else:
+                masked_v = _mask_record_tree(
+                    v,
+                    custom_phi_keys=custom_phi_keys,
+                    active_registry=active_registry,
+                )
+                rebuilt[k] = masked_v
+                if masked_v is not v:
+                    changed = True
+        if custom_phi_keys:
+            post_custom = mask_custom_phi_recursive(rebuilt, custom_phi_keys)
+            if isinstance(post_custom, dict) and post_custom != rebuilt:
+                rebuilt = post_custom
+                changed = True
+        return value if not changed and isinstance(value, dict) else rebuilt
+
+    if isinstance(value, (list, tuple)):
+        elems = [
+            _mask_record_tree(
+                elem, custom_phi_keys=custom_phi_keys, active_registry=active_registry
+            )
+            for elem in value
+        ]
+        if all(new_el is old_el for new_el, old_el in zip(elems, value, strict=False)):
+            return value
+        return tuple(elems) if isinstance(value, tuple) else elems
+
+    model_fields = getattr(type(value), "model_fields", None)
+    model_copy = getattr(value, "model_copy", None)
+    if not isinstance(model_fields, Mapping) or not callable(model_copy):
+        return value
+
+    updates: dict[str, Any] = {}
+    for fname, finfo in model_fields.items():
+        raw_val = getattr(value, fname, None)
+        if raw_val is None or active_registry.is_exempt(fname):
+            continue
+        if _is_field_phi_sensitive(
+            fname,
+            getattr(finfo, "alias", None),
+            active_registry=active_registry,
+            custom_phi_keys=custom_phi_keys,
+        ):
+            if isinstance(raw_val, str) and raw_val != _MASKED_VALUE:
+                updates[fname] = _MASKED_VALUE
+        elif fname == "reason_for_change" and isinstance(raw_val, str):
+            scrubbed = sanitize_diagnostic_text(raw_val, registry=active_registry)
+            if scrubbed != raw_val:
+                updates[fname] = scrubbed
+        elif not isinstance(raw_val, (str, int, float, bool)):
+            masked_val = _mask_record_tree(
+                raw_val,
+                custom_phi_keys=custom_phi_keys,
+                active_registry=active_registry,
+            )
+            if masked_val is not raw_val:
+                updates[fname] = masked_val
+
+    return _copy_model_with_masked_extra(
+        value,
+        model_copy,
+        updates,
+        active_registry=active_registry,
+        custom_phi_keys=custom_phi_keys,
+    )
+
+
+def mask_cli_records(
+    items: Sequence[Any],
+    *,
+    study_key: str | None = None,
+    mask_phi: bool = True,
+    sdk: Any = None,
+    custom_phi_fields: Collection[str] | None = None,
+) -> list[Any]:
+    """Return non-flattened PHI-masked copies of ``Record`` items when *mask_phi* is True."""
+    if not mask_phi or not items:
+        return list(items)
+
+    precomputed = (
+        _normalize_custom_phi_keys(custom_phi_fields) if custom_phi_fields is not None else None
+    )
+    phi_cache: dict[str, set[str]] = {}
+    registries: dict[str, SensitivityRegistry] = {}
+    out: list[Any] = []
+
+    with sdk_governance_context(sdk):
+        for item in items:
+            if precomputed is not None:
+                phi_keys = precomputed
+                active_registry = build_study_sensitivity_registry(phi_keys)
+            else:
+                eff_study = study_key or getattr(item, "study_key", None)
+                phi_keys = set()
+                active_registry = global_sensitivity_registry
+                if isinstance(eff_study, str) and eff_study.strip():
+                    sk = eff_study.strip()
+                    if sk not in phi_cache:
+                        phi_cache[sk] = resolve_cli_phi_fields(sk, sdk=sdk)
+                    phi_keys = phi_cache[sk]
+                    if phi_keys:
+                        if sk not in registries:
+                            registries[sk] = build_study_sensitivity_registry(phi_keys)
+                        active_registry = registries[sk]
+
+            out.append(
+                _mask_record_tree(
+                    item,
+                    custom_phi_keys=phi_keys,
+                    active_registry=active_registry,
+                )
+            )
+    return out
+
+
 def mask_cli_models(
     items: Sequence[Any],
     *,
@@ -214,14 +450,12 @@ def mask_cli_models(
             raw_val = getattr(item, fname, None)
             if raw_val is None or active_registry.is_exempt(fname):
                 continue
-            alias = getattr(finfo, "alias", None)
-            is_sens = (
-                active_registry.is_sensitive(fname)
-                or (isinstance(alias, str) and active_registry.is_sensitive(alias))
-                or _matches_custom_phi_key(fname, custom_phi_keys)
-                or (isinstance(alias, str) and _matches_custom_phi_key(alias, custom_phi_keys))
-            )
-            if is_sens:
+            if _is_field_phi_sensitive(
+                fname,
+                getattr(finfo, "alias", None),
+                active_registry=active_registry,
+                custom_phi_keys=custom_phi_keys,
+            ):
                 if isinstance(raw_val, str) and raw_val != _MASKED_VALUE:
                     updates[fname] = _MASKED_VALUE
             elif fname == "reason_for_change" and isinstance(raw_val, str):
@@ -229,30 +463,14 @@ def mask_cli_models(
                 if scrubbed != raw_val:
                     updates[fname] = scrubbed
 
-        extra = getattr(item, "__pydantic_extra__", None)
-        masked_extra: dict[str, Any] | None = None
-        if isinstance(extra, dict) and extra:
-            cand = mask_clinical_phi(extra, registry=active_registry)
-            if custom_phi_keys:
-                cand = mask_custom_phi_recursive(cand, custom_phi_keys)
-            for rkey in ("reasonForChange", "reason_for_change"):
-                rval = cand.get(rkey)
-                if isinstance(rval, str) and rval != _MASKED_VALUE:
-                    cand[rkey] = sanitize_diagnostic_text(rval, registry=active_registry)
-            if cand != extra:
-                masked_extra = dict(cand)
-
-        if not updates and masked_extra is None:
-            out.append(item)
-            continue
-
-        copied = model_copy(update=updates)
-        if masked_extra is not None:
-            copied_extra = getattr(copied, "__pydantic_extra__", None)
-            if isinstance(copied_extra, dict):
-                merged_extra = dict(copied_extra)
-                merged_extra.update(masked_extra)
-                object.__setattr__(copied, "__pydantic_extra__", merged_extra)
-        out.append(copied)
+        out.append(
+            _copy_model_with_masked_extra(
+                item,
+                model_copy,
+                updates,
+                active_registry=active_registry,
+                custom_phi_keys=custom_phi_keys,
+            )
+        )
 
     return out

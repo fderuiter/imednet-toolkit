@@ -1,6 +1,7 @@
 """Unit tests for utils pandas."""
 
 import ast
+import csv
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -16,6 +17,8 @@ from imednet.models.users import User
 from imednet.models.variables import Variable
 from imednet.models.visits import Visit
 from imednet.utils.pandas import (
+    MASKED_SENTINEL,
+    _is_custom_phi_column,
     _models_to_dataframe,
     check_pandas,
     export_records_csv,
@@ -588,3 +591,237 @@ def test_export_records_csv_applies_study_config_labels_and_formula_sanitization
     assert df.loc[0, "subject_key"] == "SUBJ-808"
     assert df.loc[0, "study_key"] == "STUDY_PANDAS"
     assert df.loc[0, "record_id"] == 808
+
+
+def test_is_custom_phi_column_matches_collapsed_keys_and_preserves_exemptions() -> None:
+    """Verify _is_custom_phi_column matches normalized and collapsed Study PHI keys while exempting structural IDs."""
+    from imednet.integrations.enrichment import EnrichmentPipeline
+    from imednet.models.study_config import StudyConfiguration
+
+    cfg = StudyConfiguration(
+        studyKey="STUDY_PHI_COLLAPSE",
+        version="1.0",
+        phiFields=["medicalRecordNumber", "siteChartId", "study_key", "subject_key", "record_id"],
+    )
+    pipeline = EnrichmentPipeline(cfg)
+
+    assert _is_custom_phi_column("Medical Record Number", pipeline.phi_keys) is True
+    assert _is_custom_phi_column("medicalrecordnumber", pipeline.phi_keys) is True
+    assert _is_custom_phi_column("Site Chart ID", pipeline.phi_keys) is True
+    assert _is_custom_phi_column("siteChartId", pipeline.phi_keys) is True
+    assert _is_custom_phi_column("demographics_siteChartId", pipeline.phi_keys) is True
+    assert _is_custom_phi_column("Site Chart ID", {"sitechartid"}) is True
+    assert _is_custom_phi_column("systolicBp", pipeline.phi_keys) is False
+    assert _is_custom_phi_column("", pipeline.phi_keys) is False
+    assert _is_custom_phi_column("---", pipeline.phi_keys) is False
+    assert _is_custom_phi_column("Medical Record Number", set()) is False
+
+    for exempt_col in (
+        "study_key",
+        "subject_key",
+        "record_id",
+        "Study Key",
+        "Subject Key",
+        "Record ID",
+    ):
+        assert _is_custom_phi_column(exempt_col, pipeline.phi_keys) is False
+        assert _is_custom_phi_column(exempt_col, {"study_key", "subject_key", "record_id"}) is False
+
+
+def test_records_to_dataframe_masks_sensitive_and_brthdtc_variable_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify records_to_dataframe masks coded variables whose mapped Variable.label is sensitive, BRTHDTC, or custom PHI."""
+    from imednet.integrations import enrichment as enrichment_mod
+    from imednet.models.study_config import StudyConfiguration
+
+    study_key = "STUDY_LABEL_DF"
+    cfg = StudyConfiguration(
+        studyKey=study_key,
+        version="1.0",
+        phiFields=["medicalRecordNumber", "siteChartId"],
+    )
+    monkeypatch.setattr(
+        enrichment_mod,
+        "resolve_study_configuration",
+        lambda sk: cfg if sk == study_key else None,
+    )
+
+    rec = Record(
+        record_id=501,
+        study_key=study_key,
+        subject_key="SUBJ-501",
+        visit_id=1,
+        form_id=10,
+        record_status="Complete",
+        record_data={
+            "Q_CODE_01": "SYNTH_PHI_NAME_MARKER",
+            "Q_CODE_02": "1979-05-14",
+            "Q_CODE_03": "1984-11-02",
+            "Q_CODE_05": "SYNTH_CUSTOM_MRN_MARKER",
+            "Q_DUP_A": "SYNTH_DUP_NAME_A",
+            "Q_DUP_B": "SYNTH_DUP_NAME_B",
+            "Q_META_COLLIDE": "SAFE_CODE_VAL",
+            "Q_SAFE": 118,
+        },
+    )
+    label_map = {
+        "Q_CODE_01": "Patient Name",
+        "Q_CODE_02": "Date of Birth",
+        "Q_CODE_03": "BRTHDTC",
+        "Q_CODE_05": "Medical Record Number",
+        "Q_DUP_A": "Patient Initials",
+        "Q_DUP_B": "Patient Initials",
+        "Q_META_COLLIDE": "subject_key",
+        "Q_SAFE": "Systolic BP",
+        "subject_key": "Should Not Rename Metadata",
+    }
+
+    masked_df = records_to_dataframe(
+        [rec],
+        flatten=True,
+        mask_phi=True,
+        study_key=study_key,
+        label_map=label_map,
+    )
+    assert masked_df.loc[0, "Patient Name"] == MASKED_SENTINEL
+    assert masked_df.loc[0, "Date of Birth"] == MASKED_SENTINEL
+    assert masked_df.loc[0, "BRTHDTC"] == MASKED_SENTINEL
+    assert masked_df.loc[0, "Medical Record Number"] == MASKED_SENTINEL
+    dup_cols = masked_df.loc[:, "Patient Initials"]
+    assert isinstance(dup_cols, pd.DataFrame)
+    assert list(dup_cols.iloc[0]) == [MASKED_SENTINEL, MASKED_SENTINEL]
+    assert masked_df.loc[0, "Systolic BP"] == 118
+    assert masked_df.loc[0, "subject_key"] == "SUBJ-501"
+    assert masked_df.loc[0, "Q_META_COLLIDE"] == "SAFE_CODE_VAL"
+    assert masked_df.loc[0, "study_key"] == study_key
+    assert masked_df.loc[0, "record_id"] == 501
+
+    unmasked_df = records_to_dataframe(
+        [rec],
+        flatten=True,
+        mask_phi=False,
+        study_key=study_key,
+        label_map=label_map,
+    )
+    assert unmasked_df.loc[0, "Patient Name"] == "SYNTH_PHI_NAME_MARKER"
+    assert unmasked_df.loc[0, "Date of Birth"] == "1979-05-14"
+    assert unmasked_df.loc[0, "BRTHDTC"] == "1984-11-02"
+    assert unmasked_df.loc[0, "Medical Record Number"] == "SYNTH_CUSTOM_MRN_MARKER"
+    assert unmasked_df.loc[0, "Systolic BP"] == 118
+    assert unmasked_df.loc[0, "subject_key"] == "SUBJ-501"
+
+
+def test_export_records_csv_masks_sensitive_variable_labels_and_prevents_phi_leaks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Verify export_records_csv masks coded Variables whose Variable.label matches SensitivityRegistry, BRTHDTC, or StudyConfiguration.phi_fields."""
+    from types import SimpleNamespace
+
+    from imednet.integrations import enrichment as enrichment_mod
+    from imednet.models.study_config import StudyConfiguration
+
+    study_key = "STUDY_CSV_LABEL_PHI"
+    phi_variables = [
+        ("Q_CODE_01", "Patient Name", "SYNTH_PHI_NAME_MARKER"),
+        ("Q_CODE_02", "Date of Birth", "1979-05-14"),
+        ("Q_CODE_03", "SSN", "000-00-9999"),
+        ("Q_CODE_04", "Email", "synth-marker@example.invalid"),
+        ("Q_CODE_05", "Medical Record Number", "SYNTH_CUSTOM_MRN_MARKER"),
+        ("Q_CODE_06", "siteChartId", "SYNTH_CUSTOM_CHART_MARKER"),
+        ("Q_CODE_07", "BRTHDTC", "1979-05-14"),
+        ("Q_CODE_08", "Phone", "+1-555-0199"),
+    ]
+    cfg = StudyConfiguration(
+        studyKey=study_key,
+        version="1.0",
+        phiFields=["medicalRecordNumber", "siteChartId"],
+    )
+    monkeypatch.setattr(
+        enrichment_mod,
+        "resolve_study_configuration",
+        lambda sk: cfg if sk == study_key else None,
+    )
+
+    rec = Record(
+        record_id=909,
+        study_key=study_key,
+        subject_key="SUBJ-909",
+        visit_id=1,
+        form_id=10,
+        record_status="Complete",
+        record_data={
+            **{vcode: marker for vcode, _, marker in phi_variables},
+            "Q_VITAL_HR": 72,
+            "Q_FORMULA_NOTE": "=SUM(A1:A2)",
+        },
+    )
+    sdk = MagicMock()
+    sdk.records.list.side_effect = lambda **_kw: [rec.model_copy(deep=True)]
+    sdk.variables.list.return_value = [
+        *[SimpleNamespace(variable_name=vcode, label=vlabel) for vcode, vlabel, _ in phi_variables],
+        SimpleNamespace(variable_name="Q_VITAL_HR", label="Heart Rate"),
+        SimpleNamespace(variable_name="Q_FORMULA_NOTE", label="Investigator Note"),
+        SimpleNamespace(variable_name="Q_EMPTY_LABEL", label="   "),
+    ]
+
+    csv_path = tmp_path / "masked_labeled_export.csv"
+    export_records_csv(
+        sdk,
+        study_key,
+        str(csv_path),
+        flatten=True,
+        mask_phi=True,
+        use_labels_as_columns=True,
+    )
+    with open(csv_path, encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+
+    csv_leaks = [
+        f"{vlabel}={rows[0].get(vlabel)!r}"
+        for _, vlabel, marker in phi_variables
+        if rows[0].get(vlabel) == marker
+    ]
+    assert not csv_leaks
+    for _, vlabel, _ in phi_variables:
+        assert rows[0][vlabel] == MASKED_SENTINEL
+    assert rows[0]["Heart Rate"] == "72"
+    assert rows[0]["Investigator Note"] == "'=SUM(A1:A2)"
+    assert rows[0]["study_key"] == study_key
+    assert rows[0]["subject_key"] == "SUBJ-909"
+    assert rows[0]["record_id"] == "909"
+
+    unmasked_csv_path = tmp_path / "unmasked_labeled_export.csv"
+    export_records_csv(
+        sdk,
+        study_key,
+        str(unmasked_csv_path),
+        flatten=True,
+        mask_phi=False,
+        use_labels_as_columns=True,
+    )
+    with open(unmasked_csv_path, encoding="utf-8", newline="") as fh:
+        unmasked_rows = list(csv.DictReader(fh))
+    assert unmasked_rows[0]["Patient Name"] == "SYNTH_PHI_NAME_MARKER"
+    assert unmasked_rows[0]["Date of Birth"] == "1979-05-14"
+    assert unmasked_rows[0]["BRTHDTC"] == "1979-05-14"
+    assert unmasked_rows[0]["Medical Record Number"] == "SYNTH_CUSTOM_MRN_MARKER"
+    assert unmasked_rows[0]["siteChartId"] == "SYNTH_CUSTOM_CHART_MARKER"
+    assert unmasked_rows[0]["Phone"] == "'+1-555-0199"
+    assert unmasked_rows[0]["Investigator Note"] == "'=SUM(A1:A2)"
+
+    sdk_no_vars = MagicMock(spec=["records"])
+    sdk_no_vars.records.list.return_value = [rec.model_copy(deep=True)]
+    fallback_csv_path = tmp_path / "no_vars_export.csv"
+    export_records_csv(
+        sdk_no_vars,
+        study_key,
+        str(fallback_csv_path),
+        flatten=True,
+        mask_phi=True,
+        use_labels_as_columns=True,
+    )
+    with open(fallback_csv_path, encoding="utf-8", newline="") as fh:
+        fallback_rows = list(csv.DictReader(fh))
+    assert fallback_rows[0]["Q_VITAL_HR"] == "72"
+    assert fallback_rows[0]["subject_key"] == "SUBJ-909"

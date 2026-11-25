@@ -19,7 +19,7 @@ from imednet.spi.errors import (
     NotFoundError,
 )
 
-from .cached_loader import CachedRecordsLoader
+from .cached_loader import CachedRecordsLoader, bind_loader_lock_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,12 @@ def _validate_max_consecutive_failures(value: Any) -> None:
         return
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError("max_consecutive_failures must be at least 1")
+
+
+def _validate_reconcile_every_n_cycles(value: Any) -> None:
+    """Validate that ``reconcile_every_n_cycles`` is a non-boolean integer >= 1."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("reconcile_every_n_cycles must be at least 1")
 
 
 class SyncWorkerState(StrEnum):
@@ -109,6 +115,7 @@ class SyncWorkerConfig:
     study_key: str
     interval_seconds: int = 900
     reconcile: bool = True
+    reconcile_every_n_cycles: int = 1
     lock_timeout_seconds: float = 30
     max_consecutive_failures: int | None = None
 
@@ -116,6 +123,7 @@ class SyncWorkerConfig:
         """Validate worker configuration bounds."""
         _validate_study_key_value(self.study_key)
         _validate_positive_number(self.interval_seconds, field_name="interval_seconds")
+        _validate_reconcile_every_n_cycles(self.reconcile_every_n_cycles)
         _validate_positive_number(self.lock_timeout_seconds, field_name="lock_timeout_seconds")
         _validate_max_consecutive_failures(self.max_consecutive_failures)
 
@@ -143,6 +151,7 @@ class SyncWorker:
         """
         _validate_study_key_value(config.study_key)
         _validate_positive_number(config.interval_seconds, field_name="interval_seconds")
+        _validate_reconcile_every_n_cycles(config.reconcile_every_n_cycles)
         _validate_positive_number(config.lock_timeout_seconds, field_name="lock_timeout_seconds")
         _validate_max_consecutive_failures(config.max_consecutive_failures)
         if max_consecutive_failures is not None:
@@ -161,6 +170,7 @@ class SyncWorker:
         self._max_consecutive_failures = effective_max
         self._state = SyncWorkerState.IDLE
         self._consecutive_failures = 0
+        self._cycle_index = 0
         self._last_error: Exception | None = None
 
     @property
@@ -196,11 +206,18 @@ class SyncWorker:
         ):
             self._state = SyncWorkerState.RUNNING
 
+        self._cycle_index += 1
+        should_reconcile = bool(
+            self._config.reconcile
+            and self._cycle_index % self._config.reconcile_every_n_cycles == 0
+        )
+
         try:
-            self._loader.sync_records(
-                self._config.study_key,
-                reconcile=self._config.reconcile,
-            )
+            with bind_loader_lock_timeout(self._config.lock_timeout_seconds):
+                self._loader.sync_records(
+                    self._config.study_key,
+                    reconcile=should_reconcile,
+                )
             record_count = self._loader.count_cached_records(self._config.study_key)
         except Exception as exc:
             self._consecutive_failures += 1

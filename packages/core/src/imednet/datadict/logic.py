@@ -488,6 +488,17 @@ def _extract_odm_range_checks(
     return tuple(parsed), implied_min, implied_max
 
 
+def _is_retired_variable_flag(var: Any) -> bool:
+    """Return True when a Variable is marked retired via ``deleted`` or ``disabled``."""
+    for key in ("deleted", "disabled"):
+        raw_val = _lookup_attr_or_extra(var, (key,))
+        if isinstance(raw_val, bool) and raw_val:
+            return True
+        if isinstance(raw_val, str) and raw_val.strip().lower() in {"true", "yes", "y", "1"}:
+            return True
+    return False
+
+
 def extract_variable_constraints(var: Any) -> VariableConstraints:
     """Extract choices, required policy, numeric bounds, and string lengths from a Variable."""
     if var is None:
@@ -508,16 +519,17 @@ def extract_variable_constraints(var: Any) -> VariableConstraints:
                 if cval is not None:
                     choices.append(str(cval))
 
-    raw_req = _lookup_attr_or_extra(var, ("required", "requiredField", "required_field"))
     required_policy: Literal["yes", "auto_query", "no"] = "no"
-    if isinstance(raw_req, bool):
-        required_policy = "yes" if raw_req else "no"
-    elif isinstance(raw_req, str):
-        norm_req = raw_req.strip().lower()
-        if norm_req in {"yes", "y", "true", "1", "hard", "required"}:
-            required_policy = "yes"
-        elif norm_req in {"auto query", "auto_query", "autoquery", "query", "soft"}:
-            required_policy = "auto_query"
+    if not _is_retired_variable_flag(var):
+        raw_req = _lookup_attr_or_extra(var, ("required", "requiredField", "required_field"))
+        if isinstance(raw_req, bool):
+            required_policy = "yes" if raw_req else "no"
+        elif isinstance(raw_req, str):
+            norm_req = raw_req.strip().lower()
+            if norm_req in {"yes", "y", "true", "1", "hard", "required"}:
+                required_policy = "yes"
+            elif norm_req in {"auto query", "auto_query", "autoquery", "query", "soft"}:
+                required_policy = "auto_query"
 
     min_value = _to_finite_float(_lookup_attr_or_extra(var, _MIN_BOUND_KEYS))
     max_value = _to_finite_float(_lookup_attr_or_extra(var, _MAX_BOUND_KEYS))
