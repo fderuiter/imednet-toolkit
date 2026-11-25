@@ -226,23 +226,34 @@ and tabular export helpers while maintaining ``mask_phi=True`` by default:
 
 - ``incremental``: Enable transactional high-water mark reads and commits.
 - ``stream_name``: Stream key used to isolate checkpoints per destination or ``Form``.
+  When omitted on an incremental or stateful export, ``ImednetExportOperator`` derives
+  a target-scoped default from ``dag_id``, ``task_id``, ``destination``, and the
+  redacted/sanitized target identifier (such as table, collection, node label, or
+  output path, omitting dynamic ``map_index`` numbers) across both tabular exports and
+  external sinks—even when ``state_provider`` or ``ledger_path`` is supplied. When a
+  newly scoped stream has no state yet, the operator automatically seeds its initial
+  watermark from a single matching pre-upgrade checkpoint (such as
+  ``{dest}_{task_id}`` or ``airflow_{dest}_{task_id}``).
 - ``state_provider``: Explicit checkpoint provider such as
   :class:`~imednet_workflows.state_ledger.AirflowStateProvider` (persisting all
   stream JSON watermarks for a ``Study`` inside one Airflow ``Variable`` map under
   ``imednet_state:<study_key>`` via ``airflow.sdk.Variable``, transparently reading
   and consolidating legacy ``imednet_state:<study_key>:<stream_name>`` keys on the
   next study write, preserving per-``Study`` state across dynamic task mapping order
-  changes, and rolling ``RUNNING`` checkpoints back to ``FAILED`` on
-  ``BaseException`` interrupts such as ``AirflowTaskTimeout``)
+  changes, enforcing monotonic ``last_timestamp`` watermarks with atomic SQL
+  compare-and-swap outside ``RuntimeTaskInstance`` and unique ``lease_token`` /
+  ``lease_id`` fencing via ``airflow.sdk.Variable`` inside ``RuntimeTaskInstance``,
+  escaping SQL ``LIKE`` wildcards on ``delete_entry``, and rolling ``RUNNING``
+  checkpoints back to ``FAILED`` on ``BaseException`` interrupts such as
+  ``AirflowTaskTimeout``)
   or :class:`~imednet_workflows.ExtractionStateLedger`
   (:class:`~imednet_workflows.state_ledger.FileStateProvider`). When omitted on an
   ``incremental=True`` run, ``ImednetExportOperator`` defaults to the ``airflow``
-  provider entry point automatically unless ``ledger_path`` is specified. Because
-  ``Variable.set`` performs last-writer-wins upserts on the consolidated study key,
-  configure distinct ``AirflowStateProvider(variable_prefix=...)`` values when
-  concurrent operators export the same ``Study`` in parallel.
+  provider entry point automatically unless ``ledger_path`` is specified.
 - ``ledger_path``: Shared filesystem path used when persisting checkpoints with
-  ``ExtractionStateLedger`` instead of Airflow ``Variable`` storage.
+  ``ExtractionStateLedger`` (:class:`~imednet_workflows.state_ledger.FileStateProvider`)
+  instead of Airflow ``Variable`` storage across both tabular exports and external
+  sinks, taking precedence even when ``AIRFLOW_CTX_TASK_ID`` is set.
 - ``modified_since``: Initial UTC lower-bound watermark when no prior checkpoint exists.
 - ``record_filter``: ``Record`` metadata filter dictionary or expression string.
 - ``record_data_filter``: ``Variable`` payload filter expression (``recordDataFilter``).

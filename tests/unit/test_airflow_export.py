@@ -1887,3 +1887,463 @@ def test_operator_sdtm_phi_redaction_and_incremental_reconciliation(
     json_rows2 = json.loads(json_path.read_text(encoding="utf-8"))
     assert len(json_rows2) == 1 and json_rows2[0]["USUBJID"] == "S01"
     assert json_rows2[0]["BRTHDTC"] == "1981"
+
+
+def test_operator_ledger_path_writes_file_checkpoints_across_all_destinations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing ledger_path to ImednetExportOperator writes checkpoints to ledger_path for all sinks and tabular exports."""
+    from collections.abc import Sequence
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from typing import Any
+
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.spi.sink_base import ExportSink
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "airflow_ctx_override_check")
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+
+    study_key = "STUDY_LEDGER_ALL"
+    rec_ts = datetime(2026, 8, 20, 14, 30, tzinfo=UTC)
+
+    def _make_mock_sdk() -> MagicMock:
+        sdk = MagicMock()
+        sdk.studies.get.return_value = MagicMock(study_key=study_key)
+        sdk.variables.list.return_value = [
+            MagicMock(
+                variable_id=1,
+                variable_name="AGE",
+                variable_type="integer",
+                label="Age",
+                form_id=10,
+                form_key="DM",
+                form_name="Demographics",
+                deleted=False,
+            )
+        ]
+        sdk.forms.list.return_value = [
+            MagicMock(form_id=10, form_key="DM", form_name="Demographics")
+        ]
+
+        class _Rec:
+            record_id = 101
+            subject_id = 1
+            subject_key = "SUBJ-01"
+            site_id = 1
+            form_id = 10
+            form_key = "DM"
+            deleted = False
+            date_created = rec_ts
+            date_modified = rec_ts
+            record_data = {"AGE": 34}
+
+            def model_dump(self, **_kw: Any) -> dict[str, Any]:
+                return {
+                    "recordId": 101,
+                    "subjectId": 1,
+                    "subjectKey": "SUBJ-01",
+                    "formId": 10,
+                    "formKey": "DM",
+                    "deleted": False,
+                    "dateModified": rec_ts.isoformat(),
+                    "recordData": {"AGE": 34},
+                }
+
+        sdk.records.list.side_effect = lambda **_kw: iter([_Rec()])
+
+        class _DummyConfig:
+            def __init__(self, **kwargs: Any) -> None:
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        class _DummySink(ExportSink):
+            def __init__(self, config: Any) -> None:
+                self.config = config
+
+            def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+                _ = batch_id
+                return len(records)
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        sdk.sinks = SimpleNamespace(
+            SnowflakeSinkConfig=_DummyConfig,
+            SnowflakeExportSink=_DummySink,
+            Neo4jSinkConfig=_DummyConfig,
+            Neo4jExportSink=_DummySink,
+            MongoDbSinkConfig=_DummyConfig,
+            MongoDbExportSink=_DummySink,
+        )
+        return sdk
+
+    ledger_file = tmp_path / "shared_file_ledger.json"
+    sqlite_db = tmp_path / "sql_dest.sqlite"
+    duck_db = tmp_path / "duck_dest.duckdb"
+    csv_out = tmp_path / "csv_dest.csv"
+
+    cases: list[tuple[str, str | None, dict[str, Any]]] = [
+        ("mongodb", None, {"database": "clin", "collection": "dm_docs"}),
+        ("snowflake", None, {"database": "WH", "schema": "PUBLIC", "table": "DM_SF"}),
+        ("neo4j", None, {"database": "neo4j", "label": "ClinicalRecord"}),
+        ("csv", str(csv_out), {}),
+        ("duckdb", str(duck_db), {"table_name": "dm_duck"}),
+        ("sql", "dm_sql_tbl", {"conn_str": f"sqlite:///{sqlite_db}"}),
+    ]
+
+    for dest, out_path, extra_kw in cases:
+        sdk = _make_mock_sdk()
+        op = ImednetExportOperator(
+            task_id=f"task_{dest}",
+            study_key=study_key,
+            destination=dest,
+            output_path=out_path,
+            incremental=True,
+            idempotent=True,
+            quality_gate_enabled=False,
+            ledger_path=str(ledger_file),
+            export_kwargs=extra_kw,
+        )
+        monkeypatch.setattr(op, "_get_sdk", lambda s=sdk: s)
+        monkeypatch.setattr(op, "_resolve_destination_connection", lambda _d: {})
+        op.execute({"dag_id": "dag_ledger_precedence", "run_id": f"run_{dest}"})
+
+    assert ledger_file.exists()
+    file_state = FileStateProvider(ledger_file).read_state()
+    assert study_key in file_state.studies
+    committed_streams = file_state.studies[study_key].streams
+    assert len(committed_streams) == 6
+    for dest_name in ("mongodb", "snowflake", "neo4j", "csv", "duckdb", "sql"):
+        matching = [
+            st
+            for s_key, st in committed_streams.items()
+            if f"task_{dest_name}" in s_key and "dag_ledger_precedence" in s_key
+        ]
+        assert len(matching) == 1
+        assert matching[0].last_timestamp == rec_ts
+
+
+def test_operator_scoped_stream_names_redact_secrets_omit_map_index_and_isolate_dags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scoped stream_name redacts secrets, omits map_index, applies with state_provider, and isolates DAGs."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from typing import Any
+
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    # 1. Secret redaction via redact_uri and redact_sensitive_text + map_index omission
+    op_redact = ImednetExportOperator(
+        task_id="sql_sync",
+        study_key="STUDY_SEC",
+        destination="sql",
+        output_path="ae_table",
+        incremental=True,
+    )
+    conn_with_secrets = {
+        "conn_str": (
+            "postgresql://svc_loader:SuperSecretPass99@db.internal:5432/edc"  # pragma: allowlist secret
+            "?api_key=RAW_QUERY_TOKEN"  # pragma: allowlist secret
+        ),
+        "table": "ae_table",
+    }
+    ti_mapped = SimpleNamespace(dag_id="dag_mapped", map_index=42)
+    generated = op_redact._default_airflow_stream_name(
+        "sql",
+        context={"ti": ti_mapped},
+        runtime_kwargs={},
+        conn_settings=conn_with_secrets,
+    )
+    assert "svc_loader" not in generated
+    assert "SuperSecretPass99" not in generated
+    assert "RAW_QUERY_TOKEN" not in generated
+    assert "42" not in generated
+    assert "dag_mapped" in generated
+    assert "sql_sync" in generated
+    assert "ae_table" in generated
+
+    # 2. Explicit state_provider operators & shared-task_id operators across DAGs preserve older Records
+    shared_ledger = FileStateProvider(tmp_path / "shared_cross_dag_ledger.json")
+    t_newer = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    t_older = datetime(2026, 7, 1, 9, 0, tzinfo=UTC)
+
+    def _make_filtered_sdk(rec_id: int, rec_dt: datetime) -> MagicMock:
+        sdk = MagicMock()
+        sdk.studies.get.return_value = MagicMock(study_key="STUDY_MULTI")
+        sdk.variables.list.return_value = [
+            MagicMock(
+                variable_id=1,
+                variable_name="V1",
+                variable_type="integer",
+                label="V1",
+                form_id=10,
+                form_key="F1",
+                form_name="Form 1",
+                deleted=False,
+            )
+        ]
+
+        def _list_records(**kwargs: Any) -> Any:
+            dm_arg = str(kwargs.get("dateModified") or kwargs.get("date_modified") or "")
+            if "2026-09-10" in dm_arg and rec_dt < t_newer:
+                return iter([])
+            rec = MagicMock(
+                record_id=rec_id,
+                subject_id=1,
+                subject_key="S1",
+                site_id=1,
+                form_id=10,
+                form_key="F1",
+                deleted=False,
+                date_created=rec_dt,
+                date_modified=rec_dt,
+                record_data={"V1": rec_id},
+            )
+            return iter([rec])
+
+        sdk.records.list.side_effect = _list_records
+        return sdk
+
+    csv_dag_one = tmp_path / "dag_one_out.csv"
+    csv_dag_two = tmp_path / "dag_two_out.csv"
+
+    op_dag1 = ImednetExportOperator(
+        task_id="shared_export_task",
+        study_key="STUDY_MULTI",
+        destination="csv",
+        output_path=str(csv_dag_one),
+        incremental=True,
+        state_provider=shared_ledger,
+        quality_gate_enabled=False,
+    )
+    monkeypatch.setattr(op_dag1, "_get_sdk", lambda: _make_filtered_sdk(1, t_newer))
+    op_dag1.execute({"dag_id": "dag_one"})
+
+    op_dag2 = ImednetExportOperator(
+        task_id="shared_export_task",
+        study_key="STUDY_MULTI",
+        destination="csv",
+        output_path=str(csv_dag_two),
+        incremental=True,
+        state_provider=shared_ledger,
+        quality_gate_enabled=False,
+    )
+    monkeypatch.setattr(op_dag2, "_get_sdk", lambda: _make_filtered_sdk(2, t_older))
+    op_dag2.execute({"dag_id": "dag_two"})
+
+    assert "1" in csv_dag_one.read_text(encoding="utf-8")
+    assert "2" in csv_dag_two.read_text(encoding="utf-8")
+    assert len(shared_ledger.read_state().studies["STUDY_MULTI"].streams) == 2
+
+
+def test_operator_resumes_from_pre_upgrade_checkpoint_on_first_upgraded_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When scoped stream_name lacks state, ImednetExportOperator seeds from {dest}_{task_id} or airflow_{dest}_{task_id}."""
+    from collections.abc import Sequence
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from typing import Any
+
+    from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+    from imednet.spi.sink_base import ExportSink
+    from imednet_workflows.state_ledger import FileStateProvider
+
+    ledger = FileStateProvider(tmp_path / "upgrade_migration_ledger.json")
+    t_pre_upgrade = datetime(2026, 9, 5, 10, 0, tzinfo=UTC)
+    t_post_upgrade = datetime(2026, 9, 6, 15, 0, tzinfo=UTC)
+
+    # 1. Pre-upgrade tabular checkpoint at '{dest}_{task_id}'
+    ledger.set_last_timestamp("STUDY_UPG", "csv_daily_csv_task", t_pre_upgrade, records_processed=8)
+    seen_csv_filters: list[str] = []
+
+    def _make_upg_sdk(seen_filters: list[str]) -> MagicMock:
+        sdk = MagicMock()
+        sdk.studies.get.return_value = MagicMock(study_key="STUDY_UPG")
+        sdk.forms.list.return_value = [MagicMock(form_id=10, form_key="DM", form_name="DM")]
+        sdk.variables.list.return_value = [
+            MagicMock(
+                variable_id=1,
+                variable_name="V1",
+                variable_type="integer",
+                label="V1",
+                form_id=10,
+                form_key="DM",
+                form_name="DM",
+                deleted=False,
+            )
+        ]
+
+        def _list_records(**kwargs: Any) -> Any:
+            seen_filters.append(
+                str(kwargs.get("dateModified") or kwargs.get("date_modified") or "")
+            )
+
+            class _UpgRec:
+                record_id = 501
+                subject_id = 1
+                subject_key = "S1"
+                site_id = 1
+                form_id = 10
+                form_key = "DM"
+                deleted = False
+                date_created = t_post_upgrade
+                date_modified = t_post_upgrade
+                record_data = {"V1": 99}
+
+                def model_dump(self, **_kw: Any) -> dict[str, Any]:
+                    return {
+                        "recordId": 501,
+                        "subjectId": 1,
+                        "subjectKey": "S1",
+                        "formId": 10,
+                        "formKey": "DM",
+                        "deleted": False,
+                        "dateModified": t_post_upgrade.isoformat(),
+                        "recordData": {"V1": 99},
+                    }
+
+            return iter([_UpgRec()])
+
+        sdk.records.list.side_effect = _list_records
+
+        class _SinkCfg:
+            def __init__(self, **kw: Any) -> None:
+                for k, v in kw.items():
+                    setattr(self, k, v)
+
+        class _SinkImpl(ExportSink):
+            def __init__(self, config: Any) -> None:
+                self.config = config
+
+            def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+                _ = batch_id
+                return len(records)
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        sdk.sinks = SimpleNamespace(
+            MongoDbSinkConfig=_SinkCfg,
+            MongoDbExportSink=_SinkImpl,
+        )
+        return sdk
+
+    out_csv = tmp_path / "upgraded_out.csv"
+    op_csv = ImednetExportOperator(
+        task_id="daily_csv_task",
+        study_key="STUDY_UPG",
+        destination="csv",
+        output_path=str(out_csv),
+        incremental=True,
+        state_provider=ledger,
+        quality_gate_enabled=False,
+    )
+    monkeypatch.setattr(op_csv, "_get_sdk", lambda: _make_upg_sdk(seen_csv_filters))
+    op_csv.execute({"dag_id": "dag_upgraded"})
+
+    assert any("2026-09-05" in flt for flt in seen_csv_filters)
+    scoped_csv_stream = op_csv._default_airflow_stream_name(
+        "csv",
+        context={"dag_id": "dag_upgraded"},
+        runtime_kwargs={"output_path": str(out_csv)},
+    )
+    assert ledger.get_last_timestamp("STUDY_UPG", scoped_csv_stream) == t_post_upgrade
+
+    # 2. Pre-upgrade external sink checkpoint at 'airflow_{dest}_{task_id}'
+    ledger.set_last_timestamp(
+        "STUDY_UPG_SINK",
+        "airflow_mongodb_daily_mongo_task",
+        t_pre_upgrade,
+        records_processed=12,
+    )
+    seen_mongo_filters: list[str] = []
+    op_mongo = ImednetExportOperator(
+        task_id="daily_mongo_task",
+        study_key="STUDY_UPG_SINK",
+        destination="mongodb",
+        incremental=True,
+        state_provider=ledger,
+        quality_gate_enabled=False,
+        export_kwargs={"database": "edc", "collection": "subjects"},
+    )
+    monkeypatch.setattr(op_mongo, "_get_sdk", lambda: _make_upg_sdk(seen_mongo_filters))
+    monkeypatch.setattr(op_mongo, "_resolve_destination_connection", lambda _d: {})
+    op_mongo.execute({"dag_id": "dag_upgraded"})
+
+    assert any("2026-09-05" in flt for flt in seen_mongo_filters)
+    scoped_mongo_stream = op_mongo._default_airflow_stream_name(
+        "mongodb",
+        sink_prefix=True,
+        context={"dag_id": "dag_upgraded"},
+        runtime_kwargs={"database": "edc", "collection": "subjects"},
+        conn_settings={},
+    )
+    assert ledger.get_last_timestamp("STUDY_UPG_SINK", scoped_mongo_stream) == t_post_upgrade
+
+    # 3. Multiple conflicting pre-upgrade checkpoints do not ambiguously cross-seed
+    ledger.set_last_timestamp(
+        "STUDY_AMBIG",
+        "mongodb_ambig_task",
+        datetime(2026, 8, 1, 0, 0, tzinfo=UTC),
+    )
+    ledger.set_last_timestamp(
+        "STUDY_AMBIG",
+        "airflow_mongodb_ambig_task",
+        datetime(2026, 9, 1, 0, 0, tzinfo=UTC),
+    )
+    seen_ambig_filters: list[str] = []
+    op_ambig = ImednetExportOperator(
+        task_id="ambig_task",
+        study_key="STUDY_AMBIG",
+        destination="mongodb",
+        incremental=True,
+        state_provider=ledger,
+        quality_gate_enabled=False,
+        export_kwargs={"database": "edc", "collection": "ambig"},
+    )
+    monkeypatch.setattr(op_ambig, "_get_sdk", lambda: _make_upg_sdk(seen_ambig_filters))
+    monkeypatch.setattr(op_ambig, "_resolve_destination_connection", lambda _d: {})
+    op_ambig.execute({"dag_id": "dag_upgraded"})
+    assert seen_ambig_filters == [""]
+
+    # 4. Per-form pre-upgrade checkpoint migration (sql_by_form_{task_id}_{form_key})
+    sqlite_by_form = tmp_path / "by_form_upg.sqlite"
+    ledger.set_last_timestamp(
+        "STUDY_BY_FORM_UPG",
+        "sql_by_form_daily_by_form_DM",
+        t_pre_upgrade,
+    )
+    seen_bf_filters: list[str] = []
+    op_bf = ImednetExportOperator(
+        task_id="daily_by_form",
+        study_key="STUDY_BY_FORM_UPG",
+        destination="sql_by_form",
+        output_path=f"sqlite:///{sqlite_by_form}",
+        incremental=True,
+        state_provider=ledger,
+        quality_gate_enabled=False,
+    )
+    monkeypatch.setattr(op_bf, "_get_sdk", lambda: _make_upg_sdk(seen_bf_filters))
+    op_bf.execute({"dag_id": "dag_upgraded"})
+    scoped_bf_prefix = op_bf._default_airflow_stream_name(
+        "sql_by_form",
+        context={"dag_id": "dag_upgraded"},
+        runtime_kwargs={"output_path": f"sqlite:///{sqlite_by_form}"},
+    )
+    assert (
+        ledger.get_last_timestamp("STUDY_BY_FORM_UPG", f"{scoped_bf_prefix}_DM") == t_post_upgrade
+    )

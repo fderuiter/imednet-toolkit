@@ -249,7 +249,20 @@ def get_state_provider(
 
     target_name = provider_name or "default"
     eps = list(entry_points(group=STATE_PROVIDER_ENTRY_POINT_GROUP))
-    matched = [ep for ep in eps if ep.name == target_name]
+    if ledger_path is not None and target_name in ("default", "airflow"):
+        file_eps = [ep for ep in eps if ep.name == "file"]
+        if file_eps:
+            target_name = "file"
+            matched = file_eps
+        else:
+            default_eps = [ep for ep in eps if ep.name == "default"]
+            if default_eps:
+                target_name = "default"
+                matched = default_eps
+            else:
+                matched = [ep for ep in eps if ep.name == target_name]
+    else:
+        matched = [ep for ep in eps if ep.name == target_name]
     if not matched and provider_name is None and eps:
         matched = [eps[0]]
     if not matched:
