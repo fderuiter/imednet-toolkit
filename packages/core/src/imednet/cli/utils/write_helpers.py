@@ -20,6 +20,7 @@ from imednet.errors import (
     AuthorizationError,
     ForbiddenError,
     NotFoundError,
+    PathTraversalValidationError,
     RateLimitError,
     UnauthorizedError,
     ValidationError,
@@ -52,13 +53,8 @@ from imednet.utils.tabular import (
 )
 from imednet.validation.cache import BaseSchemaCache, SchemaCache, ValidationSchemaProtocol
 
-from ..decorators import _redact_secrets, validate_cli_path_segment
-from .args import (
-    add_output_format,
-    add_simulation_arg,
-    resolve_output_format,
-    resolve_study_key,
-)
+from ..decorators import _redact_secrets
+from .args import add_output_format, add_simulation_arg, resolve_output_format
 from .context import fetching_status
 from .output import display_list, emit_json, format_job_progress, print_error
 from .terminal import is_json_output_mode, is_non_interactive, is_tty, supports_live_status
@@ -198,32 +194,6 @@ def guard_stdin_dash_tty(file_arg: str | None) -> None:
         sys.exit(1)
 
 
-def prepare_write_cli_preflight(
-    parser: argparse.ArgumentParser,
-    args: argparse.Namespace,
-    *,
-    file_arg: str | None = None,
-    allow_stdin_dash: bool = True,
-) -> str:
-    """Resolve and validate ``study_key``, numeric batch flags, and optional input file path."""
-    study_key = resolve_study_key(parser, args, required=True)
-    assert study_key is not None
-    validate_cli_path_segment(study_key, name="study_key")
-    validate_write_numeric_flags(
-        chunk_size=args.chunk_size,
-        timeout=args.timeout,
-        interval=args.interval,
-    )
-    resolved_file = file_arg if file_arg is not None else getattr(args, "input_file", None)
-    if resolved_file:
-        if allow_stdin_dash:
-            guard_stdin_dash_tty(resolved_file)
-        if (not allow_stdin_dash or resolved_file != "-") and not Path(resolved_file).exists():
-            print_error(f"Error: Input file not found: '{resolved_file}'")
-            sys.exit(1)
-    return study_key
-
-
 def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSchemaProtocol:
     """Load an offline :class:`DataDictionary` from JSON, ODM XML, REDCap CSV, ZIP, or CSV dir."""
     path = Path(schema_source)
@@ -235,7 +205,10 @@ def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSche
     if suffix == ".zip":
         return load_from_csv(path, study_key=study_key)
     if suffix == ".json":
-        return DataDictionary.model_validate_json(path.read_text(encoding="utf-8"))
+        dd = DataDictionary.model_validate_json(path.read_text(encoding="utf-8"))
+        if study_key:
+            dd.metadata.studyKey = study_key
+        return dd
     if suffix == ".xml":
         return load_from_cdisc_odm(path, study_key=study_key)
     if suffix == ".csv":
@@ -544,11 +517,14 @@ def merge_inline_data_overrides(
     merged = dict(rec)
     if not data_pairs:
         return merged
-    raw_fk = merged.get("formKey") or merged.get("form_key") or default_form_key
+    raw_fk = merged.get("formKey") or merged.get("form_key")
     rec_form_key = str(raw_fk).strip() if isinstance(raw_fk, str) and raw_fk.strip() else None
     rec_form_id = _coerce_optional_form_id(merged)
-    if rec_form_id is None:
-        rec_form_id = default_form_id
+    if rec_form_key is None and rec_form_id is None:
+        if default_form_key and default_form_key.strip():
+            rec_form_key = default_form_key.strip()
+        else:
+            rec_form_id = default_form_id
     coerced_inline = parse_key_value_pairs(
         data_pairs,
         schema=schema,
@@ -880,6 +856,14 @@ def _summary_to_json_item(summary: BatchSubmissionSummary) -> dict[str, Any]:
     return item
 
 
+def _plain_job_state(state: Any) -> str | None:
+    """Return a plain string job state name without Enum ``<JobState.*>`` repr formatting."""
+    if state is None:
+        return None
+    raw_val = getattr(state, "value", state)
+    return str(raw_val)
+
+
 def _format_summary_failure_message(summary: BatchSubmissionSummary) -> str:
     details: list[str] = []
     for job in summary.jobs:
@@ -893,7 +877,7 @@ def _format_summary_failure_message(summary: BatchSubmissionSummary) -> str:
             or bool(res_err)
             or (summary.wait_for_completion and not getattr(sanitized, "is_successful", False))
         ):
-            part = f"{bid} (state={sanitized.state})"
+            part = f"{bid} (state={_plain_job_state(sanitized.state)})"
             if isinstance(failed_count, int) and failed_count > 0:
                 part += f", failed_records={failed_count}"
             if res_err:
@@ -916,7 +900,7 @@ def _render_committed_jobs_table(summary: BatchSubmissionSummary, *, resource: s
         {
             "batch_id": j.batch_id,
             "job_id": j.job_id,
-            "state": j.state,
+            "state": _plain_job_state(j.state),
             "progress": getattr(j, "progress", None),
             "total_records": getattr(j, "total_records", None),
             "failed_records": getattr(j, "failed_records", None),
@@ -941,7 +925,10 @@ def _format_exception_batch_context(partial: BatchSubmissionSummary | None) -> s
     if partial.batch_ids:
         context_parts.append(f"accepted_batches={partial.batch_ids}")
     if partial.poll_summary is not None and partial.poll_summary.terminal_statuses:
-        states = {bid: st.state for bid, st in partial.poll_summary.terminal_statuses.items()}
+        states = {
+            bid: _plain_job_state(st.state)
+            for bid, st in partial.poll_summary.terminal_statuses.items()
+        }
         context_parts.append(f"settled_states={states}")
     if partial.unsubmitted_records:
         context_parts.append(f"unsubmitted_records={len(partial.unsubmitted_records)}")
@@ -1074,109 +1061,33 @@ def _extract_failure_summary(
     return None
 
 
-BatchPayloadBuilder = Callable[[ValidationSchemaProtocol | None], list[dict[str, Any]]]
-BatchFilteredBuilder = Callable[[ValidationSchemaProtocol | None], tuple[list[dict[str, Any]], int]]
-BatchProgressRunner = Callable[[ValidationSchemaProtocol | None, dict[str, Any]], tuple[Any, int]]
-
-
-def run_cli_batch_write(
-    sdk: ImednetSDK,
-    args: argparse.Namespace,
+def execute_cli_write(
+    operation: Callable[[], BatchSubmissionSummary],
     *,
+    study_key: str,
     resource: str,
-    action_label: str,
-    prepare_payload: BatchPayloadBuilder | None = None,
-    prepare_batch: BatchFilteredBuilder | None = None,
-    submit_in_progress: BatchProgressRunner | None = None,
+    output_format: str | None = None,
+    dry_run: bool = False,
+    skipped_count: int | Callable[[], int] = 0,
+    total_records: int | Callable[[], int] = 0,
 ) -> None:
-    """Resolve schema, run batch write with progress reporting, handle errors, and render summary."""
-    no_interactive = bool(getattr(args, "no_interactive", False))
-    total_records = 0
-    skipped_count = 0
-
-    def _operation() -> BatchSubmissionSummary:
-        nonlocal total_records, skipped_count
-        resolved_schema = resolve_cli_schema(
-            sdk,
-            args.study_key,
-            args.schema_source,
-            dry_run=args.dry_run,
-        )
-        payload: list[dict[str, Any]] | None = None
-        if prepare_batch is not None:
-            payload, skipped_count = prepare_batch(resolved_schema)
-            total_records = len(payload)
-        elif prepare_payload is not None:
-            payload = prepare_payload(resolved_schema)
-            total_records = len(payload)
-        elif submit_in_progress is None:
-            raise ValueError(
-                "One of prepare_payload, prepare_batch, or submit_in_progress is required."
-            )
-
-        email_notify = parse_email_notify(args.email_notify)
-        try:
-            with write_progress_context(
-                action_label,
-                args.study_key,
-                no_interactive=no_interactive,
-                output_format=args.output_format,
-                dry_run=args.dry_run,
-            ) as on_progress:
-                batch_kwargs: dict[str, Any] = {
-                    "email_notify": email_notify,
-                    "schema": resolved_schema,
-                    "chunk_size": args.chunk_size,
-                    "wait_for_completion": args.wait,
-                    "timeout": args.timeout,
-                    "interval": args.interval,
-                    "on_progress": on_progress,
-                    "dry_run": args.dry_run,
-                    "collect_errors": True,
-                }
-                if submit_in_progress is not None:
-                    raw_summary, total_records = submit_in_progress(resolved_schema, batch_kwargs)
-                else:
-                    assert payload is not None
-                    raw_summary = sdk.records.create_batch(
-                        args.study_key,
-                        payload,
-                        **batch_kwargs,
-                    )
-        except Exception as exc:
-            if skipped_count:
-                for attr in ("batch_summary", "partial_summary"):
-                    attached = getattr(exc, attr, None)
-                    if isinstance(attached, BatchSubmissionSummary):
-                        attached.skipped_count = skipped_count
-            raise
-
-        summary = coerce_batch_summary(
-            raw_summary,
-            study_key=args.study_key,
-            total_records=total_records,
-            dry_run=args.dry_run,
-            skipped_count=skipped_count,
-            wait_for_completion=args.wait,
-        )
-        if skipped_count:
-            summary.skipped_count = skipped_count
-        return summary
-
-    resolved_format = resolve_output_format(args.output_format)
+    """Orchestrate a CLI write command, emitting structured partial/validation failures before exit 1."""
+    resolved_format = resolve_output_format(output_format)
     try:
-        summary = _operation()
+        summary = operation()
     except SystemExit:
         raise
     except KeyboardInterrupt:
         raise
     except Exception as exc:
+        resolved_skipped = skipped_count() if callable(skipped_count) else skipped_count
+        resolved_total = total_records() if callable(total_records) else total_records
         partial = _extract_failure_summary(
             exc,
-            study_key=args.study_key,
-            dry_run=args.dry_run,
-            skipped_count=skipped_count,
-            total_records=total_records,
+            study_key=study_key,
+            dry_run=dry_run,
+            skipped_count=resolved_skipped,
+            total_records=resolved_total,
         )
         if partial is not None and (
             partial.validation_report is not None and not partial.validation_report.is_valid
@@ -1195,11 +1106,14 @@ def run_cli_batch_write(
             print_error(full_line)
             sys.exit(1)
 
+        if isinstance(exc, PathTraversalValidationError):
+            raise
+
         if isinstance(exc, (ValidationError, ValueError, TypeError)):
             exit_cli_validation_error(
                 exc,
                 resource=resource,
-                study_key=args.study_key,
+                study_key=study_key,
                 output_format=resolved_format,
             )
 
@@ -1207,9 +1121,9 @@ def run_cli_batch_write(
             exit_cli_write_error(
                 exc,
                 resource=resource,
-                study_key=args.study_key,
-                total_records=total_records,
-                skipped_count=skipped_count,
+                study_key=study_key,
+                total_records=resolved_total,
+                skipped_count=resolved_skipped,
                 output_format=resolved_format,
             )
 
@@ -1254,36 +1168,50 @@ def exit_cli_write_error(
     output_format: str | None = None,
 ) -> NoReturn:
     """Print redacted/PHI-masked batch or job failure diagnostics, emit JSON if needed, and exit 1."""
+    effective_study_key = (
+        study_key
+        or getattr(getattr(exc, "partial_summary", None), "study_key", None)
+        or getattr(getattr(exc, "batch_summary", None), "study_key", None)
+        or ""
+    )
     partial = _extract_failure_summary(
         exc,
-        study_key=study_key or "",
+        study_key=str(effective_study_key),
         dry_run=False,
         skipped_count=skipped_count,
         total_records=total_records,
     )
-    full_line, formatted_err = _format_cli_write_exception(exc, partial=partial)
+    full_line, _ = _format_cli_write_exception(exc, partial=partial)
     print_error(full_line)
-    if resolve_output_format(output_format) == "json":
-        if (
-            partial is not None
-            and study_key is not None
-            and (
-                partial.jobs or partial.unsubmitted_chunks or partial.validation_report is not None
-            )
-        ):
-            emit_json([_summary_to_json_item(partial)], resource, status="failed")
-        else:
-            emit_json(
-                [
-                    {
-                        "studyKey": study_key,
-                        "allSuccessful": False,
-                        "error": formatted_err,
-                        "jobs": [],
-                        "validationReport": None,
-                    }
-                ],
-                resource,
-                status="failed",
-            )
+    if (
+        resolve_output_format(output_format) == "json"
+        and partial is not None
+        and (partial.jobs or partial.unsubmitted_chunks or partial.validation_report is not None)
+    ):
+        emit_json([_summary_to_json_item(partial)], resource, status="failed")
     sys.exit(1)
+
+
+_LAZY_BATCH_EXPORTS: frozenset[str] = frozenset(
+    {
+        "BatchFilteredBuilder",
+        "BatchPayloadBuilder",
+        "BatchProgressRunner",
+        "prepare_write_cli_preflight",
+        "run_cli_batch_write",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily expose batch preflight and runner helpers from :mod:`._write_batch`."""
+    if name in _LAZY_BATCH_EXPORTS:
+        from . import _write_batch
+
+        return getattr(_write_batch, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Return module attributes including lazily re-exported batch helpers."""
+    return sorted(set(globals()) | _LAZY_BATCH_EXPORTS)

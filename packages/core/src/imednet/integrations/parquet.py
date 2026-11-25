@@ -14,9 +14,15 @@ from unittest.mock import NonCallableMock
 from ..models.standards import resolve_sdtm_domain, transform_records_to_sdtm
 from ..sdk import ImednetSDK
 from ..utils import validate_partition_key
+from ._export_contracts import (
+    append_dataframe_manifest,
+    delete_superseded_hive_files,
+    snapshot_hive_partition_files,
+)
 from .enrichment import resolve_enrichment_pipeline
 from .export import (
     SdtmKeyTuple,
+    _append_jsonl_manifest,
     _apply_naming_convention_to_df,
     _build_form_export_contexts,
     _build_tabular_sink_config,
@@ -46,6 +52,7 @@ from .sink_base import (
     extract_record_id,
     rehydrate_sdtm_lineage,
     resolve_voided_sdtm_keys,
+    should_preserve_sdtm_record_id,
     stamp_tabular_batch,
     validate_max_buffered_records,
 )
@@ -144,6 +151,8 @@ def _write_hive_form_rows(
     naming_convention: str | None = None,
     sdtm_domain: str | None = None,
     dedupe_incremental: bool = False,
+    manifest_path: str | None = None,
+    batch_id: str | None = None,
 ) -> int:
     """Convert parsed form rows into an Arrow table and commit to the Hive partition."""
     df = mapper._build_dataframe(
@@ -180,6 +189,15 @@ def _write_hive_form_rows(
         study_key=study_key,
         form_key=form_key,
     )
+    if manifest_path and len(df) > 0:
+        dest_dir = str(Path(base_dir) / f"study_key={study_key}" / f"form_key={form_key}")
+        append_dataframe_manifest(
+            manifest_path,
+            batch_id=batch_id or f"{study_key}/{form_key}/0",
+            destination=dest_dir,
+            df=df,
+            append_fn=_append_jsonl_manifest,
+        )
     return len(df)
 
 
@@ -307,8 +325,12 @@ def export_to_hive_parquet(
     validate_partition_key(study_key)
 
     extra_kwargs = dict(kwargs)
-    extra_kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
-    extra_kwargs.setdefault("batch_size", chunk_size)
+    has_config_obj = "config" in extra_kwargs and extra_kwargs["config"] is not None
+    if not has_config_obj:
+        extra_kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
+        extra_kwargs.setdefault("batch_size", chunk_size)
+    elif chunk_size != 5_000 and "batch_size" not in extra_kwargs:
+        extra_kwargs["batch_size"] = chunk_size
     if max_buffered_records is not None:
         extra_kwargs["max_buffered_records"] = max_buffered_records
     manifest_path = extra_kwargs.pop("manifest_path", None)
@@ -322,6 +344,10 @@ def export_to_hive_parquet(
         default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
+    if has_config_obj and chunk_size != 5_000:
+        config.batch_size = chunk_size
+    if has_config_obj and max_buffered_records is not None:
+        config.max_buffered_records = max_buffered_records
     if config.pandas_kwargs:
         unexpected = next(iter(config.pandas_kwargs))
         raise TypeError(
@@ -341,15 +367,19 @@ def export_to_hive_parquet(
     phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
+    effective_use_labels = config.use_labels_as_columns
+    effective_var_whitelist = config.variable_whitelist
+    effective_form_whitelist = config.form_whitelist
 
     if _config_has_streaming_options(config) or config.quality_gate_enabled or config.as_sdtm:
+        preserve_rec_id = should_preserve_sdtm_record_id(config)
         contexts, all_variables = _build_form_export_contexts(
             sdk,
             study_key,
             mapper,
-            use_labels_as_columns=use_labels_as_columns,
-            variable_whitelist=variable_whitelist,
-            form_whitelist=form_whitelist,
+            use_labels_as_columns=effective_use_labels,
+            variable_whitelist=effective_var_whitelist,
+            form_whitelist=effective_form_whitelist,
             mask_phi=effective_mask_phi,
             pipeline=pipeline,
             stream_prefix="hive_parquet",
@@ -358,13 +388,21 @@ def export_to_hive_parquet(
             as_sdtm=config.as_sdtm,
             sdtm_domain=config.sdtm_domain,
             naming_convention=config.naming_convention,
-            preserve_record_id=_is_incremental_config(config),
+            preserve_record_id=preserve_rec_id,
         )
         if not contexts:
             return
 
         is_incremental = _is_incremental_config(config)
-        preexisting_files: dict[str, list[Path]] = {}
+        preexisting_files: dict[str, list[Path]] = (
+            snapshot_hive_partition_files(
+                base_dir,
+                study_key,
+                (ctx.form_key for ctx in contexts),
+            )
+            if config.idempotent
+            else {}
+        )
         updated_ids: dict[str, set[str]] = {ctx.form_key: set() for ctx in contexts}
         voided_ids: dict[str, set[str]] = {ctx.form_key: set() for ctx in contexts}
         active_id_counts: dict[str, dict[str, int]] = {ctx.form_key: {} for ctx in contexts}
@@ -372,14 +410,9 @@ def export_to_hive_parquet(
             ctx.form_key: set() for ctx in contexts
         }
         in_run_sdtm_keys: dict[str, set[SdtmKeyTuple]] = {ctx.form_key: set() for ctx in contexts}
-        if is_incremental and config.idempotent:
-            for ctx in contexts:
-                part_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={ctx.form_key}"
-                preexisting_files[ctx.form_key] = (
-                    sorted(part_dir.rglob("*.parquet")) if part_dir.exists() else []
-                )
+        in_run_record_ids: dict[str, set[str]] = {ctx.form_key: set() for ctx in contexts}
 
-        def _on_hive_active(ctx: _FormExportContext, batch: list[Any], _batch_idx: int) -> int:
+        def _on_hive_active(ctx: _FormExportContext, batch: list[Any], batch_idx: int) -> int:
             if config.as_sdtm:
                 if not batch:
                     return 0
@@ -409,7 +442,7 @@ def export_to_hive_parquet(
                     mask_phi=effective_mask_phi,
                     seq_counters=ctx.seq_counters,
                     record_seqs=ctx.record_seqs,
-                    preserve_record_id=is_incremental,
+                    preserve_record_id=preserve_rec_id,
                     phi_keys=phi_keys,
                     pipeline=pipeline,
                     seq_overrides=seq_overrides,
@@ -419,7 +452,8 @@ def export_to_hive_parquet(
                     dom_wm[subj_key] = max(dom_wm.get(subj_key, 0), wm_val)
                 if df.empty:
                     return 0
-                if is_incremental and config.idempotent:
+                has_rec_id_col = _find_df_record_id_col(df) is not None
+                if has_rec_id_col and config.idempotent:
                     df, batch_cids = _dedupe_df_by_record_id(df, study_key=study_key)
                     if df.empty:
                         return 0
@@ -430,26 +464,38 @@ def export_to_hive_parquet(
                     batch_cids = set()
 
                 batch_skeys = {skey for skey in _df_sdtm_keys(df) if skey is not None}
-                if not is_incremental:
+                if not is_incremental and config.idempotent:
                     part_dir = (
                         Path(base_dir) / f"study_key={study_key}" / f"form_key={ctx.form_key}"
                     )
+                    overlap_ids = batch_cids & in_run_record_ids[ctx.form_key]
                     overlap_in_run = batch_skeys & in_run_sdtm_keys[ctx.form_key]
-                    if overlap_in_run and part_dir.exists():
+                    if (overlap_ids or overlap_in_run) and part_dir.exists():
                         pre_set = set(preexisting_files.get(ctx.form_key, []))
                         current_run_files = [
                             p for p in sorted(part_dir.rglob("*.parquet")) if p not in pre_set
                         ]
                         if current_run_files:
-                            _prune_hive_partition_sdtm_keys(
-                                current_run_files,
-                                overlap_in_run,
-                                pyarrow_module=pyarrow_module,
-                                storage_engine=storage_engine,
-                                base_dir=base_dir,
-                                study_key=study_key,
-                                form_key=ctx.form_key,
-                            )
+                            if overlap_ids:
+                                _prune_hive_partition_record_ids(
+                                    current_run_files,
+                                    overlap_ids,
+                                    pyarrow_module=pyarrow_module,
+                                    storage_engine=storage_engine,
+                                    base_dir=base_dir,
+                                    study_key=study_key,
+                                    form_key=ctx.form_key,
+                                )
+                            elif overlap_in_run:
+                                _prune_hive_partition_sdtm_keys(
+                                    current_run_files,
+                                    overlap_in_run,
+                                    pyarrow_module=pyarrow_module,
+                                    storage_engine=storage_engine,
+                                    base_dir=base_dir,
+                                    study_key=study_key,
+                                    form_key=ctx.form_key,
+                                )
 
                 stamp_tabular_batch(
                     df,
@@ -464,6 +510,17 @@ def export_to_hive_parquet(
                     study_key=study_key,
                     form_key=ctx.form_key,
                 )
+                if config.manifest_path and len(df) > 0:
+                    dest_dir = str(
+                        Path(base_dir) / f"study_key={study_key}" / f"form_key={ctx.form_key}"
+                    )
+                    append_dataframe_manifest(
+                        config.manifest_path,
+                        batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}",
+                        destination=dest_dir,
+                        df=df,
+                        append_fn=_append_jsonl_manifest,
+                    )
                 commit_sdtm_lineage(
                     ctx,
                     lineage_out,
@@ -471,6 +528,7 @@ def export_to_hive_parquet(
                     stream_name=ctx.stream_name,
                 )
                 in_run_sdtm_keys[ctx.form_key].update(batch_skeys)
+                in_run_record_ids[ctx.form_key].update(batch_cids)
                 written = len(df)
                 if is_incremental and config.idempotent and written > 0:
                     superseded_sdtm_keys[ctx.form_key].update(batch_skeys)
@@ -493,7 +551,7 @@ def export_to_hive_parquet(
                 mapper=mapper,
                 variable_keys=ctx.variable_keys,
                 label_map=ctx.label_map,
-                use_labels_as_columns=use_labels_as_columns,
+                use_labels_as_columns=effective_use_labels,
                 mask_phi=effective_mask_phi,
                 phi_keys=phi_keys,
                 pyarrow_module=pyarrow_module,
@@ -505,6 +563,8 @@ def export_to_hive_parquet(
                 naming_convention=config.naming_convention,
                 sdtm_domain=ctx.sdtm_domain or config.sdtm_domain,
                 dedupe_incremental=(is_incremental and config.idempotent),
+                manifest_path=config.manifest_path,
+                batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}",
             )
             if is_incremental and config.idempotent and written > 0:
                 seen_batch_cids: set[str] = set()
@@ -548,7 +608,14 @@ def export_to_hive_parquet(
             return max(len(cids), len(skeys))
 
         def _reconcile_partitions_before_checkpoints() -> None:
-            if not (is_incremental and config.idempotent):
+            if not config.idempotent:
+                return
+            if not is_incremental:
+                delete_superseded_hive_files(
+                    preexisting_files,
+                    base_dir=base_dir,
+                    study_key=study_key,
+                )
                 return
             pandas_module = _ensure_pandas()
             for ctx in contexts:
@@ -639,10 +706,12 @@ def export_to_hive_parquet(
 
     forms = list(sdk.forms.list(study_key=study_key))
 
-    form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
+    form_filter: dict[str, Any] = (
+        {"formId": effective_form_whitelist} if effective_form_whitelist else {}
+    )
     all_variables = (
         []
-        if form_whitelist is not None and len(form_whitelist) == 0
+        if effective_form_whitelist is not None and len(effective_form_whitelist) == 0
         else list(sdk.variables.list(study_key=study_key, **form_filter))
     )
     variables_by_form: dict[int, list[Any]] = {}
@@ -654,7 +723,7 @@ def export_to_hive_parquet(
     for form in forms:
         if form.form_id is None or form.form_key is None:
             continue
-        if form_whitelist is not None and form.form_id not in form_whitelist:
+        if effective_form_whitelist is not None and form.form_id not in effective_form_whitelist:
             continue
         validate_partition_key(form.form_key)
 
@@ -664,7 +733,10 @@ def export_to_hive_parquet(
                 variable.variable_name
                 for variable in variables
                 if variable.variable_name
-                and (variable_whitelist is None or variable.variable_name in variable_whitelist)
+                and (
+                    effective_var_whitelist is None
+                    or variable.variable_name in effective_var_whitelist
+                )
             )
         )
         label_map = {
@@ -685,6 +757,16 @@ def export_to_hive_parquet(
     if not form_specs:
         return
 
+    full_preexisting_files = (
+        snapshot_hive_partition_files(
+            base_dir,
+            study_key,
+            (spec["form_key"] for spec in form_specs),
+        )
+        if config.idempotent
+        else {}
+    )
+
     iter_records = getattr(mapper, "_iter_records", None)
     can_stream_single_pass = (
         not isinstance(mapper, NonCallableMock)
@@ -695,11 +777,11 @@ def export_to_hive_parquet(
         by_form_id = {spec["form_id"]: spec for spec in form_specs}
         by_form_key = {spec["form_key"]: spec for spec in form_specs}
 
-        def _flush_hive_batch(form_key: str, batch: list[Any], _batch_idx: int) -> None:
+        def _flush_hive_batch(form_key: str, batch: list[Any], batch_idx: int) -> None:
             spec = by_form_key[form_key]
             parsed_rows, _ = mapper._parse_records(batch, spec["record_model"])
             rows = (
-                [pipeline.process(r, mask_phi=mask_phi) for r in parsed_rows]
+                [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
                 if pipeline is not None and not has_native_enrichment
                 else parsed_rows
             )
@@ -708,8 +790,8 @@ def export_to_hive_parquet(
                 mapper=mapper,
                 variable_keys=spec["variable_keys"],
                 label_map=spec["label_map"],
-                use_labels_as_columns=use_labels_as_columns,
-                mask_phi=mask_phi,
+                use_labels_as_columns=effective_use_labels,
+                mask_phi=effective_mask_phi,
                 phi_keys=phi_keys,
                 pyarrow_module=pyarrow_module,
                 storage_engine=storage_engine,
@@ -717,17 +799,19 @@ def export_to_hive_parquet(
                 study_key=study_key,
                 form_key=form_key,
                 skip_empty=True,
+                manifest_path=config.manifest_path,
+                batch_id=f"{study_key}/{form_key}/{batch_idx}",
             )
 
         router = BoundedFormBufferRouter(
             [spec["form_key"] for spec in form_specs],
-            batch_size=chunk_size,
-            max_buffered_records=max_buffered_records,
+            batch_size=config.batch_size,
+            max_buffered_records=config.max_buffered_records,
             on_flush_active=_flush_hive_batch,
         )
         study_extra_filters = (
             {"formId": [spec["form_id"] for spec in form_specs]}
-            if form_whitelist is not None
+            if effective_form_whitelist is not None
             else None
         )
         for rec in iter_records(study_key, extra_filters=study_extra_filters):
@@ -740,6 +824,12 @@ def export_to_hive_parquet(
             if matched is not None:
                 router.add_active(matched["form_key"], rec)
         router.flush_all()
+        if config.idempotent:
+            delete_superseded_hive_files(
+                full_preexisting_files,
+                base_dir=base_dir,
+                study_key=study_key,
+            )
         return
 
     iter_parsed_rows = getattr(mapper, "_iter_parsed_rows", None)
@@ -749,9 +839,11 @@ def export_to_hive_parquet(
                 study_key,
                 extra_filters={"formId": spec["form_id"]},
             )
-            for parsed_rows, _ in iter_parsed_rows(records, spec["record_model"]):
+            for batch_idx, (parsed_rows, _) in enumerate(
+                iter_parsed_rows(records, spec["record_model"])
+            ):
                 rows = (
-                    [pipeline.process(r, mask_phi=mask_phi) for r in parsed_rows]
+                    [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
                     if pipeline is not None and not has_native_enrichment
                     else parsed_rows
                 )
@@ -760,8 +852,8 @@ def export_to_hive_parquet(
                     mapper=mapper,
                     variable_keys=spec["variable_keys"],
                     label_map=spec["label_map"],
-                    use_labels_as_columns=use_labels_as_columns,
-                    mask_phi=mask_phi,
+                    use_labels_as_columns=effective_use_labels,
+                    mask_phi=effective_mask_phi,
                     phi_keys=phi_keys,
                     pyarrow_module=pyarrow_module,
                     storage_engine=storage_engine,
@@ -769,6 +861,8 @@ def export_to_hive_parquet(
                     study_key=study_key,
                     form_key=spec["form_key"],
                     skip_empty=True,
+                    manifest_path=config.manifest_path,
+                    batch_id=f"{study_key}/{spec['form_key']}/{batch_idx}",
                 )
             continue
 
@@ -778,7 +872,7 @@ def export_to_hive_parquet(
         )
         parsed_rows, _ = mapper._parse_records(records, spec["record_model"])
         rows = (
-            [pipeline.process(r, mask_phi=mask_phi) for r in parsed_rows]
+            [pipeline.process(r, mask_phi=effective_mask_phi) for r in parsed_rows]
             if pipeline is not None and not has_native_enrichment
             else parsed_rows
         )
@@ -787,8 +881,8 @@ def export_to_hive_parquet(
             mapper=mapper,
             variable_keys=spec["variable_keys"],
             label_map=spec["label_map"],
-            use_labels_as_columns=use_labels_as_columns,
-            mask_phi=mask_phi,
+            use_labels_as_columns=effective_use_labels,
+            mask_phi=effective_mask_phi,
             phi_keys=phi_keys,
             pyarrow_module=pyarrow_module,
             storage_engine=storage_engine,
@@ -796,6 +890,15 @@ def export_to_hive_parquet(
             study_key=study_key,
             form_key=spec["form_key"],
             skip_empty=False,
+            manifest_path=config.manifest_path,
+            batch_id=f"{study_key}/{spec['form_key']}/0",
+        )
+
+    if config.idempotent:
+        delete_superseded_hive_files(
+            full_preexisting_files,
+            base_dir=base_dir,
+            study_key=study_key,
         )
 
 

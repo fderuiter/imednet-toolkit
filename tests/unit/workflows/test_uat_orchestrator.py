@@ -1097,3 +1097,84 @@ def test_workflow_dry_run_validates_payloads_without_submitting(mock_sdk):
     assert bad_dry_res.validation_report.is_valid is False
     assert bad_dry_res.validation_report.error_count >= 1
     workflow.submit.assert_not_called()
+
+
+def test_study_snapshot_from_data_dictionary_and_offline_five_formats(tmp_path) -> None:
+    """StudySnapshot.from_data_dictionary and UATWorkflow.run(dry_run=True) work across all 5 formats with 0 HTTP calls."""
+    import zipfile
+    from pathlib import Path
+
+    from tests.unit.datadict.test_datadict_cdisc_odm_loader import SAMPLE_ODM_XML
+    from tests.unit.datadict.test_datadict_redcap_loader import SAMPLE_REDCAP_CSV
+
+    from imednet.cli.utils.write_helpers import load_offline_schema
+    from imednet.datadict import load_from_csv
+    from imednet_workflows.uat.models import UATWorkflowState
+
+    fixtures_dir = Path(__file__).parent.parent.parent / "fixtures" / "data_dictionary"
+    json_path = tmp_path / "study_dd.json"
+    json_path.write_text(
+        load_from_csv(fixtures_dir, study_key="ORIG_STUDY").model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    xml_path = tmp_path / "study_odm.xml"
+    xml_path.write_text(SAMPLE_ODM_XML, encoding="utf-8")
+    redcap_path = tmp_path / "study_redcap.csv"
+    redcap_path.write_text(SAMPLE_REDCAP_CSV, encoding="utf-8")
+    zip_path = tmp_path / "study_csv.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for fname in ("FORMS.csv", "QUESTIONS.csv", "CHOICES.csv", "BUSINESS_LOGIC.csv"):
+            zf.write(fixtures_dir / fname, arcname=fname)
+
+    for fmt_name, fmt_path in (
+        ("json", json_path),
+        ("xml", xml_path),
+        ("csv", redcap_path),
+        ("zip", zip_path),
+        ("dir", fixtures_dir),
+    ):
+        dd = load_offline_schema(str(fmt_path), study_key="OFFLINE_STUDY")
+        assert dd.metadata.studyKey == "OFFLINE_STUDY", fmt_name
+
+        snapshot = StudySnapshot.from_data_dictionary(
+            dd,
+            "OFFLINE_STUDY",
+            site_name="Offline Clinic",
+        )
+        assert snapshot.study_key == "OFFLINE_STUDY"
+        assert len(snapshot.forms) == len(dd.forms)
+        assert [s.site_name for s in snapshot.active_sites()] == ["Offline Clinic"]
+
+        failing_sdk = MagicMock()
+        failing_sdk.get_forms.side_effect = AssertionError("HTTP forbidden in offline dry run")
+        failing_sdk.get_variables.side_effect = AssertionError("HTTP forbidden in offline dry run")
+        failing_sdk.get_intervals.side_effect = AssertionError("HTTP forbidden in offline dry run")
+        failing_sdk.get_sites.side_effect = AssertionError("HTTP forbidden in offline dry run")
+
+        wf = UATWorkflow(failing_sdk, seed=7)
+        result = wf.run("OFFLINE_STUDY", schema=dd, dry_run=True)
+        assert result.state == UATWorkflowState.COMPLETED, (fmt_name, result.error_message)
+        assert result.overall_success is True, fmt_name
+        assert result.validation_report is not None and result.validation_report.is_valid is True
+
+
+def test_workflow_spec_preserves_subject_count_unless_overridden(mock_sdk, snapshot) -> None:
+    """UATWorkflow.run(spec=...) preserves saved subject_count when None and updates subject+form counts on override."""
+    from imednet_workflows.uat.models import UATWorkflowState
+
+    wf = UATWorkflow(mock_sdk, seed=19)
+    wf.inspect = MagicMock(return_value=snapshot)
+
+    saved_spec = wf.build_spec(snapshot, subject_count=3)
+    assert [s.subject_count for s in saved_spec.subject_specs] == [3]
+    assert all(f.subject_count == 3 for f in saved_spec.form_specs)
+
+    preserved = wf.run("TEST_STUDY", spec=saved_spec, subject_count=None, dry_run=True)
+    assert preserved.state == UATWorkflowState.COMPLETED
+    assert all(len(rs.payloads) == 3 for rs in preserved.record_sets)
+
+    overridden = wf.run("TEST_STUDY", spec=saved_spec, subject_count=5, dry_run=True)
+    assert overridden.state == UATWorkflowState.COMPLETED
+    assert [s.subject_count for s in overridden.spec.subject_specs] == [5]
+    assert all(f.subject_count == 5 for f in overridden.spec.form_specs)
+    assert all(len(rs.payloads) == 5 for rs in overridden.record_sets)

@@ -3,20 +3,26 @@
 
 from __future__ import annotations
 
-import re
 from datetime import datetime
 from enum import Enum
 from typing import Any
 
 from pydantic import Field, field_validator
 
+from imednet.models._lifecycle import (
+    apply_entity_transition,
+    build_terminal_transition_map,
+    coerce_field_status,
+    coerce_status,
+    is_entity_deleted,
+    is_valid_status_transition,
+    resolve_effective_status,
+    resolve_status_member,
+    setattr_with_soft_delete_guard,
+    validate_status_transition,
+)
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
-
-
-def _normalize_subject_token(value: str) -> str:
-    """Collapse whitespace, underscores, and hyphens into a lowercase token."""
-    return re.sub(r"[\s_-]+", " ", value.strip()).lower()
 
 
 class SubjectStatus(str, Enum):
@@ -41,19 +47,11 @@ class SubjectStatus(str, Enum):
     @classmethod
     def _missing_(cls, value: object) -> SubjectStatus | None:
         """Resolve subject status case- and separator-insensitively."""
-        if isinstance(value, str):
-            normalized = _normalize_subject_token(value)
-            if not normalized:
-                return None
-            if normalized == "screen failure":
-                return cls.SCREEN_FAILED
-            for member in cls:
-                if (
-                    _normalize_subject_token(member.value) == normalized
-                    or _normalize_subject_token(member.name) == normalized
-                ):
-                    return member
-        return None
+        return resolve_status_member(
+            cls,
+            value,
+            aliases={"screen failure": cls.SCREEN_FAILED},
+        )
 
     def can_transition_to(self, target: SubjectStatus | str) -> bool:
         """Return True if transitioning from this status to *target* is permitted."""
@@ -69,31 +67,19 @@ class SubjectStatus(str, Enum):
         return set(ALLOWED_SUBJECT_TRANSITIONS.get(self, set()))
 
 
-_NON_DELETED_SUBJECT_STATUSES: set[SubjectStatus] = {
-    s for s in SubjectStatus if s != SubjectStatus.DELETED
-}
-
-ALLOWED_SUBJECT_TRANSITIONS: dict[SubjectStatus, set[SubjectStatus]] = {
-    **{
-        status: (_NON_DELETED_SUBJECT_STATUSES - {status}) | {SubjectStatus.DELETED}
-        for status in _NON_DELETED_SUBJECT_STATUSES
-    },
-    SubjectStatus.DELETED: set(),
-}
+ALLOWED_SUBJECT_TRANSITIONS: dict[SubjectStatus, set[SubjectStatus]] = (
+    build_terminal_transition_map(
+        SubjectStatus,
+        SubjectStatus.DELETED,
+    )
+)
 
 
 def normalize_subject_status(
     value: SubjectStatus | str | None,
 ) -> SubjectStatus | str | None:
     """Normalize known subject statuses while preserving custom study status strings."""
-    if value is None or isinstance(value, SubjectStatus):
-        return value
-    if isinstance(value, str):
-        try:
-            return SubjectStatus(value)
-        except ValueError:
-            return value
-    return str(value)
+    return coerce_status(SubjectStatus, value)
 
 
 def is_valid_subject_transition(
@@ -103,10 +89,15 @@ def is_valid_subject_transition(
     deleted: bool | None = None,
 ) -> bool:
     """Return True if transitioning a subject from *from_status* to *to_status* is valid."""
-    try:
-        return validate_subject_transition(from_status, to_status, deleted=deleted)
-    except ValueError:
-        return False
+    return is_valid_status_transition(
+        SubjectStatus,
+        ALLOWED_SUBJECT_TRANSITIONS,
+        SubjectStatus.DELETED,
+        "Subject",
+        from_status,
+        to_status,
+        deleted=deleted,
+    )
 
 
 def validate_subject_transition(
@@ -116,27 +107,15 @@ def validate_subject_transition(
     deleted: bool | None = None,
 ) -> bool:
     """Validate a subject status transition, raising ValueError if soft-deleted or invalid."""
-    src = normalize_subject_status(from_status)
-    dst = normalize_subject_status(to_status)
-    if dst is None or (isinstance(dst, str) and not dst.strip()):
-        raise ValueError(f"Invalid target subject status: {to_status!r}")
-
-    if deleted is True or src == SubjectStatus.DELETED:
-        raise ValueError(
-            f"Cannot transition soft-deleted Subject from {SubjectStatus.DELETED.value} to {dst!s}."
-        )
-
-    if isinstance(src, SubjectStatus) and isinstance(dst, SubjectStatus):
-        permitted = ALLOWED_SUBJECT_TRANSITIONS.get(src, set())
-        if dst not in permitted:
-            options = sorted(p.value for p in permitted)
-            raise ValueError(
-                f"Cannot transition subject status from {src.value} to {dst.value}. "
-                f"Permitted transitions from {src.value}: {options}"
-            )
-    elif src is not None and src == dst:
-        raise ValueError(f"Cannot transition subject status from {src!s} to {dst!s}.")
-    return True
+    return validate_status_transition(
+        SubjectStatus,
+        ALLOWED_SUBJECT_TRANSITIONS,
+        SubjectStatus.DELETED,
+        "Subject",
+        from_status,
+        to_status,
+        deleted=deleted,
+    )
 
 
 class SubjectKeyword(ImednetBaseModel):
@@ -162,21 +141,17 @@ class Subject(ImednetBaseModel):
     @classmethod
     def _validate_subject_status(cls, value: Any) -> SubjectStatus | str | None:
         """Normalize known subject statuses and preserve custom study strings."""
-        if value is None or isinstance(value, (SubjectStatus, str)):
-            return normalize_subject_status(value)
-        return normalize_subject_status(str(value))
+        return coerce_field_status(SubjectStatus, value)
 
     @property
     def is_deleted(self) -> bool:
         """Return True when the subject is soft-deleted."""
-        return self.deleted is True or self.subject_status == SubjectStatus.DELETED
+        return is_entity_deleted(self.deleted, self.subject_status, SubjectStatus.DELETED)
 
     @property
     def effective_status(self) -> SubjectStatus | str | None:
         """Return DELETED when ``deleted=True``, otherwise ``subject_status``."""
-        if self.is_deleted:
-            return SubjectStatus.DELETED
-        return self.subject_status
+        return resolve_effective_status(self.deleted, self.subject_status, SubjectStatus.DELETED)
 
     def can_transition_to(self, target_status: SubjectStatus | str) -> bool:
         """Return True if transitioning to *target_status* is allowed."""
@@ -188,17 +163,15 @@ class Subject(ImednetBaseModel):
 
     def transition_to(self, target_status: SubjectStatus | str) -> SubjectStatus | str:
         """Transition subject to *target_status*, enforcing soft-delete invariants."""
-        validate_subject_transition(
-            self.subject_status,
-            target_status,
-            deleted=self.is_deleted,
+        return apply_entity_transition(
+            self,
+            enum_cls=SubjectStatus,
+            allowed_transitions=ALLOWED_SUBJECT_TRANSITIONS,
+            deleted_member=SubjectStatus.DELETED,
+            entity_label="Subject",
+            status_field="subject_status",
+            target_status=target_status,
         )
-        normalized = normalize_subject_status(target_status)
-        assert normalized is not None
-        super().__setattr__("subject_status", normalized)
-        if normalized == SubjectStatus.DELETED:
-            super().__setattr__("deleted", True)
-        return normalized
 
     def update_status(self, target_status: SubjectStatus | str) -> SubjectStatus | str:
         """Alias for :meth:`transition_to`."""
@@ -206,29 +179,15 @@ class Subject(ImednetBaseModel):
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Enforce terminal soft-delete invariants on direct attribute mutation."""
-        initialized = "deleted" in self.__dict__ or "subject_status" in self.__dict__
-        currently_deleted = (
-            self.__dict__.get("deleted") is True
-            or self.__dict__.get("subject_status") == SubjectStatus.DELETED
+        setattr_with_soft_delete_guard(
+            self,
+            name,
+            value,
+            enum_cls=SubjectStatus,
+            deleted_member=SubjectStatus.DELETED,
+            entity_label="Subject",
+            status_field="subject_status",
         )
-        if initialized and currently_deleted:
-            if name == "deleted" and value is not True:
-                raise ValueError("Cannot restore a soft-deleted Subject by clearing deleted.")
-            if name == "subject_status":
-                normalized = normalize_subject_status(value)
-                if normalized != SubjectStatus.DELETED:
-                    raise ValueError(
-                        f"Cannot mutate soft-deleted Subject to active status {value!r}."
-                    )
-                super().__setattr__(name, normalized)
-                return
-        if initialized and name == "subject_status":
-            normalized = normalize_subject_status(value)
-            super().__setattr__(name, normalized)
-            if normalized == SubjectStatus.DELETED:
-                super().__setattr__("deleted", True)
-            return
-        super().__setattr__(name, value)
 
 
 Subject = ModelEngine.get_model('Subject', Subject)

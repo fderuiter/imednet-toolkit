@@ -63,7 +63,7 @@ class RecordUpdateWorkflow:
 
     def __init__(
         self,
-        sdk: "FacadeLike",
+        sdk: FacadeLike,
         *,
         batch_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         schema: ValidationSchemaProtocol | None = None,

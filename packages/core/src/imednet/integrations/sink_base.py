@@ -98,13 +98,21 @@ from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
 from imednet.models.standards import (
+    _SDTM_RECORDS_SORT,
     PROFILE_REGISTRY,
     SDTM_DOMAIN_SPECS,
     StandardsProfile,
     StandardsReadinessReport,
     StandardsReadinessValidator,
+    build_form_sdtm_domain_map,
+    extract_record_form_ref,
+    filter_forms_by_sdtm_domain,
     format_iso8601_dtc,
+    iter_subject_ordered_sdtm_records,
+    merge_form_ids_into_record_filter,
     normalize_naming_convention,
+    record_matches_sdtm_domain,
+    resolve_form_sdtm_domain,
     resolve_sdtm_domain,
     resolve_standards_profile,
     validate_cdash_variable,
@@ -241,7 +249,20 @@ def get_state_provider(
 
     target_name = provider_name or "default"
     eps = list(entry_points(group=STATE_PROVIDER_ENTRY_POINT_GROUP))
-    matched = [ep for ep in eps if ep.name == target_name]
+    if ledger_path is not None and target_name in ("default", "airflow"):
+        file_eps = [ep for ep in eps if ep.name == "file"]
+        if file_eps:
+            target_name = "file"
+            matched = file_eps
+        else:
+            default_eps = [ep for ep in eps if ep.name == "default"]
+            if default_eps:
+                target_name = "default"
+                matched = default_eps
+            else:
+                matched = [ep for ep in eps if ep.name == target_name]
+    else:
+        matched = [ep for ep in eps if ep.name == target_name]
     if not matched and provider_name is None and eps:
         matched = [eps[0]]
     if not matched:
@@ -365,6 +386,7 @@ class SinkConfig:
     standards_profile: str | Any | None = None
     min_standards_score: float | None = None
     naming_convention: str | None = None
+    preserve_record_id: bool | None = None
 
     def __post_init__(self) -> None:
         """Validate config properties after initialization."""
@@ -385,6 +407,8 @@ class SinkConfig:
             raise ValueError("retry_backoff must be a finite non-negative number")
         if not isinstance(self.mask_phi, bool):
             raise ValueError("mask_phi must be a boolean")
+        if self.preserve_record_id is not None and not isinstance(self.preserve_record_id, bool):
+            raise ValueError("preserve_record_id must be a boolean or None")
         if not self.idempotent and (self.incremental or self.state_provider is not None):
             raise ExportConfigurationError(
                 "SinkConfig(idempotent=False) cannot be combined with incremental=True or "
@@ -1229,10 +1253,11 @@ def _extract_record_for_standards(
     *,
     configured_domain: str | None = None,
     form_domain_map: Mapping[Any, str] | None = None,
+    study_config: Any = None,
+    pipeline: Any = None,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """Return ``(domain, raw_data, canonical_data)`` without mutating ``record``."""
     raw_domain: str | None = None
-    form_id_val: Any = None
     subject_val: Any = None
     raw_data: dict[str, Any] = {}
 
@@ -1240,7 +1265,6 @@ def _extract_record_for_standards(
         rd = getattr(record, "record_data", None)
         raw_data = dict(rd) if isinstance(rd, Mapping) else {}
         raw_domain = getattr(record, "form_key", None)
-        form_id_val = getattr(record, "form_id", None)
         subject_val = getattr(record, "subject_key", None)
     elif isinstance(record, Mapping):
         raw_domain = (
@@ -1249,7 +1273,6 @@ def _extract_record_for_standards(
             or record.get("formKey")
             or record.get("form_key")
         )
-        form_id_val = record.get("formId", record.get("form_id"))
         subject_val = record.get("subjectKey") or record.get("subject_key") or record.get("USUBJID")
         nested = record.get("record_data")
         if nested is None:
@@ -1271,7 +1294,6 @@ def _extract_record_for_standards(
                 or dumped.get("formKey")
                 or dumped.get("form_key")
             )
-            form_id_val = dumped.get("formId", dumped.get("form_id"))
             subject_val = (
                 dumped.get("subjectKey")
                 or dumped.get("subject_key")
@@ -1287,7 +1309,6 @@ def _extract_record_for_standards(
                 }
     elif hasattr(record, "__dict__"):
         raw_domain = getattr(record, "form_key", None) or getattr(record, "domain", None)
-        form_id_val = getattr(record, "form_id", getattr(record, "formId", None))
         subject_val = getattr(record, "subject_key", None) or getattr(record, "subjectKey", None)
         rd = (
             getattr(record, "record_data", None)
@@ -1297,17 +1318,21 @@ def _extract_record_for_standards(
         raw_data = dict(rd) if isinstance(rd, Mapping) else {}
 
     mapped_domain: str | None = None
-    if form_domain_map:
-        if raw_domain is not None and raw_domain in form_domain_map:
-            mapped_domain = form_domain_map[raw_domain]
-        elif (
-            isinstance(raw_domain, str)
-            and raw_domain.strip()
-            and raw_domain.strip() in form_domain_map
-        ):
-            mapped_domain = form_domain_map[raw_domain.strip()]
-        elif form_id_val is not None and form_id_val in form_domain_map:
-            mapped_domain = form_domain_map[form_id_val]
+    resolved_from_form = resolve_form_sdtm_domain(
+        record,
+        study_config=study_config,
+        form_domain_map=form_domain_map,
+        fallback="",
+    )
+    if not resolved_from_form and raw_domain is not None:
+        resolved_from_form = resolve_form_sdtm_domain(
+            raw_domain,
+            study_config=study_config,
+            form_domain_map=form_domain_map,
+            fallback="",
+        )
+    if resolved_from_form:
+        mapped_domain = resolved_from_form
 
     raw_resolved = (
         resolve_sdtm_domain(str(raw_domain), fallback="")
@@ -1320,7 +1345,22 @@ def _extract_record_for_standards(
         domain = raw_resolved
     else:
         domain = resolve_sdtm_domain(configured_domain or raw_domain, fallback="AE")
-    canonical: dict[str, Any] = dict(raw_data)
+
+    source_data: dict[str, Any] = dict(raw_data)
+    if pipeline is not None and hasattr(pipeline, "process"):
+        try:
+            enriched = pipeline.process(
+                dict(raw_data),
+                mask_phi=False,
+                domain=domain,
+                form_key=str(raw_domain) if raw_domain else None,
+            )
+        except TypeError:
+            enriched = pipeline.process(dict(raw_data), mask_phi=False)
+        if isinstance(enriched, Mapping):
+            source_data = dict(enriched)
+
+    canonical: dict[str, Any] = dict(source_data)
 
     resolved_subject = (
         canonical.get("subjectKey")
@@ -1333,7 +1373,7 @@ def _extract_record_for_standards(
 
     spec = SDTM_DOMAIN_SPECS.get(domain)
     if spec is not None:
-        lower_raw = {str(k).lower(): v for k, v in raw_data.items()}
+        lower_raw = {str(k).lower(): v for k, v in source_data.items()}
         for sdtm_var, aliases in spec["aliases"].items():
             if not aliases:
                 continue
@@ -1345,8 +1385,8 @@ def _extract_record_for_standards(
                 has_val = True
             else:
                 for cand in [sdtm_var, *aliases]:
-                    if cand in raw_data:
-                        found_val = raw_data[cand]
+                    if cand in source_data:
+                        found_val = source_data[cand]
                         has_val = True
                         break
                     if cand.lower() in lower_raw:
@@ -1374,7 +1414,8 @@ def evaluate_standards_readiness(
     form_domain_map: Mapping[Any, str] | None = None,
 ) -> StandardsReadinessReport:
     """Validate and score records against CDASH naming rules and a StandardsProfile."""
-    _ = study_key
+    from imednet.integrations.enrichment import EnrichmentPipeline, resolve_study_configuration
+
     raw_prof = (
         standards_profile
         if standards_profile is not None
@@ -1386,11 +1427,37 @@ def evaluate_standards_readiness(
         else (getattr(config, "sdtm_domain", None) if config is not None else None)
     )
     extra = getattr(config, "extra", None) if config is not None else None
-    lookups = terminology_lookups
-    if lookups is None and isinstance(extra, Mapping):
-        maybe_lookups = extra.get("terminology_lookups")
-        if isinstance(maybe_lookups, dict):
-            lookups = maybe_lookups
+    study_cfg: Any = (
+        extra.get("study_config")
+        if isinstance(extra, Mapping) and extra.get("study_config") is not None
+        else resolve_study_configuration(study_key)
+    )
+    pipeline: Any = extra.get("enrichment_pipeline") if isinstance(extra, Mapping) else None
+    if pipeline is None and study_cfg is not None:
+        pipeline = EnrichmentPipeline(study_cfg)
+
+    merged_lookups: dict[str, dict[str, str]] = {}
+    cfg_lookups = getattr(study_cfg, "terminology_lookups", None)
+    if isinstance(cfg_lookups, Mapping):
+        for tbl_name, tbl_vals in cfg_lookups.items():
+            if isinstance(tbl_vals, Mapping):
+                merged_lookups[str(tbl_name)] = {str(k): str(v) for k, v in tbl_vals.items()}
+    extra_lookups = (
+        extra.get("terminology_lookups")
+        if isinstance(extra, Mapping) and isinstance(extra.get("terminology_lookups"), Mapping)
+        else None
+    )
+    for explicit_map in (extra_lookups, terminology_lookups):
+        if isinstance(explicit_map, Mapping):
+            for tbl_name, tbl_vals in explicit_map.items():
+                if isinstance(tbl_vals, Mapping):
+                    dest_tbl = merged_lookups.setdefault(str(tbl_name), {})
+                    dest_tbl.update({str(k): str(v) for k, v in tbl_vals.items()})
+    lookups: dict[str, dict[str, str]] | None = merged_lookups or None
+
+    effective_form_map: dict[Any, str] = build_form_sdtm_domain_map(None, study_config=study_cfg)
+    if form_domain_map:
+        effective_form_map.update(form_domain_map)
 
     profile = resolve_standards_profile(raw_prof)
     validator = StandardsReadinessValidator(profile=profile)
@@ -1408,7 +1475,9 @@ def evaluate_standards_readiness(
         domain, raw_data, canonical = _extract_record_for_standards(
             rec,
             configured_domain=cfg_domain,
-            form_domain_map=form_domain_map,
+            form_domain_map=effective_form_map or None,
+            study_config=study_cfg,
+            pipeline=pipeline,
         )
         if target_dom and domain != target_dom:
             continue
@@ -1431,6 +1500,8 @@ def evaluate_standards_readiness(
     )
     if cdash_warnings:
         report.warnings = [*report.warnings, *cdash_warnings]
+    if config is not None and getattr(config, "mask_phi", True) is True and report.warnings:
+        report.warnings = [mask_clinical_phi(w) for w in report.warnings]
     return report
 
 
@@ -1443,20 +1514,32 @@ def apply_quality_gate(
     variables: Iterable[Any] | None = None,
     forms: Iterable[Any] | None = None,
 ) -> Iterator[Any]:
-    """Filter records based on schema readiness and optional CDASH/SDTM readiness rules."""
+    """Filter records based on schema readiness and optional CDASH naming checks."""
     cfg_profile = getattr(config, "standards_profile", None)
-    cfg_min_std = getattr(config, "min_standards_score", None)
     cfg_domain = getattr(config, "sdtm_domain", None)
 
     if not config.quality_gate_enabled and cfg_profile is None:
         yield from records
         return
 
+    from imednet.integrations.enrichment import resolve_study_configuration
+
+    extra = getattr(config, "extra", None)
+    study_cfg: Any = (
+        extra.get("study_config")
+        if isinstance(extra, Mapping) and extra.get("study_config") is not None
+        else resolve_study_configuration(study_key)
+    )
+    gate_form_map = build_form_sdtm_domain_map(forms, study_config=study_cfg)
+
     if not config.quality_gate_enabled:
         seen_cdash: set[tuple[str, str]] = set()
         for record in records:
             domain, raw_data, _ = _extract_record_for_standards(
-                record, configured_domain=cfg_domain
+                record,
+                configured_domain=cfg_domain,
+                form_domain_map=gate_form_map or None,
+                study_config=study_cfg,
             )
             for field_key in raw_data:
                 pair = (domain, str(field_key))
@@ -1507,11 +1590,6 @@ def apply_quality_gate(
         for fid, fk_val in form_key_by_id.items():
             validator.schema._form_id_to_key[(study_key, fid)] = fk_val
 
-    std_validator = (
-        StandardsReadinessValidator(resolve_standards_profile(cfg_profile))
-        if cfg_profile is not None
-        else None
-    )
     seen_gate_cdash: set[tuple[str, str]] = set()
 
     dropped_count = 0
@@ -1568,7 +1646,16 @@ def apply_quality_gate(
             continue
 
         if isinstance(data, Mapping):
-            domain_for_cdash = resolve_sdtm_domain(cfg_domain or str(fk), fallback="AE")
+            domain_for_cdash = (
+                resolve_sdtm_domain(cfg_domain, fallback="AE")
+                if cfg_domain
+                else resolve_form_sdtm_domain(
+                    str(fk),
+                    study_config=study_cfg,
+                    form_domain_map=gate_form_map or None,
+                    fallback="AE",
+                )
+            )
             for field_key in data:
                 pair = (domain_for_cdash, str(field_key))
                 if pair not in seen_gate_cdash:
@@ -1578,23 +1665,6 @@ def apply_quality_gate(
                     )
                     if not valid_cdash and cdash_msg:
                         logger.warning("CDASH naming warning (%s): %s", domain_for_cdash, cdash_msg)
-
-        if std_validator is not None and cfg_min_std is None:
-            dom, _, canonical = _extract_record_for_standards(
-                record, configured_domain=cfg_domain or str(fk)
-            )
-            rec_report = std_validator.score_records(records_by_domain={dom: [canonical]})
-            if rec_report.score < config.min_schema_readiness_score:
-                std_reasons = [v.message for v in rec_report.violations]
-                logger.info(
-                    "Dropped record %s (Standards Score: %.1f < %.1f). Reasons: %s",
-                    rec_dict.get("record_id", "Unknown"),
-                    rec_report.score,
-                    config.min_schema_readiness_score,
-                    "; ".join(std_reasons),
-                )
-                dropped_count += 1
-                continue
 
         yield record
 
@@ -1634,31 +1704,6 @@ def extract_record_id(record: Any) -> Any | None:
     if rec_id is None:
         rec_id = getattr(record, "recordId", None)
     return rec_id
-
-
-def extract_record_form_ref(record: Any) -> tuple[int | None, str | None]:
-    """Extract ``(form_id, form_key)`` from a record object or mapping."""
-    if isinstance(record, Mapping):
-        raw_id = record.get("form_id")
-        if raw_id is None:
-            raw_id = record.get("formId")
-        raw_key = record.get("form_key") or record.get("formKey")
-    else:
-        raw_id = getattr(record, "form_id", None)
-        if raw_id is None:
-            raw_id = getattr(record, "formId", None)
-        raw_key = getattr(record, "form_key", None) or getattr(record, "formKey", None)
-
-    form_id: int | None = None
-    if isinstance(raw_id, int) and not isinstance(raw_id, bool):
-        form_id = raw_id
-    elif isinstance(raw_id, str):
-        stripped_id = raw_id.strip()
-        if stripped_id.lstrip("-").isdigit():
-            form_id = int(stripped_id)
-
-    form_key = raw_key.strip() if isinstance(raw_key, str) and raw_key.strip() else None
-    return form_id, form_key
 
 
 class BoundedFormBufferRouter:
@@ -2187,6 +2232,7 @@ def iter_filtered_sdk_records(
     record_filter: dict[str, Any] | str | Sequence[str] | None = None,
     record_data_filter: str | None = None,
     exclude_deleted_upstream: bool = True,
+    sort: str | None = None,
 ) -> Iterator[Any]:
     """Lazily yield records from ``sdk.records.list`` across one or more AND-safe branches."""
     validated_rdf = (
@@ -2207,10 +2253,13 @@ def iter_filtered_sdk_records(
     seen_ids: set[Any] = set()
 
     for branch, post_predicate in resolved:
+        call_kwargs = dict(branch)
+        if sort and "sort" not in call_kwargs:
+            call_kwargs["sort"] = sort
         page_iter = sdk.records.list(
             study_key=study_key,
             record_data_filter=validated_rdf,
-            **branch,
+            **call_kwargs,
         )
         for record in page_iter:
             if post_predicate is not None and not post_predicate(record):
@@ -2383,72 +2432,15 @@ def _enforce_batch_standards_readiness(
         )
 
 
-def resolve_form_sdtm_domain(form: Any, *, fallback: str = "AE") -> str:
-    """Resolve the 2-character or canonical SDTM domain for a Study Form object or mapping."""
-    if isinstance(form, Mapping):
-        raw_key = form.get("formKey") or form.get("form_key")
-        raw_name = form.get("formName") or form.get("form_name")
-    else:
-        raw_key = getattr(form, "form_key", None) or getattr(form, "formKey", None)
-        raw_name = getattr(form, "form_name", None) or getattr(form, "formName", None)
+def _is_bound_real_records_endpoint(sdk: Any) -> bool:
+    """Return True strictly when ``sdk.records.list`` is an unmocked ``RecordsEndpoint.list``."""
+    from imednet.endpoints.records import RecordsEndpoint
 
-    key_dom = (
-        resolve_sdtm_domain(raw_key, fallback="")
-        if isinstance(raw_key, str) and raw_key.strip()
-        else ""
-    )
-    if key_dom and key_dom in SDTM_DOMAIN_SPECS:
-        return key_dom
-
-    name_dom = (
-        resolve_sdtm_domain(raw_name, fallback="")
-        if isinstance(raw_name, str) and raw_name.strip()
-        else ""
-    )
-    if name_dom and name_dom in SDTM_DOMAIN_SPECS:
-        return name_dom
-
-    if key_dom:
-        return key_dom
-    if name_dom:
-        return name_dom
-    return fallback
-
-
-def filter_forms_by_sdtm_domain(
-    forms: Sequence[Any],
-    sdtm_domain: str | None,
-) -> list[Any]:
-    """Filter Study Forms down to those matching ``sdtm_domain`` when specified."""
-    if not sdtm_domain or not isinstance(sdtm_domain, str) or not sdtm_domain.strip():
-        return list(forms)
-    target = resolve_sdtm_domain(sdtm_domain)
-    return [f for f in forms if resolve_form_sdtm_domain(f, fallback="") == target]
-
-
-def build_form_sdtm_domain_map(forms: Iterable[Any]) -> dict[Any, str]:
-    """Build a lookup map from ``form_id`` and ``form_key`` to resolved SDTM domain."""
-    mapping: dict[Any, str] = {}
-    for form in forms:
-        if isinstance(form, NonCallableMock):
-            continue
-        dom = resolve_form_sdtm_domain(form, fallback="")
-        if not dom:
-            continue
-        if isinstance(form, Mapping):
-            fid = form.get("formId") if "formId" in form else form.get("form_id")
-            fkey = form.get("formKey") or form.get("form_key")
-        else:
-            fid = getattr(form, "form_id", None)
-            if fid is None:
-                fid = getattr(form, "formId", None)
-            fkey = getattr(form, "form_key", None) or getattr(form, "formKey", None)
-        if isinstance(fid, int) and not isinstance(fid, bool):
-            mapping[fid] = dom
-        if isinstance(fkey, str) and fkey.strip():
-            mapping[fkey] = dom
-            mapping[fkey.strip()] = dom
-    return mapping
+    records_ep = getattr(sdk, "records", None)
+    if not isinstance(records_ep, RecordsEndpoint):
+        return False
+    list_attr = getattr(records_ep, "list", None)
+    return getattr(list_attr, "__func__", None) is RecordsEndpoint.list
 
 
 def _try_fetch_study_forms(sdk: Any, study_key: str) -> list[Any]:
@@ -2922,6 +2914,13 @@ def run_streaming_export(
 
     from imednet.core.context import sdk_governance_context
 
+    raw_extra = config.extra if isinstance(config, SinkConfig) else getattr(config, "extra", None)
+    study_cfg_override = (
+        raw_extra.get("study_config")
+        if isinstance(raw_extra, Mapping) and raw_extra.get("study_config") is not None
+        else None
+    )
+
     with contextlib.ExitStack() as stack:
         stack.enter_context(sdk_governance_context(sdk))
         tx: dict[str, Any] | None = None
@@ -2967,78 +2966,88 @@ def run_streaming_export(
         )
         exclude_deleted_upstream = (not opts["include_deleted"]) and (not reconcile_voided)
 
-        study_forms = _try_fetch_study_forms(sdk, study_key) if opts["as_sdtm"] else []
-        if study_forms:
+        study_forms = (
+            _try_fetch_study_forms(sdk, study_key)
+            if (opts["as_sdtm"] or opts["sdtm_domain"] is not None)
+            else []
+        )
+        active_form_map: dict[Any, str] = (
+            build_form_sdtm_domain_map(
+                study_forms,
+                study_config=study_cfg_override,
+                study_key=study_key,
+            )
+            if (opts["as_sdtm"] or opts["sdtm_domain"] is not None)
+            else {}
+        )
+        if active_form_map:
             with contextlib.suppress(Exception):
-                sink_obj._active_form_domain_map = build_form_sdtm_domain_map(study_forms)  # type: ignore[attr-defined]
+                sink_obj._active_form_domain_map = active_form_map  # type: ignore[attr-defined]
+
+        sdtm_sort = _SDTM_RECORDS_SORT if opts["as_sdtm"] else None
+        source_is_ordered = False
 
         if records_source is not None:
             raw_records = records_source(watermark, exclude_deleted_upstream)
+            source_is_ordered = bool(getattr(records_source, "_sdtm_source_is_ordered", False))
         else:
-            allowed_sdtm_form_ids: set[int] | None = None
-            allowed_sdtm_form_keys: set[str] | None = None
-            if opts["sdtm_domain"] is not None and study_forms:
-                matched_forms = filter_forms_by_sdtm_domain(study_forms, opts["sdtm_domain"])
-                if not matched_forms:
-                    raw_records = iter(())
+            source_is_ordered = bool(opts["as_sdtm"] and _is_bound_real_records_endpoint(sdk))
+            if opts["sdtm_domain"] is not None:
+                if study_forms:
+                    matched_forms = filter_forms_by_sdtm_domain(
+                        study_forms,
+                        opts["sdtm_domain"],
+                        study_config=study_cfg_override,
+                        study_key=study_key,
+                    )
+                    if not matched_forms:
+                        raw_records = iter(())
+                    else:
+                        upstream_filter = merge_form_ids_into_record_filter(
+                            opts["record_filter"],
+                            matched_forms,
+                        )
+                        base_iter = iter_filtered_sdk_records(
+                            sdk,
+                            study_key,
+                            watermark=watermark,
+                            record_filter=upstream_filter,
+                            record_data_filter=opts["record_data_filter"],
+                            exclude_deleted_upstream=exclude_deleted_upstream,
+                            sort=sdtm_sort,
+                        )
+                        raw_records = (
+                            item
+                            for item in base_iter
+                            if record_matches_sdtm_domain(
+                                item,
+                                opts["sdtm_domain"],
+                                form_domain_map=active_form_map,
+                                study_config=study_cfg_override,
+                                study_key=study_key,
+                            )
+                        )
                 else:
-                    if len(matched_forms) < len(study_forms):
-                        allowed_sdtm_form_ids = {
-                            fid
-                            for f in matched_forms
-                            if isinstance(
-                                (
-                                    fid := (
-                                        f.get("formId") or f.get("form_id")
-                                        if isinstance(f, Mapping)
-                                        else getattr(f, "form_id", None)
-                                    )
-                                ),
-                                int,
-                            )
-                            and not isinstance(fid, bool)
-                        }
-                        allowed_sdtm_form_keys = {
-                            str(fkey)
-                            for f in matched_forms
-                            if (
-                                fkey := (
-                                    f.get("formKey") or f.get("form_key")
-                                    if isinstance(f, Mapping)
-                                    else getattr(f, "form_key", None)
-                                )
-                            )
-                        }
-                    raw_records = iter_filtered_sdk_records(
+                    base_iter = iter_filtered_sdk_records(
                         sdk,
                         study_key,
                         watermark=watermark,
                         record_filter=opts["record_filter"],
                         record_data_filter=opts["record_data_filter"],
                         exclude_deleted_upstream=exclude_deleted_upstream,
+                        sort=sdtm_sort,
                     )
-                    if allowed_sdtm_form_ids is not None or allowed_sdtm_form_keys is not None:
-                        base_iter = raw_records
-
-                        def _filter_by_domain_forms(it: Iterable[Any]) -> Iterator[Any]:
-                            for item in it:
-                                fid, fkey = extract_record_form_ref(item)
-                                if (
-                                    (
-                                        allowed_sdtm_form_ids
-                                        and fid is not None
-                                        and fid in allowed_sdtm_form_ids
-                                    )
-                                    or (
-                                        allowed_sdtm_form_keys
-                                        and fkey is not None
-                                        and fkey in allowed_sdtm_form_keys
-                                    )
-                                    or (fid is None and not fkey)
-                                ):
-                                    yield item
-
-                        raw_records = _filter_by_domain_forms(base_iter)
+                    raw_records = (
+                        item
+                        for item in base_iter
+                        if record_matches_sdtm_domain(
+                            item,
+                            opts["sdtm_domain"],
+                            form_domain_map=active_form_map,
+                            study_config=study_cfg_override,
+                            study_key=study_key,
+                        )
+                    )
             else:
                 raw_records = iter_filtered_sdk_records(
                     sdk,
@@ -3047,6 +3056,7 @@ def run_streaming_export(
                     record_filter=opts["record_filter"],
                     record_data_filter=opts["record_data_filter"],
                     exclude_deleted_upstream=exclude_deleted_upstream,
+                    sort=sdtm_sort,
                 )
 
         pending_voided: list[Any] = []
@@ -3102,7 +3112,19 @@ def run_streaming_export(
                     exported_timestamps.append(rec_ts)
                 yield rec
 
-        filtered_records = _track_accepted(gate_fn(sdk, study_key, _observe_and_route(), config))
+        filtered_records: Iterable[Any] = _track_accepted(
+            gate_fn(sdk, study_key, _observe_and_route(), config)
+        )
+        if opts["as_sdtm"]:
+            filtered_records = iter_subject_ordered_sdtm_records(
+                filtered_records,
+                study_key=study_key,
+                sdtm_domain=opts["sdtm_domain"],
+                form_domain_map=active_form_map or None,
+                study_config=study_cfg_override,
+                mask_phi=getattr(config, "mask_phi", True) is not False,
+                source_is_ordered=source_is_ordered,
+            )
         check_standards = (
             opts["standards_profile"] is not None or opts["min_standards_score"] is not None
         )
@@ -3157,6 +3179,26 @@ def is_incremental_sink_config(config: Any) -> bool:
     )
 
 
+def should_preserve_sdtm_record_id(
+    config: Any,
+    preserve_record_id: bool | None = None,
+) -> bool:
+    """Return True when SDTM sink projections should retain ``RECORD_ID`` for lineage/upserts."""
+    if preserve_record_id is not None:
+        return bool(preserve_record_id)
+    cfg_val = getattr(config, "preserve_record_id", None)
+    if isinstance(cfg_val, bool):
+        return cfg_val
+    extra = getattr(config, "extra", None)
+    if isinstance(extra, Mapping):
+        extra_val = extra.get("preserve_record_id")
+        if isinstance(extra_val, bool):
+            return extra_val
+    return bool(
+        getattr(config, "idempotent", True) is not False or is_incremental_sink_config(config)
+    )
+
+
 def bind_sdtm_stream_metadata(
     metadata: dict[str, Any],
     seq_counters: dict[str, int],
@@ -3184,6 +3226,7 @@ def bind_sdtm_stream_metadata(
 __all__ = [
     "DEFAULT_MAX_BUFFERED_RECORDS",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
+    "_SDTM_RECORDS_SORT",
     "BoundedFormBufferRouter",
     "ExportSink",
     "SinkConfig",
@@ -3210,15 +3253,19 @@ __all__ = [
     "is_record_deleted",
     "iter_batches",
     "iter_filtered_sdk_records",
+    "iter_subject_ordered_sdtm_records",
+    "merge_form_ids_into_record_filter",
     "normalize_phi_keys_snapshot",
     "normalize_sink_value",
     "normalize_watermark_datetime",
+    "record_matches_sdtm_domain",
     "redact_batch_records",
     "rehydrate_sdtm_lineage",
     "resolve_form_sdtm_domain",
     "resolve_max_buffered_records",
     "resolve_voided_sdtm_keys",
     "run_streaming_export",
+    "should_preserve_sdtm_record_id",
     "stamp_tabular_batch",
     "validate_max_buffered_records",
 ]

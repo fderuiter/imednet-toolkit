@@ -852,3 +852,68 @@ def test_retired_facade_result_wrappers_and_resolve_sdk_result_fetcher_contract(
         jobs=SimpleNamespace(fetch_result=fn),
     )
     assert resolve_sdk_result_fetcher(double) is fn
+
+
+@pytest.mark.asyncio
+async def test_job_poller_and_async_poller_isolate_terminal_cache_across_studies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reusing JobPoller or AsyncJobPoller across ('STUDY_A', 'BATCH-1') and ('STUDY_B', 'BATCH-1') isolates each Study."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    sync_queues: dict[tuple[str, str], list[JobStatus]] = {
+        ("STUDY_A", "BATCH-1"): [
+            JobStatus(jobId="JA-1", batchId="BATCH-1", state="COMPLETED", progress=100),
+            JobStatus(jobId="JA-1", batchId="BATCH-1", state="RUNNING", progress=20),
+        ],
+        ("STUDY_B", "BATCH-1"): [
+            JobStatus(jobId="JB-1", batchId="BATCH-1", state="RUNNING", progress=40),
+            JobStatus(jobId="JB-1", batchId="BATCH-1", state="FAILED", progress=100),
+        ],
+    }
+    sync_poller = JobPoller(lambda sk, bid: sync_queues[(sk, bid)].pop(0))
+
+    res_a = sync_poller.run("STUDY_A", "BATCH-1", interval=0, timeout=5)
+    assert res_a.job_id == "JA-1"
+    assert res_a.state == "COMPLETED"
+    assert ("STUDY_A", "BATCH-1") in sync_poller._terminal_states
+    assert ("STUDY_B", "BATCH-1") not in sync_poller._terminal_states
+
+    # STUDY_B with identical BATCH-1 must NOT read STUDY_A's cached COMPLETED status
+    with pytest.raises(JobFailedError) as sync_b_exc:
+        sync_poller.run("STUDY_B", "BATCH-1", interval=0, timeout=5)
+    assert sync_b_exc.value.status is not None
+    assert sync_b_exc.value.status.job_id == "JB-1"
+    assert sync_b_exc.value.status.state == "FAILED"
+
+    # STUDY_A still preserves its own terminal status against a stale RUNNING response
+    res_a_stale = sync_poller.run("STUDY_A", "BATCH-1", interval=0, timeout=5)
+    assert res_a_stale.job_id == "JA-1"
+    assert res_a_stale.state == "COMPLETED"
+
+    # AsyncJobPoller isolation across STUDY_A and STUDY_B
+    async_queues: dict[tuple[str, str], list[JobStatus]] = {
+        ("STUDY_A", "BATCH-1"): [
+            JobStatus(jobId="AJA-1", batchId="BATCH-1", state="COMPLETED", progress=100),
+            JobStatus(jobId="AJA-1", batchId="BATCH-1", state="RUNNING", progress=10),
+        ],
+        ("STUDY_B", "BATCH-1"): [
+            JobStatus(jobId="AJB-1", batchId="BATCH-1", state="RUNNING", progress=50),
+            JobStatus(jobId="AJB-1", batchId="BATCH-1", state="COMPLETED", progress=100),
+        ],
+    }
+
+    async def get_async_job(sk: str, bid: str) -> JobStatus:
+        return async_queues[(sk, bid)].pop(0)
+
+    async_poller = AsyncJobPoller(get_async_job)
+    ares_a = await async_poller.run("STUDY_A", "BATCH-1", interval=0, timeout=5)
+    ares_b = await async_poller.run("STUDY_B", "BATCH-1", interval=0, timeout=5)
+    ares_a_stale = await async_poller.run("STUDY_A", "BATCH-1", interval=0, timeout=5)
+
+    assert ares_a.job_id == "AJA-1"
+    assert ares_b.job_id == "AJB-1"
+    assert ares_a_stale.job_id == "AJA-1"
+    assert async_poller._terminal_states[("STUDY_A", "BATCH-1")].job_id == "AJA-1"
+    assert async_poller._terminal_states[("STUDY_B", "BATCH-1")].job_id == "AJB-1"

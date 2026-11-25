@@ -24,14 +24,27 @@ def test_profile_registry_contains_general_drug_and_device_profiles() -> None:
 
 
 def test_drug_profile_enforces_ae_decod_relationship_and_ctcae_grades() -> None:
-    """Test that drug profile enforces ae decod relationship and ctcae grades."""
+    """Test that drug profile enforces ae decod relationship and accepts CDISC/CTCAE severities."""
     profile = DrugSafetyProfile()
+    for allowed_sev in ("MILD", "MODERATE", "SEVERE", "1", "2", "3", "4", "5"):
+        sev_violations = profile.validate(
+            domain="AE",
+            data={
+                "subjectKey": "S001",
+                "aeTerm": "Headache",
+                "aeSeverity": allowed_sev,
+            },
+        )
+        assert ("aeSeverity", "ERROR") not in {
+            (violation.field, violation.severity) for violation in sev_violations
+        }
+
     violations = profile.validate(
         domain="AE",
         data={
             "subjectKey": "S001",
             "aeTerm": "Headache",
-            "aeSeverity": "SEVERE",
+            "aeSeverity": "GRADE_9",
         },
     )
 

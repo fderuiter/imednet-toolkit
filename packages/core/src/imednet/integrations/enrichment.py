@@ -375,31 +375,62 @@ class CentralizedMapper:
             self._masked_meta_cache[cache_key] = cached
         return cached
 
-    def _resolve_record_sdtm_domain(self, record: Any) -> str:
-        """Resolve the target SDTM domain for *record* using explicit domain or Form metadata."""
+    def _resolve_pipeline_for_study(self, sk: str) -> Any:
+        """Resolve and cache the active ``EnrichmentPipeline`` for *sk*."""
+        if sk not in self._pipeline_cache:
+            if self._default_pipeline is not None:
+                self._pipeline_cache[sk] = self._default_pipeline
+            else:
+                sdk_obj = getattr(self, "sdk", None)
+                if sdk_obj is not None:
+                    from imednet.core.context import sdk_governance_context
+
+                    with sdk_governance_context(sdk_obj):
+                        resolved_cfg = resolve_study_configuration(sk)
+                else:
+                    resolved_cfg = resolve_study_configuration(sk)
+                self._pipeline_cache[sk] = (
+                    EnrichmentPipeline(resolved_cfg)
+                    if resolved_cfg is not None
+                    else self._DEFAULT_PIPELINE
+                )
+        return self._pipeline_cache[sk]
+
+    def _resolve_record_sdtm_domain(
+        self,
+        record: Any,
+        *,
+        study_key: str | None = None,
+        study_config: Any | None = None,
+    ) -> str:
+        """Resolve the target SDTM domain for *record* using explicit domain, Form metadata, or StudyConfiguration."""
         if self.sdtm_domain:
             return self.sdtm_domain
+        from imednet.models.sdtm import resolve_form_sdtm_domain
+
+        resolved_cfg = study_config
+        if resolved_cfg is None and self._default_pipeline is not None:
+            resolved_cfg = getattr(self._default_pipeline, "config", None)
+        if resolved_cfg is None and study_key:
+            active_pipe = self._resolve_pipeline_for_study(study_key)
+            if active_pipe is not None and active_pipe is not self._DEFAULT_PIPELINE:
+                resolved_cfg = getattr(active_pipe, "config", None)
+
+        dom = resolve_form_sdtm_domain(
+            record,
+            study_config=resolved_cfg,
+            form_domain_map=self._form_domain_map,
+            fallback="",
+        )
+        if dom:
+            return dom
         is_mapping = isinstance(record, Mapping)
-        raw_dom: Any = None
-        if is_mapping:
-            raw_dom = record.get("DOMAIN") or record.get("domain")
-            if not raw_dom and self._form_domain_map:
-                fid = record.get("formId") if "formId" in record else record.get("form_id")
-                fkey = record.get("formKey") or record.get("form_key")
-                raw_dom = self._form_domain_map.get(fid) or self._form_domain_map.get(fkey)
-            if not raw_dom:
-                raw_dom = record.get("form_key") or record.get("formKey")
-        else:
-            raw_dom = getattr(record, "domain", None) or getattr(record, "DOMAIN", None)
-            if not raw_dom and self._form_domain_map:
-                fid = getattr(record, "form_id", None)
-                if fid is None:
-                    fid = getattr(record, "formId", None)
-                fkey = getattr(record, "form_key", None) or getattr(record, "formKey", None)
-                raw_dom = self._form_domain_map.get(fid) or self._form_domain_map.get(fkey)
-            if not raw_dom:
-                raw_dom = getattr(record, "form_key", None) or getattr(record, "formKey", None)
-        return resolve_sdtm_domain(raw_dom, fallback="AE")
+        raw_fk = (
+            record.get("form_key") or record.get("formKey")
+            if is_mapping
+            else getattr(record, "form_key", None) or getattr(record, "formKey", None)
+        )
+        return resolve_sdtm_domain(raw_fk, fallback="AE")
 
     def _counters_for_domain(self, domain: str) -> dict[str, int]:
         """Return the per-USUBJID sequence counter map scoped to ``domain``."""
@@ -442,7 +473,7 @@ class CentralizedMapper:
                     else getattr(rec, "study_key", None)
                 )
             ) or "UNKNOWN"
-            dom = self._resolve_record_sdtm_domain(rec)
+            dom = self._resolve_record_sdtm_domain(rec, study_key=str(resolved_sk))
             key = (str(resolved_sk), dom)
             if key not in partitions:
                 partitions[key] = []
@@ -451,24 +482,7 @@ class CentralizedMapper:
 
         results: list[tuple[Any, dict[str, Any]]] = []
         for sk, dom in partition_order:
-            if sk not in self._pipeline_cache:
-                if self._default_pipeline is not None:
-                    self._pipeline_cache[sk] = self._default_pipeline
-                else:
-                    sdk_obj = getattr(self, "sdk", None)
-                    if sdk_obj is not None:
-                        from imednet.core.context import sdk_governance_context
-
-                        with sdk_governance_context(sdk_obj):
-                            resolved_cfg = resolve_study_configuration(sk)
-                    else:
-                        resolved_cfg = resolve_study_configuration(sk)
-                    self._pipeline_cache[sk] = (
-                        EnrichmentPipeline(resolved_cfg)
-                        if resolved_cfg is not None
-                        else self._DEFAULT_PIPELINE
-                    )
-            active_pipeline = self._pipeline_cache[sk]
+            active_pipeline = self._resolve_pipeline_for_study(sk)
             pipeline_phi_keys: set[str] = getattr(active_pipeline, "phi_keys", set())
             has_active_rules = bool(
                 active_pipeline is not None
@@ -527,24 +541,7 @@ class CentralizedMapper:
             )
         )
         sk = resolved_study_key or "UNKNOWN"
-        if sk not in self._pipeline_cache:
-            if self._default_pipeline is not None:
-                self._pipeline_cache[sk] = self._default_pipeline
-            else:
-                sdk_obj = getattr(self, "sdk", None)
-                if sdk_obj is not None:
-                    from imednet.core.context import sdk_governance_context
-
-                    with sdk_governance_context(sdk_obj):
-                        resolved_cfg = resolve_study_configuration(sk)
-                else:
-                    resolved_cfg = resolve_study_configuration(sk)
-                self._pipeline_cache[sk] = (
-                    EnrichmentPipeline(resolved_cfg)
-                    if resolved_cfg is not None
-                    else self._DEFAULT_PIPELINE
-                )
-        active_pipeline = self._pipeline_cache[sk]
+        active_pipeline = self._resolve_pipeline_for_study(sk)
         pipeline_phi_keys: set[str] = getattr(active_pipeline, "phi_keys", set())
         has_active_rules = bool(
             active_pipeline is not None
@@ -559,7 +556,7 @@ class CentralizedMapper:
         )
 
         if self.as_sdtm:
-            target_domain = self._resolve_record_sdtm_domain(record)
+            target_domain = self._resolve_record_sdtm_domain(record, study_key=sk)
             domain_counters = self._counters_for_domain(target_domain)
             sdtm_rows = transform_records_to_sdtm_rows(
                 [record],
@@ -599,6 +596,15 @@ class CentralizedMapper:
                     camel_f = format_variable_name(snake_key, "camelCase")
                     if camel_f not in {f, snake_key}:
                         val = record.get(camel_f)
+                if val is None and active_conv == "sdtm":
+                    sdtm_f = format_variable_name(
+                        snake_key,
+                        "sdtm",
+                        domain=self.sdtm_domain,
+                        is_metadata=True,
+                    )
+                    if sdtm_f not in {f, snake_key}:
+                        val = record.get(sdtm_f)
             else:
                 val = getattr(record, f, None)
 
@@ -607,16 +613,38 @@ class CentralizedMapper:
                 if self.mask_phi and val:
                     val = mask_clinical_phi(val)
                 if has_active_rules:
+                    rec_fk = (
+                        record.get("form_key") or record.get("formKey")
+                        if is_mapping
+                        else getattr(record, "form_key", None) or getattr(record, "formKey", None)
+                    )
+                    rec_dom = self.sdtm_domain if self.sdtm_domain else None
                     if self.mask_phi:
                         try:
-                            val = active_pipeline.process(val, _skip_default_phi=False)
+                            val = active_pipeline.process(
+                                val,
+                                _skip_default_phi=False,
+                                domain=rec_dom,
+                                form_key=str(rec_fk) if rec_fk else None,
+                            )
                         except TypeError:
-                            val = active_pipeline.process(val)
+                            try:
+                                val = active_pipeline.process(val, _skip_default_phi=False)
+                            except TypeError:
+                                val = active_pipeline.process(val)
                     else:
                         try:
-                            val = active_pipeline.process(val, mask_phi=False)
+                            val = active_pipeline.process(
+                                val,
+                                mask_phi=False,
+                                domain=rec_dom,
+                                form_key=str(rec_fk) if rec_fk else None,
+                            )
                         except TypeError:
-                            val = active_pipeline.process(val)
+                            try:
+                                val = active_pipeline.process(val, mask_phi=False)
+                            except TypeError:
+                                val = active_pipeline.process(val)
                 if self.mode == "tabular":
                     val = flatten(val)
                 if active_conv is None or active_conv == "snake_case":
@@ -662,7 +690,8 @@ class CentralizedMapper:
                     domain=self.sdtm_domain,
                     is_metadata=True,
                 )
-                converted[target_mk] = mv
+                if mv is not None or target_mk not in converted:
+                    converted[target_mk] = mv
             mapped = converted
 
         if self.post_processor:
@@ -707,17 +736,155 @@ class EnrichmentPipeline:
             if snake_term_key and snake_term_key not in self._snake_terminology:
                 self._snake_terminology[snake_term_key] = lookup
 
-        self.mappings = {}
+        self.mappings: dict[str, Any] = {}
         self._snake_mappings: dict[str, Any] = {}
+        self._var_rule_counts: dict[str, int] = {}
+        self._snake_rule_counts: dict[str, int] = {}
+        self.all_mappings: list[Any] = []
+        self.indexed_mappings: dict[tuple[str, str, str], Any] = {}
+        self._indexed_snake_mappings: dict[tuple[str, str, str], Any] = {}
+        self._domain_var_mappings: dict[tuple[str, str], Any] = {}
+        self._domain_snake_mappings: dict[tuple[str, str], Any] = {}
+        self._form_var_mappings: dict[tuple[str, str], Any] = {}
+        self._form_snake_mappings: dict[tuple[str, str], Any] = {}
+
         for mapping in config.mappings:
             if mapping.source_variable_name:
-                self.mappings[mapping.source_variable_name] = mapping
-                snake_src = _to_snake_case(mapping.source_variable_name)
-                if snake_src and snake_src not in self._snake_mappings:
-                    self._snake_mappings[snake_src] = mapping
+                src_var = mapping.source_variable_name
+                snake_src = _to_snake_case(src_var)
+                norm_dom = (
+                    resolve_sdtm_domain(mapping.domain, fallback="") if mapping.domain else ""
+                )
+                raw_fk = mapping.source_form_key or ""
+                norm_fk = _normalize_key(raw_fk).replace("_", "") if raw_fk else ""
 
-        self._has_rules = bool(self.phi_keys or self.terminology or self.mappings)
+                self.all_mappings.append(mapping)
+                self.mappings.setdefault(src_var, mapping)
+                self._var_rule_counts[src_var] = self._var_rule_counts.get(src_var, 0) + 1
+                if snake_src:
+                    self._snake_mappings.setdefault(snake_src, mapping)
+                    self._snake_rule_counts[snake_src] = (
+                        self._snake_rule_counts.get(snake_src, 0) + 1
+                    )
+
+                self.indexed_mappings[(norm_dom, norm_fk, src_var)] = mapping
+                if raw_fk and raw_fk != norm_fk:
+                    self.indexed_mappings.setdefault((norm_dom, raw_fk, src_var), mapping)
+                if snake_src:
+                    self._indexed_snake_mappings.setdefault((norm_dom, norm_fk, snake_src), mapping)
+
+                if norm_dom:
+                    self._domain_var_mappings.setdefault((norm_dom, src_var), mapping)
+                    if snake_src:
+                        self._domain_snake_mappings.setdefault((norm_dom, snake_src), mapping)
+                if norm_fk:
+                    self._form_var_mappings.setdefault((norm_fk, src_var), mapping)
+                    if snake_src:
+                        self._form_snake_mappings.setdefault((norm_fk, snake_src), mapping)
+
+        self._has_rules = bool(self.phi_keys or self.terminology or self.all_mappings)
         self._last_clean_repr: str | None = None
+
+    @staticmethod
+    def _is_empty_input(val: Any) -> bool:
+        """Return True when *val* is ``None`` or an empty/whitespace-only string."""
+        return val is None or (isinstance(val, str) and not val.strip())
+
+    def _resolve_rule_for_key(
+        self,
+        key: str,
+        snake_key: str | None,
+        *,
+        norm_domain: str | None,
+        norm_form_key: str | None,
+    ) -> Any | None:
+        """Look up a ``MappingRule`` scoped by ``(domain, source_form_key, source_variable_name)``."""
+        if norm_domain and norm_form_key:
+            rule = self.indexed_mappings.get((norm_domain, norm_form_key, key))
+            if rule is None and snake_key:
+                rule = self._indexed_snake_mappings.get((norm_domain, norm_form_key, snake_key))
+            if rule is not None:
+                return rule
+            # Fall back to domain-scoped rule when form_key is a generic/study form alias for norm_domain
+            # and no conflicting form-specific rule matched.
+            dom_rule = self._domain_var_mappings.get((norm_domain, key))
+            if dom_rule is None and snake_key:
+                dom_rule = self._domain_snake_mappings.get((norm_domain, snake_key))
+            if dom_rule is not None:
+                rule_fk = getattr(dom_rule, "source_form_key", "") or ""
+                rule_fk_norm = _normalize_key(rule_fk).replace("_", "") if rule_fk else ""
+                if not rule_fk_norm or resolve_sdtm_domain(rule_fk, fallback="") == norm_domain:
+                    return dom_rule
+            return None
+
+        if norm_domain:
+            rule = self._domain_var_mappings.get((norm_domain, key))
+            if rule is None and snake_key:
+                rule = self._domain_snake_mappings.get((norm_domain, snake_key))
+            return rule
+
+        if norm_form_key:
+            rule = self._form_var_mappings.get((norm_form_key, key))
+            if rule is None and snake_key:
+                rule = self._form_snake_mappings.get((norm_form_key, snake_key))
+            if rule is not None:
+                return rule
+            from imednet.models.sdtm import resolve_form_sdtm_domain
+
+            inferred_dom = resolve_form_sdtm_domain(
+                norm_form_key, study_config=self.config, fallback=""
+            )
+            if inferred_dom:
+                dom_rule = self._domain_var_mappings.get((inferred_dom, key))
+                if dom_rule is None and snake_key:
+                    dom_rule = self._domain_snake_mappings.get((inferred_dom, snake_key))
+                if dom_rule is not None:
+                    rule_fk = getattr(dom_rule, "source_form_key", "") or ""
+                    rule_fk_norm = _normalize_key(rule_fk).replace("_", "") if rule_fk else ""
+                    if (
+                        not rule_fk_norm
+                        or rule_fk_norm == norm_form_key
+                        or resolve_sdtm_domain(rule_fk, fallback="") == inferred_dom
+                    ):
+                        return dom_rule
+            # In non-SDTM mode (norm_domain is None), allow unambiguous single-variable rules
+            if self._var_rule_counts.get(key, 0) == 1:
+                return self.mappings.get(key)
+            if snake_key and self._snake_rule_counts.get(snake_key, 0) == 1:
+                return self._snake_mappings.get(snake_key)
+            return None
+
+        rule = self.mappings.get(key)
+        if rule is None and snake_key is not None:
+            rule = self._snake_mappings.get(snake_key)
+        return rule
+
+    def _applicable_fallback_rules(
+        self,
+        *,
+        norm_domain: str | None,
+        norm_form_key: str | None,
+    ) -> list[Any]:
+        """Return rules with ``fallback_value`` applicable to ``(norm_domain, norm_form_key)``."""
+        candidates: list[Any] = []
+        for rule in self.all_mappings:
+            if rule.fallback_value is None:
+                continue
+            r_dom = resolve_sdtm_domain(rule.domain, fallback="") if rule.domain else ""
+            r_fk_raw = rule.source_form_key or ""
+            r_fk = _normalize_key(r_fk_raw).replace("_", "") if r_fk_raw else ""
+
+            if norm_domain and r_dom and r_dom != norm_domain:
+                continue
+            if (
+                norm_form_key
+                and r_fk
+                and r_fk != norm_form_key
+                and not (norm_domain and resolve_sdtm_domain(r_fk_raw, fallback="") == norm_domain)
+            ):
+                continue
+            candidates.append(rule)
+        return candidates
 
     def process(
         self,
@@ -725,12 +892,16 @@ class EnrichmentPipeline:
         *,
         mask_phi: bool = True,
         _skip_default_phi: bool = False,
+        domain: str | None = None,
+        form_key: str | None = None,
     ) -> Any:
         """Process the input data through the enrichment pipeline.
 
         Args:
             data: The raw data to be enriched.
             mask_phi: Whether default and configured PHI rules should be applied.
+            domain: Optional SDTM domain scoping ``MappingRule`` resolution.
+            form_key: Optional EDC Form key scoping ``MappingRule`` resolution.
 
         Returns:
             The enriched and transformed data.
@@ -749,13 +920,39 @@ class EnrichmentPipeline:
             if res is data and _is_pure_builtin_tree(data):
                 self._last_clean_repr = repr(data)
             return res
-        if not mask_phi and not (self.terminology or self.mappings):
+        if not mask_phi and not (self.terminology or self.all_mappings):
             return data
+
+        raw_dom = domain
+        raw_fk = form_key
+        if isinstance(data, Mapping):
+            if not raw_dom:
+                cand_dom = data.get("DOMAIN") or data.get("domain")
+                if isinstance(cand_dom, str) and cand_dom.strip():
+                    raw_dom = cand_dom
+            if not raw_fk:
+                cand_fk = data.get("form_key") or data.get("formKey")
+                if isinstance(cand_fk, str) and cand_fk.strip():
+                    raw_fk = cand_fk
+
+        norm_dom = (
+            resolve_sdtm_domain(raw_dom, fallback="")
+            if isinstance(raw_dom, str) and raw_dom.strip()
+            else None
+        ) or None
+        norm_fk = (
+            _normalize_key(raw_fk).replace("_", "")
+            if isinstance(raw_fk, str) and raw_fk.strip()
+            else None
+        ) or None
+
         return self._transform_recursive(
             data,
             depth=0,
             mask_phi=mask_phi,
             _skip_default_phi=_skip_default_phi,
+            norm_domain=norm_dom,
+            norm_form_key=norm_fk,
         )
 
     def _evaluate_business_logic(self, expr: str, value: Any) -> Any:
@@ -784,19 +981,12 @@ class EnrichmentPipeline:
         *,
         mask_phi: bool = True,
         _skip_default_phi: bool = False,
+        norm_domain: str | None = None,
+        norm_form_key: str | None = None,
     ) -> Any:
-        """Recursively transform data structures.
-
-        Args:
-            data: The data structure to transform.
-            depth: The current recursion depth.
-            mask_phi: Whether configured PHI masking rules should run.
-
-        Returns:
-            The transformed data structure.
-        """
+        """Recursively transform data structures."""
         if isinstance(data, dict):
-            new_dict = {}
+            new_dict: dict[str, Any] = {}
             for k, v in data.items():
                 new_key = k
                 is_phi_key = False
@@ -814,6 +1004,8 @@ class EnrichmentPipeline:
                         depth + 1,
                         mask_phi=mask_phi,
                         _skip_default_phi=_skip_default_phi,
+                        norm_domain=norm_domain,
+                        norm_form_key=norm_form_key,
                     )
                     if isinstance(v, (dict, list, tuple))
                     else v
@@ -822,20 +1014,43 @@ class EnrichmentPipeline:
                 # If value is not a complex structure, apply rules
                 if not isinstance(v, (dict, list, tuple)):
                     snake_k = _to_snake_case(k) if isinstance(k, str) else None
-                    # Terminology mapping: exact sourceVariableName first, then snake_case fallback
-                    term_lookup = self.terminology.get(k)
-                    if term_lookup is None and snake_k is not None:
-                        term_lookup = self._snake_terminology.get(snake_k)
+                    rule = (
+                        self._resolve_rule_for_key(
+                            k,
+                            snake_k,
+                            norm_domain=norm_domain,
+                            norm_form_key=norm_form_key,
+                        )
+                        if isinstance(k, str)
+                        else None
+                    )
+                    used_fallback = False
+                    if (
+                        rule is not None
+                        and rule.fallback_value is not None
+                        and self._is_empty_input(new_val)
+                    ):
+                        new_val = rule.fallback_value
+                        used_fallback = True
+
+                    # Terminology mapping: domain.target/source first, then exact sourceVariableName, then snake_case
+                    term_lookup = None
+                    if isinstance(k, str):
+                        if norm_domain and f"{norm_domain}.{k}" in self.terminology:
+                            term_lookup = self.terminology[f"{norm_domain}.{k}"]
+                        else:
+                            term_lookup = self.terminology.get(k)
+                        if term_lookup is None and snake_k is not None:
+                            term_lookup = self._snake_terminology.get(snake_k)
                     if not is_phi_key and term_lookup is not None and str(new_val) in term_lookup:
                         new_val = term_lookup[str(new_val)]
 
                     # Mapping rules (business logic and key renaming)
-                    rule = self.mappings.get(k)
-                    if rule is None and snake_k is not None:
-                        rule = self._snake_mappings.get(snake_k)
                     if rule is not None:
-                        if not is_phi_key and rule.business_logic:
+                        if not is_phi_key and rule.business_logic and not used_fallback:
                             new_val = self._evaluate_business_logic(rule.business_logic, new_val)
+                            if rule.fallback_value is not None and self._is_empty_input(new_val):
+                                new_val = rule.fallback_value
                         if rule.target_field and rule.target_field != k:
                             new_key = rule.target_field
 
@@ -854,6 +1069,31 @@ class EnrichmentPipeline:
                         new_val = _MASKED_VALUE
 
                 new_dict[new_key] = new_val
+
+            if depth == 0 and self.all_mappings:
+                for fb_rule in self._applicable_fallback_rules(
+                    norm_domain=norm_domain,
+                    norm_form_key=norm_form_key,
+                ):
+                    target_k = fb_rule.target_field or fb_rule.source_variable_name
+                    if not target_k:
+                        continue
+                    if target_k not in new_dict or self._is_empty_input(new_dict.get(target_k)):
+                        fb_val = fb_rule.fallback_value
+                        if (
+                            mask_phi
+                            and isinstance(target_k, str)
+                            and not global_sensitivity_registry.is_exempt(target_k)
+                            and (
+                                _matches_custom_phi_key(target_k, self.phi_keys)
+                                or (
+                                    not _skip_default_phi
+                                    and global_sensitivity_registry.is_sensitive(target_k)
+                                )
+                            )
+                        ):
+                            fb_val = _MASKED_VALUE
+                        new_dict[target_k] = fb_val
             return new_dict
 
         if isinstance(data, list):
@@ -863,6 +1103,8 @@ class EnrichmentPipeline:
                     depth + 1,
                     mask_phi=mask_phi,
                     _skip_default_phi=_skip_default_phi,
+                    norm_domain=norm_domain,
+                    norm_form_key=norm_form_key,
                 )
                 for item in data
             ]
@@ -873,6 +1115,8 @@ class EnrichmentPipeline:
                     depth + 1,
                     mask_phi=mask_phi,
                     _skip_default_phi=_skip_default_phi,
+                    norm_domain=norm_domain,
+                    norm_form_key=norm_form_key,
                 )
                 for item in data
             )

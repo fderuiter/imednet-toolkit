@@ -13,6 +13,7 @@ from ...sdk import ImednetSDK
 from ...utils.pandas import import_records_csv
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import display_list, fetching_status, print_error, simulation_mode_context
+from ..utils._write_batch import prepare_write_cli_preflight, run_cli_batch_write
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
@@ -28,8 +29,6 @@ from ..utils.write_helpers import (
     add_write_common_args,
     assemble_cli_write_records,
     load_records_from_path_or_stdin,
-    prepare_write_cli_preflight,
-    run_cli_batch_write,
 )
 
 

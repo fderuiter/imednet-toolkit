@@ -155,6 +155,7 @@ class DuckDBIngestionWorkflowProtocol(Protocol):
         start_date: str | None = None,
         end_date: str | None = None,
         mode: Literal["append", "replace"] = "append",
+        mask_phi: bool | None = None,
     ) -> int:
         """Ingest study record revisions into the DuckDB bronze table."""
         ...
@@ -1200,6 +1201,7 @@ class MongoDbSinkConfigProtocol(Protocol):
     standards_profile: str | Any | None
     min_standards_score: float | None
     naming_convention: str | None
+    preserve_record_id: bool | None
     idempotent: bool
     mask_phi: bool
     include_deleted: bool
@@ -1237,6 +1239,7 @@ class MongoDbSinkConfigFactoryProtocol(Protocol):
         standards_profile: str | Any | None = None,
         min_standards_score: float | None = None,
         naming_convention: str | None = None,
+        preserve_record_id: bool | None = None,
         uri: str = "",
         database: str = "",
         collection: str = "",
@@ -1306,6 +1309,7 @@ class Neo4jSinkConfigProtocol(Protocol):
     standards_profile: str | Any | None
     min_standards_score: float | None
     naming_convention: str | None
+    preserve_record_id: bool | None
     idempotent: bool
     mask_phi: bool
     include_deleted: bool
@@ -1343,6 +1347,7 @@ class Neo4jSinkConfigFactoryProtocol(Protocol):
         standards_profile: str | Any | None = None,
         min_standards_score: float | None = None,
         naming_convention: str | None = None,
+        preserve_record_id: bool | None = None,
         uri: str = "",
         auth: tuple[str, str] = ("", ""),
         database: str = "neo4j",
@@ -1415,6 +1420,7 @@ class SnowflakeSinkConfigProtocol(Protocol):
     standards_profile: str | Any | None
     min_standards_score: float | None
     naming_convention: str | None
+    preserve_record_id: bool | None
     idempotent: bool
     mask_phi: bool
     include_deleted: bool
@@ -1452,6 +1458,7 @@ class SnowflakeSinkConfigFactoryProtocol(Protocol):
         standards_profile: str | Any | None = None,
         min_standards_score: float | None = None,
         naming_convention: str | None = None,
+        preserve_record_id: bool | None = None,
         account: str = "",
         user: str = "",
         password: str = "",

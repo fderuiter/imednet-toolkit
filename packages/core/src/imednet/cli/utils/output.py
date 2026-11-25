@@ -723,10 +723,6 @@ def _project_item_to_row(
         dumped = item.model_dump()
         if isinstance(dumped, dict):
             return dumped
-    if hasattr(item, "dict"):
-        dumped_legacy = item.dict()
-        if isinstance(dumped_legacy, dict):
-            return dumped_legacy
     return {k: getattr(item, k, None) for k in field_keys}
 
 
@@ -773,8 +769,6 @@ def display_list(
         first = items[0]
         if hasattr(first, "model_dump"):
             data_list = [item.model_dump() for item in items]
-        elif hasattr(first, "dict"):
-            data_list = [item.dict() for item in items]
         elif isinstance(first, dict):
             data_list = list(items)
 

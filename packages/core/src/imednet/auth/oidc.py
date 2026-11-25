@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import time
 from types import SimpleNamespace
@@ -419,6 +420,24 @@ def _verify_token_signature(
     return False
 
 
+def _is_valid_numeric_date(value: Any) -> bool:
+    """Return True when value is a finite int or float and not a boolean."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _normalize_aud_claim(value: Any) -> list[str] | None:
+    """Validate and normalize an 'aud' claim or audience allowlist to non-empty strings."""
+    if isinstance(value, str):
+        return [value] if value.strip() else None
+    if (
+        isinstance(value, list)
+        and value
+        and all(isinstance(item, str) and bool(item.strip()) for item in value)
+    ):
+        return list(value)
+    return None
+
+
 class OIDCAuth:
     """Authentication strategy using OIDC token."""
 
@@ -447,19 +466,44 @@ class OIDCAuth:
             leeway: Clock skew leeway in seconds for time-based claims.
         """
         self.token = token
-        self.public_key = public_key or os.getenv("IMEDNET_OIDC_PUBLIC_KEY")
-        self.jwks_url = jwks_url or os.getenv("IMEDNET_OIDC_JWKS_URL")
+        env_pub_key = os.getenv("IMEDNET_OIDC_PUBLIC_KEY")
+        self.public_key = public_key if public_key is not None else (env_pub_key or None)
+        env_jwks_url = os.getenv("IMEDNET_OIDC_JWKS_URL")
+        self.jwks_url = jwks_url if jwks_url is not None else (env_jwks_url or None)
         self.jwks = jwks
-        self.audience = audience or os.getenv("IMEDNET_OIDC_AUDIENCE")
+        env_audience = os.getenv("IMEDNET_OIDC_AUDIENCE")
+        self.audience = audience if audience is not None else (env_audience or None)
         env_algos = os.getenv("IMEDNET_OIDC_ALGORITHMS")
         self.algorithms = (
             algorithms
             if algorithms is not None
-            else ([a.strip() for a in env_algos.split(",")] if env_algos else None)
+            else (
+                [a.strip() for a in env_algos.split(",") if a.strip()]
+                if env_algos and env_algos.strip()
+                else None
+            )
         )
-        self.issuer = issuer or os.getenv("IMEDNET_OIDC_ISSUER")
+        env_issuer = os.getenv("IMEDNET_OIDC_ISSUER")
+        self.issuer = issuer if issuer is not None else (env_issuer or None)
         self.leeway = leeway
-        self._decoded_claims = self._decode_token_claims(token)
+
+        self._verification_configured = any(
+            opt is not None
+            for opt in (
+                self.public_key,
+                self.jwks_url,
+                self.jwks,
+                self.audience,
+                self.algorithms,
+                self.issuer,
+            )
+        )
+        is_jwt_candidate = isinstance(token, str) and len(token.split(".")) == 3
+        self._requires_verification = is_jwt_candidate or self._verification_configured
+        self._token_verified = False
+        self._decoded_claims: dict[str, Any] = {}
+        if isinstance(token, str) and token.strip() and self._requires_verification:
+            self._decoded_claims = self._decode_token_claims(token)
 
     def _default_allowed_algorithms(self) -> list[str]:
         """Return default allowed JWS algorithms matched to the configured key type."""
@@ -468,6 +512,38 @@ class OIDCAuth:
         if self.public_key is not None and _is_symmetric_key_input(self.public_key):
             return list(_SYMMETRIC_ALGORITHMS)
         return list(_ASYMMETRIC_ALGORITHMS)
+
+    def _has_active_temporal_claims(
+        self,
+        claims: dict[str, Any],
+        *,
+        current_time: float | None = None,
+    ) -> bool:
+        """Validate 'exp', 'nbf', and 'leeway' against RFC 7519 Section 4.1.4."""
+        if not _is_valid_numeric_date(self.leeway) or self.leeway < 0:
+            logger.warning("OIDC token validation failed: Invalid 'leeway' configuration.")
+            return False
+
+        now = time.time() if current_time is None else current_time
+        if "exp" in claims:
+            exp_val = claims["exp"]
+            if not _is_valid_numeric_date(exp_val):
+                logger.warning("OIDC token validation failed: Invalid 'exp' claim format.")
+                return False
+            if now >= (exp_val + self.leeway):
+                logger.warning("OIDC token validation failed: Token has expired.")
+                return False
+
+        if "nbf" in claims:
+            nbf_val = claims["nbf"]
+            if not _is_valid_numeric_date(nbf_val):
+                logger.warning("OIDC token validation failed: Invalid 'nbf' claim format.")
+                return False
+            if now < (nbf_val - self.leeway):
+                logger.warning("OIDC token validation failed: Token is not yet valid (nbf).")
+                return False
+
+        return True
 
     def _decode_token_claims(self, token: str) -> dict[str, Any]:
         """Extract, cryptographically verify, and validate claims from the JWT token.
@@ -479,6 +555,14 @@ class OIDCAuth:
             A dictionary containing the verified token claims, or an empty dictionary
             if token verification or claims validation fails.
         """
+        is_primary_token = token == self.token
+        if is_primary_token:
+            self._token_verified = False
+
+        if not isinstance(token, str) or not token.strip():
+            logger.warning("OIDC token validation failed: Token must be a non-empty string.")
+            return {}
+
         parts = token.split(".")
         if len(parts) != 3:
             logger.warning(
@@ -601,75 +685,133 @@ class OIDCAuth:
             logger.warning("OIDC token validation failed: Failed to decode payload: %s", exc)
             return {}
 
-        current_time = time.time()
-        if "exp" in claims:
-            exp_val = claims["exp"]
-            if not isinstance(exp_val, (int, float)):
-                logger.warning("OIDC token validation failed: Invalid 'exp' claim format.")
-                return {}
-            if current_time > (exp_val + self.leeway):
-                logger.warning("OIDC token validation failed: Token has expired.")
+        if not self._has_active_temporal_claims(claims):
+            return {}
+
+        actual_auds: list[str] | None = None
+        if "aud" in claims:
+            actual_auds = _normalize_aud_claim(claims["aud"])
+            if actual_auds is None:
+                logger.warning("OIDC token validation failed: Invalid 'aud' claim format.")
                 return {}
 
-        if "nbf" in claims:
-            nbf_val = claims["nbf"]
-            if not isinstance(nbf_val, (int, float)):
-                logger.warning("OIDC token validation failed: Invalid 'nbf' claim format.")
+        if self.audience is not None:
+            expected_input = (
+                list(self.audience) if isinstance(self.audience, (tuple, set)) else self.audience
+            )
+            expected_auds = _normalize_aud_claim(expected_input)
+            if expected_auds is None:
+                logger.warning(
+                    "OIDC token validation failed: Invalid expected 'audience' configuration."
+                )
                 return {}
-            if current_time < (nbf_val - self.leeway):
-                logger.warning("OIDC token validation failed: Token is not yet valid (nbf).")
-                return {}
-
-        if self.audience:
-            token_aud = claims.get("aud")
-            if not token_aud:
+            if actual_auds is None:
                 logger.warning("OIDC token validation failed: Missing required 'aud' claim.")
                 return {}
-            expected_auds = (
-                [self.audience] if isinstance(self.audience, str) else list(self.audience)
-            )
-            actual_auds = [token_aud] if isinstance(token_aud, str) else list(token_aud)
             if not any(a in expected_auds for a in actual_auds):
                 logger.warning("OIDC token validation failed: Audience mismatch.")
                 return {}
 
-        if self.issuer:
-            token_iss = claims.get("iss")
-            if token_iss != self.issuer:
+        if "iss" in claims:
+            token_iss = claims["iss"]
+            if not isinstance(token_iss, str) or not token_iss.strip():
+                logger.warning("OIDC token validation failed: Invalid 'iss' claim format.")
+                return {}
+
+        if self.issuer is not None:
+            if not isinstance(self.issuer, str) or not self.issuer.strip():
+                logger.warning(
+                    "OIDC token validation failed: Invalid expected 'issuer' configuration."
+                )
+                return {}
+            if claims.get("iss") != self.issuer:
                 logger.warning("OIDC token validation failed: Issuer mismatch.")
                 return {}
 
+        if is_primary_token:
+            self._token_verified = True
         return claims
 
+    def _get_active_claims(self) -> dict[str, Any]:
+        """Return verified token claims when currently within the token validity window."""
+        if not self._token_verified or not isinstance(self._decoded_claims, dict):
+            return {}
+        if not self._has_active_temporal_claims(self._decoded_claims):
+            return {}
+        return dict(self._decoded_claims)
+
+    @property
+    def claims(self) -> dict[str, Any]:
+        """Return a read-only copy of currently active verified JWT claims."""
+        return self._get_active_claims()
+
     def get_headers(self) -> dict[str, str]:
-        """Return the Authorization header."""
+        """Return the Authorization header when the token is valid and active."""
+        if not isinstance(self.token, str) or not self.token.strip():
+            return {}
+        if "\r" in self.token or "\n" in self.token:
+            return {}
+        if self._requires_verification:
+            if not self._token_verified or not isinstance(self._decoded_claims, dict):
+                return {}
+            if not self._has_active_temporal_claims(self._decoded_claims):
+                return {}
         return {"Authorization": f"Bearer {self.token}"}
 
     def get_user_id(self) -> str | None:
-        """Extract the user identifier from the token claims.
+        """Extract the user identifier from active verified token claims.
 
         Returns:
-            The user ID (sub or preferred_username) if found, otherwise None.
+            The user ID (sub or preferred_username) if found and valid, otherwise None.
         """
-        val = self._decoded_claims.get("sub") or self._decoded_claims.get("preferred_username")
-        return str(val) if val else None
+        active_claims = self._get_active_claims()
+        for claim_name in ("sub", "preferred_username"):
+            val = active_claims.get(claim_name)
+            if val is None or val == "":
+                continue
+            if isinstance(val, str) and val.strip():
+                return val
+            logger.warning("OIDC user ID extraction failed: Invalid '%s' claim format.", claim_name)
+            return None
+        return None
 
     def get_user_roles(self) -> list[str]:
-        """Extract and map user roles from the token claims.
+        """Extract and map user roles from active verified token claims.
 
         Returns:
             A list of mapped system roles.
         """
-        # Assume groups or roles claim maps to our roles
-        # In a real environment, role mapping config would be applied here
-        roles = self._decoded_claims.get("roles") or self._decoded_claims.get("groups") or []
-        if isinstance(roles, str):
-            roles = [roles]
+        active_claims = self._get_active_claims()
+        raw_roles: list[str] = []
+        for claim_name in ("roles", "groups"):
+            if claim_name not in active_claims or active_claims[claim_name] is None:
+                continue
+            candidate = active_claims[claim_name]
+            if isinstance(candidate, str):
+                if not candidate.strip():
+                    continue
+                raw_roles = [candidate]
+                break
+            if isinstance(candidate, list):
+                if not all(isinstance(item, str) and bool(item.strip()) for item in candidate):
+                    logger.warning(
+                        "OIDC role extraction failed: '%s' claim contains non-string or blank items.",
+                        claim_name,
+                    )
+                    return []
+                if not candidate:
+                    continue
+                raw_roles = candidate
+                break
+            logger.warning("OIDC role extraction failed: Invalid '%s' claim format.", claim_name)
+            return []
 
-        # Enterprise role mapping to system roles
-        mapped_roles = []
-        for r in roles:
-            r_lower = r.lower()
+        if not raw_roles:
+            return []
+
+        mapped_roles: list[str] = []
+        for role in raw_roles:
+            r_lower = role.lower()
             if "admin" in r_lower:
                 mapped_roles.append("admin")
             elif "manager" in r_lower:
@@ -679,8 +821,7 @@ class OIDCAuth:
             else:
                 mapped_roles.append("viewer")
 
-        # If no explicit match, default mapping logic if any...
-        return mapped_roles or list(roles)
+        return mapped_roles
 
     def __repr__(self) -> str:
         """Return a redacted string representation of the OIDC authentication."""

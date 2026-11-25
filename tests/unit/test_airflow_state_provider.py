@@ -542,12 +542,14 @@ def test_imednet_export_operator_incremental_idempotent_in_real_airflow_dag(
     assert "filter" not in seen_params[0]
     assert "dateModified>=" in seen_params[1].get("filter", "")
 
+    dag_obj = _load_dag_from_file(dag_file, "dag")
+    expected_stream = dag_obj.get_task("export_records")._default_airflow_stream_name("json")
+    assert expected_stream.startswith("json_dag_export_incremental_export_records_")
     provider = AirflowStateProvider()
     assert (
-        provider.get_last_status("STUDY_EXPORT", "json_export_records")
-        == StreamExecutionStatus.SUCCESS
+        provider.get_last_status("STUDY_EXPORT", expected_stream) == StreamExecutionStatus.SUCCESS
     )
-    assert provider.get_last_timestamp("STUDY_EXPORT", "json_export_records") == datetime(
+    assert provider.get_last_timestamp("STUDY_EXPORT", expected_stream) == datetime(
         2026, 9, 10, 15, 0, 0, tzinfo=timezone.utc
     )
 
@@ -728,7 +730,7 @@ def test_50_form_export_runtime_comms_orm_sql_budgets_and_legacy_migration(
     )
     assert str(dag_run.state) == "success"
     seen_rt_msgs = json.loads(comms_report.read_text(encoding="utf-8"))
-    assert seen_rt_msgs == ["GetVariable", "PutVariable", "PutVariable"]
+    assert seen_rt_msgs == ["GetVariable", "PutVariable", "GetVariable", "PutVariable"]
     rt_state = provider_rt.read_state()
     assert len(rt_state.studies["STUDY_50_RT"].streams) == 50
     assert provider_rt.get_last_timestamp("STUDY_50_RT", "sql_F50") == datetime(
@@ -902,3 +904,347 @@ def test_50_form_export_runtime_comms_orm_sql_budgets_and_legacy_migration(
     finally:
         event.remove(settings.engine, "before_cursor_execute", _on_before_cursor)
         event.remove(settings.Session, "after_commit", _on_after_commit)
+
+
+def test_airflow_orm_and_runtime_optimistic_cas_and_wildcard_delete_isolation(
+    airflow_runtime_env: Path,
+    tmp_path: Path,
+) -> None:
+    """Concurrent transactions enforce CAS/lease_token + monotonic watermarks and delete_entry isolates STUDY_1."""
+    import threading
+    import time
+
+    from airflow.models.variable import Variable as ModelVariable
+
+    from imednet_workflows.state_ledger import (
+        AirflowStateProvider,
+        InvalidStateTransitionError,
+        StreamExecutionStatus,
+    )
+
+    provider = AirflowStateProvider(variable_prefix="imednet_cas_test")
+    t_initial = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    t_older = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
+    t_newer = datetime(2026, 9, 15, 16, 30, tzinfo=timezone.utc)
+
+    provider.set_last_timestamp("STUDY_CAS", "records", t_initial, records_processed=5)
+
+    # 1. Two concurrent ORM transaction callers on one (study_key, stream_name):
+    # exactly one wins and one raises InvalidStateTransitionError; watermark never regresses.
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def _worker(proposed_ts: datetime) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            with provider.transaction("STUDY_CAS", "records") as tx:
+                time.sleep(0.05)
+                tx["new_timestamp"] = proposed_ts
+                tx["records_processed"] = 11
+            with lock:
+                outcomes.append("committed")
+        except InvalidStateTransitionError as exc:
+            with lock:
+                errors.append(exc)
+
+    t_a = threading.Thread(target=_worker, args=(t_older,))
+    t_b = threading.Thread(target=_worker, args=(t_newer,))
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=10.0)
+    t_b.join(timeout=10.0)
+
+    assert outcomes == ["committed"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], InvalidStateTransitionError)
+    final_ts = provider.get_last_timestamp("STUDY_CAS", "records")
+    assert final_ts is not None and final_ts >= t_initial
+    assert provider.get_last_status("STUDY_CAS", "records") == StreamExecutionStatus.SUCCESS
+
+    # Explicitly verify monotonic clamp on older timestamp in ORM transaction
+    with provider.transaction("STUDY_CAS", "records") as tx_monotonic:
+        tx_monotonic["new_timestamp"] = t_older
+    assert provider.get_last_timestamp("STUDY_CAS", "records") == final_ts
+
+    # Two concurrent ORM transactions on distinct streams of the same Study both succeed via CAS retry
+    sibling_barrier = threading.Barrier(2)
+    sibling_ok: list[str] = []
+
+    def _sibling_worker(s_name: str) -> None:
+        sibling_barrier.wait(timeout=5.0)
+        with provider.transaction("STUDY_CAS", s_name) as tx:
+            time.sleep(0.02)
+            tx["new_timestamp"] = t_newer
+            tx["records_processed"] = 3
+        with lock:
+            sibling_ok.append(s_name)
+
+    s_a = threading.Thread(target=_sibling_worker, args=("form_dm",))
+    s_b = threading.Thread(target=_sibling_worker, args=("form_ae",))
+    s_a.start()
+    s_b.start()
+    s_a.join(timeout=10.0)
+    s_b.join(timeout=10.0)
+    assert sorted(sibling_ok) == ["form_ae", "form_dm"]
+    assert provider.get_last_timestamp("STUDY_CAS", "form_dm") == t_newer
+    assert provider.get_last_timestamp("STUDY_CAS", "form_ae") == t_newer
+
+    # 2. Wildcard delete isolation outside RuntimeTaskInstance (ORM)
+    provider.set_last_timestamp("STUDY_1", "records", t_initial)
+    provider.set_last_timestamp("STUDYA1", "records", t_initial)
+    provider.set_last_timestamp("STUDY%1", "records", t_initial)
+    ModelVariable.set(
+        "imednet_cas_test:STUDY%1:raw_leg",
+        {
+            "study_key": "STUDY%1",
+            "stream_name": "raw_leg",
+            "last_timestamp": t_initial.isoformat(),
+            "status": "success",
+        },
+        serialize_json=True,
+    )
+    assert provider.delete_entry("STUDY_1") is True
+    assert provider.get_last_timestamp("STUDY_1", "records") is None
+    assert provider.get_last_timestamp("STUDYA1", "records") == t_initial
+    assert provider.get_last_timestamp("STUDY%1", "records") == t_initial
+    assert ModelVariable.get("imednet_cas_test:STUDY%1:raw_leg", default_var=None) is not None
+
+    # 3. Inside RuntimeTaskInstance: lease_token verification, monotonic watermark, and STUDY_1 delete isolation
+    rt_report = tmp_path / "rt_cas_and_delete.json"
+    dag_file = airflow_runtime_env / "dag_rt_cas_and_delete.py"
+    provider.set_last_timestamp("STUDY_1", "records", t_initial)
+
+    dag_file.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            from datetime import datetime, timezone
+            from pathlib import Path
+            from airflow.sdk import DAG, Variable as SdkVariable, task
+            from imednet_workflows.state_ledger import (
+                AirflowStateProvider,
+                InvalidStateTransitionError,
+            )
+
+            with DAG("dag_rt_cas_and_delete", start_date=datetime(2026, 1, 1, tzinfo=timezone.utc)) as dag:
+                @task
+                def verify_runtime_cas_and_delete() -> None:
+                    prov = AirflowStateProvider(variable_prefix="imednet_cas_test")
+                    t_old = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+                    t_hi = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
+
+                    with prov.transaction("STUDY_RT_CAS", "records") as tx1:
+                        var_key = prov._get_study_variable_key("STUDY_RT_CAS")
+                        persisted = SdkVariable.get(var_key, deserialize_json=True)
+                        lease_tok = persisted["streams"]["records"].get("lease_token")
+                        assert isinstance(lease_tok, str) and len(lease_tok) >= 16
+                        conflict_raised = False
+                        try:
+                            with prov.transaction("STUDY_RT_CAS", "records"):
+                                pass
+                        except InvalidStateTransitionError:
+                            conflict_raised = True
+                        assert conflict_raised is True
+                        tx1["new_timestamp"] = t_hi
+
+                    # Attempt to regress watermark to t_old inside RuntimeTaskInstance
+                    with prov.transaction("STUDY_RT_CAS", "records") as tx2:
+                        tx2["new_timestamp"] = t_old
+
+                    deleted_s1 = prov.delete_entry("STUDY_1")
+                    Path({str(rt_report)!r}).write_text(
+                        json.dumps(
+                            {{
+                                "rt_ts": prov.get_last_timestamp("STUDY_RT_CAS", "records").isoformat(),
+                                "deleted_s1": deleted_s1,
+                                "s1_ts": prov.get_last_timestamp("STUDY_1", "records"),
+                                "studya1_ts": prov.get_last_timestamp("STUDYA1", "records").isoformat(),
+                                "study_pct_ts": prov.get_last_timestamp("STUDY%1", "records").isoformat(),
+                            }}
+                        ),
+                        encoding="utf-8",
+                    )
+
+                verify_runtime_cas_and_delete()
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    dag_run = _load_dag_from_file(dag_file, "dag").test(
+        logical_date=datetime(2026, 9, 21, tzinfo=timezone.utc)
+    )
+    assert str(dag_run.state) == "success"
+    report = json.loads(rt_report.read_text(encoding="utf-8"))
+    assert report["rt_ts"] == "2026-09-20T12:00:00+00:00"
+    assert report["deleted_s1"] is True
+    assert report["s1_ts"] is None
+    assert report["studya1_ts"] == t_initial.isoformat()
+    assert report["study_pct_ts"] == t_initial.isoformat()
+
+    # 4. ORM transaction and batch_transaction failure rollback + SDTM lineage CAS
+    with (
+        pytest.raises(RuntimeError, match="orm_tx_boom"),
+        provider.transaction("STUDY_ORM_ROLLBACK", "dm") as tx_fail,
+    ):
+        tx_fail["records_processed"] = 3
+        raise RuntimeError("orm_tx_boom")
+    assert provider.get_last_status("STUDY_ORM_ROLLBACK", "dm") == StreamExecutionStatus.FAILED
+
+    with (
+        pytest.raises(RuntimeError, match="orm_batch_boom"),
+        provider.batch_transaction("STUDY_ORM_ROLLBACK", ["ae", "vs"]) as btx_fail,
+    ):
+        btx_fail["ae"]["records_processed"] = 2
+        raise RuntimeError("orm_batch_boom")
+    assert provider.get_last_status("STUDY_ORM_ROLLBACK", "ae") == StreamExecutionStatus.FAILED
+    assert provider.get_last_status("STUDY_ORM_ROLLBACK", "vs") == StreamExecutionStatus.FAILED
+
+    provider.record_sdtm_lineage(
+        "STUDY_ORM_ROLLBACK",
+        "dm",
+        lineage_updates={"R1": {"domain": "DM", "seq": 1}},
+        seq_watermarks={"S01": 1},
+    )
+    lin = provider.get_sdtm_lineage("STUDY_ORM_ROLLBACK", "dm")
+    assert lin["sdtm_seq_watermarks"] == {"S01": 1}
+
+
+def test_mapped_expand_kwargs_export_operator_preserves_older_records_across_targets(
+    airflow_runtime_env: Path,
+    tmp_path: Path,
+) -> None:
+    """Mapped .partial().expand_kwargs() exports all older Records across distinct target tables."""
+    import duckdb
+
+    duck_file = tmp_path / "mapped_forms.duckdb"
+    dag_file = airflow_runtime_env / "dag_mapped_multi_target.py"
+
+    dag_file.write_text(
+        textwrap.dedent(
+            f"""
+            from datetime import datetime, timezone
+            import httpx
+            from airflow.sdk import DAG
+            from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
+            from imednet import ImednetSDK
+
+            class MockMappedExportOperator(ImednetExportOperator):
+                def _get_sdk(self) -> ImednetSDK:
+                    def handler(request: httpx.Request) -> httpx.Response:
+                        if request.url.path.endswith("/variables"):
+                            return httpx.Response(
+                                200,
+                                json={{
+                                    "data": [
+                                        {{
+                                            "studyKey": "STUDY_MAPPED",
+                                            "variableId": 1,
+                                            "variableName": "VAL",
+                                            "variableType": "text",
+                                            "label": "Val",
+                                            "formId": 10,
+                                            "formKey": "DM",
+                                            "formName": "Demographics",
+                                        }},
+                                        {{
+                                            "studyKey": "STUDY_MAPPED",
+                                            "variableId": 2,
+                                            "variableName": "AE_TERM",
+                                            "variableType": "text",
+                                            "label": "AE Term",
+                                            "formId": 20,
+                                            "formKey": "AE",
+                                            "formName": "Adverse Events",
+                                        }},
+                                    ],
+                                    "pagination": {{"totalPages": 1}},
+                                }},
+                            )
+                        if request.url.path.endswith("/records"):
+                            flt = request.url.params.get("filter", "")
+                            all_recs = [
+                                {{
+                                    "studyKey": "STUDY_MAPPED",
+                                    "recordId": 1,
+                                    "subjectId": 1,
+                                    "subjectKey": "S1",
+                                    "formId": 10,
+                                    "formKey": "DM",
+                                    "dateCreated": "2026-09-10 10:00:00",
+                                    "dateModified": "2026-09-10 15:00:00",
+                                    "recordData": {{"VAL": "dm_new"}},
+                                }},
+                                {{
+                                    "studyKey": "STUDY_MAPPED",
+                                    "recordId": 2,
+                                    "subjectId": 1,
+                                    "subjectKey": "S1",
+                                    "formId": 20,
+                                    "formKey": "AE",
+                                    "dateCreated": "2026-07-01 08:00:00",
+                                    "dateModified": "2026-07-01 09:00:00",
+                                    "recordData": {{"AE_TERM": "headache_old"}},
+                                }},
+                            ]
+                            matched = []
+                            for r in all_recs:
+                                if "formKey==DM" in flt and r["formKey"] != "DM":
+                                    continue
+                                if "formKey==AE" in flt and r["formKey"] != "AE":
+                                    continue
+                                if "dateModified>=2026-09-10" in flt and r["dateModified"] < "2026-09-10":
+                                    continue
+                                matched.append(r)
+                            return httpx.Response(
+                                200,
+                                json={{"data": matched, "pagination": {{"totalPages": 1}}}},
+                            )
+                        return httpx.Response(200, json={{"data": [], "pagination": {{"totalPages": 1}}}})
+
+                    return ImednetSDK(
+                        api_key="k",
+                        security_key="s",
+                        base_url="https://edc.trn.imednetapi.com",
+                        transport=httpx.MockTransport(handler),
+                    )
+
+            with DAG("dag_mapped_multi_target", start_date=datetime(2026, 1, 1, tzinfo=timezone.utc)) as dag:
+                MockMappedExportOperator.partial(
+                    task_id="export_form_subset",
+                    study_key="STUDY_MAPPED",
+                    destination="duckdb",
+                    output_path={str(duck_file)!r},
+                    idempotent=True,
+                    incremental=True,
+                    quality_gate_enabled=False,
+                    mask_phi=False,
+                ).expand_kwargs(
+                    [
+                        {{
+                            "record_filter": {{"form_key": "DM"}},
+                            "export_kwargs": {{"table_name": "dm_records"}},
+                        }},
+                        {{
+                            "record_filter": {{"form_key": "AE"}},
+                            "export_kwargs": {{"table_name": "ae_records"}},
+                        }},
+                    ]
+                )
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    dag_run = _load_dag_from_file(dag_file, "dag").test(
+        logical_date=datetime(2026, 9, 12, tzinfo=timezone.utc)
+    )
+    assert str(dag_run.state) == "success"
+
+    with duckdb.connect(str(duck_file), read_only=True) as con:
+        dm_rows = con.execute("SELECT COUNT(*) FROM dm_records").fetchone()
+        ae_rows = con.execute("SELECT COUNT(*) FROM ae_records").fetchone()
+    assert dm_rows is not None and dm_rows[0] == 1
+    assert ae_rows is not None and ae_rows[0] == 1

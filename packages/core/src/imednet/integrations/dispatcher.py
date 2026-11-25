@@ -121,7 +121,7 @@ def export(
         target: The target destination type (e.g., 'csv', 'snowflake', 'mongodb').
         sdk: Authenticated SDK instance used to fetch study records.
         study_key: Study identifier to export.
-        config: Optional sink configuration (for sink-based targets).
+        config: Optional sink configuration (forwarded to both tabular and sink targets).
         **kwargs: Target-specific configuration parameters.
 
     Returns:
@@ -134,6 +134,8 @@ def export(
     # 1. Try tabular path
     tabular_func = _registry.get_tabular(target)
     if tabular_func is not None:
+        if config is not None:
+            return tabular_func(sdk, study_key, config=config, **kwargs)
         return tabular_func(sdk, study_key, **kwargs)
 
     # 2. Try sink path

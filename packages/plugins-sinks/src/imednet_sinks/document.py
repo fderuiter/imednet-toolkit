@@ -76,7 +76,9 @@ Usage
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
@@ -100,12 +102,12 @@ from imednet.spi.sinks import (
     commit_sdtm_lineage,
     extract_record_id,
     extract_sdtm_composite_key,
-    is_incremental_sink_config,
     normalize_sink_value,
     rehydrate_sdtm_lineage,
     require_optional_dep,
     resolve_voided_sdtm_keys,
     run_streaming_export,
+    should_preserve_sdtm_record_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,6 +140,19 @@ class MongoDbSinkConfig(SinkConfig):
 def _make_document_id(study_key: str, record_id: Any) -> str:
     """Return the composite ``_id`` for a MongoDB record document."""
     return f"{study_key}/{record_id}"
+
+
+def _make_non_idempotent_id() -> Any:
+    """Return a unique ``_id`` for append-only MongoDB writes (``ObjectId`` or UUID string)."""
+    try:
+        import bson
+
+        object_id_cls = getattr(bson, "ObjectId", None)
+        if callable(object_id_cls):
+            return object_id_cls()
+    except ImportError:
+        pass
+    return str(uuid.uuid4())
 
 
 def _encode_bson_scalars(value: Any) -> Any:
@@ -226,6 +241,13 @@ def _dedupe_sdtm_mongo_docs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     index_by_key: dict[tuple[Any, ...], int] = {}
     ordered: list[dict[str, Any] | None] = []
     for doc in docs:
+        if "_id" in doc and "RECORD_ID" in doc and doc.get("RECORD_ID") is not None:
+            comp_id: tuple[Any, ...] = ("_id", doc["_id"])
+            if comp_id in index_by_key:
+                ordered[index_by_key[comp_id]] = None
+            index_by_key[comp_id] = len(ordered)
+            ordered.append(doc)
+            continue
         comp = extract_sdtm_composite_key(doc)
         if comp is None or (comp[1] != "DM" and comp[4] is None):
             ordered.append(doc)
@@ -318,6 +340,11 @@ class MongoDbExportSink(ExportSink):
             db = self._client[self._database]
             self._collection = db[self._collection_name]
         except Exception as exc:
+            if self._client is not None:
+                with contextlib.suppress(Exception):
+                    self._client.close()
+                self._client = None
+            self._collection = None
             raise ExportConfigurationError(
                 f"Cannot connect to MongoDB at {redacted}. Driver error type: {type(exc).__name__}"
             ) from exc
@@ -348,7 +375,7 @@ class MongoDbExportSink(ExportSink):
             bool(doc_cfg.as_sdtm),
             doc_cfg.sdtm_domain,
             doc_cfg.naming_convention,
-            is_incremental_sink_config(doc_cfg),
+            should_preserve_sdtm_record_id(doc_cfg),
             id(extra.get("study_config")),
             id(extra.get("enrichment_pipeline")),
         )
@@ -407,11 +434,18 @@ class MongoDbExportSink(ExportSink):
                             _attach_sdtm_document_id(doc, src_rec, self._study_key)
                             for src_rec, doc in pairs
                         ]
-                        mapped_docs = _dedupe_sdtm_mongo_docs(raw_docs)
+                        mapped_docs = (
+                            _dedupe_sdtm_mongo_docs(raw_docs)
+                            if self.config.idempotent
+                            else raw_docs
+                        )
                     else:
                         mapped_docs = [
                             _record_to_document(r, self._study_key, mapper=mapper) for r in records
                         ]
+                    if not self.config.idempotent:
+                        for doc in mapped_docs:
+                            doc["_id"] = _make_non_idempotent_id()
                 except ExportConfigurationError:
                     raise
                 except Exception:

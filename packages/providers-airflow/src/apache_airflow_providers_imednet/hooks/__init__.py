@@ -480,6 +480,18 @@ class ImednetHook(BaseHook):
                 resolved["table_name"] = table_name
             return resolved
 
+        if dest == "hive_parquet":
+            resolved = {}
+            base_dir = (
+                cls._string_or_none(extras.get("base_dir"))
+                or cls._string_or_none(extras.get("path"))
+                or cls._string_or_none(getattr(conn, "host", None))
+                or cls._string_or_none(getattr(conn, "schema", None))
+            )
+            if base_dir:
+                resolved["base_dir"] = base_dir
+            return resolved
+
         return {}
 
     @classmethod

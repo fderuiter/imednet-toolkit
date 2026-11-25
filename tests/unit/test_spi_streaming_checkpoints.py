@@ -389,6 +389,35 @@ def test_spi_discovers_pluggable_state_providers(
         get_state_provider(provider_name="default")
 
 
+def test_spi_get_state_provider_honors_ledger_path_under_airflow_and_default_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sink_base.get_state_provider resolves FileStateProvider whenever ledger_path is set."""
+    custom_ledger = tmp_path / "explicit_override_ledger.json"
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "export_study_task")
+    monkeypatch.setenv("USE_AIRFLOW_STATE_PROVIDER", "1")
+
+    for prov_name in (None, "default", "airflow", "file"):
+        resolved = get_state_provider(ledger_path=custom_ledger, provider_name=prov_name)
+        assert isinstance(resolved, FileStateProvider)
+        assert Path(resolved.ledger_path) == custom_ledger
+
+    # Fallback when a custom entry-point registry only exposes 'default' without 'file'
+    class _StubEP:
+        name = "default"
+
+        @staticmethod
+        def load() -> Any:
+            from imednet_workflows.state_ledger import get_state_provider as wf_factory
+
+            return wf_factory
+
+    monkeypatch.setattr("importlib.metadata.entry_points", lambda **_kwargs: [_StubEP()])
+    fallback_resolved = get_state_provider(ledger_path=custom_ledger, provider_name="airflow")
+    assert isinstance(fallback_resolved, FileStateProvider)
+    assert Path(fallback_resolved.ledger_path) == custom_ledger
+
+
 def test_incremental_checkpoint_lifecycle_and_flush_ordering(tmp_path: Path) -> None:
     """Checkpoints pass dateModified>=watermark and commit ONLY after sink.flush() succeeds."""
     ledger_path = tmp_path / "state.json"

@@ -14,13 +14,12 @@ from ...utils.enrollment import (
 )
 from ..decorators import with_sdk
 from ..utils import print_error, register_list_command, simulation_mode_context
+from ..utils._write_batch import prepare_write_cli_preflight, run_cli_batch_write
 from ..utils.args import add_study_key_args
 from ..utils.context import is_offline_schema_dry_run
 from ..utils.write_helpers import (
     add_write_common_args,
     assemble_cli_write_records,
-    prepare_write_cli_preflight,
-    run_cli_batch_write,
 )
 
 

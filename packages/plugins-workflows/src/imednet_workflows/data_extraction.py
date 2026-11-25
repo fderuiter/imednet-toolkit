@@ -1,67 +1,22 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
 from collections.abc import Callable
-from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.models import Record, RecordRevision
 from imednet.spi.sink_base import is_record_deleted
-from imednet.spi.utils import normalize_utc_timestamp_bound
+from imednet.spi.utils import (
+    matches_revision_date_bound,
+    matches_revision_date_bounds,
+    parse_revision_timestamp_utc,
+    split_revision_date_bounds,
+)
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
 
-
-def _parse_date_created_utc(raw: Any) -> datetime | None:
-    """Parse a revision timestamp or date into a UTC-aware datetime."""
-    if raw is None:
-        return None
-    if isinstance(raw, datetime):
-        return raw.replace(tzinfo=UTC) if raw.tzinfo is None else raw.astimezone(UTC)
-    if isinstance(raw, date):
-        return datetime(raw.year, raw.month, raw.day, tzinfo=UTC)
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return None
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError:
-            return None
-        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
-    return None
-
-
-def _matches_local_date_bound(rev_dt: datetime | None, op: str, bound_val: Any) -> bool:
-    """Evaluate a local dateCreated comparison operator against a parsed UTC timestamp."""
-    if rev_dt is None:
-        return False
-    if isinstance(bound_val, datetime):
-        bound_dt = _parse_date_created_utc(bound_val)
-    elif isinstance(bound_val, (str, date)):
-        bound_str = bound_val if isinstance(bound_val, str) else bound_val.isoformat()
-        try:
-            norm_str = normalize_utc_timestamp_bound(bound_str, is_end=op in ("<=", "<"))
-            bound_dt = _parse_date_created_utc(norm_str)
-        except ValueError:
-            bound_dt = _parse_date_created_utc(bound_val)
-    else:
-        bound_dt = None
-    if bound_dt is None:
-        return False
-    if op in ("==", "="):
-        return rev_dt == bound_dt
-    if op in ("!=", "<>"):
-        return rev_dt != bound_dt
-    if op == "<":
-        return rev_dt < bound_dt
-    if op == "<=":
-        return rev_dt <= bound_dt
-    if op == ">":
-        return rev_dt > bound_dt
-    if op == ">=":
-        return rev_dt >= bound_dt
-    raise ValueError(f"Unsupported dateCreated filter operator: {op!r}")
+_parse_date_created_utc = parse_revision_timestamp_utc
+_matches_local_date_bound = matches_revision_date_bound
 
 
 class DataExtractionWorkflow:
@@ -196,55 +151,21 @@ class DataExtractionWorkflow:
         final_filter_dict: dict[str, Any] = dict(user_filter) if user_filter else {}
         final_filter_dict.update(filters)
 
-        local_date_bounds: list[tuple[str, Any]] = []
-        has_existing_tuple_list = any(
-            isinstance(final_filter_dict.get(k), list)
-            and any(isinstance(item, tuple) for item in final_filter_dict[k])
-            for k in ("date_created", "dateCreated")
-            if k in final_filter_dict
+        upstream_filters, local_date_bounds = split_revision_date_bounds(
+            final_filter_dict,
+            start_date=start_date,
+            end_date=end_date,
         )
-        if start_date is not None or end_date is not None or has_existing_tuple_list:
-            date_bounds: list[tuple[str, Any]] = []
-            for key_variant in ("date_created", "dateCreated"):
-                if key_variant in final_filter_dict:
-                    existing = final_filter_dict.pop(key_variant)
-                    if isinstance(existing, list):
-                        for item in existing:
-                            date_bounds.append(item if isinstance(item, tuple) else ("==", item))
-                    elif isinstance(existing, tuple):
-                        date_bounds.append(existing)
-                    else:
-                        date_bounds.append(("==", existing))
-
-            if start_date is not None:
-                start_utc = normalize_utc_timestamp_bound(start_date, is_end=False)
-                date_bounds.append((">=", start_utc))
-            if end_date is not None:
-                end_utc = normalize_utc_timestamp_bound(end_date, is_end=True)
-                date_bounds.append(("<=", end_utc))
-
-            if date_bounds:
-                final_filter_dict["dateCreated"] = date_bounds[0]
-                local_date_bounds = date_bounds[1:]
 
         revisions = list(
             self._sdk.get_record_revisions(
                 study_key,
-                **final_filter_dict,
+                **upstream_filters,
             )
         )
         if local_date_bounds:
             revisions = [
-                rev
-                for rev in revisions
-                if all(
-                    _matches_local_date_bound(
-                        _parse_date_created_utc(getattr(rev, "date_created", None)),
-                        op,
-                        bound_val,
-                    )
-                    for op, bound_val in local_date_bounds
-                )
+                rev for rev in revisions if matches_revision_date_bounds(rev, local_date_bounds)
             ]
         return revisions
 

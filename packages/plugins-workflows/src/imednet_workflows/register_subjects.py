@@ -66,7 +66,7 @@ class RegisterSubjectsWorkflow:
 
     def __init__(
         self,
-        sdk: "FacadeLike",
+        sdk: FacadeLike,
         *,
         batch_size: int = DEFAULT_BATCH_CHUNK_SIZE,
         filter_enrolled: bool = False,

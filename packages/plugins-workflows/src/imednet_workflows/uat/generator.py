@@ -54,6 +54,8 @@ _CALC_TYPES = frozenset({"calculation", "calc", "calculated"})
 _DATE_TYPES = frozenset(
     {
         "date",
+        "partialdate",
+        "incompletedate",
         "date ymd",
         "date mdy",
         "date dmy",
@@ -63,7 +65,15 @@ _DATE_TYPES = frozenset(
     }
 )
 _DATETIME_TYPES = frozenset(
-    {"datetime", "date/time", "date time", "durationdatetime", "intervaldatetime"}
+    {
+        "datetime",
+        "partialdatetime",
+        "incompletedatetime",
+        "date/time",
+        "date time",
+        "durationdatetime",
+        "intervaldatetime",
+    }
 )
 _SKIP_EMPTY_TYPES = frozenset(
     {"signature", "file", "upload", "fileupload", "file upload", "descriptive", "label"}
@@ -115,9 +125,9 @@ class SyntheticRecordGenerator:
             locale: Ignored.
             data_dictionary: Optional DataDictionary used to enrich variable choices and bounds.
         """
+        _ = locale
         self._rng = random.Random(seed)  # noqa: S311
-        self._seed = seed
-        self._locale = locale
+        self._seeded = seed is not None
         self._data_dictionary = data_dictionary
 
     def _lexify(self, text: str) -> str:
@@ -159,7 +169,13 @@ class SyntheticRecordGenerator:
                 continue
             constraints = extract_variable_constraints(dd_var)
             updates: dict[str, Any] = {}
-            dd_type = getattr(dd_var, "variable_type", getattr(dd_var, "variableType", None))
+            dd_extra = getattr(dd_var, "extraAttributes", None)
+            raw_odm_dt = dd_extra.get("odmDataType") if isinstance(dd_extra, dict) else None
+            dd_type = (
+                raw_odm_dt.strip()
+                if isinstance(raw_odm_dt, str) and raw_odm_dt.strip()
+                else getattr(dd_var, "variable_type", getattr(dd_var, "variableType", None))
+            )
             snap_norm = _normalize_var_type(v.variable_type)
             dd_norm = _normalize_var_type(dd_type)
             if dd_type and (
@@ -173,6 +189,20 @@ class SyntheticRecordGenerator:
                     )
                 )
                 or (snap_norm == "text" and dd_norm != "text")
+                or (
+                    snap_norm in {"date", "datetime", "time"}
+                    and dd_norm
+                    in {
+                        "partialdate",
+                        "incompletedate",
+                        "partialdatetime",
+                        "incompletedatetime",
+                        "durationdatetime",
+                        "intervaldatetime",
+                        "partialtime",
+                        "incompletetime",
+                    }
+                )
             ):
                 updates["variable_type"] = dd_type
             if not v.coded_values and constraints.choices:
@@ -381,7 +411,9 @@ class SyntheticRecordGenerator:
                 count = self._rng.randint(1, min(3, len(var_spec.coded_values)))
                 choices = self._rng.sample(var_spec.coded_values, count)
                 return "`".join(choices)
-            return True if var_spec.required else ""
+            if not var_spec.required:
+                return ""
+            return "1" if v_norm in {"multi select", "multiselect"} else True
 
         if v_norm in _BOOL_TYPES:
             return self._rng.choice([True, False])
@@ -412,6 +444,8 @@ class SyntheticRecordGenerator:
         if v_norm in _FLOAT_TYPES:
             if var_spec.coded_values:
                 chosen_f = self._rng.choice(var_spec.coded_values)
+                if isinstance(chosen_f, str) and chosen_f.strip().lstrip("+-").isdigit():
+                    return int(chosen_f.strip())
                 try:
                     return float(chosen_f)
                 except (TypeError, ValueError):
@@ -432,12 +466,15 @@ class SyntheticRecordGenerator:
         if v_norm in _DATETIME_TYPES:
             if spec.global_date_value:
                 return f"{spec.global_date_value.isoformat()}T12:00:00+00:00"
-            if self._seed is not None or spec.seed is not None:
+            if self._seeded or spec.seed is not None:
                 return f"{date.today().isoformat()}T12:00:00+00:00"
             return datetime.now(UTC).isoformat()
 
-        if v_norm == "time":
+        if v_norm in {"time", "partialtime", "incompletetime"}:
             return "12:00:00"
+
+        if v_norm == "uri":
+            return "https://example.com"
 
         if v_norm in _MEMO_TYPES:
             if var_spec.coded_values:
