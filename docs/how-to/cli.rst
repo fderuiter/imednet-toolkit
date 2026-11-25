@@ -6,8 +6,9 @@ reads authentication details from environment variables (or runs completely offl
 against synthetic ``SimulationTransport`` fixtures when ``--simulation`` or
 ``IMEDNET_SIMULATION_MODE=true`` is passed). Every Study-scoped command across core,
 ``datadict from-api``, ``export``, ``workflows``, and ``tui`` accepts either a
-positional ``STUDY`` argument or ``-s`` / ``--study-key STUDY`` (passing conflicting
-values exits with status code ``2``). See :doc:`/reference/configuration` for the full
+positional ``STUDY`` argument or ``-s`` / ``--study-key STUDY`` (falling back to
+``IMEDNET_STUDY_KEY`` when omitted, while passing conflicting explicit values exits
+with status code ``2``). See :doc:`/reference/configuration` for the full
 list of environment variables and details on using an ``.env`` file.
 
 .. argparse::
@@ -156,10 +157,14 @@ issuing HTTP requests, whereas ``--dry-run`` without ``--schema`` loads the live
 
 Legacy ``records list -o/--output`` accepts ``json``, ``csv``, or an explicit ``.json`` /
 ``.csv`` destination path (preserving ``./records.json`` and ``./records.csv`` for
-``-o json`` and ``-o csv``), flattens ``recordData`` variables, masks ``Subject`` PHI to
-``***MASKED***`` by default (``--mask-phi``; opt out with ``--no-mask-phi``), and emits a
-``stderr`` deprecation warning (prefer ``--format json`` for stdout or ``imednet export``
-for file exports); combining ``-o/--output`` with ``--format json`` is an error. Existing ``export``
+``-o json`` and ``-o csv``), flattens ``recordData`` variables, and emits a ``stderr``
+deprecation warning (prefer ``--format json`` for stdout or ``imednet export`` for file
+exports); combining ``-o/--output`` with ``--format json`` is an error. Across
+``records list --format json``, ``InteractiveDataGrid`` side inspection panels (including
+pages loaded via ``a``), and ``-o/--output``, ``records list`` masks default clinical PHI
+and committed ``StudyConfiguration`` ``phiFields`` to ``***MASKED***`` by default
+(``--mask-phi``; opt out with ``--no-mask-phi``), matching ``workflows extract-records``
+and ``imednet export``. Existing ``export``
 commands (which also accept ``--no-interactive`` to suppress live spinners) and ``datadict`` JSON/schema/diff outputs
 (see :doc:`/how-to/data_dictionary`) retain their own contracts. This is not a global JSON wrapper for arbitrary third-party plugins.
 See :doc:`/adr/0007-cli-framework-and-output-contracts` for the framework decision,
@@ -254,8 +259,13 @@ arguments using ``=`` or the standard iMednet comparison operators (``<``, ``<=`
 ``>``, ``>=``, ``==``, ``!=``) with exclusive ``;`` (AND) or ``,`` (OR) connectors.
 Filter attribute names (in ``snake_case`` or ``camelCase``) and scalar values are
 validated locally against each endpoint's documented filter allowlist and resource
-model before sending HTTP requests: string identifiers preserve leading zeros,
-double-quoted strings (including empty ``""``), and non-ASCII text (such as
+model before sending HTTP requests (for ``intervals list``, where the upstream REST
+endpoint omits a server ``filter`` parameter, validated ``--filter`` clauses are
+evaluated client-side before ``--limit`` truncation without forwarding ``filter``
+upstream, while unsupported pattern operators such as ``=@``, ``=^``, ``=$``, ``!@``,
+``!^``, and ``!$`` exit ``1`` with guidance toward ``records list --record-data-filter``
+``=~``): string identifiers preserve leading zeros,
+double-quoted strings (including empty ``""``, ``"@..."``, ``"^..."``, and ``"$..."``), and non-ASCII text (such as
 ``subject_key=001``, ``code=0042``, ``reason==""``, or ``value=²``), while integer
 and boolean attributes reject invalid values on ``stderr`` with exit code ``1``. Commands that take a positional
 ``study_key`` reject redundant ``study_key`` / ``studyKey`` attributes in

@@ -24,6 +24,7 @@ _ISO_8601_TIMESTAMP_REGEX = re.compile(
 ORDERED_FILTER_OPERATORS: tuple[str, ...] = ("<=", ">=", "!=", "==", "=~", "<", ">")
 ALLOWED_OPERATORS = frozenset({"<", "<=", ">", ">=", "==", "!="})
 RECORD_DATA_OPERATORS = frozenset(ORDERED_FILTER_OPERATORS)
+_UNSUPPORTED_PATTERN_OPERATORS: tuple[str, ...] = ("=@", "=^", "=$", "!@", "!^", "!$")
 _OPERATOR_CHARS = frozenset("<>=!~")
 
 T = TypeVar("T")
@@ -132,6 +133,12 @@ def _parse_clause_operator(clause: str) -> tuple[str, str, str] | None:
     op_end = op_start
     while op_end < len(prefix) and prefix[op_end] in _OPERATOR_CHARS:
         op_end += 1
+    if (
+        clause[op_start:op_end] in ("=", "!")
+        and op_end < len(prefix)
+        and prefix[op_end] in ("@", "^", "$")
+    ):
+        op_end += 1
 
     attr = clause[:op_start]
     op = clause[op_start:op_end]
@@ -156,6 +163,17 @@ def extract_filter_attributes(filter_str: str) -> list[str]:
     return attributes
 
 
+def _unsupported_pattern_operator_message(operator: str) -> str:
+    """Format Common API operator guidance for unsupported substring/anchor operators."""
+    return (
+        f"Unsupported filter operator '{operator}'. "
+        "The iMednet Common API supports '<', '<=', '>', '>=', '==', and '!=' "
+        'for --filter (quote literal prefixes such as key=="^value" or key=="@value"), '
+        "and '=~' via 'records list --record-data-filter' for pattern matching on "
+        "Record Variable values."
+    )
+
+
 def validate_filter_operator(operator: str, *, allow_regex: bool = False) -> None:
     """Validate that an operator matches allowed tokens and contains no whitespace.
 
@@ -170,6 +188,8 @@ def validate_filter_operator(operator: str, *, allow_regex: bool = False) -> Non
         raise ValueError("Filter operator must be a non-empty string")
     if any(c.isspace() for c in operator):
         raise ValueError(f"Filter operator '{operator}' cannot contain whitespace")
+    if operator in _UNSUPPORTED_PATTERN_OPERATORS:
+        raise ValueError(_unsupported_pattern_operator_message(operator))
     allowed = RECORD_DATA_OPERATORS if allow_regex else ALLOWED_OPERATORS
     if operator not in allowed:
         raise ValueError(
@@ -347,7 +367,11 @@ def validate_filter_key(
 
 
 _VALID_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
-_CANDIDATE_OPERATORS: tuple[str, ...] = (*ORDERED_FILTER_OPERATORS, "=")
+_CANDIDATE_OPERATORS: tuple[str, ...] = (
+    *ORDERED_FILTER_OPERATORS,
+    *_UNSUPPORTED_PATTERN_OPERATORS,
+    "=",
+)
 
 
 def _split_outside_quotes(expr: str, separator: str) -> list[str]:
@@ -545,6 +569,11 @@ def _parse_single_clause(
     op_idx, matched_op = found
     raw_key = clause[:op_idx]
     raw_value = clause[op_idx + len(matched_op) :]
+    if matched_op in _UNSUPPORTED_PATTERN_OPERATORS and raw_key and raw_key.strip():
+        raise ValueError(
+            f"Invalid filter format: '{raw_arg}'. "
+            f"{_unsupported_pattern_operator_message(matched_op)}"
+        )
     if not raw_key or not raw_key.strip() or not raw_value or not raw_value.strip():
         raise ValueError(
             f"Invalid filter format: '{raw_arg}'. "
@@ -786,6 +815,8 @@ def _validate_filter_expression(filter_str: str, *, allow_regex: bool) -> None:
         if parsed is None:
             continue
         attr, op, _ = parsed
+        if op in _UNSUPPORTED_PATTERN_OPERATORS:
+            raise ValueError(_unsupported_pattern_operator_message(op))
         if op not in allowed:
             raise ValueError(
                 f"Invalid filter operator '{op}'. Allowed operators: {sorted(allowed)}"

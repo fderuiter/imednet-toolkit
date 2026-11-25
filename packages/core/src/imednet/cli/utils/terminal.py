@@ -6,12 +6,12 @@ import os
 import sys
 from typing import Any
 
+from imednet.utils.validators import parse_bool
+
 NON_INTERACTIVE_ENV = "IMEDNET_NON_INTERACTIVE"
 OUTPUT_FORMAT_ENV = "IMEDNET_CLI_OUTPUT_FORMAT"
 SIMULATION_MODE_ENV = "IMEDNET_SIMULATION_MODE"
 NO_COLOR_ENV = "NO_COLOR"
-
-_TRUTHY_NON_INTERACTIVE = frozenset({"1", "true", "yes"})
 
 
 def is_tty(stream: Any) -> bool:
@@ -29,7 +29,7 @@ def is_dumb_terminal() -> bool:
 
 def is_non_interactive() -> bool:
     """Return True when non-interactive CLI mode has been requested."""
-    return os.environ.get(NON_INTERACTIVE_ENV, "").strip().lower() in _TRUTHY_NON_INTERACTIVE
+    return parse_bool(os.environ.get(NON_INTERACTIVE_ENV), strict=False)
 
 
 def is_json_output_mode() -> bool:

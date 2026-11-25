@@ -2238,11 +2238,21 @@ def test_study_scoped_list_commands_reject_study_key_in_filter(
     getattr(sdk, attr).list.assert_not_called()
 
 
-def test_intervals_list_omits_filter_flag(runner: CliRunner, sdk: MagicMock) -> None:
-    """Intervals list omits --filter/-f per Table 1 in the upstream Common spec."""
-    result = runner.invoke(cli.app, ["intervals", "list", "STUDY", "-f", "intervalId==1"])
-    assert result.exit_code == 2
-    sdk.intervals.list.assert_not_called()
+def test_intervals_list_evaluates_filter_client_side(runner: CliRunner, sdk: MagicMock) -> None:
+    """Intervals list evaluates --filter/-f client-side without passing filter upstream."""
+    from imednet.models.intervals import Interval
+
+    sdk.intervals.list.return_value = [
+        Interval(interval_id=1, interval_name="Baseline", study_key="STUDY"),
+        Interval(interval_id=2, interval_name="Follow-Up", study_key="STUDY"),
+    ]
+    result = runner.invoke(
+        cli.app, ["intervals", "list", "STUDY", "-f", "intervalId==1", "--format", "json"]
+    )
+    assert result.exit_code == 0
+    sdk.intervals.list.assert_called_once_with("STUDY")
+    assert '"intervalId": 1' in result.stdout
+    assert '"intervalId": 2' not in result.stdout
 
 
 def test_get_model_value_and_cli_utils_export() -> None:
@@ -2330,35 +2340,20 @@ def test_codings_subjects_users_delegate_to_register_list_command() -> None:
         assert help_map["list"] == expected_help
 
 
-def test_preflight_query_order_across_codings_subjects_and_users(
+def test_preflight_query_order_across_codings_subjects_intervals_and_users(
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """codings and subjects validate queries before get_sdk, while users initializes get_sdk first."""
+    """codings, subjects, intervals, and users all validate queries before get_sdk."""
     from imednet import cli
 
-    for preflight_subcmd in ("codings", "subjects"):
+    for preflight_subcmd in ("codings", "subjects", "intervals", "users"):
         not_called = MagicMock(side_effect=AssertionError("get_sdk called during preflight"))
         monkeypatch.setattr("imednet.cli.utils.context.get_sdk", not_called)
         res = runner.invoke(cli.app, [preflight_subcmd, "list", "STUDY", "--limit", "0"])
         assert res.exit_code == 1
         assert "--limit must be a positive integer" in res.stderr
         not_called.assert_not_called()
-
-    events: list[str] = []
-    mock_sdk = MagicMock()
-    mock_sdk.close.side_effect = lambda: events.append("sdk_close")
-
-    def _recording_get_sdk() -> MagicMock:
-        events.append("get_sdk")
-        return mock_sdk
-
-    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", _recording_get_sdk)
-    users_res = runner.invoke(cli.app, ["users", "list", "STUDY", "--limit", "0"])
-    assert users_res.exit_code == 1
-    assert "--limit must be a positive integer" in users_res.stderr
-    assert events == ["get_sdk", "sdk_close"]
-    mock_sdk.users.list.assert_not_called()
 
 
 def test_register_list_command_hooks_no_study_and_subparser_reuse(

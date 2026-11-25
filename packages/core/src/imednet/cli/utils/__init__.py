@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .._read_guards import is_cli_phi_key_sensitive, sanitize_cli_phi, sanitize_cli_records
 from .args import (
     STUDY_KEY_ARG,
     UniqueStoreAction,
@@ -20,7 +21,7 @@ from .args import (
     resolve_study_key,
 )
 from .commands import get_model_value, register_list_command
-from .context import fetching_status, get_sdk, simulation_mode_context
+from .context import bootstrap_cli_dotenv, fetching_status, get_sdk, simulation_mode_context
 from .output import (
     _HC_STATUS_COLOR_MAP,
     _STATUS_COLOR_MAP,
@@ -74,6 +75,7 @@ __all__ = [
     "add_output_format",
     "add_simulation_arg",
     "add_study_key_args",
+    "bootstrap_cli_dotenv",
     "clear_line",
     "console",
     "display_list",
@@ -82,6 +84,7 @@ __all__ = [
     "format_job_progress",
     "get_model_value",
     "get_sdk",
+    "is_cli_phi_key_sensitive",
     "is_dumb_terminal",
     "is_interactive_terminal",
     "is_json_output_mode",
@@ -100,6 +103,8 @@ __all__ = [
     "resolve_output_format",
     "resolve_study_key",
     "run_interactive_grid",
+    "sanitize_cli_phi",
+    "sanitize_cli_records",
     "simulation_mode_context",
     "supports_ansi_color",
     "supports_fullscreen_ui",

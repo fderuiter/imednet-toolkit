@@ -10,18 +10,28 @@ from contextlib import contextmanager
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar
 
+from imednet.core.context import _safe_context_attr, sdk_governance_context
 from imednet.errors import (
     ApiError,
     AuthenticationError,
     AuthorizationError,
+    CircuitBreakerError,
     ForbiddenError,
     NotFoundError,
     PathTraversalValidationError,
     RateLimitError,
+    RequestError,
     UnauthorizedError,
 )
-from imednet.utils.security import sanitize_diagnostic_text
 from imednet.utils.url import validate_path_segment
+from imednet.utils.validators import parse_bool
+
+from ._read_guards import (
+    _collapse_single_line,
+    format_cli_diagnostic_error,
+    redact_cli_secrets,
+    resolve_cli_phi_registry,
+)
 
 if TYPE_CHECKING:
     from ..sdk import ImednetSDK
@@ -29,22 +39,16 @@ if TYPE_CHECKING:
 P = ParamSpec("P")
 R = TypeVar("R")
 
-
-def redact_cli_secrets(msg: str) -> str:
-    """Redact environment secrets, credentials, and inline clinical PHI from CLI messages."""
-    redacted = msg
-    for env_var in ("IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_OIDC_TOKEN"):
-        val = os.environ.get(env_var)
-        if val:
-            if val in redacted:
-                redacted = redacted.replace(val, "********")
-            stripped = val.strip()
-            if stripped and stripped in redacted:
-                redacted = redacted.replace(stripped, "********")
-    return sanitize_diagnostic_text(redacted)
-
-
 _redact_secrets = redact_cli_secrets
+
+__all__ = [
+    "_redact_secrets",
+    "cli_execution_guard",
+    "format_cli_diagnostic_error",
+    "redact_cli_secrets",
+    "validate_cli_path_segment",
+    "with_sdk",
+]
 
 
 @contextmanager
@@ -112,6 +116,21 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
                 schema_source=raw_schema_src if isinstance(raw_schema_src, str) else None,
             )
 
+        raw_study_arg = bound.arguments.get("study_key")
+        if raw_study_arg is None:
+            for arg_val in bound.arguments.values():
+                cand_sk = _safe_context_attr(arg_val, "study_key") or _safe_context_attr(
+                    arg_val, "study"
+                )
+                if isinstance(cand_sk, str) and cand_sk.strip():
+                    raw_study_arg = cand_sk
+                    break
+        active_study_key = (
+            raw_study_arg.strip()
+            if isinstance(raw_study_arg, str) and raw_study_arg.strip()
+            else None
+        )
+
         mod_get_sdk = func.__globals__.get("get_sdk")
         with _context_mod.offline_dry_run_context(is_offline_dry_run):
             if (
@@ -121,42 +140,72 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
                 sdk = mod_get_sdk()
             else:
                 sdk = _context_mod.get_sdk()
+        cfg = _safe_context_attr(sdk, "config")
+        is_simulation = (_safe_context_attr(cfg, "simulation_mode") is True) or parse_bool(
+            os.environ.get("IMEDNET_SIMULATION_MODE"), strict=False
+        )
         try:
-            return func(sdk, *args, **kwargs)
-        except SystemExit:
-            raise
-        except PathTraversalValidationError as exc:
-            msg = _redact_secrets(str(exc))
-            print_error(f"Error: {msg}")
-            sys.exit(1)
-        except (AuthenticationError, UnauthorizedError) as exc:
-            msg = _redact_secrets(str(exc))
-            print_error(f"Authentication Failed: {msg}")
-            sys.exit(1)
-        except (AuthorizationError, ForbiddenError) as exc:
-            msg = _redact_secrets(str(exc))
-            print_error(f"Permission Denied: {msg}")
-            sys.exit(1)
-        except RateLimitError as exc:
-            msg = _redact_secrets(str(exc))
-            print_error(f"Rate Limit Exceeded: {msg}")
-            sys.exit(1)
-        except NotFoundError as exc:
-            msg = _redact_secrets(str(exc))
-            print_error(f"Not Found: {msg}")
-            sys.exit(1)
-        except ApiError as exc:
-            msg = _redact_secrets(str(exc))
-            print_error(f"API Error: {msg}")
-            sys.exit(1)
-        except KeyboardInterrupt:
-            clear_line()
-            print_error("\nAborted by user.")
-            sys.exit(130)
-        except Exception as exc:  # pragma: no cover - defensive
-            msg = _redact_secrets(str(exc))
-            print_error(f"Unexpected error: {msg}")
-            sys.exit(1)
+            with sdk_governance_context(sdk):
+                try:
+                    return func(sdk, *args, **kwargs)
+                except SystemExit:
+                    raise
+                except PathTraversalValidationError as exc:
+                    reg = resolve_cli_phi_registry(active_study_key)
+                    msg = redact_cli_secrets(_collapse_single_line(str(exc)), registry=reg)
+                    print_error(f"Error: {msg}")
+                    sys.exit(1)
+                except (AuthenticationError, UnauthorizedError) as exc:
+                    msg = format_cli_diagnostic_error(
+                        exc, simulation=is_simulation, study_key=active_study_key
+                    )
+                    print_error(f"Authentication Failed: {msg}")
+                    sys.exit(1)
+                except (AuthorizationError, ForbiddenError) as exc:
+                    msg = format_cli_diagnostic_error(
+                        exc, simulation=is_simulation, study_key=active_study_key
+                    )
+                    print_error(f"Permission Denied: {msg}")
+                    sys.exit(1)
+                except RateLimitError as exc:
+                    msg = format_cli_diagnostic_error(
+                        exc, simulation=is_simulation, study_key=active_study_key
+                    )
+                    print_error(f"Rate Limit Exceeded: {msg}")
+                    sys.exit(1)
+                except NotFoundError as exc:
+                    msg = format_cli_diagnostic_error(
+                        exc, simulation=is_simulation, study_key=active_study_key
+                    )
+                    print_error(f"Not Found: {msg}")
+                    sys.exit(1)
+                except ApiError as exc:
+                    msg = format_cli_diagnostic_error(
+                        exc, simulation=is_simulation, study_key=active_study_key
+                    )
+                    print_error(f"API Error: {msg}")
+                    sys.exit(1)
+                except CircuitBreakerError as exc:
+                    msg = format_cli_diagnostic_error(
+                        exc, simulation=is_simulation, study_key=active_study_key
+                    )
+                    print_error(f"Circuit Breaker Open: {msg}")
+                    sys.exit(1)
+                except RequestError as exc:
+                    msg = format_cli_diagnostic_error(
+                        exc, simulation=is_simulation, study_key=active_study_key
+                    )
+                    print_error(f"Network Error: {msg}")
+                    sys.exit(1)
+                except KeyboardInterrupt:
+                    clear_line()
+                    print_error("\nAborted by user.")
+                    sys.exit(130)
+                except Exception as exc:  # pragma: no cover - defensive
+                    reg = resolve_cli_phi_registry(active_study_key)
+                    msg = redact_cli_secrets(_collapse_single_line(str(exc)), registry=reg)
+                    print_error(f"Unexpected error: {msg}")
+                    sys.exit(1)
         finally:
             close = getattr(sdk, "close", None)
             if callable(close):

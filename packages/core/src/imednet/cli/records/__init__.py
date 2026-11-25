@@ -24,7 +24,11 @@ from ..utils.args import (
     resolve_output_format,
     resolve_study_key,
 )
-from ..utils.export import export_list_to_file, resolve_records_export_target
+from ..utils.export import (
+    export_list_to_file,
+    resolve_records_export_target,
+    sanitize_cli_records,
+)
 from ..utils.write_helpers import (
     add_write_common_args,
     assemble_cli_write_records,
@@ -189,7 +193,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             )
 
         if resolved_format == "json":
-            display_list(records, "records", output_format="json")
+            sanitized_records = sanitize_cli_records(
+                records,
+                study_key=study_key,
+                mask_phi=mask_phi,
+                sdk=sdk,
+            )
+            display_list(sanitized_records, "records", output_format="json")
         elif output:
             export_list_to_file(
                 records,
@@ -199,17 +209,29 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 mask_phi=mask_phi,
             )
         else:
-            view_models = [_record_view_model(r) for r in records]
+            sanitized_records = sanitize_cli_records(
+                records,
+                study_key=study_key,
+                mask_phi=mask_phi,
+                sdk=sdk,
+            )
+            view_models = [_record_view_model(r) for r in sanitized_records]
 
             def _load_more_records() -> tuple[list[dict[str, Any]], list[Any]]:
                 more = load_remaining() if load_remaining is not None else []
-                return [_record_view_model(r) for r in more], more
+                sanitized_more = sanitize_cli_records(
+                    more,
+                    study_key=study_key,
+                    mask_phi=mask_phi,
+                    sdk=sdk,
+                )
+                return [_record_view_model(r) for r in sanitized_more], sanitized_more
 
             display_list(
                 view_models,
                 "records",
                 "No records found.",
-                details=records,
+                details=sanitized_records,
                 truncated=truncated,
                 interactive=False if no_interactive else None,
                 output_format=resolved_format,

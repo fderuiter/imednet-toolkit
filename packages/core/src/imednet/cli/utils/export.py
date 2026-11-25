@@ -18,9 +18,23 @@ from imednet.utils import sanitize_csv_formula
 from imednet.utils.security import global_sensitivity_registry, mask_clinical_phi
 from imednet.utils.serialization import flatten
 
+from .._read_guards import (
+    is_cli_phi_key_sensitive,
+    sanitize_cli_phi,
+    sanitize_cli_records,
+)
 from .output import print_error
 
 _MASKED_VALUE = "***MASKED***"
+
+__all__ = [
+    "Model",
+    "export_list_to_file",
+    "is_cli_phi_key_sensitive",
+    "resolve_records_export_target",
+    "sanitize_cli_phi",
+    "sanitize_cli_records",
+]
 
 
 class Model(Protocol):

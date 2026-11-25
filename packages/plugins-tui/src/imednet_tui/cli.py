@@ -12,6 +12,7 @@ from imednet.spi.cli import (
     add_no_interactive,
     add_simulation_arg,
     add_study_key_args,
+    bootstrap_cli_dotenv,
     is_non_interactive,
     print_error,
     resolve_study_key,
@@ -99,6 +100,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         run_tui(sdk, **run_kwargs)
 
     def run_tui_command(args: argparse.Namespace | None = None) -> None:
+        dotenv_added_keys = bootstrap_cli_dotenv()
         old_high_contrast = os.environ.get("IMEDNET_HIGH_CONTRAST")
         try:
             resolved_study: str | None = None
@@ -136,5 +138,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 os.environ["IMEDNET_HIGH_CONTRAST"] = old_high_contrast
             else:
                 os.environ.pop("IMEDNET_HIGH_CONTRAST", None)
+            for key in dotenv_added_keys:
+                os.environ.pop(key, None)
 
     tui_parser.set_defaults(func=run_tui_command)

@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
+from imednet.utils.validators import parse_bool
+
 from .terminal import is_json_output_mode, supports_ansi_color, supports_live_status
 
 if TYPE_CHECKING:
@@ -686,7 +688,7 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
     print(_colorize(header_str, "bold_magenta"))
     print("-" * _display_width(header_str))
 
-    is_hc = os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
+    is_hc = parse_bool(os.environ.get("IMEDNET_HIGH_CONTRAST"), strict=False)
 
     for row in rows:
         colored_row = []

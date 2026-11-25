@@ -426,8 +426,104 @@ def compile_record_predicate(
     )
 
 
+def _lookup_model_attribute(item: Any, field: str) -> tuple[bool, Any]:
+    """Resolve a top-level or dotted attribute across Pydantic models and mappings."""
+    if isinstance(item, Mapping):
+        return _lookup_mapping_value(item, field)
+    if isinstance(item, Record):
+        return _lookup_record_attribute(item, field)
+
+    for candidate in _name_variants(field):
+        val = getattr(item, candidate, _MISSING)
+        if val is not _MISSING:
+            return True, val
+
+    if "." in field:
+        segments = field.split(".")
+        current: Any = item
+        for seg in segments:
+            if isinstance(current, Mapping):
+                found_seg, current = _lookup_mapping_value(current, seg)
+                if not found_seg:
+                    return False, None
+                continue
+            matched = False
+            for candidate in _name_variants(seg):
+                val = getattr(current, candidate, _MISSING)
+                if val is not _MISSING:
+                    current = val
+                    matched = True
+                    break
+            if not matched:
+                return False, None
+        return True, current
+
+    extra = getattr(item, "__pydantic_extra__", None)
+    if isinstance(extra, Mapping):
+        return _lookup_mapping_value(extra, field)
+    return False, None
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledModelPredicate:
+    """Compiled client-side filter predicate for general SDK models and mappings."""
+
+    groups: tuple[tuple[str, tuple[_CompiledClause, ...]], ...] = ()
+    always_empty: bool = False
+
+    def matches(self, item: Any) -> bool:
+        """Return True when *item* satisfies all compiled filter groups."""
+        if self.always_empty:
+            return False
+        return all(
+            _evaluate_group(connector, clauses, lambda f: _lookup_model_attribute(item, f))
+            for connector, clauses in self.groups
+        )
+
+
+def compile_model_predicate(
+    extra_filters: Mapping[str, Any] | None = None,
+) -> CompiledModelPredicate:
+    """Compile parsed filter kwargs (from ``parse_filter_expressions``) for client-side evaluation."""
+    working_filters: dict[str, Any] = dict(extra_filters) if extra_filters else {}
+    for ignored in _IGNORED_PASSTHROUGH_KEYS:
+        working_filters.pop(ignored, None)
+    if not working_filters:
+        return CompiledModelPredicate()
+
+    raw_filter = working_filters.pop("filter", None)
+    if any(isinstance(val, list) and len(val) == 0 for val in working_filters.values()):
+        return CompiledModelPredicate(always_empty=True)
+
+    built_filter = build_filter_string(working_filters) if working_filters else None
+    combined_raw: str | None = None
+    if raw_filter is not None:
+        validate_filter_syntax(raw_filter)
+        stripped_raw = raw_filter.strip()
+        if stripped_raw and stripped_raw.lower() != "none":
+            combined_raw = stripped_raw
+
+    if built_filter:
+        if combined_raw:
+            merged = f"{combined_raw};{built_filter}"
+            validate_filter_syntax(merged)
+            combined_raw = merged
+        else:
+            combined_raw = built_filter
+
+    groups: list[tuple[str, tuple[_CompiledClause, ...]]] = []
+    if combined_raw:
+        conn, clauses = _compile_clause_group(combined_raw, allow_regex=False)
+        if clauses:
+            groups.append((conn, clauses))
+
+    return CompiledModelPredicate(groups=tuple(groups))
+
+
 __all__ = [
     "RECORDS_FILTER_ATTRIBUTES",
+    "CompiledModelPredicate",
     "CompiledRecordPredicate",
+    "compile_model_predicate",
     "compile_record_predicate",
 ]
