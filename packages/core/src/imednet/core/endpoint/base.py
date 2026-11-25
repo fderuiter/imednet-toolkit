@@ -6,7 +6,7 @@ import builtins
 from collections.abc import Callable, Iterable
 from typing import Any, TypeVar
 
-from imednet.constants import DEFAULT_PAGE_SIZE, LARGE_PAGE_SIZE
+from imednet.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from imednet.core.context import strict_mode_context
 from imednet.core.endpoint.abc import EndpointABC
 from imednet.core.endpoint.dispatch import (
@@ -294,9 +294,11 @@ class _ListEndpointBase(GenericEndpoint[T]):
             from imednet.core.paginator import _parse_int_param
 
             raw_size = _parse_int_param("size", params["size"])
-            if raw_size <= 0:
-                raise ValueError(f"size must be a positive integer, got {raw_size}")
-            params["size"] = min(raw_size, LARGE_PAGE_SIZE)
+            if raw_size < 1 or raw_size > MAX_PAGE_SIZE:
+                raise ValueError(
+                    f"Pagination 'size' must be between 1 and {MAX_PAGE_SIZE}, got {raw_size}."
+                )
+            params["size"] = raw_size
 
         record_data_filter = params.get("recordDataFilter")
         if record_data_filter is None:

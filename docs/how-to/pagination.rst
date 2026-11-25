@@ -11,7 +11,8 @@ Cursor model
 - :attr:`Paginator.page_size <imednet.pagination.Paginator.page_size>` exposes the active page size (default: ``100``).
 - :attr:`Paginator.cursor <imednet.pagination.Paginator.cursor>` is ``None`` before iteration starts, then exposes the next
   page cursor while iterating, and returns to ``None`` once exhausted.
-- The SDK does not enforce a maximum page size value; API-side limits still apply.
+- The SDK enforces ``1 <= size <= 500`` (:data:`~imednet.constants.MAX_PAGE_SIZE`), raising :class:`ValueError` for
+  out-of-range ``size`` values while supporting multi-page ``limit`` values above ``500``.
 
 Iteration and memory behavior
 -----------------------------

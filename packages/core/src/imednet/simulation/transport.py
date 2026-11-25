@@ -12,8 +12,17 @@ from typing import Any
 
 import httpx
 
+from imednet.constants import MAX_PAGE_SIZE
+from imednet.endpoints.registry import ENDPOINT_REGISTRY
 from imednet.simulation.state import SimulationState, get_default_simulation_state
-from imednet.utils.filters import ORDERED_FILTER_OPERATORS, _snake_to_camel, validate_filter_key
+from imednet.utils.filters import (
+    ORDERED_FILTER_OPERATORS,
+    _snake_to_camel,
+    extract_filter_attributes,
+    validate_filter_key,
+    validate_filter_syntax,
+    validate_record_filter,
+)
 
 _ISO_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}|\b|$)")
 _TWO_CHAR_OPS = frozenset(op for op in ORDERED_FILTER_OPERATORS if len(op) == 2)
@@ -166,28 +175,6 @@ def _split_filter_clauses(filter_str: str, *, attribute: str) -> tuple[str, list
                 tokens.append("".join(buf))
                 buf = []
                 idx += 1
-                continue
-            if (
-                ch.isspace()
-                and idx + 4 < length
-                and filter_str[idx + 1 : idx + 4].lower() == "and"
-                and filter_str[idx + 4].isspace()
-            ):
-                has_and = True
-                tokens.append("".join(buf))
-                buf = []
-                idx += 5
-                continue
-            if (
-                ch.isspace()
-                and idx + 3 < length
-                and filter_str[idx + 1 : idx + 3].lower() == "or"
-                and filter_str[idx + 3].isspace()
-            ):
-                has_or = True
-                tokens.append("".join(buf))
-                buf = []
-                idx += 4
                 continue
 
         buf.append(ch)
@@ -495,6 +482,21 @@ def _apply_sort(
     return result
 
 
+_STUDY_SUBROUTES: dict[str, tuple[str, Any]] | None = None
+
+
+def _get_study_subroutes() -> dict[str, tuple[str, Any]]:
+    """Return cached ``{cls.PATH: (endpoint_key, endpoint_cls)}`` for Study sub-routes."""
+    global _STUDY_SUBROUTES
+    if _STUDY_SUBROUTES is None:
+        _STUDY_SUBROUTES = {
+            str(cls.PATH): (key, cls)
+            for key, cls in ENDPOINT_REGISTRY.items()
+            if getattr(cls, "PATH", "")
+        }
+    return _STUDY_SUBROUTES
+
+
 class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
     """In-memory HTTP transport implementing offline clinical REST simulation."""
 
@@ -512,8 +514,40 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         await request.aread()
         return self._dispatch(request)
 
+    def _get_study_resource_items(
+        self, endpoint_key: str, study_key: str, params: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        """Return raw Study-scoped fixture dictionaries for a backed list endpoint."""
+        if endpoint_key == "sites":
+            return self.state.get_sites(study_key)
+        if endpoint_key == "subjects":
+            return self.state.get_subjects(study_key)
+        if endpoint_key == "forms":
+            return self.state.get_forms(study_key)
+        if endpoint_key == "visits":
+            return self.state.get_visits(study_key)
+        if endpoint_key == "records":
+            return self.state.get_records(study_key)
+        if endpoint_key == "record_revisions":
+            return self.state.get_record_revisions(study_key)
+        if endpoint_key == "codings":
+            return self.state.get_codings(study_key)
+        if endpoint_key == "queries":
+            return self.state.get_queries(study_key)
+        if endpoint_key == "intervals":
+            return self.state.get_intervals(study_key)
+        if endpoint_key == "variables":
+            return self.state.get_variables(study_key)
+        if endpoint_key == "users":
+            items = self.state.get_users(study_key)
+            include_inactive = params.get("includeInactive", "false").strip().lower() == "true"
+            if not include_inactive:
+                items = [u for u in items if u.get("userActiveInStudy", True) is not False]
+            return items
+        return []
+
     def _dispatch(self, request: httpx.Request) -> httpx.Response:
-        """Dispatch HTTP request to in-memory fixtures."""
+        """Dispatch HTTP request to in-memory fixtures backed by ``ENDPOINT_REGISTRY``."""
         method = request.method.upper()
         raw_path = request.url.path
         raw_segments = [urllib.parse.unquote(s) for s in raw_path.strip("/").split("/") if s]
@@ -527,126 +561,76 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
 
         params = dict(request.url.params)
 
-        # Route matching
-        # 1. Studies: /studies
+        # 1. Studies: GET /studies
         if segments == ["studies"]:
+            studies_cls = ENDPOINT_REGISTRY["studies"]
+            if method != "GET" or not hasattr(studies_cls, "list"):
+                return self._not_found_response(request, f"Route {method} {raw_path} not found")
             items = self.state.get_studies()
-            return self._filter_and_paginate(request, items, params)
+            return self._filter_and_paginate(request, items, params, endpoint_key="studies")
 
-        # 2. Study-level resources: /studies/{study_key}/...
+        # 2. Study-level resources: /studies/{study_key}/{resource}[/{item_id}]
         if len(segments) >= 2 and segments[0] == "studies":
             study_key = segments[1]
-            resource = segments[2] if len(segments) >= 3 else None
-            sub_id = segments[3] if len(segments) >= 4 else None
+            if len(segments) == 2:
+                if not self.state.has_study(study_key):
+                    return self._not_found_response(request, f"Study '{study_key}' not found")
+                return self._not_found_response(request, f"Route {method} {raw_path} not found")
 
-            if resource is None:
-                # Single study lookup
-                items = [s for s in self.state.get_studies() if s.get("studyKey") == study_key]
-                if not items:
-                    return httpx.Response(
-                        404, json={"detail": f"Study {study_key} not found"}, request=request
-                    )
-                return httpx.Response(200, json=items[0], request=request)
+            resource = segments[2]
+            subroute = _get_study_subroutes().get(resource)
+            if subroute is None:
+                return self._not_found_response(request, f"Route {method} {raw_path} not found")
 
-            if resource == "sites":
-                items = self.state.get_sites(study_key)
-                return self._filter_and_paginate(request, items, params)
+            if not self.state.has_study(study_key):
+                return self._not_found_response(request, f"Study '{study_key}' not found")
 
-            if resource == "subjects":
-                items = self.state.get_subjects(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "forms":
-                items = self.state.get_forms(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "visits":
-                items = self.state.get_visits(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "records":
-                if method == "POST":
-                    records_data = []
-                    if request.content:
-                        try:
-                            parsed = json.loads(request.content)
-                            if isinstance(parsed, list):
-                                records_data = parsed
-                            elif isinstance(parsed, dict):
-                                records_data = [parsed]
-                        except Exception:
-                            records_data = []
-                    job_res = self.state.create_records(study_key, records_data)
-                    return httpx.Response(
-                        202,
-                        json=job_res,
-                        headers={"content-type": "application/json"},
-                        request=request,
-                    )
-
-                items = self.state.get_records(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "recordRevisions":
-                items = self.state.get_record_revisions(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "codings":
-                items = self.state.get_codings(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "queries":
-                items = self.state.get_queries(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "jobs":
-                if sub_id is not None:
-                    sub_action = segments[4] if len(segments) >= 5 else None
-                    if sub_action == "results":
-                        job_results = self.state.get_job_results(study_key, sub_id)
-                        if job_results is None:
-                            return self._not_found_response(request, f"Job {sub_id} not found")
-                        return httpx.Response(200, json=job_results, request=request)
-                    job_status = self.state.get_job(study_key, sub_id)
-                    if job_status is None:
-                        return self._not_found_response(request, f"Job {sub_id} not found")
-                    return httpx.Response(200, json=job_status, request=request)
-                # List jobs: JobsEndpoint uses JsonListPaginator which expects a raw JSON list
-                items = self.state.get_jobs(study_key)
-                return httpx.Response(200, json=items, request=request)
-
-            if resource == "intervals":
-                items = self.state.get_intervals(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "variables":
-                items = self.state.get_variables(study_key)
-                return self._filter_and_paginate(request, items, params)
-
-            if resource == "users":
-                items = self.state.get_users(study_key)
-                include_inactive = params.get("includeInactive", "false").strip().lower() == "true"
-                if not include_inactive:
-                    items = [u for u in items if u.get("userActiveInStudy", True) is not False]
-                return self._filter_and_paginate(request, items, params)
-
-        # 3. Direct /jobs/{batch_id} path
-        if len(segments) >= 1 and segments[0] == "jobs":
-            if len(segments) == 1:
-                return httpx.Response(200, json=self.state.get_jobs(None), request=request)
-            batch_id = segments[1]
-            if len(segments) >= 3 and segments[2] == "results":
-                job_results = self.state.get_job_results(None, batch_id)
-                if job_results is None:
+            endpoint_key, endpoint_cls = subroute
+            if not hasattr(endpoint_cls, "list"):
+                if method != "GET" or len(segments) != 4 or not hasattr(endpoint_cls, "get"):
+                    return self._not_found_response(request, f"Route {method} {raw_path} not found")
+                batch_id = segments[3]
+                job_status = self.state.get_job(study_key, batch_id)
+                if job_status is None:
                     return self._not_found_response(request, f"Job {batch_id} not found")
-                return httpx.Response(200, json=job_results, request=request)
-            job_status = self.state.get_job(None, batch_id)
-            if job_status is None:
-                return self._not_found_response(request, f"Job {batch_id} not found")
-            return httpx.Response(200, json=job_status, request=request)
+                return httpx.Response(
+                    200,
+                    json=job_status,
+                    headers={"content-type": "application/json"},
+                    request=request,
+                )
 
-        # Fallback for unrecognized endpoints: return empty paginated response
-        return self._filter_and_paginate(request, [], params)
+            if len(segments) != 3:
+                return self._not_found_response(request, f"Route {method} {raw_path} not found")
+
+            if method == "POST":
+                if not hasattr(endpoint_cls, "create"):
+                    return self._not_found_response(request, f"Route {method} {raw_path} not found")
+                records_data: list[Any] = []
+                if request.content:
+                    try:
+                        parsed = json.loads(request.content)
+                        if isinstance(parsed, list):
+                            records_data = parsed
+                        elif isinstance(parsed, dict):
+                            records_data = [parsed]
+                    except Exception:
+                        records_data = []
+                job_res = self.state.create_records(study_key, records_data)
+                return httpx.Response(
+                    202,
+                    json=job_res,
+                    headers={"content-type": "application/json"},
+                    request=request,
+                )
+
+            if method != "GET":
+                return self._not_found_response(request, f"Route {method} {raw_path} not found")
+
+            items = self._get_study_resource_items(endpoint_key, study_key, params)
+            return self._filter_and_paginate(request, items, params, endpoint_key=endpoint_key)
+
+        return self._not_found_response(request, f"Route {method} {raw_path} not found")
 
     def _error_response(
         self,
@@ -699,32 +683,81 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         )
 
     def _filter_and_paginate(
-        self, request: httpx.Request, items: list[dict[str, Any]], params: dict[str, str]
+        self,
+        request: httpx.Request,
+        items: list[dict[str, Any]],
+        params: dict[str, str],
+        *,
+        endpoint_key: str,
     ) -> httpx.Response:
-        """Apply filter, recordDataFilter, and sort parameters, then paginate."""
+        """Validate and apply filter, recordDataFilter, sort, and pagination parameters."""
+        endpoint_cls = ENDPOINT_REGISTRY[endpoint_key]
+        allowed_attrs: frozenset[str] = getattr(endpoint_cls, "FILTER_ATTRIBUTES", frozenset())
         try:
-            filter_str = params.get("filter")
-            if filter_str:
-                connector, clauses = _split_filter_clauses(filter_str, attribute="filter")
-                if clauses:
-                    items = [item for item in items if _matches_clauses(item, connector, clauses)]
-
-            rec_filter_str = params.get("recordDataFilter")
-            project_none_record_data = False
-            if rec_filter_str is not None and rec_filter_str.strip():
-                if rec_filter_str.strip().lower() == "none":
-                    project_none_record_data = True
-                else:
-                    rec_conn, rec_clauses = _split_filter_clauses(
-                        rec_filter_str, attribute="recordDataFilter"
+            if "filter" in params:
+                filter_str = params["filter"]
+                if not allowed_attrs:
+                    raise _FilterParseError(
+                        f"Unsupported filter parameter for {endpoint_cls.__name__}: "
+                        "filter is not supported.",
+                        attribute="filter",
+                        value=filter_str,
                     )
-                    if rec_clauses:
+                try:
+                    validate_filter_syntax(filter_str)
+                except ValueError as exc:
+                    raise _FilterParseError(str(exc), attribute="filter", value=filter_str) from exc
+                if filter_str.strip() and filter_str.strip().lower() != "none":
+                    for attr in extract_filter_attributes(filter_str):
+                        try:
+                            validate_filter_key(attr)
+                        except ValueError as exc:
+                            raise _FilterParseError(
+                                str(exc), attribute="filter", value=filter_str
+                            ) from exc
+                        if attr not in allowed_attrs:
+                            allowed_str = ", ".join(sorted(allowed_attrs))
+                            raise _FilterParseError(
+                                f"Unsupported filter attribute '{attr}' for {endpoint_cls.__name__}. "
+                                f"Allowed filter attributes: {allowed_str}.",
+                                attribute="filter",
+                                value=filter_str,
+                            )
+                    connector, clauses = _split_filter_clauses(filter_str, attribute="filter")
+                    if clauses:
                         items = [
-                            item
-                            for item in items
-                            if isinstance(item.get("recordData"), dict)
-                            and _matches_clauses(item["recordData"], rec_conn, rec_clauses)
+                            item for item in items if _matches_clauses(item, connector, clauses)
                         ]
+
+            project_none_record_data = False
+            if "recordDataFilter" in params:
+                rec_filter_str = params["recordDataFilter"]
+                if endpoint_key != "records":
+                    raise _FilterParseError(
+                        f"Unsupported parameter 'recordDataFilter' for {endpoint_cls.__name__}.",
+                        attribute="recordDataFilter",
+                        value=rec_filter_str,
+                    )
+                try:
+                    validate_record_filter(rec_filter_str)
+                except ValueError as exc:
+                    raise _FilterParseError(
+                        str(exc), attribute="recordDataFilter", value=rec_filter_str
+                    ) from exc
+                if rec_filter_str.strip():
+                    if rec_filter_str.strip().lower() == "none":
+                        project_none_record_data = True
+                    else:
+                        rec_conn, rec_clauses = _split_filter_clauses(
+                            rec_filter_str, attribute="recordDataFilter"
+                        )
+                        if rec_clauses:
+                            items = [
+                                item
+                                for item in items
+                                if isinstance(item.get("recordData"), dict)
+                                and _matches_clauses(item["recordData"], rec_conn, rec_clauses)
+                            ]
 
             raw_sorts = list(request.url.params.get_list("sort"))
             if not raw_sorts and "sort" in params:
@@ -737,33 +770,71 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
                 items = [
                     {**item, "recordData": None} if "recordData" in item else item for item in items
                 ]
+
+            page = 0
+            if "page" in params:
+                raw_page = params["page"]
+                if not raw_page.strip():
+                    raise _FilterParseError(
+                        f"Pagination 'page' must be a non-negative integer, got {raw_page!r}.",
+                        attribute="page",
+                        value=str(raw_page),
+                    )
+                try:
+                    page = int(raw_page.strip())
+                except (ValueError, TypeError) as exc:
+                    raise _FilterParseError(
+                        f"Pagination 'page' must be a non-negative integer, got {raw_page!r}.",
+                        attribute="page",
+                        value=str(raw_page),
+                    ) from exc
+                if page < 0:
+                    raise _FilterParseError(
+                        f"Pagination 'page' must be a non-negative integer, got {page}.",
+                        attribute="page",
+                        value=str(raw_page),
+                    )
+
+            size = 25
+            if "size" in params:
+                raw_size = params["size"]
+                if not raw_size.strip():
+                    raise _FilterParseError(
+                        f"Pagination 'size' must be an integer between 1 and {MAX_PAGE_SIZE}, "
+                        f"got {raw_size!r}.",
+                        attribute="size",
+                        value=str(raw_size),
+                    )
+                try:
+                    size = int(raw_size.strip())
+                except (ValueError, TypeError) as exc:
+                    raise _FilterParseError(
+                        f"Pagination 'size' must be an integer between 1 and {MAX_PAGE_SIZE}, "
+                        f"got {raw_size!r}.",
+                        attribute="size",
+                        value=str(raw_size),
+                    ) from exc
+                if size < 1 or size > MAX_PAGE_SIZE:
+                    raise _FilterParseError(
+                        f"Pagination 'size' must be between 1 and {MAX_PAGE_SIZE}, got {size}.",
+                        attribute="size",
+                        value=str(raw_size),
+                    )
         except _FilterParseError as exc:
             return self._bad_request_response(request, exc)
 
-        return self._paginate_response(request, items, params, sort_specs=sort_specs)
+        return self._paginate_response(request, items, page=page, size=size, sort_specs=sort_specs)
 
     def _paginate_response(
         self,
         request: httpx.Request,
         items: list[dict[str, Any]],
-        params: dict[str, str],
         *,
+        page: int = 0,
+        size: int = 25,
         sort_specs: list[dict[str, str]] | None = None,
     ) -> httpx.Response:
         """Format items into standard iMedNet ApiResponse JSON envelope."""
-        try:
-            page = int(params.get("page", 0))
-        except (ValueError, TypeError):
-            page = 0
-
-        try:
-            size = int(params.get("size", 25))
-        except (ValueError, TypeError):
-            size = 25
-        if size <= 0:
-            size = 25
-        page = max(page, 0)
-
         total_elements = len(items)
         if total_elements == 0:
             total_pages = 0

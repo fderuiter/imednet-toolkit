@@ -313,3 +313,58 @@ async def test_async_to_dataframe_missing_dependency(
 
     mock_list.assert_not_called()
     assert captured["count"] == 0
+
+
+@pytest.mark.parametrize("bad_size", [0, -1, 501, 600, True, "abc"])
+def test_users_endpoint_rejects_out_of_range_or_invalid_size(dummy_client, bad_size):
+    """Test UsersEndpoint and AsyncUsersEndpoint raise ValueError on invalid size."""
+    sync_ep = users.UsersEndpoint(dummy_client)
+    with pytest.raises(ValueError, match="size"):
+        sync_ep.list(study_key="S1", size=bad_size)
+
+    async_ep = users.AsyncUsersEndpoint(dummy_client)
+    with pytest.raises(ValueError, match="size"):
+        async_ep.list(study_key="S1", size=bad_size)
+
+
+@pytest.mark.asyncio
+async def test_users_endpoint_limit_above_500_paginates_without_error():
+    """Test UsersEndpoint and AsyncUsersEndpoint paginate limit=600 across 500-item pages."""
+    pages = [
+        {"data": [{"userId": i} for i in range(500)], "pagination": {"totalPages": 2}},
+        {"data": [{"userId": i} for i in range(500, 650)], "pagination": {"totalPages": 2}},
+    ]
+    sync_calls: list[dict[str, object]] = []
+
+    class SyncStub:
+        def get(self, path, params=None):
+            sync_calls.append({"path": path, "params": dict(params or {})})
+            payload = pages[len(sync_calls) - 1]
+            return type("Resp", (), {"json": lambda self: payload})()
+
+    sync_ep = users.UsersEndpoint(SyncStub())  # type: ignore[arg-type]
+    sync_items = list(sync_ep.list(study_key="S1", limit=600))
+    assert len(sync_items) == 600
+    assert sync_calls == [
+        {
+            "path": "/api/v1/edc/studies/S1/users",
+            "params": {"includeInactive": "false", "page": 0, "size": 500},
+        },
+        {
+            "path": "/api/v1/edc/studies/S1/users",
+            "params": {"includeInactive": "false", "page": 1, "size": 500},
+        },
+    ]
+
+    async_calls: list[dict[str, object]] = []
+
+    class AsyncStub:
+        async def get(self, path, params=None):
+            async_calls.append({"path": path, "params": dict(params or {})})
+            payload = pages[len(async_calls) - 1]
+            return type("Resp", (), {"json": lambda self: payload})()
+
+    async_ep = users.AsyncUsersEndpoint(AsyncStub())  # type: ignore[arg-type]
+    async_items = [u async for u in async_ep.list(study_key="S1", limit=600)]
+    assert len(async_items) == 600
+    assert len(async_calls) == 2

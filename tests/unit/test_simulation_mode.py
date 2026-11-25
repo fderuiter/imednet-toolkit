@@ -81,12 +81,18 @@ def test_simulation_state_fixtures():
     assert len(state.queries) >= 2
     assert len(state.jobs) >= 2
     assert len(state.intervals) >= 1
-    assert len(state.variables) >= 2
+    assert len(state.variables) == 21
+    assert all("variableKey" not in var for var in state.variables)
     assert len(state.users) >= 2
 
     for user in state.users:
         assert "userName" not in user
         assert {"login", "firstName", "lastName", "userActiveInStudy", "roles"} <= set(user.keys())
+        for role in user["roles"]:
+            for ts_key in ("dateCreated", "dateModified"):
+                ts_val = role[ts_key]
+                assert isinstance(ts_val, list) and len(ts_val) == 7
+                assert all(isinstance(part, int) for part in ts_val)
     assert any(u["userActiveInStudy"] is True for u in state.users)
     assert any(u["userActiveInStudy"] is False for u in state.users)
 
@@ -241,21 +247,53 @@ def test_simulation_users_contract_fields_and_include_inactive():
         assert inactive_user.user_active_in_study is False
 
 
-def test_simulation_strict_mode_zero_additive_drift():
-    """Verify updated simulation contract routes pass IMEDNET_STRICT_MODE=true without drift."""
-    with patch.dict(os.environ, {"IMEDNET_STRICT_MODE": "true"}, clear=True):
-        sdk = ImednetSDK(simulation_mode=True)
-        assert len(list(sdk.studies.list())) == 3
-        assert len(list(sdk.sites.list(study_key="STUDY"))) >= 1
-        assert len(list(sdk.subjects.list(study_key="STUDY"))) >= 1
-        assert len(list(sdk.forms.list(study_key="STUDY"))) == 3
-        assert len(list(sdk.visits.list(study_key="STUDY"))) == 2
-        assert len(list(sdk.records.list(study_key="STUDY"))) == 3
-        assert len(list(sdk.record_revisions.list(study_key="STUDY"))) == 3
-        assert len(list(sdk.codings.list(study_key="STUDY"))) == 2
-        assert len(list(sdk.queries.list(study_key="STUDY"))) == 2
-        assert len(list(sdk.intervals.list(study_key="STUDY"))) == 1
-        assert len(list(sdk.users.list(study_key="STUDY", include_inactive=True))) == 3
+@pytest.mark.asyncio
+async def test_simulation_strict_mode_zero_additive_drift():
+    """Verify updated simulation contract routes pass strict_mode=True without drift."""
+    with patch.dict(os.environ, {}, clear=True):
+        with ImednetSDK(simulation_mode=True, strict_mode=True) as sdk:
+            assert len(list(sdk.studies.list())) == 3
+            assert len(list(sdk.sites.list(study_key="STUDY"))) >= 1
+            assert len(list(sdk.subjects.list(study_key="STUDY"))) >= 1
+            assert len(list(sdk.forms.list(study_key="STUDY"))) == 3
+            assert len(list(sdk.visits.list(study_key="STUDY"))) == 2
+            assert len(list(sdk.records.list(study_key="STUDY"))) == 3
+            assert len(list(sdk.record_revisions.list(study_key="STUDY"))) == 3
+            assert len(list(sdk.codings.list(study_key="STUDY"))) == 2
+            assert len(list(sdk.queries.list(study_key="STUDY"))) == 2
+            assert len(list(sdk.intervals.list(study_key="STUDY"))) == 1
+            assert len(list(sdk.variables.list("STUDY"))) == 21
+            assert len(list(sdk.users.list("STUDY"))) == 2
+            assert len(list(sdk.users.list(study_key="STUDY", include_inactive=True))) == 3
+            assert sdk.jobs.get("STUDY", "BATCH").batch_id == "BATCH"
+
+        async with AsyncImednetSDK(simulation_mode=True, strict_mode=True) as async_sdk:
+            assert len([s async for s in async_sdk.studies.list()]) == 3
+            assert len([s async for s in async_sdk.sites.list(study_key="STUDY")]) >= 1
+            assert len([s async for s in async_sdk.subjects.list(study_key="STUDY")]) >= 1
+            assert len([f async for f in async_sdk.forms.list(study_key="STUDY")]) == 3
+            assert len([v async for v in async_sdk.visits.list(study_key="STUDY")]) == 2
+            assert len([r async for r in async_sdk.records.list(study_key="STUDY")]) == 3
+            assert (
+                len([rev async for rev in async_sdk.record_revisions.list(study_key="STUDY")]) == 3
+            )
+            assert len([c async for c in async_sdk.codings.list(study_key="STUDY")]) == 2
+            assert len([q async for q in async_sdk.queries.list(study_key="STUDY")]) == 2
+            assert len([i async for i in async_sdk.intervals.list(study_key="STUDY")]) == 1
+            assert len([v async for v in async_sdk.variables.list("STUDY")]) == 21
+            assert len([u async for u in async_sdk.users.list("STUDY")]) == 2
+            assert (
+                len(
+                    [
+                        u
+                        async for u in async_sdk.users.list(
+                            study_key="STUDY", include_inactive=True
+                        )
+                    ]
+                )
+                == 3
+            )
+            assert (await async_sdk.jobs.get("STUDY", "BATCH")).batch_id == "BATCH"
 
 
 def test_simulation_filter_operators_quotes_and_connectors():
@@ -309,13 +347,13 @@ def test_simulation_filter_operators_quotes_and_connectors():
         ne_forms = list(sdk.forms.list(study_key="STUDY", form_id=("!=", 301)))
         assert [f.form_key for f in ne_forms] == ["F_VS", "F_AE"]
 
-        # Regex / contains operator (=~) via HTTP transport filter
+        # Regex / contains operator (=~) is rejected on filter (400) and supported on recordDataFilter
         regex_resp = client.get(
             "/api/v1/edc/studies/STUDY/codings",
             params={"filter": "dictionaryName=~^Med"},
         )
-        assert regex_resp.status_code == 200
-        assert [c["codingId"] for c in regex_resp.json()["data"]] == [1101]
+        assert regex_resp.status_code == 400
+        assert regex_resp.json()["metadata"]["error"]["code"] == "400"
 
         # OR connector (,) via list of values on PopStudyKeyStrategy endpoint
         or_codings = list(sdk.codings.list(study_key="STUDY", code=["C16576", "W001"]))
@@ -340,18 +378,31 @@ def test_simulation_filter_operators_quotes_and_connectors():
         assert [q["annotationId"] for q in q_resp.json()["data"]] == [701]
         assert "status" not in q_resp.json()["data"][0]
 
-        # Keyword 'or' connector via raw HTTP
-        or_resp = client.get(
+        # Keyword 'or' with unquoted whitespace is rejected on filter (400); comma OR succeeds
+        bad_or_resp = client.get(
             "/api/v1/edc/studies/STUDY/forms",
             params={"filter": "formKey==F_DM or formKey==F_VS"},
+        )
+        assert bad_or_resp.status_code == 400
+        assert bad_or_resp.json()["metadata"]["error"]["code"] == "400"
+
+        or_resp = client.get(
+            "/api/v1/edc/studies/STUDY/forms",
+            params={"filter": "formKey==F_DM,formKey==F_VS"},
         )
         assert or_resp.status_code == 200
         assert len(or_resp.json()["data"]) == 2
 
-        # Dotted recordData.<key> filter lookup on pinned SimulationState via SimulationTransport
-        dotted_age_resp = client.get(
+        # Dotted recordData.<key> in filter is rejected (400); recordDataFilter evaluates recordData
+        bad_dotted_filter = client.get(
             "/api/v1/edc/studies/STUDY/records",
             params={"filter": "recordData.V_AGE>40"},
+        )
+        assert bad_dotted_filter.status_code == 400
+
+        dotted_age_resp = client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"recordDataFilter": "V_AGE>40"},
         )
         assert dotted_age_resp.status_code == 200
         dotted_age_body = dotted_age_resp.json()
@@ -359,24 +410,24 @@ def test_simulation_filter_operators_quotes_and_connectors():
         assert [r["recordId"] for r in dotted_age_body["data"]] == [601]
         assert dotted_age_body["data"][0]["recordData"]["V_AGE"] == 45
 
-        # Dotted snake_case record_data.<key>, != missing-key skip, OR across dotted keys, and SDK kwargs
+        # snake_case v_weight, != missing-key skip, and OR across recordDataFilter keys
         dotted_snake_resp = client.get(
             "/api/v1/edc/studies/STUDY/records",
-            params={"filter": "record_data.V_WEIGHT>=68.5"},
+            params={"recordDataFilter": "v_weight>=68.5"},
         )
         assert dotted_snake_resp.status_code == 200
         assert [r["recordId"] for r in dotted_snake_resp.json()["data"]] == [602]
 
         dotted_ne_resp = client.get(
             "/api/v1/edc/studies/STUDY/records",
-            params={"filter": "recordData.V_AGE!=50"},
+            params={"recordDataFilter": "V_AGE!=50"},
         )
         assert dotted_ne_resp.status_code == 200
         assert [r["recordId"] for r in dotted_ne_resp.json()["data"]] == [601]
 
         dotted_or_resp = client.get(
             "/api/v1/edc/studies/STUDY/records",
-            params={"filter": "recordData.V_AGE>40,recordData.V_WEIGHT>60"},
+            params={"recordDataFilter": "V_AGE>40,V_WEIGHT>60"},
         )
         assert dotted_or_resp.status_code == 200
         assert [r["recordId"] for r in dotted_or_resp.json()["data"]] == [601, 602]
@@ -676,35 +727,53 @@ async def test_async_sdk_simulation_mode():
         )
         assert bad_resp.status_code == 400
 
-        async_dotted_resp = await aclient.get(
+        bad_dotted_async = await aclient.get(
             "/api/v1/edc/studies/STUDY/records",
             params={"filter": "recordData.V_AGE>40", "sort": "recordData.V_AGE,desc"},
+        )
+        assert bad_dotted_async.status_code == 400
+
+        async_dotted_resp = await aclient.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"recordDataFilter": "V_AGE>40", "sort": "recordData.V_AGE,desc"},
         )
         assert async_dotted_resp.status_code == 200
         assert [r["recordData"]["V_AGE"] for r in async_dotted_resp.json()["data"]] == [60, 45]
 
 
 def test_simulation_filter_sort_and_state_edge_cases():
-    """Verify state getter fallbacks, malformed syntax 400s, and type/sort edge cases."""
+    """Verify registered-study state scoping, malformed syntax 400s, and type/sort edge cases."""
     state = SimulationState()
     assert len(state.get_sites(None)) >= 3
-    assert state.get_sites("UNKNOWN-STUDY")[0]["studyKey"] == "UNKNOWN-STUDY"
+    assert state.get_sites("UNKNOWN-STUDY") == []
+    assert state.get_sites("") == []
     assert len(state.get_subjects(None)) >= 2
-    assert state.get_subjects("UNKNOWN-STUDY")[0]["studyKey"] == "UNKNOWN-STUDY"
+    assert state.get_subjects("UNKNOWN-STUDY") == []
     assert len(state.get_forms(None)) >= 2
-    assert state.get_forms("UNKNOWN-STUDY")[0]["studyKey"] == "UNKNOWN-STUDY"
+    assert state.get_forms("UNKNOWN-STUDY") == []
     assert len(state.get_visits(None)) >= 2
-    assert state.get_visits("UNKNOWN-STUDY")[0]["studyKey"] == "UNKNOWN-STUDY"
+    assert state.get_visits("UNKNOWN-STUDY") == []
     assert len(state.get_records(None)) >= 2
+    assert state.get_records("UNKNOWN-STUDY") == []
     assert len(state.get_queries(None)) >= 2
-    assert state.get_queries("UNKNOWN-STUDY")[0]["studyKey"] == "UNKNOWN-STUDY"
+    assert state.get_queries("UNKNOWN-STUDY") == []
     assert len(state.get_intervals(None)) >= 1
+    assert state.get_intervals("UNKNOWN-STUDY") == []
     assert len(state.get_variables(None)) >= 3
+    assert state.get_variables("UNKNOWN-STUDY") == []
     assert len(state.get_codings(None)) >= 2
+    assert state.get_codings("UNKNOWN-STUDY") == []
     assert len(state.get_record_revisions(None)) >= 2
+    assert state.get_record_revisions("UNKNOWN-STUDY") == []
     assert len(state.get_users(None)) >= 3
+    assert state.get_users("UNKNOWN-STUDY") == []
+    assert state.get_jobs("UNKNOWN-STUDY") == []
+    assert state.get_job("UNKNOWN-STUDY", "BATCH") is None
+    assert state.get_job_results("UNKNOWN-STUDY", "BATCH") is None
     assert state.get_job("STUDY", "AUTO-BATCH") is None
     assert state.get_job_results("STUDY", "AUTO-BATCH") is None
+    with pytest.raises(KeyError, match="Study 'UNKNOWN-STUDY' not found"):
+        state.create_records("UNKNOWN-STUDY", [])
 
     transport = create_simulation_transport(state)
     client = httpx.Client(transport=transport, base_url="https://sim.local")
@@ -713,13 +782,20 @@ def test_simulation_filter_sort_and_state_edge_cases():
     assert client.get("/api/v1/edc/jobs/AUTO-BATCH").status_code == 404
     assert client.get("/api/v1/edc/jobs/AUTO-BATCH/results").status_code == 404
 
-    # Boolean filter, numeric string ordering, timezone offset ISO datetime, and 'and' connector
+    # Boolean filter, numeric string ordering, timezone offset ISO datetime, and ';' AND connector
+    assert (
+        client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"filter": "deleted==false;dateCreated>=2026-01-10T04:30:00-05:00"},
+        ).status_code
+        == 200
+    )
     assert (
         client.get(
             "/api/v1/edc/studies/STUDY/records",
             params={"filter": "deleted==false and dateCreated>=2026-01-10T04:30:00-05:00"},
         ).status_code
-        == 200
+        == 400
     )
     num_str_resp = client.get(
         "/api/v1/edc/studies/STUDY/codings",
@@ -727,7 +803,7 @@ def test_simulation_filter_sort_and_state_edge_cases():
     )
     assert [c["codingId"] for c in num_str_resp.json()["data"]] == [1102]
 
-    # Filter 'none' bypass, list/dict field handling, non-bool/non-float inequality
+    # Filter 'none' bypass, list/dict field handling on recordDataFilter, non-bool/non-float !=
     assert (
         client.get("/api/v1/edc/studies/STUDY/records", params={"filter": "none"}).status_code
         == 200
@@ -741,18 +817,16 @@ def test_simulation_filter_sort_and_state_edge_cases():
         >= 1
     )
     assert (
-        len(
-            client.get(
-                "/api/v1/edc/studies/STUDY/subjects", params={"filter": "keywords!=empty"}
-            ).json()["data"]
-        )
-        >= 1
+        client.get(
+            "/api/v1/edc/studies/STUDY/subjects", params={"filter": "keywords!=empty"}
+        ).status_code
+        == 400
     )
     assert (
         client.get(
             "/api/v1/edc/studies/STUDY/subjects", params={"filter": "keywords=~test"}
-        ).json()["data"]
-        == []
+        ).status_code
+        == 400
     )
     assert (
         len(
@@ -766,12 +840,12 @@ def test_simulation_filter_sort_and_state_edge_cases():
     # Multi-field sort (;), colon direction (:), default ASC, ISO sort, and missing recordData sort
     sort_resp = client.get(
         "/api/v1/edc/studies/STUDY/records",
-        params={"sort": "deleted;dateCreated:desc;V_AGE,asc", "page": "invalid", "size": "-5"},
+        params={"sort": "deleted;dateCreated:desc;V_AGE,asc"},
     )
     assert sort_resp.status_code == 200
     assert [r["recordId"] for r in sort_resp.json()["data"]] == [602, 601, 600]
 
-    # Empty result pagination, variables/jobs/direct-jobs/fallback routes, single-dict POST
+    # Empty result pagination, variables route, unbacked job/unknown routes 404, single-dict POST
     empty_resp = client.get(
         "/api/v1/edc/studies/STUDY/records", params={"filter": "recordId==999999"}
     )
@@ -779,19 +853,21 @@ def test_simulation_filter_sort_and_state_edge_cases():
     assert empty_resp.json()["data"] == []
 
     assert client.get("/api/v1/edc/studies/STUDY/variables").status_code == 200
-    assert isinstance(client.get("/api/v1/edc/studies/STUDY/jobs").json(), list)
-    assert client.get("/api/v1/edc/jobs/BATCH").json()["batchId"] == "BATCH"
-    assert client.get("/api/v1/edc/unknownResource").json()["data"] == []
+    assert client.get("/api/v1/edc/studies/STUDY/jobs").status_code == 404
+    assert client.get("/api/v1/edc/jobs/BATCH").status_code == 404
+    assert client.get("/api/v1/edc/unknownResource").status_code == 404
     post_job_resp = client.post(
         "/api/v1/edc/studies/STUDY/records", json={"subjectKey": "SUB1", "V_AGE": 40}
     )
     assert post_job_resp.status_code == 202
     batch_id = post_job_resp.json()["batchId"]
-    assert len(client.get(f"/api/v1/edc/studies/STUDY/jobs/{batch_id}/results").json()) == 1
-    assert len(client.get(f"/api/v1/edc/jobs/{batch_id}/results").json()) == 1
+    assert state.get_job_results("STUDY", batch_id) is not None
+    assert len(state.get_job_results("STUDY", batch_id)) == 1
+    assert client.get(f"/api/v1/edc/studies/STUDY/jobs/{batch_id}/results").status_code == 404
+    assert client.get(f"/api/v1/edc/jobs/{batch_id}/results").status_code == 404
     assert client.post("/api/v1/edc/studies/STUDY/records", content=b"{invalid").status_code == 202
 
-    # Malformed filter & sort syntax -> HTTP 400
+    # Malformed filter, sort, and pagination bounds -> HTTP 400
     bad_params = [
         {"filter": 'siteName=="unclosed'},
         {"filter": 'siteName=="trailing\\"'},
@@ -807,23 +883,54 @@ def test_simulation_filter_sort_and_state_edge_cases():
         {"filter": "recordData.>40"},
         {"filter": ".V_AGE>40"},
         {"sort": ",asc"},
+        {"page": ""},
+        {"page": "invalid"},
+        {"page": "-1"},
+        {"size": ""},
+        {"size": "invalid"},
+        {"size": "-5"},
+        {"size": "0"},
+        {"size": "501"},
+        {"size": "600"},
     ]
     for params in bad_params:
         resp = client.get("/api/v1/edc/studies/STUDY/forms", params=params)
         assert resp.status_code == 400, f"Expected 400 for {params}, got {resp.status_code}"
 
-    # Non-dict intermediate segment and nested dotted dict lookup
+    # Non-dict intermediate segment, list/dict value comparison, and nested dotted dict lookup
+    assert (
+        client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"filter": "recordId.nested==601"},
+        ).status_code
+        == 400
+    )
     non_dict_dotted = client.get(
         "/api/v1/edc/studies/STUDY/records",
-        params={"filter": "recordId.nested==601"},
+        params={"recordDataFilter": "V_AGE.nested==45"},
     )
     assert non_dict_dotted.status_code == 200
     assert non_dict_dotted.json()["data"] == []
 
     state.records[0]["recordData"]["nested"] = {"severity": "MILD", "literal.key": "OK"}
+    state.records[0]["recordData"]["tags"] = ["alpha", "beta"]
+    assert (
+        client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"recordDataFilter": "tags!=empty"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/api/v1/edc/studies/STUDY/records",
+            params={"recordDataFilter": "tags=~alpha"},
+        ).json()["data"]
+        == []
+    )
     nested_dotted = client.get(
         "/api/v1/edc/studies/STUDY/records",
-        params={"filter": "recordData.nested.severity==MILD;recordData.nested.literal.key==OK"},
+        params={"recordDataFilter": "nested.severity==MILD;nested.literal.key==OK"},
     )
     assert nested_dotted.status_code == 200
     assert [r["recordId"] for r in nested_dotted.json()["data"]] == [601]
@@ -1265,11 +1372,22 @@ async def test_simulation_subject_enrollment_scheduled_upsert_and_revisions():
 def test_simulation_study_coherent_foreign_keys_and_cleared_fixtures():
     """Verify synthesized clinical foreign keys across Studies, Query types, and cleared-fixture guards."""
     state = SimulationState()
+    state.studies.append(
+        {
+            "studyKey": "AD-HOC-STUDY",
+            "studyName": "Ad-Hoc Registered Study",
+            "studyDescription": "Dynamically registered study without seeded child fixtures",
+            "studyType": "STUDY",
+        }
+    )
     transport = create_simulation_transport(state)
     client = httpx.Client(transport=transport, base_url="https://sim.local")
 
     with patch.dict(os.environ, {"IMEDNET_STRICT_MODE": "true"}, clear=True):
         sdk = ImednetSDK(transport=transport, simulation_mode=True)
+
+        with pytest.raises(NotFoundError):
+            list(sdk.sites.list(study_key="UNREGISTERED-STUDY"))
 
         expected_study_profiles = [
             ("STUDY", 101, "SITE", 201, "SUB1"),
@@ -1410,7 +1528,7 @@ def test_simulation_create_records_materializes_unseeded_study_and_isolates_jobs
         assert client.get(f"/api/v1/edc/studies/STUDY/jobs/{study_batch_id}").status_code == 200
         assert (
             client.get(f"/api/v1/edc/studies/STUDY/jobs/{study_batch_id}/results").status_code
-            == 200
+            == 404
         )
         assert (
             client.get(f"/api/v1/edc/studies/DEMO-STUDY/jobs/{study_batch_id}").status_code == 404
@@ -1420,14 +1538,15 @@ def test_simulation_create_records_materializes_unseeded_study_and_isolates_jobs
             == 404
         )
         assert client.get(f"/api/v1/edc/studies/MY_STUDY/jobs/{study_batch_id}").status_code == 404
-        assert client.get(f"/api/v1/edc/jobs/{study_batch_id}").status_code == 200
-        assert client.get(f"/api/v1/edc/jobs/{study_batch_id}/results").status_code == 200
+        assert client.get(f"/api/v1/edc/jobs/{study_batch_id}").status_code == 404
+        assert client.get(f"/api/v1/edc/jobs/{study_batch_id}/results").status_code == 404
+        assert client.get("/api/v1/edc/studies/DEMO-STUDY/jobs").status_code == 404
 
-        demo_visible_batches = {
-            j["batchId"] for j in client.get("/api/v1/edc/studies/DEMO-STUDY/jobs").json()
-        }
+        demo_visible_batches = {j["batchId"] for j in state.get_jobs("DEMO-STUDY")}
         assert study_batch_id not in demo_visible_batches
         assert my_study_job.batch_id not in demo_visible_batches
+        assert state.get_job_results("DEMO-STUDY", study_batch_id) is None
+        assert len(state.get_job_results("STUDY", study_batch_id) or []) == 1
 
         # Cross-study lookup against active STUDY job returns 404 without advancing STUDY poll counter
         with pytest.raises(NotFoundError):
@@ -1481,3 +1600,80 @@ def test_simulation_workflows_subject_data_and_queries_by_site():
             assert len(main_queries) == 2
             assert all(q.subject_key == "SUB1" for q in main_queries)
             assert {q.type for q in main_queries} == {"record", "question"}
+
+
+def test_simulation_missing_study_and_unbacked_routes_return_404_error_envelope():
+    """Verify unknown paths, unbacked routes, and missing Studies return HTTP 404 metadata.error."""
+    from imednet.endpoints.registry import ENDPOINT_REGISTRY
+
+    transport = create_simulation_transport(SimulationState())
+    client = httpx.Client(transport=transport, base_url="https://sim.local")
+
+    study_subroutes = sorted(
+        str(cls.PATH) for cls in ENDPOINT_REGISTRY.values() if getattr(cls, "PATH", "")
+    )
+    assert len(study_subroutes) == 12
+
+    missing_study = "MISSING-STUDY"
+    not_found_requests = [
+        ("GET", "/api/v1/edc/nonexistent"),
+        ("GET", f"/api/v1/edc/studies/{missing_study}"),
+        ("GET", "/api/v1/edc/studies/STUDY"),
+        ("POST", "/api/v1/edc/studies"),
+        ("POST", "/api/v1/edc/studies/STUDY/forms"),
+        ("DELETE", "/api/v1/edc/studies/STUDY/records"),
+        ("GET", "/api/v1/edc/studies/STUDY/records/601"),
+        ("GET", "/api/v1/edc/studies/STUDY/jobs"),
+        ("GET", "/api/v1/edc/studies/STUDY/jobs/BATCH/results"),
+        ("POST", "/api/v1/edc/studies/STUDY/jobs/BATCH"),
+        ("POST", f"/api/v1/edc/studies/{missing_study}/records"),
+        ("GET", f"/api/v1/edc/studies/{missing_study}/jobs/JOB-1002"),
+        *[("GET", f"/api/v1/edc/studies/{missing_study}/{sub}") for sub in study_subroutes],
+    ]
+
+    for method, path in not_found_requests:
+        resp = client.request(method, path)
+        assert resp.status_code == 404, f"Expected 404 for {method} {path}, got {resp.status_code}"
+        body = resp.json()
+        assert body["metadata"]["status"] == "NOT_FOUND"
+        assert body["metadata"]["method"] == method
+        assert body["metadata"]["path"] == path
+        assert body["metadata"]["error"]["code"] == "404"
+        assert body["metadata"]["error"]["message"]
+
+
+def test_simulation_filter_record_data_filter_and_size_bounds_return_400():
+    """Verify filter/recordDataFilter contract rules and strict size bounds return HTTP 400."""
+    transport = create_simulation_transport(SimulationState())
+    client = httpx.Client(transport=transport, base_url="https://sim.local")
+
+    bad_requests = [
+        ("/api/v1/edc/studies/STUDY/forms", {"filter": "formKey=~^F_"}, "filter"),
+        ("/api/v1/edc/studies/STUDY/forms", {"filter": "formKey == F_DM"}, "filter"),
+        ("/api/v1/edc/studies/STUDY/forms", {"filter": "formId>=301;formId<=303"}, "filter"),
+        ("/api/v1/edc/studies/STUDY/forms", {"filter": "unknownAttribute==1"}, "filter"),
+        ("/api/v1/edc/studies/STUDY/users", {"filter": "login==sim_user"}, "filter"),
+        ("/api/v1/edc/studies/STUDY/intervals", {"filter": "intervalId==501"}, "filter"),
+        ("/api/v1/edc/studies/STUDY/forms", {"recordDataFilter": "V_AGE==45"}, "recordDataFilter"),
+        ("/api/v1/edc/studies/STUDY/records", {"size": "600"}, "size"),
+        ("/api/v1/edc/studies/STUDY/records", {"size": "501"}, "size"),
+        ("/api/v1/edc/studies/STUDY/records", {"size": "0"}, "size"),
+        ("/api/v1/edc/studies/STUDY/records", {"page": "-1"}, "page"),
+    ]
+
+    for path, params, expected_attr in bad_requests:
+        resp = client.get(path, params=params)
+        assert resp.status_code == 400, f"Expected 400 for {path} {params}, got {resp.status_code}"
+        body = resp.json()
+        assert body["metadata"]["status"] == "BAD_REQUEST"
+        assert body["metadata"]["error"]["code"] == "400"
+        assert body["metadata"]["error"]["field"]["attribute"] == expected_attr
+
+    # SDK multi-page limit=600 continues to succeed using 500-item pages
+    with patch.dict(os.environ, {}, clear=True):
+        sdk = ImednetSDK(transport=transport, simulation_mode=True)
+        assert len(list(sdk.records.list("STUDY", limit=600))) == 3
+        with pytest.raises(ValueError, match="between 1 and 500"):
+            list(sdk.records.list("STUDY", size=600))
+        with pytest.raises(ValueError, match="between 1 and 500"):
+            list(sdk.users.list("STUDY", size=600))

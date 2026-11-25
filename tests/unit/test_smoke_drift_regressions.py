@@ -162,12 +162,34 @@ def test_precompiled_normalizers_and_forward_ref_rebuild():
 
 
 def test_detect_drift_gates_additive_checks_by_debug_extra_and_strict(caplog, monkeypatch):
-    """Verify additive drift checks skip at default log levels on extra='ignore', log deduplicated DEBUG notices when enabled, and warn on extra!='ignore'."""
+    """Verify additive drift logs once-per-runtime WARNING on extra='ignore', skips extra='allow', and raises in strict mode."""
     import logging
 
     from pydantic import ConfigDict
 
+    from imednet.models import (
+        Coding,
+        Form,
+        Interval,
+        Job,
+        JobStatus,
+        Query,
+        Record,
+        RecordJobResponse,
+        RecordRevision,
+        Site,
+        Study,
+        Subject,
+        User,
+        Variable,
+        Visit,
+    )
     from imednet.models.base import ImednetBaseModel, _drift_reported
+    from imednet.models.reporting import (
+        AnalysisAdverseEvent,
+        AnalysisLabResult,
+        SubjectLevelAnalysis,
+    )
 
     class IgnoredExtraModel(ImednetBaseModel):
         req_id: int = Field(..., alias="reqId")
@@ -176,59 +198,93 @@ def test_detect_drift_gates_additive_checks_by_debug_extra_and_strict(caplog, mo
         model_config = ConfigDict(extra="allow")
         req_id: int = Field(default=1, alias="reqId")
 
+    rest_models = (
+        Coding,
+        Form,
+        Interval,
+        Job,
+        JobStatus,
+        Query,
+        Record,
+        RecordJobResponse,
+        RecordRevision,
+        Site,
+        Study,
+        Subject,
+        User,
+        Variable,
+        Visit,
+    )
+    allow_models = (SubjectLevelAnalysis, AnalysisAdverseEvent, AnalysisLabResult)
+
     monkeypatch.setenv("IMEDNET_STRICT_MODE", "0")
     drift_logger = logging.getLogger("imednet.drift")
     orig_level = drift_logger.level
 
     try:
-        # 1. Default WARNING level on extra='ignore' skips additive drift notice
+        # 1. Default WARNING level on extra='ignore' logs deduplicated WARNING once per runtime
         _drift_reported.clear()
         caplog.clear()
         drift_logger.setLevel(logging.WARNING)
         with caplog.at_level(logging.WARNING, logger="imednet.drift"):
-            inst = IgnoredExtraModel.model_validate({"reqId": 1, "newApiField": "x"})
-            assert inst.req_id == 1
-        assert "newApiField" not in caplog.text
-
-        # 2. Enabling DEBUG on imednet.drift logs deduplicated DEBUG additive drift notice
-        _drift_reported.clear()
-        caplog.clear()
-        drift_logger.setLevel(logging.DEBUG)
-        with caplog.at_level(logging.DEBUG, logger="imednet.drift"):
-            IgnoredExtraModel.model_validate({"reqId": 1, "newApiField": "x"})
-            IgnoredExtraModel.model_validate({"reqId": 2, "newApiField": "y"})
-
-        debug_records = [
-            r
-            for r in caplog.records
-            if r.name == "imednet.drift"
-            and r.levelno == logging.DEBUG
-            and "Drift detected (additive): IgnoredExtraModel received unexpected fields: newApiField"
-            in r.message
-        ]
-        assert len(debug_records) == 1
-
-        # 3. extra != 'ignore' logs deduplicated WARNING even when DEBUG is enabled or disabled
-        _drift_reported.clear()
-        caplog.clear()
-        drift_logger.setLevel(logging.WARNING)
-        with caplog.at_level(logging.WARNING, logger="imednet.drift"):
-            AllowedExtraModel.model_validate({"reqId": 1, "extraAllowedField": "v1"})
-            AllowedExtraModel.model_validate({"reqId": 2, "extraAllowedField": "v2"})
+            inst1 = IgnoredExtraModel.model_validate({"reqId": 1, "newApiField": "x"})
+            inst2 = IgnoredExtraModel.model_validate({"reqId": 2, "newApiField": "y"})
+            assert inst1.req_id == 1
+            assert inst2.req_id == 2
 
         warn_records = [
             r
             for r in caplog.records
             if r.name == "imednet.drift"
             and r.levelno == logging.WARNING
-            and "Drift detected (additive): AllowedExtraModel received unexpected fields: extraAllowedField"
+            and "Drift detected (additive): IgnoredExtraModel received unexpected fields: newApiField"
             in r.message
         ]
         assert len(warn_records) == 1
 
-        # 4. Destructive drift still warns when required field/alias is missing from data
+        # 2. All 15 REST models (extra='ignore') log once-per-runtime WARNING in permissive mode
         _drift_reported.clear()
         caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="imednet.drift"):
+            for model_cls in rest_models:
+                model_cls.model_validate({"unexpectedDriftField": "v1"})
+                model_cls.model_validate({"unexpectedDriftField": "v2"})
+
+        rest_warn_records = [
+            r
+            for r in caplog.records
+            if r.name == "imednet.drift"
+            and r.levelno == logging.WARNING
+            and "Drift detected (additive):" in r.message
+        ]
+        assert len(rest_warn_records) == 15
+
+        # 3. extra == 'allow' (custom + 3 CDISC reporting models) skips additive drift warnings
+        _drift_reported.clear()
+        caplog.clear()
+        drift_logger.setLevel(logging.DEBUG)
+        with caplog.at_level(logging.DEBUG, logger="imednet.drift"):
+            allowed_inst = AllowedExtraModel.model_validate({"reqId": 1, "extraAllowedField": "v1"})
+            assert getattr(allowed_inst, "extraAllowedField") == "v1"
+            for allow_cls in allow_models:
+                rep_inst = allow_cls.model_validate({"subjectKey": "SUB1", "TRT01P": "Placebo"})
+                assert getattr(rep_inst, "TRT01P") == "Placebo"
+        assert [r for r in caplog.records if r.name == "imednet.drift"] == []
+
+        # 4. Strict mode raises on extra='ignore' models while extra='allow' models still succeed
+        monkeypatch.setenv("IMEDNET_STRICT_MODE", "1")
+        for model_cls in rest_models:
+            with pytest.raises(ValidationError, match="Drift detected \\(additive\\)"):
+                model_cls.model_validate({"unexpectedDriftField": "strict"})
+        for allow_cls in allow_models:
+            rep_strict = allow_cls.model_validate({"subjectKey": "SUB1", "AVAL": 42.5})
+            assert getattr(rep_strict, "AVAL") == 42.5
+
+        # 5. Destructive drift still warns when required field/alias is missing from data
+        monkeypatch.setenv("IMEDNET_STRICT_MODE", "0")
+        _drift_reported.clear()
+        caplog.clear()
+        drift_logger.setLevel(logging.WARNING)
         with caplog.at_level(logging.WARNING, logger="imednet.drift"):
             with pytest.raises(ValidationError):
                 IgnoredExtraModel.model_validate({})

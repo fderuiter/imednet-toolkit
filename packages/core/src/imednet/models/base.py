@@ -266,23 +266,17 @@ class ImednetBaseModel(BaseModel):
         except KeyError:
             defined_fields, required_fields = _get_field_metadata(cls)
 
-        is_strict = is_strict_mode()
-        warn_extra = cls.model_config.get("extra") != "ignore"
-        debug_drift = _drift_logger.isEnabledFor(logging.DEBUG)
-
-        if is_strict or warn_extra or debug_drift:
+        extra_mode = cls.model_config.get("extra")
+        if extra_mode != "allow":
+            is_strict = is_strict_mode()
             unexpected_fields = data.keys() - defined_fields
             if unexpected_fields:
                 msg = f"Drift detected (additive): {cls.__name__} received unexpected fields: {', '.join(sorted(unexpected_fields))}"
                 if is_strict:
                     raise ValueError(msg)
-                if warn_extra:
-                    if msg not in _drift_reported:
-                        _drift_reported.add(msg)
-                        _drift_logger.warning(msg)
-                elif debug_drift and msg not in _drift_reported:
+                if extra_mode == "ignore" and msg not in _drift_reported:
                     _drift_reported.add(msg)
-                    _drift_logger.debug(msg)
+                    _drift_logger.warning(msg)
 
         if required_fields:
             missing_fields: list[str] | None = None

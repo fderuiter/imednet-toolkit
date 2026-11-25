@@ -3,11 +3,9 @@
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, Generic, TypeVar
 
-from imednet.constants import LARGE_PAGE_SIZE
+from imednet.constants import MAX_PAGE_SIZE
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.errors.client import PaginationError
-
-MAX_PAGE_SIZE = LARGE_PAGE_SIZE
 
 ClientT = TypeVar("ClientT", RequesterProtocol, AsyncRequesterProtocol)
 

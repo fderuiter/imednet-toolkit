@@ -302,3 +302,36 @@ class TestBaseEndpoint:
 
         assert "to_dataframe" in records.RecordsEndpoint.__dict__
         assert "to_dataframe" in records.AsyncRecordsEndpoint.__dict__
+
+    @pytest.mark.parametrize("bad_size", [0, -5, 501, 600, True, "abc"])
+    def test_list_endpoint_rejects_out_of_range_or_invalid_size(self, client, bad_size):
+        """Test _ListEndpointBase raises ValueError instead of clamping invalid size."""
+        sync_ep = MockListEndpoint(client)
+        with pytest.raises(ValueError, match="size"):
+            sync_ep.list(study_key="S1", size=bad_size)
+
+        async_ep = MockAsyncListEndpoint(async_client=MagicMock())
+        with pytest.raises(ValueError, match="size"):
+            async_ep.list(study_key="S1", size=bad_size)
+
+    def test_list_endpoint_accepts_max_page_size_and_limit_above_500(self):
+        """Test _ListEndpointBase accepts size=500 and paginates limit=600 across 500-item pages."""
+        calls: list[dict[str, object]] = []
+        pages = [
+            {"data": [{"item_id": i} for i in range(500)], "pagination": {"totalPages": 2}},
+            {"data": [{"item_id": i} for i in range(500, 650)], "pagination": {"totalPages": 2}},
+        ]
+
+        class StubClient:
+            def get(self, path, params=None):
+                calls.append({"path": path, "params": dict(params or {})})
+                payload = pages[len(calls) - 1]
+                return type("Resp", (), {"json": lambda self: payload})()
+
+        ep = MockListEndpoint(StubClient())  # type: ignore[arg-type]
+        items = list(ep.list(study_key="S1", limit=600))
+        assert len(items) == 600
+        assert calls == [
+            {"path": "/api/v1/edc/studies/S1/list-items", "params": {"page": 0, "size": 500}},
+            {"path": "/api/v1/edc/studies/S1/list-items", "params": {"page": 1, "size": 500}},
+        ]

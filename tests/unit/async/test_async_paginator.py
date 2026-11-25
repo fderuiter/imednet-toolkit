@@ -56,6 +56,10 @@ async def test_async_paginator_bounds_and_tracks_has_more() -> None:
     with pytest.raises(ValueError, match="between 1 and 500"):
         AsyncPaginator(client, "/items", page_size=0)
     with pytest.raises(ValueError, match="between 1 and 500"):
+        AsyncPaginator(client, "/items", page_size=600)
+    with pytest.raises(ValueError, match="between 1 and 500"):
+        AsyncPaginator(client, "/items", params={"size": 600})
+    with pytest.raises(ValueError, match="between 1 and 500"):
         AsyncPaginator(client, "/items", params={"size": 1200})
 
     ait = paginator.__aiter__()
@@ -154,7 +158,7 @@ async def test_async_sdk_list_forwards_params_and_supports_bounded_consumption()
                     "S1",
                     include_inactive=True,
                     sort="login,asc",
-                    size=900,
+                    size=500,
                 )
             ]
             assert len(users) == 1
@@ -164,6 +168,9 @@ async def test_async_sdk_list_forwards_params_and_supports_bounded_consumption()
                 "size": "500",
                 "page": "0",
             }
+
+            with pytest.raises(ValueError, match="between 1 and 500"):
+                sdk.users.list("S1", size=900)
 
             with pytest.raises(ConfigurationError, match="does not support query filtering"):
                 sdk.users.list("S1", login="clinician")

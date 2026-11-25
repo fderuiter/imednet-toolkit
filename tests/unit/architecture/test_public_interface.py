@@ -50,11 +50,18 @@ def test_module_has_all(module_name: str) -> None:
 
 @pytest.mark.parametrize("module_name", OPTIONAL_MODULES_WITH_ALL)
 def test_optional_module_has_all(module_name: str) -> None:
-    """Optional modules (extra dependencies) must also declare __all__ when available."""
+    """Optional modules (extra dependencies) must declare __all__ and bind every exported symbol."""
     mod = pytest.importorskip(module_name)
     assert hasattr(mod, "__all__"), (
         f"{module_name} must define __all__ to declare its public surface"
     )
+    assert len(mod.__all__) == 17
+    for symbol in mod.__all__:
+        assert hasattr(mod, symbol), f"{module_name}.{symbol} declared in __all__ must be bound"
+        assert callable(getattr(mod, symbol))
+    assert set(mod.__all__).issubset(set(dir(mod)))
+    with pytest.raises(AttributeError):
+        _ = mod.nonexistent_testing_helper
 
 
 # ---------------------------------------------------------------------------
@@ -289,3 +296,31 @@ def test_unused_sdtm_private_helpers_are_not_reexported() -> None:
             f"imednet.spi.models.__all__ must retain {export_name}"
         )
         assert hasattr(spi_models_mod, export_name), f"imednet.spi.models must expose {export_name}"
+
+
+def test_imednet_testing_lazy_faker_isolation() -> None:
+    """Importing canonical_type and value_for from imednet.testing succeeds when faker is absent."""
+    import subprocess
+    import sys
+
+    code = (
+        "import builtins, sys\n"
+        "real_import = builtins.__import__\n"
+        "def guard_import(name, *args, **kwargs):\n"
+        "    if name == 'faker' or name.startswith('faker.'):\n"
+        "        raise ModuleNotFoundError(\"No module named 'faker'\")\n"
+        "    return real_import(name, *args, **kwargs)\n"
+        "builtins.__import__ = guard_import\n"
+        "from imednet.testing import canonical_type, value_for\n"
+        "assert 'imednet.testing.fake_data' not in sys.modules\n"
+        "assert canonical_type('Text') == 'string'\n"
+        "assert value_for('integer') == 1\n"
+        "import imednet.testing as t\n"
+        "assert 'fake_variable' not in t.__dict__\n"
+        "fn = t.fake_variable\n"
+        "assert 'imednet.testing.fake_data' in sys.modules\n"
+        "assert 'fake_variable' in t.__dict__\n"
+        "assert isinstance(fn(), dict)\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"Subprocess failed:\n{proc.stdout}\n{proc.stderr}"
