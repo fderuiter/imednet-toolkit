@@ -569,7 +569,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         form_list = [int(f.strip()) for f in forms.split(",")] if forms else None
         with fetching_status("records for SQL export", study_key):
             if long_format:
-                export_to_long_sql(sdk, study_key, table, connection_string, **stream_kwargs)
+                long_kwargs: dict[str, Any] = dict(stream_kwargs)
+                if var_list is not None:
+                    long_kwargs["variable_whitelist"] = var_list
+                if form_list is not None:
+                    long_kwargs["form_whitelist"] = form_list
+                export_to_long_sql(sdk, study_key, table, connection_string, **long_kwargs)
                 return
             if not single_table and engine.dialect.name == "sqlite":
                 export_to_sql_by_form(
