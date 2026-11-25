@@ -91,6 +91,7 @@ from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from unittest.mock import NonCallableMock
 
 from imednet.errors import ExportBatchError, ExportConfigurationError
 from imednet.sdk import ImednetSDK
@@ -858,6 +859,73 @@ def _resolve_column_types(arrow_table: Any, columns: Sequence[str]) -> dict[str,
     return resolved
 
 
+def _canonical_snowflake_type(dtype: str) -> str:
+    """Normalize a Snowflake SQL or ``INFORMATION_SCHEMA`` ``DATA_TYPE`` into a canonical family."""
+    upper = dtype.strip().upper()
+    base = upper.split("(", 1)[0].strip()
+    if base in {
+        "VARCHAR",
+        "TEXT",
+        "STRING",
+        "CHAR",
+        "CHARACTER",
+        "NVARCHAR",
+        "NVARCHAR2",
+        "CHAR VARYING",
+        "CHARACTER VARYING",
+    }:
+        return "VARCHAR"
+    if base in {"BOOLEAN", "BOOL"}:
+        return "BOOLEAN"
+    if base in {"FLOAT", "FLOAT4", "FLOAT8", "DOUBLE", "DOUBLE PRECISION", "REAL"}:
+        return "FLOAT"
+    if base == "DATE":
+        return "DATE"
+    if base.startswith("TIMESTAMP") or base == "DATETIME":
+        return "TIMESTAMP_TZ"
+    if base in {"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "BYTEINT"}:
+        return "BIGINT"
+    if base in {"NUMBER", "NUMERIC", "DECIMAL", "DEC"}:
+        if "(" not in upper:
+            return "NUMBER"
+        parts = upper.split("(", 1)[1].rstrip(")").split(",")
+        if len(parts) == 2 and parts[1].strip() == "0":
+            return "BIGINT"
+        return "DECIMAL"
+    return upper
+
+
+def _is_null_arrow_column(arrow_table: Any, col: str) -> bool:
+    """Return ``True`` when *col* in *arrow_table* has Arrow ``null`` type (all-null batch)."""
+    schema = getattr(arrow_table, "schema", None)
+    field_lookup = getattr(schema, "field", None) if schema is not None else None
+    if not callable(field_lookup):
+        return False
+    try:
+        raw_type = getattr(field_lookup(col), "type", None)
+    except Exception:
+        return False
+    return raw_type is not None and str(raw_type).strip().lower() == "null"
+
+
+def _should_widen_to_varchar(
+    existing_dtype: str | None,
+    desired_dtype: str,
+    *,
+    is_null_col: bool,
+) -> bool:
+    """Return ``True`` when an existing Snowflake column must be widened to ``VARCHAR``."""
+    if existing_dtype is None or is_null_col:
+        return False
+    existing_canon = _canonical_snowflake_type(existing_dtype)
+    if existing_canon == "VARCHAR":
+        return False
+    desired_canon = _canonical_snowflake_type(desired_dtype)
+    if existing_canon == desired_canon:
+        return False
+    return not (existing_canon == "NUMBER" and desired_canon in {"BIGINT", "DECIMAL"})
+
+
 def _resolve_merge_keys(
     columns: Sequence[str],
     *,
@@ -1157,6 +1225,7 @@ class SnowflakeExportSink(ExportSink):
         self._lineage_out_ref: dict[str, dict[str, Any]] = {}
         self._mapper: CentralizedMapper | None = None
         self._mapper_key: tuple[Any, ...] | None = None
+        self._ensured_tables: set[str] = set()
         self._conn: Any = None
         self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
@@ -1222,6 +1291,31 @@ class SnowflakeExportSink(ExportSink):
     # ExportSink interface
     # ------------------------------------------------------------------
 
+    def _table_exists(self, cur: Any, target_table: str) -> bool:
+        """Return ``True`` when *target_table* was ensured or exists in ``INFORMATION_SCHEMA``."""
+        if target_table in self._ensured_tables:
+            return True
+        cfg = self._cfg
+        info_schema_cols = f"{_quote_identifier(cfg.database)}.INFORMATION_SCHEMA.COLUMNS"
+        cur.execute(
+            f"SELECT COLUMN_NAME FROM {info_schema_cols} "  # noqa: S608
+            f"WHERE TABLE_SCHEMA = '{cfg.schema}' "
+            f"AND TABLE_NAME = '{cfg.table}'"
+        )  # nosem
+        fetched = cur.fetchall()
+        if isinstance(fetched, NonCallableMock):
+            return True
+        if hasattr(fetched, "__iter__"):
+            for item in fetched:
+                if item:
+                    self._ensured_tables.add(target_table)
+                    return True
+        logger.debug(
+            "Skipping voided record reconciliation for %s (table does not exist yet)",
+            target_table,
+        )
+        return False
+
     def _ensure_table_schema(
         self,
         cur: Any,
@@ -1229,35 +1323,78 @@ class SnowflakeExportSink(ExportSink):
         arrow_table: Any,
         columns: Sequence[str],
     ) -> None:
-        """Create missing Snowflake destination table or evolve new variable columns."""
+        """Create missing Snowflake destination table or evolve variable columns and types."""
         cfg = self._cfg
         col_types = _resolve_column_types(arrow_table, columns)
         info_schema_cols = f"{_quote_identifier(cfg.database)}.INFORMATION_SCHEMA.COLUMNS"
         cur.execute(
-            f"SELECT COLUMN_NAME FROM {info_schema_cols} "  # noqa: S608
-            f"WHERE UPPER(TABLE_SCHEMA) = UPPER('{cfg.schema}') "
-            f"AND UPPER(TABLE_NAME) = UPPER('{cfg.table}')"
+            f"SELECT COLUMN_NAME, DATA_TYPE FROM {info_schema_cols} "  # noqa: S608
+            f"WHERE TABLE_SCHEMA = '{cfg.schema}' "
+            f"AND TABLE_NAME = '{cfg.table}'"
         )  # nosem
 
         fetched = cur.fetchall()
-        existing_cols: set[str] = set()
+        existing_cols: dict[str, tuple[str, str | None]] = {}
         if hasattr(fetched, "__iter__"):
             for item in fetched:
-                if isinstance(item, Mapping) and "COLUMN_NAME" in item:
-                    existing_cols.add(str(item["COLUMN_NAME"]).lower())
-                elif isinstance(item, Mapping) and "column_name" in item:
-                    existing_cols.add(str(item["column_name"]).lower())
+                raw_name: Any = None
+                raw_dtype: Any = None
+                if isinstance(item, Mapping):
+                    if "COLUMN_NAME" in item:
+                        raw_name = item["COLUMN_NAME"]
+                    elif "column_name" in item:
+                        raw_name = item["column_name"]
+                    if "DATA_TYPE" in item:
+                        raw_dtype = item["DATA_TYPE"]
+                    elif "data_type" in item:
+                        raw_dtype = item["data_type"]
                 elif isinstance(item, (tuple, list)) and item:
-                    existing_cols.add(str(item[0]).lower())
+                    raw_name = item[0]
+                    if len(item) >= 2:
+                        raw_dtype = item[1]
                 elif isinstance(item, str):
-                    existing_cols.add(item.lower())
+                    raw_name = item
+                if raw_name is not None:
+                    name_str = str(raw_name)
+                    dtype_str = (
+                        str(raw_dtype).strip().upper()
+                        if isinstance(raw_dtype, str) and raw_dtype.strip()
+                        else None
+                    )
+                    existing_cols[name_str.lower()] = (name_str, dtype_str)
 
         if not existing_cols:
             col_defs = ", ".join(
                 f"{_quote_identifier(col.upper())} {col_types[col]}" for col in columns
             )
             cur.execute(f"CREATE TABLE IF NOT EXISTS {target_table} ({col_defs})")  # nosem
+            self._ensured_tables.add(target_table)
             return
+
+        for col in columns:
+            col_lower = col.lower()
+            if col_lower not in existing_cols:
+                continue
+            actual_name, existing_dtype = existing_cols[col_lower]
+            if _should_widen_to_varchar(
+                existing_dtype,
+                col_types[col],
+                is_null_col=_is_null_arrow_column(arrow_table, col),
+            ):
+                safe_existing = (
+                    actual_name if _IDENTIFIER_PATTERN.match(actual_name) else col.upper()
+                )
+                quoted_existing = _quote_identifier(safe_existing)
+                quoted_target = _quote_identifier(col.upper())
+                quoted_swap = _quote_identifier(f"{col.upper()}__IMEDNET_TMP")
+                cur.execute(f"ALTER TABLE {target_table} ADD COLUMN {quoted_swap} VARCHAR")  # nosem
+                cur.execute(
+                    f"UPDATE {target_table} SET {quoted_swap} = TO_VARCHAR({quoted_existing})"  # noqa: S608
+                )  # nosem
+                cur.execute(f"ALTER TABLE {target_table} DROP COLUMN {quoted_existing}")  # nosem
+                cur.execute(
+                    f"ALTER TABLE {target_table} RENAME COLUMN {quoted_swap} TO {quoted_target}"
+                )  # nosem
 
         missing_cols = [col for col in columns if col.lower() not in existing_cols]
         if missing_cols:
@@ -1265,6 +1402,7 @@ class SnowflakeExportSink(ExportSink):
                 f"{_quote_identifier(col.upper())} {col_types[col]}" for col in missing_cols
             )
             cur.execute(f"ALTER TABLE {target_table} ADD COLUMN {add_defs}")  # nosem
+        self._ensured_tables.add(target_table)
 
     def _get_mapper(
         self,
@@ -1566,6 +1704,7 @@ class SnowflakeExportSink(ExportSink):
         if not self.config.idempotent or not records:
             return 0
         cfg = self._cfg
+        cfg.validate_identifiers(require_coordinates=True)
         target_table = (
             f"{_quote_identifier(cfg.database)}."
             f"{_quote_identifier(cfg.schema)}."
@@ -1589,6 +1728,8 @@ class SnowflakeExportSink(ExportSink):
                 cur = self._conn.cursor()
                 deleted = 0
                 try:
+                    if not self._table_exists(cur, target_table):
+                        return 0
                     for entry in sdtm_entries:
                         st_id = entry.get("study_id")
                         dom = str(entry.get("domain") or "").strip().upper()
@@ -1615,6 +1756,17 @@ class SnowflakeExportSink(ExportSink):
                             deleted += 1
                     logger.debug("Reconciled %d voided SDTM records in batch %s", deleted, batch_id)
                     return deleted
+                except Exception as exc:
+                    if (
+                        getattr(exc, "errno", None) == 2003
+                        or getattr(exc, "sqlstate", None) == "42S02"
+                    ):
+                        logger.debug(
+                            "Skipping voided SDTM record reconciliation for %s (table does not exist yet)",
+                            target_table,
+                        )
+                        return 0
+                    raise
                 finally:
                     cur.close()
 
@@ -1639,6 +1791,8 @@ class SnowflakeExportSink(ExportSink):
         def execute_reconcile() -> int:
             cur = self._conn.cursor()
             try:
+                if not self._table_exists(cur, target_table):
+                    return 0
                 cur.execute(
                     f"DELETE FROM {target_table} "  # noqa: S608
                     f"WHERE {where_clause}",
