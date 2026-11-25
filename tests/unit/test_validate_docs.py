@@ -1486,3 +1486,145 @@ def test_sphinx_shadowed_methods_and_spi_compliance_html_links(tmp_path: Path) -
         encoding="utf-8",
     )
     assert check_compliance_html_links(html_dir, require_exists=True) is True
+
+
+def test_parse_html_file_extracts_headerlink_source_and_backlink_aria_labels(
+    tmp_path: Path,
+) -> None:
+    """_parse_html_file extracts target-specific aria-labels and flags unlabeled links."""
+    from scripts.validate_docs import _parse_html_file
+
+    api_sample = tmp_path / "sample.html"
+    api_sample.write_text(
+        "<html><body>"
+        '<h1>Auth<a class="headerlink" href="#auth" aria-label="Permalink to Auth">¶</a></h1>'
+        '<dl class="py class"><dt id="imednet.auth.api_key.ApiKeyAuth">'
+        "class ApiKeyAuth"
+        '<a class="reference internal viewcode-source-link" '
+        'href="../../_modules/imednet/auth/api_key.html#ApiKeyAuth" '
+        'aria-label="[source] for imednet.auth.api_key.ApiKeyAuth">'
+        '<span class="viewcode-link"><span class="pre">[source]</span></span></a>'
+        '<a class="headerlink" href="#imednet.auth.api_key.ApiKeyAuth" '
+        'aria-label="Permalink to imednet.auth.api_key.ApiKeyAuth">¶</a>'
+        "</dt><dd><p>Auth strategy.</p></dd></dl>"
+        '<a class="reference internal" href="../../_modules/imednet/sdk.html#ImednetSDK">'
+        '<span class="viewcode-link"><span class="pre">[source]</span></span></a>'
+        "</body></html>\n",
+        encoding="utf-8",
+    )
+    parsed = _parse_html_file(api_sample)
+    assert parsed.headerlinks == [
+        ("#auth", "Permalink to Auth"),
+        ("#imednet.auth.api_key.ApiKeyAuth", "Permalink to imednet.auth.api_key.ApiKeyAuth"),
+    ]
+    assert parsed.source_links == [
+        (
+            "../../_modules/imednet/auth/api_key.html#ApiKeyAuth",
+            "[source] for imednet.auth.api_key.ApiKeyAuth",
+            True,
+        ),
+        ("../../_modules/imednet/sdk.html#ImednetSDK", None, False),
+    ]
+
+    mod_sample = tmp_path / "mod.html"
+    mod_sample.write_text(
+        "<html><body>"
+        '<div class="viewcode-block" id="ApiKeyAuth">'
+        '<a class="viewcode-back" '
+        'href="../../../../reference/api/imednet.auth.html#imednet.auth.api_key.ApiKeyAuth" '
+        'aria-label="[docs] for imednet.auth.api_key.ApiKeyAuth">[docs]</a>'
+        "</div>"
+        '<a class="viewcode-back" href="../../../../reference/api/imednet.auth.html#Raw">[docs]</a>'
+        "</body></html>\n",
+        encoding="utf-8",
+    )
+    mod_parsed = _parse_html_file(mod_sample)
+    assert mod_parsed.backlink_labels == [
+        (
+            "../../../../reference/api/imednet.auth.html#imednet.auth.api_key.ApiKeyAuth",
+            "[docs] for imednet.auth.api_key.ApiKeyAuth",
+        ),
+        ("../../../../reference/api/imednet.auth.html#Raw", None),
+    ]
+
+
+def test_sphinx_mini_build_emits_accessible_link_labels_and_rejects_regressions(
+    tmp_path: Path,
+) -> None:
+    """Mini Sphinx HTML build emits aria-labels on ¶, [source], and [docs] links, and validate_docs catches regressions."""
+    import shutil
+
+    from scripts.validate_docs import _parse_html_file
+
+    repo_root = Path(__file__).resolve().parents[2]
+    built_html = repo_root / "docs" / "_build" / "html"
+    if not (built_html / "reference" / "api" / "imednet.models.html").exists():
+        pytest.skip("docs/_build/html not populated in this isolated test run")
+
+    assert check_rendered_api_reference(built_html) is False
+
+    # Copy minimal subset needed by check_rendered_api_reference into tmp_path to test regression detection
+    subset_dir = tmp_path / "html_subset"
+    (subset_dir / "reference" / "api").mkdir(parents=True)
+    (subset_dir / "_modules" / "imednet" / "auth").mkdir(parents=True)
+    for api_name in (
+        "imednet.models.html",
+        "imednet.endpoints.html",
+        "imednet.html",
+        "imednet.pagination.html",
+        "imednet.core.html",
+        "imednet.auth.html",
+    ):
+        shutil.copy2(
+            built_html / "reference" / "api" / api_name,
+            subset_dir / "reference" / "api" / api_name,
+        )
+    shutil.copy2(built_html / "_modules" / "index.html", subset_dir / "_modules" / "index.html")
+    shutil.copy2(
+        built_html / "_modules" / "imednet" / "auth" / "api_key.html",
+        subset_dir / "_modules" / "imednet" / "auth" / "api_key.html",
+    )
+    # Verify parsed subset has all 3 link categories populated before mutating
+    auth_parsed = _parse_html_file(subset_dir / "reference" / "api" / "imednet.auth.html")
+    mod_parsed = _parse_html_file(subset_dir / "_modules" / "imednet" / "auth" / "api_key.html")
+    assert auth_parsed.headerlinks and auth_parsed.source_links and mod_parsed.backlink_labels
+
+    # 1. Generic headerlink aria-label fails check_rendered_api_reference
+    auth_page = subset_dir / "reference" / "api" / "imednet.auth.html"
+    orig_auth = auth_page.read_text(encoding="utf-8")
+    auth_page.write_text(
+        orig_auth.replace(
+            'aria-label="Permalink to imednet.auth.api_key.ApiKeyAuth"',
+            'aria-label="Permalink to this definition"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    assert check_rendered_api_reference(subset_dir) is True
+    auth_page.write_text(orig_auth, encoding="utf-8")
+
+    # 2. Missing [source] symbol aria-label fails check_rendered_api_reference
+    auth_page.write_text(
+        orig_auth.replace(
+            'aria-label="[source] for imednet.auth.api_key.ApiKeyAuth"',
+            'aria-label="[source]"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    assert check_rendered_api_reference(subset_dir) is True
+    auth_page.write_text(orig_auth, encoding="utf-8")
+
+    # 3. Missing [docs] backlink aria-label fails check_rendered_api_reference
+    mod_page = subset_dir / "_modules" / "imednet" / "auth" / "api_key.html"
+    orig_mod = mod_page.read_text(encoding="utf-8")
+    mod_page.write_text(
+        orig_mod.replace(
+            'aria-label="[docs] for imednet.auth.api_key.ApiKeyAuth"',
+            'aria-label="[docs]"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    assert check_rendered_api_reference(subset_dir) is True
+    mod_page.write_text(orig_mod, encoding="utf-8")

@@ -2067,11 +2067,18 @@ class _ApiHtmlExtractor(HTMLParser):
         self.dl_classes_by_id: dict[str, set[str]] = {}
         self.empty_class_ids: list[str] = []
         self.backlinks: list[str] = []
+        self.backlink_labels: list[tuple[str, str | None]] = []
+        self.headerlinks: list[tuple[str, str | None]] = []
+        self.source_links: list[tuple[str, str | None, bool]] = []
         self.internal_hrefs: dict[str, list[str]] = {}
         self._dl_stack: list[_DlFrame] = []
         self._in_dt = False
         self._cur_dt_id: str | None = None
         self._cur_dt_chunks: list[str] = []
+        self._cur_a_href: str | None = None
+        self._cur_a_aria_label: str | None = None
+        self._cur_a_classes: set[str] = set()
+        self._cur_a_has_viewcode_span = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_map = dict(attrs)
@@ -2099,12 +2106,25 @@ class _ApiHtmlExtractor(HTMLParser):
                 self._dl_stack[-1].dd_p_chunks = []
         elif tag == "a":
             classes = (attr_map.get("class") or "").split()
+            class_set = set(classes)
             href = attr_map.get("href")
-            if "viewcode-back" in classes and href:
+            aria_label = attr_map.get("aria-label")
+            self._cur_a_href = href
+            self._cur_a_aria_label = aria_label
+            self._cur_a_classes = class_set
+            self._cur_a_has_viewcode_span = False
+            if "headerlink" in class_set:
+                self.headerlinks.append((href or "", aria_label))
+            if "viewcode-back" in class_set and href:
                 self.backlinks.append(href)
-            if "reference" in classes and "internal" in classes and href and self._dl_stack:
+                self.backlink_labels.append((href, aria_label))
+            if "reference" in class_set and "internal" in class_set and href and self._dl_stack:
                 for dt_id in self._dl_stack[-1].dt_ids:
                     self.internal_hrefs.setdefault(dt_id, []).append(href)
+        elif tag == "span" and self._cur_a_href is not None:
+            span_classes = set((attr_map.get("class") or "").split())
+            if "viewcode-link" in span_classes:
+                self._cur_a_has_viewcode_span = True
 
     def handle_data(self, data: str) -> None:
         if self._in_dt:
@@ -2120,7 +2140,20 @@ class _ApiHtmlExtractor(HTMLParser):
                     top.dd_non_p_chunks.append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag == "dt" and self._in_dt:
+        if tag == "a" and self._cur_a_href is not None:
+            if "viewcode-source-link" in self._cur_a_classes or self._cur_a_has_viewcode_span:
+                self.source_links.append(
+                    (
+                        self._cur_a_href,
+                        self._cur_a_aria_label,
+                        "viewcode-source-link" in self._cur_a_classes,
+                    )
+                )
+            self._cur_a_href = None
+            self._cur_a_aria_label = None
+            self._cur_a_classes = set()
+            self._cur_a_has_viewcode_span = False
+        elif tag == "dt" and self._in_dt:
             dt_norm = " ".join("".join(self._cur_dt_chunks).split())
             if self._cur_dt_id is not None:
                 self.dt_text[self._cur_dt_id] = dt_norm
@@ -3177,40 +3210,118 @@ def check_rendered_api_reference(html_dir: Path | None = None) -> bool:
         print("Error: _modules/index.html or _modules/builtins.html contains 'builtins.html'.")
         has_errors = True
 
-    target_ids_cache: dict[Path, set[str]] = {}
+    parsed_pages_cache: dict[Path, _ApiHtmlExtractor] = {}
+
+    def _get_parsed_page(path: Path) -> _ApiHtmlExtractor:
+        resolved = path.resolve()
+        if resolved not in parsed_pages_cache:
+            parsed_pages_cache[resolved] = _parse_html_file(resolved)
+        return parsed_pages_cache[resolved]
+
     broken_backlinks = 0
+    unlabeled_backlinks = 0
     total_backlinks = 0
     for mod_html in sorted((html_dir / "_modules").rglob("*.html")):
         if mod_html.name == "index.html":
             continue
-        mod_parsed = _parse_html_file(mod_html)
-        for href in mod_parsed.backlinks:
+        mod_parsed = _get_parsed_page(mod_html)
+        for href, aria_label in mod_parsed.backlink_labels:
             total_backlinks += 1
             rel_part, _, frag = href.partition("#")
+            label_norm = (aria_label or "").strip()
+            if (
+                not label_norm
+                or not label_norm.startswith("[docs]")
+                or label_norm == "[docs]"
+                or (frag and frag not in label_norm)
+            ):
+                print(
+                    f"Error: Missing or non-specific [docs] aria-label in "
+                    f"{mod_html.relative_to(html_dir)} for {href}: {aria_label!r}"
+                )
+                unlabeled_backlinks += 1
+                has_errors = True
+
             target_file = (mod_html.parent / rel_part).resolve()
             if not target_file.exists():
                 print(f"Error: Broken [docs] page link in {mod_html.relative_to(html_dir)}: {href}")
                 broken_backlinks += 1
                 has_errors = True
                 continue
-            if frag:
-                if target_file not in target_ids_cache:
-                    target_ids_cache[target_file] = _parse_html_file(target_file).ids
-                if frag not in target_ids_cache[target_file]:
-                    print(
-                        f"Error: Broken [docs] fragment in {mod_html.relative_to(html_dir)}: {href}"
-                    )
-                    broken_backlinks += 1
-                    has_errors = True
+            if frag and frag not in _get_parsed_page(target_file).ids:
+                print(f"Error: Broken [docs] fragment in {mod_html.relative_to(html_dir)}: {href}")
+                broken_backlinks += 1
+                has_errors = True
 
     if total_backlinks == 0:
         print("Error: Zero [docs] viewcode backlinks found in _modules/.")
+        has_errors = True
+
+    # 4. Verify every a.headerlink and [source] link across all built HTML pages has a target-specific aria-label
+    generic_permalink_labels = {
+        "Permalink to this heading",
+        "Permalink to this definition",
+        "Permalink to this table",
+        "Permalink to this code",
+        "Permalink to this image",
+        "Permalink to this toctree",
+        "Link to this heading",
+        "Link to this definition",
+        "Permalink to",
+    }
+    total_headerlinks = 0
+    unlabeled_headerlinks = 0
+    total_source_links = 0
+    unlabeled_source_links = 0
+    for page_html in sorted(html_dir.rglob("*.html")):
+        page_parsed = _get_parsed_page(page_html)
+        rel_page = page_html.relative_to(html_dir)
+        for hl_href, hl_label in page_parsed.headerlinks:
+            total_headerlinks += 1
+            hl_norm = (hl_label or "").strip()
+            if (
+                not hl_norm
+                or hl_norm in generic_permalink_labels
+                or not hl_norm.startswith("Permalink to ")
+                or not hl_norm.removeprefix("Permalink to ").strip()
+            ):
+                print(
+                    f"Error: Missing or generic headerlink aria-label in {rel_page} "
+                    f"for {hl_href}: {hl_label!r}"
+                )
+                unlabeled_headerlinks += 1
+                has_errors = True
+
+        for src_href, src_label, has_src_class in page_parsed.source_links:
+            total_source_links += 1
+            _, _, src_frag = src_href.partition("#")
+            src_norm = (src_label or "").strip()
+            if (
+                not has_src_class
+                or not src_norm
+                or not src_norm.startswith("[source]")
+                or src_norm == "[source]"
+                or (src_frag and src_frag not in src_norm)
+            ):
+                print(
+                    f"Error: Missing .viewcode-source-link or symbol aria-label in {rel_page} "
+                    f"for {src_href}: class={has_src_class}, aria-label={src_label!r}"
+                )
+                unlabeled_source_links += 1
+                has_errors = True
+
+    if total_headerlinks == 0:
+        print("Error: Zero a.headerlink permalinks found in rendered HTML.")
+        has_errors = True
+    if total_source_links == 0:
+        print("Error: Zero [source] viewcode links found in rendered HTML.")
         has_errors = True
 
     if not has_errors:
         print(
             f"Rendered API reference verified ({len(expected_models)} models, "
             f"{len(distinct_rendered_fields)} fields, {len(all_endpoints)} endpoints, "
+            f"{total_headerlinks} headerlinks, {total_source_links} [source] links, "
             f"{total_backlinks} [docs] backlinks with {broken_backlinks} broken)."
         )
     return has_errors
