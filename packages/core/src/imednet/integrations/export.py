@@ -16,7 +16,7 @@ import re
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 from unittest.mock import NonCallableMock
@@ -317,6 +317,52 @@ def _mask_df(
     return df
 
 
+def _normalize_sqlite_temporal_object_columns(
+    df: pd.DataFrame,
+    engine: Any,
+    *,
+    dtype: Any = None,
+) -> pd.DataFrame:
+    """Normalize Python ``datetime`` and ``date`` values in SQLite-bound ``object`` columns."""
+    if (
+        pd is None
+        or not isinstance(df, pd.DataFrame)
+        or isinstance(df, NonCallableMock)
+        or df.empty
+        or getattr(getattr(engine, "dialect", None), "name", None) != "sqlite"
+    ):
+        return df
+    if dtype is not None and not isinstance(dtype, Mapping):
+        return df
+    mapped_cols = dtype if isinstance(dtype, Mapping) else None
+
+    normalized: pd.DataFrame | None = None
+    for idx in range(len(df.columns)):
+        col_name = df.columns[idx]
+        if mapped_cols is not None and col_name in mapped_cols:
+            continue
+        series = df.iloc[:, idx]
+        if series.dtype != object:
+            continue
+        values = series.tolist()
+        if not any(val is not pd.NaT and isinstance(val, date) for val in values):
+            continue
+        if normalized is None:
+            normalized = df.copy()
+        new_vals: list[Any] = []
+        for val in values:
+            if val is pd.NaT:
+                new_vals.append(val)
+            elif isinstance(val, datetime):
+                new_vals.append(val.isoformat(" "))
+            elif isinstance(val, date):
+                new_vals.append(val.isoformat())
+            else:
+                new_vals.append(val)
+        normalized.isetitem(idx, pd.Series(new_vals, index=series.index, dtype=object))
+    return normalized if normalized is not None else df
+
+
 def _to_sql_with_chunking(
     df: pd.DataFrame,
     table: str,
@@ -331,6 +377,11 @@ def _to_sql_with_chunking(
     exceeds this, the data is written to multiple tables suffixed with
     ``_part1``, ``_part2`` and so on.
     """
+    df = _normalize_sqlite_temporal_object_columns(
+        df,
+        engine,
+        dtype=kwargs.get("dtype"),
+    )
     if engine.dialect.name == "sqlite" and len(df.columns) > MAX_SQLITE_COLUMNS:
         for i, start in enumerate(range(0, len(df.columns), MAX_SQLITE_COLUMNS), start=1):
             chunk = df.iloc[:, start : start + MAX_SQLITE_COLUMNS]
@@ -5986,7 +6037,11 @@ class _LongSQLSink(ExportSink):
             if_exists: Literal["replace", "append"] = (
                 self._initial_if_exists if self._is_first_write else "append"
             )
-            pd.DataFrame(chunk).to_sql(
+            chunk_df = _normalize_sqlite_temporal_object_columns(
+                pd.DataFrame(chunk),
+                self.engine,
+            )
+            chunk_df.to_sql(
                 self.table,
                 self.engine,
                 if_exists=if_exists,
@@ -6106,7 +6161,10 @@ def export_to_long_sql(
             )
             first = True
             for start in range(0, len(long_rows), max(1, chunk_size)):
-                df = pd.DataFrame(long_rows[start : start + max(1, chunk_size)])
+                df = _normalize_sqlite_temporal_object_columns(
+                    pd.DataFrame(long_rows[start : start + max(1, chunk_size)]),
+                    engine,
+                )
                 df.to_sql(
                     table_name,
                     engine,
