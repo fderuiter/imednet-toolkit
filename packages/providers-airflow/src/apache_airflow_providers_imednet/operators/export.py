@@ -274,6 +274,7 @@ class ImednetExportOperator(BaseOperator):
         standards_profile: str | None = None,
         min_standards_score: float | None = None,
         naming_convention: str | None = None,
+        preserve_record_id: bool | None = None,
         modified_since: Any = None,
         record_filter: Any = None,
         record_data_filter: str | None = None,
@@ -299,6 +300,7 @@ class ImednetExportOperator(BaseOperator):
         :param mask_phi: Whether to replace sensitive PHI values with ``***MASKED***`` by default.
         :param quality_gate_enabled: Whether to filter records through the schema readiness quality gate prior to export.
         :param min_schema_readiness_score: Minimum schema readiness score (0-100) required when the quality gate is enabled.
+        :param preserve_record_id: Optional override controlling whether ``RECORD_ID`` is retained in SDTM outputs (defaults to retaining it only when ``incremental=True``).
         :param kwargs: Additional Airflow BaseOperator arguments.
         """
         super().__init__(**kwargs)
@@ -325,6 +327,7 @@ class ImednetExportOperator(BaseOperator):
         self.standards_profile = standards_profile
         self.min_standards_score = min_standards_score
         self.naming_convention = naming_convention
+        self.preserve_record_id = preserve_record_id
         self.modified_since = modified_since
         self.record_filter = record_filter
         self.record_data_filter = record_data_filter
@@ -530,6 +533,11 @@ class ImednetExportOperator(BaseOperator):
         )
         if resolved_convention is not None:
             opts["naming_convention"] = str(resolved_convention)
+        raw_preserve_rec_id = runtime_kwargs.get(
+            "preserve_record_id", getattr(self, "preserve_record_id", None)
+        )
+        if raw_preserve_rec_id is not None:
+            opts["preserve_record_id"] = bool(raw_preserve_rec_id)
         return opts
 
     def _default_airflow_stream_name(
@@ -866,6 +874,23 @@ class ImednetExportOperator(BaseOperator):
                 namespace = "sql"
                 raw_name = table_target
             outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(raw_name)))
+        elif dest == "hive_parquet":
+            raw_base_dir = str(
+                self.output_path
+                or runtime_kwargs.get("base_dir")
+                or runtime_kwargs.get("path")
+                or conn_settings.get("base_dir")
+                or ""
+            ).strip()
+            if raw_base_dir:
+                if "://" in raw_base_dir:
+                    parsed_out = urlsplit(raw_base_dir)
+                    namespace = _lineage_authority(raw_base_dir)
+                    name = parsed_out.path.lstrip("/") or _sanitize_lineage_text(raw_base_dir)
+                else:
+                    namespace = "file"
+                    name = _sanitize_lineage_text(raw_base_dir)
+                outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(name)))
         elif self.output_path:
             raw_target = str(self.output_path)
             if "://" in raw_target:
@@ -906,11 +931,7 @@ class ImednetExportOperator(BaseOperator):
         validate_path_segment(self.study_key, name="study_key")
         runtime_kwargs = self._get_runtime_export_kwargs()
         # Resolve destination early to fail fast on invalid configs (like legacy _get_export_callable)
-        dest = self.destination
-        if not dest and self.export_func:
-            dest = self.export_func.replace("export_to_", "")
-        elif not dest:
-            dest = "csv"
+        dest = self._effective_destination()
 
         export_callable = None
         if dest in _TABULAR_EXPORTS:
@@ -1038,6 +1059,8 @@ class ImednetExportOperator(BaseOperator):
                 )
                 if dest == "duckdb_by_form":
                     conn_settings = self._resolve_destination_connection(dest)
+                    tabular_kwargs.pop("table_name", None)
+                    tabular_kwargs.pop("table", None)
                     db_path_arg = (
                         self.output_path
                         or tabular_kwargs.pop("db_path", None)
@@ -1054,20 +1077,26 @@ class ImednetExportOperator(BaseOperator):
                     )
                     return redact_uri(str(db_path_arg)) if db_path_arg is not None else None
                 if dest == "hive_parquet":
+                    conn_settings = self._resolve_destination_connection(dest)
                     base_dir_arg = (
                         self.output_path
                         or tabular_kwargs.pop("base_dir", None)
                         or tabular_kwargs.pop("path", None)
+                        or conn_settings.get("base_dir")
                     )
-                    if base_dir_arg is not None:
-                        _validate_no_secrets_in_value(base_dir_arg, field_name="output_path")
+                    if not base_dir_arg:
+                        raise AirflowException(
+                            "hive_parquet destination requires output_path, export_kwargs['base_dir'], "
+                            "or destination_conn_id with a configured base_dir."
+                        )
+                    _validate_no_secrets_in_value(base_dir_arg, field_name="output_path")
                     export_callable(
                         sdk,
                         self.study_key,
                         base_dir_arg,
                         **tabular_kwargs,
                     )
-                    return redact_uri(str(base_dir_arg)) if base_dir_arg is not None else None
+                    return redact_uri(str(base_dir_arg))
                 if dest == "duckdb":
                     conn_settings = self._resolve_destination_connection(dest)
                     db_path_arg = (

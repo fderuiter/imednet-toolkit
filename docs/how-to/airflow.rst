@@ -111,8 +111,8 @@ so ``test_connection()`` and ``dag.test()`` resolve database-stored
   raw credentials.
 - ``resolve_destination_connection()`` resolves runtime destination connection
   settings for ``snowflake``, ``neo4j``, ``mongodb``, ``duckdb`` (including
-  ``duckdb_by_form``), and ``sql`` (including ``sql_by_form`` and ``long_sql``)
-  targets.
+  ``duckdb_by_form``), ``hive_parquet``, and ``sql`` (including ``sql_by_form``
+  and ``long_sql``) targets.
 
 Operators and Sensors
 ---------------------
@@ -120,8 +120,9 @@ The Airflow integration organizes hooks, operators, and sensors in dedicated
 subpackages for clarity.
 
 ``ImednetExportOperator`` is a unified execution engine that seamlessly writes
-records to any supported destination (CSV, Parquet, DuckDB, SQL / ``sql_by_form``
-/ ``long_sql``, Snowflake, Neo4j, MongoDB, etc.)
+records to any supported destination (CSV, Parquet / ``hive_parquet``, DuckDB /
+``duckdb_by_form``, SQL / ``sql_by_form`` / ``long_sql``, Snowflake, Neo4j,
+MongoDB, etc.)
 using the core SDK's universal sink interface. Common operational parameters
 (``batch_size``, ``max_retries``, ``idempotent``, ``mask_phi``,
 ``quality_gate_enabled`` — ``False`` by default and deterministically forwarded

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import Field
 
@@ -88,13 +88,6 @@ def is_enrollment_form(form: Any) -> bool:
 def is_unscheduled_form(form: Any) -> bool:
     """Return True when ``form`` has ``unscheduledVisit=True``."""
     return _is_true_flag(form, "unscheduled_visit", "unscheduledVisit")
-
-
-class FormVariableMap(TypedDict):
-    """Mapping of a form to its associated variables."""
-
-    form: Form
-    variables: list[Variable]
 
 
 class StudySnapshot(ImednetBaseModel):

@@ -2843,16 +2843,14 @@ def _verify_api_reference_parity(api_html_dir: Path, repo_root: Path | None = No
                 )
                 has_errors = True
 
-        for td_qname in (
-            "imednet.orchestration.types.OrchestratorResult",
-            "imednet_workflows.uat.inspector.FormVariableMap",
-        ):
-            if td_qname not in page_by_id:
-                print(f"Error: Expected TypedDict '{td_qname}' missing from rendered API HTML.")
-                has_errors = True
-        if typeddict_classes < 2 or typeddict_keys < 6:
+        if "imednet.orchestration.types.OrchestratorResult" not in page_by_id:
             print(
-                f"Error: Expected >=2 TypedDict classes and >=6 keys, got {typeddict_classes} classes and {typeddict_keys} keys."
+                "Error: Expected TypedDict 'imednet.orchestration.types.OrchestratorResult' missing from rendered API HTML."
+            )
+            has_errors = True
+        if typeddict_classes < 1 or typeddict_keys < 4:
+            print(
+                f"Error: Expected >=1 TypedDict classes and >=4 keys, got {typeddict_classes} classes and {typeddict_keys} keys."
             )
             has_errors = True
 

@@ -20,7 +20,9 @@ def _setup_airflow(monkeypatch):
 EXPORT_FUNCTIONS = [
     "export_to_csv",
     "export_to_duckdb",
+    "export_to_duckdb_by_form",
     "export_to_parquet",
+    "export_to_hive_parquet",
     "export_to_excel",
     "export_to_json",
     "export_to_sql",
@@ -74,7 +76,8 @@ import importlib
 from unittest.mock import patch
 import imednet.integrations as integrations
 
-# A cached submodule import must not decide whether `export` is callable or a module.
+# Fresh imports AND reloads must both keep `export` callable while preserving submodule attributes.
+assert callable(integrations.export)
 importlib.reload(integrations)
 assert callable(integrations.export)
 import imednet.spi as spi

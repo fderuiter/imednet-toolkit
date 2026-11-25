@@ -704,3 +704,36 @@ def test_dropdown_memo_keywords_and_schema_cache_and_datadict_validation(mock_sn
         assert isinstance(data["NOTES"], str) and 1 <= len(data["NOTES"]) <= 24
         validate_record_entry(cache, payload)
         validate_record_entry(dd, payload)
+
+
+def test_seeded_datetime_determinism_and_locale_compat(mock_snapshot):
+    """SyntheticRecordGenerator accepts legacy locale without storing dead _seed/_locale attributes."""
+    spec = UATSpecification(
+        study_key="S1",
+        study_name="S1",
+        form_specs=[
+            UATFormSpec(
+                form_key="F1",
+                form_name="F1",
+                form_type="Standard",
+                test_type=RecordTestType.CREATE_NEW_RECORD,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="DT",
+                        variable_key="V1",
+                        variable_type="DateTime",
+                        form_key="F1",
+                    )
+                ],
+            )
+        ],
+    )
+    gen1 = SyntheticRecordGenerator(seed=123, locale="fr_FR")
+    gen2 = SyntheticRecordGenerator(seed=123, locale="de_DE")
+    assert not hasattr(gen1, "_seed")
+    assert not hasattr(gen1, "_locale")
+    res1 = gen1.generate(spec, mock_snapshot)
+    res2 = gen2.generate(spec, mock_snapshot)
+    assert res1[0].payloads[0]["data"]["DT"] == res2[0].payloads[0]["data"]["DT"]
+    assert res1[0].payloads[0]["data"]["DT"].endswith("T12:00:00+00:00")
