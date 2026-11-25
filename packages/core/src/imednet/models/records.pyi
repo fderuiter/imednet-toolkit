@@ -17,8 +17,6 @@ from pydantic import (
 
 from imednet.models.base import ImednetBaseModel
 
-def _normalize_record_token(value: str) -> str: ...
-
 class RecordStatus(str, Enum):
     """Normalized lifecycle statuses for eCRF form records."""
 
@@ -42,7 +40,6 @@ class RecordStatus(str, Enum):
     @property
     def allowed_transitions(self) -> set[RecordStatus]: ...
 
-_NON_DELETED_RECORD_STATUSES: set[RecordStatus]
 ALLOWED_RECORD_TRANSITIONS: dict[RecordStatus, set[RecordStatus]]
 
 def normalize_record_status(value: RecordStatus | str | None) -> RecordStatus | str | None: ...

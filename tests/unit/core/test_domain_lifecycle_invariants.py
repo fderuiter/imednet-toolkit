@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import re
+from enum import Enum
+from typing import Any
+
 import pytest
 
 from imednet.models import (
@@ -203,6 +207,355 @@ def test_record_status_transitions_and_soft_delete_invariants() -> None:
     rec.update_status(RecordStatus.DELETED)
     assert rec.deleted is True
     assert rec.effective_status == RecordStatus.DELETED
+
+
+class _StringableToken:
+    """Test helper with custom string representation for non-string status coercion."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def __str__(self) -> str:
+        return self._text
+
+
+@pytest.mark.parametrize("empty_value", ["", "   ", "\t\n"])
+@pytest.mark.parametrize(
+    ("enum_cls", "normalizer"),
+    [
+        (SiteEnrollmentStatus, normalize_site_enrollment_status),
+        (SubjectStatus, normalize_subject_status),
+        (RecordStatus, normalize_record_status),
+    ],
+)
+def test_empty_status_strings_rejected_by_enums_and_preserved_by_normalizers(
+    enum_cls: type[Enum],
+    normalizer: Any,
+    empty_value: str,
+) -> None:
+    """Ensure empty or whitespace-only status strings fail enum lookup and remain unnormalized."""
+    with pytest.raises(ValueError):
+        enum_cls(empty_value)
+    assert normalizer(empty_value) == empty_value
+    assert is_site_enrollment_eligible(empty_value) is False
+
+
+@pytest.mark.parametrize("raw_value", [0, 404, False, 3.14])
+@pytest.mark.parametrize(
+    ("enum_cls", "normalizer", "model_cls", "payload_key", "attr_name"),
+    [
+        (
+            SiteEnrollmentStatus,
+            normalize_site_enrollment_status,
+            Site,
+            "siteEnrollmentStatus",
+            "site_enrollment_status",
+        ),
+        (
+            SubjectStatus,
+            normalize_subject_status,
+            Subject,
+            "subjectStatus",
+            "subject_status",
+        ),
+        (
+            RecordStatus,
+            normalize_record_status,
+            Record,
+            "recordStatus",
+            "record_status",
+        ),
+    ],
+)
+def test_non_string_status_inputs_across_enums_normalizers_and_models(
+    enum_cls: type[Enum],
+    normalizer: Any,
+    model_cls: Any,
+    payload_key: str,
+    attr_name: str,
+    raw_value: Any,
+) -> None:
+    """Ensure non-string inputs are rejected by Enum._missing_ and stringified on coercion."""
+    with pytest.raises(ValueError):
+        enum_cls(raw_value)
+    assert normalizer(raw_value) == str(raw_value)
+    assert is_site_enrollment_eligible(raw_value) is False
+
+    instance = model_cls.model_validate({"studyKey": "S1", payload_key: raw_value})
+    assert getattr(instance, attr_name) == str(raw_value)
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "payload_key", "attr_name", "token_text", "expected_member"),
+    [
+        (
+            Site,
+            "siteEnrollmentStatus",
+            "site_enrollment_status",
+            "enrollment_open",
+            SiteEnrollmentStatus.ENROLLMENT_OPEN,
+        ),
+        (
+            Subject,
+            "subjectStatus",
+            "subject_status",
+            "screen failure",
+            SubjectStatus.SCREEN_FAILED,
+        ),
+        (
+            Record,
+            "recordStatus",
+            "record_status",
+            "record-complete",
+            RecordStatus.RECORD_COMPLETE,
+        ),
+    ],
+)
+def test_non_string_stringable_objects_coerce_in_field_validators(
+    model_cls: Any,
+    payload_key: str,
+    attr_name: str,
+    token_text: str,
+    expected_member: Enum,
+) -> None:
+    """Verify field validators coerce stringable non-str inputs into canonical enum members."""
+    instance = model_cls.model_validate(
+        {"studyKey": "S1", payload_key: _StringableToken(token_text)}
+    )
+    assert getattr(instance, attr_name) is expected_member
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "status_field", "first_status", "second_status", "deleted_status"),
+    [
+        (
+            Record,
+            "record_status",
+            RecordStatus.RECORD_INCOMPLETE,
+            RecordStatus.RECORD_COMPLETE,
+            RecordStatus.DELETED,
+        ),
+        (
+            Subject,
+            "subject_status",
+            SubjectStatus.SCREENED,
+            SubjectStatus.ENROLLED,
+            SubjectStatus.DELETED,
+        ),
+    ],
+)
+def test_lifecycle_mutations_update_model_fields_set(
+    model_cls: Any,
+    status_field: str,
+    first_status: Any,
+    second_status: Any,
+    deleted_status: Any,
+) -> None:
+    """Verify transition_to, update_status, and __setattr__ update Pydantic model_fields_set."""
+    via_transition = model_cls(studyKey="S1")
+    assert via_transition.model_fields_set == {"study_key"}
+
+    via_transition.transition_to(first_status)
+    assert via_transition.model_fields_set == {"study_key", status_field}
+
+    via_transition.update_status(deleted_status)
+    assert via_transition.deleted is True
+    assert via_transition.model_fields_set == {"study_key", status_field, "deleted"}
+
+    via_setattr = model_cls(studyKey="S1")
+    assert via_setattr.model_fields_set == {"study_key"}
+
+    setattr(via_setattr, status_field, second_status.value.lower())
+    assert getattr(via_setattr, status_field) is second_status
+    assert via_setattr.model_fields_set == {"study_key", status_field}
+
+    setattr(via_setattr, status_field, "deleted")
+    assert getattr(via_setattr, status_field) is deleted_status
+    assert via_setattr.deleted is True
+    assert via_setattr.model_fields_set == {"study_key", status_field, "deleted"}
+
+    # Idempotent assignment of DELETED and deleted=True, plus non-status field updates
+    setattr(via_setattr, status_field, deleted_status)
+    via_setattr.deleted = True
+    via_setattr.site_id = 7
+    assert getattr(via_setattr, status_field) is deleted_status
+    assert via_setattr.model_fields_set == {"study_key", status_field, "deleted", "site_id"}
+
+
+@pytest.mark.parametrize(
+    ("validator_fn", "boolean_fn", "from_status", "to_status", "deleted", "expected_message"),
+    [
+        (
+            validate_record_transition,
+            is_valid_record_transition,
+            RecordStatus.INCOMPLETE,
+            "",
+            None,
+            "Invalid target record status: ''",
+        ),
+        (
+            validate_record_transition,
+            is_valid_record_transition,
+            RecordStatus.INCOMPLETE,
+            "   ",
+            None,
+            "Invalid target record status: '   '",
+        ),
+        (
+            validate_record_transition,
+            is_valid_record_transition,
+            RecordStatus.INCOMPLETE,
+            None,
+            None,
+            "Invalid target record status: None",
+        ),
+        (
+            validate_subject_transition,
+            is_valid_subject_transition,
+            SubjectStatus.SCREENED,
+            "",
+            None,
+            "Invalid target subject status: ''",
+        ),
+        (
+            validate_subject_transition,
+            is_valid_subject_transition,
+            SubjectStatus.SCREENED,
+            "   ",
+            None,
+            "Invalid target subject status: '   '",
+        ),
+        (
+            validate_subject_transition,
+            is_valid_subject_transition,
+            SubjectStatus.SCREENED,
+            None,
+            None,
+            "Invalid target subject status: None",
+        ),
+        (
+            validate_record_transition,
+            is_valid_record_transition,
+            RecordStatus.DELETED,
+            RecordStatus.RECORD_COMPLETE,
+            None,
+            "Cannot transition soft-deleted Record from DELETED to Record Complete.",
+        ),
+        (
+            validate_record_transition,
+            is_valid_record_transition,
+            RecordStatus.RECORD_INCOMPLETE,
+            RecordStatus.LOCKED,
+            True,
+            "Cannot transition soft-deleted Record from DELETED to Locked.",
+        ),
+        (
+            validate_subject_transition,
+            is_valid_subject_transition,
+            SubjectStatus.DELETED,
+            SubjectStatus.ACTIVE,
+            None,
+            "Cannot transition soft-deleted Subject from DELETED to Active.",
+        ),
+        (
+            validate_subject_transition,
+            is_valid_subject_transition,
+            SubjectStatus.ENROLLED,
+            SubjectStatus.COMPLETED,
+            True,
+            "Cannot transition soft-deleted Subject from DELETED to Completed.",
+        ),
+        (
+            validate_record_transition,
+            is_valid_record_transition,
+            RecordStatus.COMPLETE,
+            RecordStatus.COMPLETE,
+            None,
+            (
+                "Cannot transition record status from Complete to Complete. "
+                "Permitted transitions from Complete: "
+                f"{sorted(p.value for p in ALLOWED_RECORD_TRANSITIONS[RecordStatus.COMPLETE])}"
+            ),
+        ),
+        (
+            validate_subject_transition,
+            is_valid_subject_transition,
+            SubjectStatus.ENROLLED,
+            SubjectStatus.ENROLLED,
+            None,
+            (
+                "Cannot transition subject status from Enrolled to Enrolled. "
+                "Permitted transitions from Enrolled: "
+                f"{sorted(p.value for p in ALLOWED_SUBJECT_TRANSITIONS[SubjectStatus.ENROLLED])}"
+            ),
+        ),
+        (
+            validate_record_transition,
+            is_valid_record_transition,
+            "Custom Draft",
+            "Custom Draft",
+            None,
+            "Cannot transition record status from Custom Draft to Custom Draft.",
+        ),
+        (
+            validate_subject_transition,
+            is_valid_subject_transition,
+            "Custom Hold",
+            "Custom Hold",
+            None,
+            "Cannot transition subject status from Custom Hold to Custom Hold.",
+        ),
+    ],
+)
+def test_transition_validators_preserve_exact_value_error_messages(
+    validator_fn: Any,
+    boolean_fn: Any,
+    from_status: Any,
+    to_status: Any,
+    deleted: bool | None,
+    expected_message: str,
+) -> None:
+    """Verify exact ValueError messages across record and subject transition failure modes."""
+    assert boolean_fn(from_status, to_status, deleted=deleted) is False
+    with pytest.raises(ValueError, match=f"^{re.escape(expected_message)}$"):
+        validator_fn(from_status, to_status, deleted=deleted)
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "status_field", "attempted_status", "clear_msg", "mutate_msg"),
+    [
+        (
+            Record,
+            "record_status",
+            "Record Complete",
+            "Cannot restore a soft-deleted Record by clearing deleted.",
+            "Cannot mutate soft-deleted Record to active status 'Record Complete'.",
+        ),
+        (
+            Subject,
+            "subject_status",
+            "Active",
+            "Cannot restore a soft-deleted Subject by clearing deleted.",
+            "Cannot mutate soft-deleted Subject to active status 'Active'.",
+        ),
+    ],
+)
+def test_soft_delete_setattr_guards_preserve_exact_value_error_messages(
+    model_cls: Any,
+    status_field: str,
+    attempted_status: str,
+    clear_msg: str,
+    mutate_msg: str,
+) -> None:
+    """Verify exact ValueError messages on soft-deleted attribute mutation guards."""
+    deleted_entity = model_cls.model_validate(
+        {"studyKey": "S1", "deleted": True, status_field: attempted_status}
+    )
+    for cleared in (False, None):
+        with pytest.raises(ValueError, match=f"^{re.escape(clear_msg)}$"):
+            deleted_entity.deleted = cleared
+    with pytest.raises(ValueError, match=f"^{re.escape(mutate_msg)}$"):
+        setattr(deleted_entity, status_field, attempted_status)
 
 
 def test_record_revision_bounds_and_monotonic_chain_validation() -> None:
