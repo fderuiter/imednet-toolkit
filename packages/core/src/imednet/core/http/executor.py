@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -29,6 +31,10 @@ from imednet.errors import DiagnosticContext
 from imednet.utils.url import redact_url_query
 
 _SUPPRESSED_LOG_LEVEL = logging.CRITICAL + 1
+_SUPPRESSED_LOGGER_NAMES: tuple[str, ...] = ("httpx", "httpcore")
+_LOGGER_SUPPRESSION_LOCK = threading.Lock()
+_LOGGER_SUPPRESSION_COUNT = 0
+_SAVED_LOGGER_LEVELS: dict[str, int] = {}
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
@@ -65,23 +71,32 @@ class BaseRequestExecutor(ABC):
     @staticmethod
     @contextmanager
     def _suppress_httpx_request_logging() -> Iterator[None]:
-        """Context manager to suppress low-level HTTPX logging.
+        """Context manager to suppress low-level HTTPX logging across concurrent calls.
 
         Yields:
             None
         """
-        loggers = {
-            "httpx": logging.getLogger("httpx"),
-            "httpcore": logging.getLogger("httpcore"),
-        }
-        logger_states = {name: logger.level for name, logger in loggers.items()}
-        for logger in loggers.values():
-            logger.setLevel(_SUPPRESSED_LOG_LEVEL)
+        global _LOGGER_SUPPRESSION_COUNT
+        with _LOGGER_SUPPRESSION_LOCK:
+            if _LOGGER_SUPPRESSION_COUNT == 0:
+                _SAVED_LOGGER_LEVELS.clear()
+                for name in _SUPPRESSED_LOGGER_NAMES:
+                    target_logger = logging.getLogger(name)
+                    _SAVED_LOGGER_LEVELS[name] = target_logger.level
+                    target_logger.setLevel(_SUPPRESSED_LOG_LEVEL)
+            else:
+                for name in _SUPPRESSED_LOGGER_NAMES:
+                    logging.getLogger(name).setLevel(_SUPPRESSED_LOG_LEVEL)
+            _LOGGER_SUPPRESSION_COUNT += 1
         try:
             yield
         finally:
-            for name, original_level in logger_states.items():
-                loggers[name].setLevel(original_level)
+            with _LOGGER_SUPPRESSION_LOCK:
+                _LOGGER_SUPPRESSION_COUNT = max(0, _LOGGER_SUPPRESSION_COUNT - 1)
+                if _LOGGER_SUPPRESSION_COUNT == 0:
+                    for name, original_level in _SAVED_LOGGER_LEVELS.items():
+                        logging.getLogger(name).setLevel(original_level)
+                    _SAVED_LOGGER_LEVELS.clear()
 
     def _get_retry_predicate(self, method: str) -> Callable[[RetryCallState], bool]:
         """Return a retry predicate that includes the HTTP method in state."""
@@ -151,12 +166,13 @@ class BaseRequestExecutor(ABC):
             lease.record_failure()
             raise RuntimeError("Request failed without response or exception")
         self._record_response_outcome(response, lease)
-        monitor.on_success(response)
+        monitor.on_response(response)
         return handle_response(
             response,
             method=monitor.method,
             url=monitor.safe_url,
             attempt_count=attempt_count,
+            max_retry_after=self.retry_config.max_retry_after,
         )
 
     def _extract_or_fail_retry_error(
@@ -189,9 +205,12 @@ class BaseRequestExecutor(ABC):
         monitor.on_request_error(error, attempt_count=attempt_count)
 
     @staticmethod
-    def _parse_retry_after_seconds(response: httpx.Response) -> float | None:
+    def _parse_retry_after_seconds(
+        response: httpx.Response,
+        max_retry_after: float | None = None,
+    ) -> float | None:
         """Parse the 'Retry-After' header from an HTTP response."""
-        return parse_retry_after_seconds(response)
+        return parse_retry_after_seconds(response, max_retry_after=max_retry_after)
 
     def _wait_strategy(self, retry_state: RetryCallState) -> float:
         """Calculate the wait time before the next retry attempt.
@@ -206,8 +225,8 @@ class BaseRequestExecutor(ABC):
             result = retry_state.outcome.result()
             if isinstance(result, httpx.Response):
                 retry_after_seconds = self._parse_retry_after_seconds(result)
-                if retry_after_seconds is not None:
-                    return min(retry_after_seconds, self.retry_config.max_retry_after)
+                if retry_after_seconds is not None and math.isfinite(retry_after_seconds):
+                    return min(max(retry_after_seconds, 0.0), self.retry_config.max_retry_after)
         return float(self._jitter_wait(retry_state))
 
     def _get_retryer_kwargs(self, method: str) -> dict[str, Any]:

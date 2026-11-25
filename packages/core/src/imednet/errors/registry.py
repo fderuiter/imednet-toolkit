@@ -84,11 +84,24 @@ def _resolve_code_error(code: str, *, is_forbidden: bool) -> type[ApiError] | No
     return CODE_TO_ERROR.get(code)
 
 
+def _preserve_http_status_subclass(
+    status_code: int,
+    exc_cls: type[ApiError],
+) -> type[ApiError]:
+    """Preserve HTTP 400 and 401 status-specific subclasses during payload dispatch."""
+    if status_code == 400 and exc_cls is ValidationError:
+        return BadRequestError
+    if status_code == 401 and exc_cls is AuthenticationError:
+        return UnauthorizedError
+    return exc_cls
+
+
 def get_error_class(status_code: int, response_body: Any = None) -> type[ApiError]:
     """Get error class for status code and response payload.
 
     Inspects nested ``metadata.error`` (dict or list) and ``metadata.status`` first,
-    preserving ``ForbiddenError`` on HTTP 403 or ``FORBIDDEN`` responses with code ``9001``,
+    preserving ``BadRequestError`` on HTTP 400, ``UnauthorizedError`` on HTTP 401, and
+    ``ForbiddenError`` on HTTP 403 or ``FORBIDDEN`` responses with code ``9001``,
     then legacy top-level keys, and finally falls back to HTTP status mappings.
     Defaults to generic ``ApiError`` for unmapped client/server errors.
     """
@@ -116,31 +129,30 @@ def get_error_class(status_code: int, response_body: Any = None) -> type[ApiErro
             for nested_code in _extract_error_codes(metadata.get("error")):
                 mapped_code_cls = _resolve_code_error(nested_code, is_forbidden=is_forbidden)
                 if mapped_code_cls is not None:
-                    return mapped_code_cls
+                    return _preserve_http_status_subclass(status_code, mapped_code_cls)
 
             if meta_status_upper:
                 mapped_meta_cls = METADATA_STATUS_TO_ERROR.get(meta_status_upper)
                 if mapped_meta_cls is not None:
-                    return mapped_meta_cls
+                    return _preserve_http_status_subclass(status_code, mapped_meta_cls)
 
         top_code = _normalize_code(response_body.get("code"))
         if top_code:
             mapped_top_cls = _resolve_code_error(top_code, is_forbidden=is_forbidden)
             if mapped_top_cls is not None:
-                return mapped_top_cls
+                return _preserve_http_status_subclass(status_code, mapped_top_cls)
 
         for fallback_key in ("error", "errors"):
             for item_code in _extract_error_codes(response_body.get(fallback_key)):
                 mapped_item_cls = _resolve_code_error(item_code, is_forbidden=is_forbidden)
                 if mapped_item_cls is not None:
-                    return mapped_item_cls
+                    return _preserve_http_status_subclass(status_code, mapped_item_cls)
 
-        status = response_body.get("status")
         # Identify specific subclasses based on legacy top-level status
-        if status_code == 400 and status == "validation_error":
-            return ValidationError
-        if status_code == 401 and status == "authentication_failed":
-            return AuthenticationError
+        if status_code == 400 and top_status_upper in {"VALIDATION_ERROR", "BAD_REQUEST"}:
+            return BadRequestError
+        if status_code == 401 and top_status_upper in {"AUTHENTICATION_FAILED", "UNAUTHORIZED"}:
+            return UnauthorizedError
 
     error_cls = STATUS_TO_ERROR.get(status_code)
     if error_cls:

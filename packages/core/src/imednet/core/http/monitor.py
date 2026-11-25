@@ -40,24 +40,34 @@ class RequestMonitor(_BaseMonitor):
             attributes={"endpoint": self.safe_url, "method": self.method},
         )
 
-    def on_success(self, response: httpx.Response) -> None:
-        """Record a successful request completion.
+    def on_response(self, response: httpx.Response) -> None:
+        """Record an HTTP response on the active span and emit status-tiered logs.
 
         Args:
-            response: The successful HTTPX response.
+            response: The HTTPX response received from transport.
         """
         latency = time.monotonic() - self.start_time
-        logger.info(
+        status_code = response.status_code
+        log_fn = logger.warning if status_code >= 400 else logger.info
+        log_fn(
             "http_request",
             extra={
                 "method": self.method,
                 "url": self.safe_url,
-                "status_code": response.status_code,
+                "status_code": status_code,
                 "latency": latency,
             },
         )
         if self.span:
-            self.span.set_attribute("status_code", response.status_code)
+            self.span.set_attribute("status_code", status_code)
+
+    def on_success(self, response: httpx.Response) -> None:
+        """Record a request completion response.
+
+        Args:
+            response: The HTTPX response received from transport.
+        """
+        self.on_response(response)
 
     def _resolve_error_context(
         self,
