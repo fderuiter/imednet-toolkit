@@ -13,9 +13,11 @@ import math
 import numbers
 import os
 import re
+import sys
+import types
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -3750,21 +3752,49 @@ def _build_tabular_sink_config(
 ) -> TabularSinkConfig:
     """Construct a :class:`TabularSinkConfig` while keeping sink kwargs out of ``pandas_kwargs``."""
     config = kwargs.pop("config", None)
+    explicit_sanitize = kwargs.pop("sanitize", None)
     if isinstance(config, TabularSinkConfig):
-        return config
+        _pop_sink_kwargs(kwargs)
+        updates: dict[str, Any] = {}
+        if config.study_key != study_key:
+            updates["study_key"] = study_key
+        if manifest_path is not None and config.manifest_path is None:
+            updates["manifest_path"] = manifest_path
+        if use_labels_as_columns and not config.use_labels_as_columns:
+            updates["use_labels_as_columns"] = True
+        if variable_whitelist is not None and config.variable_whitelist is None:
+            updates["variable_whitelist"] = variable_whitelist
+        if form_whitelist is not None and config.form_whitelist is None:
+            updates["form_whitelist"] = form_whitelist
+        if kwargs:
+            updates["pandas_kwargs"] = {**config.pandas_kwargs, **kwargs}
+        return replace(config, **updates) if updates else config
     if isinstance(config, SinkConfig):
         _pop_sink_kwargs(kwargs)
         base_values = {f.name: getattr(config, f.name) for f in fields(SinkConfig)}
         base_values["study_key"] = study_key
+        if not mask_phi:
+            base_values["mask_phi"] = False
+        if default_quality_gate:
+            base_values["quality_gate_enabled"] = True
+        resolved_manifest = (
+            manifest_path
+            if manifest_path is not None
+            else (
+                str(config.extra["manifest_path"])
+                if isinstance(config.extra, Mapping) and config.extra.get("manifest_path")
+                else None
+            )
+        )
         return TabularSinkConfig(
             **base_values,
-            manifest_path=manifest_path,
+            manifest_path=resolved_manifest,
+            sanitize=bool(explicit_sanitize) if explicit_sanitize is not None else False,
             pandas_kwargs=kwargs,
             use_labels_as_columns=use_labels_as_columns,
             variable_whitelist=variable_whitelist,
             form_whitelist=form_whitelist,
         )
-    explicit_sanitize = kwargs.pop("sanitize", None)
     sink_kwargs = _pop_sink_kwargs(kwargs)
     sink_kwargs.setdefault("quality_gate_enabled", default_quality_gate)
     sink_kwargs.setdefault("mask_phi", mask_phi)
@@ -3891,6 +3921,11 @@ def export_to_csv(
         When ``True`` (default), sensitive Subject PHI values are replaced with
         ``***MASKED***``.
     """
+    raw_cfg = kwargs.get("config")
+    raw_extra = getattr(raw_cfg, "extra", None)
+    cfg_manifest = getattr(raw_cfg, "manifest_path", None) or (
+        raw_extra.get("manifest_path") if isinstance(raw_extra, Mapping) else None
+    )
     kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     kwargs.setdefault("sanitize", True)
     config = _build_tabular_sink_config(
@@ -3899,7 +3934,8 @@ def export_to_csv(
         use_labels_as_columns=use_labels_as_columns,
         variable_whitelist=variable_whitelist,
         form_whitelist=form_whitelist,
-        manifest_path=manifest_path or str(Path(path).with_suffix(".manifest.jsonl")),
+        manifest_path=manifest_path
+        or (str(cfg_manifest) if cfg_manifest else str(Path(path).with_suffix(".manifest.jsonl"))),
         default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
     )
@@ -4659,11 +4695,11 @@ def export_to_json(
         is_mock_hier_mapper = _is_mock_mapper(mapper) or not callable(
             getattr(mapper, "_get_enrichment_pipeline", None)
         )
-        hier_kwargs: dict[str, Any] = {"use_labels_as_keys": use_labels_as_columns}
-        if variable_whitelist is not None:
-            hier_kwargs["variable_whitelist"] = variable_whitelist
-        if form_whitelist is not None:
-            hier_kwargs["form_whitelist"] = form_whitelist
+        hier_kwargs: dict[str, Any] = {"use_labels_as_keys": config.use_labels_as_columns}
+        if config.variable_whitelist is not None:
+            hier_kwargs["variable_whitelist"] = config.variable_whitelist
+        if config.form_whitelist is not None:
+            hier_kwargs["form_whitelist"] = config.form_whitelist
         if _config_has_streaming_options(config):
             hier_kwargs["include_deleted"] = config.include_deleted
         if not config.mask_phi and not _is_mock_mapper(mapper):
@@ -5553,9 +5589,9 @@ def export_to_duckdb_by_form(
         sdk,
         study_key,
         mapper,
-        use_labels_as_columns=use_labels_as_columns,
-        variable_whitelist=variable_whitelist,
-        form_whitelist=form_whitelist,
+        use_labels_as_columns=config.use_labels_as_columns,
+        variable_whitelist=config.variable_whitelist,
+        form_whitelist=config.form_whitelist,
         mask_phi=config.mask_phi,
         pipeline=pipeline,
         stream_prefix="duckdb",
@@ -5583,7 +5619,7 @@ def export_to_duckdb_by_form(
                     rows,
                     ctx.variable_keys,
                     ctx.label_map,
-                    use_labels_as_columns,
+                    config.use_labels_as_columns,
                 )
                 if isinstance(df, pd.DataFrame):
                     df = _dedup_case_insensitive_columns(df, ensure_str_columns=True)
@@ -5614,7 +5650,7 @@ def export_to_duckdb_by_form(
                     study_key,
                     config,
                     ctx,
-                    use_labels_as_columns=use_labels_as_columns,
+                    use_labels_as_columns=config.use_labels_as_columns,
                 )
                 inner_ddb_sink = TabularDuckDBSink(
                     db_path,
@@ -5711,9 +5747,9 @@ def export_to_sql_by_form(
         sdk,
         study_key,
         mapper,
-        use_labels_as_columns=use_labels_as_columns,
-        variable_whitelist=variable_whitelist,
-        form_whitelist=form_whitelist,
+        use_labels_as_columns=config.use_labels_as_columns,
+        variable_whitelist=config.variable_whitelist,
+        form_whitelist=config.form_whitelist,
         mask_phi=config.mask_phi,
         pipeline=pipeline,
         stream_prefix="sql",
@@ -5738,7 +5774,7 @@ def export_to_sql_by_form(
                 rows,
                 ctx.variable_keys,
                 ctx.label_map,
-                use_labels_as_columns,
+                config.use_labels_as_columns,
             )
             if isinstance(df, pd.DataFrame):
                 df = _dedup_case_insensitive_columns(df, ensure_str_columns=False)
@@ -5777,7 +5813,7 @@ def export_to_sql_by_form(
                 study_key,
                 config,
                 ctx,
-                use_labels_as_columns=use_labels_as_columns,
+                use_labels_as_columns=config.use_labels_as_columns,
                 pandas_kwargs=form_pandas_kwargs,
             )
             inner_sql_sink = TabularSQLSink(ctx.form_key, engine, form_config)
@@ -5861,8 +5897,17 @@ def _unpack_long_sql_rows(
     phi_keys: set[str] | None,
     naming_convention: str | None = None,
     sdtm_domain: str | None = None,
+    variable_whitelist: Sequence[str] | set[str] | None = None,
+    form_whitelist: Sequence[int] | set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Unpack ``Record`` envelopes into normalized long-format variable rows with PHI masking."""
+    allowed_forms = set(form_whitelist) if form_whitelist is not None else None
+    allowed_vars = set(variable_whitelist) if variable_whitelist is not None else None
+    if (allowed_forms is not None and not allowed_forms) or (
+        allowed_vars is not None and not allowed_vars
+    ):
+        return []
+
     long_rows: list[dict[str, Any]] = []
     for rec in records:
         rec_id = extract_record_id(rec)
@@ -5876,10 +5921,26 @@ def _unpack_long_sql_rows(
             form_id = getattr(rec, "form_id", getattr(rec, "formId", None))
             timestamp = getattr(rec, "date_modified", getattr(rec, "dateModified", None))
             raw_payload = getattr(rec, "record_data", getattr(rec, "recordData", None))
+        if allowed_forms is not None:
+            fid_norm, _ = extract_record_form_ref(rec)
+            resolved_fid = fid_norm if fid_norm is not None else form_id
+            if resolved_fid not in allowed_forms:
+                continue
         rec_payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
         if pipeline is not None and rec_payload:
             rec_payload = pipeline.process(rec_payload, mask_phi=mask_phi)
         for name, value in rec_payload.items():
+            formatted_var_name = (
+                format_variable_name(name, naming_convention, domain=sdtm_domain)
+                if naming_convention is not None
+                else name
+            )
+            if (
+                allowed_vars is not None
+                and name not in allowed_vars
+                and formatted_var_name not in allowed_vars
+            ):
+                continue
             if not mask_phi:
                 masked_value = value
             elif global_sensitivity_registry.is_sensitive(name) or _is_custom_phi_key(
@@ -5890,11 +5951,6 @@ def _unpack_long_sql_rows(
                 masked_value = mask_clinical_phi(value)
                 if phi_keys:
                     masked_value = mask_custom_phi_recursive(masked_value, phi_keys)
-            formatted_var_name = (
-                format_variable_name(name, naming_convention, domain=sdtm_domain)
-                if naming_convention is not None
-                else name
-            )
             long_rows.append(
                 {
                     "record_id": rec_id,
@@ -5920,6 +5976,8 @@ class _LongSQLSink(ExportSink):
         *,
         chunk_size: int,
         pipeline: EnrichmentPipeline | None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
     ) -> None:
         super().__init__(config)
         self.table = table
@@ -5928,6 +5986,12 @@ class _LongSQLSink(ExportSink):
         self._chunk_size = max(1, chunk_size)
         self._pipeline = pipeline
         self._phi_keys = set(pipeline.phi_keys) if pipeline is not None else None
+        self._variable_whitelist = (
+            variable_whitelist if variable_whitelist is not None else config.variable_whitelist
+        )
+        self._form_whitelist = (
+            form_whitelist if form_whitelist is not None else config.form_whitelist
+        )
         self._is_incremental_sync = _is_incremental_config(config)
         self._is_first_write = True
         self._initial_if_exists: Literal["replace", "append"] = (
@@ -5959,14 +6023,38 @@ class _LongSQLSink(ExportSink):
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         if not records:
             return 0
-        incoming_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if self._form_whitelist is not None:
+            allowed_forms = set(self._form_whitelist)
+            filtered_records: Sequence[Any] = [
+                r
+                for r in records
+                if ((fid := extract_record_form_ref(r)[0]) is not None and fid in allowed_forms)
+                or (
+                    fid is None
+                    and (
+                        r.get("form_id")
+                        if isinstance(r, Mapping) and "form_id" in r
+                        else (
+                            r.get("formId")
+                            if isinstance(r, Mapping)
+                            else getattr(r, "form_id", getattr(r, "formId", None))
+                        )
+                    )
+                    in allowed_forms
+                )
+            ]
+        else:
+            filtered_records = records
+        incoming_ids = [rid for r in filtered_records if (rid := extract_record_id(r)) is not None]
         long_rows = _unpack_long_sql_rows(
-            records,
+            filtered_records,
             mask_phi=self._cfg.mask_phi,
             pipeline=self._pipeline,
             phi_keys=self._phi_keys,
             naming_convention=self._cfg.naming_convention,
             sdtm_domain=self._cfg.sdtm_domain,
+            variable_whitelist=self._variable_whitelist,
+            form_whitelist=self._form_whitelist,
         )
 
         def execute_export() -> int:
@@ -5979,7 +6067,7 @@ class _LongSQLSink(ExportSink):
                 self._delete_record_ids(incoming_ids)
             if long_rows:
                 self._write_long_chunks(long_rows)
-            return len(records)
+            return len(filtered_records)
 
         return self._execute_with_retry("export_long_sql", batch_id, execute_export)
 
@@ -6025,6 +6113,8 @@ def export_to_long_sql(
     table_name: str,
     conn_str: str,
     *,
+    variable_whitelist: list[str] | None = None,
+    form_whitelist: list[int] | None = None,
     chunk_size: int = 1000,
     quality_gate_enabled: bool = False,
     mask_phi: bool = True,
@@ -6043,6 +6133,8 @@ def export_to_long_sql(
     config = _build_tabular_sink_config(
         study_key,
         kwargs,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
         manifest_path=manifest_path,
         default_quality_gate=quality_gate_enabled,
         mask_phi=mask_phi,
@@ -6065,6 +6157,8 @@ def export_to_long_sql(
                 mask_phi=config.mask_phi,
                 pipeline=pipeline,
                 phi_keys=phi_keys,
+                variable_whitelist=config.variable_whitelist,
+                form_whitelist=config.form_whitelist,
             )
             first = True
             for start in range(0, len(long_rows), max(1, chunk_size)):
@@ -6076,6 +6170,11 @@ def export_to_long_sql(
                     index=False,
                 )
                 first = False
+            if first and config.idempotent and not isinstance(engine, NonCallableMock):
+                empty_df = pd.DataFrame(
+                    columns=["record_id", "form_id", "variable_name", "value", "timestamp"]
+                )
+                empty_df.to_sql(table_name, engine, if_exists="replace", index=False)
         finally:
             db_name = getattr(getattr(engine, "url", None), "database", None)
             if (
@@ -6106,6 +6205,8 @@ def export_to_long_sql(
         config,
         chunk_size=chunk_size,
         pipeline=pipeline,
+        variable_whitelist=config.variable_whitelist,
+        form_whitelist=config.form_whitelist,
     )
     run_streaming_export(
         sdk,
@@ -6139,3 +6240,24 @@ _UNPATCHED_EXPORTS: dict[str, Callable[..., Any]] = {
     "export_to_sql": export_to_sql,
     "export_to_sql_by_form": export_to_sql_by_form,
 }
+
+
+class _CallableExportModule(types.ModuleType):
+    """Module subclass delegating direct calls to :func:`imednet.integrations.dispatcher.export`."""
+
+    def __call__(
+        self,
+        target: str,
+        sdk: ImednetSDK,
+        study_key: str,
+        *,
+        config: SinkConfig | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Invoke the unified export dispatcher while preserving submodule attributes."""
+        from .dispatcher import export as _dispatch_export
+
+        return _dispatch_export(target, sdk, study_key, config=config, **kwargs)
+
+
+sys.modules[__name__].__class__ = _CallableExportModule

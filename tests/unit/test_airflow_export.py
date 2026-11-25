@@ -20,7 +20,9 @@ def _setup_airflow(monkeypatch):
 EXPORT_FUNCTIONS = [
     "export_to_csv",
     "export_to_duckdb",
+    "export_to_duckdb_by_form",
     "export_to_parquet",
+    "export_to_hive_parquet",
     "export_to_excel",
     "export_to_json",
     "export_to_sql",
@@ -74,7 +76,8 @@ import importlib
 from unittest.mock import patch
 import imednet.integrations as integrations
 
-# A cached submodule import must not decide whether `export` is callable or a module.
+# Fresh imports AND reloads must both keep `export` callable while preserving submodule attributes.
+assert callable(integrations.export)
 importlib.reload(integrations)
 assert callable(integrations.export)
 import imednet.spi as spi
@@ -1887,3 +1890,175 @@ def test_operator_sdtm_phi_redaction_and_incremental_reconciliation(
     json_rows2 = json.loads(json_path.read_text(encoding="utf-8"))
     assert len(json_rows2) == 1 and json_rows2[0]["USUBJID"] == "S01"
     assert json_rows2[0]["BRTHDTC"] == "1981"
+
+
+def test_operator_executes_duckdb_by_form_and_hive_parquet_with_connections_and_openlineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ImednetExportOperator, ImednetHook, and OpenLineage support duckdb_by_form and hive_parquet."""
+    import json
+
+    pytest.importorskip("pyarrow")
+    duckdb_mod = pytest.importorskip("duckdb")
+
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+    from apache_airflow_providers_imednet.operators.export import (
+        _TABULAR_EXPORTS,
+        ImednetExportOperator,
+    )
+    from imednet.integrations.parquet import hive_parquet_query
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    assert "duckdb_by_form" in _TABULAR_EXPORTS
+    assert "hive_parquet" in _TABULAR_EXPORTS
+
+    ddb_conn_file = tmp_path / "conn_forms.duckdb"
+    hive_conn_dir = tmp_path / "conn_hive_lake"
+    conns = {
+        "duck_forms_conn": SimpleNamespace(
+            host=str(ddb_conn_file),
+            schema=None,
+            extra={"table": "ignored_for_by_form"},
+        ),
+        "hive_extra_conn": SimpleNamespace(
+            host=None,
+            schema=None,
+            extra={"base_dir": str(hive_conn_dir)},
+        ),
+        "hive_host_conn": SimpleNamespace(
+            host="/mnt/clinical_lake",
+            schema=None,
+            extra={},
+        ),
+    }
+    monkeypatch.setattr(
+        ImednetHook,
+        "_get_airflow_connection",
+        classmethod(lambda cls, cid: conns[cid]),
+    )
+
+    assert ImednetHook.resolve_destination_connection("duck_forms_conn", "duckdb_by_form") == {
+        "db_path": str(ddb_conn_file),
+        "table_name": "ignored_for_by_form",
+    }
+    assert ImednetHook.resolve_destination_connection("hive_extra_conn", "hive_parquet") == {
+        "base_dir": str(hive_conn_dir),
+    }
+    assert ImednetHook.resolve_destination_connection("hive_host_conn", "hive_parquet") == {
+        "base_dir": "/mnt/clinical_lake",
+    }
+
+    forms = [
+        Form(form_id=10, form_key="DEMO", form_name="Demographics"),
+        Form(form_id=20, form_key="VITALS", form_name="Vitals"),
+    ]
+    variables = [
+        Variable(variable_name="AGE", variable_type="int", form_id=10, form_key="DEMO"),
+        Variable(variable_name="HR", variable_type="int", form_id=20, form_key="VITALS"),
+    ]
+    records = [
+        Record(
+            record_id=1,
+            study_key="STUDY_MULTI",
+            subject_key="S01",
+            form_id=10,
+            form_key="DEMO",
+            date_modified="2026-06-01T00:00:00Z",
+            record_data={"AGE": 48},
+        ),
+        Record(
+            record_id=2,
+            study_key="STUDY_MULTI",
+            subject_key="S01",
+            form_id=20,
+            form_key="VITALS",
+            date_modified="2026-06-01T00:05:00Z",
+            record_data={"HR": 71},
+        ),
+    ]
+    sdk = MagicMock(sinks=None)
+    sdk.forms.list.return_value = forms
+    sdk.get_forms.return_value = forms
+    sdk.variables.list.return_value = variables
+    sdk.get_variables.return_value = variables
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+
+    # 1. Execute duckdb_by_form via destination_conn_id (ensuring extra table_name does not cause TypeError)
+    op_ddb_forms = ImednetExportOperator(
+        task_id="export_duckdb_by_form",
+        study_key="STUDY_MULTI",
+        destination="duckdb_by_form",
+        destination_conn_id="duck_forms_conn",
+        batch_size=50,
+    )
+    monkeypatch.setattr(op_ddb_forms, "_get_sdk", lambda: sdk)
+    assert op_ddb_forms.execute({}) == str(ddb_conn_file)
+
+    with duckdb_mod.connect(str(ddb_conn_file), read_only=True) as dconn:
+        assert dconn.execute('SELECT "recordId", "AGE" FROM DEMO').fetchall() == [(1, 48)]
+        assert dconn.execute('SELECT "recordId", "HR" FROM VITALS').fetchall() == [(2, 71)]
+
+    # 2. Execute hive_parquet via destination_conn_id across two consecutive idempotent=True runs with manifest
+    manifest_file = tmp_path / "af_hive_manifest.jsonl"
+    op_hive = ImednetExportOperator(
+        task_id="export_hive_parquet",
+        study_key="STUDY_MULTI",
+        destination="hive_parquet",
+        destination_conn_id="hive_extra_conn",
+        idempotent=True,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=50.0,
+        export_kwargs={"manifest_path": str(manifest_file)},
+    )
+    monkeypatch.setattr(op_hive, "_get_sdk", lambda: sdk)
+    assert op_hive.execute({"run_id": "r1"}) == str(hive_conn_dir)
+    assert op_hive.execute({"run_id": "r2"}) == str(hive_conn_dir)
+
+    with duckdb_mod.connect(":memory:") as dconn:
+        hive_rows = dconn.execute(
+            f'SELECT "form_key", "recordId" FROM ({hive_parquet_query(str(hive_conn_dir))}) ORDER BY "recordId"'
+        ).fetchall()
+    assert hive_rows == [("DEMO", 1), ("VITALS", 2)]
+    manifest_lines = [
+        json.loads(line)
+        for line in manifest_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(manifest_lines) == 4  # 2 forms * 2 runs
+
+    # 3. Verify OpenLineage dataset emission for duckdb_by_form and hive_parquet
+    dataset_cls = lambda namespace, name: SimpleNamespace(namespace=namespace, name=name)  # noqa: E731
+    _, ddb_outputs = op_ddb_forms._build_openlineage_datasets(dataset_cls)
+    assert len(ddb_outputs) == 1
+    assert ddb_outputs[0].namespace == "duckdb"
+    assert ddb_outputs[0].name == f"{ddb_conn_file}.ignored_for_by_form"
+
+    op_ddb_default = ImednetExportOperator(
+        task_id="export_duckdb_by_form_default",
+        study_key="STUDY_MULTI",
+        destination="duckdb_by_form",
+        output_path="/tmp/forms_lake.duckdb",
+    )
+    _, ddb_def_outputs = op_ddb_default._build_openlineage_datasets(dataset_cls)
+    assert len(ddb_def_outputs) == 1
+    assert ddb_def_outputs[0].namespace == "duckdb"
+    assert ddb_def_outputs[0].name == "/tmp/forms_lake.duckdb.forms"
+
+    _, hive_outputs = op_hive._build_openlineage_datasets(dataset_cls)
+    assert len(hive_outputs) == 1
+    assert hive_outputs[0].namespace == "file"
+    assert hive_outputs[0].name == str(hive_conn_dir)
+
+    op_hive_s3 = ImednetExportOperator(
+        task_id="export_hive_s3",
+        study_key="STUDY_MULTI",
+        destination="hive_parquet",
+        export_kwargs={"base_dir": "s3://clinical-bucket/studies/hive"},
+    )
+    _, hive_s3_outputs = op_hive_s3._build_openlineage_datasets(dataset_cls)
+    assert len(hive_s3_outputs) == 1
+    assert hive_s3_outputs[0].namespace == "s3://clinical-bucket"
+    assert hive_s3_outputs[0].name == "studies/hive"

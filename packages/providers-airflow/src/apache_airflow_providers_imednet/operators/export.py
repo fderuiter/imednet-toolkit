@@ -847,6 +847,23 @@ class ImednetExportOperator(BaseOperator):
                 namespace = "sql"
                 raw_name = table_target
             outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(raw_name)))
+        elif dest == "hive_parquet":
+            raw_base_dir = str(
+                self.output_path
+                or runtime_kwargs.get("base_dir")
+                or runtime_kwargs.get("path")
+                or conn_settings.get("base_dir")
+                or ""
+            ).strip()
+            if raw_base_dir:
+                if "://" in raw_base_dir:
+                    parsed_out = urlsplit(raw_base_dir)
+                    namespace = _lineage_authority(raw_base_dir)
+                    name = parsed_out.path.lstrip("/") or _sanitize_lineage_text(raw_base_dir)
+                else:
+                    namespace = "file"
+                    name = _sanitize_lineage_text(raw_base_dir)
+                outputs.append(dataset_cls(namespace=namespace, name=_sanitize_lineage_text(name)))
         elif self.output_path:
             raw_target = str(self.output_path)
             if "://" in raw_target:
@@ -887,11 +904,7 @@ class ImednetExportOperator(BaseOperator):
         validate_path_segment(self.study_key, name="study_key")
         runtime_kwargs = self._get_runtime_export_kwargs()
         # Resolve destination early to fail fast on invalid configs (like legacy _get_export_callable)
-        dest = self.destination
-        if not dest and self.export_func:
-            dest = self.export_func.replace("export_to_", "")
-        elif not dest:
-            dest = "csv"
+        dest = self._effective_destination()
 
         export_callable = None
         if dest in _TABULAR_EXPORTS:
@@ -978,6 +991,8 @@ class ImednetExportOperator(BaseOperator):
                 )
                 if dest == "duckdb_by_form":
                     conn_settings = self._resolve_destination_connection(dest)
+                    tabular_kwargs.pop("table_name", None)
+                    tabular_kwargs.pop("table", None)
                     db_path_arg = (
                         self.output_path
                         or tabular_kwargs.pop("db_path", None)
@@ -994,10 +1009,12 @@ class ImednetExportOperator(BaseOperator):
                     )
                     return redact_uri(str(db_path_arg)) if db_path_arg is not None else None
                 if dest == "hive_parquet":
+                    conn_settings = self._resolve_destination_connection(dest)
                     base_dir_arg = (
                         self.output_path
                         or tabular_kwargs.pop("base_dir", None)
                         or tabular_kwargs.pop("path", None)
+                        or conn_settings.get("base_dir")
                     )
                     if base_dir_arg is not None:
                         _validate_no_secrets_in_value(base_dir_arg, field_name="output_path")

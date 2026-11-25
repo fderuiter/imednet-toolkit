@@ -2418,3 +2418,121 @@ def test_register_list_command_hooks_no_study_and_subparser_reuse(
     payload = json.loads(out_json)
     assert payload["items"] == [study.model_dump(mode="json", by_alias=True)]
     mock_sdk.studies.list.assert_called_once_with(archived=False)
+
+
+def test_export_sql_long_format_whitelists_forwarded_and_end_to_end(
+    runner: CliRunner,
+    sdk: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """imednet export sql --long-format --forms ... --vars ... forwards whitelists and writes only whitelisted rows."""
+    import sqlite3
+
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    # 1. Verify CLI forwards variable_whitelist and form_whitelist when provided
+    long_func = MagicMock()
+    with monkeypatch.context() as m:
+        m.setattr(export_mod, "export_to_long_sql", long_func)
+        m.setattr(cli, "export_to_long_sql", export_mod.export_to_long_sql)
+
+        res_mock = runner.invoke(
+            cli.app,
+            [
+                "export",
+                "sql",
+                "STUDY",
+                "long_tbl",
+                "sqlite://",
+                "--long-format",
+                "--forms",
+                "10,20",
+                "--vars",
+                "AGE,HR",
+            ],
+        )
+    assert res_mock.exit_code == 0, res_mock.stderr
+    long_func.assert_called_once_with(
+        sdk,
+        "STUDY",
+        "long_tbl",
+        "sqlite://",
+        variable_whitelist=["AGE", "HR"],
+        form_whitelist=[10, 20],
+    )
+
+    # 2. End-to-end SQLite verification without mocking export_to_long_sql
+    e2e_sdk = MagicMock()
+    e2e_sdk.forms.list.return_value = [
+        Form(form_id=10, form_key="DEMO", form_name="Demographics"),
+        Form(form_id=20, form_key="VITALS", form_name="Vitals"),
+        Form(form_id=30, form_key="LABS", form_name="Labs"),
+    ]
+    e2e_sdk.variables.list.return_value = [
+        Variable(variable_name="AGE", variable_type="int", form_id=10, form_key="DEMO"),
+        Variable(variable_name="WEIGHT", variable_type="int", form_id=10, form_key="DEMO"),
+        Variable(variable_name="HR", variable_type="int", form_id=20, form_key="VITALS"),
+        Variable(variable_name="GLUCOSE", variable_type="int", form_id=30, form_key="LABS"),
+    ]
+    records = [
+        Record(
+            record_id=1,
+            study_key="STUDY",
+            subject_key="S1",
+            form_id=10,
+            form_key="DEMO",
+            date_modified="2026-04-01T00:00:00Z",
+            record_data={"AGE": 50, "WEIGHT": 80},
+        ),
+        Record(
+            record_id=2,
+            study_key="STUDY",
+            subject_key="S1",
+            form_id=20,
+            form_key="VITALS",
+            date_modified="2026-04-02T00:00:00Z",
+            record_data={"HR": 74},
+        ),
+        Record(
+            record_id=3,
+            study_key="STUDY",
+            subject_key="S1",
+            form_id=30,
+            form_key="LABS",
+            date_modified="2026-04-03T00:00:00Z",
+            record_data={"GLUCOSE": 99},
+        ),
+    ]
+    e2e_sdk.records.list.side_effect = lambda **_kw: iter(
+        [r.model_copy(deep=True) for r in records]
+    )
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: e2e_sdk)
+
+    sqlite_file = tmp_path / "cli_long_e2e.sqlite"
+    res_e2e = runner.invoke(
+        cli.app,
+        [
+            "export",
+            "sql",
+            "STUDY",
+            "long_eav",
+            f"sqlite:///{sqlite_file}",
+            "--long-format",
+            "--forms",
+            "10,20",
+            "--vars",
+            "AGE,HR",
+        ],
+    )
+    assert res_e2e.exit_code == 0, res_e2e.stderr
+    with sqlite3.connect(sqlite_file) as conn:
+        rows = conn.execute(
+            "SELECT record_id, form_id, variable_name, value FROM long_eav ORDER BY record_id"
+        ).fetchall()
+    assert rows == [
+        (1, 10, "AGE", 50),
+        (2, 20, "HR", 74),
+    ]

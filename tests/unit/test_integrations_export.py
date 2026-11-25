@@ -2896,3 +2896,355 @@ def test_incremental_reconciliation_with_sdtm_naming_convention(tmp_path: Path) 
         engine.dispose()
     assert sql_df["RECORD_ID"].tolist() == [1]
     assert sql_df["SYSBP"].tolist() == [135]
+
+
+def test_fresh_import_callable_export_barrel_and_spi_delegation(tmp_path: Path) -> None:
+    """Fresh Python imports expose callable imednet.integrations.export and lazy imednet.spi.export while keeping submodule attributes."""
+    import os
+    import subprocess
+
+    out_integrations = tmp_path / "fresh_integrations.csv"
+    out_spi = tmp_path / "fresh_spi.csv"
+    script = f"""
+import inspect
+import sys
+import types
+from unittest.mock import MagicMock, patch
+
+import imednet.spi as spi
+
+# Accessing imednet.spi alone must keep imednet.integrations.export lazy
+assert "imednet.integrations.export" not in sys.modules
+
+spi_export = spi.export
+import imednet.integrations as integrations
+
+assert callable(integrations.export)
+assert callable(spi_export)
+assert spi_export is integrations.export
+assert isinstance(integrations.export, types.ModuleType)
+assert inspect.ismodule(integrations.export)
+assert callable(integrations.export.export_to_csv)
+assert isinstance(integrations.export.MAX_SQLITE_COLUMNS, int)
+assert callable(spi.export_helpers.export_to_hive_parquet)
+
+from imednet.models.forms import Form
+from imednet.models.records import Record
+from imednet.models.variables import Variable
+from imednet.spi.sink_base import SinkConfig
+
+sdk = MagicMock()
+sdk.forms.list.return_value = [Form(form_id=10, form_key="DEMO", form_name="Demographics")]
+sdk.variables.list.return_value = [
+    Variable(variable_name="patientName", variable_type="text", label="Patient Name", form_id=10, form_key="DEMO"),
+    Variable(variable_name="AGE", variable_type="int", label="Age", form_id=10, form_key="DEMO"),
+]
+rec = Record(
+    record_id=1,
+    study_key="STUDY",
+    subject_key="S01",
+    form_id=10,
+    form_key="DEMO",
+    record_data={{"patientName": "Alice Smith", "AGE": 34}},
+)
+sdk.records.list.side_effect = lambda **_kw: iter([rec.model_copy(deep=True)])
+
+cfg = SinkConfig(study_key="STUDY", mask_phi=False)
+integrations.export("csv", sdk, "STUDY", path={str(out_integrations)!r}, config=cfg)
+spi.export("csv", sdk, "STUDY", path={str(out_spi)!r}, config=cfg)
+
+with patch("imednet.integrations.export.export_to_csv", return_value="patched") as mocked:
+    assert integrations.export.export_to_csv("x") == "patched"
+    mocked.assert_called_once_with("x")
+"""
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    if env.get("IMEDNET_TEST_WHEELS") != "1":
+        core_src = str(repo_root / "packages" / "core" / "src")
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = f"{core_src}{os.pathsep}{existing}" if existing else core_src
+
+    res = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    df_int = pd.read_csv(out_integrations)
+    df_spi = pd.read_csv(out_spi)
+    assert df_int["patientName"].tolist() == ["Alice Smith"]
+    assert df_int.equals(df_spi)
+
+
+def test_dispatcher_and_tabular_helpers_honor_sink_config_attributes(tmp_path: Path) -> None:
+    """SinkConfig passed to dispatcher.export or export_to_* preserves all attributes and matches mask_phi=False output."""
+    import json
+    import sqlite3
+
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("openpyxl")
+    duckdb_mod = pytest.importorskip("duckdb")
+
+    from imednet.integrations import dispatcher
+    from imednet.integrations.sink_base import SinkConfig
+
+    sdk = _make_phi_export_sdk()
+
+    # 1. Verify _build_tabular_sink_config converts base SinkConfig with all fields intact and no sanitize leak
+    manifest_file = tmp_path / "tabular_manifest.jsonl"
+    base_cfg = SinkConfig(
+        study_key="STUDY1",
+        batch_size=7,
+        max_buffered_records=77,
+        max_retries=5,
+        retry_backoff=2.5,
+        idempotent=False,
+        mask_phi=False,
+        quality_gate_enabled=True,
+        min_schema_readiness_score=65.0,
+        modified_since="2025-01-01T00:00:00Z",
+        record_filter={"siteId": 5},
+        record_data_filter="systolicBp>100",
+        include_deleted=True,
+        as_sdtm=False,
+        naming_convention="camelCase",
+        extra={"manifest_path": str(manifest_file)},
+    )
+    converted = export_mod._build_tabular_sink_config(
+        "STUDY1",
+        {"config": base_cfg, "sanitize": True, "sep": "|"},
+    )
+    assert converted.study_key == "STUDY1"
+    assert converted.batch_size == 7
+    assert converted.max_buffered_records == 77
+    assert converted.max_retries == 5
+    assert converted.retry_backoff == 2.5
+    assert converted.idempotent is False
+    assert converted.mask_phi is False
+    assert converted.sanitize is True
+    assert converted.quality_gate_enabled is True
+    assert converted.min_schema_readiness_score == 65.0
+    assert converted.modified_since == "2025-01-01T00:00:00Z"
+    assert converted.record_filter == {"siteId": 5}
+    assert converted.record_data_filter == "systolicBp>100"
+    assert converted.include_deleted is True
+    assert converted.naming_convention == "camelCase"
+    assert converted.manifest_path == str(manifest_file)
+    assert converted.pandas_kwargs == {"sep": "|"}
+
+    # 2. Acceptance check: SinkConfig(study_key="STUDY", mask_phi=False) via dispatcher.export and export_to_csv
+    # produces identical unmasked output to mask_phi=False, while default SinkConfig keeps mask_phi=True.
+    csv_kwarg = tmp_path / "kwarg_unmasked.csv"
+    csv_direct_cfg = tmp_path / "direct_cfg_unmasked.csv"
+    csv_dispatch_cfg = tmp_path / "dispatch_cfg_unmasked.csv"
+    csv_default_cfg = tmp_path / "default_cfg_masked.csv"
+
+    unmasked_cfg = SinkConfig(study_key="STUDY1", mask_phi=False)
+    default_cfg = SinkConfig(study_key="STUDY1")
+
+    export_mod.export_to_csv(sdk, "STUDY1", str(csv_kwarg), mask_phi=False)
+    export_mod.export_to_csv(sdk, "STUDY1", str(csv_direct_cfg), config=unmasked_cfg)
+    dispatcher.export("csv", sdk, "STUDY1", path=str(csv_dispatch_cfg), config=unmasked_cfg)
+    dispatcher.export("csv", sdk, "STUDY1", path=str(csv_default_cfg), config=default_cfg)
+
+    assert csv_direct_cfg.read_text(encoding="utf-8") == csv_kwarg.read_text(encoding="utf-8")
+    assert csv_dispatch_cfg.read_text(encoding="utf-8") == csv_kwarg.read_text(encoding="utf-8")
+    assert "Jane Doe" in csv_dispatch_cfg.read_text(encoding="utf-8")
+    assert "***MASKED***" in csv_default_cfg.read_text(encoding="utf-8")
+    assert "Jane Doe" not in csv_default_cfg.read_text(encoding="utf-8")
+
+    # 3. Verify dispatcher.export forwards SinkConfig(mask_phi=False) across remaining tabular targets
+    pq_path = tmp_path / "cfg.parquet"
+    hive_dir = tmp_path / "cfg_hive"
+    xl_path = tmp_path / "cfg.xlsx"
+    json_path = tmp_path / "cfg.json"
+    ddb_path = tmp_path / "cfg.duckdb"
+    ddb_form_path = tmp_path / "cfg_by_form.duckdb"
+    sql_path = tmp_path / "cfg.sqlite"
+    sql_form_path = tmp_path / "cfg_by_form.sqlite"
+    long_sql_path = tmp_path / "cfg_long.sqlite"
+
+    dispatcher.export("parquet", sdk, "STUDY1", path=str(pq_path), config=unmasked_cfg)
+    dispatcher.export("hive_parquet", sdk, "STUDY1", base_dir=str(hive_dir), config=unmasked_cfg)
+    dispatcher.export("excel", sdk, "STUDY1", path=str(xl_path), config=unmasked_cfg)
+    dispatcher.export("json", sdk, "STUDY1", path=str(json_path), config=unmasked_cfg)
+    dispatcher.export(
+        "duckdb", sdk, "STUDY1", db_path=str(ddb_path), table_name="records", config=unmasked_cfg
+    )
+    dispatcher.export(
+        "duckdb_by_form", sdk, "STUDY1", db_path=str(ddb_form_path), config=unmasked_cfg
+    )
+    dispatcher.export(
+        "sql",
+        sdk,
+        "STUDY1",
+        table="records",
+        conn_str=f"sqlite:///{sql_path}",
+        config=unmasked_cfg,
+    )
+    dispatcher.export(
+        "sql_by_form",
+        sdk,
+        "STUDY1",
+        conn_str=f"sqlite:///{sql_form_path}",
+        config=unmasked_cfg,
+    )
+    dispatcher.export(
+        "long_sql",
+        sdk,
+        "STUDY1",
+        table_name="long_records",
+        conn_str=f"sqlite:///{long_sql_path}",
+        config=unmasked_cfg,
+    )
+
+    assert pd.read_parquet(pq_path)["patientName"].tolist() == ["Jane Doe"]
+    hive_files = list((hive_dir / "study_key=STUDY1" / "form_key=DEMO").glob("**/*.parquet"))
+    assert pd.read_parquet(hive_files[0])["patientName"].tolist() == ["Jane Doe"]
+    assert pd.read_excel(xl_path)["patientName"].tolist() == ["Jane Doe"]
+    assert json.loads(json_path.read_text(encoding="utf-8"))[0]["patientName"] == "Jane Doe"
+    with duckdb_mod.connect(str(ddb_path), read_only=True) as dconn:
+        assert dconn.execute('SELECT "patientName" FROM records').fetchone() == ("Jane Doe",)
+    with duckdb_mod.connect(str(ddb_form_path), read_only=True) as dconn:
+        assert dconn.execute('SELECT "patientName" FROM DEMO').fetchone() == ("Jane Doe",)
+    with sqlite3.connect(sql_path) as sconn:
+        assert sconn.execute('SELECT "patientName" FROM records').fetchone() == ("Jane Doe",)
+    with sqlite3.connect(sql_form_path) as sconn:
+        assert sconn.execute('SELECT "patientName" FROM DEMO').fetchone() == ("Jane Doe",)
+    with sqlite3.connect(long_sql_path) as sconn:
+        vals = dict(sconn.execute("SELECT variable_name, value FROM long_records").fetchall())
+        assert vals["patientName"] == "Jane Doe"
+
+
+def test_export_to_long_sql_whitelists_streaming_and_mock_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """export_to_long_sql, _unpack_long_sql_rows, and _LongSQLSink emit only whitelisted Form IDs and Variable names."""
+    import sqlite3
+
+    from imednet.models.forms import Form
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable
+
+    forms = [
+        Form(form_id=10, form_key="DEMO", form_name="Demographics"),
+        Form(form_id=20, form_key="VITALS", form_name="Vitals"),
+        Form(form_id=30, form_key="LABS", form_name="Labs"),
+    ]
+    variables = [
+        Variable(variable_name="AGE", variable_type="int", form_id=10, form_key="DEMO"),
+        Variable(variable_name="WEIGHT", variable_type="int", form_id=10, form_key="DEMO"),
+        Variable(variable_name="HR", variable_type="int", form_id=20, form_key="VITALS"),
+        Variable(variable_name="BP", variable_type="int", form_id=20, form_key="VITALS"),
+        Variable(variable_name="GLUCOSE", variable_type="int", form_id=30, form_key="LABS"),
+    ]
+    records = [
+        Record(
+            record_id=1,
+            study_key="STUDY_WL",
+            subject_key="S1",
+            form_id=10,
+            form_key="DEMO",
+            date_modified="2026-03-01T00:00:00Z",
+            record_data={"AGE": 45, "WEIGHT": 72},
+        ),
+        Record(
+            record_id=2,
+            study_key="STUDY_WL",
+            subject_key="S1",
+            form_id=20,
+            form_key="VITALS",
+            date_modified="2026-03-02T00:00:00Z",
+            record_data={"HR": 68, "BP": 120},
+        ),
+        Record(
+            record_id=3,
+            study_key="STUDY_WL",
+            subject_key="S1",
+            form_id=30,
+            form_key="LABS",
+            date_modified="2026-03-03T00:00:00Z",
+            record_data={"GLUCOSE": 95},
+        ),
+    ]
+
+    # 1. Direct _unpack_long_sql_rows unit verification
+    unpacked = export_mod._unpack_long_sql_rows(
+        records,
+        mask_phi=False,
+        pipeline=None,
+        phi_keys=set(),
+        variable_whitelist=["AGE", "HR"],
+        form_whitelist=[10, 20],
+    )
+    assert [(r["record_id"], r["form_id"], r["variable_name"], r["value"]) for r in unpacked] == [
+        (1, 10, "AGE", 45),
+        (2, 20, "HR", 68),
+    ]
+
+    # 2. End-to-end streaming SQLite export via _LongSQLSink
+    sdk = MagicMock()
+    sdk.forms.list.return_value = forms
+    sdk.variables.list.return_value = variables
+    sdk.records.list.side_effect = lambda **_kw: iter([r.model_copy(deep=True) for r in records])
+
+    db_file = tmp_path / "long_whitelisted.sqlite"
+    export_mod.export_to_long_sql(
+        sdk,
+        "STUDY_WL",
+        "long_eav",
+        f"sqlite:///{db_file}",
+        form_whitelist=[10, 20],
+        variable_whitelist=["AGE", "HR"],
+        mask_phi=False,
+    )
+    with sqlite3.connect(db_file) as conn:
+        rows = conn.execute(
+            "SELECT record_id, form_id, variable_name, value FROM long_eav ORDER BY record_id, variable_name"
+        ).fetchall()
+    assert rows == [
+        (1, 10, "AGE", 45),
+        (2, 20, "HR", 68),
+    ]
+
+    # Empty whitelist produces empty table / no matching rows without error
+    empty_db = tmp_path / "long_empty_wl.sqlite"
+    export_mod.export_to_long_sql(
+        sdk,
+        "STUDY_WL",
+        "empty_eav",
+        f"sqlite:///{empty_db}",
+        form_whitelist=[],
+    )
+    with sqlite3.connect(empty_db) as conn:
+        row_count = conn.execute("SELECT COUNT(*) FROM empty_eav").fetchone()[0]
+    assert row_count == 0
+
+    # 3. Mock _fetch_records fallback path also honors whitelists
+    mapper_inst = MagicMock(_fetch_records=MagicMock(return_value=records))
+    monkeypatch.setattr(export_mod, "_record_mapper", lambda: MagicMock(return_value=mapper_inst))
+    sa_module = ModuleType("sqlalchemy")
+    sa_module.create_engine = MagicMock(return_value=MagicMock())
+    monkeypatch.setitem(sys.modules, "sqlalchemy", sa_module)
+    captured_mock: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        pd.DataFrame,
+        "to_sql",
+        lambda self, *_a, **_k: captured_mock.extend(self.to_dict("records")),
+    )
+    export_mod.export_to_long_sql(
+        sdk,
+        "STUDY_WL",
+        "mock_eav",
+        "sqlite://",
+        form_whitelist=[20],
+        variable_whitelist=["BP"],
+        mask_phi=False,
+    )
+    assert [
+        (r["record_id"], r["form_id"], r["variable_name"], r["value"]) for r in captured_mock
+    ] == [(2, 20, "BP", 120)]

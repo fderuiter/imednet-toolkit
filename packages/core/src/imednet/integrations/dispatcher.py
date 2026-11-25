@@ -134,6 +134,8 @@ def export(
     # 1. Try tabular path
     tabular_func = _registry.get_tabular(target)
     if tabular_func is not None:
+        if config is not None:
+            return tabular_func(sdk, study_key, config=config, **kwargs)
         return tabular_func(sdk, study_key, **kwargs)
 
     # 2. Try sink path
