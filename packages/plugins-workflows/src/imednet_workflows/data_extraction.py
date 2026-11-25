@@ -65,7 +65,7 @@ class DataExtractionWorkflow:
             if on_progress:
                 on_progress("Querying subjects matching filter criteria...")
             subjects = self._sdk.get_subjects(study_key, **subject_filter)
-            matching_subject_keys = {s.subject_key for s in subjects}  # type: ignore
+            matching_subject_keys = {s.subject_key for s in subjects}  # type: ignore[misc]
             if on_progress:
                 on_progress(f"Retrieved {len(matching_subject_keys)} matching subjects.")
             if not matching_subject_keys:
@@ -85,7 +85,7 @@ class DataExtractionWorkflow:
             if matching_subject_keys:
                 visits = [v for v in visits if v.subject_key in matching_subject_keys]
 
-            matching_visit_ids = {v.visit_id for v in visits}  # type: ignore
+            matching_visit_ids = {v.visit_id for v in visits}  # type: ignore[misc]
             if on_progress:
                 on_progress(f"Retrieved {len(matching_visit_ids)} matching visits.")
             if not matching_visit_ids:

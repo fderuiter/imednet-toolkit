@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import builtins
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from imednet.core.endpoint.dispatch import execute_list
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
@@ -14,6 +14,13 @@ from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.models.record_revisions import RecordRevision
 from imednet.utils.filters import matches_revision_date_bounds, split_revision_date_bounds
 from imednet.utils.typing import FilterValue
+
+if TYPE_CHECKING:
+    from imednet.core.endpoint.base import _ListGetEndpointBase
+
+    _RecordRevisionsMixinBase = _ListGetEndpointBase[RecordRevision]
+else:
+    _RecordRevisionsMixinBase = object
 
 
 class _BoundedRevisionIterator(Iterator[RecordRevision]):
@@ -104,14 +111,14 @@ class _BoundedRevisionListOperation(ListOperation[RecordRevision]):
         return _AsyncBoundedRevisionIterator(base_aiter, self._local_bounds, self._local_limit)
 
 
-class RecordRevisionsOperationDef:
+class RecordRevisionsOperationDef(_RecordRevisionsMixinBase):
     """Definition for Record Revision operations."""
 
-    PATH = "recordRevisions"
+    PATH: ClassVar[str] = "recordRevisions"
     MODEL = RecordRevision
     _id_param = "recordRevisionId"
-    _lookup_key_hint = "recordOid"
-    FILTER_ATTRIBUTES = frozenset(
+    _lookup_key_hint: ClassVar[str | None] = "recordOid"
+    FILTER_ATTRIBUTES: ClassVar[frozenset[str] | None] = frozenset(
         {
             "recordRevisionId",
             "recordId",
@@ -142,12 +149,12 @@ class RecordRevisionsOperationDef:
         """Build a standard or locally bounded revision list operation."""
         upstream_filters, local_bounds = split_revision_date_bounds(raw_filters)
         if not local_bounds:
-            state = self._prepare_list_request(study_key, None, upstream_filters)  # type: ignore[attr-defined]
+            state = self._prepare_list_request(study_key, None, upstream_filters)
             return ListOperation[RecordRevision](
                 path=state.path,
                 params=state.params,
-                page_size=self.PAGE_SIZE,  # type: ignore[attr-defined]
-                parse_func=self._resolve_parse_func(),  # type: ignore[attr-defined]
+                page_size=self.PAGE_SIZE,
+                parse_func=self._resolve_parse_func(),
             )
 
         local_limit: int | None = None
@@ -158,32 +165,34 @@ class RecordRevisionsOperationDef:
                 raise ValueError(f"Pagination 'limit' must be >= 1, got {parsed_limit}.")
             local_limit = parsed_limit
 
-        state = self._prepare_list_request(study_key, None, upstream_filters)  # type: ignore[attr-defined]
+        state = self._prepare_list_request(study_key, None, upstream_filters)
         return _BoundedRevisionListOperation(
             path=state.path,
             params=state.params,
-            page_size=self.PAGE_SIZE,  # type: ignore[attr-defined]
-            parse_func=self._resolve_parse_func(),  # type: ignore[attr-defined]
+            page_size=self.PAGE_SIZE,
+            parse_func=self._resolve_parse_func(),
             local_bounds=local_bounds,
             local_limit=local_limit,
         )
 
-    @execute_list  # type: ignore[arg-type]
-    def list(
-        self,
-        study_key: str | None = None,
-        **filters: FilterValue,
-    ) -> ListOperation[RecordRevision]:
-        """List record revisions matching filters, splitting secondary date bounds locally."""
-        return self._build_revision_list_operation(study_key, dict(filters))
+    if not TYPE_CHECKING:
+
+        @execute_list
+        def list(
+            self,
+            study_key: str | None = None,
+            **filters: FilterValue,
+        ) -> ListOperation[RecordRevision]:
+            """List record revisions matching filters, splitting secondary date bounds locally."""
+            return self._build_revision_list_operation(study_key, dict(filters))
 
     def _list_sync(self, *a: Any, **k: Any) -> builtins.list[RecordRevision]:
         study_key = k.pop("study_key", None)
         op = self._build_revision_list_operation(study_key, k)
         return builtins.list(
             op.execute_sync(
-                self._require_sync_client(),  # type: ignore[attr-defined]
-                self.PAGINATOR_CLS,  # type: ignore[attr-defined]
+                self._require_sync_client(),
+                self.PAGINATOR_CLS,
             )
         )
 
@@ -193,17 +202,17 @@ class RecordRevisionsOperationDef:
         return [
             item
             async for item in op.execute_async(
-                self._require_async_client(),  # type: ignore[attr-defined]
-                self.ASYNC_PAGINATOR_CLS,  # type: ignore[attr-defined]
+                self._require_async_client(),
+                self.ASYNC_PAGINATOR_CLS,
             )
         ]
 
 
-class RecordRevisionsEndpoint(RecordRevisionsOperationDef, EdcSyncListGetEndpoint[RecordRevision]):  # type: ignore[misc]
+class RecordRevisionsEndpoint(RecordRevisionsOperationDef, EdcSyncListGetEndpoint[RecordRevision]):
     """Synchronous endpoint for managing Record Revisions."""
 
 
-class AsyncRecordRevisionsEndpoint(  # type: ignore[misc]
+class AsyncRecordRevisionsEndpoint(
     RecordRevisionsOperationDef, EdcAsyncListGetEndpoint[RecordRevision]
 ):
     """Asynchronous endpoint for managing Record Revisions."""

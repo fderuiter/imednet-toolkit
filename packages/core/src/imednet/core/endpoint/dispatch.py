@@ -15,10 +15,15 @@ from typing import (
     cast,
     get_args,
     get_type_hints,
-    overload,
 )
 
 if TYPE_CHECKING:
+    from typing import ClassVar, Literal
+
+    from imednet.core.endpoint._mixin_protocols import (
+        ListMethodDescriptorProtocol,
+        MethodDescriptorProtocol,
+    )
     from imednet.core.endpoint.operations.filter_get import FilterGetOperation
     from imednet.core.endpoint.operations.list import ListOperation
 
@@ -29,9 +34,15 @@ P = ParamSpec("P")
 class SyncEndpointContext:
     """Marker class for synchronous endpoints."""
 
+    if TYPE_CHECKING:
+        _endpoint_mode: ClassVar[Literal["sync"]]
+
 
 class AsyncEndpointContext:
     """Marker class for asynchronous endpoints."""
+
+    if TYPE_CHECKING:
+        _endpoint_mode: ClassVar[Literal["async"]]
 
 
 class Operation(Generic[T]):
@@ -119,7 +130,7 @@ def _configure_wrapper(
 
     resolved_annotations: dict[str, Any] = {}
     for key, val in hints.items():
-        if key == "return":
+        if key in ("return", "self"):
             continue
         resolved_annotations[key] = (
             model_cls if (isinstance(val, TypeVar) and model_cls is not None) else val
@@ -129,7 +140,7 @@ def _configure_wrapper(
     updated_params = [
         param.replace(annotation=resolved_annotations[param.name])
         if param.name in resolved_annotations
-        else param
+        else (param.replace(annotation=inspect.Parameter.empty) if param.name == "self" else param)
         for param in params
     ]
     wrapper.__annotations__ = resolved_annotations
@@ -195,173 +206,142 @@ def _build_operation_callable(
     return _configure_wrapper(sync_wrapper, func, target_cls, is_async=False, bound=True)
 
 
-class execute_operation(Generic[P, T]):  # noqa: N801
-    """Descriptor that dispatches an operation-returning method to sync/async execution."""
+if TYPE_CHECKING:
 
-    def __init__(self, func: Callable[Concatenate[Any, P], Operation[T]]):
-        """Initialize."""
-        self.func = func
-        functools.update_wrapper(cast(Any, self), func)
+    def execute_operation(
+        func: Callable[Concatenate[Any, P], Operation[T]],
+    ) -> MethodDescriptorProtocol[
+        T,
+        Callable[P, T],
+        Callable[P, Coroutine[Any, Any, T]],
+    ]:
+        """Dispatch an operation-returning method across sync and async endpoints."""
+        ...
 
-    @overload
-    def __get__(self, instance: SyncEndpointContext, owner: Any) -> Callable[P, T]: ...
+else:
 
-    @overload
-    def __get__(
-        self, instance: AsyncEndpointContext, owner: Any
-    ) -> Callable[P, Coroutine[Any, Any, T]]: ...
+    class execute_operation(Generic[P, T]):  # noqa: N801
+        """Descriptor that dispatches an operation-returning method to sync/async execution."""
 
-    @overload
-    def __get__(
-        self, instance: None, owner: type[AsyncEndpointContext]
-    ) -> Callable[Concatenate[Any, P], Coroutine[Any, Any, T]]: ...
+        def __init__(self, func: Callable[Concatenate[Any, P], Operation[T]]):
+            """Initialize."""
+            self.func = func
+            functools.update_wrapper(cast(Any, self), func)
 
-    @overload
-    def __get__(
-        self, instance: None, owner: type[SyncEndpointContext]
-    ) -> Callable[Concatenate[Any, P], T]: ...
-
-    @overload
-    def __get__(self, instance: None, owner: Any) -> Callable[Concatenate[Any, P], Any]: ...
-
-    def __get__(self, instance: Any, owner: Any = None) -> Any:
-        """Get."""
-        if instance is None and owner is None:
-            return self
-        return _build_operation_callable(self.func, instance, owner, pass_paginator=False)
-
-    if not TYPE_CHECKING:
+        def __get__(self, instance: Any, owner: Any = None) -> Any:
+            """Get."""
+            if instance is None and owner is None:
+                return self
+            return _build_operation_callable(self.func, instance, owner, pass_paginator=False)
 
         def __call__(self, endpoint: Any, *args: Any, **kwargs: Any) -> Any:
             """Execute the wrapped operation against the given endpoint instance."""
             return self.__get__(endpoint, type(endpoint))(*args, **kwargs)
 
 
-class execute_list(Generic[P, T]):  # noqa: N801
-    """Descriptor that dispatches a list operation."""
+if TYPE_CHECKING:
 
-    def __init__(self, func: Callable[Concatenate[Any, P], ListOperation[T]]):
-        """Initialize."""
-        self.func = func
-        functools.update_wrapper(cast(Any, self), func)
+    def execute_list(
+        func: Callable[Concatenate[Any, P], ListOperation[T]],
+    ) -> ListMethodDescriptorProtocol[P, T]:
+        """Dispatch a list operation across sync and async endpoints."""
+        ...
 
-    @overload
-    def __get__(self, instance: SyncEndpointContext, owner: Any) -> Callable[P, Iterator[T]]: ...
+else:
 
-    @overload
-    def __get__(
-        self, instance: AsyncEndpointContext, owner: Any
-    ) -> Callable[P, AsyncIterator[T]]: ...
+    class execute_list(Generic[P, T]):  # noqa: N801
+        """Descriptor that dispatches a list operation."""
 
-    @overload
-    def __get__(
-        self, instance: None, owner: type[AsyncEndpointContext]
-    ) -> Callable[Concatenate[Any, P], AsyncIterator[T]]: ...
+        def __init__(self, func: Callable[Concatenate[Any, P], ListOperation[T]]):
+            """Initialize."""
+            self.func = func
+            functools.update_wrapper(cast(Any, self), func)
 
-    @overload
-    def __get__(
-        self, instance: None, owner: type[SyncEndpointContext]
-    ) -> Callable[Concatenate[Any, P], Iterator[T]]: ...
+        def __get__(self, instance: Any, owner: Any = None) -> Any:
+            """Get."""
+            if instance is None and owner is None:
+                return self
 
-    @overload
-    def __get__(self, instance: None, owner: Any) -> Callable[Concatenate[Any, P], Any]: ...
+            target_cls = type(instance) if instance is not None else owner
+            is_async = isinstance(target_cls, type) and issubclass(target_cls, AsyncEndpointContext)
+            func = self.func
 
-    def __get__(self, instance: Any, owner: Any = None) -> Any:
-        """Get."""
-        if instance is None and owner is None:
-            return self
+            if instance is None:
+                if is_async:
 
-        target_cls = type(instance) if instance is not None else owner
-        is_async = isinstance(target_cls, type) and issubclass(target_cls, AsyncEndpointContext)
-        func = self.func
+                    def unbound_async(
+                        endpoint: Any, *args: P.args, **kwargs: P.kwargs
+                    ) -> AsyncIterator[T]:
+                        op = func(endpoint, *args, **kwargs)
+                        return op.execute_async(
+                            endpoint._require_async_client(),
+                            endpoint.ASYNC_PAGINATOR_CLS,
+                        )
 
-        if instance is None:
+                    return _configure_wrapper(
+                        unbound_async, func, target_cls, is_list=True, is_async=True, bound=False
+                    )
+
+                def unbound_sync(endpoint: Any, *args: P.args, **kwargs: P.kwargs) -> Iterator[T]:
+                    op = func(endpoint, *args, **kwargs)
+                    return op.execute_sync(endpoint._require_sync_client(), endpoint.PAGINATOR_CLS)
+
+                return _configure_wrapper(
+                    unbound_sync, func, target_cls, is_list=True, is_async=False, bound=False
+                )
+
             if is_async:
 
-                def unbound_async(
-                    endpoint: Any, *args: P.args, **kwargs: P.kwargs
-                ) -> AsyncIterator[T]:
-                    op = func(endpoint, *args, **kwargs)
+                def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> AsyncIterator[T]:
+                    op = func(instance, *args, **kwargs)
                     return op.execute_async(
-                        endpoint._require_async_client(),
-                        endpoint.ASYNC_PAGINATOR_CLS,
+                        instance._require_async_client(), instance.ASYNC_PAGINATOR_CLS
                     )
 
                 return _configure_wrapper(
-                    unbound_async, func, target_cls, is_list=True, is_async=True, bound=False
+                    async_wrapper, func, target_cls, is_list=True, is_async=True, bound=True
                 )
 
-            def unbound_sync(endpoint: Any, *args: P.args, **kwargs: P.kwargs) -> Iterator[T]:
-                op = func(endpoint, *args, **kwargs)
-                return op.execute_sync(endpoint._require_sync_client(), endpoint.PAGINATOR_CLS)
-
-            return _configure_wrapper(
-                unbound_sync, func, target_cls, is_list=True, is_async=False, bound=False
-            )
-
-        if is_async:
-
-            def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> AsyncIterator[T]:
+            def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> Iterator[T]:
                 op = func(instance, *args, **kwargs)
-                return op.execute_async(
-                    instance._require_async_client(), instance.ASYNC_PAGINATOR_CLS
-                )
+                return op.execute_sync(instance._require_sync_client(), instance.PAGINATOR_CLS)
 
             return _configure_wrapper(
-                async_wrapper, func, target_cls, is_list=True, is_async=True, bound=True
+                sync_wrapper, func, target_cls, is_list=True, is_async=False, bound=True
             )
-
-        def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> Iterator[T]:
-            op = func(instance, *args, **kwargs)
-            return op.execute_sync(instance._require_sync_client(), instance.PAGINATOR_CLS)
-
-        return _configure_wrapper(
-            sync_wrapper, func, target_cls, is_list=True, is_async=False, bound=True
-        )
-
-    if not TYPE_CHECKING:
 
         def __call__(self, endpoint: Any, *args: Any, **kwargs: Any) -> Any:
             """Execute the wrapped list operation against the given endpoint instance."""
             return self.__get__(endpoint, type(endpoint))(*args, **kwargs)
 
 
-class execute_get(Generic[P, T]):  # noqa: N801
-    """Descriptor that dispatches a get operation."""
+if TYPE_CHECKING:
 
-    def __init__(self, func: Callable[Concatenate[Any, P], FilterGetOperation[T]]):
-        """Initialize."""
-        self.func = func
-        functools.update_wrapper(cast(Any, self), func)
+    def execute_get(
+        func: Callable[Concatenate[Any, P], FilterGetOperation[T]],
+    ) -> MethodDescriptorProtocol[
+        T,
+        Callable[P, T],
+        Callable[P, Coroutine[Any, Any, T]],
+    ]:
+        """Dispatch a filter-based get operation across sync and async endpoints."""
+        ...
 
-    @overload
-    def __get__(self, instance: SyncEndpointContext, owner: Any) -> Callable[P, T]: ...
+else:
 
-    @overload
-    def __get__(
-        self, instance: AsyncEndpointContext, owner: Any
-    ) -> Callable[P, Coroutine[Any, Any, T]]: ...
+    class execute_get(Generic[P, T]):  # noqa: N801
+        """Descriptor that dispatches a get operation."""
 
-    @overload
-    def __get__(
-        self, instance: None, owner: type[AsyncEndpointContext]
-    ) -> Callable[Concatenate[Any, P], Coroutine[Any, Any, T]]: ...
+        def __init__(self, func: Callable[Concatenate[Any, P], FilterGetOperation[T]]):
+            """Initialize."""
+            self.func = func
+            functools.update_wrapper(cast(Any, self), func)
 
-    @overload
-    def __get__(
-        self, instance: None, owner: type[SyncEndpointContext]
-    ) -> Callable[Concatenate[Any, P], T]: ...
-
-    @overload
-    def __get__(self, instance: None, owner: Any) -> Callable[Concatenate[Any, P], Any]: ...
-
-    def __get__(self, instance: Any, owner: Any = None) -> Any:
-        """Get."""
-        if instance is None and owner is None:
-            return self
-        return _build_operation_callable(self.func, instance, owner, pass_paginator=True)
-
-    if not TYPE_CHECKING:
+        def __get__(self, instance: Any, owner: Any = None) -> Any:
+            """Get."""
+            if instance is None and owner is None:
+                return self
+            return _build_operation_callable(self.func, instance, owner, pass_paginator=True)
 
         def __call__(self, endpoint: Any, *args: Any, **kwargs: Any) -> Any:
             """Execute the wrapped get operation against the given endpoint instance."""

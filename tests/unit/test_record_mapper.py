@@ -2393,3 +2393,93 @@ def test_record_mapper_endpoint_fallbacks_and_cached_loader_predicates() -> None
         )
     )
     assert [r.record_id for r in filtered] == [3]
+
+
+def test_record_mapper_falls_back_to_variable_name_when_label_missing_or_empty() -> None:
+    """Test dataframe and build_hierarchy fall back to variable_name when Variable.label is None or empty."""
+    from unittest.mock import patch
+
+    variables = [
+        Variable(variable_name="AGE", label=None, form_id=10, form_key="DM"),
+        Variable(variable_name="WEIGHT", label="", form_id=10, form_key="DM"),
+        Variable(variable_name="BMI", label="   ", form_id=10, form_key="DM"),
+        Variable(variable_name="HEIGHT", label="Height (cm)", form_id=10, form_key="DM"),
+    ]
+    sdk = MagicMock()
+    sdk.get_variables.return_value = variables
+    records = [
+        Record(
+            study_key="STUDY",
+            record_id=1,
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=10,
+            form_key="DM",
+            record_status="Complete",
+            date_created=datetime(2024, 1, 1),
+            record_data={"AGE": 35, "WEIGHT": 70.5, "BMI": 23.0, "HEIGHT": 175},
+        ),
+        Record(
+            study_key="STUDY",
+            record_id=2,
+            subject_key=None,
+            visit_id=1,
+            form_id=10,
+            form_key="DM",
+            record_status="Complete",
+            date_created=datetime(2024, 1, 2),
+            record_data={"AGE": 40, "WEIGHT": 80.0, "BMI": 24.7, "HEIGHT": 180},
+        ),
+        Record(
+            study_key="STUDY",
+            record_id=3,
+            subject_key="SUBJ-1",
+            visit_id=1,
+            form_id=None,
+            form_key=None,
+            record_status="Complete",
+            date_created=datetime(2024, 1, 3),
+            record_data={"AGE": 99},
+        ),
+    ]
+    sdk.get_records.return_value = records[:1]
+    sdk.forms = None
+    sdk.intervals = None
+    sdk.visits = None
+    sdk.sites = None
+
+    mapper = RecordMapper(sdk)
+    df = mapper.dataframe("STUDY", use_labels_as_columns=True)
+
+    assert None not in df.columns
+    assert "" not in df.columns
+    assert "   " not in df.columns
+    assert "AGE" in df.columns
+    assert "WEIGHT" in df.columns
+    assert "BMI" in df.columns
+    assert "Height (cm)" in df.columns
+    assert df.iloc[0]["AGE"] == 35
+    assert df.iloc[0]["WEIGHT"] == 70.5
+    assert df.iloc[0]["BMI"] == 23.0
+    assert df.iloc[0]["Height (cm)"] == 175
+
+    mock_struct = MagicMock()
+    mock_struct.forms = []
+    interval = MagicMock()
+    form = MagicMock()
+    form.form_id = 10
+    form.variables = variables
+    interval.forms = [form]
+    mock_struct.intervals = [interval]
+
+    with patch("imednet_workflows.study_structure.get_study_structure", return_value=mock_struct):
+        hierarchy = mapper.build_hierarchy("STUDY", use_labels_as_keys=True, records=records)
+
+    assert len(hierarchy) == 2
+    assert hierarchy[0]["subject_key"] == "SUBJ-1"
+    assert hierarchy[1]["subject_key"] is None
+    record_payload = hierarchy[0]["visits"][0]["forms"][0]["records"][0]
+    assert record_payload["AGE"] == 35
+    assert record_payload["WEIGHT"] == 70.5
+    assert record_payload["BMI"] == 23.0
+    assert record_payload["Height (cm)"] == 175

@@ -77,14 +77,32 @@ class SchemaProfiler:
         variables = self._sdk.get_variables(study_key=study_key)
         schema = SchemaCache()
         schema.populate(variables)
-        form_names = {form.form_key: form.form_name for form in forms}
+        form_names: dict[str, str] = {
+            form.form_key: (
+                form.form_name if form.form_name and form.form_name.strip() else form.form_key
+            )
+            for form in forms
+            if form.form_key
+        }
+        form_keys_by_id: dict[int, str] = {
+            form.form_id: form.form_key
+            for form in forms
+            if form.form_id is not None and form.form_key
+        }
         records_iterable = records if records is not None else self._iter_records(study_key)
 
         form_accumulators: dict[str, _FormAccumulator] = {}
         for record in records_iterable:
-            form_key = (
-                record.form_key or schema.form_key_from_id(record.form_id) or str(record.form_id)  # type: ignore
+            resolved_from_id = (
+                schema.form_key_from_id(record.form_id)
+                or form_keys_by_id.get(record.form_id)
+                or str(record.form_id)
+                if record.form_id is not None
+                else ""
             )
+            form_key = record.form_key or resolved_from_id
+            if not form_key:
+                continue
             accumulator = form_accumulators.setdefault(form_key, _FormAccumulator())
             accumulator.record_count += 1
 
@@ -110,7 +128,7 @@ class SchemaProfiler:
             }
             profiles[form_key] = FormProfile(
                 form_key=form_key,
-                form_name=form_names.get(form_key, form_key),  # type: ignore
+                form_name=form_names.get(form_key) or form_key,
                 record_count=accumulator.record_count,
                 fields=fields,
             )

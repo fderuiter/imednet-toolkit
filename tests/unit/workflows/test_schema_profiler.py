@@ -188,3 +188,71 @@ def test_schema_profiler_streams_chunked_loader_records() -> None:
     loader._iter_mock.assert_called_once_with("STUDY")
     assert profile.record_count == 2
     assert profile.fields["RESULT"].population_rate == 100.0
+
+
+def test_schema_profiler_handles_nullable_form_metadata_and_unlinked_records() -> None:
+    """Test Form.form_name fallback to form_key and safe skipping of unlinked records."""
+    sdk = MagicMock()
+    sdk.get_forms.return_value = [
+        Form(form_key="DM", form_name=None, form_id=1),
+        Form(form_key="VS", form_name="", form_id=2),
+        Form(form_key="LB", form_name="   ", form_id=4),
+        Form(form_key="", form_name="Ignored Empty Key", form_id=3),
+    ]
+    sdk.get_variables.return_value = [
+        Variable(form_id=1, form_key=None, variable_name="AGE", label=None, variable_type="int"),
+        Variable(form_id=None, form_key=None, variable_name="ORPHAN_VAR", label="Orphan"),
+    ]
+    records = [
+        Record(
+            study_key="STUDY",
+            form_id=1,
+            form_key=None,
+            record_id=10,
+            subject_key="S1",
+            record_data={"AGE": 42},
+        ),
+        Record(
+            study_key="STUDY",
+            form_id=2,
+            form_key="VS",
+            record_id=13,
+            subject_key="S1",
+            record_data={"HR": 72},
+        ),
+        Record(
+            study_key="STUDY",
+            form_id=4,
+            form_key=None,
+            record_id=14,
+            subject_key="S1",
+            record_data={"HGB": 13.8},
+        ),
+        Record(
+            study_key="STUDY",
+            form_id=None,
+            form_key=None,
+            record_id=11,
+            subject_key="S1",
+            record_data={"AGE": 50},
+        ),
+        Record(
+            study_key="STUDY",
+            form_id=None,
+            form_key="",
+            record_id=12,
+            subject_key="S1",
+            record_data={"AGE": 60},
+        ),
+    ]
+
+    profiler = SchemaProfiler(sdk)
+    profiles = profiler.profile_records("STUDY", records=records)
+
+    assert set(profiles.keys()) == {"DM", "VS", "LB"}
+    assert profiles["DM"].form_name == "DM"
+    assert profiles["VS"].form_name == "VS"
+    assert profiles["LB"].form_name == "LB"
+    assert profiles["DM"].record_count == 1
+    assert profiles["DM"].fields["AGE"].label == "AGE"
+    assert profiles["DM"].fields["AGE"].population_rate == 100.0

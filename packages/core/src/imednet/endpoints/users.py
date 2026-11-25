@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
+from imednet.core.endpoint._mixin_protocols import ListEndpointSelfProtocol
 from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.core.endpoint.structs import ParamState
 from imednet.core.protocols import ParamProcessor
@@ -51,13 +52,13 @@ class UsersParamProcessor(ParamProcessor):
 class UsersOperationDef:
     """Definition for User operations."""
 
-    PATH = "users"
+    PATH: ClassVar[str] = "users"
     MODEL = User
-    PARAM_PROCESSOR = UsersParamProcessor()
-    FILTER_ATTRIBUTES: frozenset[str] = frozenset()
+    PARAM_PROCESSOR: ClassVar[ParamProcessor | None] = UsersParamProcessor()
+    FILTER_ATTRIBUTES: ClassVar[frozenset[str] | None] = frozenset()
 
     def _resolve_params(
-        self,
+        self: ListEndpointSelfProtocol[User],
         study_key: str | None,
         extra_params: dict[str, Any] | None,
         filters: dict[str, Any],
@@ -76,9 +77,9 @@ class UsersOperationDef:
             ConfigurationError: If any unsupported query filter parameters are passed.
         """
         explicit_study_key_filter = study_key is not None and "studyKey" in filters
-        filters = self._auto_filter(filters.copy())  # type: ignore[attr-defined]
+        filters = self._auto_filter(filters.copy())
 
-        processed_filters, special_params = self.param_processor.process_filters(filters)  # type: ignore[attr-defined]
+        processed_filters, special_params = self.param_processor.process_filters(filters)
         if special_params:
             extra_params = {} if extra_params is None else extra_params.copy()
             extra_params.update(special_params)
@@ -86,8 +87,8 @@ class UsersOperationDef:
         if study_key is not None:
             processed_filters["studyKey"] = study_key
 
-        study, processed_filters = self.study_key_strategy.process(processed_filters)  # type: ignore[attr-defined]
-        self._validate_study_key(study)  # type: ignore[attr-defined]
+        study, processed_filters = self.study_key_strategy.process(processed_filters)
+        self._validate_study_key(study)
 
         # Check for unsupported query parameters
         unsupported = [k for k in processed_filters if k != "studyKey"]
@@ -128,7 +129,7 @@ class UsersOperationDef:
         return ParamState(study=study, params=params, other_filters={})
 
 
-class UsersEndpoint(UsersOperationDef, EdcSyncListEndpoint[User]):  # type: ignore[misc]
+class UsersEndpoint(UsersOperationDef, EdcSyncListEndpoint[User]):
     """Synchronous endpoint for managing Users."""
 
     def to_dataframe(
@@ -155,7 +156,7 @@ class UsersEndpoint(UsersOperationDef, EdcSyncListEndpoint[User]):  # type: igno
         return users_to_dataframe(users)
 
 
-class AsyncUsersEndpoint(UsersOperationDef, EdcAsyncListEndpoint[User]):  # type: ignore[misc]
+class AsyncUsersEndpoint(UsersOperationDef, EdcAsyncListEndpoint[User]):
     """Asynchronous endpoint for managing Users."""
 
     async def to_dataframe(

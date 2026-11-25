@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Callable, Iterable
-from typing import Any, TypeVar
+from collections.abc import Callable, Coroutine, Iterable
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, overload
 
 from imednet.constants import DEFAULT_PAGE_SIZE, LARGE_PAGE_SIZE
 from imednet.core.context import strict_mode_context
+from imednet.core.endpoint._mixin_protocols import AsyncSelfProtocol, SyncSelfProtocol
 from imednet.core.endpoint.abc import EndpointABC
 from imednet.core.endpoint.dispatch import (
     AsyncEndpointContext,
@@ -133,7 +134,9 @@ class GenericEndpoint(EndpointABC[T]):
 class _GetEndpointBase(GenericEndpoint[T]):
     """Generic base for endpoints providing single-resource retrieval."""
 
-    @execute_operation  # type: ignore
+    _item_id_label: ClassVar[str] = "item_id"
+
+    @execute_operation
     def get(self, study_key: str | None, item_id: ItemId) -> PathGetOperation[T]:
         """Retrieve a single resource by its ID.
 
@@ -146,7 +149,7 @@ class _GetEndpointBase(GenericEndpoint[T]):
         """
         self._require_item_id(item_id)
         self._validate_study_key(study_key)
-        validate_path_segment(item_id, name="item_id")
+        validate_path_segment(item_id, name=self._item_id_label)
         path = self._get_endpoint_path(study_key, item_id)
         return PathGetOperation[T](
             path=path,
@@ -161,13 +164,13 @@ class _ListEndpointBase(GenericEndpoint[T]):
     Uses composable operations to provide standard list operations.
     """
 
-    PAGE_SIZE: int = DEFAULT_PAGE_SIZE
-    PAGINATOR_CLS: type[Paginator] = Paginator
-    ASYNC_PAGINATOR_CLS: type[AsyncPaginator] = AsyncPaginator
-    PARAM_PROCESSOR: ParamProcessor | None = None
-    PARAM_PROCESSOR_CLS: type[ParamProcessor] = DefaultParamProcessor
-    STUDY_KEY_STRATEGY: StudyKeyStrategy | None = None
-    FILTER_ATTRIBUTES: frozenset[str] | None = None
+    PAGE_SIZE: ClassVar[int] = DEFAULT_PAGE_SIZE
+    PAGINATOR_CLS: ClassVar[type[Paginator]] = Paginator
+    ASYNC_PAGINATOR_CLS: ClassVar[type[AsyncPaginator]] = AsyncPaginator
+    PARAM_PROCESSOR: ClassVar[ParamProcessor | None] = None
+    PARAM_PROCESSOR_CLS: ClassVar[type[ParamProcessor]] = DefaultParamProcessor
+    STUDY_KEY_STRATEGY: ClassVar[StudyKeyStrategy | None] = None
+    FILTER_ATTRIBUTES: ClassVar[frozenset[str] | None] = None
 
     @property
     def study_key_strategy(self) -> StudyKeyStrategy:
@@ -333,7 +336,7 @@ class _ListEndpointBase(GenericEndpoint[T]):
             study=study,
         )
 
-    @execute_list  # type: ignore
+    @execute_list  # type: ignore[arg-type]
     def list(self, study_key: str | None = None, **filters: FilterValue) -> ListOperation[T]:
         """List resources matching the given filters.
 
@@ -391,7 +394,7 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
     Uses composable operations to provide standard list/get read operations.
     """
 
-    _lookup_key_hint: str | None = None
+    _lookup_key_hint: ClassVar[str | None] = None
 
     def _validate_item_id(self, item_id: object) -> int:
         """Validate a single-item identifier before constructing the lookup filter."""
@@ -428,17 +431,8 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
             self._raise_not_found(study_key, item_id)
         return items[0]
 
-    @execute_get
-    def get(self, study_key: str | None, item_id: int) -> FilterGetOperation[T]:
-        """Retrieve a single resource by its ID.
-
-        Args:
-            study_key: The study key.
-            item_id: The ID of the resource to retrieve.
-
-        Returns:
-            The requested resource.
-        """
+    def _build_get_operation(self, study_key: str | None, item_id: int) -> FilterGetOperation[T]:
+        """Build the filter-based get operation for a single resource ID."""
         self._require_item_id(item_id)
         if study_key is not None:
             self._validate_study_key(study_key)
@@ -477,6 +471,33 @@ class _ListGetEndpointBase(_ListEndpointBase[T]):
             list_sync_func=self._list_sync,
             list_async_func=self._list_async,
         )
+
+    if TYPE_CHECKING:
+
+        @overload
+        def get(self: SyncSelfProtocol[T], study_key: str | None, item_id: int) -> T: ...
+
+        @overload
+        def get(
+            self: AsyncSelfProtocol[T], study_key: str | None, item_id: int
+        ) -> Coroutine[Any, Any, T]: ...
+
+        def get(self, study_key: Any = None, item_id: Any = None) -> Any: ...
+
+    else:
+
+        @execute_get
+        def get(self, study_key: str | None, item_id: int) -> FilterGetOperation[T]:
+            """Retrieve a single resource by its ID.
+
+            Args:
+                study_key: The study key.
+                item_id: The ID of the resource to retrieve.
+
+            Returns:
+                The requested resource.
+            """
+            return self._build_get_operation(study_key, item_id)
 
 
 class SyncListEndpoint(_ListEndpointBase[T], SyncEndpointContext):

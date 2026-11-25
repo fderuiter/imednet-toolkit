@@ -1,5 +1,7 @@
 """Endpoint for managing visits (interval instances) in a study."""
 
+from typing import ClassVar
+
 from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.models.visits import Visit
 
@@ -7,9 +9,9 @@ from imednet.models.visits import Visit
 class VisitsOperationDef:
     """Definition for Visit operations."""
 
-    PATH = "visits"
+    PATH: ClassVar[str] = "visits"
     MODEL = Visit
-    FILTER_ATTRIBUTES = frozenset(
+    FILTER_ATTRIBUTES: ClassVar[frozenset[str] | None] = frozenset(
         {
             "intervalId",
             "intervalName",
@@ -29,9 +31,9 @@ class VisitsOperationDef:
     )
 
 
-class VisitsEndpoint(VisitsOperationDef, EdcSyncListEndpoint[Visit]):  # type: ignore[misc]
+class VisitsEndpoint(VisitsOperationDef, EdcSyncListEndpoint[Visit]):
     """Synchronous endpoint for managing Visits."""
 
 
-class AsyncVisitsEndpoint(VisitsOperationDef, EdcAsyncListEndpoint[Visit]):  # type: ignore[misc]
+class AsyncVisitsEndpoint(VisitsOperationDef, EdcAsyncListEndpoint[Visit]):
     """Asynchronous endpoint for managing Visits."""

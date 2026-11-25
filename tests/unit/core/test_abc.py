@@ -17,15 +17,8 @@ class MockModel(ImednetBaseModel):
 class ConcreteEndpoint(EndpointABC[MockModel]):
     """Test suite for ConcreteEndpoint."""
 
-    @property
-    def PATH(self) -> str:
-        """Helper function to PATH."""
-        return "mock"
-
-    @property
-    def MODEL(self) -> type[MockModel]:
-        """Helper function to MODEL."""
-        return MockModel
+    PATH = "mock"
+    MODEL = MockModel
 
     def _build_path(self, *segments: Any) -> str:
         """Helper function to  build path."""
@@ -65,8 +58,15 @@ def test_endpoint_abc_abstract_instantiation_fails():
 
 def test_endpoint_abc_pass_coverage():
     """Test that endpoint abc pass coverage."""
-    # Hit the `pass` statements in abstract properties/methods to ensure 100% coverage
-    assert EndpointABC.PATH.fget(None) is None
-    assert EndpointABC.MODEL.fget(None) is None
-    assert EndpointABC._build_path(None) is None
-    assert EndpointABC._auto_filter(None, {}) is None
+    # Hit the `pass` statements in abstract methods to ensure 100% coverage
+    assert EndpointABC._build_path(None) is None  # type: ignore[arg-type]
+    assert EndpointABC._auto_filter(None, {}) is None  # type: ignore[arg-type]
+
+
+def test_operation_def_mixins_preserve_pure_object_runtime_bases() -> None:
+    """Ensure TYPE_CHECKING mixin bases do not alter runtime OperationDef inheritance."""
+    from imednet.endpoints.record_revisions import RecordRevisionsOperationDef
+    from imednet.endpoints.studies import StudiesOperationDef
+
+    assert StudiesOperationDef.__bases__ == (object,)
+    assert RecordRevisionsOperationDef.__bases__ == (object,)

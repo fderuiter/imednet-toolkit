@@ -88,7 +88,7 @@ async def test_async_paginator() -> None:
             {"data": [2], "pagination": {"totalPages": 2}},
         ]
     )
-    paginator = AsyncPaginator(client, "/p", params={"a": 1}, page_size=10)  # type: ignore
+    paginator = AsyncPaginator(client, "/p", params={"a": 1}, page_size=10)  # type: ignore[arg-type]
     items = [item async for item in paginator]
     assert items == [1, 2]
     assert client.calls[0]["params"] == {"a": 1, "page": 0, "size": 10}
@@ -99,7 +99,7 @@ async def test_async_paginator() -> None:
 async def test_async_paginator_empty() -> None:
     """Test AsyncPaginator with empty results."""
     client = AsyncDummyClient([{"data": []}])
-    paginator = AsyncPaginator(client, "/p")  # type: ignore
+    paginator = AsyncPaginator(client, "/p")  # type: ignore[arg-type]
     items = [item async for item in paginator]
     assert items == []
 
@@ -113,7 +113,7 @@ def test_pagination_key_is_null() -> None:
 
 def test_invalid_payload_type_raises_error() -> None:
     """Test TypeError is raised when the API response payload is not a dictionary."""
-    client = DummyClient([["this is a list, not a dict"]])  # type: ignore
+    client = DummyClient([["this is a list, not a dict"]])  # type: ignore[list-item]
     paginator = Paginator(client, "/p")
     with pytest.raises(TypeError, match="API response must be a dictionary"):
         list(paginator)
@@ -148,7 +148,7 @@ def test_json_list_paginator_invalid_payload_type_raises_error() -> None:
 async def test_async_json_list_paginator_invalid_payload_type_raises_error() -> None:
     """Test TypeError is raised in AsyncJsonListPaginator when the response is not a list."""
     client = AsyncDummyClient([{"not a": "list"}])
-    paginator = AsyncJsonListPaginator(client, "/p")  # type: ignore
+    paginator = AsyncJsonListPaginator(client, "/p")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="API response must be a list"):
         # explicitly consume the async generator to trigger the exception
         [item async for item in paginator]
@@ -165,7 +165,7 @@ def test_json_list_paginator_valid_list() -> None:
 async def test_async_json_list_paginator_valid_list() -> None:
     """Test AsyncJsonListPaginator yields items correctly from a list."""
     client = AsyncDummyClient([[1, 2, 3]])
-    paginator = AsyncJsonListPaginator(client, "/p")  # type: ignore
+    paginator = AsyncJsonListPaginator(client, "/p")  # type: ignore[arg-type]
     items = [item async for item in paginator]
     assert items == [1, 2, 3]
 
@@ -219,7 +219,7 @@ def test_paginator_rejects_invalid_bounds(
 
     async_client = AsyncDummyClient([{"data": [1]}])
     with pytest.raises(ValueError, match=match):
-        AsyncPaginator(async_client, "/p", params=params, page_size=page_size)  # type: ignore
+        AsyncPaginator(async_client, "/p", params=params, page_size=page_size)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

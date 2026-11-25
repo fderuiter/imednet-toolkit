@@ -297,7 +297,7 @@ def test_job_status_event_immutable() -> None:
         batch_id="1", status=status, poll_number=1, elapsed=1.0, is_terminal=True
     )
     with pytest.raises(AttributeError):
-        event.poll_number = 2  # type: ignore
+        event.poll_number = 2  # type: ignore[misc]
 
 
 def test_job_poller_fetch_result(monkeypatch: pytest.MonkeyPatch) -> None:

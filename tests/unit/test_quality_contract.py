@@ -31,6 +31,7 @@ EXPECTED_RUFF_SELECT = {
     "PT",
     "RET",
     "RUF",
+    "PGH003",
 }
 EXPECTED_TEST_IGNORES = ["SLF001", "S", "D", "PT", "SIM", "RUF", "B", "RET", "UP", "C", "F821"]
 
@@ -88,6 +89,10 @@ def _assert_guardrail_contract(
 
     ruff_lint = project["tool"]["ruff"]["lint"]
     assert set(ruff_lint["select"]) == EXPECTED_RUFF_SELECT
+    mypy_cfg = project["tool"]["mypy"]
+    assert mypy_cfg["warn_unused_ignores"] is True
+    assert mypy_cfg["warn_redundant_casts"] is True
+    assert "ignore-without-code" in mypy_cfg["enable_error_code"]
     per_file_ignores = ruff_lint["per-file-ignores"]
     testpaths = project["tool"]["pytest"]["ini_options"]["testpaths"]
     assert set(testpaths) >= {"tests", "packages/plugins-sinks/tests", "packages/plugins-tui/tests"}
@@ -607,6 +612,24 @@ def _mutate_test_exit_code_5_bypass(
     run_step["run"] += '\n|| { RET=$?; if [ $RET -eq 5 ]; then exit 0; fi; exit $RET; }'
 
 
+def _mutate_disabled_unused_ignores(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    project["tool"]["mypy"]["warn_unused_ignores"] = False
+
+
+def _mutate_disabled_redundant_casts(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    project["tool"]["mypy"]["warn_redundant_casts"] = False
+
+
+def _mutate_missing_ignore_without_code(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    project["tool"]["mypy"]["enable_error_code"] = []
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -633,6 +656,9 @@ def _mutate_test_exit_code_5_bypass(
         _mutate_build_selective_upload,
         _mutate_test_hatch_run,
         _mutate_test_exit_code_5_bypass,
+        _mutate_disabled_unused_ignores,
+        _mutate_disabled_redundant_casts,
+        _mutate_missing_ignore_without_code,
     ],
 )
 def test_guardrail_manifest_contract_rejects_simulated_drift(mutator) -> None:

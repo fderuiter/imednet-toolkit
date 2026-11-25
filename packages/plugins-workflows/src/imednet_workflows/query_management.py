@@ -36,7 +36,7 @@ class QueryStateCounts(dict[str, int]):
             return self[key.value]
         return super().__getitem__(key)
 
-    def get(self, key: Any, default: Any = 0) -> Any:  # type: ignore[override]
+    def get(self, key: Any, default: Any = 0) -> Any:
         """Get state count with fallback default on missing keys."""
         try:
             return self[key]

@@ -248,7 +248,7 @@ def test_invalid_subject_identifier_type_raises_keyerror() -> None:
             form_identifier="F1",
             subject_identifier="SUBJ1",
             data={"x": 1},
-            subject_identifier_type="invalid_type",  # type: ignore
+            subject_identifier_type="invalid_type",  # type: ignore[arg-type]
         )
 
 
@@ -264,7 +264,7 @@ def test_invalid_site_identifier_type_raises_keyerror() -> None:
             form_identifier="F1",
             site_identifier="SITE1",
             data={"x": 1},
-            site_identifier_type="invalid_type",  # type: ignore
+            site_identifier_type="invalid_type",  # type: ignore[arg-type]
         )
 
 
@@ -281,7 +281,7 @@ def test_update_scheduled_record_invalid_interval_identifier_type() -> None:
             subject_identifier="SUBJ1",
             interval_identifier="INT1",
             data={"x": 1},
-            interval_identifier_type="invalid_type",  # type: ignore
+            interval_identifier_type="invalid_type",  # type: ignore[arg-type]
         )
 
 

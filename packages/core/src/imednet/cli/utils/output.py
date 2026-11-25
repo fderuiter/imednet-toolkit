@@ -784,7 +784,7 @@ def display_list(
         from .grid import is_interactive_terminal, run_interactive_grid
     except ImportError:
 
-        def is_interactive_terminal() -> bool:  # type: ignore[misc]
+        def is_interactive_terminal() -> bool:
             return False
 
         def run_interactive_grid(*args: Any, **kwargs: Any) -> bool:  # type: ignore[misc]

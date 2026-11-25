@@ -11,6 +11,7 @@ import collections
 import functools
 import logging
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from pydantic import BaseModel, Field, ValidationError
@@ -283,6 +284,23 @@ def _evaluate_business_logic(
         return None
 
 
+def _record_timeline_sort_key(record: Record) -> str:
+    """Return a normalized chronological sort key for longitudinal subject records."""
+    raw: Any = record.date_created or record.date_modified or record.last_updated
+    if raw is None:
+        return ""
+    if isinstance(raw, datetime):
+        if raw.tzinfo is not None:
+            return raw.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        return raw.isoformat()
+    if hasattr(raw, "isoformat"):
+        return str(raw.isoformat())
+    text = str(raw)
+    if text.endswith("+00:00"):
+        return f"{text[:-6]}Z"
+    return text
+
+
 def extract_canonical_records(
     records: Iterable[Record],
     study_configuration: StudyConfiguration,
@@ -300,11 +318,13 @@ def extract_canonical_records(
     for record in records:
         if not include_deleted and is_record_deleted(record):
             continue
-        subject_records[record.subject_key].append(record)  # type: ignore
+        if not record.subject_key:
+            continue
+        subject_records[record.subject_key].append(record)
 
     for subject_key, s_records in subject_records.items():
-        # sort by date_created to simulate longitudinal timeline
-        s_records.sort(key=lambda r: r.date_created or r.date_updated)  # type: ignore
+        # sort by timestamp to simulate longitudinal timeline
+        s_records.sort(key=_record_timeline_sort_key)
 
         context = SubjectContext(subject_key)
 
@@ -313,10 +333,12 @@ def extract_canonical_records(
         has_adsl_rules = False
 
         for record in s_records:
+            if not record.form_key:
+                continue
             top_level_payload = _LazyRecordPayload(record)
 
             for domain, by_form in grouped_mappings.items():
-                rules = by_form.get(record.form_key)  # type: ignore
+                rules = by_form.get(record.form_key)
                 if not rules:
                     continue
 

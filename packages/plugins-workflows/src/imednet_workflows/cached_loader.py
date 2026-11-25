@@ -1193,9 +1193,9 @@ class CachedRecordsLoader:
                 continue
             prepared.append(
                 (
-                    cast(str, resolved_study_key),
-                    cast(int, record.record_id),
-                    cast(str, record.form_key or ""),
+                    resolved_study_key,
+                    record.record_id,
+                    record.form_key or "",
                     _serialize_date_modified(record.date_modified),
                     json.dumps(record.model_dump(mode="json", by_alias=True), sort_keys=True),
                 )

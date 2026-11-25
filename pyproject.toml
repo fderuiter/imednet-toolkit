@@ -63,7 +63,7 @@ known-first-party = ["imednet", "imednet_workflows", "apache_airflow_providers_i
 known-third-party = ["airflow"]
 
 [tool.ruff.lint]
-select = ["PL", "PIE", "FURB", "E", "F", "I", "N", "SLF", "D", "S", "B", "C4", "SIM", "UP", "PT", "RET", "RUF"]
+select = ["PL", "PIE", "FURB", "E", "F", "I", "N", "SLF", "D", "S", "B", "C4", "SIM", "UP", "PT", "RET", "RUF", "PGH003"]
 ignore = ["FURB110", "PLC0105", "PLC0415", "PLE0704", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004", "PLW0108", "PLW0603", "PLW1510", "S106", "ANN", "S101", "E501", "E402", "E701", "E713", "F403", "F405", "N802", "F811"]
 
 [tool.ruff.lint.pep8-naming]
@@ -75,8 +75,9 @@ convention = "google"
 [tool.mypy]
 python_version = "3.12"
 strict = true
-warn_unused_ignores = false
-warn_redundant_casts = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+enable_error_code = ["ignore-without-code"]
 plugins = []
 files = [
     "packages/core/src/imednet",
@@ -86,8 +87,9 @@ files = [
     "packages/plugins-tui/src/imednet_tui",
     "examples",
     "tests/typing/endpoint_contracts.py",
+    "tests/typing/airflow_export_contracts.py",
 ]
-exclude = '^(tests/(?!typing/endpoint_contracts\.py$).*|packages/.*/tests/.*|sandbox/.*)$'
+exclude = '^(tests/(?!typing/(endpoint_contracts|airflow_export_contracts)\.py$).*|packages/.*/tests/.*|sandbox/.*)$'
 
 [[tool.mypy.overrides]]
 module = [
@@ -213,6 +215,7 @@ verify-static = [
     "mypy packages/plugins-tui/src/imednet_tui",
     "mypy examples",
     "mypy tests/typing/endpoint_contracts.py",
+    "mypy tests/typing/airflow_export_contracts.py",
 ]
 verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_sinks --cov=imednet_tui --cov-fail-under=90"
 verify = ["verify-static", "verify-tests"]

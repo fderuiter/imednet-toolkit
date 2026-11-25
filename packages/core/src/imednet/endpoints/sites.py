@@ -1,5 +1,7 @@
 """Endpoint for managing sites (study locations) in a study."""
 
+from typing import ClassVar
+
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.models.sites import Site
 
@@ -7,11 +9,11 @@ from imednet.models.sites import Site
 class SitesOperationDef:
     """Definition for Site operations."""
 
-    PATH = "sites"
+    PATH: ClassVar[str] = "sites"
     MODEL = Site
     _id_param = "siteId"
-    _lookup_key_hint = "siteName"
-    FILTER_ATTRIBUTES = frozenset(
+    _lookup_key_hint: ClassVar[str | None] = "siteName"
+    FILTER_ATTRIBUTES: ClassVar[frozenset[str] | None] = frozenset(
         {
             "siteId",
             "siteName",
@@ -23,9 +25,9 @@ class SitesOperationDef:
     )
 
 
-class SitesEndpoint(SitesOperationDef, EdcSyncListGetEndpoint[Site]):  # type: ignore[misc]
+class SitesEndpoint(SitesOperationDef, EdcSyncListGetEndpoint[Site]):
     """Synchronous endpoint for managing Sites."""
 
 
-class AsyncSitesEndpoint(SitesOperationDef, EdcAsyncListGetEndpoint[Site]):  # type: ignore[misc]
+class AsyncSitesEndpoint(SitesOperationDef, EdcAsyncListGetEndpoint[Site]):
     """Asynchronous endpoint for managing Sites."""

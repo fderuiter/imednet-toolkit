@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Generic, TypeVar
+from typing import Any, ClassVar, Generic, NoReturn, TypeVar
 
 from imednet.core.protocols import ClientProvider
 from imednet.models.base import ImednetBaseModel
@@ -15,18 +15,14 @@ class EndpointABC(ABC, ClientProvider, Generic[T]):
     """Abstract base class defining the contract for all API endpoints.
 
     This ensures that all endpoint implementations provide necessary
-    properties like PATH and MODEL, and implement core path building logic.
+    class attributes like PATH and MODEL, and implement core path building logic.
     """
 
-    @property
-    @abstractmethod
-    def PATH(self) -> str:
-        """The relative path for the endpoint."""
+    PATH: ClassVar[str]
+    """The relative path for the endpoint."""
 
-    @property
-    @abstractmethod
-    def MODEL(self) -> type[T]:
-        """The model class associated with this endpoint."""
+    MODEL: type[T]
+    """The model class associated with this endpoint."""
 
     requires_study_key: bool = True
     """
@@ -99,7 +95,7 @@ class EndpointABC(ABC, ClientProvider, Generic[T]):
             segments.append(validate_path_segment(segment, name="segment"))
         return self._build_path(*segments)
 
-    def _raise_not_found(self, study_key: str | None, item_id: Any = None) -> None:
+    def _raise_not_found(self, study_key: str | None, item_id: Any = None) -> NoReturn:
         """Raise a standardized NotFoundError."""
         from imednet.errors import NotFoundError
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -753,3 +753,163 @@ def test_extract_canonical_records_blocks_payload_clear(
     # Derived logic failed safely, keeping initial extracted value
     assert result.adverse_events[0].ae_term == "Headache"
     assert any("Derivation logic failed for SUBJ-001" in r.message for r in caplog.records)
+
+
+def test_extract_canonical_records_orders_nullable_and_mixed_timestamps() -> None:
+    """Test chronological timeline sorting with None, fallback, and mixed datetime/ISO timestamps."""
+    config = StudyConfiguration(
+        study_key="STUDY-TIMELINE",
+        mappings=[
+            MappingRule(
+                domain="ADSL",
+                target_field="subjectKey",
+                source_form_key="DM_FORM",
+                source_variable_name="subjectKey",
+            ),
+            MappingRule(
+                domain="ADSL",
+                target_field="firstDoseDate",
+                source_form_key="EX_FORM",
+                source_variable_name="recordData.doseDate",
+                business_logic="value",
+            ),
+            MappingRule(
+                domain="ADAE",
+                target_field="subjectKey",
+                source_form_key="AE_FORM",
+                source_variable_name="subjectKey",
+            ),
+            MappingRule(
+                domain="ADAE",
+                target_field="aeTerm",
+                source_form_key="AE_FORM",
+                source_variable_name="recordData.term",
+            ),
+            MappingRule(
+                domain="ADAE",
+                target_field="treatmentEmergent",
+                source_form_key="AE_FORM",
+                source_variable_name="",
+                business_logic=(
+                    "record.record_data.get('onsetDate', '') "
+                    ">= state.get('ADSL.firstDoseDate', '9999-99-99')"
+                ),
+            ),
+        ],
+    )
+
+    ae_after_dose = Record.model_construct(
+        record_id=30,
+        form_key="AE_FORM",
+        subject_key="SUBJ-1",
+        date_created=None,
+        date_modified=datetime(2024, 3, 5, 12, 0, 0, tzinfo=UTC),
+        record_data={"term": "Rash", "onsetDate": "2024-03-05"},
+    )
+    ae_same_day_later_iso = Record.model_construct(
+        record_id=31,
+        form_key="AE_FORM",
+        subject_key="SUBJ-1",
+        date_created=None,
+        date_modified=None,
+        last_updated="2024-03-05T12:00:01Z",
+        record_data={"term": "Headache", "onsetDate": "2024-03-05"},
+    )
+    ex_dose_iso_str = Record.model_construct(
+        record_id=20,
+        form_key="EX_FORM",
+        subject_key="SUBJ-1",
+        date_created=None,
+        date_modified=None,
+        last_updated="2024-03-01T08:00:00+00:00",
+        record_data={"doseDate": "2024-03-01"},
+    )
+    dm_no_dates = Record.model_construct(
+        record_id=10,
+        form_key="DM_FORM",
+        subject_key="SUBJ-1",
+        date_created=None,
+        date_modified=None,
+        record_data={},
+    )
+
+    result = extract_canonical_records(
+        records=[ae_same_day_later_iso, ae_after_dose, ex_dose_iso_str, dm_no_dates],
+        study_configuration=config,
+    )
+
+    assert len(result.adsl_records) == 1
+    assert len(result.adae_records) == 2
+    adae_terms = [rec.model_dump(by_alias=True)["aeTerm"] for rec in result.adae_records]
+    assert adae_terms == ["Rash", "Headache"]
+    assert all(
+        rec.model_dump(by_alias=True)["treatmentEmergent"] is True for rec in result.adae_records
+    )
+
+
+def test_extract_canonical_records_skips_missing_or_empty_subject_and_form_keys() -> None:
+    """Test records missing subject_key or form_key are skipped without corrupting valid extraction."""
+    config = StudyConfiguration(
+        study_key="STUDY-MISSING-KEYS",
+        mappings=[
+            MappingRule(
+                domain="AE",
+                target_field="subjectKey",
+                source_form_key="AE_FORM",
+                source_variable_name="subjectKey",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeTerm",
+                source_form_key="AE_FORM",
+                source_variable_name="recordData.term",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeSeverity",
+                source_form_key="AE_FORM",
+                source_variable_name="",
+                fallback_value="MILD",
+            ),
+        ],
+    )
+
+    records = [
+        Record(
+            record_id=1,
+            form_key="AE_FORM",
+            subject_key=None,
+            record_data={"term": "Ignored no subject"},
+        ),
+        Record(
+            record_id=2,
+            form_key="AE_FORM",
+            subject_key="",
+            record_data={"term": "Ignored empty subject"},
+        ),
+        Record(
+            record_id=3,
+            form_key=None,
+            subject_key="SUBJ-001",
+            record_data={"term": "Ignored no form"},
+        ),
+        Record(
+            record_id=4,
+            form_key="",
+            subject_key="SUBJ-001",
+            record_data={"term": "Ignored empty form"},
+        ),
+        Record(
+            record_id=5,
+            form_key="AE_FORM",
+            subject_key="SUBJ-001",
+            record_data={"term": "Valid event"},
+        ),
+    ]
+
+    result = extract_canonical_records(records=records, study_configuration=config)
+
+    assert len(result.adverse_events) == 1
+    assert result.adverse_events[0].subject_key == "SUBJ-001"
+    assert result.adverse_events[0].ae_term == "Valid event"
+    assert result.validation_errors == []

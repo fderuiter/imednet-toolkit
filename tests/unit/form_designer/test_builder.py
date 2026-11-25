@@ -46,7 +46,7 @@ def test_form_builder_add_field_invalid_type():
     """Test that form builder add field invalid type."""
     builder = FormBuilder()
     with pytest.raises(ValueError, match="Unsupported field type: invalid"):
-        builder.add_field(type="invalid", label="Invalid", question_name="inv")  # type: ignore
+        builder.add_field(type="invalid", label="Invalid", question_name="inv")  # type: ignore[arg-type]
 
 
 def test_form_builder_add_all_field_types():
