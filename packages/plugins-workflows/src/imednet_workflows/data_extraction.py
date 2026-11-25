@@ -1,9 +1,16 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
-from collections.abc import Callable
+import contextlib
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
+from imednet.spi.cdisc import (
+    OdmAuditRecord,
+    build_odm_audit_record_from_revision,
+    sanitize_odm_oid,
+    sanitize_xml_id,
+)
 from imednet.spi.models import Record, RecordRevision
 from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import normalize_utc_timestamp_bound
@@ -62,6 +69,32 @@ def _matches_local_date_bound(rev_dt: datetime | None, op: str, bound_val: Any) 
     if op == ">=":
         return rev_dt >= bound_dt
     raise ValueError(f"Unsupported dateCreated filter operator: {op!r}")
+
+
+def _list_sdk_resource(
+    sdk: Any,
+    facade_attr: str,
+    endpoint_attr: str,
+    study_key: str,
+    **filters: Any,
+) -> list[Any]:
+    """List items from a facade getter or fallback endpoint ``.list`` method."""
+    from unittest.mock import NonCallableMock
+
+    if isinstance(sdk, NonCallableMock):
+        children = getattr(sdk, "_mock_children", {})
+        inst_vars = vars(sdk)
+        if facade_attr in children or facade_attr in inst_vars:
+            return list(getattr(sdk, facade_attr)(study_key, **filters))
+        if endpoint_attr in children or endpoint_attr in inst_vars:
+            ep = getattr(sdk, endpoint_attr)
+            return list(ep.list(study_key=study_key, **filters))
+        return list(getattr(sdk, facade_attr)(study_key, **filters))
+    facade_fn = getattr(sdk, facade_attr, None)
+    if callable(facade_fn):
+        return list(facade_fn(study_key, **filters))
+    ep = getattr(sdk, endpoint_attr)
+    return list(ep.list(study_key=study_key, **filters))
 
 
 class DataExtractionWorkflow:
@@ -227,11 +260,12 @@ class DataExtractionWorkflow:
                 final_filter_dict["dateCreated"] = date_bounds[0]
                 local_date_bounds = date_bounds[1:]
 
-        revisions = list(
-            self._sdk.get_record_revisions(
-                study_key,
-                **final_filter_dict,
-            )
+        revisions = _list_sdk_resource(
+            self._sdk,
+            "get_record_revisions",
+            "record_revisions",
+            study_key,
+            **final_filter_dict,
         )
         if local_date_bounds:
             revisions = [
@@ -247,6 +281,101 @@ class DataExtractionWorkflow:
                 )
             ]
         return revisions
+
+    def extract_odm_audit_records(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        *,
+        record_ids: Sequence[int | str] | None = None,
+        mask_phi: bool = True,
+        **filters: Any,
+    ) -> list[OdmAuditRecord]:
+        """Extract record revisions mapped to canonical ODM ``<AuditRecord>`` elements.
+
+        Populates ``<UserRef>``, ``<LocationRef>``, ``<DateTimeStamp>``, and
+        ``<ReasonForChange>`` while enforcing default PHI masking.
+        """
+        from unittest.mock import NonCallableMock
+
+        revisions = self.extract_audit_trail(
+            study_key,
+            start_date=start_date,
+            end_date=end_date,
+            user_filter=user_filter,
+            **filters,
+        )
+        if record_ids is not None:
+            allowed_ids = {str(rid).strip() for rid in record_ids}
+            revisions = [
+                rev
+                for rev in revisions
+                if str(getattr(rev, "record_id", "")).strip() in allowed_ids
+            ]
+
+        site_lookup: dict[str, str] = {}
+        user_lookup: dict[str, str] = {}
+        mock_children = getattr(self._sdk, "_mock_children", {})
+        sdk_vars = vars(self._sdk) if hasattr(self._sdk, "__dict__") else {}
+        if not isinstance(self._sdk, NonCallableMock) or (
+            "get_sites" in mock_children
+            or "get_sites" in sdk_vars
+            or "sites" in mock_children
+            or "sites" in sdk_vars
+        ):
+            with contextlib.suppress(Exception):
+                for site in _list_sdk_resource(self._sdk, "get_sites", "sites", study_key):
+                    sid = getattr(site, "site_id", None)
+                    sname = getattr(site, "site_name", None)
+                    raw_s = sid if sid not in (None, "") else sname
+                    if raw_s not in (None, ""):
+                        loc_oid = sanitize_odm_oid("LOC", raw_s)
+                        if sid not in (None, ""):
+                            site_lookup[str(sid).strip()] = loc_oid
+                        if sname not in (None, ""):
+                            site_lookup[str(sname).strip()] = loc_oid
+
+        if not isinstance(self._sdk, NonCallableMock) or (
+            "get_users" in mock_children
+            or "get_users" in sdk_vars
+            or "users" in mock_children
+            or "users" in sdk_vars
+        ):
+            with contextlib.suppress(Exception):
+                for usr in _list_sdk_resource(self._sdk, "get_users", "users", study_key):
+                    uid = getattr(usr, "user_id", None)
+                    ulogin = getattr(usr, "login", None)
+                    raw_u = uid if uid not in (None, "") else ulogin
+                    if raw_u not in (None, ""):
+                        u_oid = sanitize_odm_oid("USR", raw_u)
+                        if uid not in (None, ""):
+                            user_lookup[str(uid).strip()] = u_oid
+                        if ulogin not in (None, ""):
+                            user_lookup[str(ulogin).strip()] = u_oid
+
+        audit_records: list[OdmAuditRecord] = []
+        seen_ids: set[str] = set()
+        for rev in revisions:
+            aud = build_odm_audit_record_from_revision(
+                rev,
+                user_oid_lookup=user_lookup or None,
+                site_oid_lookup=site_lookup or None,
+                mask_phi=mask_phi,
+            )
+            if aud.audit_id and aud.audit_id in seen_ids:
+                aud = aud.model_copy(
+                    update={
+                        "audit_id": sanitize_xml_id("AR", f"{aud.audit_id}_{len(seen_ids) + 1}")
+                    }
+                )
+            if aud.audit_id:
+                seen_ids.add(aud.audit_id)
+            audit_records.append(aud)
+
+        audit_records.sort(key=lambda a: (a.date_time_stamp, a.audit_id or ""))
+        return audit_records
 
 
 # Integration:

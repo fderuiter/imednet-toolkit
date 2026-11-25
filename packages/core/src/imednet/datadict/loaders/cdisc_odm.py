@@ -9,6 +9,25 @@ from typing import Any, BinaryIO, TextIO
 import defusedxml.ElementTree as ET  # noqa: N817
 from defusedxml.common import DefusedXmlException
 
+from ..exchange import (
+    OdmAdminData,
+    OdmAnnotation,
+    OdmArchive,
+    OdmAuditRecord,
+    OdmClinicalData,
+    OdmComment,
+    OdmFlag,
+    OdmFormData,
+    OdmItemData,
+    OdmItemGroupData,
+    OdmLocation,
+    OdmMetaDataVersionRef,
+    OdmReferenceData,
+    OdmSignatureDef,
+    OdmStudyEventData,
+    OdmSubjectData,
+    OdmUser,
+)
 from ..logic import parse_logic_xml
 from ..models import (
     BusinessLogicRule,
@@ -42,6 +61,7 @@ KNOWN_FORM_ATTRIBUTES = {
 
 KNOWN_IMEDNET_FORM_ATTRIBUTES = {
     "formid",
+    "formtype",
 }
 
 KNOWN_ITEM_GROUP_ATTRIBUTES = {
@@ -73,6 +93,7 @@ KNOWN_IMEDNET_ITEM_ATTRIBUTES = {
     "variabletype",
     "format",
     "precision",
+    "controltype",
 }
 
 KNOWN_ITEM_REF_ATTRIBUTES = {
@@ -724,6 +745,7 @@ def _parse_imednet_condition_rule(
             parsed_logic = parse_logic_xml(raw_logic_xml)
         except ValueError as exc:
             record_warning(f"Malformed logic XML on ConditionDef '{rule_id}': {exc}")
+            extra["malformedLogicXml"] = str(exc)
 
     return (
         container_form,
@@ -824,46 +846,76 @@ def _parse_formal_rule_element(
     )
 
 
-def load_from_cdisc_odm(
-    source: Path | str | TextIO | BinaryIO,
+_NON_METADATA_ODM_CONTAINERS: frozenset[str] = frozenset(
+    {
+        "clinicaldata",
+        "admindata",
+        "referencedata",
+        "association",
+        "signature",
+        "signatures",
+        "subjectdata",
+        "studyeventdata",
+        "formdata",
+        "itemgroupdata",
+        "itemdata",
+        "auditrecords",
+        "auditrecord",
+        "annotations",
+        "annotation",
+    }
+)
+
+
+def _check_allowed_children(
+    parent: ET.Element,
+    parent_label: str,
+    allowed_tags_lower: set[str] | frozenset[str],
+    record_warning: Any,
+) -> None:
+    """Emit a warning (or raise in strict mode) for any unparsed child elements."""
+    for child in parent:
+        tag = _local_tag(child)
+        tag_low = tag.lower()
+        if tag_low in allowed_tags_lower:
+            continue
+        if tag_low in _NON_METADATA_ODM_CONTAINERS:
+            record_warning(
+                f"Unparsed non-metadata ODM element '<{tag}>' inside '<{parent_label}>'; "
+                "use load_odm_archive() to parse full ODM 1.3.2 snapshots."
+            )
+        else:
+            record_warning(f"Unparsed ODM element '<{tag}>' inside '<{parent_label}>'.")
+
+
+def _parse_datadict_from_root(
+    root: ET.Element,
     *,
     study_key: str | None = None,
     strict: bool = False,
     no_raw_xml: bool = False,
+    allow_archive_containers: bool = False,
 ) -> DataDictionary:
-    """Parse CDISC ODM 1.3 XML file or stream into a canonical DataDictionary.
-
-    Args:
-        source: XML file path, string buffer, or file-like stream.
-        study_key: Optional study key override. If omitted, uses Study OID from XML.
-        strict: If True, raise ValueError on validation warnings or unmapped definitions.
-        no_raw_xml: If True, omit verbatim logicRawXml strings on BusinessLogicRule entries.
-
-    Returns:
-        Canonical DataDictionary representation.
-
-    Raises:
-        ValueError: If strict is True and validation warnings are encountered, or XML is invalid.
-        DefusedXmlException: If XML entity expansion or malicious XML is detected.
-    """
     warnings: list[str] = []
 
     def record_warning(msg: str) -> None:
         warnings.append(msg)
-        if strict:
-            raise ValueError(f"Strict loading error: {msg}")
-
-    # 1. Read source bytes and parse safely with defusedxml
-    content = _read_source_content(source)
-    try:
-        root = ET.fromstring(content)
-    except DefusedXmlException:
-        raise
-    except Exception as exc:
-        raise ValueError(f"Failed to parse CDISC ODM XML: {exc}") from exc
 
     if _local_tag(root).lower() != "odm":
         record_warning(f"Root XML tag is '{_local_tag(root)}', expected 'ODM'.")
+    else:
+        allowed_root_children = (
+            {"study", "admindata", "referencedata", "clinicaldata"}
+            if allow_archive_containers
+            else {"study"}
+        )
+        _check_allowed_children(root, "ODM", allowed_root_children, record_warning)
+        study_children = _find_children(root, "Study")
+        if len(study_children) > 1:
+            record_warning(
+                f"Multiple '<Study>' elements ({len(study_children)}) found under '<ODM>'; "
+                "only the first '<Study>' is loaded into DataDictionary."
+            )
 
     # 2. Extract Study metadata & BasicDefinitions MeasurementUnits
     study_elem = _find_first_child(root, "Study")
@@ -875,9 +927,21 @@ def load_from_cdisc_odm(
     study_measurement_units: list[dict[str, Any]] = []
 
     if study_elem is not None:
+        _check_allowed_children(
+            study_elem,
+            "Study",
+            {"globalvariables", "basicdefinitions", "metadataversion"},
+            record_warning,
+        )
         study_oid = _get_attr(study_elem, "OID")
         gv_elem = _find_first_child(study_elem, "GlobalVariables")
         if gv_elem is not None:
+            _check_allowed_children(
+                gv_elem,
+                "GlobalVariables",
+                {"studyname", "studydescription", "protocolname"},
+                record_warning,
+            )
             name_elem = _find_first_child(gv_elem, "StudyName")
             if name_elem is not None and name_elem.text:
                 study_name = name_elem.text.strip()
@@ -889,6 +953,12 @@ def load_from_cdisc_odm(
                 protocol_name = proto_name_elem.text.strip()
 
         for bd_elem in _find_children(study_elem, "BasicDefinitions"):
+            _check_allowed_children(
+                bd_elem,
+                "BasicDefinitions",
+                {"measurementunit"},
+                record_warning,
+            )
             for mu_elem in _find_children(bd_elem, "MeasurementUnit"):
                 mu_extra = _extract_unmapped_attributes(
                     mu_elem,
@@ -932,6 +1002,8 @@ def load_from_cdisc_odm(
 
     if not mdv_elements:
         record_warning("No 'MetaDataVersion' element found in ODM document.")
+        if strict and warnings:
+            raise ValueError("Strict loading error: " + "; ".join(warnings))
         metadata = Metadata.create(
             study_key=effective_study_key,
             source="cdisc_odm",
@@ -951,25 +1023,84 @@ def load_from_cdisc_odm(
     method_def_elems: dict[str, ET.Element] = {}
 
     for mdv in mdv_elements:
+        _check_allowed_children(
+            mdv,
+            "MetaDataVersion",
+            {
+                "protocol",
+                "studyeventdef",
+                "formdef",
+                "itemgroupdef",
+                "itemdef",
+                "codelist",
+                "conditiondef",
+                "methoddef",
+            },
+            record_warning,
+        )
         for proto in _find_children(mdv, "Protocol"):
+            _check_allowed_children(
+                proto,
+                "Protocol",
+                {"description", "studyeventref"},
+                record_warning,
+            )
             protocol_elems.append(proto)
         for se in _find_children(mdv, "StudyEventDef"):
+            _check_allowed_children(
+                se,
+                "StudyEventDef",
+                {"description", "formref"},
+                record_warning,
+            )
             se_oid = _get_attr(se, "OID")
             if se_oid:
                 study_event_def_elems[se_oid] = se
         for cl in _find_children(mdv, "CodeList"):
+            _check_allowed_children(
+                cl,
+                "CodeList",
+                {"description", "codelistitem", "enumerateditem"},
+                record_warning,
+            )
             cl_oid = _get_attr(cl, "OID")
             if cl_oid:
                 codelist_elems[cl_oid] = cl
         for item in _find_children(mdv, "ItemDef"):
+            _check_allowed_children(
+                item,
+                "ItemDef",
+                {
+                    "description",
+                    "question",
+                    "measurementunitref",
+                    "rangecheck",
+                    "codelistref",
+                    "origin",
+                    "comment",
+                },
+                record_warning,
+            )
             item_oid = _get_attr(item, "OID")
             if item_oid:
                 item_def_elems[item_oid] = item
         for ig in _find_children(mdv, "ItemGroupDef"):
+            _check_allowed_children(
+                ig,
+                "ItemGroupDef",
+                {"description", "itemref"},
+                record_warning,
+            )
             ig_oid = _get_attr(ig, "OID")
             if ig_oid:
                 item_group_def_elems[ig_oid] = ig
         for f in _find_children(mdv, "FormDef"):
+            _check_allowed_children(
+                f,
+                "FormDef",
+                {"description", "itemgroupref", "itemref"},
+                record_warning,
+            )
             form_def_elems.append(f)
         for cond in _find_children(mdv, "ConditionDef"):
             cond_oid = _get_attr(cond, "OID")
@@ -1311,7 +1442,11 @@ def load_from_cdisc_odm(
         raw_datatype = _get_attr(it_def, "DataType")
         if raw_datatype and raw_datatype.strip().lower() in _PRESERVED_ODM_RAW_DATA_TYPES:
             it_extra["odmDataType"] = raw_datatype.strip()
-        control_type = _get_attr(it_def, "ControlType") or _get_attr(item_ref, "ControlType")
+        control_type = (
+            _get_attr(it_def, "ControlType")
+            or _get_imednet_attr(it_def, "ControlType")
+            or _get_attr(item_ref, "ControlType")
+        )
         imednet_var_type = _get_imednet_attr(it_def, "VariableType")
 
         cl_ref = _find_first_child(it_def, "CodeListRef")
@@ -1355,7 +1490,10 @@ def load_from_cdisc_odm(
     for form_elem in form_def_elems:
         f_oid = _get_attr(form_elem, "OID") or ""
         f_name = _get_attr(form_elem, "Name") or f_oid
-        f_type = normalize_form_type(_get_attr(form_elem, "FormType"), default="Subject")
+        f_type = normalize_form_type(
+            _get_attr(form_elem, "FormType") or _get_imednet_attr(form_elem, "FormType"),
+            default="Subject",
+        )
         raw_form_id = _get_imednet_attr(form_elem, "FormId")
         f_id = normalize_form_id(raw_form_id, form_key=f_oid)
         f_extra = _extract_unmapped_attributes(
@@ -1559,6 +1697,9 @@ def load_from_cdisc_odm(
         else:
             unassigned_logic.append(rule)
 
+    if strict and warnings:
+        raise ValueError("Strict loading error: " + "; ".join(warnings))
+
     # 6. Build Metadata envelope
     metadata = Metadata.create(
         study_key=effective_study_key,
@@ -1571,4 +1712,472 @@ def load_from_cdisc_odm(
         metadata=metadata,
         forms=forms,
         unassignedBusinessLogic=unassigned_logic,
+    )
+
+
+def load_from_cdisc_odm(
+    source: Path | str | TextIO | BinaryIO,
+    *,
+    study_key: str | None = None,
+    strict: bool = False,
+    no_raw_xml: bool = False,
+) -> DataDictionary:
+    """Parse CDISC ODM 1.3 / 1.3.2 XML metadata into a canonical DataDictionary.
+
+    Non-metadata ODM elements (such as ``<ClinicalData>``, ``<AdminData>``,
+    ``<ReferenceData>``, ``<AuditRecord>``, or ``<Annotation>``) emit validation
+    warnings in default mode and raise ``ValueError`` when ``strict=True`` so
+    nothing is silently dropped. Use :func:`load_odm_archive` to load full ODM
+    1.3.2 snapshots including clinical, administrative, and reference datasets.
+
+    Args:
+        source: XML file path, string buffer, or file-like stream.
+        study_key: Optional study key override. If omitted, uses Study OID from XML.
+        strict: If True, raise ValueError on validation warnings or non-metadata elements.
+        no_raw_xml: If True, omit verbatim logicRawXml strings on BusinessLogicRule entries.
+
+    Returns:
+        Canonical DataDictionary representation.
+
+    Raises:
+        ValueError: If strict is True and validation warnings or non-metadata elements exist.
+        DefusedXmlException: If XML entity expansion or malicious XML is detected.
+    """
+    content = _read_source_content(source)
+    try:
+        root = ET.fromstring(content)
+    except DefusedXmlException:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Failed to parse CDISC ODM XML: {exc}") from exc
+
+    return _parse_datadict_from_root(
+        root,
+        study_key=study_key,
+        strict=strict,
+        no_raw_xml=no_raw_xml,
+        allow_archive_containers=False,
+    )
+
+
+def _child_text(parent: ET.Element, tag_name: str) -> str | None:
+    child = _find_first_child(parent, tag_name)
+    if child is None or child.text is None:
+        return None
+    return str(child.text)
+
+
+def _parse_audit_record_elem(elem: ET.Element) -> OdmAuditRecord:
+    user_ref = _find_first_child(elem, "UserRef")
+    loc_ref = _find_first_child(elem, "LocationRef")
+    user_oid = (_get_attr(user_ref, "UserOID") if user_ref is not None else None) or "USR.UNKNOWN"
+    loc_oid = (_get_attr(loc_ref, "LocationOID") if loc_ref is not None else None) or "LOC.UNKNOWN"
+    dt_text = (_child_text(elem, "DateTimeStamp") or "").strip() or "1970-01-01T00:00:00Z"
+    reason = _child_text(elem, "ReasonForChange")
+    source_id = _child_text(elem, "SourceID")
+    edit_point = _get_attr(elem, "EditPoint")
+    used_imp = _get_attr(elem, "UsedImputationMethod")
+    aud_id = _get_attr(elem, "ID")
+
+    ep_val: Any = edit_point if edit_point in {"Monitoring", "DataManagement", "DBAudit"} else None
+    ui_val: Any = used_imp if used_imp in {"Yes", "No"} else None
+    return OdmAuditRecord(
+        audit_id=aud_id,
+        editPoint=ep_val,
+        usedImputationMethod=ui_val,
+        userOid=user_oid,
+        locationOid=loc_oid,
+        dateTimeStamp=dt_text,
+        reasonForChange=reason.strip() if reason is not None else None,
+        sourceId=source_id.strip() if source_id is not None else None,
+    )
+
+
+def _parse_annotation_elem(elem: ET.Element, fallback_seq: int = 1) -> OdmAnnotation:
+    raw_seq = _get_attr(elem, "SeqNum")
+    try:
+        seq_num = max(1, int(raw_seq)) if raw_seq is not None else max(1, fallback_seq)
+    except ValueError:
+        seq_num = max(1, fallback_seq)
+
+    ann_id = _get_attr(elem, "ID")
+    tx_raw = _get_attr(elem, "TransactionType")
+    tx_val: Any = tx_raw if tx_raw in {"Insert", "Update", "Remove", "Upsert", "Context"} else None
+
+    comment_obj: OdmComment | None = None
+    comment_el = _find_first_child(elem, "Comment")
+    if comment_el is not None:
+        src_raw = _get_attr(comment_el, "SponsorOrSite")
+        src_val: Any = src_raw if src_raw in {"Sponsor", "Site"} else None
+        comment_obj = OdmComment(
+            text=(comment_el.text or ""),
+            sponsorOrSite=src_val,
+        )
+
+    flags: list[OdmFlag] = []
+    for flag_el in _find_children(elem, "Flag"):
+        fv_el = _find_first_child(flag_el, "FlagValue")
+        if fv_el is None:
+            continue
+        fv_cl = _get_attr(fv_el, "CodeListOID") or "CL.FLAG"
+        fv_txt = (fv_el.text or "").strip()
+        ft_el = _find_first_child(flag_el, "FlagType")
+        ft_txt = (ft_el.text or "").strip() if ft_el is not None and ft_el.text else None
+        ft_cl = _get_attr(ft_el, "CodeListOID") if ft_el is not None else None
+        flags.append(
+            OdmFlag(
+                flagValue=fv_txt,
+                flagValueCodeListOid=fv_cl,
+                flagType=ft_txt,
+                flagTypeCodeListOid=ft_cl,
+            )
+        )
+
+    return OdmAnnotation(
+        seqNum=seq_num,
+        annotation_id=ann_id,
+        transactionType=tx_val,
+        comment=comment_obj,
+        flags=tuple(flags),
+    )
+
+
+def _parse_tx_type(elem: ET.Element) -> Any:
+    tx_raw = _get_attr(elem, "TransactionType")
+    return tx_raw if tx_raw in {"Insert", "Update", "Remove", "Upsert", "Context"} else None
+
+
+def _parse_item_data_elem(elem: ET.Element) -> OdmItemData:
+    item_oid = _get_attr(elem, "ItemOID") or "UNKNOWN"
+    is_null_attr = (_get_attr(elem, "IsNull") or "").strip().lower() == "yes"
+    val_attr = _get_attr(elem, "Value")
+    if val_attr is None and not is_null_attr and elem.text and elem.text.strip():
+        val_attr = elem.text
+    mu_ref = _find_first_child(elem, "MeasurementUnitRef")
+    mu_oid = _get_attr(elem, "MeasurementUnitOID") or (
+        _get_attr(mu_ref, "MeasurementUnitOID") if mu_ref is not None else None
+    )
+    aud_el = _find_first_child(elem, "AuditRecord")
+    anns = tuple(
+        _parse_annotation_elem(a_el, idx)
+        for idx, a_el in enumerate(_find_children(elem, "Annotation"), start=1)
+    )
+    return OdmItemData(
+        itemOid=item_oid,
+        value=None if is_null_attr else val_attr,
+        isNull=is_null_attr,
+        transactionType=_parse_tx_type(elem),
+        measurementUnitOid=mu_oid,
+        auditRecordId=_get_attr(elem, "AuditRecordID"),
+        annotationId=_get_attr(elem, "AnnotationID"),
+        auditRecord=_parse_audit_record_elem(aud_el) if aud_el is not None else None,
+        annotations=anns,
+    )
+
+
+def _parse_item_group_data_elem(elem: ET.Element) -> OdmItemGroupData:
+    ig_oid = _get_attr(elem, "ItemGroupOID") or "IG_UNKNOWN"
+    aud_el = _find_first_child(elem, "AuditRecord")
+    anns = tuple(
+        _parse_annotation_elem(a_el, idx)
+        for idx, a_el in enumerate(_find_children(elem, "Annotation"), start=1)
+    )
+    items: list[OdmItemData] = []
+    for child in elem:
+        if _local_tag(child).lower().startswith("itemdata"):
+            items.append(_parse_item_data_elem(child))
+    return OdmItemGroupData(
+        itemGroupOid=ig_oid,
+        itemGroupRepeatKey=_get_attr(elem, "ItemGroupRepeatKey"),
+        transactionType=_parse_tx_type(elem),
+        auditRecordId=_get_attr(elem, "AuditRecordID"),
+        annotationId=_get_attr(elem, "AnnotationID"),
+        auditRecord=_parse_audit_record_elem(aud_el) if aud_el is not None else None,
+        annotations=anns,
+        items=tuple(items),
+    )
+
+
+def _parse_admin_data_elem(elem: ET.Element) -> OdmAdminData:
+    users: list[OdmUser] = []
+    for u_el in _find_children(elem, "User"):
+        u_oid = _get_attr(u_el, "OID") or "USR.UNKNOWN"
+        ut_raw = _get_attr(u_el, "UserType")
+        ut_val: Any = ut_raw if ut_raw in {"Sponsor", "Investigator", "Lab", "Other"} else None
+        loc_oids = tuple(
+            loid
+            for lr in _find_children(u_el, "LocationRef")
+            if (loid := _get_attr(lr, "LocationOID"))
+        )
+        users.append(
+            OdmUser(
+                oid=u_oid,
+                userType=ut_val,
+                loginName=_child_text(u_el, "LoginName"),
+                displayName=_child_text(u_el, "DisplayName"),
+                fullName=_child_text(u_el, "FullName"),
+                firstName=_child_text(u_el, "FirstName"),
+                lastName=_child_text(u_el, "LastName"),
+                organization=_child_text(u_el, "Organization"),
+                email=_child_text(u_el, "Email"),
+                phone=_child_text(u_el, "Phone"),
+                locationOids=loc_oids,
+            )
+        )
+
+    locations: list[OdmLocation] = []
+    for l_el in _find_children(elem, "Location"):
+        l_oid = _get_attr(l_el, "OID") or "LOC.UNKNOWN"
+        l_name = _get_attr(l_el, "Name") or l_oid
+        lt_raw = _get_attr(l_el, "LocationType")
+        lt_val: Any = lt_raw if lt_raw in {"Sponsor", "Site", "CRO", "Lab", "Other"} else "Site"
+        mdv_refs = tuple(
+            OdmMetaDataVersionRef(
+                studyOid=_get_attr(mr, "StudyOID") or "STUDY",
+                metaDataVersionOid=_get_attr(mr, "MetaDataVersionOID") or "MDV.001",
+                effectiveDate=_get_attr(mr, "EffectiveDate") or "1970-01-01",
+            )
+            for mr in _find_children(l_el, "MetaDataVersionRef")
+        )
+        locations.append(
+            OdmLocation(
+                oid=l_oid,
+                name=l_name,
+                locationType=lt_val,
+                metaDataVersionRefs=mdv_refs,
+            )
+        )
+
+    sig_defs: list[OdmSignatureDef] = []
+    for s_el in _find_children(elem, "SignatureDef"):
+        s_oid = _get_attr(s_el, "OID") or "SIG.UNKNOWN"
+        meth_raw = _get_attr(s_el, "Methodology")
+        meth_val: Any = meth_raw if meth_raw in {"Digital", "Electronic"} else None
+        sig_defs.append(
+            OdmSignatureDef(
+                oid=s_oid,
+                meaning=_child_text(s_el, "Meaning") or s_oid,
+                legalReason=_child_text(s_el, "LegalReason") or s_oid,
+                methodology=meth_val,
+            )
+        )
+
+    return OdmAdminData(
+        studyOid=_get_attr(elem, "StudyOID"),
+        users=tuple(users),
+        locations=tuple(locations),
+        signatureDefs=tuple(sig_defs),
+    )
+
+
+def _parse_reference_data_elem(elem: ET.Element, default_study_oid: str) -> OdmReferenceData:
+    study_oid = _get_attr(elem, "StudyOID") or default_study_oid
+    mdv_oid = _get_attr(elem, "MetaDataVersionOID") or "MDV.001"
+    igs = tuple(_parse_item_group_data_elem(ig) for ig in _find_children(elem, "ItemGroupData"))
+    return OdmReferenceData(
+        studyOid=study_oid,
+        metaDataVersionOid=mdv_oid,
+        itemGroupData=igs,
+    )
+
+
+def _parse_clinical_data_elem(elem: ET.Element, default_study_oid: str) -> OdmClinicalData:
+    study_oid = _get_attr(elem, "StudyOID") or default_study_oid
+    mdv_oid = _get_attr(elem, "MetaDataVersionOID") or "MDV.001"
+
+    subjects: list[OdmSubjectData] = []
+    for s_el in _find_children(elem, "SubjectData"):
+        subj_key = _get_attr(s_el, "SubjectKey") or "UNKNOWN"
+        inv_ref = _find_first_child(s_el, "InvestigatorRef")
+        site_ref = _find_first_child(s_el, "SiteRef")
+        s_aud = _find_first_child(s_el, "AuditRecord")
+        s_anns = tuple(
+            _parse_annotation_elem(a_el, idx)
+            for idx, a_el in enumerate(_find_children(s_el, "Annotation"), start=1)
+        )
+        events: list[OdmStudyEventData] = []
+        for se_el in _find_children(s_el, "StudyEventData"):
+            se_oid = _get_attr(se_el, "StudyEventOID") or "SE.COMMON"
+            se_aud = _find_first_child(se_el, "AuditRecord")
+            se_anns = tuple(
+                _parse_annotation_elem(a_el, idx)
+                for idx, a_el in enumerate(_find_children(se_el, "Annotation"), start=1)
+            )
+            forms: list[OdmFormData] = []
+            for fd_el in _find_children(se_el, "FormData"):
+                fd_oid = _get_attr(fd_el, "FormOID") or "FORM"
+                fd_aud = _find_first_child(fd_el, "AuditRecord")
+                fd_anns = tuple(
+                    _parse_annotation_elem(a_el, idx)
+                    for idx, a_el in enumerate(_find_children(fd_el, "Annotation"), start=1)
+                )
+                igs = tuple(
+                    _parse_item_group_data_elem(ig_el)
+                    for ig_el in _find_children(fd_el, "ItemGroupData")
+                )
+                forms.append(
+                    OdmFormData(
+                        formOid=fd_oid,
+                        formRepeatKey=_get_attr(fd_el, "FormRepeatKey"),
+                        transactionType=_parse_tx_type(fd_el),
+                        auditRecordId=_get_attr(fd_el, "AuditRecordID"),
+                        annotationId=_get_attr(fd_el, "AnnotationID"),
+                        auditRecord=_parse_audit_record_elem(fd_aud)
+                        if fd_aud is not None
+                        else None,
+                        annotations=fd_anns,
+                        itemGroupData=igs,
+                    )
+                )
+            events.append(
+                OdmStudyEventData(
+                    studyEventOid=se_oid,
+                    studyEventRepeatKey=_get_attr(se_el, "StudyEventRepeatKey"),
+                    transactionType=_parse_tx_type(se_el),
+                    auditRecordId=_get_attr(se_el, "AuditRecordID"),
+                    annotationId=_get_attr(se_el, "AnnotationID"),
+                    auditRecord=_parse_audit_record_elem(se_aud) if se_aud is not None else None,
+                    annotations=se_anns,
+                    formData=tuple(forms),
+                )
+            )
+        subjects.append(
+            OdmSubjectData(
+                subjectKey=subj_key,
+                transactionType=_parse_tx_type(s_el),
+                site_location_oid=_get_attr(site_ref, "LocationOID")
+                if site_ref is not None
+                else None,
+                investigatorUserOid=(
+                    _get_attr(inv_ref, "UserOID") if inv_ref is not None else None
+                ),
+                auditRecordId=_get_attr(s_el, "AuditRecordID"),
+                annotationId=_get_attr(s_el, "AnnotationID"),
+                auditRecord=_parse_audit_record_elem(s_aud) if s_aud is not None else None,
+                annotations=s_anns,
+                studyEventData=tuple(events),
+            )
+        )
+
+    audit_records: list[OdmAuditRecord] = []
+    for ars_el in _find_children(elem, "AuditRecords"):
+        for ar_el in _find_children(ars_el, "AuditRecord"):
+            audit_records.append(_parse_audit_record_elem(ar_el))
+
+    annotations: list[OdmAnnotation] = []
+    for anns_el in _find_children(elem, "Annotations"):
+        for idx, ann_el in enumerate(_find_children(anns_el, "Annotation"), start=1):
+            annotations.append(_parse_annotation_elem(ann_el, idx))
+
+    return OdmClinicalData(
+        studyOid=study_oid,
+        metaDataVersionOid=mdv_oid,
+        subject_data=tuple(subjects),
+        auditRecords=tuple(audit_records),
+        annotations=tuple(annotations),
+    )
+
+
+def load_odm_archive(
+    source: Path | str | TextIO | BinaryIO,
+    *,
+    study_key: str | None = None,
+    strict: bool = False,
+    no_raw_xml: bool = False,
+) -> OdmArchive:
+    """Parse a complete CDISC ODM 1.3.2 XML snapshot into a read-only ``OdmArchive``.
+
+    Preserves Data Dictionary ``<Study>`` / ``<MetaDataVersion>`` metadata alongside
+    ``<AdminData>``, ``<ReferenceData>``, ``<ClinicalData>``, ``<AuditRecord>``, and
+    ``<Annotation>`` elements using ``defusedxml``.
+    """
+    content = _read_source_content(source)
+    try:
+        root = ET.fromstring(content)
+    except DefusedXmlException:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Failed to parse CDISC ODM XML: {exc}") from exc
+
+    if _local_tag(root).lower() != "odm":
+        raise ValueError(f"Root XML tag is '{_local_tag(root)}', expected 'ODM'.")
+
+    if strict:
+
+        def _strict_raise(msg: str) -> None:
+            raise ValueError(f"Strict loading error: {msg}")
+
+        _check_allowed_children(
+            root,
+            "ODM",
+            {"study", "admindata", "referencedata", "clinicaldata"},
+            _strict_raise,
+        )
+
+    dd: DataDictionary | None = None
+    if _find_first_child(root, "Study") is not None:
+        dd = _parse_datadict_from_root(
+            root,
+            study_key=study_key,
+            strict=strict,
+            no_raw_xml=no_raw_xml,
+            allow_archive_containers=True,
+        )
+
+    default_study_oid = (
+        study_key
+        or (dd.metadata.studyKey if dd is not None and dd.metadata.studyKey else None)
+        or "STUDY_001"
+    )
+
+    admin_list = tuple(_parse_admin_data_elem(el) for el in _find_children(root, "AdminData"))
+    ref_list = tuple(
+        _parse_reference_data_elem(el, default_study_oid)
+        for el in _find_children(root, "ReferenceData")
+    )
+    clin_list = tuple(
+        _parse_clinical_data_elem(el, default_study_oid)
+        for el in _find_children(root, "ClinicalData")
+    )
+
+    ft_raw = _get_attr(root, "FileType")
+    file_type: Any = ft_raw if ft_raw in {"Snapshot", "Transactional"} else "Snapshot"
+    ver_raw = _get_attr(root, "ODMVersion")
+    odm_ver: Any = ver_raw if ver_raw in {"1.2", "1.3", "1.3.1", "1.3.2"} else "1.3.2"
+    gran_raw = _get_attr(root, "Granularity")
+    gran_val: Any = (
+        gran_raw
+        if gran_raw
+        in {
+            "All",
+            "Metadata",
+            "AdminData",
+            "ReferenceData",
+            "AllClinicalData",
+            "SingleSite",
+            "SingleSubject",
+        }
+        else None
+    )
+    arch_raw = _get_attr(root, "Archival")
+    arch_val: Any = "Yes" if arch_raw == "Yes" else None
+
+    return OdmArchive(
+        fileOid=_get_attr(root, "FileOID") or f"ODM.{default_study_oid}",
+        fileType=file_type,
+        odmVersion=odm_ver,
+        creationDateTime=_get_attr(root, "CreationDateTime") or "1970-01-01T00:00:00Z",
+        description=_get_attr(root, "Description"),
+        granularity=gran_val,
+        archival=arch_val,
+        priorFileOid=_get_attr(root, "PriorFileOID"),
+        asOfDateTime=_get_attr(root, "AsOfDateTime"),
+        originator=_get_attr(root, "Originator"),
+        sourceSystem=_get_attr(root, "SourceSystem"),
+        sourceSystemVersion=_get_attr(root, "SourceSystemVersion"),
+        id=_get_attr(root, "ID"),
+        data_dictionary=dd,
+        adminData=admin_list,
+        referenceData=ref_list,
+        clinicalData=clin_list,
     )

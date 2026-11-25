@@ -285,19 +285,20 @@ Export PHI masking, SDTM, and quality-gate controls
 ---------------------------------------------------
 
 Every ``imednet export`` subcommand (``csv``, ``parquet``, ``excel``, ``json``,
-``duckdb``, ``sql``, ``mongodb``, ``neo4j``, and ``snowflake``) masks sensitive
-``Subject`` identifiers and committed ``StudyConfiguration`` ``phiFields`` to
-``***MASKED***`` by default (``--mask-phi``) before building ``USUBJID`` or
-domain outputs, even when ``--use-labels`` or ``--hierarchical`` is active.
-Authorized compliance workflows operating inside a restricted enclave can opt
-out explicitly with ``--no-mask-phi``.
+``odm``, ``dataset-json``, ``duckdb``, ``sql``, ``mongodb``, ``neo4j``, and
+``snowflake``) masks sensitive ``Subject`` identifiers and committed
+``StudyConfiguration`` ``phiFields`` to ``***MASKED***`` by default
+(``--mask-phi``) before building ``USUBJID`` or domain outputs, even when
+``--use-labels`` or ``--hierarchical`` is active. Authorized compliance
+workflows operating inside a restricted enclave can opt out explicitly with
+``--no-mask-phi``.
 
 Exports also support native CDISC SDTM transformation (``--as-sdtm`` and
 ``--sdtm-domain``), batch-level CDISC standards readiness gating via
 ``StandardsReadinessValidator`` (``--standards-profile`` and
 ``--min-standards-score``), raw ``Variable`` casing alignment
 (``--naming-convention snake_case|camelCase|sdtm``), and opt-in pre-write
-``Record`` schema readiness filtering (disabled by default across all nine
+``Record`` schema readiness filtering (disabled by default across all eleven
 subcommands, including SQLite per-``Form``, ``--single-table``, and
 ``--long-format`` SQL exports; enable with ``--quality-gate`` and optional
 ``--min-readiness-score``):
@@ -306,6 +307,9 @@ subcommands, including SQLite per-``Form``, ``--single-table``, and
 
    imednet export csv STUDY ./ae_sdtm.csv --sdtm-domain AE --standards-profile drug \
        --min-standards-score 85 --simulation
+   imednet export odm STUDY ./study_snapshot.xml --validate-schema --simulation
+   imednet export dataset-json STUDY ./ae_dataset.json --as-sdtm --sdtm-domain AE \
+       --validate-schema --simulation
    imednet workflows validate-standards STUDY --profile drug --simulation
    imednet export parquet STUDY ./aligned_study.parquet --naming-convention snake_case
    imednet export json STUDY ./study_tree.json --hierarchical --use-labels

@@ -1,0 +1,916 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:odm="http://www.cdisc.org/ns/odm/v1.3"
+           targetNamespace="http://www.cdisc.org/ns/odm/v1.3"
+           elementFormDefault="qualified"
+           attributeFormDefault="unqualified">
+
+  <xs:import namespace="http://www.w3.org/XML/1998/namespace" schemaLocation="xml.xsd"/>
+
+  <!-- Vendor namespace extension attribute wildcard (CDISC ODM 1.3.2 Foundation) -->
+  <xs:attributeGroup name="ExtensionAttributes">
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:attributeGroup>
+
+  <!-- Simple Types (CDISC ODM 1.3.2 Foundation) -->
+  <xs:simpleType name="oid">
+    <xs:restriction base="xs:string">
+      <xs:minLength value="1"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="oidref">
+    <xs:restriction base="xs:string">
+      <xs:minLength value="1"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="yesOrNo">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Yes"/>
+      <xs:enumeration value="No"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="yesOnly">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Yes"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="fileType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Snapshot"/>
+      <xs:enumeration value="Transactional"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="granularity">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="All"/>
+      <xs:enumeration value="Metadata"/>
+      <xs:enumeration value="AdminData"/>
+      <xs:enumeration value="ReferenceData"/>
+      <xs:enumeration value="AllClinicalData"/>
+      <xs:enumeration value="SingleSite"/>
+      <xs:enumeration value="SingleSubject"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="odmVersion">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="1.2"/>
+      <xs:enumeration value="1.3"/>
+      <xs:enumeration value="1.3.1"/>
+      <xs:enumeration value="1.3.2"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="transactionType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Insert"/>
+      <xs:enumeration value="Update"/>
+      <xs:enumeration value="Remove"/>
+      <xs:enumeration value="Upsert"/>
+      <xs:enumeration value="Context"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="eventType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Scheduled"/>
+      <xs:enumeration value="Unscheduled"/>
+      <xs:enumeration value="Common"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="dataType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="text"/>
+      <xs:enumeration value="integer"/>
+      <xs:enumeration value="float"/>
+      <xs:enumeration value="date"/>
+      <xs:enumeration value="time"/>
+      <xs:enumeration value="datetime"/>
+      <xs:enumeration value="string"/>
+      <xs:enumeration value="boolean"/>
+      <xs:enumeration value="double"/>
+      <xs:enumeration value="hexBinary"/>
+      <xs:enumeration value="base64Binary"/>
+      <xs:enumeration value="hexFloat"/>
+      <xs:enumeration value="base64Float"/>
+      <xs:enumeration value="partialDate"/>
+      <xs:enumeration value="partialTime"/>
+      <xs:enumeration value="partialDatetime"/>
+      <xs:enumeration value="durationDatetime"/>
+      <xs:enumeration value="intervalDatetime"/>
+      <xs:enumeration value="incompleteDatetime"/>
+      <xs:enumeration value="incompleteDate"/>
+      <xs:enumeration value="incompleteTime"/>
+      <xs:enumeration value="URI"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="clDataType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="integer"/>
+      <xs:enumeration value="float"/>
+      <xs:enumeration value="text"/>
+      <xs:enumeration value="string"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="userType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Sponsor"/>
+      <xs:enumeration value="Investigator"/>
+      <xs:enumeration value="Lab"/>
+      <xs:enumeration value="Other"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="locationType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Sponsor"/>
+      <xs:enumeration value="Site"/>
+      <xs:enumeration value="CRO"/>
+      <xs:enumeration value="Lab"/>
+      <xs:enumeration value="Other"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="editPointType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Monitoring"/>
+      <xs:enumeration value="DataManagement"/>
+      <xs:enumeration value="DBAudit"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="commentType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Sponsor"/>
+      <xs:enumeration value="Site"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Shared Complex Elements -->
+  <xs:complexType name="ODMcomplexTypeDefinition-TranslatedText">
+    <xs:simpleContent>
+      <xs:extension base="xs:string">
+        <xs:attribute ref="xml:lang" use="optional"/>
+        <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+      </xs:extension>
+    </xs:simpleContent>
+  </xs:complexType>
+  <xs:element name="TranslatedText" type="odm:ODMcomplexTypeDefinition-TranslatedText"/>
+
+  <xs:complexType name="ODMcomplexTypeDefinition-Description">
+    <xs:sequence>
+      <xs:element ref="odm:TranslatedText" minOccurs="1" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+  </xs:complexType>
+  <xs:element name="Description" type="odm:ODMcomplexTypeDefinition-Description"/>
+  <xs:element name="Question" type="odm:ODMcomplexTypeDefinition-Description"/>
+  <xs:element name="Decode" type="odm:ODMcomplexTypeDefinition-Description"/>
+  <xs:element name="ErrorMessage" type="odm:ODMcomplexTypeDefinition-Description"/>
+  <xs:element name="Symbol" type="odm:ODMcomplexTypeDefinition-Description"/>
+
+  <xs:complexType name="ODMcomplexTypeDefinition-Alias">
+    <xs:attribute name="Context" type="xs:string" use="required"/>
+    <xs:attribute name="Name" type="xs:string" use="required"/>
+    <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+  </xs:complexType>
+  <xs:element name="Alias" type="odm:ODMcomplexTypeDefinition-Alias"/>
+
+  <xs:complexType name="ODMcomplexTypeDefinition-FormalExpression">
+    <xs:simpleContent>
+      <xs:extension base="xs:string">
+        <xs:attribute name="Context" type="xs:string" use="required"/>
+        <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+      </xs:extension>
+    </xs:simpleContent>
+  </xs:complexType>
+  <xs:element name="FormalExpression" type="odm:ODMcomplexTypeDefinition-FormalExpression"/>
+
+  <!-- Study & MetaDataVersion -->
+  <xs:element name="GlobalVariables">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="StudyName" type="xs:string"/>
+        <xs:element name="StudyDescription" type="xs:string"/>
+        <xs:element name="ProtocolName" type="xs:string"/>
+      </xs:sequence>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="MeasurementUnit">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Symbol"/>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="BasicDefinitions">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:MeasurementUnit" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="StudyEventRef">
+    <xs:complexType>
+      <xs:attribute name="StudyEventOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+      <xs:attribute name="Mandatory" type="odm:yesOrNo" use="required"/>
+      <xs:attribute name="CollectionExceptionConditionOID" type="odm:oidref" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Protocol">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Description" minOccurs="0"/>
+        <xs:element ref="odm:StudyEventRef" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="FormRef">
+    <xs:complexType>
+      <xs:attribute name="FormOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+      <xs:attribute name="Mandatory" type="odm:yesOrNo" use="required"/>
+      <xs:attribute name="CollectionExceptionConditionOID" type="odm:oidref" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="StudyEventDef">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Description" minOccurs="0"/>
+        <xs:element ref="odm:FormRef" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attribute name="Repeating" type="odm:yesOrNo" use="required"/>
+      <xs:attribute name="Type" type="odm:eventType" use="required"/>
+      <xs:attribute name="Category" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ItemGroupRef">
+    <xs:complexType>
+      <xs:attribute name="ItemGroupOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+      <xs:attribute name="Mandatory" type="odm:yesOrNo" use="required"/>
+      <xs:attribute name="CollectionExceptionConditionOID" type="odm:oidref" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ArchiveLayout">
+    <xs:complexType>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="PdfFileName" type="xs:string" use="required"/>
+      <xs:attribute name="PresentationOID" type="odm:oidref" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="FormDef">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Description" minOccurs="0"/>
+        <xs:element ref="odm:ItemGroupRef" minOccurs="1" maxOccurs="unbounded"/>
+        <xs:element ref="odm:ArchiveLayout" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attribute name="Repeating" type="odm:yesOrNo" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Role">
+    <xs:complexType>
+      <xs:simpleContent>
+        <xs:extension base="xs:string">
+          <xs:attribute name="CodeListOID" type="odm:oidref" use="optional"/>
+          <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+        </xs:extension>
+      </xs:simpleContent>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ItemRef">
+    <xs:complexType>
+      <xs:attribute name="ItemOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+      <xs:attribute name="Mandatory" type="odm:yesOrNo" use="required"/>
+      <xs:attribute name="KeySequence" type="xs:integer" use="optional"/>
+      <xs:attribute name="MethodOID" type="odm:oidref" use="optional"/>
+      <xs:attribute name="ImputationMethodOID" type="odm:oidref" use="optional"/>
+      <xs:attribute name="Role" type="xs:string" use="optional"/>
+      <xs:attribute name="RoleCodeListOID" type="odm:oidref" use="optional"/>
+      <xs:attribute name="CollectionExceptionConditionOID" type="odm:oidref" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ItemGroupDef">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Description" minOccurs="0"/>
+        <xs:element ref="odm:ItemRef" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attribute name="Repeating" type="odm:yesOrNo" use="required"/>
+      <xs:attribute name="IsReferenceData" type="odm:yesOrNo" use="optional"/>
+      <xs:attribute name="SASDatasetName" type="xs:string" use="optional"/>
+      <xs:attribute name="Domain" type="xs:string" use="optional"/>
+      <xs:attribute name="Origin" type="xs:string" use="optional"/>
+      <xs:attribute name="Role" type="xs:string" use="optional"/>
+      <xs:attribute name="Purpose" type="xs:string" use="optional"/>
+      <xs:attribute name="Comment" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ExternalQuestion">
+    <xs:complexType>
+      <xs:attribute name="Dictionary" type="xs:string" use="optional"/>
+      <xs:attribute name="Version" type="xs:string" use="optional"/>
+      <xs:attribute name="Code" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="MeasurementUnitRef">
+    <xs:complexType>
+      <xs:attribute name="MeasurementUnitOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="RangeCheck">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:choice>
+          <xs:element name="CheckValue" type="xs:string" minOccurs="1" maxOccurs="unbounded"/>
+          <xs:element ref="odm:FormalExpression" minOccurs="1" maxOccurs="unbounded"/>
+        </xs:choice>
+        <xs:element ref="odm:MeasurementUnitRef" minOccurs="0"/>
+        <xs:element ref="odm:ErrorMessage" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attribute name="Comparator" type="xs:string" use="optional"/>
+      <xs:attribute name="SoftHard" type="xs:string" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="CodeListRef">
+    <xs:complexType>
+      <xs:attribute name="CodeListOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Origin">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Description" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attribute name="Type" type="xs:string" use="optional"/>
+      <xs:attribute name="Source" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ItemDef">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Description" minOccurs="0"/>
+        <xs:element ref="odm:Question" minOccurs="0"/>
+        <xs:element ref="odm:ExternalQuestion" minOccurs="0"/>
+        <xs:element ref="odm:MeasurementUnitRef" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:RangeCheck" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:CodeListRef" minOccurs="0"/>
+        <xs:element ref="odm:Role" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Origin" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attribute name="DataType" type="odm:dataType" use="required"/>
+      <xs:attribute name="Length" type="xs:positiveInteger" use="optional"/>
+      <xs:attribute name="SignificantDigits" type="xs:nonNegativeInteger" use="optional"/>
+      <xs:attribute name="SASFieldName" type="xs:string" use="optional"/>
+      <xs:attribute name="SDSVarName" type="xs:string" use="optional"/>
+      <xs:attribute name="Origin" type="xs:string" use="optional"/>
+      <xs:attribute name="Comment" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="CodeListItem">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Decode"/>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="CodedValue" type="xs:string" use="required"/>
+      <xs:attribute name="Rank" type="xs:decimal" use="optional"/>
+      <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="EnumeratedItem">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="CodedValue" type="xs:string" use="required"/>
+      <xs:attribute name="Rank" type="xs:decimal" use="optional"/>
+      <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ExternalCodeList">
+    <xs:complexType>
+      <xs:attribute name="Dictionary" type="xs:string" use="optional"/>
+      <xs:attribute name="Version" type="xs:string" use="optional"/>
+      <xs:attribute name="ref" type="xs:string" use="optional"/>
+      <xs:attribute name="href" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="CodeList">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Description" minOccurs="0"/>
+        <xs:choice minOccurs="0">
+          <xs:element ref="odm:CodeListItem" maxOccurs="unbounded"/>
+          <xs:element ref="odm:EnumeratedItem" maxOccurs="unbounded"/>
+          <xs:element ref="odm:ExternalCodeList"/>
+        </xs:choice>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attribute name="DataType" type="odm:clDataType" use="required"/>
+      <xs:attribute name="SASFormatName" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ConditionDef">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Description" minOccurs="0"/>
+        <xs:element ref="odm:FormalExpression" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="MethodDef">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Description" minOccurs="0"/>
+        <xs:element ref="odm:FormalExpression" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Alias" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attribute name="Type" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="MetaDataVersion">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Protocol" minOccurs="0"/>
+        <xs:element ref="odm:StudyEventDef" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:FormDef" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:ItemGroupDef" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:ItemDef" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:CodeList" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:ConditionDef" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:MethodDef" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attribute name="Description" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Study">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:GlobalVariables"/>
+        <xs:element ref="odm:BasicDefinitions" minOccurs="0"/>
+        <xs:element ref="odm:MetaDataVersion" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- AdminData -->
+  <xs:element name="LocationRef">
+    <xs:complexType>
+      <xs:attribute name="LocationOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="User">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="LoginName" type="xs:string" minOccurs="0"/>
+        <xs:element name="DisplayName" type="xs:string" minOccurs="0"/>
+        <xs:element name="FullName" type="xs:string" minOccurs="0"/>
+        <xs:element name="FirstName" type="xs:string" minOccurs="0"/>
+        <xs:element name="LastName" type="xs:string" minOccurs="0"/>
+        <xs:element name="Organization" type="xs:string" minOccurs="0"/>
+        <xs:element name="Email" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element name="Phone" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:LocationRef" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="UserType" type="odm:userType" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="MetaDataVersionRef">
+    <xs:complexType>
+      <xs:attribute name="StudyOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="MetaDataVersionOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="EffectiveDate" type="xs:date" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Location">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:MetaDataVersionRef" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Name" type="xs:string" use="required"/>
+      <xs:attribute name="LocationType" type="odm:locationType" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="SignatureDef">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="Meaning" type="xs:string"/>
+        <xs:element name="LegalReason" type="xs:string"/>
+      </xs:sequence>
+      <xs:attribute name="OID" type="odm:oid" use="required"/>
+      <xs:attribute name="Methodology" type="xs:string" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="AdminData">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:User" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Location" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:SignatureDef" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="StudyOID" type="odm:oidref" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- AuditRecord, Signature, Annotation -->
+  <xs:element name="UserRef">
+    <xs:complexType>
+      <xs:attribute name="UserOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="AuditRecord">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:UserRef"/>
+        <xs:element ref="odm:LocationRef"/>
+        <xs:element name="DateTimeStamp" type="xs:string"/>
+        <xs:element name="ReasonForChange" type="xs:string" minOccurs="0"/>
+        <xs:element name="SourceID" type="xs:string" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attribute name="EditPoint" type="odm:editPointType" use="optional"/>
+      <xs:attribute name="UsedImputationMethod" type="odm:yesOrNo" use="optional"/>
+      <xs:attribute name="ID" type="xs:ID" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="SignatureRef">
+    <xs:complexType>
+      <xs:attribute name="SignatureOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Signature">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:UserRef"/>
+        <xs:element ref="odm:LocationRef"/>
+        <xs:element ref="odm:SignatureRef"/>
+        <xs:element name="DateTimeStamp" type="xs:string"/>
+      </xs:sequence>
+      <xs:attribute name="ID" type="xs:ID" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Comment">
+    <xs:complexType>
+      <xs:simpleContent>
+        <xs:extension base="xs:string">
+          <xs:attribute name="SponsorOrSite" type="odm:commentType" use="optional"/>
+          <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+        </xs:extension>
+      </xs:simpleContent>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="FlagValue">
+    <xs:complexType>
+      <xs:simpleContent>
+        <xs:extension base="xs:string">
+          <xs:attribute name="CodeListOID" type="odm:oidref" use="required"/>
+          <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+        </xs:extension>
+      </xs:simpleContent>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="FlagType">
+    <xs:complexType>
+      <xs:simpleContent>
+        <xs:extension base="xs:string">
+          <xs:attribute name="CodeListOID" type="odm:oidref" use="required"/>
+          <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+        </xs:extension>
+      </xs:simpleContent>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Flag">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:FlagValue"/>
+        <xs:element ref="odm:FlagType" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Annotation">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Comment" minOccurs="0"/>
+        <xs:element ref="odm:Flag" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="SeqNum" type="xs:integer" use="required"/>
+      <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+      <xs:attribute name="ID" type="xs:ID" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- ClinicalData & ReferenceData -->
+  <xs:element name="ItemData">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:AuditRecord" minOccurs="0"/>
+        <xs:element ref="odm:Signature" minOccurs="0"/>
+        <xs:element ref="odm:MeasurementUnitRef" minOccurs="0"/>
+        <xs:element ref="odm:Annotation" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="ItemOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+      <xs:attribute name="Value" type="xs:string" use="optional"/>
+      <xs:attribute name="IsNull" type="odm:yesOnly" use="optional"/>
+      <xs:attribute name="AuditRecordID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="SignatureID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="AnnotationID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="MeasurementUnitOID" type="odm:oidref" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ItemGroupData">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:AuditRecord" minOccurs="0"/>
+        <xs:element ref="odm:Signature" minOccurs="0"/>
+        <xs:element ref="odm:Annotation" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:ItemData" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="ItemGroupOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="ItemGroupRepeatKey" type="xs:string" use="optional"/>
+      <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+      <xs:attribute name="AuditRecordID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="SignatureID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="AnnotationID" type="xs:IDREF" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ReferenceData">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:ItemGroupData" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="StudyOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="MetaDataVersionOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="FormData">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:AuditRecord" minOccurs="0"/>
+        <xs:element ref="odm:Signature" minOccurs="0"/>
+        <xs:element ref="odm:Annotation" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:ItemGroupData" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="FormOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="FormRepeatKey" type="xs:string" use="optional"/>
+      <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+      <xs:attribute name="AuditRecordID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="SignatureID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="AnnotationID" type="xs:IDREF" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="StudyEventData">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:AuditRecord" minOccurs="0"/>
+        <xs:element ref="odm:Signature" minOccurs="0"/>
+        <xs:element ref="odm:Annotation" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:FormData" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="StudyEventOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="StudyEventRepeatKey" type="xs:string" use="optional"/>
+      <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+      <xs:attribute name="AuditRecordID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="SignatureID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="AnnotationID" type="xs:IDREF" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="InvestigatorRef">
+    <xs:complexType>
+      <xs:attribute name="UserOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="SiteRef">
+    <xs:complexType>
+      <xs:attribute name="LocationOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="SubjectData">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:AuditRecord" minOccurs="0"/>
+        <xs:element ref="odm:Signature" minOccurs="0"/>
+        <xs:element ref="odm:InvestigatorRef" minOccurs="0"/>
+        <xs:element ref="odm:SiteRef" minOccurs="0"/>
+        <xs:element ref="odm:Annotation" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:StudyEventData" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="SubjectKey" type="xs:string" use="required"/>
+      <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+      <xs:attribute name="AuditRecordID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="SignatureID" type="xs:IDREF" use="optional"/>
+      <xs:attribute name="AnnotationID" type="xs:IDREF" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="AuditRecords">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:AuditRecord" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Signatures">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Signature" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Annotations">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Annotation" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="ClinicalData">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:SubjectData" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:AuditRecords" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Signatures" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Annotations" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="StudyOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="MetaDataVersionOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="Association">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:any minOccurs="0" maxOccurs="unbounded" processContents="lax"/>
+      </xs:sequence>
+      <xs:attribute name="StudyOID" type="odm:oidref" use="required"/>
+      <xs:attribute name="MetaDataVersionOID" type="odm:oidref" use="required"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- Root ODM Element -->
+  <xs:element name="ODM">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="odm:Study" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:AdminData" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:ReferenceData" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:ClinicalData" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element ref="odm:Association" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+      <xs:attribute name="Description" type="xs:string" use="optional"/>
+      <xs:attribute name="FileType" type="odm:fileType" use="required"/>
+      <xs:attribute name="Granularity" type="odm:granularity" use="optional"/>
+      <xs:attribute name="Archival" type="odm:yesOnly" use="optional"/>
+      <xs:attribute name="FileOID" type="odm:oid" use="required"/>
+      <xs:attribute name="CreationDateTime" type="xs:string" use="required"/>
+      <xs:attribute name="PriorFileOID" type="odm:oidref" use="optional"/>
+      <xs:attribute name="AsOfDateTime" type="xs:string" use="optional"/>
+      <xs:attribute name="ODMVersion" type="odm:odmVersion" use="optional"/>
+      <xs:attribute name="Originator" type="xs:string" use="optional"/>
+      <xs:attribute name="SourceSystem" type="xs:string" use="optional"/>
+      <xs:attribute name="SourceSystemVersion" type="xs:string" use="optional"/>
+      <xs:attribute name="ID" type="xs:ID" use="optional"/>
+      <xs:attributeGroup ref="odm:ExtensionAttributes"/>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

@@ -17,6 +17,13 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 from pydantic import BaseModel, Field, ValidationError, create_model
 
+from imednet.spi.cdisc import (
+    DataDictionary,
+    DatasetJsonClinicalData,
+    DatasetJsonDataset,
+    build_dataset_json_clinical_data,
+    build_dataset_json_dataset,
+)
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
 from imednet.spi.models import (
@@ -28,6 +35,8 @@ from imednet.spi.models import (
     _iter_sorted_sdtm_frames,
     _SdtmNormalizer,
     format_iso8601_dtc,
+    resolve_sdtm_domain,
+    transform_records_to_sdtm_rows,
 )
 from imednet.spi.models import (
     transform_records_to_sdtm as _core_transform_records_to_sdtm,
@@ -1832,6 +1841,384 @@ class RecordMapper:
                 ),
             )
         return combined
+
+    def _try_load_datadict(self, study_key: str) -> DataDictionary | None:
+        """Attempt to build a DataDictionary from SDK forms/variables when available."""
+        from imednet.spi.cdisc import Form as DdForm
+        from imednet.spi.cdisc import Metadata as DdMetadata
+        from imednet.spi.cdisc import Variable as DdVariable
+
+        forms_raw = self._try_fetch_study_forms_for_sdtm(study_key)
+        _, _ = self._fetch_variable_metadata(study_key)
+        vars_raw = self._last_variables
+        if not forms_raw and not vars_raw:
+            return None
+
+        vars_by_form_key: dict[str, list[DdVariable]] = {}
+        form_id_to_key: dict[int, str] = {}
+        dd_forms: dict[str, DdForm] = {}
+
+        for f in forms_raw:
+            fid = f.get("formId") if isinstance(f, dict) else getattr(f, "form_id", None)
+            fkey = (
+                (f.get("formKey") or f.get("form_key"))
+                if isinstance(f, dict)
+                else getattr(f, "form_key", None)
+            )
+            fname = (
+                (f.get("formName") or f.get("form_name"))
+                if isinstance(f, dict)
+                else getattr(f, "form_name", None)
+            )
+            ftype = (
+                (f.get("formType") or f.get("form_type"))
+                if isinstance(f, dict)
+                else getattr(f, "form_type", None)
+            )
+            if not fkey:
+                continue
+            fkey_str = str(fkey)
+            if isinstance(fid, int) and not isinstance(fid, bool):
+                form_id_to_key[fid] = fkey_str
+            dd_forms[fkey_str] = DdForm(
+                formKey=fkey_str,
+                formName=str(fname) if fname else fkey_str,
+                formId=fid if isinstance(fid, int) and not isinstance(fid, bool) else None,
+                formType=str(ftype) if ftype else "Subject",
+                variables=[],
+            )
+
+        for idx, v in enumerate(vars_raw, start=1):
+            v_name = getattr(v, "variable_name", None)
+            if not v_name:
+                continue
+            vf_id = getattr(v, "form_id", None)
+            vf_key = getattr(v, "form_key", None) or (
+                form_id_to_key.get(vf_id)
+                if isinstance(vf_id, int) and not isinstance(vf_id, bool)
+                else None
+            )
+            target_fk = str(vf_key) if vf_key else "DEFAULT"
+            vars_by_form_key.setdefault(target_fk, []).append(
+                DdVariable(
+                    variableName=str(v_name),
+                    label=str(getattr(v, "label", None) or v_name),
+                    variableType=str(getattr(v, "variable_type", None) or "Text"),
+                    sequence=getattr(v, "sequence", None) or idx,
+                )
+            )
+
+        for fk, f_vars in vars_by_form_key.items():
+            if fk in dd_forms:
+                dd_forms[fk] = dd_forms[fk].model_copy(update={"variables": f_vars})
+            else:
+                dd_forms[fk] = DdForm(
+                    formKey=fk,
+                    formName=fk,
+                    variables=f_vars,
+                )
+
+        if not dd_forms:
+            return None
+        return DataDictionary(
+            metadata=DdMetadata.create(study_key=study_key, source="api"),
+            forms=list(dd_forms.values()),
+        )
+
+    def dataset_json(
+        self,
+        study_key: str,
+        *,
+        item_group_oid: str | None = None,
+        name: str | None = None,
+        label: str | None = None,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        sdtm_domain: str | None = None,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        creation_date_time: str | None = None,
+    ) -> DatasetJsonDataset:
+        """Emit a CDISC Dataset-JSON v1.1 ``itemGroupData`` dataset for a CDASH Form or SDTM domain."""
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
+        effective_include_deleted = (
+            self._include_deleted if include_deleted is None else include_deleted
+        )
+        pipeline = self._get_enrichment_pipeline(study_key)
+        raw_phi_keys = (
+            getattr(pipeline, "phi_fields", None) or getattr(pipeline, "phi_keys", None)
+            if pipeline is not None
+            else None
+        )
+        custom_phi = set(normalize_phi_keys_snapshot(raw_phi_keys)) if raw_phi_keys else None
+
+        extra_filters: dict[str, Any] = {}
+        if form_whitelist is not None:
+            if len(form_whitelist) == 0:
+                resolved_empty_dom = (
+                    resolve_sdtm_domain(domain or sdtm_domain, fallback="AE")
+                    if (as_sdtm or (domain or sdtm_domain) is not None)
+                    else None
+                )
+                return build_dataset_json_dataset(
+                    study_key,
+                    [],
+                    dataset_name=name or resolved_empty_dom or study_key,
+                    dataset_label=label
+                    or (f"SDTM {resolved_empty_dom} Domain" if resolved_empty_dom else study_key),
+                    item_group_oid=item_group_oid
+                    or (f"IG.{resolved_empty_dom}" if resolved_empty_dom else f"IG_{study_key}"),
+                    as_sdtm=bool(resolved_empty_dom),
+                    sdtm_domain=resolved_empty_dom,
+                    creation_date_time=creation_date_time,
+                    mask_phi=should_mask,
+                    custom_phi_keys=custom_phi,
+                )
+            extra_filters["formId"] = (
+                form_whitelist[0] if len(form_whitelist) == 1 else list(form_whitelist)
+            )
+
+        resolved_domain_arg = domain or sdtm_domain
+        if as_sdtm or resolved_domain_arg is not None:
+            target_domain = resolve_sdtm_domain(resolved_domain_arg, fallback="AE")
+            matched_ids: set[int] | None = (
+                set(form_whitelist) if form_whitelist is not None else None
+            )
+            matched_keys: set[str] | None = None
+            form_domain_map: dict[Any, str] = {}
+            if form_whitelist is None:
+                study_forms = self._try_fetch_study_forms_for_sdtm(study_key)
+                form_domain_map = build_form_sdtm_domain_map(study_forms, study_key=study_key)
+                if study_forms:
+                    matched_forms = filter_forms_by_sdtm_domain(
+                        study_forms,
+                        target_domain,
+                        study_key=study_key,
+                    )
+                    if not matched_forms:
+                        return build_dataset_json_dataset(
+                            study_key,
+                            [],
+                            dataset_name=name or target_domain,
+                            dataset_label=label or f"SDTM {target_domain} Domain",
+                            item_group_oid=item_group_oid or f"IG.{target_domain}",
+                            as_sdtm=True,
+                            sdtm_domain=target_domain,
+                            creation_date_time=creation_date_time,
+                            mask_phi=should_mask,
+                            custom_phi_keys=custom_phi,
+                        )
+                    m_ids = [
+                        fid
+                        for f in matched_forms
+                        if isinstance(
+                            (
+                                fid := (
+                                    f.get("formId") or f.get("form_id")
+                                    if isinstance(f, dict)
+                                    else getattr(f, "form_id", None)
+                                )
+                            ),
+                            int,
+                        )
+                        and not isinstance(fid, bool)
+                    ]
+                    m_keys = {
+                        str(fk)
+                        for f in matched_forms
+                        if (
+                            fk := (
+                                f.get("formKey") or f.get("form_key")
+                                if isinstance(f, dict)
+                                else getattr(f, "form_key", None)
+                            )
+                        )
+                    }
+                    if m_ids:
+                        extra_filters["formId"] = m_ids[0] if len(m_ids) == 1 else m_ids
+                        matched_ids = set(m_ids)
+                    if m_keys:
+                        matched_keys = m_keys
+
+            records_iter: Iterable[Any] = self._iter_records(
+                study_key,
+                visit_key=visit_key,
+                extra_filters=extra_filters or None,
+                include_deleted=effective_include_deleted,
+                sort=_SDTM_RECORDS_SORT,
+                group_by_subject=True,
+            )
+            if matched_ids is not None or matched_keys:
+                records_iter = self._filter_records_by_matched_forms(
+                    records_iter,
+                    matched_ids,
+                    matched_keys,
+                )
+            if form_whitelist is None:
+                records_iter = (
+                    rec
+                    for rec in records_iter
+                    if record_matches_sdtm_domain(
+                        rec,
+                        target_domain,
+                        form_domain_map=form_domain_map,
+                        study_key=study_key,
+                    )
+                )
+            sdtm_rows = transform_records_to_sdtm_rows(
+                records_iter,
+                domain=target_domain,
+                study_key=study_key,
+                include_deleted=effective_include_deleted,
+                mask_phi=should_mask,
+                pipeline=pipeline,
+                phi_keys=custom_phi,
+            )
+            if variable_whitelist is not None:
+                allowed_sdtm = {str(v).strip() for v in variable_whitelist if str(v).strip()}
+                keep_cols = allowed_sdtm | {"STUDYID", "DOMAIN", "USUBJID"}
+                if target_domain != "DM":
+                    keep_cols.add(f"{target_domain}SEQ")
+                sdtm_rows = [{k: v for k, v in row.items() if k in keep_cols} for row in sdtm_rows]
+            return build_dataset_json_dataset(
+                study_key,
+                sdtm_rows,
+                dataset_name=name or target_domain,
+                dataset_label=label or f"SDTM {target_domain} Domain",
+                item_group_oid=item_group_oid or f"IG.{target_domain}",
+                as_sdtm=True,
+                sdtm_domain=target_domain,
+                creation_date_time=creation_date_time,
+                mask_phi=should_mask,
+                custom_phi_keys=custom_phi,
+            )
+
+        dd = self._try_load_datadict(study_key)
+        raw_records = list(
+            self._iter_records(
+                study_key,
+                visit_key=visit_key,
+                extra_filters=extra_filters or None,
+                include_deleted=effective_include_deleted,
+            )
+        )
+        if variable_whitelist is not None:
+            raw_records = list(self._project_record_whitelist(raw_records, set(variable_whitelist)))
+
+        matched_form = None
+        if dd is not None:
+            if name and any(f.formKey == name for f in dd.forms):
+                matched_form = next(f for f in dd.forms if f.formKey == name)
+            elif len(dd.forms) == 1:
+                matched_form = dd.forms[0]
+            elif raw_records:
+                _, fk = extract_record_form_ref(raw_records[0])
+                if fk:
+                    matched_form = next((f for f in dd.forms if f.formKey == fk), None)
+
+        resolved_name = name or (matched_form.formKey if matched_form is not None else study_key)
+        resolved_ig = item_group_oid or f"IG_{resolved_name}"
+        resolved_label = label or (
+            matched_form.formName or matched_form.formKey
+            if matched_form is not None
+            else resolved_name
+        )
+        return build_dataset_json_dataset(
+            study_key,
+            raw_records,
+            dataset_name=resolved_name,
+            dataset_label=resolved_label,
+            item_group_oid=resolved_ig,
+            form=matched_form,
+            as_sdtm=False,
+            creation_date_time=creation_date_time,
+            mask_phi=should_mask,
+            custom_phi_keys=custom_phi,
+        )
+
+    def dataset_json_clinical_data(
+        self,
+        study_key: str,
+        *,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        as_sdtm: bool = False,
+        domains: list[str] | None = None,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        creation_date_time: str | None = None,
+    ) -> DatasetJsonClinicalData:
+        """Emit CDISC Dataset-JSON v1.1 ``clinicalData`` containing ``itemGroupData`` datasets."""
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
+        effective_include_deleted = (
+            self._include_deleted if include_deleted is None else include_deleted
+        )
+        pipeline = self._get_enrichment_pipeline(study_key)
+        raw_phi_keys = (
+            getattr(pipeline, "phi_fields", None) or getattr(pipeline, "phi_keys", None)
+            if pipeline is not None
+            else None
+        )
+        custom_phi = set(normalize_phi_keys_snapshot(raw_phi_keys)) if raw_phi_keys else None
+
+        if as_sdtm or domains:
+            default_sdtm_order = ["DM", "AE", "VS", "LB", "CM", "EX", "MH", "DV", "DD"]
+            raw_domains = (
+                [resolve_sdtm_domain(d, fallback=d.strip().upper()) for d in domains]
+                if domains is not None
+                else [d for d in default_sdtm_order if d in SDTM_DOMAIN_SPECS]
+            )
+            target_domains = list(dict.fromkeys(raw_domains))
+            ig_map: dict[str, DatasetJsonDataset] = {}
+            for dom in target_domains:
+                ds = self.dataset_json(
+                    study_key,
+                    visit_key=visit_key,
+                    variable_whitelist=variable_whitelist,
+                    form_whitelist=form_whitelist,
+                    as_sdtm=True,
+                    domain=dom,
+                    mask_phi=should_mask,
+                    include_deleted=effective_include_deleted,
+                    creation_date_time=creation_date_time,
+                )
+                if ds.records > 0 or domains is not None:
+                    ig_map[ds.item_group_oid] = ds
+            return DatasetJsonClinicalData(
+                studyOID=study_key,
+                metaDataVersionOID="MDV.001",
+                itemGroupData=tuple(ig_map.values()),
+            )
+
+        extra_filters: dict[str, Any] = {}
+        if form_whitelist is not None:
+            extra_filters["formId"] = (
+                form_whitelist[0] if len(form_whitelist) == 1 else list(form_whitelist)
+            )
+        raw_records = list(
+            self._iter_records(
+                study_key,
+                visit_key=visit_key,
+                extra_filters=extra_filters or None,
+                include_deleted=effective_include_deleted,
+            )
+        )
+        if variable_whitelist is not None:
+            raw_records = list(self._project_record_whitelist(raw_records, set(variable_whitelist)))
+        dd = self._try_load_datadict(study_key)
+        return build_dataset_json_clinical_data(
+            study_key,
+            raw_records,
+            data_dictionary=dd,
+            creation_date_time=creation_date_time,
+            mask_phi=should_mask,
+            include_deleted=effective_include_deleted,
+            custom_phi_keys=custom_phi,
+        )
 
 
 __all__ = [

@@ -7,9 +7,10 @@ import json
 
 # Serialization only: this module never parses XML; defusedxml has no Element builder.
 import xml.etree.ElementTree as ET  # nosemgrep: python.lang.security.use-defused-xml.use-defused-xml
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, TextIO
 
 from .models import BusinessLogicRule, Choice, DataDictionary, Form, Variable
 from .normalize import (
@@ -18,6 +19,21 @@ from .normalize import (
     normalize_variable_bounds,
     normalize_variable_type,
 )
+
+if TYPE_CHECKING:
+    from .exchange import (
+        OdmAdminData,
+        OdmAnnotation,
+        OdmArchive,
+        OdmAuditRecord,
+        OdmClinicalData,
+        OdmFormData,
+        OdmItemData,
+        OdmItemGroupData,
+        OdmReferenceData,
+        OdmStudyEventData,
+        OdmSubjectData,
+    )
 
 ODM_NS = "http://www.cdisc.org/ns/odm/v1.3"
 IMEDNET_NS = "http://www.imednet.com/ns/odm/metadata"
@@ -478,6 +494,17 @@ def _allocate_item_oids(
     return sorted_vars_by_form, oid_by_occ, referencing_forms_by_oid
 
 
+def resolve_form_item_oids(datadict: DataDictionary) -> dict[tuple[str, str], str]:
+    """Return deterministic ``(formKey, variableName) -> ItemOID`` mappings for ``datadict``."""
+    sorted_forms = sorted(datadict.forms, key=lambda f: f.formKey or "")
+    sorted_vars_by_form, oid_by_occ, _ = _allocate_item_oids(sorted_forms)
+    mapping: dict[tuple[str, str], str] = {}
+    for f_idx, form in enumerate(sorted_forms):
+        for v_idx, var in enumerate(sorted_vars_by_form[f_idx]):
+            mapping[(form.formKey, var.variableName)] = oid_by_occ[(f_idx, v_idx)]
+    return mapping
+
+
 def _collect_study_measurement_units(
     datadict: DataDictionary,
     sorted_forms: list[Form],
@@ -721,33 +748,14 @@ def _emit_formal_rules(
     _emit_native_odm_rules(mdv_elem, scoped_rules, "MethodDef", seen_oids, used_cond_oids)
 
 
-def to_odm_xml(
+def _build_study_elem(
     datadict: DataDictionary,
     *,
-    file_oid: str | None = None,
-    creation_datetime: str | None = None,
     meta_data_version_oid: str = "MDV.001",
     meta_data_version_name: str | None = None,
-    indent: str = "  ",
-) -> str:
-    """Serialize DataDictionary to CDISC ODM 1.3 XML format.
-
-    This function does not mutate the input DataDictionary instance.
-
-    Args:
-        datadict: DataDictionary instance to serialize.
-        file_oid: Optional FileOID attribute for root ODM element.
-        creation_datetime: Optional ISO 8601 creation datetime string.
-        meta_data_version_oid: MetaDataVersion OID identifier (default: 'MDV.001').
-        meta_data_version_name: Optional MetaDataVersion name.
-        indent: Indentation string for XML formatting (default: two spaces).
-
-    Returns:
-        Valid CDISC ODM 1.3 XML document string.
-    """
-    ET.register_namespace("", ODM_NS)
-    ET.register_namespace("imednet", IMEDNET_NS)
-
+    strict_132: bool = False,
+) -> ET.Element:
+    """Build the ``<Study>`` metadata subtree for ``datadict`` without mutating inputs."""
     study_key = datadict.metadata.studyKey or "STUDY_001"
     study_name = (
         getattr(datadict.metadata, "studyName", None)
@@ -764,34 +772,21 @@ def to_odm_xml(
         or datadict.metadata.extraAttributes.get("protocolName")
         or study_key
     )
-
-    now_iso = creation_datetime or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-    f_oid = file_oid or f"ODM_{study_key}_{now_iso}"
     mdv_name = (
         meta_data_version_name
         or getattr(datadict.metadata, "metaDataVersionName", None)
         or "Initial Metadata Version"
     )
 
-    root = ET.Element(
-        f"{{{ODM_NS}}}ODM",
-        {
-            "ODMVersion": "1.3",
-            "FileType": "Snapshot",
-            "FileOID": f_oid,
-            "CreationDateTime": now_iso,
-        },
-    )
-
-    study_elem = ET.SubElement(root, f"{{{ODM_NS}}}Study", {"OID": study_key})
+    study_elem = ET.Element(f"{{{ODM_NS}}}Study", {"OID": study_key})
     gv_elem = ET.SubElement(study_elem, f"{{{ODM_NS}}}GlobalVariables")
     sn_elem = ET.SubElement(gv_elem, f"{{{ODM_NS}}}StudyName")
     sn_elem.text = str(study_name)
 
-    if study_description:
+    if study_description or strict_132:
         sd_elem = ET.SubElement(gv_elem, f"{{{ODM_NS}}}StudyDescription")
         sd_elem.text = str(study_description)
-    if protocol_name:
+    if protocol_name or strict_132:
         on_elem = ET.SubElement(gv_elem, f"{{{ODM_NS}}}ProtocolName")
         on_elem.text = str(protocol_name)
 
@@ -832,7 +827,8 @@ def to_odm_xml(
             "Repeating": str(form.extraAttributes.get("repeating", "No")),
         }
         if form.formType:
-            form_attribs["FormType"] = form.formType
+            form_type_attr = f"{{{IMEDNET_NS}}}FormType" if strict_132 else "FormType"
+            form_attribs[form_type_attr] = form.formType
         norm_fid = normalize_form_id(form.formId, form_key=form.formKey)
         if norm_fid is not None:
             form_attribs[f"{{{IMEDNET_NS}}}FormId"] = str(norm_fid)
@@ -862,6 +858,11 @@ def to_odm_xml(
             "Name": f"{form.formName or form.formKey} Details",
             "Repeating": str(form.extraAttributes.get("repeating", "No")),
         }
+        if str(form.extraAttributes.get("isReferenceData", "")).lower() in ("yes", "true", "1") or (
+            (form.formType or "").strip().lower()
+            in {"reference", "study", "non-subject", "nonsubject"}
+        ):
+            ig_attribs["IsReferenceData"] = "Yes"
         domain = _extract_sdtm_attr(form, "Domain")
         sas_dataset = _extract_sdtm_attr(form, "SASDatasetName")
         purpose = _extract_sdtm_attr(form, "Purpose")
@@ -985,7 +986,10 @@ def to_odm_xml(
             else:
                 vendor_item_attribs[f"{{{IMEDNET_NS}}}Precision"] = prec_str
         if control_type:
-            item_attribs["ControlType"] = control_type
+            if strict_132:
+                vendor_item_attribs[f"{{{IMEDNET_NS}}}ControlType"] = control_type
+            else:
+                item_attribs["ControlType"] = control_type
 
         origin_desc = _extract_sdtm_attr(var, "originDescription")
         origin_source = _extract_sdtm_attr(var, "originSource")
@@ -1171,6 +1175,378 @@ def to_odm_xml(
     if scoped_rules:
         _emit_formal_rules(mdv_elem, scoped_rules)
 
+    return study_elem
+
+
+def _build_audit_record_elem(audit: OdmAuditRecord) -> ET.Element:
+    attribs: dict[str, str] = {}
+    if audit.edit_point:
+        attribs["EditPoint"] = audit.edit_point
+    if audit.used_imputation_method:
+        attribs["UsedImputationMethod"] = audit.used_imputation_method
+    if audit.audit_id:
+        attribs["ID"] = audit.audit_id
+
+    ar_elem = ET.Element(f"{{{ODM_NS}}}AuditRecord", attribs)
+    ET.SubElement(ar_elem, f"{{{ODM_NS}}}UserRef", {"UserOID": audit.user_oid})
+    ET.SubElement(ar_elem, f"{{{ODM_NS}}}LocationRef", {"LocationOID": audit.location_oid})
+    dt_elem = ET.SubElement(ar_elem, f"{{{ODM_NS}}}DateTimeStamp")
+    dt_elem.text = audit.date_time_stamp
+    if audit.reason_for_change is not None:
+        rfc_elem = ET.SubElement(ar_elem, f"{{{ODM_NS}}}ReasonForChange")
+        rfc_elem.text = audit.reason_for_change
+    if audit.source_id is not None:
+        src_elem = ET.SubElement(ar_elem, f"{{{ODM_NS}}}SourceID")
+        src_elem.text = audit.source_id
+    return ar_elem
+
+
+def _build_annotation_elem(ann: OdmAnnotation) -> ET.Element:
+    attribs: dict[str, str] = {"SeqNum": str(ann.seq_num)}
+    if ann.transaction_type:
+        attribs["TransactionType"] = ann.transaction_type
+    if ann.annotation_id:
+        attribs["ID"] = ann.annotation_id
+
+    ann_elem = ET.Element(f"{{{ODM_NS}}}Annotation", attribs)
+    if ann.comment is not None:
+        c_attribs: dict[str, str] = {}
+        if ann.comment.sponsor_or_site:
+            c_attribs["SponsorOrSite"] = ann.comment.sponsor_or_site
+        c_elem = ET.SubElement(ann_elem, f"{{{ODM_NS}}}Comment", c_attribs)
+        c_elem.text = ann.comment.text
+    for flag in ann.flags:
+        f_elem = ET.SubElement(ann_elem, f"{{{ODM_NS}}}Flag")
+        fv_elem = ET.SubElement(
+            f_elem,
+            f"{{{ODM_NS}}}FlagValue",
+            {"CodeListOID": flag.flag_value_codelist_oid},
+        )
+        fv_elem.text = flag.flag_value
+        if flag.flag_type is not None:
+            ft_elem = ET.SubElement(
+                f_elem,
+                f"{{{ODM_NS}}}FlagType",
+                {"CodeListOID": flag.flag_type_codelist_oid or "CL.FLAG_TYPE"},
+            )
+            ft_elem.text = flag.flag_type
+    return ann_elem
+
+
+def _build_admin_data_elem(admin: OdmAdminData) -> ET.Element:
+    attribs: dict[str, str] = {}
+    if admin.study_oid:
+        attribs["StudyOID"] = admin.study_oid
+    adm_elem = ET.Element(f"{{{ODM_NS}}}AdminData", attribs)
+
+    for usr in sorted(admin.users, key=lambda u: u.oid):
+        u_attribs: dict[str, str] = {"OID": usr.oid}
+        if usr.user_type:
+            u_attribs["UserType"] = usr.user_type
+        u_elem = ET.SubElement(adm_elem, f"{{{ODM_NS}}}User", u_attribs)
+        for tag_name, val in (
+            ("LoginName", usr.login_name),
+            ("DisplayName", usr.display_name),
+            ("FullName", usr.full_name),
+            ("FirstName", usr.first_name),
+            ("LastName", usr.last_name),
+            ("Organization", usr.organization),
+            ("Email", usr.email),
+            ("Phone", usr.phone),
+        ):
+            if val is not None:
+                sub = ET.SubElement(u_elem, f"{{{ODM_NS}}}{tag_name}")
+                sub.text = val
+        for loc_oid in usr.location_oids:
+            ET.SubElement(u_elem, f"{{{ODM_NS}}}LocationRef", {"LocationOID": loc_oid})
+
+    for loc in sorted(admin.locations, key=lambda lc: lc.oid):
+        l_attribs: dict[str, str] = {
+            "OID": loc.oid,
+            "Name": loc.name,
+            "LocationType": loc.location_type,
+        }
+        l_elem = ET.SubElement(adm_elem, f"{{{ODM_NS}}}Location", l_attribs)
+        for mdv_ref in loc.metadata_version_refs:
+            ET.SubElement(
+                l_elem,
+                f"{{{ODM_NS}}}MetaDataVersionRef",
+                {
+                    "StudyOID": mdv_ref.study_oid,
+                    "MetaDataVersionOID": mdv_ref.metadata_version_oid,
+                    "EffectiveDate": mdv_ref.effective_date,
+                },
+            )
+
+    for sig_def in sorted(admin.signature_defs, key=lambda s: s.oid):
+        s_attribs: dict[str, str] = {"OID": sig_def.oid}
+        if sig_def.methodology:
+            s_attribs["Methodology"] = sig_def.methodology
+        s_elem = ET.SubElement(adm_elem, f"{{{ODM_NS}}}SignatureDef", s_attribs)
+        meaning_el = ET.SubElement(s_elem, f"{{{ODM_NS}}}Meaning")
+        meaning_el.text = sig_def.meaning
+        reason_el = ET.SubElement(s_elem, f"{{{ODM_NS}}}LegalReason")
+        reason_el.text = sig_def.legal_reason
+
+    return adm_elem
+
+
+def _build_item_data_elem(item: OdmItemData) -> ET.Element:
+    attribs: dict[str, str] = {"ItemOID": item.item_oid}
+    if item.transaction_type:
+        attribs["TransactionType"] = item.transaction_type
+    if item.is_null:
+        attribs["IsNull"] = "Yes"
+    elif item.value is not None:
+        attribs["Value"] = item.value
+    if item.audit_record_id:
+        attribs["AuditRecordID"] = item.audit_record_id
+    if item.annotation_id:
+        attribs["AnnotationID"] = item.annotation_id
+    if item.measurement_unit_oid:
+        attribs["MeasurementUnitOID"] = item.measurement_unit_oid
+
+    it_elem = ET.Element(f"{{{ODM_NS}}}ItemData", attribs)
+    if item.audit_record is not None:
+        it_elem.append(_build_audit_record_elem(item.audit_record))
+    if item.measurement_unit_oid:
+        ET.SubElement(
+            it_elem,
+            f"{{{ODM_NS}}}MeasurementUnitRef",
+            {"MeasurementUnitOID": item.measurement_unit_oid},
+        )
+    for ann in item.annotations:
+        it_elem.append(_build_annotation_elem(ann))
+    return it_elem
+
+
+def _build_item_group_data_elem(ig: OdmItemGroupData) -> ET.Element:
+    attribs: dict[str, str] = {"ItemGroupOID": ig.item_group_oid}
+    if ig.item_group_repeat_key is not None:
+        attribs["ItemGroupRepeatKey"] = ig.item_group_repeat_key
+    if ig.transaction_type:
+        attribs["TransactionType"] = ig.transaction_type
+    if ig.audit_record_id:
+        attribs["AuditRecordID"] = ig.audit_record_id
+    if ig.annotation_id:
+        attribs["AnnotationID"] = ig.annotation_id
+
+    ig_elem = ET.Element(f"{{{ODM_NS}}}ItemGroupData", attribs)
+    if ig.audit_record is not None:
+        ig_elem.append(_build_audit_record_elem(ig.audit_record))
+    for ann in ig.annotations:
+        ig_elem.append(_build_annotation_elem(ann))
+    for item in ig.items:
+        ig_elem.append(_build_item_data_elem(item))
+    return ig_elem
+
+
+def _build_reference_data_elem(ref: OdmReferenceData) -> ET.Element:
+    ref_elem = ET.Element(
+        f"{{{ODM_NS}}}ReferenceData",
+        {
+            "StudyOID": ref.study_oid,
+            "MetaDataVersionOID": ref.metadata_version_oid,
+        },
+    )
+    for ig in ref.item_group_data:
+        ref_elem.append(_build_item_group_data_elem(ig))
+    return ref_elem
+
+
+def _build_form_data_elem(fd: OdmFormData) -> ET.Element:
+    attribs: dict[str, str] = {"FormOID": fd.form_oid}
+    if fd.form_repeat_key is not None:
+        attribs["FormRepeatKey"] = fd.form_repeat_key
+    if fd.transaction_type:
+        attribs["TransactionType"] = fd.transaction_type
+    if fd.audit_record_id:
+        attribs["AuditRecordID"] = fd.audit_record_id
+    if fd.annotation_id:
+        attribs["AnnotationID"] = fd.annotation_id
+
+    fd_elem = ET.Element(f"{{{ODM_NS}}}FormData", attribs)
+    if fd.audit_record is not None:
+        fd_elem.append(_build_audit_record_elem(fd.audit_record))
+    for ann in fd.annotations:
+        fd_elem.append(_build_annotation_elem(ann))
+    for ig in fd.item_group_data:
+        fd_elem.append(_build_item_group_data_elem(ig))
+    return fd_elem
+
+
+def _build_study_event_data_elem(sed: OdmStudyEventData) -> ET.Element:
+    attribs: dict[str, str] = {"StudyEventOID": sed.study_event_oid}
+    if sed.study_event_repeat_key is not None:
+        attribs["StudyEventRepeatKey"] = sed.study_event_repeat_key
+    if sed.transaction_type:
+        attribs["TransactionType"] = sed.transaction_type
+    if sed.audit_record_id:
+        attribs["AuditRecordID"] = sed.audit_record_id
+    if sed.annotation_id:
+        attribs["AnnotationID"] = sed.annotation_id
+
+    sed_elem = ET.Element(f"{{{ODM_NS}}}StudyEventData", attribs)
+    if sed.audit_record is not None:
+        sed_elem.append(_build_audit_record_elem(sed.audit_record))
+    for ann in sed.annotations:
+        sed_elem.append(_build_annotation_elem(ann))
+    for fd in sed.form_data:
+        sed_elem.append(_build_form_data_elem(fd))
+    return sed_elem
+
+
+def _build_subject_data_elem(subj: OdmSubjectData) -> ET.Element:
+    attribs: dict[str, str] = {"SubjectKey": subj.subject_key}
+    if subj.transaction_type:
+        attribs["TransactionType"] = subj.transaction_type
+    if subj.audit_record_id:
+        attribs["AuditRecordID"] = subj.audit_record_id
+    if subj.annotation_id:
+        attribs["AnnotationID"] = subj.annotation_id
+
+    subj_elem = ET.Element(f"{{{ODM_NS}}}SubjectData", attribs)
+    if subj.audit_record is not None:
+        subj_elem.append(_build_audit_record_elem(subj.audit_record))
+    if subj.investigator_user_oid:
+        ET.SubElement(
+            subj_elem,
+            f"{{{ODM_NS}}}InvestigatorRef",
+            {"UserOID": subj.investigator_user_oid},
+        )
+    if subj.site_location_oid:
+        ET.SubElement(
+            subj_elem,
+            f"{{{ODM_NS}}}SiteRef",
+            {"LocationOID": subj.site_location_oid},
+        )
+    for ann in subj.annotations:
+        subj_elem.append(_build_annotation_elem(ann))
+    for sed in subj.study_event_data:
+        subj_elem.append(_build_study_event_data_elem(sed))
+    return subj_elem
+
+
+def _build_clinical_data_elem(clin: OdmClinicalData) -> ET.Element:
+    clin_elem = ET.Element(
+        f"{{{ODM_NS}}}ClinicalData",
+        {
+            "StudyOID": clin.study_oid,
+            "MetaDataVersionOID": clin.metadata_version_oid,
+        },
+    )
+    for subj in clin.subject_data:
+        clin_elem.append(_build_subject_data_elem(subj))
+    if clin.audit_records:
+        ars_elem = ET.SubElement(clin_elem, f"{{{ODM_NS}}}AuditRecords")
+        for aud in clin.audit_records:
+            ars_elem.append(_build_audit_record_elem(aud))
+    if clin.annotations:
+        anns_elem = ET.SubElement(clin_elem, f"{{{ODM_NS}}}Annotations")
+        for ann in clin.annotations:
+            anns_elem.append(_build_annotation_elem(ann))
+    return clin_elem
+
+
+def _normalize_container_seq(items: Sequence[Any] | Any | None) -> list[Any]:
+    if items is None:
+        return []
+    if isinstance(items, (list, tuple)):
+        return list(items)
+    return [items]
+
+
+def to_odm_xml(
+    datadict: DataDictionary,
+    *,
+    file_oid: str | None = None,
+    creation_datetime: str | None = None,
+    creation_date_time: str | None = None,
+    meta_data_version_oid: str = "MDV.001",
+    meta_data_version_name: str | None = None,
+    odm_version: Literal["1.3", "1.3.2"] | None = None,
+    file_type: Literal["Snapshot", "Transactional"] = "Snapshot",
+    granularity: str | None = None,
+    originator: str | None = None,
+    source_system: str | None = None,
+    source_system_version: str | None = None,
+    admin_data: Sequence[OdmAdminData] | OdmAdminData | None = None,
+    reference_data: Sequence[OdmReferenceData] | OdmReferenceData | None = None,
+    clinical_data: Sequence[OdmClinicalData] | OdmClinicalData | None = None,
+    indent: str = "  ",
+) -> str:
+    """Serialize DataDictionary (and optional AdminData/ReferenceData/ClinicalData) to ODM XML.
+
+    This function does not mutate the input DataDictionary instance.
+
+    Args:
+        datadict: DataDictionary instance to serialize.
+        file_oid: Optional FileOID attribute for root ODM element.
+        creation_datetime: Optional ISO 8601 creation datetime string.
+        creation_date_time: Optional alias for ``creation_datetime``.
+        meta_data_version_oid: MetaDataVersion OID identifier (default: 'MDV.001').
+        meta_data_version_name: Optional MetaDataVersion name.
+        odm_version: ODMVersion attribute ('1.3' or '1.3.2'). Defaults to '1.3.2' when
+            AdminData/ReferenceData/ClinicalData are present, or '1.3' for metadata-only calls.
+        file_type: ODM FileType ('Snapshot' or 'Transactional').
+        granularity: Optional ODM Granularity attribute.
+        originator: Optional Originator attribute on the root ODM element.
+        source_system: Optional SourceSystem attribute.
+        source_system_version: Optional SourceSystemVersion attribute.
+        admin_data: Optional AdminData container(s) for Site/User metadata.
+        reference_data: Optional ReferenceData container(s) for non-subject datasets.
+        clinical_data: Optional ClinicalData container(s) for subject clinical records.
+        indent: Indentation string for XML formatting (default: two spaces).
+
+    Returns:
+        Valid CDISC ODM XML document string.
+    """
+    ET.register_namespace("", ODM_NS)
+    ET.register_namespace("imednet", IMEDNET_NS)
+
+    admin_list = _normalize_container_seq(admin_data)
+    ref_list = _normalize_container_seq(reference_data)
+    clin_list = _normalize_container_seq(clinical_data)
+    has_archive_containers = bool(admin_list or ref_list or clin_list)
+    resolved_version = odm_version or ("1.3.2" if has_archive_containers else "1.3")
+    strict_132 = resolved_version == "1.3.2"
+
+    study_key = datadict.metadata.studyKey or "STUDY_001"
+    resolved_creation = creation_datetime or creation_date_time
+    now_iso = resolved_creation or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    f_oid = file_oid or f"ODM_{study_key}_{now_iso}"
+
+    root_attribs: dict[str, str] = {
+        "ODMVersion": resolved_version,
+        "FileType": file_type,
+        "FileOID": f_oid,
+        "CreationDateTime": now_iso,
+    }
+    if granularity:
+        root_attribs["Granularity"] = granularity
+    if originator:
+        root_attribs["Originator"] = originator
+    if source_system:
+        root_attribs["SourceSystem"] = source_system
+    if source_system_version:
+        root_attribs["SourceSystemVersion"] = source_system_version
+
+    root = ET.Element(f"{{{ODM_NS}}}ODM", root_attribs)
+    root.append(
+        _build_study_elem(
+            datadict,
+            meta_data_version_oid=meta_data_version_oid,
+            meta_data_version_name=meta_data_version_name,
+            strict_132=strict_132,
+        )
+    )
+    for adm in admin_list:
+        root.append(_build_admin_data_elem(adm))
+    for ref in ref_list:
+        root.append(_build_reference_data_elem(ref))
+    for clin in clin_list:
+        root.append(_build_clinical_data_elem(clin))
+
     ET.indent(root, space=indent)
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     xml_str = xml_bytes.decode("utf-8")
@@ -1185,38 +1561,352 @@ def to_odm_file(
     *,
     file_oid: str | None = None,
     creation_datetime: str | None = None,
+    creation_date_time: str | None = None,
     meta_data_version_oid: str = "MDV.001",
     meta_data_version_name: str | None = None,
+    odm_version: Literal["1.3", "1.3.2"] | None = None,
+    file_type: Literal["Snapshot", "Transactional"] = "Snapshot",
+    granularity: str | None = None,
+    originator: str | None = None,
+    source_system: str | None = None,
+    source_system_version: str | None = None,
+    admin_data: Sequence[OdmAdminData] | OdmAdminData | None = None,
+    reference_data: Sequence[OdmReferenceData] | OdmReferenceData | None = None,
+    clinical_data: Sequence[OdmClinicalData] | OdmClinicalData | None = None,
     indent: str = "  ",
 ) -> None:
-    """Write CDISC ODM 1.3 XML content to a UTF-8 encoded file.
-
-    Args:
-        datadict: DataDictionary instance.
-        file_path: Destination file path.
-        file_oid: Optional FileOID attribute for root ODM element.
-        creation_datetime: Optional ISO 8601 creation datetime string.
-        meta_data_version_oid: MetaDataVersion OID identifier (default: 'MDV.001').
-        meta_data_version_name: Optional MetaDataVersion name.
-        indent: Indentation string for XML formatting.
-    """
+    """Write CDISC ODM XML content to a UTF-8 encoded file."""
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     xml_str = to_odm_xml(
         datadict,
         file_oid=file_oid,
-        creation_datetime=creation_datetime,
+        creation_datetime=creation_datetime or creation_date_time,
         meta_data_version_oid=meta_data_version_oid,
         meta_data_version_name=meta_data_version_name,
+        odm_version=odm_version,
+        file_type=file_type,
+        granularity=granularity,
+        originator=originator,
+        source_system=source_system,
+        source_system_version=source_system_version,
+        admin_data=admin_data,
+        reference_data=reference_data,
+        clinical_data=clinical_data,
         indent=indent,
     )
     path.write_text(xml_str, encoding="utf-8")
 
 
+def to_odm_archive_xml(
+    archive: OdmArchive,
+    *,
+    meta_data_version_oid: str | None = None,
+    meta_data_version_name: str | None = None,
+    indent: str = "  ",
+) -> str:
+    """Serialize a canonical ``OdmArchive`` snapshot to CDISC ODM 1.3.2 XML."""
+    ET.register_namespace("", ODM_NS)
+    ET.register_namespace("imednet", IMEDNET_NS)
+
+    root_attribs: dict[str, str] = {
+        "ODMVersion": archive.odm_version,
+        "FileType": archive.file_type,
+        "FileOID": archive.file_oid,
+        "CreationDateTime": archive.creation_date_time,
+    }
+    if archive.description:
+        root_attribs["Description"] = archive.description
+    if archive.granularity:
+        root_attribs["Granularity"] = archive.granularity
+    if archive.archival:
+        root_attribs["Archival"] = archive.archival
+    if archive.prior_file_oid:
+        root_attribs["PriorFileOID"] = archive.prior_file_oid
+    if archive.as_of_date_time:
+        root_attribs["AsOfDateTime"] = archive.as_of_date_time
+    if archive.originator:
+        root_attribs["Originator"] = archive.originator
+    if archive.source_system:
+        root_attribs["SourceSystem"] = archive.source_system
+    if archive.source_system_version:
+        root_attribs["SourceSystemVersion"] = archive.source_system_version
+    if archive.archive_id:
+        root_attribs["ID"] = archive.archive_id
+
+    root = ET.Element(f"{{{ODM_NS}}}ODM", root_attribs)
+
+    resolved_mdv_oid = meta_data_version_oid
+    if resolved_mdv_oid is None:
+        if archive.clinical_data:
+            resolved_mdv_oid = archive.clinical_data[0].metadata_version_oid
+        elif archive.reference_data:
+            resolved_mdv_oid = archive.reference_data[0].metadata_version_oid
+        elif archive.admin_data and archive.admin_data[0].locations:
+            refs = archive.admin_data[0].locations[0].metadata_version_refs
+            resolved_mdv_oid = refs[0].metadata_version_oid if refs else "MDV.001"
+        else:
+            resolved_mdv_oid = "MDV.001"
+
+    if archive.data_dictionary is not None:
+        root.append(
+            _build_study_elem(
+                archive.data_dictionary,
+                meta_data_version_oid=resolved_mdv_oid,
+                meta_data_version_name=meta_data_version_name,
+                strict_132=(archive.odm_version == "1.3.2"),
+            )
+        )
+    for adm in archive.admin_data:
+        root.append(_build_admin_data_elem(adm))
+    for ref in archive.reference_data:
+        root.append(_build_reference_data_elem(ref))
+    for clin in archive.clinical_data:
+        root.append(_build_clinical_data_elem(clin))
+
+    ET.indent(root, space=indent)
+    xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    xml_str = xml_bytes.decode("utf-8")
+    if not xml_str.endswith("\n"):
+        xml_str += "\n"
+    return str(xml_str)
+
+
+def to_odm_archive_file(
+    archive: OdmArchive,
+    file_path: Path | str,
+    *,
+    meta_data_version_oid: str | None = None,
+    meta_data_version_name: str | None = None,
+    indent: str = "  ",
+) -> None:
+    """Write a canonical ``OdmArchive`` snapshot to a UTF-8 ODM 1.3.2 XML file."""
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        to_odm_archive_xml(
+            archive,
+            meta_data_version_oid=meta_data_version_oid,
+            meta_data_version_name=meta_data_version_name,
+            indent=indent,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _quote_xml_attr(value: str) -> str:
+    """Escape and double-quote an XML attribute value without importing xml.sax."""
+    escaped = (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("\t", "&#9;")
+        .replace("\n", "&#10;")
+        .replace("\r", "&#13;")
+    )
+    return f'"{escaped}"'
+
+
+def _serialize_subtree_indented(elem: ET.Element, *, indent: str, level: int = 1) -> str:
+    """Serialize a standalone ODM subtree indented at ``level`` without repeating root xmlns."""
+    ET.indent(elem, space=indent, level=level)
+    raw = ET.tostring(elem, encoding="unicode")
+    # Strip redundant default ODM namespace redeclaration when already declared on <ODM>
+    cleaned = raw.replace(f' xmlns="{ODM_NS}"', "", 1).replace(
+        f' xmlns:imednet="{IMEDNET_NS}"', "", 1
+    )
+    prefix = indent * level
+    return f"{prefix}{cleaned}\n"
+
+
+def stream_odm_xml(
+    datadict: DataDictionary | None = None,
+    *,
+    study_oid: str | None = None,
+    file_oid: str | None = None,
+    creation_datetime: str | None = None,
+    creation_date_time: str | None = None,
+    meta_data_version_oid: str = "MDV.001",
+    meta_data_version_name: str | None = None,
+    odm_version: Literal["1.2", "1.3", "1.3.1", "1.3.2"] = "1.3.2",
+    file_type: Literal["Snapshot", "Transactional"] = "Snapshot",
+    granularity: str | None = None,
+    originator: str | None = None,
+    source_system: str | None = "imednet-toolkit",
+    source_system_version: str | None = None,
+    admin_data: Iterable[OdmAdminData] = (),
+    reference_data: Iterable[OdmReferenceData] = (),
+    clinical_data: Sequence[OdmClinicalData] | OdmClinicalData | None = None,
+    subject_data: Iterable[OdmSubjectData] = (),
+    audit_records: Iterable[OdmAuditRecord] = (),
+    annotations: Iterable[OdmAnnotation] = (),
+    indent: str = "  ",
+) -> Iterator[str]:
+    """Stream CDISC ODM 1.3.2 XML chunks without holding full ClinicalData DOM in memory."""
+    ET.register_namespace("", ODM_NS)
+    ET.register_namespace("imednet", IMEDNET_NS)
+
+    clin_blocks = _normalize_container_seq(clinical_data)
+    resolved_study_oid = (
+        study_oid
+        or (clin_blocks[0].study_oid if clin_blocks else None)
+        or (
+            datadict.metadata.studyKey
+            if datadict is not None and datadict.metadata.studyKey
+            else None
+        )
+        or "STUDY_001"
+    )
+    resolved_mdv_oid = (
+        clin_blocks[0].metadata_version_oid
+        if (clin_blocks and meta_data_version_oid == "MDV.001")
+        else meta_data_version_oid
+    )
+
+    now_iso = (
+        creation_datetime or creation_date_time or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    f_oid = file_oid or f"ODM.{resolved_study_oid}"
+
+    attrs = [
+        f"xmlns={_quote_xml_attr(ODM_NS)}",
+        f"xmlns:imednet={_quote_xml_attr(IMEDNET_NS)}",
+        f"ODMVersion={_quote_xml_attr(odm_version)}",
+        f"FileType={_quote_xml_attr(file_type)}",
+        f"FileOID={_quote_xml_attr(f_oid)}",
+        f"CreationDateTime={_quote_xml_attr(now_iso)}",
+    ]
+    if granularity:
+        attrs.append(f"Granularity={_quote_xml_attr(granularity)}")
+    if originator:
+        attrs.append(f"Originator={_quote_xml_attr(originator)}")
+    if source_system:
+        attrs.append(f"SourceSystem={_quote_xml_attr(source_system)}")
+    if source_system_version:
+        attrs.append(f"SourceSystemVersion={_quote_xml_attr(source_system_version)}")
+
+    yield "<?xml version='1.0' encoding='utf-8'?>\n"
+    yield f"<ODM {' '.join(attrs)}>\n"
+
+    if datadict is not None:
+        study_elem = _build_study_elem(
+            datadict,
+            meta_data_version_oid=resolved_mdv_oid,
+            meta_data_version_name=meta_data_version_name,
+            strict_132=(odm_version == "1.3.2"),
+        )
+        yield _serialize_subtree_indented(study_elem, indent=indent, level=1)
+
+    for adm in admin_data:
+        yield _serialize_subtree_indented(_build_admin_data_elem(adm), indent=indent, level=1)
+
+    for ref in reference_data:
+        yield _serialize_subtree_indented(_build_reference_data_elem(ref), indent=indent, level=1)
+
+    for clin_block in clin_blocks:
+        yield (
+            f"{indent}<ClinicalData StudyOID={_quote_xml_attr(clin_block.study_oid)} "
+            f"MetaDataVersionOID={_quote_xml_attr(clin_block.metadata_version_oid)}>\n"
+        )
+        for subj in clin_block.subject_data:
+            yield _serialize_subtree_indented(
+                _build_subject_data_elem(subj), indent=indent, level=2
+            )
+        if clin_block.audit_records:
+            yield f"{indent * 2}<AuditRecords>\n"
+            for aud in clin_block.audit_records:
+                yield _serialize_subtree_indented(
+                    _build_audit_record_elem(aud), indent=indent, level=3
+                )
+            yield f"{indent * 2}</AuditRecords>\n"
+        if clin_block.annotations:
+            yield f"{indent * 2}<Annotations>\n"
+            for ann in clin_block.annotations:
+                yield _serialize_subtree_indented(
+                    _build_annotation_elem(ann), indent=indent, level=3
+                )
+            yield f"{indent * 2}</Annotations>\n"
+        yield f"{indent}</ClinicalData>\n"
+
+    clin_opened = False
+
+    def _ensure_clin_open() -> str:
+        nonlocal clin_opened
+        if not clin_opened:
+            clin_opened = True
+            return (
+                f"{indent}<ClinicalData StudyOID={_quote_xml_attr(resolved_study_oid)} "
+                f"MetaDataVersionOID={_quote_xml_attr(resolved_mdv_oid)}>\n"
+            )
+        return ""
+
+    for subj in subject_data:
+        header = _ensure_clin_open()
+        if header:
+            yield header
+        yield _serialize_subtree_indented(_build_subject_data_elem(subj), indent=indent, level=2)
+
+    aud_iter = iter(audit_records)
+    first_aud = next(aud_iter, None)
+    if first_aud is not None:
+        header = _ensure_clin_open()
+        if header:
+            yield header
+        yield f"{indent * 2}<AuditRecords>\n"
+        yield _serialize_subtree_indented(
+            _build_audit_record_elem(first_aud), indent=indent, level=3
+        )
+        for aud in aud_iter:
+            yield _serialize_subtree_indented(_build_audit_record_elem(aud), indent=indent, level=3)
+        yield f"{indent * 2}</AuditRecords>\n"
+
+    ann_iter = iter(annotations)
+    first_ann = next(ann_iter, None)
+    if first_ann is not None:
+        header = _ensure_clin_open()
+        if header:
+            yield header
+        yield f"{indent * 2}<Annotations>\n"
+        yield _serialize_subtree_indented(_build_annotation_elem(first_ann), indent=indent, level=3)
+        for ann in ann_iter:
+            yield _serialize_subtree_indented(_build_annotation_elem(ann), indent=indent, level=3)
+        yield f"{indent * 2}</Annotations>\n"
+
+    if clin_opened:
+        yield f"{indent}</ClinicalData>\n"
+
+    yield "</ODM>\n"
+
+
+def write_odm_xml_stream(
+    dest: Path | str | TextIO,
+    datadict: DataDictionary | None = None,
+    **stream_kwargs: Any,
+) -> None:
+    """Write streamed CDISC ODM 1.3.2 XML chunks directly to ``dest``."""
+    if datadict is not None and "datadict" not in stream_kwargs:
+        stream_kwargs["datadict"] = datadict
+    if isinstance(dest, (str, Path)):
+        out_path = Path(dest)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as fh:
+            for chunk in stream_odm_xml(**stream_kwargs):
+                fh.write(chunk)
+    else:
+        for chunk in stream_odm_xml(**stream_kwargs):
+            dest.write(chunk)
+
+
 __all__ = [
+    "resolve_form_item_oids",
     "sort_data_dictionary",
+    "stream_odm_xml",
     "to_file",
     "to_json",
+    "to_odm_archive_file",
+    "to_odm_archive_xml",
     "to_odm_file",
     "to_odm_xml",
+    "write_odm_xml_stream",
 ]

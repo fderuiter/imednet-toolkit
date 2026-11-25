@@ -13,6 +13,8 @@ import math
 import numbers
 import os
 import re
+import sys
+import types
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
@@ -6223,15 +6225,43 @@ def export_to_hive_parquet(*args: Any, **kwargs: Any) -> None:
     return _hive_export(*args, **kwargs)
 
 
+def export_to_odm(*args: Any, **kwargs: Any) -> None:
+    """Export study snapshot or incremental delta to CDISC ODM 1.3.2 XML."""
+    from .cdisc import export_to_odm as _odm_export
+
+    return _odm_export(*args, **kwargs)
+
+
+def export_to_dataset_json(*args: Any, **kwargs: Any) -> None:
+    """Export study records to CDISC Dataset-JSON v1.1."""
+    from .cdisc import export_to_dataset_json as _dataset_json_export
+
+    return _dataset_json_export(*args, **kwargs)
+
+
 _UNPATCHED_EXPORTS: dict[str, Callable[..., Any]] = {
     "export_to_csv": export_to_csv,
+    "export_to_dataset_json": export_to_dataset_json,
     "export_to_duckdb": export_to_duckdb,
     "export_to_duckdb_by_form": export_to_duckdb_by_form,
     "export_to_excel": export_to_excel,
     "export_to_hive_parquet": export_to_hive_parquet,
     "export_to_json": export_to_json,
     "export_to_long_sql": export_to_long_sql,
+    "export_to_odm": export_to_odm,
     "export_to_parquet": export_to_parquet,
     "export_to_sql": export_to_sql,
     "export_to_sql_by_form": export_to_sql_by_form,
 }
+
+
+class _CallableExportModule(types.ModuleType):
+    """Module subclass allowing ``imednet.integrations.export(...)`` to invoke ``dispatcher.export``."""
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        from .dispatcher import export as _dispatch_export
+
+        return _dispatch_export(*args, **kwargs)
+
+
+sys.modules[__name__].__class__ = _CallableExportModule

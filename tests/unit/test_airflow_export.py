@@ -19,7 +19,9 @@ def _setup_airflow(monkeypatch):
 
 EXPORT_FUNCTIONS = [
     "export_to_csv",
+    "export_to_dataset_json",
     "export_to_duckdb",
+    "export_to_odm",
     "export_to_parquet",
     "export_to_excel",
     "export_to_json",
@@ -1887,3 +1889,51 @@ def test_operator_sdtm_phi_redaction_and_incremental_reconciliation(
     json_rows2 = json.loads(json_path.read_text(encoding="utf-8"))
     assert len(json_rows2) == 1 and json_rows2[0]["USUBJID"] == "S01"
     assert json_rows2[0]["BRTHDTC"] == "1981"
+
+
+def test_export_operator_dispatches_odm_and_dataset_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify ImednetExportOperator dispatches odm and dataset-json (including extra_kwargs path)."""
+    from apache_airflow_providers_imednet import export
+    from apache_airflow_providers_imednet.operators.export import (
+        _TABULAR_EXPORTS,
+        ImednetExportOperator,
+    )
+
+    assert _TABULAR_EXPORTS["odm"] is export.export_to_odm
+    assert _TABULAR_EXPORTS["dataset_json"] is export.export_to_dataset_json
+
+    mock_sdk = MagicMock()
+    odm_out = tmp_path / "archive.odm.xml"
+    dsj_out = tmp_path / "ae.dataset.json"
+
+    with patch("imednet.integrations.export.export_to_odm") as mock_odm:
+        op_odm = ImednetExportOperator(
+            task_id="export_odm",
+            study_key="STUDY_AF",
+            destination="odm",
+            output_path=str(odm_out),
+            export_kwargs={"validate_schema": True},
+        )
+        monkeypatch.setattr(op_odm, "_get_sdk", lambda: mock_sdk)
+        res_odm = op_odm.execute({})
+        assert res_odm == str(odm_out)
+        assert mock_odm.call_count == 1
+        assert mock_odm.call_args.args[:3] == (mock_sdk, "STUDY_AF", str(odm_out))
+        assert mock_odm.call_args.kwargs["validate_schema"] is True
+
+    with patch("imednet.integrations.export.export_to_dataset_json") as mock_dsj:
+        op_dsj = ImednetExportOperator(
+            task_id="export_dsj",
+            study_key="STUDY_AF",
+            destination="dataset-json",
+            export_kwargs={"path": str(dsj_out), "sdtm_domain": "AE"},
+        )
+        assert op_dsj._effective_destination() == "dataset_json"
+        monkeypatch.setattr(op_dsj, "_get_sdk", lambda: mock_sdk)
+        res_dsj = op_dsj.execute({})
+        assert res_dsj == str(dsj_out)
+        assert mock_dsj.call_count == 1
+        assert mock_dsj.call_args.args[:3] == (mock_sdk, "STUDY_AF", str(dsj_out))
+        assert mock_dsj.call_args.kwargs["sdtm_domain"] == "AE"

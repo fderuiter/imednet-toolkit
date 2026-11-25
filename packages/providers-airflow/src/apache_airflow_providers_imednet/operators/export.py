@@ -28,10 +28,12 @@ logger = logging.getLogger(__name__)
 # Fallback mapping for tabular exports if the user explicitly needs them or backward compatibility
 _TABULAR_EXPORTS = {
     "csv": export.export_to_csv,
+    "dataset_json": export.export_to_dataset_json,
     "parquet": export.export_to_parquet,
     "hive_parquet": export.export_to_hive_parquet,
     "excel": export.export_to_excel,
     "json": export.export_to_json,
+    "odm": export.export_to_odm,
     "sql": export.export_to_sql,
     "sql_by_form": export.export_to_sql_by_form,
     "long_sql": export.export_to_long_sql,
@@ -439,7 +441,8 @@ class ImednetExportOperator(BaseOperator):
             dest = self.export_func.replace("export_to_", "")
         elif not dest:
             dest = "csv"
-        return dest.lower().strip()
+        normalized = dest.lower().strip()
+        return "dataset_json" if normalized == "dataset-json" else normalized
 
     def _get_sdk(self) -> ImednetSDK:
         """Resolve the SDK client from the configured Airflow connection at execute time."""
@@ -892,6 +895,8 @@ class ImednetExportOperator(BaseOperator):
             dest = self.export_func.replace("export_to_", "")
         elif not dest:
             dest = "csv"
+        if dest == "dataset-json":
+            dest = "dataset_json"
 
         export_callable = None
         if dest in _TABULAR_EXPORTS:
@@ -1052,7 +1057,11 @@ class ImednetExportOperator(BaseOperator):
                     if self.output_path is not None:
                         return redact_uri(self.output_path)
                     return redact_uri(str(table_arg)) if table_arg is not None else None
-                export_callable(sdk, self.study_key, self.output_path, **tabular_kwargs)
+                target_path = self.output_path or tabular_kwargs.pop("path", None)
+                if target_path is not None:
+                    _validate_no_secrets_in_value(target_path, field_name="output_path")
+                export_callable(sdk, self.study_key, target_path, **tabular_kwargs)
+                return redact_uri(str(target_path)) if target_path is not None else None
             return redact_uri(self.output_path) if self.output_path is not None else None
 
 

@@ -9,6 +9,14 @@ imednet.spi package
 Submodules
 ----------
 
+imednet.spi.cdisc module
+------------------------
+
+.. automodule:: imednet.spi.cdisc
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 imednet.spi.cli module
 ----------------------
 

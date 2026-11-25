@@ -452,6 +452,190 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     json_parser.set_defaults(func=_dispatch_json)
 
+    # odm
+    odm_parser = sub.add_parser(
+        "odm",
+        help="Export study metadata, clinical data, audit trail, and queries to CDISC ODM 1.3.2 XML.",
+    )
+    _add_export_study_args(odm_parser)
+    odm_parser.add_argument("path", type=Path, help="Destination ODM 1.3.2 XML file.")
+    odm_parser.add_argument(
+        "--vars", dest="vars_", help="Comma-separated list of variable names to include."
+    )
+    odm_parser.add_argument("--forms", help="Comma-separated list of form IDs to include.")
+    odm_parser.add_argument(
+        "--no-admin-data",
+        dest="include_admin_data",
+        action="store_false",
+        default=True,
+        help="Omit <AdminData> site and user metadata.",
+    )
+    odm_parser.add_argument(
+        "--no-audit-records",
+        dest="include_audit_records",
+        action="store_false",
+        default=True,
+        help="Omit <AuditRecord> record revision entries.",
+    )
+    odm_parser.add_argument(
+        "--no-annotations",
+        dest="include_annotations",
+        action="store_false",
+        default=True,
+        help="Omit <Annotation> query entries.",
+    )
+    odm_parser.add_argument(
+        "--creation-date-time",
+        dest="creation_date_time",
+        default=None,
+        help="Explicit ISO-8601 CreationDateTime for deterministic archive stamping.",
+    )
+    odm_parser.add_argument(
+        "--validate-schema",
+        dest="validate_schema",
+        action="store_true",
+        default=False,
+        help="Validate output against the official CDISC ODM 1.3.2 XSD before finalizing.",
+    )
+    _add_streaming_export_args(odm_parser)
+
+    @with_sdk
+    def export_odm_cmd(
+        sdk: ImednetSDK,
+        /,
+        study_key: str,
+        path: Path,
+        vars_: str | None = None,
+        forms: str | None = None,
+        include_admin_data: bool = True,
+        include_audit_records: bool = True,
+        include_annotations: bool = True,
+        creation_date_time: str | None = None,
+        validate_schema: bool = False,
+        **stream_kwargs: Any,
+    ) -> None:
+        from .. import export_to_odm
+
+        var_list = [v.strip() for v in vars_.split(",")] if vars_ else None
+        form_list = [int(f.strip()) for f in forms.split(",")] if forms else None
+        with fetching_status("study snapshot for CDISC ODM 1.3.2 export", study_key):
+            export_to_odm(
+                sdk,
+                study_key,
+                str(path),
+                variable_whitelist=var_list,
+                form_whitelist=form_list,
+                include_admin_data=include_admin_data,
+                include_audit_records=include_audit_records,
+                include_annotations=include_annotations,
+                creation_date_time=creation_date_time,
+                validate_schema=validate_schema,
+                **stream_kwargs,
+            )
+
+    def _dispatch_odm(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(odm_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_odm_cmd(
+                study_key=study_key,
+                path=args.path,
+                vars_=args.vars_,
+                forms=args.forms,
+                include_admin_data=args.include_admin_data,
+                include_audit_records=args.include_audit_records,
+                include_annotations=args.include_annotations,
+                creation_date_time=args.creation_date_time,
+                validate_schema=args.validate_schema,
+                **stream_kwargs,
+            )
+
+    odm_parser.set_defaults(func=_dispatch_odm)
+
+    # dataset-json
+    dsj_parser = sub.add_parser(
+        "dataset-json",
+        help="Export study records to CDISC Dataset-JSON v1.1 for CDASH Forms or SDTM domains.",
+    )
+    _add_export_study_args(dsj_parser)
+    dsj_parser.add_argument(
+        "path",
+        type=Path,
+        help="Destination Dataset-JSON v1.1 file (.json) or directory (per-form/per-domain).",
+    )
+    dsj_parser.add_argument(
+        "--vars", dest="vars_", help="Comma-separated list of variable names to include."
+    )
+    dsj_parser.add_argument("--forms", help="Comma-separated list of form IDs to include.")
+    dsj_parser.add_argument(
+        "--per-form",
+        dest="per_form",
+        action="store_true",
+        default=None,
+        help="Write one Dataset-JSON v1.1 file per CDASH Form or SDTM domain into a directory.",
+    )
+    dsj_parser.add_argument(
+        "--creation-date-time",
+        dest="creation_date_time",
+        default=None,
+        help="Explicit ISO-8601 datasetJSONCreationDateTime for deterministic stamping.",
+    )
+    dsj_parser.add_argument(
+        "--validate-schema",
+        dest="validate_schema",
+        action="store_true",
+        default=False,
+        help="Validate output against the official CDISC Dataset-JSON v1.1 JSON Schema.",
+    )
+    _add_streaming_export_args(dsj_parser)
+
+    @with_sdk
+    def export_dataset_json_cmd(
+        sdk: ImednetSDK,
+        /,
+        study_key: str,
+        path: Path,
+        vars_: str | None = None,
+        forms: str | None = None,
+        per_form: bool | None = None,
+        creation_date_time: str | None = None,
+        validate_schema: bool = False,
+        **stream_kwargs: Any,
+    ) -> None:
+        from .. import export_to_dataset_json
+
+        var_list = [v.strip() for v in vars_.split(",")] if vars_ else None
+        form_list = [int(f.strip()) for f in forms.split(",")] if forms else None
+        with fetching_status("records for CDISC Dataset-JSON v1.1 export", study_key):
+            export_to_dataset_json(
+                sdk,
+                study_key,
+                str(path),
+                variable_whitelist=var_list,
+                form_whitelist=form_list,
+                per_form=per_form,
+                creation_date_time=creation_date_time,
+                validate_schema=validate_schema,
+                **stream_kwargs,
+            )
+
+    def _dispatch_dataset_json(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(dsj_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_dataset_json_cmd(
+                study_key=study_key,
+                path=args.path,
+                vars_=args.vars_,
+                forms=args.forms,
+                per_form=args.per_form,
+                creation_date_time=args.creation_date_time,
+                validate_schema=args.validate_schema,
+                **stream_kwargs,
+            )
+
+    dsj_parser.set_defaults(func=_dispatch_dataset_json)
+
     # duckdb
     ddb_parser = sub.add_parser("duckdb", help="Export study records to a DuckDB table.")
     _add_export_study_args(ddb_parser)

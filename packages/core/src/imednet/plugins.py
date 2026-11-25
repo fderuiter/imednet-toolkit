@@ -56,6 +56,12 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from .datadict import DataDictionary
+    from .datadict.exchange import (
+        DatasetJsonClinicalData,
+        DatasetJsonDataset,
+        OdmAnnotation,
+        OdmAuditRecord,
+    )
     from .integrations.sink_base import ExportSink
     from .models.forms import Form
     from .models.intervals import Interval
@@ -142,6 +148,20 @@ class DataExtractionWorkflowProtocol(Protocol):
         **filters: Any,
     ) -> list[RecordRevision]:
         """Extract record revisions bounded by optional UTC dates and filters."""
+        ...
+
+    def extract_odm_audit_records(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        *,
+        record_ids: Sequence[int | str] | None = None,
+        mask_phi: bool = True,
+        **filters: Any,
+    ) -> list[OdmAuditRecord]:
+        """Extract record revisions mapped to canonical ODM ``<AuditRecord>`` elements."""
         ...
 
 
@@ -256,6 +276,20 @@ class QueryManagementWorkflowProtocol(Protocol):
         """Synchronize clinical queries for a study into a local triage queue."""
         ...
 
+    def extract_odm_annotations(
+        self,
+        study_key: str,
+        *,
+        unresolved_only: bool = False,
+        record_ids: Sequence[int | str] | None = None,
+        state_filter: str | None = None,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        mask_phi: bool = True,
+        **kwargs: Any,
+    ) -> list[OdmAnnotation]:
+        """Map study ``Query`` and ``QueryComment`` items to ODM ``<Annotation>`` elements."""
+        ...
+
 
 class RecordMapperProtocol(Protocol):
     """Structural contract for ``sdk.workflows.record_mapper``."""
@@ -348,6 +382,42 @@ class RecordMapperProtocol(Protocol):
         include_deleted: bool | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked DataFrames mapped to a CDISC SDTM domain."""
+        ...
+
+    def dataset_json(
+        self,
+        study_key: str,
+        *,
+        item_group_oid: str | None = None,
+        name: str | None = None,
+        label: str | None = None,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        sdtm_domain: str | None = None,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        creation_date_time: str | None = None,
+    ) -> DatasetJsonDataset:
+        """Emit a CDISC Dataset-JSON v1.1 ``itemGroupData`` dataset for a CDASH Form or SDTM domain."""
+        ...
+
+    def dataset_json_clinical_data(
+        self,
+        study_key: str,
+        *,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        as_sdtm: bool = False,
+        domains: list[str] | None = None,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        creation_date_time: str | None = None,
+    ) -> DatasetJsonClinicalData:
+        """Emit CDISC Dataset-JSON v1.1 ``clinicalData`` containing ``itemGroupData`` datasets."""
         ...
 
 
