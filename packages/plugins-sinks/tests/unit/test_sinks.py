@@ -97,6 +97,29 @@ class TestNeo4jExportSink:
                     study_key="STUDY1", uri="bolt://localhost:7687", auth=("neo4j", "pass")
                 )
             )
+        driver.close.assert_called_once()
+
+    def test_connect_closes_driver_and_suppresses_close_error_on_failure(self, monkeypatch):
+        """Neo4jExportSink._connect closes driver, clears _driver, and suppresses secondary close() errors."""
+        import imednet_sinks.graph as graph_mod
+        from imednet_sinks.graph import Neo4jExportSink
+
+        neo4j, driver = _fake_neo4j_module(fail_connect=True)
+        driver.close.side_effect = RuntimeError("secondary close failure")
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
+
+        sink = Neo4jExportSink.__new__(Neo4jExportSink)
+        sink._uri = "bolt://neo4j:topsecret@localhost:7687"  # pragma: allowlist secret
+        sink._auth = ("neo4j", "topsecret")  # pragma: allowlist secret
+        sink._driver = None
+
+        with pytest.raises(ExportConfigurationError) as exc_info:
+            sink._connect()
+
+        driver.close.assert_called_once()
+        assert sink._driver is None
+        assert "topsecret" not in str(exc_info.value)
+        assert "localhost:7687" in str(exc_info.value)
 
     def test_write_batch_returns_count(self, monkeypatch):
         """TODO: Add docstring."""
@@ -322,6 +345,115 @@ class TestNeo4jExportSink:
         assert row["parent_record_id"] is None
         assert json.loads(row["keywords"])[0]["keywordId"] == 5
 
+    @pytest.mark.parametrize("idempotent", [True, False])
+    @pytest.mark.parametrize(
+        ("convention", "study_prop", "subject_prop", "cypher_visit_prop", "row_visit_prop"),
+        [
+            ("snake_case", "study_key", "subject_key", "visit_id", "visit_id"),
+            ("camelCase", "studyKey", "subjectKey", "visitId", "visitId"),
+            ("sdtm", "STUDYID", "USUBJID", "VISIT_ID", "VISITNUM"),
+        ],
+    )
+    def test_write_batch_null_subject_key_guards_subject_and_visit_merges(
+        self,
+        monkeypatch,
+        idempotent: bool,
+        convention: str,
+        study_prop: str,
+        subject_prop: str,
+        cypher_visit_prop: str,
+        row_visit_prop: str,
+    ):
+        """Unassigned records (subject_key=None) skip Subject/Visit merges and link directly to Study."""
+        import re
+
+        import imednet_sinks.graph as graph_mod
+        from imednet.models.records import Record
+        from imednet_sinks.graph import Neo4jExportSink
+
+        neo4j, driver = _fake_neo4j_module()
+        monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j)
+
+        records = [
+            Record(
+                record_id=1,
+                study_key="STUDY_NULL_SUBJ",
+                subject_key=None,
+                visit_id=None,
+                form_id=10,
+                record_data={"note": "unassigned_unscheduled"},
+            ),
+            Record(
+                record_id=2,
+                study_key="STUDY_NULL_SUBJ",
+                subject_key=None,
+                visit_id=5,
+                form_id=10,
+                record_data={"note": "unassigned_with_visit"},
+            ),
+            Record(
+                record_id=3,
+                study_key="STUDY_NULL_SUBJ",
+                subject_key="SUBJ-3",
+                visit_id=5,
+                form_id=10,
+                record_data={"note": "assigned_scheduled"},
+            ),
+            Record(
+                record_id=4,
+                study_key="STUDY_NULL_SUBJ",
+                subject_key="SUBJ-3",
+                visit_id=None,
+                form_id=10,
+                record_data={"note": "assigned_unscheduled"},
+            ),
+        ]
+
+        with Neo4jExportSink(
+            Neo4jSinkConfig(
+                study_key="STUDY_NULL_SUBJ",
+                uri="bolt://localhost:7687",
+                auth=("neo4j", "pass"),  # pragma: allowlist secret
+                idempotent=idempotent,
+                naming_convention=convention,
+            )
+        ) as sink:
+            assert sink.write_batch(records, batch_id="STUDY_NULL_SUBJ/0") == 4
+
+        run_call = driver.session.return_value.__enter__.return_value.run.call_args
+        cypher = run_call.args[0]
+        rows = run_call.kwargs["rows"]
+
+        # Outer FOREACH guards Subject and Visit merges on non-null subject property with distinct variable
+        outer_match = re.search(
+            rf"FOREACH\s*\(\s*(\w+)\s+IN\s+CASE\s+WHEN\s+row\.{subject_prop}\s+IS\s+NOT\s+NULL",
+            cypher,
+        )
+        assert outer_match is not None
+        outer_var = outer_match.group(1)
+
+        inner_vars = re.findall(
+            rf"FOREACH\s*\(\s*(\w+)\s+IN\s+CASE\s+WHEN\s+row\.{cypher_visit_prop}\s+IS",
+            cypher,
+        )
+        assert len(inner_vars) == 2
+        assert all(v != outer_var for v in inner_vars)
+
+        assert f"CASE WHEN row.{cypher_visit_prop} IS NOT NULL" in cypher
+        assert f"CASE WHEN row.{cypher_visit_prop} IS NULL" in cypher
+        assert f"CASE WHEN row.{subject_prop} IS NULL" in cypher
+        assert "MERGE (s)-[:HAS_RECORD]->(r)" in cypher
+
+        assert rows[0][subject_prop] is None
+        assert rows[0][row_visit_prop] is None
+        assert rows[1][subject_prop] is None
+        assert rows[1][row_visit_prop] == 5
+        assert rows[2][subject_prop] == "SUBJ-3"
+        assert rows[2][row_visit_prop] == 5
+        assert rows[3][subject_prop] == "SUBJ-3"
+        assert rows[3][row_visit_prop] is None
+        assert all(r[study_prop] == "STUDY_NULL_SUBJ" for r in rows)
+
 
 # ---------------------------------------------------------------------------
 # MongoDbExportSink
@@ -370,6 +502,32 @@ class TestMongoDbExportSink:
                     collection="col",
                 )
             )
+        client.close.assert_called_once()
+
+    def test_connect_closes_client_and_suppresses_close_error_on_failure(self, monkeypatch):
+        """MongoDbExportSink._connect closes client, clears _client, and suppresses secondary close() errors."""
+        import imednet_sinks.document as doc_mod
+        from imednet_sinks.document import MongoDbExportSink
+
+        pymongo, client, _collection = _fake_pymongo_module(fail_connect=True)
+        client.close.side_effect = RuntimeError("secondary close failure")
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+
+        sink = MongoDbExportSink.__new__(MongoDbExportSink)
+        sink._uri = "mongodb://admin:topsecret@localhost:27017"  # pragma: allowlist secret
+        sink._database = "db"
+        sink._collection_name = "col"
+        sink._client = None
+        sink._collection = None
+
+        with pytest.raises(ExportConfigurationError) as exc_info:
+            sink._connect()
+
+        client.close.assert_called_once()
+        assert sink._client is None
+        assert sink._collection is None
+        assert "topsecret" not in str(exc_info.value)
+        assert "localhost:27017" in str(exc_info.value)
 
     def test_connect_error_message_redacts_credentials(self, monkeypatch):
         """TODO: Add docstring."""
@@ -578,6 +736,101 @@ class TestMongoDbExportSink:
         doc2 = _record_to_document(record, study_key="STUDY1", mapper=custom_mapper)
         assert doc2["_id"] == "STUDY1/10"
         assert "STUDY1" in custom_mapper._pipeline_cache
+
+    def test_write_batch_non_idempotent_assigns_unique_ids_with_bson_and_uuid_fallback(
+        self, monkeypatch
+    ):
+        """MongoDbExportSink(idempotent=False) generates unique _id per Record while keeping default helper _id."""
+        import sys
+        import uuid
+
+        from bson import ObjectId
+
+        import imednet_sinks.document as doc_mod
+        from imednet.models.records import Record
+        from imednet_sinks.document import (
+            MongoDbExportSink,
+            MongoDbSinkConfig,
+            _post_process_document,
+            _record_to_document,
+        )
+
+        stored_ids: set[object] = set()
+        inserted_docs: list[dict] = []
+
+        def strict_insert_many(docs, ordered=False):
+            batch_ids = []
+            for doc in docs:
+                doc_id = doc["_id"]
+                if doc_id in stored_ids:
+                    raise RuntimeError(f"E11000 duplicate key error: {doc_id!r}")
+                stored_ids.add(doc_id)
+                inserted_docs.append(dict(doc))
+                batch_ids.append(doc_id)
+            return SimpleNamespace(inserted_ids=batch_ids)
+
+        pymongo, _client, collection = _fake_pymongo_module()
+        collection.insert_many.side_effect = strict_insert_many
+        monkeypatch.setattr(doc_mod, "_require_optional_dep", lambda *_: pymongo)
+
+        rec = Record(
+            record_id=42,
+            study_key="STUDY_APPEND",
+            subject_key="SUBJ-42",
+            visit_id=1,
+            form_id=5,
+            form_key="AE",
+            record_data={"aeterm": "Headache"},
+        )
+
+        # Standalone helpers preserve deterministic <study_key>/<record_id> _id
+        assert _record_to_document(rec, study_key="STUDY_APPEND")["_id"] == "STUDY_APPEND/42"
+        assert (
+            _post_process_document({"study_key": "STUDY_APPEND", "record_id": 42})["_id"]
+            == "STUDY_APPEND/42"
+        )
+
+        # Repeated idempotent=False writes assign distinct ObjectId values when bson is present
+        append_cfg = MongoDbSinkConfig(
+            study_key="STUDY_APPEND",
+            uri="mongodb://localhost:27017",
+            database="clinical",
+            collection="append_log",
+            idempotent=False,
+        )
+        with MongoDbExportSink(config=append_cfg) as sink:
+            assert sink.write_batch([rec, rec], batch_id="STUDY_APPEND/0") == 2
+            assert sink.write_batch([rec], batch_id="STUDY_APPEND/1") == 1
+
+        assert len(inserted_docs) == 3
+        assert all(isinstance(d["_id"], ObjectId) for d in inserted_docs)
+        assert len({d["_id"] for d in inserted_docs}) == 3
+
+        # SDTM + idempotent=False also assigns unique _id per Record across repeated batches
+        sdtm_append_cfg = MongoDbSinkConfig(
+            study_key="STUDY_APPEND",
+            uri="mongodb://localhost:27017",
+            database="clinical",
+            collection="append_sdtm",
+            idempotent=False,
+            as_sdtm=True,
+            sdtm_domain="AE",
+        )
+        with MongoDbExportSink(config=sdtm_append_cfg) as sdtm_sink:
+            assert sdtm_sink.write_batch([rec], batch_id="STUDY_APPEND/s0") == 1
+            assert sdtm_sink.write_batch([rec], batch_id="STUDY_APPEND/s1") == 1
+        assert len(inserted_docs) == 5
+
+        # Fall back to UUID strings when bson is unavailable
+        monkeypatch.setitem(sys.modules, "bson", None)
+        with MongoDbExportSink(config=append_cfg) as fallback_sink:
+            assert fallback_sink.write_batch([rec, rec], batch_id="STUDY_APPEND/uuid") == 2
+
+        uuid_docs = inserted_docs[-2:]
+        assert uuid_docs[0]["_id"] != uuid_docs[1]["_id"]
+        for d in uuid_docs:
+            assert isinstance(d["_id"], str)
+            assert str(uuid.UUID(d["_id"])) == d["_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -2478,6 +2731,219 @@ class TestSnowflakeSchemaEvolutionAndTabularMerge:
         assert len(warehouse_rows) == 2
         assert warehouse_rows[("STUDY_EVOLVE", 1)]["diastolic_bp"] == 78
         assert warehouse_rows[("STUDY_EVOLVE", 2)]["assessment_note"] == "elevated"
+
+    def test_snowflake_ensure_table_schema_case_sensitive_and_varchar_swap_widening(
+        self, monkeypatch, tmp_path
+    ):
+        """_ensure_table_schema matches exact schema/table case and widens conflicting types to VARCHAR via swap DDL."""
+        import re
+
+        import pyarrow.parquet as pq
+
+        import imednet_sinks.warehouse as wh_mod
+        from imednet.models.records import Record
+        from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+
+        sf, _conn, cursor = _fake_snowflake_module()
+        orig_require = wh_mod._require_optional_dep
+        monkeypatch.setattr(
+            wh_mod,
+            "_require_optional_dep",
+            lambda pkg, extras: sf if pkg == "snowflake.connector" else orig_require(pkg, extras),
+        )
+
+        # Pre-populate an UPPERCASE table ("STUDY_SCHEMA", "SUBJECTRECORDS_V1") to ensure
+        # case-sensitive ("study_schema", "SubjectRecords_v1") does NOT collide via UPPER(...)
+        catalog: dict[tuple[str, str], dict[str, str]] = {
+            ("STUDY_SCHEMA", "SUBJECTRECORDS_V1"): {
+                "STUDY_KEY": "TEXT",
+                "RECORD_ID": "NUMBER",
+            }
+        }
+        table_data: dict[tuple[str, int], dict[str, object]] = {}
+        staged_rows: list[dict[str, object]] = []
+        executed_sqls: list[str] = []
+
+        def fake_execute(sql: str) -> None:
+            nonlocal staged_rows
+            executed_sqls.append(sql)
+            if "INFORMATION_SCHEMA.COLUMNS" in sql:
+                assert "UPPER(" not in sql
+                m_schema = re.search(r"TABLE_SCHEMA = '([^']+)'", sql)
+                m_table = re.search(r"TABLE_NAME = '([^']+)'", sql)
+                assert m_schema is not None and m_table is not None
+                cols_map = catalog.get((m_schema.group(1), m_table.group(1)), {})
+                cursor.fetchall.return_value = [
+                    {"column_name": c_name, "data_type": c_type}
+                    for c_name, c_type in cols_map.items()
+                ]
+            elif sql.startswith("CREATE TABLE IF NOT EXISTS"):
+                col_pairs = re.findall(
+                    r'"([A-Za-z0-9_$]+)"\s+(NUMBER\(38,\s*\d+\)|[A-Z_]+)',
+                    sql.split("(", 1)[1],
+                )
+                catalog[("study_schema", "SubjectRecords_v1")] = {
+                    c_name: (
+                        "NUMBER"
+                        if c_type == "BIGINT"
+                        else ("TEXT" if c_type == "VARCHAR" else c_type)
+                    )
+                    for c_name, c_type in col_pairs
+                }
+                cursor.fetchall.return_value = []
+            elif sql.startswith("ALTER TABLE") and "ADD COLUMN" in sql:
+                cols_map = catalog[("study_schema", "SubjectRecords_v1")]
+                for c_name, c_type in re.findall(
+                    r'"([A-Za-z0-9_$]+)"\s+(NUMBER\(38,\s*\d+\)|[A-Z_]+)',
+                    sql.split("ADD COLUMN", 1)[1],
+                ):
+                    cols_map[c_name] = c_type
+                cursor.fetchall.return_value = []
+            elif sql.startswith("UPDATE ") and "TO_VARCHAR(" in sql:
+                m_upd = re.search(r'SET "([^"]+)" = TO_VARCHAR\("([^"]+)"\)', sql)
+                assert m_upd is not None
+                tmp_col, src_col = m_upd.group(1).lower(), m_upd.group(2).lower()
+                for row in table_data.values():
+                    val = row.get(src_col)
+                    row[tmp_col] = None if val is None else str(val)
+                cursor.fetchall.return_value = []
+            elif sql.startswith("ALTER TABLE") and "DROP COLUMN" in sql:
+                m_drop = re.search(r'DROP COLUMN "([^"]+)"', sql)
+                assert m_drop is not None
+                dropped = m_drop.group(1)
+                catalog[("study_schema", "SubjectRecords_v1")].pop(dropped, None)
+                for row in table_data.values():
+                    row.pop(dropped.lower(), None)
+                cursor.fetchall.return_value = []
+            elif sql.startswith("ALTER TABLE") and "RENAME COLUMN" in sql:
+                m_ren = re.search(r'RENAME COLUMN "([^"]+)" TO "([^"]+)"', sql)
+                assert m_ren is not None
+                src_col, dst_col = m_ren.group(1), m_ren.group(2)
+                cols_map = catalog[("study_schema", "SubjectRecords_v1")]
+                cols_map[dst_col] = cols_map.pop(src_col)
+                for row in table_data.values():
+                    row[dst_col.lower()] = row.pop(src_col.lower(), None)
+                cursor.fetchall.return_value = []
+            elif sql.startswith("PUT file://"):
+                local_file = sql.split("PUT file://", 1)[1].split(" ", 1)[0]
+                staged_rows = pq.read_table(local_file).to_pylist()
+                cursor.fetchall.return_value = []
+            elif sql.startswith("MERGE INTO"):
+                cols_map = catalog[("study_schema", "SubjectRecords_v1")]
+                for row in staged_rows:
+                    coerced_row = dict(row)
+                    for k, v in list(coerced_row.items()):
+                        if v is not None and cols_map.get(k.upper()) in ("VARCHAR", "TEXT"):
+                            coerced_row[k] = str(v)
+                    key = (str(coerced_row["study_key"]), int(coerced_row["record_id"]))
+                    existing = table_data.get(key, {})
+                    existing.update(coerced_row)
+                    table_data[key] = existing
+                cursor.fetchall.return_value = []
+            else:
+                cursor.fetchall.return_value = []
+
+        cursor.execute.side_effect = fake_execute
+
+        cfg = SnowflakeSinkConfig(
+            study_key="study_case",
+            account="acct",
+            user="loader",
+            password="secret",  # pragma: allowlist secret
+            database="clinical_db",
+            schema="study_schema",
+            warehouse="compute_wh",
+            stage="my_stage",
+            table="SubjectRecords_v1",
+            local_staging_dir=str(tmp_path),
+        )
+
+        with SnowflakeExportSink(config=cfg) as sink:
+            # Batch 1: creates mixed-case table despite uppercase sibling in INFORMATION_SCHEMA
+            sink.write_batch(
+                [
+                    Record(
+                        record_id=1,
+                        form_id=1,
+                        subject_key="S1",
+                        record_data={"lab_value": 42, "ratio": 1.5, "note": "initial"},
+                    )
+                ],
+                batch_id="b1",
+            )
+            assert ("study_schema", "SubjectRecords_v1") in catalog
+            assert catalog[("study_schema", "SubjectRecords_v1")]["LAB_VALUE"] == "NUMBER"
+            assert catalog[("study_schema", "SubjectRecords_v1")]["RATIO"] == "FLOAT"
+            assert catalog[("study_schema", "SubjectRecords_v1")]["NOTE"] == "TEXT"
+
+            # Batch 2: all-null lab_value and narrower int note into VARCHAR -> no swap DDL
+            before_b2 = len(executed_sqls)
+            sink.write_batch(
+                [
+                    Record(
+                        record_id=2,
+                        form_id=1,
+                        subject_key="S2",
+                        record_data={"lab_value": None, "ratio": 2.25, "note": 100},
+                    )
+                ],
+                batch_id="b2",
+            )
+            b2_sqls = executed_sqls[before_b2:]
+            assert not any("TO_VARCHAR" in s or "RENAME COLUMN" in s for s in b2_sqls)
+            assert catalog[("study_schema", "SubjectRecords_v1")]["LAB_VALUE"] == "NUMBER"
+            assert catalog[("study_schema", "SubjectRecords_v1")]["NOTE"] == "TEXT"
+
+            # Batch 3: string values for lab_value and ratio -> widens both to VARCHAR via swap DDL
+            before_b3 = len(executed_sqls)
+            sink.write_batch(
+                [
+                    Record(
+                        record_id=3,
+                        form_id=1,
+                        subject_key="S3",
+                        record_data={
+                            "lab_value": "below_detection_limit",
+                            "ratio": "not_applicable",
+                            "note": "text_again",
+                        },
+                    )
+                ],
+                batch_id="b3",
+            )
+            b3_sqls = executed_sqls[before_b3:]
+            assert any('ADD COLUMN "LAB_VALUE__IMEDNET_TMP" VARCHAR' in s for s in b3_sqls)
+            assert any(
+                'SET "LAB_VALUE__IMEDNET_TMP" = TO_VARCHAR("LAB_VALUE")' in s for s in b3_sqls
+            )
+            assert any('DROP COLUMN "LAB_VALUE"' in s for s in b3_sqls)
+            assert any(
+                'RENAME COLUMN "LAB_VALUE__IMEDNET_TMP" TO "LAB_VALUE"' in s for s in b3_sqls
+            )
+            assert catalog[("study_schema", "SubjectRecords_v1")]["LAB_VALUE"] == "VARCHAR"
+            assert catalog[("study_schema", "SubjectRecords_v1")]["RATIO"] == "VARCHAR"
+
+            # Batch 4: narrower numeric types into widened VARCHAR columns -> kept as VARCHAR without DDL
+            before_b4 = len(executed_sqls)
+            sink.write_batch(
+                [
+                    Record(
+                        record_id=4,
+                        form_id=1,
+                        subject_key="S4",
+                        record_data={"lab_value": 99, "ratio": 3.5, "note": "done"},
+                    )
+                ],
+                batch_id="b4",
+            )
+            b4_sqls = executed_sqls[before_b4:]
+            assert not any("ALTER TABLE" in s or "TO_VARCHAR" in s for s in b4_sqls)
+            assert catalog[("study_schema", "SubjectRecords_v1")]["LAB_VALUE"] == "VARCHAR"
+
+        assert table_data[("study_case", 1)]["lab_value"] == "42"
+        assert table_data[("study_case", 1)]["ratio"] == "1.5"
+        assert table_data[("study_case", 3)]["lab_value"] == "below_detection_limit"
+        assert table_data[("study_case", 4)]["lab_value"] == "99"
 
     def test_export_to_snowflake_run_scoped_batches_and_soft_vs_hard_delete(
         self, monkeypatch, tmp_path

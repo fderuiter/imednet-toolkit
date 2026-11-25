@@ -65,6 +65,7 @@ Usage
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -144,34 +145,44 @@ class Neo4jSinkConfig(SinkConfig):
 _MERGE_RECORD_CYPHER = """\
 UNWIND $rows AS row
 MERGE (s:Study   {study_key:   row.study_key})
-MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
 MERGE (r:Record   {record_id:  row.record_id,   study_key: row.study_key})
 SET r += row
-MERGE (s)-[:HAS_SUBJECT]->(su)
-FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
-    MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
-    MERGE (su)-[:HAS_VISIT]->(v)
-    MERGE (v)-[:HAS_RECORD]->(r)
+FOREACH (_su IN CASE WHEN row.subject_key IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
+    MERGE (s)-[:HAS_SUBJECT]->(su)
+    FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
+        MERGE (su)-[:HAS_VISIT]->(v)
+        MERGE (v)-[:HAS_RECORD]->(r)
+    )
+    FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
+        MERGE (su)-[:HAS_RECORD]->(r)
+    )
 )
-FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
-    MERGE (su)-[:HAS_RECORD]->(r)
+FOREACH (_no_su IN CASE WHEN row.subject_key IS NULL THEN [1] ELSE [] END |
+    MERGE (s)-[:HAS_RECORD]->(r)
 )
 """
 
 _CREATE_RECORD_CYPHER = """\
 UNWIND $rows AS row
 MERGE (s:Study   {study_key:   row.study_key})
-MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
 CREATE (r:Record)
 SET r = row
-MERGE (s)-[:HAS_SUBJECT]->(su)
-FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
-    MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
-    MERGE (su)-[:HAS_VISIT]->(v)
-    MERGE (v)-[:HAS_RECORD]->(r)
+FOREACH (_su IN CASE WHEN row.subject_key IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
+    MERGE (s)-[:HAS_SUBJECT]->(su)
+    FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
+        MERGE (su)-[:HAS_VISIT]->(v)
+        MERGE (v)-[:HAS_RECORD]->(r)
+    )
+    FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
+        MERGE (su)-[:HAS_RECORD]->(r)
+    )
 )
-FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
-    MERGE (su)-[:HAS_RECORD]->(r)
+FOREACH (_no_su IN CASE WHEN row.subject_key IS NULL THEN [1] ELSE [] END |
+    MERGE (s)-[:HAS_RECORD]->(r)
 )
 """
 
@@ -244,37 +255,36 @@ def _build_convention_cypher(
             raise ExportConfigurationError(
                 f"Neo4j Cypher property {prop_name} contains invalid characters: {prop_val!r}"
             )
+    lineage_block = (
+        f"FOREACH (_su IN CASE WHEN row.{subject_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
+        f"    MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        "    MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"    FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
+        f"        MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        "        MERGE (su)-[:HAS_VISIT]->(v)\n"
+        "        MERGE (v)-[:HAS_RECORD]->(r)\n"
+        "    )\n"
+        f"    FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
+        "        MERGE (su)-[:HAS_RECORD]->(r)\n"
+        "    )\n"
+        ")\n"
+        f"FOREACH (_no_su IN CASE WHEN row.{subject_prop} IS NULL THEN [1] ELSE [] END |\n"
+        "    MERGE (s)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+    )
     merge_cypher = (
         "UNWIND $rows AS row\n"
         f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
-        f"MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
         f"MERGE (r:Record   {{{record_prop}: row.{record_prop}, {study_prop}: row.{study_prop}}})\n"
         "SET r += row\n"
-        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
-        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
-        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
-        "    MERGE (su)-[:HAS_VISIT]->(v)\n"
-        "    MERGE (v)-[:HAS_RECORD]->(r)\n"
-        ")\n"
-        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
-        "    MERGE (su)-[:HAS_RECORD]->(r)\n"
-        ")\n"
+        f"{lineage_block}"
     )
     create_cypher = (
         "UNWIND $rows AS row\n"
         f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
-        f"MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
         "CREATE (r:Record)\n"
         "SET r = row\n"
-        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
-        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
-        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
-        "    MERGE (su)-[:HAS_VISIT]->(v)\n"
-        "    MERGE (v)-[:HAS_RECORD]->(r)\n"
-        ")\n"
-        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
-        "    MERGE (su)-[:HAS_RECORD]->(r)\n"
-        ")\n"
+        f"{lineage_block}"
     )
     return merge_cypher, create_cypher
 
@@ -495,6 +505,10 @@ class Neo4jExportSink(ExportSink):
             self._driver = neo4j_mod.GraphDatabase.driver(self._uri, auth=self._auth)
             self._driver.verify_connectivity()
         except Exception as exc:
+            if self._driver is not None:
+                with contextlib.suppress(Exception):
+                    self._driver.close()
+                self._driver = None
             raise ExportConfigurationError(f"Cannot connect to Neo4j at {redacted}: {exc}") from exc
 
     # ------------------------------------------------------------------
