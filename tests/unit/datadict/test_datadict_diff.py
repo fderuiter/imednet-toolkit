@@ -188,10 +188,10 @@ def test_diff_cross_loader_normalization_zero_false_modifications() -> None:
             "formId,formKey,formName,formType\n1001,demographics,Demographics,Patient\n"
         ),
         questions_file=io.StringIO(
-            "formKey,variableName,label,variableType,sequence,required\n"
-            "demographics,age,Subject Age,Number,1,Yes\n"
-            "demographics,sex,Biological Sex,RadioButton,2,Yes\n"
-            "demographics,cohort,Cohort Arm,Dropdown,3,No\n"
+            "formKey,variableName,label,variableType,sequence,required,precision\n"
+            "demographics,age,Subject Age,Number,1,Yes,0\n"
+            "demographics,sex,Biological Sex,RadioButton,2,Yes,\n"
+            "demographics,cohort,Cohort Arm,Dropdown,3,No,\n"
         ),
         choices_file=io.StringIO(
             "formKey,variableName,choiceValue,choiceText,position\n"

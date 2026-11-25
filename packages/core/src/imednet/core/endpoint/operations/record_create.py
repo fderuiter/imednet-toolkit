@@ -40,7 +40,7 @@ class RecordCreateOperation(Operation[T]):
     def __init__(
         self,
         path: str,
-        records_data: list[dict[str, Any]],
+        records_data: list[Any],
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         *,
@@ -62,8 +62,20 @@ class RecordCreateOperation(Operation[T]):
             ValidationError: If record data is invalid against the schema.
             ClientError: If email_notify contains invalid characters.
         """
+        from imednet.models.records import BaseRecordRequest
+
         self.path = path
-        self.records_data = records_data
+        if all(isinstance(rec, dict) for rec in records_data):
+            self.records_data: list[dict[str, Any]] = records_data
+        else:
+            self.records_data = [
+                (
+                    rec.model_dump(by_alias=True, exclude_none=True)
+                    if isinstance(rec, BaseRecordRequest)
+                    else dict(rec)
+                )
+                for rec in records_data
+            ]
         self.email_notify = email_notify
         self.schema = schema
         self.study_key = study_key if study_key is not None else _infer_study_key_from_path(path)

@@ -283,6 +283,20 @@ def _evaluate_business_logic(
         return None
 
 
+def _record_chronological_sort_key(record: Record) -> tuple[int, str, int]:
+    """Build a total-order chronological sort key from documented Record attributes."""
+    for attr in ("date_created", "date_modified", "last_updated"):
+        val = getattr(record, attr, None)
+        if val is None:
+            continue
+        if hasattr(val, "isoformat"):
+            return (0, val.isoformat(), getattr(record, "record_id", None) or 0)
+        text = str(val).strip()
+        if text:
+            return (0, text, getattr(record, "record_id", None) or 0)
+    return (1, "", getattr(record, "record_id", None) or 0)
+
+
 def extract_canonical_records(
     records: Iterable[Record],
     study_configuration: StudyConfiguration,
@@ -303,8 +317,8 @@ def extract_canonical_records(
         subject_records[record.subject_key].append(record)  # type: ignore
 
     for subject_key, s_records in subject_records.items():
-        # sort by date_created to simulate longitudinal timeline
-        s_records.sort(key=lambda r: r.date_created or r.date_updated)  # type: ignore
+        # Sort by documented longitudinal timestamps with deterministic record_id tiebreaker
+        s_records.sort(key=_record_chronological_sort_key)
 
         context = SubjectContext(subject_key)
 

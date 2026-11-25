@@ -119,3 +119,70 @@ def test_build_study_structure_populates_standalone_forms_and_handles_none_form_
     assert [f.form_key for f in structure.forms] == ["F_DM", "F_VS", "F_AE"]
     assert structure.forms[0].variables[0].variable_name == "AGE"
     assert structure.forms[2].variables[0].variable_name == "AETERM"
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_get_study_structure_succeeds_in_strict_mode_context(async_mode: bool) -> None:
+    """AC 8: get_study_structure and async_get_study_structure succeed inside strict_mode_context(True)."""
+    from imednet.core.context import strict_mode_context
+
+    sdk = MagicMock()
+    interval = Interval(
+        study_key="STUDY_STRICT",
+        interval_id=10,
+        interval_name="Screening",
+        interval_sequence=1,
+        interval_description="Screening Visit",
+        interval_group_name="Core",
+        disabled=False,
+        date_created="2025-01-01T00:00:00Z",
+        date_modified="2025-01-02T00:00:00Z",
+        forms=[FormSummary(form_id=101, form_key="F_DM", form_name="Demographics")],
+    )
+    form = Form(
+        study_key="STUDY_STRICT",
+        form_id=101,
+        form_key="F_DM",
+        form_name="Demographics",
+        form_type="Enrollment",
+        revision=2,
+        embedded_log=False,
+        enforce_ownership=False,
+        user_agreement=False,
+        subject_record_report=False,
+        unscheduled_visit=False,
+        other_forms=False,
+        epro_form=False,
+        allow_copy=True,
+        disabled=False,
+        date_created="2025-01-01T00:00:00Z",
+        date_modified="2025-01-02T00:00:00Z",
+    )
+    variable = Variable(
+        study_key="STUDY_STRICT",
+        variable_id=1001,
+        variable_name="V_AGE",
+        label="Age",
+        form_id=101,
+        form_key="F_DM",
+    )
+
+    with strict_mode_context(True):
+        if async_mode:
+
+            async def _ret(items):
+                return items
+
+            sdk.async_get_intervals = MagicMock(return_value=_ret([interval]))
+            sdk.async_get_forms = MagicMock(return_value=_ret([form]))
+            sdk.async_get_variables = MagicMock(return_value=_ret([variable]))
+            structure = asyncio.run(async_get_study_structure(sdk, "STUDY_STRICT"))
+        else:
+            sdk.get_intervals.return_value = [interval]
+            sdk.get_forms.return_value = [form]
+            sdk.get_variables.return_value = [variable]
+            structure = get_study_structure(sdk, "STUDY_STRICT")
+
+    assert structure.study_key == "STUDY_STRICT"
+    assert structure.intervals[0].forms[0].form_key == "F_DM"
+    assert structure.forms[0].variables[0].variable_name == "V_AGE"

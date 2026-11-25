@@ -1,6 +1,7 @@
 """Type definitions for imednet SDK utilities."""
 
 import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, Union, runtime_checkable
 
 #: Generic JSON object type (mapping of string keys to arbitrary values).
@@ -22,10 +23,18 @@ class _TabularDataFrameLike(Protocol):
 if TYPE_CHECKING:
     import pandas as pd
 
+    from imednet.models.records import BaseRecordRequest
+
     DataFrame: TypeAlias = pd.DataFrame
-    RecordsInput: TypeAlias = list[JsonDict] | pd.DataFrame | str | os.PathLike[str]
+    RecordsInput: TypeAlias = (
+        list[JsonDict]
+        | Sequence[BaseRecordRequest | JsonDict]
+        | pd.DataFrame
+        | str
+        | os.PathLike[str]
+    )
 else:
-    RecordsInput = list[JsonDict] | _TabularDataFrameLike | str | os.PathLike[str]
+    RecordsInput = list[JsonDict] | Sequence[Any] | _TabularDataFrameLike | str | os.PathLike[str]
     globals().pop("DataFrame", None)
 
     def __getattr__(name: str) -> Any:

@@ -161,7 +161,8 @@ def test_normalize_variable_type() -> None:
 
     assert normalize_variable_type(None) is None
     assert normalize_variable_type("   ") is None
-    assert normalize_variable_type("Number") == "Integer"
+    assert normalize_variable_type("Number") == "Float"
+    assert normalize_variable_type("Number", precision="") == "Float"
     assert normalize_variable_type("Number", precision="0") == "Integer"
     assert normalize_variable_type("Number", precision="2") == "Float"
     assert normalize_variable_type("Numeric") == "Float"

@@ -38,7 +38,14 @@ class FormStructure(ImednetBaseModel):
     @classmethod
     def from_form(cls, form: Form, variables: list[Variable]) -> FormStructure:
         """Creates FormStructure from a Form model and its associated variables."""
-        form_data = form.model_dump(by_alias=True)
+        declared_keys = {
+            field_info.alias or name
+            for name, field_info in cls.model_fields.items()
+            if name != "variables"
+        } | {name for name in cls.model_fields if name != "variables"}
+        form_data = {
+            key: val for key, val in form.model_dump(by_alias=True).items() if key in declared_keys
+        }
         return cls(**form_data, variables=variables)
 
 
@@ -64,9 +71,16 @@ class IntervalStructure(ImednetBaseModel):
     @classmethod
     def from_interval(cls, interval: Interval, forms: list[FormStructure]) -> IntervalStructure:
         """Creates IntervalStructure from an Interval model and its associated FormStructures."""
-        interval_data = interval.model_dump(by_alias=True)
-        # Remove the 'forms' key to avoid multiple values for keyword argument 'forms'
-        interval_data.pop("forms", None)
+        declared_keys = {
+            field_info.alias or name
+            for name, field_info in cls.model_fields.items()
+            if name != "forms"
+        } | {name for name in cls.model_fields if name != "forms"}
+        interval_data = {
+            key: val
+            for key, val in interval.model_dump(by_alias=True).items()
+            if key in declared_keys
+        }
         return cls(**interval_data, forms=forms)
 
 

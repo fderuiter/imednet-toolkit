@@ -619,7 +619,6 @@ def test_workflow_run_tags_subjects_forwards_schema_and_reuses_uat_subjects_on_r
     from imednet.datadict import Form as DDForm
     from imednet.datadict import Variable as DDVariable
     from imednet.simulation import SimulationState, create_simulation_transport
-    from imednet_workflows.uat.submission import subject_has_keyword
 
     state = SimulationState()
     state.forms = [
@@ -775,8 +774,11 @@ def test_workflow_run_tags_subjects_forwards_schema_and_reuses_uat_subjects_on_r
 
     subjects_after_first = list(sdk.subjects.list("STUDY"))
     assert len(subjects_after_first) == pre_run_count + 2
-    uat_subjects = [s for s in subjects_after_first if subject_has_keyword(s, "UAT")]
+    uat_subjects = [
+        s for s in subjects_after_first if s.subject_oid and s.subject_oid.startswith("UAT-")
+    ]
     assert len(uat_subjects) == 2
+    assert all("keywords" not in r for r in state.records)
 
     res2 = wf.run("STUDY", subject_count=2)
     assert res2.overall_success is True
@@ -1176,5 +1178,60 @@ def test_workflow_spec_preserves_subject_count_unless_overridden(mock_sdk, snaps
     overridden = wf.run("TEST_STUDY", spec=saved_spec, subject_count=5, dry_run=True)
     assert overridden.state == UATWorkflowState.COMPLETED
     assert [s.subject_count for s in overridden.spec.subject_specs] == [5]
-    assert all(f.subject_count == 5 for f in overridden.spec.form_specs)
+    assert (
+        all(f.subject_count == 5 for f in overridden.form_specs)
+        if hasattr(overridden, "form_specs")
+        else all(f.subject_count == 5 for f in overridden.spec.form_specs)
+    )
     assert all(len(rs.payloads) == 5 for rs in overridden.record_sets)
+
+
+def test_uat_spec_builder_preserves_api_variable_required_without_datadict() -> None:
+    """UATSpecificationBuilder preserves API Variable.required when data_dictionary is None."""
+    from imednet.models.forms import Form
+    from imednet.models.sites import Site
+    from imednet.models.variables import Variable
+
+    api_snapshot = StudySnapshot(
+        study_key="REQ_STUDY",
+        study_name="Required Flag Study",
+        forms=[
+            Form(
+                form_id=10,
+                form_key="F_REG",
+                form_name="Registration",
+                form_type="Subject",
+                subject_record_report=True,
+                disabled=False,
+            )
+        ],
+        variables=[
+            Variable(
+                variable_id=1,
+                variable_name="SUBJ_INITIALS",
+                variable_type="Text",
+                form_id=10,
+                form_key="F_REG",
+                required=True,
+            ),
+            Variable(
+                variable_id=2,
+                variable_name="OPT_COMMENT",
+                variable_type="Text",
+                form_id=10,
+                form_key="F_REG",
+                required=False,
+            ),
+        ],
+        intervals=[],
+        sites=[Site(site_id=1, site_name="Site A", site_enrollment_status="Enrollment Open")],
+        subjects=[],
+    )
+
+    spec = UATSpecificationBuilder(data_dictionary=None).build(api_snapshot)
+    assert len(spec.form_specs) == 1
+    form_spec = spec.form_specs[0]
+    by_name = {v.variable_name: v for v in form_spec.variables}
+    assert by_name["SUBJ_INITIALS"].required is True
+    assert by_name["OPT_COMMENT"].required is False
+    assert form_spec.required_variable_names == ["SUBJ_INITIALS"]

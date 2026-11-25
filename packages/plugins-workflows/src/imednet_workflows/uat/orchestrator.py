@@ -418,6 +418,14 @@ class UATSpecificationBuilder:
             resolved_type = snap_type or dd_type or "Text"
 
         constraints = extract_variable_constraints(source_dd_var)
+        api_required = False
+        raw_dd_req = getattr(source_dd_var, "required", None) if source_dd_var is not None else None
+        if raw_dd_req is None or (isinstance(raw_dd_req, str) and not raw_dd_req.strip()):
+            raw_req = getattr(variable, "required", None)
+            if isinstance(raw_req, bool):
+                api_required = raw_req
+            elif isinstance(raw_req, str):
+                api_required = raw_req.strip().lower() in {"yes", "true", "1", "y"}
         return UATVariableSpec(
             variable_name=var_name,
             variable_key=var_key,
@@ -428,7 +436,7 @@ class UATSpecificationBuilder:
             max_value=constraints.max_value,
             max_length=constraints.max_length,
             coded_values=list(constraints.choices),
-            required=constraints.required_policy == "yes",
+            required=(constraints.required_policy == "yes") or api_required,
         )
 
     def validate_enabled_form_keys(
@@ -562,8 +570,10 @@ def _collect_failed_batch_ids(poll_summary: Any) -> list[str]:
 
 
 _TYPE_WORD_SEP_RE = re.compile(r"[\s_-]+")
-_INT_SCHEMA_TYPES = frozenset({"int", "integer", "number"})
-_FLOAT_SCHEMA_TYPES = frozenset({"float", "decimal", "double", "numeric", "slider", "calculation"})
+_INT_SCHEMA_TYPES = frozenset({"int", "integer"})
+_FLOAT_SCHEMA_TYPES = frozenset(
+    {"number", "float", "decimal", "double", "numeric", "slider", "calculation"}
+)
 _BOOL_SCHEMA_TYPES = frozenset({"bool", "boolean"})
 
 
@@ -608,7 +618,9 @@ def _coerce_payloads_for_validation(
                 else:
                     new_data[var_name] = val
             elif norm_type in _FLOAT_SCHEMA_TYPES:
-                if getattr(var_meta, "choices", None) and stripped.lstrip("+-").isdigit():
+                if stripped.lstrip("+-").isdigit() and (
+                    norm_type == "number" or getattr(var_meta, "choices", None)
+                ):
                     new_data[var_name] = int(stripped)
                 else:
                     try:
@@ -1309,6 +1321,14 @@ def _merge_snapshot_into_data_dictionary(
     if not needs_backfill:
         return data_dictionary
 
+    def _snap_required_str(var_obj: Any) -> str | None:
+        raw_req = getattr(var_obj, "required", None)
+        if isinstance(raw_req, bool):
+            return "Yes" if raw_req else "No"
+        if isinstance(raw_req, str) and raw_req.strip():
+            return raw_req.strip()
+        return None
+
     snap_vars_lookup = {fk: active_vars for fk, _, active_vars in active_snap_forms}
     merged_forms: list[Any] = []
     for dd_form in data_dictionary.forms:
@@ -1318,14 +1338,16 @@ def _merge_snapshot_into_data_dictionary(
             vname = getattr(v, "variable_name", None) or getattr(v, "variableName", None)
             if vname and vname not in known_vars:
                 known_vars.add(vname)
-                extra_vars.append(
-                    {
-                        "variableName": vname,
-                        "variableType": getattr(v, "variable_type", None)
-                        or getattr(v, "variableType", None),
-                        "label": getattr(v, "label", None),
-                    }
-                )
+                var_dict: dict[str, Any] = {
+                    "variableName": vname,
+                    "variableType": getattr(v, "variable_type", None)
+                    or getattr(v, "variableType", None),
+                    "label": getattr(v, "label", None),
+                }
+                req_val = _snap_required_str(v)
+                if req_val is not None:
+                    var_dict["required"] = req_val
+                extra_vars.append(var_dict)
         if extra_vars:
             merged_forms.append(
                 {
@@ -1345,14 +1367,16 @@ def _merge_snapshot_into_data_dictionary(
             vname = getattr(v, "variable_name", None) or getattr(v, "variableName", None)
             if vname and vname not in seen_names:
                 seen_names.add(vname)
-                snap_var_dicts.append(
-                    {
-                        "variableName": vname,
-                        "variableType": getattr(v, "variable_type", None)
-                        or getattr(v, "variableType", None),
-                        "label": getattr(v, "label", None),
-                    }
-                )
+                snap_var_dict: dict[str, Any] = {
+                    "variableName": vname,
+                    "variableType": getattr(v, "variable_type", None)
+                    or getattr(v, "variableType", None),
+                    "label": getattr(v, "label", None),
+                }
+                req_val = _snap_required_str(v)
+                if req_val is not None:
+                    snap_var_dict["required"] = req_val
+                snap_var_dicts.append(snap_var_dict)
         merged_forms.append(
             {
                 "formKey": fk,

@@ -113,8 +113,8 @@ _TEXT_LIKE_TYPES: frozenset[str] = frozenset(
     }
 )
 
-_INT_LIKE_TYPES: frozenset[str] = frozenset({"int", "integer", "number"})
-_FLOAT_LIKE_TYPES: frozenset[str] = frozenset({"float", "decimal", "double", "numeric"})
+_INT_LIKE_TYPES: frozenset[str] = frozenset({"int", "integer"})
+_FLOAT_LIKE_TYPES: frozenset[str] = frozenset({"float", "decimal", "double", "numeric", "number"})
 _NUMERIC_LIKE_TYPES: frozenset[str] = _INT_LIKE_TYPES | _FLOAT_LIKE_TYPES
 _BOOL_LIKE_TYPES: frozenset[str] = frozenset({"bool", "boolean"})
 _COMPUTED_FLEX_TYPES: frozenset[str] = frozenset({"calculation", "calc", "calculated", "slider"})
@@ -697,13 +697,35 @@ def normalize_records_input(
             default_form_key=default_form_key,
             default_form_id=default_form_id,
         )
+    from imednet.models.records import BaseRecordRequest
+
     if isinstance(records_data, list):
-        ensure_no_masked_sentinel(records_data)
-        return records_data
+        if all(isinstance(item, dict) for item in records_data):
+            ensure_no_masked_sentinel(records_data)
+            return records_data
+        materialized_list: list[JsonDict] = []
+        for item in records_data:
+            if isinstance(item, BaseRecordRequest):
+                materialized_list.append(item.model_dump(by_alias=True, exclude_none=True))
+            elif isinstance(item, Mapping):
+                materialized_list.append(item if isinstance(item, dict) else dict(item))
+            else:
+                raise TypeError(
+                    "All items in records_data sequence must be mappings or BaseRecordRequest."
+                )
+        ensure_no_masked_sentinel(materialized_list)
+        return materialized_list
     if isinstance(records_data, Sequence) and not isinstance(records_data, (str, bytes)):
-        materialized = [dict(item) for item in records_data if isinstance(item, Mapping)]
-        if len(materialized) != len(records_data):
-            raise TypeError("All items in records_data sequence must be mappings.")
+        materialized: list[JsonDict] = []
+        for item in records_data:
+            if isinstance(item, BaseRecordRequest):
+                materialized.append(item.model_dump(by_alias=True, exclude_none=True))
+            elif isinstance(item, Mapping):
+                materialized.append(dict(item))
+            else:
+                raise TypeError(
+                    "All items in records_data sequence must be mappings or BaseRecordRequest."
+                )
         ensure_no_masked_sentinel(materialized)
         return materialized
     raise TypeError(

@@ -997,8 +997,17 @@ class UATExecutionEngine:
             )
             if deleted is True:
                 continue
-            if require_keyword and not subject_has_keyword(subj, "UAT"):
-                continue
+            if require_keyword:
+                subj_oid = (
+                    (subj.get("subject_oid") or subj.get("subjectOid"))
+                    if isinstance(subj, Mapping)
+                    else (getattr(subj, "subject_oid", None) or getattr(subj, "subjectOid", None))
+                )
+                has_uat_oid = isinstance(subj_oid, str) and subj_oid.strip().lower().startswith(
+                    "uat-"
+                )
+                if not (subject_has_keyword(subj, "UAT") or has_uat_oid):
+                    continue
             key = (
                 (subj.get("subject_key") or subj.get("subjectKey"))
                 if isinstance(subj, Mapping)
@@ -1080,6 +1089,13 @@ class UATExecutionEngine:
                     break
 
         if not reg_form_key:
+            any_existing = self._find_uat_subject_at_site(
+                existing_subjects,
+                site_name,
+                require_keyword=False,
+            )
+            if any_existing is not None:
+                return any_existing
             return None
 
         before_keys: set[str] = set()
@@ -1092,10 +1108,12 @@ class UATExecutionEngine:
             if isinstance(sk, str) and sk.strip():
                 before_keys.add(sk.strip())
 
+        import uuid
+
         reg_payload: dict[str, Any] = {
             "formKey": reg_form_key,
             "siteName": site_name,
-            "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+            "subjectOid": f"UAT-{uuid.uuid4().hex[:12]}",
             "data": self._build_prerequisite_registration_data(reg_form_key, snapshot),
         }
         job = self._sdk.create_record(study_key, [reg_payload])
@@ -1453,7 +1471,9 @@ class UATExecutionEngine:
                 if enrolled_subject_key is not None:
                     payload["subjectKey"] = enrolled_subject_key
                 elif snap_form is not None and is_enrollment_form(snap_form):
-                    payload["keywords"] = [{"keywordName": "UAT", "keywordKey": "UAT"}]
+                    import uuid
+
+                    payload["subjectOid"] = f"UAT-{uuid.uuid4().hex[:12]}"
                 else:
                     payload["subjectKey"] = f"UAT-SUBJ-{idx}"
 

@@ -830,7 +830,8 @@ def test_uat_engine_resolves_site_interval_and_registers_or_reuses_uat_subject()
     assert len(submitted_payloads) == 4  # 1 prerequisite registration + 3 rules
     assert submitted_payloads[0]["formKey"] == "F_DM"
     assert submitted_payloads[0]["siteName"] == "OpenSite"
-    assert submitted_payloads[0]["keywords"] == [{"keywordName": "UAT", "keywordKey": "UAT"}]
+    assert submitted_payloads[0]["subjectOid"].startswith("UAT-")
+    assert all("keywords" not in p for p in submitted_payloads)
 
     # Scheduled form payloads include enrolled subjectKey, siteName, and active intervalName
     assert submitted_payloads[1]["subjectKey"] == "SUBJ-ENROLLED-1"

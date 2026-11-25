@@ -22,6 +22,7 @@ def mock_snapshot():
     """Fixture for StudySnapshot mock."""
     snapshot = MagicMock(spec=StudySnapshot)
     snapshot.active_sites.return_value = [MagicMock(site_name="Test Site")]
+    snapshot.subjects = [MagicMock(subject_key="SUBJ-001", deleted=False)]
     return snapshot
 
 
@@ -67,7 +68,7 @@ def test_generate_registration(basic_spec, mock_snapshot):
     assert len(res.payloads) == 1
     assert res.payloads[0]["formKey"] == "F_REG"
     assert res.payloads[0]["siteName"] == "Test Site"
-    assert res.payloads[0]["keywords"] == [{"keywordName": "UAT", "keywordKey": "UAT"}]
+    assert "keywords" not in res.payloads[0]
     assert "SUBJID" in res.payloads[0]["data"]
     assert len(res.payloads[0]["data"]["SUBJID"]) == 5
 
@@ -385,7 +386,8 @@ def test_unrecognized_type(mock_snapshot, caplog):
 
 
 def test_no_subjects_pool_default(mock_snapshot):
-    """Test default subject pool when none provided."""
+    """Generator emits zero non-registration payloads when no subjects exist or are registered."""
+    mock_snapshot.subjects = []
     spec = UATSpecification(
         study_key="S1",
         study_name="S1",
@@ -403,7 +405,8 @@ def test_no_subjects_pool_default(mock_snapshot):
     )
     generator = SyntheticRecordGenerator()
     results = generator.generate(spec, mock_snapshot)
-    assert results[0].subject_keys == ["UAT-TEST-001"]
+    assert results[0].subject_keys == []
+    assert results[0].payloads == []
 
 
 def test_canonical_variable_types_and_datadictionary_enrichment(mock_snapshot):
@@ -691,7 +694,7 @@ def test_dropdown_memo_keywords_and_schema_cache_and_datadict_validation(mock_sn
     assert len(record_sets[0].payloads) == 2
 
     for idx, payload in enumerate(record_sets[0].payloads):
-        assert payload["keywords"] == [{"keywordName": "UAT-PRELIVE", "keywordKey": "UAT-PRELIVE"}]
+        assert "keywords" not in payload
         data = payload["data"]
         assert data["AGE"] == (18 if idx == 0 else 65)
         assert isinstance(data["AGE"], int)
@@ -737,3 +740,49 @@ def test_seeded_datetime_determinism_and_locale_compat(mock_snapshot):
     res2 = gen2.generate(spec, mock_snapshot)
     assert res1[0].payloads[0]["data"]["DT"] == res2[0].payloads[0]["data"]["DT"]
     assert res1[0].payloads[0]["data"]["DT"].endswith("T12:00:00+00:00")
+
+
+def test_scheduled_form_omits_default_interval_and_empty_subjects_emits_zero_payloads():
+    """Scheduled forms without interval_name omit Default Interval; empty subjects emit zero UAT-TEST-001."""
+    snapshot_with_subject = MagicMock(spec=StudySnapshot)
+    snapshot_with_subject.active_sites.return_value = [MagicMock(site_name="Test Site")]
+    snapshot_with_subject.subjects = [MagicMock(subject_key="SUBJ-REAL-1", deleted=False)]
+
+    spec = UATSpecification(
+        study_key="S1",
+        study_name="S1",
+        subject_specs=[],
+        form_specs=[
+            UATFormSpec(
+                form_key="F_SCHED",
+                form_name="Scheduled Visit",
+                form_type="Subject",
+                test_type=RecordTestType.UPDATE_SCHEDULED_RECORD,
+                interval_name=None,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="PULSE",
+                        variable_key="PULSE",
+                        variable_type="Integer",
+                        form_key="F_SCHED",
+                    )
+                ],
+            )
+        ],
+    )
+
+    gen = SyntheticRecordGenerator(seed=11)
+    with_subj_sets = gen.generate(spec, snapshot_with_subject)
+    assert len(with_subj_sets[0].payloads) == 1
+    scheduled_payload = with_subj_sets[0].payloads[0]
+    assert scheduled_payload["subjectKey"] == "SUBJ-REAL-1"
+    assert "intervalName" not in scheduled_payload
+    assert "keywords" not in scheduled_payload
+
+    empty_snapshot = MagicMock(spec=StudySnapshot)
+    empty_snapshot.active_sites.return_value = [MagicMock(site_name="Test Site")]
+    empty_snapshot.subjects = []
+    empty_sets = gen.generate(spec, empty_snapshot)
+    assert empty_sets[0].subject_keys == []
+    assert empty_sets[0].payloads == []

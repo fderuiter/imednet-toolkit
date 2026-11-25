@@ -179,17 +179,44 @@ class BaseRecordRequest(ImednetBaseModel):
     """Base class for record creation/update requests."""
 
     form_key: str = Field("", alias="formKey")
+    form_id: int | None = Field(default=None, alias="formId")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    interval_id: int | None = Field(default=None, alias="intervalId")
+    record_id: int | None = Field(default=None, alias="recordId")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
 
     def __init__(
-        self, *, form_key: str = "", formKey: str = "", data: RecordData | dict[str, Any] = ...
+        self,
+        *,
+        form_key: str = "",
+        formKey: str = "",
+        form_id: int | None = None,
+        formId: int | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        data: RecordData | dict[str, Any] = ...,
     ) -> None: ...
+    @field_validator("subject_oid", mode="before")
+    @classmethod
+    def _normalize_optional_base_oid(cls, value: Any) -> str | None: ...
+    @model_serializer(mode="wrap")
+    def _serialize_omitting_blank_and_unset_identifiers(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]: ...
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]: ...
 
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
-    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
+    Requires ``formKey`` (or ``formId``) and a site identifier (``siteName`` or ``siteId``).
+    Optional ``subjectKey``, ``subjectId``, and ``subjectOid`` attributes are omitted when
     ``None`` so server-assigned subject keys continue working by default; when
     explicitly supplied, they are preserved for enrollment and deduplication.
     """
@@ -205,15 +232,22 @@ class RegisterSubjectRequest(BaseRecordRequest):
     subject_key: str | None = Field(
         default=None, alias="subjectKey", description="Optional client-assigned subject key"
     )
-    subject_oid: str | None = Field(
-        default=None, alias="subjectOid", description="Optional subject OID"
-    )
 
     def __init__(
         self,
         *,
         form_key: str = "",
         formKey: str = "",
+        form_id: int | None = None,
+        formId: int | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
         data: RecordData | dict[str, Any] = ...,
         site_name: str = "",
         siteName: str = "",
@@ -221,17 +255,10 @@ class RegisterSubjectRequest(BaseRecordRequest):
         siteId: int | None = None,
         subject_key: str | None = None,
         subjectKey: str | None = None,
-        subject_oid: str | None = None,
-        subjectOid: str | None = None,
     ) -> None: ...
-    @field_validator("subject_key", "subject_oid", mode="before")
+    @field_validator("subject_key", mode="before")
     @classmethod
     def _normalize_optional_subject_identifier(cls, value: Any) -> str | None: ...
-    @model_serializer(mode="wrap")
-    def _serialize_omitting_unset_enrollment_fields(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, Any]: ...
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]: ...
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):
     """Payload for updating an existing scheduled record."""
@@ -244,6 +271,16 @@ class UpdateScheduledRecordRequest(BaseRecordRequest):
         *,
         form_key: str = "",
         formKey: str = "",
+        form_id: int | None = None,
+        formId: int | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
         data: RecordData | dict[str, Any] = ...,
         subject_key: str = "",
         subjectKey: str = "",
@@ -261,6 +298,16 @@ class CreateNewRecordRequest(BaseRecordRequest):
         *,
         form_key: str = "",
         formKey: str = "",
+        form_id: int | None = None,
+        formId: int | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
         data: RecordData | dict[str, Any] = ...,
         subject_key: str = "",
         subjectKey: str = "",

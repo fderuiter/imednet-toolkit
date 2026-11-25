@@ -321,3 +321,56 @@ async def test_register_subjects_workflow_offline_dry_run_skips_sites_and_subjec
     async_sdk.async_get_sites.assert_not_called()
     async_sdk.async_get_subjects.assert_not_called()
     async_sdk.async_create_record.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_register_subjects_preserves_form_id_without_schema_and_rejects_missing_form_target() -> (
+    None
+):
+    """AC 5: RegisterSubjectsWorkflow preserves formId when schema=None and rejects missing formKey+formId."""
+    from unittest.mock import AsyncMock
+
+    from imednet.models.records import RegisterSubjectRequest
+
+    active_site = Site(studyKey="STUDY", siteId=10, siteName="SITE", siteEnrollmentStatus="Active")
+
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.get_sites.return_value = [active_site]
+    sync_sdk.create_record.return_value = Job(jobId="1", batchId="B-1", state="COMPLETED")
+    sync_wf = RegisterSubjectsWorkflow(sync_sdk)
+
+    sync_wf.register_subjects(
+        "STUDY",
+        [
+            {"formId": 301, "siteId": 10, "subjectOid": "OID-1", "data": {"V_AGE": 31}},
+            RegisterSubjectRequest(formId=301, siteName="SITE", data={"V_AGE": 32}),
+        ],
+    )
+    sent_sync = sync_sdk.create_record.call_args.kwargs["records_data"]
+    assert sent_sync == [
+        {"formId": 301, "siteId": 10, "subjectOid": "OID-1", "data": {"V_AGE": 31}},
+        {"formId": 301, "siteName": "SITE", "data": {"V_AGE": 32}},
+    ]
+    assert all("formKey" not in item for item in sent_sync)
+
+    with pytest.raises(ValueError, match="formKey.*formId"):
+        sync_wf.register_subjects("STUDY", [{"siteName": "SITE", "data": {"V_AGE": 30}}])
+    with pytest.raises(ValueError, match="formKey.*formId"):
+        sync_wf.register_subjects("STUDY", [RegisterSubjectRequest(siteName="SITE")])
+
+    async_sdk = MagicMock()
+    async_sdk.async_get_sites = AsyncMock(return_value=[active_site])
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="2", batchId="B-2", state="COMPLETED")
+    )
+    async_wf = RegisterSubjectsWorkflow(async_sdk)
+    await async_wf.async_register_subjects(
+        "STUDY",
+        [{"formId": 301, "siteName": "SITE", "data": {"V_AGE": 40}}],
+    )
+    sent_async = async_sdk.async_create_record.call_args.kwargs["records_data"]
+    assert sent_async == [{"formId": 301, "siteName": "SITE", "data": {"V_AGE": 40}}]
+
+    with pytest.raises(ValueError, match="formKey.*formId"):
+        await async_wf.async_register_subjects("STUDY", [{"siteId": 10, "data": {}}])

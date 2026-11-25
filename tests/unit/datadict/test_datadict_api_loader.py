@@ -42,7 +42,7 @@ def test_load_from_api_mocked_sdk() -> None:
     assert dm_form.formType == "Subject"
     assert len(dm_form.variables) == 1
     assert dm_form.variables[0].variableName == "AGE"
-    assert dm_form.variables[0].variableType == "Integer"
+    assert dm_form.variables[0].variableType == "Float"
     assert dm_form.variables[0].choices == []
     assert dm_form.businessLogic == []
     assert dd.unassignedBusinessLogic == []
@@ -196,3 +196,100 @@ def test_load_from_api_skips_deleted_and_disabled_variables_and_keeps_forms() ->
 
     validate_record_data(dd, "DM", {"SUBJID": "SUBJ-001"})
     validate_record_data(dd, "LEGACY", {})
+
+
+def test_load_from_api_excludes_disabled_forms_and_accepts_decimal_number_end_to_end() -> None:
+    """AC 7: load_from_api, SchemaValidator, calculate_readiness_score, and apply_quality_gate exclude disabled forms and accept 98.6."""
+    import io
+
+    import pytest
+
+    from imednet.datadict.loaders.csv_export import load_from_csv_files
+    from imednet.errors import ValidationError
+    from imednet.integrations.sink_base import SinkConfig, apply_quality_gate
+    from imednet.models.forms import Form as SdkForm
+    from imednet.models.records import Record
+    from imednet.models.variables import Variable as SdkVariable
+    from imednet.validation.cache import (
+        SchemaValidator,
+        calculate_readiness_score,
+        validate_record_data,
+        validate_record_entry,
+    )
+
+    active_form = SdkForm(form_id=10, form_key="VS", form_name="Vitals", disabled=False)
+    disabled_form = SdkForm(form_id=20, form_key="OLD_VS", form_name="Old Vitals", disabled=True)
+    temp_var = SdkVariable(
+        form_id=10,
+        form_key="VS",
+        variable_name="TEMP",
+        variable_type="NUMBER",
+        required=True,
+    )
+    disabled_form_var = SdkVariable(
+        form_id=20,
+        form_key="OLD_VS",
+        variable_name="OLD_TEMP",
+        variable_type="NUMBER",
+        required=True,
+    )
+
+    mock_sdk = Mock()
+    mock_sdk.forms.list.return_value = [active_form, disabled_form]
+    mock_sdk.variables.list.return_value = [temp_var, disabled_form_var]
+    mock_sdk.get_variables.return_value = [temp_var]
+
+    dd = load_from_api(mock_sdk, study_key="STUDY_AC7")
+    assert [f.formKey for f in dd.forms] == ["VS"]
+    assert dd.form_for_key("OLD_VS") is None
+    assert dd.form_key_from_id(20) is None
+    assert dd.forms[0].variables[0].variableType == "Float"
+    validate_record_data(dd, "VS", {"TEMP": 98.6})
+    with pytest.raises(ValidationError, match="Unknown form OLD_VS"):
+        validate_record_entry(dd, {"formKey": "OLD_VS", "data": {"OLD_TEMP": 98.6}})
+    with pytest.raises(ValidationError, match="Unknown form ID 20"):
+        validate_record_entry(dd, {"formId": 20, "data": {"OLD_TEMP": 98.6}})
+
+    validator = SchemaValidator(mock_sdk)
+    validator.validate_record("STUDY_AC7", {"formKey": "VS", "data": {"TEMP": 98.6}})
+
+    dd_score, dd_reasons = calculate_readiness_score(dd, "VS", {"TEMP": 98.6})
+    assert dd_score == pytest.approx(100.0)
+    assert dd_reasons == []
+
+    cache_score, cache_reasons = calculate_readiness_score(validator.schema, "VS", {"TEMP": 98.6})
+    assert cache_score == pytest.approx(100.0)
+    assert cache_reasons == []
+
+    recs = [
+        Record(record_id=1, form_id=10, form_key="VS", record_data={"TEMP": 98.6}),
+        Record(record_id=2, form_id=20, form_key=None, record_data={"OLD_TEMP": 98.6}),
+        Record(record_id=3, form_id=20, form_key="OLD_VS", record_data={"OLD_TEMP": 98.6}),
+    ]
+    kept = list(
+        apply_quality_gate(
+            mock_sdk,
+            "STUDY_AC7",
+            recs,
+            SinkConfig(
+                study_key="STUDY_AC7",
+                quality_gate_enabled=True,
+                min_schema_readiness_score=100.0,
+            ),
+            variables=[temp_var, disabled_form_var],
+            forms=[active_form, disabled_form],
+        )
+    )
+    assert [r.record_id for r in kept] == [1]
+
+    dd_csv_zero = load_from_csv_files(
+        forms_file=io.StringIO("formId,formKey,formName,formType\n10,VS,Vitals,Patient\n"),
+        questions_file=io.StringIO(
+            "formKey,variableName,label,variableType,sequence,required,precision\n"
+            "VS,COUNT,Count,Number,1,Yes,0\n"
+        ),
+        choices_file=io.StringIO("formKey,variableName,choiceValue,choiceText,position\n"),
+        business_logic_file=io.StringIO("id,name,type,status,formKey,sequence,logic\n"),
+        study_key="STUDY_AC7",
+    )
+    assert dd_csv_zero.forms[0].variables[0].variableType == "Integer"

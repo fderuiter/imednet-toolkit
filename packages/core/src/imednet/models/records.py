@@ -210,14 +210,62 @@ class BaseRecordRequest(ImednetBaseModel):
     """Base class for record creation/update requests."""
 
     form_key: str = Field("", alias="formKey")
+    form_id: int | None = Field(default=None, alias="formId")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    interval_id: int | None = Field(default=None, alias="intervalId")
+    record_id: int | None = Field(default=None, alias="recordId")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
+
+    @field_validator("subject_oid", mode="before")
+    @classmethod
+    def _normalize_optional_base_oid(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @model_serializer(mode="wrap")
+    def _serialize_omitting_blank_and_unset_identifiers(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        serialized: dict[str, Any] = handler(self)
+        if not self.form_key or not self.form_key.strip():
+            serialized.pop("form_key", None)
+            serialized.pop("formKey", None)
+        for attr_name, alias_name in (
+            ("form_id", "formId"),
+            ("subject_id", "subjectId"),
+            ("subject_oid", "subjectOid"),
+            ("interval_id", "intervalId"),
+            ("record_id", "recordId"),
+            ("site_id", "siteId"),
+        ):
+            if getattr(self, attr_name, None) is None:
+                serialized.pop(attr_name, None)
+                serialized.pop(alias_name, None)
+        for str_attr, str_alias in (
+            ("site_name", "siteName"),
+            ("subject_key", "subjectKey"),
+            ("interval_name", "intervalName"),
+        ):
+            raw_val = getattr(self, str_attr, None)
+            if raw_val is None or not str(raw_val).strip():
+                serialized.pop(str_attr, None)
+                serialized.pop(str_alias, None)
+        return serialized
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        """Serialize record request payload, omitting ``None`` and blank identifier defaults."""
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump(**kwargs)
 
 
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
-    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
+    Requires ``formKey`` (or ``formId``) and a site identifier (``siteName`` or ``siteId``).
+    Optional ``subjectKey``, ``subjectId``, and ``subjectOid`` attributes are omitted when
     ``None`` so server-assigned subject keys continue working by default; when
     explicitly supplied, they are preserved for enrollment and deduplication.
     """
@@ -235,53 +283,14 @@ class RegisterSubjectRequest(BaseRecordRequest):
         alias="subjectKey",
         description="Optional client-assigned subject key",
     )
-    subject_oid: str | None = Field(
-        default=None,
-        alias="subjectOid",
-        description="Optional subject OID",
-    )
 
-    @field_validator("subject_key", "subject_oid", mode="before")
+    @field_validator("subject_key", mode="before")
     @classmethod
     def _normalize_optional_subject_identifier(cls, value: Any) -> str | None:
         if value is None:
             return None
         text = str(value).strip()
         return text or None
-
-    @model_serializer(mode="wrap")
-    def _serialize_omitting_unset_enrollment_fields(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, Any]:
-        serialized: dict[str, Any] = handler(self)
-        if self.site_id is None:
-            serialized.pop("site_id", None)
-            serialized.pop("siteId", None)
-        elif not self.site_name:
-            serialized.pop("site_name", None)
-            serialized.pop("siteName", None)
-        if self.subject_key is None:
-            serialized.pop("subject_key", None)
-            serialized.pop("subjectKey", None)
-        if self.subject_oid is None:
-            serialized.pop("subject_oid", None)
-            serialized.pop("subjectOid", None)
-        return serialized
-
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
-        """Serialize enrollment payload, omitting ``None`` optional attributes by default."""
-        kwargs.setdefault("exclude_none", True)
-        if not self.site_name and self.site_id is not None:
-            raw_exclude = kwargs.get("exclude")
-            if raw_exclude is None:
-                kwargs["exclude"] = {"site_name"}
-            elif isinstance(raw_exclude, set):
-                kwargs["exclude"] = raw_exclude | {"site_name"}
-            elif isinstance(raw_exclude, dict):
-                merged = dict(raw_exclude)
-                merged["site_name"] = True
-                kwargs["exclude"] = merged
-        return super().model_dump(**kwargs)
 
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):

@@ -51,7 +51,8 @@ def test_create_or_update_records_no_wait(schema: SchemaCache, async_mode: bool)
     wf = RecordUpdateWorkflow(sdk)
     wf._validator.schema = schema
     wf._schema = schema
-    record = fake_data.fake_record(schema)
+    raw_record = fake_data.fake_record(schema)
+    record = {"formKey": raw_record["formKey"], "data": raw_record["recordData"]}
 
     if async_mode:
         result = asyncio.run(wf.async_create_or_update_records("S", [record]))

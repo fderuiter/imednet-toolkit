@@ -841,8 +841,8 @@ _CANONICAL_VARIABLE_TAXONOMY: dict[str, tuple[str, Any, Callable[[Any], None]]] 
     # Whole-number numeric types
     "int": ("number", 1, _validate_int),
     "integer": ("number", 1, _validate_int),
-    "number": ("number", 1, _validate_int),
     # Decimal numeric types
+    "number": ("number", 1, _validate_float),
     "float": ("number", 1.0, _validate_float),
     "decimal": ("number", 1.0, _validate_float),
     "double": ("number", 1.0, _validate_float),
@@ -1515,6 +1515,10 @@ def validate_record_data(
             _record_error(f"Unknown form {form_key}", rule_id="unknown_form")
             return _finish()
 
+    if not isinstance(data, Mapping):
+        _record_error("Record 'data' must be a mapping/dictionary", rule_id="invalid_data")
+        return _finish()
+
     unknown = [k for k in data if k not in variables]
     if unknown:
         _record_error(
@@ -1839,6 +1843,28 @@ def _has_existing_record_target(record: Mapping[str, Any]) -> bool:
     return False
 
 
+def _extract_write_payload_data(
+    record: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """Extract and validate the write envelope ``data`` mapping on a POST /records payload."""
+    if "recordData" in record or "record_data" in record:
+        return (
+            None,
+            "Record write payload must use 'data', not 'recordData'",
+            "invalid_record_envelope",
+        )
+    if "data" not in record:
+        return {}, None, None
+    raw_data = record["data"]
+    if not isinstance(raw_data, Mapping):
+        return (
+            None,
+            "Record 'data' must be a mapping/dictionary",
+            "invalid_data",
+        )
+    return raw_data if isinstance(raw_data, dict) else dict(raw_data), None, None
+
+
 @overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
@@ -1929,16 +1955,7 @@ def validate_record_entry(
                     )
                 ],
             )
-    if fk:
-        return validate_record_data(
-            schema,
-            fk,
-            record.get("recordData", record.get("data", {})),
-            study_key=eff_study_key,
-            collect_errors=collect_errors,
-            record_index=record_index,
-        )
-    if not _has_existing_record_target(record):
+    if not fk:
         msg = "Record payload must include 'formKey' or 'formId'"
         if not collect_errors:
             raise ValidationError(msg)
@@ -1957,92 +1974,34 @@ def validate_record_entry(
             ],
         )
 
-    raw_data = record.get("recordData", record.get("data", {}))
-    if isinstance(raw_data, Mapping) and raw_data:
-        forms_attr = getattr(schema, "forms", None)
-        is_datadict_like = isinstance(forms_attr, Sequence) and not isinstance(
-            schema, BaseSchemaCache
-        )
-        if is_datadict_like or collect_errors:
-            form_keys: Iterable[str]
-            if isinstance(schema, BaseSchemaCache):
-                form_keys = schema.forms_for_study(eff_study_key) if eff_study_key else schema.forms
-            elif isinstance(forms_attr, Sequence):
-                form_keys = [
-                    str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
-                    for f in forms_attr
-                    if getattr(f, "form_key", None) or getattr(f, "formKey", None)
-                ]
-            else:
-                form_keys = ()
-
-            known_vars: dict[str, list[Any]] = {}
-            for candidate_fk in form_keys:
-                f_vars = (
-                    schema.variables_for_form(candidate_fk, study_key=eff_study_key)
-                    if isinstance(schema, BaseSchemaCache)
-                    else schema.variables_for_form(candidate_fk)
+    payload_data, envelope_err, envelope_rule = _extract_write_payload_data(record)
+    if envelope_err is not None or payload_data is None:
+        err_msg = envelope_err or "Record 'data' must be a mapping/dictionary"
+        if not collect_errors:
+            raise ValidationError(err_msg)
+        return BatchValidationReport(
+            total_records=1,
+            valid_records=0,
+            invalid_records=1,
+            errors=[
+                RecordValidationIssue(
+                    record_index=record_index,
+                    form_key=fk,
+                    variable_name=None,
+                    message=err_msg,
+                    rule_id=envelope_rule or "invalid_data",
                 )
-                for v_name, v_obj in f_vars.items():
-                    known_vars.setdefault(v_name, []).append(v_obj)
+            ],
+        )
 
-            if known_vars:
-                formless_errors: list[RecordValidationIssue] = []
-                for var_name, var_val in raw_data.items():
-                    candidates = known_vars.get(var_name)
-                    if not candidates:
-                        msg = f"Unknown variable {var_name}"
-                        if not collect_errors:
-                            raise ValidationError(msg)
-                        formless_errors.append(
-                            RecordValidationIssue(
-                                record_index=record_index,
-                                form_key=None,
-                                variable_name=var_name,
-                                message=msg,
-                                rule_id="unknown_variable",
-                            )
-                        )
-                        continue
-                    if not _is_empty_value(var_val):
-                        distinct_types = {
-                            str(getattr(vo, "variable_type", getattr(vo, "variableType", "")) or "")
-                            .strip()
-                            .lower()
-                            for vo in candidates
-                        }
-                        distinct_types.discard("")
-                        if len(distinct_types) == 1:
-                            vtype = getattr(
-                                candidates[0],
-                                "variable_type",
-                                getattr(candidates[0], "variableType", None),
-                            )
-                            try:
-                                _check_type(vtype, var_val)
-                            except ValidationError as exc:
-                                if not collect_errors:
-                                    raise
-                                formless_errors.append(
-                                    RecordValidationIssue(
-                                        record_index=record_index,
-                                        form_key=None,
-                                        variable_name=var_name,
-                                        message=str(exc),
-                                        rule_id="invalid_type",
-                                    )
-                                )
-                if formless_errors:
-                    return BatchValidationReport(
-                        total_records=1,
-                        valid_records=0,
-                        invalid_records=1,
-                        errors=formless_errors,
-                    )
-
-    if collect_errors:
-        return BatchValidationReport(total_records=1, valid_records=1, invalid_records=0)
-    return None
+    return validate_record_data(
+        schema,
+        fk,
+        payload_data,
+        study_key=eff_study_key,
+        collect_errors=collect_errors,
+        record_index=record_index,
+    )
 
 
 def validate_records_batch(
@@ -2159,9 +2118,13 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
             _, fid = _extract_form_ref(record)
             if fid is not None:
                 raise ValidationError(f"Unknown form ID {fid}")
+            raise ValidationError("Record payload must include 'formKey' or 'formId'")
+        payload_data, envelope_err, _ = _extract_write_payload_data(record)
+        if envelope_err is not None or payload_data is None:
+            raise ValidationError(envelope_err or "Record 'data' must be a mapping/dictionary")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            payload_data,
             study_key=study_key,
         )
 
@@ -2248,9 +2211,13 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
             _, fid = _extract_form_ref(record)
             if fid is not None:
                 raise ValidationError(f"Unknown form ID {fid}")
+            raise ValidationError("Record payload must include 'formKey' or 'formId'")
+        payload_data, envelope_err, _ = _extract_write_payload_data(record)
+        if envelope_err is not None or payload_data is None:
+            raise ValidationError(envelope_err or "Record 'data' must be a mapping/dictionary")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            payload_data,
             study_key=study_key,
         )
 

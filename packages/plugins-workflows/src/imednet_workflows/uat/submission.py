@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -111,6 +112,21 @@ def subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
         if keyword_tag in candidates:
             return True
     return False
+
+
+def _subject_has_uat_oid(subj: Any, keyword_tag: str) -> bool:
+    """Return True if ``subj`` carries a ``subjectOid`` prefixed with ``<keyword_tag>-``."""
+    clean_tag = keyword_tag.strip().lower()
+    if not clean_tag:
+        return False
+    raw_oid = (
+        (subj.get("subject_oid") or subj.get("subjectOid"))
+        if isinstance(subj, dict)
+        else (getattr(subj, "subject_oid", None) or getattr(subj, "subjectOid", None))
+    )
+    if not isinstance(raw_oid, str) or not raw_oid.strip():
+        return False
+    return raw_oid.strip().lower().startswith(f"{clean_tag}-")
 
 
 def _clean_str(val: Any) -> str | None:
@@ -495,7 +511,10 @@ class BulkRecordSubmissionWorkflow:
                 subject_ids=set(),
                 subject_oids=set(),
             )
-            if registration_sets and data_sets:
+            has_live_subjects = not _is_unconfigured_mock_method(
+                getattr(self.sdk, "get_subjects", None)
+            )
+            if registration_sets and (data_sets or (self.await_registration and has_live_subjects)):
                 snap = (
                     self._initial_subjects_snapshot
                     if self._initial_subjects_snapshot is not None
@@ -528,6 +547,8 @@ class BulkRecordSubmissionWorkflow:
             batch_item_groups: list[tuple[BatchSubmission, list[_SubmittedRegistrationItem]]] = []
 
             # Phase 1: Registration
+            tag_prefix = (keyword_tag or "UAT").strip() or "UAT"
+            assigned_batch_oids: set[str] = set()
             self.transition_to(SubmissionPhase.REGISTRATION)
             for rs in registration_sets:
                 filtered_payloads: list[dict[str, Any]] = []
@@ -545,6 +566,20 @@ class BulkRecordSubmissionWorkflow:
                     clean_payload = dict(payload)
                     clean_payload.pop("subjectKey", None)
                     clean_payload.pop("subject_key", None)
+                    clean_payload.pop("keywords", None)
+                    existing_oid = _clean_str(
+                        _get_attr_or_key(clean_payload, "subjectOid", "subject_oid")
+                    )
+                    if not existing_oid:
+                        candidate_oid = f"{tag_prefix}-{uuid.uuid4().hex[:12]}"
+                        while (
+                            candidate_oid in pre_existing.subject_oids
+                            or candidate_oid in assigned_batch_oids
+                        ):
+                            candidate_oid = f"{tag_prefix}-{uuid.uuid4().hex[:12]}"
+                        clean_payload["subjectOid"] = candidate_oid
+                        existing_oid = candidate_oid
+                    assigned_batch_oids.add(existing_oid)
                     raw_data = (
                         clean_payload.get("data")
                         if "data" in clean_payload
@@ -562,9 +597,7 @@ class BulkRecordSubmissionWorkflow:
                             _get_attr_or_key(clean_payload, "siteName", "site_name")
                         ),
                         site_id=_clean_int(_get_attr_or_key(clean_payload, "siteId", "site_id")),
-                        subject_oid=_clean_str(
-                            _get_attr_or_key(clean_payload, "subjectOid", "subject_oid")
-                        ),
+                        subject_oid=existing_oid,
                         data=dict(raw_data) if isinstance(raw_data, dict) else {},
                     )
                     filtered_payloads.append(clean_payload)
@@ -607,7 +640,7 @@ class BulkRecordSubmissionWorkflow:
                         batch_item_groups=batch_item_groups,
                         summary=poll_summary,
                         pre_existing=pre_existing,
-                        allow_record_lookup=bool(data_sets),
+                        allow_record_lookup=bool(data_sets) or has_live_subjects,
                     )
                     if enrolled_keys is not None:
                         if reused_key_map:
@@ -663,6 +696,26 @@ class BulkRecordSubmissionWorkflow:
                     )
 
             # Phase 2: Data Submission
+            if not registration_sets and data_sets and has_live_subjects:
+                known_study_subjects = (
+                    self._initial_subjects_snapshot.subject_keys
+                    if self._initial_subjects_snapshot is not None
+                    else self._snapshot_existing_subjects(study_key).subject_keys
+                )
+                for rs in data_sets:
+                    for payload in rs.payloads:
+                        cand_sk = _clean_str(_get_attr_or_key(payload, "subjectKey", "subject_key"))
+                        if (
+                            cand_sk
+                            and cand_sk.startswith("UAT-TEST-")
+                            and cand_sk not in known_study_subjects
+                        ):
+                            raise BulkSubmissionError(
+                                f"Refusing to submit records for unregistered placeholder "
+                                f"subject '{cand_sk}'.",
+                                failed_batches=[],
+                            )
+
             for rs in data_sets:
                 for chunk in self._chunk_payloads(rs.payloads):
                     batch = self._submit_batch(
@@ -1093,6 +1146,72 @@ class BulkRecordSubmissionWorkflow:
                 remaining.append((idx, item))
 
             if remaining:
+                subjects = _load_subjects()
+                if subjects:
+                    delta_candidates: list[tuple[tuple[int, int, str, int], Any, str]] = []
+                    seen_delta_keys: set[str] = set()
+                    for pos, subj in enumerate(subjects):
+                        if bool(_get_attr_or_key(subj, "deleted")):
+                            continue
+                        cand_key = _clean_str(_get_attr_or_key(subj, "subject_key", "subjectKey"))
+                        if (
+                            not cand_key
+                            or cand_key in pre_existing.subject_keys
+                            or cand_key in assigned_keys
+                            or cand_key in seen_delta_keys
+                        ):
+                            continue
+                        cand_id = _clean_int(_get_attr_or_key(subj, "subject_id", "subjectId"))
+                        if cand_id is not None and cand_id in pre_existing.subject_ids:
+                            continue
+                        cand_oid = _clean_str(_get_attr_or_key(subj, "subject_oid", "subjectOid"))
+                        if cand_oid and cand_oid in pre_existing.subject_oids:
+                            continue
+                        raw_created = _get_attr_or_key(subj, "date_created", "dateCreated")
+                        created_str = (
+                            raw_created.isoformat()
+                            if hasattr(raw_created, "isoformat")
+                            else (str(raw_created).strip() if raw_created is not None else "")
+                        )
+                        seen_delta_keys.add(cand_key)
+                        sort_key = (0 if cand_id is not None else 1, cand_id or 0, created_str, pos)
+                        delta_candidates.append((sort_key, subj, cand_key))
+
+                    if len(delta_candidates) == len(remaining):
+                        delta_candidates.sort(key=lambda entry: entry[0])
+                        used_delta: set[int] = set()
+                        tentative_pairs: list[tuple[int, str]] = []
+                        for idx, item in remaining:
+                            matched_delta_idx: int | None = None
+                            for d_idx, (_skey, subj_obj, cand_key) in enumerate(delta_candidates):
+                                if d_idx in used_delta:
+                                    continue
+                                s_name = _clean_str(
+                                    _get_attr_or_key(subj_obj, "site_name", "siteName")
+                                )
+                                if item.site_name and s_name and s_name != item.site_name:
+                                    continue
+                                s_id = _clean_int(_get_attr_or_key(subj_obj, "site_id", "siteId"))
+                                if (
+                                    item.site_id is not None
+                                    and s_id is not None
+                                    and s_id != item.site_id
+                                ):
+                                    continue
+                                matched_delta_idx = d_idx
+                                tentative_pairs.append((idx, cand_key))
+                                break
+                            if matched_delta_idx is None:
+                                break
+                            used_delta.add(matched_delta_idx)
+
+                        if len(tentative_pairs) == len(remaining):
+                            for idx, cand_key in tentative_pairs:
+                                resolved_by_index[idx] = cand_key
+                                assigned_keys.add(cand_key)
+                            remaining = []
+
+            if remaining:
                 if any(not item.data for _, item in remaining):
                     return (
                         None,
@@ -1234,7 +1353,10 @@ class BulkRecordSubmissionWorkflow:
             )
             if deleted is True:
                 continue
-            if not self._subject_has_keyword(subj, keyword_tag):
+            if not (
+                self._subject_has_keyword(subj, keyword_tag)
+                or _subject_has_uat_oid(subj, keyword_tag)
+            ):
                 continue
             key = (
                 (subj.get("subject_key") or subj.get("subjectKey"))

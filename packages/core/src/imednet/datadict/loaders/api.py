@@ -145,18 +145,29 @@ def _build_datadict_from_items(
     ]
 
     forms_map: dict[str, Form] = {}
+    disabled_form_keys: set[str] = set()
+    disabled_form_ids: set[int] = set()
     for item in forms_list:
         f_key = str(_extract_attr(item, "form_key", "formKey", "form") or "")
         f_name = _extract_attr(item, "form_name", "formName", "name")
         f_id = _extract_attr(item, "form_id", "formId", "id")
         f_type = _extract_attr(item, "form_type", "formType", "type")
+        norm_fid = normalize_form_id(f_id, form_key=f_key or None)
+        if _is_truthy_flag(_extract_attr(item, "disabled")) or _is_truthy_flag(
+            _extract_attr(item, "deleted")
+        ):
+            if f_key:
+                disabled_form_keys.add(f_key)
+            if isinstance(norm_fid, int) and not isinstance(norm_fid, bool):
+                disabled_form_ids.add(norm_fid)
+            continue
         extra = _extract_extra_attributes(item, _EXCLUDED_FORM_EXTRA_KEYS)
 
         if f_key:
             forms_map[f_key] = Form(
                 formKey=f_key,
                 formName=str(f_name) if f_name is not None else None,
-                formId=normalize_form_id(f_id, form_key=f_key),
+                formId=norm_fid,
                 formType=normalize_form_type(
                     str(f_type) if f_type is not None else None,
                     default="Subject",
@@ -167,16 +178,23 @@ def _build_datadict_from_items(
     for idx, item in enumerate(variables_list):
         f_key = str(_extract_attr(item, "form_key", "formKey", "form_name", "form") or "")
         f_id = _extract_attr(item, "form_id", "formId")
+        norm_var_fid = normalize_form_id(f_id, form_key=f_key or None)
+        if (f_key and f_key in disabled_form_keys) or (
+            isinstance(norm_var_fid, int)
+            and not isinstance(norm_var_fid, bool)
+            and norm_var_fid in disabled_form_ids
+        ):
+            continue
         if _is_retired_api_variable(item):
             if f_key:
                 if f_key not in forms_map:
                     forms_map[f_key] = Form(
                         formKey=f_key,
-                        formId=normalize_form_id(f_id, form_key=f_key),
+                        formId=norm_var_fid,
                         formType=normalize_form_type(None, default="Subject"),
                     )
                 elif forms_map[f_key].formId is None and f_id is not None:
-                    forms_map[f_key].formId = normalize_form_id(f_id, form_key=f_key)
+                    forms_map[f_key].formId = norm_var_fid
             continue
         v_name = str(
             _extract_attr(item, "variable_name", "variableName", "variable_oid", "name") or ""

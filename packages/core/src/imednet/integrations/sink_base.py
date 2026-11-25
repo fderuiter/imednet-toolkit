@@ -1555,26 +1555,46 @@ def apply_quality_gate(
     from imednet.validation.cache import SchemaValidator, calculate_readiness_score
 
     validator = SchemaValidator(sdk)
+    form_key_by_id: dict[int, str] = {}
+    disabled_form_keys: set[str] = set()
+    disabled_form_ids: set[int] = set()
+    for form in forms or ():
+        fid = getattr(form, "form_id", None)
+        fk_val = getattr(form, "form_key", None)
+        raw_dis = getattr(form, "disabled", None)
+        is_disabled = (
+            raw_dis
+            if isinstance(raw_dis, bool)
+            else (isinstance(raw_dis, str) and raw_dis.strip().lower() in {"true", "yes", "y", "1"})
+        )
+        if is_disabled:
+            if isinstance(fk_val, str) and fk_val:
+                disabled_form_keys.add(fk_val)
+            if isinstance(fid, int) and not isinstance(fid, bool):
+                disabled_form_ids.add(fid)
+            continue
+        if (
+            isinstance(fid, int)
+            and not isinstance(fid, bool)
+            and isinstance(fk_val, str)
+            and fk_val
+        ):
+            form_key_by_id[fid] = fk_val
+
     if variables is None:
         validator.refresh(study_key)
     else:
-        form_key_by_id: dict[int, str] = {}
-        for form in forms or ():
-            fid = getattr(form, "form_id", None)
-            fk_val = getattr(form, "form_key", None)
-            if (
-                isinstance(fid, int)
-                and not isinstance(fid, bool)
-                and isinstance(fk_val, str)
-                and fk_val
-            ):
-                form_key_by_id[fid] = fk_val
-
         prepared_vars: list[Any] = []
         for var in variables:
             prepared_var = var
             var_fk = getattr(var, "form_key", None)
             var_fid = getattr(var, "form_id", None)
+            if (isinstance(var_fk, str) and var_fk in disabled_form_keys) or (
+                isinstance(var_fid, int)
+                and not isinstance(var_fid, bool)
+                and var_fid in disabled_form_ids
+            ):
+                continue
             if not var_fk and isinstance(var_fid, int) and var_fid in form_key_by_id:
                 resolved_fk = form_key_by_id[var_fid]
                 model_copy = getattr(var, "model_copy", None)
@@ -1613,9 +1633,20 @@ def apply_quality_gate(
 
         ctx_token = set_study_context(study_key)
         try:
+            raw_fid = rec_dict.get("formId") or rec_dict.get("form_id")
             fk = rec_dict.get("formKey") or rec_dict.get("form_key")
+            if (isinstance(fk, str) and fk in disabled_form_keys) or (
+                isinstance(raw_fid, int)
+                and not isinstance(raw_fid, bool)
+                and raw_fid in disabled_form_ids
+            ):
+                logger.info(
+                    "Dropped record %s: Disabled form", rec_dict.get("record_id", "Unknown")
+                )
+                dropped_count += 1
+                continue
             if not fk:
-                fid = rec_dict.get("formId") or rec_dict.get("form_id") or 0
+                fid = raw_fid or 0
                 fk = validator.schema.form_key_from_id(fid)
 
             if not fk:

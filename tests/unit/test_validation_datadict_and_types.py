@@ -234,7 +234,7 @@ def test_cold_cache_form_id_refresh_and_unknown_form_id_sync_and_async() -> None
     validator = SchemaValidator(sync_sdk)
 
     # Cold cache + formId triggers refresh and catches invalid bool value on numeric variable
-    with pytest.raises(ValidationError, match="integer"):
+    with pytest.raises(ValidationError, match="numeric"):
         validator.validate_record("STUDY", {"formId": 301, "data": {"V_AGE": True}})
     sync_sdk.get_variables.assert_called_once_with(study_key="STUDY")
 
@@ -581,6 +581,7 @@ async def test_seeded_simulation_state_f_dm_validates_sync_and_async() -> None:
     state = SimulationState()
     seeded_f_dm = [r for r in state.records if r.get("formKey") == "F_DM"]
     assert seeded_f_dm
+    write_f_dm = [{"formKey": r["formKey"], "data": r["recordData"]} for r in seeded_f_dm]
 
     with ImednetSDK(
         api_key="sim-key",  # pragma: allowlist secret
@@ -588,7 +589,9 @@ async def test_seeded_simulation_state_f_dm_validates_sync_and_async() -> None:
         simulation_mode=True,
     ) as sync_sdk:
         sync_validator = SchemaValidator(sync_sdk)
-        sync_validator.validate_batch("STUDY", seeded_f_dm)
+        with pytest.raises(ValidationError, match="recordData"):
+            sync_validator.validate_batch("STUDY", seeded_f_dm)
+        sync_validator.validate_batch("STUDY", write_f_dm)
         score, reasons = calculate_readiness_score(
             sync_validator.schema, "F_DM", seeded_f_dm[0]["recordData"]
         )
@@ -601,7 +604,9 @@ async def test_seeded_simulation_state_f_dm_validates_sync_and_async() -> None:
         simulation_mode=True,
     ) as async_sdk:
         async_validator = AsyncSchemaValidator(async_sdk)
-        await async_validator.validate_batch("STUDY", seeded_f_dm)
+        with pytest.raises(ValidationError, match="recordData"):
+            await async_validator.validate_batch("STUDY", seeded_f_dm)
+        await async_validator.validate_batch("STUDY", write_f_dm)
         async_score, async_reasons = calculate_readiness_score(
             async_validator.schema, "F_DM", seeded_f_dm[0]["recordData"]
         )
@@ -988,3 +993,100 @@ def test_load_offline_schema_supports_zip_archive_and_is_file_target(tmp_path: P
     assert isinstance(dd, DataDictionary)
     assert dd.metadata.studyKey == "ZIP_STUDY"
     assert {f.formKey for f in dd.forms} == {"AE", "AEACTEL", "AESDC"}
+
+
+@pytest.mark.asyncio
+async def test_records_endpoint_accepts_base_record_request_subclasses_sync_and_async() -> None:
+    """BaseRecordRequest subclasses serialize ID/OID fields cleanly and work in sync & async create."""
+    import json
+
+    import httpx
+
+    from imednet.models.records import (
+        CreateNewRecordRequest,
+        RegisterSubjectRequest,
+        UpdateScheduledRecordRequest,
+    )
+
+    reg_req = RegisterSubjectRequest(
+        form_id=101,
+        site_id=10,
+        subject_oid="OID-SUBJ-1",
+        data={"AGE": 42},
+    )
+    sched_req = UpdateScheduledRecordRequest(
+        form_id=102,
+        subject_id=201,
+        interval_id=301,
+        record_id=401,
+        data={"SYSBP": 120},
+    )
+    new_req = CreateNewRecordRequest(
+        form_id=103,
+        subject_oid="OID-SUBJ-1",
+        data={"AE_TERM": "Headache"},
+    )
+
+    reg_dumped = reg_req.model_dump(by_alias=True, exclude_none=True)
+    sched_dumped = sched_req.model_dump(by_alias=True, exclude_none=True)
+    new_dumped = new_req.model_dump(by_alias=True, exclude_none=True)
+
+    assert reg_dumped == {
+        "formId": 101,
+        "siteId": 10,
+        "subjectOid": "OID-SUBJ-1",
+        "data": {"AGE": 42},
+    }
+    assert sched_dumped == {
+        "formId": 102,
+        "subjectId": 201,
+        "intervalId": 301,
+        "recordId": 401,
+        "data": {"SYSBP": 120},
+    }
+    assert new_dumped == {
+        "formId": 103,
+        "subjectOid": "OID-SUBJ-1",
+        "data": {"AE_TERM": "Headache"},
+    }
+    for dumped in (reg_dumped, sched_dumped, new_dumped):
+        for omitted_blank in ("formKey", "siteName", "subjectKey", "intervalName"):
+            assert omitted_blank not in dumped
+
+    captured_batches: list[list[dict[str, object]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            captured_batches.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                200, json={"batchId": f"batch-{len(captured_batches)}", "state": "COMPLETED"}
+            )
+        return httpx.Response(200, json={"data": []})
+
+    with ImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        transport=httpx.MockTransport(handler),
+    ) as sync_sdk:
+        job_sync = sync_sdk.records.create("STUDY", [reg_req, sched_req, new_req])
+        assert job_sync.batch_id == "batch-1"
+
+    async with AsyncImednetSDK(
+        api_key="k",  # pragma: allowlist secret
+        security_key="s",  # pragma: allowlist secret
+        transport=httpx.MockTransport(handler),
+    ) as async_sdk:
+        job_async = await async_sdk.records.create("STUDY", [reg_req, sched_req, new_req])
+        assert job_async.batch_id == "batch-2"
+
+    assert len(captured_batches) == 2
+    assert captured_batches[0] == [reg_dumped, sched_dumped, new_dumped]
+    assert captured_batches[1] == [reg_dumped, sched_dumped, new_dumped]
+
+    from imednet.core.endpoint.operations.record_create import RecordCreateOperation
+
+    direct_op: RecordCreateOperation[object] = RecordCreateOperation(
+        "/api/v1/edc/studies/STUDY/records",
+        [reg_req, sched_req, new_req],
+    )
+    assert direct_op.records_data == [reg_dumped, sched_dumped, new_dumped]

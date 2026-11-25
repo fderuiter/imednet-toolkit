@@ -753,3 +753,64 @@ def test_extract_canonical_records_blocks_payload_clear(
     # Derived logic failed safely, keeping initial extracted value
     assert result.adverse_events[0].ae_term == "Headache"
     assert any("Derivation logic failed for SUBJ-001" in r.message for r in caplog.records)
+
+
+def test_extract_canonical_records_sorts_none_date_created_without_attribute_error() -> None:
+    """AC 8: extract_canonical_records sorts Record items with date_created=None using documented fields."""
+    config = StudyConfiguration(
+        study_key="STUDY-SORT",
+        mappings=[
+            MappingRule(
+                domain="AE",
+                target_field="subjectKey",
+                source_form_key="AE_FORM",
+                source_variable_name="subjectKey",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeTerm",
+                source_form_key="AE_FORM",
+                source_variable_name="recordData.term",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeSeverity",
+                source_form_key="AE_FORM",
+                source_variable_name="recordData.severity",
+            ),
+        ],
+    )
+
+    records = [
+        Record(
+            record_id=30,
+            form_key="AE_FORM",
+            subject_key="SUBJ-1",
+            date_created=None,
+            date_modified=None,
+            last_updated=None,
+            record_data={"term": "ThirdNoTimestamps", "severity": "MILD"},
+        ),
+        Record(
+            record_id=20,
+            form_key="AE_FORM",
+            subject_key="SUBJ-1",
+            date_created=None,
+            date_modified=datetime(2025, 2, 1, 10, 0, 0),
+            record_data={"term": "SecondByModified", "severity": "MODERATE"},
+        ),
+        Record(
+            record_id=10,
+            form_key="AE_FORM",
+            subject_key="SUBJ-1",
+            date_created=datetime(2025, 1, 1, 9, 0, 0),
+            record_data={"term": "FirstByCreated", "severity": "MILD"},
+        ),
+    ]
+
+    result = extract_canonical_records(records=records, study_configuration=config)
+    assert [ae.ae_term for ae in result.adverse_events] == [
+        "FirstByCreated",
+        "SecondByModified",
+        "ThirdNoTimestamps",
+    ]

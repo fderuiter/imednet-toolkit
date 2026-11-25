@@ -240,12 +240,21 @@ class SyntheticRecordGenerator:
         """
         active_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
         results: list[GeneratedRecordSet] = []
-        subject_pool = list(subject_keys) if subject_keys else self._get_subject_pool(spec)
+        subject_pool = (
+            list(subject_keys)
+            if subject_keys is not None
+            else self._get_subject_pool(spec, snapshot)
+        )
 
         # Phase 1: Enrollment/registration forms
         for form_spec in spec.forms_by_type(RecordTestType.REGISTER_SUBJECT):
             enriched = self._enrich_form_spec(form_spec, active_dd)
-            results.append(self._generate_registration_set(spec, enriched, snapshot, subject_pool))
+            reg_pool = (
+                subject_pool
+                if subject_pool
+                else [f"UAT-REG-{i + 1:03d}" for i in range(enriched.subject_count)]
+            )
+            results.append(self._generate_registration_set(spec, enriched, snapshot, reg_pool))
 
         # Phase 2: Scheduled forms
         for form_spec in spec.forms_by_type(RecordTestType.UPDATE_SCHEDULED_RECORD):
@@ -324,15 +333,38 @@ class SyntheticRecordGenerator:
 
         return key_map
 
-    def _get_subject_pool(self, spec: UATSpecification) -> list[str]:
-        """Return a mocked value."""
-        pool = []
-        for s_spec in spec.subject_specs:
-            for i in range(s_spec.subject_count):
-                pool.append(f"{s_spec.subject_key_prefix}{i + 1:03d}")
-        if not pool:
-            pool = ["UAT-TEST-001"]
-        return pool
+    def _get_subject_pool(
+        self,
+        spec: UATSpecification,
+        snapshot: StudySnapshot | None = None,
+    ) -> list[str]:
+        """Resolve subject pool from registration placeholders or existing study subjects."""
+        has_reg_forms = bool(spec.forms_by_type(RecordTestType.REGISTER_SUBJECT))
+        snap_subjects = getattr(snapshot, "subjects", None) if snapshot is not None else None
+        has_concrete_snapshot_subjects = False
+        existing_study_keys: list[str] = []
+        if isinstance(snap_subjects, (list, tuple)):
+            has_concrete_snapshot_subjects = True
+            for subj in snap_subjects:
+                if getattr(subj, "deleted", False) is True:
+                    continue
+                sk = getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None)
+                if isinstance(sk, str) and sk.strip() and sk.strip() not in existing_study_keys:
+                    existing_study_keys.append(sk.strip())
+
+        if spec.subject_specs:
+            has_custom_prefix = any(
+                s_spec.subject_key_prefix != "UAT-TEST-" for s_spec in spec.subject_specs
+            )
+            if has_reg_forms or has_custom_prefix or not has_concrete_snapshot_subjects:
+                return [
+                    f"{s_spec.subject_key_prefix}{i + 1:03d}"
+                    for s_spec in spec.subject_specs
+                    for i in range(s_spec.subject_count)
+                ]
+            return existing_study_keys
+
+        return existing_study_keys
 
     @staticmethod
     def _coerce_fixed_value(var_spec: UATVariableSpec) -> Any:
@@ -508,7 +540,12 @@ class SyntheticRecordGenerator:
     def _generate_data_payloads(
         self, spec: UATSpecification, form_spec: UATFormSpec, subject_pool: list[str]
     ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
-        warnings = []
+        warnings: list[str] = []
+        if not subject_pool:
+            warnings.append(
+                f"No enrolled subjects available for form {form_spec.form_key}; skipping generation."
+            )
+            return [], warnings, []
         coded_all_vars = [
             v for v in form_spec.variables if v.strategy == VariableTestStrategy.CODED_ALL
         ]
@@ -604,7 +641,6 @@ class SyntheticRecordGenerator:
                 snapshot.active_sites()[0].site_name if snapshot.active_sites() else "Default Site"
             )
         )
-        keyword_tag = (subj_spec.keyword_tag if subj_spec is not None else "UAT").strip()
 
         final_payloads = []
         for data in data_payloads:
@@ -613,8 +649,6 @@ class SyntheticRecordGenerator:
                 "siteName": site_name,
                 "data": data,
             }
-            if keyword_tag:
-                reg_payload["keywords"] = [{"keywordName": keyword_tag, "keywordKey": keyword_tag}]
             final_payloads.append(reg_payload)
 
         return GeneratedRecordSet(
@@ -637,16 +671,26 @@ class SyntheticRecordGenerator:
             spec, form_spec, subject_pool
         )
 
+        clean_interval = (
+            form_spec.interval_name.strip()
+            if isinstance(form_spec.interval_name, str) and form_spec.interval_name.strip()
+            else None
+        )
+        if data_payloads and clean_interval is None:
+            warnings.append(
+                f"Scheduled form {form_spec.form_key} has no intervalName; omitting intervalName."
+            )
+
         final_payloads = []
         for i, data in enumerate(data_payloads):
-            final_payloads.append(
-                {
-                    "formKey": form_spec.form_key,
-                    "subjectKey": subject_keys[i],
-                    "intervalName": form_spec.interval_name or "Default Interval",
-                    "data": data,
-                }
-            )
+            sched_payload: dict[str, Any] = {
+                "formKey": form_spec.form_key,
+                "subjectKey": subject_keys[i],
+                "data": data,
+            }
+            if clean_interval is not None:
+                sched_payload["intervalName"] = clean_interval
+            final_payloads.append(sched_payload)
 
         return GeneratedRecordSet(
             form_key=form_spec.form_key,

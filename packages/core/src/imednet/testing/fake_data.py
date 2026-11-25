@@ -15,6 +15,7 @@ from imednet.validation.cache import (
     _validate_calculation,
     _validate_float,
     _validate_int,
+    _validate_text,
 )
 
 from .data_generator import generator as faker
@@ -119,7 +120,7 @@ def _fake_value(var_type: str) -> Any:
     """Return a fake value matching ``var_type``."""
     spec = _CANONICAL_VARIABLE_TAXONOMY.get(_normalize_variable_type_key(var_type))
     if spec is not None:
-        category, _, validator = spec
+        category, sample_val, validator = spec
         if validator is _validate_int:
             return faker.random_int(min=0, max=100)
         if validator in (_validate_float, _validate_calculation):
@@ -132,6 +133,8 @@ def _fake_value(var_type: str) -> Any:
             return faker.date_time().strftime("%Y-%m-%dT%H:%M:%S")
         if category == "time":
             return faker.date_time().strftime("%H:%M:%S")
+        if validator is not _validate_text:
+            return sample_val
     return faker.word()
 
 

@@ -139,19 +139,27 @@ def normalize_subject_registration_inputs(
 
     pairs: list[tuple[RegisterSubjectRequest | dict[str, Any], RegisterSubjectRequest]] = []
     dumped_for_check: list[JsonDict] = []
-    for raw_subj in raw_items:
+    for idx, raw_subj in enumerate(raw_items):
         normalized_raw: RegisterSubjectRequest | dict[str, Any]
         if isinstance(raw_subj, RegisterSubjectRequest):
             model_subj = raw_subj
-            needs_form = bool(default_form_key and not model_subj.form_key)
+            has_form_key = bool(model_subj.form_key and model_subj.form_key.strip())
+            resolved_model_fk: str | None = None
+            if not has_form_key and model_subj.form_id is not None and schema is not None:
+                resolved_model_fk = _lookup_form_key_from_id(
+                    schema, model_subj.form_id, study_key=study_key
+                )
+            needs_form = bool(default_form_key and not has_form_key and model_subj.form_id is None)
             needs_site = bool(
                 (default_site_name or default_site_id is not None)
                 and not model_subj.site_name
                 and model_subj.site_id is None
             )
-            if needs_form or needs_site:
+            if resolved_model_fk or needs_form or needs_site:
                 patched = model_subj.model_dump(by_alias=True, exclude_none=True)
-                if needs_form and default_form_key:
+                if resolved_model_fk:
+                    patched["formKey"] = resolved_model_fk
+                elif needs_form and default_form_key:
                     patched["formKey"] = default_form_key
                 if needs_site:
                     if default_site_name:
@@ -159,20 +167,36 @@ def normalize_subject_registration_inputs(
                     elif default_site_id is not None:
                         patched["siteId"] = default_site_id
                 model_subj = RegisterSubjectRequest.model_validate(patched)
+            if not (model_subj.form_key and model_subj.form_key.strip()) and (
+                model_subj.form_id is None
+            ):
+                raise ValueError(
+                    f"Subject registration item at index {idx} must specify 'formKey' or 'formId'."
+                )
             normalized_raw = model_subj
         elif isinstance(raw_subj, Mapping):
             raw_dict = dict(raw_subj)
-            if not (raw_dict.get("formKey") or raw_dict.get("form_key")):
-                raw_fid = raw_dict.get("formId")
-                if raw_fid is None:
-                    raw_fid = raw_dict.get("form_id")
-                if raw_fid is not None and schema is not None:
-                    resolved_fk = _lookup_form_key_from_id(
-                        schema, int(raw_fid), study_key=study_key
-                    )
-                    if resolved_fk:
-                        raw_dict["formKey"] = resolved_fk
-            if default_form_key and not (raw_dict.get("formKey") or raw_dict.get("form_key")):
+            raw_fk_val = raw_dict.get("formKey") or raw_dict.get("form_key")
+            has_fk = bool(raw_fk_val and str(raw_fk_val).strip())
+            raw_fid = (
+                raw_dict.get("formId")
+                if raw_dict.get("formId") is not None
+                else raw_dict.get("form_id")
+            )
+            if raw_fid == "":
+                raw_fid = None
+                raw_dict.pop("formId", None)
+                raw_dict.pop("form_id", None)
+            if isinstance(raw_fid, bool):
+                raise ValueError(
+                    f"Subject registration item at index {idx} has invalid boolean 'formId'."
+                )
+            if not has_fk and raw_fid is not None and schema is not None:
+                resolved_fk = _lookup_form_key_from_id(schema, int(raw_fid), study_key=study_key)
+                if resolved_fk:
+                    raw_dict["formKey"] = resolved_fk
+                    has_fk = True
+            if default_form_key and not has_fk and raw_fid is None:
                 raw_dict["formKey"] = default_form_key
             has_site_name = bool(raw_dict.get("siteName") or raw_dict.get("site_name"))
             has_site_id = raw_dict.get("siteId") is not None or raw_dict.get("site_id") is not None
@@ -182,6 +206,12 @@ def normalize_subject_registration_inputs(
                 raw_dict["siteId"] = default_site_id
             normalized_raw = raw_dict
             model_subj = RegisterSubjectRequest.model_validate(raw_dict)
+            if not (model_subj.form_key and model_subj.form_key.strip()) and (
+                model_subj.form_id is None
+            ):
+                raise ValueError(
+                    f"Subject registration item at index {idx} must specify 'formKey' or 'formId'."
+                )
         else:
             raise TypeError(
                 "Each subject registration item must be a RegisterSubjectRequest or dict; "

@@ -24,9 +24,12 @@ def test_typed_values_canonical_taxonomy_and_loader_parity() -> None:
     """Every canonical, loader-emitted, and fake_data variable type validates with its sample value."""
     import io
 
+    import pytest
+
     from imednet.datadict import load_from_cdisc_odm, load_from_csv_files, load_from_redcap
     from imednet.datadict.loaders.api import load_from_api
     from imednet.datadict.normalize import _CANONICAL_VARIABLE_TYPES, normalize_variable_type
+    from imednet.errors import ValidationError
     from imednet.models.forms import Form as ApiForm
     from imednet.models.variables import Variable as ApiVariable
     from imednet.testing import fake_data
@@ -58,7 +61,12 @@ def test_typed_values_canonical_taxonomy_and_loader_parity() -> None:
         validate_record_data(cache, "F_TAX", {f"V_{idx}": sample})
 
         generated = fake_data.fake_record(cache)
-        validate_record_entry(cache, generated)
+        validate_record_entry(
+            cache,
+            {"formKey": generated["formKey"], "data": generated["recordData"]},
+        )
+        with pytest.raises(ValidationError, match="recordData"):
+            validate_record_entry(cache, generated)
 
     # 2. Normalization of whitespace and casing in typed_values, plus None for unknown types
     assert typed_values.canonical_type("  Single   Select  ") == "single select"

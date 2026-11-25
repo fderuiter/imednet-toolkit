@@ -273,9 +273,9 @@ def normalize_variable_type(
     if key == "number":
         if precision is not None:
             prec_clean = str(precision).strip()
-            if prec_clean.isdigit() and int(prec_clean) > 0:
-                return "Float"
-        return "Integer"
+            if prec_clean.isdigit() and int(prec_clean) == 0:
+                return "Integer"
+        return "Float"
     return _CANONICAL_VARIABLE_TYPES.get(key, cleaned)
 
 

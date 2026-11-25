@@ -148,7 +148,7 @@ def test_validate_record_with_form_id_fallback(async_mode: bool) -> None:
 
 @pytest.mark.parametrize("async_mode", [False, True])
 def test_validate_record_missing_form_identifier(async_mode: bool) -> None:
-    """Test that validate record missing form identifier."""
+    """AC 6: Missing formKey and formId raises ValidationError."""
     var = Variable(variable_name="age", variable_type="integer", form_id=1, form_key="F1")
     sdk = _build_sdk(var, async_mode)
     if async_mode:
@@ -158,13 +158,52 @@ def test_validate_record_missing_form_identifier(async_mode: bool) -> None:
 
     validator.schema._form_variables["F1"] = {"age": var}
 
-    # Missing formKey and formId entirely should just skip validation without error
+    with pytest.raises(ValidationError, match="formKey.*formId"):
+        if async_mode:
+            asyncio.run(validator.validate_record("STUDY", {"data": {"age": 1}}))
+        else:
+            validator.validate_record("STUDY", {"data": {"age": 1}})
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        {"formKey": "F1", "recordData": {"age": 1}},
+        {"formKey": "F1", "data": None},
+        {"formKey": "F1", "data": ["not-a-dict"]},
+        {"recordId": 99, "data": {"age": 1}},
+    ],
+)
+def test_validate_record_rejects_record_data_only_none_data_and_missing_form(
+    async_mode: bool,
+    bad_payload: dict,
+) -> None:
+    """AC 6: SchemaValidator, AsyncSchemaValidator, and validate_record_entry reject invalid write envelopes."""
+    from imednet.validation.cache import validate_record_entry
+
+    var = Variable(variable_name="age", variable_type="integer", form_id=1, form_key="F1")
+    sdk = _build_sdk(var, async_mode)
     if async_mode:
-        asyncio.run(validator.validate_record("STUDY", {"data": {"age": "bad"}}))
-        sdk.async_get_variables.assert_not_awaited()
+        validator = AsyncSchemaValidator(sdk)  # type: ignore[assignment]
     else:
-        validator.validate_record("STUDY", {"data": {"age": "bad"}})
-        sdk.get_variables.assert_not_called()
+        validator = SchemaValidator(sdk)  # type: ignore[assignment]
+    validator.schema.populate([var], study_key="STUDY")
+
+    with pytest.raises(ValidationError):
+        if async_mode:
+            asyncio.run(validator.validate_record("STUDY", bad_payload))
+        else:
+            validator.validate_record("STUDY", bad_payload)
+
+    with pytest.raises(ValidationError):
+        validate_record_entry(validator.schema, bad_payload, study_key="STUDY")
+
+    report = validate_record_entry(
+        validator.schema, bad_payload, study_key="STUDY", collect_errors=True
+    )
+    assert not report.is_valid
+    assert report.invalid_records == 1
 
 
 def test_schema_validator_rejects_is_async() -> None:

@@ -1492,3 +1492,121 @@ def test_submit_forwards_schema_to_sdk_create_record(mock_sdk):
     assert mock_sdk.create_record.call_count == 2
     assert mock_sdk.create_record.call_args_list[0].kwargs["schema"] is dd
     assert mock_sdk.create_record.call_args_list[1].kwargs["schema"] is dd
+
+
+@pytest.mark.parametrize("preserve_client_oid", [True, False])
+def test_submit_correlates_multi_subject_batch_with_standard_job_status_fields_only(
+    preserve_client_oid: bool,
+) -> None:
+    """Multi-subject registration correlates deterministically when JobStatus has no results field."""
+    from datetime import datetime, timezone
+
+    from imednet.models.subjects import Subject
+
+    sdk = MagicMock()
+    sdk.poll_jobs = None
+    existing_subject = Subject(
+        subject_id=10,
+        subject_key="EXISTING-001",
+        subject_oid="OID-EXISTING-001",
+        site_name="Site1",
+        deleted=False,
+    )
+    current_subjects: list[Subject] = [existing_subject]
+    captured_batches: list[list[dict]] = []
+
+    def fake_get_subjects(study_key: str):
+        return list(current_subjects)
+
+    def fake_create_record(study_key: str, records_data: list[dict], **kwargs):
+        batch_copy = [dict(item) for item in records_data]
+        captured_batches.append(batch_copy)
+        batch_idx = len(captured_batches)
+        if batch_idx == 1:
+            # Phase 1 registration batch creates 3 new subjects
+            for idx, payload in enumerate(batch_copy, start=1):
+                assigned_key = f"SUBJ-AUTO-{100 + idx}"
+                assigned_oid = (
+                    payload["subjectOid"] if preserve_client_oid else f"SERVER-OID-{100 + idx}"
+                )
+                current_subjects.append(
+                    Subject(
+                        subject_id=100 + idx,
+                        subject_key=assigned_key,
+                        subject_oid=assigned_oid,
+                        site_name=payload["siteName"],
+                        deleted=False,
+                    )
+                )
+        return Job(batch_id=f"batch-{batch_idx}", state="PENDING")
+
+    def fake_get_job(study_key: str, batch_id: str) -> JobStatus:
+        ts = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        return JobStatus(
+            job_id=f"job-{batch_id}",
+            batch_id=batch_id,
+            state="COMPLETED",
+            date_created=ts,
+            date_started=ts,
+            date_finished=ts,
+        )
+
+    sdk.get_subjects.side_effect = fake_get_subjects
+    sdk.create_record.side_effect = fake_create_record
+    sdk.get_job.side_effect = fake_get_job
+
+    rs_reg = GeneratedRecordSet(
+        form_key="F_REG",
+        form_name="Registration",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[
+            {"formKey": "F_REG", "siteName": "Site1", "data": {"AGE": 21}},
+            {"formKey": "F_REG", "siteName": "Site1", "data": {"AGE": 32}},
+            {"formKey": "F_REG", "siteName": "Site2", "data": {"AGE": 43}},
+        ],
+        subject_keys=["UAT-TEST-001", "UAT-TEST-002", "UAT-TEST-003"],
+    )
+    rs_data = GeneratedRecordSet(
+        form_key="F_VS",
+        form_name="Vital Signs",
+        test_type=RecordTestType.CREATE_NEW_RECORD,
+        payloads=[
+            {"formKey": "F_VS", "subjectKey": "UAT-TEST-001", "data": {"HR": 70}},
+            {"formKey": "F_VS", "subjectKey": "UAT-TEST-002", "data": {"HR": 72}},
+            {"formKey": "F_VS", "subjectKey": "UAT-TEST-003", "data": {"HR": 74}},
+        ],
+        subject_keys=["UAT-TEST-001", "UAT-TEST-002", "UAT-TEST-003"],
+    )
+
+    workflow = BulkRecordSubmissionWorkflow(
+        sdk, registration_poll_interval=0.001, skip_existing_subjects=False
+    )
+    result = workflow.submit("STUDY_CORR", [rs_reg, rs_data])
+
+    assert result.enrolled_subject_keys == ["SUBJ-AUTO-101", "SUBJ-AUTO-102", "SUBJ-AUTO-103"]
+    assert len(captured_batches) == 2
+    assert all(p["subjectOid"].startswith("UAT-") for p in captured_batches[0])
+    assert len({p["subjectOid"] for p in captured_batches[0]}) == 3
+    assert all("keywords" not in p for batch in captured_batches for p in batch)
+    assert [p["subjectKey"] for p in captured_batches[1]] == [
+        "SUBJ-AUTO-101",
+        "SUBJ-AUTO-102",
+        "SUBJ-AUTO-103",
+    ]
+
+
+def test_submit_blocks_unregistered_uat_test_placeholder_when_no_registration_set(mock_sdk) -> None:
+    """Submitting Phase 2 records referencing unregistered UAT-TEST-001 fails before POST /records."""
+    mock_sdk.get_subjects.return_value = []
+    workflow = BulkRecordSubmissionWorkflow(mock_sdk, skip_existing_subjects=False)
+    rs_data = GeneratedRecordSet(
+        form_key="F_VS",
+        form_name="Vital Signs",
+        test_type=RecordTestType.CREATE_NEW_RECORD,
+        payloads=[{"formKey": "F_VS", "subjectKey": "UAT-TEST-001", "data": {"HR": 70}}],
+        subject_keys=["UAT-TEST-001"],
+    )
+
+    with pytest.raises(BulkSubmissionError, match="unregistered placeholder subject"):
+        workflow.submit("STUDY_NO_SUBJ", [rs_data])
+    mock_sdk.create_record.assert_not_called()
