@@ -2630,3 +2630,385 @@ def test_all_four_cli_write_commands_json_emit_unsubmitted_chunks_plain_states_a
             output_format="json",
         )
     assert capsys.readouterr().out == ""
+
+
+def test_cli_dash_d_choice_strings_boolean_coercion_and_numeric_choice_matching(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Req 1 & 2: CLI -d preserves choice strings ('01','1.0','1.5','true','false') and converts bool only for boolean targets."""
+    from imednet.datadict import Choice, DataDictionary, Form
+    from imednet.datadict import Variable as DDVariable
+
+    _state, requests = _install_reusable_sim_sdk(monkeypatch)
+    dd = DataDictionary(
+        forms=[
+            Form(
+                formId=777,
+                formKey="F_CHOICES",
+                formName="Choice & Bool Form",
+                variables=[
+                    DDVariable(
+                        variableName="C_PAD",
+                        variableType="Coded",
+                        choices=[
+                            Choice(choiceValue="01", choiceText="One"),
+                            Choice(choiceValue="02", choiceText="Two"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="C_DEC",
+                        variableType="Radio",
+                        choices=[
+                            Choice(choiceValue="1.0", choiceText="OnePtZero"),
+                            Choice(choiceValue="1.5", choiceText="OnePtFive"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="C_TF_STR",
+                        variableType="Dropdown",
+                        choices=[
+                            Choice(choiceValue="true", choiceText="TrueCode"),
+                            Choice(choiceValue="false", choiceText="FalseCode"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="CB_STR_OPTS",
+                        variableType="Checkbox",
+                        choices=[
+                            Choice(choiceValue="true", choiceText="TrueOpt"),
+                            Choice(choiceValue="false", choiceText="FalseOpt"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="CB_CODED",
+                        variableType="Checkbox",
+                        choices=[
+                            Choice(choiceValue="1", choiceText="Yes"),
+                            Choice(choiceValue="2", choiceText="No"),
+                        ],
+                    ),
+                    DDVariable(variableName="CB_BOOL", variableType="Checkbox"),
+                    DDVariable(variableName="B_PRIM", variableType="Boolean"),
+                ],
+            )
+        ]
+    )
+    schema_file = tmp_path / "choices_dd.json"
+    schema_file.write_text(dd.model_dump_json(by_alias=True), encoding="utf-8")
+
+    res = _invoke_cli(
+        capsys,
+        [
+            "records",
+            "create",
+            "STUDY",
+            "--form-key",
+            "F_CHOICES",
+            "--subject-key",
+            "SUB1",
+            "--site-name",
+            "SITE",
+            "-d",
+            "C_PAD=1",
+            "-d",
+            "C_DEC=1.5",
+            "-d",
+            "C_TF_STR=true",
+            "-d",
+            "CB_STR_OPTS=false",
+            "-d",
+            "CB_CODED=true",
+            "-d",
+            "CB_BOOL=true",
+            "-d",
+            "B_PRIM=false",
+            "--schema",
+            str(schema_file),
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res.exit_code == 0, res.stderr
+    posted = json.loads([r for r in requests if r.method == "POST"][0].content.decode("utf-8"))
+    assert posted[0]["data"] == {
+        "C_PAD": "01",
+        "C_DEC": "1.5",
+        "C_TF_STR": "true",
+        "CB_STR_OPTS": "false",
+        "CB_CODED": True,
+        "CB_BOOL": True,
+        "B_PRIM": False,
+    }
+    assert isinstance(posted[0]["data"]["C_TF_STR"], str)
+    assert isinstance(posted[0]["data"]["CB_STR_OPTS"], str)
+    assert posted[0]["data"]["CB_CODED"] is True
+    assert posted[0]["data"]["CB_BOOL"] is True
+    assert posted[0]["data"]["B_PRIM"] is False
+
+
+def test_cli_parquet_routing_and_subjects_register_form_id_and_subject_overrides(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Req 4 & 6: CLI routes .parquet files and applies --form-id, --subject-key, --subject-oid overrides cleanly."""
+    import pandas as pd
+
+    state, requests = _install_reusable_sim_sdk(monkeypatch)
+    schema_path = _write_schema_fixture(tmp_path, "json", state)
+
+    # 1. Parquet routing across records import, records create -f, and subjects register -f
+    pq_records = tmp_path / "import_records.parquet"
+    pd.DataFrame(
+        [{"formKey": "F_TEXT", "siteName": "SITE", "subjectKey": "SUB-PQ-1", "ZIP_CODE": "90210"}]
+    ).to_parquet(pq_records, index=False)
+
+    for argv in (
+        [
+            "records",
+            "import",
+            "STUDY",
+            str(pq_records),
+            "--schema",
+            schema_path,
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+        [
+            "records",
+            "create",
+            "STUDY",
+            "-f",
+            str(pq_records),
+            "--schema",
+            schema_path,
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    ):
+        requests.clear()
+        res_pq = _invoke_cli(capsys, argv)
+        assert res_pq.exit_code == 0, res_pq.stderr
+        post_body = json.loads(
+            [r for r in requests if r.method == "POST"][0].content.decode("utf-8")
+        )
+        assert post_body[0]["data"]["ZIP_CODE"] == "90210"
+
+    # 2. subjects register with --form-id, --subject-key, AND --subject-oid overrides on --json and --file
+    requests.clear()
+    res_json_ovr = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--json",
+            '{"formKey": "OLD_FORM", "siteName": "SITE", "subjectKey": "OLD-SUB", "data": {"ZIP_CODE": "90210"}}',
+            "--form-id",
+            "99",
+            "--subject-key",
+            "NEW-SUB",
+            "--subject-oid",
+            "NEW-OID",
+            "--schema",
+            schema_path,
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_json_ovr.exit_code == 0, res_json_ovr.stderr
+    posted_ovr = json.loads([r for r in requests if r.method == "POST"][0].content.decode("utf-8"))
+    assert posted_ovr == [
+        {
+            "formId": 99,
+            "siteName": "SITE",
+            "subjectKey": "NEW-SUB",
+            "subjectOid": "NEW-OID",
+            "data": {"ZIP_CODE": "90210"},
+        }
+    ]
+    assert "formKey" not in posted_ovr[0]
+
+    requests.clear()
+    pq_subj = tmp_path / "single_subj.parquet"
+    pd.DataFrame([{"siteName": "SITE", "ZIP_CODE": "90210"}]).to_parquet(pq_subj, index=False)
+    res_file_ovr = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--file",
+            str(pq_subj),
+            "--form-id",
+            "99",
+            "--subject-key",
+            "PQ-SUB",
+            "--subject-oid",
+            "PQ-OID",
+            "--schema",
+            schema_path,
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_file_ovr.exit_code == 0, res_file_ovr.stderr
+    posted_pq_ovr = json.loads(
+        [r for r in requests if r.method == "POST"][0].content.decode("utf-8")
+    )
+    assert posted_pq_ovr == [
+        {
+            "formId": 99,
+            "siteName": "SITE",
+            "subjectKey": "PQ-SUB",
+            "subjectOid": "PQ-OID",
+            "data": {"ZIP_CODE": "90210"},
+        }
+    ]
+    assert "formKey" not in posted_pq_ovr[0]
+
+    # 3. Multi-Subject --json / --file without per-item keys rejects --subject-oid as well as --subject-key
+    res_multi_oid = _invoke_cli(
+        capsys,
+        [
+            "subjects",
+            "register",
+            "STUDY",
+            "--json",
+            '[{"formId": 99, "siteName": "SITE"}, {"formId": 99, "siteName": "SITE"}]',
+            "--subject-oid",
+            "DUP-OID",
+            "--no-interactive",
+            "--format",
+            "json",
+        ],
+    )
+    assert res_multi_oid.exit_code == 1
+    assert "--subject-oid" in res_multi_oid.stderr
+    assert json.loads(res_multi_oid.stdout)["status"] == "failed"
+
+
+def test_cli_wait_format_json_emits_v1_envelope_across_failure_modes(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Req 8 & AC 9: --wait --format json emits schemaVersion 1.0 JSON envelope and exits 1 before decorators.py."""
+    from imednet.endpoints.records import RecordsEndpoint
+    from imednet.errors import ServerError
+    from imednet.models.jobs import InvalidJobStateError, JobStatus
+    from imednet.utils.job_poller import JobFailedError, JobPollSummary, JobTimeoutError
+
+    _install_reusable_sim_sdk(monkeypatch)
+
+    sib_ok = JobStatus(jobId="J-1", batchId="B-SIB-OK", state="COMPLETED", progress=100)
+    sib_fail = JobStatus(jobId="J-2", batchId="B-SIB-FAIL", state="FAILED", progress=100)
+    poll_sum = JobPollSummary(
+        study_key="STUDY",
+        results={"B-SIB-OK": sib_ok},
+        failures={},
+        elapsed_total=0.1,
+    )
+    job_fail_err = JobFailedError(
+        "Job B-SIB-FAIL ended in state FAILED",
+        sib_fail,
+        poll_summary=poll_sum,
+    )
+    poll_sum.failures["B-SIB-FAIL"] = job_fail_err
+
+    csv_file = tmp_path / "wait_fail.csv"
+    csv_file.write_text("formKey,siteName,subjectKey,V_AGE\nF_DM,SITE,SUB1,30\n", encoding="utf-8")
+
+    for exc_to_raise in (
+        job_fail_err,
+        JobTimeoutError("Timed out polling B-TIMEOUT"),
+        InvalidJobStateError("Unrecognized job state 'BOGUS'"),
+        ServerError("502 Bad Gateway during --wait", status_code=502),
+    ):
+        monkeypatch.setattr(
+            RecordsEndpoint,
+            "create_batch",
+            lambda *_a, _e=exc_to_raise, **_kw: (_ for _ in ()).throw(_e),
+        )
+        for argv, expected_resource in (
+            (
+                [
+                    "records",
+                    "create",
+                    "STUDY",
+                    "--form-key",
+                    "F_DM",
+                    "-d",
+                    "V_AGE=30",
+                    "--wait",
+                    "--no-interactive",
+                    "--format",
+                    "json",
+                ],
+                "records_create",
+            ),
+            (
+                [
+                    "records",
+                    "update",
+                    "STUDY",
+                    "--record-id",
+                    "601",
+                    "-d",
+                    "V_AGE=31",
+                    "--wait",
+                    "--no-interactive",
+                    "--format",
+                    "json",
+                ],
+                "records_update",
+            ),
+            (
+                [
+                    "records",
+                    "import",
+                    "STUDY",
+                    str(csv_file),
+                    "--wait",
+                    "--no-interactive",
+                    "--format",
+                    "json",
+                ],
+                "records_import",
+            ),
+            (
+                [
+                    "subjects",
+                    "register",
+                    "STUDY",
+                    "--form-id",
+                    "10",
+                    "--site-name",
+                    "SITE",
+                    "--wait",
+                    "--no-interactive",
+                    "--format",
+                    "json",
+                ],
+                "subjects_register",
+            ),
+        ):
+            res = _invoke_cli(capsys, argv)
+            assert res.exit_code == 1
+            assert "Unexpected error:" not in res.stderr
+            envelope = json.loads(res.stdout)
+            assert envelope["schemaVersion"] == "1.0"
+            assert envelope["status"] == "failed"
+            assert envelope["resource"] == expected_resource
+            assert envelope["items"][0]["allSuccessful"] is False
+            if exc_to_raise is job_fail_err:
+                job_bids = [j["batchId"] for j in envelope["items"][0]["jobs"]]
+                assert "B-SIB-OK" in job_bids
+                assert "B-SIB-FAIL" in job_bids

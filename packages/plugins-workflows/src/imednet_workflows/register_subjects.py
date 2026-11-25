@@ -16,12 +16,18 @@ from imednet.spi.utils import (
     normalize_subject_registration_inputs,
     validate_subject_registration_sites,
 )
-from imednet.spi.validation import BaseSchemaCache, ValidationSchemaProtocol
+from imednet.spi.validation import (
+    AsyncSchemaValidator,
+    BaseSchemaCache,
+    SchemaValidator,
+    ValidationSchemaProtocol,
+)
 
 from ._workflow_helpers import (
     FacadeLike,
     WorkflowBatchSpec,
     build_keyword_record_chunk_submitter,
+    check_schema_cache_needs_refresh,
     enforce_single_job_records,
     ensure_sync_workflow_mode,
     prepare_batch_preflight,
@@ -173,6 +179,13 @@ class RegisterSubjectsWorkflow:
             chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
         )
         sdk = cast("ImednetFacade", self._sdk)
+        validator: SchemaValidator | None = None
+        if not offline_dry_run and isinstance(schema, BaseSchemaCache):
+            validator = SchemaValidator(sdk)
+            validator.schema = cast(Any, schema)
+            needs_refresh, _, _ = check_schema_cache_needs_refresh(schema, study_key, subjects)
+            if needs_refresh:
+                validator.refresh(study_key)
         sites = None if offline_dry_run else sdk.get_sites(study_key=study_key)
         pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
         existing = sdk.get_subjects(study_key=study_key) if should_filter else None
@@ -192,7 +205,12 @@ class RegisterSubjectsWorkflow:
         submitter = build_keyword_record_chunk_submitter(
             sdk.create_record, study_key, email_notify=email_notify, schema=schema
         )
-        return submit_workflow_batch_sync(sdk, spec, submitter)
+        return submit_workflow_batch_sync(
+            sdk,
+            spec,
+            submitter,
+            validate_batch_fn=None if validator is None else validator.validate_batch,
+        )
 
     def register_subjects(
         self,
@@ -277,6 +295,13 @@ class RegisterSubjectsWorkflow:
             chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
         )
         sdk = cast("AsyncImednetFacade", self._sdk)
+        validator: AsyncSchemaValidator | None = None
+        if not offline_dry_run and isinstance(schema, BaseSchemaCache):
+            validator = AsyncSchemaValidator(sdk)
+            validator.schema = cast(Any, schema)
+            needs_refresh, _, _ = check_schema_cache_needs_refresh(schema, study_key, subjects)
+            if needs_refresh:
+                await validator.refresh(study_key)
         sites = None if offline_dry_run else await sdk.async_get_sites(study_key=study_key)
         pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
         existing = await sdk.async_get_subjects(study_key=study_key) if should_filter else None
@@ -296,7 +321,12 @@ class RegisterSubjectsWorkflow:
         submitter = build_keyword_record_chunk_submitter(
             sdk.async_create_record, study_key, email_notify=email_notify, schema=schema
         )
-        return await submit_workflow_batch_async(sdk, spec, submitter)
+        return await submit_workflow_batch_async(
+            sdk,
+            spec,
+            submitter,
+            validate_batch_fn=None if validator is None else validator.validate_batch,
+        )
 
     async def async_register_subjects(
         self,

@@ -140,6 +140,15 @@ class BatchSubmissionSummary:
     wait_for_completion: bool = False
     has_error: bool = False
 
+    def __post_init__(self) -> None:
+        """Propagate aggregate batch IDs onto submitted jobs and polled statuses."""
+        all_bids = [j.batch_id for j in self.jobs if j.batch_id]
+        for job in self.jobs:
+            job.batch_ids = all_bids
+        if self.poll_summary is not None:
+            for st in self.poll_summary.terminal_statuses.values():
+                st.batch_ids = all_bids
+
     @property
     def batch_ids(self) -> list[str]:
         """Return all non-empty batch IDs created across submitted chunks."""
@@ -517,6 +526,15 @@ def _raise_from_poll_summary(
 
     target_exc: Exception | None = None
     if sanitized_poll.failures:
+        for err in sanitized_poll.failures.values():
+            try:
+                err.poll_summary = sanitized_poll  # type: ignore[attr-defined]
+                err.partial_summary = attached_summary  # type: ignore[attr-defined]
+                err.batch_summary = attached_summary  # type: ignore[attr-defined]
+                err.submitted_jobs = list(sanitized_jobs)  # type: ignore[attr-defined]
+                _attach_committed_jobs_context(err, sanitized_jobs, partial_summary.chunk_sizes)
+            except (AttributeError, TypeError):
+                pass
         target_exc = next(iter(sanitized_poll.failures.values()))
     else:
         for batch_id, status in sanitized_poll.results.items():

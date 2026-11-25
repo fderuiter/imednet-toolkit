@@ -121,8 +121,12 @@ if TYPE_CHECKING:
     from imednet.utils.tabular import (
         MASKED_SENTINEL,
         ensure_no_masked_sentinel,
+        extract_records_input_form_refs,
+        json_to_records,
+        load_tabular_file_records,
         normalize_records_input,
         normalize_tabular_row,
+        parquet_to_records,
     )
     from imednet.utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
     from imednet.utils.url import (
@@ -201,6 +205,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "imednet.utils.enrollment",
         "extract_candidate_subject_key",
     ),
+    "extract_records_input_form_refs": (
+        "imednet.utils.tabular",
+        "extract_records_input_form_refs",
+    ),
     "extract_sdk_security_key": ("imednet.core.context", "extract_sdk_security_key"),
     "extract_single_submitted_job": (
         "imednet.utils.batch_coordinator",
@@ -227,6 +235,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "is_boolean_token": ("imednet.utils.validators", "is_boolean_token"),
     "is_missing_value": ("imednet.utils.validators", "is_missing_value"),
     "is_site_enrollment_eligible": ("imednet.utils.enrollment", "is_site_enrollment_eligible"),
+    "json_to_records": ("imednet.utils.tabular", "json_to_records"),
+    "load_tabular_file_records": ("imednet.utils.tabular", "load_tabular_file_records"),
     "mask_clinical_phi": ("imednet.utils.security", "mask_clinical_phi"),
     "mask_custom_phi_recursive": (
         "imednet.integrations.enrichment",
@@ -247,6 +257,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     ),
     "normalize_tabular_row": ("imednet.utils.tabular", "normalize_tabular_row"),
     "normalize_utc_timestamp_bound": ("imednet.utils.dates", "normalize_utc_timestamp_bound"),
+    "parquet_to_records": ("imednet.utils.tabular", "parquet_to_records"),
     "parse_bool": ("imednet.utils.validators", "parse_bool"),
     "parse_expression": ("imednet.utils.evaluator", "parse_expression"),
     "parse_filter_expression": ("imednet.utils.filters", "parse_filter_expression"),
@@ -361,6 +372,7 @@ __all__ = [
     "evaluate_expression",
     "evaluate_job_state",
     "extract_candidate_subject_key",
+    "extract_records_input_form_refs",
     "extract_sdk_security_key",
     "extract_single_submitted_job",
     "fetch_terminal_job_result",
@@ -378,6 +390,8 @@ __all__ = [
     "is_boolean_token",
     "is_missing_value",
     "is_site_enrollment_eligible",
+    "json_to_records",
+    "load_tabular_file_records",
     "mask_clinical_phi",
     "mask_custom_phi_recursive",
     "matches_revision_date_bound",
@@ -389,6 +403,7 @@ __all__ = [
     "normalize_subject_registration_inputs",
     "normalize_tabular_row",
     "normalize_utc_timestamp_bound",
+    "parquet_to_records",
     "parse_bool",
     "parse_expression",
     "parse_filter_expression",

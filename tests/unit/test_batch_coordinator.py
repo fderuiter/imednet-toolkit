@@ -1591,3 +1591,8 @@ async def test_batch_coordinator_fail_fast_chunk_two_preserves_batch_one_complet
     assert async_partial.poll_summary is not None
     assert "BATCH-2" in async_partial.poll_summary.failures
     assert "BATCH-1" not in async_partial.poll_summary.failures
+    assert sync_exc_info.value.sibling_statuses["BATCH-1"].state == "COMPLETED"
+    assert "BATCH-2" not in sync_exc_info.value.sibling_statuses
+    assert async_exc_info.value.sibling_statuses["BATCH-1"].state == "COMPLETED"
+    assert all(j.batch_ids == ["BATCH-1", "BATCH-2"] for j in sync_partial.jobs)
+    assert all(j.batch_ids == ["BATCH-1", "BATCH-2"] for j in async_partial.jobs)

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -33,6 +33,8 @@ from imednet.utils.batch_coordinator import (
     sanitize_job_diagnostics,
 )
 from imednet.utils.job_poller import (
+    InvalidJobStateError,
+    InvalidJobTransitionError,
     JobFailedError,
     JobPollSummary,
     JobProgressHandler,
@@ -40,16 +42,21 @@ from imednet.utils.job_poller import (
 )
 from imednet.utils.security import sanitize_diagnostic_payload
 from imednet.utils.tabular import (
+    _BOOL_LIKE_TYPES,
+    _CHOICE_TYPES,
+    _DECIMAL_LITERAL_RE,
     _INT_LITERAL_RE,
-    _SLASH_SPACE_RE,
     _TEXT_LIKE_TYPES,
     MASKED_SENTINEL,
     _coerce_clinical_value,
     _contains_masked_sentinel,
-    _resolve_expected_var_type,
+    _match_choice_code,
+    _resolve_variable_metadata,
     csv_text_to_records,
     csv_to_records,
     ensure_no_masked_sentinel,
+    normalize_record_mapping,
+    parquet_to_records,
 )
 from imednet.validation.cache import BaseSchemaCache, SchemaCache, ValidationSchemaProtocol
 
@@ -252,28 +259,28 @@ def _unquote_double_quoted_literal(raw_val: str) -> str | None:
     return stripped[1:-1].replace('\\"', '"').replace("\\\\", "\\")
 
 
-def _resolve_cli_var_type(
+def _resolve_cli_var_metadata(
     schema: ValidationSchemaProtocol | None,
     *,
     form_key: str | None,
     form_id: int | None,
     var_name: str,
     study_key: str | None = None,
-) -> str | None:
-    """Resolve normalized variable type from *schema* and optional form context."""
+) -> tuple[str | None, tuple[str, ...]]:
+    """Resolve normalized ``(variable_type, choices)`` from *schema* and optional form context."""
     if schema is None:
-        return None
-    direct = _resolve_expected_var_type(
+        return None, ()
+    direct_type, direct_choices = _resolve_variable_metadata(
         schema,
         form_key,
         form_id,
         var_name,
         study_key=study_key,
     )
-    if direct is not None:
-        return direct
+    if direct_type is not None or direct_choices:
+        return direct_type, direct_choices or ()
     if form_key or form_id is not None:
-        return None
+        return None, ()
 
     # Form-less update fallback: check if variable has a single unambiguous type across forms
     candidate_fks: Sequence[str]
@@ -291,22 +298,57 @@ def _resolve_cli_var_type(
             candidate_fks = []
 
     matched_types: set[str] = set()
+    matched_choice_sets: set[tuple[str, ...]] = set()
     for fk in candidate_fks:
-        form_vars: Mapping[str, Any] = (
-            schema.variables_for_form(fk, study_key=study_key)
-            if isinstance(schema, BaseSchemaCache)
-            else schema.variables_for_form(fk)
+        fk_type, fk_choices = _resolve_variable_metadata(
+            schema,
+            fk,
+            None,
+            var_name,
+            study_key=study_key,
         )
-        if form_vars and var_name in form_vars:
-            raw = getattr(form_vars[var_name], "variable_type", None) or getattr(
-                form_vars[var_name], "variableType", None
-            )
-            if isinstance(raw, str) and raw.strip():
-                normalized = re.sub(r"[\s_-]+", " ", raw.strip().lower())
-                matched_types.add(_SLASH_SPACE_RE.sub("/", normalized))
+        if fk_type is not None:
+            matched_types.add(fk_type)
+            if fk_choices:
+                matched_choice_sets.add(fk_choices)
     if len(matched_types) == 1:
-        return next(iter(matched_types))
-    return None
+        resolved_choices = next(iter(matched_choice_sets)) if len(matched_choice_sets) == 1 else ()
+        return next(iter(matched_types)), resolved_choices
+    return None, ()
+
+
+def _coerce_cli_choice_pair_value(
+    raw_val: str,
+    *,
+    expected_var_type: str,
+    choices: tuple[str, ...],
+) -> Any:
+    """Coerce a ``-d`` string value for a single-choice or multi-choice Variable."""
+    val_stripped = raw_val.strip()
+    if choices:
+        if raw_val in choices:
+            return raw_val
+        if val_stripped in choices:
+            return val_stripped
+        if val_stripped.lower() in {"true", "false"}:
+            ci_matches = [c for c in choices if c.strip().lower() == val_stripped.lower()]
+            if len(ci_matches) == 1:
+                return ci_matches[0]
+            if expected_var_type in {"checkbox", "check box"}:
+                return val_stripped.lower() == "true"
+            return raw_val
+        if _INT_LITERAL_RE.match(val_stripped) or _DECIMAL_LITERAL_RE.match(val_stripped):
+            matched = _match_choice_code(Decimal(val_stripped), choices)
+            if matched is not None:
+                return matched
+        return raw_val
+
+    if expected_var_type in {"checkbox", "check box"} and val_stripped.lower() in {
+        "true",
+        "false",
+    }:
+        return val_stripped.lower() == "true"
+    return raw_val
 
 
 def parse_key_value_pairs(
@@ -341,7 +383,7 @@ def parse_key_value_pairs(
             parsed[key] = unquoted
             continue
 
-        expected_var_type = _resolve_cli_var_type(
+        expected_var_type, vchoices = _resolve_cli_var_metadata(
             schema,
             form_key=form_key,
             form_id=form_id,
@@ -352,6 +394,24 @@ def parse_key_value_pairs(
             parsed[key] = raw_val
             continue
         val_stripped = raw_val.strip()
+        if expected_var_type in _BOOL_LIKE_TYPES:
+            if val_stripped.lower() in {"true", "false"}:
+                parsed[key] = val_stripped.lower() == "true"
+            else:
+                parsed[key] = _coerce_clinical_value(
+                    raw_val,
+                    from_csv_str=True,
+                    expected_var_type=expected_var_type,
+                    choices=vchoices,
+                )
+            continue
+        if expected_var_type in _CHOICE_TYPES:
+            parsed[key] = _coerce_cli_choice_pair_value(
+                raw_val,
+                expected_var_type=expected_var_type,
+                choices=vchoices,
+            )
+            continue
         if expected_var_type is None:
             if _INT_LITERAL_RE.match(val_stripped):
                 parsed[key] = int(val_stripped)
@@ -361,16 +421,12 @@ def parse_key_value_pairs(
                     from_csv_str=True,
                     expected_var_type=None,
                 )
-        elif expected_var_type in {"checkbox", "check box"} and val_stripped.lower() in {
-            "true",
-            "false",
-        }:
-            parsed[key] = val_stripped.lower() == "true"
         else:
             parsed[key] = _coerce_clinical_value(
                 raw_val,
                 from_csv_str=True,
                 expected_var_type=expected_var_type,
+                choices=vchoices,
             )
     return parsed
 
@@ -416,7 +472,22 @@ def parse_stdin_records_text(
     if not stripped:
         raise ValueError("Empty input received from stdin ('-').")
     if stripped[0] in {"{", "["}:
-        return parse_json_records_text(cleaned, source_label="stdin")
+        raw_items = parse_json_records_text(cleaned, source_label="stdin")
+        return [
+            rec
+            for idx, item in enumerate(raw_items)
+            if (
+                rec := normalize_record_mapping(
+                    item,
+                    schema=schema,
+                    study_key=study_key,
+                    default_form_key=default_form_key,
+                    default_form_id=default_form_id,
+                    allow_flat_columns=True,
+                    row_index=idx,
+                )
+            )
+        ]
     if "\n" not in stripped.rstrip():
         try:
             json.loads(stripped)
@@ -458,9 +529,33 @@ def load_records_from_path_or_stdin(
     file_path = Path(file_arg)
     if not file_path.exists():
         raise ValueError(f"Input file not found: '{file_arg}'")
-    if file_path.suffix.lower() == ".json":
-        return parse_json_records_text(
-            file_path.read_text(encoding="utf-8"), source_label=str(file_path)
+    suffix = file_path.suffix.lower()
+    if suffix == ".json":
+        raw_items = parse_json_records_text(
+            file_path.read_text(encoding="utf-8-sig"), source_label=str(file_path)
+        )
+        return [
+            rec
+            for idx, item in enumerate(raw_items)
+            if (
+                rec := normalize_record_mapping(
+                    item,
+                    schema=schema,
+                    study_key=study_key,
+                    default_form_key=default_form_key,
+                    default_form_id=default_form_id,
+                    allow_flat_columns=True,
+                    row_index=idx,
+                )
+            )
+        ]
+    if suffix in {".parquet", ".pq"}:
+        return parquet_to_records(
+            file_path,
+            schema=schema,
+            study_key=study_key,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
         )
     return csv_to_records(
         file_path,
@@ -580,20 +675,35 @@ def assemble_cli_write_records(
             )
         records = [{"data": {}}]
 
-    if subject_key_arg and len(records) > 1:
+    if (subject_key_arg or subject_oid_arg) and len(records) > 1:
         existing_subjects = {
             sid for r in records if (sid := _extract_subject_identifier(r)) is not None
         }
         missing_count = sum(1 for r in records if _extract_subject_identifier(r) is None)
         if missing_count > 0 and (is_subject_registration or len(existing_subjects) > 1):
+            flag_name = "--subject-key" if subject_key_arg else "--subject-oid"
             raise ValueError(
-                "Cannot apply --subject-key across multi-Subject inputs lacking subject keys."
+                f"Cannot apply {flag_name} across multi-Subject inputs lacking subject keys."
             )
 
+    is_single_record = len(records) == 1
+    from_inline_json = bool(args.json_payload)
     resolved: list[dict[str, Any]] = []
-    for item in records:
+    for idx, item in enumerate(records):
         rec = dict(item)
-        if args.form_key and not (rec.get("formKey") or rec.get("form_key")):
+        if is_single_record:
+            if args.form_key:
+                rec["formKey"] = args.form_key
+                rec.pop("form_key", None)
+                if form_id_arg is None:
+                    rec.pop("formId", None)
+                    rec.pop("form_id", None)
+            elif form_id_arg is not None:
+                rec["formId"] = form_id_arg
+                rec.pop("form_id", None)
+                rec.pop("formKey", None)
+                rec.pop("form_key", None)
+        elif args.form_key and not (rec.get("formKey") or rec.get("form_key")):
             rec["formKey"] = args.form_key
         elif form_id_arg is not None and rec.get("formId") is None and rec.get("form_id") is None:
             rec["formId"] = form_id_arg
@@ -610,7 +720,16 @@ def assemble_cli_write_records(
         if visit_id_arg is not None and rec.get("visitId") is None and rec.get("visit_id") is None:
             rec["visitId"] = visit_id_arg
 
-        if _extract_subject_identifier(rec) is None:
+        if is_single_record:
+            if subject_key_arg:
+                rec["subjectKey"] = subject_key_arg
+                rec.pop("subject_key", None)
+            if subject_oid_arg:
+                rec["subjectOid"] = subject_oid_arg
+                rec.pop("subject_oid", None)
+            if subject_id_arg is not None and _extract_subject_identifier(rec) is None:
+                rec["subjectId"] = subject_id_arg
+        elif _extract_subject_identifier(rec) is None:
             if subject_key_arg:
                 rec["subjectKey"] = subject_key_arg
             elif subject_oid_arg:
@@ -636,6 +755,15 @@ def assemble_cli_write_records(
             rec["recordStatus"] = record_status_arg
         if reason_for_change_arg:
             rec["reasonForChange"] = reason_for_change_arg
+
+        if from_inline_json:
+            rec = normalize_record_mapping(
+                rec,
+                schema=schema,
+                study_key=resolved_study_key,
+                allow_flat_columns=False,
+                row_index=idx,
+            )
 
         if data_pairs:
             raw_fk = rec.get("formKey") or rec.get("form_key")
@@ -800,8 +928,11 @@ def summary_from_job_failure(
                 partial.skipped_count = skipped_count
             return partial
     committed_jobs = getattr(exc, "jobs", None)
+    attached_poll = getattr(exc, "poll_summary", None)
     if isinstance(committed_jobs, list) and committed_jobs:
         jobs: list[Job] = [_sanitize_job_for_cli(j) for j in committed_jobs]
+    elif isinstance(attached_poll, JobPollSummary) and attached_poll.terminal_statuses:
+        jobs = [_sanitize_job_for_cli(st) for st in attached_poll.terminal_statuses.values()]
     elif exc.status is not None:
         jobs = [_sanitize_job_for_cli(exc.status)]
     else:
@@ -816,13 +947,24 @@ def summary_from_job_failure(
         chunk_sizes = []
 
     fail_key = getattr(exc.status, "batch_id", None) or getattr(exc, "batch_id", None) or "failed"
-    results_map = {j.batch_id: j for j in jobs if isinstance(j, JobStatus) and j.batch_id}
-    poll_summary = JobPollSummary(
-        study_key=study_key,
-        results=results_map,
-        failures={str(fail_key): exc},
-        elapsed_total=0.0,
-    )
+    if isinstance(attached_poll, JobPollSummary):
+        poll_summary = JobPollSummary(
+            study_key=attached_poll.study_key or study_key,
+            results={
+                bid: cast(JobStatus, _sanitize_job_for_cli(st))
+                for bid, st in attached_poll.results.items()
+            },
+            failures=dict(attached_poll.failures) or {str(fail_key): exc},
+            elapsed_total=attached_poll.elapsed_total,
+        )
+    else:
+        results_map = {j.batch_id: j for j in jobs if isinstance(j, JobStatus) and j.batch_id}
+        poll_summary = JobPollSummary(
+            study_key=study_key,
+            results=results_map,
+            failures={str(fail_key): exc},
+            elapsed_total=0.0,
+        )
     return BatchSubmissionSummary(
         study_key=study_key,
         jobs=jobs,
@@ -1039,6 +1181,58 @@ def render_write_summary(
     _render_committed_jobs_table(summary, resource=resource)
 
 
+def _summary_from_poll_exception(
+    exc: Exception,
+    *,
+    study_key: str,
+    total_records: int = 0,
+    skipped_count: int = 0,
+) -> BatchSubmissionSummary:
+    """Synthesize a failed :class:`BatchSubmissionSummary` for polling timeout or state errors."""
+    committed_jobs = getattr(exc, "jobs", None)
+    attached_poll = getattr(exc, "poll_summary", None)
+    status_candidate = getattr(exc, "status", None) or getattr(exc, "last_status", None)
+    if isinstance(committed_jobs, list) and committed_jobs:
+        jobs: list[Job] = [_sanitize_job_for_cli(j) for j in committed_jobs]
+    elif isinstance(attached_poll, JobPollSummary) and attached_poll.terminal_statuses:
+        jobs = [_sanitize_job_for_cli(st) for st in attached_poll.terminal_statuses.values()]
+    elif isinstance(status_candidate, Job):
+        jobs = [_sanitize_job_for_cli(status_candidate)]
+    else:
+        jobs = []
+
+    fail_key = (
+        getattr(status_candidate, "batch_id", None) or getattr(exc, "batch_id", None) or "failed"
+    )
+    if isinstance(attached_poll, JobPollSummary):
+        poll_summary = JobPollSummary(
+            study_key=attached_poll.study_key or study_key,
+            results={
+                bid: cast(JobStatus, _sanitize_job_for_cli(st))
+                for bid, st in attached_poll.results.items()
+            },
+            failures=dict(attached_poll.failures) or {str(fail_key): exc},
+            elapsed_total=attached_poll.elapsed_total,
+        )
+    else:
+        poll_summary = JobPollSummary(
+            study_key=study_key,
+            results={j.batch_id: j for j in jobs if isinstance(j, JobStatus) and j.batch_id},
+            failures={str(fail_key): exc},
+            elapsed_total=0.0,
+        )
+    return BatchSubmissionSummary(
+        study_key=study_key,
+        jobs=jobs,
+        chunk_sizes=[total_records] if jobs and total_records else [],
+        total_records=total_records,
+        skipped_count=skipped_count,
+        poll_summary=poll_summary,
+        wait_for_completion=True,
+        has_error=True,
+    )
+
+
 def _extract_failure_summary(
     exc: Exception,
     *,
@@ -1076,7 +1270,24 @@ def _extract_failure_summary(
             skipped_count=skipped_count,
         )
 
+    if isinstance(exc, (JobTimeoutError, InvalidJobStateError, InvalidJobTransitionError)):
+        return _summary_from_poll_exception(
+            exc,
+            study_key=study_key,
+            total_records=total_records,
+            skipped_count=skipped_count,
+        )
+
     return None
+
+
+def _has_renderable_partial_summary(partial: BatchSubmissionSummary | None) -> bool:
+    return partial is not None and bool(
+        partial.jobs
+        or partial.unsubmitted_chunks
+        or partial.poll_summary is not None
+        or partial.validation_report is not None
+    )
 
 
 def execute_cli_write(
@@ -1086,6 +1297,7 @@ def execute_cli_write(
     resource: str,
     output_format: str | None = None,
     dry_run: bool = False,
+    wait: bool = False,
 ) -> None:
     """Orchestrate a CLI write command, emitting structured partial/validation failures before exit 1."""
     resolved_format = resolve_output_format(output_format)
@@ -1105,7 +1317,8 @@ def execute_cli_write(
             print_error(_redact_secrets(partial.validation_report.format_summary()))
             sys.exit(1)
 
-        if partial is not None and (partial.jobs or partial.unsubmitted_chunks):
+        if _has_renderable_partial_summary(partial):
+            assert partial is not None
             if resolved_format == "json":
                 emit_json([_summary_to_json_item(partial)], resource, status="failed")
             elif partial.jobs:
@@ -1125,15 +1338,13 @@ def execute_cli_write(
                 output_format=resolved_format,
             )
 
-        if isinstance(exc, (JobFailedError, JobTimeoutError, ApiError)):
-            exit_cli_write_error(
-                exc,
-                resource=resource,
-                study_key=study_key,
-                output_format=resolved_format,
-            )
-
-        raise
+        exit_cli_write_error(
+            exc,
+            resource=resource,
+            study_key=study_key,
+            output_format=resolved_format,
+            wait=wait,
+        )
 
     render_write_summary(summary, resource=resource, output_format=resolved_format)
 
@@ -1172,6 +1383,7 @@ def exit_cli_write_error(
     total_records: int = 0,
     skipped_count: int = 0,
     output_format: str | None = None,
+    wait: bool = False,
 ) -> NoReturn:
     """Print redacted/PHI-masked batch or job failure diagnostics, emit JSON if needed, and exit 1."""
     effective_study_key = (
@@ -1187,12 +1399,23 @@ def exit_cli_write_error(
         skipped_count=skipped_count,
         total_records=total_records,
     )
-    full_line, _ = _format_cli_write_exception(exc, partial=partial)
+    full_line, formatted_body = _format_cli_write_exception(exc, partial=partial)
     print_error(full_line)
-    if (
-        resolve_output_format(output_format) == "json"
-        and partial is not None
-        and (partial.jobs or partial.unsubmitted_chunks or partial.validation_report is not None)
-    ):
-        emit_json([_summary_to_json_item(partial)], resource, status="failed")
+    if resolve_output_format(output_format) == "json":
+        if _has_renderable_partial_summary(partial):
+            assert partial is not None
+            emit_json([_summary_to_json_item(partial)], resource, status="failed")
+        elif wait:
+            fallback_summary = BatchSubmissionSummary(
+                study_key=str(effective_study_key),
+                jobs=[],
+                chunk_sizes=[],
+                total_records=total_records,
+                skipped_count=skipped_count,
+                wait_for_completion=True,
+                has_error=True,
+            )
+            item = _summary_to_json_item(fallback_summary)
+            item["error"] = formatted_body
+            emit_json([item], resource, status="failed")
     sys.exit(1)

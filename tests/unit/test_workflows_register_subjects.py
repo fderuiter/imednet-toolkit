@@ -321,3 +321,133 @@ async def test_register_subjects_workflow_offline_dry_run_skips_sites_and_subjec
     async_sdk.async_get_sites.assert_not_called()
     async_sdk.async_get_subjects.assert_not_called()
     async_sdk.async_create_record.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_register_subjects_workflow_refreshes_cold_schema_cache_before_coercion(
+    tmp_path,
+) -> None:
+    """Req 5 & 6: RegisterSubjectsWorkflow refreshes cold SchemaCache before coercing formId, choices, and timestamps."""
+    from datetime import date
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    from imednet.models.variables import Variable
+    from imednet.validation.cache import AsyncSchemaCache, SchemaCache
+
+    active_site = Site(studyKey="STUDY", siteId=1, siteName="SITE", siteEnrollmentStatus="Active")
+    arm_var = Variable(
+        study_key="STUDY",
+        form_id=505,
+        form_key="F_ENROLL",
+        variable_id=1,
+        variable_name="ARM_CODE",
+        variable_type="Coded",
+    )
+    object.__setattr__(arm_var, "choices", [{"choiceValue": "01"}, {"choiceValue": "02"}])
+    enroll_vars = [
+        arm_var,
+        Variable(
+            study_key="STUDY",
+            form_id=505,
+            form_key="F_ENROLL",
+            variable_id=2,
+            variable_name="DOSE_TIER",
+            variable_type="Radio",
+        ),
+        Variable(
+            study_key="STUDY",
+            form_id=505,
+            form_key="F_ENROLL",
+            variable_id=3,
+            variable_name="WEIGHT_KG",
+            variable_type="Float",
+        ),
+        Variable(
+            study_key="STUDY",
+            form_id=505,
+            form_key="F_ENROLL",
+            variable_id=4,
+            variable_name="CONSENT_DT",
+            variable_type="Date",
+        ),
+    ]
+
+    # Sync cold SchemaCache with CSV input preserving '1.0' on Radio and matching 1 -> '01' on Coded
+    csv_path = tmp_path / "enroll.csv"
+    csv_path.write_text(
+        "formId,siteName,subjectKey,ARM_CODE,DOSE_TIER,WEIGHT_KG,CONSENT_DT\n"
+        "505,SITE,SUBJ-505,1,1.0,72.5,2026-07-15\n",
+        encoding="utf-8",
+    )
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.get_sites.return_value = [active_site]
+    sync_sdk.get_variables.return_value = enroll_vars
+    sync_sdk.create_record.return_value = Job(jobId="J1", batchId="B-REG-1", state="COMPLETED")
+    cold_cache = SchemaCache()
+
+    sync_wf = RegisterSubjectsWorkflow(sync_sdk)
+    job = sync_wf.register_subjects("STUDY", csv_path, schema=cold_cache)
+    assert job.batch_ids == ["B-REG-1"]
+    sync_sdk.get_variables.assert_called_once_with(study_key="STUDY")
+    sent_records = sync_sdk.create_record.call_args.kwargs["records_data"]
+    assert sent_records == [
+        {
+            "formId": 505,
+            "siteName": "SITE",
+            "subjectKey": "SUBJ-505",
+            "data": {
+                "ARM_CODE": "01",
+                "DOSE_TIER": "1.0",
+                "WEIGHT_KG": 72.5,
+                "CONSENT_DT": "2026-07-15",
+            },
+        }
+    ]
+    assert "formKey" not in sent_records[0]
+
+    # Async cold AsyncSchemaCache with RegisterSubjectRequest / dict inputs
+    async_sdk = MagicMock()
+    async_sdk.async_get_sites = AsyncMock(return_value=[active_site])
+    async_sdk.async_get_variables = AsyncMock(return_value=enroll_vars)
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="J2", batchId="B-REG-2", state="COMPLETED")
+    )
+    cold_async_cache = AsyncSchemaCache()
+
+    async_wf = RegisterSubjectsWorkflow(async_sdk)
+    ajob = await async_wf.async_register_subjects(
+        "STUDY",
+        [
+            RegisterSubjectRequest(
+                formId=505,
+                siteName="SITE",
+                subjectOid="OID-505",
+                data={
+                    "ARM_CODE": 1,
+                    "DOSE_TIER": Decimal("1.5"),
+                    "WEIGHT_KG": Decimal("68.25"),
+                    "CONSENT_DT": date(2026, 7, 16),
+                },
+            )
+        ],
+        schema=cold_async_cache,
+    )
+    assert ajob.batch_ids == ["B-REG-2"]
+    async_sdk.async_get_variables.assert_awaited_once_with(study_key="STUDY")
+    async_sent = async_sdk.async_create_record.call_args.kwargs["records_data"]
+    assert async_sent == [
+        {
+            "formId": 505,
+            "siteName": "SITE",
+            "subjectOid": "OID-505",
+            "data": {
+                "ARM_CODE": "01",
+                "DOSE_TIER": "1.5",
+                "WEIGHT_KG": 68.25,
+                "CONSENT_DT": "2026-07-16",
+            },
+        }
+    ]
+    assert "formKey" not in async_sent[0]

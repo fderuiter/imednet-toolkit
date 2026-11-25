@@ -917,3 +917,36 @@ async def test_job_poller_and_async_poller_isolate_terminal_cache_across_studies
     assert ares_a_stale.job_id == "AJA-1"
     assert async_poller._terminal_states[("STUDY_A", "BATCH-1")].job_id == "AJA-1"
     assert async_poller._terminal_states[("STUDY_B", "BATCH-1")].job_id == "AJB-1"
+
+
+@pytest.mark.asyncio
+async def test_poll_many_attaches_sibling_statuses_to_job_failed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Req 7 & AC 8: JobPoller.poll_many and AsyncJobPoller.async_poll_many attach sibling JobStatus results to JobFailedError."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    def get_sync(_sk: str, bid: str) -> JobStatus:
+        if bid == "B-FAIL":
+            return JobStatus(jobId="J-2", batchId="B-FAIL", state="FAILED", progress=100)
+        return JobStatus(jobId=f"J-{bid}", batchId=bid, state="COMPLETED", progress=100)
+
+    summary = JobPoller(get_sync).poll_many("STUDY", ["B-OK-1", "B-FAIL", "B-OK-2"], interval=0)
+    err = summary.failures["B-FAIL"]
+    assert isinstance(err, JobFailedError)
+    assert err.poll_summary is summary
+    assert set(err.sibling_statuses) == {"B-OK-1", "B-OK-2"}
+    assert err.sibling_statuses["B-OK-1"].state == "COMPLETED"
+    assert err.sibling_statuses["B-OK-2"].state == "COMPLETED"
+
+    async def get_async(sk: str, bid: str) -> JobStatus:
+        return get_sync(sk, bid)
+
+    async_summary = await AsyncJobPoller(get_async).async_poll_many(
+        "STUDY", ["B-OK-1", "B-FAIL", "B-OK-2"], interval=0
+    )
+    async_err = async_summary.failures["B-FAIL"]
+    assert isinstance(async_err, JobFailedError)
+    assert async_err.poll_summary is async_summary
+    assert set(async_err.sibling_statuses) == {"B-OK-1", "B-OK-2"}

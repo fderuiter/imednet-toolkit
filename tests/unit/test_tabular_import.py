@@ -658,3 +658,344 @@ async def test_dry_run_without_schema_loads_study_datadict_in_endpoint_and_impor
     assert async_summary.validation_report is not None
     assert async_summary.validation_report.is_valid is False
     assert not any(r.method == "POST" for r in async_captured)
+
+
+def test_categorical_choice_strings_numeric_matching_temporal_and_decimal_coercion(
+    tmp_path: Path,
+) -> None:
+    """Req 1 & 3: Preserve choice strings, match numeric choice codes, and serialize temporal/Decimal scalars."""
+    import datetime
+    import json
+    from decimal import Decimal
+
+    import numpy as np
+    import pandas as pd
+
+    from imednet.datadict import Choice, DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+    from imednet.models.variables import Variable as SdkVariable
+    from imednet.utils.tabular import (
+        csv_to_records,
+        json_to_records,
+        load_tabular_file_records,
+        normalize_records_input,
+        parquet_to_records,
+    )
+    from imednet.validation.cache import SchemaCache, validate_records_batch
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formId=501,
+                formKey="F_CAT",
+                formName="Categorical & Scalar Form",
+                variables=[
+                    DDVariable(
+                        variableName="V_ZERO_PAD",
+                        variableType="Coded",
+                        choices=[
+                            Choice(choiceValue="01", choiceText="One"),
+                            Choice(choiceValue="02", choiceText="Two"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="V_DEC_CODE",
+                        variableType="Radio",
+                        choices=[
+                            Choice(choiceValue="1.0", choiceText="Base"),
+                            Choice(choiceValue="1.5", choiceText="Half"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="V_BOOL_CHOICE",
+                        variableType="Dropdown",
+                        choices=[
+                            Choice(choiceValue="true", choiceText="YesStr"),
+                            Choice(choiceValue="false", choiceText="NoStr"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="V_MULTI",
+                        variableType="Multi Select",
+                        choices=[
+                            Choice(choiceValue="01", choiceText="A"),
+                            Choice(choiceValue="1.5", choiceText="B"),
+                        ],
+                    ),
+                    DDVariable(variableName="V_DATE", variableType="Date"),
+                    DDVariable(variableName="V_DT", variableType="DateTime"),
+                    DDVariable(variableName="V_TIME", variableType="Time"),
+                    DDVariable(variableName="V_INT", variableType="Integer"),
+                    DDVariable(variableName="V_DEC", variableType="Decimal"),
+                    DDVariable(variableName="V_TXT", variableType="Text"),
+                ],
+            )
+        ]
+    )
+
+    csv_path = tmp_path / "choices.csv"
+    csv_path.write_text(
+        "formKey,subjectKey,V_ZERO_PAD,V_DEC_CODE,V_BOOL_CHOICE,V_MULTI,V_DATE,V_DT,V_TIME,V_INT,V_DEC,V_TXT\n"
+        "F_CAT,SUB-1,01,1.0,true,01,2026-05-01,2026-05-01T14:30:00,09:15:00,42,3.75,007.50\n"
+        "F_CAT,SUB-2,02,1.5,false,1.5,2026-05-02,2026-05-02T08:00:00,18:45:00,7,1.0,false\n",
+        encoding="utf-8",
+    )
+    csv_recs = csv_to_records(csv_path, schema=dd, study_key="STUDY")
+    assert csv_recs[0]["data"] == {
+        "V_ZERO_PAD": "01",
+        "V_DEC_CODE": "1.0",
+        "V_BOOL_CHOICE": "true",
+        "V_MULTI": "01",
+        "V_DATE": "2026-05-01",
+        "V_DT": "2026-05-01T14:30:00",
+        "V_TIME": "09:15:00",
+        "V_INT": 42,
+        "V_DEC": 3.75,
+        "V_TXT": "007.50",
+    }
+    assert csv_recs[1]["data"]["V_DEC_CODE"] == "1.5"
+    assert csv_recs[1]["data"]["V_BOOL_CHOICE"] == "false"
+    assert validate_records_batch(dd, csv_recs, study_key="STUDY", collect_errors=True).is_valid
+
+    # Numeric inputs in DataFrame, Parquet, JSON, and list[dict] match configured choice codes
+    df = pd.DataFrame(
+        [
+            {
+                "formId": 501,
+                "subjectKey": "SUB-DF",
+                "V_ZERO_PAD": 1,
+                "V_DEC_CODE": 1.5,
+                "V_BOOL_CHOICE": True,
+                "V_MULTI": 1,
+                "V_DATE": pd.Timestamp("2026-05-01"),
+                "V_DT": np.datetime64("2026-05-01T14:30:00"),
+                "V_TIME": datetime.time(9, 15, 0),
+                "V_INT": Decimal(42),
+                "V_DEC": Decimal("3.75"),
+                "V_TXT": Decimal("7.50"),
+            }
+        ]
+    )
+    df_recs = dataframe_to_records(df, schema=dd, study_key="STUDY")
+    assert df_recs[0]["data"] == {
+        "V_ZERO_PAD": "01",
+        "V_DEC_CODE": "1.5",
+        "V_BOOL_CHOICE": "true",
+        "V_MULTI": "01",
+        "V_DATE": "2026-05-01",
+        "V_DT": "2026-05-01T14:30:00",
+        "V_TIME": "09:15:00",
+        "V_INT": 42,
+        "V_DEC": 3.75,
+        "V_TXT": "7.50",
+    }
+    assert json.loads(json.dumps(df_recs)) == df_recs
+    assert validate_records_batch(dd, df_recs, study_key="STUDY", collect_errors=True).is_valid
+
+    pq_path = tmp_path / "choices.parquet"
+    df_pq = df.drop(columns=["V_INT", "V_DEC", "V_TXT", "V_TIME"]).assign(
+        V_INT=42, V_DEC=3.75, V_TXT="007.50"
+    )
+    df_pq.to_parquet(pq_path, index=False)
+    pq_recs = parquet_to_records(pq_path, schema=dd, study_key="STUDY")
+    assert pq_recs[0]["data"]["V_ZERO_PAD"] == "01"
+    assert pq_recs[0]["data"]["V_DEC_CODE"] == "1.5"
+    assert pq_recs[0]["data"]["V_BOOL_CHOICE"] == "true"
+    assert pq_recs[0]["data"]["V_DATE"] == "2026-05-01"
+    assert validate_records_batch(dd, pq_recs, study_key="STUDY", collect_errors=True).is_valid
+
+    json_path = tmp_path / "choices.json"
+    json_path.write_text(
+        json.dumps(
+            [
+                {
+                    "formKey": "F_CAT",
+                    "subjectKey": "SUB-J",
+                    "data": {
+                        "V_ZERO_PAD": 2,
+                        "V_DEC_CODE": 1,
+                        "V_BOOL_CHOICE": "false",
+                        "V_MULTI": [1, 1.5],
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    j_recs = json_to_records(json_path, schema=dd, study_key="STUDY")
+    assert j_recs[0]["data"] == {
+        "V_ZERO_PAD": "02",
+        "V_DEC_CODE": "1.0",
+        "V_BOOL_CHOICE": "false",
+        "V_MULTI": ["01", "1.5"],
+    }
+    assert load_tabular_file_records(json_path, schema=dd, study_key="STUDY") == j_recs
+
+    dict_recs = normalize_records_input(
+        [
+            {
+                "formKey": "F_CAT",
+                "subjectKey": "SUB-DICT",
+                "data": {
+                    "V_ZERO_PAD": Decimal(1),
+                    "V_DEC_CODE": Decimal("1.50"),
+                    "V_BOOL_CHOICE": False,
+                    "V_MULTI": [1, Decimal("1.5")],
+                    "V_DATE": datetime.date(2026, 5, 3),
+                    "V_DT": datetime.datetime(2026, 5, 3, 12, 0, 0),
+                    "V_INT": Decimal(19),
+                    "V_DEC": Decimal("2.25"),
+                    "V_TXT": Decimal("9.00"),
+                },
+            }
+        ],
+        schema=dd,
+        study_key="STUDY",
+    )
+    assert dict_recs[0]["data"] == {
+        "V_ZERO_PAD": "01",
+        "V_DEC_CODE": "1.5",
+        "V_BOOL_CHOICE": "false",
+        "V_MULTI": ["01", "1.5"],
+        "V_DATE": "2026-05-03",
+        "V_DT": "2026-05-03T12:00:00",
+        "V_INT": 19,
+        "V_DEC": 2.25,
+        "V_TXT": "9.00",
+    }
+    assert validate_records_batch(dd, dict_recs, study_key="STUDY", collect_errors=True).is_valid
+
+    # SchemaCache choice Preservation and multi-Study shared Form key/ID resolution
+    cache = SchemaCache()
+    cache.populate(
+        [
+            SdkVariable(
+                study_key="STUDY_ONE",
+                form_id=10,
+                form_key="F_SHARED",
+                variable_name="V_VAL",
+                variable_type="Radio",
+            ),
+        ],
+        study_key="STUDY_ONE",
+    )
+    cache.populate(
+        [
+            SdkVariable(
+                study_key="STUDY_TWO",
+                form_id=10,
+                form_key="F_TWO",
+                variable_name="V_VAL",
+                variable_type="Integer",
+            ),
+            SdkVariable(
+                study_key="STUDY_TWO",
+                form_id=20,
+                form_key="F_SHARED",
+                variable_name="V_VAL",
+                variable_type="Integer",
+            ),
+        ],
+        study_key="STUDY_TWO",
+    )
+    s1 = normalize_records_input(
+        [{"formId": 10, "data": {"V_VAL": 1.5}}], schema=cache, study_key="STUDY_ONE"
+    )
+    s2 = normalize_records_input(
+        [{"formId": 10, "data": {"V_VAL": 4.0}}], schema=cache, study_key="STUDY_TWO"
+    )
+    assert s1[0]["data"]["V_VAL"] == "1.5"
+    assert s2[0]["data"]["V_VAL"] == 4
+    assert isinstance(s2[0]["data"]["V_VAL"], int)
+
+
+def test_parquet_and_json_routing_masked_sentinel_and_lazy_pandas_and_form_id_enrollment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Req 4 & 6: Route .parquet/.json without csv_to_records, lazy check_pandas, and preserve formId on enrollment."""
+    import json
+
+    import pandas as pd
+
+    import imednet.utils.pandas as pandas_mod
+    import imednet.utils.tabular as tabular_mod
+    from imednet.models.records import RegisterSubjectRequest
+    from imednet.utils.enrollment import normalize_subject_registration_inputs
+
+    pq_ok = tmp_path / "records.parquet"
+    pd.DataFrame(
+        [{"formKey": "F_DM", "siteName": "SITE", "subjectKey": "SUB-PQ", "V_AGE": 29}]
+    ).to_parquet(pq_pq := pq_ok, index=False)
+    json_ok = tmp_path / "records.json"
+    json_ok.write_text(
+        json.dumps(
+            [{"formId": 99, "siteName": "SITE", "subjectKey": "SUB-JS", "data": {"V_AGE": 31}}]
+        ),
+        encoding="utf-8",
+    )
+
+    # Ensure csv_to_records is never called for .parquet or .json
+    def _forbid_csv(*_a: object, **_kw: object) -> list[dict[str, object]]:
+        raise AssertionError("csv_to_records must not be called for non-CSV formats")
+
+    monkeypatch.setattr(tabular_mod, "csv_to_records", _forbid_csv)
+    monkeypatch.setattr(pandas_mod, "csv_to_records", _forbid_csv)
+
+    sdk, _state, captured = _make_sim_sdk()
+    pq_summary = import_records_csv(sdk, "STUDY", pq_pq)
+    assert pq_summary.total_records == 1
+    assert any(r.method == "POST" for r in captured)
+
+    # Enrollment with formId omits empty formKey and routes .parquet and .json
+    req_fid = RegisterSubjectRequest(
+        formId=301, siteName="SITE", subjectKey="SUB-FID", subjectOid="OID-FID"
+    )
+    dumped_fid = req_fid.model_dump(by_alias=True)
+    assert dumped_fid == {
+        "formId": 301,
+        "siteName": "SITE",
+        "subjectKey": "SUB-FID",
+        "subjectOid": "OID-FID",
+        "data": {},
+    }
+    assert "formKey" not in dumped_fid
+
+    json_pairs = normalize_subject_registration_inputs(json_ok)
+    assert json_pairs[0][1].form_id == 99
+    assert "formKey" not in json_pairs[0][1].model_dump(by_alias=True)
+    assert isinstance(json_pairs[0][0], dict)
+    assert "formKey" not in json_pairs[0][0]
+    assert json_pairs[0][0]["formId"] == 99
+
+    pq_no_fk = tmp_path / "subjects_fid.parquet"
+    pd.DataFrame([{"siteName": "SITE", "subjectKey": "SUB-DEF-FID", "V_AGE": 44}]).to_parquet(
+        pq_no_fk, index=False
+    )
+    pq_pairs = normalize_subject_registration_inputs(pq_no_fk, default_form_id=301)
+    assert pq_pairs[0][1].form_id == 301
+    assert isinstance(pq_pairs[0][0], dict)
+    assert "formKey" not in pq_pairs[0][0]
+    assert pq_pairs[0][0]["formId"] == 301
+
+    # Masked sentinel rejected on .parquet and .json before HTTP
+    pq_masked = tmp_path / "masked.parquet"
+    pd.DataFrame(
+        [{"formKey": "F_DM", "subjectKey": "SUB-M", "V_NOTES": "***MASKED***"}]
+    ).to_parquet(pq_masked, index=False)
+    with pytest.raises(ValidationError, match="MASKED"):
+        tabular_mod.parquet_to_records(pq_masked)
+
+    json_masked = tmp_path / "masked.json"
+    json_masked.write_text(
+        json.dumps([{"formKey": "F_DM", "data": {"V_NOTES": "***MASKED***"}}]), encoding="utf-8"
+    )
+    with pytest.raises(ValidationError, match="MASKED"):
+        tabular_mod.json_to_records(json_masked)
+
+    # check_pandas called lazily only for .parquet, not .json
+    monkeypatch.setattr(pandas_mod, "pd", None)
+    assert tabular_mod.load_tabular_file_records(json_ok)[0]["formId"] == 99
+    with pytest.raises(ImportError, match="pandas is required"):
+        tabular_mod.load_tabular_file_records(pq_pq)

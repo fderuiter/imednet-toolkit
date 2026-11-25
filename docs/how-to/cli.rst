@@ -133,7 +133,8 @@ Batch writes, schema-aware coercion, and dry runs
 
 ``imednet records create``, ``imednet records update``, ``imednet records import``, and
 ``imednet subjects register`` share a unified write pipeline across inline flags, ``--json``,
-``-f`` / ``--file`` (or positional ``FILE`` on ``records import``), and piped ``-`` ``stdin``
+``-f`` / ``--file`` (or positional ``FILE`` on ``records import``, routing ``.csv``,
+``.json``, and ``.parquet`` files automatically), and piped ``-`` ``stdin``
 (auto-detecting JSON or CSV while rejecting interactive TTY ``stdin`` before opening SDK
 connections):
 
@@ -144,15 +145,18 @@ connections):
    imednet records update STUDY --record-id 601 -d V_AGE=51 \
        --reason-for-change "Chart correction" --wait --format json
    cat batch.csv | imednet records import STUDY - --schema api --wait --format json
-   imednet subjects register STUDY --file subjects.csv --skip-existing --wait
+   imednet subjects register STUDY --file subjects.parquet --form-id 101 --skip-existing --wait
 
 Passing ``--schema`` (``api``, canonical ``DataDictionary`` JSON, CDISC ODM XML, REDCap
 CSV, or a 4-file CSV directory/ZIP) preserves string values on ``text``, ``string``, and
-``memo`` Variables for both CSV cells and ``-d KEY=VALUE`` overrides, while double-quoted
-``-d 'KEY="90210"'`` values always remain strings even without ``--schema``. Offline
-``--dry-run`` runs with an offline ``--schema`` perform local validation only without
-issuing HTTP requests, whereas ``--dry-run`` without ``--schema`` loads the live Study
-``DataDictionary`` to validate Form and Variable keys before reporting results.
+``memo`` Variables as well as categorical choice codes (such as ``"01"``, ``"1.0"``, or
+string ``"true"`` / ``"false"`` options, converting ``true`` / ``false`` to booleans only
+when the target Variable expects a boolean) across tabular files and ``-d KEY=VALUE``
+overrides, while double-quoted ``-d 'KEY="90210"'`` values always remain strings even
+without ``--schema``. Offline ``--dry-run`` runs with an offline ``--schema`` perform local
+validation only without issuing HTTP requests, whereas ``--dry-run`` without ``--schema``
+loads the live Study ``DataDictionary`` to validate Form and Variable keys before reporting
+results.
 
 Legacy ``records list -o/--output`` accepts ``json``, ``csv``, or an explicit ``.json`` /
 ``.csv`` destination path (preserving ``./records.json`` and ``./records.csv`` for

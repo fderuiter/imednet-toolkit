@@ -565,15 +565,25 @@ class DataDictionary(DictCompatMixin, BaseModel):
                 return form
         return None
 
-    def variables_for_form(self, form_key: str) -> dict[str, Variable]:
+    def variables_for_form(
+        self,
+        form_key: str,
+        study_key: str | None = None,
+    ) -> dict[str, Variable]:
         """Return a mapping of variable names to Variable definitions for ``form_key``."""
+        del study_key
         form = self.form_for_key(form_key)
         if form is None:
             return {}
         return {var.variableName: var for var in form.variables if var.variableName}
 
-    def form_key_from_id(self, form_id: int | str) -> str | None:
+    def form_key_from_id(
+        self,
+        form_id: int | str,
+        study_key: str | None = None,
+    ) -> str | None:
         """Resolve a ``formKey`` from a numeric or string ``formId``."""
+        del study_key
         if isinstance(form_id, bool) or form_id is None or form_id == "":
             return None
         target_str = str(form_id).strip()

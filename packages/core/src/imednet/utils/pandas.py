@@ -29,7 +29,12 @@ from .security import (
     mask_clinical_phi,
     sanitize_csv_formula,
 )
-from .tabular import MASKED_SENTINEL, csv_to_records, dataframe_rows_to_records
+from .tabular import (
+    MASKED_SENTINEL,
+    csv_to_records,
+    dataframe_rows_to_records,
+    load_tabular_file_records,
+)
 from .typing import JsonDict
 
 if TYPE_CHECKING:  # pragma: no cover - only for type checking
@@ -262,14 +267,16 @@ def import_records_csv(
     ``packages/core`` even when ``pandas`` is not installed, and rejects
     ``***MASKED***`` sentinels before any HTTP request is sent.
     """
-    records = csv_to_records(file_path, schema=schema, study_key=study_key)
+    records = load_tabular_file_records(file_path, schema=schema, study_key=study_key)
     effective_schema = schema
     if records and effective_schema is None and not skip_validation:
         from imednet.datadict.loaders.api import can_load_from_api, load_from_api
 
         if can_load_from_api(sdk):
             effective_schema = load_from_api(sdk, study_key)
-            records = csv_to_records(file_path, schema=effective_schema, study_key=study_key)
+            records = load_tabular_file_records(
+                file_path, schema=effective_schema, study_key=study_key
+            )
     return sdk.records.create_batch(
         study_key,
         records,

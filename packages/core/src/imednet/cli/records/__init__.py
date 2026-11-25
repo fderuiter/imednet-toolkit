@@ -260,7 +260,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             "--file",
             dest="input_file",
             default=None,
-            help="Path to JSON or CSV file of record payloads ('-' for stdin JSON or CSV).",
+            help="Path to JSON, CSV, or Parquet file of record payloads ('-' for stdin JSON or CSV).",
         )
         target_parser.add_argument(
             "--json",
@@ -349,6 +349,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             resource="records_create",
             output_format=args.output_format,
             dry_run=args.dry_run,
+            wait=args.wait,
         )
 
     def _dispatch_create_records(args: argparse.Namespace) -> None:
@@ -410,6 +411,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             resource="records_update",
             output_format=args.output_format,
             dry_run=args.dry_run,
+            wait=args.wait,
         )
 
     def _dispatch_update_records(args: argparse.Namespace) -> None:
@@ -445,12 +447,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     # 4. records import
     import_parser = sub.add_parser(
         "import",
-        help="Import study records from a CSV or JSON file (or '-' for stdin).",
+        help="Import study records from a CSV, JSON, or Parquet file (or '-' for stdin).",
     )
     add_study_key_args(import_parser)
     import_parser.add_argument(
         "file",
-        help="Path to CSV or JSON file to import ('-' for stdin JSON or CSV).",
+        help="Path to CSV, JSON, or Parquet file to import ('-' for stdin JSON or CSV).",
     )
     add_write_common_args(import_parser)
 
@@ -466,10 +468,16 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 args.schema_source,
                 dry_run=args.dry_run,
             )
-            if args.file == "-" or input_path.suffix.lower() == ".json":
+            if args.file == "-" or input_path.suffix.lower() in {".json", ".parquet", ".pq"}:
+                effective_schema = resolved_schema
+                if effective_schema is None and args.file != "-":
+                    from ...datadict.loaders.api import can_load_from_api, load_from_api
+
+                    if can_load_from_api(sdk):
+                        effective_schema = load_from_api(sdk, args.study_key)
                 payload = load_records_from_path_or_stdin(
                     args.file,
-                    schema=resolved_schema,
+                    schema=effective_schema,
                     study_key=args.study_key,
                 )
                 return submit_cli_records_batch(
@@ -477,7 +485,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                     args,
                     payload,
                     action_label="record import",
-                    schema=resolved_schema,
+                    schema=effective_schema,
                 )
             email_notify = parse_email_notify(args.email_notify)
             with write_progress_context(
@@ -515,6 +523,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             resource="records_import",
             output_format=args.output_format,
             dry_run=args.dry_run,
+            wait=args.wait,
         )
 
     def _dispatch_import_records(args: argparse.Namespace) -> None:

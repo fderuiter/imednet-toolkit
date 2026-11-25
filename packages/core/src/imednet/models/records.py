@@ -216,12 +216,17 @@ class BaseRecordRequest(ImednetBaseModel):
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
+    Requires ``formKey`` (or ``formId``) and a site identifier (``siteName`` or ``siteId``).
     Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
     ``None`` so server-assigned subject keys continue working by default; when
     explicitly supplied, they are preserved for enrollment and deduplication.
     """
 
+    form_id: int | None = Field(
+        default=None,
+        alias="formId",
+        description="Numeric ID of the registration form",
+    )
     site_name: str = Field(
         "", alias="siteName", description="Name of the site where the subject is enrolled"
     )
@@ -254,6 +259,12 @@ class RegisterSubjectRequest(BaseRecordRequest):
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, Any]:
         serialized: dict[str, Any] = handler(self)
+        if self.form_id is None:
+            serialized.pop("form_id", None)
+            serialized.pop("formId", None)
+        elif not self.form_key:
+            serialized.pop("form_key", None)
+            serialized.pop("formKey", None)
         if self.site_id is None:
             serialized.pop("site_id", None)
             serialized.pop("siteId", None)
@@ -271,15 +282,21 @@ class RegisterSubjectRequest(BaseRecordRequest):
     def model_dump(self, **kwargs: Any) -> dict[str, Any]:
         """Serialize enrollment payload, omitting ``None`` optional attributes by default."""
         kwargs.setdefault("exclude_none", True)
+        omitted_fields: set[str] = set()
+        if not self.form_key and self.form_id is not None:
+            omitted_fields.add("form_key")
         if not self.site_name and self.site_id is not None:
+            omitted_fields.add("site_name")
+        if omitted_fields:
             raw_exclude = kwargs.get("exclude")
             if raw_exclude is None:
-                kwargs["exclude"] = {"site_name"}
+                kwargs["exclude"] = omitted_fields
             elif isinstance(raw_exclude, set):
-                kwargs["exclude"] = raw_exclude | {"site_name"}
+                kwargs["exclude"] = raw_exclude | omitted_fields
             elif isinstance(raw_exclude, dict):
                 merged = dict(raw_exclude)
-                merged["site_name"] = True
+                for field_name in omitted_fields:
+                    merged[field_name] = True
                 kwargs["exclude"] = merged
         return super().model_dump(**kwargs)
 

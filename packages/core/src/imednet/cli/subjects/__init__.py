@@ -89,7 +89,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "--file",
         dest="input_file",
         default=None,
-        help="Path to CSV or JSON file of subject registration requests ('-' for stdin JSON or CSV).",
+        help="Path to CSV, JSON, or Parquet file of subject registration requests ('-' for stdin JSON or CSV).",
     )
     register_parser.add_argument(
         "--json",
@@ -101,6 +101,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "--form-key",
         default=None,
         help="Registration form key (formKey) for inline registration or file default.",
+    )
+    register_parser.add_argument(
+        "--form-id",
+        type=int,
+        default=None,
+        help="Registration form ID (formId) for inline registration or file default.",
     )
     register_parser.add_argument(
         "--site-name",
@@ -164,6 +170,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             normalized_pairs = normalize_subject_registration_inputs(
                 raw_inputs,
                 default_form_key=args.form_key,
+                default_form_id=args.form_id,
                 default_site_name=args.site_name,
                 default_site_id=args.site_id,
                 schema=resolved_schema,
@@ -198,6 +205,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             resource="subjects_register",
             output_format=args.output_format,
             dry_run=args.dry_run,
+            wait=args.wait,
         )
 
     def _dispatch_register_subjects(args: argparse.Namespace) -> None:
@@ -216,10 +224,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if (
             not args.input_file
             and not args.json_payload
-            and (not args.form_key or (not args.site_name and args.site_id is None))
+            and (
+                (not args.form_key and args.form_id is None)
+                or (not args.site_name and args.site_id is None)
+            )
         ):
             print_error(
-                "Error: Provide --file, --json, or both --form-key and --site-name to register subjects."
+                "Error: Provide --file, --json, or (--form-key / --form-id) and (--site-name / --site-id) to register subjects."
             )
             sys.exit(1)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):

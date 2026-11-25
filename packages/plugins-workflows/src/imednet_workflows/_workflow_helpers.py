@@ -13,6 +13,7 @@ from imednet.spi.utils import (
     BatchCoordinator,
     BatchSubmissionSummary,
     JobProgressHandler,
+    extract_records_input_form_refs,
     extract_single_submitted_job,
     poll_facade_many_async,
     poll_facade_many_sync,
@@ -20,13 +21,32 @@ from imednet.spi.utils import (
     poll_facade_single_sync,
     validate_single_job_preflight,
 )
-from imednet.spi.validation import ValidationSchemaProtocol
+from imednet.spi.validation import BaseSchemaCache, ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
 _ResultT = TypeVar("_ResultT")
+
+
+def check_schema_cache_needs_refresh(
+    cache: BaseSchemaCache[Any],
+    study_key: str,
+    input_data: Any,
+) -> tuple[bool, list[str], list[Any]]:
+    """Return ``(needs_refresh, explicit_form_keys, form_ids)`` for *input_data* against *cache*."""
+    explicit_form_keys, form_ids = extract_records_input_form_refs(input_data)
+    if any(not cache.variables_for_form(fk, study_key=study_key) for fk in explicit_form_keys):
+        return True, explicit_form_keys, form_ids
+    for fid in form_ids:
+        resolved = cache.form_key_from_id(fid, study_key=study_key)
+        if not resolved or not cache.variables_for_form(resolved, study_key=study_key):
+            return True, explicit_form_keys, form_ids
+    has_items = bool(input_data) if not hasattr(input_data, "empty") else not input_data.empty
+    needs_cold = has_items and not cache.forms_for_study(study_key)
+    return needs_cold, explicit_form_keys, form_ids
+
 
 _SUBJECT_ID_FIELDS = {"key": "subjectKey", "id": "subjectId", "oid": "subjectOid"}
 _SITE_ID_FIELDS = {"name": "siteName", "id": "siteId"}

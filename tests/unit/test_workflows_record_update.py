@@ -1030,3 +1030,140 @@ async def test_record_update_workflow_email_notify_across_all_ten_methods() -> N
         "false",
         "async-alerts@example.com",
     ]
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_cold_cache_refresh_across_all_inputs_and_batch_ids(
+    tmp_path,
+) -> None:
+    """Req 5 & AC 4: Refresh cold SchemaCache before normalizing CSV, JSON, Parquet, DataFrame, and list[dict], and surface batch_ids."""
+    import json
+
+    import pandas as pd
+
+    from imednet.validation.cache import AsyncSchemaCache, SchemaCache
+
+    study_vars = [
+        Variable(
+            study_key="STUDY",
+            form_id=404,
+            form_key="F_COLD",
+            variable_id=1,
+            variable_name="V_CODE",
+            variable_type="Text",
+        ),
+        Variable(
+            study_key="STUDY",
+            form_id=404,
+            form_key="F_COLD",
+            variable_id=2,
+            variable_name="V_VISIT_DATE",
+            variable_type="Date",
+        ),
+    ]
+
+    csv_path = tmp_path / "cold.csv"
+    csv_path.write_text(
+        "formId,subjectKey,V_CODE,V_VISIT_DATE\n404,SUB-CSV,01,2026-06-01\n",
+        encoding="utf-8",
+    )
+    json_path = tmp_path / "cold.json"
+    json_path.write_text(
+        json.dumps(
+            [{"formId": 404, "subjectKey": "SUB-JSON", "V_CODE": 1.0, "V_VISIT_DATE": "2026-06-01"}]
+        ),
+        encoding="utf-8",
+    )
+    df_input = pd.DataFrame(
+        [
+            {
+                "formId": 404,
+                "subjectKey": "SUB-DF",
+                "V_CODE": 1.5,
+                "V_VISIT_DATE": pd.Timestamp("2026-06-01"),
+            }
+        ]
+    )
+    pq_path = tmp_path / "cold.parquet"
+    df_input.to_parquet(pq_path, index=False)
+    dict_input = [
+        {
+            "formId": 404,
+            "subjectKey": "SUB-DICT",
+            "data": {"V_CODE": 1.5, "V_VISIT_DATE": pd.Timestamp("2026-06-01")},
+        }
+    ]
+
+    for input_source, expected_code in (
+        (csv_path, "01"),
+        (json_path, "1"),
+        (pq_path, "1.5"),
+        (df_input, "1.5"),
+        (dict_input, "1.5"),
+    ):
+        captured_sync: list[list[dict[str, object]]] = []
+        sync_sdk = MagicMock()
+        del sync_sdk.async_create_record
+        sync_sdk.get_variables.return_value = study_vars
+
+        def _sync_create(_sk: str, recs: list[dict[str, object]], **_kw: object) -> Job:
+            captured_sync.append(recs)
+            return Job(jobId="J-1", batchId="B-SINGLE", state="COMPLETED")
+
+        sync_sdk.create_record.side_effect = _sync_create
+        explicit_cache = SchemaCache()
+        wf = RecordUpdateWorkflow(sync_sdk)
+        job = wf.create_or_update_records("STUDY", input_source, schema=explicit_cache)
+        assert sync_sdk.get_variables.call_count == 1
+        assert captured_sync[0][0]["data"] == {
+            "V_CODE": expected_code,
+            "V_VISIT_DATE": "2026-06-01",
+        }
+        assert job.batch_ids == ["B-SINGLE"]
+
+        # Async cold cache parity
+        captured_async: list[list[dict[str, object]]] = []
+        async_sdk = MagicMock()
+        async_sdk.async_get_variables = AsyncMock(return_value=study_vars)
+
+        async def _async_create(_sk: str, recs: list[dict[str, object]], **_kw: object) -> Job:
+            captured_async.append(recs)
+            return Job(jobId="AJ-1", batchId="AB-SINGLE", state="COMPLETED")
+
+        async_sdk.async_create_record = AsyncMock(side_effect=_async_create)
+        async_cache = AsyncSchemaCache()
+        awf = RecordUpdateWorkflow(async_sdk, schema=async_cache)
+        ajob = await awf.async_create_or_update_records("STUDY", input_source)
+        assert async_sdk.async_get_variables.call_count == 1
+        assert captured_async[0][0]["data"] == {
+            "V_CODE": expected_code,
+            "V_VISIT_DATE": "2026-06-01",
+        }
+        assert ajob.batch_ids == ["AB-SINGLE"]
+
+    # Multi-chunk batch Jobs surface all chunk batch_ids
+    chunk_counter = 0
+    batch_sdk = MagicMock()
+    del batch_sdk.async_create_record
+    batch_sdk.get_variables.return_value = study_vars
+
+    def _next_chunk_job(_sk: str, _recs: list[dict[str, object]], **_kw: object) -> Job:
+        nonlocal chunk_counter
+        chunk_counter += 1
+        return Job(jobId=f"J-{chunk_counter}", batchId=f"BATCH-{chunk_counter}", state="COMPLETED")
+
+    batch_sdk.create_record.side_effect = _next_chunk_job
+    batch_wf = RecordUpdateWorkflow(batch_sdk, batch_size=2)
+    five_records = [
+        {
+            "formKey": "F_COLD",
+            "subjectKey": f"S-{i}",
+            "data": {"V_CODE": "01", "V_VISIT_DATE": "2026-06-01"},
+        }
+        for i in range(5)
+    ]
+    batch_summary = batch_wf.create_or_update_records_batch("STUDY", five_records)
+    assert batch_summary.batch_ids == ["BATCH-1", "BATCH-2", "BATCH-3"]
+    assert batch_summary.last_job is not None
+    assert batch_summary.last_job.batch_ids == ["BATCH-1", "BATCH-2", "BATCH-3"]
+    assert all(j.batch_ids == ["BATCH-1", "BATCH-2", "BATCH-3"] for j in batch_summary.jobs)

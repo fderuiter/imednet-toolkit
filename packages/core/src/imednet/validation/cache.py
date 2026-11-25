@@ -1884,7 +1884,9 @@ def validate_record_entry(
 
     Resolves the form key from "formKey", "form_key", "formId", or "form_id".
     """
-    raw_study = study_key or record.get("studyKey") or record.get("study_key")
+    raw_study = (
+        study_key or record.get("studyKey") or record.get("study_key") or get_study_context()
+    )
     eff_study_key = str(raw_study) if raw_study else None
     fk, fid = _extract_form_ref(record)
     if not fk and fid is not None:
@@ -1906,11 +1908,13 @@ def validate_record_entry(
                     )
                 ],
             )
-        fk = (
-            schema.form_key_from_id(fid, study_key=eff_study_key)
-            if isinstance(schema, BaseSchemaCache)
-            else schema.form_key_from_id(fid)
-        )
+        if eff_study_key is not None:
+            try:
+                fk = schema.form_key_from_id(fid, study_key=eff_study_key)  # type: ignore[call-arg]
+            except TypeError:
+                fk = schema.form_key_from_id(fid)
+        else:
+            fk = schema.form_key_from_id(fid)
         if not fk:
             msg = f"Unknown form ID {fid}"
             if not collect_errors:
@@ -1978,11 +1982,16 @@ def validate_record_entry(
 
             known_vars: dict[str, list[Any]] = {}
             for candidate_fk in form_keys:
-                f_vars = (
-                    schema.variables_for_form(candidate_fk, study_key=eff_study_key)
-                    if isinstance(schema, BaseSchemaCache)
-                    else schema.variables_for_form(candidate_fk)
-                )
+                if eff_study_key is not None:
+                    try:
+                        f_vars = schema.variables_for_form(
+                            candidate_fk,
+                            study_key=eff_study_key,  # type: ignore[call-arg]
+                        )
+                    except TypeError:
+                        f_vars = schema.variables_for_form(candidate_fk)
+                else:
+                    f_vars = schema.variables_for_form(candidate_fk)
                 for v_name, v_obj in f_vars.items():
                     known_vars.setdefault(v_name, []).append(v_obj)
 

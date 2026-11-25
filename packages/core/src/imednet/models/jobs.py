@@ -276,6 +276,18 @@ class Job(ImednetBaseModel):
         """Checks if the job failed or was cancelled."""
         return self.state in FAILED_JOB_STATES if self.state else False
 
+    @property
+    def batch_ids(self) -> list[str]:
+        """Return all chunk batch IDs associated with this job submission."""
+        stored = getattr(self, "_batch_ids", None)
+        if stored is not None:
+            return list(stored)
+        return [self.batch_id] if self.batch_id else []  # type: ignore[attr-defined]
+
+    @batch_ids.setter
+    def batch_ids(self, value: list[str] | tuple[str, ...] | None) -> None:
+        object.__setattr__(self, "_batch_ids", list(value) if value is not None else None)
+
 
 Job = ModelEngine.get_model('Job', Job)
 

@@ -229,6 +229,7 @@ class JobFailedError(Exception):
         result_error: str | None = None,
         poll_summary: JobPollSummary | None = None,
         partial_summary: Any | None = None,
+        sibling_statuses: dict[str, JobStatus] | None = None,
     ) -> None:
         """Initialize the JobFailedError with attached record and batch diagnostics."""
         resolved_errors = (
@@ -257,6 +258,25 @@ class JobFailedError(Exception):
         self.result_error = resolved_result_error
         self.poll_summary = poll_summary
         self.partial_summary = partial_summary
+        self._sibling_statuses = dict(sibling_statuses) if sibling_statuses is not None else None
+
+    @property
+    def sibling_statuses(self) -> dict[str, JobStatus]:
+        """Return terminal sibling :class:`JobStatus` results excluding this failed job."""
+        if self._sibling_statuses is not None:
+            return dict(self._sibling_statuses)
+        own_bid = getattr(self.status, "batch_id", None)
+        siblings: dict[str, JobStatus] = {}
+        if self.poll_summary is not None:
+            for bid, st in self.poll_summary.terminal_statuses.items():
+                if bid != own_bid:
+                    siblings[bid] = st
+        elif self.partial_summary is not None:
+            for job in getattr(self.partial_summary, "jobs", ()):
+                j_bid = getattr(job, "batch_id", None)
+                if isinstance(job, JobStatus) and j_bid and j_bid != own_bid:
+                    siblings[j_bid] = job
+        return siblings
 
 
 def evaluate_job_state(
@@ -618,12 +638,21 @@ class BaseJobPoller:
         start: float,
     ) -> JobPollSummary:
         """Assemble a :class:`JobPollSummary` with total elapsed polling duration."""
-        return JobPollSummary(
+        summary = JobPollSummary(
             study_key=study_key,
             results=results,
             failures=failures,
             elapsed_total=time.monotonic() - start,
         )
+        for bid, err in failures.items():
+            try:
+                if getattr(err, "poll_summary", None) is None:
+                    err.poll_summary = summary  # type: ignore[attr-defined]
+                if bid and not getattr(err, "batch_id", None):
+                    err.batch_id = bid  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                pass
+        return summary
 
     def _attach_fail_fast_context(
         self,
