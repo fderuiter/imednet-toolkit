@@ -934,3 +934,412 @@ def test_iter_cached_records_order_by_subject_groups_subjects_cleanly(tmp_path: 
 
     subject_grouped = list(loader.iter_cached_records("STUDY", chunk_size=2, order_by_subject=True))
     assert [r.record_id for r in subject_grouped] == [40, 20, 50, 10, 30]
+
+
+def test_cached_loader_sqlite_connection_delegates_to_core_lock_under_concurrency(
+    tmp_path: Path,
+) -> None:
+    """Concurrent threads opening a fresh SQLite cache serialize WAL pragma setup cleanly."""
+    import threading
+    from unittest.mock import patch
+
+    import imednet_workflows.cached_loader as cl_mod
+    from imednet.spi.utils import get_db_init_lock
+    from imednet.spi.utils import get_sqlite_connection as spi_get_sqlite_connection
+
+    with patch.object(
+        cl_mod,
+        "_spi_get_sqlite_connection",
+        wraps=spi_get_sqlite_connection,
+    ) as spy_spi_conn:
+        probe_conn = cl_mod.get_sqlite_connection(tmp_path / "probe.sqlite3")
+        probe_conn.close()
+        spy_spi_conn.assert_called_once()
+
+    db_file = tmp_path / "concurrent" / "records_cache.sqlite3"
+    rel_alias = tmp_path / "concurrent" / "." / "records_cache.sqlite3"
+    assert get_db_init_lock(db_file) is get_db_init_lock(rel_alias)
+
+    n_threads = 12
+    barrier = threading.Barrier(n_threads)
+    errors: list[Exception] = []
+    modes: list[str] = []
+    modes_lock = threading.Lock()
+
+    def _open_concurrently(idx: int) -> None:
+        sdk = MagicMock()
+        barrier.wait()
+        try:
+            if idx % 2 == 0:
+                loader = CachedRecordsLoader(
+                    sdk,
+                    cache_dir=db_file.parent,
+                    database_name=db_file.name,
+                )
+                conn = cl_mod.get_sqlite_connection(loader.db_path)
+            else:
+                conn = cl_mod.get_sqlite_connection(db_file)
+            try:
+                mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                with modes_lock:
+                    modes.append(mode)
+            finally:
+                conn.close()
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_open_concurrently, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == []
+    assert modes == ["wal"] * n_threads
+
+
+def test_zero_delta_sync_preflight_skips_full_study_projection_sweep(tmp_path: Path) -> None:
+    """Zero-delta reconcile cycle with matching upstream count skips full-Study page sweeps."""
+    import httpx
+    import respx
+
+    from imednet import ImednetSDK
+    from imednet.constants import DEFAULT_BASE_URL
+
+    records_url = f"{DEFAULT_BASE_URL}/api/v1/edc/studies/STUDY/records"
+    initial_payload = [
+        _record(1, "2024-01-01 00:00:00+00:00").model_dump(mode="json", by_alias=True),
+        _record(2, "2024-01-02 00:00:00+00:00").model_dump(mode="json", by_alias=True),
+        _record(3, "2024-01-03 00:00:00+00:00").model_dump(mode="json", by_alias=True),
+    ]
+    observed_queries: list[dict[str, str]] = []
+
+    def _records_handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        observed_queries.append(params)
+        filt = params.get("filter", "")
+        rdf = params.get("recordDataFilter")
+        size = int(params.get("size", "100"))
+
+        if "dateModified>=" in filt:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": size,
+                        "totalPages": 0,
+                        "totalElements": 0,
+                    },
+                },
+            )
+        if rdf == "none" and size == 1:
+            # Simulate a multi-page Study (e.g. 3 elements across 3 pages at size=1)
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"studyKey": "STUDY", "recordId": 1, "formKey": "FORM"}],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 1,
+                        "totalPages": 3,
+                        "totalElements": 3,
+                    },
+                },
+            )
+        if rdf == "none":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"studyKey": "STUDY", "recordId": r["recordId"], "formKey": "FORM"}
+                        for r in initial_payload
+                    ],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": size,
+                        "totalPages": 1,
+                        "totalElements": 3,
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": initial_payload,
+                "pagination": {
+                    "currentPage": 0,
+                    "size": size,
+                    "totalPages": 1,
+                    "totalElements": 3,
+                },
+            },
+        )
+
+    with respx.mock(assert_all_called=True) as router:
+        router.get(records_url).mock(side_effect=_records_handler)
+        sdk = ImednetSDK(
+            api_key="preflight-key",  # pragma: allowlist secret
+            security_key="preflight-sec",  # pragma: allowlist secret
+        )
+        loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+        # Cycle 1: Initial full sync + active projection
+        loader.sync_records("STUDY", reconcile=True)
+        observed_queries.clear()
+
+        # Cycle 2: Zero delta + matching active count (3) and 0 local untimestamped drafts
+        loader.sync_records("STUDY", reconcile=True)
+
+    assert len(observed_queries) == 2
+    assert "dateModified>=" in observed_queries[0].get("filter", "")
+    assert observed_queries[1] == {
+        "page": "0",
+        "size": "1",
+        "filter": "deleted==false",
+        "recordDataFilter": "none",
+    }
+    assert [r.record_id for r in loader.get_cached_records("STUDY")] == [1, 2, 3]
+
+
+def test_zero_delta_sync_preflight_detects_count_drop_and_prunes_deleted_records(
+    tmp_path: Path,
+) -> None:
+    """Upstream active count drop on a zero-delta cycle runs full reconciliation and prunes orphans."""
+    import httpx
+    import respx
+
+    from imednet import ImednetSDK
+    from imednet.constants import DEFAULT_BASE_URL
+
+    records_url = f"{DEFAULT_BASE_URL}/api/v1/edc/studies/STUDY/records"
+    active_records: dict[int, dict[str, object]] = {
+        1: _record(1, "2024-01-01 00:00:00+00:00").model_dump(mode="json", by_alias=True),
+        2: _record(2, "2024-01-02 00:00:00+00:00").model_dump(mode="json", by_alias=True),
+    }
+    observed_queries: list[dict[str, str]] = []
+
+    def _records_handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        observed_queries.append(params)
+        filt = params.get("filter", "")
+        rdf = params.get("recordDataFilter")
+        size = int(params.get("size", "100"))
+        items = [active_records[k] for k in sorted(active_records)]
+
+        if "dateModified>=" in filt:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": size,
+                        "totalPages": 0,
+                        "totalElements": 0,
+                    },
+                },
+            )
+        if rdf == "none" and size == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "data": (
+                        [{"studyKey": "STUDY", "recordId": items[0]["recordId"], "formKey": "FORM"}]
+                        if items
+                        else []
+                    ),
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 1,
+                        "totalPages": len(items),
+                        "totalElements": len(items),
+                    },
+                },
+            )
+        if rdf == "none":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"studyKey": "STUDY", "recordId": r["recordId"], "formKey": "FORM"}
+                        for r in items
+                    ],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": size,
+                        "totalPages": 1 if items else 0,
+                        "totalElements": len(items),
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": items,
+                "pagination": {
+                    "currentPage": 0,
+                    "size": size,
+                    "totalPages": 1 if items else 0,
+                    "totalElements": len(items),
+                },
+            },
+        )
+
+    with respx.mock(assert_all_called=True) as router:
+        router.get(records_url).mock(side_effect=_records_handler)
+        sdk = ImednetSDK(
+            api_key="prune-key",  # pragma: allowlist secret
+            security_key="prune-sec",  # pragma: allowlist secret
+        )
+        loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+        loader.sync_records("STUDY", reconcile=True)
+        assert [r.record_id for r in loader.get_cached_records("STUDY")] == [1, 2]
+
+        # Delete record 2 upstream; preflight sees totalElements=1 != 2 -> triggers full scan & prune
+        del active_records[2]
+        observed_queries.clear()
+        loader.sync_records("STUDY", reconcile=True)
+        assert [r.record_id for r in loader.get_cached_records("STUDY")] == [1]
+        assert any(
+            q.get("recordDataFilter") == "none" and q.get("size") != "1" for q in observed_queries
+        )
+
+        # Delete remaining record 1 upstream; preflight sees totalElements=0 -> prunes directly without full scan
+        del active_records[1]
+        observed_queries.clear()
+        loader.sync_records("STUDY", reconcile=True)
+        assert loader.get_cached_records("STUDY") == []
+        assert len(observed_queries) == 2
+
+
+def test_sync_preflight_runs_full_scan_on_count_increase_or_local_untimestamped_drafts(
+    tmp_path: Path,
+) -> None:
+    """Count increases and local date_modified=None drafts trigger full projection sweeps."""
+    import httpx
+    import respx
+
+    from imednet import ImednetSDK
+    from imednet.constants import DEFAULT_BASE_URL
+
+    records_url = f"{DEFAULT_BASE_URL}/api/v1/edc/studies/STUDY/records"
+    active_records: dict[int, dict[str, object]] = {
+        1: _record(1, "2024-01-01 00:00:00+00:00").model_dump(mode="json", by_alias=True),
+    }
+
+    def _records_handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        filt = params.get("filter", "")
+        rdf = params.get("recordDataFilter")
+        size = int(params.get("size", "100"))
+        items = [active_records[k] for k in sorted(active_records)]
+
+        if "dateModified>=" in filt:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": size,
+                        "totalPages": 0,
+                        "totalElements": 0,
+                    },
+                },
+            )
+        if "recordId==" in filt or "recordId=in=" in filt:
+            wanted = {
+                int(tok)
+                for tok in filt.replace("recordId==", "")
+                .replace("recordId=in=(", "")
+                .replace(")", "")
+                .replace(" or ", ",")
+                .split(",")
+                if tok.strip().isdigit()
+            }
+            matched = [r for r in items if int(r["recordId"]) in wanted]  # type: ignore[arg-type]
+            return httpx.Response(
+                200,
+                json={
+                    "data": matched,
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": size,
+                        "totalPages": 1,
+                        "totalElements": len(matched),
+                    },
+                },
+            )
+        if rdf == "none" and size == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"studyKey": "STUDY", "recordId": items[0]["recordId"], "formKey": "FORM"}
+                    ],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 1,
+                        "totalPages": len(items),
+                        "totalElements": len(items),
+                    },
+                },
+            )
+        if rdf == "none":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "studyKey": "STUDY",
+                            "recordId": r["recordId"],
+                            "formKey": r["formKey"],
+                        }
+                        for r in items
+                    ],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": size,
+                        "totalPages": 1,
+                        "totalElements": len(items),
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": items,
+                "pagination": {
+                    "currentPage": 0,
+                    "size": size,
+                    "totalPages": 1,
+                    "totalElements": len(items),
+                },
+            },
+        )
+
+    with respx.mock(assert_all_called=True) as router:
+        router.get(records_url).mock(side_effect=_records_handler)
+        sdk = ImednetSDK(
+            api_key="draft-key",  # pragma: allowlist secret
+            security_key="draft-sec",  # pragma: allowlist secret
+        )
+        loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+        # Cycle 1: Initial load of timestamped record 1
+        loader.sync_records("STUDY", reconcile=True)
+        assert [r.record_id for r in loader.get_cached_records("STUDY")] == [1]
+
+        # Cycle 2: Untimestamped draft record 2 added upstream -> preflight count increases (2 != 1)
+        active_records[2] = _null_timestamp_record(2).model_dump(mode="json", by_alias=True)
+        loader.sync_records("STUDY", reconcile=True)
+        assert [r.record_id for r in loader.get_cached_records("STUDY")] == [1, 2]
+
+        # Cycle 3: Draft 2 replaced by draft 3 (upstream count stays 2, but local cache has untimestamped draft)
+        del active_records[2]
+        active_records[3] = _null_timestamp_record(3).model_dump(mode="json", by_alias=True)
+        loader.sync_records("STUDY", reconcile=True)
+        assert [r.record_id for r in loader.get_cached_records("STUDY")] == [1, 3]

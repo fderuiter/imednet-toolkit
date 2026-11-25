@@ -478,3 +478,133 @@ def test_interleaved_slow_reconcile_and_concurrent_workflows_retain_all_active_r
     assert max(hold_durations) < 0.05, (
         f"Max FileLock hold duration {max(hold_durations):.4f}s exceeded 50ms"
     )
+
+
+def test_sync_worker_periodic_reconcile_cadence_and_preflight_integration(
+    tmp_path: Path,
+) -> None:
+    """SyncWorker reconciles on configured Nth cycles using count preflight without mutating lock.timeout."""
+    import httpx
+    import respx
+
+    from imednet import ImednetSDK
+    from imednet.constants import DEFAULT_BASE_URL
+
+    records_url = f"{DEFAULT_BASE_URL}/api/v1/edc/studies/PROT-01/records"
+    active_records: dict[int, dict[str, Any]] = {
+        1: _make_record(1).model_dump(mode="json", by_alias=True),
+        2: _make_record(2).model_dump(mode="json", by_alias=True),
+    }
+    cycle_queries: list[dict[str, str]] = []
+    lock_held_on_http: list[bool] = []
+    loader_ref: list[CachedRecordsLoader] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if loader_ref:
+            lock_held_on_http.append(loader_ref[0].lock.is_locked)
+        params = dict(request.url.params)
+        cycle_queries.append(params)
+        filt = params.get("filter", "")
+        rdf = params.get("recordDataFilter")
+        size = int(params.get("size", "100"))
+        items = [active_records[k] for k in sorted(active_records)]
+
+        if "dateModified>=" in filt:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": size,
+                        "totalPages": 0,
+                        "totalElements": 0,
+                    },
+                },
+            )
+        if rdf == "none" and size == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"studyKey": "PROT-01", "recordId": items[0]["recordId"], "formKey": "FORM"}
+                    ],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 1,
+                        "totalPages": len(items),
+                        "totalElements": len(items),
+                    },
+                },
+            )
+        if rdf == "none":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"studyKey": "PROT-01", "recordId": r["recordId"], "formKey": "FORM"}
+                        for r in items
+                    ],
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": size,
+                        "totalPages": 1,
+                        "totalElements": len(items),
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": items,
+                "pagination": {
+                    "currentPage": 0,
+                    "size": size,
+                    "totalPages": 1,
+                    "totalElements": len(items),
+                },
+            },
+        )
+
+    with respx.mock(assert_all_called=True) as router:
+        router.get(records_url).mock(side_effect=_handler)
+        sdk = ImednetSDK(
+            api_key="int-worker-key",  # pragma: allowlist secret
+            security_key="int-worker-sec",  # pragma: allowlist secret
+        )
+        loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+        loader_ref.append(loader)
+        worker = SyncWorker(
+            loader,
+            config=SyncWorkerConfig(
+                study_key="PROT-01",
+                interval_seconds=1,
+                reconcile=True,
+                reconcile_every_n_cycles=3,
+                lock_timeout_seconds=0.25,
+            ),
+        )
+        assert loader.lock.timeout == 30.0
+
+        # Cycle 1: Initial full load (reconcile=False on cycle 1 of 3)
+        assert worker.run_once() == 2
+        cycle_queries.clear()
+
+        # Cycle 2: Non-reconcile delta-only cycle -> 1 HTTP call
+        assert worker.run_once() == 2
+        assert len(cycle_queries) == 1
+        cycle_queries.clear()
+
+        # Cycle 3: Scheduled reconcile cycle with matching count -> 1 delta + 1 preflight (no full scan)
+        assert worker.run_once() == 2
+        assert len(cycle_queries) == 2
+        assert cycle_queries[1]["size"] == "1"
+
+        # Upstream deletes record 2; cycles 4 & 5 defer reconciliation, cycle 6 detects drop and prunes
+        del active_records[2]
+        assert worker.run_once() == 2
+        assert worker.run_once() == 2
+        assert worker.run_once() == 1
+
+    assert loader.lock.timeout == 30.0
+    assert all(is_locked is False for is_locked in lock_held_on_http)

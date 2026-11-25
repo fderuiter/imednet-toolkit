@@ -102,12 +102,16 @@ def _is_live_test(node: object) -> bool:
 
 @pytest.fixture(autouse=True)
 def reset_study_context_between_tests():
-    """Reset the global study context before and after each test to ensure isolation."""
-    from imednet.core.context import clear_study_context
+    """Reset global study and governance contexts before and after each test to ensure isolation."""
+    from imednet.core.context import _active_base_url, _active_security_key, clear_study_context
 
     clear_study_context()
+    _active_base_url.set(None)
+    _active_security_key.set(None)
     yield
     clear_study_context()
+    _active_base_url.set(None)
+    _active_security_key.set(None)
 
 
 @pytest.fixture(autouse=True)
