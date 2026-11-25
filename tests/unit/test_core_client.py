@@ -87,7 +87,7 @@ def test_request_error_mapping(status, exc) -> None:
                     },
                 }
             },
-            errors.ValidationError,
+            errors.BadRequestError,
             1000,
             "Field raised validation errors",
             {"attribute": "page", "value": "XX"},
@@ -123,7 +123,7 @@ def test_request_error_mapping(status, exc) -> None:
                     },
                 }
             },
-            errors.AuthenticationError,
+            errors.UnauthorizedError,
             9001,
             "Unauthorized error. Insufficient permission to retrieve data.",
             None,
@@ -167,6 +167,10 @@ def test_nested_metadata_error_http_dispatch(
 
     err = exc_info.value
     assert type(err) is expected_exc
+    if http_status == 400:
+        assert isinstance(err, errors.ValidationError)
+    if http_status == 401:
+        assert isinstance(err, errors.AuthenticationError)
     assert err.code == expected_code
     assert err.message == expected_msg
     assert err.description == expected_msg

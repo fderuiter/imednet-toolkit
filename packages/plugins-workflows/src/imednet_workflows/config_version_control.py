@@ -21,18 +21,21 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
+from imednet.spi.constants import DEFAULT_BASE_URL
 from imednet.spi.models import StudyConfiguration
 from imednet.spi.utils import (
     PathTraversalValidationError,
+    extract_sdk_base_url,
     extract_sdk_security_key,
     flatten,
     get_base_url_context,
     get_security_key_context,
     get_study_context,
     sdk_governance_context,
+    set_security_key_context,
     sqlite_connection,
     validate_partition_key,
 )
@@ -76,6 +79,12 @@ _COMMITTED_CONFIG_CACHE: dict[
 ] = {}
 
 
+def _bounded_cache_get(cache: dict[Any, Any], key: Any) -> Any:
+    """Read ``key`` from ``cache`` while holding ``_CACHE_LOCK``."""
+    with _CACHE_LOCK:
+        return cache.get(key)
+
+
 def _bounded_cache_put(cache: dict[Any, Any], key: Any, value: Any, max_size: int) -> None:
     """Insert ``value`` into ``cache`` while enforcing a fixed ``max_size`` bound."""
     with _CACHE_LOCK:
@@ -84,6 +93,12 @@ def _bounded_cache_put(cache: dict[Any, Any], key: Any, value: Any, max_size: in
         while len(cache) >= max_size:
             cache.pop(next(iter(cache)), None)
         cache[key] = value
+
+
+def _get_write_generation() -> int:
+    """Return the current write generation counter while holding ``_CACHE_LOCK``."""
+    with _CACHE_LOCK:
+        return _WRITE_GENERATION
 
 
 def _bump_write_generation() -> None:
@@ -124,8 +139,8 @@ def _get_fernet_key(fallback_key: str | None = None) -> bytes:
     raw_key = (
         os.environ.get("IMEDNET_ENCRYPTION_KEY")
         or os.environ.get("IMEDNET_SECURITY_KEY")
-        or get_security_key_context()
         or fallback_key
+        or get_security_key_context()
     )
     if not raw_key:
         raise ValueError(
@@ -197,9 +212,9 @@ def _get_raw_db_path(db_path: str | Path | None = None) -> Path:
     if raw_env:
         if "~" not in raw_env:
             key = ("env", raw_env, "")
-            cached = _RAW_DB_PATH_CACHE.get(key)
+            cached = _bounded_cache_get(_RAW_DB_PATH_CACHE, key)
             if cached is not None:
-                return cached
+                return cast(Path, cached)
             resolved = Path(raw_env)
         else:
             home_str = (
@@ -210,9 +225,9 @@ def _get_raw_db_path(db_path: str | Path | None = None) -> Path:
                 )
             )
             key = ("env_tilde", raw_env, home_str)
-            cached = _RAW_DB_PATH_CACHE.get(key)
+            cached = _bounded_cache_get(_RAW_DB_PATH_CACHE, key)
             if cached is not None:
-                return cached
+                return cast(Path, cached)
             resolved = _expand_path_with_home(raw_env)
         _bounded_cache_put(_RAW_DB_PATH_CACHE, key, resolved, _MAX_RAW_DB_PATH_CACHE)
         return resolved
@@ -220,41 +235,64 @@ def _get_raw_db_path(db_path: str | Path | None = None) -> Path:
     if is_home_patched:
         patched_home = Path(home_fn())
         key = ("home_patched", os.fspath(patched_home), "")
-        cached = _RAW_DB_PATH_CACHE.get(key)
+        cached = _bounded_cache_get(_RAW_DB_PATH_CACHE, key)
         if cached is not None:
-            return cached
+            return cast(Path, cached)
         resolved = patched_home / ".imednet" / "config_versions.sqlite3"
     else:
         env_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
         if env_home:
             key = ("home_env", env_home, "")
-            cached = _RAW_DB_PATH_CACHE.get(key)
+            cached = _bounded_cache_get(_RAW_DB_PATH_CACHE, key)
             if cached is not None:
-                return cached
+                return cast(Path, cached)
             resolved = Path(env_home) / ".imednet" / "config_versions.sqlite3"
         else:
             std_home = Path.home()
             key = ("home_std", os.fspath(std_home), "")
-            cached = _RAW_DB_PATH_CACHE.get(key)
+            cached = _bounded_cache_get(_RAW_DB_PATH_CACHE, key)
             if cached is not None:
-                return cached
+                return cast(Path, cached)
             resolved = std_home / ".imednet" / "config_versions.sqlite3"
 
     _bounded_cache_put(_RAW_DB_PATH_CACHE, key, resolved, _MAX_RAW_DB_PATH_CACHE)
     return resolved
 
 
-def _get_origin_layout(base_db_path: Path) -> _OriginLayout:
+def _resolve_effective_base_url(pinned_base_url: str | None = None) -> tuple[str, bool]:
+    """Return ``(effective_base_url, allow_localhost_fallback)`` for origin path resolution."""
+    default_host = _sanitize_base_url_for_path(DEFAULT_BASE_URL)
+    if pinned_base_url is not None:
+        resolved = pinned_base_url if pinned_base_url.strip() else "http://localhost"
+        return (resolved, _sanitize_base_url_for_path(resolved) == default_host)
+
+    ctx_url = get_base_url_context()
+    if ctx_url is not None:
+        resolved = ctx_url if ctx_url.strip() else "http://localhost"
+        return (resolved, _sanitize_base_url_for_path(resolved) == default_host)
+
+    env_url = os.environ.get("IMEDNET_BASE_URL")
+    if env_url is not None and env_url.strip():
+        return (env_url, _sanitize_base_url_for_path(env_url) == default_host)
+
+    return (DEFAULT_BASE_URL, True)
+
+
+def _get_origin_layout(
+    base_db_path: Path, *, base_url_override: str | None = None
+) -> _OriginLayout:
     """Validate active study context and return memoized canonical/legacy layout for ``base_db_path``."""
     ctx_study_key = get_study_context()
     if ctx_study_key:
         validate_partition_key(ctx_study_key)
 
-    base_url = get_base_url_context() or os.environ.get("IMEDNET_BASE_URL") or "http://localhost"
+    base_url = (
+        base_url_override if base_url_override is not None else _resolve_effective_base_url()[0]
+    )
     cache_key = (os.fspath(base_db_path), base_url)
-    cached = _ORIGIN_LAYOUT_CACHE.get(cache_key)
+    cached = _bounded_cache_get(_ORIGIN_LAYOUT_CACHE, cache_key)
     if cached is not None:
-        return cached
+        return cast(_OriginLayout, cached)
 
     sanitized_url = _sanitize_base_url_for_path(base_url)
     base_dir = base_db_path.parent
@@ -302,15 +340,15 @@ def _get_base_dir_entries(base_dir: Path, db_name: str) -> frozenset[str] | None
         st.st_nlink,
         st.st_size,
         st.st_ino,
-        _WRITE_GENERATION,
+        _get_write_generation(),
     )
-    entries = _BASE_DIR_ENTRIES_CACHE.get(snap_key)
+    entries = _bounded_cache_get(_BASE_DIR_ENTRIES_CACHE, snap_key)
     if entries is not None and not (
         db_name not in entries
         and (time.time_ns() - max(st.st_mtime_ns, st.st_ctime_ns)) < _COARSE_MTIME_GUARD_NS
         and os.path.exists(base_dir / db_name)
     ):
-        return entries
+        return cast(frozenset[str], entries)
 
     try:
         with os.scandir(base_dir) as it:
@@ -337,15 +375,15 @@ def _get_host_dir_listing(host_dir: Path, db_name: str) -> tuple[frozenset[str],
         st.st_nlink,
         st.st_size,
         st.st_ino,
-        _WRITE_GENERATION,
+        _get_write_generation(),
     )
-    cached = _HOST_SUBDIR_CACHE.get(snap_key)
+    cached = _bounded_cache_get(_HOST_SUBDIR_CACHE, snap_key)
     if cached is not None and not (
         db_name not in cached[0]
         and (time.time_ns() - max(st.st_mtime_ns, st.st_ctime_ns)) < _COARSE_MTIME_GUARD_NS
         and os.path.exists(host_dir / db_name)
     ):
-        return cached
+        return cast(tuple[frozenset[str], frozenset[str]], cached)
 
     names: set[str] = set()
     subdirs: set[str] = set()
@@ -376,20 +414,43 @@ class ConfigVersionStore:
             ``~/.imednet/config_versions.sqlite3``.
     """
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        *,
+        base_url: str | None = None,
+        sdk: Any = None,
+    ) -> None:
         """Initialize the configuration version store.
 
         Args:
             db_path: Path to the SQLite database file.
+            base_url: Optional explicit API origin URL to pin this store to.
+            sdk: Optional SDK instance to extract pinned origin and session credentials from.
         """
         self._original_db_path = _get_raw_db_path(db_path)
         self._lock = RLock()
-        self._sdk_security_key: str | None = None
+        self._sdk_security_key: str | None = (
+            extract_sdk_security_key(sdk) if sdk is not None else None
+        )
+        if base_url is not None:
+            self._pinned_base_url: str | None = base_url if base_url.strip() else "http://localhost"
+        elif sdk is not None:
+            self._pinned_base_url = extract_sdk_base_url(sdk)
+        else:
+            ctx_url = get_base_url_context()
+            env_url = os.environ.get("IMEDNET_BASE_URL")
+            if ctx_url is not None:
+                self._pinned_base_url = ctx_url if ctx_url.strip() else "http://localhost"
+            elif env_url is not None and env_url.strip():
+                self._pinned_base_url = env_url
+            else:
+                self._pinned_base_url = None
         self._ensure_schema_initialized(self.db_path)
 
     @property
     def db_path(self) -> Path:
-        """Return the dynamically selected database file path based on active base URL context."""
+        """Return the dynamically selected database file path based on pinned or active base URL."""
         return self._get_get_dynamic_db_path()
 
     @db_path.setter
@@ -398,15 +459,19 @@ class ConfigVersionStore:
         self._original_db_path = _expand_path_with_home(value)
 
     @staticmethod
-    def _get_dynamic_db_path_no_create(base_db_path: Path) -> Path:
+    def _get_dynamic_db_path_no_create(
+        base_db_path: Path, *, pinned_base_url: str | None = None
+    ) -> Path:
         """Compute host-scoped dynamic DB path without splitting by study_context or creating dirs."""
-        return _get_origin_layout(base_db_path).canonical_db_path
+        effective_url, _ = _resolve_effective_base_url(pinned_base_url)
+        return _get_origin_layout(base_db_path, base_url_override=effective_url).canonical_db_path
 
     @staticmethod
     def _get_legacy_db_paths_no_create(base_db_path: Path, study_key: str) -> list[Path]:
         """Return legacy study_context-partitioned and flat candidate SQLite paths without creating dirs."""
         validate_partition_key(study_key)
-        layout = _get_origin_layout(base_db_path)
+        effective_url, allow_localhost_fallback = _resolve_effective_base_url()
+        layout = _get_origin_layout(base_db_path, base_url_override=effective_url)
         base_entries = _get_base_dir_entries(layout.base_dir, layout.db_name)
         if base_entries is None:
             return []
@@ -421,6 +486,22 @@ class ConfigVersionStore:
                     legacy_candidate = legacy_study_dir / layout.db_name
                     if legacy_candidate != layout.canonical_db_path:
                         candidates.append(legacy_candidate)
+
+        if allow_localhost_fallback and "localhost" in base_entries:
+            lh_layout = _get_origin_layout(base_db_path, base_url_override="http://localhost")
+            lh_entries, lh_subdirs = _get_host_dir_listing(lh_layout.host_dir, lh_layout.db_name)
+            if (
+                lh_layout.db_name in lh_entries
+                and lh_layout.canonical_db_path != layout.canonical_db_path
+            ):
+                candidates.append(lh_layout.canonical_db_path)
+            if study_key and study_key in lh_subdirs:
+                lh_study_dir = lh_layout.host_dir / study_key
+                if lh_study_dir.resolve().is_relative_to(lh_layout.resolved_base):
+                    lh_study_candidate = lh_study_dir / lh_layout.db_name
+                    if lh_study_candidate not in candidates:
+                        candidates.append(lh_study_candidate)
+
         if layout.flat_db_path is not None and layout.db_name in base_entries:
             candidates.append(layout.flat_db_path)
         return candidates
@@ -464,9 +545,9 @@ class ConfigVersionStore:
             wal_ino,
             wal_mtime_ns,
             wal_size,
-            _WRITE_GENERATION,
+            _get_write_generation(),
         )
-        head_index = _HEAD_INDEX_CACHE.get(snap_key)
+        head_index = _bounded_cache_get(_HEAD_INDEX_CACHE, snap_key)
         if head_index is None:
             try:
                 with sqlite_connection(candidate_path, timeout=30.0) as conn:
@@ -514,9 +595,9 @@ class ConfigVersionStore:
             ) from exc
 
         cfg_cache_key = (snap_key, study_key, head_id, fernet_key)
-        cached_cfg = _COMMITTED_CONFIG_CACHE.get(cfg_cache_key)
+        cached_cfg = _bounded_cache_get(_COMMITTED_CONFIG_CACHE, cfg_cache_key)
         if cached_cfg is not None:
-            return cached_cfg.model_copy(deep=True)
+            return cast(StudyConfiguration, cached_cfg).model_copy(deep=True)
 
         with sqlite_connection(candidate_path, timeout=30.0) as conn:
             cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(config_commits)").fetchall()}
@@ -593,7 +674,8 @@ class ConfigVersionStore:
             return cfg if isinstance(cfg, StudyConfiguration) else None
 
         raw_db_path = _get_raw_db_path()
-        layout = _get_origin_layout(raw_db_path)
+        effective_url, allow_localhost_fallback = _resolve_effective_base_url()
+        layout = _get_origin_layout(raw_db_path, base_url_override=effective_url)
         base_entries = _get_base_dir_entries(layout.base_dir, layout.db_name)
         if base_entries is None:
             return None
@@ -612,23 +694,53 @@ class ConfigVersionStore:
                     return resolved
             has_legacy_study_dir = bool(study_key and study_key in host_subdirs)
 
+        has_localhost_legacy = False
+        if allow_localhost_fallback and "localhost" in base_entries:
+            lh_layout = _get_origin_layout(raw_db_path, base_url_override="http://localhost")
+            lh_entries, lh_subdirs = _get_host_dir_listing(lh_layout.host_dir, lh_layout.db_name)
+            if lh_layout.db_name in lh_entries:
+                resolved = cls._read_committed_from_sqlite_path(
+                    lh_layout.canonical_db_path,
+                    study_key,
+                    raw_db_path=raw_db_path,
+                )
+                if resolved is not None:
+                    return resolved
+            has_localhost_legacy = bool(study_key and study_key in lh_subdirs)
+
         has_flat_db = layout.flat_db_path is not None and layout.db_name in base_entries
         if (
             hasattr(cls.resolve_legacy_committed_config, "_mock_name")
             or has_legacy_study_dir
+            or has_localhost_legacy
             or has_flat_db
         ):
             return cls.resolve_legacy_committed_config(study_key)
         return None
 
     def _get_get_dynamic_db_path(self) -> Path:
-        """Resolve database path dynamically based on active base URL without splitting by study_context."""
-        result = self._get_dynamic_db_path_no_create(self._original_db_path)
+        """Resolve database path dynamically based on pinned or active base URL without splitting by study_context."""
+        pinned = getattr(self, "_pinned_base_url", None)
+        result = self._get_dynamic_db_path_no_create(
+            self._original_db_path,
+            pinned_base_url=pinned,
+        )
         parent_existed = result.parent.exists()
         result.parent.mkdir(parents=True, exist_ok=True)
         if not parent_existed:
             _bump_write_generation()
         return result
+
+    def _get_fallback_localhost_db_path(self) -> Path | None:
+        """Return existing legacy ``localhost`` SQLite path when resolved origin is production."""
+        pinned = getattr(self, "_pinned_base_url", None)
+        _effective_url, allow_localhost_fallback = _resolve_effective_base_url(pinned)
+        if not allow_localhost_fallback:
+            return None
+        lh_layout = _get_origin_layout(self._original_db_path, base_url_override="http://localhost")
+        if lh_layout.canonical_db_path.is_file():
+            return lh_layout.canonical_db_path
+        return None
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -782,12 +894,18 @@ class ConfigVersionStore:
         except Exception as exc:
             raise PermissionError(f"Server-side authorization failure: {exc}") from exc
 
-        # Legacy fallback: if using static keys, validate server-side by making an API call
-        if not roles and getattr(sdk.auth, "api_key", None):
+        # Legacy/opaque token fallback: if using static keys or an opaque OIDC bearer token
+        # (never an unverified JWT), validate server-side by making an API call.
+        has_opaque_oidc_token = bool(
+            isinstance(getattr(sdk.auth, "token", None), str)
+            and getattr(sdk.auth, "token", "").strip()
+            and not getattr(sdk.auth, "_requires_verification", False)
+        )
+        if not roles and (getattr(sdk.auth, "api_key", None) or has_opaque_oidc_token):
             try:
-                # Validate the key has access by requesting study data
+                # Validate the credential has access by requesting study data
                 sdk.get_sites(study_key, limit=1)
-                roles = ["admin"]  # Legacy keys with access map to admin
+                roles = ["admin"]
             except Exception as exc:
                 raise PermissionError(  # noqa: B904
                     f"Server-side authorization failure for legacy key: {exc}"
@@ -807,15 +925,29 @@ class ConfigVersionStore:
             author = "legacy-api-key"
         elif user_id:
             author = str(user_id)
+        elif has_opaque_oidc_token:
+            author = "oidc-token-user"
         else:
             author = ""
 
         if not author:
             raise ValueError("A user identifier is required to commit.")
 
+        sdk_base_url = extract_sdk_base_url(sdk)
+        if getattr(self, "_pinned_base_url", None) is None and sdk_base_url is not None:
+            self._pinned_base_url = sdk_base_url
+
         sdk_sec_key = extract_sdk_security_key(sdk)
         if sdk_sec_key is not None:
             self._sdk_security_key = sdk_sec_key
+            if (
+                not (
+                    os.environ.get("IMEDNET_ENCRYPTION_KEY")
+                    or os.environ.get("IMEDNET_SECURITY_KEY")
+                )
+                and get_security_key_context() is None
+            ):
+                set_security_key_context(sdk_sec_key)
 
         config_json = json.dumps(config.model_dump(mode="json", by_alias=True), sort_keys=True)
         content_hash = _sha256_of(config_json)
@@ -824,7 +956,8 @@ class ConfigVersionStore:
         with sdk_governance_context(sdk):
             # Secure the payload using Fernet encryption before writing to SQLite
             encrypted_config_json = _encrypt_payload(
-                config_json, fallback_key=self._sdk_security_key
+                config_json,
+                fallback_key=self._sdk_security_key,
             )
 
             with self._lock, self._connection() as conn:
@@ -904,10 +1037,10 @@ class ConfigVersionStore:
 
         return commit_id
 
-    def get_head(self, study_key: str) -> str | None:
-        """Return the current head ``commit_id`` for *study_key*, or ``None`` if empty."""
-        validate_partition_key(study_key)
-        with self._lock, self._connection() as conn:
+    def _query_head_for_path(self, path: Path, study_key: str) -> str | None:
+        """Query head commit_id for *study_key* from *path*."""
+        self._ensure_schema_initialized(path)
+        with sqlite_connection(path, timeout=30.0) as conn:
             row = conn.execute(
                 "SELECT head_commit_id FROM config_heads WHERE study_key = ?",
                 (study_key,),
@@ -926,6 +1059,18 @@ class ConfigVersionStore:
             ).fetchone()
         return str(fallback["commit_id"]) if fallback is not None else None
 
+    def get_head(self, study_key: str) -> str | None:
+        """Return the current head ``commit_id`` for *study_key*, or ``None`` if empty."""
+        validate_partition_key(study_key)
+        with self._lock:
+            head_id = self._query_head_for_path(self.db_path, study_key)
+            if head_id is not None:
+                return head_id
+            lh_path = self._get_fallback_localhost_db_path()
+            if lh_path is not None:
+                return self._query_head_for_path(lh_path, study_key)
+        return None
+
     def get_history(self, study_key: str) -> list[dict[str, Any]]:
         """Return all commits for *study_key*, ordered oldest-first.
 
@@ -940,24 +1085,32 @@ class ConfigVersionStore:
             :meth:`rollback_config` to retrieve the full body for a specific commit.
         """
         validate_partition_key(study_key)
-        with self._lock, self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT commit_id, study_key, version_tag, config_data,
-                       modified_by, description, timestamp,
-                       parent_commit_id, content_hash
-                FROM   config_commits
-                WHERE  study_key = ?
-                ORDER  BY timestamp ASC, rowid ASC
-                """,
-                (study_key,),
-            ).fetchall()
+        query = """
+            SELECT commit_id, study_key, version_tag, config_data,
+                   modified_by, description, timestamp,
+                   parent_commit_id, content_hash
+            FROM   config_commits
+            WHERE  study_key = ?
+            ORDER  BY timestamp ASC, rowid ASC
+        """
+        with self._lock:
+            with self._connection() as conn:
+                rows = conn.execute(query, (study_key,)).fetchall()
+            if not rows:
+                lh_path = self._get_fallback_localhost_db_path()
+                if lh_path is not None:
+                    self._ensure_schema_initialized(lh_path)
+                    with sqlite_connection(lh_path, timeout=30.0) as lh_conn:
+                        rows = lh_conn.execute(query, (study_key,)).fetchall()
         fallback_key = getattr(self, "_sdk_security_key", None)
         history: list[dict[str, Any]] = []
         for row in rows:
             commit = dict(row)
             # Decrypt payload before verification
-            decrypted_data = _decrypt_payload(commit["config_data"], fallback_key=fallback_key)
+            decrypted_data = _decrypt_payload(
+                commit["config_data"],
+                fallback_key=fallback_key,
+            )
             self._verify_commit_signature(
                 commit["commit_id"],
                 decrypted_data,
@@ -1027,20 +1180,27 @@ class ConfigVersionStore:
                 requested study.
         """
         validate_partition_key(study_key)
-        with self._lock, self._connection() as conn:
-            row = conn.execute(
-                """
-                SELECT commit_id, study_key, config_data, parent_commit_id, content_hash
-                FROM config_commits
-                WHERE commit_id = ? AND study_key = ?
-                """,
-                (commit_id, study_key),
-            ).fetchone()
+        query = """
+            SELECT commit_id, study_key, config_data, parent_commit_id, content_hash
+            FROM config_commits
+            WHERE commit_id = ? AND study_key = ?
+        """
+        with self._lock:
+            with self._connection() as conn:
+                row = conn.execute(query, (commit_id, study_key)).fetchone()
+            if row is None:
+                lh_path = self._get_fallback_localhost_db_path()
+                if lh_path is not None:
+                    self._ensure_schema_initialized(lh_path)
+                    with sqlite_connection(lh_path, timeout=30.0) as lh_conn:
+                        row = lh_conn.execute(query, (commit_id, study_key)).fetchone()
         if row is None:
             raise KeyError(f"Commit {commit_id!r} not found for study {study_key!r}.")
+        fallback_key = getattr(self, "_sdk_security_key", None)
         # Decrypt payload before validation
         decrypted_data = _decrypt_payload(
-            row["config_data"], fallback_key=getattr(self, "_sdk_security_key", None)
+            row["config_data"],
+            fallback_key=fallback_key,
         )
         self._verify_commit_signature(
             row["commit_id"],
@@ -1057,20 +1217,27 @@ class ConfigVersionStore:
 
     def _fetch_config_data(self, commit_id: str) -> dict[str, Any]:
         """Retrieve the raw configuration JSON for a specific commit."""
-        with self._lock, self._connection() as conn:
-            row = conn.execute(
-                """
-                SELECT commit_id, study_key, config_data, parent_commit_id, content_hash
-                FROM config_commits
-                WHERE commit_id = ?
-                """,
-                (commit_id,),
-            ).fetchone()
+        query = """
+            SELECT commit_id, study_key, config_data, parent_commit_id, content_hash
+            FROM config_commits
+            WHERE commit_id = ?
+        """
+        with self._lock:
+            with self._connection() as conn:
+                row = conn.execute(query, (commit_id,)).fetchone()
+            if row is None:
+                lh_path = self._get_fallback_localhost_db_path()
+                if lh_path is not None:
+                    self._ensure_schema_initialized(lh_path)
+                    with sqlite_connection(lh_path, timeout=30.0) as lh_conn:
+                        row = lh_conn.execute(query, (commit_id,)).fetchone()
         if row is None:
             raise KeyError(f"Commit {commit_id!r} not found.")
+        fallback_key = getattr(self, "_sdk_security_key", None)
         # Decrypt payload first
         decrypted_data = _decrypt_payload(
-            row["config_data"], fallback_key=getattr(self, "_sdk_security_key", None)
+            row["config_data"],
+            fallback_key=fallback_key,
         )
         self._verify_commit_signature(
             row["commit_id"],

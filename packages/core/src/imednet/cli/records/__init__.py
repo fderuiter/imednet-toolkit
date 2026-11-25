@@ -10,10 +10,10 @@ from typing import Any
 from ...endpoints.records import RecordsEndpoint
 from ...models.records import Record
 from ...sdk import ImednetSDK
-from ...utils.batch_coordinator import BatchSubmissionSummary
 from ...utils.pandas import import_records_csv
 from ..decorators import validate_cli_path_segment, with_sdk
 from ..utils import display_list, fetching_status, print_error, simulation_mode_context
+from ..utils._write_batch import prepare_write_cli_preflight, run_cli_batch_write
 from ..utils.args import (
     add_list_query_args,
     add_output_format,
@@ -24,19 +24,16 @@ from ..utils.args import (
     resolve_output_format,
     resolve_study_key,
 )
-from ..utils.export import export_list_to_file, resolve_records_export_target
+from ..utils.export import (
+    export_list_to_file,
+    mask_cli_records,
+    resolve_cli_phi_fields,
+    resolve_records_export_target,
+)
 from ..utils.write_helpers import (
     add_write_common_args,
     assemble_cli_write_records,
-    coerce_batch_summary,
-    execute_cli_write,
-    guard_stdin_dash_tty,
     load_records_from_path_or_stdin,
-    parse_email_notify,
-    resolve_cli_schema,
-    submit_cli_records_batch,
-    validate_write_numeric_flags,
-    write_progress_context,
 )
 
 
@@ -58,31 +55,6 @@ def _has_update_mutation_input(args: argparse.Namespace) -> bool:
         or getattr(args, "record_status", None)
         or getattr(args, "reason_for_change", None)
     )
-
-
-def _assemble_records_payload(
-    args: argparse.Namespace,
-    *,
-    schema: Any = None,
-    is_update: bool = False,
-) -> list[dict[str, Any]]:
-    """Build record create/update payload(s) from ``--file``, ``--json``, or inline flags."""
-    return assemble_cli_write_records(
-        args,
-        schema=schema,
-        study_key=getattr(args, "study_key", None),
-        is_subject_registration=False,
-        is_update=is_update,
-    )
-
-
-def _assemble_create_records_payload(
-    args: argparse.Namespace,
-    *,
-    schema: Any = None,
-) -> list[dict[str, Any]]:
-    """Build record creation payload(s) from ``--file``, ``--json``, or inline flags."""
-    return _assemble_records_payload(args, schema=schema, is_update=False)
 
 
 def _record_view_model(r: Any) -> dict[str, Any]:
@@ -188,9 +160,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 effective_limit,
             )
 
-        if resolved_format == "json":
-            display_list(records, "records", output_format="json")
-        elif output:
+        if output:
             export_list_to_file(
                 records,
                 "records",
@@ -198,11 +168,34 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 study_key=study_key,
                 mask_phi=mask_phi,
             )
+            return
+
+        custom_phi_fields = (
+            resolve_cli_phi_fields(study_key, sdk=sdk)
+            if mask_phi and (records or load_remaining is not None)
+            else None
+        )
+        records = mask_cli_records(
+            records,
+            study_key=study_key,
+            mask_phi=mask_phi,
+            sdk=sdk,
+            custom_phi_fields=custom_phi_fields,
+        )
+        if resolved_format == "json":
+            display_list(records, "records", output_format="json")
         else:
             view_models = [_record_view_model(r) for r in records]
 
             def _load_more_records() -> tuple[list[dict[str, Any]], list[Any]]:
                 more = load_remaining() if load_remaining is not None else []
+                more = mask_cli_records(
+                    more,
+                    study_key=study_key,
+                    mask_phi=mask_phi,
+                    sdk=sdk,
+                    custom_phi_fields=custom_phi_fields,
+                )
                 return [_record_view_model(r) for r in more], more
 
             display_list(
@@ -327,43 +320,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def create_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
-        def _run() -> BatchSubmissionSummary:
-            resolved_schema = resolve_cli_schema(
-                sdk,
-                args.study_key,
-                args.schema_source,
-                dry_run=args.dry_run,
-            )
-            payload = _assemble_create_records_payload(args, schema=resolved_schema)
-            return submit_cli_records_batch(
-                sdk,
-                args,
-                payload,
-                action_label="record submission",
-                schema=resolved_schema,
-            )
-
-        execute_cli_write(
-            _run,
-            study_key=args.study_key,
+        run_cli_batch_write(
+            sdk,
+            args,
             resource="records_create",
-            output_format=args.output_format,
-            dry_run=args.dry_run,
+            action_label="record submission",
+            prepare_payload=lambda schema: assemble_cli_write_records(
+                args,
+                schema=schema,
+                study_key=args.study_key,
+                is_update=False,
+            ),
         )
 
     def _dispatch_create_records(args: argparse.Namespace) -> None:
-        study_key = resolve_study_key(create_parser, args, required=True)
-        assert study_key is not None
-        validate_cli_path_segment(study_key, name="study_key")
-        validate_write_numeric_flags(
-            chunk_size=args.chunk_size,
-            timeout=args.timeout,
-            interval=args.interval,
-        )
-        guard_stdin_dash_tty(args.input_file)
-        if args.input_file and args.input_file != "-" and not Path(args.input_file).exists():
-            print_error(f"Error: Input file not found: '{args.input_file}'")
-            sys.exit(1)
+        prepare_write_cli_preflight(create_parser, args)
         if (
             not args.input_file
             and not args.json_payload
@@ -388,43 +359,21 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def update_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
-        def _run() -> BatchSubmissionSummary:
-            resolved_schema = resolve_cli_schema(
-                sdk,
-                args.study_key,
-                args.schema_source,
-                dry_run=args.dry_run,
-            )
-            payload = _assemble_records_payload(args, schema=resolved_schema, is_update=True)
-            return submit_cli_records_batch(
-                sdk,
-                args,
-                payload,
-                action_label="record update",
-                schema=resolved_schema,
-            )
-
-        execute_cli_write(
-            _run,
-            study_key=args.study_key,
+        run_cli_batch_write(
+            sdk,
+            args,
             resource="records_update",
-            output_format=args.output_format,
-            dry_run=args.dry_run,
+            action_label="record update",
+            prepare_payload=lambda schema: assemble_cli_write_records(
+                args,
+                schema=schema,
+                study_key=args.study_key,
+                is_update=True,
+            ),
         )
 
     def _dispatch_update_records(args: argparse.Namespace) -> None:
-        study_key = resolve_study_key(update_parser, args, required=True)
-        assert study_key is not None
-        validate_cli_path_segment(study_key, name="study_key")
-        validate_write_numeric_flags(
-            chunk_size=args.chunk_size,
-            timeout=args.timeout,
-            interval=args.interval,
-        )
-        guard_stdin_dash_tty(args.input_file)
-        if args.input_file and args.input_file != "-" and not Path(args.input_file).exists():
-            print_error(f"Error: Input file not found: '{args.input_file}'")
-            sys.exit(1)
+        prepare_write_cli_preflight(update_parser, args)
         if not args.input_file and not args.json_payload:
             if not _has_update_target_selector(args):
                 print_error(
@@ -456,80 +405,33 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     @with_sdk
     def import_records_cmd(sdk: ImednetSDK, args: argparse.Namespace) -> None:
-        no_interactive = getattr(args, "no_interactive", False)
         input_path = Path(args.file)
 
-        def _run() -> BatchSubmissionSummary:
-            resolved_schema = resolve_cli_schema(
-                sdk,
-                args.study_key,
-                args.schema_source,
-                dry_run=args.dry_run,
-            )
+        def _submit_import(
+            resolved_schema: Any,
+            batch_kwargs: dict[str, Any],
+        ) -> tuple[Any, int]:
             if args.file == "-" or input_path.suffix.lower() == ".json":
                 payload = load_records_from_path_or_stdin(
                     args.file,
                     schema=resolved_schema,
                     study_key=args.study_key,
                 )
-                return submit_cli_records_batch(
-                    sdk,
-                    args,
-                    payload,
-                    action_label="record import",
-                    schema=resolved_schema,
-                )
-            email_notify = parse_email_notify(args.email_notify)
-            with write_progress_context(
-                "record import",
-                args.study_key,
-                no_interactive=no_interactive,
-                output_format=args.output_format,
-                dry_run=args.dry_run,
-            ) as on_progress:
-                raw_summary = import_records_csv(
-                    sdk,
-                    args.study_key,
-                    input_path,
-                    email_notify=email_notify,
-                    schema=resolved_schema,
-                    chunk_size=args.chunk_size,
-                    wait_for_completion=args.wait,
-                    timeout=args.timeout,
-                    interval=args.interval,
-                    on_progress=on_progress,
-                    dry_run=args.dry_run,
-                    collect_errors=True,
-                )
-            return coerce_batch_summary(
-                raw_summary,
-                study_key=args.study_key,
-                total_records=getattr(raw_summary, "total_records", None) or 0,
-                dry_run=args.dry_run,
-                wait_for_completion=args.wait,
-            )
+                raw = sdk.records.create_batch(args.study_key, payload, **batch_kwargs)
+                return raw, len(payload)
+            raw = import_records_csv(sdk, args.study_key, input_path, **batch_kwargs)
+            return raw, getattr(raw, "total_records", None) or 0
 
-        execute_cli_write(
-            _run,
-            study_key=args.study_key,
+        run_cli_batch_write(
+            sdk,
+            args,
             resource="records_import",
-            output_format=args.output_format,
-            dry_run=args.dry_run,
+            action_label="record import",
+            submit_in_progress=_submit_import,
         )
 
     def _dispatch_import_records(args: argparse.Namespace) -> None:
-        study_key = resolve_study_key(import_parser, args, required=True)
-        assert study_key is not None
-        validate_cli_path_segment(study_key, name="study_key")
-        validate_write_numeric_flags(
-            chunk_size=args.chunk_size,
-            timeout=args.timeout,
-            interval=args.interval,
-        )
-        guard_stdin_dash_tty(args.file)
-        if args.file != "-" and not Path(args.file).exists():
-            print_error(f"Error: Input file not found: '{args.file}'")
-            sys.exit(1)
+        prepare_write_cli_preflight(import_parser, args, file_arg=args.file)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             import_records_cmd(args)
 

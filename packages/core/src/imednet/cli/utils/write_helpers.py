@@ -504,6 +504,40 @@ def _coerce_optional_form_id(rec: Mapping[str, Any]) -> int | None:
     return None
 
 
+def merge_inline_data_overrides(
+    rec: Mapping[str, Any],
+    data_pairs: Sequence[str] | None,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+) -> dict[str, Any]:
+    """Merge repeatable ``-d/--data`` key-value overrides into a copied record payload dict."""
+    merged = dict(rec)
+    if not data_pairs:
+        return merged
+    raw_fk = merged.get("formKey") or merged.get("form_key")
+    rec_form_key = str(raw_fk).strip() if isinstance(raw_fk, str) and raw_fk.strip() else None
+    rec_form_id = _coerce_optional_form_id(merged)
+    if rec_form_key is None and rec_form_id is None:
+        if default_form_key and default_form_key.strip():
+            rec_form_key = default_form_key.strip()
+        else:
+            rec_form_id = default_form_id
+    coerced_inline = parse_key_value_pairs(
+        data_pairs,
+        schema=schema,
+        form_key=rec_form_key,
+        form_id=rec_form_id,
+        study_key=study_key,
+    )
+    existing_data = dict(merged.get("data") or merged.get("recordData") or {})
+    existing_data.update(coerced_inline)
+    merged["data"] = existing_data
+    return merged
+
+
 def assemble_cli_write_records(
     args: argparse.Namespace,
     *,
@@ -638,26 +672,36 @@ def assemble_cli_write_records(
             rec["reasonForChange"] = reason_for_change_arg
 
         if data_pairs:
-            raw_fk = rec.get("formKey") or rec.get("form_key")
-            rec_form_key = (
-                str(raw_fk).strip() if isinstance(raw_fk, str) and raw_fk.strip() else None
-            )
-            rec_form_id = _coerce_optional_form_id(rec)
-            coerced_inline = parse_key_value_pairs(
+            rec = merge_inline_data_overrides(
+                rec,
                 data_pairs,
                 schema=schema,
-                form_key=rec_form_key,
-                form_id=rec_form_id,
                 study_key=resolved_study_key,
+                default_form_key=args.form_key,
+                default_form_id=form_id_arg,
             )
-            existing_data = dict(rec.get("data") or rec.get("recordData") or {})
-            existing_data.update(coerced_inline)
-            rec["data"] = existing_data
 
         resolved.append(rec)
 
     ensure_no_masked_sentinel(resolved)
     return resolved
+
+
+def make_job_progress_callback(status_ctrl: Any = None) -> JobProgressHandler:
+    """Create a job polling progress callback that updates ``status_ctrl`` or live stderr."""
+
+    def _on_progress(event: Any) -> None:
+        msg = format_job_progress(event)
+        if status_ctrl is not None and hasattr(status_ctrl, "update"):
+            status_ctrl.update(msg)
+        elif supports_live_status(sys.stderr):
+            try:
+                sys.stderr.write(f"\r\033[K{msg}")
+                sys.stderr.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+    return _on_progress
 
 
 @contextmanager
@@ -682,19 +726,7 @@ def write_progress_context(
         return
 
     with fetching_status(action_label, study_key) as status_ctrl:
-
-        def _on_progress(event: Any) -> None:
-            msg = format_job_progress(event)
-            if status_ctrl is not None and hasattr(status_ctrl, "update"):
-                status_ctrl.update(msg)
-            elif supports_live_status(sys.stderr):
-                try:
-                    sys.stderr.write(f"\r\033[K{msg}")
-                    sys.stderr.flush()
-                except (BrokenPipeError, OSError, ValueError):
-                    pass
-
-        yield _on_progress
+        yield make_job_progress_callback(status_ctrl)
 
 
 def coerce_batch_summary(
@@ -708,6 +740,8 @@ def coerce_batch_summary(
 ) -> BatchSubmissionSummary:
     """Coerce an SDK batch response (or mocked Job) into a :class:`BatchSubmissionSummary`."""
     if isinstance(raw_result, BatchSubmissionSummary):
+        if skipped_count:
+            raw_result.skipped_count = skipped_count
         return raw_result
     if isinstance(raw_result, Job):
         return BatchSubmissionSummary(
@@ -728,58 +762,6 @@ def coerce_batch_summary(
         dry_run=dry_run,
         wait_for_completion=wait_for_completion,
     )
-
-
-def submit_cli_records_batch(
-    sdk: ImednetSDK,
-    args: argparse.Namespace,
-    payload: list[dict[str, Any]],
-    *,
-    action_label: str,
-    schema: ValidationSchemaProtocol | None,
-    skipped_count: int = 0,
-) -> BatchSubmissionSummary:
-    """Submit or dry-run a prepared record or subject payload batch via ``sdk.records.create_batch``."""
-    no_interactive = getattr(args, "no_interactive", False)
-    email_notify = parse_email_notify(args.email_notify)
-    try:
-        with write_progress_context(
-            action_label,
-            args.study_key,
-            no_interactive=no_interactive,
-            output_format=args.output_format,
-            dry_run=args.dry_run,
-        ) as on_progress:
-            raw_summary = sdk.records.create_batch(
-                args.study_key,
-                payload,
-                email_notify=email_notify,
-                schema=schema,
-                chunk_size=args.chunk_size,
-                wait_for_completion=args.wait,
-                timeout=args.timeout,
-                interval=args.interval,
-                on_progress=on_progress,
-                dry_run=args.dry_run,
-                collect_errors=True,
-            )
-    except Exception as exc:
-        for attr in ("batch_summary", "partial_summary"):
-            attached = getattr(exc, attr, None)
-            if isinstance(attached, BatchSubmissionSummary) and skipped_count:
-                attached.skipped_count = skipped_count
-        raise
-
-    summary = coerce_batch_summary(
-        raw_summary,
-        study_key=args.study_key,
-        total_records=len(payload),
-        dry_run=args.dry_run,
-        skipped_count=skipped_count,
-        wait_for_completion=args.wait,
-    )
-    summary.skipped_count = skipped_count
-    return summary
 
 
 _sanitize_job_for_cli = sanitize_job_diagnostics
@@ -1086,6 +1068,8 @@ def execute_cli_write(
     resource: str,
     output_format: str | None = None,
     dry_run: bool = False,
+    skipped_count: int | Callable[[], int] = 0,
+    total_records: int | Callable[[], int] = 0,
 ) -> None:
     """Orchestrate a CLI write command, emitting structured partial/validation failures before exit 1."""
     resolved_format = resolve_output_format(output_format)
@@ -1096,7 +1080,15 @@ def execute_cli_write(
     except KeyboardInterrupt:
         raise
     except Exception as exc:
-        partial = _extract_failure_summary(exc, study_key=study_key, dry_run=dry_run)
+        resolved_skipped = skipped_count() if callable(skipped_count) else skipped_count
+        resolved_total = total_records() if callable(total_records) else total_records
+        partial = _extract_failure_summary(
+            exc,
+            study_key=study_key,
+            dry_run=dry_run,
+            skipped_count=resolved_skipped,
+            total_records=resolved_total,
+        )
         if partial is not None and (
             partial.validation_report is not None and not partial.validation_report.is_valid
         ):
@@ -1130,6 +1122,8 @@ def execute_cli_write(
                 exc,
                 resource=resource,
                 study_key=study_key,
+                total_records=resolved_total,
+                skipped_count=resolved_skipped,
                 output_format=resolved_format,
             )
 
@@ -1196,3 +1190,28 @@ def exit_cli_write_error(
     ):
         emit_json([_summary_to_json_item(partial)], resource, status="failed")
     sys.exit(1)
+
+
+_LAZY_BATCH_EXPORTS: frozenset[str] = frozenset(
+    {
+        "BatchFilteredBuilder",
+        "BatchPayloadBuilder",
+        "BatchProgressRunner",
+        "prepare_write_cli_preflight",
+        "run_cli_batch_write",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily expose batch preflight and runner helpers from :mod:`._write_batch`."""
+    if name in _LAZY_BATCH_EXPORTS:
+        from . import _write_batch
+
+        return getattr(_write_batch, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Return module attributes including lazily re-exported batch helpers."""
+    return sorted(set(globals()) | _LAZY_BATCH_EXPORTS)

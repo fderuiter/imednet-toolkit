@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from imednet.core.context import (
+        extract_sdk_base_url,
         extract_sdk_security_key,
         get_base_url_context,
         get_security_key_context,
@@ -53,7 +54,7 @@ if TYPE_CHECKING:
         normalize_utc_timestamp_bound,
         parse_iso_datetime,
     )
-    from imednet.utils.db import get_sqlite_connection, sqlite_connection
+    from imednet.utils.db import get_db_init_lock, get_sqlite_connection, sqlite_connection
     from imednet.utils.enrollment import (
         ELIGIBLE_SITE_ENROLLMENT_STATUSES,
         extract_candidate_subject_key,
@@ -201,6 +202,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "imednet.utils.enrollment",
         "extract_candidate_subject_key",
     ),
+    "extract_sdk_base_url": ("imednet.core.context", "extract_sdk_base_url"),
     "extract_sdk_security_key": ("imednet.core.context", "extract_sdk_security_key"),
     "extract_single_submitted_job": (
         "imednet.utils.batch_coordinator",
@@ -214,6 +216,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "flatten": ("imednet.utils.serialization", "flatten"),
     "format_iso_datetime": ("imednet.utils.dates", "format_iso_datetime"),
     "get_base_url_context": ("imednet.core.context", "get_base_url_context"),
+    "get_db_init_lock": ("imednet.utils.db", "get_db_init_lock"),
     "get_security_key_context": ("imednet.core.context", "get_security_key_context"),
     "get_sqlite_connection": ("imednet.utils.db", "get_sqlite_connection"),
     "get_study_context": ("imednet.core.context", "get_study_context"),
@@ -361,6 +364,7 @@ __all__ = [
     "evaluate_expression",
     "evaluate_job_state",
     "extract_candidate_subject_key",
+    "extract_sdk_base_url",
     "extract_sdk_security_key",
     "extract_single_submitted_job",
     "fetch_terminal_job_result",
@@ -368,6 +372,7 @@ __all__ = [
     "flatten",
     "format_iso_datetime",
     "get_base_url_context",
+    "get_db_init_lock",
     "get_security_key_context",
     "get_sqlite_connection",
     "get_study_context",

@@ -127,30 +127,57 @@ def extract_sdk_base_url(sdk: Any) -> str | None:
 
 
 def extract_sdk_security_key(sdk: Any) -> str | None:
-    """Extract a non-empty string security_key from an SDK or client instance, if present."""
+    """Extract a non-empty governance secret from an SDK or client instance, if present.
+
+    Precedence follows ADR-0005 when explicit encryption env vars are unset:
+    explicit/configured ``security_key``, then OIDC bearer ``token``, then ``api_key``.
+    """
     if sdk is None:
         return None
-    candidates = (
+    cfg = _safe_context_attr(sdk, "config")
+    sdk_auth = _safe_context_attr(sdk, "auth")
+    sync_client_auth = _safe_context_attr(_safe_context_attr(sdk, "_client"), "auth")
+    async_client_auth = _safe_context_attr(_safe_context_attr(sdk, "_async_client"), "auth")
+    pub_client_auth = _safe_context_attr(_safe_context_attr(sdk, "client"), "auth")
+    pub_async_auth = _safe_context_attr(_safe_context_attr(sdk, "async_client"), "auth")
+
+    security_candidates = (
         _safe_context_attr(sdk, "_security_key"),
-        _safe_context_attr(_safe_context_attr(sdk, "config"), "security_key"),
-        _safe_context_attr(_safe_context_attr(sdk, "auth"), "security_key"),
-        _safe_context_attr(
-            _safe_context_attr(_safe_context_attr(sdk, "_client"), "auth"), "security_key"
-        ),
-        _safe_context_attr(
-            _safe_context_attr(_safe_context_attr(sdk, "_async_client"), "auth"), "security_key"
-        ),
-        _safe_context_attr(
-            _safe_context_attr(_safe_context_attr(sdk, "client"), "auth"), "security_key"
-        ),
-        _safe_context_attr(
-            _safe_context_attr(_safe_context_attr(sdk, "async_client"), "auth"), "security_key"
-        ),
+        _safe_context_attr(cfg, "security_key"),
+        _safe_context_attr(sdk_auth, "security_key"),
+        _safe_context_attr(sync_client_auth, "security_key"),
+        _safe_context_attr(async_client_auth, "security_key"),
+        _safe_context_attr(pub_client_auth, "security_key"),
+        _safe_context_attr(pub_async_auth, "security_key"),
     )
-    for candidate in candidates:
+    oidc_candidates = (
+        _safe_context_attr(sdk_auth, "token"),
+        _safe_context_attr(sync_client_auth, "token"),
+        _safe_context_attr(async_client_auth, "token"),
+        _safe_context_attr(pub_client_auth, "token"),
+        _safe_context_attr(pub_async_auth, "token"),
+        _safe_context_attr(cfg, "oidc_token"),
+    )
+    api_key_candidates = (
+        _safe_context_attr(sdk, "_api_key"),
+        _safe_context_attr(cfg, "api_key"),
+        _safe_context_attr(sdk_auth, "api_key"),
+        _safe_context_attr(sync_client_auth, "api_key"),
+        _safe_context_attr(async_client_auth, "api_key"),
+        _safe_context_attr(pub_client_auth, "api_key"),
+        _safe_context_attr(pub_async_auth, "api_key"),
+    )
+
+    simulated_placeholders = {"SIMULATED_KEY", "simulated_security_key", "simulated_api_key"}
+    simulated_fallback: str | None = None
+    for candidate in (*security_candidates, *oidc_candidates, *api_key_candidates):
         if isinstance(candidate, str) and candidate.strip():
+            if candidate in simulated_placeholders:
+                if simulated_fallback is None:
+                    simulated_fallback = candidate
+                continue
             return candidate
-    return None
+    return simulated_fallback
 
 
 @contextmanager

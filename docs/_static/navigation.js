@@ -4,8 +4,9 @@
  * Restores WCAG 2.1/2.2 SC 2.1.1 (Keyboard), SC 2.4.3 (Focus Order), SC 2.4.7 (Focus Visible),
  * and SC 4.1.2 (Name, Role, Value) across:
  *   1. Sidebar submenu switches (input.toctree-checkbox) — Space + Enter toggling.
- *   2. Responsive drawers (.sidebar-drawer <= 63em, .toc-drawer <= 82em) — inert syncing,
- *      accessible label button triggers, focus entry on open, and Escape / TOC link close.
+ *   2. Responsive drawers (.sidebar-drawer <= 63em, .toc-drawer <= 82em) — native
+ *      <button type="button"> triggers, modal dialog semantics, sibling inert isolation,
+ *      inline close buttons, Escape/backdrop restoration, and TOC heading focus transfer.
  *   3. Module index toggles (img.toggler on py-modindex.html) — role="button", tabindex="0",
  *      package aria-label, keyboard Enter/Space activation, and aria-expanded + alt syncing.
  */
@@ -103,6 +104,12 @@
         const tocInput = document.getElementById("__toc");
         const sidebarDrawer = document.querySelector(".sidebar-drawer");
         const tocDrawer = document.querySelector(".toc-drawer");
+        const mainRegion = document.querySelector(".main");
+        const contentRegion =
+            document.querySelector(".main > .content") || document.querySelector(".content");
+        const mobileHeader = document.querySelector("header.mobile-header");
+        const skipLink = document.querySelector("a.skip-to-content");
+        const announcements = Array.from(document.querySelectorAll(".announcement"));
 
         if (!sidebarDrawer && !tocDrawer) {
             return;
@@ -115,8 +122,8 @@
             tocDrawer.id = TOC_DRAWER_ID;
         }
 
-        const navTriggers = Array.from(document.querySelectorAll(".nav-overlay-icon"));
-        const tocTriggers = Array.from(
+        const rawNavTriggers = Array.from(document.querySelectorAll(".nav-overlay-icon"));
+        const rawTocTriggers = Array.from(
             document.querySelectorAll(
                 ".toc-header-icon:not(.no-toc), .toc-content-icon:not(.no-toc)"
             )
@@ -127,6 +134,7 @@
         hiddenTocLabels.forEach(function (lbl) {
             lbl.removeAttribute("tabindex");
             lbl.removeAttribute("role");
+            lbl.removeAttribute("for");
             lbl.setAttribute("aria-hidden", "true");
         });
 
@@ -146,91 +154,252 @@
 
         function upgradeTrigger(trigger, kind, toggleInput, drawerEl, fallbackLabel) {
             if (!trigger || !toggleInput || !drawerEl) {
-                return;
+                return trigger;
             }
             const labelText =
                 (toggleInput.getAttribute("aria-label") || "").trim() || fallbackLabel;
-            trigger.setAttribute("role", "button");
-            trigger.setAttribute("tabindex", "0");
-            trigger.setAttribute("aria-controls", drawerEl.id);
-            trigger.setAttribute("aria-label", labelText);
-            trigger.setAttribute("aria-expanded", toggleInput.checked ? "true" : "false");
 
-            trigger.querySelectorAll(".icon, svg").forEach(function (iconEl) {
+            let btn = trigger;
+            if ((trigger.tagName || "").toUpperCase() !== "BUTTON") {
+                btn = document.createElement("button");
+                btn.type = "button";
+                if (trigger.id) {
+                    btn.id = trigger.id;
+                }
+                if (trigger.className) {
+                    btn.className = trigger.className;
+                }
+                if (typeof trigger.hasAttribute === "function" && trigger.hasAttribute("title")) {
+                    btn.setAttribute("title", trigger.getAttribute("title") || "");
+                }
+                while (trigger.firstChild) {
+                    btn.appendChild(trigger.firstChild);
+                }
+                if (trigger.parentNode) {
+                    trigger.parentNode.replaceChild(btn, trigger);
+                }
+            } else {
+                btn.setAttribute("type", "button");
+                btn.removeAttribute("role");
+                btn.removeAttribute("for");
+                btn.removeAttribute("tabindex");
+            }
+
+            btn.setAttribute("aria-controls", drawerEl.id);
+            btn.setAttribute("aria-label", labelText);
+            btn.setAttribute("aria-expanded", toggleInput.checked ? "true" : "false");
+
+            btn.querySelectorAll(".icon, svg").forEach(function (iconEl) {
                 iconEl.setAttribute("aria-hidden", "true");
             });
 
-            if (trigger.getAttribute("data-nav-upgraded") === "true") {
-                return;
+            if (btn.getAttribute("data-nav-upgraded") === "true") {
+                return btn;
             }
-            trigger.setAttribute("data-nav-upgraded", "true");
+            btn.setAttribute("data-nav-upgraded", "true");
 
-            trigger.addEventListener("click", function () {
-                lastTrigger[kind] = trigger;
+            btn.addEventListener("click", function () {
+                lastTrigger[kind] = btn;
+                toggleInput.checked = !toggleInput.checked;
+                toggleInput.dispatchEvent(new Event("change", { bubbles: true }));
             });
 
-            trigger.addEventListener("keydown", function (event) {
-                if (event.altKey || event.ctrlKey || event.metaKey) {
-                    return;
-                }
-                if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
-                    event.preventDefault();
-                    lastTrigger[kind] = trigger;
-                    toggleInput.checked = !toggleInput.checked;
-                    toggleInput.dispatchEvent(new Event("change", { bubbles: true }));
-                }
-            });
+            return btn;
         }
 
-        navTriggers.forEach(function (trigger) {
-            upgradeTrigger(
-                trigger,
-                "nav",
-                navInput,
-                sidebarDrawer,
-                "Toggle site navigation sidebar"
-            );
-        });
-        tocTriggers.forEach(function (trigger) {
-            upgradeTrigger(
-                trigger,
-                "toc",
-                tocInput,
-                tocDrawer,
-                "Toggle table of contents sidebar"
-            );
-        });
+        const navTriggers = rawNavTriggers
+            .map(function (trigger) {
+                return upgradeTrigger(
+                    trigger,
+                    "nav",
+                    navInput,
+                    sidebarDrawer,
+                    "Toggle site navigation sidebar"
+                );
+            })
+            .filter(Boolean);
+
+        const tocTriggers = rawTocTriggers
+            .map(function (trigger) {
+                return upgradeTrigger(
+                    trigger,
+                    "toc",
+                    tocInput,
+                    tocDrawer,
+                    "Toggle table of contents sidebar"
+                );
+            })
+            .filter(Boolean);
+
+        let navHeaderEl = null;
+        let navCloseBtn = null;
+        let tocHeaderEl = null;
+        let tocCloseBtn = null;
+
+        function createCloseButton(ariaLabel, kind, toggleInput) {
+            const closeBtn = document.createElement("button");
+            closeBtn.type = "button";
+            closeBtn.className = "drawer-close-btn";
+            closeBtn.setAttribute("aria-label", ariaLabel);
+            closeBtn.hidden = true;
+            const iconSpan = document.createElement("span");
+            iconSpan.setAttribute("aria-hidden", "true");
+            iconSpan.textContent = "\u00d7";
+            closeBtn.appendChild(iconSpan);
+            closeBtn.addEventListener("click", function () {
+                if (toggleInput) {
+                    toggleInput.checked = false;
+                }
+                syncDrawers();
+                restoreTriggerFocus(kind, false);
+            });
+            return closeBtn;
+        }
+
+        if (sidebarDrawer) {
+            navCloseBtn = sidebarDrawer.querySelector("button.drawer-close-btn");
+            navHeaderEl = sidebarDrawer.querySelector(".drawer-header");
+            if (!navCloseBtn) {
+                navHeaderEl = document.createElement("div");
+                navHeaderEl.className = "drawer-header";
+                navHeaderEl.hidden = true;
+                const titleSpan = document.createElement("span");
+                titleSpan.className = "drawer-header-title";
+                titleSpan.textContent = "Navigation";
+                navCloseBtn = createCloseButton("Close site navigation", "nav", navInput);
+                navHeaderEl.appendChild(titleSpan);
+                navHeaderEl.appendChild(navCloseBtn);
+                const sticky =
+                    sidebarDrawer.querySelector(".sidebar-sticky") ||
+                    sidebarDrawer.firstElementChild ||
+                    sidebarDrawer;
+                sticky.insertBefore(navHeaderEl, sticky.firstChild);
+            }
+        }
+
+        if (tocDrawer && !tocDrawer.classList.contains("no-toc")) {
+            tocCloseBtn = tocDrawer.querySelector("button.drawer-close-btn");
+            tocHeaderEl = tocDrawer.querySelector(".drawer-header");
+            if (!tocCloseBtn) {
+                tocCloseBtn = createCloseButton("Close table of contents", "toc", tocInput);
+                const titleContainer = tocDrawer.querySelector(".toc-title-container");
+                if (titleContainer) {
+                    titleContainer.appendChild(tocCloseBtn);
+                } else {
+                    tocHeaderEl = document.createElement("div");
+                    tocHeaderEl.className = "drawer-header";
+                    tocHeaderEl.hidden = true;
+                    tocHeaderEl.appendChild(tocCloseBtn);
+                    const sticky =
+                        tocDrawer.querySelector(".toc-sticky") ||
+                        tocDrawer.firstElementChild ||
+                        tocDrawer;
+                    sticky.insertBefore(tocHeaderEl, sticky.firstChild);
+                }
+            }
+        }
 
         function syncDrawers() {
             const sidebarModal = Boolean(sidebarMql && sidebarMql.matches);
+            const tocModal = Boolean(tocMql && tocMql.matches);
+            const isNoToc = Boolean(tocDrawer && tocDrawer.classList.contains("no-toc"));
+
+            if (!sidebarModal && navInput && navInput.checked) {
+                navInput.checked = false;
+            }
+            if ((!tocModal || isNoToc) && tocInput && tocInput.checked) {
+                tocInput.checked = false;
+            }
+
+            const navOpen = Boolean(sidebarDrawer && sidebarModal && navInput && navInput.checked);
+            let tocOpen = Boolean(tocDrawer && !isNoToc && tocModal && tocInput && tocInput.checked);
+            if (navOpen && tocOpen && tocInput) {
+                tocInput.checked = false;
+                tocOpen = false;
+            }
+            const anyModalOpen = navOpen || tocOpen;
+
             if (sidebarDrawer) {
-                if (!sidebarModal && navInput && navInput.checked) {
-                    navInput.checked = false;
+                setInertState(sidebarDrawer, (sidebarModal && !navOpen) || tocOpen);
+                if (!sidebarDrawer.getAttribute("aria-label")) {
+                    sidebarDrawer.setAttribute("aria-label", "Site navigation");
                 }
-                const navOpen = Boolean(sidebarModal && navInput && navInput.checked);
-                setInertState(sidebarDrawer, sidebarModal && !navOpen);
+                if (navOpen) {
+                    sidebarDrawer.setAttribute("role", "dialog");
+                    sidebarDrawer.setAttribute("aria-modal", "true");
+                } else {
+                    sidebarDrawer.removeAttribute("role");
+                    sidebarDrawer.removeAttribute("aria-modal");
+                }
+                if (navHeaderEl) {
+                    navHeaderEl.hidden = !navOpen;
+                }
+                if (navCloseBtn) {
+                    navCloseBtn.hidden = !navOpen;
+                }
                 navTriggers.forEach(function (trigger) {
                     trigger.setAttribute("aria-expanded", navOpen ? "true" : "false");
                 });
             }
 
-            const tocModal = Boolean(tocMql && tocMql.matches);
             if (tocDrawer) {
-                const isNoToc = tocDrawer.classList.contains("no-toc");
-                if ((!tocModal || isNoToc) && tocInput && tocInput.checked) {
-                    tocInput.checked = false;
+                setInertState(tocDrawer, isNoToc || (tocModal && !tocOpen) || navOpen);
+                if (!isNoToc && !tocDrawer.getAttribute("aria-label")) {
+                    tocDrawer.setAttribute("aria-label", "Table of contents");
                 }
-                const tocOpen = Boolean(!isNoToc && tocModal && tocInput && tocInput.checked);
-                setInertState(tocDrawer, isNoToc || (tocModal && !tocOpen));
+                if (tocOpen) {
+                    tocDrawer.setAttribute("role", "dialog");
+                    tocDrawer.setAttribute("aria-modal", "true");
+                } else {
+                    tocDrawer.removeAttribute("role");
+                    tocDrawer.removeAttribute("aria-modal");
+                }
+                if (tocHeaderEl) {
+                    tocHeaderEl.hidden = !tocOpen;
+                }
+                if (tocCloseBtn) {
+                    tocCloseBtn.hidden = !tocOpen;
+                }
                 tocTriggers.forEach(function (trigger) {
                     trigger.setAttribute("aria-expanded", tocOpen ? "true" : "false");
                 });
             }
+
+            const mainContainsToc = Boolean(
+                mainRegion &&
+                    tocDrawer &&
+                    typeof mainRegion.contains === "function" &&
+                    mainRegion.contains(tocDrawer)
+            );
+            setInertState(mainRegion, navOpen || (tocOpen && !mainContainsToc));
+            if (mainRegion && mainRegion.children) {
+                Array.from(mainRegion.children).forEach(function (child) {
+                    if (child !== tocDrawer) {
+                        setInertState(child, anyModalOpen);
+                    }
+                });
+            } else if (contentRegion) {
+                setInertState(contentRegion, anyModalOpen);
+            }
+            setInertState(mobileHeader, anyModalOpen);
+            setInertState(skipLink, anyModalOpen);
+            announcements.forEach(function (el) {
+                setInertState(el, anyModalOpen);
+            });
         }
 
         function focusInsideDrawer(drawerEl) {
             if (!drawerEl) return;
             void drawerEl.offsetWidth;
+            const preferred = drawerEl.querySelectorAll(
+                ".toc-tree a[href], .sidebar-brand[href], .sidebar-search, .sidebar-tree a[href]"
+            );
+            for (let i = 0; i < preferred.length; i++) {
+                if (isElementVisible(preferred[i])) {
+                    preferred[i].focus();
+                    return;
+                }
+            }
             const candidates = drawerEl.querySelectorAll(FOCUSABLE_SELECTOR);
             for (let i = 0; i < candidates.length; i++) {
                 const candidate = candidates[i];
@@ -277,12 +446,8 @@
                     syncDrawers();
                     focusInsideDrawer(sidebarDrawer);
                 } else {
-                    const active = document.activeElement;
-                    const focusInside = Boolean(
-                        sidebarDrawer && active && sidebarDrawer.contains(active)
-                    );
                     syncDrawers();
-                    if (focusInside || active === document.body || active === navInput) {
+                    if (sidebarModal) {
                         restoreTriggerFocus("nav", false);
                     }
                 }
@@ -301,14 +466,62 @@
                     syncDrawers();
                     focusInsideDrawer(tocDrawer);
                 } else {
-                    const active = document.activeElement;
-                    const focusInside = Boolean(tocDrawer && active && tocDrawer.contains(active));
                     syncDrawers();
-                    if (focusInside || active === document.body || active === tocInput) {
+                    if (tocModal && !isNoToc) {
                         restoreTriggerFocus("toc", false);
                     }
                 }
             });
+        }
+
+        function resolveTocTarget(link) {
+            if (!link || typeof link.getAttribute !== "function") {
+                return null;
+            }
+            const rawHref = (link.getAttribute("href") || "").trim();
+            if (!rawHref || rawHref.charAt(0) !== "#") {
+                return null;
+            }
+            if (rawHref === "#") {
+                const topHeading = document.querySelector(
+                    "#furo-main-content h1, article h1, .main h1"
+                );
+                const mainContent = document.getElementById("furo-main-content");
+                return {
+                    rawHref: rawHref,
+                    scrollEl: null,
+                    focusEl: topHeading || mainContent
+                };
+            }
+            let targetId = rawHref.slice(1);
+            try {
+                targetId = decodeURIComponent(targetId);
+            } catch (_err) {
+                // Preserve raw fragment identifier when percent-decoding fails
+            }
+            const anchorEl = document.getElementById(targetId);
+            if (!anchorEl) {
+                return null;
+            }
+            let focusEl = anchorEl;
+            const tagName = (anchorEl.tagName || "").toUpperCase();
+            if (
+                !/^H[1-6]$/.test(tagName) &&
+                tagName !== "DT" &&
+                typeof anchorEl.querySelector === "function"
+            ) {
+                const childHeading = anchorEl.querySelector(
+                    ":scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6, h1, h2, h3, h4, h5, h6"
+                );
+                if (childHeading) {
+                    focusEl = childHeading;
+                }
+            }
+            return {
+                rawHref: rawHref,
+                scrollEl: anchorEl,
+                focusEl: focusEl
+            };
         }
 
         if (tocDrawer && tocDrawer.getAttribute("data-nav-upgraded") !== "true") {
@@ -319,13 +532,75 @@
                     target && typeof target.closest === "function"
                         ? target.closest("a[href]")
                         : null;
-                if (link && tocInput && tocInput.checked && tocMql && tocMql.matches) {
-                    tocInput.checked = false;
+                if (!link) {
+                    return;
+                }
+                const resolved = resolveTocTarget(link);
+                const wasModalOpen = Boolean(
+                    tocInput && tocInput.checked && tocMql && tocMql.matches
+                );
+                if (!resolved) {
+                    if (wasModalOpen) {
+                        tocInput.checked = false;
+                        syncDrawers();
+                    }
+                    return;
+                }
+                if (wasModalOpen || resolved.focusEl) {
+                    if (event && typeof event.preventDefault === "function") {
+                        event.preventDefault();
+                    }
+                    if (tocInput && tocInput.checked) {
+                        tocInput.checked = false;
+                    }
                     syncDrawers();
-                    restoreTriggerFocus("toc", true);
-                    globalThis.setTimeout(function () {
-                        restoreTriggerFocus("toc", true);
-                    }, 0);
+                    if (
+                        globalThis.location &&
+                        globalThis.history &&
+                        typeof globalThis.history.pushState === "function"
+                    ) {
+                        const expectedHash = resolved.rawHref === "#" ? "" : resolved.rawHref;
+                        const nextUrl =
+                            resolved.rawHref === "#"
+                                ? globalThis.location.pathname + globalThis.location.search
+                                : resolved.rawHref;
+                        if (globalThis.location.hash !== expectedHash) {
+                            globalThis.history.pushState(null, "", nextUrl);
+                        }
+                    }
+                    if (resolved.rawHref === "#") {
+                        if (typeof globalThis.scrollTo === "function") {
+                            try {
+                                globalThis.scrollTo({ top: 0, behavior: "instant" });
+                            } catch (_err) {
+                                globalThis.scrollTo(0, 0);
+                            }
+                        }
+                    } else if (
+                        resolved.scrollEl &&
+                        typeof resolved.scrollEl.scrollIntoView === "function"
+                    ) {
+                        try {
+                            resolved.scrollEl.scrollIntoView({
+                                block: "start",
+                                behavior: "instant"
+                            });
+                        } catch (_err) {
+                            resolved.scrollEl.scrollIntoView(true);
+                        }
+                    }
+                    if (resolved.focusEl) {
+                        if (
+                            typeof resolved.focusEl.hasAttribute === "function" &&
+                            !resolved.focusEl.hasAttribute("tabindex") &&
+                            typeof resolved.focusEl.setAttribute === "function"
+                        ) {
+                            resolved.focusEl.setAttribute("tabindex", "-1");
+                        }
+                        if (typeof resolved.focusEl.focus === "function") {
+                            resolved.focusEl.focus({ preventScroll: true });
+                        }
+                    }
                 }
             });
         }

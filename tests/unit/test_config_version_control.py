@@ -1402,3 +1402,407 @@ def test_ten_thousand_uncached_study_lookups_skip_duplicate_legacy_and_path_reso
 
     assert legacy_count == 0
     assert resolve_count <= 3
+
+
+def test_multi_origin_sdk_instantiation_preserves_pinned_store_and_default_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Creating a second ImednetSDK for another origin leaves pinned stores and DEFAULT_BASE_URL intact."""
+    import threading
+
+    import pandas as pd
+
+    from imednet import ImednetSDK
+    from imednet.core.context import (
+        get_base_url_context,
+        get_security_key_context,
+        reset_base_url_context,
+        reset_security_key_context,
+        set_base_url_context,
+        set_security_key_context,
+    )
+    from imednet.integrations.enrichment import resolve_study_configuration
+    from imednet.integrations.export import export_to_csv
+    from imednet.orchestration.orchestrator import MultiStudyOrchestrator
+    from imednet.simulation import SimulationState, create_simulation_transport
+
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
+    base_db = tmp_path / "multi_origin" / "config_versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(base_db))
+
+    state = SimulationState()
+    state.variables.append(
+        {
+            "studyKey": "STUDY",
+            "variableId": 888,
+            "variableName": "CUSTOM_ORIGIN_SECRET",
+            "variableType": "TEXT",
+            "formId": 301,
+            "formKey": "F_DM",
+            "formName": "Demographics",
+            "label": "Origin Secret",
+            "deleted": False,
+        }
+    )
+    for rec in state.records:
+        if rec.get("studyKey") == "STUDY" and rec.get("formKey") == "F_DM":
+            rec.setdefault("recordData", {})[
+                "CUSTOM_ORIGIN_SECRET"  # pragma: allowlist secret
+            ] = "SENSITIVE-ORIGIN-PHI"  # pragma: allowlist secret
+
+    transport = create_simulation_transport(state)
+    b_tok = set_base_url_context(None)
+    s_tok = set_security_key_context(None)
+    try:
+        prod_sdk = ImednetSDK(
+            api_key="prod-api-key",  # pragma: allowlist secret
+            security_key="prod-sec-key",  # pragma: allowlist secret
+            transport=transport,
+            simulation_mode=True,
+        )
+        # Constructing an SDK must not pollute ambient thread-local ContextVars
+        assert get_base_url_context() is None
+        assert get_security_key_context() is None
+
+        prod_store = ConfigVersionStore()
+        assert "edc.prod.imednetapi.com" in str(prod_store.db_path)
+
+        cfg = StudyConfiguration(
+            study_key="STUDY",
+            phi_fields=["CUSTOM_ORIGIN_SECRET"],
+        )
+        commit_id = prod_store.commit_config(
+            "STUDY",
+            cfg,
+            desc="Commit prod PHI rules",
+            sdk=prod_sdk,
+        )
+        prod_db_path = prod_store.db_path
+        assert "edc.prod.imednetapi.com" in str(prod_db_path)
+
+        # Instantiate a training-environment SDK in the same thread
+        trn_sdk = ImednetSDK(
+            api_key="trn-api-key",  # pragma: allowlist secret
+            security_key="trn-different-sec-key",  # pragma: allowlist secret
+            base_url="https://edc.trn.imednetapi.com",
+            transport=transport,
+            simulation_mode=True,
+        )
+        assert get_base_url_context() is None
+        assert get_security_key_context() == "prod-sec-key"
+
+        # Even inside `with trn_sdk:`, prod_store stays pinned to prod origin and prod key
+        with trn_sdk:
+            assert prod_store.db_path == prod_db_path
+            assert prod_store.get_head("STUDY") == commit_id
+            history = prod_store.get_history("STUDY")
+            assert len(history) == 1
+            assert history[0]["commit_id"] == commit_id
+            assert prod_store.rollback_config("STUDY", commit_id).phi_fields == [
+                "CUSTOM_ORIGIN_SECRET"
+            ]
+
+        trn_store = ConfigVersionStore(sdk=trn_sdk)
+        assert "edc.trn.imednetapi.com" in str(trn_store.db_path)
+        assert trn_store.get_head("STUDY") is None
+        assert trn_store.get_history("STUDY") == []
+
+        # Unscoped background thread resolves DEFAULT_BASE_URL when security key is bound via sdk_governance_context
+        from imednet.spi.utils import sdk_governance_context
+
+        worker_resolved: list[StudyConfiguration | None] = []
+
+        def _bg_resolve() -> None:
+            with sdk_governance_context(prod_sdk):
+                worker_resolved.append(resolve_study_configuration("STUDY"))
+
+        bg_thread = threading.Thread(target=_bg_resolve)
+        bg_thread.start()
+        bg_thread.join(timeout=5)
+        assert len(worker_resolved) == 1
+        assert worker_resolved[0] is not None
+        assert worker_resolved[0].phi_fields == ["CUSTOM_ORIGIN_SECRET"]
+
+        # MultiStudyOrchestrator worker threads mask custom PHI without IMEDNET_BASE_URL
+        def _export_job(study_key: str, worker_sdk: ImednetSDK, _logger: object) -> Path:
+            out_csv = tmp_path / f"multi_origin_{study_key}.csv"
+            export_to_csv(worker_sdk, study_key, out_csv, quality_gate_enabled=False)
+            return out_csv
+
+        orch = MultiStudyOrchestrator(prod_sdk, max_workers=2)
+        results = orch.execute_pipeline(_export_job, whitelist={"STUDY"})
+        assert results["STUDY"]["status"] == "SUCCESS"
+        df = pd.read_csv(results["STUDY"]["data"])
+        assert set(df["CUSTOM_ORIGIN_SECRET"].dropna()) == {"***MASKED***"}
+
+        # Legacy `localhost` ledger fallback works seamlessly for pre-existing local ledgers
+        legacy_store = ConfigVersionStore(db_path=base_db, base_url="http://localhost")
+        legacy_cfg = StudyConfiguration(study_key="LEGACY_STUDY", phi_fields=["LEGACY_MRN"])
+        legacy_commit = legacy_store.commit_config(
+            "LEGACY_STUDY",
+            legacy_cfg,
+            desc="Legacy localhost ledger commit",
+            sdk=prod_sdk,
+        )
+        assert "localhost" in str(legacy_store.db_path)
+
+        with sdk_governance_context(prod_sdk):
+            unscoped_reader = ConfigVersionStore(db_path=base_db)
+            assert unscoped_reader.get_head("LEGACY_STUDY") == legacy_commit
+            assert len(unscoped_reader.get_history("LEGACY_STUDY")) == 1
+            assert unscoped_reader.rollback_config("LEGACY_STUDY", legacy_commit).phi_fields == [
+                "LEGACY_MRN"
+            ]
+            resolved_legacy = resolve_study_configuration("LEGACY_STUDY")
+            assert resolved_legacy is not None
+            assert resolved_legacy.phi_fields == ["LEGACY_MRN"]
+    finally:
+        reset_base_url_context(b_tok)
+        reset_security_key_context(s_tok)
+
+
+def test_oidc_credential_source_commits_reads_and_masks_without_env_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OIDC JWT and opaque CredentialSource sessions encrypt/decrypt configs without env keys."""
+    import base64
+    import hashlib
+    import hmac
+    import time
+
+    import pandas as pd
+
+    from imednet import ImednetSDK
+    from imednet.auth import Credentials, MemoryCredentialStore, OIDCAuth
+    from imednet.core.client import Client
+    from imednet.core.context import reset_security_key_context, set_security_key_context
+    from imednet.integrations.enrichment import resolve_study_configuration
+    from imednet.integrations.export import export_to_csv
+    from imednet.simulation import SimulationState, create_simulation_transport
+
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
+
+    state = SimulationState()
+    state.variables.append(
+        {
+            "studyKey": "STUDY",
+            "variableId": 901,
+            "variableName": "OIDC_CUSTOM_SSN",
+            "variableType": "TEXT",
+            "formId": 301,
+            "formKey": "F_DM",
+            "formName": "Demographics",
+            "label": "OIDC SSN",
+            "deleted": False,
+        }
+    )
+    for rec in state.records:
+        if rec.get("studyKey") == "STUDY" and rec.get("formKey") == "F_DM":
+            rec.setdefault("recordData", {})["OIDC_CUSTOM_SSN"] = "999-00-1234"
+
+    transport = create_simulation_transport(state)
+    sec_tok = set_security_key_context(None)
+    try:
+        # 1. Signed JWT OIDC session without IMEDNET_ENCRYPTION_KEY / IMEDNET_SECURITY_KEY
+        jwt_db = tmp_path / "jwt_oidc" / "config_versions.sqlite3"
+        monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(jwt_db))
+
+        hmac_secret = "oidc-jwt-signing-secret-key"  # pragma: allowlist secret
+        hdr = (
+            base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+            .decode()
+            .rstrip("=")
+        )
+        pld = (
+            base64.urlsafe_b64encode(
+                json.dumps(
+                    {
+                        "sub": "dm-jwt-user",
+                        "roles": ["Data Manager"],
+                        "exp": time.time() + 600,
+                    }
+                ).encode()
+            )
+            .decode()
+            .rstrip("=")
+        )
+        sig = (
+            base64.urlsafe_b64encode(
+                hmac.new(hmac_secret.encode(), f"{hdr}.{pld}".encode(), hashlib.sha256).digest()
+            )
+            .decode()
+            .rstrip("=")
+        )
+        signed_jwt = f"{hdr}.{pld}.{sig}"
+
+        jwt_client = Client(
+            auth=OIDCAuth(signed_jwt, public_key=hmac_secret),
+            transport=transport,
+        )
+        jwt_sdk = ImednetSDK(client=jwt_client)
+        jwt_store = ConfigVersionStore()
+        cfg = StudyConfiguration(study_key="STUDY", phi_fields=["OIDC_CUSTOM_SSN"])
+        jwt_commit = jwt_store.commit_config("STUDY", cfg, desc="JWT OIDC commit", sdk=jwt_sdk)
+
+        # Verify zero plaintext JSON in SQLite ledger
+        with sqlite3.connect(jwt_store.db_path) as conn:
+            raw_payload = str(
+                conn.execute(
+                    "SELECT config_data FROM config_commits WHERE commit_id = ?",
+                    (jwt_commit,),
+                ).fetchone()[0]
+            )
+        assert "OIDC_CUSTOM_SSN" not in raw_payload
+        assert "phiFields" not in raw_payload
+
+        hist = jwt_store.get_history("STUDY")
+        assert len(hist) == 1
+        assert hist[0]["modified_by"] == "dm-jwt-user"
+        assert jwt_store.rollback_config("STUDY", jwt_commit).phi_fields == ["OIDC_CUSTOM_SSN"]
+
+        with jwt_sdk:
+            resolved_jwt = resolve_study_configuration("STUDY")
+            assert resolved_jwt is not None
+            assert resolved_jwt.phi_fields == ["OIDC_CUSTOM_SSN"]
+            jwt_csv = tmp_path / "jwt_oidc_export.csv"
+            export_to_csv(jwt_sdk, "STUDY", jwt_csv, quality_gate_enabled=False)
+            df_jwt = pd.read_csv(jwt_csv)
+            assert set(df_jwt["OIDC_CUSTOM_SSN"].dropna()) == {"***MASKED***"}
+
+        # 2. Opaque bearer CredentialSource (MemoryCredentialStore) without env keys
+        reset_security_key_context(sec_tok)
+        sec_tok = set_security_key_context(None)
+        opaque_db = tmp_path / "opaque_oidc" / "config_versions.sqlite3"
+        monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(opaque_db))
+
+        cred_source = MemoryCredentialStore(
+            Credentials(oidc_token="opaque-bearer-session-token-abc123")  # pragma: allowlist secret
+        )
+        opaque_sdk = ImednetSDK(
+            credential_source=cred_source,
+            transport=transport,
+        )
+        opaque_store = ConfigVersionStore()
+        opaque_commit = opaque_store.commit_config(
+            "STUDY",
+            cfg,
+            desc="Opaque OIDC session commit",
+            sdk=opaque_sdk,
+        )
+
+        with sqlite3.connect(opaque_store.db_path) as conn:
+            opaque_raw = str(
+                conn.execute(
+                    "SELECT config_data FROM config_commits WHERE commit_id = ?",
+                    (opaque_commit,),
+                ).fetchone()[0]
+            )
+        assert "OIDC_CUSTOM_SSN" not in opaque_raw
+
+        opaque_hist = opaque_store.get_history("STUDY")
+        assert len(opaque_hist) == 1
+        assert opaque_hist[0]["modified_by"] == "oidc-token-user"
+        assert opaque_store.rollback_config("STUDY", opaque_commit).phi_fields == [
+            "OIDC_CUSTOM_SSN"
+        ]
+
+        with opaque_sdk:
+            resolved_opaque = resolve_study_configuration("STUDY")
+            assert resolved_opaque is not None
+            assert resolved_opaque.phi_fields == ["OIDC_CUSTOM_SSN"]
+
+        # Unauthenticated/unpinned fresh store without key or wrong key fails closed on decrypt & resolve
+        reset_security_key_context(sec_tok)
+        sec_tok = set_security_key_context(None)
+        fresh_unkeyed_store = ConfigVersionStore(db_path=opaque_db)
+        with pytest.raises(ValueError, match="key is missing|Decryption failed"):
+            fresh_unkeyed_store.get_history("STUDY")
+        assert resolve_study_configuration("STUDY") is None
+
+        wrong_tok = set_security_key_context("wrong-oidc-token")
+        try:
+            with pytest.raises(ValueError, match="Decryption failed|integrity check failed"):
+                fresh_unkeyed_store.get_history("STUDY")
+            assert resolve_study_configuration("STUDY") is None
+        finally:
+            reset_security_key_context(wrong_tok)
+
+        # 3. Unverified/forged 3-part JWT via MemoryCredentialStore must still fail closed with PermissionError
+        forged_hdr = (
+            base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+            .decode()
+            .rstrip("=")
+        )
+        forged_pld = (
+            base64.urlsafe_b64encode(json.dumps({"sub": "attacker", "roles": ["admin"]}).encode())
+            .decode()
+            .rstrip("=")
+        )
+        forged_jwt = f"{forged_hdr}.{forged_pld}.forged_signature"
+        forged_sdk = ImednetSDK(
+            credential_source=MemoryCredentialStore(Credentials(oidc_token=forged_jwt)),
+            transport=transport,
+        )
+        with pytest.raises(PermissionError, match="authorization failure|lacks manager or admin"):
+            opaque_store.commit_config("STUDY", cfg, desc="forged", sdk=forged_sdk)
+    finally:
+        reset_security_key_context(sec_tok)
+
+
+def test_config_version_store_concurrent_cache_access_and_eviction_thread_safety(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_sdk: MockSDK,
+) -> None:
+    """Concurrent multi-threaded commits, lookups, and bounded cache evictions are race-free."""
+    import threading
+
+    import imednet_workflows.config_version_control as cvc
+
+    db_file = tmp_path / "concurrent_cvc" / "versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv(
+        "IMEDNET_SECURITY_KEY", "concurrent-cache-secret"
+    )  # pragma: allowlist secret
+    monkeypatch.setattr(cvc, "_MAX_COMMITTED_CONFIG_CACHE", 8)
+    monkeypatch.setattr(cvc, "_MAX_HEAD_INDEX_CACHE", 4)
+    monkeypatch.setattr(cvc, "_MAX_ORIGIN_LAYOUT_CACHE", 8)
+
+    n_threads = 6
+    barrier = threading.Barrier(n_threads)
+    errors: list[Exception] = []
+
+    def _worker(tid: int) -> None:
+        local_store = ConfigVersionStore(db_path=db_file)
+        barrier.wait()
+        try:
+            for step in range(12):
+                study = f"STUDY_{tid}_{step % 6}"
+                cfg = StudyConfiguration(
+                    study_key=study,
+                    version=f"1.0.{step}",
+                    phi_fields=[f"FIELD_{tid}_{step}"],
+                )
+                cid = local_store.commit_config(study, cfg, desc=f"t{tid}-s{step}", sdk=mock_sdk)
+                assert local_store.get_head(study) is not None
+                resolved = ConfigVersionStore.resolve_committed_config(study)
+                assert resolved is not None
+                assert resolved.study_key == study
+                restored = local_store.rollback_config(study, cid)
+                assert restored.phi_fields == [f"FIELD_{tid}_{step}"]
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert errors == []
