@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import json
 import os
@@ -9,6 +10,12 @@ import tempfile
 import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
+
+try:
+    from scripts import tighten_dependencies
+except ImportError:
+    import tighten_dependencies  # type: ignore[no-redef]
 
 
 def run_command(
@@ -54,59 +61,6 @@ def generate_adr_index(adr_dir: Path | None = None) -> None:
     print(f"Generated ADR catalog at {index_file} ({len(records)} records).")
 
 
-def build_and_stage_wheels(
-    repo_root: Path | None = None, wheels_dir: Path | None = None
-) -> list[Path]:
-    """Build pure Python wheels for workspace packages and stage into docs/_static/wheels/."""
-    if repo_root is None:
-        repo_root = Path(__file__).resolve().parent.parent
-
-    if wheels_dir is None:
-        wheels_dir = repo_root / "docs" / "_static" / "wheels"
-
-    wheels_dir.mkdir(parents=True, exist_ok=True)
-
-    # Clean existing staged wheels
-    for whl in wheels_dir.glob("*.whl"):
-        with contextlib.suppress(OSError):
-            whl.unlink()
-
-    uv_bin = shutil.which("uv") or "uv"
-    build_cmd = [
-        uv_bin,
-        "build",
-        "--all-packages",
-        "--wheel",
-        "--out-dir",
-        str(wheels_dir),
-    ]
-
-    print(f"Building pure Python workspace wheels into {wheels_dir}...")
-    try:
-        # Attempt offline build first to respect offline constraint
-        subprocess.run(build_cmd + ["--offline"], check=True, cwd=str(repo_root))
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        try:
-            subprocess.run(build_cmd, check=True, cwd=str(repo_root))
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            print(f"Warning: Failed to build wheels with uv: {exc}")
-
-    # Remove non-browser wheels (workspace root placeholder, Airflow server provider, CLI TUI)
-    excluded_patterns = (
-        "imednet_workspace-*.whl",
-        "apache_airflow_providers_imednet-*.whl",
-        "imednet_tui-*.whl",
-    )
-    for pattern in excluded_patterns:
-        for excluded_whl in wheels_dir.glob(pattern):
-            with contextlib.suppress(OSError):
-                excluded_whl.unlink()
-
-    staged = sorted(wheels_dir.glob("*.whl"))
-    print(f"Staged {len(staged)} wheel artifact(s) in {wheels_dir}: {[w.name for w in staged]}")
-    return staged
-
-
 BROWSER_WHEEL_SPECS: tuple[tuple[str, str], ...] = (
     ("imednet", "core"),
     ("imednet_workflows", "plugins-workflows"),
@@ -121,6 +75,123 @@ EXCLUDED_BROWSER_WHEEL_PREFIXES: tuple[str, ...] = (
     "imednet_tui-",
     "imednet-tui-",
 )
+
+
+def _find_browser_wheel(search_dir: Path, dist_prefix: str) -> Path | None:
+    """Return the latest matching browser wheel in *search_dir* for *dist_prefix*."""
+    matches = sorted(
+        whl
+        for whl in search_dir.glob(f"{dist_prefix}-*.whl")
+        if whl.name.split("-", 1)[0] == dist_prefix
+        and not whl.name.startswith(EXCLUDED_BROWSER_WHEEL_PREFIXES)
+    )
+    return matches[-1] if matches else None
+
+
+def _restore_pyproject_backups(repo_root: Path, internal_packages: dict[str, Any]) -> None:
+    """Restore tightened pyproject.toml files and remove any leftover .toml.bak files."""
+    if internal_packages:
+        tighten_dependencies.restore_files(internal_packages)
+    packages_dir = repo_root / "packages"
+    if packages_dir.is_dir():
+        for backup_path in packages_dir.glob("*/*.toml.bak"):
+            pyproject_path = backup_path.with_suffix("")
+            shutil.copy2(backup_path, pyproject_path)
+            backup_path.unlink()
+            print(f"Restored {pyproject_path} from backup")
+
+
+def build_and_stage_wheels(
+    repo_root: Path | None = None,
+    wheels_dir: Path | None = None,
+    wheel_dir: Path | None = None,
+) -> list[Path]:
+    """Stage prebuilt or tightened pure Python browser wheels into docs/_static/wheels/."""
+    if repo_root is None:
+        repo_root = Path(__file__).resolve().parent.parent
+
+    if wheels_dir is None:
+        wheels_dir = repo_root / "docs" / "_static" / "wheels"
+
+    wheels_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean existing staged wheels
+    for whl in wheels_dir.glob("*.whl"):
+        with contextlib.suppress(OSError):
+            whl.unlink()
+
+    prebuilt_wheels: dict[str, Path] = {}
+    if wheel_dir is not None and wheel_dir.is_dir():
+        resolved_wheel_dir = wheel_dir.resolve()
+        for dist_prefix, _ in BROWSER_WHEEL_SPECS:
+            found = _find_browser_wheel(resolved_wheel_dir, dist_prefix)
+            if found is not None:
+                prebuilt_wheels[dist_prefix] = found
+
+    if len(prebuilt_wheels) == len(BROWSER_WHEEL_SPECS):
+        for dist_prefix, _ in BROWSER_WHEEL_SPECS:
+            src_whl = prebuilt_wheels[dist_prefix]
+            shutil.copy2(src_whl, wheels_dir / src_whl.name)
+        staged = sorted(wheels_dir.glob("*.whl"))
+        print(
+            f"Reused {len(staged)} prebuilt wheel artifact(s) from {wheel_dir} in {wheels_dir}: "
+            f"{[w.name for w in staged]}"
+        )
+        return staged
+
+    uv_bin = shutil.which("uv") or "uv"
+    build_cmd = [
+        uv_bin,
+        "build",
+        "--all-packages",
+        "--wheel",
+        "--out-dir",
+        str(wheels_dir),
+    ]
+
+    manifest_path = repo_root / ".release-please-manifest.json"
+    internal_packages = (
+        tighten_dependencies.get_internal_packages(manifest_path) if manifest_path.is_file() else {}
+    )
+
+    print(f"Building pure Python workspace wheels into {wheels_dir}...")
+    try:
+        for pkg_info in internal_packages.values():
+            tighten_dependencies.tighten_file(pkg_info["pyproject_path"], internal_packages)
+
+        try:
+            # Attempt offline build first to respect offline constraint
+            subprocess.run(build_cmd + ["--offline"], check=True, cwd=str(repo_root))
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            try:
+                subprocess.run(build_cmd, check=True, cwd=str(repo_root))
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                print(f"Warning: Failed to build wheels with uv: {exc}")
+    finally:
+        _restore_pyproject_backups(repo_root, internal_packages)
+
+    # Remove non-browser wheels (workspace root placeholder, Airflow server provider, CLI TUI)
+    excluded_patterns = (
+        "imednet_workspace-*.whl",
+        "apache_airflow_providers_imednet-*.whl",
+        "imednet_tui-*.whl",
+    )
+    for pattern in excluded_patterns:
+        for excluded_whl in wheels_dir.glob(pattern):
+            with contextlib.suppress(OSError):
+                excluded_whl.unlink()
+
+    # Prefer any prebuilt browser wheels supplied in wheel_dir over fallback rebuilds
+    for dist_prefix, src_whl in prebuilt_wheels.items():
+        for existing_whl in list(wheels_dir.glob(f"{dist_prefix}-*.whl")):
+            if existing_whl.name.split("-", 1)[0] == dist_prefix:
+                with contextlib.suppress(OSError):
+                    existing_whl.unlink()
+        shutil.copy2(src_whl, wheels_dir / src_whl.name)
+
+    staged = sorted(wheels_dir.glob("*.whl"))
+    print(f"Staged {len(staged)} wheel artifact(s) in {wheels_dir}: {[w.name for w in staged]}")
+    return staged
 
 
 def write_wheel_manifest(
@@ -307,7 +378,22 @@ def generate_api_reference(api_dir: Path | None = None) -> None:
             raise
 
 
-def main() -> None:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for building documentation."""
+    parser = argparse.ArgumentParser(
+        description="Build and validate Sphinx documentation and interactive Pyodide wheels."
+    )
+    parser.add_argument(
+        "--wheel-dir",
+        type=Path,
+        default=None,
+        help="Optional directory containing prebuilt workspace wheels to stage.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
     require_sphinx_tools("sphinx-apidoc", "sphinx-build")
     generate_api_reference()
 
@@ -318,7 +404,7 @@ def main() -> None:
     run_command([sys.executable, "scripts/generate_rest_reference.py"])
 
     print("Building and staging workspace wheels for interactive documentation...")
-    build_and_stage_wheels()
+    build_and_stage_wheels(wheel_dir=args.wheel_dir)
 
     print("Validating mermaid diagrams...")
     run_command([sys.executable, "scripts/validate_diagrams.py"])

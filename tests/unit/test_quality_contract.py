@@ -1,6 +1,7 @@
 """Guard shared verification tasks and public package metadata against drift."""
 
 import copy
+import json
 import os
 import re
 import shutil
@@ -13,6 +14,19 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SHA_SETUP_UV_RE = re.compile(r"^astral-sh/setup-uv@[0-9a-f]{40}$")
+SHA_PINNED_ACTION_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$")
+EXPECTED_DEPLOY_DOCS_NEEDS = {
+    "plan",
+    "global-lint",
+    "pre-commit",
+    "quality",
+    "build",
+    "test",
+    "integration-sandbox",
+    "fuzzing",
+    "validate-package-consumption",
+    "docs",
+}
 EXPECTED_RUFF_SELECT = {
     "PL",
     "PIE",
@@ -119,6 +133,14 @@ def _assert_guardrail_contract(
     ]
 
     jobs = pipeline["jobs"]
+    assert pipeline.get("permissions") == {}
+    for job_id, job_cfg in jobs.items():
+        for step in job_cfg.get("steps", []):
+            if "uses" in step:
+                assert SHA_PINNED_ACTION_RE.match(str(step["uses"])), (
+                    f"Job '{job_id}' action '{step['uses']}' must be pinned to a 40-char SHA"
+                )
+
     assert jobs["global-lint"]["name"] == "Global Code Quality Check"
     assert jobs["pre-commit"]["name"] == "Pre-commit Quality Checks"
     assert jobs["quality"]["name"] == "Workspace Quality & Security"
@@ -163,6 +185,11 @@ def _assert_guardrail_contract(
     filter_step = next(s for s in jobs["plan"]["steps"] if s.get("id") == "filter")
     export_patterns = yaml.safe_load(filter_step["with"]["filters"])["export_logic"]
     assert "packages/plugins-sinks/**" in export_patterns
+    assert jobs["plan"]["outputs"]["run_integration"] == (
+        "${{ steps.set-matrix.outputs.run_integration }}"
+    )
+    set_matrix_step = next(s for s in jobs["plan"]["steps"] if s.get("id") == "set-matrix")
+    assert set_matrix_step["env"]["EXPORT_LOGIC"] == "${{ steps.filter.outputs.export_logic }}"
 
     build_steps = jobs["build"]["steps"]
     build_step = next(s for s in build_steps if s.get("name") == "Build Workspace Packages")
@@ -186,6 +213,35 @@ def _assert_guardrail_contract(
     assert "hatch run" not in run_tests_step["run"]
     assert "Passing gracefully" not in run_tests_step["run"]
     assert "-eq 5" not in run_tests_step["run"]
+
+    docs_job = jobs["docs"]
+    docs_needs = docs_job.get("needs", [])
+    if isinstance(docs_needs, str):
+        docs_needs = [docs_needs]
+    assert set(docs_needs) == {"plan", "build"}
+    docs_download = next(
+        s for s in docs_job["steps"] if s.get("name") == "Download Built Artifacts"
+    )
+    assert docs_download["uses"].startswith("actions/download-artifact@")
+    assert "${{ runner.temp }}" in str(docs_download["with"]["path"])
+    docs_runs = [s.get("run", "") for s in docs_job["steps"] if "run" in s]
+    assert (
+        sum(
+            'uv run python scripts/build_docs.py --wheel-dir "$RUNNER_TEMP/wheels"' == r.strip()
+            for r in docs_runs
+        )
+        == 1
+    )
+
+    deploy_job = jobs["deploy-docs"]
+    assert set(deploy_job.get("needs", [])) == EXPECTED_DEPLOY_DOCS_NEEDS
+    deploy_cond = " ".join(str(deploy_job.get("if", "")).split())
+    assert "always()" not in deploy_cond
+    for upstream_job in EXPECTED_DEPLOY_DOCS_NEEDS:
+        assert f"needs.{upstream_job}.result == 'success'" in deploy_cond
+    assert "!contains(needs.*.result, 'failure')" in deploy_cond
+    assert "!contains(needs.*.result, 'cancelled')" in deploy_cond
+    assert "!contains(needs.*.result, 'skipped')" in deploy_cond
 
 
 def test_ci_uses_canonical_full_verification():
@@ -256,11 +312,33 @@ def test_ci_docs_job_enforces_clean_working_tree_and_validation():
     docs_deps = project["dependency-groups"]["docs"]
     assert not any("sphinx-thebe" in dep for dep in docs_deps)
     pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
-    steps = pipeline["jobs"]["docs"]["steps"]
+    docs_job = pipeline["jobs"]["docs"]
+    assert set(docs_job["needs"]) == {"plan", "build"}
+    docs_cond = " ".join(str(docs_job["if"]).split())
+    assert "needs.plan.result == 'success'" in docs_cond
+    assert "needs.build.result == 'success' || needs.build.result == 'skipped'" in docs_cond
+
+    steps = docs_job["steps"]
+    download_step = next(s for s in steps if s.get("name") == "Download Built Artifacts")
+    assert download_step["uses"].startswith("actions/download-artifact@")
+    assert (
+        download_step["if"]
+        == "needs.build.result == 'success' && needs.plan.outputs.build_matrix != '[]'"
+    )
+    assert download_step["with"]["pattern"] == "dist-*"
+    assert download_step["with"]["path"] == "${{ runner.temp }}/wheels"
+    assert download_step["with"]["merge-multiple"] is True
+
     run_blocks = [s.get("run", "") for s in steps if "run" in s]
     assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in steps)
     assert any("uv sync --locked --all-packages --all-extras" in r for r in run_blocks)
-    assert sum("uv run python scripts/build_docs.py" == r.strip() for r in run_blocks) == 1
+    assert (
+        sum(
+            'uv run python scripts/build_docs.py --wheel-dir "$RUNNER_TEMP/wheels"' == r.strip()
+            for r in run_blocks
+        )
+        == 1
+    )
     assert any("scripts/verify_pyodide_tutorials.py" in r for r in run_blocks)
     assert not any("pip install" in r for r in run_blocks)
     assert not any("hatch run" in r for r in run_blocks)
@@ -290,12 +368,14 @@ def test_ci_deploy_docs_gates_and_manual_dispatch():
 
     deploy = pipeline["jobs"]["deploy-docs"]
     needs = set(deploy["needs"])
-    assert {"plan", "pre-commit", "test", "docs", "global-lint", "quality"} <= needs
+    assert needs == EXPECTED_DEPLOY_DOCS_NEEDS
     cond = " ".join(str(deploy["if"]).split())
-    assert "needs.docs.result == 'success'" in cond
-    assert "needs.pre-commit.result == 'success'" in cond
+    assert "always()" not in cond
+    for upstream_job in EXPECTED_DEPLOY_DOCS_NEEDS:
+        assert f"needs.{upstream_job}.result == 'success'" in cond
     assert "!contains(needs.*.result, 'failure')" in cond
     assert "!contains(needs.*.result, 'cancelled')" in cond
+    assert "!contains(needs.*.result, 'skipped')" in cond
     assert "github.ref == 'refs/heads/main'" in cond
     assert "github.event_name == 'push'" in cond
     assert "github.event_name == 'workflow_dispatch'" in cond
@@ -388,10 +468,53 @@ def test_copilot_and_consumption_workflows_use_canonical_uv_sync():
     assert not any("pip install" in r for r in consumption_runs)
 
 
-def test_ci_export_filter_includes_sinks_and_schedules_integration_sandbox():
+def _run_plan_set_matrix(
+    script: str,
+    tmp_path: Path,
+    *,
+    event_name: str,
+    github_ref: str,
+    changed_files: str,
+    export_logic: str,
+) -> dict[str, object]:
+    output_file = tmp_path / f"github_output_{event_name}_{abs(hash((github_ref, changed_files)))}"
+    output_file.write_text("", encoding="utf-8")
+    env = {
+        **os.environ,
+        "EVENT_NAME": event_name,
+        "GITHUB_REF": github_ref,
+        "ALL_CHANGED_FILES": changed_files,
+        "EXPORT_LOGIC": export_logic,
+        "GITHUB_OUTPUT": str(output_file),
+    }
+    subprocess.run(
+        [shutil.which("bash") or "bash", "-e", "-c", script],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    parsed: dict[str, object] = {}
+    for line in output_file.read_text(encoding="utf-8").splitlines():
+        key, _, val = line.partition("=")
+        if key in {"matrix", "build_matrix"}:
+            parsed[key] = json.loads(val)
+        elif key:
+            parsed[key] = val
+    return parsed
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("jq") is None,
+    reason="Bash and jq are needed for workflow plan script tests",
+)
+def test_ci_export_filter_includes_sinks_and_schedules_integration_sandbox(tmp_path: Path):
     pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
     plan_job = pipeline["jobs"]["plan"]
-    assert plan_job["outputs"]["run_integration"] == "${{ steps.filter.outputs.export_logic }}"
+    assert plan_job["outputs"]["run_integration"] == (
+        "${{ steps.set-matrix.outputs.run_integration }}"
+    )
 
     filter_step = next(s for s in plan_job["steps"] if s.get("id") == "filter")
     filters = yaml.safe_load(filter_step["with"]["filters"])
@@ -407,6 +530,89 @@ def test_ci_export_filter_includes_sinks_and_schedules_integration_sandbox():
 
     sandbox_job = pipeline["jobs"]["integration-sandbox"]
     assert "needs.plan.outputs.run_integration == 'true'" in sandbox_job["if"]
+
+    set_matrix_step = next(s for s in plan_job["steps"] if s.get("id") == "set-matrix")
+    assert set_matrix_step["env"]["EXPORT_LOGIC"] == "${{ steps.filter.outputs.export_logic }}"
+    expected_five = [
+        "core",
+        "plugins-sinks",
+        "plugins-tui",
+        "plugins-workflows",
+        "providers-airflow",
+    ]
+
+    # Docs-only main push still forces all five packages and run_integration=true
+    main_docs_push = _run_plan_set_matrix(
+        set_matrix_step["run"],
+        tmp_path,
+        event_name="push",
+        github_ref="refs/heads/main",
+        changed_files="docs/index.rst,README.md",
+        export_logic="false",
+    )
+    assert main_docs_push == {
+        "matrix": expected_five,
+        "build_matrix": expected_five,
+        "run_integration": "true",
+    }
+
+    # Manual workflow_dispatch forces all five packages and run_integration=true
+    dispatch_run = _run_plan_set_matrix(
+        set_matrix_step["run"],
+        tmp_path,
+        event_name="workflow_dispatch",
+        github_ref="refs/heads/main",
+        changed_files="README.md",
+        export_logic="",
+    )
+    assert dispatch_run == {
+        "matrix": expected_five,
+        "build_matrix": expected_five,
+        "run_integration": "true",
+    }
+
+    # Pull requests preserve selective change planning for fast contributor feedback
+    pr_docs_only = _run_plan_set_matrix(
+        set_matrix_step["run"],
+        tmp_path,
+        event_name="pull_request",
+        github_ref="refs/pull/42/merge",
+        changed_files="docs/index.rst,README.md",
+        export_logic="false",
+    )
+    assert pr_docs_only == {
+        "matrix": [],
+        "build_matrix": [],
+        "run_integration": "false",
+    }
+
+    pr_sinks = _run_plan_set_matrix(
+        set_matrix_step["run"],
+        tmp_path,
+        event_name="pull_request",
+        github_ref="refs/pull/42/merge",
+        changed_files="packages/plugins-sinks/src/imednet_sinks/warehouse.py",
+        export_logic="true",
+    )
+    assert pr_sinks == {
+        "matrix": ["plugins-sinks"],
+        "build_matrix": ["plugins-sinks"],
+        "run_integration": "true",
+    }
+
+    pr_core_readme = _run_plan_set_matrix(
+        set_matrix_step["run"],
+        tmp_path,
+        event_name="pull_request",
+        github_ref="refs/pull/42/merge",
+        changed_files="packages/core/README.md",
+        export_logic="false",
+    )
+    assert pr_core_readme == {
+        "matrix": expected_five,
+        "build_matrix": ["core"],
+        "run_integration": "false",
+    }
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is needed for workflow scripts")
@@ -607,6 +813,57 @@ def _mutate_test_exit_code_5_bypass(
     run_step["run"] += '\n|| { RET=$?; if [ $RET -eq 5 ]; then exit 0; fi; exit $RET; }'
 
 
+def _mutate_deploy_docs_missing_consumption_gate(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["deploy-docs"]["needs"] = [
+        j for j in pipeline["jobs"]["deploy-docs"]["needs"] if j != "validate-package-consumption"
+    ]
+
+
+def _mutate_deploy_docs_missing_sandbox_gate(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["deploy-docs"]["needs"] = [
+        j for j in pipeline["jobs"]["deploy-docs"]["needs"] if j != "integration-sandbox"
+    ]
+
+
+def _mutate_deploy_docs_missing_fuzzing_gate(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["deploy-docs"]["needs"] = [
+        j for j in pipeline["jobs"]["deploy-docs"]["needs"] if j != "fuzzing"
+    ]
+
+
+def _mutate_deploy_docs_missing_build_gate(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["deploy-docs"]["needs"] = [
+        j for j in pipeline["jobs"]["deploy-docs"]["needs"] if j != "build"
+    ]
+
+
+def _mutate_deploy_docs_allows_skipped(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["deploy-docs"]["if"] = str(pipeline["jobs"]["deploy-docs"]["if"]).replace(
+        "!contains(needs.*.result, 'skipped') &&", ""
+    )
+
+
+def _mutate_docs_missing_wheel_dir(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    build_step = next(
+        s
+        for s in pipeline["jobs"]["docs"]["steps"]
+        if s.get("name") == "Build and Validate Documentation"
+    )
+    build_step["run"] = "uv run python scripts/build_docs.py"
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -633,6 +890,12 @@ def _mutate_test_exit_code_5_bypass(
         _mutate_build_selective_upload,
         _mutate_test_hatch_run,
         _mutate_test_exit_code_5_bypass,
+        _mutate_deploy_docs_missing_consumption_gate,
+        _mutate_deploy_docs_missing_sandbox_gate,
+        _mutate_deploy_docs_missing_fuzzing_gate,
+        _mutate_deploy_docs_missing_build_gate,
+        _mutate_deploy_docs_allows_skipped,
+        _mutate_docs_missing_wheel_dir,
     ],
 )
 def test_guardrail_manifest_contract_rejects_simulated_drift(mutator) -> None:

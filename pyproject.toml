@@ -217,8 +217,8 @@ verify-static = [
 verify-tests = "pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_sinks --cov=imednet_tui --cov-fail-under=90"
 verify = ["verify-static", "verify-tests"]
 test = "pytest --ignore=tests/live/ {args:tests/}"
-docs = "python scripts/build_docs.py"
-build-docs = "python scripts/build_docs.py"
+docs = "python scripts/build_docs.py {args}"
+build-docs = "python scripts/build_docs.py {args}"
 check-root-files = "python scripts/check_root_files.py {args}"
 ci-plan = "python scripts/ci_plan.py {args}"
 aggregate-verification = "python scripts/aggregate_verification.py {args}"

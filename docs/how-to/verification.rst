@@ -48,15 +48,21 @@ Canonical tasks
 ``pyproject.toml`` defines ``hatch run verify-static`` (format, lint,
 non-mutating ``typos --force-exclude .`` spell checking, and the
 typing targets), ``hatch run verify-tests`` (offline workspace tests and
-90% coverage), ``hatch run docs`` (strict documentation checks), and
-``hatch run validate-package-consumption`` (isolated clean-venv wheel,
+90% coverage), ``hatch run docs`` (strict documentation checks and tightened
+Pyodide browser wheel staging; pass ``--wheel-dir <dir>`` to reuse prebuilt
+wheels), and ``hatch run validate-package-consumption`` (isolated clean-venv wheel,
 PEP 561 ``py.typed`` / ``mypy --strict`` consumer typing, and
 optional-dependency smoke checks across all workspace packages and 21 extras;
 pass ``--wheel-dir <dir>`` to reuse prebuilt wheels). Set ``IMEDNET_TEST_WHEELS=1``
 after installing built wheels into ``.venv`` to replicate CI wheel-mode ``pytest`` runs.
 ``hatch run verify`` runs ``verify-static`` and ``verify-tests`` in order; the
-Pipeline ``docs`` job runs ``uv run python scripts/build_docs.py`` once on the
-synced ``.venv`` workspace. The expanded commands above are useful for diagnostics.
+Pipeline ``docs`` job runs ``uv run python scripts/build_docs.py --wheel-dir "$RUNNER_TEMP/wheels"``
+once on the synced ``.venv`` workspace (staging prebuilt tightened ``dist-*`` wheels
+from ``build`` and falling back to ``scripts/tighten_dependencies.py`` rewrite/restore
+on local runs or docs-only pull requests), and ``deploy-docs`` requires all ten upstream
+jobs (including ``build``, ``validate-package-consumption``, ``integration-sandbox``,
+and ``fuzzing`` across all five packages) to succeed on ``main``. The expanded commands
+above are useful for diagnostics.
 
 Install with ``uv sync --locked --all-packages --all-extras`` or the setup wizard;
 no real credentials or live EDC access are required. Run pre-commit first and

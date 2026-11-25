@@ -1718,11 +1718,20 @@ def validate_staged_wheels(
 
 
 def stage_wheels(repo_root: Path, wheels_dir: Path | None = None) -> list[Path]:
-    """Build and stage pure Python wheels for workspace packages."""
+    """Build and stage tightened pure Python wheels for workspace packages."""
+    try:
+        from scripts import tighten_dependencies
+    except ImportError:
+        import tighten_dependencies  # type: ignore[no-redef]
+
     if wheels_dir is None:
         wheels_dir = repo_root / "docs" / "_static" / "wheels"
 
     wheels_dir.mkdir(parents=True, exist_ok=True)
+    for whl in wheels_dir.glob("*.whl"):
+        with contextlib.suppress(OSError):
+            whl.unlink()
+
     uv_bin = shutil.which("uv") or "uv"
     build_cmd = [
         uv_bin,
@@ -1733,13 +1742,31 @@ def stage_wheels(repo_root: Path, wheels_dir: Path | None = None) -> list[Path]:
         str(wheels_dir),
     ]
 
+    manifest_path = repo_root / ".release-please-manifest.json"
+    internal_packages = (
+        tighten_dependencies.get_internal_packages(manifest_path) if manifest_path.is_file() else {}
+    )
+
     try:
-        subprocess.run(build_cmd + ["--offline"], check=True, cwd=str(repo_root))
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        for pkg_info in internal_packages.values():
+            tighten_dependencies.tighten_file(pkg_info["pyproject_path"], internal_packages)
+
         try:
-            subprocess.run(build_cmd, check=True, cwd=str(repo_root))
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            print(f"Warning: Failed to stage wheels: {exc}")
+            subprocess.run(build_cmd + ["--offline"], check=True, cwd=str(repo_root))
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            try:
+                subprocess.run(build_cmd, check=True, cwd=str(repo_root))
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                print(f"Warning: Failed to stage wheels: {exc}")
+    finally:
+        if internal_packages:
+            tighten_dependencies.restore_files(internal_packages)
+        packages_dir = repo_root / "packages"
+        if packages_dir.is_dir():
+            for backup_path in packages_dir.glob("*/*.toml.bak"):
+                pyproject_path = backup_path.with_suffix("")
+                shutil.copy2(backup_path, pyproject_path)
+                backup_path.unlink()
 
     excluded_patterns = (
         "imednet_workspace-*.whl",

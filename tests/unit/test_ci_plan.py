@@ -50,6 +50,13 @@ def test_is_ignored_path_exempts_agents_docs_examples_and_markdown():
     assert is_ignored_path("docs/agents/issue-tracker.md") is True
     assert is_ignored_path("examples/demo.py") is True
     assert is_ignored_path("AGENTS.md") is True
+    assert is_ignored_path("README.md") is True
+    assert is_ignored_path("CONTRIBUTING.md") is True
+    assert is_ignored_path("packages/core/CHANGELOG.md") is True
+    assert is_ignored_path("packages/core/README.md") is False
+    assert is_ignored_path("packages/plugins-sinks/README.md") is False
+    assert is_ignored_path(r"packages\providers-airflow\README.md") is False
+    assert is_ignored_path("./packages/plugins-tui/README.md") is False
     assert is_ignored_path("scripts/setup_agent_harnesses.py") is False
 
 
@@ -63,10 +70,41 @@ def test_plan_ci_impact_skips_packages_for_agents_only_changes():
             ".agents/skills/triage/SKILL.md",
             ".agents/skills/triage/agents/openai.yaml",
             "AGENTS.md",
+            "README.md",
+            "docs/how-to/verification.rst",
         ],
         packages,
     )
     assert result == {"test": [], "build": []}
+
+
+def test_plan_ci_impact_schedules_builds_and_tests_for_package_readmes():
+    packages = {
+        "core": {"name": "imednet", "deps": []},
+        "plugins-sinks": {"name": "imednet-plugins-sinks", "deps": ["imednet"]},
+        "plugins-tui": {"name": "imednet-tui", "deps": ["imednet"]},
+        "plugins-workflows": {"name": "imednet-workflows", "deps": ["imednet"]},
+        "providers-airflow": {"name": "apache-airflow-providers-imednet", "deps": ["imednet"]},
+    }
+
+    core_readme_plan = plan_ci_impact(["packages/core/README.md"], packages)
+    assert core_readme_plan["build"] == ["core"]
+    assert core_readme_plan["test"] == list(packages.keys())
+
+    leaf_readme_plan = plan_ci_impact(["packages/plugins-tui/README.md"], packages)
+    assert leaf_readme_plan == {
+        "build": ["plugins-tui"],
+        "test": ["plugins-tui"],
+    }
+
+    mixed_plan = plan_ci_impact(
+        ["docs/index.rst", "README.md", "packages/plugins-sinks/README.md"],
+        packages,
+    )
+    assert mixed_plan == {
+        "build": ["plugins-sinks"],
+        "test": ["plugins-sinks"],
+    }
 
 
 def test_plan_ci_impact_falls_back_on_scripts_and_propagates_core_deps():

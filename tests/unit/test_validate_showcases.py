@@ -243,9 +243,23 @@ def test_validate_staged_wheels_missing_required_module(tmp_path: Path) -> None:
     assert any("missing required module entry 'imednet/sdk.py'" in e for e in errors)
 
 
-def test_validate_staged_wheels_workspace_integration(tmp_path: Path) -> None:
-    """Verify that staged browser wheels pass validation and simulated Pyodide import."""
+def test_validate_staged_wheels_workspace_integration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify that staged browser wheels pass validation, tighten bounds, and restore backups."""
+    import email
+    import json
+
+    import scripts.validate_showcases as showcases_mod
+    from scripts import tighten_dependencies as td
+
     repo_root = Path(__file__).resolve().parents[2]
+    manifest = json.loads((repo_root / ".release-please-manifest.json").read_text(encoding="utf-8"))
+    internal_pkgs = td.get_internal_packages(repo_root / ".release-please-manifest.json")
+    before_tomls = {
+        pkg_path: (repo_root / pkg_path / "pyproject.toml").read_text(encoding="utf-8")
+        for pkg_path in manifest
+    }
     wheels_dir = tmp_path / "wheels"
 
     staged = stage_wheels(repo_root, wheels_dir)
@@ -255,9 +269,41 @@ def test_validate_staged_wheels_workspace_integration(tmp_path: Path) -> None:
     assert any(n.startswith("imednet_plugins_sinks-") for n in staged_names)
     assert not any(n.startswith("apache_airflow_providers_imednet-") for n in staged_names)
     assert not any(n.startswith("imednet_tui-") for n in staged_names)
+    assert list((repo_root / "packages").glob("*/*.toml.bak")) == []
+
+    internal_requires: list[str] = []
+    for whl_path in staged:
+        with zipfile.ZipFile(whl_path) as zf:
+            meta_name = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
+            msg = email.message_from_bytes(zf.read(meta_name))
+        for req in msg.get_all("Requires-Dist", []):
+            base_req = req.split(";", 1)[0].strip()
+            for internal_name, info in internal_pkgs.items():
+                if base_req == internal_name or base_req.startswith(
+                    (
+                        f"{internal_name}[",
+                        f"{internal_name}>",
+                        f"{internal_name}<",
+                        f"{internal_name}=",
+                    )
+                ):
+                    assert td.compute_upper_bound(info["version"]) in base_req
+                    internal_requires.append(req)
+    assert len(internal_requires) == 7
 
     errors = validate_staged_wheels(wheels_dir)
     assert not errors, f"Expected all three staged browser wheels to pass validation, got: {errors}"
+
+    def _boom_run(*_args, **_kwargs):
+        raise RuntimeError("simulated stage_wheels failure")
+
+    monkeypatch.setattr(showcases_mod.subprocess, "run", _boom_run)
+    with pytest.raises(RuntimeError, match="simulated stage_wheels failure"):
+        stage_wheels(repo_root, tmp_path / "failed_wheels")
+
+    assert list((repo_root / "packages").glob("*/*.toml.bak")) == []
+    for pkg_path, original in before_tomls.items():
+        assert (repo_root / pkg_path / "pyproject.toml").read_text(encoding="utf-8") == original
 
 
 def test_validate_staged_wheels_detects_missing_plugin_wheels(tmp_path: Path) -> None:

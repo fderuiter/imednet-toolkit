@@ -108,7 +108,7 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       build_matrix: ${{ steps.set-matrix.outputs.build_matrix }}
-      run_integration: ${{ steps.filter.outputs.export_logic }}
+      run_integration: ${{ steps.set-matrix.outputs.run_integration }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -121,6 +121,7 @@ jobs:
 
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
+        if: github.event_name == 'pull_request'
         with:
           filters: |
             export_logic:
@@ -131,6 +132,7 @@ jobs:
 
       - name: Get changed files
         id: changed-files
+        if: github.event_name == 'pull_request'
         uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
         with:
           separator: ","
@@ -138,16 +140,26 @@ jobs:
       - name: Determine Impacted Packages
         id: set-matrix
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
           ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+          EXPORT_LOGIC: ${{ steps.filter.outputs.export_logic }}
         run: |
-          if [ -z "$ALL_CHANGED_FILES" ]; then
-            PLAN=$(echo "" | python3 scripts/ci_plan.py)
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] || { [ "$EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; }; then
+            PLAN=$(python3 scripts/ci_plan.py < /dev/null)
+            RUN_INTEGRATION="true"
           else
-            PLAN=$(echo "$ALL_CHANGED_FILES" | tr ',' '\n' | python3 scripts/ci_plan.py)
+            if [ -z "$ALL_CHANGED_FILES" ]; then
+              PLAN=$(echo "" | python3 scripts/ci_plan.py)
+            else
+              PLAN=$(echo "$ALL_CHANGED_FILES" | tr ',' '\n' | python3 scripts/ci_plan.py)
+            fi
+            RUN_INTEGRATION="${EXPORT_LOGIC:-false}"
           fi
-          echo "Impacted packages: $PLAN"
+          echo "Impacted packages: $PLAN (run_integration=$RUN_INTEGRATION)"
           echo "matrix=$(echo "$PLAN" | jq -c '.test')" >> "$GITHUB_OUTPUT"
           echo "build_matrix=$(echo "$PLAN" | jq -c '.build')" >> "$GITHUB_OUTPUT"
+          echo "run_integration=$RUN_INTEGRATION" >> "$GITHUB_OUTPUT"
 
   scorecard:
     name: OpenSSF Scorecard
@@ -607,7 +619,11 @@ jobs:
   # ------------------------------------------------------------------
   docs:
     name: Build Documentation
-    needs: plan
+    needs: [plan, build]
+    if: >-
+      !cancelled() &&
+      needs.plan.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -630,6 +646,14 @@ jobs:
           restore-keys: |
             uv-venv-${{ runner.os }}-"3.11"-
 
+      - name: Download Built Artifacts
+        if: needs.build.result == 'success' && needs.plan.outputs.build_matrix != '[]'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: ${{ runner.temp }}/wheels
+          merge-multiple: true
+
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
@@ -640,7 +664,7 @@ jobs:
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Build and Validate Documentation
-        run: uv run python scripts/build_docs.py
+        run: uv run python scripts/build_docs.py --wheel-dir "$RUNNER_TEMP/wheels"
 
       - name: Verify Interactive Pyodide Tutorials
         run: |
@@ -696,18 +720,36 @@ jobs:
   # ------------------------------------------------------------------
   deploy-docs:
     name: Deploy to GH Pages
-    needs: [plan, pre-commit, test, docs, global-lint, quality]
+    needs:
+      - plan
+      - global-lint
+      - pre-commit
+      - quality
+      - build
+      - test
+      - integration-sandbox
+      - fuzzing
+      - validate-package-consumption
+      - docs
     concurrency:
       group: pages
       cancel-in-progress: false
-    # Only deploy docs if upstream checks succeed without failure or cancellation on main
+    # Only deploy docs if all ten upstream checks succeed without skip, failure, or cancellation on main
     if: >-
-      always() &&
       !cancelled() &&
-      needs.docs.result == 'success' &&
+      needs.plan.result == 'success' &&
+      needs.global-lint.result == 'success' &&
       needs.pre-commit.result == 'success' &&
+      needs.quality.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.test.result == 'success' &&
+      needs.integration-sandbox.result == 'success' &&
+      needs.fuzzing.result == 'success' &&
+      needs.validate-package-consumption.result == 'success' &&
+      needs.docs.result == 'success' &&
       !contains(needs.*.result, 'failure') &&
       !contains(needs.*.result, 'cancelled') &&
+      !contains(needs.*.result, 'skipped') &&
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest

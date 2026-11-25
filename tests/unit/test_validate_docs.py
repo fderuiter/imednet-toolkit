@@ -14,8 +14,10 @@ from typing import TypeVar
 import pytest
 from scripts.build_docs import (
     SCOPED_INHERITED_MEMBERS,
+    build_and_stage_wheels,
     emit_curated_core_reference,
     generate_api_reference,
+    parse_args,
     require_sphinx_tools,
     scope_apidoc_inherited_members,
     write_wheel_manifest,
@@ -1486,3 +1488,118 @@ def test_sphinx_shadowed_methods_and_spi_compliance_html_links(tmp_path: Path) -
         encoding="utf-8",
     )
     assert check_compliance_html_links(html_dir, require_exists=True) is True
+
+
+def test_build_and_stage_wheels_reuses_prebuilt_wheels_and_preserves_sha256(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """build_and_stage_wheels copies exact prebuilt browser wheels from --wheel-dir without rebuilding."""
+    import hashlib
+
+    import scripts.build_docs as build_docs_mod
+
+    parsed = parse_args(["--wheel-dir", str(tmp_path / "prebuilt")])
+    assert parsed.wheel_dir == tmp_path / "prebuilt"
+    assert parse_args([]).wheel_dir is None
+
+    prebuilt_dir = tmp_path / "prebuilt"
+    prebuilt_dir.mkdir(parents=True)
+    staged_dir = tmp_path / "staged"
+    staged_dir.mkdir(parents=True)
+    (staged_dir / "stale-0.1.0-py3-none-any.whl").write_bytes(b"stale")
+
+    browser_payloads = {
+        "imednet-1.2.0-py3-none-any.whl": b"core-wheel-tightened-bytes",
+        "imednet_workflows-1.2.0-py3-none-any.whl": b"workflows-wheel-tightened-bytes",
+        "imednet_plugins_sinks-1.1.0-py3-none-any.whl": b"sinks-wheel-tightened-bytes",
+    }
+    for name, payload in browser_payloads.items():
+        (prebuilt_dir / name).write_bytes(payload)
+
+    # Non-browser wheels and sdists present in CI dist-* artifacts must be ignored
+    (prebuilt_dir / "apache_airflow_providers_imednet-1.2.0-py3-none-any.whl").write_bytes(b"air")
+    (prebuilt_dir / "imednet_tui-1.0.0-py3-none-any.whl").write_bytes(b"tui")
+    (prebuilt_dir / "imednet_workspace-0.1.0-py3-none-any.whl").write_bytes(b"ws")
+    (prebuilt_dir / "imednet-1.2.0.tar.gz").write_bytes(b"sdist")
+
+    def _forbid_subprocess_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run must not be called when prebuilt wheels exist")
+
+    monkeypatch.setattr(build_docs_mod.subprocess, "run", _forbid_subprocess_run)
+
+    staged = build_and_stage_wheels(
+        repo_root=Path(__file__).resolve().parents[2],
+        wheels_dir=staged_dir,
+        wheel_dir=prebuilt_dir,
+    )
+    assert [w.name for w in staged] == sorted(browser_payloads.keys())
+    for name, payload in browser_payloads.items():
+        expected_digest = hashlib.sha256(payload).hexdigest()
+        actual_digest = hashlib.sha256((staged_dir / name).read_bytes()).hexdigest()
+        assert actual_digest == expected_digest
+
+
+def test_build_and_stage_wheels_fallback_tightens_bounds_and_restores_backups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fallback local wheel builds tighten internal Requires-Dist bounds and restore all .toml.bak files."""
+    import email
+    import json
+    import zipfile
+
+    import scripts.build_docs as build_docs_mod
+    from scripts import tighten_dependencies as td
+
+    repo_root = Path(__file__).resolve().parents[2]
+    manifest = json.loads((repo_root / ".release-please-manifest.json").read_text(encoding="utf-8"))
+    internal_pkgs = td.get_internal_packages(repo_root / ".release-please-manifest.json")
+    before_tomls = {
+        pkg_path: (repo_root / pkg_path / "pyproject.toml").read_text(encoding="utf-8")
+        for pkg_path in manifest
+    }
+
+    staged_dir = tmp_path / "fallback_wheels"
+    staged = build_and_stage_wheels(
+        repo_root=repo_root,
+        wheels_dir=staged_dir,
+        wheel_dir=tmp_path / "missing_wheel_dir",
+    )
+    assert len(staged) == 3
+    assert list((repo_root / "packages").glob("*/*.toml.bak")) == []
+    for pkg_path, original in before_tomls.items():
+        assert (repo_root / pkg_path / "pyproject.toml").read_text(encoding="utf-8") == original
+
+    internal_requires: list[str] = []
+    for whl_path in staged:
+        with zipfile.ZipFile(whl_path) as zf:
+            meta_name = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
+            msg = email.message_from_bytes(zf.read(meta_name))
+        for req in msg.get_all("Requires-Dist", []):
+            base_req = req.split(";", 1)[0].strip()
+            for internal_name, info in internal_pkgs.items():
+                if base_req == internal_name or base_req.startswith(
+                    (
+                        f"{internal_name}[",
+                        f"{internal_name}>",
+                        f"{internal_name}<",
+                        f"{internal_name}=",
+                    )
+                ):
+                    expected_upper = td.compute_upper_bound(info["version"])
+                    assert expected_upper in base_req, (
+                        f"Untightened internal Requires-Dist '{req}' in {whl_path.name}"
+                    )
+                    internal_requires.append(req)
+    assert len(internal_requires) == 7
+
+    # Simulated failure during build still restores all pyproject.toml backups in finally
+    def _boom_run(*_args, **_kwargs):
+        raise RuntimeError("simulated build crash")
+
+    monkeypatch.setattr(build_docs_mod.subprocess, "run", _boom_run)
+    with pytest.raises(RuntimeError, match="simulated build crash"):
+        build_and_stage_wheels(repo_root=repo_root, wheels_dir=tmp_path / "crash_wheels")
+
+    assert list((repo_root / "packages").glob("*/*.toml.bak")) == []
+    for pkg_path, original in before_tomls.items():
+        assert (repo_root / pkg_path / "pyproject.toml").read_text(encoding="utf-8") == original
