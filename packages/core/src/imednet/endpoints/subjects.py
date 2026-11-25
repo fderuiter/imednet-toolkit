@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
+from imednet.core.endpoint.base import ListEndpointSelfProtocol
 from imednet.core.endpoint.dispatch import Operation, execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.models.subjects import Subject
@@ -13,7 +14,9 @@ from imednet.utils.url import validate_path_segment
 class ListBySiteOperation(Operation[list[Subject]]):
     """List by site operation."""
 
-    def __init__(self, endpoint: Any, study_key: str, site_id: str | int):
+    def __init__(
+        self, endpoint: ListEndpointSelfProtocol[Subject], study_key: str, site_id: str | int
+    ):
         """Initialize."""
         self.endpoint = endpoint
         self.study_key = study_key
@@ -29,7 +32,7 @@ class ListBySiteOperation(Operation[list[Subject]]):
 
     async def execute_async(self, client: Any, parse_func: Any = None) -> list[Subject]:
         """Execute async."""
-        return await self.endpoint._list_async(  # type: ignore[no-any-return]
+        return await self.endpoint._list_async(
             client,
             self.endpoint.ASYNC_PAGINATOR_CLS,
             study_key=self.study_key,
@@ -40,11 +43,11 @@ class ListBySiteOperation(Operation[list[Subject]]):
 class SubjectsOperationDef:
     """Definition for Subject operations."""
 
-    PATH = "subjects"
+    PATH: ClassVar[str] = "subjects"
     MODEL = Subject
     _id_param = "subjectId"
-    _lookup_key_hint = "subjectKey"
-    FILTER_ATTRIBUTES = frozenset(
+    _lookup_key_hint: ClassVar[str | None] = "subjectKey"
+    FILTER_ATTRIBUTES: ClassVar[frozenset[str] | None] = frozenset(
         {
             "subjectId",
             "subjectOid",
@@ -61,16 +64,18 @@ class SubjectsOperationDef:
     )
 
     @execute_operation
-    def list_by_site(self, study_key: str, site_id: str | int) -> ListBySiteOperation:
+    def list_by_site(
+        self: ListEndpointSelfProtocol[Subject], study_key: str, site_id: str | int
+    ) -> ListBySiteOperation:
         """List subjects by site ID."""
-        self._validate_study_key(study_key)  # type: ignore[attr-defined]
+        self._validate_study_key(study_key)
         validate_path_segment(site_id, name="site_id")
         return ListBySiteOperation(self, study_key, site_id)
 
 
-class SubjectsEndpoint(SubjectsOperationDef, EdcSyncListGetEndpoint[Subject]):  # type: ignore[misc]
+class SubjectsEndpoint(SubjectsOperationDef, EdcSyncListGetEndpoint[Subject]):
     """Synchronous endpoint for managing Subjects."""
 
 
-class AsyncSubjectsEndpoint(SubjectsOperationDef, EdcAsyncListGetEndpoint[Subject]):  # type: ignore[misc]
+class AsyncSubjectsEndpoint(SubjectsOperationDef, EdcAsyncListGetEndpoint[Subject]):
     """Asynchronous endpoint for managing Subjects."""

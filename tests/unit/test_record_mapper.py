@@ -2393,3 +2393,35 @@ def test_record_mapper_endpoint_fallbacks_and_cached_loader_predicates() -> None
         )
     )
     assert [r.record_id for r in filtered] == [3]
+
+
+def test_dataframe_use_labels_as_columns_retains_variable_name_when_label_is_none() -> None:
+    """Verify RecordMapper.dataframe(study_key, use_labels_as_columns=True) retains variable_name when label is None."""
+    sdk = MagicMock()
+    sdk.get_variables.return_value = [
+        Variable(variable_name="AGE", label=None, form_id=10),
+        Variable(variable_name="SEX", label="Biological Sex", form_id=10),
+        Variable(variable_name="WEIGHT", label="", form_id=10),
+    ]
+    sdk.get_records.return_value = [
+        Record(
+            record_id=1,
+            subject_key="SUBJ-01",
+            visit_id=1,
+            form_id=10,
+            record_status="Complete",
+            date_created=datetime(2024, 1, 1),
+            record_data={"AGE": 42, "SEX": "F", "WEIGHT": 64.5},
+        )
+    ]
+
+    mapper = RecordMapper(sdk)
+    df = mapper.dataframe("STUDY-UNLABELLED", use_labels_as_columns=True)
+
+    assert None not in df.columns
+    assert "AGE" in df.columns
+    assert "Biological Sex" in df.columns
+    assert "WEIGHT" in df.columns
+    assert df.iloc[0]["AGE"] == 42
+    assert df.iloc[0]["Biological Sex"] == "F"
+    assert df.iloc[0]["WEIGHT"] == 64.5

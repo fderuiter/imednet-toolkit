@@ -318,3 +318,4 @@ discover_subject_key
 discover_interval_name
 _.__doc__
 _exhausted
+_endpoint_mode

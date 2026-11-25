@@ -1,10 +1,12 @@
 from collections.abc import AsyncIterator, Iterator
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal, assert_type
 
 import pandas as pd
 
+from apache_airflow_providers_imednet import export as airflow_export
 from imednet import (
     ApiError,
     AsyncImednetSDK,
@@ -1018,3 +1020,130 @@ def mixed_alias_and_narrowed_type_contracts() -> None:
     assert_type(Subject(study_key='S', subjectStatus='Enrolled'), Subject)
     assert_type(Variable(study_key='S', variableOid='VAR_AGE'), Variable)
     assert_type(Visit(study_key='S', visitId=1), Visit)
+
+
+def airflow_export_contracts(sdk: ImednetSDK, out_path: Path) -> None:
+    assert_type(
+        airflow_export.export_to_csv(
+            sdk,
+            'S',
+            out_path,
+            use_labels_as_columns=True,
+            variable_whitelist=['AGE'],
+            form_whitelist=[1],
+            manifest_path='out.manifest.jsonl',
+            quality_gate_enabled=True,
+            mask_phi=True,
+        ),
+        None,
+    )
+    assert_type(
+        airflow_export.export_to_duckdb(
+            sdk,
+            'S',
+            out_path,
+            'records',
+            use_labels_as_columns=False,
+            variable_whitelist=['AGE'],
+            form_whitelist=[1],
+            quality_gate_enabled=False,
+            mask_phi=True,
+        ),
+        None,
+    )
+    assert_type(
+        airflow_export.export_to_duckdb_by_form(
+            sdk,
+            'S',
+            out_path,
+            use_labels_as_columns=True,
+            quality_gate_enabled=False,
+            mask_phi=True,
+        ),
+        None,
+    )
+    assert_type(
+        airflow_export.export_to_parquet(
+            sdk,
+            'S',
+            out_path,
+            use_labels_as_columns=False,
+            quality_gate_enabled=False,
+            mask_phi=True,
+        ),
+        None,
+    )
+    assert_type(
+        airflow_export.export_to_hive_parquet(
+            sdk,
+            'S',
+            '/tmp/hive',
+            use_labels_as_columns=False,
+            chunk_size=1000,
+            quality_gate_enabled=False,
+            mask_phi=True,
+            max_buffered_records=5000,
+        ),
+        None,
+    )
+    assert_type(
+        airflow_export.export_to_excel(
+            sdk,
+            'S',
+            out_path,
+            use_labels_as_columns=True,
+            quality_gate_enabled=False,
+            mask_phi=True,
+        ),
+        None,
+    )
+    assert_type(
+        airflow_export.export_to_json(
+            sdk,
+            'S',
+            out_path,
+            use_labels_as_columns=False,
+            hierarchical=True,
+            quality_gate_enabled=False,
+            mask_phi=True,
+        ),
+        None,
+    )
+    assert_type(
+        airflow_export.export_to_sql(
+            sdk,
+            'S',
+            'records',
+            'sqlite:///:memory:',
+            'replace',
+            use_labels_as_columns=False,
+            manifest_path='sql.manifest.jsonl',
+            quality_gate_enabled=False,
+            mask_phi=True,
+        ),
+        None,
+    )
+    assert_type(
+        airflow_export.export_to_sql_by_form(
+            sdk,
+            'S',
+            'sqlite:///:memory:',
+            'append',
+            use_labels_as_columns=False,
+            quality_gate_enabled=False,
+            mask_phi=True,
+        ),
+        None,
+    )
+    assert_type(
+        airflow_export.export_to_long_sql(
+            sdk,
+            'S',
+            'long_records',
+            'sqlite:///:memory:',
+            chunk_size=500,
+            quality_gate_enabled=False,
+            mask_phi=True,
+        ),
+        None,
+    )

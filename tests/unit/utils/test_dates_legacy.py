@@ -73,4 +73,4 @@ class TestLegacyDateParsing:
     def test_legacy_none(self, force_legacy_dates):
         """Test that None raises TypeError/AttributeError (same as native)."""
         with pytest.raises((TypeError, AttributeError)):
-            dates.parse_iso_datetime(None)  # type: ignore
+            dates.parse_iso_datetime(None)  # type: ignore[arg-type]

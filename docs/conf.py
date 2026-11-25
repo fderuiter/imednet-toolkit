@@ -85,7 +85,7 @@ if not importlib.util.find_spec("pandas"):
             self.loc = type("MockLoc", (), {"__getitem__": lambda self, idx: DataFrame()})()
             self.empty = True
 
-    def json_normalize(*args: Any, **kwargs: Any) -> DataFrame:  # type: ignore
+    def json_normalize(*args: Any, **kwargs: Any) -> DataFrame:
         """Dummy json_normalize function."""
         return DataFrame()
 

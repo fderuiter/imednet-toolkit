@@ -123,8 +123,8 @@ class RecordCreateOperation(Operation[T]):
         client_strict = getattr(client, "strict_mode", None)
         if isinstance(client_strict, bool):
             with strict_mode_context(client_strict):
-                return parser(payload)  # type: ignore
-        return parser(payload)  # type: ignore
+                return parser(payload)  # type: ignore[return-value]
+        return parser(payload)  # type: ignore[return-value]
 
     def execute_sync(
         self,

@@ -65,7 +65,7 @@ async def test_async_json_list_paginator_raises_on_dict():
     instead of the expected list.
     """
     client = MockAsyncClient({"error": "Async error"})
-    paginator = AsyncJsonListPaginator(client, "/path")  # type: ignore
+    paginator = AsyncJsonListPaginator(client, "/path")  # type: ignore[arg-type]
 
     with pytest.raises(TypeError, match="API response must be a list"):
         [item async for item in paginator]
@@ -75,7 +75,7 @@ async def test_async_json_list_paginator_raises_on_dict():
 async def test_async_json_list_paginator_raises_on_none():
     """Test that AsyncJsonListPaginator raises TypeError when the API returns null."""
     client = MockAsyncClient(None)
-    paginator = AsyncJsonListPaginator(client, "/path")  # type: ignore
+    paginator = AsyncJsonListPaginator(client, "/path")  # type: ignore[arg-type]
 
     with pytest.raises(TypeError, match="API response must be a list"):
         [item async for item in paginator]

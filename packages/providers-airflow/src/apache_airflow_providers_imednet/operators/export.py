@@ -5,9 +5,9 @@ from __future__ import annotations
 import inspect
 import logging
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote_plus, urlsplit
 
 from imednet import ImednetSDK
@@ -26,7 +26,7 @@ from ..hooks import ImednetHook
 logger = logging.getLogger(__name__)
 
 # Fallback mapping for tabular exports if the user explicitly needs them or backward compatibility
-_TABULAR_EXPORTS = {
+_TABULAR_EXPORTS: dict[str, Callable[..., None]] = {
     "csv": export.export_to_csv,
     "parquet": export.export_to_parquet,
     "hive_parquet": export.export_to_hive_parquet,
@@ -142,7 +142,7 @@ def _load_openlineage_types() -> tuple[Any, Any] | None:
         from airflow.providers.common.compat.openlineage.facet import Dataset
     except (ImportError, ModuleNotFoundError):
         try:
-            from openlineage.client.event_v2 import Dataset  # type: ignore[no-redef]
+            from openlineage.client.event_v2 import Dataset
         except (ImportError, ModuleNotFoundError):
             return None
     if OperatorLineage is None or Dataset is None:
@@ -243,7 +243,7 @@ class ImednetExportOperator(BaseOperator):
 
     def __new__(cls, *args: Any, **kwargs: Any) -> ImednetExportOperator:
         """Record explicitly supplied operational flags prior to default binding."""
-        instance = cast("ImednetExportOperator", super().__new__(cls))
+        instance = super().__new__(cls)
         object.__setattr__(
             instance,
             "_explicit_tabular_options",

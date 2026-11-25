@@ -122,7 +122,7 @@ class MongoDbSinkConfig(SinkConfig):
 
     def __post_init__(self) -> None:
         """Validate MongoDB config properties after initialization."""
-        super().__post_init__()  # type: ignore[no-untyped-call]
+        super().__post_init__()
         if not self.uri or not isinstance(self.uri, str) or not self.uri.strip():
             raise ValueError("uri must be a non-empty string")
         if not self.database or not isinstance(self.database, str) or not self.database.strip():

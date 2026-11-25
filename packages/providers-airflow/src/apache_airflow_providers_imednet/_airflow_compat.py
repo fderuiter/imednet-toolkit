@@ -131,7 +131,7 @@ if TYPE_CHECKING:
     from airflow.sdk.definitions.context import Context
 else:  # pragma: no cover - typing fallback for optional Airflow dependency
     try:
-        from airflow.sdk.definitions.context import Context  # type: ignore
+        from airflow.sdk.definitions.context import Context
     except (ImportError, ModuleNotFoundError):
         Context = dict[str, Any]
     try:

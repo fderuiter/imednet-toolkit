@@ -300,11 +300,13 @@ def extract_canonical_records(
     for record in records:
         if not include_deleted and is_record_deleted(record):
             continue
-        subject_records[record.subject_key].append(record)  # type: ignore
+        if not record.subject_key:
+            continue
+        subject_records[record.subject_key].append(record)
 
     for subject_key, s_records in subject_records.items():
-        # sort by date_created to simulate longitudinal timeline
-        s_records.sort(key=lambda r: r.date_created or r.date_updated)  # type: ignore
+        # Sort by Record timestamps to reconstruct the Subject longitudinal timeline
+        s_records.sort(key=lambda r: r.date_created or r.date_modified or r.last_updated or "")
 
         context = SubjectContext(subject_key)
 
@@ -313,10 +315,12 @@ def extract_canonical_records(
         has_adsl_rules = False
 
         for record in s_records:
+            if not record.form_key:
+                continue
             top_level_payload = _LazyRecordPayload(record)
 
             for domain, by_form in grouped_mappings.items():
-                rules = by_form.get(record.form_key)  # type: ignore
+                rules = by_form.get(record.form_key)
                 if not rules:
                     continue
 

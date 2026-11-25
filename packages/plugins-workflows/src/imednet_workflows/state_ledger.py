@@ -454,10 +454,10 @@ class FileStateProvider(BaseStateProvider):
 
         with open(self._lock_path, "w") as lock_file:
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
                 yield
             finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def read_state(self) -> LedgerState:
         """Reads and validates the current ledger state."""

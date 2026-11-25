@@ -188,3 +188,49 @@ def test_schema_profiler_streams_chunked_loader_records() -> None:
     loader._iter_mock.assert_called_once_with("STUDY")
     assert profile.record_count == 2
     assert profile.fields["RESULT"].population_rate == 100.0
+
+
+def test_schema_profiler_falls_back_form_name_to_form_key_and_guards_null_form_id() -> None:
+    """Verify SchemaProfiler populates FormProfile.form_name with form_key when Form.form_name is None."""
+    sdk = MagicMock()
+    sdk.get_forms.return_value = [
+        Form(form_key="DM_FORM", form_name=None, form_id=10),
+        Form(form_key=None, form_name="Ignored Missing Key", form_id=20),
+    ]
+    sdk.get_variables.return_value = [
+        Variable(
+            form_id=10,
+            form_key="DM_FORM",
+            variable_name="BRTHDAT",
+            label=None,
+            variable_type="date",
+        )
+    ]
+    records = [
+        Record(
+            study_key="STUDY-NULL-FORM",
+            form_id=10,
+            form_key="DM_FORM",
+            record_id=1,
+            subject_key="SUBJ-01",
+            record_data={"BRTHDAT": "1985-06-15"},
+        ),
+        Record(
+            study_key="STUDY-NULL-FORM",
+            form_id=None,
+            form_key=None,
+            record_id=2,
+            subject_key="SUBJ-02",
+            record_data={"BRTHDAT": "1990-01-01"},
+        ),
+    ]
+
+    profiler = SchemaProfiler(sdk)
+    profiles = profiler.profile_records("STUDY-NULL-FORM", records=records)
+
+    assert list(profiles.keys()) == ["DM_FORM"]
+    dm_profile = profiles["DM_FORM"]
+    assert dm_profile.form_key == "DM_FORM"
+    assert dm_profile.form_name == "DM_FORM"
+    assert dm_profile.record_count == 1
+    assert dm_profile.fields["BRTHDAT"].label == "BRTHDAT"

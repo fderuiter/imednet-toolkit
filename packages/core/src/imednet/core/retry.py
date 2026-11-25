@@ -126,7 +126,7 @@ class RetryConfig:
         return Retrying(
             stop=stop_after_attempt(self.retries + 1),
             wait=wait,
-            retry=retry_predicate,  # type: ignore
+            retry=retry_predicate,  # type: ignore[arg-type]
             reraise=False,
             **kwargs,
         )
@@ -142,7 +142,7 @@ class RetryConfig:
         return AsyncRetrying(
             stop=stop_after_attempt(self.retries + 1),
             wait=wait,
-            retry=retry_predicate,  # type: ignore
+            retry=retry_predicate,  # type: ignore[arg-type]
             reraise=False,
             **kwargs,
         )

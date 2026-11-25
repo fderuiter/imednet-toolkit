@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import NonCallableMock
 
+from imednet.core.endpoint.base import EndpointSelfProtocol
 from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.core.endpoint.operations.record_create import RecordCreateOperation
 from imednet.core.endpoint.strategies import MappingParamProcessor
+from imednet.core.protocols import ParamProcessor
 from imednet.endpoints.forms import AsyncFormsEndpoint, FormsEndpoint
 from imednet.endpoints.jobs import AsyncJobsEndpoint, JobsEndpoint
 from imednet.endpoints.variables import AsyncVariablesEndpoint, VariablesEndpoint
@@ -60,21 +62,21 @@ def _build_async_schema_adapter(async_client: Any) -> _EndpointSchemaAdapter | N
 class RecordsOperationDef:
     """Definition for Record operations."""
 
-    PATH = "records"
+    PATH: ClassVar[str] = "records"
     MODEL = Record
     _id_param = "recordId"
-    _lookup_key_hint = "recordOid"
-    PARAM_PROCESSOR = MappingParamProcessor(
+    _lookup_key_hint: ClassVar[str | None] = "recordOid"
+    PARAM_PROCESSOR: ClassVar[ParamProcessor | None] = MappingParamProcessor(
         {
             "record_data_filter": "recordDataFilter",
             "recordDataFilter": "recordDataFilter",
         }
     )
-    FILTER_ATTRIBUTES = RECORDS_FILTER_ATTRIBUTES
+    FILTER_ATTRIBUTES: ClassVar[frozenset[str] | None] = RECORDS_FILTER_ATTRIBUTES
 
     @execute_operation
     def create(
-        self,
+        self: EndpointSelfProtocol[Record],
         study_key: str,
         records_data: RecordsInput,
         email_notify: bool | str | None = None,
@@ -94,9 +96,9 @@ class RecordsOperationDef:
         Returns:
             The background job for the creation operation.
         """
-        self._validate_study_key(study_key)  # type: ignore
+        self._validate_study_key(study_key)
         normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
-        path = self._get_endpoint_path(study_key)  # type: ignore
+        path = self._get_endpoint_path(study_key)
         return RecordCreateOperation[Job](
             path=path,
             records_data=normalized,
@@ -107,7 +109,7 @@ class RecordsOperationDef:
         )
 
 
-class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # type: ignore[misc]
+class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):
     """API endpoint for interacting with records (form instances)."""
 
     def create_batch(
@@ -180,7 +182,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         return records_to_dataframe(records, flatten=flatten, mask_phi=mask_phi)
 
 
-class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record]):  # type: ignore[misc]
+class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record]):
     """Async API endpoint for interacting with records (form instances)."""
 
     async def create_batch(

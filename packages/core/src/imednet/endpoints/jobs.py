@@ -1,37 +1,22 @@
 """Endpoint for checking job status in a study."""
 
-from typing import Any
+from typing import Any, ClassVar
 
-from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncGetEndpoint, EdcSyncGetEndpoint
-from imednet.core.endpoint.operations.get import PathGetOperation
 from imednet.models.jobs import JobStatus
 from imednet.utils.job_poller import JobPollSummary, JobProgressHandler
-from imednet.utils.typing import ItemId
 from imednet.utils.url import validate_path_segment
 
 
 class JobsOperationDef:
     """Definition for Job operations."""
 
-    PATH = "jobs"
+    PATH: ClassVar[str] = "jobs"
     MODEL = JobStatus
-
-    @execute_operation  # type: ignore
-    def get(self, study_key: str | None, item_id: ItemId) -> PathGetOperation[JobStatus]:
-        """Get a single Job by ID."""
-        self._require_item_id(item_id)  # type: ignore
-        self._validate_study_key(study_key)  # type: ignore
-        validate_path_segment(item_id, name="batch_id")
-        path = self._get_endpoint_path(study_key, item_id)  # type: ignore
-        return PathGetOperation[JobStatus](
-            path=path,
-            parse_func=self._parse_item,  # type: ignore
-            not_found_func=lambda: self._raise_not_found(study_key, item_id),  # type: ignore
-        )
+    _item_id_label: ClassVar[str] = "batch_id"
 
 
-class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ignore[misc]
+class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):
     """Synchronous endpoint for managing Jobs."""
 
     def _fetch_result_url(self, url: str) -> Any:
@@ -88,7 +73,7 @@ class JobsEndpoint(JobsOperationDef, EdcSyncGetEndpoint[JobStatus]):  # type: ig
         )
 
 
-class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # type: ignore[misc]
+class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):
     """Asynchronous endpoint for managing Jobs."""
 
     async def _fetch_result_url(self, url: str) -> Any:
@@ -98,7 +83,7 @@ class AsyncJobsEndpoint(JobsOperationDef, EdcAsyncGetEndpoint[JobStatus]):  # ty
             return await client.get(url)
         fetch_external = getattr(client, "fetch_external_url", None)
         if callable(fetch_external):
-            return await fetch_external(url)  # type: ignore[misc]
+            return await fetch_external(url)
         return await client.get(url)
 
     async def fetch_result(self, result_url: str) -> Any:

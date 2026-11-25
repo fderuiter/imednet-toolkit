@@ -753,3 +753,86 @@ def test_extract_canonical_records_blocks_payload_clear(
     # Derived logic failed safely, keeping initial extracted value
     assert result.adverse_events[0].ae_term == "Headache"
     assert any("Derivation logic failed for SUBJ-001" in r.message for r in caplog.records)
+
+
+def test_extract_canonical_records_sorts_nullable_date_created_and_skips_nullable_keys() -> None:
+    """Verify extract_canonical_records sorts Subject records with date_created=None via date_modified/last_updated."""
+    config = StudyConfiguration(
+        study_key="STUDY-NULLABLE-TIMESTAMPS",
+        mappings=[
+            MappingRule(
+                domain="AE",
+                target_field="subjectKey",
+                source_form_key="AE_FORM",
+                source_variable_name="subjectKey",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeTerm",
+                source_form_key="AE_FORM",
+                source_variable_name="recordData.term",
+            ),
+            MappingRule(
+                domain="AE",
+                target_field="aeSeverity",
+                source_form_key="AE_FORM",
+                source_variable_name="",
+                fallback_value="MILD",
+            ),
+        ],
+    )
+
+    records = [
+        # Latest via last_updated when both date_created and date_modified are None
+        Record.model_construct(
+            record_id=3,
+            form_key="AE_FORM",
+            subject_key="SUBJ-100",
+            date_created=None,
+            date_modified=None,
+            last_updated="2024-03-03T12:00:00Z",
+            record_data={"term": "Third Event"},
+        ),
+        # Earliest with no timestamps at all (falls back to empty string)
+        Record.model_construct(
+            record_id=1,
+            form_key="AE_FORM",
+            subject_key="SUBJ-100",
+            date_created=None,
+            date_modified=None,
+            last_updated=None,
+            record_data={"term": "First Event"},
+        ),
+        # Middle via date_modified when date_created is None
+        Record.model_construct(
+            record_id=2,
+            form_key="AE_FORM",
+            subject_key="SUBJ-100",
+            date_created=None,
+            date_modified="2024-03-02T12:00:00Z",
+            last_updated="2024-03-05T12:00:00Z",
+            record_data={"term": "Second Event"},
+        ),
+        # Records missing subject_key or form_key are safely ignored
+        Record.model_construct(
+            record_id=4,
+            form_key="AE_FORM",
+            subject_key=None,
+            date_created=None,
+            record_data={"term": "Missing Subject"},
+        ),
+        Record.model_construct(
+            record_id=5,
+            form_key=None,
+            subject_key="SUBJ-100",
+            date_created=None,
+            record_data={"term": "Missing Form"},
+        ),
+    ]
+
+    result = extract_canonical_records(records=records, study_configuration=config)
+    assert [ae.ae_term for ae in result.adverse_events] == [
+        "First Event",
+        "Second Event",
+        "Third Event",
+    ]

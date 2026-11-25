@@ -1,5 +1,7 @@
 """Endpoint for managing variables (data points on forms) in a study."""
 
+from typing import ClassVar
+
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.models.variables import Variable
 
@@ -7,12 +9,12 @@ from imednet.models.variables import Variable
 class VariablesOperationDef:
     """Definition for Variable operations."""
 
-    PATH = "variables"
+    PATH: ClassVar[str] = "variables"
     MODEL = Variable
     _id_param = "variableId"
-    _lookup_key_hint = "variableName"
-    PAGE_SIZE = 500
-    FILTER_ATTRIBUTES = frozenset(
+    _lookup_key_hint: ClassVar[str | None] = "variableName"
+    PAGE_SIZE: ClassVar[int] = 500
+    FILTER_ATTRIBUTES: ClassVar[frozenset[str] | None] = frozenset(
         {
             "variableId",
             "variableType",
@@ -34,9 +36,9 @@ class VariablesOperationDef:
     )
 
 
-class VariablesEndpoint(VariablesOperationDef, EdcSyncListGetEndpoint[Variable]):  # type: ignore[misc]
+class VariablesEndpoint(VariablesOperationDef, EdcSyncListGetEndpoint[Variable]):
     """Synchronous endpoint for managing Variables."""
 
 
-class AsyncVariablesEndpoint(VariablesOperationDef, EdcAsyncListGetEndpoint[Variable]):  # type: ignore[misc]
+class AsyncVariablesEndpoint(VariablesOperationDef, EdcAsyncListGetEndpoint[Variable]):
     """Asynchronous endpoint for managing Variables."""

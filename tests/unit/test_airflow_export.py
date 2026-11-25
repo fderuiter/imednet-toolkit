@@ -1887,3 +1887,53 @@ def test_operator_sdtm_phi_redaction_and_incremental_reconciliation(
     json_rows2 = json.loads(json_path.read_text(encoding="utf-8"))
     assert len(json_rows2) == 1 and json_rows2[0]["USUBJID"] == "S01"
     assert json_rows2[0]["BRTHDTC"] == "1981"
+
+
+def test_airflow_export_signatures_match_core_and_typecheck(tmp_path: Path) -> None:
+    """Verify Airflow export helpers expose explicit typed signatures enforced by mypy."""
+    import inspect
+
+    from mypy import api as mypy_api
+
+    import imednet.integrations.export as core_export
+    import imednet.integrations.parquet as core_parquet
+    from apache_airflow_providers_imednet import export as airflow_export
+
+    assert len(airflow_export.__all__) == 10
+    for name in airflow_export.__all__:
+        af_fn = getattr(airflow_export, name)
+        ref_fn = (
+            core_parquet.export_to_hive_parquet
+            if name == "export_to_hive_parquet"
+            else getattr(core_export, name)
+        )
+        af_sig = inspect.signature(af_fn)
+        ref_sig = inspect.signature(ref_fn)
+        assert not any(
+            p.kind == inspect.Parameter.VAR_POSITIONAL for p in af_sig.parameters.values()
+        ), f"{name} must not use *args wrapper signature"
+        assert list(af_sig.parameters) == list(ref_sig.parameters), f"Parameter mismatch on {name}"
+        for param_name, af_param in af_sig.parameters.items():
+            ref_param = ref_sig.parameters[param_name]
+            assert af_param.kind == ref_param.kind
+            assert af_param.default == ref_param.default
+
+    bad_snippet = tmp_path / "bad_airflow_export_usage.py"
+    bad_snippet.write_text(
+        "from apache_airflow_providers_imednet import export\n"
+        "from imednet import ImednetSDK\n\n"
+        "def bad_calls(sdk: ImednetSDK) -> None:\n"
+        "    export.export_to_csv(sdk, 123, 'out.csv')\n"
+        "    export.export_to_sql(sdk, 'S', 'tbl', 'sqlite://', if_exists='bogus')\n",
+        encoding="utf-8",
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    stdout, stderr, exit_status = mypy_api.run(
+        [
+            "--config-file",
+            str(repo_root / "pyproject.toml"),
+            str(bad_snippet),
+        ]
+    )
+    assert exit_status != 0, f"Expected mypy to reject invalid export calls: {stdout}\n{stderr}"
+    assert "arg-type" in stdout

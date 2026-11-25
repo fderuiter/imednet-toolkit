@@ -431,8 +431,8 @@ def _execute_set_state(
         ledger = _resolve_attr("get_state_provider")(ledger_path)
         try:
             ledger.set_last_timestamp(
-                study_key=study_key,  # type: ignore[arg-type]
-                stream_name=stream,  # type: ignore[arg-type]
+                study_key=study_key,
+                stream_name=stream,
                 timestamp=dt,
                 records_processed=records_processed,
                 status="success",
@@ -972,7 +972,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         sync_worker_cfg_cls = _resolve_attr("SyncWorkerConfig")
         sync_worker_state_cls = _resolve_attr("SyncWorkerState")
         worker = sync_worker_cls(
-            CachedRecordsLoader(sdk),  # type: ignore[arg-type]
+            CachedRecordsLoader(sdk),
             config=sync_worker_cfg_cls(study_key=study_key, interval_seconds=interval),
         )
 
@@ -1091,7 +1091,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         from .wizard import print_progress
 
         try:
-            snapshot = StudySchemaInspector(sdk).inspect(study_key)  # type: ignore[arg-type]
+            snapshot = StudySchemaInspector(sdk).inspect(study_key)
             spec = UATSpecificationBuilder(data_dictionary=data_dictionary).build(
                 snapshot,
                 subject_count=subject_count,
@@ -1320,7 +1320,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             wf_kwargs["data_dictionary"] = data_dictionary
 
         workflow = UATWorkflow(
-            sdk,  # type: ignore[arg-type]
+            sdk,
             **wf_kwargs,
         )
 

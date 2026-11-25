@@ -437,9 +437,11 @@ class RecordMapper:
             return [], {}
 
         self._last_variables = list(variables)
-        variable_keys = [v.variable_name for v in variables]
-        label_map = {v.variable_name: v.label for v in variables}
-        return variable_keys, label_map  # type: ignore
+        variable_keys = [v.variable_name for v in variables if v.variable_name]
+        label_map = {
+            v.variable_name: v.label or v.variable_name for v in variables if v.variable_name
+        }
+        return variable_keys, label_map
 
     def _build_record_model(
         self, variable_keys: list[str], label_map: dict[str, str]
@@ -449,9 +451,9 @@ class RecordMapper:
         for key in variable_keys:
             fields[key] = (
                 Any | None,
-                Field(None, alias=key, description=label_map.get(key, key)),
+                Field(None, alias=key, description=label_map.get(key) or key),
             )
-        return create_model("RecordData", __base__=BaseModel, **fields)  # type: ignore
+        return create_model("RecordData", __base__=BaseModel, **fields)  # type: ignore[call-overload, no-any-return]
 
     @staticmethod
     def _extract_form_ids(
@@ -1137,7 +1139,7 @@ class RecordMapper:
                     sensitive_vars.append(key)
                     continue
                 if use_labels:
-                    mapped_label = str(label_map.get(key, key))
+                    mapped_label = str(label_map.get(key) or key)
                     if mapped_label != key and _is_header_sensitive(mapped_label):
                         sensitive_vars.append(key)
 
@@ -1175,7 +1177,7 @@ class RecordMapper:
                             df[col] = _mask_series_nested_containers(target, pipeline_phi_keys)
 
         if use_labels:
-            rename_map = {key: label_map.get(key, key) for key in unique_effective_var_keys}
+            rename_map = {key: label_map.get(key) or key for key in unique_effective_var_keys}
             df = df.rename(columns=rename_map)
 
         effective_phi_keys: Iterable[str] = (
@@ -1310,10 +1312,12 @@ class RecordMapper:
                 )
             )
             label_map = {
-                v.variable_name: v.label for v in (form.variables or []) if v.variable_name
+                v.variable_name: v.label or v.variable_name
+                for v in (form.variables or [])
+                if v.variable_name
             }
-            form_models[form.form_id] = self._build_record_model(var_keys, label_map)  # type: ignore
-            form_label_maps[form.form_id] = label_map  # type: ignore
+            form_models[form.form_id] = self._build_record_model(var_keys, label_map)
+            form_label_maps[form.form_id] = label_map
 
         extra_filters: dict[str, Any] = {}
         if form_whitelist is not None:
@@ -1354,7 +1358,7 @@ class RecordMapper:
                 continue
 
             model = form_models[rec.form_id]
-            label_map = form_label_maps[rec.form_id]  # type: ignore
+            label_map = form_label_maps[rec.form_id]
 
             try:
                 parsed_data = self._parse_record(
@@ -1424,9 +1428,9 @@ class RecordMapper:
 
             subj_key = rec.subject_key
             if subj_key not in tree:
-                tree[subj_key] = {"subject_key": subj_key, "visits": {}, "forms": {}}  # type: ignore
+                tree[subj_key] = {"subject_key": subj_key, "visits": {}, "forms": {}}  # type: ignore[index]
 
-            subj_node = tree[subj_key]  # type: ignore
+            subj_node = tree[subj_key]  # type: ignore[index]
             form_id = rec.form_id
 
             visit_id = rec.visit_id

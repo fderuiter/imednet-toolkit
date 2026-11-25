@@ -1,5 +1,7 @@
 """Endpoint for managing codings (medical coding) in a study."""
 
+from typing import ClassVar
+
 from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.models.codings import Coding
 
@@ -7,9 +9,9 @@ from imednet.models.codings import Coding
 class CodingsOperationDef:
     """Definition for Coding operations."""
 
-    PATH = "codings"
+    PATH: ClassVar[str] = "codings"
     MODEL = Coding
-    FILTER_ATTRIBUTES = frozenset(
+    FILTER_ATTRIBUTES: ClassVar[frozenset[str] | None] = frozenset(
         {
             "siteName",
             "siteId",
@@ -33,9 +35,9 @@ class CodingsOperationDef:
     )
 
 
-class CodingsEndpoint(CodingsOperationDef, EdcSyncListEndpoint[Coding]):  # type: ignore[misc]
+class CodingsEndpoint(CodingsOperationDef, EdcSyncListEndpoint[Coding]):
     """Synchronous endpoint for managing Codings."""
 
 
-class AsyncCodingsEndpoint(CodingsOperationDef, EdcAsyncListEndpoint[Coding]):  # type: ignore[misc]
+class AsyncCodingsEndpoint(CodingsOperationDef, EdcAsyncListEndpoint[Coding]):
     """Asynchronous endpoint for managing Codings."""
