@@ -187,6 +187,7 @@ def test_navigation_keyboard_css_and_controller_contracts() -> None:
     """Verify conf.py, custom.css, and navigation.js contracts for switches, drawers, and modindex."""
     from docs import conf as docs_conf
 
+    assert docs_conf.templates_path == []
     assert "navigation.js" in docs_conf.html_js_files
 
     css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
@@ -201,18 +202,34 @@ def test_navigation_keyboard_css_and_controller_contracts() -> None:
     assert '"Enter"' in nav_js
     assert '"switch"' in nav_js
 
-    # 2. Responsive drawer visibility guards (<= 82em TOC, <= 63em sidebar) & inert syncing
+    # 2. Native <button type="button"> drawer triggers, modal dialog ARIA, sibling inert, & close buttons
     assert "@media (max-width: 82em)" in css_content
     assert "#__toc:not(:checked) ~ .page .toc-drawer" in css_content
     assert "@media (max-width: 63em)" in css_content
     assert "#__navigation:not(:checked) ~ .page .sidebar-drawer" in css_content
     assert "visibility: hidden" in css_content
+    assert "button.nav-overlay-icon" in css_content
+    assert "button.toc-header-icon" in css_content
+    assert "button.toc-content-icon" in css_content
+    assert "button.drawer-close-btn" in css_content
+    assert ".drawer-close-btn:focus-visible" in css_content
+    assert "article h2:focus-visible" in css_content
+    assert "article dt:focus-visible" in css_content
     assert "(max-width: 63em)" in nav_js
     assert "(max-width: 82em)" in nav_js
     assert ".inert" in nav_js
+    assert 'createElement("button")' in nav_js
     assert ".nav-overlay-icon" in nav_js
     assert ".toc-header-icon:not(.no-toc)" in nav_js
     assert ".toc-content-icon:not(.no-toc)" in nav_js
+    assert "drawer-close-btn" in nav_js
+    assert '"dialog"' in nav_js
+    assert '"aria-modal"' in nav_js
+    assert "header.mobile-header" in nav_js
+    assert "a.skip-to-content" in nav_js
+    assert ".announcement" in nav_js
+    assert "resolveTocTarget" in nav_js
+    assert 'restoreTriggerFocus("toc", true)' not in nav_js
     assert "aria-controls" in nav_js
     assert "aria-expanded" in nav_js
     assert '"Escape"' in nav_js
@@ -3518,7 +3535,8 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         api_tabbed_switches.append(sw_id)
                 assert api_tabbed_switches == api_visible_switches
 
-                # 5b. Responsive drawers & triggers across 1280x900, 375x812, 320x640, and 1400x900
+                # 5b. Responsive drawers & triggers across 1280x800, 375x812, 320x640, and 1400x900
+                nav_page.set_viewport_size({"width": 1280, "height": 800})
                 nav_page.goto(
                     f"http://127.0.0.1:{port}/index.html",
                     wait_until="load",
@@ -3529,13 +3547,29 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     """() => {
                         const sd = document.querySelector('.sidebar-drawer');
                         const td = document.querySelector('.toc-drawer');
+                        const navTrigger = document.querySelector('.nav-overlay-icon');
+                        const tocHdrTrigger = document.querySelector('.toc-header-icon');
                         const tocTrigger = document.querySelector('.toc-content-icon');
                         return {
                             sdVis: getComputedStyle(sd).visibility,
                             sdInert: sd.inert,
+                            sdRole: sd.getAttribute('role'),
+                            sdModal: sd.getAttribute('aria-modal'),
                             tdVis: getComputedStyle(td).visibility,
                             tdInert: td.inert,
+                            tdRole: td.getAttribute('role'),
+                            tdModal: td.getAttribute('aria-modal'),
+                            mainInert: document.querySelector('.main').inert,
+                            navTag: navTrigger.tagName,
+                            navType: navTrigger.getAttribute('type'),
+                            navRole: navTrigger.getAttribute('role'),
+                            tocHdrTag: tocHdrTrigger.tagName,
+                            tocHdrType: tocHdrTrigger.getAttribute('type'),
+                            tocHdrRole: tocHdrTrigger.getAttribute('role'),
+                            tocTag: tocTrigger.tagName,
+                            tocType: tocTrigger.getAttribute('type'),
                             tocRole: tocTrigger.getAttribute('role'),
+                            tocHasFor: tocTrigger.hasAttribute('for'),
                             tocTabIndex: tocTrigger.tabIndex,
                             tocControls: tocTrigger.getAttribute('aria-controls'),
                             tocExpanded: tocTrigger.getAttribute('aria-expanded'),
@@ -3544,24 +3578,47 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     }"""
                 )
                 assert drawer_1280["sdVis"] == "visible" and drawer_1280["sdInert"] is False
+                assert drawer_1280["sdRole"] is None and drawer_1280["sdModal"] is None
                 assert drawer_1280["tdVis"] == "hidden" and drawer_1280["tdInert"] is True
-                assert drawer_1280["tocRole"] == "button"
+                assert drawer_1280["tdRole"] is None and drawer_1280["tdModal"] is None
+                assert drawer_1280["mainInert"] is False
+                assert drawer_1280["navTag"] == "BUTTON" and drawer_1280["navType"] == "button"
+                assert drawer_1280["navRole"] is None
+                assert (
+                    drawer_1280["tocHdrTag"] == "BUTTON" and drawer_1280["tocHdrType"] == "button"
+                )
+                assert drawer_1280["tocHdrRole"] is None
+                assert drawer_1280["tocTag"] == "BUTTON" and drawer_1280["tocType"] == "button"
+                assert drawer_1280["tocRole"] is None
+                assert drawer_1280["tocHasFor"] is False
                 assert drawer_1280["tocTabIndex"] == 0
                 assert drawer_1280["tocControls"] == "furo-toc-drawer"
                 assert drawer_1280["tocExpanded"] == "false"
                 assert drawer_1280["tocLabel"]
 
-                # Open .toc-drawer via Enter, verify focus moves inside, close via Escape -> focus returns
+                # Open .toc-drawer via Enter at 1280x800, verify modal dialog + sibling inert + close btn
                 nav_page.locator(".toc-content-icon").focus()
                 nav_page.keyboard.press("Enter")
                 toc_open_state = nav_page.evaluate(
                     """() => {
                         const td = document.querySelector('.toc-drawer');
+                        const closeBtn = td.querySelector('button.drawer-close-btn');
                         const trigger = document.querySelector('.toc-content-icon');
                         return {
                             checked: document.getElementById('__toc').checked,
                             vis: getComputedStyle(td).visibility,
                             inert: td.inert,
+                            role: td.getAttribute('role'),
+                            ariaModal: td.getAttribute('aria-modal'),
+                            ariaLabel: Boolean(td.getAttribute('aria-label')),
+                            closeBtnVisible: Boolean(
+                                closeBtn && !closeBtn.hidden && closeBtn.getClientRects().length > 0
+                            ),
+                            mainInert: document.querySelector('.main').inert,
+                            contentInert: document.querySelector('.main > .content').inert,
+                            headerInert: document.querySelector('header.mobile-header').inert,
+                            skipInert: document.querySelector('a.skip-to-content').inert,
+                            sidebarInert: document.querySelector('.sidebar-drawer').inert,
                             expanded: trigger.getAttribute('aria-expanded'),
                             focusInside: td.contains(document.activeElement)
                         };
@@ -3571,26 +3628,50 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     "checked": True,
                     "vis": "visible",
                     "inert": False,
+                    "role": "dialog",
+                    "ariaModal": "true",
+                    "ariaLabel": True,
+                    "closeBtnVisible": True,
+                    "mainInert": False,
+                    "contentInert": True,
+                    "headerInert": True,
+                    "skipInert": True,
+                    "sidebarInert": True,
                     "expanded": "true",
                     "focusInside": True,
                 }
-                # Verify Tab and Shift+Tab wrap inside open modal .toc-drawer at 1280x900
+                # Press Tab 30 times and Shift+Tab 30 times inside open .toc-drawer at 1280x800
+                for key_name in ("Tab", "Shift+Tab"):
+                    for _ in range(30):
+                        nav_page.keyboard.press(key_name)
+                        inside_toc = nav_page.evaluate(
+                            "document.querySelector('.toc-drawer').contains(document.activeElement)"
+                        )
+                        assert inside_toc is True, (
+                            f"{key_name} escaped open .toc-drawer at 1280x800"
+                        )
+
+                # Verify Tab and Shift+Tab wrap cleanly between first (close btn) and last item
                 toc_bounds_1280 = nav_page.evaluate(
                     """() => {
                         const td = document.querySelector('.toc-drawer');
-                        const items = Array.from(td.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                        const items = Array.from(td.querySelectorAll('a[href], button:not([disabled]):not([hidden]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
                             .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
                         items[items.length - 1].focus();
-                        return { count: items.length };
+                        return {
+                            count: items.length,
+                            firstIsClose: items[0].classList.contains('drawer-close-btn')
+                        };
                     }"""
                 )
                 assert toc_bounds_1280["count"] >= 2
+                assert toc_bounds_1280["firstIsClose"] is True
                 nav_page.keyboard.press("Tab")
                 assert (
                     nav_page.evaluate(
                         """() => {
                             const td = document.querySelector('.toc-drawer');
-                            const items = Array.from(td.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                            const items = Array.from(td.querySelectorAll('a[href], button:not([disabled]):not([hidden]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
                                 .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
                             return document.activeElement === items[0];
                         }"""
@@ -3602,7 +3683,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     nav_page.evaluate(
                         """() => {
                             const td = document.querySelector('.toc-drawer');
-                            const items = Array.from(td.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                            const items = Array.from(td.querySelectorAll('a[href], button:not([disabled]):not([hidden]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
                                 .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
                             return document.activeElement === items[items.length - 1];
                         }"""
@@ -3619,6 +3700,11 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             checked: document.getElementById('__toc').checked,
                             vis: getComputedStyle(td).visibility,
                             inert: td.inert,
+                            role: td.getAttribute('role'),
+                            ariaModal: td.getAttribute('aria-modal'),
+                            mainInert: document.querySelector('.main').inert,
+                            contentInert: document.querySelector('.main > .content').inert,
+                            sidebarInert: document.querySelector('.sidebar-drawer').inert,
                             expanded: trigger.getAttribute('aria-expanded'),
                             focusRestored: document.activeElement === trigger
                         };
@@ -3628,23 +3714,71 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     "checked": False,
                     "vis": "hidden",
                     "inert": True,
+                    "role": None,
+                    "ariaModal": None,
+                    "mainInert": False,
+                    "contentInert": False,
+                    "sidebarInert": False,
                     "expanded": "false",
                     "focusRestored": True,
                 }
 
-                # Reopen via Space and verify TOC link click closes drawer & restores trigger focus
+                # Verify inline button.drawer-close-btn and backdrop .toc-overlay restore trigger focus
                 nav_page.keyboard.press("Space")
                 assert nav_page.evaluate("document.getElementById('__toc').checked") is True
-                nav_page.locator(".toc-drawer .toc-tree a").nth(1).click()
-                nav_page.wait_for_timeout(30)
+                nav_page.locator(".toc-drawer button.drawer-close-btn").click()
+                nav_page.wait_for_timeout(280)
                 assert nav_page.evaluate("document.getElementById('__toc').checked") is False
-                assert nav_page.evaluate("document.querySelector('.toc-drawer').inert") is True
                 assert (
                     nav_page.evaluate(
                         "document.activeElement === document.querySelector('.toc-content-icon')"
                     )
                     is True
                 )
+
+                nav_page.keyboard.press("Space")
+                assert nav_page.evaluate("document.getElementById('__toc').checked") is True
+                nav_page.locator("label.toc-overlay").click(position={"x": 20, "y": 20})
+                nav_page.wait_for_timeout(280)
+                assert nav_page.evaluate("document.getElementById('__toc').checked") is False
+                assert (
+                    nav_page.evaluate(
+                        "document.activeElement === document.querySelector('.toc-content-icon')"
+                    )
+                    is True
+                )
+
+                # Reopen via Space and verify TOC link click focuses destination heading (NOT trigger)
+                nav_page.keyboard.press("Space")
+                assert nav_page.evaluate("document.getElementById('__toc').checked") is True
+                nav_page.locator(".toc-drawer .toc-tree a").nth(1).click()
+                nav_page.wait_for_timeout(30)
+                idx_toc_nav = nav_page.evaluate(
+                    """() => {
+                        const ae = document.activeElement;
+                        const cs = ae ? getComputedStyle(ae) : null;
+                        return {
+                            checked: document.getElementById('__toc').checked,
+                            tocInert: document.querySelector('.toc-drawer').inert,
+                            mainInert: document.querySelector('.main').inert,
+                            isHeading: Boolean(ae && /^H[1-6]$/.test(ae.tagName)),
+                            tabindex: ae ? ae.getAttribute('tabindex') : null,
+                            focusVisible: Boolean(ae && ae.matches(':focus-visible')),
+                            outlineStyle: cs ? cs.outlineStyle : '',
+                            outlineWidth: cs ? cs.outlineWidth : ''
+                        };
+                    }"""
+                )
+                assert idx_toc_nav == {
+                    "checked": False,
+                    "tocInert": True,
+                    "mainInert": False,
+                    "isHeading": True,
+                    "tabindex": "-1",
+                    "focusVisible": True,
+                    "outlineStyle": "solid",
+                    "outlineWidth": "2px",
+                }
 
                 # Mobile viewports (375x812 and 320x640): both drawers closed, 0 off-screen Tab stops
                 for vp_w, vp_h in ((375, 812), (320, 640)):
@@ -3654,19 +3788,29 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         """() => {
                             const sd = document.querySelector('.sidebar-drawer');
                             const td = document.querySelector('.toc-drawer');
+                            const navBtn = document.querySelector('.nav-overlay-icon');
+                            const tocBtn = document.querySelector('.toc-header-icon');
                             return {
                                 sdVis: getComputedStyle(sd).visibility,
                                 sdInert: sd.inert,
+                                sdRole: sd.getAttribute('role'),
                                 tdVis: getComputedStyle(td).visibility,
-                                tdInert: td.inert
+                                tdInert: td.inert,
+                                tdRole: td.getAttribute('role'),
+                                navTag: navBtn.tagName,
+                                tocTag: tocBtn.tagName
                             };
                         }"""
                     )
                     assert closed_mobile == {
                         "sdVis": "hidden",
                         "sdInert": True,
+                        "sdRole": None,
                         "tdVis": "hidden",
                         "tdInert": True,
+                        "tdRole": None,
+                        "navTag": "BUTTON",
+                        "tocTag": "BUTTON",
                     }, f"{vp_w}x{vp_h} closed drawers mismatch: {closed_mobile}"
 
                     # Press Tab 15 times and confirm 0 stops land inside closed drawers
@@ -3685,10 +3829,10 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             f"Closed drawer trapped Tab stop at {vp_w}x{vp_h}"
                         )
 
-                    # Keyboard toggle #__navigation and #__toc and restore on Escape
-                    for trig_sel, input_id, drawer_sel in (
-                        (".nav-overlay-icon", "__navigation", ".sidebar-drawer"),
-                        (".toc-header-icon", "__toc", ".toc-drawer"),
+                    # Keyboard toggle #__navigation and #__toc, verify 30x Tab/Shift+Tab trap, close via btn & Escape
+                    for trig_sel, input_id, drawer_sel, inactive_sel in (
+                        (".nav-overlay-icon", "__navigation", ".sidebar-drawer", ".toc-drawer"),
+                        (".toc-header-icon", "__toc", ".toc-drawer", ".sidebar-drawer"),
                     ):
                         nav_page.locator(trig_sel).focus()
                         nav_page.keyboard.press("Space")
@@ -3696,10 +3840,21 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             f"""() => {{
                                 const dr = document.querySelector('{drawer_sel}');
                                 const tr = document.querySelector('{trig_sel}');
+                                const closeBtn = dr.querySelector('button.drawer-close-btn');
                                 return {{
                                     checked: document.getElementById('{input_id}').checked,
                                     vis: getComputedStyle(dr).visibility,
                                     inert: dr.inert,
+                                    role: dr.getAttribute('role'),
+                                    ariaModal: dr.getAttribute('aria-modal'),
+                                    closeBtnVisible: Boolean(
+                                        closeBtn && !closeBtn.hidden && closeBtn.getClientRects().length > 0
+                                    ),
+                                    mainInert: document.querySelector('.main').inert,
+                                    contentInert: document.querySelector('.main > .content').inert,
+                                    headerInert: document.querySelector('header.mobile-header').inert,
+                                    skipInert: document.querySelector('a.skip-to-content').inert,
+                                    inactiveInert: document.querySelector('{inactive_sel}').inert,
                                     expanded: tr.getAttribute('aria-expanded'),
                                     focusInside: dr.contains(document.activeElement)
                                 }};
@@ -3709,14 +3864,33 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             "checked": True,
                             "vis": "visible",
                             "inert": False,
+                            "role": "dialog",
+                            "ariaModal": "true",
+                            "closeBtnVisible": True,
+                            "mainInert": drawer_sel == ".sidebar-drawer",
+                            "contentInert": True,
+                            "headerInert": True,
+                            "skipInert": True,
+                            "inactiveInert": True,
                             "expanded": "true",
                             "focusInside": True,
                         }
+                        # Press Tab and Shift+Tab 30 times inside open drawer at 320x640 / 375x812
+                        for key_name in ("Tab", "Shift+Tab"):
+                            for _ in range(30):
+                                nav_page.keyboard.press(key_name)
+                                inside_dr = nav_page.evaluate(
+                                    f"document.querySelector('{drawer_sel}').contains(document.activeElement)"
+                                )
+                                assert inside_dr is True, (
+                                    f"{key_name} escaped open {drawer_sel} at {vp_w}x{vp_h}"
+                                )
+
                         # Verify Tab and Shift+Tab wrap inside open modal drawer on mobile
                         nav_page.evaluate(
                             f"""() => {{
                                 const dr = document.querySelector('{drawer_sel}');
-                                const items = Array.from(dr.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                                const items = Array.from(dr.querySelectorAll('a[href], button:not([disabled]):not([hidden]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
                                     .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
                                 items[items.length - 1].focus();
                             }}"""
@@ -3726,7 +3900,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             nav_page.evaluate(
                                 f"""() => {{
                                     const dr = document.querySelector('{drawer_sel}');
-                                    const items = Array.from(dr.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                                    const items = Array.from(dr.querySelectorAll('a[href], button:not([disabled]):not([hidden]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
                                         .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
                                     return document.activeElement === items[0];
                                 }}"""
@@ -3738,11 +3912,30 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             nav_page.evaluate(
                                 f"""() => {{
                                     const dr = document.querySelector('{drawer_sel}');
-                                    const items = Array.from(dr.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                                    const items = Array.from(dr.querySelectorAll('a[href], button:not([disabled]):not([hidden]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'))
                                         .filter((el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden');
                                     return document.activeElement === items[items.length - 1];
                                 }}"""
                             )
+                            is True
+                        )
+                        # Close via inline button.drawer-close-btn -> restores trigger focus
+                        nav_page.locator(f"{drawer_sel} button.drawer-close-btn").click()
+                        assert (
+                            nav_page.evaluate(f"document.getElementById('{input_id}').checked")
+                            is False
+                        )
+                        assert (
+                            nav_page.evaluate(
+                                f"document.activeElement === document.querySelector('{trig_sel}')"
+                            )
+                            is True
+                        )
+
+                        # Reopen and close via Escape -> restores trigger focus
+                        nav_page.keyboard.press("Enter")
+                        assert (
+                            nav_page.evaluate(f"document.getElementById('{input_id}').checked")
                             is True
                         )
                         nav_page.keyboard.press("Escape")
@@ -3754,6 +3947,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             nav_page.evaluate(f"document.querySelector('{drawer_sel}').inert")
                             is True
                         )
+                        assert nav_page.evaluate("document.querySelector('.main').inert") is False
                         assert (
                             nav_page.evaluate(
                                 f"document.activeElement === document.querySelector('{trig_sel}')"
@@ -3761,7 +3955,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             is True
                         )
 
-                # Wide desktop (> 82em = 1400x900) leaves both drawers visible and non-inert
+                # Wide desktop (> 82em = 1400x900) leaves both drawers visible, non-inert, and landmark-clean
                 nav_page.set_viewport_size({"width": 1400, "height": 900})
                 nav_page.wait_for_timeout(50)
                 wide_drawers = nav_page.evaluate(
@@ -3771,17 +3965,112 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         return {
                             sdVis: getComputedStyle(sd).visibility,
                             sdInert: sd.inert,
+                            sdRole: sd.getAttribute('role'),
+                            sdModal: sd.getAttribute('aria-modal'),
+                            sdCloseHidden: sd.querySelector('button.drawer-close-btn').hidden,
                             tdVis: getComputedStyle(td).visibility,
-                            tdInert: td.inert
+                            tdInert: td.inert,
+                            tdRole: td.getAttribute('role'),
+                            tdModal: td.getAttribute('aria-modal'),
+                            tdCloseHidden: td.querySelector('button.drawer-close-btn').hidden,
+                            mainInert: document.querySelector('.main').inert
                         };
                     }"""
                 )
                 assert wide_drawers == {
                     "sdVis": "visible",
                     "sdInert": False,
+                    "sdRole": None,
+                    "sdModal": None,
+                    "sdCloseHidden": True,
                     "tdVis": "visible",
                     "tdInert": False,
+                    "tdRole": None,
+                    "tdModal": None,
+                    "tdCloseHidden": True,
+                    "mainInert": False,
                 }
+
+                # Deep CLI TOC anchor navigation on how-to/cli.html at 1280x800 and 320x640
+                nav_page.goto(
+                    f"http://127.0.0.1:{port}/how-to/cli.html",
+                    wait_until="load",
+                )
+                for cli_w, cli_h, cli_trig in (
+                    (1280, 800, ".toc-content-icon"),
+                    (320, 640, ".toc-header-icon"),
+                ):
+                    nav_page.set_viewport_size({"width": cli_w, "height": cli_h})
+                    nav_page.evaluate("globalThis.scrollTo({ top: 0, behavior: 'instant' })")
+                    nav_page.wait_for_timeout(60)
+                    nav_page.locator(cli_trig).click()
+                    assert nav_page.evaluate("document.getElementById('__toc').checked") is True
+                    deep_toc_link = nav_page.locator(
+                        '.toc-drawer .toc-tree a[href="#path-segment-validation-and-exit-codes"]'
+                    )
+                    deep_toc_link.focus()
+                    nav_page.keyboard.press("Enter")
+                    cli_heading_state = nav_page.evaluate(
+                        """() => {
+                            const sec = document.getElementById('path-segment-validation-and-exit-codes');
+                            const ae = document.activeElement;
+                            const r = ae ? ae.getBoundingClientRect() : null;
+                            const mh = document.querySelector('header.mobile-header');
+                            const mhBottom = mh && getComputedStyle(mh).display !== 'none'
+                                ? mh.getBoundingClientRect().bottom
+                                : 0;
+                            const cs = ae ? getComputedStyle(ae) : null;
+                            return {
+                                checked: document.getElementById('__toc').checked,
+                                mainInert: document.querySelector('.main').inert,
+                                contentInert: document.querySelector('.main > .content').inert,
+                                tocInert: document.querySelector('.toc-drawer').inert,
+                                hash: globalThis.location.hash,
+                                inSection: Boolean(sec && ae && sec.contains(ae)),
+                                tag: ae ? ae.tagName : '',
+                                tabindex: ae ? ae.getAttribute('tabindex') : null,
+                                focusVisible: Boolean(ae && ae.matches(':focus-visible')),
+                                outlineStyle: cs ? cs.outlineStyle : '',
+                                outlineWidth: cs ? cs.outlineWidth : '',
+                                inViewport: Boolean(
+                                    r && r.top >= mhBottom - 1 && r.bottom <= globalThis.innerHeight + 1
+                                ),
+                                scrollY: globalThis.scrollY
+                            };
+                        }"""
+                    )
+                    assert cli_heading_state["checked"] is False
+                    assert cli_heading_state["mainInert"] is False
+                    assert cli_heading_state["contentInert"] is False
+                    assert cli_heading_state["tocInert"] is True
+                    assert cli_heading_state["hash"] == "#path-segment-validation-and-exit-codes"
+                    assert cli_heading_state["inSection"] is True
+                    assert cli_heading_state["tag"] in {"H2", "H3", "H4"}
+                    assert cli_heading_state["tabindex"] == "-1"
+                    assert cli_heading_state["focusVisible"] is True
+                    assert cli_heading_state["outlineStyle"] == "solid"
+                    assert cli_heading_state["outlineWidth"] == "2px"
+                    assert cli_heading_state["inViewport"] is True, (
+                        f"Destination heading off-screen at {cli_w}x{cli_h}: {cli_heading_state}"
+                    )
+                    assert cli_heading_state["scrollY"] > 1000
+
+                    # Next Tab stays inside #path-segment-validation-and-exit-codes without resetting to page top
+                    nav_page.keyboard.press("Tab")
+                    next_tab_cli = nav_page.evaluate(
+                        """() => {
+                            const sec = document.getElementById('path-segment-validation-and-exit-codes');
+                            const ae = document.activeElement;
+                            return {
+                                inTargetSection: Boolean(sec && ae && sec.contains(ae)),
+                                scrollY: globalThis.scrollY
+                            };
+                        }"""
+                    )
+                    assert next_tab_cli["inTargetSection"] is True, (
+                        f"Next Tab left #path-segment-validation-and-exit-codes at {cli_w}x{cli_h}: {next_tab_cli}"
+                    )
+                    assert next_tab_cli["scrollY"] > 1000
 
                 # 5c. py-modindex.html: .no-toc triggers skipped & 5 img.toggler controls
                 nav_page.set_viewport_size({"width": 1280, "height": 900})
