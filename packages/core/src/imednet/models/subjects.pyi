@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidatorFunctionWrapHandler, field_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -116,9 +116,11 @@ class Subject(ImednetBaseModel):
         last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
-    @field_validator("subject_status", mode="before")
+    @field_validator("subject_status", mode="wrap")
     @classmethod
-    def _validate_subject_status(cls, value: Any) -> SubjectStatus | str | None: ...
+    def _validate_subject_status(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> SubjectStatus | str | None: ...
     @property
     def is_deleted(self) -> bool: ...
     @property

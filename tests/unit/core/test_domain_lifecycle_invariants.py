@@ -286,28 +286,56 @@ def test_non_string_status_inputs_across_enums_normalizers_and_models(
 
 
 @pytest.mark.parametrize(
-    ("model_cls", "payload_key", "attr_name", "token_text", "expected_member"),
+    ("model_cls", "payload_key", "attr_name", "token_text", "expected_value"),
     [
         (
             Site,
             "siteEnrollmentStatus",
             "site_enrollment_status",
-            "enrollment_open",
+            "Enrollment Open",
             SiteEnrollmentStatus.ENROLLMENT_OPEN,
         ),
         (
             Subject,
             "subjectStatus",
             "subject_status",
-            "screen failure",
+            "Screen Failed",
             SubjectStatus.SCREEN_FAILED,
         ),
         (
             Record,
             "recordStatus",
             "record_status",
-            "record-complete",
+            "Record Complete",
             RecordStatus.RECORD_COMPLETE,
+        ),
+        (
+            RecordRevision,
+            "recordStatus",
+            "record_status",
+            "Record Complete",
+            RecordStatus.RECORD_COMPLETE,
+        ),
+        (
+            Site,
+            "siteEnrollmentStatus",
+            "site_enrollment_status",
+            "enrollment_open",
+            "enrollment_open",
+        ),
+        (
+            Subject,
+            "subjectStatus",
+            "subject_status",
+            "screen failure",
+            "screen failure",
+        ),
+        (
+            Record,
+            "recordStatus",
+            "record_status",
+            "record-complete",
+            "record-complete",
         ),
     ],
 )
@@ -316,13 +344,152 @@ def test_non_string_stringable_objects_coerce_in_field_validators(
     payload_key: str,
     attr_name: str,
     token_text: str,
-    expected_member: Enum,
+    expected_value: Any,
 ) -> None:
-    """Verify field validators coerce stringable non-str inputs into canonical enum members."""
+    """Verify field validators match exact enum .value and preserve non-matching tokens verbatim."""
     instance = model_cls.model_validate(
         {"studyKey": "S1", payload_key: _StringableToken(token_text)}
     )
-    assert getattr(instance, attr_name) is expected_member
+    actual = getattr(instance, attr_name)
+    if isinstance(expected_value, Enum):
+        assert actual is expected_value
+    else:
+        assert type(actual) is str
+        assert actual == expected_value
+
+
+def test_verbatim_status_deserialization_and_cli_emit_json_preservation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify verbatim status strings survive model_dump and CLI emit_json across all models."""
+    import json
+
+    from imednet.cli.utils.output import emit_json
+    from imednet.utils.record_filter_eval import compile_record_predicate
+
+    rec_complete = Record.model_validate(
+        {"studyKey": "S1", "recordId": 1, "recordStatus": "COMPLETE", "deleted": False}
+    )
+    rec_incomplete = Record.model_validate(
+        {"studyKey": "S1", "recordId": 2, "recordStatus": "RECORD_INCOMPLETE", "deleted": False}
+    )
+    rec_deleted_str = Record.model_validate(
+        {"studyKey": "S1", "recordId": 3, "recordStatus": "deleted", "deleted": False}
+    )
+    rev_incomplete = RecordRevision.model_validate(
+        {
+            "studyKey": "S1",
+            "recordId": 2,
+            "recordRevision": 1,
+            "dataRevision": 1,
+            "recordStatus": "RECORD_INCOMPLETE",
+        }
+    )
+    subj_screen_failure = Subject.model_validate(
+        {"studyKey": "S1", "subjectKey": "SUBJ-1", "subjectStatus": "Screen Failure"}
+    )
+    site_open = Site.model_validate(
+        {"studyKey": "S1", "siteId": 10, "siteEnrollmentStatus": "ENROLLMENT_OPEN"}
+    )
+
+    assert type(rec_complete.record_status) is str
+    assert rec_complete.model_dump(mode="json", by_alias=True)["recordStatus"] == "COMPLETE"
+    assert (
+        rec_incomplete.model_dump(mode="json", by_alias=True)["recordStatus"] == "RECORD_INCOMPLETE"
+    )
+    assert rec_deleted_str.model_dump(mode="json", by_alias=True)["recordStatus"] == "deleted"
+    assert (
+        rev_incomplete.model_dump(mode="json", by_alias=True)["recordStatus"] == "RECORD_INCOMPLETE"
+    )
+    assert (
+        subj_screen_failure.model_dump(mode="json", by_alias=True)["subjectStatus"]
+        == "Screen Failure"
+    )
+    assert (
+        site_open.model_dump(mode="json", by_alias=True)["siteEnrollmentStatus"]
+        == "ENROLLMENT_OPEN"
+    )
+
+    assert compile_record_predicate(extra_filters={"filter": "recordStatus==COMPLETE"}).matches(
+        rec_complete
+    )
+
+    emit_json(
+        [
+            rec_complete,
+            rec_incomplete,
+            rec_deleted_str,
+            rev_incomplete,
+            subj_screen_failure,
+            site_open,
+        ],
+        "mixed",
+    )
+    emitted = json.loads(capsys.readouterr().out)["items"]
+    assert emitted[0]["recordStatus"] == "COMPLETE"
+    assert emitted[1]["recordStatus"] == "RECORD_INCOMPLETE"
+    assert emitted[2]["recordStatus"] == "deleted"
+    assert emitted[3]["recordStatus"] == "RECORD_INCOMPLETE"
+    assert emitted[4]["subjectStatus"] == "Screen Failure"
+    assert emitted[5]["siteEnrollmentStatus"] == "ENROLLMENT_OPEN"
+
+
+def test_explicit_deleted_false_overrides_deleted_status_strings() -> None:
+    """Entities with deleted=False and status 'deleted' report is_deleted=False and allow transitions."""
+    from imednet.utils.record_filter_eval import compile_record_predicate
+
+    rec = Record.model_validate(
+        {"studyKey": "S1", "recordId": 101, "deleted": False, "recordStatus": "deleted"}
+    )
+    assert rec.deleted is False
+    assert rec.record_status == "deleted"
+    assert rec.is_deleted is False
+    assert compile_record_predicate(extra_filters={"filter": "deleted==false"}).matches(rec) is True
+    assert rec.can_transition_to(RecordStatus.RECORD_COMPLETE) is True
+    rec.transition_to(RecordStatus.RECORD_COMPLETE)
+    assert rec.record_status is RecordStatus.RECORD_COMPLETE
+    assert rec.deleted is False
+
+    rec_setattr = Record.model_validate(
+        {"studyKey": "S1", "recordId": 102, "deleted": False, "recordStatus": "deleted"}
+    )
+    rec_setattr.record_status = "Record Incomplete"
+    assert rec_setattr.record_status is RecordStatus.RECORD_INCOMPLETE
+    assert rec_setattr.is_deleted is False
+
+    subj = Subject.model_validate(
+        {"studyKey": "S1", "subjectKey": "SUBJ-101", "deleted": False, "subjectStatus": "deleted"}
+    )
+    assert subj.deleted is False
+    assert subj.subject_status == "deleted"
+    assert subj.is_deleted is False
+    assert subj.can_transition_to(SubjectStatus.ACTIVE) is True
+    subj.transition_to(SubjectStatus.ACTIVE)
+    assert subj.subject_status is SubjectStatus.ACTIVE
+    assert subj.deleted is False
+
+    subj_setattr = Subject.model_validate(
+        {"studyKey": "S1", "subjectKey": "SUBJ-102", "deleted": False, "subjectStatus": "deleted"}
+    )
+    subj_setattr.subject_status = "Enrolled"
+    assert subj_setattr.subject_status is SubjectStatus.ENROLLED
+    assert subj_setattr.is_deleted is False
+
+    rec_upper = Record.model_validate(
+        {"studyKey": "S1", "recordId": 103, "deleted": False, "recordStatus": "DELETED"}
+    )
+    assert rec_upper.record_status is RecordStatus.DELETED
+    assert rec_upper.is_deleted is False
+    rec_upper.transition_to(RecordStatus.COMPLETE)
+    assert rec_upper.record_status is RecordStatus.COMPLETE
+
+    subj_upper = Subject.model_validate(
+        {"studyKey": "S1", "subjectKey": "SUBJ-103", "deleted": False, "subjectStatus": "DELETED"}
+    )
+    assert subj_upper.subject_status is SubjectStatus.DELETED
+    assert subj_upper.is_deleted is False
+    subj_upper.transition_to(SubjectStatus.COMPLETED)
+    assert subj_upper.subject_status is SubjectStatus.COMPLETED
 
 
 @pytest.mark.parametrize(

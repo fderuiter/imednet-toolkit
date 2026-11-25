@@ -496,7 +496,11 @@ def test_record_batch_validation_call_counts_and_subclass_validator_order(monkey
             2026, 5, 13, 14, 6, 50, 612000, tzinfo=datetime.UTC
         )
         rec = Record.from_json({"recordId": 1, "recordStatus": "record_complete", "deleted": False})
-        assert rec.record_status == RecordStatus.RECORD_COMPLETE
+        assert rec.record_status == "record_complete"
+        canonical_rec = Record.from_json(
+            {"recordId": 2, "recordStatus": "Record Complete", "deleted": False}
+        )
+        assert canonical_rec.record_status is RecordStatus.RECORD_COMPLETE
         job = JobStatus.from_json(
             {"batchId": "B-1", "progress": "80", "total_records": 10, "successful_records": 8}
         )

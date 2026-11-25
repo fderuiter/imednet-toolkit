@@ -713,17 +713,17 @@ def test_record_mapper_cached_matches_uncached_across_extra_filters_record_data_
         query_matrix: list[dict[str, Any]] = [
             {"extra_filters": {"subject_key": "SUBJ-01"}},
             {"extra_filters": {"subjectKey": ["SUBJ-01", "SUBJ-03"]}},
-            {"extra_filters": {"formId": [10, 20], "site_id": 1}},
+            {"extra_filters": {"formId": [10, 20]}},
+            {"extra_filters": {"formId": ["10"]}},
             {"extra_filters": {"record_status": "Record Complete", "site_id": 1}},
             {"extra_filters": {"date_modified": (">=", "2026-01-12T10:00:00Z")}},
             {"extra_filters": {"filter": "subjectKey==SUBJ-02,subjectKey==SUBJ-03"}},
             {"record_data_filter": "AGE>=40;COHORT==Arm-Alpha"},
-            {"record_data_filter": "age>=40;cohort==Arm-Alpha"},
             {"record_data_filter": "AETERM=~headache,AETERM=~nausea"},
             {"record_data_filter": "none", "extra_filters": {"form_key": "DEMOG"}},
             {
                 "visit_key": "100",
-                "extra_filters": {"formId": [10, 20], "recordId": ("!=", 1)},
+                "extra_filters": {"formId": "20", "recordId": ("!=", 1)},
                 "record_data_filter": "AGE>50",
             },
         ]
@@ -738,11 +738,31 @@ def test_record_mapper_cached_matches_uncached_across_extra_filters_record_data_
                 r.record_data for r in uncached_items
             ], f"record_data mismatch for {kwargs}"
 
-        # Invalid filter syntax or unsupported attributes raise ValueError/ConfigurationError identically
+        # String numeric formId=["10"] matches cached Record(form_id=10)
+        assert [
+            r.record_id for r in cached._iter_records("STUDY-MAP", extra_filters={"formId": ["10"]})
+        ] == [1, 2]
+
+        # Cached RecordMapper enforces exact case-sensitive recordDataFilter keys
+        assert (
+            list(cached._iter_records("STUDY-MAP", record_data_filter="age>=40;cohort==Arm-Alpha"))
+            == []
+        )
+
+        # Invalid filter syntax, mixed connectors on formId, invalid formId items, or unsupported attributes raise ValueError
         for bad_kwargs in (
             {"record_data_filter": "AGE invalid syntax"},
             {"extra_filters": {"subject_key": ("=~", "SUBJ")}},
             {"extra_filters": {"subjectKey": ["SUBJ-01", "SUBJ-03"], "formId": [10, 20]}},
+            {"extra_filters": {"formId": [10, 20], "site_id": 1}},
+            {
+                "visit_key": "100",
+                "extra_filters": {"formId": [10, 20], "recordId": ("!=", 1)},
+                "record_data_filter": "AGE>50",
+            },
+            {"extra_filters": {"formId": [10, "not-an-int"]}},
+            {"extra_filters": {"formId": [10, True]}},
+            {"extra_filters": {"formId": [10, None]}},
             {"extra_filters": {"unknownAttribute": "value"}},
             {"extra_filters": {"filter": "unknownAttr==1"}},
         ):
@@ -783,6 +803,164 @@ def test_record_mapper_cached_matches_uncached_across_extra_filters_record_data_
                 == [r.record_id for r in uncached_desc]
                 == [3, 2, 1]
             )
+
+
+def test_cached_loader_omits_revision_queries_preserves_verbatim_status_and_validates_strict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CachedRecordsLoader executes zero revision lookups, stores verbatim status, and validates in strict mode."""
+    from imednet.core.context import strict_mode_context
+
+    records_state: list[dict[str, Any]] = [
+        {
+            "studyKey": "STUDY-STRICT",
+            "recordId": 101,
+            "formId": 10,
+            "formKey": "DEMOG",
+            "visitId": 100,
+            "siteId": 1,
+            "subjectKey": "SUBJ-01",
+            "recordStatus": "COMPLETE",
+            "deleted": False,
+            "dateCreated": "2026-01-10T09:00:00Z",
+            "dateModified": "2026-01-10T10:00:00Z",
+            "recordData": {"AGE": 45},
+        },
+        {
+            "studyKey": "STUDY-STRICT",
+            "recordId": 102,
+            "formId": 20,
+            "formKey": "AE",
+            "visitId": 100,
+            "siteId": 1,
+            "subjectKey": "SUBJ-01",
+            "recordStatus": "RECORD_INCOMPLETE",
+            "deleted": False,
+            "dateCreated": "2026-01-11T09:00:00Z",
+            "dateModified": "2026-01-11T10:00:00Z",
+            "recordData": {"AETERM": "Headache"},
+        },
+    ]
+    base_transport = _build_env_transport(study_key="STUDY-STRICT", records_ref=records_state)
+
+    def _strict_rest_handler(request: httpx.Request) -> httpx.Response:
+        resp = base_transport.handle_request(request)
+        if request.url.params.get("recordDataFilter") == "none":
+            body = json.loads(resp.content)
+            for item in body.get("data", []):
+                if item.get("recordData") is None:
+                    item["recordData"] = {}
+            return httpx.Response(resp.status_code, json=body, request=request)
+        return resp
+
+    transport = httpx.MockTransport(_strict_rest_handler)
+    executed_sql: list[str] = []
+    real_get_conn = cached_loader_mod.get_sqlite_connection
+
+    def _traced_conn(db_path: Path) -> Any:
+        conn = real_get_conn(db_path)
+        conn.set_trace_callback(executed_sql.append)
+        return conn
+
+    monkeypatch.setattr(cached_loader_mod, "get_sqlite_connection", _traced_conn)
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "1")
+
+    with (
+        strict_mode_context(True),
+        ImednetSDK(
+            api_key="k",
+            security_key="s",
+            base_url="https://edc.prod.imednetapi.com",
+            transport=transport,
+        ) as sdk,
+    ):
+        loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+        loader.sync_records("STUDY-STRICT")
+
+        # Trigger incremental sync update path to exercise _get_local_record_metadata and _is_projected_record_updated
+        records_state[0]["dateModified"] = "2026-01-12T10:00:00Z"
+        records_state[0]["recordData"] = {"AGE": 46}
+        loader.sync_records("STUDY-STRICT")
+
+        assert not any("$.revision" in stmt or "revision" in stmt.lower() for stmt in executed_sql)
+
+        with get_sqlite_connection(loader.db_path) as conn:
+            rows = conn.execute(
+                "SELECT record_id, payload FROM record_cache WHERE study_key = ? ORDER BY record_id",
+                ("STUDY-STRICT",),
+            ).fetchall()
+        assert len(rows) == 2
+        assert json.loads(rows[0][1])["recordStatus"] == "COMPLETE"
+        assert json.loads(rows[1][1])["recordStatus"] == "RECORD_INCOMPLETE"
+        assert "revision" not in json.loads(rows[0][1])
+
+        cached_records = loader.get_cached_records("STUDY-STRICT")
+        streamed_records = list(loader.iter_cached_records("STUDY-STRICT"))
+        assert [r.record_status for r in cached_records] == ["COMPLETE", "RECORD_INCOMPLETE"]
+        assert [r.record_status for r in streamed_records] == ["COMPLETE", "RECORD_INCOMPLETE"]
+        assert cached_records[0].record_data == {"AGE": 46}
+
+        # Verify _is_projected_record_updated never touches projected.revision
+        class _NoRevisionProjection:
+            date_modified = "2026-01-12T10:00:00Z"
+            record_status = "COMPLETE"
+            form_key = "DEMOG"
+            last_updated = None
+
+            @property
+            def revision(self) -> int:
+                raise AssertionError("projected.revision must not be accessed")
+
+        meta = cached_loader_mod._LocalRecordMeta(
+            date_modified="2026-01-12T10:00:00Z",
+            form_key="DEMOG",
+            record_status="COMPLETE",
+            last_updated=None,
+        )
+        assert (
+            cached_loader_mod._is_projected_record_updated(
+                _NoRevisionProjection(),  # type: ignore[arg-type]
+                meta,
+            )
+            is False
+        )
+
+        # Verify all 20 documented Record attributes validate cleanly under strict mode, while 'revision' is rejected
+        full_20_attr_payload: dict[str, Any] = {
+            "studyKey": "STUDY-STRICT",
+            "intervalId": 1,
+            "formId": 10,
+            "formKey": "DEMOG",
+            "siteId": 1,
+            "recordId": 201,
+            "recordOid": "REC-201",
+            "recordType": "SUBJECT",
+            "recordStatus": "COMPLETE",
+            "deleted": False,
+            "dateCreated": "2026-01-10T09:00:00Z",
+            "dateModified": "2026-01-10T10:00:00Z",
+            "subjectId": 500,
+            "subjectOid": "SUBJ-OID-1",
+            "subjectKey": "SUBJ-01",
+            "visitId": 100,
+            "parentRecordId": None,
+            "recordData": {"AGE": 45},
+            "lastUpdated": "2026-01-10T10:00:00Z",
+            "keywords": [
+                {
+                    "keywordName": "Tag",
+                    "keywordKey": "TAG",
+                    "keywordId": 1,
+                    "dateAdded": "2026-01-10T10:00:00Z",
+                }
+            ],
+        }
+        assert len(full_20_attr_payload) == 20
+        validated_full = Record.from_json(full_20_attr_payload)
+        assert validated_full.record_status == "COMPLETE"
+        with pytest.raises(Exception, match="revision"):
+            Record.from_json({**full_20_attr_payload, "revision": 2})
 
 
 # ---------------------------------------------------------------------------

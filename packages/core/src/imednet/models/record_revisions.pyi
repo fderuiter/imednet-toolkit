@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidatorFunctionWrapHandler, field_validator, model_validator
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.records import RecordStatus
@@ -81,9 +81,11 @@ class RecordRevision(ImednetBaseModel):
     @model_validator(mode="before")
     @classmethod
     def _validate_bounds(cls, data: Any) -> Any: ...
-    @field_validator("record_status", mode="before")
+    @field_validator("record_status", mode="wrap")
     @classmethod
-    def _validate_record_status(cls, value: Any) -> RecordStatus | str | None: ...
+    def _validate_record_status(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> RecordStatus | str | None: ...
     def __setattr__(self, name: str, value: Any) -> None: ...
     def validate_follows(
         self, previous: RecordRevision, *, allow_partial: bool = False

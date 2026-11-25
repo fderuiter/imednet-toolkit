@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidatorFunctionWrapHandler, field_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -64,9 +64,11 @@ class Site(ImednetBaseModel):
         last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
-    @field_validator("site_enrollment_status", mode="before")
+    @field_validator("site_enrollment_status", mode="wrap")
     @classmethod
-    def _validate_site_enrollment_status(cls, value: Any) -> SiteEnrollmentStatus | str | None: ...
+    def _validate_site_enrollment_status(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> SiteEnrollmentStatus | str | None: ...
     @property
     def is_enrollment_open(self) -> bool: ...
     @property

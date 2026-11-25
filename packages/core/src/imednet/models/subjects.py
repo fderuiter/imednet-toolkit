@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidatorFunctionWrapHandler, field_validator
 
 from imednet.models._lifecycle import (
     apply_entity_transition,
@@ -137,11 +137,15 @@ class Subject(ImednetBaseModel):
     subject_status: SubjectStatus | str | None = Field(default=None, alias="subjectStatus")
     deleted: bool | None = Field(default=None, alias="deleted")
 
-    @field_validator("subject_status", mode="before")
+    @field_validator("subject_status", mode="wrap")
     @classmethod
-    def _validate_subject_status(cls, value: Any) -> SubjectStatus | str | None:
-        """Normalize known subject statuses and preserve custom study strings."""
-        return coerce_field_status(SubjectStatus, value)
+    def _validate_subject_status(
+        cls,
+        value: Any,
+        handler: ValidatorFunctionWrapHandler,
+    ) -> SubjectStatus | str | None:
+        """Preserve verbatim subject statuses unless matching an exact SubjectStatus value."""
+        return coerce_field_status(SubjectStatus, value, handler)
 
     @property
     def is_deleted(self) -> bool:
@@ -158,7 +162,7 @@ class Subject(ImednetBaseModel):
         return is_valid_subject_transition(
             self.subject_status,
             target_status,
-            deleted=self.is_deleted,
+            deleted=self.deleted,
         )
 
     def transition_to(self, target_status: SubjectStatus | str) -> SubjectStatus | str:
