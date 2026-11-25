@@ -1239,6 +1239,16 @@ def test_uat_engine_parallel_submissions_and_multipage_queries_single_subject():
             },
         )
 
+    baseline_query_items = [
+        {
+            "annotationId": 9999,
+            "studyKey": "STUDY1",
+            "subjectKey": "SUBJ-SHARED-1",
+            "recordId": 1001,
+            "variable": "V_1",
+            "status": "OPEN",
+        }
+    ]
     all_query_items = [
         {
             "annotationId": i + 1,
@@ -1250,7 +1260,9 @@ def test_uat_engine_parallel_submissions_and_multipage_queries_single_subject():
         }
         for i in range(1050)
     ]
-    # Place matching open queries on page 0 and page 2 (index > 1000) to exercise multi-page indexing
+    # Pre-existing open query on V_1 (annotationId=9999) remains open post-submission and must be excluded
+    all_query_items[1] = dict(baseline_query_items[0])
+    # Place newly opened matching queries on page 0 and page 2 (index > 1000) to exercise multi-page indexing
     all_query_items[5] = {
         "annotationId": 6,
         "studyKey": "STUDY1",
@@ -1272,9 +1284,12 @@ def test_uat_engine_parallel_submissions_and_multipage_queries_single_subject():
         query_requests.append(request)
         page = int(request.url.params.get("page", "0"))
         size = int(request.url.params.get("size", "100"))
+        with lock:
+            has_submitted = bool(seen_traces)
+        active_items = all_query_items if has_submitted else baseline_query_items
         start = page * size
-        chunk = all_query_items[start : start + size]
-        total_pages = (len(all_query_items) + size - 1) // size
+        chunk = active_items[start : start + size]
+        total_pages = max(1, (len(active_items) + size - 1) // size)
         return httpx.Response(
             200,
             json={
@@ -1283,7 +1298,7 @@ def test_uat_engine_parallel_submissions_and_multipage_queries_single_subject():
                     "currentPage": page,
                     "size": size,
                     "totalPages": total_pages,
-                    "totalElements": len(all_query_items),
+                    "totalElements": len(active_items),
                 },
             },
         )
@@ -1359,9 +1374,12 @@ def test_uat_engine_parallel_submissions_and_multipage_queries_single_subject():
 
     assert max_in_flight >= 2
     assert seen_traces == ["ctx-uat-42"] * 6
-    # 1,050 queries at PAGE_SIZE=500 -> exactly 3 GET /queries requests, all scoped to SUBJ-SHARED-1
-    assert len(query_requests) == 3
-    for page_idx, req in enumerate(query_requests):
+    # 1 baseline GET /queries snapshot + 3 post-submission paginated GET /queries requests (1,050 items at size=500)
+    assert len(query_requests) == 4
+    assert query_requests[0].url.params["page"] == "0"
+    assert query_requests[0].url.params["size"] == "500"
+    assert "subjectKey==SUBJ-SHARED-1" in query_requests[0].url.params["filter"]
+    for page_idx, req in enumerate(query_requests[1:]):
         assert req.url.params["size"] == "500"
         assert req.url.params["page"] == str(page_idx)
         assert "subjectKey==SUBJ-SHARED-1" in req.url.params["filter"]
@@ -1476,13 +1494,14 @@ def test_uat_engine_mixed_sync_and_job_soft_acceptances_and_zero_soft_skip():
 
 
 def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
-    """_OpenQueryIndex matches wildcard Queries missing recordId/variable/subjectKey without cross-matching separate Queries."""
+    """_OpenQueryIndex rejects None-wildcard Queries on constrained rules while matching omitted caller dimensions."""
     from imednet.models.queries import Query
     from imednet.spi.models import Job, JobStatus
+    from imednet_workflows.uat.engine import _OpenQueryIndex
 
     rules = [
         {
-            "Name": "WildcardRecordId",
+            "Name": "MissingQueryRecordIdMustFail",
             "Status": "Active",
             "Form": "F1",
             "Variable": "VAR_NO_REC",
@@ -1491,7 +1510,7 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
             "Severity": "warning",
         },
         {
-            "Name": "WildcardVariable",
+            "Name": "MissingQueryVariableMustFail",
             "Status": "Active",
             "Form": "F1",
             "Variable": "VAR_ANY",
@@ -1500,7 +1519,7 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
             "Severity": "warning",
         },
         {
-            "Name": "WildcardSubjectKey",
+            "Name": "MissingQuerySubjectKeyMustFail",
             "Status": "Active",
             "Form": "F1",
             "Variable": "VAR_NO_SUBJ",
@@ -1517,6 +1536,15 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
             "Value": "5",
             "Severity": "warning",
         },
+        {
+            "Name": "UnconstrainedCallerRecordIdPasses",
+            "Status": "Active",
+            "Form": "F1",
+            "Variable": "VAR_SYNC_NOREC",
+            "Operator": "<=",
+            "Value": "5",
+            "Severity": "warning",
+        },
     ]
     dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
     sdk = Mock()
@@ -1526,6 +1554,7 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
         Job(batch_id="b-2", state="PENDING"),
         Job(batch_id="b-3", state="PENDING"),
         Job(batch_id="b-4", state="PENDING"),
+        {},  # Synchronous response without recordId -> caller omits expected_record_ids
     ]
     rec_map = {"b-1": 701, "b-2": 702, "b-3": 703, "b-4": 704}
     sdk.get_job.side_effect = lambda _s, bid: JobStatus(
@@ -1535,7 +1564,6 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
         results=[{"recordId": rec_map[bid], "status": "SUCCESS"}],
     )
     sdk.get_queries.return_value = [
-        # Missing recordId (wildcard recordId)
         Query(
             study_key="STUDY1",
             subject_key="UAT-SUBJ-0",
@@ -1543,7 +1571,6 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
             variable="VAR_NO_REC",
             status="OPEN",
         ),
-        # Missing variable (wildcard variable)
         Query(
             study_key="STUDY1",
             subject_key="UAT-SUBJ-1",
@@ -1551,7 +1578,6 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
             variable=None,
             status="OPEN",
         ),
-        # Missing subjectKey (wildcard subjectKey)
         Query(
             study_key="STUDY1",
             subject_key=None,
@@ -1559,7 +1585,13 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
             variable="VAR_NO_SUBJ",
             status="OPEN",
         ),
-        # Two partial matches for CrossQueryMustNotMatch (record 704 has wrong var; right var has wrong record 999)
+        Query(
+            study_key="STUDY1",
+            subject_key=None,
+            record_id=None,
+            variable=None,
+            status="OPEN",
+        ),
         Query(
             study_key="STUDY1",
             subject_key="UAT-SUBJ-3",
@@ -1574,6 +1606,13 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
             variable="VAR_TARGET",
             status="OPEN",
         ),
+        Query(
+            study_key="STUDY1",
+            subject_key="UAT-SUBJ-4",
+            record_id=705,
+            variable="VAR_SYNC_NOREC",
+            status="OPEN",
+        ),
     ]
 
     engine = UATExecutionEngine(sdk, dd, poll_interval=0.01)
@@ -1582,11 +1621,24 @@ def test_uat_engine_wildcard_queries_and_no_cross_query_false_positives():
     assert sdk.get_queries.call_count == 1
     by_name = {r["rule_name"]: r["status"] for r in report.results}
     assert by_name == {
-        "WildcardRecordId": EditCheckResultStatus.PASS,
-        "WildcardVariable": EditCheckResultStatus.PASS,
-        "WildcardSubjectKey": EditCheckResultStatus.PASS,
+        "MissingQueryRecordIdMustFail": EditCheckResultStatus.FAIL,
+        "MissingQueryVariableMustFail": EditCheckResultStatus.FAIL,
+        "MissingQuerySubjectKeyMustFail": EditCheckResultStatus.FAIL,
         "CrossQueryMustNotMatch": EditCheckResultStatus.FAIL,
+        "UnconstrainedCallerRecordIdPasses": EditCheckResultStatus.PASS,
     }
+
+    # Direct _OpenQueryIndex checks: omitted rule_vars or subject_key probe _UNCONSTRAINED only
+    idx = _OpenQueryIndex.from_queries(
+        [
+            Query(
+                study_key="STUDY1", subject_key="SUB1", record_id=888, variable="V_X", status="OPEN"
+            )
+        ]
+    )
+    assert idx.matches(expected_record_ids={888}, rule_vars=set(), subject_key="SUB1") is True
+    assert idx.matches(expected_record_ids={888}, rule_vars={"V_X"}, subject_key="") is True
+    assert idx.matches(expected_record_ids={888}, rule_vars={"V_Y"}, subject_key="SUB1") is False
 
 
 def test_uat_engine_records_get_queries_errors_per_accepted_soft_rule():
@@ -1679,3 +1731,677 @@ def test_uat_engine_records_get_queries_errors_per_accepted_soft_rule():
         job_status=type("SyncRec", (), {"recordId": "801"})(),
     )
     assert direct_res["status"] == EditCheckResultStatus.PASS
+
+
+def test_uat_engine_simulation_transport_soft_rules_exclude_baseline_unattributed_and_dep_vars():
+    """Soft rules against SimulationTransport fail with Accepted (No Open Query) despite baseline, wildcard, and dep queries."""
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.simulation import SimulationState, create_simulation_transport
+
+    state = SimulationState()
+    # Tag SUB1 as UAT so UATExecutionEngine reuses SUB1 (which already has open queries 701 & 702)
+    state.subjects[0]["keywords"] = [{"keywordName": "UAT", "keywordKey": "UAT"}]
+    state.queries.extend(
+        [
+            {
+                "annotationId": 703,
+                "studyKey": "STUDY",
+                "subjectKey": "SUB1",
+                "recordId": None,
+                "variable": None,
+                "status": "OPEN",
+            },
+            {
+                "annotationId": 704,
+                "studyKey": "STUDY",
+                "subjectKey": None,
+                "recordId": None,
+                "variable": None,
+                "status": "OPEN",
+            },
+        ]
+    )
+
+    sim_transport = create_simulation_transport(state)
+    post_injected = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_injected
+        response = sim_transport.handle_request(request)
+        if request.method == "POST" and request.url.path.endswith("/records") and not post_injected:
+            post_injected = True
+            # Inject new post-submission open queries on (None, None, SUB1), (None, None, None),
+            # and on the dependency variable V_SEX for the newly created recordId 1001.
+            state.queries.extend(
+                [
+                    {
+                        "annotationId": 901,
+                        "studyKey": "STUDY",
+                        "subjectKey": "SUB1",
+                        "recordId": None,
+                        "variable": None,
+                        "status": "OPEN",
+                    },
+                    {
+                        "annotationId": 902,
+                        "studyKey": "STUDY",
+                        "subjectKey": None,
+                        "recordId": None,
+                        "variable": None,
+                        "status": "OPEN",
+                    },
+                    {
+                        "annotationId": 903,
+                        "studyKey": "STUDY",
+                        "subjectKey": "SUB1",
+                        "recordId": 1001,
+                        "variable": "V_SEX",
+                        "status": "OPEN",
+                    },
+                ]
+            )
+        return response
+
+    rules = [
+        {
+            "Name": "SoftWeightWithDep",
+            "Status": "Active",
+            "Form": "F_VS",
+            "Variable": "V_WEIGHT",
+            "Operator": ">=",
+            "Value": "50",
+            "Dependency Variable": "V_SEX",
+            "Dependency Value": "F",
+            "Check Type": "Query",
+        },
+        {
+            "Name": "SoftBpSubjectWildcard",
+            "Status": "Active",
+            "Form": "F_VS",
+            "Variable": "V_BP_SYS",
+            "Operator": "<=",
+            "Value": "140",
+            "Check Type": "Query",
+        },
+    ]
+    dd = DataDictionary(business_logic=rules, choices=[], forms=[], questions=[])
+    with ImednetSDK(
+        transport=httpx.MockTransport(handler),
+        simulation_mode=True,
+    ) as sdk:
+        report = UATExecutionEngine(sdk, dd, poll_interval=0.01).run_verification("STUDY")
+
+    assert report.passed_rules == 0
+    assert report.failed_rules == 2
+    for res in report.results:
+        assert res["status"] == EditCheckResultStatus.FAIL
+        assert res["actual_response"] == "Accepted (No Open Query)"
+
+
+def test_uat_engine_legacy_query_status_delegation_and_annotation_id_edges():
+    """_is_query_open delegates legacy comment threads to calculate_legacy_status."""
+    from imednet.models.queries import Query, QueryComment
+    from imednet.spi.models import QueryStatus, calculate_legacy_status
+    from imednet_workflows.uat.engine import _extract_query_annotation_id
+
+    comment_cases: list[tuple[list[dict[str, object]], bool]] = [
+        # Monitor Answered -> ANSWERED (non-open)
+        (
+            [
+                {"sequence": 1, "annotationStatus": "Open", "closed": False},
+                {"sequence": 2, "annotationStatus": "Monitor Answered", "closed": False},
+            ],
+            False,
+        ),
+        # Cancelled -> CANCELLED (non-open)
+        (
+            [
+                {"sequence": 1, "annotationStatus": "Open", "closed": False},
+                {"sequence": 2, "annotationStatus": "Cancelled", "closed": None},
+            ],
+            False,
+        ),
+        (
+            [
+                {"sequence": 1, "annotationStatus": "Open", "closed": False},
+                {"sequence": 2, "annotationStatus": "Cancelled", "closed": True},
+            ],
+            False,
+        ),
+        # Out-of-order list where sequence=2 Closed precedes sequence=1 Open -> CLOSED (non-open)
+        (
+            [
+                {"sequence": 2, "annotationStatus": "Closed", "closed": True},
+                {"sequence": 1, "annotationStatus": "Open", "closed": False},
+            ],
+            False,
+        ),
+        # Latest sequence=3 reopened -> OPEN
+        (
+            [
+                {"sequence": 2, "annotationStatus": "Closed", "closed": True},
+                {"sequence": 1, "annotationStatus": "Open", "closed": False},
+                {"sequence": 3, "annotationStatus": "Open", "closed": False},
+            ],
+            True,
+        ),
+    ]
+    for raw_comments, expected_bool in comment_cases:
+        dict_query = {"studyKey": "STUDY", "queryComments": raw_comments}
+        model_comments = [QueryComment.model_validate(c) for c in raw_comments]
+        model_query = Query.model_construct(
+            study_key="STUDY",
+            status=None,
+            query_comments=model_comments,
+        )
+        expected_open = calculate_legacy_status(model_comments) == QueryStatus.OPEN
+        assert expected_open is expected_bool
+        assert UATExecutionEngine._is_query_open(dict_query) is expected_bool  # noqa: SLF001
+        assert UATExecutionEngine._is_query_open(model_query) is expected_bool  # noqa: SLF001
+    assert UATExecutionEngine._is_query_open({"studyKey": "STUDY"}) is False  # noqa: SLF001
+
+    assert _extract_query_annotation_id({"annotationId": 701}) == 701
+    assert _extract_query_annotation_id({"annotation_id": "42"}) == 42
+    assert _extract_query_annotation_id({"annotationId": True}) is None
+    assert _extract_query_annotation_id({"annotationId": 0}) is None
+    assert _extract_query_annotation_id({"annotationId": "not-an-int"}) is None
+
+
+def test_uat_engine_tabular_rule_normalization_typed_scalars_and_companion_fields():
+    """generate_negative_test_case normalizes tabular rules and populates typed companion Required='Yes' fields."""
+    from imednet.datadict import Choice
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_TAB",
+                variables=[
+                    DDVariable(variableName="AGE_GTE", variableType="Integer", required="No"),
+                    DDVariable(variableName="AGE_GT", variableType="Integer", required="No"),
+                    DDVariable(variableName="AGE_LTE", variableType="Integer", required="No"),
+                    DDVariable(variableName="AGE_LT", variableType="Integer", required="No"),
+                    DDVariable(variableName="STATUS_EQ", variableType="Text", required="No"),
+                    DDVariable(variableName="STATUS_NE", variableType="Text", required="No"),
+                    DDVariable(variableName="REQ_TARGET", variableType="Text", required="Yes"),
+                    DDVariable(variableName="DEP_NO_VAL", variableType="Text", required="No"),
+                    DDVariable(variableName="DEP_FLAG", variableType="Yes/No", required="No"),
+                    DDVariable(variableName="REQ_INT", variableType="Integer", required="Yes"),
+                    DDVariable(variableName="REQ_FLT", variableType="Float", required="Yes"),
+                    DDVariable(variableName="REQ_BOOL", variableType="Boolean", required="Yes"),
+                    DDVariable(variableName="REQ_YN", variableType="Yes/No", required="Yes"),
+                    DDVariable(variableName="REQ_DATE", variableType="Date", required="Yes"),
+                    DDVariable(variableName="REQ_DT", variableType="DateTime", required="Yes"),
+                    DDVariable(variableName="REQ_TIME", variableType="Time", required="Yes"),
+                    DDVariable(variableName="REQ_CALC", variableType="Calculation", required="Yes"),
+                    DDVariable(
+                        variableName="REQ_CHOICE",
+                        variableType="Dropdown",
+                        required="Yes",
+                        choices=[Choice(choiceText="Option A", choiceValue="OPT_A")],
+                    ),
+                ],
+            )
+        ],
+        business_logic=[
+            {
+                "Name": "IntGte90",
+                "Status": "Active",
+                "Form": "F_TAB",
+                "Variable": "AGE_GTE",
+                "Operator": ">=",
+                "Value": "90",
+            },
+            {
+                "Name": "IntGt40",
+                "Status": "Active",
+                "Form": "F_TAB",
+                "Variable": "AGE_GT",
+                "Operator": ">",
+                "Value": "40",
+            },
+            {
+                "Name": "IntLte10",
+                "Status": "Active",
+                "Form": "F_TAB",
+                "Variable": "AGE_LTE",
+                "Operator": "<=",
+                "Value": "10",
+            },
+            {
+                "Name": "IntLt10",
+                "Status": "Active",
+                "Form": "F_TAB",
+                "Variable": "AGE_LT",
+                "Operator": "<",
+                "Value": "10",
+            },
+            {
+                "Name": "EqRule",
+                "Status": "Active",
+                "Form": "F_TAB",
+                "Variable": "STATUS_EQ",
+                "Operator": "==",
+                "Value": "ACTIVE",
+            },
+            {
+                "Name": "NeqRule",
+                "Status": "Active",
+                "Form": "F_TAB",
+                "Variable": "STATUS_NE",
+                "Operator": "!=",
+                "Value": "VOID",
+            },
+            {
+                "Name": "RequiredRule",
+                "Status": "Active",
+                "Form": "F_TAB",
+                "Variable": "REQ_TARGET",
+                "Operator": "Required",
+                "Value": "",
+            },
+            {
+                "Name": "DepMissingValRule",
+                "Status": "Active",
+                "Form": "F_TAB",
+                "Variable": "DEP_NO_VAL",
+                "Operator": ">=",
+                "Value": None,
+                "Dependency Variable": "DEP_FLAG",
+                "Dependency Value": "Yes",
+            },
+        ],
+    )
+
+    engine = UATExecutionEngine(Mock(), dd)
+    rules_by_name = {r["rule_name"]: r for r in engine._rules}  # noqa: SLF001
+
+    gte_data = engine.generate_negative_test_case(rules_by_name["IntGte90"])
+    assert gte_data["AGE_GTE"] == 89
+    assert isinstance(gte_data["AGE_GTE"], int) and not isinstance(gte_data["AGE_GTE"], bool)
+    assert isinstance(gte_data["REQ_INT"], int)
+    assert isinstance(gte_data["REQ_FLT"], float)
+    assert gte_data["REQ_BOOL"] is True
+    assert gte_data["REQ_YN"] == "Yes"
+    assert gte_data["REQ_DATE"] == "2026-01-01"
+    assert "T" in gte_data["REQ_DT"]
+    assert gte_data["REQ_TIME"] == "12:00:00"
+    assert isinstance(gte_data["REQ_CALC"], int)
+    assert gte_data["REQ_CHOICE"] == "OPT_A"
+
+    gt_data = engine.generate_negative_test_case(rules_by_name["IntGt40"])
+    assert gt_data["AGE_GT"] == 39
+    assert isinstance(gt_data["AGE_GT"], int)
+
+    lte_data = engine.generate_negative_test_case(rules_by_name["IntLte10"])
+    assert lte_data["AGE_LTE"] == 11
+
+    lt_data = engine.generate_negative_test_case(rules_by_name["IntLt10"])
+    assert lt_data["AGE_LT"] >= 10
+    assert isinstance(lt_data["AGE_LT"], int)
+
+    eq_data = engine.generate_negative_test_case(rules_by_name["EqRule"])
+    assert eq_data["STATUS_EQ"] != "ACTIVE"
+
+    neq_data = engine.generate_negative_test_case(rules_by_name["NeqRule"])
+    assert neq_data["STATUS_NE"] == "VOID"
+
+    req_data = engine.generate_negative_test_case(rules_by_name["RequiredRule"])
+    assert req_data["REQ_TARGET"] == ""
+    assert req_data["REQ_CHOICE"] == "OPT_A"
+
+    dep_data = engine.generate_negative_test_case(rules_by_name["DepMissingValRule"])
+    assert dep_data["DEP_FLAG"] == "Yes"
+    assert dep_data["DEP_NO_VAL"] == "Invalid_Value"
+
+
+def test_uat_engine_enrollment_form_rules_and_site_scoped_subject_isolation_with_simulation():
+    """Enrollment rules omit subjectKey/skip prerequisite subject; non-enrollment rules isolate UAT subjects by Site."""
+    import json
+
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.simulation import SimulationState, create_simulation_transport
+    from imednet.spi.errors import ServerError
+
+    state = SimulationState()
+    state.subjects[0]["keywords"] = [{"keywordName": "UAT", "keywordKey": "UAT"}]
+    state.sites.append(
+        {
+            "siteId": 104,
+            "studyKey": "STUDY",
+            "siteName": "South Site",
+            "siteEnrollmentStatus": "Enrollment Open",
+        }
+    )
+
+    sim_transport = create_simulation_transport(state)
+    posted_batches: list[list[dict]] = []
+
+    def enrollment_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            posted_batches.append(json.loads(request.content.decode("utf-8")))
+        resp = sim_transport.handle_request(request)
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            # Open a query on the newly enrolled subject SUBJ-1001 (recordId=1001)
+            state.queries.append(
+                {
+                    "annotationId": 8801,
+                    "studyKey": "STUDY",
+                    "subjectKey": "SUBJ-1001",
+                    "recordId": 1001,
+                    "variable": "V_AGE",
+                    "status": "OPEN",
+                }
+            )
+        return resp
+
+    # Part 1: Enrollment-only rule omits subjectKey, skips prerequisite subject, and matches job subjectKey
+    enrollment_dd = DataDictionary(
+        business_logic=[
+            {
+                "Name": "EnrollmentAgeSoft",
+                "Status": "Active",
+                "Form": "F_DM",
+                "Variable": "V_AGE",
+                "Operator": ">=",
+                "Value": "21",
+                "Check Type": "Query",
+            }
+        ],
+        choices=[],
+        forms=[],
+        questions=[],
+    )
+    with ImednetSDK(
+        transport=httpx.MockTransport(enrollment_handler),
+        simulation_mode=True,
+    ) as sdk:
+        enr_report = UATExecutionEngine(sdk, enrollment_dd, poll_interval=0.01).run_verification(
+            "STUDY",
+            site_name="South Site",
+        )
+
+    assert len(posted_batches) == 1
+    assert "subjectKey" not in posted_batches[0][0]
+    assert "intervalName" not in posted_batches[0][0]
+    assert posted_batches[0][0]["siteName"] == "South Site"
+    assert enr_report.passed_rules == 1
+    assert enr_report.results[0]["status"] == EditCheckResultStatus.PASS
+
+    # Part 2: Fresh state at South Site with SUB1 tagged UAT at SITE -> never reuses SUB1 from SITE
+    state2 = SimulationState()
+    state2.subjects[0]["keywords"] = [{"keywordName": "UAT", "keywordKey": "UAT"}]
+    state2.sites.append(
+        {
+            "siteId": 104,
+            "studyKey": "STUDY",
+            "siteName": "South Site",
+            "siteEnrollmentStatus": "Enrollment Open",
+        }
+    )
+    sim_transport2 = create_simulation_transport(state2)
+    south_posts: list[list[dict]] = []
+
+    def south_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            south_posts.append(json.loads(request.content.decode("utf-8")))
+        return sim_transport2.handle_request(request)
+
+    non_enr_dd = DataDictionary(
+        business_logic=[
+            {
+                "Name": "SouthSiteWeightSoft",
+                "Status": "Active",
+                "Form": "F_VS",
+                "Variable": "V_WEIGHT",
+                "Operator": ">=",
+                "Value": "50",
+                "Check Type": "Query",
+            }
+        ],
+        choices=[],
+        forms=[],
+        questions=[],
+    )
+    with ImednetSDK(
+        transport=httpx.MockTransport(south_handler),
+        simulation_mode=True,
+    ) as sdk2:
+        south_report = UATExecutionEngine(sdk2, non_enr_dd, poll_interval=0.01).run_verification(
+            "STUDY",
+            site_name="South Site",
+        )
+
+    assert len(south_posts) == 2  # 1 prerequisite enrollment at South Site + 1 F_VS submission
+    assert south_posts[0][0]["formKey"] == "F_DM"
+    assert south_posts[0][0]["siteName"] == "South Site"
+    assert "subjectKey" not in south_posts[0][0]
+    assert south_posts[1][0]["formKey"] == "F_VS"
+    assert south_posts[1][0]["subjectKey"] == "SUBJ-1001"
+    assert south_posts[1][0]["subjectKey"] != "SUB1"
+    assert south_report.failed_rules == 1
+
+    # Part 3: Baseline query snapshot error marks accepted soft rule as ERROR
+    err_sdk = Mock()
+    err_sdk.poll_jobs = None
+    err_sdk.get_subjects.return_value = [
+        {"subjectKey": "SUBJ-S", "siteName": "South Site", "keywords": ["UAT"]}
+    ]
+    err_sdk.create_record.return_value = {"recordId": 55}
+    err_sdk.get_queries.side_effect = ServerError("Baseline query HTTP 503", status_code=503)
+    err_report = UATExecutionEngine(err_sdk, non_enr_dd).run_verification(
+        "STUDY",
+        site_name="South Site",
+    )
+    assert err_report.results[0]["status"] == EditCheckResultStatus.ERROR
+    assert "503" in err_report.results[0]["actual_response"]
+
+
+def test_uat_engine_prerequisite_snapshot_types_job_extractors_and_batch_states():
+    """Cover snapshot prerequisite variable types, job extractors, and polled batch failure states."""
+    from types import SimpleNamespace
+
+    from imednet.datadict import DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.spi.models import Form as CoreForm
+    from imednet.spi.models import Site as CoreSite
+    from imednet.spi.models import Variable as CoreVariable
+    from imednet.spi.utils import JobPollSummary
+    from imednet_workflows.uat.inspector import StudySnapshot
+
+    snap = StudySnapshot(
+        study_key="STUDY",
+        forms=[
+            CoreForm(
+                form_id=1,
+                form_key="F_ENR",
+                form_name="Enrollment",
+                form_type="Subject",
+                subject_record_report=True,
+            )
+        ],
+        variables=[
+            CoreVariable(
+                variable_id=1,
+                variable_name="S_INT",
+                form_key="F_ENR",
+                variable_type="Integer",
+                required=True,
+            ),
+            CoreVariable(
+                variable_id=2,
+                variable_name="S_FLT",
+                form_key="F_ENR",
+                variable_type="Float",
+                required=True,
+            ),
+            CoreVariable(
+                variable_id=3,
+                variable_name="S_BOOL",
+                form_key="F_ENR",
+                variable_type="Boolean",
+                required=True,
+            ),
+            CoreVariable(
+                variable_id=4,
+                variable_name="S_DATE",
+                form_key="F_ENR",
+                variable_type="Date",
+                required=True,
+            ),
+            CoreVariable(
+                variable_id=5,
+                variable_name="S_DT",
+                form_key="F_ENR",
+                variable_type="DateTime",
+                required=True,
+            ),
+            CoreVariable(
+                variable_id=6,
+                variable_name="S_TIME",
+                form_key="F_ENR",
+                variable_type="Time",
+                required=True,
+            ),
+            CoreVariable(
+                variable_id=7,
+                variable_name="S_YN",
+                form_key="F_ENR",
+                variable_type="Yes/No",
+                required=True,
+            ),
+            CoreVariable(
+                variable_id=8,
+                variable_name="S_TXT",
+                form_key="F_ENR",
+                variable_type="Text",
+                required=True,
+            ),
+            CoreVariable(
+                variable_id=9,
+                variable_name="S_DEL",
+                form_key="F_ENR",
+                variable_type="Text",
+                required=True,
+                deleted=True,
+            ),
+            CoreVariable(
+                variable_id=10,
+                variable_name="S_OPT",
+                form_key="F_ENR",
+                variable_type="Text",
+                required=False,
+            ),
+        ],
+        intervals=[],
+        sites=[
+            CoreSite(
+                site_id=1,
+                study_key="STUDY",
+                site_name="SITE",
+                site_enrollment_status="Enrollment Open",
+            )
+        ],
+    )
+
+    raw_container = SimpleNamespace(
+        business_logic=[
+            {
+                "Name": "RawDictDepRule",
+                "Status": "Active",
+                "Form": "F_STD",
+                "Variable": "V_OUT",
+                "Operator": "==",
+                "Value": "OK",
+                "Dependency Variable": "V_DEP",
+                "Dependency Value": "1",
+            }
+        ]
+    )
+    engine = UATExecutionEngine(Mock(), raw_container)  # type: ignore[arg-type]
+    neg = engine.generate_negative_test_case(engine._rules[0])  # noqa: SLF001
+    assert neg["V_DEP"] == "1"
+    assert neg["V_OUT"] == "NOT_OK"
+
+    reg_data = engine._build_prerequisite_registration_data("F_ENR", snap)  # noqa: SLF001
+    assert reg_data == {
+        "S_INT": 18,
+        "S_FLT": 50.0,
+        "S_BOOL": True,
+        "S_DATE": "2026-01-01",
+        "S_DT": "2026-01-01T12:00:00+00:00",
+        "S_TIME": "12:00:00",
+        "S_YN": "Yes",
+        "S_TXT": "UAT",
+    }
+
+    # Job recordId & subjectKey extraction across nested mapping/object shapes
+    assert engine._extract_job_record_ids(None) == set()  # noqa: SLF001
+    assert engine._extract_job_record_ids({"results": {"records": [{"recordId": "44"}]}}) == {44}  # noqa: SLF001
+    assert engine._extract_job_record_ids({"record_id": 55}) == {55}  # noqa: SLF001
+    assert engine._extract_job_subject_key(None) is None  # noqa: SLF001
+    assert (
+        engine._extract_job_subject_key({"results": {"records": [{"subjectKey": "SUBJ-77"}]}})  # noqa: SLF001
+        == "SUBJ-77"
+    )
+    assert engine._extract_job_subject_key({"subject_key": "SUBJ-88"}) == "SUBJ-88"  # noqa: SLF001
+    assert (
+        engine._extract_job_subject_key(SimpleNamespace(results=None, subject_key="SUBJ-99"))  # noqa: SLF001
+        == "SUBJ-99"
+    )
+    assert engine._extract_rule_variables({"condition_variables": [" V_A ", ""]}) == {"V_A"}  # noqa: SLF001
+
+    # Polled batch classification for TIMEOUT, structural error, and missing batch result
+    from imednet_workflows.uat.engine import EditCheckVerificationReport
+
+    rep = EditCheckVerificationReport(study_key="STUDY")
+    summary = JobPollSummary(
+        study_key="STUDY",
+        elapsed_total=0.1,
+        results={
+            "b-timeout": SimpleNamespace(batch_id="b-timeout", state="TIMEOUT"),
+            "b-struct": SimpleNamespace(
+                batch_id="b-struct",
+                state="FAILED",
+                result_error="Form not found: F_MISSING",
+            ),
+        },
+        failures={"b-exc": RuntimeError("network drop")},
+    )
+    for bid, expected_substr in (
+        ("b-timeout", "timed out"),
+        ("b-struct", "Form not found"),
+        ("b-exc", "network drop"),
+        ("b-missing", "Missing poll status"),
+    ):
+        r_entry: dict[str, object] = {"expected_response": "Rejected"}
+        engine._classify_polled_batch(r_entry, bid, summary, rep)  # noqa: SLF001
+        assert r_entry["status"] == EditCheckResultStatus.ERROR
+        assert expected_substr in str(r_entry["actual_response"])
+
+    # Fallback enrollment form resolution from DataDictionary when snapshot has no enrollment form
+    dd_enr = DataDictionary(
+        forms=[DDForm(formKey="F_DD_ENR", formType="Enrollment")],
+    )
+    sdk_dd = Mock()
+    sdk_dd.poll_jobs = None
+    sdk_dd.get_job = Mock()
+    sdk_dd.get_subjects.side_effect = [
+        [],
+        [{"subjectKey": "SUBJ-DD-1", "siteName": "SITE", "keywords": []}],
+    ]
+    sdk_dd.create_record.return_value = {}
+    eng_dd = UATExecutionEngine(sdk_dd, dd_enr)
+    resolved_sk = eng_dd._ensure_prerequisite_subject(  # noqa: SLF001
+        "STUDY",
+        snapshot=None,
+        site_name="SITE",
+        interval=0.0,
+        timeout=1.0,
+    )
+    assert resolved_sk == "SUBJ-DD-1"

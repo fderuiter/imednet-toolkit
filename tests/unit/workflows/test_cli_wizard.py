@@ -2076,3 +2076,352 @@ def test_uat_snapshot_metadata_and_cli_json_preflight_and_state_envelopes(
     )
     assert reset_study_again.exit_code == 0
     assert json.loads(reset_study_again.stdout)["items"][0]["removed"] is False
+
+
+def test_uat_run_interactive_live_prompts_email_notify_with_simulation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Interactive live uat_run invokes prompt_email_notify, validates input, and runs against SimulationTransport."""
+    res = run_cli_command(
+        cli_app,
+        ["workflows", "uat", "run", "--simulation", "--interactive"],
+        # study=STUDY, count=1, site=SITE, forms=F_DM, invalid email -> valid email
+        stdin_input="STUDY\n1\nSITE\nF_DM\nnot-an-email\nqa@example.com\n",
+        capsys=capsys,
+    )
+    assert res.exit_code == 0, res.stderr
+    assert "Enter email notification" in res.stderr
+    assert "Invalid --email-notify value" in res.stderr
+    assert "Overall: PASS" in res.stdout
+
+
+def test_uat_run_json_failure_envelope_across_all_workflow_stages(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Headless uat run --format json emits _serialize_uat_run_result envelope for every failed UATRunResult stage."""
+    import json
+    from datetime import UTC, datetime
+
+    from imednet_workflows.uat import UATRunResult, UATWorkflowState
+
+    expected_keys = {
+        "studyKey",
+        "runId",
+        "state",
+        "stateHistory",
+        "failurePhase",
+        "dryRun",
+        "overallSuccess",
+        "formsTested",
+        "recordsGenerated",
+        "recordsSubmitted",
+        "jobsMonitored",
+        "validationReport",
+        "phaseDurations",
+        "errorMessage",
+    }
+
+    # 1. Returned failed UATRunResult across INSPECTING, BUILDING_SPEC, GENERATING, SUBMITTING, MONITORING
+    for stage in (
+        UATWorkflowState.INSPECTING,
+        UATWorkflowState.BUILDING_SPEC,
+        UATWorkflowState.GENERATING,
+        UATWorkflowState.SUBMITTING,
+        UATWorkflowState.MONITORING,
+    ):
+        now = datetime.now(UTC)
+        failed_run = UATRunResult(
+            study_key="STUDY",
+            run_id=f"run-{stage.value.lower()}",
+            started_at=now,
+            completed_at=now,
+            state=UATWorkflowState.FAILED,
+            state_history=[stage, UATWorkflowState.FAILED],
+            failure_phase=stage,
+            error_message=f"Failure during {stage.value} [variable=DOB] '1980-01-01'",
+            phase_durations={stage.value: 0.12},
+        )
+
+        class _StageFailingWorkflow:
+            def __init__(self, sdk, **kwargs):
+                self.last_result = failed_run
+
+            def run(self, **_kwargs):
+                return self.last_result
+
+        monkeypatch.setattr("imednet_workflows.uat.UATWorkflow", _StageFailingWorkflow)
+        res = run_cli_command(
+            cli_app,
+            ["workflows", "uat", "run", "STUDY", "--simulation", "--format", "json"],
+            capsys=capsys,
+        )
+        assert res.exit_code == 1, stage
+        assert res.stderr == ""
+        env = json.loads(res.stdout)
+        assert env["resource"] == "uat_run"
+        assert env["status"] == "failed"
+        assert len(env["items"]) == 1
+        item = env["items"][0]
+        assert expected_keys.issubset(item.keys())
+        assert item["studyKey"] == "STUDY"
+        assert item["state"] == "FAILED"
+        assert item["failurePhase"] == stage.value
+        assert item["stateHistory"] == [stage.value, "FAILED"]
+        assert item["overallSuccess"] is False
+        assert "1980-01-01" not in res.stdout
+
+    # 2. Raised exception with workflow.last_result populated also serializes via _serialize_uat_run_result
+    now = datetime.now(UTC)
+    raised_last = UATRunResult(
+        study_key="STUDY",
+        run_id="run-raised-submit",
+        started_at=now,
+        completed_at=now,
+        state=UATWorkflowState.FAILED,
+        state_history=[UATWorkflowState.SUBMITTING, UATWorkflowState.FAILED],
+        failure_phase=UATWorkflowState.SUBMITTING,
+        error_message="Batch submission failed",
+    )
+
+    class _RaisingWorkflow:
+        def __init__(self, sdk, **kwargs):
+            self.last_result = raised_last
+
+        def run(self, **_kwargs):
+            raise RuntimeError("Batch submission failed")
+
+    monkeypatch.setattr("imednet_workflows.uat.UATWorkflow", _RaisingWorkflow)
+    raised_res = run_cli_command(
+        cli_app,
+        ["workflows", "uat", "run", "STUDY", "--simulation", "--format", "json"],
+        capsys=capsys,
+    )
+    assert raised_res.exit_code == 1
+    assert raised_res.stderr == ""
+    raised_env = json.loads(raised_res.stdout)
+    assert raised_env["resource"] == "uat_run"
+    assert raised_env["status"] == "failed"
+    assert raised_env["items"][0]["runId"] == "run-raised-submit"
+    assert raised_env["items"][0]["failurePhase"] == "SUBMITTING"
+
+
+def test_uat_run_real_workflow_json_failures_and_spec_subject_count_override(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End-to-end CLI uat run --format json emits uat_run envelopes on real stage failures and honors --subject-count on --spec."""
+    import json
+
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.simulation import SimulationState, create_simulation_transport
+    from imednet_workflows.uat import (
+        RecordTestType,
+        UATFormSpec,
+        UATSpecification,
+        UATSubjectSpec,
+        UATVariableSpec,
+    )
+
+    monkeypatch.setenv("IMEDNET_API_KEY", "dummy")
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "dummy")
+
+    # 1. INSPECTING failure (HTTP 500 on GET /forms)
+    def inspect_fail_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"metadata": {"error": {"message": "Forms 500"}}})
+
+    monkeypatch.setattr(
+        "imednet.cli.utils.context.get_sdk",
+        lambda **_kw: ImednetSDK(
+            transport=httpx.MockTransport(inspect_fail_handler), simulation_mode=True
+        ),
+    )
+    ins_res = run_cli_command(
+        cli_app,
+        ["workflows", "uat", "run", "STUDY", "--format", "json"],
+        capsys=capsys,
+    )
+    assert ins_res.exit_code == 1
+    assert ins_res.stderr == ""
+    ins_env = json.loads(ins_res.stdout)
+    assert ins_env["resource"] == "uat_run"
+    assert ins_env["status"] == "failed"
+    assert ins_env["items"][0]["failurePhase"] == "INSPECTING"
+
+    # 2. GENERATING failure (spec with zero enabled forms)
+    empty_spec_path = tmp_path / "empty_spec.json"
+    empty_spec_path.write_text(
+        UATSpecification(
+            study_key="STUDY",
+            study_name="STUDY",
+            subject_specs=[UATSubjectSpec(site_name="SITE", subject_count=1)],
+            form_specs=[
+                UATFormSpec(
+                    form_key="F_DM",
+                    form_name="Demographics",
+                    form_type="Enrollment",
+                    test_type=RecordTestType.REGISTER_SUBJECT,
+                    enabled=False,
+                    subject_count=1,
+                    variables=[],
+                )
+            ],
+        ).model_dump_json(by_alias=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "imednet.cli.utils.context.get_sdk",
+        lambda **_kw: ImednetSDK(
+            transport=httpx.MockTransport(
+                create_simulation_transport(SimulationState()).handle_request
+            ),
+            simulation_mode=True,
+        ),
+    )
+    gen_res = run_cli_command(
+        cli_app,
+        ["workflows", "uat", "run", "STUDY", "--spec", str(empty_spec_path), "--format", "json"],
+        capsys=capsys,
+    )
+    assert gen_res.exit_code == 1
+    gen_env = json.loads(gen_res.stdout)
+    assert gen_env["resource"] == "uat_run"
+    assert gen_env["items"][0]["failurePhase"] == "GENERATING"
+
+    # 3. SUBMITTING failure (HTTP 400 on POST /records)
+    sub_sim = create_simulation_transport(SimulationState())
+
+    def submit_fail_handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST" and req.url.path.endswith("/records"):
+            return httpx.Response(400, json={"metadata": {"error": {"message": "Bad record"}}})
+        return sub_sim.handle_request(req)
+
+    monkeypatch.setattr(
+        "imednet.cli.utils.context.get_sdk",
+        lambda **_kw: ImednetSDK(
+            transport=httpx.MockTransport(submit_fail_handler), simulation_mode=True
+        ),
+    )
+    sub_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "STUDY",
+            "--form-key",
+            "F_DM",
+            "--subject-count",
+            "1",
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert sub_res.exit_code == 1
+    sub_env = json.loads(sub_res.stdout)
+    assert sub_env["resource"] == "uat_run"
+    assert sub_env["items"][0]["failurePhase"] == "SUBMITTING"
+
+    # 4. MONITORING failure (GET /jobs returns FAILED for non-registration batch)
+    mon_state = SimulationState()
+    mon_state.subjects[0]["keywords"] = [{"keywordName": "UAT", "keywordKey": "UAT"}]
+    mon_sim = create_simulation_transport(mon_state)
+
+    def monitor_fail_handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and "/jobs/" in req.url.path:
+            bid = req.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={"batchId": bid, "state": "FAILED", "failedRecords": 1},
+            )
+        return mon_sim.handle_request(req)
+
+    monkeypatch.setattr(
+        "imednet.cli.utils.context.get_sdk",
+        lambda **_kw: ImednetSDK(
+            transport=httpx.MockTransport(monitor_fail_handler), simulation_mode=True
+        ),
+    )
+    mon_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "STUDY",
+            "--form-key",
+            "F_AE",
+            "--subject-count",
+            "1",
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert mon_res.exit_code == 1
+    mon_env = json.loads(mon_res.stdout)
+    assert mon_env["resource"] == "uat_run"
+    assert mon_env["items"][0]["failurePhase"] == "MONITORING"
+
+    # 5. Saved --spec with --subject-count override generates & submits overridden count
+    saved_spec_path = tmp_path / "saved_dm_spec.json"
+    saved_spec_path.write_text(
+        UATSpecification(
+            study_key="STUDY",
+            study_name="STUDY",
+            subject_specs=[UATSubjectSpec(site_name="SITE", subject_count=1)],
+            form_specs=[
+                UATFormSpec(
+                    form_key="F_DM",
+                    form_name="Demographics",
+                    form_type="Enrollment",
+                    test_type=RecordTestType.REGISTER_SUBJECT,
+                    subject_count=1,
+                    variables=[
+                        UATVariableSpec(
+                            variable_name="V_AGE",
+                            variable_key="V_AGE",
+                            variable_type="Integer",
+                            form_key="F_DM",
+                        )
+                    ],
+                )
+            ],
+        ).model_dump_json(by_alias=True),
+        encoding="utf-8",
+    )
+    override_state = SimulationState()
+    monkeypatch.setattr(
+        "imednet.cli.utils.context.get_sdk",
+        lambda **_kw: ImednetSDK(
+            transport=httpx.MockTransport(
+                create_simulation_transport(override_state).handle_request
+            ),
+            simulation_mode=True,
+        ),
+    )
+    ov_res = run_cli_command(
+        cli_app,
+        [
+            "workflows",
+            "uat",
+            "run",
+            "STUDY",
+            "--spec",
+            str(saved_spec_path),
+            "--subject-count",
+            "3",
+            "--format",
+            "json",
+        ],
+        capsys=capsys,
+    )
+    assert ov_res.exit_code == 0, ov_res.stderr
+    ov_env = json.loads(ov_res.stdout)
+    assert ov_env["status"] == "complete"
+    assert ov_env["items"][0]["recordsGenerated"] == 3
+    assert ov_env["items"][0]["recordsSubmitted"] == 3

@@ -6,6 +6,7 @@ import contextvars
 import logging
 import re
 from collections.abc import Iterable, Mapping
+from collections.abc import Set as AbstractSet
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -22,7 +23,7 @@ from imednet.spi.errors import (
     ServerError,
 )
 from imednet.spi.facade import ImednetFacade
-from imednet.spi.models import QueryStatus, is_site_enrollment_eligible
+from imednet.spi.models import QueryStatus, calculate_legacy_status, is_site_enrollment_eligible
 from imednet.spi.utils import (
     JobFailedError,
     JobPoller,
@@ -38,13 +39,28 @@ from imednet.spi.validation import (
     extract_variable_constraints,
 )
 
-from .inspector import (
-    StudySchemaInspector,
-    StudySnapshot,
+from ._contracts import (
+    BOOL_TYPES,
+    CALC_TYPES,
+    DATE_TYPES,
+    DATETIME_TYPES,
+    FLOAT_TYPES,
+    INT_TYPES,
+    TIME_TYPES,
+    YES_NO_TYPES,
+    coerce_variable_scalar,
+    extract_schema_variable_type,
+    extract_subject_key,
     is_enrollment_form,
+    is_enrollment_form_key,
+    is_retired_variable_def,
     is_unscheduled_form,
+    iter_matching_uat_subject_keys,
+    normalize_tabular_rule_conditions,
+    normalize_variable_type,
 )
-from .submission import is_unconfigured_mock_method, subject_has_keyword
+from .inspector import StudySchemaInspector, StudySnapshot
+from .submission import is_unconfigured_mock_method
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +136,31 @@ def _is_mock_object(obj: Any) -> bool:
     return type(obj).__module__.startswith("unittest.mock")
 
 
+def _extract_query_annotation_id(query: Any) -> int | None:
+    """Extract a positive integer ``annotationId`` from a ``Query`` model or mapping."""
+    raw = (
+        (
+            query.get("annotation_id")
+            if query.get("annotation_id") is not None
+            else query.get("annotationId")
+        )
+        if isinstance(query, Mapping)
+        else (
+            getattr(query, "annotation_id", None)
+            if getattr(query, "annotation_id", None) is not None
+            else getattr(query, "annotationId", None)
+        )
+    )
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, str) and raw.strip().isdigit():
+        parsed = int(raw.strip())
+        return parsed if parsed > 0 else None
+    return None
+
+
 def _is_query_open(query: Any) -> bool:
     """Return True when ``query`` is in ``QueryStatus.OPEN`` state."""
     status_val = (
@@ -132,17 +173,18 @@ def _is_query_open(query: Any) -> bool:
     if status_val is not None and not _is_mock_object(status_val):
         return False
 
-    comments = (
-        (query.get("query_comments") or query.get("queryComments"))
-        if isinstance(query, Mapping)
-        else (getattr(query, "query_comments", None) or getattr(query, "queryComments", None))
-    )
+    if isinstance(query, Mapping):
+        comments = (
+            query.get("query_comments")
+            if query.get("query_comments") is not None
+            else query.get("queryComments")
+        )
+    else:
+        raw_qc = getattr(query, "query_comments", None)
+        comments = raw_qc if raw_qc is not None else getattr(query, "queryComments", None)
+
     if isinstance(comments, list):
-        if not comments:
-            return True
-        last = comments[-1]
-        closed = last.get("closed") if isinstance(last, Mapping) else getattr(last, "closed", None)
-        return closed is not True
+        return calculate_legacy_status(comments) == QueryStatus.OPEN
     return False
 
 
@@ -153,17 +195,30 @@ class _OpenQueryIndex:
     _entries: set[tuple[Any, Any, Any]] = field(default_factory=set)
 
     @classmethod
-    def from_queries(cls, queries: Iterable[Any]) -> _OpenQueryIndex:
+    def from_queries(
+        cls,
+        queries: Iterable[Any],
+        *,
+        exclude_annotation_ids: AbstractSet[int] | None = None,
+    ) -> _OpenQueryIndex:
         """Build an ``_OpenQueryIndex`` from an iterable of ``Query`` models or mappings."""
         entries: set[tuple[Any, Any, Any]] = set()
         for q in queries:
             if not _is_query_open(q):
                 continue
+            if exclude_annotation_ids:
+                ann_id = _extract_query_annotation_id(q)
+                if ann_id is not None and ann_id in exclude_annotation_ids:
+                    continue
 
             raw_rec_id = (
                 (q.get("record_id") if q.get("record_id") is not None else q.get("recordId"))
                 if isinstance(q, Mapping)
-                else (getattr(q, "record_id", None) or getattr(q, "recordId", None))
+                else (
+                    getattr(q, "record_id", None)
+                    if getattr(q, "record_id", None) is not None
+                    else getattr(q, "recordId", None)
+                )
             )
             if isinstance(raw_rec_id, str) and raw_rec_id.strip().isdigit():
                 raw_rec_id = int(raw_rec_id.strip())
@@ -175,14 +230,7 @@ class _OpenQueryIndex:
                 else None
             )
 
-            raw_subj = (
-                (q.get("subject_key") or q.get("subjectKey"))
-                if isinstance(q, Mapping)
-                else (getattr(q, "subject_key", None) or getattr(q, "subjectKey", None))
-            )
-            subj_key: str | None = (
-                raw_subj.strip() if isinstance(raw_subj, str) and raw_subj.strip() else None
-            )
+            subj_key = extract_subject_key(q)
 
             raw_var = q.get("variable") if isinstance(q, Mapping) else getattr(q, "variable", None)
             var_name: str | None = (
@@ -206,10 +254,10 @@ class _OpenQueryIndex:
         if not self._entries:
             return False
         r_probes: tuple[Any, ...] = (
-            (*expected_record_ids, None) if expected_record_ids else (_UNCONSTRAINED,)
+            tuple(expected_record_ids) if expected_record_ids else (_UNCONSTRAINED,)
         )
-        v_probes: tuple[Any, ...] = (*rule_vars, None) if rule_vars else (_UNCONSTRAINED,)
-        s_probes: tuple[Any, ...] = (subject_key, None) if subject_key else (_UNCONSTRAINED,)
+        v_probes: tuple[Any, ...] = tuple(rule_vars) if rule_vars else (_UNCONSTRAINED,)
+        s_probes: tuple[Any, ...] = (subject_key,) if subject_key else (_UNCONSTRAINED,)
         return any(
             (rk, vk, sk) in self._entries for rk in r_probes for vk in v_probes for sk in s_probes
         )
@@ -329,7 +377,10 @@ class UATExecutionEngine:
 
             check_type = row.get(
                 "CheckType",
-                row.get("check_type", row.get("Type", row.get("type", "Range"))),
+                row.get(
+                    "Check Type",
+                    row.get("check_type", row.get("Type", row.get("type", "Range"))),
+                ),
             )
             raw_sev = row.get("Severity", row.get("severity"))
             sev_norm = str(raw_sev or "").strip().lower()
@@ -340,22 +391,31 @@ class UATExecutionEngine:
                 else "error"
             )
             target_var = row.get("Variable", row.get("variable"))
-            dep_var_val = row.get("DependencyVariable", row.get("dependency_variable"))
+            dep_var_val = row.get(
+                "DependencyVariable",
+                row.get("Dependency Variable", row.get("dependency_variable")),
+            )
             cond_vars = [v for v in (target_var, dep_var_val) if isinstance(v, str) and v]
 
-            rule = {
-                "rule_name": row.get("Name", row.get("rule_name", "Unknown Rule")),
+            rule: dict[str, Any] = {
+                "rule_name": row.get("Name", row.get("name", row.get("rule_name", "Unknown Rule"))),
                 "form": row.get("Form", row.get("form", default_form or "UnknownForm")),
                 "variable": target_var,
                 "check_type": check_type,
                 "operator": row.get("Operator", row.get("operator", "==")),
-                "value": row.get("Value", row.get("value", "")),
+                "value": row.get("Value", row.get("value", None)),
                 "dependency_variable": dep_var_val,
-                "dependency_value": row.get("DependencyValue", row.get("dependency_value")),
+                "dependency_value": row.get(
+                    "DependencyValue",
+                    row.get("Dependency Value", row.get("dependency_value")),
+                ),
                 "condition_variables": cond_vars,
                 "severity": severity,
                 "raw": row,
             }
+            normalized_conds = normalize_tabular_rule_conditions(rule)
+            if normalized_conds:
+                rule["xml_conditions"] = normalized_conds
             rules.append(rule)
         return rules
 
@@ -364,26 +424,15 @@ class UATExecutionEngine:
         var_def = self._form_variables.get(form_key or "", {}).get(var_name)
         if var_def is None:
             return str(candidate)
-        vtype = (
-            (getattr(var_def, "variable_type", getattr(var_def, "variableType", None)) or "")
-            .strip()
-            .lower()
-        )
         if candidate == "":
             return ""
-        if vtype in {"int", "integer", "number"}:
-            try:
-                return int(float(candidate))
-            except (TypeError, ValueError):
-                return candidate
-        if vtype in {"float", "decimal", "slider"}:
-            try:
-                return float(candidate)
-            except (TypeError, ValueError):
-                return candidate
-        if vtype in {"bool", "boolean"} and isinstance(candidate, bool):
-            return candidate
-        return str(candidate)
+        vtype = extract_schema_variable_type(var_def)
+        constraints = extract_variable_constraints(var_def)
+        return coerce_variable_scalar(
+            vtype,
+            candidate,
+            has_choices=bool(constraints.choices),
+        )
 
     def _apply_xml_condition(
         self,
@@ -391,13 +440,17 @@ class UATExecutionEngine:
         form_key: str | None,
         data: dict[str, Any],
     ) -> None:
-        """Populate ``data`` so ``cond`` evaluates to True (triggering the XML edit check)."""
+        """Populate ``data`` so ``cond`` evaluates to True (triggering the edit check)."""
         var_def = self._form_variables.get(form_key or "", {}).get(cond.variable)
         constraints = extract_variable_constraints(var_def) if var_def is not None else None
         choices = constraints.choices if constraints is not None else []
 
         op = cond.operator
         want_match = cond.expected_truth
+
+        if op == "literal_invalid":
+            data[cond.variable] = str(cond.value or "Invalid_Test_Value")
+            return
 
         if cond.compare_variable:
             rhs_var = cond.compare_variable
@@ -439,7 +492,9 @@ class UATExecutionEngine:
         if (op == "==" and not want_match) or (op == "!=" and want_match):
             alt_choices = [c for c in choices if c != str(raw_val)]
             if alt_choices:
-                data[cond.variable] = alt_choices[0]
+                data[cond.variable] = self._format_typed_value(
+                    form_key, cond.variable, alt_choices[0]
+                )
             else:
                 try:
                     num_v = float(raw_val)
@@ -470,7 +525,9 @@ class UATExecutionEngine:
             else:
                 outside = [c for c in choices if c not in set(tokens)]
                 data[cond.variable] = (
-                    outside[0] if outside else f"NOT_{tokens[0] if tokens else 'IN'}"
+                    self._format_typed_value(form_key, cond.variable, outside[0])
+                    if outside
+                    else f"NOT_{tokens[0] if tokens else 'IN'}"
                 )
             return
 
@@ -488,34 +545,38 @@ class UATExecutionEngine:
         if not form_key or form_key not in self._form_variables:
             return
         for vname, var_def in self._form_variables[form_key].items():
-            if vname in data:
+            if vname in data or is_retired_variable_def(var_def):
                 continue
             constraints = extract_variable_constraints(var_def)
             if constraints.required_policy != "yes":
                 continue
+            vtype = extract_schema_variable_type(var_def)
             if constraints.choices:
-                data[vname] = constraints.choices[0]
-            else:
-                vtype = (
-                    (
-                        getattr(var_def, "variable_type", getattr(var_def, "variableType", None))
-                        or ""
-                    )
-                    .strip()
-                    .lower()
+                data[vname] = coerce_variable_scalar(
+                    vtype,
+                    constraints.choices[0],
+                    has_choices=True,
                 )
-                if vtype in {"int", "integer", "number"}:
+            else:
+                vnorm = normalize_variable_type(vtype)
+                if vnorm in INT_TYPES or vnorm in CALC_TYPES:
                     base = int(constraints.min_value) if constraints.min_value is not None else 1
                     data[vname] = base
-                elif vtype in {"float", "decimal", "slider"}:
-                    base_f = constraints.min_value if constraints.min_value is not None else 1.0
+                elif vnorm in FLOAT_TYPES:
+                    base_f = (
+                        float(constraints.min_value) if constraints.min_value is not None else 1.0
+                    )
                     data[vname] = base_f
-                elif vtype in {"bool", "boolean"}:
+                elif vnorm in BOOL_TYPES:
                     data[vname] = True
-                elif vtype in {"yes/no", "yesno"}:
+                elif vnorm in YES_NO_TYPES:
                     data[vname] = "Yes"
-                elif vtype in {"date", "date/time precision"}:
+                elif vnorm in DATE_TYPES:
                     data[vname] = "2026-01-01"
+                elif vnorm in DATETIME_TYPES:
+                    data[vname] = "2026-01-01T12:00:00+00:00"
+                elif vnorm in TIME_TYPES:
+                    data[vname] = "12:00:00"
                 else:
                     max_l = constraints.max_length or 5
                     data[vname] = "X" * min(max_l, 5)
@@ -523,63 +584,27 @@ class UATExecutionEngine:
     def generate_negative_test_case(self, rule: dict[str, Any]) -> dict[str, Any]:
         """Generate a data payload designed to violate (trigger) the given rule."""
         xml_conditions: list[ExtractedCondition] | None = rule.get("xml_conditions")
-        if xml_conditions:
-            data: dict[str, Any] = {}
-            form_key = rule.get("form")
-            combinator = str(rule.get("logical_operator", "AND")).upper()
-            active_conds = xml_conditions if combinator != "OR" else [xml_conditions[-1]]
-            for cond in active_conds:
+        conditions = xml_conditions or normalize_tabular_rule_conditions(rule)
+        if not conditions:
+            return {}
+
+        data: dict[str, Any] = {}
+        form_key = rule.get("form")
+        combinator = str(rule.get("logical_operator", "AND")).upper()
+        active_conds = conditions if combinator != "OR" else [conditions[-1]]
+        for cond in active_conds:
+            self._apply_xml_condition(cond, form_key, data)
+        self._populate_other_required_fields(form_key, data)
+        raw_rule = rule.get("raw")
+        if (
+            xml_conditions
+            and combinator == "OR"
+            and len(conditions) > 1
+            and raw_rule is not None
+            and not _LOGIC_EVALUATOR.evaluate_rule(raw_rule, data, form_key=form_key).triggered
+        ):
+            for cond in conditions:
                 self._apply_xml_condition(cond, form_key, data)
-            self._populate_other_required_fields(form_key, data)
-            raw_rule = rule.get("raw")
-            if (
-                combinator == "OR"
-                and len(xml_conditions) > 1
-                and raw_rule is not None
-                and not _LOGIC_EVALUATOR.evaluate_rule(raw_rule, data, form_key=form_key).triggered
-            ):
-                for cond in xml_conditions:
-                    self._apply_xml_condition(cond, form_key, data)
-            return data
-
-        data = {}
-        variable = rule.get("variable")
-        if not variable:
-            return data
-
-        operator = rule.get("operator")
-        value = rule.get("value")
-
-        dep_var = rule.get("dependency_variable")
-        dep_val = rule.get("dependency_value")
-
-        if dep_var and dep_val:
-            data[dep_var] = dep_val
-            if operator == "==":
-                data[variable] = f"NOT_{value}"
-            elif operator == "!=":
-                data[variable] = value
-            else:
-                data[variable] = "Invalid_Value"
-        elif operator == ">=":
-            try:
-                data[variable] = str(float(value or 0) - 1)
-            except (ValueError, TypeError):
-                data[variable] = "0"
-        elif operator == "<=":
-            try:
-                data[variable] = str(float(value or 0) + 1)
-            except (ValueError, TypeError):
-                data[variable] = "9999"
-        elif operator == "==":
-            data[variable] = f"NOT_{value}"
-        elif operator == "!=":
-            data[variable] = value
-        elif operator == "Required" or str(value).lower() == "required":
-            data[variable] = ""
-        else:
-            data[variable] = "Invalid_Test_Value"
-
         return data
 
     def _extract_job_batch_id(self, job: Any) -> str | None:
@@ -752,12 +777,19 @@ class UATExecutionEngine:
             for k in ("records", "items", "data", "results"):
                 if isinstance(raw_results.get(k), list):
                     candidates.extend(raw_results[k])
+        elif raw_results is None:
+            if isinstance(status, Mapping):
+                candidates.append(status)
+            else:
+                direct_sk = extract_subject_key(status)
+                if direct_sk:
+                    return direct_sk
         for entry in candidates:
             if not isinstance(entry, Mapping):
                 continue
-            sk = entry.get("subjectKey") or entry.get("subject_key")
-            if isinstance(sk, str) and sk.strip():
-                return sk.strip()
+            sk = extract_subject_key(entry)
+            if sk:
+                return sk
         return None
 
     @staticmethod
@@ -767,15 +799,23 @@ class UATExecutionEngine:
 
     @staticmethod
     def _extract_rule_variables(rule: dict[str, Any]) -> set[str]:
-        """Extract target and condition ``Variable`` names referenced by ``rule``."""
+        """Extract target ``Variable`` name referenced by ``rule`` (or condition fallback)."""
+        target = rule.get("variable")
+        if isinstance(target, str) and target.strip():
+            return {target.strip()}
         return {
-            v
-            for v in (
-                rule.get("variable"),
-                *(rule.get("condition_variables") or []),
-            )
-            if isinstance(v, str) and v
+            v.strip()
+            for v in (rule.get("condition_variables") or [])
+            if isinstance(v, str) and v.strip()
         }
+
+    def _resolve_rule_subject_key(self, payload: dict[str, Any], job_status: Any = None) -> str:
+        """Resolve subjectKey from payload or fallback to enrolled job result subjectKey."""
+        payload_sk = str(payload.get("subjectKey") or "").strip()
+        if payload_sk:
+            return payload_sk
+        job_sk = self._extract_job_subject_key(job_status)
+        return job_sk if job_sk else ""
 
     def _query_index_matches_rule(
         self,
@@ -786,7 +826,7 @@ class UATExecutionEngine:
         job_status: Any = None,
     ) -> bool:
         """Return True if ``query_index`` contains an open ``Query`` matching ``rule``."""
-        subject_key = str(payload.get("subjectKey") or "").strip()
+        subject_key = self._resolve_rule_subject_key(payload, job_status)
         expected_record_ids = self._extract_job_record_ids(job_status)
         rule_vars = self._extract_rule_variables(rule)
         return query_index.matches(
@@ -795,23 +835,50 @@ class UATExecutionEngine:
             subject_key=subject_key,
         )
 
-    def _fetch_open_query_index(
+    def _query_items_for_subjects(
         self,
         study_key: str,
         subject_keys: Iterable[str],
-    ) -> _OpenQueryIndex:
-        """Fetch ``Queries`` once (scoped to one ``Subject`` when shared) and index open items."""
+    ) -> Iterable[Any]:
+        """Fetch ``Queries`` once (scoped to one ``Subject`` when all non-empty keys match)."""
         cleaned_keys = [sk.strip() for sk in subject_keys]
         unique_non_empty = {sk for sk in cleaned_keys if sk}
         if cleaned_keys and all(cleaned_keys) and len(unique_non_empty) == 1:
             shared_subject_key = next(iter(unique_non_empty))
             try:
-                queries = self._sdk.get_queries(study_key, subject_key=shared_subject_key)
+                return self._sdk.get_queries(study_key, subject_key=shared_subject_key)
             except TypeError:
-                queries = self._sdk.get_queries(study_key)
-        else:
-            queries = self._sdk.get_queries(study_key)
-        return _OpenQueryIndex.from_queries(queries)
+                return self._sdk.get_queries(study_key)
+        return self._sdk.get_queries(study_key)
+
+    def _snapshot_open_query_annotation_ids(
+        self,
+        study_key: str,
+        subject_keys: Iterable[str],
+    ) -> set[int]:
+        """Return positive integer ``annotationId`` values of open ``Queries`` before submission."""
+        baseline_ids: set[int] = set()
+        for q in self._query_items_for_subjects(study_key, subject_keys):
+            if not _is_query_open(q):
+                continue
+            ann_id = _extract_query_annotation_id(q)
+            if ann_id is not None:
+                baseline_ids.add(ann_id)
+        return baseline_ids
+
+    def _fetch_open_query_index(
+        self,
+        study_key: str,
+        subject_keys: Iterable[str],
+        *,
+        exclude_annotation_ids: AbstractSet[int] | None = None,
+    ) -> _OpenQueryIndex:
+        """Fetch ``Queries`` once (scoped to one ``Subject`` when shared) and index open items."""
+        queries = self._query_items_for_subjects(study_key, subject_keys)
+        return _OpenQueryIndex.from_queries(
+            queries,
+            exclude_annotation_ids=exclude_annotation_ids,
+        )
 
     def _has_matching_open_query(
         self,
@@ -820,14 +887,19 @@ class UATExecutionEngine:
         rule: dict[str, Any],
         payload: dict[str, Any],
         job_status: Any = None,
+        exclude_annotation_ids: AbstractSet[int] | None = None,
     ) -> bool:
         """Query ``sdk.get_queries`` and return True if an open Query matches this soft rule."""
         get_queries_fn = getattr(self._sdk, "get_queries", None)
         if is_unconfigured_mock_method(get_queries_fn):
             return False
 
-        subject_key = str(payload.get("subjectKey") or "").strip()
-        query_index = self._fetch_open_query_index(study_key, [subject_key])
+        subject_key = self._resolve_rule_subject_key(payload, job_status)
+        query_index = self._fetch_open_query_index(
+            study_key,
+            [subject_key],
+            exclude_annotation_ids=exclude_annotation_ids,
+        )
         return self._query_index_matches_rule(
             query_index,
             rule=rule,
@@ -986,38 +1058,15 @@ class UATExecutionEngine:
         exclude_keys: set[str] | None = None,
         require_keyword: bool = True,
     ) -> str | None:
-        """Find a non-deleted UAT-tagged ``subjectKey`` matching ``site_name``."""
-        excluded = exclude_keys or set()
-        fallback_any_site: str | None = None
-        for subj in subjects:
-            deleted = (
-                subj.get("deleted", False)
-                if isinstance(subj, Mapping)
-                else getattr(subj, "deleted", False)
-            )
-            if deleted is True:
-                continue
-            if require_keyword and not subject_has_keyword(subj, "UAT"):
-                continue
-            key = (
-                (subj.get("subject_key") or subj.get("subjectKey"))
-                if isinstance(subj, Mapping)
-                else (getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None))
-            )
-            if not isinstance(key, str) or not key.strip() or key.strip() in excluded:
-                continue
-            clean_key = key.strip()
-            subj_site = (
-                (subj.get("site_name") or subj.get("siteName"))
-                if isinstance(subj, Mapping)
-                else (getattr(subj, "site_name", None) or getattr(subj, "siteName", None))
-            )
-            subj_site_str = subj_site.strip() if isinstance(subj_site, str) else ""
-            if not subj_site_str or subj_site_str == site_name:
-                return clean_key
-            if fallback_any_site is None:
-                fallback_any_site = clean_key
-        return fallback_any_site
+        """Find a non-deleted UAT-tagged ``subjectKey`` strictly matching ``site_name``."""
+        matched_keys = iter_matching_uat_subject_keys(
+            subjects,
+            keyword_tag="UAT",
+            require_keyword=require_keyword,
+            site_name=site_name,
+            exclude_keys=exclude_keys,
+        )
+        return matched_keys[0] if matched_keys else None
 
     def _build_prerequisite_registration_data(
         self,
@@ -1029,22 +1078,28 @@ class UATExecutionEngine:
         self._populate_other_required_fields(form_key, reg_data)
         if snapshot is not None:
             for var in snapshot.variables_by_form.get(form_key, []):
-                if getattr(var, "deleted", None) is True or getattr(var, "disabled", None) is True:
+                if is_retired_variable_def(var):
                     continue
                 vname = getattr(var, "variable_name", None)
                 if not isinstance(vname, str) or not vname or vname in reg_data:
                     continue
                 if getattr(var, "required", None) is not True:
                     continue
-                vtype = (getattr(var, "variable_type", None) or "").strip().lower()
-                if vtype in {"int", "integer", "number"}:
+                vnorm = normalize_variable_type(getattr(var, "variable_type", None))
+                if vnorm in INT_TYPES or vnorm in CALC_TYPES:
                     reg_data[vname] = 18
-                elif vtype in {"float", "decimal", "double", "numeric", "slider"}:
+                elif vnorm in FLOAT_TYPES:
                     reg_data[vname] = 50.0
-                elif vtype in {"bool", "boolean"}:
+                elif vnorm in BOOL_TYPES:
                     reg_data[vname] = True
-                elif vtype in {"date", "date/time precision"}:
+                elif vnorm in DATE_TYPES:
                     reg_data[vname] = "2026-01-01"
+                elif vnorm in DATETIME_TYPES:
+                    reg_data[vname] = "2026-01-01T12:00:00+00:00"
+                elif vnorm in TIME_TYPES:
+                    reg_data[vname] = "12:00:00"
+                elif vnorm in YES_NO_TYPES:
+                    reg_data[vname] = "Yes"
                 else:
                     reg_data[vname] = "UAT"
         return reg_data
@@ -1309,9 +1364,18 @@ class UATExecutionEngine:
         study_key: str,
         accepted_soft_rules: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Any]],
         report: EditCheckVerificationReport,
+        *,
+        exclude_annotation_ids: AbstractSet[int] | None = None,
+        baseline_error: BaseException | None = None,
     ) -> None:
         """Fetch open ``Queries`` once and classify all accepted soft warning rules."""
         if not accepted_soft_rules:
+            return
+
+        if baseline_error is not None:
+            for result, _, _, _ in accepted_soft_rules:
+                _record_exception_error(result, baseline_error)
+                report.failed_rules += 1
             return
 
         get_queries_fn = getattr(self._sdk, "get_queries", None)
@@ -1330,10 +1394,15 @@ class UATExecutionEngine:
             return
 
         subject_keys = [
-            str(payload.get("subjectKey") or "").strip() for _, _, payload, _ in accepted_soft_rules
+            self._resolve_rule_subject_key(payload, job_status)
+            for _, _, payload, job_status in accepted_soft_rules
         ]
         try:
-            query_index = self._fetch_open_query_index(study_key, subject_keys)
+            query_index = self._fetch_open_query_index(
+                study_key,
+                subject_keys,
+                exclude_annotation_ids=exclude_annotation_ids,
+            )
         except Exception as exc:
             for result, _, _, _ in accepted_soft_rules:
                 _record_exception_error(result, exc)
@@ -1366,17 +1435,17 @@ class UATExecutionEngine:
         effective_timeout = self._poll_timeout if poll_timeout is None else float(poll_timeout)
 
         snapshot: StudySnapshot | None = None
-        prerequisite_error: Exception | None = None
+        inspect_error: Exception | None = None
         try:
             snapshot = self._inspect_study_metadata(study_key)
         except PathTraversalValidationError:
             raise
         except Exception as exc:
-            prerequisite_error = exc
+            inspect_error = exc
 
         resolved_site = (
             self._resolve_verification_site(study_key, snapshot, site_name)
-            if prerequisite_error is None
+            if inspect_error is None
             else site_name
         )
 
@@ -1385,7 +1454,8 @@ class UATExecutionEngine:
         pending_jobs: list[tuple[dict[str, Any], str, dict[str, Any], dict[str, Any]]] = []
         accepted_soft_rules: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], Any]] = []
         enrolled_subject_key: str | None = None
-        prerequisite_checked = prerequisite_error is not None
+        prerequisite_checked = False
+        prerequisite_error: Exception | None = None
 
         for idx, rule in enumerate(self._rules):
             if form_scope and rule.get("form") != form_scope:
@@ -1405,21 +1475,6 @@ class UATExecutionEngine:
                     }
                 )
             else:
-                if not prerequisite_checked:
-                    prerequisite_checked = True
-                    try:
-                        enrolled_subject_key = self._ensure_prerequisite_subject(
-                            study_key,
-                            snapshot=snapshot,
-                            site_name=resolved_site,
-                            interval=effective_interval,
-                            timeout=effective_timeout,
-                        )
-                    except PathTraversalValidationError:
-                        raise
-                    except Exception as exc:
-                        prerequisite_error = exc
-
                 is_soft = rule.get("severity") == "warning"
                 expected_response = "Query Opened" if is_soft else "Rejected"
                 result: dict[str, Any] = {
@@ -1430,8 +1485,8 @@ class UATExecutionEngine:
                 }
                 report.results.append(result)
 
-                if prerequisite_error is not None:
-                    _record_exception_error(result, prerequisite_error)
+                if inspect_error is not None:
+                    _record_exception_error(result, inspect_error)
                     report.failed_rules += 1
                     if report.total_rules >= 100:
                         logger.warning(
@@ -1440,32 +1495,84 @@ class UATExecutionEngine:
                         break
                     continue
 
-                snap_form = (
-                    snapshot.forms_by_key.get(form_key)
-                    if snapshot is not None and isinstance(form_key, str)
-                    else None
+                rule_is_enrollment = is_enrollment_form_key(
+                    form_key if isinstance(form_key, str) else None,
+                    snapshot,
+                    self._data_dictionary,
                 )
+                if not rule_is_enrollment:
+                    if not prerequisite_checked:
+                        prerequisite_checked = True
+                        try:
+                            enrolled_subject_key = self._ensure_prerequisite_subject(
+                                study_key,
+                                snapshot=snapshot,
+                                site_name=resolved_site,
+                                interval=effective_interval,
+                                timeout=effective_timeout,
+                            )
+                        except PathTraversalValidationError:
+                            raise
+                        except Exception as exc:
+                            prerequisite_error = exc
+
+                    if prerequisite_error is not None:
+                        _record_exception_error(result, prerequisite_error)
+                        report.failed_rules += 1
+                        if report.total_rules >= 100:
+                            logger.warning(
+                                "Reached maximum rule limit of 100 per UAT verification run."
+                            )
+                            break
+                        continue
+
                 payload: dict[str, Any] = {
                     "formKey": form_key,
                     "siteName": resolved_site,
                     "data": test_data,
                 }
-                if enrolled_subject_key is not None:
-                    payload["subjectKey"] = enrolled_subject_key
-                elif snap_form is not None and is_enrollment_form(snap_form):
+                if rule_is_enrollment:
                     payload["keywords"] = [{"keywordName": "UAT", "keywordKey": "UAT"}]
+                elif enrolled_subject_key is not None:
+                    payload["subjectKey"] = enrolled_subject_key
                 else:
                     payload["subjectKey"] = f"UAT-SUBJ-{idx}"
 
-                interval_name = self._resolve_active_interval(snapshot, form_key)
-                if interval_name:
-                    payload["intervalName"] = interval_name
+                if not rule_is_enrollment:
+                    interval_name = self._resolve_active_interval(snapshot, form_key)
+                    if interval_name:
+                        payload["intervalName"] = interval_name
 
                 prepared_submissions.append((result, rule, payload))
 
             if report.total_rules >= 100:
                 logger.warning("Reached maximum rule limit of 100 per UAT verification run.")
                 break
+
+        baseline_annotation_ids: set[int] = set()
+        baseline_query_error: BaseException | None = None
+        soft_subject_keys = [
+            str(sub_payload.get("subjectKey") or "").strip()
+            for _, sub_rule, sub_payload in prepared_submissions
+            if sub_rule.get("severity") == "warning"
+        ]
+        has_study_state = snapshot is not None or not is_unconfigured_mock_method(
+            getattr(self._sdk, "get_subjects", None)
+        )
+        if (
+            soft_subject_keys
+            and has_study_state
+            and not is_unconfigured_mock_method(getattr(self._sdk, "get_queries", None))
+        ):
+            try:
+                baseline_annotation_ids = self._snapshot_open_query_annotation_ids(
+                    study_key,
+                    soft_subject_keys,
+                )
+            except PathTraversalValidationError:
+                raise
+            except Exception as exc:
+                baseline_query_error = exc
 
         create_record_fn = getattr(self._sdk, "create_record", None)
         run_sequential = (
@@ -1531,5 +1638,11 @@ class UATExecutionEngine:
                     accepted_soft_rules=accepted_soft_rules,
                 )
 
-        self._resolve_accepted_soft_rules(study_key, accepted_soft_rules, report)
+        self._resolve_accepted_soft_rules(
+            study_key,
+            accepted_soft_rules,
+            report,
+            exclude_annotation_ids=baseline_annotation_ids,
+            baseline_error=baseline_query_error,
+        )
         return report

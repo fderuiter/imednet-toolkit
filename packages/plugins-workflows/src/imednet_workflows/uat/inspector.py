@@ -18,76 +18,19 @@ from imednet.spi.models import (
     is_site_enrollment_eligible,
 )
 
+from ._contracts import (
+    coerce_optional_bool as _coerce_optional_bool,
+)
+from ._contracts import (
+    is_disabled_form,
+    is_enrollment_form,
+    is_non_subject_form,
+    is_unscheduled_form,
+)
+
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
     from imednet.spi.validation import DataDictionary
-
-_NON_SUBJECT_FORM_TYPES = frozenset({"site", "study", "admin"})
-_LEGACY_ENROLLMENT_FORM_TYPES = frozenset({"enrollment", "registration"})
-_SUBJECT_ENROLLMENT_FORM_TYPES = frozenset({"subject", "crf", ""})
-
-
-def _coerce_optional_bool(value: Any) -> bool | None:
-    """Parse boolean or truthy/falsy string tokens into ``bool | None``."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        token = value.strip().lower()
-        if token in {"true", "yes", "y", "1"}:
-            return True
-        if token in {"false", "no", "n", "0"}:
-            return False
-    return None
-
-
-def _is_true_flag(obj: Any, *attrs: str) -> bool:
-    """Return True only when an attribute or mapping key on ``obj`` is literally ``True``."""
-    for attr in attrs:
-        val = obj.get(attr) if isinstance(obj, Mapping) else getattr(obj, attr, None)
-        if val is True:
-            return True
-    return False
-
-
-def _normalized_form_type(form: Any) -> str:
-    """Extract lowercase ``form_type`` / ``formType`` string when available."""
-    raw = (
-        (form.get("form_type") or form.get("formType"))
-        if isinstance(form, Mapping)
-        else (getattr(form, "form_type", None) or getattr(form, "formType", None))
-    )
-    return raw.strip().lower() if isinstance(raw, str) else ""
-
-
-def is_disabled_form(form: Any) -> bool:
-    """Return True when ``form`` has ``disabled=True``."""
-    return _is_true_flag(form, "disabled")
-
-
-def is_non_subject_form(form: Any) -> bool:
-    """Return True when ``form`` is an ``otherForms`` or Site/Study/Admin form."""
-    return (
-        _is_true_flag(form, "other_forms", "otherForms")
-        or _normalized_form_type(form) in _NON_SUBJECT_FORM_TYPES
-    )
-
-
-def is_enrollment_form(form: Any) -> bool:
-    """Return True when ``form`` is an active Subject registration/enrollment form."""
-    if is_disabled_form(form) or is_non_subject_form(form):
-        return False
-    ft = _normalized_form_type(form)
-    if ft in _LEGACY_ENROLLMENT_FORM_TYPES:
-        return True
-    return (
-        _is_true_flag(form, "subject_record_report", "subjectRecordReport")
-        and ft in _SUBJECT_ENROLLMENT_FORM_TYPES
-    )
-
-
-def is_unscheduled_form(form: Any) -> bool:
-    """Return True when ``form`` has ``unscheduledVisit=True``."""
-    return _is_true_flag(form, "unscheduled_visit", "unscheduledVisit")
 
 
 class StudySnapshot(ImednetBaseModel):

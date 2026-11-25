@@ -23,6 +23,11 @@ from imednet.spi.utils import (
 )
 from imednet.spi.validation import ValidationSchemaProtocol
 
+from ._contracts import (
+    iter_matching_uat_subjects,
+    subject_has_keyword,
+    subject_matches_site,
+)
 from .generator import GeneratedRecordSet, SyntheticRecordGenerator
 from .models import RecordTestType
 
@@ -80,37 +85,6 @@ def is_unconfigured_mock_method(fn: Any) -> bool:
 
 
 _is_unconfigured_mock_method = is_unconfigured_mock_method
-
-
-def subject_has_keyword(subj: Any, keyword_tag: str) -> bool:
-    """Return True if ``subj`` has a keyword matching ``keyword_tag``."""
-    if not keyword_tag:
-        return True
-    keywords = subj.get("keywords") if isinstance(subj, dict) else getattr(subj, "keywords", None)
-    if not keywords:
-        return False
-    for kw in keywords:
-        if isinstance(kw, str):
-            if kw == keyword_tag:
-                return True
-            continue
-        if isinstance(kw, dict):
-            candidates = (
-                kw.get("keyword_key"),
-                kw.get("keywordKey"),
-                kw.get("keyword_name"),
-                kw.get("keywordName"),
-            )
-        else:
-            candidates = (
-                getattr(kw, "keyword_key", None),
-                getattr(kw, "keywordKey", None),
-                getattr(kw, "keyword_name", None),
-                getattr(kw, "keywordName", None),
-            )
-        if keyword_tag in candidates:
-            return True
-    return False
 
 
 def _clean_str(val: Any) -> str | None:
@@ -428,6 +402,7 @@ class BulkRecordSubmissionWorkflow:
         self._phase: SubmissionPhase = SubmissionPhase.PENDING
         self._initial_subjects_snapshot: _PreExistingSubjectsSnapshot | None = None
         self._ordered_existing_uat_keys: list[str] = []
+        self._existing_uat_subjects: list[tuple[str, Any]] = []
 
     @property
     def phase(self) -> SubmissionPhase:
@@ -446,6 +421,7 @@ class BulkRecordSubmissionWorkflow:
         self._phase = SubmissionPhase.PENDING
         self._initial_subjects_snapshot = None
         self._ordered_existing_uat_keys = []
+        self._existing_uat_subjects = []
 
     def submit(
         self,
@@ -475,53 +451,82 @@ class BulkRecordSubmissionWorkflow:
 
         self._initial_subjects_snapshot = None
         self._ordered_existing_uat_keys = []
+        self._existing_uat_subjects = []
         existing_subjects: set[str] = set()
 
         try:
-            ordered_existing: list[str] = []
+            ordered_existing_pairs: list[tuple[str, Any]] = []
             if self.skip_existing_subjects:
                 existing_subjects = self._find_existing_uat_subjects(study_key, keyword_tag)
-                ordered_existing = [
-                    k for k in self._ordered_existing_uat_keys if k in existing_subjects
-                ]
-                if len(ordered_existing) < len(existing_subjects):
-                    seen_ord = set(ordered_existing)
-                    ordered_existing.extend(
-                        sorted(k for k in existing_subjects if k not in seen_ord)
-                    )
+                if self._existing_uat_subjects:
+                    ordered_existing_pairs = [
+                        (k, subj)
+                        for k, subj in self._existing_uat_subjects
+                        if k in existing_subjects
+                    ]
+                else:
+                    ordered_keys = [
+                        k for k in self._ordered_existing_uat_keys if k in existing_subjects
+                    ]
+                    if len(ordered_keys) < len(existing_subjects):
+                        seen_ord = set(ordered_keys)
+                        ordered_keys.extend(
+                            sorted(k for k in existing_subjects if k not in seen_ord)
+                        )
+                    ordered_existing_pairs = [(k, {"subjectKey": k}) for k in ordered_keys]
 
             pre_existing = _PreExistingSubjectsSnapshot(
                 subject_keys=set(existing_subjects),
                 subject_ids=set(),
                 subject_oids=set(),
             )
-            if registration_sets and data_sets:
-                snap = (
-                    self._initial_subjects_snapshot
-                    if self._initial_subjects_snapshot is not None
-                    else self._snapshot_existing_subjects(study_key)
-                )
+            if self._initial_subjects_snapshot is not None:
+                pre_existing.subject_keys.update(self._initial_subjects_snapshot.subject_keys)
+                pre_existing.subject_ids.update(self._initial_subjects_snapshot.subject_ids)
+                pre_existing.subject_oids.update(self._initial_subjects_snapshot.subject_oids)
+            elif registration_sets and data_sets:
+                snap = self._snapshot_existing_subjects(study_key)
                 pre_existing.subject_keys.update(snap.subject_keys)
                 pre_existing.subject_ids.update(snap.subject_ids)
                 pre_existing.subject_oids.update(snap.subject_oids)
 
             reused_key_map: dict[str, str] = {}
-            if registration_sets and ordered_existing:
+            if registration_sets and ordered_existing_pairs:
                 placeholder_order: list[str] = []
-                seen_ph: set[str] = set()
-                for rs in (*registration_sets, *data_sets):
-                    for sk in rs.subject_keys:
-                        if isinstance(sk, str) and sk and sk not in seen_ph:
-                            seen_ph.add(sk)
+                placeholder_sites: dict[str, list[tuple[str | None, int | None]]] = {}
+                for rs in registration_sets:
+                    for i, payload in enumerate(rs.payloads):
+                        sk = rs.subject_keys[i] if i < len(rs.subject_keys) else None
+                        if not isinstance(sk, str) or not sk:
+                            continue
+                        if sk not in placeholder_sites:
                             placeholder_order.append(sk)
-                remaining_existing = list(ordered_existing)
+                            placeholder_sites[sk] = []
+                        p_site_name = _clean_str(_get_attr_or_key(payload, "siteName", "site_name"))
+                        p_site_id = _clean_int(_get_attr_or_key(payload, "siteId", "site_id"))
+                        placeholder_sites[sk].append((p_site_name, p_site_id))
+
+                def _candidate_fits_placeholder(cand_subj: Any, ph_key: str) -> bool:
+                    return all(
+                        subject_matches_site(cand_subj, site_name=s_name, site_id=s_id)
+                        for s_name, s_id in placeholder_sites.get(ph_key, [])
+                    )
+
+                remaining_pairs = list(ordered_existing_pairs)
                 for ph in placeholder_order:
-                    if ph in existing_subjects and ph in remaining_existing:
-                        reused_key_map[ph] = ph
-                        remaining_existing.remove(ph)
+                    for idx_cand, (cand_key, cand_subj) in enumerate(remaining_pairs):
+                        if cand_key == ph and _candidate_fits_placeholder(cand_subj, ph):
+                            reused_key_map[ph] = cand_key
+                            remaining_pairs.pop(idx_cand)
+                            break
                 for ph in placeholder_order:
-                    if ph not in reused_key_map and remaining_existing:
-                        reused_key_map[ph] = remaining_existing.pop(0)
+                    if ph in reused_key_map:
+                        continue
+                    for idx_cand, (cand_key, cand_subj) in enumerate(remaining_pairs):
+                        if _candidate_fits_placeholder(cand_subj, ph):
+                            reused_key_map[ph] = cand_key
+                            remaining_pairs.pop(idx_cand)
+                            break
 
             submitted_placeholders: list[str | None] = []
             skipped_placeholders: set[str] = set()
@@ -611,19 +616,11 @@ class BulkRecordSubmissionWorkflow:
                     )
                     if enrolled_keys is not None:
                         if reused_key_map:
-                            unique_sub_ph = list(
-                                dict.fromkeys(
-                                    p
-                                    for p in submitted_placeholders
-                                    if isinstance(p, str) and p and p not in reused_key_map
-                                )
-                            )
-                            new_bindings = {
-                                ph: enrolled_keys[idx % len(enrolled_keys)]
-                                for idx, ph in enumerate(unique_sub_ph)
-                            }
-                            full_placeholders = [*reused_key_map.keys(), *new_bindings.keys()]
-                            full_enrolled = [*reused_key_map.values(), *new_bindings.values()]
+                            full_placeholders: list[str | None] = [
+                                *reused_key_map.keys(),
+                                *submitted_placeholders,
+                            ]
+                            full_enrolled = [*reused_key_map.values(), *enrolled_keys]
                             result.enrolled_subject_keys = list(
                                 dict.fromkeys([*reused_key_map.values(), *enrolled_keys])
                             )
@@ -1220,32 +1217,27 @@ class BulkRecordSubmissionWorkflow:
         """Return True if the subject has a keyword matching keyword_tag."""
         return subject_has_keyword(subj, keyword_tag)
 
-    def _find_existing_uat_subjects(self, study_key: str, keyword_tag: str) -> set[str]:
-        """Query non-deleted subjects and inspect Subject keywords locally for UAT tags."""
+    def _find_existing_uat_subjects(
+        self,
+        study_key: str,
+        keyword_tag: str,
+        *,
+        site_name: str | None = None,
+        site_id: int | None = None,
+    ) -> set[str]:
+        """Query non-deleted subjects and inspect Subject keywords/sites locally for UAT tags."""
         subjects = self.sdk.get_subjects(study_key, deleted=False)
         self._initial_subjects_snapshot = self._extract_snapshot_from_subjects(subjects)
-        ordered_keys: list[str] = []
-        existing_keys: set[str] = set()
-        for subj in subjects:
-            deleted = (
-                subj.get("deleted", False)
-                if isinstance(subj, dict)
-                else getattr(subj, "deleted", False)
-            )
-            if deleted is True:
-                continue
-            if not self._subject_has_keyword(subj, keyword_tag):
-                continue
-            key = (
-                (subj.get("subject_key") or subj.get("subjectKey"))
-                if isinstance(subj, dict)
-                else (getattr(subj, "subject_key", None) or getattr(subj, "subjectKey", None))
-            )
-            if isinstance(key, str) and key and key not in existing_keys:
-                existing_keys.add(key)
-                ordered_keys.append(key)
-        self._ordered_existing_uat_keys = ordered_keys
-        return existing_keys
+        matched = iter_matching_uat_subjects(
+            subjects,
+            keyword_tag=keyword_tag,
+            require_keyword=bool(keyword_tag),
+            site_name=site_name,
+            site_id=site_id,
+        )
+        self._existing_uat_subjects = matched
+        self._ordered_existing_uat_keys = [key for key, _ in matched]
+        return set(self._ordered_existing_uat_keys)
 
 
 __all__ = [
