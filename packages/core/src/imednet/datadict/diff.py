@@ -107,6 +107,18 @@ class DiffReport:
         return "\n".join(lines) + "\n"
 
 
+def _effective_extra_attributes(obj: Any) -> dict[str, Any]:
+    """Merge Pydantic ``model_extra`` and ``extraAttributes`` on a DataDictionary model."""
+    merged: dict[str, Any] = {}
+    model_extra = getattr(obj, "model_extra", None)
+    if isinstance(model_extra, dict):
+        merged.update(model_extra)
+    explicit_extra = getattr(obj, "extraAttributes", None)
+    if isinstance(explicit_extra, dict):
+        merged.update(explicit_extra)
+    return merged
+
+
 def _compare_extra_attributes(
     old_extra: dict[str, Any],
     new_extra: dict[str, Any],
@@ -115,12 +127,13 @@ def _compare_extra_attributes(
 ) -> None:
     all_keys = sorted(set(old_extra.keys()) | set(new_extra.keys()))
     for k in all_keys:
+        full_path = f"{path_prefix}.{k}" if path_prefix else k
         if k not in old_extra:
-            report.add("added", f"{path_prefix}.{k}", new_val=new_extra[k])
+            report.add("added", full_path, new_val=new_extra[k])
         elif k not in new_extra:
-            report.add("removed", f"{path_prefix}.{k}", old_val=old_extra[k])
+            report.add("removed", full_path, old_val=old_extra[k])
         elif old_extra[k] != new_extra[k]:
-            report.add("modified", f"{path_prefix}.{k}", old_extra[k], new_extra[k])
+            report.add("modified", full_path, old_extra[k], new_extra[k])
 
 
 def _rule_key(r: BusinessLogicRule, idx: int) -> str:
@@ -151,14 +164,14 @@ def _compare_rules(
             report.add("added", f"{path_prefix}.rule[{rid}]", new_val=new_r.name or rid)
         else:
             old_r = old_by_id[rid]
-            for attr in ("name", "status", "type", "logic", "logicRawXml"):
+            for attr in ("name", "status", "type", "form", "sequence", "logic", "logicRawXml"):
                 ov = getattr(old_r, attr)
                 nv = getattr(new_r, attr)
                 if ov != nv:
                     report.add("modified", f"{path_prefix}.rule[{rid}].{attr}", ov, nv)
             _compare_extra_attributes(
-                old_r.extraAttributes,
-                new_r.extraAttributes,
+                _effective_extra_attributes(old_r),
+                _effective_extra_attributes(new_r),
                 f"{path_prefix}.rule[{rid}]",
                 report,
             )
@@ -176,6 +189,13 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
     """
     report = DiffReport()
 
+    _compare_extra_attributes(
+        _effective_extra_attributes(old_dict),
+        _effective_extra_attributes(new_dict),
+        "",
+        report,
+    )
+
     # 1. Compare Metadata (ignoring generatedAt)
     for attr in ("schemaVersion", "studyKey", "source"):
         ov = getattr(old_dict.metadata, attr)
@@ -183,8 +203,15 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
         if ov != nv:
             report.add("modified", f"metadata.{attr}", ov, nv)
     _compare_extra_attributes(
-        old_dict.metadata.extraAttributes, new_dict.metadata.extraAttributes, "metadata", report
+        _effective_extra_attributes(old_dict.metadata),
+        _effective_extra_attributes(new_dict.metadata),
+        "metadata",
+        report,
     )
+
+    old_src = (old_dict.metadata.source or "").strip().lower() or None
+    new_src = (new_dict.metadata.source or "").strip().lower() or None
+    cross_source = old_src is not None and new_src is not None and old_src != new_src
 
     # 2. Compare Forms
     old_forms = {f.formKey: f for f in old_dict.forms}
@@ -204,7 +231,9 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
 
             old_fid = normalize_form_id(old_f.formId, fk)
             new_fid = normalize_form_id(new_f.formId, fk)
-            if old_fid is not None and new_fid is not None and old_fid != new_fid:
+            if old_fid != new_fid and (
+                (old_fid is not None and new_fid is not None) or not cross_source
+            ):
                 report.add("modified", f"forms[{fk}].formId", old_f.formId, new_f.formId)
 
             old_ft = normalize_form_type(old_f.formType, default="Subject")
@@ -213,7 +242,10 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
                 report.add("modified", f"forms[{fk}].formType", old_f.formType, new_f.formType)
 
             _compare_extra_attributes(
-                old_f.extraAttributes, new_f.extraAttributes, f"forms[{fk}]", report
+                _effective_extra_attributes(old_f),
+                _effective_extra_attributes(new_f),
+                f"forms[{fk}]",
+                report,
             )
 
             # Compare Variables on form
@@ -250,8 +282,8 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
                         if ov != nv:
                             report.add("modified", f"forms[{fk}].variables[{vn}].{attr}", ov, nv)
                     _compare_extra_attributes(
-                        old_v.extraAttributes,
-                        new_v.extraAttributes,
+                        _effective_extra_attributes(old_v),
+                        _effective_extra_attributes(new_v),
                         f"forms[{fk}].variables[{vn}]",
                         report,
                     )
@@ -288,8 +320,8 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
                                         nv,
                                     )
                             _compare_extra_attributes(
-                                old_c.extraAttributes,
-                                new_c.extraAttributes,
+                                _effective_extra_attributes(old_c),
+                                _effective_extra_attributes(new_c),
                                 f"forms[{fk}].variables[{vn}].choices[{cv}]",
                                 report,
                             )

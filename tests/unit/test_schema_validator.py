@@ -158,12 +158,16 @@ def test_validate_record_missing_form_identifier(async_mode: bool) -> None:
 
     validator.schema._form_variables["F1"] = {"age": var}
 
-    # Missing formKey and formId entirely should just skip validation without error
+    # Missing formKey, formId, and target record identifiers must raise ValidationError
+    with pytest.raises(ValidationError, match="formKey.*formId"):
+        if async_mode:
+            asyncio.run(validator.validate_record("STUDY", {"data": {"age": "bad"}}))
+        else:
+            validator.validate_record("STUDY", {"data": {"age": "bad"}})
+
     if async_mode:
-        asyncio.run(validator.validate_record("STUDY", {"data": {"age": "bad"}}))
         sdk.async_get_variables.assert_not_awaited()
     else:
-        validator.validate_record("STUDY", {"data": {"age": "bad"}})
         sdk.get_variables.assert_not_called()
 
 
@@ -451,3 +455,121 @@ def test_multi_study_schema_validator_isolates_colliding_form_keys_and_ids(
         cache.variables_for_form("DM")
     with pytest.raises(ValidationError, match="Ambiguous form ID"):
         cache.form_key_from_id(101)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_validators_reject_unscoped_targetless_records_and_empty_form_keys(
+    async_mode: bool,
+) -> None:
+    """Sync/async validate_record, validate_batch, and _ValidatorMixin reject unscoped records."""
+    from imednet.validation._base import _ValidatorMixin
+    from imednet.validation.cache import SchemaCache
+
+    var = Variable(variable_name="age", variable_type="integer", form_id=1, form_key="F1")
+    sdk = _build_sdk(var, async_mode)
+    validator = AsyncSchemaValidator(sdk) if async_mode else SchemaValidator(sdk)
+
+    for unscoped in ({}, {"data": {"age": 20}}, {"formKey": "", "data": {"age": 20}}):
+        with pytest.raises(ValidationError, match="formKey.*formId"):
+            if async_mode:
+                asyncio.run(validator.validate_record("STUDY", unscoped))  # type: ignore[arg-type]
+            else:
+                validator.validate_record("STUDY", unscoped)
+
+        with pytest.raises(ValidationError, match="formKey.*formId"):
+            if async_mode:
+                asyncio.run(validator.validate_batch("STUDY", [unscoped]))  # type: ignore[arg-type]
+            else:
+                validator.validate_batch("STUDY", [unscoped])
+
+    # Direct _ValidatorMixin._validate_cached check
+    class _DummyValidator(_ValidatorMixin):
+        def __init__(self) -> None:
+            self.schema = SchemaCache()
+            self.schema.populate([var])
+
+    dummy = _DummyValidator()
+    with pytest.raises(ValidationError, match="formKey.*formId"):
+        dummy._validate_cached(None, {"age": 20})
+    with pytest.raises(ValidationError, match="formKey.*formId"):
+        dummy._validate_cached("", {"age": 20})
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_validators_refresh_and_retain_zero_variable_forms_and_accept_number_decimals(
+    async_mode: bool,
+) -> None:
+    """Refresh retains active zero-Variable Forms and accepts finite decimals on Number Variables."""
+    from imednet.models.forms import Form as ApiForm
+    from imednet.validation.cache import AsyncSchemaCache, SchemaCache, calculate_readiness_score
+
+    empty_form = ApiForm(studyKey="STUDY", formId=500, formKey="F_EMPTY", formName="Empty Form")
+    disabled_form = ApiForm(
+        studyKey="STUDY", formId=501, formKey="F_DISABLED", formName="Disabled", disabled=True
+    )
+    deleted_form_dict = {
+        "studyKey": "STUDY",
+        "formId": 503,
+        "formKey": "F_DELETED",
+        "deleted": True,
+    }
+    weight_var = Variable(
+        studyKey="STUDY", variable_name="WEIGHT", variable_type="Number", form_id=502, form_key="VS"
+    )
+
+    if async_mode:
+        sdk = MagicMock()
+        sdk.async_get_forms = AsyncMock(return_value=[empty_form, disabled_form, deleted_form_dict])
+        sdk.async_get_variables = AsyncMock(return_value=[weight_var])
+        validator = AsyncSchemaValidator(sdk)
+        asyncio.run(validator.validate_record("STUDY", {"formKey": "F_EMPTY", "data": {}}))
+        asyncio.run(validator.validate_record("STUDY", {"formId": 500, "data": {}}))
+        asyncio.run(validator.validate_record("STUDY", {"formKey": "VS", "data": {"WEIGHT": 68.5}}))
+        with pytest.raises(ValidationError, match="Unknown form"):
+            asyncio.run(validator.validate_record("STUDY", {"formKey": "F_DISABLED", "data": {}}))
+        with pytest.raises(ValidationError, match="Unknown form"):
+            asyncio.run(validator.validate_record("STUDY", {"formKey": "F_DELETED", "data": {}}))
+        score, reasons = calculate_readiness_score(
+            validator.schema, "F_EMPTY", {}, study_key="STUDY"
+        )
+        assert score == pytest.approx(100.0)
+        assert reasons == []
+
+        async_cache = AsyncSchemaCache()
+        forms_ep = MagicMock()
+        vars_ep = MagicMock()
+        forms_ep.list = AsyncMock(return_value=[empty_form, disabled_form, deleted_form_dict])
+        vars_ep.list = AsyncMock(return_value=[weight_var])
+        asyncio.run(async_cache.refresh(forms_ep, vars_ep, study_key="STUDY"))
+        assert "F_EMPTY" in async_cache.forms_for_study("STUDY")
+        assert "F_DISABLED" not in async_cache.forms_for_study("STUDY")
+        assert "F_DELETED" not in async_cache.forms_for_study("STUDY")
+        assert async_cache.form_key_from_id(500, study_key="STUDY") == "F_EMPTY"
+    else:
+        sdk = MagicMock()
+        sdk.get_forms.return_value = [empty_form, disabled_form, deleted_form_dict]
+        sdk.get_variables.return_value = [weight_var]
+        validator = SchemaValidator(sdk)
+        validator.validate_record("STUDY", {"formKey": "F_EMPTY", "data": {}})
+        validator.validate_record("STUDY", {"formId": 500, "data": {}})
+        validator.validate_record("STUDY", {"formKey": "VS", "data": {"WEIGHT": 68.5}})
+        with pytest.raises(ValidationError, match="Unknown form"):
+            validator.validate_record("STUDY", {"formKey": "F_DISABLED", "data": {}})
+        with pytest.raises(ValidationError, match="Unknown form"):
+            validator.validate_record("STUDY", {"formKey": "F_DELETED", "data": {}})
+        score, reasons = calculate_readiness_score(
+            validator.schema, "F_EMPTY", {}, study_key="STUDY"
+        )
+        assert score == pytest.approx(100.0)
+        assert reasons == []
+
+        sync_cache = SchemaCache()
+        forms_ep = MagicMock()
+        vars_ep = MagicMock()
+        forms_ep.list.return_value = [empty_form, disabled_form, deleted_form_dict]
+        vars_ep.list.return_value = [weight_var]
+        sync_cache.refresh(forms_ep, vars_ep, study_key="STUDY")
+        assert "F_EMPTY" in sync_cache.forms_for_study("STUDY")
+        assert "F_DISABLED" not in sync_cache.forms_for_study("STUDY")
+        assert "F_DELETED" not in sync_cache.forms_for_study("STUDY")
+        assert sync_cache.form_key_from_id(500, study_key="STUDY") == "F_EMPTY"

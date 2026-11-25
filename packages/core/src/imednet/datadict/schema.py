@@ -4,17 +4,26 @@ from __future__ import annotations
 
 import contextlib
 import json
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import ValidationError
 
 from .logic import LogicTreeEvaluator, extract_variable_constraints, parse_logic_xml
 from .models import BusinessLogicRule, DataDictionary, Form
-from .normalize import _is_file_target, _safe_is_file, normalize_form_id
+from .normalize import _is_file_target, _safe_is_file, normalize_form_id, validate_timestamp
 
 SCHEMA_PATH = Path(__file__).parent / "resources" / "data-dictionary-1.0.0.schema.json"
 _RULE_VALIDATOR = LogicTreeEvaluator()
+_CANONICAL_ROOT_KEYS = frozenset({"metadata", "forms", "unassignedBusinessLogic"})
+
+
+@lru_cache(maxsize=1)
+def _load_canonical_schema() -> dict[str, Any]:
+    """Load and cache the canonical Data Dictionary JSON Schema from ``SCHEMA_PATH``."""
+    return cast(dict[str, Any], json.loads(SCHEMA_PATH.read_text(encoding="utf-8")))
+
 
 __all__ = [
     "SCHEMA_PATH",
@@ -193,8 +202,20 @@ def _validate_rule_semantics(
 
 
 def _validate_semantics(dd: DataDictionary) -> list[str]:
-    """Validate duplicate keys, broken references, and inverted variable bounds."""
+    """Validate timestamps, duplicate keys, broken references, and inverted variable bounds."""
     errors: list[str] = []
+    if dd.metadata.generatedAt is not None:
+        if not isinstance(dd.metadata.generatedAt, str) or not dd.metadata.generatedAt.strip():
+            errors.append(
+                f"[metadata.generatedAt] Invalid timestamp '{dd.metadata.generatedAt}': "
+                "timestamps must adhere to MM-DD-YYYY format (e.g., 09-28-2026)"
+            )
+        else:
+            try:
+                validate_timestamp(dd.metadata.generatedAt)
+            except ValueError as exc:
+                errors.append(f"[metadata.generatedAt] {exc}")
+
     forms_by_key: dict[str, Form] = {}
     vars_by_form: dict[str, set[str]] = {}
     seen_form_ids: dict[str, str] = {}
@@ -405,31 +426,46 @@ def validate(
     else:
         return [f"Unsupported target type for validation: {type(target)}"]
 
-    # 2. If a custom JSON schema is provided, validate via jsonschema if available
-    if schema is not None:
-        try:
-            import jsonschema
+    # 2. Validate against the provided JSON schema or the canonical SCHEMA_PATH by default
+    effective_schema = schema if schema is not None else _load_canonical_schema()
+    ran_jsonschema = False
+    try:
+        import jsonschema
 
-            validator = jsonschema.Draft202012Validator(schema)
-            for err in validator.iter_errors(data):
-                loc = ".".join(str(p) for p in err.absolute_path)
-                prefix = f"[{loc}] " if loc else ""
-                errors.append(f"{prefix}{err.message}")
-            if not errors:
-                with contextlib.suppress(ValidationError):
-                    dd_checked = DataDictionary.model_validate(data)
-                    errors.extend(_validate_business_logic_regexes(dd_checked))
-                    errors.extend(_validate_semantics(dd_checked))
-            return errors
-        except ImportError:
+        ran_jsonschema = True
+        validator = jsonschema.Draft202012Validator(effective_schema)
+        for err in validator.iter_errors(data):
+            loc = ".".join(str(p) for p in err.absolute_path)
+            prefix = f"[{loc}] " if loc else ""
+            errors.append(f"{prefix}{err.message}")
+    except ImportError:
+        if schema is not None:
             errors.append(
                 "jsonschema library is not installed; falling back to Pydantic model validation."
             )
 
-    # 3. Model validation via Pydantic
-    if not isinstance(target, DataDictionary) and isinstance(data, dict) and "forms" not in data:
-        errors.append("[forms] Field required")
+    if ran_jsonschema:
+        if errors:
+            return errors
+        if schema is not None:
+            with contextlib.suppress(ValidationError):
+                dd_checked = DataDictionary.model_validate(data)
+                errors.extend(_validate_business_logic_regexes(dd_checked))
+                errors.extend(_validate_semantics(dd_checked))
+            return errors
+    else:
+        if not isinstance(data, dict):
+            return [f"Invalid root type: expected JSON object, got {type(data).__name__}"]
+        if "forms" not in data:
+            errors.append("[forms] Field required")
+        for extra_key in sorted(set(data.keys()) - _CANONICAL_ROOT_KEYS):
+            errors.append(
+                f"[{extra_key}] Additional properties are not allowed ('{extra_key}' was unexpected)"
+            )
+        if errors:
+            return errors
 
+    # 3. Model validation via Pydantic
     try:
         dd = DataDictionary.model_validate(data)
     except ValidationError as val_err:
@@ -439,10 +475,7 @@ def validate(
             errors.append(f"[{loc}] {msg}")
         return errors
 
-    if errors:
-        return errors
-
-    # 4. Regex safety and semantic validation (duplicate keys, broken references, inverted bounds)
+    # 4. Regex safety and semantic validation (timestamps, duplicate keys, broken references, bounds)
     errors.extend(_validate_business_logic_regexes(dd))
     errors.extend(_validate_semantics(dd))
     return errors

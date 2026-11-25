@@ -335,3 +335,113 @@ def test_diff_detects_genuine_normalized_field_modifications() -> None:
     assert "forms[DM].formId" in modified_paths
     assert "forms[DM].formType" in modified_paths
     assert "forms[DM].variables[AGE].variableType" in modified_paths
+
+
+def test_diff_same_source_form_id_rule_fields_and_root_child_custom_attributes() -> None:
+    """AC 8: diff reports same-source None<->int formId, rule form/sequence, and root/child extraAttributes + model_extra."""
+    dd_old = DataDictionary(
+        metadata=Metadata(source="csv", extraAttributes={"metaTag": "v1"}),
+        forms=[
+            Form(
+                formKey="DM",
+                formId=None,
+                variables=[
+                    Variable(
+                        variableName="SEX",
+                        choices=[
+                            Choice(
+                                choiceValue="M",
+                                choiceText="Male",
+                                extraAttributes={"cdiscCode": "C20197"},
+                            )
+                        ],
+                    )
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="R1",
+                        name="Rule 1",
+                        type="Form",
+                        form="DM",
+                        sequence=1,
+                        extraAttributes={"owner": "dm_team"},
+                    )
+                ],
+            )
+        ],
+        unassignedBusinessLogic=[
+            BusinessLogicRule(
+                id="R_UNASSIGNED", name="Moved Rule", type="Query", form="DM", sequence=1
+            )
+        ],
+    )
+    dd_new = DataDictionary(
+        metadata=Metadata(source="csv", extraAttributes={"metaTag": "v2"}),
+        forms=[
+            Form(
+                formKey="DM",
+                formId=1001,
+                variables=[
+                    Variable(
+                        variableName="SEX",
+                        choices=[
+                            Choice(
+                                choiceValue="M",
+                                choiceText="Male",
+                                extraAttributes={"cdiscCode": "C20197_V2"},
+                            )
+                        ],
+                    )
+                ],
+                businessLogic=[
+                    BusinessLogicRule(
+                        id="R1",
+                        name="Rule 1",
+                        type="Form",
+                        form="DM",
+                        sequence=2,
+                        extraAttributes={"owner": "safety_team"},
+                    )
+                ],
+            )
+        ],
+        unassignedBusinessLogic=[
+            BusinessLogicRule(
+                id="R_UNASSIGNED", name="Moved Rule", type="Query", form="VS", sequence=5
+            )
+        ],
+    )
+
+    # Simulate programmatic Pydantic __pydantic_extra__ attributes on root and child models
+    object.__setattr__(dd_old, "__pydantic_extra__", {"rootVendor": "acme-1", "rootDynamic": "old"})
+    object.__setattr__(
+        dd_new,
+        "__pydantic_extra__",
+        {"rootVendor": "acme-2", "rootAdded": True, "rootDynamic": "new"},
+    )
+    object.__setattr__(dd_old.forms[0], "__pydantic_extra__", {"formDynamic": 1})
+    object.__setattr__(dd_new.forms[0], "__pydantic_extra__", {"formDynamic": 2})
+
+    report = diff(dd_old, dd_new)
+    by_path = {item.path: item for item in report.items}
+
+    assert by_path["forms[DM].formId"].action == "modified"
+    assert by_path["forms[DM].formId"].old_value is None
+    assert by_path["forms[DM].formId"].new_value == 1001
+
+    assert by_path["forms[DM].rule[R1].sequence"].action == "modified"
+    assert by_path["forms[DM].rule[R1].owner"].action == "modified"
+    assert by_path["unassignedBusinessLogic.rule[R_UNASSIGNED].form"].action == "modified"
+    assert by_path["unassignedBusinessLogic.rule[R_UNASSIGNED].sequence"].action == "modified"
+
+    assert by_path["rootVendor"].action == "modified"
+    assert by_path["rootAdded"].action == "added"
+    assert by_path["rootDynamic"].action == "modified"
+    assert by_path["metadata.metaTag"].action == "modified"
+    assert by_path["forms[DM].formDynamic"].action == "modified"
+    assert by_path["forms[DM].variables[SEX].choices[M].cdiscCode"].action == "modified"
+
+    # Reverse int -> None same-source transition is also reported
+    rev_report = diff(dd_new, dd_old)
+    rev_paths = {item.path: item for item in rev_report.items}
+    assert rev_paths["forms[DM].formId"].action == "modified"

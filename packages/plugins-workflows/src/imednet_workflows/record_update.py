@@ -18,6 +18,7 @@ from imednet.spi.validation import (
     SchemaCache,
     SchemaValidator,
     ValidationSchemaProtocol,
+    has_existing_record_target,
 )
 
 from ._workflow_helpers import (
@@ -108,13 +109,15 @@ class RecordUpdateWorkflow:
         return self._schema, not isinstance(self._schema, BaseSchemaCache)
 
     def _collect_distinct_form_refs(
-        self, records_data: list[dict[str, Any]]
-    ) -> tuple[list[str], list[Any]]:
-        """Collect distinct explicit form keys and form IDs across all records in order."""
+        self,
+        records_data: list[dict[str, Any]],
+    ) -> tuple[list[str], list[Any], bool]:
+        """Collect distinct form keys, form IDs, and whether targeted updates are present."""
         seen_keys: set[str] = set()
         explicit_form_keys: list[str] = []
         seen_ids: set[Any] = set()
         form_ids: list[Any] = []
+        has_targeted_updates = False
 
         for rec in records_data:
             fk, fid = _extract_record_form_ref(rec)
@@ -130,8 +133,14 @@ class RecordUpdateWorkflow:
                 if fid not in seen_ids:
                     seen_ids.add(fid)
                     form_ids.append(fid)
+                continue
 
-        return explicit_form_keys, form_ids
+            if has_existing_record_target(rec):
+                has_targeted_updates = True
+            else:
+                raise ValidationError("Record payload must include 'formKey' or 'formId'")
+
+        return explicit_form_keys, form_ids, has_targeted_updates
 
     def _check_form_refs_need_refresh(
         self,
@@ -139,13 +148,19 @@ class RecordUpdateWorkflow:
         study_key: str,
         explicit_form_keys: list[str],
         form_ids: list[Any],
+        *,
+        has_targeted_updates: bool = False,
     ) -> bool:
-        """Return True if any explicit form key or form ID for ``study_key`` is missing from ``cache``."""
-        if any(not cache.variables_for_form(fk, study_key=study_key) for fk in explicit_form_keys):
+        """Return True if any form reference or cold targeted-update cache needs refreshing."""
+        study_forms = cache.forms_for_study(study_key)
+        refreshed: set[str] = getattr(cache, "_refreshed_studies", None) or set()
+        if has_targeted_updates and not study_forms and study_key not in refreshed:
+            return True
+        if any(fk not in study_forms for fk in explicit_form_keys):
             return True
         for fid in form_ids:
             resolved = cache.form_key_from_id(fid, study_key=study_key)
-            if not resolved or not cache.variables_for_form(resolved, study_key=study_key):
+            if not resolved or resolved not in study_forms:
                 return True
         return False
 
@@ -160,27 +175,35 @@ class RecordUpdateWorkflow:
         study_forms = cache.forms_for_study(study_key)
         for fk in explicit_form_keys:
             if fk not in study_forms:
-                raise ValueError(f"Form key '{fk}' not found")
+                raise ValidationError(f"Form key '{fk}' not found")
         for fid in form_ids:
             resolved = cache.form_key_from_id(fid, study_key=study_key)
             if not resolved or resolved not in study_forms:
                 raise ValidationError(f"Unknown form ID {fid}")
 
     def _prepare_form_ref_validation(
-        self, study_key: str, records_data: list[dict[str, Any]]
+        self,
+        study_key: str,
+        records_data: list[dict[str, Any]],
     ) -> tuple[BaseSchemaCache[Any], list[str], list[Any], bool] | None:
         """Collect distinct form references and determine whether cache refresh is needed."""
         if not records_data or not isinstance(self._schema, BaseSchemaCache):
             return None
         cache = self._schema
-        explicit_form_keys, form_ids = self._collect_distinct_form_refs(records_data)
+        explicit_form_keys, form_ids, has_targeted_updates = self._collect_distinct_form_refs(
+            records_data
+        )
         needs_refresh = self._check_form_refs_need_refresh(
-            cache, study_key, explicit_form_keys, form_ids
+            cache,
+            study_key,
+            explicit_form_keys,
+            form_ids,
+            has_targeted_updates=has_targeted_updates,
         )
         return cache, explicit_form_keys, form_ids, needs_refresh
 
     def _validate_form_key(self, study_key: str, records_data: list[dict[str, Any]]) -> None:
-        """Refresh schema once if any distinct form key or form ID in the batch is uncached."""
+        """Refresh schema once if any distinct form key, form ID, or targeted update is uncached."""
         self._ensure_sync_mode("_validate_form_key", "_async_validate_form_key")
         prepared = self._prepare_form_ref_validation(study_key, records_data)
         if prepared is None:
@@ -283,7 +306,7 @@ class RecordUpdateWorkflow:
         spec = self._build_batch_spec(
             study_key, records_data, active_schema, eff_chunk, opts, _single_job_method
         )
-        if not is_offline:
+        if not is_offline and not (dry_run or collect_errors):
             self._validate_form_key(study_key, spec.records_data)
         sdk = cast("ImednetFacade", self._sdk)
         submitter = build_positional_record_chunk_submitter(
@@ -352,7 +375,7 @@ class RecordUpdateWorkflow:
         spec = self._build_batch_spec(
             study_key, records_data, active_schema, eff_chunk, opts, _single_job_method
         )
-        if not is_offline:
+        if not is_offline and not (dry_run or collect_errors):
             await self._async_validate_form_key(study_key, spec.records_data)
         sdk = cast("AsyncImednetFacade", self._sdk)
         submitter = build_positional_record_chunk_submitter(

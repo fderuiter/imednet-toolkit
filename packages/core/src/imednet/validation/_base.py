@@ -58,7 +58,10 @@ class _ValidatorMixin:
             data: The record data to validate.
             study_key: Optional study key used for study-partitioned schema lookup.
         """
-        if form_key:
-            from .cache import validate_record_data
+        from imednet.errors import ValidationError
 
-            validate_record_data(self.schema, form_key, data, study_key=study_key)
+        from .cache import validate_record_data
+
+        if not form_key:
+            raise ValidationError("Record payload must include 'formKey' or 'formId'")
+        validate_record_data(self.schema, form_key, data, study_key=study_key)

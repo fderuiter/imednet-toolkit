@@ -1431,14 +1431,14 @@ class LogicTreeEvaluator:
         if self._has_unsafe_regex_condition(conditions, data):
             return False, False, "unsafe_regex"
 
-        triggered = self._eval_node(
+        root_val = self._eval_node(
             cond_root,
             data,
             form_key=form_key,
             rule_type=rule_type,
             group_combinator=root_combinator,
         )
-        return triggered, False, None
+        return root_val is True, False, None
 
     @staticmethod
     def _has_unsafe_regex_condition(
@@ -1977,6 +1977,29 @@ class LogicTreeEvaluator:
             False,
         )
 
+    @staticmethod
+    def _kleene_not(value: bool | None) -> bool | None:
+        return None if value is None else (not value)
+
+    @staticmethod
+    def _kleene_combine(
+        values: Sequence[bool | None],
+        combinator: Literal["AND", "OR"],
+    ) -> bool | None:
+        if not values:
+            return False
+        if combinator == "OR":
+            if any(v is True for v in values):
+                return True
+            if all(v is False for v in values):
+                return False
+            return None
+        if any(v is False for v in values):
+            return False
+        if all(v is True for v in values):
+            return True
+        return None
+
     def _eval_combinator_branch(
         self,
         branch_val: Any,
@@ -1986,7 +2009,7 @@ class LogicTreeEvaluator:
         form_key: str | None,
         rule_type: str | None,
         default_operator: str | None,
-        results: list[bool],
+        results: list[bool | None],
     ) -> None:
         if branch_val is True:
             return
@@ -2025,20 +2048,22 @@ class LogicTreeEvaluator:
         rule_type: str | None,
         default_operator: str | None = None,
         group_combinator: Literal["AND", "OR"] | None = None,
-    ) -> bool:
+    ) -> bool | None:
         if isinstance(node, list):
             if not node:
                 return False
-            eval_fn = any if group_combinator == "OR" else all
-            return eval_fn(
-                self._eval_node(
-                    item,
-                    data,
-                    form_key=form_key,
-                    rule_type=rule_type,
-                    default_operator=default_operator,
-                )
-                for item in node
+            return self._kleene_combine(
+                [
+                    self._eval_node(
+                        item,
+                        data,
+                        form_key=form_key,
+                        rule_type=rule_type,
+                        default_operator=default_operator,
+                    )
+                    for item in node
+                ],
+                "OR" if group_combinator == "OR" else "AND",
             )
         if not isinstance(node, Mapping):
             return False
@@ -2050,11 +2075,11 @@ class LogicTreeEvaluator:
                 default_operator=default_operator,
             )
             if is_cross or leaf is None:
-                return False
+                return None
             return self._eval_leaf(leaf, data, rule_type=rule_type)
 
         combinator = self._node_combinator(node, default=group_combinator or "AND")
-        results: list[bool] = []
+        results: list[bool | None] = []
 
         for and_key in _AND_GROUP_KEYS:
             if and_key in node:
@@ -2082,12 +2107,14 @@ class LogicTreeEvaluator:
             if not_key in node and node[not_key] is not True:
                 for item in _as_list(node[not_key]):
                     results.append(
-                        not self._eval_node(
-                            item,
-                            data,
-                            form_key=form_key,
-                            rule_type=rule_type,
-                            default_operator=default_operator,
+                        self._kleene_not(
+                            self._eval_node(
+                                item,
+                                data,
+                                form_key=form_key,
+                                rule_type=rule_type,
+                                default_operator=default_operator,
+                            )
                         )
                     )
 
@@ -2134,7 +2161,7 @@ class LogicTreeEvaluator:
 
         if not results:
             return False
-        return any(results) if combinator == "OR" else all(results)
+        return self._kleene_combine(results, combinator)
 
     def _eval_leaf(
         self,
@@ -2142,7 +2169,7 @@ class LogicTreeEvaluator:
         data: Mapping[str, Any],
         *,
         rule_type: str | None,
-    ) -> bool:
+    ) -> bool | None:
         actual = data.get(cond.variable)
         op = cond.operator
 
@@ -2157,7 +2184,7 @@ class LogicTreeEvaluator:
         if cond.compare_variable is not None:
             rhs = data.get(cond.compare_variable)
             if _is_empty_record_value(actual) or _is_empty_record_value(rhs):
-                return False
+                return None
             if op == "regex" and _get_compiled_safe_regex(str(rhs)) is None:
                 return False
         else:
@@ -2178,7 +2205,9 @@ class LogicTreeEvaluator:
                         base = not base
                     return base if cond.expected_truth else (not base)
                 # Required rule checking missingness via <false/>
-                return (rule_type or "").strip().lower() == "required" and not cond.expected_truth
+                if (rule_type or "").strip().lower() == "required" and not cond.expected_truth:
+                    return True
+                return None
 
         base_result = self._compare_values(actual, op, rhs)
         return base_result if cond.expected_truth else (not base_result)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import re
@@ -31,6 +32,7 @@ from imednet.datadict.logic import (
     _MIN_BOUND_KEYS,
     LogicTreeEvaluator,
     RangeCheckConstraint,
+    VariableConstraints,
     _lookup_attr_or_extra,
     _parse_comparable_temporal,
     _to_finite_float,
@@ -117,14 +119,48 @@ class ValidationSchemaProtocol(Protocol):
 
 
 def _is_retired_variable(var: Any) -> bool:
-    """Return True if an API Variable is marked ``deleted=True`` or ``disabled=True``."""
+    """Return True if an API Variable or Form is marked ``deleted=True`` or ``disabled=True``."""
+    is_mapping = isinstance(var, Mapping)
     for attr in ("deleted", "disabled"):
-        val = getattr(var, attr, None)
+        val = var.get(attr) if is_mapping else getattr(var, attr, None)
         if isinstance(val, bool) and val:
             return True
         if isinstance(val, str) and val.strip().lower() in {"true", "yes", "y", "1"}:
             return True
     return False
+
+
+async def _consume_async_or_sync_items(candidate: Any) -> list[Any]:
+    """Consume an async generator, awaitable iterable, or sync iterable into a list."""
+    if inspect.isawaitable(candidate):
+        candidate = await candidate
+    if candidate is None:
+        return []
+    if hasattr(candidate, "__aiter__"):
+        return [item async for item in candidate]
+    if isinstance(candidate, Iterable) and not isinstance(candidate, (str, bytes)):
+        return list(candidate)
+    return []
+
+
+def _extract_form_model_fields(form_obj: Any) -> tuple[str | None, Any, str]:
+    """Extract ``(form_key, form_id, study_key)`` from a Form model or dict-like object."""
+    if isinstance(form_obj, Mapping):
+        raw_fk = form_obj.get("form_key") or form_obj.get("formKey")
+        raw_fid = (
+            form_obj.get("form_id")
+            if form_obj.get("form_id") is not None
+            else form_obj.get("formId")
+        )
+        raw_sk = form_obj.get("study_key") or form_obj.get("studyKey") or ""
+    else:
+        raw_fk = getattr(form_obj, "form_key", None) or getattr(form_obj, "formKey", None)
+        raw_fid = getattr(form_obj, "form_id", None)
+        if raw_fid is None:
+            raw_fid = getattr(form_obj, "formId", None)
+        raw_sk = getattr(form_obj, "study_key", None) or getattr(form_obj, "studyKey", None) or ""
+    fk = str(raw_fk).strip() if raw_fk is not None and str(raw_fk).strip() else None
+    return fk, raw_fid, str(raw_sk)
 
 
 class BaseSchemaCache(Generic[_TClient]):
@@ -201,13 +237,31 @@ class BaseSchemaCache(Generic[_TClient]):
             ]:
                 known_forms.discard(kf_key)
 
+    def _register_form_entry(
+        self,
+        study_partition: str,
+        form_key: str,
+        form_id: Any,
+        known_forms: set[tuple[str, str] | str],
+    ) -> None:
+        """Register a Form key and optional Form ID in ``study_partition``."""
+        known_forms.add((study_partition, form_key))
+        self._form_variables.setdefault((study_partition, form_key), {})
+        if form_id is not None:
+            fid_int = self._coerce_form_id_int(form_id)
+            if fid_int is not None:
+                self._form_id_to_key[(study_partition, fid_int)] = form_key
+
     def populate(
         self,
         variables: Iterable[Variable],
         study_key: str | None = None,
+        *,
+        forms: Iterable[Any] | None = None,
     ) -> None:
-        """Populate the cache with active ``variables``, isolated by ``study_key``."""
+        """Populate the cache with active ``variables`` and ``forms``, isolated by ``study_key``."""
         vars_list = list(variables)
+        forms_list = [f for f in forms if not _is_retired_variable(f)] if forms is not None else []
         known_forms = getattr(self, "_known_forms", None)
         if known_forms is None:
             known_forms = set()
@@ -215,28 +269,35 @@ class BaseSchemaCache(Generic[_TClient]):
         if study_key is not None:
             self._clear_study_partition(study_key)
             self._refreshed_studies.add(study_key)
+            for form_obj in forms_list:
+                fk, fid, _ = _extract_form_model_fields(form_obj)
+                if fk is not None:
+                    self._register_form_entry(study_key, fk, fid, known_forms)
             for var in vars_list:
                 if var.form_key is not None:
-                    known_forms.add((study_key, var.form_key))
-                    form_bucket = self._form_variables.setdefault((study_key, var.form_key), {})
-                    if var.form_id is not None:
-                        self._form_id_to_key[(study_key, var.form_id)] = var.form_key
+                    self._register_form_entry(study_key, var.form_key, var.form_id, known_forms)
+                    form_bucket = self._form_variables[(study_key, var.form_key)]
                     if var.variable_name is not None and not _is_retired_variable(var):
                         form_bucket[var.variable_name] = var
             return
 
-        target_studies = {var.study_key or "" for var in vars_list} or {""}
+        target_studies = (
+            {var.study_key or "" for var in vars_list}
+            | {_extract_form_model_fields(f)[2] for f in forms_list}
+        ) or {""}
         for sk in target_studies:
             self._clear_study_partition(sk)
             if sk:
                 self._refreshed_studies.add(sk)
+        for form_obj in forms_list:
+            fk, fid, f_sk = _extract_form_model_fields(form_obj)
+            if fk is not None:
+                self._register_form_entry(f_sk, fk, fid, known_forms)
         for var in vars_list:
             sk = var.study_key or ""
             if var.form_key is not None:
-                known_forms.add((sk, var.form_key))
-                form_bucket = self._form_variables.setdefault((sk, var.form_key), {})
-                if var.form_id is not None:
-                    self._form_id_to_key[(sk, var.form_id)] = var.form_key
+                self._register_form_entry(sk, var.form_key, var.form_id, known_forms)
+                form_bucket = self._form_variables[(sk, var.form_key)]
                 if var.variable_name is not None and not _is_retired_variable(var):
                     form_bucket[var.variable_name] = var
 
@@ -246,16 +307,16 @@ class BaseSchemaCache(Generic[_TClient]):
         variables: AsyncVariablesEndpoint,
         study_key: str | None = None,
     ) -> None:
-        """Refresh the cache asynchronously by fetching all variables for a study.
+        """Refresh the cache asynchronously by fetching forms and variables for a study.
 
         Args:
             forms: The asynchronous forms endpoint.
             variables: The asynchronous variables endpoint.
-            study_key: The study key to refresh variables for.
+            study_key: The study key to refresh forms and variables for.
         """
-        _ = forms
-        vars_list = [v async for v in variables.list(study_key=study_key)]
-        self.populate(vars_list, study_key=study_key)
+        forms_list = await _consume_async_or_sync_items(forms.list(study_key=study_key))
+        vars_list = await _consume_async_or_sync_items(variables.list(study_key=study_key))
+        self.populate(vars_list, study_key=study_key, forms=forms_list)
 
     def _refresh_sync(
         self,
@@ -263,16 +324,16 @@ class BaseSchemaCache(Generic[_TClient]):
         variables: VariablesEndpoint,
         study_key: str | None = None,
     ) -> None:
-        """Refresh the cache synchronously by fetching all variables for a study.
+        """Refresh the cache synchronously by fetching forms and variables for a study.
 
         Args:
             forms: The synchronous forms endpoint.
             variables: The synchronous variables endpoint.
-            study_key: The study key to refresh variables for.
+            study_key: The study key to refresh forms and variables for.
         """
-        _ = forms
+        forms_list = forms.list(study_key=study_key)
         vars_list = variables.list(study_key=study_key)
-        self.populate(vars_list, study_key=study_key)
+        self.populate(vars_list, study_key=study_key, forms=forms_list)
 
     def refresh(
         self,
@@ -841,8 +902,8 @@ _CANONICAL_VARIABLE_TAXONOMY: dict[str, tuple[str, Any, Callable[[Any], None]]] 
     # Whole-number numeric types
     "int": ("number", 1, _validate_int),
     "integer": ("number", 1, _validate_int),
-    "number": ("number", 1, _validate_int),
-    # Decimal numeric types
+    # Decimal & general numeric types
+    "number": ("number", 1, _validate_float),
     "float": ("number", 1.0, _validate_float),
     "decimal": ("number", 1.0, _validate_float),
     "double": ("number", 1.0, _validate_float),
@@ -1021,7 +1082,11 @@ def _check_type(
         UnknownVariableTypeError: If the variable type is not recognized.
         ValidationError: If the value does not match the expected type.
     """
-    if value is None or not var_type:
+    if value is None:
+        return
+    if not isinstance(value, bool) and isinstance(value, float) and not math.isfinite(value):
+        raise ValidationError("Value must be a finite numeric value")
+    if not var_type:
         return
 
     validator = _TYPE_VALIDATORS.get(var_type)
@@ -1366,6 +1431,73 @@ def _validate_text_length(
         )
 
 
+def _validate_populated_variable_constraints(
+    name: str,
+    form_key: str,
+    value: Any,
+    var_type: str | None,
+    constraints: VariableConstraints,
+    *,
+    has_explicit_bounds: bool,
+    record_error: Callable[..., None],
+    record_index: int,
+    issue_form_key: str | None,
+    warnings: list[RecordValidationIssue],
+) -> None:
+    """Enforce choices, numeric bounds, ODM range checks, and text length on a non-empty value."""
+    if constraints.choices:
+        try:
+            _validate_choice_membership(name, form_key, var_type, value, constraints.choices)
+        except ValidationError as exc:
+            record_error(exc.message, variable_name=name, rule_id="choice", exc=exc)
+    if (constraints.min_value is not None or constraints.max_value is not None) and (
+        not constraints.range_checks or has_explicit_bounds
+    ):
+        try:
+            _validate_numeric_bounds(
+                name, form_key, value, constraints.min_value, constraints.max_value
+            )
+        except ValidationError as exc:
+            record_error(exc.message, variable_name=name, rule_id="bounds", exc=exc)
+    if constraints.range_checks:
+        try:
+            _validate_numeric_bounds(name, form_key, value, None, None)
+        except ValidationError as exc:
+            record_error(exc.message, variable_name=name, rule_id="range_check", exc=exc)
+        else:
+            for rc in constraints.range_checks:
+                if not _evaluate_range_check(value, rc):
+                    rc_msg = _format_range_check_message(name, form_key, value, rc)
+                    if rc.soft_hard == "Soft":
+                        logger.warning(
+                            "Soft RangeCheck warning on variable '%s' (form '%s'): %s",
+                            name,
+                            form_key,
+                            rc_msg,
+                        )
+                        warnings.append(
+                            RecordValidationIssue(
+                                record_index=record_index,
+                                form_key=issue_form_key,
+                                variable_name=name,
+                                message=rc_msg,
+                                rule_id="range_check_soft",
+                                severity="warning",
+                            )
+                        )
+                    else:
+                        record_error(rc_msg, variable_name=name, rule_id="range_check")
+    if isinstance(value, str) and (
+        constraints.min_length is not None or constraints.max_length is not None
+    ):
+        try:
+            _validate_text_length(
+                name, form_key, value, constraints.min_length, constraints.max_length
+            )
+        except ValidationError as exc:
+            record_error(exc.message, variable_name=name, rule_id="length", exc=exc)
+
+
 def _check_required_variables_only(
     variables: Mapping[str, Any],
     form_key: str,
@@ -1591,57 +1723,18 @@ def validate_record_data(
 
         value = data[name]
         vtype = getattr(var_obj, "variable_type", getattr(var_obj, "variableType", None))
-        if constraints.choices:
-            try:
-                _validate_choice_membership(name, form_key, vtype, value, constraints.choices)
-            except ValidationError as exc:
-                _record_error(exc.message, variable_name=name, rule_id="choice", exc=exc)
-        if (constraints.min_value is not None or constraints.max_value is not None) and (
-            not constraints.range_checks or _has_explicit_numeric_bounds(var_obj)
-        ):
-            try:
-                _validate_numeric_bounds(
-                    name, form_key, value, constraints.min_value, constraints.max_value
-                )
-            except ValidationError as exc:
-                _record_error(exc.message, variable_name=name, rule_id="bounds", exc=exc)
-        if constraints.range_checks:
-            try:
-                _validate_numeric_bounds(name, form_key, value, None, None)
-            except ValidationError as exc:
-                _record_error(exc.message, variable_name=name, rule_id="range_check", exc=exc)
-            else:
-                for rc in constraints.range_checks:
-                    if not _evaluate_range_check(value, rc):
-                        rc_msg = _format_range_check_message(name, form_key, value, rc)
-                        if rc.soft_hard == "Soft":
-                            logger.warning(
-                                "Soft RangeCheck warning on variable '%s' (form '%s'): %s",
-                                name,
-                                form_key,
-                                rc_msg,
-                            )
-                            warnings.append(
-                                RecordValidationIssue(
-                                    record_index=record_index,
-                                    form_key=form_key,
-                                    variable_name=name,
-                                    message=rc_msg,
-                                    rule_id="range_check_soft",
-                                    severity="warning",
-                                )
-                            )
-                        else:
-                            _record_error(rc_msg, variable_name=name, rule_id="range_check")
-        if isinstance(value, str) and (
-            constraints.min_length is not None or constraints.max_length is not None
-        ):
-            try:
-                _validate_text_length(
-                    name, form_key, value, constraints.min_length, constraints.max_length
-                )
-            except ValidationError as exc:
-                _record_error(exc.message, variable_name=name, rule_id="length", exc=exc)
+        _validate_populated_variable_constraints(
+            name,
+            form_key,
+            value,
+            vtype,
+            constraints,
+            has_explicit_bounds=_has_explicit_numeric_bounds(var_obj),
+            record_error=_record_error,
+            record_index=record_index,
+            issue_form_key=form_key,
+            warnings=warnings,
+        )
 
     rules_getter = getattr(schema, "rules_for_form", None)
     if callable(rules_getter):
@@ -1960,85 +2053,155 @@ def validate_record_entry(
     raw_data = record.get("recordData", record.get("data", {}))
     if isinstance(raw_data, Mapping) and raw_data:
         forms_attr = getattr(schema, "forms", None)
-        is_datadict_like = isinstance(forms_attr, Sequence) and not isinstance(
-            schema, BaseSchemaCache
-        )
-        if is_datadict_like or collect_errors:
-            form_keys: Iterable[str]
-            if isinstance(schema, BaseSchemaCache):
-                form_keys = schema.forms_for_study(eff_study_key) if eff_study_key else schema.forms
-            elif isinstance(forms_attr, Sequence):
-                form_keys = [
-                    str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
-                    for f in forms_attr
-                    if getattr(f, "form_key", None) or getattr(f, "formKey", None)
-                ]
-            else:
-                form_keys = ()
+        form_keys: list[str]
+        if isinstance(schema, BaseSchemaCache):
+            form_keys = list(
+                schema.forms_for_study(eff_study_key) if eff_study_key else schema.forms
+            )
+        elif isinstance(forms_attr, Sequence):
+            form_keys = [
+                str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
+                for f in forms_attr
+                if getattr(f, "form_key", None) or getattr(f, "formKey", None)
+            ]
+        else:
+            form_keys = []
 
-            known_vars: dict[str, list[Any]] = {}
-            for candidate_fk in form_keys:
-                f_vars = (
-                    schema.variables_for_form(candidate_fk, study_key=eff_study_key)
-                    if isinstance(schema, BaseSchemaCache)
-                    else schema.variables_for_form(candidate_fk)
+        known_vars: dict[str, list[tuple[str, Any]]] = {}
+        for candidate_fk in form_keys:
+            f_vars = (
+                schema.variables_for_form(candidate_fk, study_key=eff_study_key)
+                if isinstance(schema, BaseSchemaCache)
+                else schema.variables_for_form(candidate_fk)
+            )
+            for v_name, v_obj in f_vars.items():
+                known_vars.setdefault(v_name, []).append((candidate_fk, v_obj))
+
+        formless_errors: list[RecordValidationIssue] = []
+        formless_warnings: list[RecordValidationIssue] = []
+
+        def _record_targeted_error(
+            message: str,
+            *,
+            variable_name: str | None = None,
+            rule_id: str | None = None,
+            exc: ValidationError | None = None,
+            issue_fk: str | None = None,
+        ) -> None:
+            if not collect_errors:
+                if exc is not None:
+                    raise exc
+                raise ValidationError(message)
+            formless_errors.append(
+                RecordValidationIssue(
+                    record_index=record_index,
+                    form_key=issue_fk,
+                    variable_name=variable_name,
+                    message=message,
+                    rule_id=rule_id,
                 )
-                for v_name, v_obj in f_vars.items():
-                    known_vars.setdefault(v_name, []).append(v_obj)
+            )
 
-            if known_vars:
-                formless_errors: list[RecordValidationIssue] = []
-                for var_name, var_val in raw_data.items():
-                    candidates = known_vars.get(var_name)
-                    if not candidates:
-                        msg = f"Unknown variable {var_name}"
-                        if not collect_errors:
-                            raise ValidationError(msg)
-                        formless_errors.append(
-                            RecordValidationIssue(
-                                record_index=record_index,
-                                form_key=None,
-                                variable_name=var_name,
-                                message=msg,
-                                rule_id="unknown_variable",
-                            )
-                        )
-                        continue
-                    if not _is_empty_value(var_val):
-                        distinct_types = {
-                            str(getattr(vo, "variable_type", getattr(vo, "variableType", "")) or "")
-                            .strip()
-                            .lower()
-                            for vo in candidates
-                        }
-                        distinct_types.discard("")
-                        if len(distinct_types) == 1:
-                            vtype = getattr(
-                                candidates[0],
-                                "variable_type",
-                                getattr(candidates[0], "variableType", None),
-                            )
-                            try:
-                                _check_type(vtype, var_val)
-                            except ValidationError as exc:
-                                if not collect_errors:
-                                    raise
-                                formless_errors.append(
-                                    RecordValidationIssue(
-                                        record_index=record_index,
-                                        form_key=None,
-                                        variable_name=var_name,
-                                        message=str(exc),
-                                        rule_id="invalid_type",
-                                    )
-                                )
-                if formless_errors:
-                    return BatchValidationReport(
-                        total_records=1,
-                        valid_records=0,
-                        invalid_records=1,
-                        errors=formless_errors,
+        schema_has_scope = bool(known_vars or form_keys)
+        for var_name, var_val in raw_data.items():
+            if _contains_masked_sentinel(var_val):
+                _record_targeted_error(
+                    f"Variable '{var_name}' contains masked PHI sentinel '{MASKED_SENTINEL}'",
+                    variable_name=var_name,
+                    rule_id="masked_phi",
+                )
+                continue
+
+            candidates = known_vars.get(var_name)
+            if not candidates:
+                if schema_has_scope:
+                    _record_targeted_error(
+                        f"Unknown variable {var_name}",
+                        variable_name=var_name,
+                        rule_id="unknown_variable",
                     )
+                    continue
+                if not _is_empty_value(var_val):
+                    try:
+                        _check_type(None, var_val, name=var_name)
+                    except ValidationError as exc:
+                        _record_targeted_error(
+                            exc.message,
+                            variable_name=var_name,
+                            rule_id="invalid_type",
+                            exc=exc,
+                        )
+                continue
+
+            if _is_empty_value(var_val):
+                continue
+
+            unambiguous_fk = candidates[0][0] if len(candidates) == 1 else None
+            eff_types = [_effective_variable_type(vo) for _, vo in candidates]
+            distinct_norm_types = {_normalize_variable_type_key(t) for t in eff_types}
+            type_failed = False
+            try:
+                if len(distinct_norm_types) == 1:
+                    _check_type(
+                        eff_types[0],
+                        var_val,
+                        name=var_name,
+                        form_key=unambiguous_fk,
+                    )
+                else:
+                    _check_type(None, var_val, name=var_name)
+            except ValidationError as exc:
+                type_failed = True
+                _record_targeted_error(
+                    exc.message,
+                    variable_name=var_name,
+                    rule_id="invalid_type",
+                    exc=exc,
+                )
+
+            if type_failed or isinstance(schema, BaseSchemaCache):
+                continue
+
+            cand_constraints = [extract_variable_constraints(vo) for _, vo in candidates]
+            constraint_sigs = {
+                (
+                    tuple(c.choices),
+                    c.min_value,
+                    c.max_value,
+                    c.range_checks,
+                    c.min_length,
+                    c.max_length,
+                )
+                for c in cand_constraints
+            }
+            if len(constraint_sigs) == 1:
+                primary_fk, primary_vo = candidates[0]
+                raw_vtype = getattr(
+                    primary_vo, "variable_type", getattr(primary_vo, "variableType", None)
+                )
+                _validate_populated_variable_constraints(
+                    var_name,
+                    primary_fk,
+                    var_val,
+                    raw_vtype if len(distinct_norm_types) == 1 else None,
+                    cand_constraints[0],
+                    has_explicit_bounds=all(
+                        _has_explicit_numeric_bounds(vo) for _, vo in candidates
+                    ),
+                    record_error=_record_targeted_error,
+                    record_index=record_index,
+                    issue_form_key=unambiguous_fk,
+                    warnings=formless_warnings,
+                )
+
+        if formless_errors or (collect_errors and formless_warnings):
+            return BatchValidationReport(
+                total_records=1,
+                valid_records=0 if formless_errors else 1,
+                invalid_records=1 if formless_errors else 0,
+                errors=formless_errors,
+                warnings=formless_warnings,
+            )
 
     if collect_errors:
         return BatchValidationReport(total_records=1, valid_records=1, invalid_records=0)
@@ -2091,14 +2254,17 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
         self,
         variables: Iterable[Variable],
         study_key: str | None = None,
+        *,
+        forms: Iterable[Any] | None = None,
     ) -> None:
         """Common logic to populate the schema cache.
 
         Args:
             variables: An iterable of variables to populate the cache with.
             study_key: Optional study key partition for ``variables``.
+            forms: Optional iterable of forms to retain zero-variable forms.
         """
-        self.schema.populate(variables, study_key=study_key)
+        self.schema.populate(variables, study_key=study_key, forms=forms)
 
     def _needs_refresh(
         self,
@@ -2116,6 +2282,14 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
         _, fid = _extract_form_ref(record)
         if fid is not None and not isinstance(fid, bool):
             return None, True
+        if _has_existing_record_target(record):
+            refreshed: set[str] = getattr(self.schema, "_refreshed_studies", None) or set()
+            has_study_schema = (
+                study_key in refreshed or bool(self.schema.forms_for_study(study_key))
+                if study_key
+                else bool(self.schema.forms)
+            )
+            return None, not has_study_schema
         return None, False
 
 
@@ -2128,42 +2302,46 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
         self.schema = SchemaCache()
 
     def refresh(self, study_key: str) -> None:
-        """Populate the schema cache for ``study_key`` from the Variables endpoint.
+        """Populate the schema cache for ``study_key`` from the Forms and Variables endpoints.
 
         This method never raises :class:`~imednet.errors.ValidationError`;
         any API errors bubble up as :class:`~imednet.errors.ApiError`.
         """
         from unittest.mock import NonCallableMock
 
+        forms_list: Iterable[Any] | None = None
         if isinstance(self._sdk, NonCallableMock):
             mock_children = getattr(self._sdk, "_mock_children", {})
             obj_vars = vars(self._sdk)
             has_vars_ep = "variables" in mock_children or "variables" in obj_vars
             has_get_vars = "get_variables" in mock_children or "get_variables" in obj_vars
+            has_forms_ep = "forms" in mock_children or "forms" in obj_vars
+            has_get_forms = "get_forms" in mock_children or "get_forms" in obj_vars
+            if has_get_forms:
+                forms_list = self._sdk.get_forms(study_key=study_key)
+            elif has_forms_ep:
+                forms_list = self._sdk.forms.list(study_key=study_key)
             if has_vars_ep and not has_get_vars:
                 variables = self._sdk.variables.list(study_key=study_key)
-                self._refresh_common(variables, study_key=study_key)
+                self._refresh_common(variables, study_key=study_key, forms=forms_list)
                 return
+            variables = self._sdk.get_variables(study_key=study_key)
+            self._refresh_common(variables, study_key=study_key, forms=forms_list)
+            return
 
+        if hasattr(self._sdk, "get_forms"):
+            forms_list = self._sdk.get_forms(study_key=study_key)
+        elif hasattr(self._sdk, "forms"):
+            forms_list = self._sdk.forms.list(study_key=study_key)
         variables = self._sdk.get_variables(study_key=study_key)
-        self._refresh_common(variables, study_key=study_key)
+        self._refresh_common(variables, study_key=study_key, forms=forms_list)
 
     def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
         """Validate a single record payload."""
-        form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
+        _, needs_refresh = self._needs_refresh(record, study_key=study_key)
         if needs_refresh:
             self.refresh(study_key)
-            if form_key is None:
-                form_key = self._resolve_form_key(record, study_key=study_key)
-        if form_key is None:
-            _, fid = _extract_form_ref(record)
-            if fid is not None:
-                raise ValidationError(f"Unknown form ID {fid}")
-        self._validate_cached(
-            form_key,
-            record.get("recordData", record.get("data", {})),
-            study_key=study_key,
-        )
+        validate_record_entry(self.schema, record, study_key=study_key, collect_errors=False)
 
     @overload
     def validate_batch(
@@ -2229,30 +2407,66 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
         self.schema = AsyncSchemaCache()
 
     async def refresh(self, study_key: str) -> None:
-        """Populate the schema cache for ``study_key`` from the Variables endpoint.
+        """Populate the schema cache for ``study_key`` from the Forms and Variables endpoints.
 
         This method never raises :class:`~imednet.errors.ValidationError`;
         any API errors bubble up as :class:`~imednet.errors.ApiError`.
         """
+        from unittest.mock import NonCallableMock
+
+        forms_list: list[Any] | None = None
+        if isinstance(self._sdk, NonCallableMock):
+            mock_children = getattr(self._sdk, "_mock_children", {})
+            obj_vars = vars(self._sdk)
+            has_async_get_forms = (
+                "async_get_forms" in mock_children or "async_get_forms" in obj_vars
+            )
+            has_forms_ep = "forms" in mock_children or "forms" in obj_vars
+            has_get_forms = "get_forms" in mock_children or "get_forms" in obj_vars
+            has_vars_ep = "variables" in mock_children or "variables" in obj_vars
+            has_async_get_vars = (
+                "async_get_variables" in mock_children or "async_get_variables" in obj_vars
+            )
+            if has_async_get_forms:
+                forms_list = await _consume_async_or_sync_items(
+                    self._sdk.async_get_forms(study_key=study_key)
+                )
+            elif has_forms_ep:
+                forms_list = await _consume_async_or_sync_items(
+                    self._sdk.forms.list(study_key=study_key)
+                )
+            elif has_get_forms:
+                forms_list = await _consume_async_or_sync_items(
+                    self._sdk.get_forms(study_key=study_key)
+                )
+            if has_vars_ep and not has_async_get_vars:
+                variables = await _consume_async_or_sync_items(
+                    self._sdk.variables.list(study_key=study_key)
+                )
+            else:
+                variables = await _consume_async_or_sync_items(
+                    self._sdk.async_get_variables(study_key=study_key)
+                )
+            self._refresh_common(variables, study_key=study_key, forms=forms_list)
+            return
+
+        if hasattr(self._sdk, "async_get_forms"):
+            forms_list = await _consume_async_or_sync_items(
+                self._sdk.async_get_forms(study_key=study_key)
+            )
+        elif hasattr(self._sdk, "forms"):
+            forms_list = await _consume_async_or_sync_items(
+                self._sdk.forms.list(study_key=study_key)
+            )
         variables = await self._sdk.async_get_variables(study_key=study_key)
-        self._refresh_common(variables, study_key=study_key)
+        self._refresh_common(variables, study_key=study_key, forms=forms_list)
 
     async def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
         """Validate a single record payload asynchronously."""
-        form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
+        _, needs_refresh = self._needs_refresh(record, study_key=study_key)
         if needs_refresh:
             await self.refresh(study_key)
-            if form_key is None:
-                form_key = self._resolve_form_key(record, study_key=study_key)
-        if form_key is None:
-            _, fid = _extract_form_ref(record)
-            if fid is not None:
-                raise ValidationError(f"Unknown form ID {fid}")
-        self._validate_cached(
-            form_key,
-            record.get("recordData", record.get("data", {})),
-            study_key=study_key,
-        )
+        validate_record_entry(self.schema, record, study_key=study_key, collect_errors=False)
 
     @overload
     async def validate_batch(

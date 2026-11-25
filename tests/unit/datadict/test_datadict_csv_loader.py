@@ -255,3 +255,62 @@ def test_csv_loader_updated_by_emits_no_timestamp_warning_while_date_modified_va
     assert any(
         "dateModified" in w and "Invalid timestamp" in w for w in dd_bad.metadata.validationWarnings
     )
+
+
+def test_csv_loader_strict_mode_allows_unknown_headers_with_warnings_and_fails_on_real_errors() -> (
+    None
+):
+    """AC 7: strict=True succeeds on extra headers like 'Special Patient ID' while failing on structural/XML/timestamp errors."""
+    forms_csv = "Form Key,Form Name,Custom Form Column\nAE,Adverse Event,CF_1\n"
+    questions_csv = "Form,Variable Name,Special Patient ID\nAE,AESTDAT,SPID_99\n"
+    choices_csv = (
+        "Form,Variable Name,Choice Text,Choice Value,Extra Choice Meta\nAE,AESTDAT,Yes,Y,CM_1\n"
+    )
+    logic_csv = "Type,Name,Status,ID,Form,Extra Rule Col\nForm,Check AE,Active,10,AE,RC_1\n"
+
+    dd = load_from_csv_files(
+        forms_file=io.StringIO(forms_csv),
+        questions_file=io.StringIO(questions_csv),
+        choices_file=io.StringIO(choices_csv),
+        business_logic_file=io.StringIO(logic_csv),
+        strict=True,
+    )
+    assert dd.forms[0].extraAttributes.get("customFormColumn") == "CF_1"
+    assert dd.forms[0].variables[0].extraAttributes.get("specialPatientId") == "SPID_99"
+    assert dd.forms[0].variables[0].choices[0].extraAttributes.get("extraChoiceMeta") == "CM_1"
+    assert dd.forms[0].businessLogic[0].extraAttributes.get("extraRuleCol") == "RC_1"
+    assert any("Special Patient ID" in w for w in dd.metadata.validationWarnings)
+
+    # Structural error: missing Form Key in FORMS.csv fails in strict=True
+    with pytest.raises(ValueError, match="Form row without formKey"):
+        load_from_csv_files(
+            forms_file=io.StringIO("Form Key,Form Name\n,Missing Key\n"),
+            questions_file=io.StringIO("Form,Variable Name\n"),
+            choices_file=io.StringIO("Form,Variable Name,Choice Text,Choice Value\n"),
+            business_logic_file=io.StringIO("Type,Name,Status,ID,Form\n"),
+            strict=True,
+        )
+
+    # Broken rule form reference fails in strict=True
+    with pytest.raises(ValueError, match="references undefined form 'NO_FORM'"):
+        load_from_csv_files(
+            forms_file=io.StringIO("Form Key,Form Name\nAE,Adverse Event\n"),
+            questions_file=io.StringIO("Form,Variable Name\nAE,AESTDAT\n"),
+            choices_file=io.StringIO("Form,Variable Name,Choice Text,Choice Value\n"),
+            business_logic_file=io.StringIO(
+                "Type,Name,Status,ID,Form\nForm,Bad Rule,Active,1,NO_FORM\n"
+            ),
+            strict=True,
+        )
+
+    # Malformed XML fails in strict=True
+    with pytest.raises(ValueError, match="Malformed XML in business logic"):
+        load_from_csv_files(
+            forms_file=io.StringIO("Form Key,Form Name\nAE,Adverse Event\n"),
+            questions_file=io.StringIO("Form,Variable Name\nAE,AESTDAT\n"),
+            choices_file=io.StringIO("Form,Variable Name,Choice Text,Choice Value\n"),
+            business_logic_file=io.StringIO(
+                'Type,Name,Status,ID,Form,Logic\nForm,Bad XML,Active,1,AE,"<rule><unclosed>"\n'
+            ),
+            strict=True,
+        )

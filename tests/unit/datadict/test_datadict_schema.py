@@ -300,3 +300,54 @@ def test_validate_catches_malformed_business_logic_xml_and_csv_rules() -> None:
         compiled_errors = "\n".join(validate(compiled, schema=get_schema()))
         assert compiled_errors != ""
         assert "Malformed" in compiled_errors or "logic" in compiled_errors
+
+
+def test_validate_enforces_default_schema_path_and_mm_dd_yyyy_timestamps(
+    monkeypatch,
+) -> None:
+    """AC 6: validate() uses SCHEMA_PATH by default, checks MM-DD-YYYY generatedAt, and keeps Python construction permissive."""
+    import sys
+
+    from imednet.datadict.models import Metadata
+
+    # Programmatic construction in Python remains permissive
+    in_memory = DataDictionary()
+    assert in_memory.forms == []
+    custom_meta = Metadata(generatedAt="2026-09-28", extraAttributes={"vendor": "custom"})
+    assert custom_meta.generatedAt == "2026-09-28"
+
+    # Valid payload with MM-DD-YYYY generatedAt passes default validate()
+    valid_payload = {
+        "metadata": {
+            "schemaVersion": "1.0.0",
+            "generatedAt": "09-28-2026 14:30:00",
+            "extraAttributes": {"customKey": "ok"},
+        },
+        "forms": [{"formKey": "DM", "variables": []}],
+    }
+    assert validate(valid_payload) == []
+
+    # Invalid generatedAt timestamps fail default validate() for both dict and DataDictionary targets
+    for bad_ts in ("2026-09-28", "13-40-2026", "09/28/2026", "", "not-a-timestamp"):
+        bad_dict = {
+            "metadata": {"schemaVersion": "1.0.0", "generatedAt": bad_ts},
+            "forms": [{"formKey": "DM", "variables": []}],
+        }
+        dict_errs = "\n".join(validate(bad_dict))
+        assert "generatedAt" in dict_errs
+
+        bad_model = DataDictionary(
+            metadata=Metadata(generatedAt=bad_ts),
+            forms=[Form(formKey="DM", variables=[])],
+        )
+        model_errs = "\n".join(validate(bad_model))
+        assert "generatedAt" in model_errs
+
+    # Unknown root keys and empty object fail even when jsonschema is unavailable (fallback path)
+    monkeypatch.setitem(sys.modules, "jsonschema", None)
+    assert any("forms" in e for e in validate({}))
+    assert any("extraRoot" in e or "Extra" in e for e in validate({"forms": [], "extraRoot": 1}))
+    assert any(
+        "generatedAt" in e
+        for e in validate({"metadata": {"generatedAt": "2026-09-28"}, "forms": [{"formKey": "DM"}]})
+    )

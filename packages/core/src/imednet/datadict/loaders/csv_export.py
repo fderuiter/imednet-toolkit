@@ -101,6 +101,7 @@ _EXPLICIT_TIMESTAMP_KEYS = frozenset(
         "updatedTime",
         "dateTime",
         "datetime",
+        "generatedAt",
     }
 )
 
@@ -154,11 +155,11 @@ def load_from_csv_files(
     warnings: list[str] = []
     warning_set: set[str] = set()
 
-    def record_warning(msg: str) -> None:
+    def record_warning(msg: str, *, fatal_in_strict: bool = True) -> None:
         if msg not in warning_set:
             warning_set.add(msg)
             warnings.append(msg)
-        if strict:
+        if strict and fatal_in_strict:
             raise ValueError(f"Strict validation error: {msg}")
 
     # 1. Parse Forms
@@ -166,7 +167,7 @@ def load_from_csv_files(
     for row in raw_forms:
         known, extra, row_warns = normalize_row_data(row, KNOWN_FORM_FIELDS, "FORMS.csv")
         for w in row_warns:
-            record_warning(w)
+            record_warning(w, fatal_in_strict=False)
 
         fk = known.get("formKey") or known.get("form") or ""
         if not fk:
@@ -187,7 +188,7 @@ def load_from_csv_files(
     for idx, row in enumerate(raw_questions):
         known, extra, row_warns = normalize_row_data(row, KNOWN_QUESTION_FIELDS, "QUESTIONS.csv")
         for w in row_warns:
-            record_warning(w)
+            record_warning(w, fatal_in_strict=False)
 
         fk = known.get("form") or known.get("formKey") or ""
         vname = known.get("variableName") or ""
@@ -225,7 +226,7 @@ def load_from_csv_files(
     for row in raw_choices:
         known, extra, row_warns = normalize_row_data(row, KNOWN_CHOICE_FIELDS, "CHOICES.csv")
         for w in row_warns:
-            record_warning(w)
+            record_warning(w, fatal_in_strict=False)
 
         fk = known.get("form") or known.get("formKey") or ""
         vname = known.get("variableName") or ""
@@ -254,7 +255,7 @@ def load_from_csv_files(
     for idx, row in enumerate(raw_rules):
         known, extra, row_warns = normalize_row_data(row, KNOWN_RULE_FIELDS, "BUSINESS_LOGIC.csv")
         for w in row_warns:
-            record_warning(w)
+            record_warning(w, fatal_in_strict=False)
 
         # Detect raw XML from known XML headers or XML-shaped cell
         xml_content: str | None = None
@@ -296,6 +297,9 @@ def load_from_csv_files(
             logicRawXml=None if no_raw_xml else xml_content,
             extraAttributes=extra,
         )
+
+        if rule_form is not None and rule_form.strip() and rule_form not in forms_by_key:
+            record_warning(f"Rule '{rule_name or rule_id}' references undefined form '{rule_form}'")
 
         # 5 rule types: Form (attached to form), Workflow, Query, Approval, Required (routed to unassigned)
         is_form_rule = (

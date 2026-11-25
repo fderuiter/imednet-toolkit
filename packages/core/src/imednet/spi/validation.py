@@ -25,6 +25,9 @@ from imednet.validation.cache import (
     validate_record_entry,
     validate_records_batch,
 )
+from imednet.validation.cache import (
+    _has_existing_record_target as has_existing_record_target,
+)
 
 __all__ = [
     "AsyncSchemaCache",
@@ -46,6 +49,7 @@ __all__ = [
     "VariableConstraints",
     "calculate_readiness_score",
     "extract_variable_constraints",
+    "has_existing_record_target",
     "parse_logic_xml",
     "validate_record_data",
     "validate_record_entry",

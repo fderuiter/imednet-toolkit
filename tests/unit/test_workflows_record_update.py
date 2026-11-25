@@ -27,13 +27,16 @@ def test_create_or_update_records_no_wait() -> None:
     """Test that create or update records no wait."""
     sdk = MagicMock()
     del sdk.async_create_record
+    var = Variable(variable_name="a", variable_type="integer", form_id=1, form_key="F1")
+    sdk.get_variables.return_value = [var]
     job = Job(jobId="1", batchId="1", state="PROCESSING")
     sdk.create_record.return_value = job
 
     wf = RecordUpdateWorkflow(sdk)
-    result = wf.create_or_update_records("STUDY", [{"a": 1}])
+    payload = [{"formKey": "F1", "data": {"a": 1}}]
+    result = wf.create_or_update_records("STUDY", payload)
 
-    sdk.create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.create_record.assert_called_once_with("STUDY", payload, schema=wf._schema)
     assert result == job
 
 
@@ -41,6 +44,8 @@ def test_create_or_update_records_wait_for_completion(monkeypatch) -> None:
     """Test that create or update records wait for completion."""
     sdk = MagicMock()
     del sdk.async_create_record
+    var = Variable(variable_name="a", variable_type="integer", form_id=1, form_key="F1")
+    sdk.get_variables.return_value = [var]
     initial_job = Job(jobId="1", batchId="1", state="PROCESSING")
     completed_job = Job(jobId="1", batchId="1", state="COMPLETED")
     sdk.create_record.return_value = initial_job
@@ -49,15 +54,16 @@ def test_create_or_update_records_wait_for_completion(monkeypatch) -> None:
     wf = RecordUpdateWorkflow(sdk)
     # patch sleep to avoid delay
     monkeypatch.setattr("time.sleep", lambda *args: None)
+    payload = [{"formKey": "F1", "data": {"a": 1}}]
     result = wf.create_or_update_records(
         "STUDY",
-        [{"a": 1}],
+        payload,
         wait_for_completion=True,
         poll_interval=0,
         timeout=5,
     )
 
-    sdk.create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.create_record.assert_called_once_with("STUDY", payload, schema=wf._schema)
     sdk.poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0)
     assert result.state == "COMPLETED"
 
@@ -333,7 +339,7 @@ def test_create_or_update_records_form_key_not_found() -> None:
 
     wf = RecordUpdateWorkflow(sdk)
 
-    with pytest.raises(ValueError, match="Form key 'UNKNOWN_FORM' not found"):
+    with pytest.raises(ValidationError, match="Form key 'UNKNOWN_FORM' not found"):
         wf.create_or_update_records(
             "STUDY",
             [{"formKey": "UNKNOWN_FORM", "data": {"a": 1}}],
@@ -345,13 +351,16 @@ async def test_async_create_or_update_records_no_wait() -> None:
     """Test that async create or update records no wait asynchronously."""
     sdk = MagicMock()
     sdk._async_client = True
+    var = Variable(variable_name="a", variable_type="integer", form_id=1, form_key="F1")
+    sdk.async_get_variables = AsyncMock(return_value=[var])
     job = Job(jobId="1", batchId="1", state="PROCESSING")
     sdk.async_create_record = AsyncMock(return_value=job)
 
     wf = RecordUpdateWorkflow(sdk)
-    result = await wf.async_create_or_update_records("STUDY", [{"a": 1}])
+    payload = [{"formKey": "F1", "data": {"a": 1}}]
+    result = await wf.async_create_or_update_records("STUDY", payload)
 
-    sdk.async_create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.async_create_record.assert_called_once_with("STUDY", payload, schema=wf._schema)
     assert result == job
 
 
@@ -360,6 +369,8 @@ async def test_async_create_or_update_records_wait_for_completion(monkeypatch) -
     """Test that async create or update records wait for completion asynchronously."""
     sdk = MagicMock()
     sdk._async_client = True
+    var = Variable(variable_name="a", variable_type="integer", form_id=1, form_key="F1")
+    sdk.async_get_variables = AsyncMock(return_value=[var])
     initial_job = Job(jobId="1", batchId="1", state="PROCESSING")
     completed_job = Job(jobId="1", batchId="1", state="COMPLETED")
     sdk.async_create_record = AsyncMock(return_value=initial_job)
@@ -369,15 +380,16 @@ async def test_async_create_or_update_records_wait_for_completion(monkeypatch) -
     import anyio
 
     monkeypatch.setattr(anyio, "sleep", AsyncMock())
+    payload = [{"formKey": "F1", "data": {"a": 1}}]
     result = await wf.async_create_or_update_records(
         "STUDY",
-        [{"a": 1}],
+        payload,
         wait_for_completion=True,
         poll_interval=0,
         timeout=5,
     )
 
-    sdk.async_create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
+    sdk.async_create_record.assert_called_once_with("STUDY", payload, schema=wf._schema)
     sdk.async_poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0)
     assert result.state == "COMPLETED"
 
@@ -466,7 +478,7 @@ async def test_async_create_or_update_records_form_key_not_found() -> None:
 
     wf = RecordUpdateWorkflow(sdk)
 
-    with pytest.raises(ValueError, match="Form key 'UNKNOWN_FORM' not found"):
+    with pytest.raises(ValidationError, match="Form key 'UNKNOWN_FORM' not found"):
         await wf.async_create_or_update_records(
             "STUDY",
             [{"formKey": "UNKNOWN_FORM", "data": {"a": 1}}],
@@ -1030,3 +1042,103 @@ async def test_record_update_workflow_email_notify_across_all_ten_methods() -> N
         "false",
         "async-alerts@example.com",
     ]
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_rejects_unscoped_and_validates_cold_targeted_updates() -> (
+    None
+):
+    """Workflow rejects targetless unscoped records and refreshes cold Study cache on targeted updates."""
+    from imednet.models.forms import Form as ApiForm
+
+    age_var = Variable(
+        studyKey="STUDY",
+        variableName="AGE",
+        variableType="integer",
+        formId=101,
+        formKey="F_DM",
+    )
+    empty_form = ApiForm(studyKey="STUDY", formId=202, formKey="F_EMPTY", formName="Empty")
+
+    # Sync workflow
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.get_forms.return_value = [empty_form]
+    sync_sdk.get_variables.return_value = [age_var]
+    sync_sdk.create_record.return_value = Job(jobId="1", batchId="B-TARG", state="PROCESSING")
+    wf = RecordUpdateWorkflow(sync_sdk)
+
+    # 1. Unscoped targetless records fail before submission in single and batch workflows
+    with pytest.raises(ValidationError, match="formKey.*formId"):
+        wf.create_or_update_records("STUDY", [{"data": {"AGE": 30}}])
+    with pytest.raises(ValidationError, match="formKey.*formId"):
+        wf.create_or_update_records_batch("STUDY", [{"AGE": 30}])
+    sync_sdk.create_record.assert_not_called()
+
+    # 2. Cold Study cache refreshes on targeted update (recordId without formKey/formId) and catches bad data
+    with pytest.raises(ValidationError, match="Unknown variable NO_SUCH_VAR"):
+        wf.create_or_update_records("STUDY", [{"recordId": 55, "data": {"NO_SUCH_VAR": 1}}])
+    sync_sdk.get_variables.assert_called_once_with(study_key="STUDY")
+    sync_sdk.create_record.assert_not_called()
+
+    with pytest.raises(ValidationError, match="integer"):
+        wf.create_or_update_records("STUDY", [{"recordId": 55, "data": {"AGE": "not-int"}}])
+    sync_sdk.create_record.assert_not_called()
+
+    # 3. Valid targeted update and zero-variable form succeed
+    job = wf.create_or_update_records("STUDY", [{"recordId": 55, "data": {"AGE": 42}}])
+    assert job.batch_id == "B-TARG"
+    job_empty = wf.create_or_update_records("STUDY", [{"formKey": "F_EMPTY", "data": {}}])
+    assert job_empty.batch_id == "B-TARG"
+
+    # 4. Unknown form keys and unknown form IDs both raise uniform ValidationError
+    with pytest.raises(ValidationError, match="Form key 'UNKNOWN_FORM' not found"):
+        wf.create_or_update_records_batch("STUDY", [{"formKey": "UNKNOWN_FORM", "data": {}}])
+    with pytest.raises(ValidationError, match="Unknown form ID 9999"):
+        wf.create_or_update_records_batch("STUDY", [{"formId": 9999, "data": {}}])
+    with pytest.raises(ValidationError, match="Unknown form ID True"):
+        wf.create_or_update_records_batch("STUDY", [{"formId": True, "data": {}}])
+
+    # 5. dry_run / collect_errors aggregates unscoped + unknown form errors with a single refresh
+    sync_sdk.get_variables.reset_mock()
+    report_summary = wf.create_or_update_records_batch(
+        "STUDY",
+        [
+            {"data": {"AGE": 30}},
+            {"formKey": "UNKNOWN_FORM", "data": {"AGE": 30}},
+            {"formId": 9999, "data": {"AGE": 30}},
+        ],
+        dry_run=True,
+        collect_errors=True,
+    )
+    assert report_summary.validation_report is not None
+    assert report_summary.validation_report.invalid_records == 3
+    sync_sdk.get_variables.assert_called_once_with(study_key="STUDY")
+
+    # Async workflow parity
+    async_sdk = MagicMock()
+    async_sdk._async_client = True
+    async_sdk.async_get_forms = AsyncMock(return_value=[empty_form])
+    async_sdk.async_get_variables = AsyncMock(return_value=[age_var])
+    async_sdk.async_create_record = AsyncMock(
+        return_value=Job(jobId="2", batchId="B-ASYNC-TARG", state="PROCESSING")
+    )
+    async_wf = RecordUpdateWorkflow(async_sdk)
+
+    with pytest.raises(ValidationError, match="formKey.*formId"):
+        await async_wf.async_create_or_update_records("STUDY", [{"data": {"AGE": 30}}])
+    with pytest.raises(ValidationError, match="formKey.*formId"):
+        await async_wf.async_create_or_update_records_batch("STUDY", [{"AGE": 30}])
+    async_sdk.async_create_record.assert_not_called()
+
+    with pytest.raises(ValidationError, match="Unknown variable NO_SUCH_VAR"):
+        await async_wf.async_create_or_update_records(
+            "STUDY", [{"visitId": 77, "data": {"NO_SUCH_VAR": 1}}]
+        )
+    async_sdk.async_get_variables.assert_awaited_once_with(study_key="STUDY")
+    async_sdk.async_create_record.assert_not_called()
+
+    async_job = await async_wf.async_create_or_update_records(
+        "STUDY", [{"recordOid": "REC-1", "data": {"AGE": 45}}]
+    )
+    assert async_job.batch_id == "B-ASYNC-TARG"

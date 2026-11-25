@@ -140,7 +140,7 @@ def test_create_or_update_records_unknown_form_key(async_mode: bool) -> None:
     if async_mode:
         wf._validator.refresh = AsyncMock()  # type: ignore[method-assign]
         wf._validator.validate_batch = AsyncMock()  # type: ignore[method-assign]
-        with pytest.raises(ValueError, match="Form key 'F1' not found"):
+        with pytest.raises(ValidationError, match="Form key 'F1' not found"):
             asyncio.run(wf.async_create_or_update_records("S", [{"formKey": "F1", "data": {}}]))
         wf._validator.refresh.assert_awaited_once_with("S")
         wf._validator.validate_batch.assert_not_called()
@@ -151,7 +151,7 @@ def test_create_or_update_records_unknown_form_key(async_mode: bool) -> None:
         # False, so it calls it synchronously.
         wf._validator.refresh = MagicMock()  # type: ignore[method-assign]
         wf._validator.validate_batch = MagicMock()  # type: ignore[method-assign]
-        with pytest.raises(ValueError, match="Form key 'F1' not found"):
+        with pytest.raises(ValidationError, match="Form key 'F1' not found"):
             wf.create_or_update_records("S", [{"formKey": "F1", "data": {}}])
         wf._validator.refresh.assert_called_once_with("S")
         wf._validator.validate_batch.assert_not_called()

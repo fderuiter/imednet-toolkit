@@ -50,6 +50,9 @@ def test_data_extraction_filters():
 def test_record_update_submit_and_wait(monkeypatch: pytest.MonkeyPatch):
     """Test that record update submit and wait."""
     sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+    respx.get(re.compile("https://api.test/api/v1/edc/studies/ST/forms.*")).respond(
+        json={"data": [{"formId": 1, "formKey": "F1"}]}
+    )
     respx.get(re.compile("https://api.test/api/v1/edc/studies/ST/variables.*")).respond(
         json={
             "data": [{"variableName": "x", "variableType": "integer", "formId": 1, "formKey": "F1"}]
@@ -153,6 +156,9 @@ def test_data_extraction_no_matching_subjects() -> None:
 def test_record_update_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that record update timeout."""
     sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://api.test")
+    respx.get(re.compile("https://api.test/api/v1/edc/studies/ST/forms.*")).respond(
+        json={"data": [{"formId": 1, "formKey": "F1"}]}
+    )
     respx.get(re.compile("https://api.test/api/v1/edc/studies/ST/variables.*")).respond(
         json={
             "data": [{"variableName": "x", "variableType": "integer", "formId": 1, "formKey": "F1"}]

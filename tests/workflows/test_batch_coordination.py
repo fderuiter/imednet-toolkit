@@ -23,6 +23,19 @@ from imednet_workflows import (
 from imednet_workflows.uat import UATWorkflow
 
 
+def _build_forms_payload(form_keys: list[str] | None = None) -> list[dict[str, Any]]:
+    keys = form_keys or ["F1"]
+    return [
+        {
+            "studyKey": "STUDY",
+            "formId": idx + 1,
+            "formKey": fk,
+            "formName": f"Form {fk}",
+        }
+        for idx, fk in enumerate(keys)
+    ]
+
+
 def _build_variables_payload(form_keys: list[str] | None = None) -> list[dict[str, Any]]:
     keys = form_keys or ["F1"]
     return [
@@ -52,6 +65,8 @@ def test_record_update_550_records_sends_six_chunks_and_validates_once() -> None
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if request.method == "GET" and path.endswith("/forms"):
+            return httpx.Response(200, json={"data": _build_forms_payload(["F1"])})
         if request.method == "GET" and path.endswith("/variables"):
             return httpx.Response(200, json={"data": _build_variables_payload(["F1"])})
         if request.method == "POST" and path.endswith("/records"):
@@ -132,6 +147,8 @@ async def test_async_record_update_550_records_and_distinct_form_refresh() -> No
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if request.method == "GET" and path.endswith("/forms"):
+            return httpx.Response(200, json={"data": _build_forms_payload(available_forms)})
         if request.method == "GET" and path.endswith("/variables"):
             return httpx.Response(200, json={"data": _build_variables_payload(available_forms)})
         if request.method == "POST" and path.endswith("/records"):
@@ -187,8 +204,8 @@ async def test_async_record_update_550_records_and_distinct_form_refresh() -> No
         assert summary.poll_summary is not None
         assert summary.poll_summary.all_successful is True
 
-        # Unknown second form key in mixed batch raises ValueError
-        with pytest.raises(ValueError, match="Form key 'F_MISSING' not found"):
+        # Unknown second form key in mixed batch raises ValidationError
+        with pytest.raises(ValidationError, match="Form key 'F_MISSING' not found"):
             await wf.async_create_or_update_records(
                 "STUDY",
                 [
@@ -218,6 +235,8 @@ def test_register_subjects_550_records_six_chunks_validates_once_and_filters_enr
                     ]
                 },
             )
+        if request.method == "GET" and path.endswith("/forms"):
+            return httpx.Response(200, json={"data": _build_forms_payload(["ENROLL"])})
         if request.method == "GET" and path.endswith("/variables"):
             return httpx.Response(200, json={"data": _build_variables_payload(["ENROLL"])})
         if request.method == "GET" and path.endswith("/subjects"):
@@ -663,6 +682,8 @@ async def test_record_update_workflow_concurrent_submissions_sharing_cache_valid
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             nonlocal pause_on_post
             path = request.url.path
+            if request.method == "GET" and path.endswith("/forms"):
+                return httpx.Response(200, json={"data": _build_forms_payload(["F1"])})
             if request.method == "GET" and path.endswith("/variables"):
                 return httpx.Response(200, json={"data": _build_variables_payload(["F1"])})
             if request.method == "POST" and path.endswith("/records"):

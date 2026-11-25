@@ -234,7 +234,7 @@ def test_cold_cache_form_id_refresh_and_unknown_form_id_sync_and_async() -> None
     validator = SchemaValidator(sync_sdk)
 
     # Cold cache + formId triggers refresh and catches invalid bool value on numeric variable
-    with pytest.raises(ValidationError, match="integer"):
+    with pytest.raises(ValidationError, match="numeric"):
         validator.validate_record("STUDY", {"formId": 301, "data": {"V_AGE": True}})
     sync_sdk.get_variables.assert_called_once_with(study_key="STUDY")
 
@@ -988,3 +988,231 @@ def test_load_offline_schema_supports_zip_archive_and_is_file_target(tmp_path: P
     assert isinstance(dd, DataDictionary)
     assert dd.metadata.studyKey == "ZIP_STUDY"
     assert {f.formKey for f in dd.forms} == {"AE", "AEACTEL", "AESDC"}
+
+
+@pytest.mark.parametrize("bad_float", [float("nan"), float("inf"), float("-inf")])
+def test_untyped_required_variable_rejects_non_finite_floats_in_validation_and_readiness(
+    bad_float: float,
+) -> None:
+    """AC 3: Untyped required Variable with NaN/Inf/-Inf fails validation and scores < 100.0."""
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_UNTYPED",
+                variables=[
+                    DDVariable(variableName="RAW_METRIC", variableType=None, required="Yes")
+                ],
+            )
+        ]
+    )
+    cache = SchemaCache()
+    cache.populate(
+        [
+            ApiVariable(
+                variable_name="RAW_METRIC",
+                variable_type="",
+                form_id=1,
+                form_key="F_UNTYPED",
+            )
+        ]
+    )
+
+    for schema_obj in (dd, cache):
+        with pytest.raises(ValidationError, match="finite"):
+            validate_record_data(schema_obj, "F_UNTYPED", {"RAW_METRIC": bad_float})
+        with pytest.raises(ValidationError, match="finite"):
+            validate_record_entry(
+                schema_obj,
+                {"formKey": "F_UNTYPED", "data": {"RAW_METRIC": bad_float}},
+            )
+        report = validate_record_entry(
+            schema_obj,
+            {"formKey": "F_UNTYPED", "data": {"RAW_METRIC": bad_float}},
+            collect_errors=True,
+        )
+        assert report is not None and not report.is_valid
+
+    score, reasons = calculate_readiness_score(dd, "F_UNTYPED", {"RAW_METRIC": bad_float})
+    assert score < 100.0
+    assert score == pytest.approx(0.0)
+    assert any("finite" in r for r in reasons)
+
+    cache_score, cache_reasons = calculate_readiness_score(
+        cache, "F_UNTYPED", {"RAW_METRIC": bad_float}
+    )
+    assert cache_score < 100.0
+    assert any("finite" in r for r in cache_reasons)
+
+
+def test_number_variable_accepts_finite_decimals_across_caches_and_datadictionary() -> None:
+    """AC 4: Number Variables accept finite decimals like 68.5 while rejecting non-finite floats."""
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="VS",
+                variables=[DDVariable(variableName="WEIGHT", variableType="Number")],
+            )
+        ]
+    )
+    cache = SchemaCache()
+    cache.populate(
+        [ApiVariable(variable_name="WEIGHT", variable_type="Number", form_id=10, form_key="VS")],
+        study_key="STUDY",
+    )
+
+    for schema_obj in (dd, cache):
+        validate_record_data(schema_obj, "VS", {"WEIGHT": 68.5}, study_key="STUDY")
+        validate_record_data(schema_obj, "VS", {"WEIGHT": 68}, study_key="STUDY")
+        with pytest.raises(ValidationError, match="numeric"):
+            validate_record_data(schema_obj, "VS", {"WEIGHT": "68.5"}, study_key="STUDY")
+        with pytest.raises(ValidationError, match="finite"):
+            validate_record_data(schema_obj, "VS", {"WEIGHT": float("nan")}, study_key="STUDY")
+
+
+def test_targeted_record_updates_enforce_constraints_and_phi_masking_in_all_modes() -> None:
+    """AC 2 & Req 3: Targeted updates enforce unknown vars, types, choices, bounds, rangeChecks, lengths, and PHI masking."""
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_DM",
+                formId=301,
+                variables=[
+                    DDVariable(
+                        variableName="SUBJID",
+                        variableType="Text",
+                        required="Yes",
+                        extraAttributes={"minLength": 3, "maxLength": 6},
+                    ),
+                    DDVariable(
+                        variableName="WEIGHT",
+                        variableType="Number",
+                        extraAttributes={"minValue": 20.0, "maxValue": 250.0},
+                    ),
+                    DDVariable(
+                        variableName="SEX",
+                        variableType="Radio",
+                        choices=[
+                            Choice(choiceValue="M", choiceText="Male"),
+                            Choice(choiceValue="F", choiceText="Female"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="HR",
+                        variableType="Integer",
+                        extraAttributes={
+                            "rangeChecks": [
+                                {"comparator": "GT", "softHard": "Hard", "checkValue": "30"},
+                                {
+                                    "comparator": "LE",
+                                    "softHard": "Soft",
+                                    "checkValue": "100",
+                                    "errorMessage": "Elevated HR",
+                                },
+                            ]
+                        },
+                    ),
+                    DDVariable(
+                        variableName="DateOfBirth",
+                        variableType="Date",
+                        extraAttributes={
+                            "rangeChecks": [
+                                {
+                                    "comparator": "GE",
+                                    "softHard": "Hard",
+                                    "checkValue": "1920-01-01",
+                                }
+                            ]
+                        },
+                    ),
+                    DDVariable(variableName="RAW_NOTE", variableType=None),
+                ],
+            )
+        ]
+    )
+
+    cache = SchemaCache()
+    cache.populate(
+        [
+            ApiVariable(variable_name="SUBJID", variable_type="Text", form_id=301, form_key="F_DM"),
+            ApiVariable(
+                variable_name="WEIGHT", variable_type="Number", form_id=301, form_key="F_DM"
+            ),
+            ApiVariable(variable_name="SEX", variable_type="Radio", form_id=301, form_key="F_DM"),
+            ApiVariable(variable_name="HR", variable_type="Integer", form_id=301, form_key="F_DM"),
+            ApiVariable(
+                variable_name="DateOfBirth", variable_type="Date", form_id=301, form_key="F_DM"
+            ),
+            ApiVariable(variable_name="RAW_NOTE", variable_type="", form_id=301, form_key="F_DM"),
+        ],
+        study_key="STUDY",
+    )
+
+    # Valid partial targeted update omits required SUBJID without error and records Soft warning
+    ok_report = validate_record_entry(
+        dd,
+        {"recordId": 99, "data": {"WEIGHT": 68.5, "SEX": "F", "HR": 110}},
+        collect_errors=True,
+    )
+    assert ok_report is not None
+    assert ok_report.is_valid
+    assert len(ok_report.warnings) == 1
+    assert "Elevated HR" in ok_report.warnings[0].message
+
+    validate_record_entry(
+        cache,
+        {"visitId": 12, "data": {"WEIGHT": 68.5, "SEX": "M"}},
+        study_key="STUDY",
+    )
+
+    invalid_cases = [
+        ({"NO_SUCH": 1}, "Unknown variable NO_SUCH"),
+        ({"HR": "bad"}, "integer"),
+        ({"RAW_NOTE": float("inf")}, "finite"),
+        ({"DateOfBirth": MASKED_SENTINEL}, "masked PHI sentinel"),
+    ]
+    for bad_data, expected_msg in invalid_cases:
+        for schema_obj in (dd, cache):
+            with pytest.raises(ValidationError, match=expected_msg):
+                validate_record_entry(
+                    schema_obj, {"recordId": 99, "data": bad_data}, study_key="STUDY"
+                )
+            rep = validate_record_entry(
+                schema_obj,
+                {"recordOid": "OID-99", "data": bad_data},
+                study_key="STUDY",
+                collect_errors=True,
+            )
+            assert rep is not None and not rep.is_valid
+
+    # DataDictionary-specific unambiguous constraints on targeted updates (choices, bounds, rangeChecks, lengths)
+    dd_constraint_cases = [
+        ({"SEX": "X"}, "Invalid choice"),
+        ({"WEIGHT": 10.0}, "below minimum"),
+        ({"WEIGHT": 300.0}, "exceeds maximum"),
+        ({"HR": 25}, "GT 30"),
+        ({"SUBJID": "AB"}, "minimum length 3"),
+        ({"SUBJID": "ABCDEFG"}, "maximum length 6"),
+    ]
+    for bad_data, expected_msg in dd_constraint_cases:
+        with pytest.raises(ValidationError, match=expected_msg):
+            validate_record_entry(dd, {"recordId": 99, "data": bad_data})
+        rep = validate_record_entry(dd, {"recordId": 99, "data": bad_data}, collect_errors=True)
+        assert rep is not None and not rep.is_valid
+
+    # PHI redaction preserved on targeted updates across fail-fast and collect_errors modes
+    secret_dob = "1905-04-12"
+    with pytest.raises(ValidationError) as exc_info:
+        validate_record_entry(dd, {"recordId": 99, "data": {"DateOfBirth": secret_dob}})
+    assert MASKED_SENTINEL in str(exc_info.value)
+    assert secret_dob not in str(exc_info.value)
+
+    phi_report = validate_record_entry(
+        dd,
+        {"recordId": 99, "data": {"DateOfBirth": secret_dob}},
+        collect_errors=True,
+    )
+    assert phi_report is not None and not phi_report.is_valid
+    assert all(secret_dob not in err.message for err in phi_report.errors)
+    assert any(MASKED_SENTINEL in err.message for err in phi_report.errors)

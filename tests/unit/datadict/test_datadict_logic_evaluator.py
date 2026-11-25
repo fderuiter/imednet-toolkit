@@ -1600,3 +1600,101 @@ def test_datadict_schema_validate_reports_unsafe_and_invalid_rule_regexes() -> N
 
     schema_errors = validate(unsafe_dd, schema=get_schema())
     assert len(schema_errors) == 3
+
+
+def test_kleene_three_valued_truth_logic_unifies_group_and_leaf_negation() -> None:
+    """AC 9: Group <not> and leaf <negate>true</negate> / <false/> evaluate identically under missing values."""
+    evaluator = LogicTreeEvaluator()
+
+    group_not_rule = BusinessLogicRule(
+        id="R_GROUP_NOT",
+        name="Group Not Consent",
+        type="Form",
+        status="Active",
+        form="DM",
+        logic=parse_logic_xml(
+            "<rule><conditions><not>"
+            "<condition><variable>CONSENT</variable><operator>==</operator><value>Y</value></condition>"
+            "</not></conditions></rule>"
+        ),
+    )
+    leaf_negate_rule = BusinessLogicRule(
+        id="R_LEAF_NEG",
+        name="Leaf Negate Consent",
+        type="Form",
+        status="Active",
+        form="DM",
+        logic=parse_logic_xml(
+            "<rule><conditions>"
+            "<condition><variable>CONSENT</variable><operator>==</operator><value>Y</value><negate>true</negate></condition>"
+            "</conditions></rule>"
+        ),
+    )
+    leaf_false_rule = BusinessLogicRule(
+        id="R_LEAF_FALSE",
+        name="Leaf False Consent",
+        type="Form",
+        status="Active",
+        form="DM",
+        logic=parse_logic_xml(
+            "<rule><conditions>"
+            "<condition><variable>CONSENT</variable><operator>==</operator><value>Y</value><false/></condition>"
+            "</conditions></rule>"
+        ),
+    )
+
+    for payload, expected in (
+        ({}, False),
+        ({"CONSENT": None}, False),
+        ({"CONSENT": ""}, False),
+        ({"CONSENT": "N"}, True),
+        ({"CONSENT": "Y"}, False),
+    ):
+        for rule in (group_not_rule, leaf_negate_rule, leaf_false_rule):
+            res = evaluator.evaluate_rule(rule, payload, form_key="DM")
+            assert res.triggered is expected, f"{rule.id} on {payload} -> {res.triggered}"
+
+    # Kleene compound De Morgan equivalence:
+    # NOT (A == 1 AND B == 2):
+    # - A=1, B missing -> NOT(True AND Unknown) = NOT(Unknown) = Unknown -> False at root
+    # - A=0, B missing -> NOT(False AND Unknown) = NOT(False) = True
+    not_and_rule = BusinessLogicRule(
+        id="R_NOT_AND",
+        name="Not And Kleene",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><conditions><not><and>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>2</value></condition>"
+            "</and></not></conditions></rule>"
+        ),
+    )
+    assert evaluator.evaluate_rule(not_and_rule, {}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(not_and_rule, {"A": 1}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(not_and_rule, {"A": 0}, form_key="F1").triggered is True
+    assert evaluator.evaluate_rule(not_and_rule, {"A": 1, "B": 2}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(not_and_rule, {"A": 1, "B": 9}, form_key="F1").triggered is True
+
+    # NOT (A == 1 OR B == 2):
+    # - A=1, B missing -> NOT(True OR Unknown) = NOT(True) = False
+    # - A=0, B missing -> NOT(False OR Unknown) = NOT(Unknown) = Unknown -> False at root
+    # - A=0, B=0 -> NOT(False OR False) = True
+    not_or_rule = BusinessLogicRule(
+        id="R_NOT_OR",
+        name="Not Or Kleene",
+        type="Form",
+        status="Active",
+        form="F1",
+        logic=parse_logic_xml(
+            "<rule><conditions><not><or>"
+            "<condition><variable>A</variable><operator>==</operator><value>1</value></condition>"
+            "<condition><variable>B</variable><operator>==</operator><value>2</value></condition>"
+            "</or></not></conditions></rule>"
+        ),
+    )
+    assert evaluator.evaluate_rule(not_or_rule, {}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(not_or_rule, {"A": 1}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(not_or_rule, {"A": 0}, form_key="F1").triggered is False
+    assert evaluator.evaluate_rule(not_or_rule, {"A": 0, "B": 0}, form_key="F1").triggered is True
