@@ -259,6 +259,8 @@ def _emit_uat_json_failure(
     failure_phase: str = "PREFLIGHT",
 ) -> NoReturn:
     """Emit a single PHI-masked, secret-redacted failed uat_run JSON envelope and exit 1."""
+    from .uat import UATRunResult, UATWorkflowState
+
     resolved_study = study_key.strip() if isinstance(study_key, str) and study_key.strip() else ""
     safe_phi_study: str | None = None
     if resolved_study:
@@ -266,25 +268,33 @@ def _emit_uat_json_failure(
             validate_path_segment(resolved_study, name="study_key")
             safe_phi_study = resolved_study
     custom_phi = _resolve_custom_phi_fields(safe_phi_study)
-    sanitized_err = _sanitize_uat_error_text(str(exc), custom_phi_fields=custom_phi)
-    item: dict[str, Any] = {
-        "runId": "",
-        "studyKey": resolved_study,
-        "dryRun": bool(dry_run),
-        "state": "FAILED",
-        "stateHistory": [failure_phase, "FAILED"] if failure_phase else ["FAILED"],
-        "overallSuccess": False,
-        "formsTested": 0,
-        "recordsGenerated": 0,
-        "recordsSubmitted": 0,
-        "jobsMonitored": 0,
-        "failurePhase": failure_phase,
-        "errorMessage": sanitized_err,
-        "validationReport": None,
-        "phaseDurations": {},
-    }
-    masked = _mask_workflow_value(item, custom_phi_fields=custom_phi)
-    emit_json([masked if isinstance(masked, dict) else item], "uat_run", status="failed")
+    now = datetime.now(UTC)
+    failed_result = UATRunResult.model_construct(
+        study_key=resolved_study,
+        run_id="",
+        started_at=now,
+        completed_at=now,
+        state=UATWorkflowState.FAILED,
+        state_history=[failure_phase, UATWorkflowState.FAILED]
+        if failure_phase
+        else [UATWorkflowState.FAILED],
+        failure_phase=failure_phase,
+        error_message=str(exc),
+        spec=None,
+        record_sets=[],
+        submission_result=None,
+        poll_summary=None,
+        dry_run=bool(dry_run),
+        validation_report=None,
+        phase_durations={},
+    )
+    item = _serialize_uat_run_result(
+        failed_result,
+        study_key=resolved_study,
+        dry_run=dry_run,
+        custom_phi_fields=custom_phi,
+    )
+    emit_json([item], "uat_run", status="failed")
     sys.exit(1)
 
 

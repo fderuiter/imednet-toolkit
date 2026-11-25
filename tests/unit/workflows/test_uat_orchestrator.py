@@ -1178,3 +1178,243 @@ def test_workflow_spec_preserves_subject_count_unless_overridden(mock_sdk, snaps
     assert [s.subject_count for s in overridden.spec.subject_specs] == [5]
     assert all(f.subject_count == 5 for f in overridden.spec.form_specs)
     assert all(len(rs.payloads) == 5 for rs in overridden.record_sets)
+
+
+def test_uat_workflow_boundary_enrollment_retains_both_enrolled_subjects_simulation() -> None:
+    """UATWorkflow.run retains ['SUBJ-1001', 'SUBJ-1002'] on BOUNDARY enrollment Form specs with subject_count=1."""
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.simulation import SimulationState, create_simulation_transport
+    from imednet_workflows.uat.models import (
+        RecordTestType,
+        UATFormSpec,
+        UATSpecification,
+        UATSubjectSpec,
+        UATVariableSpec,
+        UATWorkflowState,
+        VariableTestStrategy,
+    )
+
+    state = SimulationState()
+    sim_transport = create_simulation_transport(state)
+    sdk = ImednetSDK(
+        transport=httpx.MockTransport(sim_transport.handle_request),
+        simulation_mode=True,
+    )
+
+    spec = UATSpecification(
+        study_key="STUDY",
+        study_name="STUDY",
+        subject_specs=[
+            UATSubjectSpec(site_name="SITE", subject_count=1, subject_key_prefix="UAT-TEST-")
+        ],
+        form_specs=[
+            UATFormSpec(
+                form_key="F_DM",
+                form_name="Demographics",
+                form_type="Enrollment",
+                test_type=RecordTestType.REGISTER_SUBJECT,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="V_AGE",
+                        variable_key="V_AGE",
+                        variable_type="Integer",
+                        form_key="F_DM",
+                        strategy=VariableTestStrategy.BOUNDARY,
+                        min_value=18,
+                        max_value=65,
+                    )
+                ],
+            ),
+            UATFormSpec(
+                form_key="F_AE",
+                form_name="Adverse Events",
+                form_type="Standard",
+                test_type=RecordTestType.CREATE_NEW_RECORD,
+                subject_count=2,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="V_TERM",
+                        variable_key="V_TERM",
+                        variable_type="Text",
+                        form_key="F_AE",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    result = UATWorkflow(sdk, poll_interval=0.01, seed=7).run("STUDY", spec=spec)
+    assert result.state == UATWorkflowState.COMPLETED
+    assert result.overall_success is True
+    assert result.submission_result is not None
+    assert result.submission_result.enrolled_subject_keys == ["SUBJ-1001", "SUBJ-1002"]
+    reg_rs, ae_rs = result.record_sets
+    assert reg_rs.subject_keys == ["SUBJ-1001", "SUBJ-1002"]
+    assert [p["subjectKey"] for p in ae_rs.payloads] == ["SUBJ-1001", "SUBJ-1002"]
+
+
+def test_uat_workflow_coded_all_integer_parity_and_datadict_backfill_simulation() -> None:
+    """CODED_ALL emits identical Integer scalars in dry_run/live and UATSpecificationBuilder backfills DD-only variables."""
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.datadict import Choice, DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+    from imednet.simulation import SimulationState, create_simulation_transport
+    from imednet_workflows.uat.inspector import StudySchemaInspector
+    from imednet_workflows.uat.models import (
+        RecordTestType,
+        UATFormSpec,
+        UATSpecification,
+        UATSubjectSpec,
+        UATVariableSpec,
+        UATWorkflowState,
+        VariableTestStrategy,
+    )
+
+    assert not hasattr(UATWorkflow, "_coerce_payloads_for_validation")
+
+    dd_with_retired = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_DM",
+                extraAttributes={"formType": "Enrollment"},
+                variables=[
+                    DDVariable(variableName="V_AGE", variableType="Integer", required="Yes"),
+                    DDVariable(
+                        variableName="DD_ONLY_COHORT",
+                        variableType="Integer",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceText="Arm 1", choiceValue="1"),
+                            Choice(choiceText="Arm 2", choiceValue="2"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="DD_RETIRED_VAR",
+                        variableType="Text",
+                        required="Yes",
+                        extraAttributes={"deleted": "Yes"},
+                    ),
+                ],
+            )
+        ]
+    )
+    dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_DM",
+                extraAttributes={"formType": "Enrollment"},
+                variables=[
+                    DDVariable(variableName="V_AGE", variableType="Integer", required="Yes"),
+                    DDVariable(
+                        variableName="DD_ONLY_COHORT",
+                        variableType="Integer",
+                        required="Yes",
+                        choices=[
+                            Choice(choiceText="Arm 1", choiceValue="1"),
+                            Choice(choiceText="Arm 2", choiceValue="2"),
+                        ],
+                    ),
+                ],
+            )
+        ]
+    )
+
+    state = SimulationState()
+    sim_transport = create_simulation_transport(state)
+    sdk = ImednetSDK(
+        transport=httpx.MockTransport(sim_transport.handle_request),
+        simulation_mode=True,
+    )
+
+    live_snapshot = StudySchemaInspector(sdk).inspect("STUDY")
+    retired_check_spec = UATSpecificationBuilder(data_dictionary=dd_with_retired).build(
+        live_snapshot,
+        subject_count=1,
+        enabled_form_keys=["F_DM"],
+        seed=12,
+    )
+    dm_var_names = [v.variable_name for v in retired_check_spec.form_specs[0].variables]
+    assert "DD_ONLY_COHORT" in dm_var_names
+    assert "DD_RETIRED_VAR" not in dm_var_names
+
+    built_spec = UATSpecificationBuilder(data_dictionary=dd).build(
+        live_snapshot,
+        subject_count=1,
+        enabled_form_keys=["F_DM"],
+        seed=12,
+    )
+
+    coded_spec = UATSpecification(
+        study_key="STUDY",
+        study_name="STUDY",
+        subject_specs=[UATSubjectSpec(site_name="SITE", subject_count=1)],
+        form_specs=[
+            UATFormSpec(
+                form_key="F_DM",
+                form_name="Demographics",
+                form_type="Enrollment",
+                test_type=RecordTestType.REGISTER_SUBJECT,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="V_AGE",
+                        variable_key="V_AGE",
+                        variable_type="Integer",
+                        form_key="F_DM",
+                        strategy=VariableTestStrategy.FIXED,
+                        fixed_value="30",
+                    ),
+                    UATVariableSpec(
+                        variable_name="DD_ONLY_COHORT",
+                        variable_key="DD_ONLY_COHORT",
+                        variable_type="Coded",
+                        form_key="F_DM",
+                        strategy=VariableTestStrategy.CODED_ALL,
+                    ),
+                ],
+            )
+        ],
+    )
+
+    dry_res = UATWorkflow(sdk, poll_interval=0.01, seed=12).run(
+        "STUDY",
+        spec=coded_spec,
+        schema=dd,
+        dry_run=True,
+    )
+    live_res = UATWorkflow(sdk, poll_interval=0.01, seed=12).run(
+        "STUDY",
+        spec=coded_spec,
+        schema=dd,
+        dry_run=False,
+    )
+    assert dry_res.state == UATWorkflowState.COMPLETED
+    assert live_res.state == UATWorkflowState.COMPLETED
+    dry_vals = [p["data"]["DD_ONLY_COHORT"] for p in dry_res.record_sets[0].payloads]
+    live_vals = [p["data"]["DD_ONLY_COHORT"] for p in live_res.record_sets[0].payloads]
+    assert dry_vals == [1, 2]
+    assert live_vals == [1, 2]
+    assert [type(v) for v in dry_vals] == [int, int]
+    assert [type(v) for v in live_vals] == [int, int]
+
+    # Live subject_count override on saved spec (built from snapshot + data_dictionary) against SimulationTransport
+    state_override = SimulationState()
+    sdk_override = ImednetSDK(
+        transport=httpx.MockTransport(create_simulation_transport(state_override).handle_request),
+        simulation_mode=True,
+    )
+    override_live = UATWorkflow(sdk_override, poll_interval=0.01, seed=12).run(
+        "STUDY",
+        spec=built_spec,
+        subject_count=2,
+        data_dictionary=dd,
+    )
+    assert override_live.state == UATWorkflowState.COMPLETED
+    assert override_live.submission_result is not None
+    assert override_live.submission_result.enrolled_subject_keys == ["SUBJ-1001", "SUBJ-1002"]
