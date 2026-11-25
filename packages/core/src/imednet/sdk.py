@@ -242,7 +242,6 @@ class _BaseSDK:
                 has_transport=has_injected_transport,
             )
         from .constants import DEFAULT_BASE_URL
-        from .core.context import set_base_url_context, set_security_key_context
         from .utils.url import sanitize_base_url
 
         self.config = resolved
@@ -255,14 +254,15 @@ class _BaseSDK:
         self._base_url = sanitize_base_url(raw_base_url)
         self._strict_mode_tokens = []
         self._governance_tokens: list[tuple[Any, Any]] = []
-        set_base_url_context(self._base_url)
-        if isinstance(self._security_key, str) and self._security_key.strip():
-            set_security_key_context(self._security_key)
         return resolved
 
     def _enter_strict_mode(self) -> None:
         """Push this SDK's strict_mode and governance context onto the active task/thread context."""
-        from .core.context import set_base_url_context, set_security_key_context
+        from .core.context import (
+            extract_sdk_security_key,
+            set_base_url_context,
+            set_security_key_context,
+        )
 
         strict_val = getattr(self.config, "strict_mode", None)
         if isinstance(strict_val, bool):
@@ -270,13 +270,8 @@ class _BaseSDK:
         token_base = None
         if hasattr(self, "_base_url") and isinstance(self._base_url, str) and self._base_url:
             token_base = set_base_url_context(self._base_url)
-        token_sec = None
-        if (
-            hasattr(self, "_security_key")
-            and isinstance(self._security_key, str)
-            and self._security_key.strip()
-        ):
-            token_sec = set_security_key_context(self._security_key)
+        resolved_sec = extract_sdk_security_key(self)
+        token_sec = set_security_key_context(resolved_sec) if resolved_sec is not None else None
         if not hasattr(self, "_governance_tokens"):
             self._governance_tokens = []
         self._governance_tokens.append((token_base, token_sec))

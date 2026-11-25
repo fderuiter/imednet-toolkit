@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
+from unittest.mock import NonCallableMock
 
 from filelock import FileLock
 from pydantic import ValidationError as PydanticValidationError
@@ -33,9 +36,12 @@ from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import (
     build_filter_string,
     delegates_to_sdk_retry_policy,
+    get_db_init_lock,
     redact_sensitive_text,
     resolve_sdk_base_url,
+    validate_path_segment,
 )
+from imednet.spi.utils import get_sqlite_connection as _spi_get_sqlite_connection
 
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE
 
@@ -188,37 +194,25 @@ def _max_timestamp(candidates: Iterable[str | None]) -> str | None:
     return max(valid, key=_timestamp_sort_key)
 
 
-# Per-DB-path locks that serialise _initialise_cache across threads within the
-# same process.  Switching an SQLite database to WAL journal mode requires a
-# brief exclusive lock; if multiple threads attempt the switch simultaneously
-# they all race for that lock and the losers immediately raise
-# ``sqlite3.OperationalError: database is locked``.  Serialising initialisation
-# eliminates the race entirely.  The dict grows at most one entry per distinct
-# database file, which is negligible.
-_db_init_locks: dict[str, threading.Lock] = {}
-_db_init_locks_guard = threading.Lock()
+_active_lock_timeout_seconds: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "active_loader_lock_timeout_seconds",
+    default=None,
+)
 
 
-def _get_db_init_lock(resolved_path: Path) -> threading.Lock:
-    """Return a thread-safe lock for initializing a specific database file."""
-    key = str(resolved_path)
-    with _db_init_locks_guard:
-        return _db_init_locks.setdefault(key, threading.Lock())
+@contextmanager
+def bind_loader_lock_timeout(timeout_seconds: float | None) -> Iterator[None]:
+    """Bind a per-cycle ``FileLock`` acquisition timeout without mutating ``loader.lock.timeout``."""
+    token = _active_lock_timeout_seconds.set(timeout_seconds)
+    try:
+        yield
+    finally:
+        _active_lock_timeout_seconds.reset(token)
 
 
 def get_sqlite_connection(db_path: str | Path) -> sqlite3.Connection:
-    """Return a SQLite connection configured for concurrent cache access."""
-    resolved_path = Path(db_path).expanduser()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(resolved_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    # busy_timeout instructs SQLite to retry at the C level on SQLITE_BUSY
-    # (e.g. during the WAL transition); this complements Python's connect
-    # timeout and is also effective in cross-process scenarios.
-    conn.execute("PRAGMA busy_timeout=30000;")
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+    """Return a SQLite connection configured for concurrent WAL cache access via SPI."""
+    return _spi_get_sqlite_connection(db_path)
 
 
 class CachedRecordsLoader:
@@ -266,12 +260,44 @@ class CachedRecordsLoader:
         """Return the inter-process file lock protecting cache write operations."""
         return self._lock
 
-    def load_records(self, study_key: str, *, reconcile: bool = True) -> list[Record]:
+    @contextmanager
+    def _acquire_write_lock(self, timeout_seconds: float | None = None) -> Iterator[None]:
+        """Acquire the cache FileLock with an optional timeout without mutating ``self._lock.timeout``."""
+        effective_timeout = (
+            timeout_seconds if timeout_seconds is not None else _active_lock_timeout_seconds.get()
+        )
+        if effective_timeout is None:
+            with self._lock:
+                yield
+            return
+        self._lock.acquire(timeout=effective_timeout)
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def load_records(
+        self,
+        study_key: str,
+        *,
+        reconcile: bool = True,
+        lock_timeout_seconds: float | None = None,
+    ) -> list[Record]:
         """Synchronise the cache for ``study_key`` and return cached records."""
-        self.sync_records(study_key, reconcile=reconcile)
+        self.sync_records(
+            study_key,
+            reconcile=reconcile,
+            lock_timeout_seconds=lock_timeout_seconds,
+        )
         return self.get_cached_records(study_key)
 
-    def sync_records(self, study_key: str, *, reconcile: bool = True) -> None:
+    def sync_records(
+        self,
+        study_key: str,
+        *,
+        reconcile: bool = True,
+        lock_timeout_seconds: float | None = None,
+    ) -> None:
         """Synchronise the cache for ``study_key`` in a single atomic commit after network I/O."""
         conn = get_sqlite_connection(self.db_path)
         try:
@@ -300,42 +326,63 @@ class CachedRecordsLoader:
                 pre_reconcile_epoch: int | None = None
                 active_record_ids: set[int] = set()
                 backfill_records: list[Record] = []
+                run_reconcile_commit = False
                 if reconcile:
                     pre_reconcile_epoch = self._get_sync_epoch(conn, study_key)
-                    projected_records = self._fetch_active_records_projection(study_key)
-                    active_record_ids = {
-                        record.record_id
-                        for record in projected_records
-                        if record.record_id is not None and not is_record_deleted(record)
-                    }
-                    local_meta = self._get_local_record_metadata(conn, study_key)
-                    delta_active_ids = {
-                        record.record_id
-                        for record in active_delta_records
-                        if record.record_id is not None
-                    }
-                    missing_ids = active_record_ids - set(local_meta.keys()) - delta_active_ids
-                    stale_ids = {
-                        proj.record_id
-                        for proj in projected_records
-                        if proj.record_id is not None
-                        and not is_record_deleted(proj)
-                        and proj.record_id in local_meta
-                        and proj.record_id not in delta_active_ids
-                        and _is_projected_record_updated(proj, local_meta[proj.record_id])
-                    }
-                    ids_to_fetch = missing_ids | stale_ids
-                    if ids_to_fetch:
-                        fetched_missing = self._fetch_missing_records(study_key, ids_to_fetch)
-                        for record in fetched_missing:
-                            cycle_timestamps.append(_serialize_date_modified(record.date_modified))
-                            if is_record_deleted(record):
-                                if record.record_id is not None:
-                                    voided_delta_ids.add(record.record_id)
-                            else:
-                                backfill_records.append(record)
+                    skip_full_projection = False
+                    if (
+                        sync_state.initial_sync_complete
+                        and not delta_records
+                        and self._count_local_untimestamped_drafts(conn, study_key) == 0
+                    ):
+                        local_active_count = self.count_cached_records(study_key, conn=conn)
+                        remote_active_count = self._probe_remote_active_record_count(study_key)
+                        if remote_active_count is not None:
+                            if remote_active_count == local_active_count:
+                                skip_full_projection = True
+                            elif remote_active_count == 0:
+                                active_record_ids = set()
+                                run_reconcile_commit = True
+                                skip_full_projection = True
 
-                with self._lock, conn:
+                    if not skip_full_projection:
+                        run_reconcile_commit = True
+                        projected_records = self._fetch_active_records_projection(study_key)
+                        active_record_ids = {
+                            record.record_id
+                            for record in projected_records
+                            if record.record_id is not None and not is_record_deleted(record)
+                        }
+                        local_meta = self._get_local_record_metadata(conn, study_key)
+                        delta_active_ids = {
+                            record.record_id
+                            for record in active_delta_records
+                            if record.record_id is not None
+                        }
+                        missing_ids = active_record_ids - set(local_meta.keys()) - delta_active_ids
+                        stale_ids = {
+                            proj.record_id
+                            for proj in projected_records
+                            if proj.record_id is not None
+                            and not is_record_deleted(proj)
+                            and proj.record_id in local_meta
+                            and proj.record_id not in delta_active_ids
+                            and _is_projected_record_updated(proj, local_meta[proj.record_id])
+                        }
+                        ids_to_fetch = missing_ids | stale_ids
+                        if ids_to_fetch:
+                            fetched_missing = self._fetch_missing_records(study_key, ids_to_fetch)
+                            for record in fetched_missing:
+                                cycle_timestamps.append(
+                                    _serialize_date_modified(record.date_modified)
+                                )
+                                if is_record_deleted(record):
+                                    if record.record_id is not None:
+                                        voided_delta_ids.add(record.record_id)
+                                else:
+                                    backfill_records.append(record)
+
+                with self._acquire_write_lock(lock_timeout_seconds), conn:
                     self._tx_state.in_atomic_commit = True
                     try:
                         if active_delta_records:
@@ -352,7 +399,7 @@ class CachedRecordsLoader:
                                 backfill_records,
                                 default_study_key=study_key,
                             )
-                        if reconcile:
+                        if run_reconcile_commit:
                             self.reconcile_cache(
                                 conn,
                                 study_key,
@@ -363,7 +410,12 @@ class CachedRecordsLoader:
                     finally:
                         self._tx_state.in_atomic_commit = False
             except Exception as exc:
-                self._fail_study_sync(conn, study_key, exc)
+                self._fail_study_sync(
+                    conn,
+                    study_key,
+                    exc,
+                    lock_timeout_seconds=lock_timeout_seconds,
+                )
                 raise
         finally:
             conn.close()
@@ -512,7 +564,7 @@ class CachedRecordsLoader:
                 max_epoch=max_epoch,
             )
             return
-        with self._lock, conn:
+        with self._acquire_write_lock(), conn:
             self._reconcile_cache_unlocked(
                 conn,
                 study_key,
@@ -573,11 +625,10 @@ class CachedRecordsLoader:
 
     def _initialise_cache(self) -> None:
         """Ensure the cache database and origin-partitioned tables are created and migrated."""
-        resolved = Path(self.db_path).expanduser().resolve()
-        with _get_db_init_lock(resolved):
+        with get_db_init_lock(self.db_path):
             conn = get_sqlite_connection(self.db_path)
             try:
-                with self._lock, conn:
+                with self._acquire_write_lock(), conn:
                     self._migrate_or_create_record_cache(conn)
                     self._migrate_or_create_study_sync_state(conn)
                     self._backfill_legacy_study_sync_state(conn)
@@ -868,6 +919,63 @@ class CachedRecordsLoader:
                 (legacy_base_url, legacy_study_key, max_epoch, hwm, StudySyncStatus.SYNCED.value),
             )
 
+    def _count_local_untimestamped_drafts(self, conn: sqlite3.Connection, study_key: str) -> int:
+        """Return the number of cached records for ``study_key`` lacking ``date_modified``."""
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM record_cache
+            WHERE base_url = ? AND study_key = ? AND date_modified IS NULL
+            """,
+            (self._base_url, study_key),
+        ).fetchone()
+        if row is None:
+            return 0
+        return int(row[0])
+
+    def _probe_remote_active_record_count(self, study_key: str) -> int | None:
+        """Execute a single-page lightweight count preflight when backed by an HTTP client."""
+        if isinstance(self._sdk, NonCallableMock):
+            return None
+        records_ep = getattr(self._sdk, "records", None)
+        if isinstance(records_ep, NonCallableMock):
+            return None
+        client = (
+            getattr(records_ep, "_client", None)
+            if records_ep is not None
+            else getattr(self._sdk, "_client", None)
+        )
+        if client is None:
+            client = getattr(self._sdk, "_client", None)
+        if client is None or isinstance(client, NonCallableMock):
+            return None
+        get_fn = getattr(client, "get", None)
+        if not callable(get_fn) or isinstance(get_fn, NonCallableMock):
+            return None
+
+        safe_study_key = validate_path_segment(study_key, name="study_key")
+        path = f"/api/v1/edc/studies/{safe_study_key}/records"
+        params = {
+            "filter": build_filter_string({"deleted": False}),
+            "recordDataFilter": "none",
+            "page": 0,
+            "size": 1,
+        }
+        response = self._execute_with_retry_ownership(get_fn, path, params=params)
+        json_fn = getattr(response, "json", None)
+        if not callable(json_fn):
+            return None
+        payload = json_fn()
+        if not isinstance(payload, dict):
+            return None
+        pagination = payload.get("pagination")
+        if not isinstance(pagination, dict):
+            return None
+        total = pagination.get("totalElements")
+        if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+            return total
+        return None
+
     def _get_sync_epoch(self, conn: sqlite3.Connection, study_key: str) -> int:
         """Return the current monotonic sync epoch for ``study_key``."""
         row = conn.execute(
@@ -948,10 +1056,17 @@ class CachedRecordsLoader:
             (self._base_url, study_key, next_hwm, StudySyncStatus.SYNCED.value, now_iso),
         )
 
-    def _fail_study_sync(self, conn: sqlite3.Connection, study_key: str, exc: Exception) -> None:
+    def _fail_study_sync(
+        self,
+        conn: sqlite3.Connection,
+        study_key: str,
+        exc: Exception,
+        *,
+        lock_timeout_seconds: float | None = None,
+    ) -> None:
         """Record sync failure metadata while preserving the existing ``high_water_mark``."""
         safe_error = redact_sensitive_text(str(exc)) or type(exc).__name__
-        with self._lock, conn:
+        with self._acquire_write_lock(lock_timeout_seconds), conn:
             conn.execute(
                 """
                 INSERT INTO study_sync_state (base_url, study_key, sync_epoch, status, error_message)

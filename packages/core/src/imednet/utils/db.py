@@ -12,9 +12,14 @@ _db_init_locks_guard = threading.RLock()
 
 def _get_db_init_lock(resolved_path: Path) -> threading.RLock:
     """Return a thread-safe lock for initializing a specific database file."""
-    key = str(resolved_path)
+    key = str(Path(resolved_path).expanduser().resolve())
     with _db_init_locks_guard:
         return _db_init_locks.setdefault(key, threading.RLock())
+
+
+def get_db_init_lock(db_path: str | Path) -> threading.RLock:
+    """Return the reentrant initialization lock for ``db_path``."""
+    return _get_db_init_lock(Path(db_path))
 
 
 def get_sqlite_connection(
