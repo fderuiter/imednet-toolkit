@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Generic, TypeVar, get_args, get_origin, get_type_hints
 
 import pydantic._internal._utils as _pydantic_internal_utils
+from docutils import nodes
 from pydantic import BaseModel, RootModel
 from sphinx import addnodes
 from sphinx.util.nodes import make_refnode
@@ -1239,6 +1240,51 @@ def _sanitize_viewcode_modules(app: Any) -> list[Any]:
     return []
 
 
+_VIEWCODE_BACKLINK_RE = re.compile(
+    r'(?P<prefix>(?:<div\s+class="viewcode-block"\s+id="(?P<block_id>[^"]+)">\s*)?)'
+    r'<a\s+(?P<attrs>[^>]*\bclass="[^"]*\bviewcode-back\b[^"]*"[^>]*)>'
+)
+_HREF_ATTR_RE = re.compile(r'\bhref=(?P<q>["\'])(?P<href>[^"\']*)(?P=q)')
+
+
+def _label_viewcode_backlinks(
+    app: Any,  # noqa: ARG001
+    pagename: str,
+    templatename: str,  # noqa: ARG001
+    context: dict[str, Any],
+    doctree: Any,  # noqa: ARG001
+) -> None:
+    """Inject symbol-specific ``aria-label`` starting with ``[docs]`` on ``a.viewcode-back`` links."""
+    if not pagename.startswith("_modules/") or pagename == "_modules/index":
+        return
+    body = context.get("body")
+    if not isinstance(body, str) or "viewcode-back" not in body:
+        return
+
+    mod_name = pagename.removeprefix("_modules/").replace("/", ".")
+
+    def _inject_label(match: re.Match[str]) -> str:
+        prefix = match.group("prefix") or ""
+        block_id = match.group("block_id") or ""
+        attrs = match.group("attrs")
+        if re.search(r"\baria-label\s*=", attrs, re.IGNORECASE):
+            return match.group(0)
+
+        symbol = ""
+        href_match = _HREF_ATTR_RE.search(attrs)
+        if href_match is not None:
+            raw_href = html.unescape(href_match.group("href"))
+            _, _, frag = raw_href.partition("#")
+            symbol = frag.strip()
+        if not symbol:
+            symbol = f"{mod_name}.{block_id}" if block_id else mod_name
+
+        esc_label = html.escape(f"[docs] for {symbol}", quote=True)
+        return f'{prefix}<a {attrs} aria-label="{esc_label}">'
+
+    context["body"] = _VIEWCODE_BACKLINK_RE.sub(_inject_label, body)
+
+
 _DEFAULT_SITE_DESCRIPTION = (
     "Unofficial Python SDK, CLI, workflow plugins, TUI, and Apache Airflow provider "
     "for the iMednet clinical trials EDC API."
@@ -1448,8 +1494,155 @@ def _on_build_finished(app: Any, exception: Exception | None) -> None:
     (outdir / "robots.txt").write_text(robots_txt, encoding="utf-8")
 
 
+def _normalize_inline_label_text(raw: str) -> str:
+    """Collapse internal whitespace in a doctree text label."""
+    return " ".join(raw.split())
+
+
+def _resolve_desc_signature_symbol(signode: Any) -> str:
+    """Resolve a module-qualified symbol name from a Sphinx ``desc_signature`` node."""
+    mod = str(signode.get("module") or "").strip()
+    fullname = str(signode.get("fullname") or "").strip()
+    if mod and fullname:
+        return fullname if fullname.startswith(f"{mod}.") else f"{mod}.{fullname}"
+    if fullname:
+        return fullname
+    ids = signode.get("ids") or []
+    if ids:
+        return str(ids[0]).strip()
+    return _normalize_inline_label_text(signode.astext())
+
+
+def _resolve_viewcode_source_symbol(node: Any) -> str:
+    """Resolve the Python target symbol for a ``sphinx.ext.viewcode`` ``[source]`` reference node."""
+    cur = getattr(node, "parent", None)
+    while cur is not None:
+        if isinstance(cur, addnodes.desc_signature):
+            ids = cur.get("ids") or []
+            if ids:
+                return str(ids[0]).strip()
+            resolved = _resolve_desc_signature_symbol(cur)
+            if resolved:
+                return resolved
+            break
+        cur = getattr(cur, "parent", None)
+
+    refuri = str(node.get("refuri") or "")
+    path_part, _, frag = refuri.partition("#")
+    frag = frag.strip()
+    if "_modules/" in path_part:
+        mod_part = (
+            path_part.split("_modules/", 1)[1].removesuffix(".html").strip("/").replace("/", ".")
+        )
+        if mod_part and frag:
+            return frag if frag.startswith(f"{mod_part}.") else f"{mod_part}.{frag}"
+        if mod_part:
+            return mod_part
+    if frag:
+        return frag
+    return "symbol"
+
+
 class _AccessibleHTML5Translator(HTML5Translator):
-    """HTML5 translator that adds contextual ``aria-level`` to toctree captions."""
+    """HTML5 translator adding contextual ``aria-level`` and accessible link names."""
+
+    def _section_title_counts(self, doc: Any) -> dict[str, int]:
+        """Cache section heading title frequencies per document to disambiguate duplicates."""
+        cached_doc = getattr(self, "_cached_section_counts_doc", None)
+        cached_map = getattr(self, "_cached_section_counts_map", None)
+        if cached_doc is doc and isinstance(cached_map, dict):
+            return cached_map
+
+        counts: dict[str, int] = {}
+        if doc is not None and hasattr(doc, "findall"):
+            for sec in doc.findall(nodes.section):
+                for child in sec.children:
+                    if isinstance(child, nodes.title):
+                        title_text = _normalize_inline_label_text(child.astext())
+                        if title_text:
+                            counts[title_text] = counts.get(title_text, 0) + 1
+                        break
+        self._cached_section_counts_doc = doc
+        self._cached_section_counts_map = counts
+        return counts
+
+    def _resolve_permalink_target_label(self, node: Any) -> str:
+        """Build a concise, disambiguated target label for ``a.headerlink`` elements."""
+        if isinstance(node, addnodes.desc_signature):
+            return _resolve_desc_signature_symbol(node)
+
+        if isinstance(node, nodes.section):
+            section_title = ""
+            for child in node.children:
+                if isinstance(child, nodes.title):
+                    section_title = _normalize_inline_label_text(child.astext())
+                    break
+            if not section_title:
+                ids = node.get("ids") or []
+                return str(ids[0]).strip() if ids else ""
+
+            counts = self._section_title_counts(getattr(node, "document", None))
+            if counts.get(section_title, 0) <= 1:
+                return section_title
+
+            context_parts: list[str] = []
+            ancestor = getattr(node, "parent", None)
+            while ancestor is not None:
+                if isinstance(ancestor, addnodes.desc):
+                    for child in ancestor.children:
+                        if isinstance(child, addnodes.desc_signature):
+                            sym = _resolve_desc_signature_symbol(child)
+                            if sym:
+                                context_parts.append(sym)
+                            break
+                    if context_parts:
+                        break
+                elif isinstance(ancestor, nodes.section):
+                    for child in ancestor.children:
+                        if isinstance(child, nodes.title):
+                            ancestor_title = _normalize_inline_label_text(child.astext())
+                            if ancestor_title:
+                                context_parts.append(ancestor_title)
+                                if counts.get(ancestor_title, 0) <= 1:
+                                    ancestor = None
+                            break
+                    if ancestor is None:
+                        break
+                ancestor = getattr(ancestor, "parent", None)
+
+            if context_parts:
+                context_parts.reverse()
+                return f"{' — '.join(context_parts)} — {section_title}"
+            ids = node.get("ids") or []
+            return f"{section_title} ({ids[0]})" if ids else section_title
+
+        for child in getattr(node, "children", ()):
+            if isinstance(child, (nodes.title, nodes.caption)):
+                text = _normalize_inline_label_text(child.astext())
+                if text:
+                    return text
+            elif isinstance(child, addnodes.compact_paragraph) and child.get("toctree"):
+                for sub in child.children:
+                    if isinstance(sub, (nodes.title, nodes.caption)):
+                        text = _normalize_inline_label_text(sub.astext())
+                        if text:
+                            return text
+
+        ids = node.get("ids") or []
+        return str(ids[0]).strip() if ids else ""
+
+    def add_permalink_ref(self, node: Any, title: str) -> None:
+        """Emit ``a.headerlink`` with a target-specific ``aria-label`` (ARIA8, G91)."""
+        if node["ids"] and self.config.html_permalinks and self.builder.add_permalinks:
+            target_id = html.escape(str(node["ids"][0]), quote=True)
+            esc_title = html.escape(str(title), quote=True)
+            target_label = self._resolve_permalink_target_label(node)
+            aria_text = f"Permalink to {target_label}" if target_label else str(title)
+            esc_aria = html.escape(aria_text, quote=True)
+            self.body.append(
+                f'<a class="headerlink" href="#{target_id}" title="{esc_title}" '
+                f'aria-label="{esc_aria}">{self.config.html_permalinks_icon}</a>'
+            )
 
     def visit_title(self, node: Any) -> None:
         """Emit hierarchical ``aria-level`` on captioned toctree headings (ARIA12, G141)."""
@@ -1471,6 +1664,49 @@ class _AccessibleHTML5Translator(HTML5Translator):
             self.add_fignumber(node.parent)
             return
         super().visit_title(node)
+
+    def depart_title(self, node: Any) -> None:
+        """Route TOC-backlinked headings through ``add_permalink_ref`` so ``aria-label`` is emitted."""
+        if (
+            self.context
+            and self.context[-1].startswith("</a></h")
+            and self.config.html_permalinks
+            and self.builder.add_permalinks
+            and node.parent.hasattr("ids")
+            and node.parent["ids"]
+        ):
+            close_tag = self.context.pop()
+            self.body.append("</a>")
+            self.add_permalink_ref(node.parent, "Permalink to this heading")
+            self.context.append(close_tag.removeprefix("</a>"))
+            super(HTML5Translator, self).depart_title(node)
+            return
+        super().depart_title(node)
+
+    def visit_reference(self, node: Any) -> None:
+        """Add ``.viewcode-source-link`` and ``[source]``-prefixed symbol ``aria-label`` (G208, ARIA8)."""
+        is_viewcode_source = (
+            len(node) == 1
+            and isinstance(node[0], nodes.Element)
+            and "viewcode-link" in (node[0].get("classes") or [])
+        )
+        if is_viewcode_source:
+            classes = node.setdefault("classes", [])
+            if "viewcode-source-link" not in classes:
+                classes.append("viewcode-source-link")
+            symbol = _resolve_viewcode_source_symbol(node)
+            esc_aria = html.escape(f"[source] for {symbol}", quote=True)
+            start_idx = len(self.body)
+            super().visit_reference(node)
+            if start_idx < len(self.body) and "aria-label=" not in self.body[start_idx]:
+                self.body[start_idx] = re.sub(
+                    r"^<a\b",
+                    f'<a aria-label="{esc_aria}"',
+                    self.body[start_idx],
+                    count=1,
+                )
+            return
+        super().visit_reference(node)
 
 
 def setup(app: Any) -> dict[str, Any]:  # pragma: no cover
@@ -1494,6 +1730,7 @@ def setup(app: Any) -> dict[str, Any]:  # pragma: no cover
     app.connect("autodoc-skip-member", _skip_non_canonical_or_internal, priority=600)
     app.connect("missing-reference", _resolve_reexported_py_reference)
     app.connect("html-collect-pages", _sanitize_viewcode_modules, priority=100)
+    app.connect("html-page-context", _label_viewcode_backlinks)
 
     app.connect("html-page-context", _inject_seo_metadata)
     app.connect("build-finished", _on_build_finished)

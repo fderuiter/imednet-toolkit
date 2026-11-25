@@ -81,9 +81,116 @@ div.highlight {
 div.highlight pre:focus-visible,
 pre:focus-visible,
 .table-wrapper:focus-visible,
-.explorer-table-wrapper:focus-visible {
+.explorer-table-wrapper:focus-visible,
+a.headerlink:focus-visible,
+.viewcode-source-link:focus-visible,
+a.viewcode-back:focus-visible {
     outline: 2px solid var(--color-brand-primary);
     outline-offset: 2px;
+}
+
+a.reference:has(> .viewcode-link):focus-visible {
+    outline: 2px solid var(--color-brand-primary);
+    outline-offset: 2px;
+}
+
+/* Keyboard-reachable permalinks (WCAG 2.1.1 G202, 2.4.7 C15) & non-collapsed [source] badges (G195) */
+a.headerlink,
+.code-block-caption > .headerlink,
+dl dt > .headerlink,
+figcaption p > .headerlink,
+h1 > .headerlink,
+h2 > .headerlink,
+h3 > .headerlink,
+h4 > .headerlink,
+h5 > .headerlink,
+h6 > .headerlink,
+p.caption > .headerlink,
+table > caption > .headerlink {
+    visibility: visible;
+    opacity: 0;
+    border-radius: 2px;
+}
+
+a.headerlink:hover,
+a.headerlink:focus,
+a.headerlink:focus-visible,
+.code-block-caption:hover > .headerlink,
+.code-block-caption:focus-within > .headerlink,
+dl dt:hover > .headerlink,
+dl dt:focus-within > .headerlink,
+figcaption p:hover > .headerlink,
+figcaption p:focus-within > .headerlink,
+figure:hover > figcaption > p > .headerlink,
+figure:focus-within > figcaption > p > .headerlink,
+h1:hover > .headerlink,
+h1:focus-within > .headerlink,
+h2:hover > .headerlink,
+h2:focus-within > .headerlink,
+h3:hover > .headerlink,
+h3:focus-within > .headerlink,
+h4:hover > .headerlink,
+h4:focus-within > .headerlink,
+h5:hover > .headerlink,
+h5:focus-within > .headerlink,
+h6:hover > .headerlink,
+h6:focus-within > .headerlink,
+p.caption:hover > .headerlink,
+p.caption:focus-within > .headerlink,
+table:hover > caption > .headerlink,
+table > caption:hover > .headerlink,
+table > caption:focus-within > .headerlink {
+    visibility: visible;
+    opacity: 1;
+}
+
+div.math .headerlink,
+div.math:focus .headerlink {
+    display: inline-block;
+    visibility: visible;
+    opacity: 0;
+    border-radius: 2px;
+}
+
+div.math:hover .headerlink,
+div.math:focus-within .headerlink {
+    display: inline-block;
+    visibility: visible;
+    opacity: 1;
+}
+
+.viewcode-source-link {
+    float: right;
+    margin-left: 0.5rem;
+    text-align: right;
+    text-indent: 0;
+    font-weight: 400;
+    border-radius: 2px;
+}
+
+a.reference:has(> .viewcode-link) {
+    float: right;
+    margin-left: 0.5rem;
+    text-align: right;
+    text-indent: 0;
+    font-weight: 400;
+    border-radius: 2px;
+}
+
+.viewcode-source-link > .viewcode-link,
+.sig:not(.sig-inline) a.reference.viewcode-source-link .viewcode-link {
+    float: none;
+    width: auto;
+}
+
+a.reference:has(> .viewcode-link) > .viewcode-link,
+.sig:not(.sig-inline) a.reference:has(> .viewcode-link) .viewcode-link {
+    float: none;
+    width: auto;
+}
+
+a.viewcode-back {
+    border-radius: 2px;
 }
 
 /* Keyboard-accessible Furo sidebar submenu switches & responsive drawer guards */
@@ -1993,7 +2100,14 @@ img.toggler:focus-visible,
     .sidebar-tree .reference:focus-visible,
     .toc-tree a:focus-visible,
     .table-wrapper:focus-visible,
-    .explorer-table-wrapper:focus-visible {
+    .explorer-table-wrapper:focus-visible,
+    a.headerlink:focus-visible,
+    .viewcode-source-link:focus-visible,
+    a.viewcode-back:focus-visible {
+        outline: 2px solid var(--color-brand-primary);
+    }
+
+    a.reference:has(> .viewcode-link):focus-visible {
         outline: 2px solid var(--color-brand-primary);
     }
 }
@@ -2301,7 +2415,15 @@ img.toggler:focus-visible,
     .mermaid:focus-visible,
     .table-wrapper:focus-visible,
     .explorer-table-wrapper:focus-visible,
-    pre:focus-visible {
+    pre:focus-visible,
+    a.headerlink:focus-visible,
+    .viewcode-source-link:focus-visible,
+    a.viewcode-back:focus-visible {
+        outline: 2px solid Highlight !important;
+        outline-offset: 2px !important;
+    }
+
+    a.reference:has(> .viewcode-link):focus-visible {
         outline: 2px solid Highlight !important;
         outline-offset: 2px !important;
     }

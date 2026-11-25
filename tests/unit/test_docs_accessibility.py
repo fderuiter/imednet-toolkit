@@ -237,6 +237,81 @@ def test_navigation_keyboard_css_and_controller_contracts() -> None:
 
 
 @pytest.mark.unit
+def test_headerlink_and_viewcode_css_contracts() -> None:
+    """Verify custom.css overrides Furo headerlink visibility, [source] float collapse, and 4-mode focus rings."""
+    import re
+
+    css_content = (REPO_ROOT / "docs/_static/custom.css").read_text(encoding="utf-8")
+
+    # 1. Override Furo's visibility: hidden across headings, definitions, and captions with opacity: 0 -> 1
+    for selector in (
+        "a.headerlink",
+        ".code-block-caption > .headerlink",
+        "dl dt > .headerlink",
+        "figcaption p > .headerlink",
+        "h1 > .headerlink",
+        "h6 > .headerlink",
+        "p.caption > .headerlink",
+        "table > caption > .headerlink",
+    ):
+        assert selector in css_content
+
+    for reveal_selector in (
+        "a.headerlink:hover",
+        "a.headerlink:focus",
+        "a.headerlink:focus-visible",
+        "dl dt:focus-within > .headerlink",
+        "h1:focus-within > .headerlink",
+        "p.caption:focus-within > .headerlink",
+        "table > caption:focus-within > .headerlink",
+    ):
+        assert reveal_selector in css_content
+
+    # 2. Separate .viewcode-source-link and a.reference:has(> .viewcode-link) rule blocks
+    #    so engines without :has() never drop the .viewcode-source-link rule
+    rule_headers = [
+        block.rsplit("{", 1)[-1] if "{" in block else block for block in css_content.split("}")
+    ]
+    for header in rule_headers:
+        if ".viewcode-source-link" in header:
+            assert ":has(" not in header, (
+                f".viewcode-source-link must not share a selector list with :has(): {header!r}"
+            )
+
+    assert re.search(
+        r"\.viewcode-source-link\s*\{[^}]*float:\s*right;[^}]*text-indent:\s*0;",
+        css_content,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"a\.reference:has\(>\s*\.viewcode-link\)\s*\{[^}]*float:\s*right;[^}]*text-indent:\s*0;",
+        css_content,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"\.viewcode-source-link\s*>\s*\.viewcode-link[^{]*\{[^}]*float:\s*none;[^}]*width:\s*auto;",
+        css_content,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"a\.reference:has\(>\s*\.viewcode-link\)\s*>\s*\.viewcode-link[^{]*\{[^}]*float:\s*none;[^}]*width:\s*auto;",
+        css_content,
+        re.DOTALL,
+    )
+
+    # 3. 2px :focus-visible outlines across default, prefers-contrast: more, and forced-colors: active
+    for focus_sel in (
+        "a.headerlink:focus-visible",
+        ".viewcode-source-link:focus-visible",
+        "a.reference:has(> .viewcode-link):focus-visible",
+        "a.viewcode-back:focus-visible",
+    ):
+        assert css_content.count(focus_sel) >= 3, (
+            f"Expected {focus_sel} in base, prefers-contrast: more, and forced-colors: active blocks"
+        )
+
+
+@pytest.mark.unit
 def test_vpat_document_conformance() -> None:
     """Ensure VPAT document and showcase mock reflect community ownership and verified capabilities."""
     from imednet_tui.app import ImednetTuiApp
@@ -1132,6 +1207,209 @@ def test_accessible_html5_translator_toctree_caption_aria_levels(tmp_path: Path)
         "<caption>" in rendered
         and "aria-level" not in rendered.split("<caption>", 1)[1].split("</caption>", 1)[0]
     )
+
+
+@pytest.mark.unit
+def test_accessible_translator_link_labels_and_viewcode_backlinks(tmp_path: Path) -> None:
+    """Verify target-specific aria-labels on a.headerlink, [source], and [docs] links."""
+    from docs import conf as docs_conf
+    from docutils import nodes
+    from docutils.utils import new_document
+    from sphinx import addnodes
+    from sphinx.application import Sphinx
+    from sphinx.util.docutils import docutils_namespace
+
+    srcdir = tmp_path / "src_links"
+    srcdir.mkdir()
+    (srcdir / "conf.py").write_text(
+        'project = "test"\nextensions = []\nhtml_theme = "furo"\nmaster_doc = "index"\nhtml_permalinks = True\n',
+        encoding="utf-8",
+    )
+    (srcdir / "index.rst").write_text("Title\n=====\n", encoding="utf-8")
+
+    with docutils_namespace():
+        app = Sphinx(
+            srcdir=str(srcdir),
+            confdir=str(srcdir),
+            outdir=str(tmp_path / "out_links"),
+            doctreedir=str(tmp_path / "doctrees_links"),
+            buildername="html",
+        )
+        app.set_translator("html", docs_conf._AccessibleHTML5Translator)
+        app.builder.prepare_writing({"index"})
+        app.builder.current_docname = "index"
+        app.builder.secnumbers = {}
+        app.builder.fignumbers = {}
+        app.builder.add_permalinks = True
+        doc = new_document("index", app.builder.docsettings)
+
+        # 1. Top-level section + TOC-backlinked section + duplicate child sections
+        sec_root = nodes.section(ids=["cli-reference"])
+        sec_root += nodes.title("", "CLI Reference")
+
+        sec_toc = nodes.section(ids=["overview-sec"])
+        toc_title = nodes.title("", "Overview", refid="toc-entry-1")
+        sec_toc += toc_title
+        sec_root += sec_toc
+
+        for sub_slug, sub_name in (("extract", "extract-records"), ("validate", "validate-study")):
+            cmd_sec = nodes.section(ids=[f"cmd-{sub_slug}"])
+            cmd_sec += nodes.title("", sub_name)
+            dup_sec = nodes.section(ids=[f"pos-args-{sub_slug}"])
+            dup_sec += nodes.title("", "Positional Arguments")
+            cmd_sec += dup_sec
+            sec_root += cmd_sec
+
+        # 2. API desc_signature with dt[id] + viewcode [source] link, and :noindex: desc_signature
+        desc = addnodes.desc(domain="py", objtype="class")
+        sig = addnodes.desc_signature(
+            module="imednet.auth.api_key",
+            fullname="ApiKeyAuth",
+            ids=["imednet.auth.api_key.ApiKeyAuth"],
+        )
+        sig += addnodes.desc_name("ApiKeyAuth", "ApiKeyAuth")
+        src_ref = nodes.reference(
+            "", "", internal=True, refuri="../../_modules/imednet/auth/api_key.html#ApiKeyAuth"
+        )
+        src_span = nodes.inline("", "[source]", classes=["viewcode-link"])
+        src_ref += src_span
+        sig += src_ref
+        desc += sig
+        desc += addnodes.desc_content()
+        sec_root += desc
+
+        noindex_desc = addnodes.desc(domain="py", objtype="function")
+        noindex_sig = addnodes.desc_signature(
+            module="imednet.validation.cache",
+            fullname="validate_record_data",
+        )
+        noindex_sig += addnodes.desc_name("validate_record_data", "validate_record_data")
+        noindex_ref = nodes.reference(
+            "",
+            "",
+            internal=True,
+            refuri="../_modules/imednet/validation/cache.html#validate_record_data",
+        )
+        noindex_ref += nodes.inline("", "[source]", classes=["viewcode-link"])
+        noindex_sig += noindex_ref
+        noindex_desc += noindex_sig
+        noindex_desc += addnodes.desc_content()
+        sec_root += noindex_desc
+
+        # Standalone fallback viewcode link outside desc_signature + regular text link
+        standalone_p = nodes.paragraph()
+        standalone_src = nodes.reference(
+            "",
+            "",
+            internal=True,
+            refuri="_modules/imednet/sdk.html#ImednetSDK",
+        )
+        standalone_src += nodes.inline("", "[source]", classes=["viewcode-link"])
+        normal_link = nodes.reference("", "Standard Guide Link", internal=True, refuri="guide.html")
+        standalone_p += standalone_src
+        standalone_p += normal_link
+        sec_root += standalone_p
+
+        # 3. Captioned table, figure, and code-block container with ids
+        table = nodes.table(ids=["stability-table"])
+        table += nodes.title("", "Stability Matrix")
+        tgroup = nodes.tgroup(cols=1)
+        tgroup += nodes.colspec(colwidth=1)
+        tbody = nodes.tbody()
+        row = nodes.row()
+        entry = nodes.entry()
+        entry += nodes.paragraph(text="Cell")
+        row += entry
+        tbody += row
+        tgroup += tbody
+        table += tgroup
+        sec_root += table
+
+        fig = nodes.figure(ids=["arch-fig"])
+        fig += nodes.caption("", "Architecture Diagram")
+        sec_root += fig
+
+        code_wrap = nodes.container(ids=["sample-code"], classes=["literal-block-wrapper"])
+        code_wrap += nodes.caption("", "example.py")
+        sec_root += code_wrap
+
+        doc += sec_root
+
+        translator = docs_conf._AccessibleHTML5Translator(doc, app.builder)
+        doc.walkabout(translator)
+        # Exercise explicit caption permalink helper calls for figure & code-block wrappers
+        translator.add_permalink_ref(fig, "Permalink to this image")
+        translator.add_permalink_ref(code_wrap, "Permalink to this code")
+        rendered = "".join(translator.body)
+
+    # Heading, TOC-backlinked heading, and disambiguated duplicate headings
+    assert (
+        'href="#cli-reference" title="Permalink to this heading" aria-label="Permalink to CLI Reference"'
+        in rendered
+    )
+    assert (
+        'href="#overview-sec" title="Permalink to this heading" aria-label="Permalink to Overview"'
+        in rendered
+    )
+    assert (
+        'href="#pos-args-extract" title="Permalink to this heading" '
+        'aria-label="Permalink to extract-records — Positional Arguments"'
+    ) in rendered
+    assert (
+        'href="#pos-args-validate" title="Permalink to this heading" '
+        'aria-label="Permalink to validate-study — Positional Arguments"'
+    ) in rendered
+
+    # API definition permalink + [source] links (both indexed and :noindex: + standalone fallback)
+    assert (
+        'href="#imednet.auth.api_key.ApiKeyAuth" title="Permalink to this definition" '
+        'aria-label="Permalink to imednet.auth.api_key.ApiKeyAuth"'
+    ) in rendered
+    assert 'aria-label="[source] for imednet.auth.api_key.ApiKeyAuth"' in rendered
+    assert 'aria-label="[source] for imednet.validation.cache.validate_record_data"' in rendered
+    assert 'aria-label="[source] for imednet.sdk.ImednetSDK"' in rendered
+    assert rendered.count("viewcode-source-link") == 3
+    assert (
+        'aria-label="[source]' not in rendered.split("Standard Guide Link")[0].rsplit("<a ", 1)[-1]
+    )
+
+    # Captions (table, figure, code-block)
+    assert (
+        'href="#stability-table" title="Permalink to this table" aria-label="Permalink to Stability Matrix"'
+        in rendered
+    )
+    assert (
+        'href="#arch-fig" title="Permalink to this image" aria-label="Permalink to Architecture Diagram"'
+        in rendered
+    )
+    assert (
+        'href="#sample-code" title="Permalink to this code" aria-label="Permalink to example.py"'
+        in rendered
+    )
+
+    # 4. _label_viewcode_backlinks hook on _modules/ pages vs non-module pages
+    mod_ctx = {
+        "body": (
+            '<div class="viewcode-block" id="ApiKeyAuth">\n'
+            '<a class="viewcode-back" href="../../../../reference/api/imednet.auth.html#imednet.auth.api_key.ApiKeyAuth">[docs]</a>'
+            "</div>\n"
+            '<div class="viewcode-block" id="ApiKeyAuth.apply">'
+            '<a class="viewcode-back" href="../../../../reference/api/imednet.auth.html">[docs]</a>'
+            "</div>\n"
+            '<a class="viewcode-back" href="#existing" aria-label="[docs] for custom.Symbol">[docs]</a>'
+        )
+    }
+    docs_conf._label_viewcode_backlinks(
+        None, "_modules/imednet/auth/api_key", "page.html", mod_ctx, None
+    )
+    assert 'aria-label="[docs] for imednet.auth.api_key.ApiKeyAuth"' in mod_ctx["body"]
+    assert 'aria-label="[docs] for imednet.auth.api_key.ApiKeyAuth.apply"' in mod_ctx["body"]
+    assert mod_ctx["body"].count('aria-label="[docs] for custom.Symbol"') == 1
+
+    untouched_ctx = {"body": '<a class="viewcode-back" href="foo.html">[docs]</a>'}
+    docs_conf._label_viewcode_backlinks(None, "index", "page.html", untouched_ctx, None)
+    docs_conf._label_viewcode_backlinks(None, "_modules/index", "page.html", untouched_ctx, None)
+    assert "aria-label=" not in untouched_ctx["body"]
 
 
 @pytest.mark.unit
@@ -4387,6 +4665,462 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     )
                     cdp_session.detach()
                     nav_page.close()
+
+                # --------------------------------------------------------------
+                # 7. Sphinx link aria-labels, Furo .headerlink focus visibility,
+                #    [source] anchor geometry, & 4-mode [docs]/[source]/¶ outlines
+                # --------------------------------------------------------------
+                from scripts.validate_docs import _parse_html_file
+
+                all_built_html = sorted(html_dir.rglob("*.html"))
+                static_headerlink_count = 0
+                static_source_count = 0
+                static_backlink_count = 0
+                generic_hl_labels = {
+                    "Permalink to this heading",
+                    "Permalink to this definition",
+                    "Permalink to this table",
+                    "Permalink to this code",
+                    "Permalink to this image",
+                    "Permalink to this toctree",
+                    "Permalink to",
+                }
+                for built_page in all_built_html:
+                    parsed_built = _parse_html_file(built_page)
+                    rel_built = built_page.relative_to(html_dir)
+                    for hl_href, hl_aria in parsed_built.headerlinks:
+                        static_headerlink_count += 1
+                        assert hl_aria and hl_aria not in generic_hl_labels, (
+                            f"{rel_built} {hl_href} has missing/generic aria-label: {hl_aria!r}"
+                        )
+                        assert (
+                            hl_aria.startswith("Permalink to ")
+                            and hl_aria.removeprefix("Permalink to ").strip()
+                        ), f"{rel_built} {hl_href} invalid permalink aria-label: {hl_aria!r}"
+                    for src_href, src_aria, has_src_cls in parsed_built.source_links:
+                        static_source_count += 1
+                        assert has_src_cls is True, (
+                            f"{rel_built} {src_href} missing .viewcode-source-link class"
+                        )
+                        assert src_aria and src_aria.startswith("[source] for "), (
+                            f"{rel_built} {src_href} invalid [source] aria-label: {src_aria!r}"
+                        )
+                    if rel_built.parts[0] == "_modules" and rel_built.name != "index.html":
+                        for back_href, back_aria in parsed_built.backlink_labels:
+                            static_backlink_count += 1
+                            assert back_aria and back_aria.startswith("[docs] for "), (
+                                f"{rel_built} {back_href} invalid [docs] aria-label: {back_aria!r}"
+                            )
+
+                assert static_headerlink_count >= 4000
+                assert static_source_count >= 1400
+                assert static_backlink_count >= 1300
+
+                # Duplicate section heading disambiguation on how-to/cli.html
+                cli_parsed = _parse_html_file(html_dir / "how-to" / "cli.html")
+                cli_pos_labels = [
+                    lbl
+                    for _href, lbl in cli_parsed.headerlinks
+                    if lbl and "Positional Arguments" in lbl
+                ]
+                assert len(cli_pos_labels) >= 2
+                assert len(set(cli_pos_labels)) == len(cli_pos_labels), (
+                    f"Duplicate Positional Arguments headerlink labels on how-to/cli.html: {cli_pos_labels}"
+                )
+
+                link_page = context.new_page()
+                try:
+                    link_page.set_viewport_size({"width": 1280, "height": 800})
+
+                    # 7a. Zero a.headerlink elements compute visibility: hidden
+                    sample_headerlink_pages = (
+                        "index.html",
+                        "how-to/cli.html",
+                        "explanation/schema_validation.html",
+                        "explanation/parsing.html",
+                        "reference/api/imednet.auth.html",
+                    )
+                    for sample_rel in sample_headerlink_pages:
+                        link_page.goto(
+                            f"http://127.0.0.1:{port}/{sample_rel}",
+                            wait_until="load",
+                        )
+                        hl_vis_audit = link_page.evaluate(
+                            """() => {
+                                const links = Array.from(document.querySelectorAll('a.headerlink'));
+                                const hidden = links.filter((a) => getComputedStyle(a).visibility === 'hidden');
+                                const unlabeled = links.filter((a) => !(a.getAttribute('aria-label') || '').trim());
+                                const resting = links[0] ? getComputedStyle(links[0]) : null;
+                                return {
+                                    total: links.length,
+                                    hiddenCount: hidden.length,
+                                    unlabeledCount: unlabeled.length,
+                                    firstVisibility: resting ? resting.visibility : null,
+                                    firstOpacity: resting ? resting.opacity : null
+                                };
+                            }"""
+                        )
+                        assert hl_vis_audit["total"] >= 1, f"Expected headerlinks on {sample_rel}"
+                        assert hl_vis_audit["hiddenCount"] == 0, (
+                            f"{sample_rel} still has visibility:hidden headerlinks: {hl_vis_audit}"
+                        )
+                        assert hl_vis_audit["unlabeledCount"] == 0
+                        assert hl_vis_audit["firstVisibility"] == "visible"
+                        assert hl_vis_audit["firstOpacity"] == "0"
+
+                    # 7b. Sequential Tab focus into heading, API definition, and table caption headerlinks
+                    #     + [source] outer anchor non-zero bounding box & 4-mode :focus-visible outlines
+                    link_page.goto(
+                        f"http://127.0.0.1:{port}/reference/api/imednet.auth.html",
+                        wait_until="load",
+                    )
+                    link_page.add_script_tag(content=contrast_helper_js)
+                    link_page.add_script_tag(content=outline_helper_js)
+
+                    # Tab from last control before h1 > a.headerlink into h1 > a.headerlink
+                    link_page.evaluate(
+                        """() => {
+                            const h1Link = document.querySelector('h1 > a.headerlink');
+                            h1Link.id = 'test-h1-headerlink';
+                            const focusables = Array.from(
+                                document.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), [tabindex="0"]')
+                            ).filter((el) => {
+                                const cs = getComputedStyle(el);
+                                const r = el.getBoundingClientRect();
+                                return cs.visibility !== 'hidden' && cs.display !== 'none' && (r.width > 0 || r.height > 0);
+                            });
+                            const idx = focusables.indexOf(h1Link);
+                            if (idx > 0) focusables[idx - 1].focus();
+                        }"""
+                    )
+                    link_page.keyboard.press("Tab")
+                    h1_tab_check = link_page.evaluate(
+                        """() => {
+                            const el = document.getElementById('test-h1-headerlink');
+                            const cs = getComputedStyle(el);
+                            return {
+                                isFocused: document.activeElement === el,
+                                opacity: cs.opacity,
+                                label: el.getAttribute('aria-label') || '',
+                                outline: window.__checkToggleOutline('#test-h1-headerlink')
+                            };
+                        }"""
+                    )
+                    assert h1_tab_check["isFocused"] is True
+                    assert h1_tab_check["opacity"] == "1"
+                    assert h1_tab_check["label"].startswith("Permalink to ")
+                    assert h1_tab_check["outline"]["matches"] is True
+                    assert (
+                        h1_tab_check["outline"]["style"] == "solid"
+                        and h1_tab_check["outline"]["width"] == "2px"
+                    )
+                    assert h1_tab_check["outline"]["contrast"] >= 4.5
+
+                    # API definition dt#imednet.auth.api_key.ApiKeyAuth: [source] geometry + focus -> Tab -> ¶
+                    api_dt_geom = link_page.evaluate(
+                        """() => {
+                            const dt = document.getElementById('imednet.auth.api_key.ApiKeyAuth');
+                            const srcA = dt.querySelector('a.viewcode-source-link');
+                            const srcSpan = srcA.querySelector('.viewcode-link');
+                            const hl = dt.querySelector('a.headerlink');
+                            srcA.id = 'test-apikey-source-link';
+                            hl.id = 'test-apikey-headerlink';
+                            const aRect = srcA.getBoundingClientRect();
+                            const spanRect = srcSpan.getBoundingClientRect();
+                            const aCs = getComputedStyle(srcA);
+                            const spanCs = getComputedStyle(srcSpan);
+                            return {
+                                aWidth: aRect.width,
+                                aHeight: aRect.height,
+                                spanWidth: spanRect.width,
+                                widthDiff: Math.abs(aRect.width - spanRect.width),
+                                textIndent: aCs.textIndent,
+                                spanFloat: spanCs.float,
+                                srcLabel: srcA.getAttribute('aria-label') || '',
+                                hlLabel: hl.getAttribute('aria-label') || ''
+                            };
+                        }"""
+                    )
+                    assert api_dt_geom["aWidth"] >= 40, f"Collapsed [source] anchor: {api_dt_geom}"
+                    assert api_dt_geom["aHeight"] >= 12
+                    assert api_dt_geom["widthDiff"] <= 2.0, (
+                        f"Outer [source] anchor width diverges from inner span: {api_dt_geom}"
+                    )
+                    assert api_dt_geom["textIndent"] == "0px"
+                    assert api_dt_geom["spanFloat"] == "none"
+                    assert api_dt_geom["srcLabel"] == "[source] for imednet.auth.api_key.ApiKeyAuth"
+                    assert api_dt_geom["hlLabel"] == "Permalink to imednet.auth.api_key.ApiKeyAuth"
+
+                    # Focus preceding tabbable before [source], Tab into [source], then Tab into ¶
+                    link_page.evaluate(
+                        """() => {
+                            const srcA = document.getElementById('test-apikey-source-link');
+                            srcA.scrollIntoView({ block: 'center' });
+                            const focusables = Array.from(
+                                document.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), [tabindex="0"]')
+                            ).filter((el) => {
+                                const cs = getComputedStyle(el);
+                                const r = el.getBoundingClientRect();
+                                return cs.visibility !== 'hidden' && cs.display !== 'none' && (r.width > 0 || r.height > 0);
+                            });
+                            const idx = focusables.indexOf(srcA);
+                            if (idx > 0) focusables[idx - 1].focus();
+                        }"""
+                    )
+                    link_page.keyboard.press("Tab")
+                    src_tab_check = link_page.evaluate(
+                        """() => {
+                            const srcA = document.getElementById('test-apikey-source-link');
+                            const hl = document.getElementById('test-apikey-headerlink');
+                            return {
+                                isFocused: document.activeElement === srcA,
+                                siblingHlOpacity: getComputedStyle(hl).opacity,
+                                outline: window.__checkToggleOutline('#test-apikey-source-link')
+                            };
+                        }"""
+                    )
+                    assert src_tab_check["isFocused"] is True
+                    assert src_tab_check["siblingHlOpacity"] == "1"
+                    assert src_tab_check["outline"]["matches"] is True
+                    assert (
+                        src_tab_check["outline"]["style"] == "solid"
+                        and src_tab_check["outline"]["width"] == "2px"
+                    )
+                    assert src_tab_check["outline"]["contrast"] >= 4.5
+
+                    link_page.keyboard.press("Tab")
+                    dt_hl_tab_check = link_page.evaluate(
+                        """() => {
+                            const hl = document.getElementById('test-apikey-headerlink');
+                            return {
+                                isFocused: document.activeElement === hl,
+                                opacity: getComputedStyle(hl).opacity,
+                                outline: window.__checkToggleOutline('#test-apikey-headerlink')
+                            };
+                        }"""
+                    )
+                    assert dt_hl_tab_check["isFocused"] is True
+                    assert dt_hl_tab_check["opacity"] == "1"
+                    assert dt_hl_tab_check["outline"]["matches"] is True
+                    assert (
+                        dt_hl_tab_check["outline"]["style"] == "solid"
+                        and dt_hl_tab_check["outline"]["width"] == "2px"
+                    )
+                    assert dt_hl_tab_check["outline"]["contrast"] >= 4.5
+
+                    # 4-mode focus-visible verification on ApiKeyAuth [source] and ¶
+                    for sel in ("#test-apikey-source-link", "#test-apikey-headerlink"):
+                        for theme in ("light", "dark"):
+                            link_page.evaluate(
+                                f"document.body.setAttribute('data-theme', '{theme}')"
+                            )
+                            link_page.locator(sel).focus()
+                            link_page.keyboard.press("Shift")
+                            std_out = link_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                            assert std_out["matches"] is True
+                            assert std_out["style"] == "solid" and std_out["width"] == "2px"
+                            assert std_out["contrast"] >= 4.5
+
+                        link_page.emulate_media(contrast="more")
+                        for theme in ("light", "dark"):
+                            link_page.evaluate(
+                                f"document.body.setAttribute('data-theme', '{theme}')"
+                            )
+                            link_page.locator(sel).focus()
+                            link_page.keyboard.press("Shift")
+                            hc_out = link_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                            assert hc_out["matches"] is True
+                            assert hc_out["style"] == "solid" and hc_out["width"] == "2px"
+                            assert hc_out["contrast"] >= 7.0
+                        link_page.emulate_media(contrast="no-preference")
+
+                        link_page.emulate_media(forced_colors="active")
+                        fc_hl_color = link_page.evaluate(
+                            """() => {
+                                const p = document.createElement('span');
+                                p.style.cssText = 'forced-color-adjust: none !important; outline: 2px solid Highlight !important; display: none;';
+                                document.body.appendChild(p);
+                                const c = getComputedStyle(p).outlineColor;
+                                p.remove();
+                                return c;
+                            }"""
+                        )
+                        link_page.locator(sel).focus()
+                        link_page.keyboard.press("Shift")
+                        fc_out = link_page.evaluate(f"window.__checkToggleOutline('{sel}')")
+                        assert fc_out["matches"] is True
+                        assert fc_out["style"] == "solid" and fc_out["width"] == "2px"
+                        assert fc_out["color"] == fc_hl_color
+                        link_page.emulate_media(forced_colors="none")
+
+                    link_page.evaluate("document.body.setAttribute('data-theme', 'light')")
+
+                    # Guide page :noindex: [source] anchor geometry on explanation/parsing.html
+                    link_page.goto(
+                        f"http://127.0.0.1:{port}/explanation/parsing.html",
+                        wait_until="load",
+                    )
+                    parsing_src_geom = link_page.evaluate(
+                        """() => {
+                            const srcA = document.querySelector('a.viewcode-source-link');
+                            const srcSpan = srcA ? srcA.querySelector('.viewcode-link') : null;
+                            if (!srcA || !srcSpan) return null;
+                            const aRect = srcA.getBoundingClientRect();
+                            const spanRect = srcSpan.getBoundingClientRect();
+                            return {
+                                aWidth: aRect.width,
+                                spanWidth: spanRect.width,
+                                widthDiff: Math.abs(aRect.width - spanRect.width),
+                                label: srcA.getAttribute('aria-label') || ''
+                            };
+                        }"""
+                    )
+                    assert parsing_src_geom is not None
+                    assert parsing_src_geom["aWidth"] >= 40
+                    assert parsing_src_geom["widthDiff"] <= 2.0
+                    assert parsing_src_geom["label"].startswith("[source] for imednet.")
+
+                    # Table caption a.headerlink sequential Tab focus on explanation/schema_validation.html
+                    link_page.goto(
+                        f"http://127.0.0.1:{port}/explanation/schema_validation.html",
+                        wait_until="load",
+                    )
+                    link_page.add_script_tag(content=contrast_helper_js)
+                    link_page.add_script_tag(content=outline_helper_js)
+                    link_page.evaluate(
+                        """() => {
+                            const capHl = document.querySelector('table > caption > a.headerlink');
+                            capHl.id = 'test-caption-headerlink';
+                            capHl.scrollIntoView({ block: 'center' });
+                            const focusables = Array.from(
+                                document.querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), [tabindex="0"]')
+                            ).filter((el) => {
+                                const cs = getComputedStyle(el);
+                                const r = el.getBoundingClientRect();
+                                return cs.visibility !== 'hidden' && cs.display !== 'none' && (r.width > 0 || r.height > 0);
+                            });
+                            const idx = focusables.indexOf(capHl);
+                            if (idx > 0) focusables[idx - 1].focus();
+                        }"""
+                    )
+                    link_page.keyboard.press("Tab")
+                    cap_tab_check = link_page.evaluate(
+                        """() => {
+                            const el = document.getElementById('test-caption-headerlink');
+                            return {
+                                isFocused: document.activeElement === el,
+                                opacity: getComputedStyle(el).opacity,
+                                label: el.getAttribute('aria-label') || '',
+                                outline: window.__checkToggleOutline('#test-caption-headerlink')
+                            };
+                        }"""
+                    )
+                    assert cap_tab_check["isFocused"] is True
+                    assert cap_tab_check["opacity"] == "1"
+                    assert cap_tab_check["label"].startswith("Permalink to ")
+                    assert cap_tab_check["label"] != "Permalink to this table"
+                    assert cap_tab_check["outline"]["matches"] is True
+                    assert (
+                        cap_tab_check["outline"]["style"] == "solid"
+                        and cap_tab_check["outline"]["width"] == "2px"
+                    )
+                    assert cap_tab_check["outline"]["contrast"] >= 4.5
+
+                    # 7c. _modules/imednet/auth/api_key.html a.viewcode-back [docs] aria-labels & 4-mode focus ring
+                    link_page.goto(
+                        f"http://127.0.0.1:{port}/_modules/imednet/auth/api_key.html",
+                        wait_until="load",
+                    )
+                    link_page.add_script_tag(content=contrast_helper_js)
+                    link_page.add_script_tag(content=outline_helper_js)
+                    backlink_meta = link_page.evaluate(
+                        """() => {
+                            const backlinks = Array.from(document.querySelectorAll('a.viewcode-back'));
+                            if (backlinks[0]) backlinks[0].id = 'test-viewcode-back';
+                            return backlinks.map((el) => ({
+                                label: el.getAttribute('aria-label') || '',
+                                width: el.getBoundingClientRect().width
+                            }));
+                        }"""
+                    )
+                    assert len(backlink_meta) >= 1
+                    assert all(
+                        item["label"].startswith("[docs] for imednet.auth.api_key.")
+                        and item["width"] >= 30
+                        for item in backlink_meta
+                    )
+
+                    for theme in ("light", "dark"):
+                        link_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                        link_page.locator("#test-viewcode-back").focus()
+                        link_page.keyboard.press("Shift")
+                        back_std = link_page.evaluate(
+                            "window.__checkToggleOutline('#test-viewcode-back')"
+                        )
+                        assert back_std["matches"] is True
+                        assert back_std["style"] == "solid" and back_std["width"] == "2px"
+                        assert back_std["contrast"] >= 4.5
+
+                    link_page.emulate_media(contrast="more")
+                    for theme in ("light", "dark"):
+                        link_page.evaluate(f"document.body.setAttribute('data-theme', '{theme}')")
+                        link_page.locator("#test-viewcode-back").focus()
+                        link_page.keyboard.press("Shift")
+                        back_hc = link_page.evaluate(
+                            "window.__checkToggleOutline('#test-viewcode-back')"
+                        )
+                        assert back_hc["matches"] is True
+                        assert back_hc["style"] == "solid" and back_hc["width"] == "2px"
+                        assert back_hc["contrast"] >= 7.0
+                    link_page.emulate_media(contrast="no-preference")
+
+                    link_page.emulate_media(forced_colors="active")
+                    fc_back_hl = link_page.evaluate(
+                        """() => {
+                            const p = document.createElement('span');
+                            p.style.cssText = 'forced-color-adjust: none !important; outline: 2px solid Highlight !important; display: none;';
+                            document.body.appendChild(p);
+                            const c = getComputedStyle(p).outlineColor;
+                            p.remove();
+                            return c;
+                        }"""
+                    )
+                    link_page.locator("#test-viewcode-back").focus()
+                    link_page.keyboard.press("Shift")
+                    back_fc = link_page.evaluate(
+                        "window.__checkToggleOutline('#test-viewcode-back')"
+                    )
+                    assert back_fc["matches"] is True
+                    assert back_fc["style"] == "solid" and back_fc["width"] == "2px"
+                    assert back_fc["color"] == fc_back_hl
+                    link_page.emulate_media(forced_colors="none")
+                    link_page.evaluate("document.body.setAttribute('data-theme', 'light')")
+
+                    # 7d. Zero horizontal overflow at 1280x800 and 375x667 across key pages
+                    overflow_pages = (
+                        "reference/api/imednet.auth.html",
+                        "explanation/parsing.html",
+                        "explanation/schema_validation.html",
+                        "_modules/imednet/auth/api_key.html",
+                    )
+                    for vp_w, vp_h in ((1280, 800), (375, 667)):
+                        link_page.set_viewport_size({"width": vp_w, "height": vp_h})
+                        for ov_rel in overflow_pages:
+                            link_page.goto(
+                                f"http://127.0.0.1:{port}/{ov_rel}",
+                                wait_until="load",
+                            )
+                            ov_dims = link_page.evaluate(
+                                """() => ({
+                                    scrollWidth: document.documentElement.scrollWidth,
+                                    innerWidth: window.innerWidth
+                                })"""
+                            )
+                            assert ov_dims["scrollWidth"] <= ov_dims["innerWidth"], (
+                                f"Horizontal overflow on {ov_rel} at {vp_w}x{vp_h}: {ov_dims}"
+                            )
+                finally:
+                    link_page.close()
 
                 context.close()
             finally:
