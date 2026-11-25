@@ -1176,3 +1176,204 @@ def test_state_set_and_reset_running_lease_force_parity(
     with pytest.raises(InvalidStateTransitionError, match="displaced RUNNING lease"):
         tx_ctx_2.__exit__(None, None, None)
     assert provider.get_last_timestamp("STUDY_RUN", "records") is None
+
+
+def test_show_state_json_and_table_modes_redact_legacy_ledger_with_study_phi(
+    runner: CliRunner,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """workflows state show (--format json and --format table) scrubs all 8 canary markers per Study on legacy ledgers."""
+    import json
+    from unittest.mock import MagicMock
+
+    from imednet.cli import app as main_app
+    from imednet.integrations.enrichment import StudyConfiguration
+    from imednet.spi.cli import redact_cli_secrets
+    from imednet.spi.utils import build_study_sensitivity_registry
+    from imednet_workflows.config_version_control import ConfigVersionStore
+
+    m_uri_pass = "CANARY_URI_USERINFO_MARKER"  # pragma: allowlist secret
+    m_api_key = "CANARY_API_KEY_MARKER"  # pragma: allowlist secret
+    m_bearer = "CANARY_BEARER_MARKER"  # pragma: allowlist secret
+    m_passphrase = "CANARY_PASSPHRASE_MARKER"  # pragma: allowlist secret
+    m_jwt = (
+        "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."  # pragma: allowlist secret
+        "eyJzdWIiOiJjYW5hcnktbWFya2VyIn0.canary_jwt_marker"
+    )
+    m_default_ssn = "CANARY_DEFAULT_PHI_SSN"
+    m_default_name = "CANARY_DEFAULT_PHI_NAME"
+    m_custom_phi = "CANARY_CUSTOM_PHI_CHART"
+    all_markers = (
+        m_uri_pass,
+        m_api_key,
+        m_bearer,
+        m_passphrase,
+        m_jwt,
+        "canary_jwt_marker",
+        m_default_ssn,
+        m_default_name,
+        m_custom_phi,
+    )
+
+    composite_err = (
+        f"HTTP 503 Export failed for postgresql://svc_user:{m_uri_pass}@127.0.0.1:5432/edc "  # pragma: allowlist secret
+        f"api_key={m_api_key} Authorization: Bearer {m_bearer} "
+        f"passphrase={m_passphrase} assertion {m_jwt} "
+        f'ssn={m_default_ssn} patientName="{m_default_name}" medicalChartId={m_custom_phi}'
+    )
+
+    # Direct redact_cli_secrets optional registry check
+    custom_reg = build_study_sensitivity_registry(["medicalChartId"])
+    assert m_custom_phi not in redact_cli_secrets(composite_err, registry=custom_reg)
+
+    db_file = tmp_path / "cli_gov.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv(
+        "IMEDNET_ENCRYPTION_KEY",
+        "cli-redaction-key",  # pragma: allowlist secret
+    )
+    admin_sdk = MagicMock()
+    admin_sdk.auth.get_user_roles.return_value = ["admin"]
+    admin_sdk.auth.get_user_id.return_value = "cli-auditor"
+
+    store = ConfigVersionStore(db_path=db_file)
+    study_cfg = StudyConfiguration(study_key="STUDY_CANARY", phi_fields=["medicalChartId"])
+    store.commit_config(
+        "STUDY_CANARY", study_cfg, "Register custom Study PHI Variable", sdk=admin_sdk
+    )
+
+    # Write a legacy unredacted pipeline_ledger.json directly on disk
+    legacy_ledger_file = tmp_path / "legacy_pipeline_ledger.json"
+    legacy_ledger_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "studies": {
+                    "STUDY_CANARY": {
+                        "streams": {
+                            "records": {
+                                "last_timestamp": "2026-06-01T12:00:00+00:00",
+                                "records_processed": 17,
+                                "last_run_status": "failed",
+                                "error_message": composite_err,
+                                "metadata": {},
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    res_json = runner.invoke(
+        main_app,
+        [
+            "workflows",
+            "state",
+            "show",
+            "--ledger-path",
+            str(legacy_ledger_file),
+            "--format",
+            "json",
+        ],
+    )
+    assert res_json.exit_code == 0, res_json.stderr
+    assert res_json.stderr == ""
+    for marker in all_markers:
+        assert marker not in res_json.stdout
+
+    envelope = json.loads(res_json.stdout)
+    assert envelope["schemaVersion"] == "1.0"
+    assert envelope["resource"] == "ledger_state"
+    assert envelope["status"] == "complete"
+    assert envelope["count"] == 1
+    item = envelope["items"][0]
+    assert set(item.keys()) == {
+        "studyKey",
+        "streamName",
+        "lastTimestamp",
+        "recordsProcessed",
+        "status",
+        "errorMessage",
+    }
+    assert item["studyKey"] == "STUDY_CANARY"
+    assert item["streamName"] == "records"
+    assert item["recordsProcessed"] == 17
+    assert item["status"] == "failed"
+    assert (
+        "HTTP 503 Export failed for postgresql://svc_user:***@127.0.0.1:5432/edc"
+        in (item["errorMessage"])
+    )
+
+    res_table = runner.invoke(
+        main_app,
+        [
+            "workflows",
+            "state",
+            "show",
+            "--ledger-path",
+            str(legacy_ledger_file),
+            "--format",
+            "table",
+        ],
+    )
+    assert res_table.exit_code == 0, res_table.stderr
+    assert "STUDY_CANARY | records | 2026-06-01T12:00:00+00:00 | 17 | failed |" in res_table.stdout
+    assert "HTTP 503 Export failed for postgresql://svc_user:***@127.0.0.1:5432/edc" in (
+        res_table.stdout
+    )
+    for marker in all_markers:
+        assert marker not in res_table.stdout
+
+    # Read/write/reset error paths with explicit --study-key also apply Study-scoped registry on stderr
+    with patch("imednet_workflows.cli.get_state_provider") as mock_provider:
+        mock_provider.return_value.read_state.side_effect = OSError(composite_err)
+        mock_provider.return_value.set_last_timestamp.side_effect = OSError(composite_err)
+        mock_provider.return_value.delete_entry.side_effect = OSError(composite_err)
+        res_err = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "show",
+                "--study-key",
+                "STUDY_CANARY",
+                "--ledger-path",
+                str(legacy_ledger_file),
+            ],
+        )
+        res_set_err = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "set",
+                "--study-key",
+                "STUDY_CANARY",
+                "--stream",
+                "records",
+                "--timestamp",
+                "2026-06-01T12:00:00Z",
+                "--ledger-path",
+                str(legacy_ledger_file),
+            ],
+        )
+        res_reset_err = runner.invoke(
+            main_app,
+            [
+                "workflows",
+                "state",
+                "reset",
+                "--study-key",
+                "STUDY_CANARY",
+                "--ledger-path",
+                str(legacy_ledger_file),
+            ],
+        )
+    for failed_res in (res_err, res_set_err, res_reset_err):
+        assert failed_res.exit_code == 1
+        assert failed_res.stdout == ""
+        for marker in all_markers:
+            assert marker not in failed_res.stderr

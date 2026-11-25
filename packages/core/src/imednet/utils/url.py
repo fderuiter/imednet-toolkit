@@ -26,7 +26,7 @@ __all__ = [
 
 _FORBIDDEN_SEGMENT_CHARS = frozenset({"/", "\\", "?", "#"})
 _FORBIDDEN_RAW_PATH_CHARS = frozenset({"\\", "?", "#"})
-_URI_AUTH_PASSWORD_RE = re.compile(r"(://[^\s/:?#@]+:)[^\s/?#@]+(@)")
+_URI_AUTH_PASSWORD_RE = re.compile(r"(://[^\s/:?#\"'<>@]*:)[^\s/?#\"'<>,;&)\]}]+(@)")
 _URL_IN_TEXT_RE = re.compile(
     r"""(?:[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'<>\x00]*[^\s"'<>.,;:!?\)\]\}\x00]|(?<![A-Za-z0-9_:/.-])/[A-Za-z0-9_.~%@/-]*\?[^\s"'<>\x00]*[^\s"'<>.,;:!?\)\]\}\x00])"""
 )
@@ -146,7 +146,7 @@ def redact_url_query(
     from imednet.utils.secrets import is_sensitive_key
     from imednet.utils.security import global_sensitivity_registry, sanitize_diagnostic_text
 
-    default_params = {"api_key", "security_key", "token", "secret", "password"}
+    default_params = {"api_key", "security_key", "token", "secret", "password", "passphrase"}
     active_registry = global_sensitivity_registry if registry is None else registry
 
     parsed = urlparse(url)

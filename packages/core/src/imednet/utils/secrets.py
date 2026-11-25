@@ -1,11 +1,15 @@
 """Secret redaction utilities."""
 
+import base64
+import json
 import re
+from collections.abc import Mapping
 from typing import Any
 
 SENSITIVE_KEYS = frozenset(
     {
         "password",
+        "passphrase",
         "token",
         "secret",
         "credential",
@@ -29,6 +33,7 @@ _TOKEN_SPLIT_RE = re.compile(r"[^a-zA-Z0-9]+")
 _EXACT_SENSITIVE_KEYS = frozenset(
     {
         *(k.lower().replace("-", "_") for k in SENSITIVE_KEYS),
+        "passphrases",
         "passwd",
         "pwd",
         "tokens",
@@ -90,6 +95,8 @@ _SENSITIVE_ANYWHERE_TOKENS = frozenset(
     {
         "password",
         "passwords",
+        "passphrase",
+        "passphrases",
         "passwd",
         "pwd",
         "secret",
@@ -134,12 +141,10 @@ _EXPLICIT_CREDENTIAL_KEY_EXPR = (
     r"private[_-]?key|secret[_-]?key|csrf[_-]?key|client[_-]?secret|"
     r"oidc[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?token|"
     r"auth[_-]?token|bearer[_-]?token|session[_-]?token|csrf[_-]?token)|"
-    r"(?:[a-z0-9]+[_-]+)+(?:token|tokens|secret|secrets|password|passwords|passwd|credential|credentials)|"
+    r"(?:[a-z0-9]+[_-]+)+(?:token|tokens|secret|secrets|password|passwords|passwd|passphrase|passphrases|credential|credentials)|"
     r"authorization"
 )
-_GENERIC_CREDENTIAL_KEY_EXPR = (
-    r"token|tokens|password|passwords|passwd|pwd|secret|secrets|credential|credentials"
-)
+_GENERIC_CREDENTIAL_KEY_EXPR = r"token|tokens|password|passwords|passwd|pwd|passphrase|passphrases|secret|secrets|credential|credentials"
 _ALL_CREDENTIAL_KEY_EXPR = rf"{_EXPLICIT_CREDENTIAL_KEY_EXPR}|{_GENERIC_CREDENTIAL_KEY_EXPR}"
 
 _QUOTED_SENSITIVE_PATTERN = re.compile(
@@ -158,6 +163,11 @@ _STANDALONE_COLON_SENSITIVE_PATTERN = re.compile(
     r"([^\s,;&\"')\]}\x00]+)(?=\s*(?:[,;&)\]}\r\n\x00]|$))"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\b(bearer\s+)([^\s,;&\"')\]}\x00]+)")
+_STANDALONE_JWT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]+)"
+    r"(?:\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+    r"|\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)(?![A-Za-z0-9_-])"
+)
 
 
 def _tokenize_key(key: str) -> tuple[str, ...]:
@@ -212,10 +222,38 @@ def _replace_bearer_match(match: re.Match[str]) -> str:
     return f"{match.group(1)}***"
 
 
-def _has_sensitive_field_target(data: dict[str, Any]) -> bool:
+def _is_valid_jwt_header(header_segment: str) -> bool:
+    """Return True when *header_segment* is a valid base64url JSON object starting with ``eyJ``."""
+    if not header_segment.startswith("eyJ") or len(header_segment) % 4 == 1:
+        return False
+    padded = header_segment + ("=" * (-len(header_segment) % 4))
+    try:
+        decoded = base64.urlsafe_b64decode(padded).decode("utf-8")
+        parsed = json.loads(decoded)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(parsed, dict) and bool(parsed)
+
+
+def _replace_jwt_match(match: re.Match[str]) -> str:
+    if _is_valid_jwt_header(match.group(1)):
+        return "***"
+    return match.group(0)
+
+
+def _has_sensitive_field_target(data: Mapping[Any, Any]) -> bool:
     if "value" not in data:
         return False
-    for target_key in ("attribute", "variable", "name", "field"):
+    for target_key in (
+        "attribute",
+        "variable",
+        "variable_name",
+        "variableName",
+        "name",
+        "field",
+        "field_name",
+        "fieldName",
+    ):
         raw_target = data.get(target_key)
         if isinstance(raw_target, str) and is_sensitive_key(raw_target):
             return True
@@ -224,7 +262,7 @@ def _has_sensitive_field_target(data: dict[str, Any]) -> bool:
 
 def redact_sensitive_payload(data: Any) -> Any:
     """Return data with sensitive key values redacted."""
-    if isinstance(data, dict):
+    if isinstance(data, Mapping):
         redacted: dict[str, Any] = {}
         sensitive_field_attr = _has_sensitive_field_target(data)
         for key, value in data.items():
@@ -248,6 +286,9 @@ def redact_sensitive_payload(data: Any) -> Any:
         redacted_text = _STANDALONE_COLON_SENSITIVE_PATTERN.sub(
             _replace_unquoted_match, redacted_text
         )
-        return _BEARER_PATTERN.sub(_replace_bearer_match, redacted_text)
+        redacted_text = _BEARER_PATTERN.sub(_replace_bearer_match, redacted_text)
+        if "eyJ" in redacted_text:
+            redacted_text = _STANDALONE_JWT_PATTERN.sub(_replace_jwt_match, redacted_text)
+        return redacted_text
 
     return data

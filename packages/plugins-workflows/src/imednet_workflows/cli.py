@@ -61,6 +61,7 @@ from imednet.spi.utils import (
     mask_custom_phi_recursive,
     redact_sensitive_text,
     resolve_study_configuration,
+    resolve_study_sensitivity_registry,
     sanitize_diagnostic_text,
     validate_path_segment,
 )
@@ -75,6 +76,7 @@ DEFAULT_LEDGER_PATH: str = os.environ.get(
     "IMEDNET_WORKFLOW_LEDGER_PATH",
     str(Path.home() / ".imednet" / "pipeline_ledger.json"),
 )
+_DEFAULT_RESOLVE_STUDY_CONFIGURATION = resolve_study_configuration
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "DataExtractionWorkflow": ("imednet_workflows.data_extraction", "DataExtractionWorkflow"),
@@ -112,9 +114,17 @@ def _resolve_attr(name: str) -> Any:
     return _load_lazy_attr(name)
 
 
-def _emit_line(text: str = "", *, err: bool = False) -> None:
+def _emit_line(
+    text: str = "",
+    *,
+    err: bool = False,
+    registry: SensitivityRegistry | None = None,
+) -> None:
     """Write a PHI/secret-redacted line safely via structured CLI output."""
-    sanitized = redact_cli_secrets(redact_sensitive_text(str(text)))
+    sanitized = redact_cli_secrets(
+        redact_sensitive_text(str(text), registry=registry),
+        registry=registry,
+    )
     if err:
         print_error(sanitized)
         return
@@ -185,7 +195,11 @@ def _sanitize_phi_issue_message(
     active_registry = build_study_sensitivity_registry(custom_phi_fields)
 
     sanitized = redact_cli_secrets(
-        sanitize_diagnostic_text(redact_sensitive_text(message), registry=active_registry)
+        sanitize_diagnostic_text(
+            redact_sensitive_text(message, registry=active_registry),
+            registry=active_registry,
+        ),
+        registry=active_registry,
     )
 
     if variable_name is None:
@@ -389,6 +403,16 @@ def _resolve_custom_phi_fields(study_key: str | None) -> set[str]:
     if cfg is not None and cfg.phi_fields:
         return set(cfg.phi_fields)
     return set()
+
+
+def _resolve_cli_study_registry(study_key: str | None) -> SensitivityRegistry:
+    """Resolve Study-scoped SensitivityRegistry honoring CLI-level test monkeypatches."""
+    if resolve_study_configuration is not _DEFAULT_RESOLVE_STUDY_CONFIGURATION:
+        return resolve_study_sensitivity_registry(
+            study_key,
+            resolver=resolve_study_configuration,
+        )
+    return resolve_study_sensitivity_registry(study_key)
 
 
 def _is_key_phi_sensitive(key: str, custom_phi_fields: set[str]) -> bool:
@@ -658,7 +682,11 @@ def _execute_set_state(
                     f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
                 )
         except Exception as err:
-            _emit_line(f"Failed to write ledger: {err}", err=True)
+            _emit_line(
+                f"Failed to write ledger: {err}",
+                err=True,
+                registry=_resolve_cli_study_registry(study_key),
+            )
             sys.exit(1)
         return
 
@@ -714,7 +742,10 @@ def _execute_set_state(
                 current_status = str(st.last_run_status)
                 current_ts_str = st.last_timestamp.isoformat() if st.last_timestamp else "None"
         except Exception as exc:
-            print_progress(f"Notice: unable to read stream state from ledger: {exc}")
+            print_progress(
+                f"Notice: unable to read stream state from ledger: {exc}",
+                registry=_resolve_cli_study_registry(study_key),
+            )
 
     print_progress("\nProposed State Transition:")
     print_progress(f"  Study:             {study_key}")
@@ -741,7 +772,11 @@ def _execute_set_state(
             f"Successfully set high-water mark for '{study_key}' -> '{stream}' to {dt.isoformat()}"
         )
     except Exception as err:
-        _emit_line(f"Failed to write ledger: {err}", err=True)
+        _emit_line(
+            f"Failed to write ledger: {err}",
+            err=True,
+            registry=_resolve_cli_study_registry(study_key),
+        )
         sys.exit(1)
 
 
@@ -825,7 +860,11 @@ def _execute_reset_state(
                 _emit_line(f"No state found for study '{study_key}'.")
                 return
     except Exception as err:
-        _emit_line(f"Failed to reset ledger state: {err}", err=True)
+        _emit_line(
+            f"Failed to reset ledger state: {err}",
+            err=True,
+            registry=_resolve_cli_study_registry(study_key),
+        )
         sys.exit(1)
 
 
@@ -859,17 +898,32 @@ def _execute_show_state(
     try:
         state = ledger.read_state()
     except Exception as err:
-        _emit_line(f"Failed to read ledger from {ledger_path}: {err}", err=True)
+        err_reg = _resolve_cli_study_registry(study_key) if study_key else None
+        _emit_line(
+            f"Failed to read ledger from {ledger_path}: {err}",
+            err=True,
+            registry=err_reg,
+        )
         sys.exit(1)
 
+    registries_by_study: dict[str, SensitivityRegistry] = {}
     entries: list[dict[str, Any]] = []
     for s_key, study_state in state.studies.items():
         if study_key and s_key != study_key:
             continue
+        study_reg = registries_by_study.get(s_key)
+        if study_reg is None:
+            study_reg = _resolve_cli_study_registry(s_key)
+            registries_by_study[s_key] = study_reg
         for stream_name, stream_state in study_state.streams.items():
             ts_iso = (
                 stream_state.last_timestamp.isoformat()
                 if stream_state.last_timestamp is not None
+                else None
+            )
+            sanitized_error = (
+                redact_cli_secrets(stream_state.error_message, registry=study_reg)
+                if stream_state.error_message is not None
                 else None
             )
             entries.append(
@@ -879,7 +933,7 @@ def _execute_show_state(
                     "lastTimestamp": ts_iso,
                     "recordsProcessed": stream_state.records_processed,
                     "status": str(stream_state.last_run_status),
-                    "errorMessage": stream_state.error_message,
+                    "errorMessage": sanitized_error,
                 }
             )
 
@@ -893,8 +947,10 @@ def _execute_show_state(
     )
     for entry in entries:
         ts_str = entry["lastTimestamp"] if entry["lastTimestamp"] is not None else "None"
+        entry_reg = registries_by_study.get(entry["studyKey"])
         _emit_line(
-            f"{entry['studyKey']} | {entry['streamName']} | {ts_str} | {entry['recordsProcessed']} | {entry['status']} | {entry['errorMessage'] or ''}"
+            f"{entry['studyKey']} | {entry['streamName']} | {ts_str} | {entry['recordsProcessed']} | {entry['status']} | {entry['errorMessage'] or ''}",
+            registry=entry_reg,
         )
 
     if not entries:

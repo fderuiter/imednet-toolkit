@@ -22,7 +22,7 @@ from imednet.errors import (
     UnauthorizedError,
     ValidationError,
 )
-from imednet.utils.security import sanitize_diagnostic_text
+from imednet.utils.security import SensitivityRegistry, sanitize_diagnostic_text
 from imednet.utils.url import validate_path_segment
 
 if TYPE_CHECKING:
@@ -32,7 +32,10 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def redact_cli_secrets(msg: str) -> str:
+def redact_cli_secrets(
+    msg: str,
+    registry: SensitivityRegistry | None = None,
+) -> str:
     """Redact environment secrets, credentials, and inline clinical PHI from CLI messages."""
     redacted = msg
     for env_var in ("IMEDNET_API_KEY", "IMEDNET_SECURITY_KEY", "IMEDNET_OIDC_TOKEN"):
@@ -43,7 +46,7 @@ def redact_cli_secrets(msg: str) -> str:
             stripped = val.strip()
             if stripped and stripped in redacted:
                 redacted = redacted.replace(stripped, "********")
-    return sanitize_diagnostic_text(redacted)
+    return sanitize_diagnostic_text(redacted, registry=registry)
 
 
 _redact_secrets = redact_cli_secrets

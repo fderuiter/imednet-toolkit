@@ -607,3 +607,227 @@ def test_sanitize_diagnostic_text_masks_url_plain_filters_and_multiline_address_
     assert sanitized_indirect["error"][0]["value"] == "***MASKED***"
     assert sanitized_indirect["error"][1]["value"] == "SUBJ-200"
     assert not global_sensitivity_registry.is_sensitive("medicalChartId")
+
+
+def test_passphrase_standalone_jwt_and_clinical_eyj_identifier_guards() -> None:
+    """is_sensitive_key and redact_sensitive_payload scrub passphrases and valid JWTs while preserving clinical eyJ IDs."""
+    from imednet.utils.secrets import is_sensitive_key, redact_sensitive_payload
+    from imednet.utils.url import redact_sensitive_text, redact_url_query
+
+    for secret_key in ("passphrase", "passphrases", "ssh_passphrase", "pgpPassphrase"):
+        assert is_sensitive_key(secret_key), secret_key
+    for benign_key in (
+        "passphrase_required",
+        "passphrase_id",
+        "passphrase_length",
+        "passphrase_enabled",
+    ):
+        assert not is_sensitive_key(benign_key), benign_key
+
+    unsigned_jwt = (
+        "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."  # pragma: allowlist secret
+        "eyJzdWIiOiJjYW5hcnktbWFya2VyIn0.canary_jwt_marker"
+    )
+    jwe_token = (
+        "eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ."  # pragma: allowlist secret
+        "encrypted_key.iv_seg.cipher_seg.auth_tag"
+    )
+    clinical_eyj_ids = (
+        "eyJ123.456.789",
+        "eyJ_SUBJ_01.VISIT_1.FORM_2",
+        "eyJbe10.payload.sig",  # base64url of non-JSON-object bytes
+        "eyJh.payload.sig",  # invalid base64url length (% 4 == 1)
+    )
+
+    payload = {
+        "passphrase": "CANARY_PASSPHRASE_MARKER",  # pragma: allowlist secret
+        "ssh_passphrase": "CANARY_SSH_PASSPHRASE",  # pragma: allowlist secret
+        "passphrase_required": True,
+        "indirect": {
+            "variableName": "passphrase",
+            "value": "CANARY_INDIRECT_PASSPHRASE",  # pragma: allowlist secret
+        },
+        "assertion": unsigned_jwt,
+        "jwe": jwe_token,
+        "inline": (
+            f"Auth failed passphrase=CANARY_INLINE_PASSPHRASE "
+            f"assertion {unsigned_jwt} jwe={jwe_token} " + " ".join(clinical_eyj_ids)
+        ),
+    }
+    redacted = redact_sensitive_payload(payload)
+    assert redacted["passphrase"] == "***"
+    assert redacted["ssh_passphrase"] == "***"
+    assert redacted["passphrase_required"] is True
+    assert redacted["indirect"]["value"] == "***"
+    assert redacted["assertion"] == "***"
+    assert redacted["jwe"] == "***"
+    for secret_marker in (
+        "CANARY_PASSPHRASE_MARKER",
+        "CANARY_SSH_PASSPHRASE",
+        "CANARY_INDIRECT_PASSPHRASE",
+        "CANARY_INLINE_PASSPHRASE",
+        "canary_jwt_marker",
+        "cipher_seg",
+    ):
+        assert secret_marker not in str(redacted)
+    for clinical_id in clinical_eyj_ids:
+        assert clinical_id in redacted["inline"]
+
+    url_with_passphrase = "https://edc.example.com/export?passphrase=CANARY_URL_PASSPHRASE&study_key=STUDY-1"  # pragma: allowlist secret
+    assert "CANARY_URL_PASSPHRASE" not in redact_url_query(url_with_passphrase)
+    assert "passphrase=%2A%2A%2A" in redact_url_query(url_with_passphrase) or (
+        "passphrase=***" in redact_url_query(url_with_passphrase)
+    )
+    uri_err = "Sink error (postgresql://svc_user:CANARY_URI_PASS@127.0.0.1:5432/edc);"  # pragma: allowlist secret
+    scrubbed_uri_err = redact_sensitive_text(uri_err)
+    assert "CANARY_URI_PASS" not in scrubbed_uri_err
+    assert "postgresql://svc_user:***@127.0.0.1:5432/edc" in scrubbed_uri_err
+
+    empty_user_uri = (
+        "Cache error redis://:CANARY_REDIS_PASS@127.0.0.1:6379/0"  # pragma: allowlist secret
+    )
+    scrubbed_redis = redact_sensitive_text(empty_user_uri)
+    assert "CANARY_REDIS_PASS" not in scrubbed_redis
+    assert "redis://:***@127.0.0.1:6379/0" in scrubbed_redis
+
+    import base64 as _b64
+
+    deep_json = ('{"a":' * 100_000) + "1" + ("}" * 100_000)
+    deep_header = _b64.urlsafe_b64encode(deep_json.encode("utf-8")).decode("ascii").rstrip("=")
+    deep_token = f"{deep_header}.payload.sig"
+    assert redact_sensitive_payload(deep_token) == deep_token
+
+
+def test_resolve_study_sensitivity_registry_commits_exemptions_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    """resolve_study_sensitivity_registry loads StudyConfiguration.phi_fields via SPI and fails closed on errors."""
+    import json
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    assert isinstance(tmp_path, Path)
+
+    from imednet.integrations.enrichment import StudyConfiguration
+    from imednet.spi.utils import (
+        resolve_study_sensitivity_registry as spi_resolve_study_registry,
+    )
+    from imednet.utils.security import (
+        global_sensitivity_registry,
+        resolve_study_sensitivity_registry,
+        sanitize_diagnostic_payload,
+        sanitize_diagnostic_text,
+    )
+    from imednet_workflows.config_version_control import ConfigVersionStore
+
+    assert spi_resolve_study_registry is resolve_study_sensitivity_registry
+
+    db_file = tmp_path / "study_gov.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv(
+        "IMEDNET_ENCRYPTION_KEY",
+        "test-study-registry-key",  # pragma: allowlist secret
+    )
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+
+    admin_sdk = MagicMock()
+    admin_sdk.auth.get_user_roles.return_value = ["admin"]
+    admin_sdk.auth.get_user_id.return_value = "sec-admin"
+
+    store = ConfigVersionStore(db_path=db_file)
+    study_cfg = StudyConfiguration(
+        study_key="STUDY_CANARY",
+        phi_fields=[
+            "medicalChartId",
+            "study_key",
+            "subject_key",
+            "record_id",
+            "usubjid",
+            "subjid",
+            "studyid",
+        ],
+    )
+    store.commit_config(
+        "STUDY_CANARY", study_cfg, "Register custom Study PHI Variable", sdk=admin_sdk
+    )
+
+    reg = resolve_study_sensitivity_registry("STUDY_CANARY")
+    assert reg is not global_sensitivity_registry
+    assert reg.is_sensitive("medicalChartId")
+    assert reg.is_sensitive("medical_chart_id")
+    for exempt_key in ("study_key", "subject_key", "record_id", "usubjid", "subjid", "studyid"):
+        assert not reg.is_sensitive(exempt_key), exempt_key
+    assert not global_sensitivity_registry.is_sensitive("medicalChartId")
+
+    # Blank, None, UNKNOWN, and unconfigured studies return global_sensitivity_registry
+    assert resolve_study_sensitivity_registry(None) is global_sensitivity_registry
+    assert resolve_study_sensitivity_registry("   ") is global_sensitivity_registry
+    assert resolve_study_sensitivity_registry("UNKNOWN") is global_sensitivity_registry
+    assert resolve_study_sensitivity_registry("UNCONFIGURED_STUDY") is global_sensitivity_registry
+
+    # Composite diagnostic text and payload scrub all 8 canary classes while keeping structural IDs
+    m_jwt = (
+        "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."  # pragma: allowlist secret
+        "eyJzdWIiOiJjYW5hcnktbWFya2VyIn0.canary_jwt_marker"
+    )
+    composite_err = (
+        "HTTP 502 Export failed for postgresql://svc_user:CANARY_URI_USERINFO_MARKER@127.0.0.1:5432/edc "  # pragma: allowlist secret
+        "api_key=CANARY_API_KEY_MARKER Authorization: Bearer CANARY_BEARER_MARKER "  # pragma: allowlist secret
+        f"passphrase=CANARY_PASSPHRASE_MARKER assertion {m_jwt} "
+        'ssn=CANARY_DEFAULT_PHI_SSN patientName="CANARY_DEFAULT_PHI_NAME" '
+        "medicalChartId=CANARY_CUSTOM_PHI_CHART subject_key=SUBJ-42 record_id=108"
+    )
+    scrubbed_err = sanitize_diagnostic_text(composite_err, registry=reg)
+    assert "HTTP 502 Export failed" in scrubbed_err
+    assert "postgresql://svc_user:***@127.0.0.1:5432/edc" in scrubbed_err
+    assert "SUBJ-42" in scrubbed_err
+    assert "108" in scrubbed_err
+    for marker in (
+        "CANARY_URI_USERINFO_MARKER",
+        "CANARY_API_KEY_MARKER",
+        "CANARY_BEARER_MARKER",
+        "CANARY_PASSPHRASE_MARKER",
+        m_jwt,
+        "canary_jwt_marker",
+        "CANARY_DEFAULT_PHI_SSN",
+        "CANARY_DEFAULT_PHI_NAME",
+        "CANARY_CUSTOM_PHI_CHART",
+    ):
+        assert marker not in scrubbed_err
+
+    sample_meta = {
+        "study_key": "STUDY_CANARY",
+        "subject_key": "SUBJ-42",
+        "ssn": "CANARY_DEFAULT_PHI_SSN",
+        "api_key": "CANARY_API_KEY_MARKER",  # pragma: allowlist secret
+        "passphrase": "CANARY_PASSPHRASE_MARKER",  # pragma: allowlist secret
+        "destination_uri": "postgresql://svc_user:CANARY_URI_USERINFO_MARKER@127.0.0.1:5432/edc",  # pragma: allowlist secret
+        "assertion": m_jwt,
+        "medicalChartId": "CANARY_CUSTOM_PHI_CHART",
+        "note": "ssn=CANARY_DEFAULT_PHI_SSN medicalChartId=CANARY_CUSTOM_PHI_CHART",
+    }
+    scrubbed_meta = sanitize_diagnostic_payload(sample_meta, registry=reg)
+    assert scrubbed_meta["study_key"] == "STUDY_CANARY"
+    assert scrubbed_meta["subject_key"] == "SUBJ-42"
+    for marker in (
+        "CANARY_URI_USERINFO_MARKER",
+        "CANARY_API_KEY_MARKER",
+        "CANARY_PASSPHRASE_MARKER",
+        m_jwt,
+        "canary_jwt_marker",
+        "CANARY_DEFAULT_PHI_SSN",
+        "CANARY_CUSTOM_PHI_CHART",
+    ):
+        assert marker not in json.dumps(scrubbed_meta)
+
+    # Decryption failure or resolver error fails closed to global_sensitivity_registry
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    assert resolve_study_sensitivity_registry("STUDY_CANARY") is global_sensitivity_registry
+    assert (
+        resolve_study_sensitivity_registry(
+            "STUDY_CANARY",
+            resolver=lambda _sk: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        is global_sensitivity_registry
+    )

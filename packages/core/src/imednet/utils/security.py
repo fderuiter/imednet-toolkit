@@ -3,7 +3,7 @@
 import functools
 import json
 import re
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
 from imednet.errors import ClientError, PathTraversalValidationError
@@ -26,7 +26,7 @@ _DIAGNOSTIC_PLAIN_KV_RE = re.compile(
     r"""(?<![A-Za-z0-9_<:/.-])(?P<q1>['"]?)(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})(?P=q1)"""
     r"""(?P<op>\s*(?:==|!=|=~|<=|>=|<|>|=|:)\s*)"""
     r"""(?P<val>[^'"\s,;&\)\]\}\r\n\x00]"""
-    r"""(?:[^\r\n,;&\)\]\}\x00]*?(?=(?:\s+(?:(?:and|or|AND|OR)\s+)?[A-Za-z][A-Za-z0-9_.-]*\s*(?:==|!=|=~|<=|>=|<|>|=|:))|[,;&\)\]\}\r\n\x00]|$))?)"""
+    r"""(?:[^\r\n,;&\)\]\}\x00]*?(?=(?:\s+(?:(?:and|or|AND|OR)\s+)?['"]?[A-Za-z][A-Za-z0-9_.-]*['"]?\s*(?:==|!=|=~|<=|>=|<|>|=|:))|[,;&\)\]\}\r\n\x00]|$))?)"""
 )
 _JSON_ARRAY_ELEM_START_CHARS = frozenset(
     {'"', "{", "[", "]", "-", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "t", "f", "n"}
@@ -224,8 +224,38 @@ def build_study_sensitivity_registry(
     return reg
 
 
+def resolve_study_sensitivity_registry(
+    study_key: str | None,
+    *,
+    resolver: Callable[[str | None], Any] | None = None,
+) -> SensitivityRegistry:
+    """Resolve a Study-scoped SensitivityRegistry from committed StudyConfiguration.phi_fields.
+
+    Falls back to :data:`global_sensitivity_registry` when *study_key* is blank, invalid,
+    has no committed :class:`StudyConfiguration`, or storage/decryption errors occur.
+    """
+    if not study_key or not isinstance(study_key, str):
+        return global_sensitivity_registry
+    cleaned = study_key.strip()
+    if not cleaned or cleaned == "UNKNOWN":
+        return global_sensitivity_registry
+    try:
+        if resolver is not None:
+            cfg = resolver(cleaned)
+        else:
+            from imednet.integrations import enrichment as _enrichment_mod
+
+            cfg = _enrichment_mod.resolve_study_configuration(cleaned)
+    except Exception:
+        return global_sensitivity_registry
+    phi_fields = getattr(cfg, "phi_fields", None) if cfg is not None else None
+    if not phi_fields:
+        return global_sensitivity_registry
+    return build_study_sensitivity_registry(phi_fields)
+
+
 _FORMULA_PREFIX_CHARS = frozenset("=+-@")
-_CONTAINER_TYPES = (dict, list, tuple)
+_CONTAINER_TYPES = (dict, list, tuple, Mapping)
 
 
 def _mask_clinical_phi_synced(
@@ -235,7 +265,7 @@ def _mask_clinical_phi_synced(
 ) -> Any:
     """Recursively mask sensitive keys after syncing ``active_registry`` once."""
     vc = value.__class__
-    if vc is dict or isinstance(value, dict):
+    if vc is dict or isinstance(value, Mapping):
         out: dict[Any, Any] = {}
         for k, v in value.items():
             if k.__class__ is str:
@@ -505,11 +535,20 @@ def sanitize_diagnostic_text(
     return masked
 
 
-def _has_phi_field_target(data: dict[Any, Any], registry: SensitivityRegistry) -> bool:
+def _has_phi_field_target(data: Mapping[Any, Any], registry: SensitivityRegistry) -> bool:
     """Return True when an indirect ``{'variable': '<phi>', 'value': ...}`` dict targets PHI."""
     if "value" not in data:
         return False
-    for target_key in ("attribute", "variable", "name", "field"):
+    for target_key in (
+        "attribute",
+        "variable",
+        "variable_name",
+        "variableName",
+        "name",
+        "field",
+        "field_name",
+        "fieldName",
+    ):
         raw_target = data.get(target_key)
         if isinstance(raw_target, str) and registry.is_sensitive(raw_target):
             return True
@@ -521,7 +560,9 @@ def _scrub_diagnostic_leaves(value: Any, *, registry: SensitivityRegistry) -> An
         if value in {"[REDACTED]", "***MASKED***", "***"}:
             return value
         return sanitize_diagnostic_text(value, registry=registry)
-    if isinstance(value, dict):
+    if isinstance(value, BaseException):
+        return sanitize_diagnostic_text(value, registry=registry)
+    if isinstance(value, Mapping):
         mask_target_value = _has_phi_field_target(value, registry)
         return {
             k: (

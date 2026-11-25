@@ -2076,3 +2076,121 @@ def test_uat_snapshot_metadata_and_cli_json_preflight_and_state_envelopes(
     )
     assert reset_study_again.exit_code == 0
     assert json.loads(reset_study_again.stdout)["items"][0]["removed"] is False
+
+
+def test_display_ledger_streams_and_print_progress_redact_study_phi_on_legacy_ledgers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """display_ledger_streams and print_progress mask all 8 canary markers per Study on legacy ledgers."""
+    import json
+
+    from imednet.integrations.enrichment import StudyConfiguration
+    from imednet.spi.utils import build_study_sensitivity_registry
+    from imednet_workflows.config_version_control import ConfigVersionStore
+
+    m_uri_pass = "CANARY_URI_USERINFO_MARKER"  # pragma: allowlist secret
+    m_api_key = "CANARY_API_KEY_MARKER"  # pragma: allowlist secret
+    m_bearer = "CANARY_BEARER_MARKER"  # pragma: allowlist secret
+    m_passphrase = "CANARY_PASSPHRASE_MARKER"  # pragma: allowlist secret
+    m_jwt = (
+        "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."  # pragma: allowlist secret
+        "eyJzdWIiOiJjYW5hcnktbWFya2VyIn0.canary_jwt_marker"
+    )
+    m_default_ssn = "CANARY_DEFAULT_PHI_SSN"
+    m_default_name = "CANARY_DEFAULT_PHI_NAME"
+    m_custom_phi = "CANARY_CUSTOM_PHI_CHART"
+    all_markers = (
+        m_uri_pass,
+        m_api_key,
+        m_bearer,
+        m_passphrase,
+        m_jwt,
+        "canary_jwt_marker",
+        m_default_ssn,
+        m_default_name,
+        m_custom_phi,
+    )
+
+    composite_err = (
+        f"HTTP 504 Export failed for postgresql://svc_user:{m_uri_pass}@127.0.0.1:5432/edc "  # pragma: allowlist secret
+        f"api_key={m_api_key} Authorization: Bearer {m_bearer} "
+        f"passphrase={m_passphrase} assertion {m_jwt} "
+        f'ssn={m_default_ssn} patientName="{m_default_name}" medicalChartId={m_custom_phi}'
+    )
+
+    # 1. Direct print_progress(..., registry=...) check
+    custom_reg = build_study_sensitivity_registry(["medicalChartId"])
+    print_progress(composite_err, registry=custom_reg)
+    direct_cap = capsys.readouterr()
+    assert direct_cap.out == ""
+    assert "HTTP 504 Export failed for postgresql://svc_user:***@127.0.0.1:5432/edc" in (
+        direct_cap.err
+    )
+    for marker in all_markers:
+        assert marker not in direct_cap.err
+
+    # 2. display_ledger_streams against legacy unredacted pipeline_ledger.json with committed StudyConfiguration
+    db_file = tmp_path / "wizard_gov.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv(
+        "IMEDNET_ENCRYPTION_KEY",
+        "wizard-redaction-key",  # pragma: allowlist secret
+    )
+    admin_sdk = MagicMock()
+    admin_sdk.auth.get_user_roles.return_value = ["admin"]
+    admin_sdk.auth.get_user_id.return_value = "wizard-auditor"
+
+    store = ConfigVersionStore(db_path=db_file)
+    study_cfg = StudyConfiguration(study_key="STUDY_CANARY", phi_fields=["medicalChartId"])
+    store.commit_config(
+        "STUDY_CANARY", study_cfg, "Register custom Study PHI Variable", sdk=admin_sdk
+    )
+
+    legacy_ledger_file = tmp_path / "legacy_wizard_ledger.json"
+    legacy_ledger_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "studies": {
+                    "STUDY_CANARY": {
+                        "streams": {
+                            "records": {
+                                "last_timestamp": "2026-06-01T12:00:00+00:00",
+                                "records_processed": 9,
+                                "last_run_status": "failed",
+                                "error_message": composite_err,
+                                "metadata": {},
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = display_ledger_streams(str(legacy_ledger_file))
+    wiz_cap = capsys.readouterr()
+    assert state is not None
+    assert wiz_cap.out == ""
+    assert "STUDY_CANARY | records | 2026-06-01T12:00:00+00:00 | 9 | failed |" in wiz_cap.err
+    assert "HTTP 504 Export failed for postgresql://svc_user:***@127.0.0.1:5432/edc" in wiz_cap.err
+    for marker in all_markers:
+        assert marker not in wiz_cap.err
+
+    # 3. Corrupted read_state error path in display_ledger_streams with study_key
+    bad_provider = MagicMock()
+    bad_provider.read_state.side_effect = OSError(composite_err)
+    assert (
+        display_ledger_streams(
+            str(legacy_ledger_file),
+            study_key="STUDY_CANARY",
+            state_provider=bad_provider,
+        )
+        is None
+    )
+    err_cap = capsys.readouterr()
+    for marker in all_markers:
+        assert marker not in err_cap.err

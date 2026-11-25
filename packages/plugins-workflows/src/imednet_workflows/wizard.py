@@ -18,6 +18,7 @@ from imednet.spi.cli import (
     supports_interactive_stdin,
     validate_cli_path_segment,
 )
+from imednet.spi.utils import SensitivityRegistry, resolve_study_sensitivity_registry
 
 from .state_ledger import DEFAULT_LEDGER_PATH, BaseStateProvider, LedgerState, get_state_provider
 
@@ -33,14 +34,18 @@ def ensure_interactive_stdin(*, force_non_interactive: bool = False) -> None:
         sys.exit(1)
 
 
-def print_progress(message: str) -> None:
+def print_progress(
+    message: str,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> None:
     """Print a progress or status message to stderr and flush.
 
     This ensures stdout remains clean for structured data piping.
     """
     if is_json_output_mode():
         return
-    sys.stderr.write(f"{redact_cli_secrets(message)}\n")
+    sys.stderr.write(f"{redact_cli_secrets(message, registry=registry)}\n")
     sys.stderr.flush()
 
 
@@ -446,7 +451,11 @@ def display_ledger_streams(
     try:
         state = ledger.read_state()
     except Exception as err:
-        print_progress(f"Notice: Could not read existing ledger at {ledger_path}: {err}")
+        err_reg = resolve_study_sensitivity_registry(study_key) if study_key else None
+        print_progress(
+            f"Notice: Could not read existing ledger at {ledger_path}: {err}",
+            registry=err_reg,
+        )
         return None
 
     print_progress(f"\n--- Current Ledger Streams ({ledger_path}) ---")
@@ -455,16 +464,27 @@ def display_ledger_streams(
     print_progress("-" * len(header))
 
     found = False
+    registries_by_study: dict[str, SensitivityRegistry] = {}
     for s_key, study_state in state.studies.items():
         if study_key and s_key != study_key:
             continue
+        study_reg = registries_by_study.get(s_key)
+        if study_reg is None:
+            study_reg = resolve_study_sensitivity_registry(s_key)
+            registries_by_study[s_key] = study_reg
         for stream_name, stream_state in study_state.streams.items():
             found = True
             ts_str = (
                 stream_state.last_timestamp.isoformat() if stream_state.last_timestamp else "None"
             )
+            sanitized_error = (
+                redact_cli_secrets(stream_state.error_message, registry=study_reg)
+                if stream_state.error_message
+                else ""
+            )
             print_progress(
-                f"{s_key} | {stream_name} | {ts_str} | {stream_state.records_processed} | {stream_state.last_run_status} | {stream_state.error_message or ''}"
+                f"{s_key} | {stream_name} | {ts_str} | {stream_state.records_processed} | {stream_state.last_run_status} | {sanitized_error}",
+                registry=study_reg,
             )
 
     if not found:

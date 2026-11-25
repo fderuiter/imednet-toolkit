@@ -1248,3 +1248,165 @@ def test_mapped_expand_kwargs_export_operator_preserves_older_records_across_tar
         ae_rows = con.execute("SELECT COUNT(*) FROM ae_records").fetchone()
     assert dm_rows is not None and dm_rows[0] == 1
     assert ae_rows is not None and ae_rows[0] == 1
+
+
+@pytest.mark.parametrize("use_runtime_comms", [False, True])
+def test_airflow_state_provider_study_scoped_redaction_across_orm_and_runtime_comms(
+    airflow_runtime_env: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    use_runtime_comms: bool,
+) -> None:
+    """AirflowStateProvider scrubs URI passwords, passphrases, JWTs, default PHI, and StudyConfiguration.phi_fields."""
+    from unittest.mock import MagicMock
+
+    from airflow.models.variable import Variable as ModelVariable
+    from airflow.utils.session import create_session
+    from sqlalchemy import select
+
+    from imednet.integrations.enrichment import StudyConfiguration
+    from imednet_workflows.config_version_control import ConfigVersionStore
+    from imednet_workflows.state_ledger import AirflowStateProvider, StreamExecutionStatus
+
+    m_uri_pass = "CANARY_URI_USERINFO_MARKER"  # pragma: allowlist secret
+    m_api_key = "CANARY_API_KEY_MARKER"  # pragma: allowlist secret
+    m_bearer = "CANARY_BEARER_MARKER"  # pragma: allowlist secret
+    m_passphrase = "CANARY_PASSPHRASE_MARKER"  # pragma: allowlist secret
+    m_jwt = (
+        "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."  # pragma: allowlist secret
+        "eyJzdWIiOiJjYW5hcnktbWFya2VyIn0.canary_jwt_marker"
+    )
+    m_default_ssn = "CANARY_DEFAULT_PHI_SSN"
+    m_default_name = "CANARY_DEFAULT_PHI_NAME"
+    m_custom_phi = "CANARY_CUSTOM_PHI_CHART"
+    all_markers = (
+        m_uri_pass,
+        m_api_key,
+        m_bearer,
+        m_passphrase,
+        m_jwt,
+        "canary_jwt_marker",
+        m_default_ssn,
+        m_default_name,
+        m_custom_phi,
+    )
+
+    composite_err = (
+        f"Export failed for postgresql://svc_user:{m_uri_pass}@127.0.0.1:5432/edc "  # pragma: allowlist secret
+        f"api_key={m_api_key} Authorization: Bearer {m_bearer} "
+        f"passphrase={m_passphrase} assertion {m_jwt} "
+        f'ssn={m_default_ssn} patientName="{m_default_name}" medicalChartId={m_custom_phi}'
+    )
+    metadata_sample = {
+        "ssn": m_default_ssn,
+        "api_key": m_api_key,
+        "passphrase": m_passphrase,
+        "destination_uri": f"postgresql://svc_user:{m_uri_pass}@127.0.0.1:5432/edc",  # pragma: allowlist secret
+        "assertion": m_jwt,
+        "medicalChartId": m_custom_phi,
+        "note": f"ssn={m_default_ssn} medicalChartId={m_custom_phi}",
+    }
+
+    db_file = tmp_path / f"airflow_gov_{use_runtime_comms}.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv(
+        "IMEDNET_ENCRYPTION_KEY",
+        "airflow-redaction-key",  # pragma: allowlist secret
+    )
+    admin_sdk = MagicMock()
+    admin_sdk.auth.get_user_roles.return_value = ["admin"]
+    admin_sdk.auth.get_user_id.return_value = "airflow-auditor"
+
+    store = ConfigVersionStore(db_path=db_file)
+    study_cfg = StudyConfiguration(study_key="STUDY_CANARY", phi_fields=["medicalChartId"])
+    store.commit_config(
+        "STUDY_CANARY", study_cfg, "Register custom Study PHI Variable", sdk=admin_sdk
+    )
+
+    provider = AirflowStateProvider()
+    runtime_store: dict[str, str] = {}
+    if use_runtime_comms:
+        monkeypatch.setattr(provider, "_has_active_task_sdk_comms", lambda: True)
+        monkeypatch.setattr(
+            provider,
+            "_read_variable",
+            lambda key: json.loads(runtime_store[key]) if key in runtime_store else None,
+        )
+        monkeypatch.setattr(
+            provider,
+            "_write_variable",
+            lambda key, payload: runtime_store.__setitem__(key, json.dumps(payload)),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_list_variable_keys",
+            lambda prefix: [k for k in runtime_store if k.startswith(prefix)],
+        )
+        monkeypatch.setattr(
+            provider,
+            "_delete_listed_variable_key",
+            lambda key: runtime_store.pop(key, None),
+        )
+
+    def _dump_persisted() -> str:
+        if use_runtime_comms:
+            return "\n".join(runtime_store.values())
+        with create_session() as session:
+            rows = session.scalars(select(ModelVariable)).all()
+            return "\n".join(f"{r.key}={r.val}" for r in rows)
+
+    # 1. set_last_timestamp & record_sdtm_lineage scrub metadata and error_message while keeping SDTM lineage
+    provider.record_sdtm_lineage(
+        "STUDY_CANARY",
+        "records",
+        lineage_updates={
+            "501": {
+                "domain": "DM",
+                "usubjid": "STUDY_CANARY-SUBJ9",
+                "seq": 1,
+                "medicalChartId": m_custom_phi,
+            }
+        },
+        seq_watermarks={"DM|STUDY_CANARY-SUBJ9": 7},
+    )
+    provider.set_last_timestamp(
+        "STUDY_CANARY",
+        "records",
+        datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+        records_processed=12,
+        status=StreamExecutionStatus.SUCCESS,
+        metadata={
+            **metadata_sample,
+            "sdtm_seq_watermarks": {"DM|STUDY_CANARY-SUBJ9": 3},
+        },
+    )
+    persisted_after_set = _dump_persisted()
+    for marker in all_markers:
+        assert marker not in persisted_after_set
+    lineage = provider.get_sdtm_lineage("STUDY_CANARY", "records")
+    assert lineage["sdtm_seq_watermarks"]["DM|STUDY_CANARY-SUBJ9"] == 7
+    assert lineage["sdtm_lineage"]["501"]["usubjid"] == "STUDY_CANARY-SUBJ9"
+    assert lineage["sdtm_lineage"]["501"]["medicalChartId"] == "***MASKED***"
+
+    # 2. Failed transaction & batch_transaction scrub rollback error_message and uncommitted metadata
+    with pytest.raises(RuntimeError):
+        with provider.transaction("STUDY_CANARY", "records") as tx:
+            tx["metadata"]["uncommitted_secret"] = m_passphrase
+            raise RuntimeError(composite_err)
+
+    with pytest.raises(RuntimeError):
+        with provider.batch_transaction("STUDY_CANARY", ["visits", "subjects"]) as batch_tx:
+            batch_tx["visits"]["metadata"]["medicalChartId"] = m_custom_phi
+            raise RuntimeError(composite_err)
+
+    persisted_after_rollback = _dump_persisted()
+    for marker in all_markers:
+        assert marker not in persisted_after_rollback
+    state = provider.read_state()
+    for stream_name in ("records", "visits", "subjects"):
+        st = state.studies["STUDY_CANARY"].streams[stream_name]
+        assert st.last_run_status == StreamExecutionStatus.FAILED
+        assert st.error_message is not None
+        assert "Export failed for postgresql://svc_user:***@127.0.0.1:5432/edc" in (
+            st.error_message
+        )

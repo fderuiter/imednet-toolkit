@@ -1134,3 +1134,213 @@ def test_state_ledger_get_state_provider_custom_path_precedes_airflow_env(
     default_airflow_provider = get_state_provider()
     assert isinstance(default_airflow_provider, AirflowStateProvider)
     assert isinstance(get_state_provider(DEFAULT_LEDGER_PATH), AirflowStateProvider)
+
+
+def test_file_state_provider_study_scoped_redaction_and_streaming_exports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FileStateProvider, run_streaming_export, and _stream_records_across_forms scrub all 8 canary markers while keeping SDTM lineage."""
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from imednet.integrations.enrichment import StudyConfiguration
+    from imednet.integrations.export import (
+        TabularSinkConfig,
+        _FormExportContext,
+        _stream_records_across_forms,
+    )
+    from imednet.integrations.sink_base import ExportSink, SinkConfig, run_streaming_export
+    from imednet_workflows.config_version_control import ConfigVersionStore
+    from imednet_workflows.state_ledger import _sanitize_metadata
+
+    m_uri_pass = "CANARY_URI_USERINFO_MARKER"  # pragma: allowlist secret
+    m_api_key = "CANARY_API_KEY_MARKER"  # pragma: allowlist secret
+    m_bearer = "CANARY_BEARER_MARKER"  # pragma: allowlist secret
+    m_passphrase = "CANARY_PASSPHRASE_MARKER"  # pragma: allowlist secret
+    m_jwt = (
+        "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."  # pragma: allowlist secret
+        "eyJzdWIiOiJjYW5hcnktbWFya2VyIn0.canary_jwt_marker"
+    )
+    m_default_ssn = "CANARY_DEFAULT_PHI_SSN"
+    m_default_name = "CANARY_DEFAULT_PHI_NAME"
+    m_custom_phi = "CANARY_CUSTOM_PHI_CHART"
+    all_markers = (
+        m_uri_pass,
+        m_api_key,
+        m_bearer,
+        m_passphrase,
+        m_jwt,
+        "canary_jwt_marker",
+        m_default_ssn,
+        m_default_name,
+        m_custom_phi,
+    )
+
+    composite_err = (
+        f"Export failed for postgresql://svc_user:{m_uri_pass}@127.0.0.1:5432/edc "  # pragma: allowlist secret
+        f"api_key={m_api_key} Authorization: Bearer {m_bearer} "
+        f"passphrase={m_passphrase} assertion {m_jwt} "
+        f'ssn={m_default_ssn} patientName="{m_default_name}" medicalChartId={m_custom_phi}'
+    )
+    metadata_sample = {
+        "ssn": m_default_ssn,
+        "api_key": m_api_key,
+        "passphrase": m_passphrase,
+        "destination_uri": f"postgresql://svc_user:{m_uri_pass}@127.0.0.1:5432/edc",  # pragma: allowlist secret
+        "assertion": m_jwt,
+        "medicalChartId": m_custom_phi,
+        "note": f"ssn={m_default_ssn} medicalChartId={m_custom_phi}",
+    }
+
+    db_file = tmp_path / "gov.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv(
+        "IMEDNET_ENCRYPTION_KEY",
+        "ledger-redaction-key",  # pragma: allowlist secret
+    )
+    admin_sdk = MagicMock()
+    admin_sdk.auth.get_user_roles.return_value = ["admin"]
+    admin_sdk.auth.get_user_id.return_value = "auditor-1"
+
+    store = ConfigVersionStore(db_path=db_file)
+    study_cfg = StudyConfiguration(study_key="STUDY_CANARY", phi_fields=["medicalChartId"])
+    store.commit_config(
+        "STUDY_CANARY", study_cfg, "Register custom Study PHI Variable", sdk=admin_sdk
+    )
+
+    # 1. _sanitize_metadata with study_key
+    sanitized_meta = _sanitize_metadata(metadata_sample, "STUDY_CANARY")
+    for marker in all_markers:
+        assert marker not in json.dumps(sanitized_meta)
+
+    # 2. FileStateProvider.set_last_timestamp & record_sdtm_lineage preserve SDTM lineage and monotonic watermarks
+    ledger_file = tmp_path / "pipeline_ledger.json"
+    provider = FileStateProvider(ledger_file)
+    provider.record_sdtm_lineage(
+        "STUDY_CANARY",
+        "records",
+        lineage_updates={"101": {"domain": "AE", "usubjid": "STUDY_CANARY-SUBJ1", "seq": 3}},
+        seq_watermarks={"AE|STUDY_CANARY-SUBJ1": 5},
+    )
+    provider.set_last_timestamp(
+        "STUDY_CANARY",
+        "records",
+        datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+        records_processed=4,
+        status=StreamExecutionStatus.FAILED,
+        error_message=composite_err,
+        metadata={
+            **metadata_sample,
+            "sdtm_seq_watermarks": {"AE|STUDY_CANARY-SUBJ1": 2},
+        },
+        force=True,
+    )
+    provider.record_sdtm_lineage(
+        "STUDY_CANARY",
+        "records",
+        lineage_updates={
+            "102": {
+                "domain": "AE",
+                "usubjid": "STUDY_CANARY-SUBJ1",
+                "seq": 6,
+                "medicalChartId": m_custom_phi,
+            }
+        },
+        seq_watermarks={"AE|STUDY_CANARY-SUBJ1": 4},
+    )
+
+    lineage_snapshot = provider.get_sdtm_lineage("STUDY_CANARY", "records")
+    assert lineage_snapshot["sdtm_seq_watermarks"]["AE|STUDY_CANARY-SUBJ1"] == 5
+    assert lineage_snapshot["sdtm_lineage"]["101"]["usubjid"] == "STUDY_CANARY-SUBJ1"
+    assert lineage_snapshot["sdtm_lineage"]["102"]["medicalChartId"] == "***MASKED***"
+
+    raw_after_set = ledger_file.read_text(encoding="utf-8")
+    for marker in all_markers:
+        assert marker not in raw_after_set
+    assert "Export failed for postgresql://svc_user:***@127.0.0.1:5432/edc" in raw_after_set
+
+    # 3. Failed run_streaming_export scrubs rollback error_message without overwriting committed lineage
+    class _FailingCanarySink(ExportSink):
+        def write_batch(self, records: list[Any], *, batch_id: str) -> int:
+            raise RuntimeError(composite_err)
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    sdk = MagicMock()
+    sdk.records.list.return_value = [
+        SimpleNamespace(
+            record_id=201,
+            study_key="STUDY_CANARY",
+            subject_key="SUBJ1",
+            form_key="AE",
+            form_id=10,
+            date_modified="2026-06-02T00:00:00Z",
+            deleted=False,
+            record_data={"AETERM": "Headache"},
+        )
+    ]
+    sink_cfg = SinkConfig(
+        study_key="STUDY_CANARY",
+        incremental=True,
+        stream_name="records",
+        state_provider=provider,
+        quality_gate_enabled=False,
+    )
+    with pytest.raises(RuntimeError):
+        run_streaming_export(sdk, "STUDY_CANARY", _FailingCanarySink(sink_cfg), sink_cfg)
+
+    raw_after_stream_export = ledger_file.read_text(encoding="utf-8")
+    for marker in all_markers:
+        assert marker not in raw_after_stream_export
+    assert provider.get_sdtm_lineage("STUDY_CANARY", "records")["sdtm_seq_watermarks"] == {
+        "AE|STUDY_CANARY-SUBJ1": 5
+    }
+
+    # 4. Failed _stream_records_across_forms (batch_transaction) scrubs rollback error across all form streams
+    tab_cfg = TabularSinkConfig(
+        study_key="STUDY_CANARY",
+        incremental=True,
+        state_provider=provider,
+        quality_gate_enabled=False,
+    )
+    form_obj = SimpleNamespace(form_id=10, form_key="AE", form_name="Adverse Events")
+    form_ctx = _FormExportContext(
+        form=form_obj,
+        form_id=10,
+        form_key="AE",
+        stream_name="parquet_form_AE",
+        variables=[],
+        variable_keys=[],
+        label_map={},
+        record_model=None,
+        contract_types={},
+    )
+
+    def _fail_form_batch(_ctx: _FormExportContext, _batch: list[Any], _idx: int) -> int:
+        raise RuntimeError(composite_err)
+
+    with pytest.raises(RuntimeError):
+        _stream_records_across_forms(
+            sdk,
+            "STUDY_CANARY",
+            tab_cfg,
+            [form_ctx],
+            [],
+            on_active_batch=_fail_form_batch,
+        )
+
+    raw_after_across_forms = ledger_file.read_text(encoding="utf-8")
+    for marker in all_markers:
+        assert marker not in raw_after_across_forms
+    form_stream = provider.read_state().studies["STUDY_CANARY"].streams["parquet_form_AE"]
+    assert form_stream.last_run_status == StreamExecutionStatus.FAILED
+    assert form_stream.error_message is not None
+    assert "Export failed for postgresql://svc_user:***@127.0.0.1:5432/edc" in (
+        form_stream.error_message
+    )

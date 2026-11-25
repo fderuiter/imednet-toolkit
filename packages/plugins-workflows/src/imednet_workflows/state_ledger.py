@@ -21,25 +21,47 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-from imednet.spi.sinks import redact_uri
 from imednet.spi.utils import (
     PathTraversalValidationError,
-    mask_clinical_phi,
-    redact_sensitive_payload,
-    redact_sensitive_text,
+    SensitivityRegistry,
+    resolve_study_sensitivity_registry,
+    sanitize_diagnostic_payload,
+    sanitize_diagnostic_text,
     validate_path_segment,
 )
 
 from . import _airflow_cas
 
 
-def _sanitize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
-    """Redact credentials and mask clinical PHI keys in stream checkpoint metadata."""
-    if not isinstance(metadata, dict) or not metadata:
+def _sanitize_metadata(
+    metadata: Mapping[str, Any] | None,
+    study_key: str | None = None,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> dict[str, Any]:
+    """Redact credentials and mask clinical PHI keys and leaves in stream checkpoint metadata."""
+    if not isinstance(metadata, Mapping) or not metadata:
         return {}
-    masked = mask_clinical_phi(metadata)
-    redacted = redact_sensitive_payload(masked)
-    return redacted if isinstance(redacted, dict) else {}
+    active_registry = (
+        registry if registry is not None else resolve_study_sensitivity_registry(study_key)
+    )
+    sanitized = sanitize_diagnostic_payload(dict(metadata), registry=active_registry)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def _sanitize_error_message(
+    error_message: str | None,
+    study_key: str | None = None,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> str | None:
+    """Redact credentials, URIs, JWTs, and Study-scoped PHI from checkpoint error text."""
+    if error_message is None:
+        return None
+    active_registry = (
+        registry if registry is not None else resolve_study_sensitivity_registry(study_key)
+    )
+    return sanitize_diagnostic_text(error_message, registry=active_registry)
 
 
 def _validate_study_key(study_key: Any) -> str:
@@ -670,15 +692,25 @@ class FileStateProvider(BaseStateProvider):
                 validate_transition(current_status, validated_status)
 
             normalized_ts = _normalize_optional_utc(timestamp)
+            study_registry = resolve_study_sensitivity_registry(study_key)
             prior_meta = current_stream.metadata if current_stream else None
             merged_meta = _merge_preserved_lineage_metadata(prior_meta, metadata)
-            redacted_meta = _sanitize_metadata(merged_meta)
+            redacted_meta = _sanitize_metadata(
+                merged_meta,
+                study_key,
+                registry=study_registry,
+            )
+            redacted_error = _sanitize_error_message(
+                error_message,
+                study_key,
+                registry=study_registry,
+            )
 
             study.streams[stream_name] = StreamState(
                 last_timestamp=normalized_ts,
                 records_processed=records_processed,
                 last_run_status=validated_status,
-                error_message=error_message,
+                error_message=redacted_error,
                 metadata=redacted_meta,
             )
             self.write_state(state)
@@ -712,11 +744,20 @@ class FileStateProvider(BaseStateProvider):
                 incoming["sdtm_lineage"] = dict(lineage_updates)
             if seq_watermarks:
                 incoming["sdtm_seq_watermarks"] = dict(seq_watermarks)
+            study_registry = resolve_study_sensitivity_registry(study_key)
             merged_meta = _sanitize_metadata(
-                _merge_preserved_lineage_metadata(prior_meta, incoming)
+                _merge_preserved_lineage_metadata(prior_meta, incoming),
+                study_key,
+                registry=study_registry,
             )
             if current_stream is not None:
                 current_stream.metadata = merged_meta
+                if current_stream.error_message is not None:
+                    current_stream.error_message = _sanitize_error_message(
+                        current_stream.error_message,
+                        study_key,
+                        registry=study_registry,
+                    )
             else:
                 study.streams[stream_name] = StreamState(
                     last_timestamp=None,
@@ -761,15 +802,26 @@ class FileStateProvider(BaseStateProvider):
             ]
             if not owned_streams:
                 return
+            study_registry = resolve_study_sensitivity_registry(study_key)
+            redacted_error = _sanitize_error_message(
+                error_text,
+                study_key,
+                registry=study_registry,
+            )
             for s_name in owned_streams:
                 validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.FAILED)
                 tx_data = tx_map[s_name]
+                redacted_prior_meta = _sanitize_metadata(
+                    prior_meta_map[s_name],
+                    study_key,
+                    registry=study_registry,
+                )
                 study_entry.streams[s_name] = StreamState(
                     last_timestamp=prior_ts_map[s_name],
                     records_processed=tx_data.get("records_processed", 0),
                     last_run_status=StreamExecutionStatus.FAILED,
-                    error_message=error_text,
-                    metadata=copy.deepcopy(prior_meta_map[s_name]),
+                    error_message=redacted_error if redacted_error is not None else "",
+                    metadata=redacted_prior_meta,
                 )
             self.write_state(state)
 
@@ -807,6 +859,7 @@ class FileStateProvider(BaseStateProvider):
                     )
 
             assert study_entry is not None
+            study_registry = resolve_study_sensitivity_registry(study_key)
             for s_name in stream_names:
                 validate_transition(StreamExecutionStatus.RUNNING, StreamExecutionStatus.SUCCESS)
                 tx_data = tx_map[s_name]
@@ -826,7 +879,11 @@ class FileStateProvider(BaseStateProvider):
                     base_meta,
                     raw_commit_meta if isinstance(raw_commit_meta, Mapping) else {},
                 )
-                redacted_commit_meta = _sanitize_metadata(commit_meta)
+                redacted_commit_meta = _sanitize_metadata(
+                    commit_meta,
+                    study_key,
+                    registry=study_registry,
+                )
                 study_entry.streams[s_name] = StreamState(
                     last_timestamp=commit_ts,
                     records_processed=tx_data.get("records_processed", 0),
@@ -874,6 +931,12 @@ class FileStateProvider(BaseStateProvider):
             )
 
             now = datetime.now(UTC)
+            study_registry = resolve_study_sensitivity_registry(study_key)
+            sanitized_prior_meta = _sanitize_metadata(
+                prior_metadata,
+                study_key,
+                registry=study_registry,
+            )
             if current_stream is not None and current_status == StreamExecutionStatus.RUNNING:
                 stale_reason = _check_stale_running(
                     current_stream.owner_pid,
@@ -888,7 +951,7 @@ class FileStateProvider(BaseStateProvider):
                         records_processed=current_stream.records_processed,
                         last_run_status=StreamExecutionStatus.FAILED,
                         error_message=f"Recovered stale running stream: {stale_reason}",
-                        metadata=copy.deepcopy(prior_metadata),
+                        metadata=copy.deepcopy(sanitized_prior_meta),
                     )
                     self.write_state(state)
                     current_status = StreamExecutionStatus.FAILED
@@ -901,7 +964,7 @@ class FileStateProvider(BaseStateProvider):
                 last_timestamp=prior_ts,
                 records_processed=0,
                 last_run_status=StreamExecutionStatus.RUNNING,
-                metadata=copy.deepcopy(prior_metadata),
+                metadata=copy.deepcopy(sanitized_prior_meta),
                 owner_pid=owner_pid,
                 owner_host=owner_host,
                 lease_expires_at=now + timedelta(seconds=ttl),
@@ -1013,12 +1076,17 @@ class FileStateProvider(BaseStateProvider):
 
             ttl = self.lease_ttl_seconds if lease_ttl_seconds is None else lease_ttl_seconds
             lease_exp = now + timedelta(seconds=ttl)
+            study_registry = resolve_study_sensitivity_registry(study_key)
             for stream_name in unique_streams:
                 study.streams[stream_name] = StreamState(
                     last_timestamp=prior_ts_map[stream_name],
                     records_processed=0,
                     last_run_status=StreamExecutionStatus.RUNNING,
-                    metadata=copy.deepcopy(prior_meta_map[stream_name]),
+                    metadata=_sanitize_metadata(
+                        prior_meta_map[stream_name],
+                        study_key,
+                        registry=study_registry,
+                    ),
                     owner_pid=owner_pid,
                     owner_host=owner_host,
                     lease_expires_at=lease_exp,
@@ -1459,16 +1527,24 @@ class AirflowStateProvider(BaseStateProvider):
         lease_expires_at: datetime | None = None,
         lease_id: str | None = None,
         lease_token: str | None = None,
+        registry: SensitivityRegistry | None = None,
     ) -> dict[str, Any]:
-        """Build a secret-redacted checkpoint payload for a single stream."""
+        """Build a secret- and Study-PHI-redacted checkpoint payload for a single stream."""
         normalized_ts = _normalize_optional_utc(timestamp)
         normalized_lease = _normalize_optional_utc(lease_expires_at)
-        redacted_error = (
-            redact_sensitive_text(str(redact_sensitive_payload(redact_uri(error_message))))
-            if error_message is not None
-            else None
+        active_registry = (
+            registry if registry is not None else resolve_study_sensitivity_registry(study_key)
         )
-        redacted_meta = _sanitize_metadata(metadata)
+        redacted_error = _sanitize_error_message(
+            error_message,
+            study_key,
+            registry=active_registry,
+        )
+        redacted_meta = _sanitize_metadata(
+            metadata,
+            study_key,
+            registry=active_registry,
+        )
         effective_lease_id = lease_id if lease_id is not None else lease_token
         effective_lease_token = lease_token if lease_token is not None else lease_id
         payload: dict[str, Any] = {
@@ -1690,6 +1766,7 @@ class AirflowStateProvider(BaseStateProvider):
             resolved_study: str,
             streams: dict[str, dict[str, Any]],
         ) -> dict[str, dict[str, Any]]:
+            study_registry = resolve_study_sensitivity_registry(resolved_study)
             existing = streams.get(stream_name)
             prior_meta = existing.get("metadata") if isinstance(existing, dict) else {}
             merged_meta = _merge_preserved_lineage_metadata(
@@ -1698,7 +1775,17 @@ class AirflowStateProvider(BaseStateProvider):
             )
             if isinstance(existing, dict):
                 updated = dict(existing)
-                updated["metadata"] = _sanitize_metadata(merged_meta)
+                updated["metadata"] = _sanitize_metadata(
+                    merged_meta,
+                    resolved_study,
+                    registry=study_registry,
+                )
+                if isinstance(updated.get("error_message"), str):
+                    updated["error_message"] = _sanitize_error_message(
+                        updated["error_message"],
+                        resolved_study,
+                        registry=study_registry,
+                    )
                 streams[stream_name] = updated
             else:
                 streams[stream_name] = self._build_stream_payload(
@@ -1708,6 +1795,7 @@ class AirflowStateProvider(BaseStateProvider):
                     records_processed=0,
                     status=StreamExecutionStatus.SUCCESS,
                     metadata=merged_meta,
+                    registry=study_registry,
                 )
             return streams
 

@@ -389,6 +389,8 @@ def transact_airflow_streams(
     verify_sdk_on_acquire: bool,
 ) -> Generator[dict[str, dict[str, Any]], None, None]:
     """Execute a transactional checkpoint lease across one or more Airflow Study streams."""
+    from imednet.spi.utils import SensitivityRegistry, resolve_study_sensitivity_registry
+
     from .state_ledger import (
         InvalidStateTransitionError,
         StreamExecutionStatus,
@@ -403,6 +405,14 @@ def transact_airflow_streams(
     owner_pid = os.getpid()
     owner_host = socket.gethostname()
     lease_id = uuid.uuid4().hex
+    registries_by_study: dict[str, SensitivityRegistry] = {}
+
+    def _registry_for(target_study: str) -> SensitivityRegistry:
+        cached = registries_by_study.get(target_study)
+        if cached is None:
+            cached = resolve_study_sensitivity_registry(target_study)
+            registries_by_study[target_study] = cached
+        return cached
 
     def _prepare_running_streams(
         resolved_study: str,
@@ -451,6 +461,7 @@ def transact_airflow_streams(
                             status=StreamExecutionStatus.FAILED,
                             error_message=f"Recovered stale running stream: {stale_reason}",
                             metadata=copy.deepcopy(prior_meta),
+                            registry=_registry_for(resolved_study),
                         )
                     current_status = StreamExecutionStatus.FAILED
 
@@ -463,6 +474,7 @@ def transact_airflow_streams(
             }
 
         lease_exp = now + timedelta(seconds=ttl)
+        study_reg = _registry_for(resolved_study)
         for s_name in unique_streams:
             streams[s_name] = provider._build_stream_payload(
                 study_key=resolved_study,
@@ -476,6 +488,7 @@ def transact_airflow_streams(
                 lease_expires_at=lease_exp,
                 lease_id=lease_id,
                 lease_token=lease_id,
+                registry=study_reg,
             )
         return local_prior_ts, local_prior_meta, local_tx_map
 
@@ -513,6 +526,7 @@ def transact_airflow_streams(
             records_processed=tx_data.get("records_processed", 0),
             status=StreamExecutionStatus.SUCCESS,
             metadata=merged_commit_meta,
+            registry=_registry_for(resolved_study),
         )
 
     if provider._has_active_task_sdk_comms():
@@ -585,6 +599,7 @@ def transact_airflow_streams(
                             status=StreamExecutionStatus.FAILED,
                             error_message=err_msg,
                             metadata=copy.deepcopy(prior_meta_map[s_name]),
+                            registry=_registry_for(latest_study),
                         )
                     provider._save_study_state(
                         latest_study,
@@ -672,6 +687,7 @@ def transact_airflow_streams(
                     status=StreamExecutionStatus.FAILED,
                     error_message=err_msg,
                     metadata=copy.deepcopy(orm_prior_meta_map[s_name]),
+                    registry=_registry_for(resolved_study),
                 )
             return streams if mutated else None
 
