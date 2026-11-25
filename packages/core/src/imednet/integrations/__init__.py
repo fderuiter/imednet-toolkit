@@ -1,6 +1,9 @@
 """Integration helpers for exporting study data."""
 
-from .dispatcher import export, register_tabular_target
+import sys
+from typing import TYPE_CHECKING
+
+from .dispatcher import register_tabular_target
 from .export import (
     export_to_csv,
     export_to_duckdb,
@@ -15,6 +18,11 @@ from .export import (
 from .parquet import export_to_hive_parquet, hive_parquet_query
 from .parquet_engine import PartitionedStorageEngine, PyArrowDatasetPartitionedStorageEngine
 from .sink_base import ExportSink, SinkConfig
+
+if TYPE_CHECKING:
+    from .dispatcher import export as export
+else:
+    export = sys.modules[f"{__name__}.export"]
 
 # Register standard tabular targets
 register_tabular_target("csv", export_to_csv)

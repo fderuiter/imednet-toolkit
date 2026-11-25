@@ -1015,6 +1015,7 @@ def test_airflow_export_and_connection_targets_narrative_parity() -> None:
         "mongodb",
         "duckdb",
         "duckdb_by_form",
+        "hive_parquet",
         "sql",
         "sql_by_form",
         "long_sql",

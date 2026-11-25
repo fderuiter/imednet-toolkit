@@ -489,8 +489,8 @@ Public API exposure
   (keeping ``apache_airflow_providers_imednet`` decoupled from ``imednet_sinks``),
   while :meth:`~apache_airflow_providers_imednet.hooks.ImednetHook.resolve_destination_connection`
   resolves ``destination_conn_id`` settings for ``snowflake``, ``neo4j``,
-  ``mongodb``, ``duckdb``, ``duckdb_by_form``, ``sql``, ``sql_by_form``, and
-  ``long_sql``.
+  ``mongodb``, ``duckdb``, ``duckdb_by_form``, ``hive_parquet``, ``sql``,
+  ``sql_by_form``, and ``long_sql``.
 
 Adding New Export Sinks
 ~~~~~~~~~~~~~~~~~~~~~~~
