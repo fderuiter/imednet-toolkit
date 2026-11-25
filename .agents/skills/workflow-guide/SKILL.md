@@ -29,7 +29,7 @@ One map across our unified **31-skill** suite (`obra/superpowers` discipline + `
    - Every slice follows `test-driven-development` (RED-GREEN-REFACTOR, public seams, `pytest`, strict `respx`, `fake_data`, `>=90%` coverage).
 6. **Review, Verify & Ship:**
    - `requesting-code-review` (per-task alignment OR parallel two-axis Standards + Spec diff review) + `receiving-code-review`.
-   - `verification-before-completion` (`uvx pre-commit run --all-files`, `hatch run verify`, `hatch run docs`, `uvx hatch run quality:all packages`).
+   - `verification-before-completion` (`uvx pre-commit run --all-files`, `hatch run verify`, `hatch run docs`, `uvx hatch run quality:all`).
    - `finishing-a-development-branch` (Conventional Commit PR title, `.github/PULL_REQUEST_TEMPLATE.md`, Squash & merge, `release-please`).
 
 ---
