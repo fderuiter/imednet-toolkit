@@ -13,6 +13,7 @@ import math
 import numbers
 import os
 import re
+import shutil
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
@@ -369,19 +370,83 @@ def _normalize_sqlite_temporal_object_columns(
     return normalized if normalized is not None else df
 
 
+def _resolve_wide_sqlite_key_columns(
+    df: pd.DataFrame,
+    *,
+    study_key: str | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Return ``(adjusted_df, key_cols)`` for wide SQLite split propagation."""
+    id_col = _find_df_record_id_col(df)
+    if id_col is not None:
+        study_col = _find_df_study_col(df)
+        adjusted = df
+        if study_col is None and study_key:
+            inferred_study_col = (
+                "STUDYID"
+                if id_col == "RECORD_ID"
+                else ("study_key" if id_col == "record_id" else "studyKey")
+            )
+            adjusted = _preserve_df_stamp_and_sdtm_attr(df, df.copy())
+            adjusted.insert(0, inferred_study_col, study_key)
+            study_col = inferred_study_col
+        key_cols = [id_col]
+        if study_col is not None and study_col != id_col:
+            key_cols.append(study_col)
+        return adjusted, key_cols
+
+    if {"STUDYID", "DOMAIN", "USUBJID"} <= set(df.columns):
+        sdtm_keys = [
+            str(c)
+            for c in df.columns
+            if c in {"STUDYID", "DOMAIN", "USUBJID"}
+            or (isinstance(c, str) and c.endswith("SEQ") and c.upper() != "DMSEQ" and c != "DOMAIN")
+        ]
+        if len(sdtm_keys) < MAX_SQLITE_COLUMNS:
+            return df, sdtm_keys
+
+    return df, []
+
+
+def _filter_to_sql_chunk_kwargs(
+    kwargs: Mapping[str, Any],
+    columns: pd.Index,
+) -> dict[str, Any]:
+    """Filter per-column ``dtype`` mappings in ``to_sql`` kwargs to columns present in a chunk."""
+    out = dict(kwargs)
+    raw_dtype = out.get("dtype")
+    if isinstance(raw_dtype, Mapping):
+        col_set = set(columns)
+        out["dtype"] = {k: v for k, v in raw_dtype.items() if k in col_set}
+    return out
+
+
+def _drop_sqlite_tables_by_name(engine: Any, table_names: Sequence[str]) -> None:
+    """Drop existing SQLite tables in ``table_names`` when ``engine`` is a real SQLAlchemy engine."""
+    if not table_names or isinstance(engine, NonCallableMock):
+        return
+    from sqlalchemy import text as sa_text
+
+    preparer = engine.dialect.identifier_preparer
+    with engine.begin() as conn:
+        for t_name in table_names:
+            conn.execute(sa_text(f"DROP TABLE IF EXISTS {preparer.quote(t_name)}"))
+
+
 def _to_sql_with_chunking(
     df: pd.DataFrame,
     table: str,
     engine: Any,
     *,
     if_exists: Literal["fail", "replace", "append", "delete_rows"],
+    study_key: str | None = None,
     **kwargs: Any,
 ) -> None:
     """Write ``df`` to ``table`` splitting columns when using SQLite.
 
     SQLite limits tables to ``MAX_SQLITE_COLUMNS`` columns. When the DataFrame
     exceeds this, the data is written to multiple tables suffixed with
-    ``_part1``, ``_part2`` and so on.
+    ``_part1``, ``_part2`` and so on while propagating Record and Study keys
+    across every part when keyed columns are present.
     """
     df = _normalize_sqlite_temporal_object_columns(
         df,
@@ -389,16 +454,61 @@ def _to_sql_with_chunking(
         dtype=kwargs.get("dtype"),
     )
     if engine.dialect.name == "sqlite" and len(df.columns) > MAX_SQLITE_COLUMNS:
-        for i, start in enumerate(range(0, len(df.columns), MAX_SQLITE_COLUMNS), start=1):
-            chunk = df.iloc[:, start : start + MAX_SQLITE_COLUMNS]
+        key_cols: list[str] = []
+        if isinstance(df, pd.DataFrame):
+            df, key_cols = _resolve_wide_sqlite_key_columns(df, study_key=study_key)
+
+        chunks: list[pd.DataFrame] = []
+        if key_cols and len(key_cols) < MAX_SQLITE_COLUMNS:
+            key_set = set(key_cols)
+            non_key_cols = [c for c in df.columns if c not in key_set]
+            payload_width = MAX_SQLITE_COLUMNS - len(key_cols)
+            for idx, start in enumerate(range(0, max(1, len(non_key_cols)), payload_width)):
+                non_key_slice = non_key_cols[start : start + payload_width]
+                if idx == 0:
+                    part1_set = key_set | set(non_key_slice)
+                    part_cols = [c for c in df.columns if c in part1_set]
+                    if len(part_cols) > MAX_SQLITE_COLUMNS:
+                        part_cols = [*key_cols, *non_key_slice]
+                else:
+                    part_cols = [*key_cols, *non_key_slice]
+                chunks.append(df.loc[:, part_cols])
+        else:
+            for start in range(0, len(df.columns), MAX_SQLITE_COLUMNS):
+                chunks.append(df.iloc[:, start : start + MAX_SQLITE_COLUMNS])
+
+        if if_exists == "replace" and not isinstance(engine, NonCallableMock):
+            from sqlalchemy import inspect as sa_inspect
+
+            inspector = sa_inspect(engine)
+            stale_tables: list[str] = []
+            if bool(inspector.has_table(table)):
+                stale_tables.append(table)
+            for part_num, part_name in _list_sql_part_tables(inspector, table):
+                if part_num > len(chunks):
+                    stale_tables.append(part_name)
+            _drop_sqlite_tables_by_name(engine, stale_tables)
+
+        for i, chunk in enumerate(chunks, start=1):
+            chunk_kwargs = _filter_to_sql_chunk_kwargs(kwargs, chunk.columns)
             chunk.to_sql(
                 f"{table}_part{i}",
                 engine,
                 if_exists=if_exists,
                 index=False,
-                **kwargs,
+                **chunk_kwargs,
             )
     else:
+        if (
+            if_exists == "replace"
+            and engine.dialect.name == "sqlite"
+            and not isinstance(engine, NonCallableMock)
+        ):
+            from sqlalchemy import inspect as sa_inspect
+
+            inspector = sa_inspect(engine)
+            stale_parts = [name for _, name in _list_sql_part_tables(inspector, table)]
+            _drop_sqlite_tables_by_name(engine, stale_parts)
         df.to_sql(table, engine, if_exists=if_exists, index=False, **kwargs)
 
 
@@ -1280,6 +1390,7 @@ class TabularCSVSink(ExportSink):
         self._staged_frames: list[pd.DataFrame] = []
         self._voided_ids: set[str] = set()
         self._voided_sdtm_keys: set[SdtmKeyTuple] = set()
+        self._csv_columns: list[str] | None = None
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -1335,22 +1446,90 @@ class TabularCSVSink(ExportSink):
             return loaded
 
         def execute_export() -> int:
-            if self._is_first_batch:
-                if self._cfg.idempotent or not Path(self.path).exists():
-                    mode = "w"
-                    header = True
-                else:
-                    mode = "a"
-                    header = Path(self.path).stat().st_size == 0
+            batch_cols = [str(c) for c in df.columns]
+            df_str_cols = df
+            if list(df.columns) != batch_cols:
+                df_str_cols = df.copy()
+                df_str_cols.columns = pd.Index(batch_cols)
+
+            sep = str(self._cfg.pandas_kwargs.get("sep", ","))
+            write_fresh = bool(
+                self._is_first_batch
+                and (
+                    self._cfg.idempotent
+                    or not Path(self.path).exists()
+                    or Path(self.path).stat().st_size == 0
+                )
+            )
+
+            if write_fresh:
+                csv_str = df_str_cols.to_csv(index=False, header=True, **self._cfg.pandas_kwargs)
+                checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
+                with open(self.path, mode="w", encoding="utf-8") as f:
+                    f.write(csv_str)
+                self._csv_columns = batch_cols
             else:
-                mode = "a"
-                header = False
+                existing_cols = self._csv_columns
+                if existing_cols is None:
+                    with open(self.path, encoding="utf-8", newline="") as src_f:
+                        header_row = next(csv.reader(src_f, delimiter=sep), None)
+                    existing_cols = [c for c in (header_row or []) if c != ""]
+                if not existing_cols:
+                    csv_str = df_str_cols.to_csv(
+                        index=False,
+                        header=True,
+                        **self._cfg.pandas_kwargs,
+                    )
+                    checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
+                    with open(self.path, mode="w", encoding="utf-8") as f:
+                        f.write(csv_str)
+                    self._csv_columns = batch_cols
+                else:
+                    added_cols = [c for c in batch_cols if c not in existing_cols]
+                    if not added_cols:
+                        aligned_df = df_str_cols.reindex(columns=existing_cols)
+                        csv_str = aligned_df.to_csv(
+                            index=False,
+                            header=False,
+                            **self._cfg.pandas_kwargs,
+                        )
+                        checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
+                        with open(self.path, mode="a", encoding="utf-8") as f:
+                            f.write(csv_str)
+                        self._csv_columns = list(existing_cols)
+                    else:
+                        unified_cols = [*existing_cols, *added_cols]
+                        aligned_df = df_str_cols.reindex(columns=unified_cols)
+                        csv_str = aligned_df.to_csv(
+                            index=False,
+                            header=False,
+                            **self._cfg.pandas_kwargs,
+                        )
+                        checksum = hashlib.sha256(csv_str.encode("utf-8")).hexdigest()
+                        pad = [""] * len(added_cols)
+                        expected_old_len = len(existing_cols)
 
-            csv_str = df.to_csv(index=False, header=header, **self._cfg.pandas_kwargs)
-            checksum = hashlib.sha256(csv_str.encode('utf-8')).hexdigest()
+                        def _expand_and_append(tmp_path: str) -> None:
+                            with (
+                                open(self.path, encoding="utf-8", newline="") as src_f,
+                                open(tmp_path, mode="w", encoding="utf-8", newline="") as dst_f,
+                            ):
+                                reader = csv.reader(src_f, delimiter=sep)
+                                writer = csv.writer(dst_f, delimiter=sep, lineterminator="\n")
+                                first_row = next(reader, None)
+                                writer.writerow(unified_cols)
+                                if first_row is not None:
+                                    for row in reader:
+                                        padded_row = (
+                                            row + [""] * (expected_old_len - len(row))
+                                            if len(row) < expected_old_len
+                                            else row
+                                        )
+                                        writer.writerow(padded_row + pad)
+                                dst_f.write(csv_str)
 
-            with open(self.path, mode=mode, encoding="utf-8") as f:
-                f.write(csv_str)
+                        _atomic_replace_file(self.path, _expand_and_append, suffix=".csv.tmp")
+                        self._csv_columns = unified_cols
 
             rows_loaded = len(df)
             _append_jsonl_manifest(
@@ -1499,6 +1678,7 @@ class TabularCSVSink(ExportSink):
         self._staged_frames.clear()
         self._voided_ids.clear()
         self._voided_sdtm_keys.clear()
+        self._csv_columns = None
 
 
 _RECORD_META_CONTRACT_TYPES: tuple[tuple[str, str], ...] = (
@@ -2635,6 +2815,57 @@ class TabularParquetSink(ExportSink):
         self._schema = None
 
 
+def _list_sql_part_tables(inspector: Any, table_name: str) -> list[tuple[int, str]]:
+    """Return sorted ``(part_index, part_table_name)`` pairs for wide SQLite split tables."""
+    raw_names = inspector.get_table_names() if hasattr(inspector, "get_table_names") else None
+    if not isinstance(raw_names, (list, tuple, set, frozenset)):
+        return []
+    prefix = f"{table_name}_part"
+    parts: list[tuple[int, str]] = []
+    for name in raw_names:
+        if isinstance(name, str) and name.startswith(prefix):
+            suffix = name[len(prefix) :]
+            if suffix.isdigit() and int(suffix) >= 1:
+                parts.append((int(suffix), name))
+    parts.sort(key=lambda item: item[0])
+    return parts
+
+
+def _resolve_sql_target_tables(inspector: Any, table_name: str) -> list[str]:
+    """Return existing primary ``table_name`` and any ``{table_name}_part*`` split tables."""
+    targets: list[str] = []
+    if bool(inspector.has_table(table_name)):
+        targets.append(table_name)
+    targets.extend(name for _, name in _list_sql_part_tables(inspector, table_name))
+    return targets
+
+
+_LOGICAL_TO_ANSI_SQL: dict[str, str] = {
+    "int64": "BIGINT",
+    "float64": "FLOAT",
+    "bool": "BOOLEAN",
+    "string": "TEXT",
+}
+
+
+def _resolve_sql_alter_column_type(
+    col: Any,
+    series: pd.Series,
+    contract_types: Mapping[str, str | None],
+) -> str:
+    """Resolve an ANSI/SQLite-compatible column DDL type for ``ALTER TABLE ADD COLUMN``."""
+    col_name = str(col)
+    ltype = contract_types.get(col_name)
+    if ltype is None:
+        if col_name in {"recordId", "record_id", "RECORD_ID"} or (
+            col_name.endswith("SEQ") and col_name.upper() != "DMSEQ" and col_name != "DOMAIN"
+        ):
+            ltype = "int64"
+        else:
+            ltype = _infer_series_logical_type(series)
+    return _LOGICAL_TO_ANSI_SQL.get(ltype or "string", "TEXT")
+
+
 def _execute_chunked_sql_id_delete(
     engine: Any,
     table_name: str,
@@ -2650,36 +2881,44 @@ def _execute_chunked_sql_id_delete(
     from sqlalchemy import text as sa_text
 
     inspector = sa_inspect(engine)
-    if not inspector.has_table(table_name):
+    target_tables = _resolve_sql_target_tables(inspector, table_name)
+    if not target_tables:
         return 0
-    existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
-    id_col = next((col for col in candidate_cols if col in existing_cols), None)
-    if id_col is None:
-        return 0
-    study_col = next(
-        (col for col in ("STUDYID", "study_key", "studyKey") if col in existing_cols),
-        None,
-    )
 
     preparer = engine.dialect.identifier_preparer
-    quoted_table = preparer.quote(table_name)
-    quoted_col = preparer.quote(id_col)
-    quoted_study = preparer.quote(study_col) if (study_col is not None and study_key) else None
+    matched_any_table = False
     with engine.begin() as conn:
-        for start in range(0, len(record_ids), 500):
-            chunk = record_ids[start : start + 500]
-            params: dict[str, Any] = {f"id_{idx}": rid for idx, rid in enumerate(chunk)}
-            placeholders = ", ".join(f":{k}" for k in params)
-            if quoted_study is not None:
-                params["study_key"] = study_key
-                stmt = sa_text(
-                    f"DELETE FROM {quoted_table} "
-                    f"WHERE {quoted_study} = :study_key AND {quoted_col} IN ({placeholders})"
-                )
-            else:
-                stmt = sa_text(f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})")
-            conn.execute(stmt, params)
-    return len(record_ids)
+        for t_name in target_tables:
+            existing_cols = {c["name"] for c in inspector.get_columns(t_name)}
+            id_col = next((col for col in candidate_cols if col in existing_cols), None)
+            if id_col is None:
+                continue
+            matched_any_table = True
+            study_col = next(
+                (col for col in ("STUDYID", "study_key", "studyKey") if col in existing_cols),
+                None,
+            )
+            quoted_table = preparer.quote(t_name)
+            quoted_col = preparer.quote(id_col)
+            quoted_study = (
+                preparer.quote(study_col) if (study_col is not None and study_key) else None
+            )
+            for start in range(0, len(record_ids), 500):
+                chunk = record_ids[start : start + 500]
+                params: dict[str, Any] = {f"id_{idx}": rid for idx, rid in enumerate(chunk)}
+                placeholders = ", ".join(f":{k}" for k in params)
+                if quoted_study is not None:
+                    params["study_key"] = study_key
+                    stmt = sa_text(
+                        f"DELETE FROM {quoted_table} "
+                        f"WHERE {quoted_study} = :study_key AND {quoted_col} IN ({placeholders})"
+                    )
+                else:
+                    stmt = sa_text(
+                        f"DELETE FROM {quoted_table} WHERE {quoted_col} IN ({placeholders})"
+                    )
+                conn.execute(stmt, params)
+    return len(record_ids) if matched_any_table else 0
 
 
 class TabularSQLSink(ExportSink):
@@ -2695,13 +2934,11 @@ class TabularSQLSink(ExportSink):
         self._is_first_batch = True
         self._cfg = config
         self._contract_types: dict[str, str | None] = {}
-        self._is_incremental_sync = bool(
-            config.incremental
-            or config.modified_since is not None
-            or config.state_provider is not None
-        )
+        self._is_incremental_sync = _is_incremental_config(config)
         explicit_if_exists = self._cfg.pandas_kwargs.pop("if_exists", None)
-        if explicit_if_exists is not None:
+        if explicit_if_exists is not None and not (
+            self._is_incremental_sync and config.idempotent and explicit_if_exists == "replace"
+        ):
             self._initial_if_exists = explicit_if_exists
         elif not config.idempotent:
             self._initial_if_exists = "append"
@@ -2723,56 +2960,166 @@ class TabularSQLSink(ExportSink):
         )
 
     def _delete_existing_sdtm_keys(self, sdtm_keys: Sequence[SdtmKeyTuple]) -> int:
-        """Delete existing rows matching composite SDTM keys when the destination table exists."""
+        """Delete existing rows matching composite SDTM keys across primary and split tables."""
         if not sdtm_keys or isinstance(self.engine, NonCallableMock):
             return 0
         from sqlalchemy import inspect as sa_inspect
         from sqlalchemy import text as sa_text
 
         inspector = sa_inspect(self.engine)
-        if not inspector.has_table(self.table):
-            return 0
-        existing_cols = {c["name"] for c in inspector.get_columns(self.table)}
-        if not {"STUDYID", "DOMAIN", "USUBJID"} <= existing_cols:
+        target_tables = _resolve_sql_target_tables(inspector, self.table)
+        if not target_tables:
             return 0
 
         preparer = self.engine.dialect.identifier_preparer
-        q_table = preparer.quote(self.table)
         q_study = preparer.quote("STUDYID")
         q_domain = preparer.quote("DOMAIN")
         q_usubjid = preparer.quote("USUBJID")
 
-        deleted = 0
+        deleted_keys: set[SdtmKeyTuple] = set()
         with self.engine.begin() as conn:
-            for study_id, domain, usubjid, seq_col, seq_val in sdtm_keys:
-                if seq_col is None or domain == "DM":
-                    stmt = sa_text(
-                        f"DELETE FROM {q_table} "
-                        f"WHERE {q_study} = :study_id AND {q_domain} = :domain AND {q_usubjid} = :usubjid"
-                    )
-                    conn.execute(
-                        stmt,
-                        {"study_id": study_id, "domain": domain, "usubjid": usubjid},
-                    )
-                    deleted += 1
-                elif seq_col in existing_cols and seq_val is not None:
-                    q_seq = preparer.quote(seq_col)
-                    stmt = sa_text(
-                        f"DELETE FROM {q_table} "
-                        f"WHERE {q_study} = :study_id AND {q_domain} = :domain "
-                        f"AND {q_usubjid} = :usubjid AND {q_seq} = :seq_val"
-                    )
-                    conn.execute(
-                        stmt,
-                        {
-                            "study_id": study_id,
-                            "domain": domain,
-                            "usubjid": usubjid,
-                            "seq_val": seq_val,
-                        },
-                    )
-                    deleted += 1
-        return deleted
+            for t_name in target_tables:
+                existing_cols = {c["name"] for c in inspector.get_columns(t_name)}
+                if not {"STUDYID", "DOMAIN", "USUBJID"} <= existing_cols:
+                    continue
+                q_table = preparer.quote(t_name)
+                for skey in sdtm_keys:
+                    study_id, domain, usubjid, seq_col, seq_val = skey
+                    if seq_col is None or domain == "DM":
+                        stmt = sa_text(
+                            f"DELETE FROM {q_table} "
+                            f"WHERE {q_study} = :study_id AND {q_domain} = :domain AND {q_usubjid} = :usubjid"
+                        )
+                        conn.execute(
+                            stmt,
+                            {"study_id": study_id, "domain": domain, "usubjid": usubjid},
+                        )
+                        deleted_keys.add(skey)
+                    elif seq_col in existing_cols and seq_val is not None:
+                        q_seq = preparer.quote(seq_col)
+                        stmt = sa_text(
+                            f"DELETE FROM {q_table} "
+                            f"WHERE {q_study} = :study_id AND {q_domain} = :domain "
+                            f"AND {q_usubjid} = :usubjid AND {q_seq} = :seq_val"
+                        )
+                        conn.execute(
+                            stmt,
+                            {
+                                "study_id": study_id,
+                                "domain": domain,
+                                "usubjid": usubjid,
+                                "seq_val": seq_val,
+                            },
+                        )
+                        deleted_keys.add(skey)
+        return len(deleted_keys)
+
+    def _append_to_existing_part_tables(
+        self,
+        df: pd.DataFrame,
+        part_entries: list[tuple[int, str]],
+        inspector: Any,
+    ) -> None:
+        """Append ``df`` into existing wide SQLite ``_part*`` tables, evolving added columns."""
+        from sqlalchemy import text as sa_text
+
+        norm_df = _normalize_sqlite_temporal_object_columns(
+            df,
+            self.engine,
+            dtype=self._cfg.pandas_kwargs.get("dtype"),
+        )
+        norm_df, key_cols = _resolve_wide_sqlite_key_columns(
+            norm_df,
+            study_key=self._cfg.study_key,
+        )
+        part_cols_map: dict[str, list[str]] = {
+            part_name: [c["name"] for c in inspector.get_columns(part_name)]
+            for _, part_name in part_entries
+        }
+        all_existing = {col for cols in part_cols_map.values() for col in cols}
+        new_cols = [c for c in norm_df.columns if str(c) not in all_existing]
+
+        preparer = self.engine.dialect.identifier_preparer
+        if new_cols:
+            remaining_new = list(new_cols)
+            with self.engine.begin() as conn:
+                for _, part_name in part_entries:
+                    if not remaining_new:
+                        break
+                    room = MAX_SQLITE_COLUMNS - len(part_cols_map[part_name])
+                    if room <= 0:
+                        continue
+                    to_add = remaining_new[:room]
+                    remaining_new = remaining_new[room:]
+                    q_part = preparer.quote(part_name)
+                    for col in to_add:
+                        col_sql_type = _resolve_sql_alter_column_type(
+                            col,
+                            norm_df[col],
+                            self._contract_types,
+                        )
+                        conn.execute(
+                            sa_text(
+                                f"ALTER TABLE {q_part} ADD COLUMN {preparer.quote(str(col))} {col_sql_type}"
+                            )
+                        )
+                        part_cols_map[part_name].append(str(col))
+
+                next_part_idx = part_entries[-1][0] + 1
+                first_part_name = part_entries[0][1]
+                first_part_cols = set(part_cols_map[first_part_name])
+                seed_keys = [k for k in key_cols if k in first_part_cols]
+                payload_width = max(1, MAX_SQLITE_COLUMNS - len(seed_keys))
+                while remaining_new:
+                    batch_new = remaining_new[:payload_width]
+                    remaining_new = remaining_new[payload_width:]
+                    new_part_name = f"{self.table}_part{next_part_idx}"
+                    next_part_idx += 1
+                    q_new_part = preparer.quote(new_part_name)
+                    if seed_keys:
+                        quoted_seed = ", ".join(preparer.quote(k) for k in seed_keys)
+                        conn.execute(
+                            sa_text(
+                                f"CREATE TABLE {q_new_part} AS SELECT {quoted_seed} "
+                                f"FROM {preparer.quote(first_part_name)}"
+                            )
+                        )
+                        for col in batch_new:
+                            col_sql_type = _resolve_sql_alter_column_type(
+                                col,
+                                norm_df[col],
+                                self._contract_types,
+                            )
+                            conn.execute(
+                                sa_text(
+                                    f"ALTER TABLE {q_new_part} ADD COLUMN {preparer.quote(str(col))} {col_sql_type}"
+                                )
+                            )
+                        part_cols_map[new_part_name] = [*seed_keys, *(str(c) for c in batch_new)]
+                    else:
+                        col_defs = ", ".join(
+                            f"{preparer.quote(str(col))} "
+                            f"{_resolve_sql_alter_column_type(col, norm_df[col], self._contract_types)}"
+                            for col in batch_new
+                        )
+                        conn.execute(sa_text(f"CREATE TABLE {q_new_part} ({col_defs})"))
+                        part_cols_map[new_part_name] = [str(c) for c in batch_new]
+                    part_entries.append((next_part_idx - 1, new_part_name))
+
+        for _, part_name in part_entries:
+            part_col_set = set(part_cols_map[part_name])
+            target_cols = [c for c in norm_df.columns if str(c) in part_col_set]
+            if not target_cols:
+                continue
+            part_df = norm_df.loc[:, target_cols]
+            chunk_kwargs = _filter_to_sql_chunk_kwargs(self._cfg.pandas_kwargs, part_df.columns)
+            part_df.to_sql(
+                part_name,
+                self.engine,
+                if_exists="append",
+                index=False,
+                **chunk_kwargs,
+            )
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
         """Write a batch of records to the sink."""
@@ -2795,58 +3142,83 @@ class TabularSQLSink(ExportSink):
 
         def execute_export() -> int:
             if_exists = self._initial_if_exists if self._is_first_batch else "append"
-            if (
-                self._is_incremental_sync
-                and self._cfg.idempotent
-                and if_exists == "append"
-                and not isinstance(self.engine, NonCallableMock)
-            ):
-                if self._cfg.as_sdtm:
-                    from sqlalchemy import inspect as sa_inspect
-                    from sqlalchemy import text as sa_text
-
-                    inspector = sa_inspect(self.engine)
-                    if inspector.has_table(self.table):
-                        existing_cols = {c["name"] for c in inspector.get_columns(self.table)}
-                        missing_cols = [c for c in df.columns if c not in existing_cols]
-                        if missing_cols:
-                            preparer = self.engine.dialect.identifier_preparer
-                            q_tbl = preparer.quote(self.table)
-                            with self.engine.begin() as conn:
-                                for col in missing_cols:
-                                    col_sql_type = (
-                                        "BIGINT"
-                                        if self._contract_types.get(str(col)) == "int64"
-                                        or str(col).endswith("SEQ")
-                                        or str(col) == "RECORD_ID"
-                                        else "TEXT"
-                                    )
-                                    conn.execute(
-                                        sa_text(
-                                            f"ALTER TABLE {q_tbl} ADD COLUMN {preparer.quote(str(col))} {col_sql_type}"
-                                        )
-                                    )
-                deleted_by_id = 0
-                for candidate_col in ("recordId", "record_id", "RECORD_ID"):
-                    if candidate_col in df.columns:
-                        ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
-                        deleted_by_id = self._delete_existing_record_ids(ids)
-                        break
-                if deleted_by_id == 0 and self._cfg.as_sdtm:
-                    skeys = [k for k in _df_sdtm_keys(df) if k is not None]
-                    if skeys:
-                        self._delete_existing_sdtm_keys(skeys)
-
             df_str = df.to_csv(index=False)
-            checksum = hashlib.sha256(df_str.encode('utf-8')).hexdigest()
+            checksum = hashlib.sha256(df_str.encode("utf-8")).hexdigest()
 
-            _to_sql_with_chunking(
-                df,
-                self.table,
-                self.engine,
-                if_exists=cast(Literal["fail", "replace", "append", "delete_rows"], if_exists),
-                **self._cfg.pandas_kwargs,
-            )
+            wrote_via_parts = False
+            if if_exists == "append" and not isinstance(self.engine, NonCallableMock):
+                from sqlalchemy import inspect as sa_inspect
+                from sqlalchemy import text as sa_text
+
+                if self._is_incremental_sync and self._cfg.idempotent:
+                    deleted_by_id = 0
+                    for candidate_col in ("recordId", "record_id", "RECORD_ID"):
+                        if candidate_col in df.columns:
+                            ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
+                            deleted_by_id = self._delete_existing_record_ids(ids)
+                            break
+                    if deleted_by_id == 0 and self._cfg.as_sdtm:
+                        skeys = [k for k in _df_sdtm_keys(df) if k is not None]
+                        if skeys:
+                            self._delete_existing_sdtm_keys(skeys)
+
+                inspector = sa_inspect(self.engine)
+                part_entries = (
+                    _list_sql_part_tables(inspector, self.table)
+                    if self.engine.dialect.name == "sqlite"
+                    else []
+                )
+                if part_entries:
+                    self._append_to_existing_part_tables(df, list(part_entries), inspector)
+                    wrote_via_parts = True
+                elif bool(inspector.has_table(self.table)):
+                    existing_cols = {c["name"] for c in inspector.get_columns(self.table)}
+                    missing_cols = [c for c in df.columns if str(c) not in existing_cols]
+                    if (
+                        self.engine.dialect.name == "sqlite"
+                        and missing_cols
+                        and len(existing_cols) + len(missing_cols) > MAX_SQLITE_COLUMNS
+                    ):
+                        preparer = self.engine.dialect.identifier_preparer
+                        q_tbl = preparer.quote(self.table)
+                        prev_df = pd.read_sql(sa_text(f"SELECT * FROM {q_tbl}"), self.engine)
+                        combined_df = (
+                            _concat_tabular_frames([prev_df, df]) if not prev_df.empty else df
+                        )
+                        _to_sql_with_chunking(
+                            combined_df,
+                            self.table,
+                            self.engine,
+                            if_exists="replace",
+                            study_key=self._cfg.study_key,
+                            **self._cfg.pandas_kwargs,
+                        )
+                        wrote_via_parts = True
+                    elif missing_cols:
+                        preparer = self.engine.dialect.identifier_preparer
+                        q_tbl = preparer.quote(self.table)
+                        with self.engine.begin() as conn:
+                            for col in missing_cols:
+                                col_sql_type = _resolve_sql_alter_column_type(
+                                    col,
+                                    df[col],
+                                    self._contract_types,
+                                )
+                                conn.execute(
+                                    sa_text(
+                                        f"ALTER TABLE {q_tbl} ADD COLUMN {preparer.quote(str(col))} {col_sql_type}"
+                                    )
+                                )
+
+            if not wrote_via_parts:
+                _to_sql_with_chunking(
+                    df,
+                    self.table,
+                    self.engine,
+                    if_exists=cast(Literal["fail", "replace", "append", "delete_rows"], if_exists),
+                    study_key=self._cfg.study_key,
+                    **self._cfg.pandas_kwargs,
+                )
 
             rows_loaded = len(df)
             _append_jsonl_manifest(
@@ -3249,13 +3621,26 @@ class _TabularTransformSink(ExportSink):
         sanitize: bool,
         pipeline: EnrichmentPipeline | None = None,
         form_domain_map: Mapping[Any, str] | None = None,
+        refresh_variables_fn: Callable[[], tuple[list[str], dict[str, str], Any] | None]
+        | None = None,
+        refresh_whitelist: Sequence[str] | None = None,
+        use_explicit_refresh_whitelist: bool = False,
     ) -> None:
         super().__init__(config)
         self._inner = inner
         self._mapper = mapper
         self._record_model = record_model
-        self._variable_keys = variable_keys
-        self._label_map = label_map
+        self._variable_keys = list(variable_keys)
+        self._known_var_set: set[str] = set(variable_keys)
+        self._checked_unseen_keys: set[str] = set()
+        effective_wl = (
+            refresh_whitelist if use_explicit_refresh_whitelist else config.variable_whitelist
+        )
+        self._whitelist_set: set[str] | None = (
+            set(effective_wl) if effective_wl is not None else None
+        )
+        self._refresh_variables_fn = refresh_variables_fn
+        self._label_map = dict(label_map)
         self._cfg = config
         self._sanitize = bool(sanitize or config.sanitize)
         self._pipeline = pipeline
@@ -3266,6 +3651,36 @@ class _TabularTransformSink(ExportSink):
         self._record_seqs: dict[str, int] = {}
         self._form_domain_map: dict[Any, str] = dict(form_domain_map) if form_domain_map else {}
         self._meta_cols = {name for name, _ in _RECORD_META_CONTRACT_TYPES}
+
+    def _maybe_refresh_added_variables(self, records: Sequence[Any]) -> None:
+        if self._refresh_variables_fn is None or not records:
+            return
+        unseen: set[str] = set()
+        for rec in records:
+            raw_data = (
+                rec.get("record_data") or rec.get("recordData")
+                if isinstance(rec, Mapping)
+                else getattr(rec, "record_data", None)
+            )
+            if not isinstance(raw_data, Mapping):
+                continue
+            for key in raw_data:
+                if not isinstance(key, str) or key in self._known_var_set:
+                    continue
+                if self._whitelist_set is not None and key not in self._whitelist_set:
+                    continue
+                if key not in self._checked_unseen_keys:
+                    unseen.add(key)
+        if not unseen:
+            return
+        refreshed = self._refresh_variables_fn()
+        if refreshed is not None:
+            new_keys, new_labels, new_model = refreshed
+            self._variable_keys = list(new_keys)
+            self._known_var_set = set(new_keys)
+            self._label_map = dict(new_labels)
+            self._record_model = new_model
+        self._checked_unseen_keys.update(unseen - self._known_var_set)
 
     def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
         if self._cfg.as_sdtm:
@@ -3385,6 +3800,7 @@ class _TabularTransformSink(ExportSink):
             self._sync_active_context_to_inner()
             return self._inner.write_batch(cast(Any, df), batch_id=batch_id)
 
+        self._maybe_refresh_added_variables(records)
         rows, _ = self._mapper._parse_records(records, self._record_model)
         if self._pipeline is not None and not self._has_native_enrichment:
             rows = [self._pipeline.process(r, mask_phi=self._cfg.mask_phi) for r in rows]
@@ -3702,6 +4118,35 @@ def _tabular_export_impl(
     if isinstance(sink, (TabularParquetSink, TabularDuckDBSink, TabularSQLSink)):
         sink.set_contract_types(contract_types)
 
+    refresh_variables_fn: Callable[[], tuple[list[str], dict[str, str], Any] | None] | None = None
+    if not config.as_sdtm and not _is_mock_mapper(mapper):
+
+        def _refresh_study_variables() -> tuple[list[str], dict[str, str], Any] | None:
+            updated_keys, updated_labels = mapper._fetch_variable_metadata(
+                study_key,
+                variable_whitelist=config.variable_whitelist,
+                form_whitelist=effective_form_whitelist,
+            )
+            if not updated_keys:
+                return None
+            updated_raw = mapper._last_variables if hasattr(mapper, "_last_variables") else None
+            updated_contract = _build_tabular_contract_types(
+                updated_keys,
+                updated_labels,
+                updated_raw if isinstance(updated_raw, list) else (),
+                use_labels_as_columns=config.use_labels_as_columns,
+                mask_phi=config.mask_phi,
+                pipeline=pipeline,
+                naming_convention=config.naming_convention,
+                sdtm_domain=config.sdtm_domain,
+            )
+            if isinstance(sink, (TabularParquetSink, TabularDuckDBSink, TabularSQLSink)):
+                sink.set_contract_types(updated_contract)
+            updated_model = mapper._build_record_model(updated_keys, updated_labels)
+            return updated_keys, updated_labels, updated_model
+
+        refresh_variables_fn = _refresh_study_variables
+
     records_source = _make_mapper_records_source(
         sdk,
         study_key,
@@ -3722,6 +4167,7 @@ def _tabular_export_impl(
         sanitize=sanitize,
         pipeline=pipeline,
         form_domain_map=form_domain_map,
+        refresh_variables_fn=refresh_variables_fn,
     )
     written = run_streaming_export(
         sdk,
@@ -4134,11 +4580,33 @@ def export_to_excel(
         else None
     )
     is_incremental_excel = _is_incremental_config(config)
+    target_sheet_name = str(excel_kwargs.get("sheet_name", "Sheet1") or "Sheet1")
 
     def _read_existing_excel(excel_path: str | os.PathLike[str]) -> pd.DataFrame:
-        if not config.as_sdtm:
-            return pd.read_excel(excel_path)
-        prev = pd.read_excel(excel_path, dtype=str)
+        with pd.ExcelFile(excel_path) as xls:
+            if target_sheet_name not in xls.sheet_names:
+                return pd.DataFrame()
+            if not config.as_sdtm:
+                prev = pd.read_excel(
+                    xls,
+                    sheet_name=target_sheet_name,
+                    dtype=object,
+                    keep_default_na=False,
+                    na_values=[""],
+                )
+                for subj_col in ("subjectKey", "subject_key", "Subject Key"):
+                    if subj_col in prev.columns:
+                        prev[subj_col] = prev[subj_col].map(
+                            lambda v: v if (_is_missing_scalar(v) or isinstance(v, str)) else str(v)
+                        )
+                return prev
+            prev = pd.read_excel(
+                xls,
+                sheet_name=target_sheet_name,
+                dtype=str,
+                keep_default_na=False,
+                na_values=[""],
+            )
         for col in prev.columns:
             col_str = str(col)
             if col_str in {"AGE", "RECORD_ID"} or (
@@ -4151,29 +4619,53 @@ def export_to_excel(
                     prev[col] = numeric_series.astype("Int64")
         return prev
 
+    def _atomic_write_excel_sheet(target_df: pd.DataFrame, *, preserve_siblings: bool) -> None:
+        if preserve_siblings:
+            write_kwargs = {k: v for k, v in excel_kwargs.items() if k != "engine"}
+            write_kwargs["sheet_name"] = target_sheet_name
+
+            def _update_existing_workbook(tmp: str) -> None:
+                shutil.copyfile(path, tmp)
+                with pd.ExcelWriter(
+                    tmp,
+                    engine="openpyxl",
+                    mode="a",
+                    if_sheet_exists="replace",
+                ) as writer:
+                    target_df.to_excel(writer, index=False, **write_kwargs)
+
+            _atomic_replace_file(path, _update_existing_workbook, suffix=".xlsx")
+            return
+
+        _atomic_replace_file(
+            path,
+            lambda tmp: target_df.to_excel(tmp, index=False, **excel_kwargs),
+            suffix=".xlsx",
+        )
+
     def _write_or_reconcile_excel(combined: pd.DataFrame, voided_ids: set[str]) -> None:
+        dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
+        has_native_to_excel = getattr(pd.DataFrame.to_excel, "__module__", "").startswith("pandas")
         if not (is_incremental_excel and config.idempotent):
             target = (
                 _build_empty_contract_df(sdtm_contract)
                 if combined.empty and sdtm_contract is not None
                 else combined
             )
-            target.to_excel(path, index=False, **excel_kwargs)
+            if dest_exists and "sheet_name" in excel_kwargs and has_native_to_excel:
+                _atomic_write_excel_sheet(target, preserve_siblings=True)
+            else:
+                target.to_excel(path, index=False, **excel_kwargs)
             return
 
         voided_sdtm = set(sink._voided_sdtm_keys)
-        dest_exists = Path(path).exists() and Path(path).stat().st_size > 0
         if combined.empty and not voided_ids and not voided_sdtm:
             if dest_exists:
                 return
             empty_target = (
                 _build_empty_contract_df(sdtm_contract) if sdtm_contract is not None else combined
             )
-            _atomic_replace_file(
-                path,
-                lambda tmp: empty_target.to_excel(tmp, index=False, **excel_kwargs),
-                suffix=".xlsx",
-            )
+            _atomic_write_excel_sheet(empty_target, preserve_siblings=False)
             return
 
         delta_ids: set[str] = set()
@@ -4252,7 +4744,11 @@ def export_to_excel(
                     for col in cols_needing_mask:
                         prev_kept[col] = MASKED_SENTINEL
             if prev_kept.empty:
-                merged_df = dedup_delta
+                merged_df = (
+                    dedup_delta
+                    if not dedup_delta.empty or len(dedup_delta.columns) > 0
+                    else prev_df.iloc[0:0]
+                )
             elif dedup_delta.empty:
                 merged_df = prev_kept.reset_index(drop=True)
             else:
@@ -4260,10 +4756,9 @@ def export_to_excel(
         else:
             merged_df = dedup_delta
 
-        _atomic_replace_file(
-            path,
-            lambda tmp: merged_df.to_excel(tmp, index=False, **excel_kwargs),
-            suffix=".xlsx",
+        _atomic_write_excel_sheet(
+            merged_df,
+            preserve_siblings=dest_exists and has_native_to_excel,
         )
 
     sink = _TabularCollectingSink(config, _write_or_reconcile_excel, pass_voided_ids=True)
@@ -5637,8 +6132,49 @@ def _enter_form_transform_sink(
     inner_sink: ExportSink,
     form_config: TabularSinkConfig,
     state: _FormExportState,
+    *,
+    study_key: str | None = None,
+    study_variable_whitelist: Sequence[str] | None = None,
 ) -> None:
     """Wrap ``inner_sink`` in ``_TabularTransformSink`` and register it on ``sink_stack``."""
+    refresh_fn: Callable[[], tuple[list[str], dict[str, str], Any] | None] | None = None
+    if study_key and not form_config.as_sdtm and not _is_mock_mapper(state.mapper):
+
+        def _refresh_form_variables() -> tuple[list[str], dict[str, str], Any] | None:
+            wl_list = (
+                list(study_variable_whitelist) if study_variable_whitelist is not None else None
+            )
+            updated_keys, updated_labels = state.mapper._fetch_variable_metadata(
+                study_key,
+                variable_whitelist=wl_list,
+                form_whitelist=[ctx.form_id],
+            )
+            if not updated_keys:
+                return None
+            updated_raw = (
+                state.mapper._last_variables if hasattr(state.mapper, "_last_variables") else None
+            )
+            updated_contract = _build_tabular_contract_types(
+                updated_keys,
+                updated_labels,
+                updated_raw if isinstance(updated_raw, list) else (),
+                use_labels_as_columns=form_config.use_labels_as_columns,
+                mask_phi=form_config.mask_phi,
+                pipeline=state.pipeline,
+                naming_convention=form_config.naming_convention,
+                sdtm_domain=form_config.sdtm_domain,
+            )
+            ctx.variable_keys = list(updated_keys)
+            ctx.label_map = dict(updated_labels)
+            ctx.contract_types = updated_contract
+            if isinstance(inner_sink, (TabularDuckDBSink, TabularSQLSink)):
+                inner_sink.set_contract_types(updated_contract)
+            updated_model = state.mapper._build_record_model(updated_keys, updated_labels)
+            ctx.record_model = updated_model
+            return updated_keys, updated_labels, updated_model
+
+        refresh_fn = _refresh_form_variables
+
     transform_sink = _TabularTransformSink(
         inner_sink,
         state.mapper,
@@ -5648,6 +6184,9 @@ def _enter_form_transform_sink(
         form_config,
         sanitize=False,
         pipeline=state.pipeline,
+        refresh_variables_fn=refresh_fn,
+        refresh_whitelist=study_variable_whitelist,
+        use_explicit_refresh_whitelist=True,
     )
     ctx.sink = sink_stack.enter_context(transform_sink)
 
@@ -5804,7 +6343,15 @@ def export_to_duckdb_by_form(
                     contract_types=ctx.contract_types,
                     conn=conn,
                 )
-                _enter_form_transform_sink(sink_stack, ctx, inner_ddb_sink, form_config, state)
+                _enter_form_transform_sink(
+                    sink_stack,
+                    ctx,
+                    inner_ddb_sink,
+                    form_config,
+                    state,
+                    study_key=study_key,
+                    study_variable_whitelist=config.variable_whitelist,
+                )
 
             on_active_batch, on_voided_batch = _make_form_stream_callbacks(study_key)
 
@@ -5908,9 +6455,7 @@ def export_to_sql_by_form(
     with contextlib.ExitStack() as sink_stack:
         for ctx in contexts:
             form_pandas_kwargs = dict(config.pandas_kwargs)
-            if if_exists is not None and not (
-                config.incremental or config.modified_since is not None
-            ):
+            if if_exists is not None and not is_incremental:
                 form_pandas_kwargs["if_exists"] = if_exists
             form_config = _make_form_sink_config(
                 study_key,
@@ -5920,7 +6465,16 @@ def export_to_sql_by_form(
                 pandas_kwargs=form_pandas_kwargs,
             )
             inner_sql_sink = TabularSQLSink(ctx.form_key, engine, form_config)
-            _enter_form_transform_sink(sink_stack, ctx, inner_sql_sink, form_config, state)
+            inner_sql_sink.set_contract_types(ctx.contract_types)
+            _enter_form_transform_sink(
+                sink_stack,
+                ctx,
+                inner_sql_sink,
+                form_config,
+                state,
+                study_key=study_key,
+                study_variable_whitelist=config.variable_whitelist,
+            )
 
         on_active_batch, on_voided_batch = _make_form_stream_callbacks(study_key)
 
