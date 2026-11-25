@@ -3,6 +3,7 @@
 import functools
 import json
 import re
+from collections.abc import Collection
 from typing import Any
 
 from imednet.errors import ClientError, PathTraversalValidationError
@@ -204,6 +205,23 @@ class SensitivityRegistry:
 
 
 global_sensitivity_registry = SensitivityRegistry()
+
+
+def build_study_sensitivity_registry(
+    custom_phi_keys: Collection[str] | None = None,
+) -> SensitivityRegistry:
+    """Return a SensitivityRegistry combining global rules with *custom_phi_keys*."""
+    if not custom_phi_keys:
+        return global_sensitivity_registry
+    reg = SensitivityRegistry()
+    sens_keys, exempt_keys = global_sensitivity_registry.snapshot()
+    for ex_key in exempt_keys:
+        reg.add_exempt_key(ex_key)
+    for sens_key in sens_keys:
+        reg.add_sensitive_key(sens_key)
+    for custom_key in custom_phi_keys:
+        reg.add_sensitive_key(custom_key)
+    return reg
 
 
 _FORMULA_PREFIX_CHARS = frozenset("=+-@")

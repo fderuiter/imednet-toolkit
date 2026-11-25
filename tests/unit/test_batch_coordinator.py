@@ -1366,3 +1366,228 @@ async def test_batch_coordinator_chunk_two_failure_attaches_committed_jobs_and_b
     assert err_async.committed_jobs == err_async.jobs
     assert err_async.batch_ids == ["ABATCH-1"]
     assert err_async.batch_id == "ABATCH-1"
+
+
+@pytest.mark.asyncio
+async def test_sdk_convenience_batch_validates_study_key_and_dry_run_data_dictionary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sdk.create_records_batch and async_create_records_batch enforce study_key and dry-run DataDictionary parity."""
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    from imednet.core.async_client import AsyncClient
+    from imednet.core.client import Client
+    from imednet.errors.validation import ConfigurationError, PathTraversalValidationError
+    from imednet.sdk_convenience import (
+        _resolve_convenience_schema_adapter,
+        _should_prefer_convenience_poll_many,
+        _validate_convenience_study_key,
+    )
+    from imednet.simulation import SimulationTransport
+
+    sim_transport = SimulationTransport()
+    seen_methods: list[str] = []
+
+    def tracking_sync_handler(req: httpx.Request) -> httpx.Response:
+        seen_methods.append(req.method)
+        return sim_transport.handle_request(req)
+
+    async def tracking_async_handler(req: httpx.Request) -> httpx.Response:
+        seen_methods.append(req.method)
+        return await sim_transport.handle_async_request(req)
+
+    sdk = ImednetSDK(
+        client=Client(
+            api_key="sim-k",  # pragma: allowlist secret
+            security_key="sim-s",  # pragma: allowlist secret
+            base_url="https://edc.sim.imednet.com",
+            transport=httpx.MockTransport(tracking_sync_handler),
+        )
+    )
+    async_sdk = AsyncImednetSDK(
+        async_client=AsyncClient(
+            api_key="sim-k",  # pragma: allowlist secret
+            security_key="sim-s",  # pragma: allowlist secret
+            base_url="https://edc.sim.imednet.com",
+            transport=httpx.MockTransport(tracking_async_handler),
+        )
+    )
+    invalid_records = [
+        {"formKey": "NONEXISTENT_FORM", "subjectKey": "SUB1", "data": {"BAD_VAR": 123}},
+        {"formKey": "F_DM", "subjectKey": "SUB1", "data": {"NONEXISTENT_VAR": "abc"}},
+    ]
+    try:
+        # 1. Invalid study_key rejected before any HTTP call
+        with pytest.raises(PathTraversalValidationError):
+            sdk.create_records_batch("../secret", invalid_records, dry_run=True)
+        with pytest.raises(ConfigurationError):
+            sdk.create_records_batch(None, invalid_records, dry_run=True)  # type: ignore[arg-type]
+        with pytest.raises(PathTraversalValidationError):
+            await async_sdk.async_create_records_batch("../secret", invalid_records, dry_run=True)
+        with pytest.raises(ConfigurationError):
+            await async_sdk.async_create_records_batch(
+                None,
+                invalid_records,
+                dry_run=True,  # type: ignore[arg-type]
+            )
+        assert seen_methods == []
+
+        # 2. Dry-run without explicit schema loads Study DataDictionary and fails invalid Forms/Variables without POSTs
+        sync_conv = sdk.create_records_batch("STUDY", invalid_records, dry_run=True)
+        sync_ep = sdk.records.create_batch("STUDY", invalid_records, dry_run=True)
+        assert sync_conv.dry_run is True
+        assert sync_conv.all_successful is False
+        assert sync_conv.validation_report is not None
+        assert sync_conv.validation_report.is_valid is False
+        assert sync_ep.validation_report is not None
+        assert sync_conv.validation_report.error_count == sync_ep.validation_report.error_count
+        assert "POST" not in seen_methods
+
+        seen_methods.clear()
+        async_conv = await async_sdk.async_create_records_batch(
+            "STUDY", invalid_records, dry_run=True
+        )
+        async_ep = await async_sdk.records.create_batch("STUDY", invalid_records, dry_run=True)
+        assert async_conv.dry_run is True
+        assert async_conv.all_successful is False
+        assert async_conv.validation_report is not None
+        assert async_conv.validation_report.is_valid is False
+        assert async_ep.validation_report is not None
+        assert async_conv.validation_report.error_count == async_ep.validation_report.error_count
+        assert "POST" not in seen_methods
+
+        # 3. Single-job poll_job / async_poll_job mock seam works on 1-chunk convenience batches
+        monkeypatch.setattr(
+            sdk.records,
+            "create",
+            MagicMock(return_value=Job(jobId="J-SINGLE", batchId="B-SINGLE", state="QUEUED")),
+        )
+        mock_poll_job = MagicMock(
+            return_value=JobStatus(jobId="J-SINGLE", batchId="B-SINGLE", state="COMPLETED")
+        )
+        monkeypatch.setattr(sdk, "poll_job", mock_poll_job)
+        single_sync_res = sdk.create_records_batch(
+            "STUDY",
+            [{"formKey": "F_DM", "data": {"V_AGE": 42}}],
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert single_sync_res.all_successful is True
+        mock_poll_job.assert_called_once()
+
+        monkeypatch.setattr(
+            async_sdk.records,
+            "create",
+            AsyncMock(return_value=Job(jobId="AJ-SINGLE", batchId="AB-SINGLE", state="QUEUED")),
+        )
+        mock_apoll_job = AsyncMock(
+            return_value=JobStatus(jobId="AJ-SINGLE", batchId="AB-SINGLE", state="COMPLETED")
+        )
+        monkeypatch.setattr(async_sdk, "async_poll_job", mock_apoll_job)
+        single_async_res = await async_sdk.async_create_records_batch(
+            "STUDY",
+            [{"formKey": "F_DM", "data": {"V_AGE": 42}}],
+            skip_validation=True,
+            wait_for_completion=True,
+        )
+        assert single_async_res.all_successful is True
+        mock_apoll_job.assert_awaited_once()
+
+        # 4. Safe attribute lookup never spawns child MagicMocks on unconfigured mock doubles
+        bare_mock = MagicMock()
+        assert _resolve_convenience_schema_adapter(bare_mock, is_async=False) is None
+        assert _resolve_convenience_schema_adapter(bare_mock, is_async=True) is None
+        assert _should_prefer_convenience_poll_many(bare_mock, is_async=False) is False
+        assert _should_prefer_convenience_poll_many(bare_mock, is_async=True) is False
+        _validate_convenience_study_key(bare_mock, "STUDY_OK")
+        assert object.__getattribute__(bare_mock, "__dict__").get("_mock_children") == {}
+    finally:
+        sdk.close()
+        await async_sdk.aclose()
+
+
+@pytest.mark.asyncio
+async def test_batch_coordinator_fail_fast_chunk_two_preserves_batch_one_completed_and_batch_two_failed() -> (
+    None
+):
+    """When chunk 2 fails under fail_fast=True, partial_summary.jobs keeps BATCH-1 COMPLETED and BATCH-2 FAILED."""
+    from imednet.utils.job_poller import AsyncJobPoller, JobPoller
+
+    records = [{"formKey": "F1", "data": {"v": 1}}, {"formKey": "F1", "data": {"v": 2}}]
+
+    # 1. Sync BatchCoordinator + JobPoller(fail_fast=True)
+    sync_idx = 0
+
+    def submit_sync(_chunk: list[dict[str, Any]]) -> Job:
+        nonlocal sync_idx
+        sync_idx += 1
+        return Job(jobId=f"J-{sync_idx}", batchId=f"BATCH-{sync_idx}", state="QUEUED")
+
+    def get_sync_job(_study_key: str, batch_id: str) -> JobStatus:
+        if batch_id == "BATCH-1":
+            return JobStatus(jobId="J-1", batchId="BATCH-1", state="COMPLETED", progress=100)
+        return JobStatus(jobId="J-2", batchId="BATCH-2", state="FAILED", progress=100)
+
+    sync_poller = JobPoller(get_sync_job)
+    sync_coord = BatchCoordinator(chunk_size=1)
+    with pytest.raises(JobFailedError) as sync_exc_info:
+        sync_coord.submit(
+            "STUDY",
+            records,
+            submit_sync,
+            skip_validation=True,
+            wait_for_completion=True,
+            poll_single=lambda bid, **kw: sync_poller.run("STUDY", bid, interval=0, **kw),
+            poll_many=lambda bids, **kw: sync_poller.poll_many(
+                "STUDY", bids, interval=0, fail_fast=True, **kw
+            ),
+        )
+
+    sync_partial = sync_exc_info.value.partial_summary
+    assert sync_partial is not None
+    assert [(j.batch_id, j.state) for j in sync_partial.jobs] == [
+        ("BATCH-1", "COMPLETED"),
+        ("BATCH-2", "FAILED"),
+    ]
+    assert sync_partial.poll_summary is not None
+    assert "BATCH-2" in sync_partial.poll_summary.failures
+    assert "BATCH-1" not in sync_partial.poll_summary.failures
+
+    # 2. AsyncBatchCoordinator + AsyncJobPoller(fail_fast=True) (without poll_single to exercise attached poll_summary)
+    async_idx = 0
+
+    async def submit_async(_chunk: list[dict[str, Any]]) -> Job:
+        nonlocal async_idx
+        async_idx += 1
+        return Job(jobId=f"AJ-{async_idx}", batchId=f"BATCH-{async_idx}", state="QUEUED")
+
+    async def get_async_job(_study_key: str, batch_id: str) -> JobStatus:
+        if batch_id == "BATCH-1":
+            return JobStatus(jobId="AJ-1", batchId="BATCH-1", state="COMPLETED", progress=100)
+        return JobStatus(jobId="AJ-2", batchId="BATCH-2", state="FAILED", progress=100)
+
+    async_poller = AsyncJobPoller(get_async_job)
+    async_coord = AsyncBatchCoordinator(chunk_size=1)
+    with pytest.raises(JobFailedError) as async_exc_info:
+        await async_coord.submit(
+            "STUDY",
+            records,
+            submit_async,
+            skip_validation=True,
+            wait_for_completion=True,
+            poll_many=lambda bids, **kw: async_poller.async_poll_many(
+                "STUDY", bids, interval=0, fail_fast=True, **kw
+            ),
+        )
+
+    async_partial = async_exc_info.value.partial_summary
+    assert async_partial is not None
+    assert [(j.batch_id, j.state) for j in async_partial.jobs] == [
+        ("BATCH-1", "COMPLETED"),
+        ("BATCH-2", "FAILED"),
+    ]
+    assert async_partial.poll_summary is not None
+    assert "BATCH-2" in async_partial.poll_summary.failures
+    assert "BATCH-1" not in async_partial.poll_summary.failures

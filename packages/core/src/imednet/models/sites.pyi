@@ -10,8 +10,6 @@ from pydantic import Field, field_validator
 
 from imednet.models.base import ImednetBaseModel
 
-def _normalize_status_token(value: str) -> str: ...
-
 class SiteEnrollmentStatus(str, Enum):
     """Normalized enrollment lifecycle statuses for study sites."""
 

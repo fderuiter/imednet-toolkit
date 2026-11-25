@@ -457,3 +457,188 @@ def test_silver_view_deleted_oid_multi_study_and_close_on_exception(tmp_path) ->
         ]
     finally:
         conn.close()
+
+
+def test_duckdb_replace_study_isolation_phi_masking_and_history_transition_diffs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Study-scoped replace, close() idempotency, default PHI masking, and silver_records_history LAG() diffs."""
+    pytest.importorskip("duckdb")
+    from imednet.models.study_config import StudyConfiguration
+
+    study_cfg = StudyConfiguration(studyKey="STUDY_PHI", phiFields=["role"])
+    monkeypatch.setattr(
+        "imednet.integrations.enrichment.resolve_study_configuration",
+        lambda sk: study_cfg if sk == "STUDY_PHI" else None,
+    )
+
+    if True:
+        study_other = [
+            RecordRevision(
+                studyKey="STUDY_KEEP",
+                recordRevisionId=100,
+                recordId=1,
+                recordOid="REC-KEEP",
+                formKey="DM",
+                subjectKey="SUBJ-KEEP",
+                recordRevision=1,
+                dataRevision=1,
+                recordStatus="Record Complete",
+                user="unconfigured_actor",
+                role="CRC",
+                reasonForChange="Unconfigured normal note",
+                deleted=False,
+                dateCreated="2026-01-01T08:00:00Z",
+            )
+        ]
+
+        study_phi_revs = [
+            RecordRevision(
+                studyKey="STUDY_PHI",
+                recordRevisionId=201,
+                recordId=55,
+                recordOid="REC-55",
+                formKey="VS",
+                subjectKey="SUBJ-55",
+                recordRevision=1,
+                dataRevision=1,
+                recordStatus="Record Incomplete",
+                user="crc_actor",
+                role="Secret Coordinator Role",
+                reasonForChange='Initial capture patientName="Jane Hidden"',
+                deleted=False,
+                dateCreated="2026-01-10T09:00:00Z",
+            ),
+            RecordRevision(
+                studyKey="STUDY_PHI",
+                recordRevisionId=202,
+                recordId=55,
+                recordOid="REC-55",
+                formKey="VS",
+                subjectKey="SUBJ-55",
+                recordRevision=2,
+                dataRevision=2,
+                recordStatus="Record Complete",
+                user="crc_actor",
+                role="Secret Coordinator Role",
+                reasonForChange="Updated systolic BP",
+                deleted=False,
+                dateCreated="2026-01-11T09:00:00Z",
+            ),
+            RecordRevision(
+                studyKey="STUDY_PHI",
+                recordRevisionId=203,
+                recordId=55,
+                recordOid="REC-55",
+                formKey="VS",
+                subjectKey="SUBJ-55",
+                recordRevision=3,
+                dataRevision=2,
+                recordStatus="Verified",
+                user="pi_actor",
+                role="Secret PI Role",
+                reasonForChange="21 CFR Part 11 sign-off",
+                deleted=False,
+                dateCreated="2026-01-12T09:00:00Z",
+            ),
+            RecordRevision(
+                studyKey="STUDY_PHI",
+                recordRevisionId=204,
+                recordId=55,
+                recordOid="REC-55",
+                formKey="VS",
+                subjectKey="SUBJ-55",
+                recordRevision=4,
+                dataRevision=2,
+                recordStatus="Verified",
+                user="dm_actor",
+                role="Secret DM Role",
+                reasonForChange="Administrative comment review",
+                deleted=False,
+                dateCreated="2026-01-13T09:00:00Z",
+            ),
+            RecordRevision(
+                studyKey="STUDY_PHI",
+                recordRevisionId=205,
+                recordId=55,
+                recordOid="REC-55",
+                formKey="VS",
+                subjectKey="SUBJ-55",
+                recordRevision=5,
+                dataRevision=2,
+                recordStatus="Verified",
+                user="dm_actor",
+                role="Secret DM Role",
+                reasonForChange="Duplicate visit voided",
+                deleted=True,
+                dateCreated="2026-01-14T09:00:00Z",
+            ),
+        ]
+
+        workflow = DuckDBIngestionWorkflow(MagicMock(), ":memory:")
+        try:
+            with patch.object(
+                DataExtractionWorkflow,
+                "extract_audit_trail",
+                side_effect=[study_other, study_phi_revs],
+            ):
+                assert workflow.ingest_revisions("STUDY_KEEP", mode="append") == 1
+                assert workflow.ingest_revisions("STUDY_PHI", mode="replace") == 5
+
+            # 1. STUDY_KEEP is preserved when STUDY_PHI runs with mode="replace"
+            keep_row = workflow._connection.execute(
+                'SELECT study_key, "user", role, reason_for_change '
+                "FROM bronze_revisions WHERE study_key = 'STUDY_KEEP'"
+            ).fetchone()
+            assert keep_row == (
+                "STUDY_KEEP",
+                "unconfigured_actor",
+                "CRC",
+                "Unconfigured normal note",
+            )
+
+            # 2. Default mask_phi=True masks Study-configured `role` and inline PHI in `reason_for_change`
+            #    while keeping unconfigured `user`, `subject_key`, and `deleted=True` tombstones intact
+            phi_rows = workflow._connection.execute(
+                'SELECT record_revision, subject_key, "user", role, reason_for_change, deleted '
+                "FROM bronze_revisions WHERE study_key = 'STUDY_PHI' ORDER BY record_revision"
+            ).fetchall()
+            assert phi_rows[0][1] == "SUBJ-55"
+            assert phi_rows[0][2] == "crc_actor"
+            assert phi_rows[0][3] == "***MASKED***"
+            assert "Jane Hidden" not in phi_rows[0][4]
+            assert "***MASKED***" in phi_rows[0][4]
+            assert phi_rows[4][5] is True
+
+            # 3. silver_records_history computes accurate LAG() transition diff columns
+            workflow.build_silver_view("STUDY_KEEP")
+            workflow.build_silver_view("STUDY_PHI")
+            diffs = workflow._connection.execute(
+                "SELECT record_revision, prev_record_status, prev_data_revision, prev_deleted, "
+                "data_changed, change_type, is_current "
+                "FROM silver_records_history WHERE study_key = 'STUDY_PHI' ORDER BY record_revision"
+            ).fetchall()
+            assert diffs == [
+                (1, None, None, None, True, "created", False),
+                (2, "Record Incomplete", 1, False, True, "data_updated", False),
+                (3, "Record Complete", 2, False, False, "status_changed", False),
+                (4, "Verified", 2, False, False, "metadata_updated", False),
+                (5, "Verified", 2, False, False, "deleted", True),
+            ]
+
+            # 4. Explicit mask_phi=False preserves raw Study-configured fields when requested
+            with patch.object(
+                DataExtractionWorkflow,
+                "extract_audit_trail",
+                return_value=[study_phi_revs[0]],
+            ):
+                workflow.ingest_revisions("STUDY_PHI", mode="replace", mask_phi=False)
+            unmasked = workflow._connection.execute(
+                "SELECT role, reason_for_change FROM bronze_revisions WHERE study_key = 'STUDY_PHI'"
+            ).fetchone()
+            assert unmasked is not None
+            assert unmasked[0] == "Secret Coordinator Role"
+            assert "Jane Hidden" in unmasked[1]
+        finally:
+            workflow.close()
+            workflow.close()  # Idempotent close()

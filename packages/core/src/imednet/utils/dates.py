@@ -3,15 +3,8 @@
 from __future__ import annotations
 
 import re
-import sys
 from datetime import UTC, date, datetime
 from typing import Any, Literal
-
-# Python 3.11+ supports Z and any precision of fractional seconds in fromisoformat
-_IS_PY311_OR_GREATER = sys.version_info >= (3, 11)
-
-# Pre-compile regex for older python versions
-_ISO8601_FRAC_REGEX = re.compile(r"\.(\d+)(?=[+-]\d{2}:\d{2}|$)")
 
 _MONTHS: dict[str, int] = {
     "JAN": 1,
@@ -52,21 +45,6 @@ def parse_iso_datetime(date_str: str) -> datetime:
     Raises:
         ValueError: If the input string is not a valid ISO format.
     """
-    if _IS_PY311_OR_GREATER:
-        # Python 3.11+ handles Z suffix and arbitrary precision natively
-        return datetime.fromisoformat(date_str)
-
-    if date_str.endswith("Z"):
-        date_str = date_str[:-1] + "+00:00"
-
-    match = _ISO8601_FRAC_REGEX.search(date_str)
-    if match:
-        frac = match.group(1)
-        if 1 <= len(frac) <= 5:
-            date_str = date_str.replace("." + frac, "." + frac.ljust(6, "0"))
-        elif len(frac) > 6:
-            date_str = date_str.replace("." + frac, "." + frac[:6])
-
     return datetime.fromisoformat(date_str)
 
 

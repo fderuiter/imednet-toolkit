@@ -3,19 +3,18 @@
 
 from __future__ import annotations
 
-import re
 from enum import Enum
 from typing import Any
 
 from pydantic import Field, field_validator
 
+from imednet.models._lifecycle import (
+    coerce_field_status,
+    coerce_status,
+    resolve_status_member,
+)
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
-
-
-def _normalize_status_token(value: str) -> str:
-    """Collapse whitespace, underscores, and hyphens into a lowercase token."""
-    return re.sub(r"[\s_-]+", " ", value.strip()).lower()
 
 
 class SiteEnrollmentStatus(str, Enum):
@@ -35,17 +34,7 @@ class SiteEnrollmentStatus(str, Enum):
     @classmethod
     def _missing_(cls, value: object) -> SiteEnrollmentStatus | None:
         """Resolve site enrollment status across case and separator conventions."""
-        if isinstance(value, str):
-            token = _normalize_status_token(value)
-            if not token:
-                return None
-            for member in cls:
-                if (
-                    _normalize_status_token(member.value) == token
-                    or _normalize_status_token(member.name) == token
-                ):
-                    return member
-        return None
+        return resolve_status_member(cls, value)
 
     @property
     def is_eligible(self) -> bool:
@@ -62,14 +51,7 @@ SiteStatusInput = SiteEnrollmentStatus | str | None
 
 def normalize_site_enrollment_status(value: SiteStatusInput) -> SiteStatusInput:
     """Normalize known site enrollment statuses while preserving custom strings."""
-    if value is None or isinstance(value, SiteEnrollmentStatus):
-        return value
-    if isinstance(value, str):
-        try:
-            return SiteEnrollmentStatus(value)
-        except ValueError:
-            return value
-    return str(value)
+    return coerce_status(SiteEnrollmentStatus, value)
 
 
 def is_site_enrollment_eligible(value: SiteEnrollmentStatus | str | None) -> bool:
@@ -98,9 +80,7 @@ class Site(ImednetBaseModel):
         value: Any,
     ) -> SiteEnrollmentStatus | str | None:
         """Normalize known site enrollment statuses and preserve unknown strings."""
-        if value is None or isinstance(value, (SiteEnrollmentStatus, str)):
-            return normalize_site_enrollment_status(value)
-        return normalize_site_enrollment_status(str(value))
+        return coerce_field_status(SiteEnrollmentStatus, value)
 
     @property
     def is_enrollment_open(self) -> bool:

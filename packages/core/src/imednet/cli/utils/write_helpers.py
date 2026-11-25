@@ -20,6 +20,7 @@ from imednet.errors import (
     AuthorizationError,
     ForbiddenError,
     NotFoundError,
+    PathTraversalValidationError,
     RateLimitError,
     UnauthorizedError,
     ValidationError,
@@ -204,7 +205,10 @@ def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSche
     if suffix == ".zip":
         return load_from_csv(path, study_key=study_key)
     if suffix == ".json":
-        return DataDictionary.model_validate_json(path.read_text(encoding="utf-8"))
+        dd = DataDictionary.model_validate_json(path.read_text(encoding="utf-8"))
+        if study_key:
+            dd.metadata.studyKey = study_key
+        return dd
     if suffix == ".xml":
         return load_from_cdisc_odm(path, study_key=study_key)
     if suffix == ".csv":
@@ -870,6 +874,14 @@ def _summary_to_json_item(summary: BatchSubmissionSummary) -> dict[str, Any]:
     return item
 
 
+def _plain_job_state(state: Any) -> str | None:
+    """Return a plain string job state name without Enum ``<JobState.*>`` repr formatting."""
+    if state is None:
+        return None
+    raw_val = getattr(state, "value", state)
+    return str(raw_val)
+
+
 def _format_summary_failure_message(summary: BatchSubmissionSummary) -> str:
     details: list[str] = []
     for job in summary.jobs:
@@ -883,7 +895,7 @@ def _format_summary_failure_message(summary: BatchSubmissionSummary) -> str:
             or bool(res_err)
             or (summary.wait_for_completion and not getattr(sanitized, "is_successful", False))
         ):
-            part = f"{bid} (state={sanitized.state})"
+            part = f"{bid} (state={_plain_job_state(sanitized.state)})"
             if isinstance(failed_count, int) and failed_count > 0:
                 part += f", failed_records={failed_count}"
             if res_err:
@@ -906,7 +918,7 @@ def _render_committed_jobs_table(summary: BatchSubmissionSummary, *, resource: s
         {
             "batch_id": j.batch_id,
             "job_id": j.job_id,
-            "state": j.state,
+            "state": _plain_job_state(j.state),
             "progress": getattr(j, "progress", None),
             "total_records": getattr(j, "total_records", None),
             "failed_records": getattr(j, "failed_records", None),
@@ -931,7 +943,10 @@ def _format_exception_batch_context(partial: BatchSubmissionSummary | None) -> s
     if partial.batch_ids:
         context_parts.append(f"accepted_batches={partial.batch_ids}")
     if partial.poll_summary is not None and partial.poll_summary.terminal_statuses:
-        states = {bid: st.state for bid, st in partial.poll_summary.terminal_statuses.items()}
+        states = {
+            bid: _plain_job_state(st.state)
+            for bid, st in partial.poll_summary.terminal_statuses.items()
+        }
         context_parts.append(f"settled_states={states}")
     if partial.unsubmitted_records:
         context_parts.append(f"unsubmitted_records={len(partial.unsubmitted_records)}")
@@ -1099,6 +1114,9 @@ def execute_cli_write(
             print_error(full_line)
             sys.exit(1)
 
+        if isinstance(exc, PathTraversalValidationError):
+            raise
+
         if isinstance(exc, (ValidationError, ValueError, TypeError)):
             exit_cli_validation_error(
                 exc,
@@ -1156,36 +1174,25 @@ def exit_cli_write_error(
     output_format: str | None = None,
 ) -> NoReturn:
     """Print redacted/PHI-masked batch or job failure diagnostics, emit JSON if needed, and exit 1."""
+    effective_study_key = (
+        study_key
+        or getattr(getattr(exc, "partial_summary", None), "study_key", None)
+        or getattr(getattr(exc, "batch_summary", None), "study_key", None)
+        or ""
+    )
     partial = _extract_failure_summary(
         exc,
-        study_key=study_key or "",
+        study_key=str(effective_study_key),
         dry_run=False,
         skipped_count=skipped_count,
         total_records=total_records,
     )
-    full_line, formatted_err = _format_cli_write_exception(exc, partial=partial)
+    full_line, _ = _format_cli_write_exception(exc, partial=partial)
     print_error(full_line)
-    if resolve_output_format(output_format) == "json":
-        if (
-            partial is not None
-            and study_key is not None
-            and (
-                partial.jobs or partial.unsubmitted_chunks or partial.validation_report is not None
-            )
-        ):
-            emit_json([_summary_to_json_item(partial)], resource, status="failed")
-        else:
-            emit_json(
-                [
-                    {
-                        "studyKey": study_key,
-                        "allSuccessful": False,
-                        "error": formatted_err,
-                        "jobs": [],
-                        "validationReport": None,
-                    }
-                ],
-                resource,
-                status="failed",
-            )
+    if (
+        resolve_output_format(output_format) == "json"
+        and partial is not None
+        and (partial.jobs or partial.unsubmitted_chunks or partial.validation_report is not None)
+    ):
+        emit_json([_summary_to_json_item(partial)], resource, status="failed")
     sys.exit(1)

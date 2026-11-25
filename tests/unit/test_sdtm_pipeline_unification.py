@@ -200,6 +200,8 @@ def _build_stateful_sdtm_sdk(
             elif clause.startswith("formId=="):
                 fid = int(clause.split("==", 1)[1])
                 items = [r for r in items if r.form_id == fid]
+        if kw.get("sort") == "subjectKey,asc;recordId,asc":
+            items.sort(key=lambda r: (str(r.subject_key or ""), int(r.record_id or 0)))
         return iter([r.model_copy(deep=True) for r in items])
 
     sdk = MagicMock()
@@ -1035,13 +1037,14 @@ def test_sink_base_sdtm_lineage_quality_gate_and_filter_branch_helpers(tmp_path:
     assert readiness.warnings  # includes CDASH warning for bad-var!
 
     # apply_quality_gate: disabled schema gate with standards_profile logs CDASH and yields;
-    # enabled schema gate with standards_profile and min_standards_score=None drops low-standards records
+    # enabled schema gate retains schema-valid records when min_standards_score is unset
+    # (decoupled from min_schema_readiness_score) and drops schema-invalid records.
     cfg_cdash_only = SinkConfig(
         study_key="ST", quality_gate_enabled=False, standards_profile="drug"
     )
     assert len(list(apply_quality_gate(MagicMock(), "ST", [obj_rec], cfg_cdash_only))) == 1
 
-    cfg_strict_std = SinkConfig(
+    cfg_schema_only = SinkConfig(
         study_key="ST",
         quality_gate_enabled=True,
         min_schema_readiness_score=95.0,
@@ -1056,8 +1059,32 @@ def test_sink_base_sdtm_lineage_quality_gate_and_filter_branch_helpers(tmp_path:
             form_key="F_AE",
         )
     ]
+    retained = list(
+        apply_quality_gate(MagicMock(), "ST", [obj_rec], cfg_schema_only, variables=vars_ae)
+    )
+    assert len(retained) == 1
+
+    vars_schema_fail = [
+        *vars_ae,
+        Variable(
+            variable_id=2,
+            variable_name="AESEV_NUM",
+            variable_type="integer",
+            form_id=303,
+            form_key="F_AE",
+        ),
+    ]
+    bad_schema_rec = SimpleNamespace(
+        form_key="F_AE",
+        form_id=303,
+        subject_key="S2",
+        record_id=92,
+        record_data={"AETERM": "Fever", "AESEV_NUM": "not_an_int"},
+    )
     dropped = list(
-        apply_quality_gate(MagicMock(), "ST", [obj_rec], cfg_strict_std, variables=vars_ae)
+        apply_quality_gate(
+            MagicMock(), "ST", [bad_schema_rec], cfg_schema_only, variables=vars_schema_fail
+        )
     )
     assert dropped == []
 
@@ -1386,3 +1413,760 @@ def test_parquet_sql_and_json_sdtm_legacy_pruning_and_schema_evolution(tmp_path:
     vs_merged = next(r for r in merged_json if r.get("DOMAIN") == "VS")
     assert dm_merged["SEX"] == "F" and dm_merged["BRTHDTC"] == "1981"
     assert vs_merged["patientName"] == "***MASKED***"
+
+
+def test_mixed_form_sdtm_domain_ae_across_csv_hive_duckdb_neo4j_and_record_mapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 1: Mixed-Form Study with sdtm_domain='AE' emits only AE Records across CSV, Hive Parquet, DuckDB, Neo4j, and RecordMapper."""
+    import imednet_sinks.graph as graph_mod
+    from imednet.models.study_config import MappingRule
+    from imednet_sinks.graph import Neo4jSinkConfig, export_to_neo4j
+    from imednet_workflows.record_mapper import RecordMapper
+
+    study_key = "S_AC1_MIXED_AE"
+    study_cfg = StudyConfiguration(
+        studyKey=study_key,
+        version="1.0.0",
+        reportingProfile="drug",
+        mappings=[
+            MappingRule(
+                sourceFormKey="F_SAFETY_CUSTOM",
+                sourceVariableName="CUSTOM_TERM",
+                domain="AE",
+                targetField="AETERM",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        enrichment_mod,
+        "resolve_study_configuration",
+        lambda sk: study_cfg if sk == study_key else None,
+    )
+
+    forms = [
+        Form(form_id=301, form_key="F_DM", form_name="Demographics", form_type="Enrollment"),
+        Form(form_id=302, form_key="F_VS", form_name="Vital Signs", form_type="Standard"),
+        Form(form_id=303, form_key="F_AE", form_name="Adverse Events", form_type="Standard"),
+        Form(
+            form_id=304,
+            form_key="F_SAFETY_CUSTOM",
+            form_name="Custom Safety Log",
+            form_type="Standard",
+        ),
+    ]
+    variables = [
+        Variable(
+            variable_id=1, variable_name="SEX", variable_type="text", form_id=301, form_key="F_DM"
+        ),
+        Variable(
+            variable_id=2,
+            variable_name="VSTESTCD",
+            variable_type="text",
+            form_id=302,
+            form_key="F_VS",
+        ),
+        Variable(
+            variable_id=3,
+            variable_name="AETERM",
+            variable_type="text",
+            form_id=303,
+            form_key="F_AE",
+        ),
+        Variable(
+            variable_id=4,
+            variable_name="CUSTOM_TERM",
+            variable_type="text",
+            form_id=304,
+            form_key="F_SAFETY_CUSTOM",
+        ),
+    ]
+    upstream = {
+        1: Record(
+            record_id=1,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=301,
+            form_key="F_DM",
+            record_data={"SEX": "F"},
+        ),
+        2: Record(
+            record_id=2,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=302,
+            form_key="F_VS",
+            record_data={"VSTESTCD": "HR"},
+        ),
+        3: Record(
+            record_id=3,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=303,
+            form_key="F_AE",
+            record_data={"AETERM": "Headache"},
+        ),
+        4: Record(
+            record_id=4,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=304,
+            form_key="F_SAFETY_CUSTOM",
+            record_data={"CUSTOM_TERM": "Rash"},
+        ),
+    }
+    sdk = _build_stateful_sdtm_sdk(upstream, forms=forms, variables=variables)
+
+    # Inject a leaked non-AE record even when upstream receives formId, proving local domain filtering
+    orig_side_effect = sdk.records.list.side_effect
+    observed_form_ids: list[Any] = []
+
+    def _leaky_list_records(**kw: Any) -> Any:
+        if "formId" in kw and kw["formId"] is not None:
+            observed_form_ids.append(kw["formId"])
+        matched = list(orig_side_effect(**kw))
+        return iter([upstream[1].model_copy(deep=True), *matched])
+
+    sdk.records.list.side_effect = _leaky_list_records
+
+    csv_path = tmp_path / "ae_only.csv"
+    hive_dir = tmp_path / "ae_hive"
+    ddb_path = tmp_path / "ae_only.duckdb"
+
+    export_to_csv(sdk, study_key, csv_path, sdtm_domain="AE", quality_gate_enabled=False)
+    export_to_hive_parquet(sdk, study_key, hive_dir, sdtm_domain="AE", quality_gate_enabled=False)
+    export_to_duckdb(
+        sdk, study_key, ddb_path, "ae_tbl", sdtm_domain="AE", quality_gate_enabled=False
+    )
+
+    neo4j_calls: list[tuple[str, dict[str, Any]]] = []
+    neo4j_mod = MagicMock()
+    session = MagicMock()
+    session.run.side_effect = lambda q, **p: neo4j_calls.append((q, p)) or MagicMock()
+    session_cm = MagicMock()
+    session_cm.__enter__.return_value = session
+    session_cm.__exit__.return_value = False
+    driver = MagicMock()
+    driver.session.return_value = session_cm
+    neo4j_mod.GraphDatabase.driver.return_value = driver
+    monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+    export_to_neo4j(
+        sdk,
+        study_key,
+        config=Neo4jSinkConfig(
+            study_key=study_key,
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "secret"),
+            as_sdtm=True,
+            sdtm_domain="AE",
+            quality_gate_enabled=False,
+        ),
+    )
+
+    mapper_df = RecordMapper(sdk).sdtm_dataframe(study_key, domain="AE")
+
+    assert observed_form_ids, "Expected upstream formId filtering on Records API calls"
+    csv_df = pd.read_csv(csv_path)
+    assert set(csv_df["DOMAIN"]) == {"AE"}
+    assert len(csv_df) == 2
+
+    hive_df = pd.concat(
+        [pd.read_parquet(f) for f in sorted(hive_dir.rglob("*.parquet"))],
+        ignore_index=True,
+    )
+    assert set(hive_df["DOMAIN"]) == {"AE"}
+    assert len(hive_df) == 2
+
+    with duckdb.connect(str(ddb_path), read_only=True) as dconn:
+        ddb_df = dconn.execute('SELECT * FROM "ae_tbl"').df()
+    assert set(ddb_df["DOMAIN"]) == {"AE"}
+    assert len(ddb_df) == 2
+
+    neo_rows = [row for q, p in neo4j_calls if "MERGE (r:Record" in q for row in p.get("rows", ())]
+    assert len(neo_rows) == 2
+    assert {r["DOMAIN"] for r in neo_rows} == {"AE"}
+
+    assert set(mapper_df["DOMAIN"]) == {"AE"}
+    assert len(mapper_df) == 2
+
+
+def test_cli_export_ae_with_drug_profile_and_validate_standards_exit_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC 2 & AC 3: CLI export csv --sdtm-domain AE --standards-profile drug --min-standards-score 85 exits 0; validate-standards exits 1 when unready."""
+    study_key = "STUDY"
+    valid_sdk = _build_stateful_sdtm_sdk(
+        {
+            1: Record(
+                record_id=1,
+                study_key=study_key,
+                subject_key="S01",
+                form_id=301,
+                form_key="F_DM",
+                record_data={"SEX": "F", "BRTHDTC": "1980-04-12"},
+            ),
+            2: Record(
+                record_id=2,
+                study_key=study_key,
+                subject_key="S01",
+                form_id=303,
+                form_key="F_AE",
+                record_data={
+                    "AETERM": "Headache",
+                    "AEDECOD": "Headache",
+                    "AESEV": "MODERATE",
+                    "AEREL": "RELATED",
+                    "AEACN": "DOSE NOT CHANGED",
+                    "AEOUT": "RECOVERED/RESOLVED",
+                    "AESER": "N",
+                    "AESTDTC": "2026-03-10",
+                },
+            ),
+        },
+        variables=[
+            Variable(
+                variable_id=1,
+                variable_name="SEX",
+                variable_type="text",
+                form_id=301,
+                form_key="F_DM",
+            ),
+            Variable(
+                variable_id=2,
+                variable_name="BRTHDTC",
+                variable_type="text",
+                form_id=301,
+                form_key="F_DM",
+            ),
+            Variable(
+                variable_id=3,
+                variable_name="AETERM",
+                variable_type="text",
+                form_id=303,
+                form_key="F_AE",
+            ),
+            Variable(
+                variable_id=4,
+                variable_name="AEDECOD",
+                variable_type="text",
+                form_id=303,
+                form_key="F_AE",
+            ),
+            Variable(
+                variable_id=5,
+                variable_name="AESEV",
+                variable_type="text",
+                form_id=303,
+                form_key="F_AE",
+            ),
+            Variable(
+                variable_id=6,
+                variable_name="AEREL",
+                variable_type="text",
+                form_id=303,
+                form_key="F_AE",
+            ),
+            Variable(
+                variable_id=7,
+                variable_name="AEACN",
+                variable_type="text",
+                form_id=303,
+                form_key="F_AE",
+            ),
+            Variable(
+                variable_id=8,
+                variable_name="AEOUT",
+                variable_type="text",
+                form_id=303,
+                form_key="F_AE",
+            ),
+            Variable(
+                variable_id=9,
+                variable_name="AESER",
+                variable_type="text",
+                form_id=303,
+                form_key="F_AE",
+            ),
+            Variable(
+                variable_id=10,
+                variable_name="AESTDTC",
+                variable_type="text",
+                form_id=303,
+                form_key="F_AE",
+            ),
+        ],
+    )
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: valid_sdk)
+    monkeypatch.chdir(tmp_path)
+
+    cli_mod.app(
+        [
+            "export",
+            "csv",
+            study_key,
+            "./ae_sdtm.csv",
+            "--sdtm-domain",
+            "AE",
+            "--standards-profile",
+            "drug",
+            "--min-standards-score",
+            "85",
+        ]
+    )
+    capsys.readouterr()
+    exported_df = pd.read_csv(tmp_path / "ae_sdtm.csv")
+    assert list(exported_df["DOMAIN"]) == ["AE"]
+    assert list(exported_df["AESEV"]) == ["MODERATE"]
+
+    # Ready biologic & vaccine validation succeeds without KeyError
+    for profile_name in ("biologic", "vaccine"):
+        cli_mod.app(
+            [
+                "workflows",
+                "validate-standards",
+                study_key,
+                "--profile",
+                profile_name,
+                "--domain",
+                "AE",
+                "--format",
+                "json",
+            ]
+        )
+        out, _ = capsys.readouterr()
+        payload = json.loads(out)["items"][0]
+        assert payload["profile"] == profile_name
+        assert payload["passed"] is True
+
+    # Unready Study exits 1 without --min-score
+    unready_sdk = _build_stateful_sdtm_sdk(
+        {
+            10: Record(
+                record_id=10,
+                study_key=study_key,
+                subject_key="S01",
+                form_id=303,
+                form_key="F_AE",
+                record_data={},
+            )
+        }
+    )
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: unready_sdk)
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.app(["workflows", "validate-standards", study_key, "--profile", "drug"])
+    assert exc_info.value.code == 1
+    capsys.readouterr()
+
+
+def test_drug_safety_profile_aesev_and_empty_cm_lb_ex_mh_and_unconfigured_domain() -> None:
+    """AC 4: DrugSafetyProfile accepts MILD/MODERATE/SEVERE; empty CM/LB/EX/MH do not score 100.0; unconfigured domain returns 0.0 with warning."""
+    from imednet.models.standards import PROFILE_REGISTRY, StandardsReadinessValidator
+
+    drug_validator = StandardsReadinessValidator(profile=PROFILE_REGISTRY.get("drug"))
+    for severity in ("MILD", "MODERATE", "SEVERE"):
+        res = drug_validator.score_records(
+            records_by_domain={
+                "AE": [
+                    {
+                        "subjectKey": "S01",
+                        "aeTerm": "Nausea",
+                        "aeDecod": "Nausea",
+                        "aeSeverity": severity,
+                        "aeRelationship": "RELATED",
+                        "aeActionTaken": "DOSE NOT CHANGED",
+                        "aeOutcome": "RECOVERED/RESOLVED",
+                    }
+                ]
+            }
+        )
+        assert res.score == 100.0
+        assert res.is_ready is True
+
+    for profile_name in ("drug", "biologic", "vaccine"):
+        validator = StandardsReadinessValidator(profile=PROFILE_REGISTRY.get(profile_name))
+        for domain in ("CM", "LB", "EX", "MH"):
+            empty_record_res = validator.score_records(records_by_domain={domain: [{}]})
+            assert empty_record_res.score < 100.0
+            assert empty_record_res.is_ready is False
+
+    unconfigured_res = drug_validator.score_records(
+        records_by_domain={"ZZ": [{"subjectKey": "S01", "FOO": "BAR"}]}
+    )
+    assert unconfigured_res.score == 0.0
+    assert unconfigured_res.is_ready is False
+    assert unconfigured_res.warnings
+
+
+def test_evaluate_standards_readiness_study_config_and_decoupled_quality_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 5: evaluate_standards_readiness applies committed StudyConfiguration; apply_quality_gate retains schema-valid Records when min_standards_score is unset."""
+    from imednet.errors import ExportError
+    from imednet.integrations.sink_base import (
+        SinkConfig,
+        apply_quality_gate,
+        evaluate_standards_readiness,
+    )
+    from imednet.models.study_config import MappingRule
+
+    study_key = "S_AC5_CFG"
+    study_cfg = StudyConfiguration(
+        studyKey=study_key,
+        version="1.0.0",
+        reportingProfile="drug",
+        terminologyLookups={"aeSeverity": {"2": "MODERATE"}},
+        mappings=[
+            MappingRule(
+                sourceFormKey="F_CUSTOM_SAFETY",
+                sourceVariableName="RAW_EVENT",
+                domain="AE",
+                targetField="aeTerm",
+            ),
+            MappingRule(
+                sourceFormKey="F_CUSTOM_SAFETY",
+                sourceVariableName="RAW_DECOD",
+                domain="AE",
+                targetField="aeDecod",
+            ),
+            MappingRule(
+                sourceFormKey="F_CUSTOM_SAFETY",
+                sourceVariableName="RAW_SEV",
+                domain="AE",
+                targetField="aeSeverity",
+            ),
+            MappingRule(
+                sourceFormKey="F_CUSTOM_SAFETY",
+                sourceVariableName="RAW_REL",
+                domain="AE",
+                targetField="aeRelationship",
+            ),
+            MappingRule(
+                sourceFormKey="F_CUSTOM_SAFETY",
+                sourceVariableName="RAW_ACTION",
+                domain="AE",
+                targetField="aeActionTaken",
+            ),
+            MappingRule(
+                sourceFormKey="F_CUSTOM_SAFETY",
+                sourceVariableName="RAW_OUT",
+                domain="AE",
+                targetField="aeOutcome",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        enrichment_mod,
+        "resolve_study_configuration",
+        lambda sk: study_cfg if sk == study_key else None,
+    )
+
+    mapped_rec = Record(
+        record_id=1,
+        study_key=study_key,
+        subject_key="S01",
+        form_id=410,
+        form_key="F_CUSTOM_SAFETY",
+        record_data={
+            "RAW_EVENT": "Headache",
+            "RAW_DECOD": "Headache",
+            "RAW_SEV": "2",
+            "RAW_REL": "RELATED",
+            "RAW_ACTION": "NONE",
+            "RAW_OUT": "RECOVERED/RESOLVED",
+        },
+    )
+    report = evaluate_standards_readiness(
+        [mapped_rec],
+        study_key=study_key,
+        config=SinkConfig(study_key=study_key, standards_profile="drug"),
+    )
+    assert report.score == 100.0
+    assert report.is_ready is True
+
+    # Schema-valid AE Record missing required drug-profile AE fields is retained when min_standards_score is unset
+    schema_valid_rec = Record(
+        record_id=2,
+        study_key="S_GATE",
+        subject_key="S01",
+        form_id=303,
+        form_key="F_AE",
+        record_data={"AETERM": "Mild Rash"},
+    )
+    sdk = _build_stateful_sdtm_sdk({2: schema_valid_rec})
+    retained = list(
+        apply_quality_gate(
+            sdk,
+            "S_GATE",
+            [schema_valid_rec],
+            SinkConfig(
+                study_key="S_GATE",
+                quality_gate_enabled=True,
+                min_schema_readiness_score=80.0,
+                standards_profile="drug",
+                min_standards_score=None,
+            ),
+        )
+    )
+    assert len(retained) == 1
+
+    with pytest.raises(ExportError):
+        export_to_csv(
+            sdk,
+            "S_GATE",
+            tmp_path / "gate_fail.csv",
+            sdtm_domain="AE",
+            standards_profile="drug",
+            min_standards_score=95.0,
+        )
+
+
+def test_out_of_order_records_chronological_seq_across_batch_and_chunk_sizes_and_bounded_streaming(
+    tmp_path: Path,
+) -> None:
+    """AC 6 & Req 3/4: Out-of-order mixed-Form Records assign identical chronological <DOM>SEQ across batch_size=1, chunk_size=1, and batch_size=100, and stream 1 Subject in memory."""
+    from imednet.integrations.enrichment import CentralizedMapper
+    from imednet.integrations.sink_base import ExportSink, SinkConfig, run_streaming_export
+    from imednet.models.sdtm import iter_subject_ordered_sdtm_records
+
+    study_key = "S_AC6_SEQ"
+    # Mixed-Form, out-of-order timestamps & recordIds across S02 and S01 (with F_DM first so records[0] is DM)
+    upstream = {
+        10: Record(
+            record_id=10,
+            study_key=study_key,
+            subject_key="S02",
+            form_id=301,
+            form_key="F_DM",
+            date_created=datetime(2026, 5, 1, 9, 0, tzinfo=UTC),
+            record_data={"SEX": "M", "BRTHDTC": "1975-02-03"},
+        ),
+        30: Record(
+            record_id=30,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=303,
+            form_key="F_AE",
+            date_created=datetime(2026, 5, 3, 12, 0, tzinfo=UTC),
+            record_data={"AETERM": "Third chronologically", "AESTDTC": "2026-05-03"},
+        ),
+        20: Record(
+            record_id=20,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=303,
+            form_key="F_AE",
+            date_created=datetime(2026, 5, 1, 8, 0, tzinfo=UTC),
+            record_data={"AETERM": "First chronologically", "AESTDTC": "2026-05-01"},
+        ),
+        25: Record(
+            record_id=25,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=302,
+            form_key="F_VS",
+            date_created=datetime(2026, 5, 2, 10, 0, tzinfo=UTC),
+            record_data={"VSTESTCD": "HR", "VSORRES": 72},
+        ),
+        22: Record(
+            record_id=22,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=303,
+            form_key="F_AE",
+            date_created=datetime(2026, 5, 2, 8, 0, tzinfo=UTC),
+            record_data={"AETERM": "Second chronologically", "AESTDTC": "2026-05-02"},
+        ),
+    }
+    sdk = _build_stateful_sdtm_sdk(upstream)
+
+    csv_b1 = tmp_path / "b1.csv"
+    csv_b100 = tmp_path / "b100.csv"
+    export_to_csv(sdk, study_key, csv_b1, as_sdtm=True, batch_size=1, quality_gate_enabled=False)
+    export_to_csv(
+        sdk, study_key, csv_b100, as_sdtm=True, batch_size=100, quality_gate_enabled=False
+    )
+
+    df_csv_b1 = pd.read_csv(csv_b1)
+    df_csv_b100 = pd.read_csv(csv_b100)
+    ae_b1 = df_csv_b1[df_csv_b1["DOMAIN"] == "AE"].sort_values("AESEQ")
+    ae_b100 = df_csv_b100[df_csv_b100["DOMAIN"] == "AE"].sort_values("AESEQ")
+    assert list(ae_b1["AESEQ"].astype(int)) == [1, 2, 3]
+    assert list(ae_b1["AETERM"]) == [
+        "First chronologically",
+        "Second chronologically",
+        "Third chronologically",
+    ]
+    assert list(ae_b1["AETERM"]) == list(ae_b100["AETERM"])
+    assert set(df_csv_b1["DOMAIN"]) == {"DM", "VS", "AE"}
+
+    hive_c1 = tmp_path / "hive_c1"
+    hive_c100 = tmp_path / "hive_c100"
+    export_to_hive_parquet(
+        sdk, study_key, hive_c1, as_sdtm=True, chunk_size=1, quality_gate_enabled=False
+    )
+    export_to_hive_parquet(
+        sdk, study_key, hive_c100, as_sdtm=True, chunk_size=100, quality_gate_enabled=False
+    )
+    df_hive_c1 = pd.concat(
+        [pd.read_parquet(f) for f in sorted(hive_c1.rglob("*.parquet"))], ignore_index=True
+    )
+    df_hive_c100 = pd.concat(
+        [pd.read_parquet(f) for f in sorted(hive_c100.rglob("*.parquet"))], ignore_index=True
+    )
+    ae_h1 = df_hive_c1[df_hive_c1["DOMAIN"] == "AE"].sort_values("AESEQ")
+    ae_h100 = df_hive_c100[df_hive_c100["DOMAIN"] == "AE"].sort_values("AESEQ")
+    assert list(ae_h1["AESEQ"].astype(int)) == [1, 2, 3]
+    assert list(ae_h1["AETERM"]) == list(ae_h100["AETERM"])
+
+    # CentralizedMapper + run_streaming_export equivalence between batch_size=1 and batch_size=100
+    class _CaptureSink(ExportSink):
+        def __init__(self, cfg: SinkConfig) -> None:
+            super().__init__(cfg)
+            self.cfg = cfg
+            self.mapper = CentralizedMapper(
+                naming_convention="sdtm",
+                as_sdtm=True,
+                preserve_record_id=True,
+            )
+            self.rows: list[dict[str, Any]] = []
+
+        def write_batch(self, records: Any, *, batch_id: str) -> int:
+            mapped = self.mapper.map_batch(list(records), study_key=study_key)
+            self.rows.extend(mapped)
+            return len(mapped)
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    sink_b1 = _CaptureSink(
+        SinkConfig(study_key=study_key, as_sdtm=True, batch_size=1, quality_gate_enabled=False)
+    )
+    sink_b100 = _CaptureSink(
+        SinkConfig(study_key=study_key, as_sdtm=True, batch_size=100, quality_gate_enabled=False)
+    )
+    run_streaming_export(sdk, study_key, sink_b1, sink_b1.cfg)
+    run_streaming_export(sdk, study_key, sink_b100, sink_b100.cfg)
+    ae_stream_b1 = sorted(
+        [r for r in sink_b1.rows if r["DOMAIN"] == "AE"], key=lambda r: int(r["AESEQ"])
+    )
+    ae_stream_b100 = sorted(
+        [r for r in sink_b100.rows if r["DOMAIN"] == "AE"], key=lambda r: int(r["AESEQ"])
+    )
+    assert [int(r["AESEQ"]) for r in ae_stream_b1] == [1, 2, 3]
+    assert [r["AETERM"] for r in ae_stream_b1] == [r["AETERM"] for r in ae_stream_b100]
+
+    # Bounded 1-Subject streaming memory check when source_is_ordered=True
+    pulled_subjects: list[str] = []
+
+    def _subject_sorted_upstream() -> Any:
+        ordered = [
+            Record(
+                record_id=2,
+                study_key=study_key,
+                subject_key="S01",
+                form_id=303,
+                form_key="F_AE",
+                date_created=datetime(2026, 5, 2, tzinfo=UTC),
+                record_data={"AETERM": "Later"},
+            ),
+            Record(
+                record_id=1,
+                study_key=study_key,
+                subject_key="S01",
+                form_id=303,
+                form_key="F_AE",
+                date_created=datetime(2026, 5, 1, tzinfo=UTC),
+                record_data={"AETERM": "Earlier"},
+            ),
+            Record(
+                record_id=3,
+                study_key=study_key,
+                subject_key="S02",
+                form_id=303,
+                form_key="F_AE",
+                date_created=datetime(2026, 5, 1, tzinfo=UTC),
+                record_data={"AETERM": "Subject2"},
+            ),
+            Record(
+                record_id=4,
+                study_key=study_key,
+                subject_key="S03",
+                form_id=303,
+                form_key="F_AE",
+                date_created=datetime(2026, 5, 1, tzinfo=UTC),
+                record_data={"AETERM": "Subject3"},
+            ),
+        ]
+        for rec in ordered:
+            assert rec.subject_key is not None
+            pulled_subjects.append(rec.subject_key)
+            yield rec
+
+    stream_iter = iter_subject_ordered_sdtm_records(
+        _subject_sorted_upstream(),
+        study_key=study_key,
+        source_is_ordered=True,
+    )
+    first_emitted = next(stream_iter)
+    second_emitted = next(stream_iter)
+    assert first_emitted.record_id == 1
+    assert second_emitted.record_id == 2
+    assert "S03" not in pulled_subjects, "Bounded streaming must flush S01 before pulling S03"
+
+
+def test_enrichment_pipeline_cross_domain_composite_keys_and_fallback_values() -> None:
+    """AC 9: EnrichmentPipeline indexes rules by (domain, source_form_key, source_variable_name) and applies fallback_value on missing/empty inputs."""
+    from imednet.integrations.enrichment import EnrichmentPipeline
+    from imednet.models.study_config import MappingRule
+
+    cfg = StudyConfiguration(
+        studyKey="S_ENRICH",
+        version="1.0.0",
+        reportingProfile="general",
+        mappings=[
+            MappingRule(
+                sourceFormKey="F_AE",
+                sourceVariableName="RAW_TEXT",
+                domain="AE",
+                targetField="AETERM",
+                fallbackValue="UNSPECIFIED_AE",
+            ),
+            MappingRule(
+                sourceFormKey="F_CM",
+                sourceVariableName="RAW_TEXT",
+                domain="CM",
+                targetField="CMTRT",
+                fallbackValue="UNSPECIFIED_CM",
+            ),
+        ],
+    )
+    pipeline = EnrichmentPipeline(config=cfg)
+
+    # Cross-domain rules sharing RAW_TEXT do not collide
+    ae_present = pipeline.process(
+        {"formKey": "F_AE", "subjectKey": "S01", "RAW_TEXT": "Migraine"},
+        domain="AE",
+    )
+    cm_present = pipeline.process(
+        {"formKey": "F_CM", "subjectKey": "S01", "RAW_TEXT": "Ibuprofen"},
+        domain="CM",
+    )
+    assert ae_present["AETERM"] == "Migraine" and "CMTRT" not in ae_present
+    assert cm_present["CMTRT"] == "Ibuprofen" and "AETERM" not in cm_present
+
+    # Missing, None, empty string, and whitespace-only inputs receive fallback_value
+    for empty_payload in (
+        {"formKey": "F_AE", "subjectKey": "S01"},
+        {"formKey": "F_AE", "subjectKey": "S01", "RAW_TEXT": None},
+        {"formKey": "F_AE", "subjectKey": "S01", "RAW_TEXT": ""},
+        {"formKey": "F_AE", "subjectKey": "S01", "RAW_TEXT": "   "},
+    ):
+        enriched = pipeline.process(dict(empty_payload), domain="AE")
+        assert enriched["AETERM"] == "UNSPECIFIED_AE"

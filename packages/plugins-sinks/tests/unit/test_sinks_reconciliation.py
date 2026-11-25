@@ -223,6 +223,117 @@ def test_snowflake_incremental_streaming_and_reconciliation(
         assert idemp_sink.reconcile_deleted([{"no_id": True}], batch_id="noid") == 0
 
 
+def test_snowflake_reconcile_deleted_skips_missing_table_and_tracks_ensured_tables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SnowflakeExportSink checks INFORMATION_SCHEMA before DELETE FROM on voided-first streams and caches ensured tables."""
+    import re
+
+    sf_mod = MagicMock()
+    cursor = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    sf_mod.connect.return_value = conn
+
+    def _dep(pkg: str, _extra: str) -> Any:
+        if pkg == "snowflake.connector":
+            return sf_mod
+        if "parquet" in pkg:
+            return pq
+        return pa
+
+    monkeypatch.setattr(wh_mod, "_require_optional_dep", _dep)
+
+    table_cols: dict[tuple[str, str], list[str]] = {
+        ("STUDY_SCHEMA", "RECORDS"): ["STUDY_KEY", "RECORD_ID"]
+    }
+    executed_sqls: list[tuple[str, Any]] = []
+
+    def _exec(sql: str, params: Any = None) -> None:
+        executed_sqls.append((sql, params))
+        if "INFORMATION_SCHEMA.COLUMNS" in sql:
+            assert "UPPER(" not in sql
+            m_schema = re.search(r"TABLE_SCHEMA = '([^']+)'", sql)
+            m_table = re.search(r"TABLE_NAME = '([^']+)'", sql)
+            assert m_schema is not None and m_table is not None
+            cols = table_cols.get((m_schema.group(1), m_table.group(1)), [])
+            cursor.fetchall.return_value = [(c,) for c in cols]
+        elif sql.startswith("CREATE TABLE IF NOT EXISTS"):
+            table_cols[("study_schema", "Records")] = ["STUDY_KEY", "RECORD_ID"]
+            cursor.fetchall.return_value = []
+        elif sql.startswith("DELETE FROM"):
+            if ("study_schema", "Records") not in table_cols:
+                raise RuntimeError("SQL compilation error: Object does not exist")
+            cursor.fetchall.return_value = []
+        else:
+            cursor.fetchall.return_value = []
+
+    cursor.execute.side_effect = _exec
+
+    voided_first = _record(401, deleted=True, date_modified="2026-04-12T10:00:00Z")
+    active_mid = _record(402, deleted=False, date_modified="2026-04-12T10:05:00Z")
+    voided_after = _record(403, deleted=True, date_modified="2026-04-12T10:10:00Z")
+
+    # 1. Voided-only incremental stream on missing table skips DELETE FROM and commits checkpoint
+    ledger = ExtractionStateLedger(ledger_path=tmp_path / "sf_missing_tbl.json")
+    cfg = SnowflakeSinkConfig(
+        study_key="S-MISS",
+        account="acct",
+        user="usr",
+        password="pwd",  # pragma: allowlist secret
+        database="DB",
+        schema="study_schema",
+        warehouse="WH",
+        stage="STG",
+        table="Records",
+        batch_size=1,
+        incremental=True,
+        state_provider=ledger,
+    )
+    sdk_void_only = MagicMock()
+    sdk_void_only.records.list.side_effect = lambda **_kw: iter([voided_first])
+    assert export_to_snowflake(sdk_void_only, "S-MISS", config=cfg) == 0
+    assert not any("DELETE FROM" in s for s, _ in executed_sqls)
+    assert ledger.get_last_timestamp("S-MISS", "snowflake_Records") == datetime(
+        2026, 4, 12, 10, 0, tzinfo=timezone.utc
+    )
+
+    # 2. Voided-first -> active -> voided-after: first reconcile skips, active creates & caches, second reconcile deletes
+    executed_sqls.clear()
+    sdk_mixed = MagicMock()
+    sdk_mixed.records.list.side_effect = lambda **_kw: iter(
+        [voided_first, active_mid, voided_after]
+    )
+    assert export_to_snowflake(sdk_mixed, "S-MISS", config=cfg) == 1
+    deletes = [(s, p) for s, p in executed_sqls if s.startswith("DELETE FROM")]
+    assert len(deletes) == 1
+    assert deletes[0][1] == ["S-MISS", 403]
+    # Only 2 INFORMATION_SCHEMA queries ran (initial missing-table check + _ensure_table_schema);
+    # the post-create reconcile_deleted used self._ensured_tables without a third check.
+    info_checks = [s for s, _ in executed_sqls if "INFORMATION_SCHEMA.COLUMNS" in s]
+    assert len(info_checks) == 2
+
+    # 3. Snapshot SDTM reconcile_deleted also skips missing table cleanly
+    table_cols.pop(("study_schema", "Records"), None)
+    executed_sqls.clear()
+    sdtm_snap_cfg = SnowflakeSinkConfig(
+        study_key="S-MISS",
+        account="acct",
+        user="usr",
+        password="pwd",  # pragma: allowlist secret
+        database="DB",
+        schema="study_schema",
+        warehouse="WH",
+        stage="STG",
+        table="Records",
+        as_sdtm=True,
+        sdtm_domain="DM",
+    )
+    with SnowflakeExportSink(sdtm_snap_cfg) as sdtm_sink:
+        assert sdtm_sink.reconcile_deleted([voided_first], batch_id="sdtm_miss") == 0
+    assert not any("DELETE FROM" in s for s, _ in executed_sqls)
+
+
 def test_snowflake_direct_write_batch_tombstone_vs_reconcile_and_sdtm_hard_delete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -636,14 +747,15 @@ def test_sinks_incremental_sdtm_lineage_study_isolation_and_rollback(
     assert ("STUDY_A", 1) in neo_nodes and ("STUDY_B", 1) not in neo_nodes
     assert ("STUDY_A", 1) in sf_rows and ("STUDY_B", 1) not in sf_rows
 
-    # Boundary record 2 updated in place with stable AESEQ=2; new record 3 received monotonic AESEQ=3!
+    # Subject-sorted batch_size=1 orders "Fever" (RECORD_ID=2 -> AESEQ=1) before "Mild Rash"
+    # (RECORD_ID=1 -> AESEQ=2, voided in Run 2); boundary record 2 keeps AESEQ=1 and record 3 gets AESEQ=3!
     for store_row2, store_row3 in (
         (mongo_docs["STUDY_B/2"], mongo_docs["STUDY_B/3"]),
         (neo_nodes[("STUDY_B", 2)], neo_nodes[("STUDY_B", 3)]),
         (sf_rows[("STUDY_B", 2)], sf_rows[("STUDY_B", 3)]),
     ):
         assert store_row2["AETERM"] == "Moderate Fever"
-        assert int(store_row2["AESEQ"]) == 2
+        assert int(store_row2["AESEQ"]) == 1
         assert store_row3["AETERM"] == "Chills"
         assert int(store_row3["AESEQ"]) == 3
 

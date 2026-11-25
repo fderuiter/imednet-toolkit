@@ -661,14 +661,16 @@ def parse_filter_expressions(
     model: type[Any] | None = None,
     allowed_attributes: Collection[str] | None = None,
     allow_regex: bool = False,
+    multi_bound_attributes: Collection[str] | None = None,
 ) -> dict[str, Any]:
     """Parse multiple filter expressions into a filter dictionary.
 
     Supports compound ``;`` (AND) and ``,`` (OR) expressions, quote-aware
     values, endpoint ``allowed_attributes`` allowlists, and resource ``model``
     scalar coercion. Duplicate attributes in ``;`` (AND) clauses are rejected
-    after normalizing ``snake_case`` to ``camelCase``. Comma-separated OR
-    expressions return ``{"filter": formatted_or_string}``.
+    after normalizing ``snake_case`` to ``camelCase`` unless listed in
+    ``multi_bound_attributes`` (which accumulate into ``list[tuple[str, Any]]``).
+    Comma-separated OR expressions return ``{"filter": formatted_or_string}``.
     """
     for arg in expressions:
         if not isinstance(arg, str) or not arg or not arg.strip():
@@ -707,7 +709,13 @@ def parse_filter_expressions(
             raise ValueError(f"Invalid filter format: '{raw_arg}'. {exc}") from exc
         return {"filter": formatted}
 
+    multi_bound_set = (
+        frozenset(_snake_to_camel(attr) for attr in multi_bound_attributes)
+        if multi_bound_attributes
+        else frozenset()
+    )
     filter_dict: dict[str, Any] = {}
+    canonical_to_key: dict[str, str] = {}
     seen_and_keys: set[str] = set()
     for expr in expressions:
         for clause in _split_outside_quotes(expr, ";"):
@@ -720,11 +728,26 @@ def parse_filter_expressions(
             )
             canonical_key = _snake_to_camel(key)
             if canonical_key in seen_and_keys:
-                raise ValueError(
-                    f"Invalid filter format: '{expr}'. "
-                    f"Duplicate filter attribute '{canonical_key}' in AND clause."
-                )
+                if canonical_key not in multi_bound_set:
+                    raise ValueError(
+                        f"Invalid filter format: '{expr}'. "
+                        f"Duplicate filter attribute '{canonical_key}' in AND clause."
+                    )
+                prev_key = canonical_to_key[canonical_key]
+                prev_val = filter_dict.pop(prev_key)
+                next_tuple = ("==", val) if op == "=" else (op, val)
+                if isinstance(prev_val, list):
+                    prev_list = list(prev_val)
+                elif isinstance(prev_val, tuple):
+                    prev_list = [prev_val]
+                else:
+                    prev_list = [("==", prev_val)]
+                prev_list.append(next_tuple)
+                filter_dict[canonical_key] = prev_list
+                canonical_to_key[canonical_key] = canonical_key
+                continue
             seen_and_keys.add(canonical_key)
+            canonical_to_key[canonical_key] = key
             filter_dict[key] = val if op == "=" else (op, val)
     return filter_dict
 
@@ -933,14 +956,27 @@ def build_filter_string(
     return result
 
 
+from ._revision_filters import (
+    REVISION_DATE_ATTRIBUTES,
+    matches_revision_date_bound,
+    matches_revision_date_bounds,
+    parse_revision_timestamp_utc,
+    split_revision_date_bounds,
+)
+
 __all__ = [
     "ALLOWED_OPERATORS",
     "ORDERED_FILTER_OPERATORS",
     "RECORD_DATA_OPERATORS",
+    "REVISION_DATE_ATTRIBUTES",
     "build_filter_string",
     "extract_filter_attributes",
+    "matches_revision_date_bound",
+    "matches_revision_date_bounds",
     "parse_filter_expression",
     "parse_filter_expressions",
+    "parse_revision_timestamp_utc",
+    "split_revision_date_bounds",
     "validate_connector_exclusivity",
     "validate_filter_key",
     "validate_filter_operator",

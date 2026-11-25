@@ -33,9 +33,11 @@ from imednet.spi.models import (
     transform_records_to_sdtm as _core_transform_records_to_sdtm,
 )
 from imednet.spi.sink_base import (
+    build_form_sdtm_domain_map,
     extract_record_form_ref,
     filter_forms_by_sdtm_domain,
     is_record_deleted,
+    record_matches_sdtm_domain,
 )
 from imednet.spi.utils import (
     CompiledRecordPredicate,
@@ -1536,18 +1538,26 @@ class RecordMapper:
         allowed_vars: set[str],
     ) -> Iterator[Any]:
         """Lazily project ``record_data`` dictionaries down to ``allowed_vars``."""
+        keep_visit = bool(allowed_vars & {"VISITNUM", "visit_id", "visitId", "VISIT_ID"})
         for rec in records:
             rec_data = getattr(rec, "record_data", None)
             if hasattr(rec, "model_copy") and isinstance(rec_data, dict):
-                yield rec.model_copy(
-                    update={"record_data": {k: v for k, v in rec_data.items() if k in allowed_vars}}
-                )
+                updates: dict[str, Any] = {
+                    "record_data": {k: v for k, v in rec_data.items() if k in allowed_vars}
+                }
+                if not keep_visit and hasattr(rec, "visit_id"):
+                    updates["visit_id"] = None
+                yield rec.model_copy(update=updates)
             elif isinstance(rec, dict):
                 copied = dict(rec)
                 if isinstance(copied.get("record_data"), dict):
                     copied["record_data"] = {
                         k: v for k, v in copied["record_data"].items() if k in allowed_vars
                     }
+                if not keep_visit:
+                    copied.pop("visit_id", None)
+                    copied.pop("visitId", None)
+                    copied.pop("VISITNUM", None)
                 yield copied
             else:
                 yield rec
@@ -1575,14 +1585,21 @@ class RecordMapper:
         allowed_vars: set[str] | None = None
         if variable_whitelist is not None:
             allowed_vars = set(variable_whitelist)
-            if pipeline is not None and pipeline.mappings:
-                for src_var, rule in pipeline.mappings.items():
-                    if rule.target_field in allowed_vars:
-                        allowed_vars.add(src_var)
+            if pipeline is not None:
+                all_rules = getattr(pipeline, "all_mappings", None)
+                if isinstance(all_rules, list) and all_rules:
+                    for rule in all_rules:
+                        if rule.target_field in allowed_vars:
+                            allowed_vars.add(rule.source_variable_name)
+                elif pipeline.mappings:
+                    for src_var, rule in pipeline.mappings.items():
+                        if rule.target_field in allowed_vars:
+                            allowed_vars.add(src_var)
 
         extra_filters: dict[str, Any] = {}
         matched_form_ids: set[int] | None = None
         matched_form_keys: set[str] | None = None
+        form_domain_map: dict[Any, str] = {}
         if form_whitelist is not None:
             if len(form_whitelist) == 0:
                 return
@@ -1590,42 +1607,46 @@ class RecordMapper:
             matched_form_ids = set(form_whitelist)
         else:
             study_forms = self._try_fetch_study_forms_for_sdtm(study_key)
+            form_domain_map = build_form_sdtm_domain_map(study_forms, study_key=study_key)
             if study_forms:
-                matched_forms = filter_forms_by_sdtm_domain(study_forms, domain)
+                matched_forms = filter_forms_by_sdtm_domain(
+                    study_forms,
+                    domain,
+                    study_key=study_key,
+                )
                 if not matched_forms:
                     return
-                if len(matched_forms) < len(study_forms):
-                    m_ids = [
-                        fid
-                        for f in matched_forms
-                        if isinstance(
-                            (
-                                fid := (
-                                    f.get("formId") or f.get("form_id")
-                                    if isinstance(f, dict)
-                                    else getattr(f, "form_id", None)
-                                )
-                            ),
-                            int,
-                        )
-                        and not isinstance(fid, bool)
-                    ]
-                    m_keys = {
-                        str(fk)
-                        for f in matched_forms
-                        if (
-                            fk := (
-                                f.get("formKey") or f.get("form_key")
+                m_ids = [
+                    fid
+                    for f in matched_forms
+                    if isinstance(
+                        (
+                            fid := (
+                                f.get("formId") or f.get("form_id")
                                 if isinstance(f, dict)
-                                else getattr(f, "form_key", None)
+                                else getattr(f, "form_id", None)
                             )
+                        ),
+                        int,
+                    )
+                    and not isinstance(fid, bool)
+                ]
+                m_keys = {
+                    str(fk)
+                    for f in matched_forms
+                    if (
+                        fk := (
+                            f.get("formKey") or f.get("form_key")
+                            if isinstance(f, dict)
+                            else getattr(f, "form_key", None)
                         )
-                    }
-                    if m_ids:
-                        extra_filters["formId"] = m_ids
-                        matched_form_ids = set(m_ids)
-                    if m_keys:
-                        matched_form_keys = m_keys
+                    )
+                }
+                if m_ids:
+                    extra_filters["formId"] = m_ids[0] if len(m_ids) == 1 else m_ids
+                    matched_form_ids = set(m_ids)
+                if m_keys:
+                    matched_form_keys = m_keys
 
         source_is_ordered = False
         force_drain_ungrouped_loader = False
@@ -1653,6 +1674,17 @@ class RecordMapper:
                 records,
                 matched_form_ids,
                 matched_form_keys,
+            )
+        if form_whitelist is None:
+            records = (
+                rec
+                for rec in records
+                if record_matches_sdtm_domain(
+                    rec,
+                    domain,
+                    form_domain_map=form_domain_map,
+                    study_key=study_key,
+                )
             )
         if allowed_vars is not None:
             records = self._project_record_whitelist(records, allowed_vars)

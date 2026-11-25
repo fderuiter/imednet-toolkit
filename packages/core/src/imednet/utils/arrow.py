@@ -69,26 +69,6 @@ def _infer_type(values: list[Any]) -> pa.DataType:
     return pa.infer_type(non_null_values)
 
 
-def _coerce_value(value: Any, target_type: pa.DataType) -> Any:
-    """Coerce a value to the target Arrow data type."""
-    if value is None:
-        return None
-    if pa.types.is_null(target_type):
-        return None
-    if pa.types.is_timestamp(target_type):
-        return value if isinstance(value, datetime) else None
-    if pa.types.is_boolean(target_type):
-        if isinstance(value, str):
-            return parse_bool(value) if is_boolean_token(value) else None
-        return bool(value)
-    if pa.types.is_floating(target_type):
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-    return value
-
-
 def to_arrow_table(
     data_records: list[dict[str, Any] | _ModelDumpable], schema: pa.Schema | None = None
 ) -> pa.Table:

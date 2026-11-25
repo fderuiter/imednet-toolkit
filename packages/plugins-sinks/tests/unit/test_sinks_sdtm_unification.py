@@ -39,6 +39,15 @@ def _make_sdk(upstream_records: dict[int, Record]) -> MagicMock:
 
         flt = str(kw.get("filter", "") or "")
         items = list(upstream_records.values())
+        if kw.get("formId") is not None:
+            raw_fids = kw["formId"]
+            if isinstance(raw_fids, tuple) and len(raw_fids) == 2 and raw_fids[0] in ("==", "="):
+                fids = {int(raw_fids[1])}
+            elif isinstance(raw_fids, (list, tuple, set)):
+                fids = {int(x) for x in raw_fids}
+            else:
+                fids = {int(raw_fids)}
+            items = [r for r in items if r.form_id in fids]
         for clause in (c.strip() for c in flt.split(";") if c.strip()):
             if clause == "deleted==false":
                 items = [r for r in items if not r.deleted]
@@ -50,6 +59,8 @@ def _make_sdk(upstream_records: dict[int, Record]) -> MagicMock:
                         for r in items
                         if (ts := extract_record_timestamp(r)) is not None and ts >= wm_dt
                     ]
+        if kw.get("sort") == "subjectKey,asc;recordId,asc":
+            items.sort(key=lambda r: (str(r.subject_key or ""), int(r.record_id or 0)))
         return iter([r.model_copy(deep=True) for r in items])
 
     sdk = MagicMock()
@@ -256,7 +267,7 @@ def test_neo4j_and_snowflake_mixed_domain_partitioning_and_void_reconciliation(
     }
     sdk = _make_sdk(upstream)
 
-    # --- 1. Snapshot mode (incremental=False): omits RECORD_ID and partitions by (DOMAIN, seq_col) ---
+    # --- 1. Strict snapshot opt-out (preserve_record_id=False): omits RECORD_ID and partitions by (DOMAIN, seq_col) ---
     neo4j_calls: list[tuple[str, dict[str, Any]]] = []
     neo4j_mod = MagicMock()
     session = MagicMock()
@@ -275,6 +286,7 @@ def test_neo4j_and_snowflake_mixed_domain_partitioning_and_void_reconciliation(
         auth=("neo4j", "secret"),
         as_sdtm=True,
         incremental=False,
+        preserve_record_id=False,
     )
     export_to_neo4j(sdk, study_key, config=neo_snap_cfg)
 
@@ -312,6 +324,7 @@ def test_neo4j_and_snowflake_mixed_domain_partitioning_and_void_reconciliation(
         table="SDTM_MIXED",
         as_sdtm=True,
         incremental=False,
+        preserve_record_id=False,
     )
     export_to_snowflake(sdk, study_key, config=sf_snap_cfg)
 
@@ -546,3 +559,342 @@ def test_mongodb_sdtm_helpers_config_validation_and_composite_reconciliation(
         )
         assert deleted == 2
         assert collection.docs == {}
+
+
+def test_baseline_as_sdtm_then_modified_since_sync_preserves_record_id_and_reconciles_voids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 7: Baseline as_sdtm=True export followed by modified_since sync updates by RECORD_ID without duplicates and deletes voided Neo4j & Snowflake Records."""
+    import duckdb
+    import pandas as pd
+
+    from imednet.integrations.export import (
+        export_to_csv,
+        export_to_duckdb,
+        export_to_hive_parquet,
+    )
+
+    study_key = "S_AC7_SYNC"
+    upstream: dict[int, Record] = {
+        1: Record(
+            record_id=1,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=301,
+            form_key="F_DM",
+            deleted=False,
+            date_modified=datetime(2026, 7, 1, 10, 0, tzinfo=UTC),
+            record_data={"BRTHDTC": "1981-05-14", "SEX": "F"},
+        ),
+        2: Record(
+            record_id=2,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=303,
+            form_key="F_AE",
+            deleted=False,
+            date_modified=datetime(2026, 7, 1, 10, 1, tzinfo=UTC),
+            record_data={"AETERM": "Headache v1"},
+        ),
+        3: Record(
+            record_id=3,
+            study_key=study_key,
+            subject_key="S01",
+            form_id=303,
+            form_key="F_AE",
+            deleted=False,
+            date_modified=datetime(2026, 7, 1, 10, 2, tzinfo=UTC),
+            record_data={"AETERM": "Nausea to void"},
+        ),
+    }
+    sdk = _make_sdk(upstream)
+
+    neo4j_calls: list[tuple[str, dict[str, Any]]] = []
+    neo4j_mod = MagicMock()
+    session = MagicMock()
+    session.run.side_effect = lambda q, **p: neo4j_calls.append((q, p)) or MagicMock()
+    session_cm = MagicMock()
+    session_cm.__enter__.return_value = session
+    session_cm.__exit__.return_value = False
+    driver = MagicMock()
+    driver.session.return_value = session_cm
+    neo4j_mod.GraphDatabase.driver.return_value = driver
+    monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+
+    sf_mod = MagicMock()
+    cursor = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    sf_mod.connect.return_value = conn
+    monkeypatch.setattr(
+        wh_mod,
+        "_require_optional_dep",
+        lambda pkg, _extra: (
+            sf_mod if pkg == "snowflake.connector" else (pq if "parquet" in pkg else pa)
+        ),
+    )
+
+    csv_path = tmp_path / "sync.csv"
+    hive_dir = tmp_path / "sync_hive"
+    ddb_path = tmp_path / "sync.duckdb"
+
+    # 1. Baseline as_sdtm=True export (no incremental, no modified_since, no ledger)
+    export_to_csv(sdk, study_key, csv_path, as_sdtm=True, quality_gate_enabled=False)
+    export_to_hive_parquet(sdk, study_key, hive_dir, as_sdtm=True, quality_gate_enabled=False)
+    export_to_duckdb(
+        sdk, study_key, ddb_path, "sdtm_sync", as_sdtm=True, quality_gate_enabled=False
+    )
+    export_to_neo4j(
+        sdk,
+        study_key,
+        config=Neo4jSinkConfig(
+            study_key=study_key,
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "secret"),
+            as_sdtm=True,
+            quality_gate_enabled=False,
+        ),
+    )
+    export_to_snowflake(
+        sdk,
+        study_key,
+        config=SnowflakeSinkConfig(
+            study_key=study_key,
+            account="acct",
+            user="usr",
+            password="pwd",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="SDTM_SYNC",
+            as_sdtm=True,
+            quality_gate_enabled=False,
+        ),
+    )
+
+    baseline_csv = pd.read_csv(csv_path)
+    assert "RECORD_ID" in baseline_csv.columns
+    assert set(baseline_csv["RECORD_ID"].astype(int)) == {1, 2, 3}
+    assert any("MERGE (r:Record" in q and "RECORD_ID: row.RECORD_ID" in q for q, _ in neo4j_calls)
+    assert any(
+        "MERGE INTO" in c.args[0] and 'target."RECORD_ID" = source."RECORD_ID"' in c.args[0]
+        for c in cursor.execute.call_args_list
+    )
+
+    # 2. Follow-up modified_since sync: update record 2, void record 3
+    watermark = datetime(2026, 7, 2, 0, 0, tzinfo=UTC)
+    upstream[2].record_data = {"AETERM": "Headache v2"}
+    upstream[2].date_modified = datetime(2026, 7, 2, 9, 0, tzinfo=UTC)
+    upstream[3].deleted = True
+    upstream[3].date_modified = datetime(2026, 7, 2, 9, 5, tzinfo=UTC)
+
+    neo4j_calls.clear()
+    cursor.execute.reset_mock()
+
+    export_to_csv(
+        sdk,
+        study_key,
+        csv_path,
+        as_sdtm=True,
+        modified_since=watermark,
+        quality_gate_enabled=False,
+    )
+    export_to_hive_parquet(
+        sdk,
+        study_key,
+        hive_dir,
+        as_sdtm=True,
+        modified_since=watermark,
+        quality_gate_enabled=False,
+    )
+    export_to_duckdb(
+        sdk,
+        study_key,
+        ddb_path,
+        "sdtm_sync",
+        as_sdtm=True,
+        modified_since=watermark,
+        quality_gate_enabled=False,
+    )
+    export_to_neo4j(
+        sdk,
+        study_key,
+        config=Neo4jSinkConfig(
+            study_key=study_key,
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "secret"),
+            as_sdtm=True,
+            modified_since=watermark,
+            quality_gate_enabled=False,
+        ),
+    )
+    export_to_snowflake(
+        sdk,
+        study_key,
+        config=SnowflakeSinkConfig(
+            study_key=study_key,
+            account="acct",
+            user="usr",
+            password="pwd",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="SDTM_SYNC",
+            as_sdtm=True,
+            modified_since=watermark,
+            quality_gate_enabled=False,
+        ),
+    )
+
+    synced_csv = pd.read_csv(csv_path)
+    assert set(synced_csv["RECORD_ID"].astype(int)) == {1, 2}
+    assert synced_csv.loc[synced_csv["RECORD_ID"] == 2, "AETERM"].iloc[0] == "Headache v2"
+
+    synced_hive = pd.concat(
+        [pd.read_parquet(f) for f in sorted(hive_dir.rglob("*.parquet"))], ignore_index=True
+    )
+    assert set(synced_hive["RECORD_ID"].astype(int)) == {1, 2}
+    assert synced_hive.loc[synced_hive["RECORD_ID"] == 2, "AETERM"].iloc[0] == "Headache v2"
+
+    with duckdb.connect(str(ddb_path), read_only=True) as dconn:
+        synced_ddb = dconn.execute('SELECT * FROM "sdtm_sync"').df()
+    assert set(synced_ddb["RECORD_ID"].astype(int)) == {1, 2}
+    assert synced_ddb.loc[synced_ddb["RECORD_ID"] == 2, "AETERM"].iloc[0] == "Headache v2"
+
+    # Verify Neo4j updated record 2 by RECORD_ID and deleted voided record 3 by RECORD_ID
+    neo_delete_calls = [
+        (q, p) for q, p in neo4j_calls if "DETACH DELETE r" in q and "RECORD_ID: rid" in q
+    ]
+    assert len(neo_delete_calls) == 1
+    assert neo_delete_calls[0][1]["record_ids"] == [3]
+
+    # Verify Snowflake updated record 2 by RECORD_ID and deleted voided record 3 by RECORD_ID
+    sf_delete_calls = [
+        c.args
+        for c in cursor.execute.call_args_list
+        if len(c.args) >= 2
+        and isinstance(c.args[0], str)
+        and 'DELETE FROM "DB"."PUBLIC"."SDTM_SYNC"' in c.args[0]
+        and '"RECORD_ID" IN' in c.args[0]
+    ]
+    assert len(sf_delete_calls) == 1
+    assert sf_delete_calls[0][1] == [study_key, 3]
+
+
+def test_neo4j_sdtm_naming_convention_and_as_sdtm_visitnum_normalization_and_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 8: Neo4jExportSink normalizes positive VISITNUM and links (:Subject)-[:HAS_VISIT]->(:Visit)-[:HAS_RECORD]->(:Record) under naming_convention='sdtm' and as_sdtm=True."""
+    from decimal import Decimal
+
+    assert graph_mod._normalize_visit_id(2) == 2
+    assert graph_mod._normalize_visit_id("3") == 3
+    assert graph_mod._normalize_visit_id(4.0) == 4
+    assert graph_mod._normalize_visit_id(Decimal(5)) == 5
+    for invalid in (0, -1, "0", "-3", "", "   ", False, True, float("nan"), float("inf")):
+        assert graph_mod._normalize_visit_id(invalid) is None
+
+    neo4j_calls: list[tuple[str, dict[str, Any]]] = []
+    neo4j_mod = MagicMock()
+    session = MagicMock()
+    session.run.side_effect = lambda q, **p: neo4j_calls.append((q, p)) or MagicMock()
+    session_cm = MagicMock()
+    session_cm.__enter__.return_value = session
+    session_cm.__exit__.return_value = False
+    driver = MagicMock()
+    driver.session.return_value = session_cm
+    neo4j_mod.GraphDatabase.driver.return_value = driver
+    monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+
+    # 1. naming_convention='sdtm' (with as_sdtm=False)
+    sdtm_conv_cfg = Neo4jSinkConfig(
+        study_key="S_GRAPH_SDTM",
+        uri="bolt://localhost:7687",
+        auth=("neo4j", "secret"),
+        naming_convention="sdtm",
+        as_sdtm=False,
+    )
+    with graph_mod.Neo4jExportSink(sdtm_conv_cfg) as sink:
+        sink.write_batch(
+            [
+                {
+                    "recordId": 101,
+                    "studyKey": "S_GRAPH_SDTM",
+                    "subjectKey": "SUBJ-01",
+                    "formKey": "F_VS",
+                    "visitId": "2",
+                    "recordData": {"VSTESTCD": "HR"},
+                },
+                {
+                    "recordId": 102,
+                    "studyKey": "S_GRAPH_SDTM",
+                    "subjectKey": "SUBJ-01",
+                    "formKey": "F_AE",
+                    "visitId": 0,
+                    "recordData": {"AETERM": "Unscheduled AE"},
+                },
+            ],
+            batch_id="b1",
+        )
+
+    assert len(neo4j_calls) == 1
+    conv_cypher, conv_params = neo4j_calls[0]
+    assert (
+        "MERGE (v:Visit {VISITNUM: row.VISITNUM, USUBJID: row.USUBJID, STUDYID: row.STUDYID})"
+        in conv_cypher
+    )
+    assert "MERGE (su)-[:HAS_VISIT]->(v)" in conv_cypher
+    assert "MERGE (v)-[:HAS_RECORD]->(r)" in conv_cypher
+    assert "MERGE (su)-[:HAS_RECORD]->(r)" in conv_cypher
+    conv_by_rid = {r["RECORD_ID"]: r for r in conv_params["rows"]}
+    assert conv_by_rid[101]["VISITNUM"] == 2
+    assert conv_by_rid[102]["VISITNUM"] is None
+
+    # 2. as_sdtm=True also links positive VISITNUM via (:Subject)-[:HAS_VISIT]->(:Visit)-[:HAS_RECORD]->(:Record)
+    neo4j_calls.clear()
+    as_sdtm_cfg = Neo4jSinkConfig(
+        study_key="S_GRAPH_SDTM",
+        uri="bolt://localhost:7687",
+        auth=("neo4j", "secret"),
+        as_sdtm=True,
+    )
+    with graph_mod.Neo4jExportSink(as_sdtm_cfg) as sink:
+        sink.write_batch(
+            [
+                {
+                    "recordId": 201,
+                    "studyKey": "S_GRAPH_SDTM",
+                    "subjectKey": "SUBJ-01",
+                    "formKey": "F_VS",
+                    "visitId": 3,
+                    "recordData": {"VSTESTCD": "SYSBP", "VSORRES": 118},
+                },
+                {
+                    "recordId": 202,
+                    "studyKey": "S_GRAPH_SDTM",
+                    "subjectKey": "SUBJ-01",
+                    "formKey": "F_AE",
+                    "visitId": -1,
+                    "recordData": {"AETERM": "Unscheduled"},
+                },
+            ],
+            batch_id="b2",
+        )
+
+    as_sdtm_visit_queries = [
+        (q, p)
+        for q, p in neo4j_calls
+        if "MERGE (su)-[:HAS_VISIT]->(v)" in q and "MERGE (v)-[:HAS_RECORD]->(r)" in q
+    ]
+    as_sdtm_direct_queries = [
+        (q, p)
+        for q, p in neo4j_calls
+        if "MERGE (su)-[:HAS_RECORD]->(r)" in q and "HAS_VISIT" not in q
+    ]
+    assert len(as_sdtm_visit_queries) == 1
+    assert [r["VISITNUM"] for r in as_sdtm_visit_queries[0][1]["rows"]] == [3]
+    assert len(as_sdtm_direct_queries) == 1
+    assert "VISITNUM" not in as_sdtm_direct_queries[0][1]["rows"][0]

@@ -172,6 +172,17 @@ def test_display_list_with_fields(capfd: pytest.CaptureFixture[str]) -> None:
     # Verify optimization: model_dump should not be called
     obj.model_dump.assert_not_called()
 
+    from imednet.cli.utils.output import _project_item_to_row
+
+    unconfigured = MagicMock()
+    unconfigured.id = 123
+    unconfigured.name = "Test Item"
+    assert _project_item_to_row(unconfigured, ["id", "name"], explicit_fields=False) == {
+        "id": 123,
+        "name": "Test Item",
+    }
+    unconfigured.dict.assert_not_called()
+
 
 def test_format_header_label_preserves_acronyms_without_mangling_words() -> None:
     """_format_header_label preserves ID, OID, URL, and UTC tokens without altering normal words."""

@@ -48,9 +48,9 @@ submission:
   submission callables while preserving single-pass validation and
   ``BatchSubmissionSummary`` reporting (``jobs``, ``batch_ids``, ``chunk_sizes``,
   ``total_records``, ``skipped_count``, ``last_job``, and ``all_successful``).
-* **Concurrent multi-Job polling**: ``sdk.poll_jobs(study_key, batch_ids, *, interval=5.0, timeout=300.0, fail_fast=False)``
-  and ``sdk.jobs.poll_many(...)`` poll multiple ``Job`` IDs concurrently, resolve
-  terminal ``resultUrl`` payloads when available, and return a
+* **Concurrent multi-Job polling**: ``sdk.poll_jobs(study_key, batch_ids, *, interval=5.0, timeout=300.0, fail_fast=False, resolve_results=False)``
+  and ``sdk.jobs.poll_many(...)`` poll multiple ``Job`` IDs concurrently, optionally
+  resolve terminal ``resultUrl`` payloads when ``resolve_results=True``, and return a
   :class:`~imednet.utils.job_poller.JobPollSummary` containing ``results`` and
   ``failures`` dictionaries.
 
@@ -200,8 +200,13 @@ state when partial progress occurs before an error:
 Typed Endpoint Interface and Terminal Semantics
 -----------------------------------------------
 
-``sdk.jobs.poll(study_key, batch_id, on_progress=callback)`` and
-``sdk.jobs.poll_many(study_key, batch_ids)`` use the core pollers. Await these
+``sdk.jobs.poll(study_key, batch_id, on_progress=callback, resolve_results=False)`` and
+``sdk.jobs.poll_many(study_key, batch_ids, resolve_results=False)`` use the core pollers
+(isolation of cached terminal ``JobStatus`` entries is keyed by ``(study_key, batch_id)``).
+Pass ``resolve_results=True`` on ``poll``, ``poll_many``, ``poll_job``, ``poll_jobs``,
+``async_poll_job``, or ``async_poll_jobs`` to fetch terminal ``resultUrl`` payloads and
+raise or record :class:`~imednet.utils.job_poller.JobFailedError` when individual
+``Record`` entries fail. Await these
 methods on ``AsyncImednetSDK``. SDK convenience methods accept the same optional
 callback, which accepts either a single ``JobStatusEvent`` or the legacy
 ``(batch_id, status, elapsed)`` positional arguments. Callback exceptions

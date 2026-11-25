@@ -2896,3 +2896,258 @@ def test_incremental_reconciliation_with_sdtm_naming_convention(tmp_path: Path) 
         engine.dispose()
     assert sql_df["RECORD_ID"].tolist() == [1]
     assert sql_df["SYSBP"].tolist() == [135]
+
+
+def test_sqlite_exports_normalize_object_temporal_values_under_strict_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify SQLite exports normalize mixed datetime/date object columns without DeprecationWarning."""
+    import hashlib
+    import json
+    import sqlite3
+    import warnings
+    from datetime import UTC, date
+
+    from sqlalchemy import create_engine
+
+    naive_dt = datetime(2026, 1, 2, 3, 4, 5)
+    aware_dt = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    sample_date = date(2026, 1, 15)
+
+    mixed_df = pd.DataFrame(
+        {
+            "recordId": [1, 2, 3, 4],
+            "mixed_dt": pd.Series(
+                [naive_dt, aware_dt, "2026-01-03T00:00:00Z", pd.NaT], dtype=object
+            ),
+            "mixed_date": pd.Series([sample_date, "2026-01-16", pd.NaT, None], dtype=object),
+            "native_dt64": pd.to_datetime(
+                ["2026-01-02 03:04:05", "2026-01-03 04:05:06", None, pd.NaT]
+            ),
+        }
+    )
+    expected_checksum = hashlib.sha256(mixed_df.to_csv(index=False).encode("utf-8")).hexdigest()
+
+    mapper_inst = MagicMock()
+    mapper_inst._fetch_variable_metadata.return_value = (
+        list(mixed_df.columns),
+        {c: c for c in mixed_df.columns},
+    )
+    mapper_inst._build_record_model.return_value = object()
+    mapper_inst._iter_records.return_value = [
+        Record(record_id=1, form_id=1, form_key="F1", record_data={"A": 1})
+    ]
+    mapper_inst._fetch_records.return_value = [MagicMock()]
+    mapper_inst._parse_records.return_value = ([], 0)
+    mapper_inst._build_dataframe.side_effect = lambda *_a, **_kw: mixed_df.copy()
+    mapper_cls = MagicMock(return_value=mapper_inst)
+    monkeypatch.setattr(export_mod, "_record_mapper", lambda: mapper_cls)
+
+    sdk = _make_quality_sdk()
+    sdk.forms.list.return_value = [MagicMock(form_id=1, form_key="F1")]
+    sdk.variables.list.return_value = [
+        MagicMock(variable_name=col, label=col, form_id=1) for col in mixed_df.columns
+    ]
+
+    sql_db = tmp_path / "tabular.sqlite"
+    by_form_db = tmp_path / "by_form.sqlite"
+    manifest_file = tmp_path / "tabular_manifest.jsonl"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        export_mod.export_to_sql(
+            sdk,
+            "STUDY",
+            "records",
+            f"sqlite:///{sql_db}",
+            quality_gate_enabled=False,
+            mask_phi=False,
+            manifest_path=str(manifest_file),
+        )
+        export_mod.export_to_sql_by_form(
+            sdk,
+            "STUDY",
+            f"sqlite:///{by_form_db}",
+            quality_gate_enabled=False,
+            mask_phi=False,
+        )
+
+    # Caller DataFrame remains unmutated and manifest checksum is unchanged
+    assert mixed_df["mixed_dt"].iloc[0] == naive_dt
+    assert mixed_df["mixed_date"].iloc[0] == sample_date
+    manifest_entry = json.loads(manifest_file.read_text(encoding="utf-8").splitlines()[0])
+    assert manifest_entry["checksum"] == expected_checksum
+
+    for db_file, table_name in ((sql_db, "records"), (by_form_db, "F1")):
+        with sqlite3.connect(db_file) as conn:
+            rows = conn.execute(
+                f'SELECT "recordId", "mixed_dt", "mixed_date", "native_dt64" '
+                f'FROM "{table_name}" ORDER BY "recordId"'
+            ).fetchall()
+            col_types = {
+                info[1]: info[2].upper()
+                for info in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+            }
+        assert rows == [
+            (1, "2026-01-02 03:04:05", "2026-01-15", "2026-01-02 03:04:05.000000"),
+            (2, "2026-01-02 03:04:05+00:00", "2026-01-16", "2026-01-03 04:05:06.000000"),
+            (3, "2026-01-03T00:00:00Z", None, None),
+            (4, None, None, None),
+        ]
+        assert "DATETIME" in col_types["native_dt64"]
+
+    # Also verify direct _to_sql_with_chunking with wide SQLite tables
+    wide_cols = {f"c{i}": [i] for i in range(export_mod.MAX_SQLITE_COLUMNS)}
+    wide_cols["tail_dt"] = pd.Series([naive_dt], dtype=object)
+    wide_df = pd.DataFrame(wide_cols)
+    wide_engine = create_engine(f"sqlite:///{tmp_path / 'wide.sqlite'}")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            export_mod._to_sql_with_chunking(wide_df, "wide_tbl", wide_engine, if_exists="replace")
+    finally:
+        wide_engine.dispose()
+    with sqlite3.connect(tmp_path / "wide.sqlite") as conn:
+        assert conn.execute('SELECT "tail_dt" FROM "wide_tbl_part2"').fetchall() == [
+            ("2026-01-02 03:04:05",)
+        ]
+
+
+def test_sqlite_long_sql_normalizes_object_temporal_values_under_strict_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify streaming and legacy export_to_long_sql normalize datetime/date values on SQLite."""
+    import sqlite3
+    import warnings
+    from datetime import UTC, date
+
+    naive_dt = datetime(2026, 2, 3, 4, 5, 6)
+    aware_dt = datetime(2026, 2, 4, 5, 6, 7, tzinfo=UTC)
+    visit_date = date(2026, 2, 10)
+
+    rec1 = Record(
+        record_id=1,
+        study_key="STUDY_LONG",
+        form_id=10,
+        form_key="F1",
+        date_modified="2026-02-01T00:00:00Z",
+        record_data={"visit_dt": naive_dt, "visit_date": visit_date},
+    )
+    rec2 = rec1.model_copy(
+        update={
+            "record_id": 2,
+            "date_modified": aware_dt,
+            "record_data": {"visit_dt": pd.NaT, "note": "ok"},
+        }
+    )
+
+    # 1. Streaming _LongSQLSink path
+    stream_sdk = MagicMock()
+    stream_sdk.records.list.side_effect = lambda **_kw: iter([rec1, rec2])
+    stream_db = tmp_path / "long_stream.sqlite"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        export_mod.export_to_long_sql(
+            stream_sdk,
+            "STUDY_LONG",
+            "long_records",
+            f"sqlite:///{stream_db}",
+            chunk_size=3,
+            mask_phi=False,
+        )
+
+    # 2. Legacy mock _fetch_records path
+    legacy_mapper = MagicMock(_fetch_records=MagicMock(return_value=[rec1, rec2]))
+    monkeypatch.setattr(export_mod, "_record_mapper", lambda: MagicMock(return_value=legacy_mapper))
+    legacy_db = tmp_path / "long_legacy.sqlite"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        export_mod.export_to_long_sql(
+            MagicMock(),
+            "STUDY_LONG",
+            "long_records",
+            f"sqlite:///{legacy_db}",
+            chunk_size=3,
+            mask_phi=False,
+        )
+
+    # Chunk 1 (size 3) has mixed str/datetime timestamps (object column -> normalized ISO string);
+    # Chunk 2 (size 1) has a homogeneous datetime64 column -> preserved via SQLAlchemy DateTime.
+    expected_rows = [
+        (1, 10, "visit_dt", "2026-02-03 04:05:06", "2026-02-01T00:00:00Z"),
+        (1, 10, "visit_date", "2026-02-10", "2026-02-01T00:00:00Z"),
+        (2, 10, "visit_dt", None, "2026-02-04 05:06:07+00:00"),
+        (2, 10, "note", "ok", "2026-02-04 05:06:07.000000"),
+    ]
+    for db_file in (stream_db, legacy_db):
+        with sqlite3.connect(db_file) as conn:
+            rows = conn.execute(
+                "SELECT record_id, form_id, variable_name, value, timestamp "
+                "FROM long_records ORDER BY rowid"
+            ).fetchall()
+        assert rows == expected_rows
+
+
+def test_normalize_sqlite_temporal_helper_preserves_non_sqlite_and_dtype_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify clean DataFrames, non-SQLite dialects, dtype overrides, and MagicMocks stay untouched."""
+    from datetime import date
+
+    from sqlalchemy import String
+
+    sqlite_engine = MagicMock()
+    sqlite_engine.dialect.name = "sqlite"
+    pg_engine = MagicMock()
+    pg_engine.dialect.name = "postgresql"
+
+    clean_df = pd.DataFrame(
+        {
+            "text_col": ["a", "b"],
+            "dt64_col": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+        }
+    )
+    assert export_mod._normalize_sqlite_temporal_object_columns(clean_df, sqlite_engine) is clean_df
+
+    dt_val = datetime(2026, 3, 4, 5, 6, 7)
+    d_val = date(2026, 3, 5)
+    mixed_df = pd.DataFrame(
+        {
+            "mapped_col": pd.Series([dt_val, "raw"], dtype=object),
+            "unmapped_col": pd.Series([d_val, "raw"], dtype=object),
+        }
+    )
+
+    # Non-SQLite dialect keeps native Python datetime/date objects untouched
+    assert export_mod._normalize_sqlite_temporal_object_columns(mixed_df, pg_engine) is mixed_df
+    captured_pg: list[pd.DataFrame] = []
+    monkeypatch.setattr(
+        pd.DataFrame,
+        "to_sql",
+        lambda self, *_a, **_kw: captured_pg.append(self),
+    )
+    export_mod._to_sql_with_chunking(mixed_df, "tbl", pg_engine, if_exists="replace")
+    assert len(captured_pg) == 1
+    assert captured_pg[0] is mixed_df
+    assert captured_pg[0]["mapped_col"].iloc[0] is dt_val
+    assert captured_pg[0]["unmapped_col"].iloc[0] is d_val
+
+    # Scalar dtype override skips normalization completely
+    assert (
+        export_mod._normalize_sqlite_temporal_object_columns(
+            mixed_df, sqlite_engine, dtype=String()
+        )
+        is mixed_df
+    )
+
+    # Mapping dtype override skips explicitly mapped columns while normalizing unmapped ones
+    partial = export_mod._normalize_sqlite_temporal_object_columns(
+        mixed_df, sqlite_engine, dtype={"mapped_col": String()}
+    )
+    assert partial is not mixed_df
+    assert partial["mapped_col"].iloc[0] is dt_val
+    assert partial["unmapped_col"].tolist() == ["2026-03-05", "raw"]
+
+    # MagicMock DataFrame is returned untouched
+    mock_df = MagicMock()
+    assert export_mod._normalize_sqlite_temporal_object_columns(mock_df, sqlite_engine) is mock_df

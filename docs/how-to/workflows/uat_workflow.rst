@@ -166,7 +166,7 @@ Both Python ``UATWorkflow`` and ``imednet workflows uat`` enforce strict pre-wri
         assert dry_result.validation_report.is_valid is True
         assert dry_result.submission_result is None
 
-From the terminal, export a customizable ``UATSpecification`` plan with ``build-spec`` (supporting JSON, CDISC ODM XML, REDCap CSV, and CSV directory Data Dictionaries) and execute dry or live runs with ``imednet workflows uat run``:
+From the terminal, export a customizable ``UATSpecification`` plan with ``build-spec`` (supporting JSON, CDISC ODM XML, REDCap CSV, CSV ``.zip`` archive, and CSV directory Data Dictionaries) and execute dry or live runs with ``imednet workflows uat run``:
 
 .. code-block:: bash
 

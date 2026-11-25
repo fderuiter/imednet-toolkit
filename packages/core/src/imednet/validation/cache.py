@@ -18,12 +18,12 @@ from typing import (
     Any,
     Generic,
     Literal,
+    Protocol,
     TypeVar,
     cast,
     overload,
+    runtime_checkable,
 )
-
-from typing_extensions import Protocol, runtime_checkable
 
 from imednet.core.context import get_study_context
 from imednet.datadict.logic import (
@@ -794,6 +794,7 @@ def _validate_time(value: Any) -> None:
 
 
 _PARTIAL_HOUR_RE = re.compile(r"^([01][0-9]|2[0-3])$")
+_URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:\S+$")
 
 
 def _validate_partial_time(value: Any) -> None:
@@ -805,6 +806,19 @@ def _validate_partial_time(value: Any) -> None:
         _TIME_24H_RE.match(cleaned) is None and _PARTIAL_HOUR_RE.match(cleaned) is None
     ):
         raise ValidationError("Value must be a valid 24-hour time")
+
+
+def _validate_uri(value: Any) -> None:
+    """Validate that ``value`` is a non-empty RFC 3986 URI string with a scheme."""
+    if not isinstance(value, str):
+        raise ValidationError("Value must be a valid URI string")
+    cleaned = value.strip()
+    if (
+        not cleaned
+        or any(ch in cleaned for ch in ("\x00", "\r", "\n"))
+        or _URI_RE.match(cleaned) is None
+    ):
+        raise ValidationError("Value must be a valid URI")
 
 
 _TYPE_SEP_RE = re.compile(r"[\s_-]+")
@@ -902,6 +916,7 @@ _CANONICAL_VARIABLE_TAXONOMY: dict[str, tuple[str, Any, Callable[[Any], None]]] 
     "signature": ("signature", "signed", _validate_text),
     "descriptive": ("descriptive", "example", _validate_text),
     "label": ("descriptive", "example", _validate_text),
+    "uri": ("string", "https://example.com", _validate_uri),
 }
 
 for _base_key, _base_spec in list(_CANONICAL_VARIABLE_TAXONOMY.items()):

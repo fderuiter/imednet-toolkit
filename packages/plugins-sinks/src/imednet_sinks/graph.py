@@ -65,8 +65,10 @@ Usage
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -93,12 +95,12 @@ from imednet.spi.sinks import (
     commit_sdtm_lineage,
     deduplicate_sdtm_rows,
     extract_record_id,
-    is_incremental_sink_config,
     normalize_sink_value,
     rehydrate_sdtm_lineage,
     resolve_sdtm_domain,
     resolve_voided_sdtm_keys,
     run_streaming_export,
+    should_preserve_sdtm_record_id,
 )
 
 _CYPHER_PROP_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -143,34 +145,44 @@ class Neo4jSinkConfig(SinkConfig):
 _MERGE_RECORD_CYPHER = """\
 UNWIND $rows AS row
 MERGE (s:Study   {study_key:   row.study_key})
-MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
 MERGE (r:Record   {record_id:  row.record_id,   study_key: row.study_key})
 SET r += row
-MERGE (s)-[:HAS_SUBJECT]->(su)
-FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
-    MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
-    MERGE (su)-[:HAS_VISIT]->(v)
-    MERGE (v)-[:HAS_RECORD]->(r)
+FOREACH (_su IN CASE WHEN row.subject_key IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
+    MERGE (s)-[:HAS_SUBJECT]->(su)
+    FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
+        MERGE (su)-[:HAS_VISIT]->(v)
+        MERGE (v)-[:HAS_RECORD]->(r)
+    )
+    FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
+        MERGE (su)-[:HAS_RECORD]->(r)
+    )
 )
-FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
-    MERGE (su)-[:HAS_RECORD]->(r)
+FOREACH (_no_su IN CASE WHEN row.subject_key IS NULL THEN [1] ELSE [] END |
+    MERGE (s)-[:HAS_RECORD]->(r)
 )
 """
 
 _CREATE_RECORD_CYPHER = """\
 UNWIND $rows AS row
 MERGE (s:Study   {study_key:   row.study_key})
-MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
 CREATE (r:Record)
 SET r = row
-MERGE (s)-[:HAS_SUBJECT]->(su)
-FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
-    MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
-    MERGE (su)-[:HAS_VISIT]->(v)
-    MERGE (v)-[:HAS_RECORD]->(r)
+FOREACH (_su IN CASE WHEN row.subject_key IS NOT NULL THEN [1] ELSE [] END |
+    MERGE (su:Subject {subject_key: row.subject_key, study_key: row.study_key})
+    MERGE (s)-[:HAS_SUBJECT]->(su)
+    FOREACH (_ IN CASE WHEN row.visit_id IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (v:Visit {visit_id: row.visit_id, subject_key: row.subject_key, study_key: row.study_key})
+        MERGE (su)-[:HAS_VISIT]->(v)
+        MERGE (v)-[:HAS_RECORD]->(r)
+    )
+    FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
+        MERGE (su)-[:HAS_RECORD]->(r)
+    )
 )
-FOREACH (_ IN CASE WHEN row.visit_id IS NULL THEN [1] ELSE [] END |
-    MERGE (su)-[:HAS_RECORD]->(r)
+FOREACH (_no_su IN CASE WHEN row.subject_key IS NULL THEN [1] ELSE [] END |
+    MERGE (s)-[:HAS_RECORD]->(r)
 )
 """
 
@@ -193,19 +205,36 @@ def _graph_json_default(value: Any) -> Any:
 
 
 def _normalize_visit_id(visit_id: Any) -> Any:
-    """Normalize non-positive ``visit_id`` markers (``<= 0``) to ``None`` for unscheduled records."""
+    """Normalize positive visit identifiers and map non-positive markers (``<= 0``) to ``None``."""
     if visit_id is None or isinstance(visit_id, NonCallableMock):
         return visit_id
     if isinstance(visit_id, bool):
         return None
-    if isinstance(visit_id, (int, float, Decimal)) and visit_id <= 0:
-        return None
+    if isinstance(visit_id, int):
+        return visit_id if visit_id > 0 else None
+    if isinstance(visit_id, float):
+        if not math.isfinite(visit_id) or visit_id <= 0:
+            return None
+        return int(visit_id) if visit_id.is_integer() else visit_id
+    if isinstance(visit_id, Decimal):
+        if not visit_id.is_finite() or visit_id <= 0:
+            return None
+        integral = visit_id.to_integral_value()
+        return int(integral) if visit_id == integral else float(visit_id)
     if isinstance(visit_id, str):
         stripped = visit_id.strip()
         if not stripped:
             return None
-        if stripped.lstrip("-").isdigit() and int(stripped) <= 0:
+        if stripped.lstrip("+-").isdigit():
+            parsed_int = int(stripped)
+            return parsed_int if parsed_int > 0 else None
+        try:
+            parsed_float = float(stripped)
+        except ValueError:
+            return stripped
+        if not math.isfinite(parsed_float) or parsed_float <= 0:
             return None
+        return int(parsed_float) if parsed_float.is_integer() else parsed_float
     return visit_id
 
 
@@ -226,37 +255,36 @@ def _build_convention_cypher(
             raise ExportConfigurationError(
                 f"Neo4j Cypher property {prop_name} contains invalid characters: {prop_val!r}"
             )
+    lineage_block = (
+        f"FOREACH (_su IN CASE WHEN row.{subject_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
+        f"    MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        "    MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"    FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
+        f"        MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
+        "        MERGE (su)-[:HAS_VISIT]->(v)\n"
+        "        MERGE (v)-[:HAS_RECORD]->(r)\n"
+        "    )\n"
+        f"    FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
+        "        MERGE (su)-[:HAS_RECORD]->(r)\n"
+        "    )\n"
+        ")\n"
+        f"FOREACH (_no_su IN CASE WHEN row.{subject_prop} IS NULL THEN [1] ELSE [] END |\n"
+        "    MERGE (s)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+    )
     merge_cypher = (
         "UNWIND $rows AS row\n"
         f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
-        f"MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
         f"MERGE (r:Record   {{{record_prop}: row.{record_prop}, {study_prop}: row.{study_prop}}})\n"
         "SET r += row\n"
-        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
-        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
-        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
-        "    MERGE (su)-[:HAS_VISIT]->(v)\n"
-        "    MERGE (v)-[:HAS_RECORD]->(r)\n"
-        ")\n"
-        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
-        "    MERGE (su)-[:HAS_RECORD]->(r)\n"
-        ")\n"
+        f"{lineage_block}"
     )
     create_cypher = (
         "UNWIND $rows AS row\n"
         f"MERGE (s:Study   {{{study_prop}: row.{study_prop}}})\n"
-        f"MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
         "CREATE (r:Record)\n"
         "SET r = row\n"
-        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
-        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
-        f"    MERGE (v:Visit {{{visit_prop}: row.{visit_prop}, {subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
-        "    MERGE (su)-[:HAS_VISIT]->(v)\n"
-        "    MERGE (v)-[:HAS_RECORD]->(r)\n"
-        ")\n"
-        f"FOREACH (_ IN CASE WHEN row.{visit_prop} IS NULL THEN [1] ELSE [] END |\n"
-        "    MERGE (su)-[:HAS_RECORD]->(r)\n"
-        ")\n"
+        f"{lineage_block}"
     )
     return merge_cypher, create_cypher
 
@@ -335,9 +363,14 @@ def _partition_sdtm_graph_rows(
 
 
 def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
-    for visit_key in ("visit_id", "visitId", "VISIT_ID"):
+    for visit_key in ("visit_id", "visitId", "VISITNUM", "VISIT_ID"):
         if visit_key in row:
-            row[visit_key] = _normalize_visit_id(row.get(visit_key))
+            norm_visit = _normalize_visit_id(row.get(visit_key))
+            if norm_visit is None and visit_key == "VISITNUM":
+                raw_rd = row.get("RECORD_DATA")
+                if isinstance(raw_rd, Mapping) and "VISITNUM" in raw_rd:
+                    norm_visit = _normalize_visit_id(raw_rd.get("VISITNUM"))
+            row[visit_key] = norm_visit
             break
     else:
         row["visit_id"] = _normalize_visit_id(row.get("visit_id"))
@@ -374,6 +407,12 @@ def _post_process_graph(row: dict[str, Any]) -> dict[str, Any]:
 
 def _post_process_graph_sdtm(row: dict[str, Any]) -> dict[str, Any]:
     """Validate SDTM property keys and serialize non-primitive values for Neo4j."""
+    if "VISITNUM" in row and not isinstance(row.get("VISITNUM"), NonCallableMock):
+        norm_visit = _normalize_visit_id(row.get("VISITNUM"))
+        if norm_visit is None:
+            row.pop("VISITNUM", None)
+        else:
+            row["VISITNUM"] = norm_visit
     for key, val in list(row.items()):
         if not isinstance(key, str) or not _IDENTIFIER_PATTERN.fullmatch(key):
             raise ExportConfigurationError(
@@ -466,6 +505,10 @@ class Neo4jExportSink(ExportSink):
             self._driver = neo4j_mod.GraphDatabase.driver(self._uri, auth=self._auth)
             self._driver.verify_connectivity()
         except Exception as exc:
+            if self._driver is not None:
+                with contextlib.suppress(Exception):
+                    self._driver.close()
+                self._driver = None
             raise ExportConfigurationError(f"Cannot connect to Neo4j at {redacted}: {exc}") from exc
 
     # ------------------------------------------------------------------
@@ -494,7 +537,7 @@ class Neo4jExportSink(ExportSink):
             bool(graph_cfg.as_sdtm),
             graph_cfg.sdtm_domain,
             graph_cfg.naming_convention,
-            is_incremental_sink_config(graph_cfg),
+            should_preserve_sdtm_record_id(graph_cfg),
             id(extra.get("study_config")),
             id(extra.get("enrichment_pipeline")),
         )
@@ -539,17 +582,22 @@ class Neo4jExportSink(ExportSink):
         try:
             if self.config.as_sdtm:
                 raw_sdtm_rows = mapper.map_batch(records, study_key=self._study_key)
-                if raw_sdtm_rows and "RECORD_ID" in raw_sdtm_rows[0]:
+                if raw_sdtm_rows and any("RECORD_ID" in r for r in raw_sdtm_rows):
                     dedup_by_rec: dict[tuple[Any, Any], int] = {}
                     staged_rows: list[dict[str, Any] | None] = []
+                    without_rid: list[dict[str, Any]] = []
                     for r_row in raw_sdtm_rows:
+                        if "RECORD_ID" not in r_row or r_row.get("RECORD_ID") is None:
+                            without_rid.append(r_row)
+                            continue
                         rk = (r_row.get("STUDYID"), r_row.get("RECORD_ID"))
-                        if rk[1] is not None and rk in dedup_by_rec:
+                        if rk in dedup_by_rec:
                             staged_rows[dedup_by_rec[rk]] = None
-                        if rk[1] is not None:
-                            dedup_by_rec[rk] = len(staged_rows)
+                        dedup_by_rec[rk] = len(staged_rows)
                         staged_rows.append(r_row)
                     mapped_rows = [r_row for r_row in staged_rows if r_row is not None]
+                    if without_rid:
+                        mapped_rows.extend(deduplicate_sdtm_rows(without_rid))
                 else:
                     mapped_rows = deduplicate_sdtm_rows(raw_sdtm_rows)
             else:
@@ -568,34 +616,37 @@ class Neo4jExportSink(ExportSink):
 
         cypher_batches: list[tuple[str, list[dict[str, Any]]]] = []
         if self.config.as_sdtm:
-            has_record_id = all("RECORD_ID" in r for r in mapped_rows)
-            if has_record_id:
-                sample_row = mapped_rows[0]
-                raw_domain = (
-                    resolve_sdtm_domain(self.config.sdtm_domain)
-                    if isinstance(self.config.sdtm_domain, str) and self.config.sdtm_domain.strip()
-                    else sample_row.get("DOMAIN")
-                )
-                domain = raw_domain if isinstance(raw_domain, str) else ""
-                candidate_seq = f"{domain}SEQ"
-                seq_prop = (
-                    candidate_seq
-                    if domain != "DM"
-                    and _SDTM_DOMAIN_PATTERN.fullmatch(domain) is not None
-                    and candidate_seq in sample_row
-                    else None
-                )
-                has_visit = any("VISITNUM" in r for r in mapped_rows)
-                merge_cypher, create_cypher = _build_sdtm_cypher(
-                    seq_prop,
-                    has_visit,
-                    has_record_id=True,
-                )
-                cypher_batches.append(
-                    (merge_cypher if self.config.idempotent else create_cypher, mapped_rows)
-                )
-            else:
-                for _dom, seq_prop, part_rows in _partition_sdtm_graph_rows(mapped_rows):
+            rows_with_rid = [
+                r for r in mapped_rows if "RECORD_ID" in r and r.get("RECORD_ID") is not None
+            ]
+            rows_without_rid = [
+                r for r in mapped_rows if "RECORD_ID" not in r or r.get("RECORD_ID") is None
+            ]
+            if rows_with_rid:
+                for dom, seq_prop, part_rows in _partition_sdtm_graph_rows(rows_with_rid):
+                    if isinstance(self.config.sdtm_domain, str) and self.config.sdtm_domain.strip():
+                        cfg_dom = resolve_sdtm_domain(self.config.sdtm_domain)
+                        cand_seq = f"{cfg_dom}SEQ"
+                        effective_seq = (
+                            cand_seq
+                            if cfg_dom != "DM"
+                            and _SDTM_DOMAIN_PATTERN.fullmatch(cfg_dom) is not None
+                            and any(cand_seq in r for r in part_rows)
+                            else None
+                        )
+                    else:
+                        effective_seq = seq_prop if dom != "DM" else None
+                    has_visit = any("VISITNUM" in r for r in part_rows)
+                    merge_cypher, create_cypher = _build_sdtm_cypher(
+                        effective_seq,
+                        has_visit,
+                        has_record_id=True,
+                    )
+                    cypher_batches.append(
+                        (merge_cypher if self.config.idempotent else create_cypher, part_rows)
+                    )
+            if rows_without_rid:
+                for _dom, seq_prop, part_rows in _partition_sdtm_graph_rows(rows_without_rid):
                     has_visit = any("VISITNUM" in r for r in part_rows)
                     merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
                     part_cypher = merge_cypher if self.config.idempotent else create_cypher
@@ -607,7 +658,7 @@ class Neo4jExportSink(ExportSink):
                 )
             elif self.config.naming_convention == "sdtm":
                 merge_cypher, create_cypher = _build_convention_cypher(
-                    "STUDYID", "USUBJID", "RECORD_ID", "VISIT_ID"
+                    "STUDYID", "USUBJID", "RECORD_ID", "VISITNUM"
                 )
             else:
                 merge_cypher, create_cypher = _MERGE_RECORD_CYPHER, _CREATE_RECORD_CYPHER
@@ -641,7 +692,7 @@ class Neo4jExportSink(ExportSink):
             else Neo4jSinkConfig(study_key=self._study_key, uri=self._uri, auth=self._auth)
         )
         record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
-        if cfg.as_sdtm and (not is_incremental_sink_config(cfg) or not record_ids):
+        if cfg.as_sdtm and (not should_preserve_sdtm_record_id(cfg) or not record_ids):
             sdtm_entries = resolve_voided_sdtm_keys(
                 records,
                 self,
