@@ -391,7 +391,10 @@ def test_trigger_run_transitions_failure_redaction_and_cancellation() -> None:
                     is_terminal=True,
                     is_failed=False,
                     is_successful=True,
-                    model_dump=lambda mode="json": {"batch_id": "B_OK", "state": "COMPLETED"},
+                    model_dump=lambda mode="json", **_kw: {
+                        "batch_id": "B_OK",
+                        "state": "COMPLETED",
+                    },
                 ),
             ]
         )
@@ -405,7 +408,7 @@ def test_trigger_run_transitions_failure_redaction_and_cancellation() -> None:
         assert isinstance(events[0], TriggerEvent)
         assert events[0].payload["status"] == "success"
         assert events[0].payload["state"] == "COMPLETED"
-        assert events[0].payload["job"] == {"batch_id": "B_OK", "state": "COMPLETED"}
+        assert events[0].payload["job"] == {"batchId": "B_OK", "state": "COMPLETED"}
         async_sdk.__aexit__.assert_awaited_once()
 
         # Terminal job failure emits redacted error TriggerEvent
@@ -592,7 +595,7 @@ def test_sensor_deferrable_execution_traversal_and_execute_complete(
         {},
         {"status": "success", "state": "COMPLETED", "job": {"batch_id": "BATCH_DEF"}},
     )
-    assert completed == {"batch_id": "BATCH_DEF"}
+    assert completed == {"batchId": "BATCH_DEF"}
 
     with pytest.raises(AirflowException, match=r"\*\*\*") as err_info:
         sensor.execute_complete(
@@ -1155,8 +1158,13 @@ def test_trigger_and_sensor_phi_scrubbing_timeout_and_lexical_id_guards() -> Non
     sync_summary = poke_ret.xcom_value
     assert isinstance(sync_summary, dict)
     assert "results" not in sync_summary
-    assert sync_summary["batch_id"] == "BATCH_PHI"
+    assert "record_total_count" not in sync_summary
+    assert sync_summary["batchId"] == "BATCH_PHI"
+    assert "jobId" in sync_summary
     assert sync_summary["state"] == "COMPLETED"
+    assert sync_summary["totalRecords"] == 1
+    assert sync_summary["successfulRecords"] == 1
+    assert sync_summary["failedRecords"] == 0
     assert "Alice Clinical" not in repr(sync_summary)
     assert "SUBJ-SECRET-01" not in repr(sync_summary)
     assert "1980-05-10" not in repr(sync_summary)
@@ -1187,7 +1195,7 @@ def test_trigger_and_sensor_phi_scrubbing_timeout_and_lexical_id_guards() -> Non
         phi_dict_poke = phi_dict_sensor.poke({})
     assert isinstance(phi_dict_poke, PokeReturnValue)
     assert phi_dict_poke.xcom_value == {
-        "batch_id": "BATCH_PHI_DICT",
+        "batchId": "BATCH_PHI_DICT",
         "state": "COMPLETED",
         "patient_name": "***MASKED***",
         "dob": "***MASKED***",

@@ -11,6 +11,10 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
+from imednet.auth.api_key import ApiKeyAuth
+from imednet.errors.api import UnauthorizedError
+from imednet.errors.validation import ConfigurationError
+
 _CRYPTOGRAPHY_AVAILABLE: bool | None = None
 _CRYPTO_MODULES: SimpleNamespace | None = None
 
@@ -499,10 +503,28 @@ class OIDCAuth:
             )
         )
         is_jwt_candidate = isinstance(token, str) and len(token.split(".")) == 3
-        self._requires_verification = is_jwt_candidate or self._verification_configured
+        has_alg_none_header = _has_alg_none_prefix(token) if isinstance(token, str) else False
+        self._requires_verification = (
+            is_jwt_candidate or self._verification_configured or has_alg_none_header
+        )
         self._token_verified = False
+        self._validation_error: ConfigurationError | UnauthorizedError | None = None
         self._decoded_claims: dict[str, Any] = {}
-        if isinstance(token, str) and token.strip() and self._requires_verification:
+        if not isinstance(token, str) or not token.strip():
+            self._validation_error = ConfigurationError(
+                "OIDC token validation failed: Token must be a non-empty string."
+            )
+        elif "\r" in token or "\n" in token:
+            self._validation_error = ConfigurationError(
+                "OIDC token validation failed: Token must not contain control characters."
+            )
+        elif has_alg_none_header and not is_jwt_candidate:
+            logger.warning("OIDC token validation failed: Insecure 'none' algorithm is rejected.")
+            self._validation_error = UnauthorizedError(
+                "OIDC token validation failed: Insecure 'none' algorithm is rejected.",
+                status_code=401,
+            )
+        elif self._requires_verification:
             self._decoded_claims = self._decode_token_claims(token)
 
     def _default_allowed_algorithms(self) -> list[str]:
@@ -513,6 +535,43 @@ class OIDCAuth:
             return list(_SYMMETRIC_ALGORITHMS)
         return list(_ASYMMETRIC_ALGORITHMS)
 
+    def _temporal_claim_error(
+        self,
+        claims: dict[str, Any],
+        *,
+        current_time: float | None = None,
+    ) -> ConfigurationError | UnauthorizedError | None:
+        """Return an error when 'exp', 'nbf', or 'leeway' fails RFC 7519 Section 4.1.4."""
+        if not _is_valid_numeric_date(self.leeway) or self.leeway < 0:
+            msg = "OIDC token validation failed: Invalid 'leeway' configuration."
+            logger.warning(msg)
+            return ConfigurationError(msg)
+
+        now = time.time() if current_time is None else current_time
+        if "exp" in claims:
+            exp_val = claims["exp"]
+            if not _is_valid_numeric_date(exp_val):
+                msg = "OIDC token validation failed: Invalid 'exp' claim format."
+                logger.warning(msg)
+                return UnauthorizedError(msg, status_code=401)
+            if now >= (exp_val + self.leeway):
+                msg = "OIDC token validation failed: Token has expired."
+                logger.warning(msg)
+                return UnauthorizedError(msg, status_code=401)
+
+        if "nbf" in claims:
+            nbf_val = claims["nbf"]
+            if not _is_valid_numeric_date(nbf_val):
+                msg = "OIDC token validation failed: Invalid 'nbf' claim format."
+                logger.warning(msg)
+                return UnauthorizedError(msg, status_code=401)
+            if now < (nbf_val - self.leeway):
+                msg = "OIDC token validation failed: Token is not yet valid (nbf)."
+                logger.warning(msg)
+                return UnauthorizedError(msg, status_code=401)
+
+        return None
+
     def _has_active_temporal_claims(
         self,
         claims: dict[str, Any],
@@ -520,30 +579,17 @@ class OIDCAuth:
         current_time: float | None = None,
     ) -> bool:
         """Validate 'exp', 'nbf', and 'leeway' against RFC 7519 Section 4.1.4."""
-        if not _is_valid_numeric_date(self.leeway) or self.leeway < 0:
-            logger.warning("OIDC token validation failed: Invalid 'leeway' configuration.")
-            return False
+        return self._temporal_claim_error(claims, current_time=current_time) is None
 
-        now = time.time() if current_time is None else current_time
-        if "exp" in claims:
-            exp_val = claims["exp"]
-            if not _is_valid_numeric_date(exp_val):
-                logger.warning("OIDC token validation failed: Invalid 'exp' claim format.")
-                return False
-            if now >= (exp_val + self.leeway):
-                logger.warning("OIDC token validation failed: Token has expired.")
-                return False
-
-        if "nbf" in claims:
-            nbf_val = claims["nbf"]
-            if not _is_valid_numeric_date(nbf_val):
-                logger.warning("OIDC token validation failed: Invalid 'nbf' claim format.")
-                return False
-            if now < (nbf_val - self.leeway):
-                logger.warning("OIDC token validation failed: Token is not yet valid (nbf).")
-                return False
-
-        return True
+    def _record_validation_error(
+        self,
+        is_primary_token: bool,
+        error: ConfigurationError | UnauthorizedError,
+    ) -> dict[str, Any]:
+        """Store validation error for primary token and return empty claims."""
+        if is_primary_token:
+            self._validation_error = error
+        return {}
 
     def _decode_token_claims(self, token: str) -> dict[str, Any]:
         """Extract, cryptographically verify, and validate claims from the JWT token.
@@ -558,50 +604,79 @@ class OIDCAuth:
         is_primary_token = token == self.token
         if is_primary_token:
             self._token_verified = False
+            self._validation_error = None
 
         if not isinstance(token, str) or not token.strip():
-            logger.warning("OIDC token validation failed: Token must be a non-empty string.")
-            return {}
+            msg = "OIDC token validation failed: Token must be a non-empty string."
+            logger.warning(msg)
+            return self._record_validation_error(is_primary_token, ConfigurationError(msg))
 
         parts = token.split(".")
         if len(parts) != 3:
-            logger.warning(
-                "OIDC token validation failed: Malformed JWT structure (expected 3 parts)."
+            msg = "OIDC token validation failed: Malformed JWT structure (expected 3 parts)."
+            logger.warning(msg)
+            return self._record_validation_error(
+                is_primary_token, UnauthorizedError(msg, status_code=401)
             )
-            return {}
 
         header_b64, payload_b64, sig_b64 = parts
-        if not header_b64 or not payload_b64 or not sig_b64:
-            logger.warning(
-                "OIDC token validation failed: Missing header, payload, or signature segment."
+        if not header_b64 or not payload_b64:
+            msg = "OIDC token validation failed: Missing header, payload, or signature segment."
+            logger.warning(msg)
+            return self._record_validation_error(
+                is_primary_token, UnauthorizedError(msg, status_code=401)
             )
-            return {}
 
         try:
             header_bytes = _base64url_decode(header_b64)
             header = json.loads(header_bytes.decode("utf-8"))
             if not isinstance(header, dict):
-                logger.warning("OIDC token validation failed: Header is not a JSON object.")
-                return {}
+                msg = "OIDC token validation failed: Header is not a JSON object."
+                logger.warning(msg)
+                return self._record_validation_error(
+                    is_primary_token, UnauthorizedError(msg, status_code=401)
+                )
         except Exception as exc:
             logger.warning("OIDC token validation failed: Failed to decode header: %s", exc)
-            return {}
+            return self._record_validation_error(
+                is_primary_token,
+                UnauthorizedError(
+                    "OIDC token validation failed: Failed to decode JWT header.",
+                    status_code=401,
+                ),
+            )
 
         alg = header.get("alg")
         if not alg or not isinstance(alg, str):
-            logger.warning("OIDC token validation failed: Missing or invalid 'alg' in header.")
-            return {}
+            msg = "OIDC token validation failed: Missing or invalid 'alg' in header."
+            logger.warning(msg)
+            return self._record_validation_error(
+                is_primary_token, UnauthorizedError(msg, status_code=401)
+            )
 
         if alg.lower() == "none":
-            logger.warning("OIDC token validation failed: Insecure 'none' algorithm is rejected.")
-            return {}
+            msg = "OIDC token validation failed: Insecure 'none' algorithm is rejected."
+            logger.warning(msg)
+            return self._record_validation_error(
+                is_primary_token, UnauthorizedError(msg, status_code=401)
+            )
+
+        if not sig_b64:
+            msg = "OIDC token validation failed: Missing header, payload, or signature segment."
+            logger.warning(msg)
+            return self._record_validation_error(
+                is_primary_token, UnauthorizedError(msg, status_code=401)
+            )
 
         allowed_algorithms = (
             self.algorithms if self.algorithms is not None else self._default_allowed_algorithms()
         )
         if alg not in allowed_algorithms:
+            msg = f"OIDC token validation failed: Algorithm '{alg}' is not allowed."
             logger.warning("OIDC token validation failed: Algorithm '%s' is not allowed.", alg)
-            return {}
+            return self._record_validation_error(
+                is_primary_token, UnauthorizedError(msg, status_code=401)
+            )
 
         # Resolve verification key(s)
         keys_to_try: list[Any] = []
@@ -654,46 +729,68 @@ class OIDCAuth:
                     logger.warning("OIDC token validation failed: Could not load JWK: %s", exc)
 
         if not keys_to_try:
-            logger.warning(
-                "OIDC token validation failed: No valid public key or JWKS available to verify signature."
+            msg = (
+                "OIDC token validation failed: "
+                "No valid public key or JWKS available to verify signature."
             )
-            return {}
+            logger.warning(msg)
+            return self._record_validation_error(is_primary_token, ConfigurationError(msg))
 
         try:
             signature = _base64url_decode(sig_b64)
         except Exception as exc:
             logger.warning("OIDC token validation failed: Invalid base64 in signature: %s", exc)
-            return {}
+            return self._record_validation_error(
+                is_primary_token,
+                UnauthorizedError(
+                    "OIDC token validation failed: Invalid base64 in signature.",
+                    status_code=401,
+                ),
+            )
 
         signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
         verified = any(
             _verify_token_signature(signing_input, signature, alg, k) for k in keys_to_try
         )
         if not verified:
-            logger.warning(
-                "OIDC token validation failed: Cryptographic signature verification failed."
+            msg = "OIDC token validation failed: Cryptographic signature verification failed."
+            logger.warning(msg)
+            return self._record_validation_error(
+                is_primary_token, UnauthorizedError(msg, status_code=401)
             )
-            return {}
 
         try:
             payload_bytes = _base64url_decode(payload_b64)
             claims = json.loads(payload_bytes.decode("utf-8"))
             if not isinstance(claims, dict):
-                logger.warning("OIDC token validation failed: Payload is not a JSON object.")
-                return {}
+                msg = "OIDC token validation failed: Payload is not a JSON object."
+                logger.warning(msg)
+                return self._record_validation_error(
+                    is_primary_token, UnauthorizedError(msg, status_code=401)
+                )
         except Exception as exc:
             logger.warning("OIDC token validation failed: Failed to decode payload: %s", exc)
-            return {}
+            return self._record_validation_error(
+                is_primary_token,
+                UnauthorizedError(
+                    "OIDC token validation failed: Failed to decode JWT payload.",
+                    status_code=401,
+                ),
+            )
 
-        if not self._has_active_temporal_claims(claims):
-            return {}
+        temporal_err = self._temporal_claim_error(claims)
+        if temporal_err is not None:
+            return self._record_validation_error(is_primary_token, temporal_err)
 
         actual_auds: list[str] | None = None
         if "aud" in claims:
             actual_auds = _normalize_aud_claim(claims["aud"])
             if actual_auds is None:
-                logger.warning("OIDC token validation failed: Invalid 'aud' claim format.")
-                return {}
+                msg = "OIDC token validation failed: Invalid 'aud' claim format."
+                logger.warning(msg)
+                return self._record_validation_error(
+                    is_primary_token, UnauthorizedError(msg, status_code=401)
+                )
 
         if self.audience is not None:
             expected_input = (
@@ -701,32 +798,42 @@ class OIDCAuth:
             )
             expected_auds = _normalize_aud_claim(expected_input)
             if expected_auds is None:
-                logger.warning(
-                    "OIDC token validation failed: Invalid expected 'audience' configuration."
-                )
-                return {}
+                msg = "OIDC token validation failed: Invalid expected 'audience' configuration."
+                logger.warning(msg)
+                return self._record_validation_error(is_primary_token, ConfigurationError(msg))
             if actual_auds is None:
-                logger.warning("OIDC token validation failed: Missing required 'aud' claim.")
-                return {}
+                msg = "OIDC token validation failed: Missing required 'aud' claim."
+                logger.warning(msg)
+                return self._record_validation_error(
+                    is_primary_token, UnauthorizedError(msg, status_code=401)
+                )
             if not any(a in expected_auds for a in actual_auds):
-                logger.warning("OIDC token validation failed: Audience mismatch.")
-                return {}
+                msg = "OIDC token validation failed: Audience mismatch."
+                logger.warning(msg)
+                return self._record_validation_error(
+                    is_primary_token, UnauthorizedError(msg, status_code=401)
+                )
 
         if "iss" in claims:
             token_iss = claims["iss"]
             if not isinstance(token_iss, str) or not token_iss.strip():
-                logger.warning("OIDC token validation failed: Invalid 'iss' claim format.")
-                return {}
+                msg = "OIDC token validation failed: Invalid 'iss' claim format."
+                logger.warning(msg)
+                return self._record_validation_error(
+                    is_primary_token, UnauthorizedError(msg, status_code=401)
+                )
 
         if self.issuer is not None:
             if not isinstance(self.issuer, str) or not self.issuer.strip():
-                logger.warning(
-                    "OIDC token validation failed: Invalid expected 'issuer' configuration."
-                )
-                return {}
+                msg = "OIDC token validation failed: Invalid expected 'issuer' configuration."
+                logger.warning(msg)
+                return self._record_validation_error(is_primary_token, ConfigurationError(msg))
             if claims.get("iss") != self.issuer:
-                logger.warning("OIDC token validation failed: Issuer mismatch.")
-                return {}
+                msg = "OIDC token validation failed: Issuer mismatch."
+                logger.warning(msg)
+                return self._record_validation_error(
+                    is_primary_token, UnauthorizedError(msg, status_code=401)
+                )
 
         if is_primary_token:
             self._token_verified = True
@@ -746,16 +853,26 @@ class OIDCAuth:
         return self._get_active_claims()
 
     def get_headers(self) -> dict[str, str]:
-        """Return the Authorization header when the token is valid and active."""
+        """Return the Authorization header or raise an ImednetError on invalid/expired tokens."""
         if not isinstance(self.token, str) or not self.token.strip():
-            return {}
+            raise ConfigurationError(
+                "OIDC token validation failed: Token must be a non-empty string."
+            )
         if "\r" in self.token or "\n" in self.token:
-            return {}
+            raise ConfigurationError(
+                "OIDC token validation failed: Token must not contain control characters."
+            )
         if self._requires_verification:
             if not self._token_verified or not isinstance(self._decoded_claims, dict):
-                return {}
-            if not self._has_active_temporal_claims(self._decoded_claims):
-                return {}
+                if self._validation_error is not None:
+                    raise self._validation_error
+                raise UnauthorizedError(
+                    "OIDC token validation failed: Token could not be verified.",
+                    status_code=401,
+                )
+            temporal_err = self._temporal_claim_error(self._decoded_claims)
+            if temporal_err is not None:
+                raise temporal_err
         return {"Authorization": f"Bearer {self.token}"}
 
     def get_user_id(self) -> str | None:
@@ -828,3 +945,70 @@ class OIDCAuth:
         return "OIDCAuth(token='********')"
 
     __str__ = __repr__
+
+
+def _has_alg_none_prefix(token: str) -> bool:
+    """Return True when a dotted token segment starts with a JSON header setting alg='none'."""
+    if "." not in token:
+        return False
+    first = token.split(".", 1)[0]
+    if not first:
+        return False
+    try:
+        decoded = json.loads(_base64url_decode(first).decode("utf-8"))
+    except Exception:
+        return False
+    return (
+        isinstance(decoded, dict)
+        and isinstance(decoded.get("alg"), str)
+        and decoded["alg"].lower() == "none"
+    )
+
+
+class _ApiKeyOIDCAuth(OIDCAuth):
+    """Composite strategy sending static API key headers alongside verified OIDC bearer auth."""
+
+    def __init__(self, token: str, *, api_key_auth: ApiKeyAuth, **kwargs: Any) -> None:
+        self._api_key_auth = api_key_auth
+        super().__init__(token, **kwargs)
+
+    @property
+    def api_key(self) -> str:
+        """Return the configured static API key."""
+        return self._api_key_auth.api_key
+
+    @property
+    def security_key(self) -> str:
+        """Return the configured static security key."""
+        return self._api_key_auth.security_key
+
+    def get_headers(self) -> dict[str, str]:
+        """Validate OIDC bearer token and combine with x-api-key and x-imn-security-key."""
+        oidc_headers = super().get_headers()
+        return {**self._api_key_auth.get_headers(), **oidc_headers}
+
+    def __repr__(self) -> str:
+        """Return a redacted string representation of the composed auth strategy."""
+        return "OIDCAuth(api_key='********', security_key='********', token='********')"
+
+    __str__ = __repr__
+
+
+def build_oidc_auth(
+    oidc_token: str,
+    *,
+    api_key: str | None = None,
+    security_key: str | None = None,
+) -> OIDCAuth:
+    """Create OIDCAuth composed with ApiKeyAuth when both API keys are configured."""
+    if (
+        isinstance(api_key, str)
+        and api_key.strip()
+        and isinstance(security_key, str)
+        and security_key.strip()
+    ):
+        return _ApiKeyOIDCAuth(
+            oidc_token,
+            api_key_auth=ApiKeyAuth(api_key, security_key),
+        )
+    return OIDCAuth(oidc_token)

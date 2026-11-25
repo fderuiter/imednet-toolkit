@@ -25,6 +25,7 @@ from imednet.constants import (
 )
 from imednet.core.http.executor import BaseRequestExecutor
 from imednet.core.operations.circuit_breaker import CircuitBreaker
+from imednet.errors.client import ClientError
 
 from .base_client import BaseClient, Tracer  # type: ignore[attr-defined]
 from .retry import RetryConfig, RetryPolicy
@@ -55,6 +56,10 @@ _MAX_EXTERNAL_REDIRECTS = 5
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 
 
+class ExternalUrlError(ClientError, ValueError):
+    """Raised when an external URL violates scheme, host, SSRF, or redirect rules."""
+
+
 def _url_origin(url: httpx.URL | str) -> tuple[str, str, int | None]:
     """Return normalized (scheme, host, effective_port) origin tuple for a URL."""
     parsed = httpx.URL(url) if isinstance(url, str) else url
@@ -73,19 +78,19 @@ class _OriginScopedAuth(httpx.Auth):
 
     def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         """Inject credentials for same-origin requests and strip them cross-origin."""
-        auth_headers = self._strategy.get_headers()
-        if _url_origin(request.url) == self._origin:
-            if auth_headers:
-                for key, value in auth_headers.items():
-                    request.headers[key] = value
-            else:
+        strip_forced = bool(request.extensions.get("strip_credentials"))
+        if not strip_forced and _url_origin(request.url) == self._origin:
+            auth_headers = self._strategy.get_headers()
+            lower_auth_keys = {key.lower() for key in auth_headers}
+            for key, value in auth_headers.items():
+                request.headers[key] = value
+            if "authorization" not in lower_auth_keys:
                 for existing in list(request.headers.keys()):
                     if existing.lower() == "authorization":
                         del request.headers[existing]
         else:
-            blocked = _CREDENTIAL_HEADER_NAMES | {key.lower() for key in auth_headers}
             for existing in list(request.headers.keys()):
-                if existing.lower() in blocked:
+                if existing.lower() in _CREDENTIAL_HEADER_NAMES:
                     del request.headers[existing]
         yield request
 
@@ -107,34 +112,38 @@ def _validate_ip_address(raw_ip: str) -> None:
         or effective.is_reserved
         or effective.is_unspecified
     ):
-        raise ValueError(f"Blocked non-public IP address for external URL: {raw_ip}")
+        raise ExternalUrlError(f"Blocked non-public IP address for external URL: {raw_ip}")
 
 
 def _parse_and_validate_external_url(url: str) -> tuple[str, str | None, int]:
     """Validate external HTTPS URL syntax, host rules, and literal IP safety."""
     if not isinstance(url, str):
-        raise ValueError("External URL must be a string")
+        raise ExternalUrlError("External URL must be a string")
     stripped = url.strip()
     if not stripped or any(ord(ch) <= 32 or ord(ch) == 127 for ch in stripped):
-        raise ValueError("External URL must be a non-empty valid URL without whitespace")
+        raise ExternalUrlError("External URL must be a non-empty valid URL without whitespace")
 
-    parts = urlsplit(stripped)
+    try:
+        parts = urlsplit(stripped)
+        raw_port = parts.port
+    except ValueError as exc:
+        raise ExternalUrlError(f"Malformed external URL: {stripped!r}") from exc
     if parts.scheme.lower() != "https":
-        raise ValueError(
+        raise ExternalUrlError(
             f"External URL must use https:// scheme, got {parts.scheme or 'missing'}://"
         )
     if parts.username is not None or parts.password is not None:
-        raise ValueError("External URL must not include userinfo credentials")
+        raise ExternalUrlError("External URL must not include userinfo credentials")
     if not parts.hostname or "%" in parts.netloc:
-        raise ValueError("External URL must include a valid host")
+        raise ExternalUrlError("External URL must include a valid host")
 
-    port = parts.port or 443
+    port = raw_port or 443
     host = parts.hostname.rstrip(".").lower()
     if not host:
-        raise ValueError("External URL must include a valid host")
+        raise ExternalUrlError("External URL must include a valid host")
 
     if host in _BLOCKED_EXTERNAL_HOSTS or host.endswith((".localhost", ".local", ".internal")):
-        raise ValueError(f"Blocked internal hostname for external URL: {host}")
+        raise ExternalUrlError(f"Blocked internal hostname for external URL: {host}")
 
     try:
         ip_literal = ipaddress.ip_address(host)
@@ -147,7 +156,7 @@ def _parse_and_validate_external_url(url: str) -> tuple[str, str | None, int]:
 
     labels = [lbl for lbl in host.split(".") if lbl]
     if labels and all(_OBFUSCATED_IP_LABEL_RE.match(lbl) for lbl in labels):
-        raise ValueError(f"Blocked obfuscated IP literal for external URL: {host}")
+        raise ExternalUrlError(f"Blocked obfuscated IP literal for external URL: {host}")
 
     return stripped, host, port
 
@@ -155,7 +164,7 @@ def _parse_and_validate_external_url(url: str) -> tuple[str, str | None, int]:
 def _validate_addrinfo_results(infos: Sequence[Any], host: str) -> None:
     """Validate every IP returned by getaddrinfo against SSRF restrictions."""
     if not infos:
-        raise ValueError(f"Unable to resolve external host: {host}")
+        raise ExternalUrlError(f"Unable to resolve external host: {host}")
     for entry in infos:
         sockaddr = entry[4]
         _validate_ip_address(str(sockaddr[0]))
@@ -261,35 +270,41 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
         return not getattr(pool_fn, "__module__", "").startswith(("respx", "unittest.mock"))
 
     def _prepare_external_kwargs(self, target_url: str, kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Prepare request kwargs with redirects disabled and cross-origin credentials stripped."""
+        """Prepare request kwargs with redirects disabled and all credentials stripped."""
+        _ = target_url
         prepared = dict(kwargs)
         prepared["follow_redirects"] = False
+        raw_ext = prepared.get("extensions")
+        ext_dict = dict(raw_ext) if isinstance(raw_ext, Mapping) else {}
+        ext_dict["strip_credentials"] = True
+        prepared["extensions"] = ext_dict
         raw_headers = prepared.get("headers")
-        if _url_origin(target_url) != _url_origin(self._base_url) and isinstance(
-            raw_headers, Mapping
-        ):
-            blocked = _CREDENTIAL_HEADER_NAMES | {k.lower() for k in self.auth.get_headers()}
+        if isinstance(raw_headers, Mapping):
             prepared["headers"] = {
-                k: v for k, v in raw_headers.items() if str(k).lower() not in blocked
+                k: v
+                for k, v in raw_headers.items()
+                if str(k).lower() not in _CREDENTIAL_HEADER_NAMES
             }
         return prepared
 
     @staticmethod
-    def _resolve_same_origin_redirect(
+    def _resolve_external_redirect(
         current_url: str, response: httpx.Response, hop: int
     ) -> str | None:
-        """Validate 3xx redirect responses, blocking cross-origin redirects."""
-        if not (300 <= response.status_code < 400):
+        """Resolve 3xx redirect target URLs for per-hop HTTPS and SSRF validation."""
+        if not (300 <= response.status_code < 400) or response.status_code == 304:
             return None
         if hop >= _MAX_EXTERNAL_REDIRECTS:
-            raise ValueError("Maximum redirects exceeded for external URL")
+            raise ExternalUrlError("Maximum redirects exceeded for external URL")
         location = response.headers.get("Location")
         if not location or not location.strip():
-            raise ValueError(f"Redirect response {response.status_code} missing Location header")
-        resolved = str(httpx.URL(current_url).join(location.strip()))
-        if _url_origin(resolved) != _url_origin(current_url):
-            raise ValueError("Cross-origin redirects are not allowed for external URLs")
-        return resolved
+            raise ExternalUrlError(
+                f"Redirect response {response.status_code} missing Location header"
+            )
+        try:
+            return str(httpx.URL(current_url).join(location.strip()))
+        except httpx.InvalidURL as exc:
+            raise ExternalUrlError(f"Malformed redirect Location header: {location!r}") from exc
 
     @property
     def retry_policy(self) -> RetryPolicy:

@@ -137,3 +137,22 @@ def test_cli_surfaces_redacted_authentication_errors(monkeypatch: pytest.MonkeyP
     assert "very-secret-authorization" not in result.stderr
     assert "very-secret-api-key" not in result.stdout
     assert "very-secret-authorization" not in result.stdout
+
+
+def test_redact_sensitive_payload_preserves_clinical_equality_and_regex_filters() -> None:
+    """redact_sensitive_payload leaves TOKEN==1 and TOKEN=~pos intact while redacting token=secret."""
+    from imednet.utils.secrets import redact_sensitive_payload
+
+    payload = {
+        "eq_filter": "TOKEN==1",
+        "regex_filter": "TOKEN=~pos",
+        "quoted_regex": "'TOKEN'=~'pos'",
+        "mixed": "TOKEN==1;TOKEN=~pos;token=secret",  # pragma: allowlist secret
+    }
+    redacted = redact_sensitive_payload(payload)
+    assert redacted == {
+        "eq_filter": "TOKEN==1",
+        "regex_filter": "TOKEN=~pos",
+        "quoted_regex": "'TOKEN'=~'pos'",
+        "mixed": "TOKEN==1;TOKEN=~pos;token=***",
+    }

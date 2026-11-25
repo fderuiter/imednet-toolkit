@@ -143,10 +143,11 @@ _GENERIC_CREDENTIAL_KEY_EXPR = (
 _ALL_CREDENTIAL_KEY_EXPR = rf"{_EXPLICIT_CREDENTIAL_KEY_EXPR}|{_GENERIC_CREDENTIAL_KEY_EXPR}"
 
 _QUOTED_SENSITIVE_PATTERN = re.compile(
-    rf"(?i)(?<![a-z0-9_])([\"']?)(?<![a-z0-9_])({_ALL_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])\1(\s*[:=]\s*)([\"'])([^\"'\r\n]*)\4"
+    rf"(?i)(?<![a-z0-9_])([\"']?)(?<![a-z0-9_])({_ALL_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])\1"
+    r"(\s*(?<![=!<>])[:=](?![=~])\s*)([\"'])([^\"'\r\n]*)\4"
 )
 _EQUALS_SENSITIVE_PATTERN = re.compile(
-    rf"(?i)(?<![a-z0-9_])({_ALL_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])(\s*=\s*)"
+    rf"(?i)(?<![a-z0-9_])({_ALL_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])(\s*(?<![=!<>])=(?![=~])\s*)"
     r"(?:(?:bearer|basic)\s+)?([^\s,;&\"')\]}\x00]+)"
 )
 _HEADER_COLON_SENSITIVE_PATTERN = re.compile(

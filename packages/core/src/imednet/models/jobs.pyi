@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import Field, field_validator, model_validator
 
+from imednet.errors.base import ImednetError
 from imednet.models.base import ImednetBaseModel
 
 class JobState(str, Enum):
@@ -37,10 +38,10 @@ SUCCESSFUL_JOB_STATES: set[JobState]
 FAILED_JOB_STATES: set[JobState]
 ALLOWED_JOB_TRANSITIONS: dict[JobState, set[JobState]]
 
-class InvalidJobStateError(ValueError):
+class InvalidJobStateError(ImednetError, ValueError):
     """Raised when an unrecognized job state string is encountered."""
 
-class InvalidJobTransitionError(ValueError):
+class InvalidJobTransitionError(ImednetError, ValueError):
     """Raised when an invalid state transition is attempted."""
 
 InvalidStateTransitionError = InvalidJobTransitionError

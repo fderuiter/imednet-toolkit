@@ -23,6 +23,7 @@ from imednet.core.retry import RetryConfig
 
 from .http_client_base import (
     _MAX_EXTERNAL_REDIRECTS,
+    ExternalUrlError,
     HTTPClientBase,
     _parse_and_validate_external_url,
     _validate_addrinfo_results,
@@ -121,8 +122,8 @@ class Client(HTTPClientBase[httpx.Client, SyncRequestExecutor]):
                 _validate_addrinfo_results(infos, host_to_resolve)
             req_kwargs = self._prepare_external_kwargs(validated_url, kwargs)
             response = self._external_executor("GET", validated_url, **req_kwargs)
-            next_url = self._resolve_same_origin_redirect(validated_url, response, hop)
+            next_url = self._resolve_external_redirect(validated_url, response, hop)
             if next_url is None:
                 return response
             current_url = next_url
-        raise ValueError("Maximum redirects exceeded for external URL")
+        raise ExternalUrlError("Maximum redirects exceeded for external URL")
