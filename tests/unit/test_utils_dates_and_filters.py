@@ -766,7 +766,25 @@ def test_parse_utc_timestamp_bound_empty_lists_and_revision_filter_splitting() -
         assert up_res == {"dateCreated": expected_up}
         assert len(loc_res) == 1
 
-    # Raw OR filter with equality dateCreated + start_date evaluates locally
+    # Standalone raw OR filter passes through unchanged when always_evaluate_locally is False
+    up_raw_or_passthrough, loc_raw_or_passthrough = split_revision_date_bounds(
+        {"filter": "lastUpdated>=2025-01-01,lastUpdated<=2025-12-31", "limit": 25},
+    )
+    assert up_raw_or_passthrough == {
+        "filter": "lastUpdated>=2025-01-01,lastUpdated<=2025-12-31",
+        "limit": 25,
+    }
+    assert loc_raw_or_passthrough == []
+
+    # Raw OR filter + start_date with always_evaluate_locally=False preserves raw OR filter upstream
+    up_raw_or_start, loc_raw_or_start = split_revision_date_bounds(
+        {"filter": "lastUpdated>=2025-01-01,lastUpdated<=2025-12-31"},
+        start_date="2025-06-01",
+    )
+    assert up_raw_or_start == {"filter": "lastUpdated>=2025-01-01,lastUpdated<=2025-12-31"}
+    assert loc_raw_or_start == [("date_created", ">=", "2025-06-01")]
+
+    # Raw OR filter with equality dateCreated + start_date evaluates locally when always_evaluate_locally=True
     up_or, loc_or = split_revision_date_bounds(
         {"filter": "dateCreated==2026-01-10,dateCreated==2026-01-20T00:00:00.500000Z"},
         start_date="2026-01-01",

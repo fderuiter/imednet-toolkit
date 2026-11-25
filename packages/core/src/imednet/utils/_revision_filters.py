@@ -250,10 +250,12 @@ def split_revision_date_bounds(
     )
 
     raw_has_date_attr = False
+    raw_has_duplicate_date = False
     if has_active_raw_filter and isinstance(raw_filter, str):
         has_semi, has_comma, has_ws, in_quotes = _scan_filter_string(raw_filter)
         if not in_quotes and not (has_semi and has_comma) and not has_ws:
-            clauses_preview, _ = _split_filter_clauses(raw_filter.strip())
+            clauses_preview, conn_preview = _split_filter_clauses(raw_filter.strip())
+            seen_date_preview: set[str] = set()
             for cl in clauses_preview:
                 if not cl:
                     continue
@@ -261,14 +263,23 @@ def split_revision_date_bounds(
                     parsed_cl = _parse_clause_operator(cl)
                 except ValueError:
                     parsed_cl = None
-                if (
-                    parsed_cl is not None
-                    and _snake_to_camel(parsed_cl[0]) in REVISION_DATE_ATTRIBUTES
-                ):
+                if parsed_cl is None:
+                    continue
+                c_attr = _snake_to_camel(parsed_cl[0])
+                if c_attr in REVISION_DATE_ATTRIBUTES:
                     raw_has_date_attr = True
-                    break
+                    if conn_preview == ";" and c_attr in seen_date_preview:
+                        raw_has_duplicate_date = True
+                    seen_date_preview.add(c_attr)
 
-    if eff_start is None and eff_end is None and not has_any_date_kwarg and not raw_has_date_attr:
+    needs_processing = (
+        eff_start is not None
+        or eff_end is not None
+        or has_any_date_kwarg
+        or raw_has_duplicate_date
+        or (always_evaluate_locally and raw_has_date_attr)
+    )
+    if not needs_processing:
         return working, []
 
     local_bounds: list[tuple[str, str, Any]] = []
@@ -294,47 +305,49 @@ def split_revision_date_bounds(
         if has_comma:
             validate_filter_syntax(raw_filter)
             raw_is_or = True
-            or_clauses, _ = _split_filter_clauses(raw_filter.strip())
-            normalized_or_clauses: list[str] = []
-            or_attrs: set[str] = set()
-            or_ops: set[str] = set()
-            or_vals: list[str] = []
-            or_date_clauses: list[tuple[str, str, Any]] = []
-            or_all_date = True
-            or_needs_local = False
-            for clause in or_clauses:
-                parsed = _parse_clause_operator(clause)
-                if parsed is None:
-                    normalized_or_clauses.append(clause)
-                    or_attrs.add(clause)
-                    or_all_date = False
-                    continue
-                attr, op, raw_rhs = parsed
-                camel_attr = _snake_to_camel(attr)
-                or_attrs.add(camel_attr)
-                or_ops.add(op)
-                if camel_attr in REVISION_DATE_ATTRIBUTES:
-                    unquoted_rhs, _ = _unquote_filter_scalar(raw_rhs, clause)
-                    if not unquoted_rhs:
-                        raise ValueError(f"Invalid filter format: '{clause}'. Empty filter value.")
-                    up_op, up_val, req_local = _plan_upstream_date_clause(op, unquoted_rhs)
-                    if req_local:
-                        or_needs_local = True
-                    normalized_or_clauses.append(_build_filter_part(camel_attr, (up_op, up_val)))
-                    or_vals.append(unquoted_rhs)
-                    snake_or_attr = (
-                        "date_created" if camel_attr == "dateCreated" else "last_updated"
-                    )
-                    or_date_clauses.append((snake_or_attr, op, unquoted_rhs))
-                else:
-                    normalized_or_clauses.append(clause)
-                    or_all_date = False
-            working["filter"] = ",".join(normalized_or_clauses)
-            if or_all_date and or_date_clauses and (always_evaluate_locally or or_needs_local):
-                if len(or_attrs) == 1 and or_ops == {"=="}:
-                    local_bounds.append((or_date_clauses[0][0], "in", list(or_vals)))
-                else:
-                    local_bounds.append(("__or__", "or", or_date_clauses))
+            if always_evaluate_locally:
+                or_clauses, _ = _split_filter_clauses(raw_filter.strip())
+                normalized_or_clauses: list[str] = []
+                or_attrs: set[str] = set()
+                or_ops: set[str] = set()
+                or_vals: list[str] = []
+                or_date_clauses: list[tuple[str, str, Any]] = []
+                or_all_date = True
+                for clause in or_clauses:
+                    parsed = _parse_clause_operator(clause)
+                    if parsed is None:
+                        normalized_or_clauses.append(clause)
+                        or_attrs.add(clause)
+                        or_all_date = False
+                        continue
+                    attr, op, raw_rhs = parsed
+                    camel_attr = _snake_to_camel(attr)
+                    or_attrs.add(camel_attr)
+                    or_ops.add(op)
+                    if camel_attr in REVISION_DATE_ATTRIBUTES:
+                        unquoted_rhs, _ = _unquote_filter_scalar(raw_rhs, clause)
+                        if not unquoted_rhs:
+                            raise ValueError(
+                                f"Invalid filter format: '{clause}'. Empty filter value."
+                            )
+                        up_op, up_val, _ = _plan_upstream_date_clause(op, unquoted_rhs)
+                        normalized_or_clauses.append(
+                            _build_filter_part(camel_attr, (up_op, up_val))
+                        )
+                        or_vals.append(unquoted_rhs)
+                        snake_or_attr = (
+                            "date_created" if camel_attr == "dateCreated" else "last_updated"
+                        )
+                        or_date_clauses.append((snake_or_attr, op, unquoted_rhs))
+                    else:
+                        normalized_or_clauses.append(clause)
+                        or_all_date = False
+                working["filter"] = ",".join(normalized_or_clauses)
+                if or_all_date and or_date_clauses:
+                    if len(or_attrs) == 1 and or_ops == {"=="}:
+                        local_bounds.append((or_date_clauses[0][0], "in", list(or_vals)))
+                    else:
+                        local_bounds.append(("__or__", "or", or_date_clauses))
         else:
             clauses, _ = _split_filter_clauses(raw_filter.strip())
             seen_non_date: set[str] = set()
