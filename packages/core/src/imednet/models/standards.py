@@ -319,10 +319,17 @@ class StandardsProfile:
             value = _get_domain_field_value(domain_key, field_name, data)
             if is_missing_value(value):
                 continue
-            is_allowed = value in allowed_values or (
-                field_name in {"aeSeverity", "AESEV"}
-                and isinstance(value, str)
-                and value.strip().upper() in allowed_values
+            is_allowed = (
+                any(isinstance(av, bool) and av is value for av in allowed_values)
+                if isinstance(value, bool)
+                else (
+                    value in allowed_values
+                    or (
+                        field_name in {"aeSeverity", "AESEV"}
+                        and isinstance(value, str)
+                        and value.strip().upper() in allowed_values
+                    )
+                )
             )
             if not is_allowed:
                 violations.append(
@@ -516,9 +523,9 @@ class DeviceSafetyProfile(StandardsProfile):
         if domain_key != "DD":
             return violations
 
-        deficiency_occurred = data.get("ddOccurred")
+        deficiency_occurred = _get_domain_field_value(domain_key, "ddOccurred", data)
         if deficiency_occurred is True and all(
-            is_missing_value(data.get(field_name))
+            is_missing_value(_get_domain_field_value(domain_key, field_name, data))
             for field_name in ("ddTerm", "ddCategory", "ddDate")
         ):
             violations.append(
@@ -529,12 +536,17 @@ class DeviceSafetyProfile(StandardsProfile):
                 )
             )
 
-        dd_serious = data.get("ddSerious")
-        if not is_missing_value(dd_serious) and not isinstance(dd_serious, bool):
+        dd_serious = _get_domain_field_value(domain_key, "ddSerious", data)
+        is_valid_dd_serious = isinstance(dd_serious, bool) or (
+            isinstance(dd_serious, str) and dd_serious.strip().upper() in {"Y", "N"}
+        )
+        if not is_missing_value(dd_serious) and not is_valid_dd_serious:
             violations.append(
                 ValidationViolation(
                     field="ddSerious",
-                    message="ddSerious must be a boolean value for device studies.",
+                    message=(
+                        "ddSerious must be a boolean or CDISC NY ('Y'/'N') value for device studies."
+                    ),
                     severity="ERROR",
                 )
             )
@@ -834,6 +846,7 @@ DM_ALLOWED_VARIABLES: frozenset[str] = frozenset(
         "actarm",
         "actarmcd",
         "country",
+        "brthdat",
         "brthdtc",
         "birthdate",
         "ethnicity",
@@ -946,16 +959,19 @@ class CategoricalNormalizer:
         cdisc_ct: dict[str, set[str]] | None = None,
         *,
         date_fields: Collection[str] = (),
+        boolean_fields: Collection[str] = (),
         date_order: Literal["MDY", "DMY"] | None = None,
     ) -> None:
-        """Snapshot caller-selected codelists and date fields.
+        """Snapshot caller-selected codelists, date fields, and boolean fields.
 
-        No unversioned vocabulary or guessed date-field selection is enabled by
+        No unversioned vocabulary or guessed date/boolean field selection is enabled by
         default. cdisc_ct retains its proposed API name; supplying it does not
         establish CDISC conformance. Study lookups take precedence over codelists.
         """
         if isinstance(date_fields, str):
             raise ValueError("date_fields must be a collection of field names")
+        if isinstance(boolean_fields, str):
+            raise ValueError("boolean_fields must be a collection of field names")
         if date_order not in (None, "MDY", "DMY"):
             raise ValueError("date_order must be MDY, DMY or None")
         self.cdisc_ct = {field: set(terms) for field, terms in (cdisc_ct or {}).items()}
@@ -969,6 +985,7 @@ class CategoricalNormalizer:
                 canonical[key] = term.strip()
             self._canonical_terms[field] = canonical
         self._date_fields = frozenset(date_fields)
+        self._boolean_fields = frozenset(boolean_fields)
         self._date_order = date_order
 
     def normalize_record(
@@ -1059,10 +1076,14 @@ class CategoricalNormalizer:
             return raw_value, f"{subject_prefix}record {field_name} is unmapped"
 
         if field_name in self._canonical_terms and not is_missing_value(raw_value):
+            canonical_map = self._canonical_terms[field_name]
+            if isinstance(raw_value, bool):
+                bool_key = "TRUE" if raw_value else "FALSE"
+                ny_key = "Y" if raw_value else "N"
+                if bool_key in canonical_map or ny_key in canonical_map:
+                    return raw_value, None
             canonical = (
-                self._canonical_terms[field_name].get(raw_value.strip().upper())
-                if isinstance(raw_value, str)
-                else None
+                canonical_map.get(raw_value.strip().upper()) if isinstance(raw_value, str) else None
             )
             if canonical is not None:
                 return canonical, None
@@ -1071,14 +1092,7 @@ class CategoricalNormalizer:
         if field_name in self._date_fields:
             return normalize_iso_date(raw_value, date_order=self._date_order), None
 
-        if isinstance(raw_value, str) and field_name.strip().lower() not in {
-            "sex",
-            "dmsex",
-            "vsunit",
-            "vsorresu",
-            "aeseverity",
-            "aesev",
-        }:
+        if field_name in self._boolean_fields and isinstance(raw_value, str):
             stripped_value = raw_value.strip()
             if stripped_value and is_boolean_token(stripped_value):
                 return parse_bool(stripped_value), None
@@ -1248,18 +1262,26 @@ class StandardsReadinessValidator:
                         field_name not in existing_error_fields
                         and field_name in accepted_terms
                         and not normalized_lookups.get(field_name)
-                        and (
-                            not isinstance(val, str)
-                            or val.strip().upper() not in accepted_terms[field_name]
-                        )
                     ):
-                        record_violations.append(
-                            ValidationViolation(
-                                field=field_name,
-                                message=f"Field {field_name} is outside the configured terminology.",
-                                severity="ERROR",
+                        term_set = accepted_terms[field_name]
+                        in_terminology = (
+                            (
+                                ("TRUE" if val else "FALSE") in term_set
+                                or ("Y" if val else "N") in term_set
                             )
+                            if isinstance(val, bool)
+                            else (isinstance(val, str) and val.strip().upper() in term_set)
                         )
+                        if not in_terminology:
+                            record_violations.append(
+                                ValidationViolation(
+                                    field=field_name,
+                                    message=(
+                                        f"Field {field_name} is outside the configured terminology."
+                                    ),
+                                    severity="ERROR",
+                                )
+                            )
 
                 violations.extend(record_violations)
 

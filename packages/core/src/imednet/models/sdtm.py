@@ -34,7 +34,18 @@ _UNSET_PIPELINE: Any = object()
 
 def _is_deleted_record(rec: Any) -> bool:
     """Return True if an EDC record or mapping is marked deleted/voided."""
-    val = rec.get("deleted") if isinstance(rec, Mapping) else getattr(rec, "deleted", None)
+    if isinstance(rec, BaseModel):
+        rec_ns = rec.__dict__
+        if "deleted" in rec_ns:
+            val = rec_ns["deleted"]
+        elif hasattr(type(rec), "deleted"):
+            val = getattr(rec, "deleted", None)
+        else:
+            return False
+    elif isinstance(rec, Mapping):
+        val = rec.get("deleted")
+    else:
+        val = getattr(rec, "deleted", None)
     if isinstance(val, bool):
         return val
     if isinstance(val, (int, float)):
@@ -44,6 +55,7 @@ def _is_deleted_record(rec: Any) -> bool:
     return False
 
 
+@functools.lru_cache(maxsize=2048)
 def _parse_dtc_string(val_str: str) -> tuple[str, int | None]:
     """Parse a non-empty date/datetime string into (formatted_dtc, year_or_none)."""
     # Check standard date-only pattern YYYY-MM-DD
@@ -198,8 +210,8 @@ def _collapse_alnum_key(key: str) -> str:
 
 
 def _is_birth_dtc_key(key: str) -> bool:
-    """Return True when *key* represents a CDISC birth-date DTC variable."""
-    return _collapse_alnum_key(key).endswith("brthdtc")
+    """Return True when *key* represents a CDISC birth-date DTC/DAT variable."""
+    return _collapse_alnum_key(key).endswith(("brthdtc", "brthdat"))
 
 
 SDTM_DOMAIN_SPECS: dict[str, dict[str, Any]] = {
@@ -757,11 +769,12 @@ def _coerce_form_id_int(raw_fid: Any) -> int | None:
     if isinstance(raw_fid, bool) or raw_fid is None:
         return None
     if isinstance(raw_fid, int):
-        return raw_fid
+        return raw_fid if raw_fid > 0 else None
     if isinstance(raw_fid, str):
         s = raw_fid.strip()
-        if s and (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
-            return int(s)
+        if s and s.isdigit():
+            parsed = int(s)
+            return parsed if parsed > 0 else None
     return None
 
 
@@ -1124,21 +1137,64 @@ def format_variable_name(
 _BASE_SDTM_CONSUMED_KEYS: frozenset[str] = frozenset(
     {
         "USUBJID",
-        "subjectKey",
         "subject_key",
+        "subject_id",
+        "subject_oid",
         "study_key",
-        "studyKey",
+        "study_id",
         "STUDYID",
         "DOMAIN",
+        "record_id",
+        "record_oid",
+        "record_type",
+        "record_status",
+        "parent_record_id",
+        "program_key",
+        "form_id",
+        "form_key",
+        "form_name",
+        "interval_id",
+        "interval_name",
+        "site_id",
+        "site_name",
+        "visit_id",
+        "deleted",
+        "is_deleted",
+        "date_created",
+        "date_modified",
+        "last_updated",
+        "keywords",
+        "record_data",
+    }
+)
+
+_BASE_SDTM_EXACT_CONSUMED_KEYS: frozenset[str] = _BASE_SDTM_CONSUMED_KEYS | frozenset(
+    {
+        "usubjid",
+        "subjectKey",
+        "subjectId",
+        "subjectOid",
+        "studyKey",
         "domain",
         "recordId",
-        "record_id",
-        "formId",
-        "form_id",
-        "visitId",
-        "visit_id",
+        "recordOid",
+        "recordType",
         "recordStatus",
-        "record_status",
+        "parentRecordId",
+        "programKey",
+        "formId",
+        "formKey",
+        "formName",
+        "intervalId",
+        "intervalName",
+        "siteId",
+        "siteName",
+        "visitId",
+        "isDeleted",
+        "dateCreated",
+        "dateModified",
+        "lastUpdated",
+        "recordData",
     }
 )
 
@@ -1186,7 +1242,7 @@ def _get_model_consumed_keys(model_cls: type[BaseModel]) -> frozenset[str]:
     """Precompute base consumed keys for a Pydantic model class."""
     model_field_to_serialized, all_field_aliases = _get_model_field_aliases(model_cls)
     consumed = set(_BASE_SDTM_CONSUMED_KEYS)
-    for initial_k in list(consumed):
+    for initial_k in _BASE_SDTM_EXACT_CONSUMED_KEYS:
         if initial_k in model_field_to_serialized:
             serialized_k = model_field_to_serialized[initial_k]
             consumed.add(serialized_k)
@@ -1196,6 +1252,41 @@ def _get_model_consumed_keys(model_cls: type[BaseModel]) -> frozenset[str]:
             consumed.add(serialized_k)
             consumed.update(all_field_aliases.get(serialized_k, set()))
     return frozenset(consumed)
+
+
+@functools.lru_cache(maxsize=512)
+def _expand_model_var_consumed(
+    model_cls: type[BaseModel],
+    cand_names: tuple[str, ...],
+) -> frozenset[str]:
+    """Precompute serialized and alias keys consumed for a matched SDTM variable on *model_cls*."""
+    model_field_to_serialized, all_field_aliases = _get_model_field_aliases(model_cls)
+    extra: set[str] = set()
+    for cand in cand_names:
+        cand_lower = cand.lower()
+        if cand in model_field_to_serialized:
+            serialized_cand = model_field_to_serialized[cand]
+            extra.add(serialized_cand)
+            extra.update(all_field_aliases.get(serialized_cand, ()))
+        if cand_lower in model_field_to_serialized:
+            serialized_cand = model_field_to_serialized[cand_lower]
+            extra.add(serialized_cand)
+            extra.update(all_field_aliases.get(serialized_cand, ()))
+        extra.update(all_field_aliases.get(cand, ()))
+        extra.update(all_field_aliases.get(cand_lower, ()))
+    return frozenset(extra)
+
+
+@functools.lru_cache(maxsize=512)
+def _get_model_var_serialized_set(
+    model_cls: type[BaseModel],
+    lower_cands: tuple[str, ...],
+) -> frozenset[str]:
+    """Precompute serialized field keys on *model_cls* matching a variable or its aliases."""
+    model_field_to_serialized, _ = _get_model_field_aliases(model_cls)
+    return frozenset(
+        model_field_to_serialized[lc] for lc in lower_cands if lc in model_field_to_serialized
+    )
 
 
 def _mask_value_recursive(
@@ -1267,12 +1358,16 @@ def _dtc_sort_key(canonical_dtc: str | None) -> tuple[int, str]:
     return (1, "")
 
 
+def _single_topic_sort_entry(v: Any) -> tuple[int, str]:
+    """Build a comparable sort tuple for a single domain topic variable value."""
+    if v is None or (isinstance(v, str) and not v):
+        return (1, "")
+    return (0, str(v))
+
+
 def _topic_sort_key(topic_values: tuple[Any, ...]) -> tuple[tuple[int, str], ...]:
     """Build comparable sort tuples for domain topic variable values."""
-    return tuple(
-        (1, "") if (v is None or (isinstance(v, str) and not v)) else (0, str(v))
-        for v in topic_values
-    )
+    return tuple(map(_single_topic_sort_entry, topic_values))
 
 
 def _extract_stream_usubjid_and_id(rec: Any) -> tuple[str, tuple[int, int, str]]:
@@ -1456,6 +1551,9 @@ class _SdtmNormalizer:
                 str,
                 str,
                 tuple[tuple[str, str], ...],
+                tuple[str, ...],
+                frozenset[str],
+                tuple[str, ...],
                 bool,
                 bool,
                 bool,
@@ -1469,6 +1567,9 @@ class _SdtmNormalizer:
                 vname,
                 vname.lower(),
                 tuple((c, c.lower()) for c in self.alias_map.get(vname, [])),
+                tuple(self.alias_map.get(vname, [])),
+                frozenset((vname.lower(), *(c.lower() for c in self.alias_map.get(vname, [])))),
+                (vname.lower(), *(c.lower() for c in self.alias_map.get(vname, []))),
                 vname in self.dtc_vars or vname.endswith("DTC"),
                 _is_birth_dtc_key(vname),
                 vname in self.flag_vars or vname.endswith("SET"),
@@ -1521,200 +1622,209 @@ class _SdtmNormalizer:
             return self.terminology[var_name][str_val]
         return val
 
-    def prepare_record(self, rec: Any, orig_idx: int) -> _PreparedSdtmRow | None:
-        """Normalize a single clinical record and compute its Subject-group sort key."""
-        if not self.include_deleted and _is_deleted_record(rec):
-            return None
-
+    def _unpack_record_payload(
+        self,
+        rec: Any,
+    ) -> tuple[
+        dict[str, Any],
+        type[BaseModel] | None,
+        dict[str, str],
+        dict[str, set[str]],
+        frozenset[str] | set[str],
+        Any,
+        Any,
+        Any,
+    ]:
+        """Extract record dictionary, model metadata, and envelope identifiers."""
+        model_cls: type[BaseModel] | None = None
         model_field_to_serialized: dict[str, str] = {}
         all_field_aliases: dict[str, set[str]] = {}
         base_consumed: frozenset[str] | set[str] = _BASE_SDTM_CONSUMED_KEYS
+        raw_record_id: Any = None
+        raw_visit_id: Any = None
+        subj_fallback: Any = None
 
-        raw_record_id: Any = getattr(rec, "record_id", None)
-        if raw_record_id is None:
-            raw_record_id = getattr(rec, "recordId", None)
-
-        if hasattr(rec, "record_data") and getattr(rec, "record_data", None) is not None:
-            rec_dict = dict(rec.record_data) if isinstance(rec.record_data, dict) else {}
-            if getattr(rec, "subject_key", None):
-                rec_dict["subject_key"] = rec.subject_key
-                rec_dict["subjectKey"] = rec.subject_key
-            if getattr(rec, "date_created", None):
-                rec_dict["date_created"] = rec.date_created
-        elif isinstance(rec, BaseModel):
-            rec_dict = rec.model_dump(by_alias=True)
-            model_cls = type(rec)
-            model_field_to_serialized, all_field_aliases = _get_model_field_aliases(model_cls)
-            base_consumed = _get_model_consumed_keys(model_cls)
-        elif isinstance(rec, dict):
+        if isinstance(rec, BaseModel):
+            rec_ns = rec.__dict__
+            raw_record_id = rec_ns.get("record_id")
+            if raw_record_id is None:
+                raw_record_id = rec_ns.get("recordId")
+            raw_visit_id = rec_ns.get("visit_id")
+            if raw_visit_id is None:
+                raw_visit_id = rec_ns.get("visitId")
+            subj_fallback = rec_ns.get("subject_key") or rec_ns.get("subjectKey")
+            direct_rd = rec_ns.get("record_data")
+            if direct_rd is not None:
+                rec_dict = dict(direct_rd) if isinstance(direct_rd, Mapping) else {}
+                if subj_fallback:
+                    rec_dict.setdefault("subject_key", subj_fallback)
+                    rec_dict.setdefault("subjectKey", subj_fallback)
+            else:
+                rec_dict = rec.model_dump(by_alias=True)
+                model_cls = type(rec)
+                model_field_to_serialized, all_field_aliases = _get_model_field_aliases(model_cls)
+                base_consumed = _get_model_consumed_keys(model_cls)
+        elif isinstance(rec, Mapping):
             rec_dict = dict(rec)
         else:
-            rec_dict = dict(getattr(rec, "__dict__", {}))
+            raw_record_id = getattr(rec, "record_id", None)
+            if raw_record_id is None:
+                raw_record_id = getattr(rec, "recordId", None)
+            raw_visit_id = getattr(rec, "visit_id", None)
+            if raw_visit_id is None:
+                raw_visit_id = getattr(rec, "visitId", None)
+            subj_fallback = getattr(rec, "subject_key", None) or getattr(rec, "subjectKey", None)
+            direct_rd = getattr(rec, "record_data", None)
+            if direct_rd is None:
+                direct_rd = getattr(rec, "recordData", None)
+            if isinstance(direct_rd, Mapping):
+                rec_dict = dict(direct_rd)
+                if subj_fallback:
+                    rec_dict.setdefault("subject_key", subj_fallback)
+                    rec_dict.setdefault("subjectKey", subj_fallback)
+            else:
+                rec_dict = dict(getattr(rec, "__dict__", {}))
 
-        for rd_attr in ("record_data", "recordData"):
-            if rd_attr in rec_dict and isinstance(rec_dict[rd_attr], dict):
-                nested_data = dict(rec_dict.pop(rd_attr))
+        for nested_key in ("record_data", "recordData"):
+            if nested_key in rec_dict and isinstance(rec_dict[nested_key], Mapping):
+                nested_data = dict(rec_dict.pop(nested_key))
                 for k, v in nested_data.items():
                     if k not in rec_dict:
                         rec_dict[k] = v
 
         if raw_record_id is None:
-            if "recordId" in rec_dict:
-                raw_record_id = rec_dict.get("recordId")
-            elif "record_id" in rec_dict:
-                raw_record_id = rec_dict.get("record_id")
-            elif "RECORD_ID" in rec_dict:
-                raw_record_id = rec_dict.get("RECORD_ID")
-            else:
-                raw_record_id = getattr(rec, "record_oid", None)
+            raw_record_id = self._resolve_fallback_record_id(rec, rec_dict)
 
-        raw_visit_id: Any = getattr(rec, "visit_id", None)
-        if raw_visit_id is None:
-            raw_visit_id = getattr(rec, "visitId", None)
         if raw_visit_id is None:
             for vk in ("VISITNUM", "visitnum", "visitId", "visit_id"):
                 if vk in rec_dict and rec_dict[vk] is not None:
                     raw_visit_id = rec_dict[vk]
                     break
-        _, rec_form_key = extract_record_form_ref(rec)
 
-        if self.pipeline is not None and (
-            self.has_enrichment_transforms or not hasattr(self.pipeline, "terminology")
-        ):
-            try:
-                rec_dict = self.pipeline.process(
-                    rec_dict,
-                    mask_phi=False,
-                    domain=self.domain_clean,
-                    form_key=rec_form_key,
-                )
-            except TypeError:
-                rec_dict = self.pipeline.process(rec_dict, mask_phi=False)
-
-        explicit_usubjid = rec_dict.get("USUBJID") or rec_dict.get("usubjid")
-        usubjid_raw = (
-            explicit_usubjid
-            or rec_dict.get("subjectKey")
-            or rec_dict.get("subject_key")
-            or (
-                rec_dict.get(model_field_to_serialized.get("subject_key", ""))
-                if model_field_to_serialized
-                else None
-            )
-            or (
-                rec_dict.get(model_field_to_serialized.get("subjectKey", ""))
-                if model_field_to_serialized
-                else None
-            )
-            or getattr(rec, "subject_key", None)
-            or getattr(rec, "subjectKey", None)
-            or ""
+        return (
+            rec_dict,
+            model_cls,
+            model_field_to_serialized,
+            all_field_aliases,
+            base_consumed,
+            raw_record_id,
+            raw_visit_id,
+            subj_fallback,
         )
-        usubjid = str(usubjid_raw)
-        if (
-            self.mask_phi
-            and usubjid
-            and (
-                self._usubjid_is_sensitive
-                or (not explicit_usubjid and self._subject_key_is_sensitive)
+
+    @staticmethod
+    def _resolve_fallback_record_id(rec: Any, rec_dict: dict[str, Any]) -> Any:
+        """Resolve record identifier from unpacked dictionary or object attributes."""
+        for key in ("recordId", "record_id", "RECORD_ID"):
+            if key in rec_dict:
+                return rec_dict.get(key)
+        if isinstance(rec, BaseModel):
+            return (
+                rec.__dict__.get("record_oid")
+                or rec.__dict__.get("recordOid")
+                or rec_dict.get("recordOid")
+                or rec_dict.get("record_oid")
             )
+        if isinstance(rec, Mapping):
+            return rec_dict.get("recordOid") or rec_dict.get("record_oid")
+        return (
+            getattr(rec, "record_oid", None)
+            or getattr(rec, "recordOid", None)
+            or rec_dict.get("recordOid")
+            or rec_dict.get("record_oid")
+        )
+
+    @staticmethod
+    def _resolve_candidate_value(
+        var_name: str,
+        var_lower: str,
+        cand_pairs: tuple[tuple[str, str], ...],
+        rec_dict: dict[str, Any],
+        lower_rec_dict: dict[str, tuple[str, Any]],
+        model_field_to_serialized: dict[str, str],
+    ) -> tuple[str | None, Any]:
+        """Match an SDTM variable or one of its aliases in *rec_dict*."""
+        if var_name in rec_dict:
+            return var_name, rec_dict[var_name]
+        if var_lower in lower_rec_dict:
+            return lower_rec_dict[var_lower]
+        if (
+            var_name in model_field_to_serialized
+            and model_field_to_serialized[var_name] in rec_dict
         ):
-            usubjid = _MASKED_SENTINEL
+            fk = model_field_to_serialized[var_name]
+            return fk, rec_dict[fk]
+        if (
+            var_lower in model_field_to_serialized
+            and model_field_to_serialized[var_lower] in rec_dict
+        ):
+            fk = model_field_to_serialized[var_lower]
+            return fk, rec_dict[fk]
+        for cand, cand_lower in cand_pairs:
+            if cand in rec_dict:
+                return cand, rec_dict[cand]
+            if cand_lower in lower_rec_dict:
+                return lower_rec_dict[cand_lower]
+            if cand in model_field_to_serialized and model_field_to_serialized[cand] in rec_dict:
+                fk = model_field_to_serialized[cand]
+                return fk, rec_dict[fk]
+            if (
+                cand_lower in model_field_to_serialized
+                and model_field_to_serialized[cand_lower] in rec_dict
+            ):
+                fk = model_field_to_serialized[cand_lower]
+                return fk, rec_dict[fk]
+        return None, None
 
-        row: dict[str, Any] = {
-            "STUDYID": self.study_key,
-            "DOMAIN": self.domain_clean,
-            "USUBJID": usubjid,
-        }
-        if self.include_seq:
-            row[self.seq_var] = 0
-
-        consumed_keys: set[str] = set(base_consumed)
-        consumed_keys.add("RECORD_ID")
-        consumed_keys.add("VISITNUM")
-        consumed_keys.add("visitnum")
-        if not self.include_seq:
-            consumed_keys.add("DMSEQ")
-            consumed_keys.add("dmseq")
-
-        lower_rec_dict = {k.lower(): (k, v) for k, v in rec_dict.items()}
+    def _populate_std_vars(
+        self,
+        row: dict[str, Any],
+        rec_dict: dict[str, Any],
+        lower_rec_dict: dict[str, tuple[str, Any]],
+        consumed_keys: set[str],
+        unmasked_topic_map: dict[str, Any],
+        model_cls: type[BaseModel] | None,
+        model_field_to_serialized: dict[str, str],
+        all_field_aliases: dict[str, set[str]],
+    ) -> str | None:
+        """Populate domain-standard SDTM variables on *row* and return primary sort DTC."""
         canonical_dtc_for_sort: str | None = None
-        unmasked_topic_map: dict[str, Any] = {}
-
-        for (
-            var_name,
-            var_lower,
-            cand_pairs,
-            is_dtc,
-            is_birth_dtc,
-            is_flag,
-            is_var_exempt,
-            is_var_sensitive,
-            is_topic,
-        ) in self._compiled_std_vars:
-            val = None
-            found_key = None
-            if var_name in rec_dict:
-                val = rec_dict[var_name]
-                found_key = var_name
-            elif var_lower in lower_rec_dict:
-                found_key, val = lower_rec_dict[var_lower]
-            elif (
-                var_name in model_field_to_serialized
-                and model_field_to_serialized[var_name] in rec_dict
+        serialized_sets_fn = _get_model_var_serialized_set
+        for spec_entry in self._compiled_std_vars:
+            (
+                var_name,
+                var_lower,
+                cand_pairs,
+                cand_names,
+                all_lower_set,
+                all_lower_tuple,
+                is_dtc,
+                is_birth_dtc,
+                is_flag,
+                is_var_exempt,
+                is_var_sensitive,
+                is_topic,
+            ) = spec_entry
+            found_key: str | None = None
+            val: Any = None
+            if not all_lower_set.isdisjoint(lower_rec_dict) or (
+                model_cls is not None
+                and not serialized_sets_fn(model_cls, all_lower_tuple).isdisjoint(rec_dict)
             ):
-                found_key = model_field_to_serialized[var_name]
-                val = rec_dict[found_key]
-            elif (
-                var_lower in model_field_to_serialized
-                and model_field_to_serialized[var_lower] in rec_dict
-            ):
-                found_key = model_field_to_serialized[var_lower]
-                val = rec_dict[found_key]
-            else:
-                for cand, cand_lower in cand_pairs:
-                    if cand in rec_dict:
-                        val = rec_dict[cand]
-                        found_key = cand
-                        break
-                    if cand_lower in lower_rec_dict:
-                        found_key, val = lower_rec_dict[cand_lower]
-                        break
-                    if (
-                        cand in model_field_to_serialized
-                        and model_field_to_serialized[cand] in rec_dict
-                    ):
-                        found_key = model_field_to_serialized[cand]
-                        val = rec_dict[found_key]
-                        break
-                    if (
-                        cand_lower in model_field_to_serialized
-                        and model_field_to_serialized[cand_lower] in rec_dict
-                    ):
-                        found_key = model_field_to_serialized[cand_lower]
-                        val = rec_dict[found_key]
-                        break
-
-            if found_key:
-                consumed_keys.add(found_key)
-                if all_field_aliases:
-                    consumed_keys.update(all_field_aliases.get(found_key, ()))
-                    consumed_keys.update(all_field_aliases.get(found_key.lower(), ()))
-                for cand, cand_lower in cand_pairs:
-                    consumed_keys.add(cand)
-                    if cand_lower in lower_rec_dict:
-                        consumed_keys.add(lower_rec_dict[cand_lower][0])
-                    if model_field_to_serialized:
-                        if cand in model_field_to_serialized:
-                            serialized_cand = model_field_to_serialized[cand]
-                            consumed_keys.add(serialized_cand)
-                            consumed_keys.update(all_field_aliases.get(serialized_cand, ()))
-                        if cand_lower in model_field_to_serialized:
-                            serialized_cand = model_field_to_serialized[cand_lower]
-                            consumed_keys.add(serialized_cand)
-                            consumed_keys.update(all_field_aliases.get(serialized_cand, ()))
-                        consumed_keys.update(all_field_aliases.get(cand, ()))
-                        consumed_keys.update(all_field_aliases.get(cand_lower, ()))
+                found_key, val = self._resolve_candidate_value(
+                    var_name,
+                    var_lower,
+                    cand_pairs,
+                    rec_dict,
+                    lower_rec_dict,
+                    model_field_to_serialized,
+                )
+                if found_key:
+                    consumed_keys.add(found_key)
+                    consumed_keys.update(cand_names)
+                    if model_cls is not None:
+                        consumed_keys.update(all_field_aliases.get(found_key, ()))
+                        consumed_keys.update(_expand_model_var_consumed(model_cls, cand_names))
 
             if self.terminology:
                 val = self._apply_var_terminology(var_name, val)
@@ -1743,51 +1853,160 @@ class _SdtmNormalizer:
                     row[var_name] = full_dtc
             elif is_flag:
                 formatted_flag = _format_sdtm_flag(val)
-                if should_mask_var and formatted_flag is not None:
-                    row[var_name] = _MASKED_SENTINEL
-                else:
-                    row[var_name] = formatted_flag
+                row[var_name] = (
+                    _MASKED_SENTINEL
+                    if (should_mask_var and formatted_flag is not None)
+                    else formatted_flag
+                )
             elif should_mask_var:
                 row[var_name] = (
                     _MASKED_SENTINEL if (val is not None or found_key is not None) else None
                 )
             else:
                 row[var_name] = val
+        return canonical_dtc_for_sort
 
-        normalized_consumed = {_normalize_key(c) for c in consumed_keys}
+    def _populate_extra_vars(
+        self,
+        row: dict[str, Any],
+        rec_dict: dict[str, Any],
+        consumed_keys: set[str],
+        unmasked_topic_map: dict[str, Any],
+        canonical_dtc_for_sort: str | None,
+    ) -> str | None:
+        """Preserve non-envelope extra fields on *row* with PHI masking and DTC formatting."""
+        normalized_consumed = set(map(_normalize_key, consumed_keys))
         for k, raw_v in rec_dict.items():
-            if k not in consumed_keys and _normalize_key(k) not in normalized_consumed:
-                extra_val = self._apply_var_terminology(k, raw_v) if self.terminology else raw_v
-                if k in self._topic_set and k not in unmasked_topic_map:
-                    unmasked_topic_map[k] = extra_val
-                if self.mask_phi and not self._is_exempt_key(k):
-                    if _is_birth_dtc_key(k):
-                        if canonical_dtc_for_sort is None:
-                            canonical_dtc_for_sort = format_iso8601_dtc(extra_val, mask_phi=False)
-                        row[k] = format_iso8601_dtc(extra_val, mask_phi=True)
-                        continue
-                    if self._is_sensitive_key(k):
-                        row[k] = _MASKED_SENTINEL
-                        continue
-                    if isinstance(extra_val, (dict, list, tuple)):
-                        extra_val = _mask_value_recursive(
-                            extra_val,
-                            registry=self.registry,
-                            collapsed_phi_keys=self.collapsed_phi_keys,
-                        )
-                k_lower = k.lower()
-                if "date" in k_lower or "time" in k_lower or "dtc" in k_lower:
-                    formatted_extra_dtc = format_iso8601_dtc(extra_val, mask_phi=False)
-                    k_upper = k.upper()
-                    if k_upper == self.primary_dtc or (
-                        canonical_dtc_for_sort is None
-                        and k_upper.endswith("DTC")
-                        and formatted_extra_dtc is not None
-                    ):
-                        canonical_dtc_for_sort = formatted_extra_dtc
-                    row[k] = formatted_extra_dtc
-                else:
-                    row[k] = extra_val
+            if (
+                k in _BASE_SDTM_EXACT_CONSUMED_KEYS
+                or k in consumed_keys
+                or _normalize_key(k) in normalized_consumed
+            ):
+                continue
+            extra_val = self._apply_var_terminology(k, raw_v) if self.terminology else raw_v
+            if k in self._topic_set and k not in unmasked_topic_map:
+                unmasked_topic_map[k] = extra_val
+            if self.mask_phi and not self._is_exempt_key(k):
+                if _is_birth_dtc_key(k):
+                    if canonical_dtc_for_sort is None:
+                        canonical_dtc_for_sort = format_iso8601_dtc(extra_val, mask_phi=False)
+                    row[k] = format_iso8601_dtc(extra_val, mask_phi=True)
+                    continue
+                if self._is_sensitive_key(k):
+                    row[k] = _MASKED_SENTINEL
+                    continue
+                if isinstance(extra_val, (dict, list, tuple)):
+                    extra_val = _mask_value_recursive(
+                        extra_val,
+                        registry=self.registry,
+                        collapsed_phi_keys=self.collapsed_phi_keys,
+                    )
+            k_lower = k.lower()
+            if "date" in k_lower or "time" in k_lower or "dtc" in k_lower:
+                formatted_extra_dtc = format_iso8601_dtc(extra_val, mask_phi=False)
+                k_upper = k.upper()
+                if k_upper == self.primary_dtc or (
+                    canonical_dtc_for_sort is None
+                    and k_upper.endswith("DTC")
+                    and formatted_extra_dtc is not None
+                ):
+                    canonical_dtc_for_sort = formatted_extra_dtc
+                row[k] = formatted_extra_dtc
+            else:
+                row[k] = extra_val
+        return canonical_dtc_for_sort
+
+    def prepare_record(self, rec: Any, orig_idx: int) -> _PreparedSdtmRow | None:
+        """Normalize a single clinical record and compute its Subject-group sort key."""
+        if not self.include_deleted and _is_deleted_record(rec):
+            return None
+
+        (
+            rec_dict,
+            model_cls,
+            model_field_to_serialized,
+            all_field_aliases,
+            base_consumed,
+            raw_record_id,
+            raw_visit_id,
+            subj_fallback,
+        ) = self._unpack_record_payload(rec)
+
+        if self.pipeline is not None and (
+            self.has_enrichment_transforms or not hasattr(self.pipeline, "terminology")
+        ):
+            _, rec_form_key = extract_record_form_ref(rec)
+            try:
+                rec_dict = self.pipeline.process(
+                    rec_dict,
+                    mask_phi=False,
+                    domain=self.domain_clean,
+                    form_key=rec_form_key,
+                )
+            except TypeError:
+                rec_dict = self.pipeline.process(rec_dict, mask_phi=False)
+
+        explicit_usubjid = rec_dict.get("USUBJID") or rec_dict.get("usubjid")
+        usubjid_raw = (
+            explicit_usubjid
+            or rec_dict.get("subjectKey")
+            or rec_dict.get("subject_key")
+            or (
+                rec_dict.get(model_field_to_serialized.get("subject_key", ""))
+                if model_field_to_serialized
+                else None
+            )
+            or (
+                rec_dict.get(model_field_to_serialized.get("subjectKey", ""))
+                if model_field_to_serialized
+                else None
+            )
+            or subj_fallback
+            or ""
+        )
+        usubjid = str(usubjid_raw)
+        if (
+            self.mask_phi
+            and usubjid
+            and (
+                self._usubjid_is_sensitive
+                or (not explicit_usubjid and self._subject_key_is_sensitive)
+            )
+        ):
+            usubjid = _MASKED_SENTINEL
+
+        row: dict[str, Any] = {
+            "STUDYID": self.study_key,
+            "DOMAIN": self.domain_clean,
+            "USUBJID": usubjid,
+        }
+        if self.include_seq:
+            row[self.seq_var] = 0
+
+        consumed_keys: set[str] = set(base_consumed)
+        consumed_keys.update(("RECORD_ID", "VISITNUM", "visitnum"))
+        if not self.include_seq:
+            consumed_keys.update(("DMSEQ", "dmseq"))
+
+        lower_rec_dict = {k.lower(): (k, v) for k, v in rec_dict.items()}
+        unmasked_topic_map: dict[str, Any] = {}
+        canonical_dtc_for_sort = self._populate_std_vars(
+            row,
+            rec_dict,
+            lower_rec_dict,
+            consumed_keys,
+            unmasked_topic_map,
+            model_cls,
+            model_field_to_serialized,
+            all_field_aliases,
+        )
+        canonical_dtc_for_sort = self._populate_extra_vars(
+            row,
+            rec_dict,
+            consumed_keys,
+            unmasked_topic_map,
+            canonical_dtc_for_sort,
+        )
 
         if self.domain_clean != "DM":
             explicit_vnum = (
@@ -1809,7 +2028,7 @@ class _SdtmNormalizer:
             and str(raw_record_id).strip()
             else None
         )
-        topic_vals = tuple(unmasked_topic_map.get(tv) for tv in self.topic_vars)
+        topic_vals = tuple(map(unmasked_topic_map.get, self.topic_vars))
         sort_key = (
             _dtc_sort_key(canonical_dtc_for_sort),
             _topic_sort_key(topic_vals),
@@ -1830,24 +2049,41 @@ class _SdtmNormalizer:
         seq_counters: dict[str, int],
         record_seqs: dict[str, int] | None = None,
         *,
-        seq_overrides: Mapping[str, int] | None = None,
+        seq_overrides: Mapping[Any, int] | None = None,
         lineage_out: dict[str, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Sort a Subject's normalized rows and stamp sequential <DOM>SEQ values."""
         group.sort(key=lambda item: item.sort_key)
+        overrides_has_scoped = _mapping_has_scoped_seq_keys(seq_overrides)
+        record_seqs_has_scoped = _mapping_has_scoped_seq_keys(record_seqs)
+
         if self.include_seq and (seq_overrides or record_seqs):
             for item in group:
                 rk = item.record_id_key or _canonical_record_id_key(item.record_id)
                 if rk is not None:
-                    if seq_overrides is not None and rk in seq_overrides:
+                    ov_val = _lookup_scoped_seq_value(
+                        seq_overrides,
+                        domain=self.domain_clean,
+                        usubjid=item.usubjid,
+                        rec_id_key=rk,
+                        has_scoped_keys=overrides_has_scoped,
+                    )
+                    if ov_val is not None:
                         seq_counters[item.usubjid] = max(
                             seq_counters.get(item.usubjid, 0),
-                            int(seq_overrides[rk]),
+                            ov_val,
                         )
-                    if record_seqs is not None and rk in record_seqs:
+                    rs_val = _lookup_scoped_seq_value(
+                        record_seqs,
+                        domain=self.domain_clean,
+                        usubjid=item.usubjid,
+                        rec_id_key=rk,
+                        has_scoped_keys=record_seqs_has_scoped or overrides_has_scoped,
+                    )
+                    if rs_val is not None:
                         seq_counters[item.usubjid] = max(
                             seq_counters.get(item.usubjid, 0),
-                            int(record_seqs[rk]),
+                            rs_val,
                         )
         rows: list[dict[str, Any]] = []
         for item in group:
@@ -1855,16 +2091,22 @@ class _SdtmNormalizer:
             assigned_seq: int | None = None
             if self.include_seq:
                 override_seq: int | None = None
-                if (
-                    seq_overrides is not None
-                    and rec_id_key is not None
-                    and rec_id_key in seq_overrides
-                ):
-                    override_seq = int(seq_overrides[rec_id_key])
-                elif (
-                    record_seqs is not None and rec_id_key is not None and rec_id_key in record_seqs
-                ):
-                    override_seq = int(record_seqs[rec_id_key])
+                if rec_id_key is not None:
+                    override_seq = _lookup_scoped_seq_value(
+                        seq_overrides,
+                        domain=self.domain_clean,
+                        usubjid=item.usubjid,
+                        rec_id_key=rec_id_key,
+                        has_scoped_keys=overrides_has_scoped,
+                    )
+                    if override_seq is None:
+                        override_seq = _lookup_scoped_seq_value(
+                            record_seqs,
+                            domain=self.domain_clean,
+                            usubjid=item.usubjid,
+                            rec_id_key=rec_id_key,
+                            has_scoped_keys=record_seqs_has_scoped or overrides_has_scoped,
+                        )
 
                 if override_seq is not None:
                     assigned_seq = override_seq
@@ -1877,7 +2119,11 @@ class _SdtmNormalizer:
                     seq_counters[item.usubjid] = assigned_seq
 
                 if record_seqs is not None and rec_id_key is not None:
-                    record_seqs[rec_id_key] = assigned_seq
+                    scoped_rs_key = format_scoped_seq_override_key(
+                        self.domain_clean, item.usubjid, rec_id_key
+                    )
+                    record_seqs[scoped_rs_key] = assigned_seq
+                    record_seqs_has_scoped = True
                 item.row[self.seq_var] = assigned_seq
             if lineage_out is not None and rec_id_key is not None:
                 lineage_out[rec_id_key] = {
@@ -1907,6 +2153,73 @@ class _SdtmNormalizer:
         return out
 
 
+def format_scoped_seq_override_key(domain: str, usubjid: str, record_id: str) -> str:
+    """Format a canonical ``(domain, usubjid, record_id)`` key for ``seq_overrides``."""
+    return f"{domain.strip().upper()}:{usubjid}:{record_id}"
+
+
+def _mapping_has_scoped_seq_keys(mapping: Mapping[Any, int] | None) -> bool:
+    """Return True when ``mapping`` contains tuple or ``domain:usubjid:record_id`` keys."""
+    if not mapping:
+        return False
+    keys_iter = dict.keys(mapping) if isinstance(mapping, dict) else mapping.keys()
+    return any(
+        (isinstance(k, tuple) and len(k) == 3) or (isinstance(k, str) and k.count(":") >= 2)
+        for k in keys_iter
+    )
+
+
+def _lookup_scoped_seq_value(
+    mapping: Mapping[Any, int] | None,
+    *,
+    domain: str,
+    usubjid: str,
+    rec_id_key: str,
+    has_scoped_keys: bool,
+) -> int | None:
+    """Look up a sequence override scoped by ``(domain, usubjid, record_id)``."""
+    if not mapping:
+        return None
+    dom_clean = domain.strip().upper()
+    tuple_key = (dom_clean, usubjid, rec_id_key)
+    scoped_str_key = format_scoped_seq_override_key(dom_clean, usubjid, rec_id_key)
+
+    if isinstance(mapping, dict):
+        if dict.__contains__(mapping, tuple_key):
+            return int(dict.__getitem__(mapping, tuple_key))
+        if dict.__contains__(mapping, scoped_str_key):
+            return int(dict.__getitem__(mapping, scoped_str_key))
+        if not has_scoped_keys and dict.__contains__(mapping, rec_id_key):
+            return int(dict.__getitem__(mapping, rec_id_key))
+        return None
+
+    if tuple_key in mapping:
+        return int(mapping[tuple_key])
+    if scoped_str_key in mapping:
+        return int(mapping[scoped_str_key])
+    if not has_scoped_keys and rec_id_key in mapping:
+        return int(mapping[rec_id_key])
+    return None
+
+
+def _emit_subject_group_frames(
+    emit_buffer: list[dict[str, Any]],
+    subj_rows: list[dict[str, Any]],
+    *,
+    chunk_size: int,
+    normalizer: _SdtmNormalizer,
+) -> Iterator[pd.DataFrame]:
+    """Append finalized rows for one Subject and yield chunk-bounded DataFrames without splitting Subjects unnecessarily."""
+    if emit_buffer and len(emit_buffer) + len(subj_rows) > chunk_size:
+        yield normalizer.rows_to_dataframe(list(emit_buffer))
+        emit_buffer.clear()
+    emit_buffer.extend(subj_rows)
+    while len(emit_buffer) >= chunk_size:
+        batch = emit_buffer[:chunk_size]
+        del emit_buffer[:chunk_size]
+        yield normalizer.rows_to_dataframe(batch)
+
+
 def _iter_sorted_sdtm_frames(
     records: Iterable[Any],
     normalizer: _SdtmNormalizer,
@@ -1914,11 +2227,12 @@ def _iter_sorted_sdtm_frames(
     chunk_size: int,
     seq_counters: dict[str, int],
     source_is_ordered: bool = False,
-    seq_overrides: Mapping[str, int] | None = None,
+    seq_overrides: Mapping[Any, int] | None = None,
     lineage_out: dict[str, dict[str, Any]] | None = None,
 ) -> Iterator[pd.DataFrame]:
     """Yield bounded SDTM DataFrames grouped by USUBJID with continuous sequence counters."""
-    if isinstance(records, (list, tuple)):
+    effective_ordered = bool(source_is_ordered and not normalizer.remaps_usubjid)
+    if not effective_ordered:
         grouped: dict[str, list[_PreparedSdtmRow]] = {}
         for idx, rec in enumerate(records):
             prepared = normalizer.prepare_record(rec, idx)
@@ -1926,131 +2240,74 @@ def _iter_sorted_sdtm_frames(
                 grouped.setdefault(prepared.usubjid, []).append(prepared)
         emit_rows: list[dict[str, Any]] = []
         for usubjid in sorted(grouped):
-            emit_rows.extend(
-                normalizer.finalize_subject_group(
-                    grouped[usubjid],
-                    seq_counters,
-                    seq_overrides=seq_overrides,
-                    lineage_out=lineage_out,
-                )
-            )
-            while len(emit_rows) >= chunk_size:
-                batch = emit_rows[:chunk_size]
-                emit_rows = emit_rows[chunk_size:]
-                yield normalizer.rows_to_dataframe(batch)
-        if emit_rows:
-            yield normalizer.rows_to_dataframe(emit_rows)
-        return
-
-    staged_groups: dict[str, list[_PreparedSdtmRow]] = {}
-    group_order: list[str] = []
-    last_usubjid: str | None = None
-    staged_total_rows = 0
-    yielded_any = False
-    orig_idx = 0
-    rec_iter = iter(records)
-    emit_buffer: list[dict[str, Any]] = []
-
-    for rec in rec_iter:
-        prepared = normalizer.prepare_record(rec, orig_idx)
-        orig_idx += 1
-        if prepared is None:
-            continue
-
-        if not yielded_any:
-            if (
-                last_usubjid is not None
-                and prepared.usubjid != last_usubjid
-                and (prepared.usubjid < last_usubjid or prepared.usubjid in staged_groups)
-            ):
-                # Ungrouped input detected prior to emitting any chunk: drain and sort all subjects.
-                staged_groups.setdefault(prepared.usubjid, []).append(prepared)
-                for tail_rec in rec_iter:
-                    tail_prepared = normalizer.prepare_record(tail_rec, orig_idx)
-                    orig_idx += 1
-                    if tail_prepared is not None:
-                        staged_groups.setdefault(tail_prepared.usubjid, []).append(tail_prepared)
-                for usubjid in sorted(staged_groups):
-                    emit_buffer.extend(
-                        normalizer.finalize_subject_group(
-                            staged_groups[usubjid],
-                            seq_counters,
-                            seq_overrides=seq_overrides,
-                            lineage_out=lineage_out,
-                        )
-                    )
-                    while len(emit_buffer) >= chunk_size:
-                        batch = emit_buffer[:chunk_size]
-                        emit_buffer = emit_buffer[chunk_size:]
-                        yield normalizer.rows_to_dataframe(batch)
-                if emit_buffer:
-                    yield normalizer.rows_to_dataframe(emit_buffer)
-                return
-
-            if prepared.usubjid not in staged_groups:
-                staged_groups[prepared.usubjid] = []
-                group_order.append(prepared.usubjid)
-            staged_groups[prepared.usubjid].append(prepared)
-            staged_total_rows += 1
-            last_usubjid = prepared.usubjid
-
-            completed_groups = len(group_order) - 1
-            completed_rows = staged_total_rows - len(staged_groups[last_usubjid])
-            min_completed_groups = 1 if source_is_ordered else (4 if chunk_size == 1 else 2)
-            if completed_groups >= min_completed_groups and completed_rows >= chunk_size:
-                for done_subj in group_order[:-1]:
-                    done_group = staged_groups.pop(done_subj)
-                    emit_buffer.extend(
-                        normalizer.finalize_subject_group(
-                            done_group,
-                            seq_counters,
-                            seq_overrides=seq_overrides,
-                            lineage_out=lineage_out,
-                        )
-                    )
-                group_order = [last_usubjid]
-                staged_total_rows = len(staged_groups[last_usubjid])
-                while len(emit_buffer) >= chunk_size:
-                    batch = emit_buffer[:chunk_size]
-                    emit_buffer = emit_buffer[chunk_size:]
-                    yielded_any = True
-                    yield normalizer.rows_to_dataframe(batch)
-            continue
-
-        # Already streaming ordered Subject groups
-        assert last_usubjid is not None
-        if prepared.usubjid != last_usubjid:
-            finished_group = staged_groups.pop(last_usubjid)
-            emit_buffer.extend(
-                normalizer.finalize_subject_group(
-                    finished_group,
-                    seq_counters,
-                    seq_overrides=seq_overrides,
-                    lineage_out=lineage_out,
-                )
-            )
-            staged_groups[prepared.usubjid] = [prepared]
-            last_usubjid = prepared.usubjid
-            while len(emit_buffer) >= chunk_size:
-                batch = emit_buffer[:chunk_size]
-                emit_buffer = emit_buffer[chunk_size:]
-                yield normalizer.rows_to_dataframe(batch)
-        else:
-            staged_groups[last_usubjid].append(prepared)
-
-    for rem_subj in sorted(staged_groups) if not yielded_any else list(staged_groups):
-        emit_buffer.extend(
-            normalizer.finalize_subject_group(
-                staged_groups[rem_subj],
+            subj_rows = normalizer.finalize_subject_group(
+                grouped[usubjid],
                 seq_counters,
                 seq_overrides=seq_overrides,
                 lineage_out=lineage_out,
             )
+            yield from _emit_subject_group_frames(
+                emit_rows,
+                subj_rows,
+                chunk_size=chunk_size,
+                normalizer=normalizer,
+            )
+        if emit_rows:
+            yield normalizer.rows_to_dataframe(emit_rows)
+        return
+
+    current_group: list[_PreparedSdtmRow] = []
+    last_usubjid: str | None = None
+    emit_buffer: list[dict[str, Any]] = []
+
+    for orig_idx, rec in enumerate(records):
+        prepared = normalizer.prepare_record(rec, orig_idx)
+        if prepared is None:
+            continue
+
+        if last_usubjid is None:
+            last_usubjid = prepared.usubjid
+            current_group = [prepared]
+            continue
+
+        if prepared.usubjid == last_usubjid:
+            current_group.append(prepared)
+            continue
+
+        if prepared.usubjid < last_usubjid:
+            raise ValueError(
+                f"Non-monotonic USUBJID order in SDTM stream with source_is_ordered=True: "
+                f"{prepared.usubjid!r} arrived after {last_usubjid!r}."
+            )
+
+        subj_rows = normalizer.finalize_subject_group(
+            current_group,
+            seq_counters,
+            seq_overrides=seq_overrides,
+            lineage_out=lineage_out,
         )
-    while len(emit_buffer) >= chunk_size:
-        batch = emit_buffer[:chunk_size]
-        emit_buffer = emit_buffer[chunk_size:]
-        yield normalizer.rows_to_dataframe(batch)
+        current_group = [prepared]
+        last_usubjid = prepared.usubjid
+        yield from _emit_subject_group_frames(
+            emit_buffer,
+            subj_rows,
+            chunk_size=chunk_size,
+            normalizer=normalizer,
+        )
+
+    if current_group:
+        subj_rows = normalizer.finalize_subject_group(
+            current_group,
+            seq_counters,
+            seq_overrides=seq_overrides,
+            lineage_out=lineage_out,
+        )
+        yield from _emit_subject_group_frames(
+            emit_buffer,
+            subj_rows,
+            chunk_size=chunk_size,
+            normalizer=normalizer,
+        )
     if emit_buffer:
         yield normalizer.rows_to_dataframe(emit_buffer)
 
@@ -2217,19 +2474,24 @@ def iter_subject_ordered_sdtm_records(
             current_entries.append(entry)
             continue
 
-        if not yielded_any and usubjid < current_usubjid:
-            # Stream was not actually ordered by Subject: drain and sort all Subjects safely.
-            fallback_groups: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {
-                current_usubjid: current_entries,
-            }
-            fallback_groups.setdefault(usubjid, []).append(entry)
-            for tail_rec in rec_iter:
-                tail_entry = _prepare_entry(tail_rec, idx)
-                idx += 1
-                fallback_groups.setdefault(tail_entry[0], []).append(tail_entry)
-            for subj_key in sorted(fallback_groups):
-                yield from _sort_subject_entries(fallback_groups[subj_key])
-            return
+        if usubjid < current_usubjid:
+            if not yielded_any:
+                # Stream was not actually ordered by Subject: drain and sort all Subjects safely.
+                fallback_groups: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {
+                    current_usubjid: current_entries,
+                }
+                fallback_groups.setdefault(usubjid, []).append(entry)
+                for tail_rec in rec_iter:
+                    tail_entry = _prepare_entry(tail_rec, idx)
+                    idx += 1
+                    fallback_groups.setdefault(tail_entry[0], []).append(tail_entry)
+                for subj_key in sorted(fallback_groups):
+                    yield from _sort_subject_entries(fallback_groups[subj_key])
+                return
+            raise ValueError(
+                f"Non-monotonic USUBJID order in SDTM stream with source_is_ordered=True: "
+                f"{usubjid!r} arrived after {current_usubjid!r}."
+            )
 
         finished = current_entries
         current_usubjid = usubjid
