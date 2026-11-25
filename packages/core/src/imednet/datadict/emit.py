@@ -23,7 +23,67 @@ ODM_NS = "http://www.cdisc.org/ns/odm/v1.3"
 IMEDNET_NS = "http://www.imednet.com/ns/odm/metadata"
 
 _ROUNDTRIP_VENDOR_VARIABLE_TYPES: frozenset[str] = frozenset(
-    {"Calculation", "Slider", "File", "Descriptive"}
+    {"Calculation", "Slider", "File", "Descriptive", "Date/Time Precision"}
+)
+_BOUND_EXTRA_KEYS: frozenset[str] = frozenset(
+    {
+        "rangeChecks",
+        "textValidationMin",
+        "textValidationMax",
+        "minValue",
+        "maxValue",
+        "min",
+        "max",
+        "minimum",
+        "maximum",
+    }
+)
+_UNIT_EXTRA_KEYS: frozenset[str] = frozenset(
+    {
+        "measurementUnits",
+        "measurementUnit",
+        "units",
+        "unit",
+    }
+)
+_METADATA_NATIVE_EXTRA_KEYS: frozenset[str] = (
+    frozenset(
+        {
+            "studyName",
+            "studyDescription",
+            "protocolName",
+            "protocol",
+            "visits",
+            "roleCodeLists",
+        }
+    )
+    | _UNIT_EXTRA_KEYS
+)
+_FORM_NATIVE_EXTRA_KEYS: frozenset[str] = frozenset(
+    {
+        "visits",
+        "collectionExceptionConditionOid",
+        "Domain",
+        "SASDatasetName",
+        "Purpose",
+    }
+)
+_VARIABLE_NATIVE_EXTRA_KEYS: frozenset[str] = frozenset(
+    {
+        "SDSVarName",
+        "SASFieldName",
+        "Origin",
+        "originSource",
+        "originDescription",
+        "Comment",
+        "odmDataType",
+        "methodOid",
+        "collectionExceptionConditionOid",
+        "Role",
+        "role",
+        "RoleCodeListOID",
+        "roleCodeListOid",
+    }
 )
 _PRESERVED_ODM_DATA_TYPES: frozenset[str] = frozenset(
     {
@@ -159,6 +219,8 @@ def _map_to_odm_datatype(
     vt_norm = normalize_variable_type(var_type, precision=precision)
     if not vt_norm:
         return "text", ("RadioButton" if has_choices else None)
+    if vt_norm == "Date/Time Precision":
+        return "datetime", None
     if vt_norm in _ROUNDTRIP_VENDOR_VARIABLE_TYPES:
         return "text", None
     if vt_norm == "Integer":
@@ -644,10 +706,13 @@ def _emit_native_odm_rules(
 def _emit_formal_rules(
     mdv_elem: ET.Element,
     scoped_rules: list[tuple[str | None, BusinessLogicRule]],
+    *,
+    redcap_conditions: list[tuple[str, str, str, str]] | None = None,
+    redcap_methods: list[tuple[str, str, str, str]] | None = None,
 ) -> None:
     """Emit ODM ConditionDef (all sources) followed by MethodDef elements."""
     seen_oids: set[tuple[str, str]] = set()
-    used_cond_oids: set[str] = set()
+    used_cond_oids: set[str] = {oid for oid, _, _, _ in (redcap_conditions or [])}
 
     # Pass 1: Standard ODM ConditionDef rules
     _emit_native_odm_rules(mdv_elem, scoped_rules, "ConditionDef", seen_oids, used_cond_oids)
@@ -717,8 +782,55 @@ def _emit_formal_rules(
             )
             fe_json.text = json.dumps(rule.logic, sort_keys=True)
 
+    # Pass 2b: REDCap branchingLogic ConditionDef elements
+    for cond_oid, rc_form_key, rc_var_name, rc_expr in redcap_conditions or []:
+        rc_cond_attribs: dict[str, str] = {
+            "OID": cond_oid,
+            "Name": f"{rc_form_key}.{rc_var_name} Branching Logic"
+            if rc_form_key
+            else f"{rc_var_name} Branching Logic",
+            f"{{{IMEDNET_NS}}}RuleSource": "redcap",
+            f"{{{IMEDNET_NS}}}TargetVariable": rc_var_name,
+        }
+        if rc_form_key:
+            rc_cond_attribs[f"{{{IMEDNET_NS}}}FormKey"] = rc_form_key
+        rc_cond_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}ConditionDef", rc_cond_attribs)
+        rc_desc = ET.SubElement(rc_cond_elem, f"{{{ODM_NS}}}Description")
+        rc_tt = ET.SubElement(rc_desc, f"{{{ODM_NS}}}TranslatedText", {"xml:lang": "en"})
+        rc_tt.text = f"REDCap branching logic for {rc_var_name}"
+        rc_fe = ET.SubElement(
+            rc_cond_elem,
+            f"{{{ODM_NS}}}FormalExpression",
+            {"Context": "redcap:branchingLogic"},
+        )
+        rc_fe.text = rc_expr
+
     # Pass 3: Standard ODM MethodDef rules (always after all ConditionDef elements)
     _emit_native_odm_rules(mdv_elem, scoped_rules, "MethodDef", seen_oids, used_cond_oids)
+
+    # Pass 3b: REDCap calculation MethodDef elements
+    for meth_oid, rc_form_key, rc_var_name, rc_calc in redcap_methods or []:
+        rc_meth_attribs: dict[str, str] = {
+            "OID": meth_oid,
+            "Name": f"{rc_form_key}.{rc_var_name} Calculation"
+            if rc_form_key
+            else f"{rc_var_name} Calculation",
+            "Type": "Computation",
+            f"{{{IMEDNET_NS}}}RuleSource": "redcap",
+            f"{{{IMEDNET_NS}}}TargetVariable": rc_var_name,
+        }
+        if rc_form_key:
+            rc_meth_attribs[f"{{{IMEDNET_NS}}}FormKey"] = rc_form_key
+        rc_meth_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}MethodDef", rc_meth_attribs)
+        rc_desc = ET.SubElement(rc_meth_elem, f"{{{ODM_NS}}}Description")
+        rc_tt = ET.SubElement(rc_desc, f"{{{ODM_NS}}}TranslatedText", {"xml:lang": "en"})
+        rc_tt.text = f"REDCap calculation for {rc_var_name}"
+        rc_fe = ET.SubElement(
+            rc_meth_elem,
+            f"{{{ODM_NS}}}FormalExpression",
+            {"Context": "redcap:calculation"},
+        )
+        rc_fe.text = rc_calc
 
 
 def to_odm_xml(
@@ -748,22 +860,21 @@ def to_odm_xml(
     ET.register_namespace("", ODM_NS)
     ET.register_namespace("imednet", IMEDNET_NS)
 
+    has_explicit_study_key = datadict.metadata.studyKey is not None
     study_key = datadict.metadata.studyKey or "STUDY_001"
-    study_name = (
-        getattr(datadict.metadata, "studyName", None)
-        or datadict.metadata.extraAttributes.get("studyName")
-        or study_key
-    )
+    explicit_study_name = getattr(
+        datadict.metadata, "studyName", None
+    ) or datadict.metadata.extraAttributes.get("studyName")
+    study_name = explicit_study_name or study_key
     study_description = (
         getattr(datadict.metadata, "studyDescription", None)
         or datadict.metadata.extraAttributes.get("studyDescription")
         or ""
     )
-    protocol_name = (
-        getattr(datadict.metadata, "protocolName", None)
-        or datadict.metadata.extraAttributes.get("protocolName")
-        or study_key
-    )
+    explicit_protocol_name = getattr(
+        datadict.metadata, "protocolName", None
+    ) or datadict.metadata.extraAttributes.get("protocolName")
+    protocol_name = explicit_protocol_name or study_key
 
     now_iso = creation_datetime or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
     f_oid = file_oid or f"ODM_{study_key}_{now_iso}"
@@ -783,8 +894,26 @@ def to_odm_xml(
         },
     )
 
-    study_elem = ET.SubElement(root, f"{{{ODM_NS}}}Study", {"OID": study_key})
-    gv_elem = ET.SubElement(study_elem, f"{{{ODM_NS}}}GlobalVariables")
+    study_attribs: dict[str, str] = {"OID": study_key}
+    if not has_explicit_study_key:
+        study_attribs[f"{{{IMEDNET_NS}}}SyntheticStudyKey"] = "Yes"
+    unmapped_meta_extra = {
+        k: v
+        for k, v in datadict.metadata.extraAttributes.items()
+        if k not in _METADATA_NATIVE_EXTRA_KEYS
+    }
+    if unmapped_meta_extra:
+        study_attribs[f"{{{IMEDNET_NS}}}ExtraAttributes"] = json.dumps(
+            unmapped_meta_extra, sort_keys=True
+        )
+
+    study_elem = ET.SubElement(root, f"{{{ODM_NS}}}Study", study_attribs)
+    gv_attribs: dict[str, str] = {}
+    if not explicit_study_name:
+        gv_attribs[f"{{{IMEDNET_NS}}}SyntheticStudyName"] = "Yes"
+    if not explicit_protocol_name:
+        gv_attribs[f"{{{IMEDNET_NS}}}SyntheticProtocolName"] = "Yes"
+    gv_elem = ET.SubElement(study_elem, f"{{{ODM_NS}}}GlobalVariables", gv_attribs)
     sn_elem = ET.SubElement(gv_elem, f"{{{ODM_NS}}}StudyName")
     sn_elem.text = str(study_name)
 
@@ -799,9 +928,13 @@ def to_odm_xml(
     sorted_forms = sorted(datadict.forms, key=lambda f: f.formKey or "")
 
     # 1b. BasicDefinitions / MeasurementUnit elements (when units exist)
+    has_study_level_units = bool(normalize_measurement_units(datadict.metadata.extraAttributes))
     study_units = _collect_study_measurement_units(datadict, sorted_forms)
     if study_units:
-        bd_elem = ET.SubElement(study_elem, f"{{{ODM_NS}}}BasicDefinitions")
+        bd_attribs: dict[str, str] = {}
+        if not has_study_level_units:
+            bd_attribs[f"{{{IMEDNET_NS}}}ItemScopedOnly"] = "Yes"
+        bd_elem = ET.SubElement(study_elem, f"{{{ODM_NS}}}BasicDefinitions", bd_attribs)
         for unit in study_units:
             mu_elem = ET.SubElement(
                 bd_elem,
@@ -836,6 +969,18 @@ def to_odm_xml(
         norm_fid = normalize_form_id(form.formId, form_key=form.formKey)
         if norm_fid is not None:
             form_attribs[f"{{{IMEDNET_NS}}}FormId"] = str(norm_fid)
+        if form.formName is None:
+            form_attribs[f"{{{IMEDNET_NS}}}UnsetFormName"] = "Yes"
+        unmapped_form_extra = {
+            k: v
+            for k, v in form.extraAttributes.items()
+            if k not in _FORM_NATIVE_EXTRA_KEYS
+            and not (k == "repeating" and str(v).strip().lower() == "yes")
+        }
+        if unmapped_form_extra:
+            form_attribs[f"{{{IMEDNET_NS}}}ExtraAttributes"] = json.dumps(
+                unmapped_form_extra, sort_keys=True
+            )
 
         form_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}FormDef", form_attribs)
         ig_oid = f"IG_{form.formKey}"
@@ -856,6 +1001,32 @@ def to_odm_xml(
 
     # 3. ItemGroupDef elements
     referenced_role_codelists: dict[str, list[str]] = {}
+    used_redcap_cond_oids: set[str] = {
+        str(r.id).strip()
+        for f in sorted_forms
+        for r in f.businessLogic
+        if r.id is not None and str(r.id).strip()
+    } | {
+        str(r.id).strip()
+        for r in datadict.unassignedBusinessLogic
+        if r.id is not None and str(r.id).strip()
+    }
+    used_redcap_meth_oids: set[str] = set(used_redcap_cond_oids)
+    for f in sorted_forms:
+        if f_cond := f.extraAttributes.get("collectionExceptionConditionOid"):
+            used_redcap_cond_oids.add(str(f_cond).strip())
+        for v in f.variables:
+            if v_cond := v.extraAttributes.get("collectionExceptionConditionOid"):
+                used_redcap_cond_oids.add(str(v_cond).strip())
+            if v_meth := v.extraAttributes.get("methodOid"):
+                used_redcap_meth_oids.add(str(v_meth).strip())
+
+    redcap_conditions: list[tuple[str, str, str, str]] = []
+    redcap_methods: list[tuple[str, str, str, str]] = []
+    emitted_redcap_calc_occ: set[tuple[int, int]] = set()
+    emitted_redcap_branch_occ: set[tuple[int, int]] = set()
+    form_ig_sdtm_by_key: dict[str, tuple[str | None, str | None]] = {}
+
     for f_idx, form in enumerate(sorted_forms):
         ig_attribs: dict[str, str] = {
             "OID": f"IG_{form.formKey}",
@@ -881,6 +1052,7 @@ def to_odm_xml(
             ig_attribs["SASDatasetName"] = sas_dataset
         if purpose:
             ig_attribs["Purpose"] = purpose
+        form_ig_sdtm_by_key[form.formKey] = (domain, sas_dataset)
 
         ig_elem = ET.SubElement(
             mdv_elem,
@@ -900,8 +1072,27 @@ def to_odm_xml(
                 "OrderNumber": str(var.sequence if var.sequence is not None else var_idx),
                 "Mandatory": "Yes" if is_yes else "No",
             }
-            if (method_oid := var.extraAttributes.get("methodOid")) and str(method_oid).strip():
-                item_ref_attribs["MethodOID"] = str(method_oid).strip()
+            if var.sequence is None:
+                item_ref_attribs[f"{{{IMEDNET_NS}}}SyntheticOrder"] = "Yes"
+            if var.required is None:
+                item_ref_attribs[f"{{{IMEDNET_NS}}}UnsetRequired"] = "Yes"
+
+            explicit_method_oid = var.extraAttributes.get("methodOid")
+            if explicit_method_oid and str(explicit_method_oid).strip():
+                item_ref_attribs["MethodOID"] = str(explicit_method_oid).strip()
+            else:
+                calc_expr = var.extraAttributes.get("calculation")
+                if isinstance(calc_expr, str) and calc_expr.strip():
+                    base_meth = (
+                        f"MT.REDCAP.{form.formKey}.{var.variableName}"
+                        if form.formKey
+                        else f"MT.REDCAP.{var.variableName}"
+                    )
+                    meth_oid = _allocate_codelist_oid(base_meth, used_redcap_meth_oids)
+                    item_ref_attribs["MethodOID"] = meth_oid
+                    redcap_methods.append((meth_oid, form.formKey, var.variableName, calc_expr))
+                    emitted_redcap_calc_occ.add((f_idx, v_idx))
+
             role_val = var.extraAttributes.get("Role") or var.extraAttributes.get("role")
             if role_val is not None and str(role_val).strip():
                 item_ref_attribs["Role"] = str(role_val).strip()
@@ -916,10 +1107,25 @@ def to_odm_xml(
                     clean_role = str(role_val).strip()
                     if clean_role not in role_bucket:
                         role_bucket.append(clean_role)
-            if (cond_oid := var.extraAttributes.get("collectionExceptionConditionOid")) and str(
-                cond_oid
-            ).strip():
-                item_ref_attribs["CollectionExceptionConditionOID"] = str(cond_oid).strip()
+
+            explicit_cond_oid = var.extraAttributes.get("collectionExceptionConditionOid")
+            if explicit_cond_oid and str(explicit_cond_oid).strip():
+                item_ref_attribs["CollectionExceptionConditionOID"] = str(explicit_cond_oid).strip()
+            else:
+                branch_expr = var.extraAttributes.get("branchingLogic")
+                if isinstance(branch_expr, str) and branch_expr.strip():
+                    base_cond = (
+                        f"COND.REDCAP.{form.formKey}.{var.variableName}"
+                        if form.formKey
+                        else f"COND.REDCAP.{var.variableName}"
+                    )
+                    cond_oid_alloc = _allocate_codelist_oid(base_cond, used_redcap_cond_oids)
+                    item_ref_attribs["CollectionExceptionConditionOID"] = cond_oid_alloc
+                    redcap_conditions.append(
+                        (cond_oid_alloc, form.formKey, var.variableName, branch_expr)
+                    )
+                    emitted_redcap_branch_occ.add((f_idx, v_idx))
+
             if req_str and not is_yes and not is_no:
                 item_ref_attribs[f"{{{IMEDNET_NS}}}RequiredPolicy"] = req_str
 
@@ -927,7 +1133,7 @@ def to_odm_xml(
 
     # 4. ItemDef elements (globally unique OIDs preserving source names and distinct definitions)
     emitted_item_defs: set[str] = set()
-    item_def_elements: list[tuple[Variable, str, str, str, str | None]] = []
+    item_def_elements: list[tuple[Variable, str, str, str, str | None, tuple[int, int]]] = []
     for f_idx, form in enumerate(sorted_forms):
         sorted_vars = sorted_vars_by_form[f_idx]
         for v_idx, var in enumerate(sorted_vars):
@@ -941,10 +1147,17 @@ def to_odm_xml(
                     extra_attributes=var.extraAttributes,
                 )
                 item_def_elements.append(
-                    (var, form.formKey, item_oid, datatype, cl_oid_by_occ.get((f_idx, v_idx)))
+                    (
+                        var,
+                        form.formKey,
+                        item_oid,
+                        datatype,
+                        cl_oid_by_occ.get((f_idx, v_idx)),
+                        (f_idx, v_idx),
+                    )
                 )
 
-    for var, form_key, item_oid, datatype, item_cl_oid in item_def_elements:
+    for var, form_key, item_oid, datatype, item_cl_oid, occ_key in item_def_elements:
         _, control_type = _map_to_odm_datatype(
             var.variableType,
             precision=var.precision,
@@ -966,12 +1179,14 @@ def to_odm_xml(
         ):
             vendor_item_attribs[f"{{{IMEDNET_NS}}}VariableType"] = vt_norm
         ref_forms = referencing_forms_by_oid.get(item_oid, [form_key])
-        if any(
+        if var.variableName.startswith("IT.") or any(
             _default_unwrapped_name(item_oid, fk) != var.variableName
             or (fk and var.variableName.startswith((f"{fk}.", f"IT.{fk}.", f"IG_{fk}.")))
             for fk in ref_forms
         ):
             vendor_item_attribs[f"{{{IMEDNET_NS}}}VariableName"] = var.variableName
+        if var.label is None:
+            vendor_item_attribs[f"{{{IMEDNET_NS}}}UnsetLabel"] = "Yes"
         if var.format is not None and str(var.format).strip():
             fmt_str = str(var.format).strip()
             if fmt_str.isascii() and fmt_str.isdigit() and int(fmt_str) > 0:
@@ -995,6 +1210,32 @@ def to_odm_xml(
                 continue
             if sdtm_val := _extract_sdtm_attr(var, sdtm_key):
                 item_attribs[sdtm_key] = sdtm_val
+
+        has_emitted_bounds = bool(normalize_variable_bounds(var.extraAttributes))
+        has_emitted_units = bool(normalize_measurement_units(var.extraAttributes))
+        inherited_domain, inherited_sas = form_ig_sdtm_by_key.get(form_key, (None, None))
+        unmapped_var_extra: dict[str, Any] = {}
+        for k, v in var.extraAttributes.items():
+            if k in _VARIABLE_NATIVE_EXTRA_KEYS:
+                continue
+            if k == "calculation" and occ_key in emitted_redcap_calc_occ:
+                continue
+            if k == "branchingLogic" and occ_key in emitted_redcap_branch_occ:
+                continue
+            if has_emitted_bounds and k in _BOUND_EXTRA_KEYS:
+                continue
+            if has_emitted_units and k in _UNIT_EXTRA_KEYS:
+                continue
+            if k == "Domain" and str(v).strip() == inherited_domain:
+                continue
+            if k == "SASDatasetName" and str(v).strip() == inherited_sas:
+                continue
+            unmapped_var_extra[k] = v
+        if unmapped_var_extra:
+            vendor_item_attribs[f"{{{IMEDNET_NS}}}ExtraAttributes"] = json.dumps(
+                unmapped_var_extra, sort_keys=True
+            )
+
         item_attribs.update(vendor_item_attribs)
 
         item_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}ItemDef", item_attribs)
@@ -1070,17 +1311,27 @@ def to_odm_xml(
         )
         for c_idx, choice in enumerate(sorted_choices, 1):
             pos_str = str(choice.position if choice.position is not None else c_idx)
+            choice_attribs: dict[str, str] = {
+                "CodedValue": choice.choiceValue,
+                "OrderNumber": pos_str,
+            }
+            if choice.position is None:
+                choice_attribs[f"{{{IMEDNET_NS}}}SyntheticOrder"] = "Yes"
+            if choice.extraAttributes:
+                choice_attribs[f"{{{IMEDNET_NS}}}ExtraAttributes"] = json.dumps(
+                    choice.extraAttributes, sort_keys=True
+                )
             if choice.choiceText == choice.choiceValue:
                 ET.SubElement(
                     cl_elem,
                     f"{{{ODM_NS}}}EnumeratedItem",
-                    {"CodedValue": choice.choiceValue, "OrderNumber": pos_str},
+                    choice_attribs,
                 )
             else:
                 item_child = ET.SubElement(
                     cl_elem,
                     f"{{{ODM_NS}}}CodeListItem",
-                    {"CodedValue": choice.choiceValue, "OrderNumber": pos_str},
+                    choice_attribs,
                 )
                 decode_elem = ET.SubElement(item_child, f"{{{ODM_NS}}}Decode")
                 tt_child = ET.SubElement(
@@ -1168,8 +1419,13 @@ def to_odm_xml(
     )
     for rule in sorted_unassigned_rules:
         scoped_rules.append((None, rule))
-    if scoped_rules:
-        _emit_formal_rules(mdv_elem, scoped_rules)
+    if scoped_rules or redcap_conditions or redcap_methods:
+        _emit_formal_rules(
+            mdv_elem,
+            scoped_rules,
+            redcap_conditions=redcap_conditions,
+            redcap_methods=redcap_methods,
+        )
 
     ET.indent(root, space=indent)
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)

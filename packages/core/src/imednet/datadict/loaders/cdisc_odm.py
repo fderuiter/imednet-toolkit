@@ -32,6 +32,24 @@ IMEDNET_NS = "http://www.imednet.com/ns/odm/metadata"
 MDSOL_NS = "http://www.mdsol.com/ns/odm/metadata"
 
 # Standard ODM attributes by element type
+KNOWN_STUDY_ATTRIBUTES = {
+    "oid",
+}
+
+KNOWN_IMEDNET_STUDY_ATTRIBUTES = {
+    "syntheticstudykey",
+    "extraattributes",
+}
+
+KNOWN_IMEDNET_GLOBAL_VARIABLES_ATTRIBUTES = {
+    "syntheticstudyname",
+    "syntheticprotocolname",
+}
+
+KNOWN_IMEDNET_BASIC_DEFINITIONS_ATTRIBUTES = {
+    "itemscopedonly",
+}
+
 KNOWN_FORM_ATTRIBUTES = {
     "oid",
     "name",
@@ -42,6 +60,8 @@ KNOWN_FORM_ATTRIBUTES = {
 
 KNOWN_IMEDNET_FORM_ATTRIBUTES = {
     "formid",
+    "unsetformname",
+    "extraattributes",
 }
 
 KNOWN_ITEM_GROUP_ATTRIBUTES = {
@@ -73,6 +93,8 @@ KNOWN_IMEDNET_ITEM_ATTRIBUTES = {
     "variabletype",
     "format",
     "precision",
+    "unsetlabel",
+    "extraattributes",
 }
 
 KNOWN_ITEM_REF_ATTRIBUTES = {
@@ -89,6 +111,9 @@ KNOWN_ITEM_REF_ATTRIBUTES = {
 
 KNOWN_IMEDNET_ITEM_REF_ATTRIBUTES = {
     "requiredpolicy",
+    "syntheticorder",
+    "unsetrequired",
+    "extraattributes",
 }
 
 KNOWN_ITEM_GROUP_REF_ATTRIBUTES = {
@@ -118,6 +143,11 @@ KNOWN_CODELIST_ITEM_ATTRIBUTES = {
     "codedvalue",
     "ordernumber",
     "rank",
+}
+
+KNOWN_IMEDNET_CODELIST_ITEM_ATTRIBUTES = {
+    "syntheticorder",
+    "extraattributes",
 }
 
 KNOWN_STUDY_EVENT_ATTRIBUTES = {
@@ -171,6 +201,7 @@ KNOWN_IMEDNET_CONDITION_DEF_ATTRIBUTES = {
     "formkey",
     "containerform",
     "sequence",
+    "targetvariable",
     "extraattributes",
 }
 
@@ -178,6 +209,13 @@ KNOWN_METHOD_DEF_ATTRIBUTES = {
     "oid",
     "name",
     "type",
+}
+
+KNOWN_IMEDNET_METHOD_DEF_ATTRIBUTES = {
+    "rulesource",
+    "formkey",
+    "targetvariable",
+    "extraattributes",
 }
 
 KNOWN_FORMAL_EXPRESSION_ATTRIBUTES = {
@@ -322,6 +360,24 @@ def _extract_unmapped_attributes(
         )
         record_warning(f"Unmapped attribute '{local_name}' on {elem_type} '{elem_id}'")
     return extra
+
+
+def _load_vendor_extra_json(
+    elem: ET.Element,
+    elem_type: str,
+    record_warning: Any,
+) -> dict[str, Any]:
+    """Decode optional imednet:ExtraAttributes JSON payload from an ODM element."""
+    extra_json = _get_imednet_attr(elem, "ExtraAttributes")
+    if not extra_json:
+        return {}
+    try:
+        loaded = json.loads(extra_json)
+        if isinstance(loaded, dict):
+            return loaded
+    except json.JSONDecodeError as exc:
+        record_warning(f"Malformed imednet:ExtraAttributes JSON on {elem_type}: {exc}")
+    return {}
 
 
 def _read_source_content(source: Path | str | TextIO | BinaryIO) -> bytes:
@@ -509,6 +565,17 @@ def _unwrap_scoped_oid(raw_oid: str, f_oid: str, ig_oid: str | None) -> str:
     return raw_oid
 
 
+def _unwrap_it_matching_name(raw_oid: str, it_def: ET.Element | None) -> str:
+    """Strip an ``IT.`` prefix when the ItemDef Name exactly matches the suffix."""
+    if it_def is None or not raw_oid.startswith("IT."):
+        return raw_oid
+    suffix = raw_oid[3:].strip()
+    it_name = (_get_attr(it_def, "Name") or "").strip()
+    if suffix and it_name == suffix:
+        return suffix
+    return raw_oid
+
+
 def _resolve_variable_name(
     it_def: ET.Element,
     it_oid: str,
@@ -524,6 +591,8 @@ def _resolve_variable_name(
 
     raw_oid = (_get_attr(it_def, "OID") or it_oid).strip()
     unwrapped = _unwrap_scoped_oid(raw_oid, f_oid, ig_oid)
+    if unwrapped == raw_oid:
+        unwrapped = _unwrap_it_matching_name(raw_oid, it_def)
     if unwrapped != raw_oid and sibling_refs:
         it_name = (_get_attr(it_def, "Name") or "").strip()
         for other_oid_raw, other_ig_oid in sibling_refs:
@@ -540,6 +609,8 @@ def _resolve_variable_name(
                 (_get_attr(other_def, "Name") or "").strip() if other_def is not None else ""
             )
             other_unwrapped = _unwrap_scoped_oid(other_oid, f_oid, other_ig_oid)
+            if other_unwrapped == other_oid:
+                other_unwrapped = _unwrap_it_matching_name(other_oid, other_def)
             if other_oid == unwrapped and (
                 other_unwrapped == other_oid
                 or other_explicit == unwrapped
@@ -824,6 +895,37 @@ def _parse_formal_rule_element(
     )
 
 
+def _extract_redcap_formal_expression(
+    elem: ET.Element,
+    expected_context: str,
+    elem_type: str,
+    known_attrs: set[str],
+    known_imednet_attrs: set[str],
+    record_warning: Any,
+) -> str | None:
+    """Extract a REDCap calculation or branchingLogic expression from a vendor rule element."""
+    if (_get_imednet_attr(elem, "RuleSource") or "").strip().lower() != "redcap":
+        return None
+    _extract_unmapped_attributes(
+        elem,
+        known_attrs,
+        elem_type,
+        record_warning,
+        known_imednet=known_imednet_attrs,
+    )
+    for fe in _find_children(elem, "FormalExpression"):
+        _extract_unmapped_attributes(
+            fe,
+            KNOWN_FORMAL_EXPRESSION_ATTRIBUTES,
+            "FormalExpression",
+            record_warning,
+        )
+        ctx = (_get_attr(fe, "Context") or "").strip()
+        if ctx == expected_context and fe.text is not None and fe.text.strip():
+            return str(fe.text)
+    return None
+
+
 def load_from_cdisc_odm(
     source: Path | str | TextIO | BinaryIO,
     *,
@@ -873,22 +975,52 @@ def load_from_cdisc_odm(
     protocol_name: str | None = None
     measurement_units_by_oid: dict[str, dict[str, Any]] = {}
     study_measurement_units: list[dict[str, Any]] = []
+    study_vendor_extra: dict[str, Any] = {}
+    has_non_item_scoped_bd = False
 
     if study_elem is not None:
-        study_oid = _get_attr(study_elem, "OID")
+        study_unmapped = _extract_unmapped_attributes(
+            study_elem,
+            KNOWN_STUDY_ATTRIBUTES,
+            "Study",
+            record_warning,
+            known_imednet=KNOWN_IMEDNET_STUDY_ATTRIBUTES,
+        )
+        study_vendor_extra = _load_vendor_extra_json(study_elem, "Study", record_warning)
+        study_vendor_extra.update(study_unmapped)
+        if (_get_imednet_attr(study_elem, "SyntheticStudyKey") or "").strip().lower() != "yes":
+            study_oid = _get_attr(study_elem, "OID")
         gv_elem = _find_first_child(study_elem, "GlobalVariables")
         if gv_elem is not None:
+            _extract_unmapped_attributes(
+                gv_elem,
+                set(),
+                "GlobalVariables",
+                record_warning,
+                known_imednet=KNOWN_IMEDNET_GLOBAL_VARIABLES_ATTRIBUTES,
+            )
+            syn_sn = (_get_imednet_attr(gv_elem, "SyntheticStudyName") or "").strip().lower()
+            syn_proto = (_get_imednet_attr(gv_elem, "SyntheticProtocolName") or "").strip().lower()
             name_elem = _find_first_child(gv_elem, "StudyName")
-            if name_elem is not None and name_elem.text:
+            if name_elem is not None and name_elem.text and syn_sn != "yes":
                 study_name = name_elem.text.strip()
             desc_elem = _find_first_child(gv_elem, "StudyDescription")
             if desc_elem is not None and desc_elem.text:
                 study_description = desc_elem.text.strip()
             proto_name_elem = _find_first_child(gv_elem, "ProtocolName")
-            if proto_name_elem is not None and proto_name_elem.text:
+            if proto_name_elem is not None and proto_name_elem.text and syn_proto != "yes":
                 protocol_name = proto_name_elem.text.strip()
 
         for bd_elem in _find_children(study_elem, "BasicDefinitions"):
+            _extract_unmapped_attributes(
+                bd_elem,
+                set(),
+                "BasicDefinitions",
+                record_warning,
+                known_imednet=KNOWN_IMEDNET_BASIC_DEFINITIONS_ATTRIBUTES,
+            )
+            if (_get_imednet_attr(bd_elem, "ItemScopedOnly") or "").strip().lower() != "yes":
+                has_non_item_scoped_bd = True
             for mu_elem in _find_children(bd_elem, "MeasurementUnit"):
                 mu_extra = _extract_unmapped_attributes(
                     mu_elem,
@@ -911,7 +1043,7 @@ def load_from_cdisc_odm(
     else:
         record_warning("No 'Study' element found in ODM document.")
 
-    effective_study_key = study_key or study_oid
+    effective_study_key = study_key if study_key is not None else study_oid
 
     # 3. Locate MetaDataVersion element(s)
     mdv_elements: list[ET.Element] = []
@@ -920,14 +1052,14 @@ def load_from_cdisc_odm(
     if not mdv_elements:
         mdv_elements = _find_descendants(root, "MetaDataVersion")
 
-    extra_meta: dict[str, Any] = {}
+    extra_meta: dict[str, Any] = dict(study_vendor_extra)
     if study_name:
         extra_meta["studyName"] = study_name
     if study_description:
         extra_meta["studyDescription"] = study_description
     if protocol_name:
         extra_meta["protocolName"] = protocol_name
-    if study_measurement_units:
+    if study_measurement_units and has_non_item_scoped_bd:
         extra_meta["measurementUnits"] = study_measurement_units
 
     if not mdv_elements:
@@ -940,11 +1072,12 @@ def load_from_cdisc_odm(
         )
         return DataDictionary(metadata=metadata, forms=[])
 
-    # Index definitions across MetaDataVersion elements
+    # Index definitions across MetaDataVersion elements (deduplicating FormDef by OID)
     codelist_elems: dict[str, ET.Element] = {}
     item_def_elems: dict[str, ET.Element] = {}
     item_group_def_elems: dict[str, ET.Element] = {}
-    form_def_elems: list[ET.Element] = []
+    form_def_by_oid: dict[str, ET.Element] = {}
+    unkeyed_form_defs: list[ET.Element] = []
     study_event_def_elems: dict[str, ET.Element] = {}
     protocol_elems: list[ET.Element] = []
     condition_def_elems: dict[str, ET.Element] = {}
@@ -970,7 +1103,11 @@ def load_from_cdisc_odm(
             if ig_oid:
                 item_group_def_elems[ig_oid] = ig
         for f in _find_children(mdv, "FormDef"):
-            form_def_elems.append(f)
+            f_oid_key = (_get_attr(f, "OID") or "").strip()
+            if f_oid_key:
+                form_def_by_oid[f_oid_key] = f
+            else:
+                unkeyed_form_defs.append(f)
         for cond in _find_children(mdv, "ConditionDef"):
             cond_oid = _get_attr(cond, "OID")
             if cond_oid:
@@ -980,7 +1117,34 @@ def load_from_cdisc_odm(
             if meth_oid:
                 method_def_elems[meth_oid] = meth
 
-    known_form_oids = {oid for f in form_def_elems if (oid := (_get_attr(f, "OID") or "").strip())}
+    form_def_elems: list[ET.Element] = [*form_def_by_oid.values(), *unkeyed_form_defs]
+    known_form_oids = set(form_def_by_oid.keys())
+
+    redcap_branching_by_oid: dict[str, str] = {}
+    for cond_oid, cond_elem in condition_def_elems.items():
+        rc_branch = _extract_redcap_formal_expression(
+            cond_elem,
+            "redcap:branchingLogic",
+            "ConditionDef",
+            KNOWN_CONDITION_DEF_ATTRIBUTES,
+            KNOWN_IMEDNET_CONDITION_DEF_ATTRIBUTES,
+            record_warning,
+        )
+        if rc_branch is not None:
+            redcap_branching_by_oid[cond_oid] = rc_branch
+
+    redcap_calculation_by_oid: dict[str, str] = {}
+    for meth_oid, meth_elem in method_def_elems.items():
+        rc_calc = _extract_redcap_formal_expression(
+            meth_elem,
+            "redcap:calculation",
+            "MethodDef",
+            KNOWN_METHOD_DEF_ATTRIBUTES,
+            KNOWN_IMEDNET_METHOD_DEF_ATTRIBUTES,
+            record_warning,
+        )
+        if rc_calc is not None:
+            redcap_calculation_by_oid[meth_oid] = rc_calc
 
     condition_form_refs: dict[str, set[str]] = {oid: set() for oid in condition_def_elems}
     condition_protocol_scoped: set[str] = set()
@@ -992,11 +1156,13 @@ def load_from_cdisc_odm(
     protocol_se_meta: dict[str, dict[str, Any]] = {}
     protocol_se_order: list[str] = []
     if protocol_elems:
-        study_event_refs_data: list[dict[str, Any]] = []
+        study_event_refs_by_oid: dict[str, dict[str, Any]] = {}
+        unkeyed_study_event_refs: list[dict[str, Any]] = []
         protocol_desc: str | None = None
         for proto_elem in protocol_elems:
-            if not protocol_desc:
-                protocol_desc = _get_translated_text(_find_first_child(proto_elem, "Description"))
+            desc_candidate = _get_translated_text(_find_first_child(proto_elem, "Description"))
+            if desc_candidate:
+                protocol_desc = desc_candidate
             se_refs = _find_children(proto_elem, "StudyEventRef")
             se_refs.sort(key=lambda r: _parse_order(r, 0))
             for se_idx, se_ref in enumerate(se_refs, 1):
@@ -1032,14 +1198,18 @@ def load_from_cdisc_odm(
                 if cond_oid:
                     ref_entry["collectionExceptionConditionOid"] = cond_oid
                 ref_entry.update(se_ref_extra)
-                study_event_refs_data.append(ref_entry)
-                if se_oid and se_oid not in protocol_se_meta:
-                    protocol_se_order.append(se_oid)
+                if se_oid:
+                    study_event_refs_by_oid[se_oid] = ref_entry
+                    if se_oid not in protocol_se_meta:
+                        protocol_se_order.append(se_oid)
                     protocol_se_meta[se_oid] = {
                         "orderNumber": order_num,
                         **({"mandatory": mand} if mand else {}),
                     }
+                else:
+                    unkeyed_study_event_refs.append(ref_entry)
 
+        study_event_refs_data = [*study_event_refs_by_oid.values(), *unkeyed_study_event_refs]
         proto_payload: dict[str, Any] = {"studyEventRefs": study_event_refs_data}
         if protocol_desc:
             proto_payload["description"] = protocol_desc
@@ -1160,12 +1330,15 @@ def load_from_cdisc_odm(
             child_tag = _local_tag(child).lower()
             if child_tag in ("codelistitem", "enumerateditem"):
                 coded_val = _get_attr(child, "CodedValue") or ""
-                extra = _extract_unmapped_attributes(
+                extra_unmapped = _extract_unmapped_attributes(
                     child,
                     KNOWN_CODELIST_ITEM_ATTRIBUTES,
                     "CodeListItem",
                     record_warning,
+                    known_imednet=KNOWN_IMEDNET_CODELIST_ITEM_ATTRIBUTES,
                 )
+                extra = _load_vendor_extra_json(child, "CodeListItem", record_warning)
+                extra.update(extra_unmapped)
 
                 if child_tag == "codelistitem":
                     decode_elem = _find_first_child(child, "Decode")
@@ -1173,7 +1346,8 @@ def load_from_cdisc_odm(
                 else:
                     choice_text = coded_val
 
-                pos = _parse_order(child, pos_idx)
+                syn_pos = (_get_imednet_attr(child, "SyntheticOrder") or "").strip().lower()
+                pos: int | None = None if syn_pos == "yes" else _parse_order(child, pos_idx)
                 pos_idx += 1
 
                 choices.append(
@@ -1214,20 +1388,27 @@ def load_from_cdisc_odm(
             )
             return None
 
-        it_extra = _extract_unmapped_attributes(
+        it_extra_unmapped = _extract_unmapped_attributes(
             it_def,
             KNOWN_ITEM_ATTRIBUTES,
             "ItemDef",
             record_warning,
             known_imednet=KNOWN_IMEDNET_ITEM_ATTRIBUTES,
         )
-        for k, v in ref_extra.items():
-            it_extra.setdefault(k, v)
+        it_vendor_extra = _load_vendor_extra_json(it_def, "ItemDef", record_warning)
+        ref_vendor_extra = _load_vendor_extra_json(item_ref, "ItemRef", record_warning)
 
+        it_extra: dict[str, Any] = {}
         if inherited_domain and inherited_domain.strip():
             it_extra["Domain"] = inherited_domain.strip()
         if inherited_sas_dataset and inherited_sas_dataset.strip():
             it_extra["SASDatasetName"] = inherited_sas_dataset.strip()
+
+        it_extra.update(it_vendor_extra)
+        it_extra.update(ref_vendor_extra)
+        it_extra.update(it_extra_unmapped)
+        for k, v in ref_extra.items():
+            it_extra.setdefault(k, v)
 
         it_extra.update(_extract_item_sdtm_attributes(it_def, record_warning))
 
@@ -1253,15 +1434,18 @@ def load_from_cdisc_odm(
 
         method_oid = (_get_attr(item_ref, "MethodOID") or "").strip()
         if method_oid:
-            it_extra["methodOid"] = method_oid
-            if method_oid in method_def_elems:
-                if f_oid:
-                    method_form_refs[method_oid].add(f_oid)
-                method_target_vars[method_oid].append(var_name)
+            if method_oid in redcap_calculation_by_oid:
+                it_extra["calculation"] = redcap_calculation_by_oid[method_oid]
             else:
-                record_warning(
-                    f"MethodOID '{method_oid}' on ItemRef '{it_oid}' was not found in MetaDataVersion."
-                )
+                it_extra["methodOid"] = method_oid
+                if method_oid in method_def_elems:
+                    if f_oid:
+                        method_form_refs[method_oid].add(f_oid)
+                    method_target_vars[method_oid].append(var_name)
+                else:
+                    record_warning(
+                        f"MethodOID '{method_oid}' on ItemRef '{it_oid}' was not found in MetaDataVersion."
+                    )
 
         role_val = (_get_attr(item_ref, "Role") or "").strip()
         if role_val:
@@ -1279,32 +1463,43 @@ def load_from_cdisc_odm(
 
         cond_oid = (_get_attr(item_ref, "CollectionExceptionConditionOID") or "").strip()
         if cond_oid:
-            it_extra["collectionExceptionConditionOid"] = cond_oid
-            if cond_oid in condition_def_elems:
-                if f_oid:
-                    condition_form_refs[cond_oid].add(f_oid)
-                condition_target_vars[cond_oid].append(var_name)
+            if cond_oid in redcap_branching_by_oid:
+                it_extra["branchingLogic"] = redcap_branching_by_oid[cond_oid]
             else:
-                record_warning(
-                    f"CollectionExceptionConditionOID '{cond_oid}' on ItemRef '{it_oid}' "
-                    "was not found in MetaDataVersion."
-                )
+                it_extra["collectionExceptionConditionOid"] = cond_oid
+                if cond_oid in condition_def_elems:
+                    if f_oid:
+                        condition_form_refs[cond_oid].add(f_oid)
+                    condition_target_vars[cond_oid].append(var_name)
+                else:
+                    record_warning(
+                        f"CollectionExceptionConditionOID '{cond_oid}' on ItemRef '{it_oid}' "
+                        "was not found in MetaDataVersion."
+                    )
 
         q_elem = _find_first_child(it_def, "Question")
         desc_elem = _find_first_child(it_def, "Description")
-        var_label = (
-            _get_translated_text(q_elem)
-            or _get_translated_text(desc_elem)
-            or _get_attr(it_def, "Name")
-        )
+        var_label: str | None
+        if (_get_imednet_attr(it_def, "UnsetLabel") or "").strip().lower() == "yes":
+            var_label = None
+        else:
+            var_label = (
+                _get_translated_text(q_elem)
+                or _get_translated_text(desc_elem)
+                or _get_attr(it_def, "Name")
+            )
 
-        seq = _parse_order(item_ref, fallback_seq)
+        syn_seq = (_get_imednet_attr(item_ref, "SyntheticOrder") or "").strip().lower()
+        seq: int | None = None if syn_seq == "yes" else _parse_order(item_ref, fallback_seq)
 
         req_policy = _get_imednet_attr(item_ref, "RequiredPolicy")
+        unset_req = (_get_imednet_attr(item_ref, "UnsetRequired") or "").strip().lower()
         mand_val = _get_attr(item_ref, "Mandatory")
         req: str | None = None
         if req_policy and req_policy.strip():
             req = req_policy.strip()
+        elif unset_req == "yes":
+            req = None
         elif mand_val:
             req = _normalize_mandatory(mand_val)
 
@@ -1354,17 +1549,23 @@ def load_from_cdisc_odm(
 
     for form_elem in form_def_elems:
         f_oid = _get_attr(form_elem, "OID") or ""
-        f_name = _get_attr(form_elem, "Name") or f_oid
+        f_name: str | None
+        if (_get_imednet_attr(form_elem, "UnsetFormName") or "").strip().lower() == "yes":
+            f_name = None
+        else:
+            f_name = _get_attr(form_elem, "Name") or f_oid
         f_type = normalize_form_type(_get_attr(form_elem, "FormType"), default="Subject")
         raw_form_id = _get_imednet_attr(form_elem, "FormId")
         f_id = normalize_form_id(raw_form_id, form_key=f_oid)
-        f_extra = _extract_unmapped_attributes(
+        f_extra_unmapped = _extract_unmapped_attributes(
             form_elem,
             KNOWN_FORM_ATTRIBUTES,
             "FormDef",
             record_warning,
             known_imednet=KNOWN_IMEDNET_FORM_ATTRIBUTES,
         )
+        f_extra = _load_vendor_extra_json(form_elem, "FormDef", record_warning)
+        f_extra.update(f_extra_unmapped)
         if (repeating := _get_attr(form_elem, "Repeating")) and repeating.strip().lower() == "yes":
             f_extra.setdefault("repeating", repeating.strip())
         if f_oid in visits_by_form:
@@ -1512,6 +1713,8 @@ def load_from_cdisc_odm(
     rule_seq = 1
 
     for cond_oid, cond_elem in condition_def_elems.items():
+        if cond_oid in redcap_branching_by_oid:
+            continue
         if (_get_imednet_attr(cond_elem, "RuleSource") or "").strip().lower() == "imednet":
             container_form, rule = _parse_imednet_condition_rule(
                 cond_elem,
@@ -1543,6 +1746,8 @@ def load_from_cdisc_odm(
             unassigned_logic.append(rule)
 
     for meth_oid, meth_elem in method_def_elems.items():
+        if meth_oid in redcap_calculation_by_oid:
+            continue
         rule = _parse_formal_rule_element(
             meth_elem,
             "MethodDef",

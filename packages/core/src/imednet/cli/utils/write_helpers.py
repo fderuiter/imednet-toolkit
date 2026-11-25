@@ -272,27 +272,25 @@ def _resolve_cli_var_type(
         return None
 
     # Form-less update fallback: check if variable has a single unambiguous type across forms
-    candidate_fks: Sequence[str]
+    form_var_maps: list[Mapping[str, Any]] = []
     if isinstance(schema, BaseSchemaCache):
-        candidate_fks = list(schema.forms_for_study(study_key) if study_key else schema.forms)
+        from imednet.core.context import get_study_context
+
+        active_study = study_key or get_study_context()
+        if active_study:
+            form_var_maps = list(schema.forms_for_study(active_study).values())
+        else:
+            form_var_maps = list(schema.study_forms.values())
     else:
         forms_attr = getattr(schema, "forms", None)
         if isinstance(forms_attr, Sequence):
-            candidate_fks = [
-                str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
-                for f in forms_attr
-                if getattr(f, "form_key", None) or getattr(f, "formKey", None)
-            ]
-        else:
-            candidate_fks = []
+            for f in forms_attr:
+                fk = str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
+                if fk:
+                    form_var_maps.append(schema.variables_for_form(fk))
 
     matched_types: set[str] = set()
-    for fk in candidate_fks:
-        form_vars: Mapping[str, Any] = (
-            schema.variables_for_form(fk, study_key=study_key)
-            if isinstance(schema, BaseSchemaCache)
-            else schema.variables_for_form(fk)
-        )
+    for form_vars in form_var_maps:
         if form_vars and var_name in form_vars:
             raw = getattr(form_vars[var_name], "variable_type", None) or getattr(
                 form_vars[var_name], "variableType", None
@@ -303,6 +301,35 @@ def _resolve_cli_var_type(
     if len(matched_types) == 1:
         return next(iter(matched_types))
     return None
+
+
+def _checkbox_defines_choice_code(
+    schema: ValidationSchemaProtocol | None,
+    *,
+    form_key: str | None,
+    form_id: int | None,
+    var_name: str,
+    candidate: str,
+    study_key: str | None,
+) -> bool:
+    """Return True if a Checkbox variable explicitly lists ``candidate`` in its Choice codes."""
+    if schema is None or isinstance(schema, BaseSchemaCache):
+        return False
+    resolved_fk = form_key
+    if not resolved_fk and form_id is not None:
+        resolved_fk = schema.form_key_from_id(form_id)
+    if not resolved_fk:
+        return False
+    form_vars = schema.variables_for_form(resolved_fk)
+    var_obj = form_vars.get(var_name) if form_vars else None
+    if var_obj is None:
+        return False
+    raw_choices = getattr(var_obj, "choices", None) or []
+    for ch in raw_choices:
+        cval = ch if isinstance(ch, str) else getattr(ch, "choiceValue", None)
+        if cval is not None and str(cval) == candidate:
+            return True
+    return False
 
 
 def parse_key_value_pairs(
@@ -357,10 +384,18 @@ def parse_key_value_pairs(
                     from_csv_str=True,
                     expected_var_type=None,
                 )
-        elif expected_var_type in {"checkbox", "check box"} and val_stripped.lower() in {
-            "true",
-            "false",
-        }:
+        elif (
+            expected_var_type in {"checkbox", "check box"}
+            and val_stripped.lower() in {"true", "false"}
+            and not _checkbox_defines_choice_code(
+                schema,
+                form_key=form_key,
+                form_id=form_id,
+                var_name=key,
+                candidate=val_stripped,
+                study_key=study_key,
+            )
+        ):
             parsed[key] = val_stripped.lower() == "true"
         else:
             parsed[key] = _coerce_clinical_value(

@@ -118,6 +118,31 @@ _FLOAT_LIKE_TYPES: frozenset[str] = frozenset({"float", "decimal", "double", "nu
 _NUMERIC_LIKE_TYPES: frozenset[str] = _INT_LIKE_TYPES | _FLOAT_LIKE_TYPES
 _BOOL_LIKE_TYPES: frozenset[str] = frozenset({"bool", "boolean"})
 _COMPUTED_FLEX_TYPES: frozenset[str] = frozenset({"calculation", "calc", "calculated", "slider"})
+_CHOICE_LIKE_TYPES: frozenset[str] = frozenset(
+    {
+        "coded",
+        "radio",
+        "radiobutton",
+        "radio button",
+        "dropdown",
+        "drop down",
+        "dropdownlist",
+        "dropdown list",
+        "select",
+        "single select",
+        "singleselect",
+        "sql",
+        "yes/no",
+        "yesno",
+        "yes no",
+        "true/false",
+        "truefalse",
+        "true false",
+        "multi select",
+        "multiselect",
+    }
+)
+_CHECKBOX_LIKE_TYPES: frozenset[str] = frozenset({"checkbox", "check box"})
 
 
 def _unwrap_scalar(value: Any) -> Any:
@@ -312,18 +337,50 @@ def _coerce_clinical_value(
     if isinstance(unwrapped, (datetime.datetime, datetime.date, datetime.time)):
         return unwrapped.isoformat()
 
-    if isinstance(unwrapped, bool):
-        return unwrapped
-
     if expected_var_type is not None:
         if expected_var_type in _BOOL_LIKE_TYPES:
+            if isinstance(unwrapped, bool):
+                return unwrapped
             if isinstance(unwrapped, str):
                 low = unwrapped.strip().lower()
                 if low in {"true", "false"}:
                     return low == "true"
             return unwrapped
 
+        if expected_var_type in _CHECKBOX_LIKE_TYPES:
+            if isinstance(unwrapped, (bool, str)):
+                return unwrapped
+            if isinstance(unwrapped, int):
+                return str(unwrapped)
+            if isinstance(unwrapped, float) and math.isfinite(unwrapped):
+                return str(int(unwrapped)) if unwrapped.is_integer() else str(unwrapped)
+            return unwrapped
+
+        if expected_var_type in _CHOICE_LIKE_TYPES:
+            if isinstance(unwrapped, str):
+                return unwrapped
+            if isinstance(unwrapped, bool):
+                return "true" if unwrapped else "false"
+            if isinstance(unwrapped, int):
+                return str(unwrapped)
+            if isinstance(unwrapped, float) and math.isfinite(unwrapped):
+                return str(int(unwrapped)) if unwrapped.is_integer() else str(unwrapped)
+            if isinstance(unwrapped, (list, tuple, set, frozenset)):
+                return [
+                    ("true" if item else "false")
+                    if isinstance(item, bool)
+                    else (
+                        str(int(item))
+                        if isinstance(item, float) and math.isfinite(item) and item.is_integer()
+                        else str(item)
+                    )
+                    for item in unwrapped
+                ]
+            return unwrapped
+
         if expected_var_type in _NUMERIC_LIKE_TYPES:
+            if isinstance(unwrapped, bool):
+                return unwrapped
             if isinstance(unwrapped, int):
                 return unwrapped
             if isinstance(unwrapped, float):
@@ -349,11 +406,20 @@ def _coerce_clinical_value(
         if expected_var_type not in _COMPUTED_FLEX_TYPES:
             if isinstance(unwrapped, str):
                 return unwrapped
+            if isinstance(unwrapped, bool):
+                return (
+                    ("true" if unwrapped else "false")
+                    if expected_var_type in _TEXT_LIKE_TYPES
+                    else unwrapped
+                )
             if isinstance(unwrapped, float) and math.isfinite(unwrapped):
                 return str(int(unwrapped)) if unwrapped.is_integer() else str(unwrapped)
             if expected_var_type in _TEXT_LIKE_TYPES:
                 return str(unwrapped)
             return unwrapped
+
+    if isinstance(unwrapped, bool):
+        return unwrapped
 
     if isinstance(unwrapped, int):
         return unwrapped

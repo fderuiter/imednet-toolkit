@@ -565,15 +565,25 @@ class DataDictionary(DictCompatMixin, BaseModel):
                 return form
         return None
 
-    def variables_for_form(self, form_key: str) -> dict[str, Variable]:
+    def variables_for_form(
+        self,
+        form_key: str,
+        study_key: str | None = None,
+    ) -> dict[str, Variable]:
         """Return a mapping of variable names to Variable definitions for ``form_key``."""
+        _ = study_key
         form = self.form_for_key(form_key)
         if form is None:
             return {}
         return {var.variableName: var for var in form.variables if var.variableName}
 
-    def form_key_from_id(self, form_id: int | str) -> str | None:
+    def form_key_from_id(
+        self,
+        form_id: int | str,
+        study_key: str | None = None,
+    ) -> str | None:
         """Resolve a ``formKey`` from a numeric or string ``formId``."""
+        _ = study_key
         if isinstance(form_id, bool) or form_id is None or form_id == "":
             return None
         target_str = str(form_id).strip()
@@ -592,12 +602,13 @@ class DataDictionary(DictCompatMixin, BaseModel):
         form: Form | None,
         form_key: str,
     ) -> bool:
-        """Return True if an unassigned rule with form=None applies to ``form_key``."""
+        """Return True if an unassigned rule applies exclusively to variables on ``form_key``."""
         if form is None:
             return False
+
         from .logic import LogicTreeEvaluator
 
-        meta = LogicTreeEvaluator().extract_rule_metadata(rule)
+        meta = LogicTreeEvaluator().extract_rule_metadata(rule, default_form=rule.form)
         if meta is None or meta.is_cross_scope:
             return False
 
@@ -617,9 +628,7 @@ class DataDictionary(DictCompatMixin, BaseModel):
                 return False
             if not form_vars:
                 return True
-            return referenced_vars.issubset(form_vars) or all(
-                v in form_vars or f"{form_key}.{v}" in form_vars for v in referenced_vars
-            )
+            return all(v in form_vars or f"{form_key}.{v}" in form_vars for v in referenced_vars)
 
         return bool(form_vars) and referenced_vars.issubset(form_vars)
 
@@ -638,11 +647,30 @@ class DataDictionary(DictCompatMixin, BaseModel):
             rule_form = (
                 rule.form.strip() if isinstance(rule.form, str) and rule.form.strip() else None
             )
-            if rule_form == form_key or (
-                rule_form is None
-                and (rule.logic is not None or rule.logicRawXml)
-                and self._unassigned_rule_matches_form(rule, form, form_key)
-            ):
+            has_logic = rule.logic is not None or bool(rule.logicRawXml)
+            if rule_form is not None:
+                if rule_form != form_key:
+                    continue
+                if has_logic and form is not None and form.variables:
+                    from .logic import LogicTreeEvaluator
+
+                    meta = LogicTreeEvaluator().extract_rule_metadata(rule, default_form=form_key)
+                    if meta is not None and meta.is_cross_scope:
+                        continue
+                    if meta is not None and meta.conditions:
+                        form_vars = {v.variableName for v in form.variables if v.variableName}
+                        ref_vars = {
+                            v
+                            for c in meta.conditions
+                            for v in (c.variable, c.compare_variable)
+                            if v
+                        }
+                        if ref_vars and not all(
+                            v in form_vars or f"{form_key}.{v}" in form_vars for v in ref_vars
+                        ):
+                            continue
+                rules.append(rule)
+            elif has_logic and self._unassigned_rule_matches_form(rule, form, form_key):
                 rules.append(rule)
         return rules
 

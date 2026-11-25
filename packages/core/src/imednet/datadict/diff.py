@@ -7,7 +7,35 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .models import BusinessLogicRule, DataDictionary
-from .normalize import normalize_form_id, normalize_form_type, normalize_variable_type
+from .normalize import (
+    normalize_form_id,
+    normalize_form_type,
+    normalize_measurement_units,
+    normalize_variable_bounds,
+    normalize_variable_type,
+)
+
+_BOUND_EXTRA_KEYS: frozenset[str] = frozenset(
+    {
+        "rangeChecks",
+        "textValidationMin",
+        "textValidationMax",
+        "minValue",
+        "maxValue",
+        "min",
+        "max",
+        "minimum",
+        "maximum",
+    }
+)
+_UNIT_EXTRA_KEYS: frozenset[str] = frozenset(
+    {
+        "measurementUnits",
+        "measurementUnit",
+        "units",
+        "unit",
+    }
+)
 
 
 @dataclass
@@ -123,6 +151,56 @@ def _compare_extra_attributes(
             report.add("modified", f"{path_prefix}.{k}", old_extra[k], new_extra[k])
 
 
+def _compare_variable_extra_attributes(
+    old_extra: dict[str, Any],
+    new_extra: dict[str, Any],
+    path_prefix: str,
+    report: DiffReport,
+) -> None:
+    old_filtered = dict(old_extra)
+    new_filtered = dict(new_extra)
+
+    old_bounds = normalize_variable_bounds(old_extra)
+    new_bounds = normalize_variable_bounds(new_extra)
+    old_bound_keys = set(old_extra.keys()) & _BOUND_EXTRA_KEYS
+    new_bound_keys = set(new_extra.keys()) & _BOUND_EXTRA_KEYS
+    if old_bounds == new_bounds:
+        for k in _BOUND_EXTRA_KEYS:
+            old_filtered.pop(k, None)
+            new_filtered.pop(k, None)
+    elif old_bound_keys != new_bound_keys or not old_bound_keys:
+        for k in _BOUND_EXTRA_KEYS:
+            old_filtered.pop(k, None)
+            new_filtered.pop(k, None)
+        if not old_bounds and new_bounds:
+            report.add("added", f"{path_prefix}.rangeChecks", new_val=new_bounds)
+        elif old_bounds and not new_bounds:
+            report.add("removed", f"{path_prefix}.rangeChecks", old_val=old_bounds)
+        else:
+            report.add("modified", f"{path_prefix}.rangeChecks", old_bounds, new_bounds)
+
+    old_units = normalize_measurement_units(old_extra)
+    new_units = normalize_measurement_units(new_extra)
+    old_unit_keys = set(old_extra.keys()) & _UNIT_EXTRA_KEYS
+    new_unit_keys = set(new_extra.keys()) & _UNIT_EXTRA_KEYS
+    if old_units == new_units:
+        for k in _UNIT_EXTRA_KEYS:
+            old_filtered.pop(k, None)
+            new_filtered.pop(k, None)
+    elif old_unit_keys != new_unit_keys or not old_unit_keys:
+        for k in _UNIT_EXTRA_KEYS:
+            old_filtered.pop(k, None)
+            new_filtered.pop(k, None)
+        if not old_units and new_units:
+            report.add("added", f"{path_prefix}.measurementUnits", new_val=new_units)
+        elif old_units and not new_units:
+            report.add("removed", f"{path_prefix}.measurementUnits", old_val=old_units)
+        else:
+            report.add("modified", f"{path_prefix}.measurementUnits", old_units, new_units)
+
+    _compare_extra_attributes(old_filtered, new_filtered, path_prefix, report)
+
+
 def _rule_key(r: BusinessLogicRule, idx: int) -> str:
     if r.id is not None:
         return str(r.id)
@@ -176,8 +254,8 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
     """
     report = DiffReport()
 
-    # 1. Compare Metadata (ignoring generatedAt)
-    for attr in ("schemaVersion", "studyKey", "source"):
+    # 1. Compare Metadata (ignoring generatedAt and loader source provenance)
+    for attr in ("schemaVersion", "studyKey"):
         ov = getattr(old_dict.metadata, attr)
         nv = getattr(new_dict.metadata, attr)
         if ov != nv:
@@ -249,7 +327,7 @@ def diff(old_dict: DataDictionary, new_dict: DataDictionary) -> DiffReport:
                         nv = getattr(new_v, attr)
                         if ov != nv:
                             report.add("modified", f"forms[{fk}].variables[{vn}].{attr}", ov, nv)
-                    _compare_extra_attributes(
+                    _compare_variable_extra_attributes(
                         old_v.extraAttributes,
                         new_v.extraAttributes,
                         f"forms[{fk}].variables[{vn}]",

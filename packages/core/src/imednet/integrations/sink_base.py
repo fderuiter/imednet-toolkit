@@ -350,6 +350,7 @@ class SinkConfig:
     extra: dict[str, Any] = field(default_factory=dict)
     quality_gate_enabled: bool = False
     min_schema_readiness_score: float = 100.0
+    validation_schema: Any | None = field(default=None, repr=False, kw_only=True)
     tracer: Any | None = field(default=None, repr=False)
     modified_since: datetime | str | None = None
     record_filter: dict[str, Any] | str | None = None
@@ -1434,6 +1435,13 @@ def evaluate_standards_readiness(
     return report
 
 
+def _is_soft_readiness_warning(reason: str) -> bool:
+    """Return True if ``reason`` is a non-blocking soft query or soft RangeCheck warning."""
+    if reason.startswith(("Auto Query warning ", "Soft RangeCheck warning ")):
+        return True
+    return reason.startswith("Rule ") and " warning:" in reason
+
+
 def apply_quality_gate(
     sdk: Any,
     study_key: str,
@@ -1442,6 +1450,7 @@ def apply_quality_gate(
     *,
     variables: Iterable[Any] | None = None,
     forms: Iterable[Any] | None = None,
+    schema: Any | None = None,
 ) -> Iterator[Any]:
     """Filter records based on schema readiness and optional CDASH/SDTM readiness rules."""
     cfg_profile = getattr(config, "standards_profile", None)
@@ -1469,43 +1478,67 @@ def apply_quality_gate(
         return
 
     from imednet.core.context import reset_study_context, set_study_context
-    from imednet.validation.cache import SchemaValidator, calculate_readiness_score
+    from imednet.datadict.models import DataDictionary
+    from imednet.utils.security import global_sensitivity_registry
+    from imednet.utils.tabular import _contains_masked_sentinel
+    from imednet.validation.cache import (
+        BaseSchemaCache,
+        SchemaValidator,
+        ValidationSchemaProtocol,
+        calculate_readiness_score,
+    )
 
-    validator = SchemaValidator(sdk)
-    if variables is None:
-        validator.refresh(study_key)
+    explicit_schema = schema if schema is not None else getattr(config, "validation_schema", None)
+    if explicit_schema is None:
+        cfg_schema_attr = getattr(config, "schema", None)
+        if isinstance(cfg_schema_attr, ValidationSchemaProtocol):
+            explicit_schema = cfg_schema_attr
+    if explicit_schema is None:
+        cfg_extra = getattr(config, "extra", None)
+        if isinstance(cfg_extra, Mapping):
+            explicit_schema = cfg_extra.get("schema") or cfg_extra.get("validation_schema")
+    if explicit_schema is None and isinstance(sdk, (BaseSchemaCache, DataDictionary)):
+        explicit_schema = sdk
+
+    if explicit_schema is not None:
+        effective_schema: ValidationSchemaProtocol = explicit_schema
     else:
-        form_key_by_id: dict[int, str] = {}
-        for form in forms or ():
-            fid = getattr(form, "form_id", None)
-            fk_val = getattr(form, "form_key", None)
-            if (
-                isinstance(fid, int)
-                and not isinstance(fid, bool)
-                and isinstance(fk_val, str)
-                and fk_val
-            ):
-                form_key_by_id[fid] = fk_val
+        validator = SchemaValidator(sdk)
+        if variables is None:
+            validator.refresh(study_key)
+        else:
+            form_key_by_id: dict[int, str] = {}
+            for form in forms or ():
+                fid = getattr(form, "form_id", None)
+                fk_val = getattr(form, "form_key", None)
+                if (
+                    isinstance(fid, int)
+                    and not isinstance(fid, bool)
+                    and isinstance(fk_val, str)
+                    and fk_val
+                ):
+                    form_key_by_id[fid] = fk_val
 
-        prepared_vars: list[Any] = []
-        for var in variables:
-            prepared_var = var
-            var_fk = getattr(var, "form_key", None)
-            var_fid = getattr(var, "form_id", None)
-            if not var_fk and isinstance(var_fid, int) and var_fid in form_key_by_id:
-                resolved_fk = form_key_by_id[var_fid]
-                model_copy = getattr(var, "model_copy", None)
-                if callable(model_copy):
-                    prepared_var = model_copy(update={"form_key": resolved_fk})
-                else:
-                    cloned = copy.copy(var)
-                    cloned.form_key = resolved_fk
-                    prepared_var = cloned
-            prepared_vars.append(prepared_var)
+            prepared_vars: list[Any] = []
+            for var in variables:
+                prepared_var = var
+                var_fk = getattr(var, "form_key", None)
+                var_fid = getattr(var, "form_id", None)
+                if not var_fk and isinstance(var_fid, int) and var_fid in form_key_by_id:
+                    resolved_fk = form_key_by_id[var_fid]
+                    model_copy = getattr(var, "model_copy", None)
+                    if callable(model_copy):
+                        prepared_var = model_copy(update={"form_key": resolved_fk})
+                    else:
+                        cloned = copy.copy(var)
+                        cloned.form_key = resolved_fk
+                        prepared_var = cloned
+                prepared_vars.append(prepared_var)
 
-        validator.schema.populate(prepared_vars, study_key=study_key)
-        for fid, fk_val in form_key_by_id.items():
-            validator.schema._form_id_to_key[(study_key, fid)] = fk_val
+            validator.schema.populate(prepared_vars, study_key=study_key)
+            for fid, fk_val in form_key_by_id.items():
+                validator.schema._form_id_to_key[(study_key, fid)] = fk_val
+        effective_schema = validator.schema
 
     std_validator = (
         StandardsReadinessValidator(resolve_standards_profile(cfg_profile))
@@ -1519,47 +1552,99 @@ def apply_quality_gate(
     for record in records:
         if hasattr(record, "model_dump"):
             rec_dict = record.model_dump()
+        elif isinstance(record, Mapping):
+            rec_dict = dict(record)
         elif hasattr(record, "__dict__"):
             rec_dict = {
                 "form_key": getattr(record, "form_key", None),
+                "formKey": getattr(record, "formKey", None),
                 "form_id": getattr(record, "form_id", None),
+                "formId": getattr(record, "formId", None),
                 "record_data": getattr(record, "record_data", None),
                 "recordData": getattr(record, "recordData", None),
-                "data": getattr(record, "data", {}),
-                "record_id": getattr(record, "record_id", None),
+                "data": getattr(record, "data", None),
+                "record_id": getattr(record, "record_id", getattr(record, "recordId", None)),
             }
-        elif isinstance(record, dict):
-            rec_dict = record
         else:
-            rec_dict = {"data": {}}
+            dropped_count += 1
+            continue
 
+        rec_ident = rec_dict.get("record_id") or rec_dict.get("recordId") or "Unknown"
         ctx_token = set_study_context(study_key)
         try:
             fk = rec_dict.get("formKey") or rec_dict.get("form_key")
             if not fk:
-                fid = rec_dict.get("formId") or rec_dict.get("form_id") or 0
-                fk = validator.schema.form_key_from_id(fid)
+                raw_fid = (
+                    rec_dict.get("formId")
+                    if rec_dict.get("formId") is not None
+                    else rec_dict.get("form_id")
+                )
+                if raw_fid is not None and not isinstance(raw_fid, bool) and raw_fid != "":
+                    if isinstance(effective_schema, BaseSchemaCache):
+                        fk = effective_schema.form_key_from_id(raw_fid, study_key=study_key)
+                    else:
+                        fk = effective_schema.form_key_from_id(raw_fid)
 
             if not fk:
-                logger.info("Dropped record %s: Unknown form", rec_dict.get("record_id", "Unknown"))
+                logger.info("Dropped record %s: Unknown form", rec_ident)
                 dropped_count += 1
                 continue
 
-            data = rec_dict.get("record_data")
-            if data is None:
-                data = rec_dict.get("recordData")
-            if data is None:
-                data = rec_dict.get("data", {})
-            if not isinstance(data, Mapping):
-                data = {}
-            score, reasons = calculate_readiness_score(validator.schema, fk, dict(data))
+            raw_payload_data: Any = None
+            for data_key in ("record_data", "recordData", "data"):
+                if data_key in rec_dict and rec_dict[data_key] is not None:
+                    raw_payload_data = rec_dict[data_key]
+                    break
+            if raw_payload_data is None:
+                raw_payload_data = {}
+            if not isinstance(raw_payload_data, Mapping):
+                logger.info("Dropped record %s: Record data must be a mapping", rec_ident)
+                dropped_count += 1
+                continue
+
+            data = dict(raw_payload_data)
+            if _contains_masked_sentinel(data):
+                logger.info(
+                    "Dropped record %s: Record contains masked PHI sentinel",
+                    rec_ident,
+                )
+                dropped_count += 1
+                continue
+
+            eval_data = data
+            if bool(getattr(config, "mask_phi", False)) and data:
+                try:
+                    known_vars = (
+                        effective_schema.variables_for_form(fk, study_key=study_key)
+                        if isinstance(effective_schema, BaseSchemaCache)
+                        else effective_schema.variables_for_form(fk)
+                    )
+                except Exception:
+                    known_vars = {}
+                if known_vars:
+                    eval_data = {
+                        k: v
+                        for k, v in data.items()
+                        if k in known_vars or not global_sensitivity_registry.is_sensitive(k)
+                    }
+
+            try:
+                score, reasons = calculate_readiness_score(
+                    effective_schema,
+                    fk,
+                    eval_data,
+                    study_key=study_key,
+                )
+            except TypeError:
+                score, reasons = calculate_readiness_score(effective_schema, fk, eval_data)
         finally:
             reset_study_context(ctx_token)
 
-        if score < config.min_schema_readiness_score:
+        blocking_reasons = [r for r in reasons if not _is_soft_readiness_warning(r)]
+        if score < config.min_schema_readiness_score or blocking_reasons:
             logger.info(
-                "Dropped record %s (Score: %.1f < %.1f). Reasons: %s",
-                rec_dict.get("record_id", "Unknown"),
+                "Dropped record %s (Score: %.1f, Threshold: %.1f). Reasons: %s",
+                rec_ident,
                 score,
                 config.min_schema_readiness_score,
                 "; ".join(reasons),

@@ -1484,7 +1484,7 @@ def test_odm_13_full_fidelity_round_trip_types_rules_form_ids_and_metadata() -> 
         "PAIN_SLIDER": "Slider",
         "CONSENT_PDF": "File",
         "SECT_HDR": "Descriptive",
-        "ONSET_PARTIAL": "DateTime",
+        "ONSET_PARTIAL": "Date/Time Precision",
     }
     reloaded_subjid = next(v for v in reloaded_dm.variables if v.variableName == "SUBJID")
     assert reloaded_subjid.extraAttributes.get("Role") == "IDENTIFIER"

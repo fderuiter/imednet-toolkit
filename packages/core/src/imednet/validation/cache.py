@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import date as _date_cls
+from decimal import Decimal
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -27,12 +26,23 @@ from typing_extensions import Protocol, runtime_checkable
 
 from imednet.core.context import get_study_context
 from imednet.datadict.logic import (
+    _ISO_DURATION_RE,
     _MAX_BOUND_KEYS,
     _MIN_BOUND_KEYS,
+    _PARTIAL_HOUR_RE,
+    _PARTIAL_MY_RE,
+    _PARTIAL_YEAR_RE,
+    _PARTIAL_YM_RE,
+    _PARTIAL_YMD_HOUR_RE,
+    _TIME_24H_RE,
     LogicTreeEvaluator,
     RangeCheckConstraint,
+    _evaluate_range_check,
+    _is_non_finite_numeric,
+    _is_valid_calendar_ymd,
+    _is_valid_date_str,
+    _is_valid_datetime_str,
     _lookup_attr_or_extra,
-    _parse_comparable_temporal,
     _to_finite_float,
     extract_variable_constraints,
 )
@@ -531,7 +541,7 @@ def _validate_int(value: Any) -> None:
 
 
 def _validate_float(value: Any) -> None:
-    """Validate that the value is a finite number (int or float, excluding booleans).
+    """Validate that the value is a finite number (int, float, or Decimal, excluding booleans).
 
     Args:
         value: The value to validate.
@@ -539,9 +549,9 @@ def _validate_float(value: Any) -> None:
     Raises:
         ValidationError: If the value is not numeric, is a boolean, or is non-finite.
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         raise ValidationError("Value must be numeric")
-    if not math.isfinite(value):
+    if _is_non_finite_numeric(value):
         raise ValidationError("Value must be a finite numeric value")
 
 
@@ -627,85 +637,10 @@ def _validate_multi_choice(value: Any) -> None:
 
 def _validate_calculation(value: Any) -> None:
     """Validate that a computed or range value is a finite non-boolean number or text."""
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, str)):
         raise ValidationError("Value must be numeric or a string")
-    if isinstance(value, (int, float)):
-        if not math.isfinite(value):
-            raise ValidationError("Value must be a finite numeric value")
-    elif isinstance(value, str):
-        stripped = value.strip()
-        if stripped:
-            try:
-                parsed = float(stripped)
-            except ValueError:
-                return
-            if not math.isfinite(parsed):
-                raise ValidationError("Value must be a finite numeric value")
-
-
-_MONTH_ABBR_TO_NUM: dict[str, int] = {
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
-    "may": 5,
-    "jun": 6,
-    "jul": 7,
-    "aug": 8,
-    "sep": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12,
-}
-
-_DATE_YMD_RE = re.compile(r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$")
-_DATE_MDY_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])-([0-9]{4})$")
-_DATE_DMY_RE = re.compile(r"^(0[1-9]|[12][0-9]|3[01])-(0[1-9]|1[0-2])-([0-9]{4})$")
-_DATE_DD_MMM_YYYY_RE = re.compile(r"^(0[1-9]|[12][0-9]|3[01])-([A-Za-z]{3})-([0-9]{4})$")
-_TIME_24H_RE = re.compile(
-    r"^([01][0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9])(?:\.[0-9]{1,9})?)?"
-    r"(?:Z|[+-](?:[01][0-9]|2[0-3]):?[0-5][0-9])?$"
-)
-_DATETIME_HAS_TIME_RE = re.compile(r"[T ][0-9]{2}:[0-9]{2}")
-_PARTIAL_YEAR_RE = re.compile(r"^[0-9]{4}$")
-_PARTIAL_YM_RE = re.compile(r"^([0-9]{4})-(0[1-9]|1[0-2])$")
-_PARTIAL_MY_RE = re.compile(r"^(0[1-9]|1[0-2])-([0-9]{4})$")
-_PARTIAL_YMD_HOUR_RE = re.compile(
-    r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[T ]([01][0-9]|2[0-3])$"
-)
-_ISO_DURATION_RE = re.compile(
-    r"^P(?=[0-9T])(?:[0-9]+Y)?(?:[0-9]+M)?(?:[0-9]+W)?(?:[0-9]+D)?"
-    r"(?:T(?=[0-9])(?:[0-9]+H)?(?:[0-9]+M)?(?:[0-9]+(?:\.[0-9]+)?S)?)?$"
-)
-
-
-def _is_valid_calendar_ymd(year: int, month: int, day: int) -> bool:
-    try:
-        _date_cls(year, month, day)
-    except ValueError:
-        return False
-    return True
-
-
-def _is_valid_date_str(cleaned: str, *, allow_dmy: bool = False) -> bool:
-    m_ymd = _DATE_YMD_RE.match(cleaned)
-    if m_ymd is not None:
-        return _is_valid_calendar_ymd(int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3)))
-    if allow_dmy:
-        m_dmy = _DATE_DMY_RE.match(cleaned)
-        if m_dmy is not None:
-            return _is_valid_calendar_ymd(
-                int(m_dmy.group(3)), int(m_dmy.group(2)), int(m_dmy.group(1))
-            )
-    m_mdy = _DATE_MDY_RE.match(cleaned)
-    if m_mdy is not None:
-        return _is_valid_calendar_ymd(int(m_mdy.group(3)), int(m_mdy.group(1)), int(m_mdy.group(2)))
-    m_mmm = _DATE_DD_MMM_YYYY_RE.match(cleaned)
-    if m_mmm is not None:
-        mon = _MONTH_ABBR_TO_NUM.get(m_mmm.group(2).lower())
-        if mon is not None:
-            return _is_valid_calendar_ymd(int(m_mmm.group(3)), mon, int(m_mmm.group(1)))
-    return False
+    if _is_non_finite_numeric(value):
+        raise ValidationError("Value must be a finite numeric value")
 
 
 def _validate_date(value: Any) -> None:
@@ -724,12 +659,6 @@ def _validate_date_dmy(value: Any) -> None:
     cleaned = value.strip()
     if not cleaned or not _is_valid_date_str(cleaned, allow_dmy=True):
         raise ValidationError("Value must be a valid calendar date")
-
-
-def _is_valid_datetime_str(cleaned: str) -> bool:
-    if not _DATETIME_HAS_TIME_RE.search(cleaned):
-        return False
-    return _parse_comparable_temporal(cleaned) is not None
 
 
 def _validate_datetime(value: Any) -> None:
@@ -791,9 +720,6 @@ def _validate_time(value: Any) -> None:
     cleaned = value.strip()
     if not cleaned or _TIME_24H_RE.match(cleaned) is None:
         raise ValidationError("Value must be a valid 24-hour time")
-
-
-_PARTIAL_HOUR_RE = re.compile(r"^([01][0-9]|2[0-3])$")
 
 
 def _validate_partial_time(value: Any) -> None:
@@ -1032,14 +958,32 @@ def _check_type(
         raise
 
 
+_SPECIALIZED_ODM_TEMPORAL_TYPES: frozenset[str] = frozenset(
+    {
+        "durationdatetime",
+        "intervaldatetime",
+        "partialdate",
+        "incompletedate",
+        "partialdatetime",
+        "incompletedatetime",
+        "partialtime",
+        "incompletetime",
+    }
+)
+
+
 def _effective_variable_type(var_obj: Any) -> str | None:
-    """Return the effective variable type for type checking, honoring odmDataType."""
+    """Return the effective variable type for type checking, honoring specialized ODM subtypes."""
+    vtype = getattr(var_obj, "variable_type", getattr(var_obj, "variableType", None))
     var_extra = getattr(var_obj, "extraAttributes", None)
     if isinstance(var_extra, Mapping):
         odm_dt = var_extra.get("odmDataType")
         if isinstance(odm_dt, str) and odm_dt.strip():
-            return odm_dt.strip()
-    vtype = getattr(var_obj, "variable_type", getattr(var_obj, "variableType", None))
+            cleaned_odm = odm_dt.strip()
+            if cleaned_odm.lower() in _SPECIALIZED_ODM_TEMPORAL_TYPES or not (
+                isinstance(vtype, str) and vtype.strip()
+            ):
+                return cleaned_odm
     return str(vtype) if isinstance(vtype, str) else None
 
 
@@ -1203,22 +1147,14 @@ def _validate_numeric_bounds(
 ) -> None:
     if isinstance(value, bool):
         return
-    num: float | None = None
-    if isinstance(value, (int, float)):
-        num = float(value)
-    elif isinstance(value, str) and value.strip():
-        try:
-            num = float(value.strip())
-        except ValueError:
-            return
-    if num is None:
-        return
-
     shown_val = _display_constraint_value(name, value)
-    if not math.isfinite(num):
+    if _is_non_finite_numeric(value):
         raise ValidationError(
             f"Value {shown_val} for variable '{name}' on form '{form_key}' must be finite"
         )
+    num = _to_finite_float(value)
+    if num is None:
+        return
     if min_value is not None and num < min_value:
         raise ValidationError(
             f"Value {shown_val} for variable '{name}' on form '{form_key}' is below minimum {min_value}"
@@ -1227,84 +1163,6 @@ def _validate_numeric_bounds(
         raise ValidationError(
             f"Value {shown_val} for variable '{name}' on form '{form_key}' exceeds maximum {max_value}"
         )
-
-
-def _matches_single_range_item(actual_item: Any, check_val: str) -> bool:
-    """Return True if ``actual_item`` matches ``check_val`` numerically, temporally, or lexically."""
-    num_act = _to_finite_float(actual_item)
-    num_exp = _to_finite_float(check_val)
-    if num_act is not None and num_exp is not None:
-        return math.isclose(num_act, num_exp, rel_tol=1e-9, abs_tol=1e-12)
-    dt_act = _parse_comparable_temporal(actual_item)
-    dt_exp = _parse_comparable_temporal(check_val)
-    if dt_act is not None and dt_exp is not None:
-        return dt_act == dt_exp
-    return str(actual_item).strip() == check_val
-
-
-def _evaluate_range_check(value: Any, rc: RangeCheckConstraint) -> bool:
-    """Return True when ``value`` satisfies ``rc`` without using eval."""
-    comp = rc.comparator
-    if comp in {"IN", "NOTIN"}:
-        if isinstance(value, (list, tuple, set, frozenset)):
-            items = list(value)
-        elif isinstance(value, str) and "`" in value:
-            items = [tok.strip() for tok in value.split("`") if tok.strip()]
-        else:
-            items = [value]
-        if comp == "IN":
-            return bool(items) and all(
-                any(_matches_single_range_item(item, cv) for cv in rc.check_values)
-                for item in items
-            )
-        return all(
-            not any(_matches_single_range_item(item, cv) for cv in rc.check_values)
-            for item in items
-        )
-
-    target = rc.check_values[0]
-    num_act = _to_finite_float(value)
-    num_exp = _to_finite_float(target)
-    if num_act is not None and num_exp is not None:
-        if comp == "LT":
-            return num_act < num_exp
-        if comp == "LE":
-            return num_act <= num_exp
-        if comp == "GT":
-            return num_act > num_exp
-        if comp == "GE":
-            return num_act >= num_exp
-        if comp == "EQ":
-            return math.isclose(num_act, num_exp, rel_tol=1e-9, abs_tol=1e-12)
-        return not math.isclose(num_act, num_exp, rel_tol=1e-9, abs_tol=1e-12)
-
-    dt_act = _parse_comparable_temporal(value)
-    dt_exp = _parse_comparable_temporal(target)
-    if dt_act is not None and dt_exp is not None:
-        if comp == "LT":
-            return dt_act < dt_exp
-        if comp == "LE":
-            return dt_act <= dt_exp
-        if comp == "GT":
-            return dt_act > dt_exp
-        if comp == "GE":
-            return dt_act >= dt_exp
-        if comp == "EQ":
-            return dt_act == dt_exp
-        return dt_act != dt_exp
-
-    str_act = str(value).strip()
-    if comp == "LT":
-        return str_act < target
-    if comp == "LE":
-        return str_act <= target
-    if comp == "GT":
-        return str_act > target
-    if comp == "GE":
-        return str_act >= target
-    if comp == "EQ":
-        return str_act == target
-    return str_act != target
 
 
 def _format_range_check_message(
@@ -1398,6 +1256,14 @@ def _check_required_variables_only(
                 )
 
 
+def _extract_record_payload_data(record: Mapping[str, Any]) -> Any:
+    """Extract clinical variable data from ``record``, falling back when keys are None."""
+    for key in ("recordData", "record_data", "data"):
+        if key in record and record[key] is not None:
+            return record[key]
+    return {}
+
+
 @overload
 def validate_record_data(
     schema: ValidationSchemaProtocol,
@@ -1483,6 +1349,12 @@ def validate_record_data(
                 rule_id=rule_id,
             )
         )
+
+    if data is None:
+        data = {}
+    if not isinstance(data, Mapping):
+        _record_error("Record data must be a mapping", rule_id="invalid_record_data")
+        return _finish()
 
     variables = (
         schema.variables_for_form(form_key, study_key=study_key)
@@ -1632,7 +1504,12 @@ def validate_record_data(
     if callable(rules_getter):
         rules = rules_getter(form_key)
         if rules:
-            report = _LOGIC_EVALUATOR.evaluate_rules(rules, data, form_key=form_key)
+            report = _LOGIC_EVALUATOR.evaluate_rules(
+                rules,
+                data,
+                form_key=form_key,
+                allowed_variables=variables if variables else None,
+            )
             for warn in report.warnings:
                 logger.warning(
                     "Query rule '%s' triggered on form '%s': %s",
@@ -1689,6 +1566,9 @@ def calculate_readiness_score(
     Returns:
         A tuple of (score, list of validation failure or warning reasons).
     """
+    if data is not None and not isinstance(data, Mapping):
+        return 0.0, ["Record data must be a mapping"]
+
     variables = (
         schema.variables_for_form(form_key, study_key=study_key)
         if isinstance(schema, BaseSchemaCache)
@@ -1732,8 +1612,17 @@ def calculate_readiness_score(
     unknown = [k for k in data_map if k not in variables]
     if unknown:
         reasons.append(f"Unknown variables: {', '.join(unknown)}")
+        for uk in unknown:
+            if _contains_masked_sentinel(data_map[uk]):
+                reasons.append(
+                    f"Variable {uk} invalid: Variable '{uk}' contains masked PHI sentinel "
+                    f"'{MASKED_SENTINEL}'"
+                )
 
-    has_clinical_data = any(k in variables and not _is_empty_value(v) for k, v in data_map.items())
+    has_clinical_data = any(
+        k in variables and not _is_empty_value(v) and not _contains_masked_sentinel(v)
+        for k, v in data_map.items()
+    )
     is_cache = isinstance(schema, BaseSchemaCache)
 
     for name, var in variables.items():
@@ -1755,6 +1644,10 @@ def calculate_readiness_score(
         vtype = _effective_variable_type(var)
         raw_vtype = getattr(var, "variable_type", getattr(var, "variableType", None))
         try:
+            if _contains_masked_sentinel(value):
+                raise ValidationError(
+                    f"Variable '{name}' contains masked PHI sentinel '{MASKED_SENTINEL}'"
+                )
             _check_type(vtype, value, name=name, form_key=form_key)
             constraints = extract_variable_constraints(var)
             if _is_empty_value(value):
@@ -1800,14 +1693,18 @@ def calculate_readiness_score(
         rules_getter = getattr(schema, "rules_for_form", None)
         if callable(rules_getter):
             report = _LOGIC_EVALUATOR.evaluate_rules(
-                rules_getter(form_key), dict(data_map), form_key=form_key
+                rules_getter(form_key),
+                dict(data_map),
+                form_key=form_key,
+                allowed_variables=variables if variables else None,
             )
             for err in report.errors:
                 reasons.append(f"Rule {err.rule_name} failed: {err.message}")
             for warn in report.warnings:
                 reasons.append(f"Rule {warn.rule_name} warning: {warn.message}")
 
-    score = (valid_count / expected_count) * 100.0
+    denom = expected_count + len(unknown)
+    score = (valid_count / denom) * 100.0 if denom > 0 else 100.0
     return score, reasons
 
 
@@ -1869,8 +1766,28 @@ def validate_record_entry(
 
     Resolves the form key from "formKey", "form_key", "formId", or "form_id".
     """
+    if not isinstance(record, Mapping):
+        msg = "Record entry must be a mapping"
+        if not collect_errors:
+            raise ValidationError(msg)
+        return BatchValidationReport(
+            total_records=1,
+            valid_records=0,
+            invalid_records=1,
+            errors=[
+                RecordValidationIssue(
+                    record_index=record_index,
+                    form_key=None,
+                    variable_name=None,
+                    message=msg,
+                    rule_id="invalid_record",
+                )
+            ],
+        )
+
     raw_study = study_key or record.get("studyKey") or record.get("study_key")
     eff_study_key = str(raw_study) if raw_study else None
+    payload_data = _extract_record_payload_data(record)
     fk, fid = _extract_form_ref(record)
     if not fk and fid is not None:
         if isinstance(fid, bool):
@@ -1918,7 +1835,7 @@ def validate_record_entry(
         return validate_record_data(
             schema,
             fk,
-            record.get("recordData", record.get("data", {})),
+            payload_data,
             study_key=eff_study_key,
             collect_errors=collect_errors,
             record_index=record_index,
@@ -1942,34 +1859,68 @@ def validate_record_entry(
             ],
         )
 
-    raw_data = record.get("recordData", record.get("data", {}))
-    if isinstance(raw_data, Mapping) and raw_data:
+    if not isinstance(payload_data, Mapping):
+        msg = "Record data must be a mapping"
+        if not collect_errors:
+            raise ValidationError(msg)
+        return BatchValidationReport(
+            total_records=1,
+            valid_records=0,
+            invalid_records=1,
+            errors=[
+                RecordValidationIssue(
+                    record_index=record_index,
+                    form_key=None,
+                    variable_name=None,
+                    message=msg,
+                    rule_id="invalid_record_data",
+                )
+            ],
+        )
+
+    raw_data = payload_data
+    if raw_data:
+        for var_name, var_val in raw_data.items():
+            if _contains_masked_sentinel(var_val):
+                msg = f"Variable '{var_name}' contains masked PHI sentinel '{MASKED_SENTINEL}'"
+                if not collect_errors:
+                    raise ValidationError(msg)
+                return BatchValidationReport(
+                    total_records=1,
+                    valid_records=0,
+                    invalid_records=1,
+                    errors=[
+                        RecordValidationIssue(
+                            record_index=record_index,
+                            form_key=None,
+                            variable_name=str(var_name),
+                            message=msg,
+                            rule_id="masked_phi",
+                        )
+                    ],
+                )
         forms_attr = getattr(schema, "forms", None)
         is_datadict_like = isinstance(forms_attr, Sequence) and not isinstance(
             schema, BaseSchemaCache
         )
         if is_datadict_like or collect_errors:
-            form_keys: Iterable[str]
-            if isinstance(schema, BaseSchemaCache):
-                form_keys = schema.forms_for_study(eff_study_key) if eff_study_key else schema.forms
-            elif isinstance(forms_attr, Sequence):
-                form_keys = [
-                    str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
-                    for f in forms_attr
-                    if getattr(f, "form_key", None) or getattr(f, "formKey", None)
-                ]
-            else:
-                form_keys = ()
-
             known_vars: dict[str, list[Any]] = {}
-            for candidate_fk in form_keys:
-                f_vars = (
-                    schema.variables_for_form(candidate_fk, study_key=eff_study_key)
-                    if isinstance(schema, BaseSchemaCache)
-                    else schema.variables_for_form(candidate_fk)
-                )
-                for v_name, v_obj in f_vars.items():
-                    known_vars.setdefault(v_name, []).append(v_obj)
+            if isinstance(schema, BaseSchemaCache):
+                active_study = eff_study_key or get_study_context()
+                if active_study:
+                    for f_vars in schema.forms_for_study(active_study).values():
+                        for v_name, v_obj in f_vars.items():
+                            known_vars.setdefault(v_name, []).append(v_obj)
+                else:
+                    for f_vars in schema.study_forms.values():
+                        for v_name, v_obj in f_vars.items():
+                            known_vars.setdefault(v_name, []).append(v_obj)
+            elif isinstance(forms_attr, Sequence):
+                for f in forms_attr:
+                    candidate_fk = str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
+                    if candidate_fk:
+                        for v_name, v_obj in schema.variables_for_form(candidate_fk).items():
+                            known_vars.setdefault(v_name, []).append(v_obj)
 
             if known_vars:
                 formless_errors: list[RecordValidationIssue] = []
@@ -1991,20 +1942,14 @@ def validate_record_entry(
                         continue
                     if not _is_empty_value(var_val):
                         distinct_types = {
-                            str(getattr(vo, "variable_type", getattr(vo, "variableType", "")) or "")
-                            .strip()
-                            .lower()
+                            str(_effective_variable_type(vo) or "").strip().lower()
                             for vo in candidates
                         }
                         distinct_types.discard("")
                         if len(distinct_types) == 1:
-                            vtype = getattr(
-                                candidates[0],
-                                "variable_type",
-                                getattr(candidates[0], "variableType", None),
-                            )
+                            vtype = _effective_variable_type(candidates[0])
                             try:
-                                _check_type(vtype, var_val)
+                                _check_type(vtype, var_val, name=var_name)
                             except ValidationError as exc:
                                 if not collect_errors:
                                     raise
@@ -2040,11 +1985,13 @@ def validate_records_batch(
     """Validate a sequence of records against *schema*, aggregating errors when requested."""
     aggregated = BatchValidationReport(total_records=len(records))
     for idx, rec in enumerate(records):
-        rec_dict = rec if isinstance(rec, dict) else dict(rec)
+        rec_arg: Any = (
+            rec if isinstance(rec, dict) else (dict(rec) if isinstance(rec, Mapping) else rec)
+        )
         if collect_errors:
             entry_report = validate_record_entry(
                 schema,
-                rec_dict,
+                rec_arg,
                 study_key=study_key,
                 collect_errors=True,
                 record_index=idx,
@@ -2058,7 +2005,7 @@ def validate_records_batch(
         else:
             validate_record_entry(
                 schema,
-                rec_dict,
+                rec_arg,
                 study_key=study_key,
                 collect_errors=False,
                 record_index=idx,
@@ -2095,6 +2042,8 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
         Returns:
             A tuple of (form_key, needs_refresh).
         """
+        if not isinstance(record, Mapping):
+            return None, False
         form_key = self._resolve_form_key(record, study_key=study_key)
         if form_key:
             return form_key, not self.schema._has_form(form_key, study_key=study_key)
@@ -2135,6 +2084,8 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
 
     def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
         """Validate a single record payload."""
+        if not isinstance(record, Mapping):
+            raise ValidationError("Record entry must be a mapping")
         form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
         if needs_refresh:
             self.refresh(study_key)
@@ -2144,9 +2095,12 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
             _, fid = _extract_form_ref(record)
             if fid is not None:
                 raise ValidationError(f"Unknown form ID {fid}")
+        payload_data = _extract_record_payload_data(record)
+        if not isinstance(payload_data, Mapping):
+            raise ValidationError("Record data must be a mapping")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            dict(payload_data),
             study_key=study_key,
         )
 
@@ -2224,6 +2178,8 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
 
     async def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
         """Validate a single record payload asynchronously."""
+        if not isinstance(record, Mapping):
+            raise ValidationError("Record entry must be a mapping")
         form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
         if needs_refresh:
             await self.refresh(study_key)
@@ -2233,9 +2189,12 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
             _, fid = _extract_form_ref(record)
             if fid is not None:
                 raise ValidationError(f"Unknown form ID {fid}")
+        payload_data = _extract_record_payload_data(record)
+        if not isinstance(payload_data, Mapping):
+            raise ValidationError("Record data must be a mapping")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            dict(payload_data),
             study_key=study_key,
         )
 

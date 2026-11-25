@@ -7,9 +7,10 @@ import math
 import re
 import re._constants as _re_constants  # type: ignore[import-not-found]
 import re._parser as _re_parser  # type: ignore[import-not-found]
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Literal
 
 import defusedxml.ElementTree as ET  # noqa: N817
@@ -399,11 +400,89 @@ def _parse_comparable_temporal(value: Any) -> datetime | None:
     return dt
 
 
+_NON_FINITE_NUMERIC_STRINGS: frozenset[str] = frozenset(
+    {
+        "nan",
+        "+nan",
+        "-nan",
+        "inf",
+        "+inf",
+        "-inf",
+        "infinity",
+        "+infinity",
+        "-infinity",
+    }
+)
+
+_MONTH_ABBR_TO_NUM: dict[str, int] = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+_DATE_YMD_RE = re.compile(r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$")
+_DATE_MDY_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])-([0-9]{4})$")
+_DATE_DMY_RE = re.compile(r"^(0[1-9]|[12][0-9]|3[01])-(0[1-9]|1[0-2])-([0-9]{4})$")
+_DATE_DD_MMM_YYYY_RE = re.compile(r"^(0[1-9]|[12][0-9]|3[01])-([A-Za-z]{3})-([0-9]{4})$")
+_TIME_24H_RE = re.compile(
+    r"^([01][0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9])(?:\.[0-9]{1,9})?)?"
+    r"(?:Z|[+-](?:[01][0-9]|2[0-3]):?[0-5][0-9])?$"
+)
+_DATETIME_HAS_TIME_RE = re.compile(r"[T ][0-9]{2}:[0-9]{2}")
+_PARTIAL_YEAR_RE = re.compile(r"^[0-9]{4}$")
+_PARTIAL_YM_RE = re.compile(r"^([0-9]{4})-(0[1-9]|1[0-2])$")
+_PARTIAL_MY_RE = re.compile(r"^(0[1-9]|1[0-2])-([0-9]{4})$")
+_PARTIAL_YMD_HOUR_RE = re.compile(
+    r"^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[T ]([01][0-9]|2[0-3])$"
+)
+_PARTIAL_HOUR_RE = re.compile(r"^([01][0-9]|2[0-3])$")
+_ISO_DURATION_RE = re.compile(
+    r"^P(?=[0-9T])(?:[0-9]+Y)?(?:[0-9]+M)?(?:[0-9]+W)?(?:[0-9]+D)?"
+    r"(?:T(?=[0-9])(?:[0-9]+H)?(?:[0-9]+M)?(?:[0-9]+(?:\.[0-9]+)?S)?)?$"
+)
+
+
+def _is_non_finite_numeric(value: Any) -> bool:
+    """Return True when ``value`` is NaN or +/-Infinity as float, Decimal, or string."""
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, Decimal):
+        return value.is_nan() or value.is_infinite()
+    if isinstance(value, str):
+        stripped = value.strip().lower()
+        if not stripped:
+            return False
+        if stripped in _NON_FINITE_NUMERIC_STRINGS:
+            return True
+        try:
+            parsed = float(stripped)
+        except ValueError:
+            return False
+        return not math.isfinite(parsed)
+    return False
+
+
 def _to_finite_float(value: Any) -> float | None:
-    """Convert numeric or string input into a finite float, rejecting booleans."""
+    """Convert numeric or string input into a finite float, rejecting booleans and NaN/Inf."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
+        fval = float(value)
+        return fval if math.isfinite(fval) else None
+    if isinstance(value, Decimal):
+        if value.is_nan() or value.is_infinite():
+            return None
         fval = float(value)
         return fval if math.isfinite(fval) else None
     if isinstance(value, str):
@@ -416,6 +495,148 @@ def _to_finite_float(value: Any) -> float | None:
             return None
         return fval if math.isfinite(fval) else None
     return None
+
+
+def _is_valid_calendar_ymd(year: int, month: int, day: int) -> bool:
+    """Return True when ``(year, month, day)`` forms a real calendar date."""
+    try:
+        date(year, month, day)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_valid_date_str(cleaned: str, *, allow_dmy: bool = False) -> bool:
+    """Return True when ``cleaned`` is a valid ISO, MDY, DD-MMM-YYYY, or optional DMY date."""
+    m_ymd = _DATE_YMD_RE.match(cleaned)
+    if m_ymd is not None:
+        return _is_valid_calendar_ymd(int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3)))
+    if allow_dmy:
+        m_dmy = _DATE_DMY_RE.match(cleaned)
+        if m_dmy is not None:
+            return _is_valid_calendar_ymd(
+                int(m_dmy.group(3)), int(m_dmy.group(2)), int(m_dmy.group(1))
+            )
+    m_mdy = _DATE_MDY_RE.match(cleaned)
+    if m_mdy is not None:
+        return _is_valid_calendar_ymd(int(m_mdy.group(3)), int(m_mdy.group(1)), int(m_mdy.group(2)))
+    m_mmm = _DATE_DD_MMM_YYYY_RE.match(cleaned)
+    if m_mmm is not None:
+        mon = _MONTH_ABBR_TO_NUM.get(m_mmm.group(2).lower())
+        if mon is not None:
+            return _is_valid_calendar_ymd(int(m_mmm.group(3)), mon, int(m_mmm.group(1)))
+    return False
+
+
+def _is_valid_datetime_str(cleaned: str) -> bool:
+    """Return True when ``cleaned`` is a valid calendar DateTime string with 24-hour clock."""
+    if not _DATETIME_HAS_TIME_RE.search(cleaned):
+        return False
+    return _parse_comparable_temporal(cleaned) is not None
+
+
+def _is_invalid_temporal_shape(value: Any) -> bool:
+    """Return True if ``value`` looks like a date/datetime pattern but fails calendar parsing."""
+    if not isinstance(value, str):
+        return False
+    cleaned = value.strip()
+    if not cleaned:
+        return False
+    if (
+        _TEMPORAL_COMPARE_MDY_RE.match(cleaned) is not None
+        or _TEMPORAL_COMPARE_YMD_RE.match(cleaned) is not None
+    ):
+        return _parse_comparable_temporal(cleaned) is None
+    return False
+
+
+def _matches_single_range_item(actual_item: Any, check_val: str) -> bool:
+    """Return True if ``actual_item`` matches ``check_val`` numerically, temporally, or lexically."""
+    if _is_non_finite_numeric(actual_item) or _is_non_finite_numeric(check_val):
+        return False
+    num_act = _to_finite_float(actual_item)
+    num_exp = _to_finite_float(check_val)
+    if num_act is not None and num_exp is not None:
+        return math.isclose(num_act, num_exp, rel_tol=1e-9, abs_tol=1e-12)
+    dt_act = _parse_comparable_temporal(actual_item)
+    dt_exp = _parse_comparable_temporal(check_val)
+    if dt_act is not None and dt_exp is not None:
+        return dt_act == dt_exp
+    if _is_invalid_temporal_shape(actual_item) or _is_invalid_temporal_shape(check_val):
+        return False
+    return str(actual_item).strip() == check_val
+
+
+def _evaluate_range_check(value: Any, rc: RangeCheckConstraint) -> bool:
+    """Return True when ``value`` satisfies ``rc`` without using eval."""
+    if _is_non_finite_numeric(value) or any(_is_non_finite_numeric(cv) for cv in rc.check_values):
+        return False
+    comp = rc.comparator
+    if comp in {"IN", "NOTIN"}:
+        if isinstance(value, (list, tuple, set, frozenset)):
+            items = list(value)
+        elif isinstance(value, str) and "`" in value:
+            items = [tok.strip() for tok in value.split("`") if tok.strip()]
+        else:
+            items = [value]
+        if any(_is_non_finite_numeric(item) for item in items):
+            return False
+        if comp == "IN":
+            return bool(items) and all(
+                any(_matches_single_range_item(item, cv) for cv in rc.check_values)
+                for item in items
+            )
+        return all(
+            not any(_matches_single_range_item(item, cv) for cv in rc.check_values)
+            for item in items
+        )
+
+    target = rc.check_values[0]
+    num_act = _to_finite_float(value)
+    num_exp = _to_finite_float(target)
+    if num_act is not None and num_exp is not None:
+        if comp == "LT":
+            return num_act < num_exp
+        if comp == "LE":
+            return num_act <= num_exp
+        if comp == "GT":
+            return num_act > num_exp
+        if comp == "GE":
+            return num_act >= num_exp
+        if comp == "EQ":
+            return math.isclose(num_act, num_exp, rel_tol=1e-9, abs_tol=1e-12)
+        return not math.isclose(num_act, num_exp, rel_tol=1e-9, abs_tol=1e-12)
+
+    dt_act = _parse_comparable_temporal(value)
+    dt_exp = _parse_comparable_temporal(target)
+    if dt_act is not None and dt_exp is not None:
+        if comp == "LT":
+            return dt_act < dt_exp
+        if comp == "LE":
+            return dt_act <= dt_exp
+        if comp == "GT":
+            return dt_act > dt_exp
+        if comp == "GE":
+            return dt_act >= dt_exp
+        if comp == "EQ":
+            return dt_act == dt_exp
+        return dt_act != dt_exp
+
+    if _is_invalid_temporal_shape(value) or _is_invalid_temporal_shape(target):
+        return False
+
+    str_act = str(value).strip()
+    if comp == "LT":
+        return str_act < target
+    if comp == "LE":
+        return str_act <= target
+    if comp == "GT":
+        return str_act > target
+    if comp == "GE":
+        return str_act >= target
+    if comp == "EQ":
+        return str_act == target
+    return str_act != target
 
 
 def _to_non_negative_int(value: Any) -> int | None:
@@ -1281,9 +1502,18 @@ class LogicTreeEvaluator:
         data: Mapping[str, Any],
         *,
         form_key: str | None = None,
+        allowed_variables: Collection[str] | Mapping[str, Any] | None = None,
     ) -> LogicEvaluationReport:
         """Evaluate a sequence of BusinessLogicRule instances or dicts against ``data``."""
-        results = [self.evaluate_rule(rule, data, form_key=form_key) for rule in rules]
+        results = [
+            self.evaluate_rule(
+                rule,
+                data,
+                form_key=form_key,
+                allowed_variables=allowed_variables,
+            )
+            for rule in rules
+        ]
         return LogicEvaluationReport(results=results)
 
     def evaluate_rule(
@@ -1292,6 +1522,7 @@ class LogicTreeEvaluator:
         data: Mapping[str, Any],
         *,
         form_key: str | None = None,
+        allowed_variables: Collection[str] | Mapping[str, Any] | None = None,
     ) -> RuleEvaluationResult:
         """Evaluate a single BusinessLogicRule or dict against ``data``."""
         rule_id = self._read_field(rule, "id", "ID")
@@ -1370,6 +1601,45 @@ class LogicTreeEvaluator:
                 skipped=True,
                 skip_reason="non_validation_rule",
             )
+
+        if allowed_variables is not None and rule_form is None:
+            allowed_set = {str(k) for k in allowed_variables}
+            cond_root = unwrapped.get("conditions", unwrapped.get("if", unwrapped))
+            leaf_conds, cross_flag = (
+                self._collect_leaf_conditions(cond_root, effective_form)
+                if isinstance(cond_root, (Mapping, list))
+                else ([], False)
+            )
+            if cross_flag:
+                return RuleEvaluationResult(
+                    rule_id=rule_id,
+                    rule_name=rule_name,
+                    rule_type=rule_type,
+                    severity=severity,
+                    triggered=False,
+                    message=default_msg,
+                    skipped=True,
+                    skip_reason="cross_scope",
+                    is_cross_scope=True,
+                )
+            referenced_vars = {v for c in leaf_conds for v in (c.variable, c.compare_variable) if v}
+            if not referenced_vars:
+                extra_attrs = self._read_field(rule, "extraAttributes")
+                if isinstance(extra_attrs, Mapping):
+                    target_vars = extra_attrs.get("targetVariables")
+                    if isinstance(target_vars, list):
+                        referenced_vars = {str(v).strip() for v in target_vars if str(v).strip()}
+            if not referenced_vars or not referenced_vars.issubset(allowed_set):
+                return RuleEvaluationResult(
+                    rule_id=rule_id,
+                    rule_name=rule_name,
+                    rule_type=rule_type,
+                    severity=severity,
+                    triggered=False,
+                    message=default_msg,
+                    skipped=True,
+                    skip_reason="foreign_variable",
+                )
 
         triggered, is_cross_scope, skip_reason = self.evaluate_tree(
             unwrapped,
@@ -1977,6 +2247,15 @@ class LogicTreeEvaluator:
             False,
         )
 
+    @staticmethod
+    def _flip_combinator(
+        combinator: Literal["AND", "OR"],
+        negated: bool,
+    ) -> Literal["AND", "OR"]:
+        if not negated:
+            return combinator
+        return "OR" if combinator == "AND" else "AND"
+
     def _eval_combinator_branch(
         self,
         branch_val: Any,
@@ -1986,6 +2265,7 @@ class LogicTreeEvaluator:
         form_key: str | None,
         rule_type: str | None,
         default_operator: str | None,
+        negated: bool = False,
         results: list[bool],
     ) -> None:
         if branch_val is True:
@@ -2001,6 +2281,7 @@ class LogicTreeEvaluator:
                     rule_type=rule_type,
                     default_operator=default_operator,
                     group_combinator=branch_combinator,
+                    negated=negated,
                 )
             )
             return
@@ -2013,6 +2294,7 @@ class LogicTreeEvaluator:
                     rule_type=rule_type,
                     default_operator=default_operator,
                     group_combinator=branch_combinator,
+                    negated=negated,
                 )
             )
 
@@ -2025,11 +2307,13 @@ class LogicTreeEvaluator:
         rule_type: str | None,
         default_operator: str | None = None,
         group_combinator: Literal["AND", "OR"] | None = None,
+        negated: bool = False,
     ) -> bool:
         if isinstance(node, list):
             if not node:
                 return False
-            eval_fn = any if group_combinator == "OR" else all
+            effective_comb = self._flip_combinator(group_combinator or "AND", negated)
+            eval_fn = any if effective_comb == "OR" else all
             return eval_fn(
                 self._eval_node(
                     item,
@@ -2037,6 +2321,7 @@ class LogicTreeEvaluator:
                     form_key=form_key,
                     rule_type=rule_type,
                     default_operator=default_operator,
+                    negated=negated,
                 )
                 for item in node
             )
@@ -2047,6 +2332,7 @@ class LogicTreeEvaluator:
             leaf, is_cross = self._parse_leaf_condition(
                 node,
                 form_key,
+                negated=negated,
                 default_operator=default_operator,
             )
             if is_cross or leaf is None:
@@ -2054,6 +2340,7 @@ class LogicTreeEvaluator:
             return self._eval_leaf(leaf, data, rule_type=rule_type)
 
         combinator = self._node_combinator(node, default=group_combinator or "AND")
+        effective_combinator = self._flip_combinator(combinator, negated)
         results: list[bool] = []
 
         for and_key in _AND_GROUP_KEYS:
@@ -2065,6 +2352,7 @@ class LogicTreeEvaluator:
                     form_key=form_key,
                     rule_type=rule_type,
                     default_operator=default_operator,
+                    negated=negated,
                     results=results,
                 )
         for or_key in _OR_GROUP_KEYS:
@@ -2076,20 +2364,21 @@ class LogicTreeEvaluator:
                     form_key=form_key,
                     rule_type=rule_type,
                     default_operator=default_operator,
+                    negated=negated,
                     results=results,
                 )
         for not_key in _NOT_GROUP_KEYS:
             if not_key in node and node[not_key] is not True:
-                for item in _as_list(node[not_key]):
-                    results.append(
-                        not self._eval_node(
-                            item,
-                            data,
-                            form_key=form_key,
-                            rule_type=rule_type,
-                            default_operator=default_operator,
-                        )
-                    )
+                self._eval_combinator_branch(
+                    node[not_key],
+                    "AND",
+                    data,
+                    form_key=form_key,
+                    rule_type=rule_type,
+                    default_operator=default_operator,
+                    negated=not negated,
+                    results=results,
+                )
 
         content_keys = self._content_keys(node)
         has_node_combinator = (
@@ -2106,15 +2395,29 @@ class LogicTreeEvaluator:
                     and isinstance(child_val, Mapping)
                     else None
                 )
-                for child in _as_list(child_val):
+                if isinstance(child_val, list):
+                    for child in child_val:
+                        results.append(
+                            self._eval_node(
+                                child,
+                                data,
+                                form_key=form_key,
+                                rule_type=rule_type,
+                                default_operator=default_operator,
+                                group_combinator=inherited_combinator,
+                                negated=negated,
+                            )
+                        )
+                else:
                     results.append(
                         self._eval_node(
-                            child,
+                            child_val,
                             data,
                             form_key=form_key,
                             rule_type=rule_type,
                             default_operator=default_operator,
                             group_combinator=inherited_combinator,
+                            negated=negated,
                         )
                     )
 
@@ -2129,12 +2432,13 @@ class LogicTreeEvaluator:
                             form_key=form_key,
                             rule_type=rule_type,
                             default_operator=op_mapped,
+                            negated=negated,
                         )
                     )
 
         if not results:
             return False
-        return any(results) if combinator == "OR" else all(results)
+        return any(results) if effective_combinator == "OR" else all(results)
 
     def _eval_leaf(
         self,
@@ -2179,6 +2483,9 @@ class LogicTreeEvaluator:
                     return base if cond.expected_truth else (not base)
                 # Required rule checking missingness via <false/>
                 return (rule_type or "").strip().lower() == "required" and not cond.expected_truth
+
+        if _is_non_finite_numeric(actual) or _is_non_finite_numeric(rhs):
+            return False
 
         base_result = self._compare_values(actual, op, rhs)
         return base_result if cond.expected_truth else (not base_result)
@@ -2257,6 +2564,10 @@ class LogicTreeEvaluator:
                 return False
             return op == "!="
 
+        # Reject NaN / Inf operands so they never fall through to lexical comparison
+        if _is_non_finite_numeric(actual) or _is_non_finite_numeric(expected):
+            return False
+
         # Numeric comparison when both operands parse cleanly as finite numbers
         num_actual = _to_finite_float(actual)
         num_expected = _to_finite_float(expected)
@@ -2291,6 +2602,9 @@ class LogicTreeEvaluator:
                 return dt_actual > dt_expected
             if op == ">=":
                 return dt_actual >= dt_expected
+            return False
+
+        if _is_invalid_temporal_shape(actual) or _is_invalid_temporal_shape(expected):
             return False
 
         # Fallback lexical/string comparison (supports Coded strings)

@@ -34,6 +34,8 @@ class _ValidatorMixin:
         Returns:
             Optional[str]: The resolved form key.
         """
+        if not isinstance(record, Mapping):
+            return None
         fk, fid = _extract_form_ref(record)
         if fk:
             return fk
