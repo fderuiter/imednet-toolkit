@@ -14,7 +14,15 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal, Self
 from uuid import uuid4
 
-from imednet.spi.utils import parse_iso_datetime
+from imednet.spi.utils import (
+    SensitivityRegistry,
+    build_study_sensitivity_registry,
+    mask_clinical_phi,
+    mask_custom_phi_recursive,
+    parse_iso_datetime,
+    resolve_enrichment_pipeline,
+    sanitize_diagnostic_text,
+)
 
 from .data_extraction import DataExtractionWorkflow
 
@@ -48,12 +56,19 @@ _BRONZE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
 class DuckDBIngestionWorkflow:
     """Incremental record centralization pipeline using a bronze/silver DuckDB layout."""
 
-    def __init__(self, sdk: ImednetFacade, db_path: str = ":memory:") -> None:
+    def __init__(
+        self,
+        sdk: ImednetFacade,
+        db_path: str = ":memory:",
+        *,
+        mask_phi: bool = True,
+    ) -> None:
         """Initialize the DuckDB ingestion workflow.
 
         Args:
             sdk: An instance of the iMednet SDK facade.
             db_path: Path to the DuckDB database file or ":memory:". Defaults to ":memory:".
+            mask_phi: Redact sensitive clinical and Study-configured PHI values by default.
         """
         try:
             import duckdb
@@ -65,6 +80,7 @@ class DuckDBIngestionWorkflow:
 
         self._connection: Any = duckdb.connect(db_path)
         self._extractor = DataExtractionWorkflow(sdk)
+        self._mask_phi = bool(mask_phi)
         self._closed = False
 
     def close(self) -> None:
@@ -120,18 +136,22 @@ class DuckDBIngestionWorkflow:
         start_date: str | None = None,
         end_date: str | None = None,
         mode: Literal["append", "replace"] = "append",
+        mask_phi: bool | None = None,
     ) -> int:
         """Fetch RecordRevisions and write to the bronze_revisions table."""
         self._validate_study_key(study_key)
         if mode not in {"append", "replace"}:
             raise ValueError("mode must be one of: 'append', 'replace'")
+        effective_mask_phi = self._mask_phi if mask_phi is None else bool(mask_phi)
 
         revisions = self._extractor.extract_audit_trail(
             study_key,
             start_date=start_date,
             end_date=end_date,
         )
-        rows = self._deduplicate_rows(self._to_rows(study_key, revisions))
+        rows = self._deduplicate_rows(
+            self._to_rows(study_key, revisions, mask_phi=effective_mask_phi)
+        )
         staging_relation = self._build_staging_relation(rows) if rows else None
 
         self._ensure_bronze_table()
@@ -378,25 +398,61 @@ class DuckDBIngestionWorkflow:
                 deleted,
                 date_created,
                 last_updated,
-                COALESCE(date_created, last_updated) AS valid_from,
-                LEAD(COALESCE(date_created, last_updated)) OVER (
+                prev_record_status,
+                prev_data_revision,
+                prev_deleted,
+                data_changed,
+                CASE
+                    WHEN COALESCE(deleted, FALSE) AND NOT COALESCE(prev_deleted, FALSE) THEN 'deleted'
+                    WHEN NOT _has_prev THEN 'created'
+                    WHEN data_changed THEN 'data_updated'
+                    WHEN record_status IS DISTINCT FROM prev_record_status THEN 'status_changed'
+                    ELSE 'metadata_updated'
+                END AS change_type,
+                valid_from,
+                valid_to,
+                is_current
+            FROM (
+                SELECT
+                    study_key,
+                    record_revision_id,
+                    record_id,
+                    record_oid,
+                    form_key,
+                    subject_key,
+                    site_id,
+                    interval_id,
+                    record_status,
+                    record_revision,
+                    data_revision,
+                    "user",
+                    role,
+                    reason_for_change,
+                    deleted,
+                    date_created,
+                    last_updated,
+                    LAG(1) OVER rev_window IS NOT NULL AS _has_prev,
+                    LAG(record_status) OVER rev_window AS prev_record_status,
+                    LAG(data_revision) OVER rev_window AS prev_data_revision,
+                    LAG(deleted) OVER rev_window AS prev_deleted,
+                    CASE
+                        WHEN LAG(1) OVER rev_window IS NULL THEN COALESCE(data_revision, 0) > 0
+                        ELSE COALESCE(data_revision, 0) > COALESCE(LAG(data_revision) OVER rev_window, 0)
+                    END AS data_changed,
+                    COALESCE(date_created, last_updated) AS valid_from,
+                    LEAD(COALESCE(date_created, last_updated)) OVER rev_window AS valid_to,
+                    LEAD(1) OVER rev_window IS NULL AS is_current
+                FROM bronze_revisions
+                WHERE study_key = '{escaped_study_key}'
+                WINDOW rev_window AS (
                     PARTITION BY {record_partition_expr}
                     ORDER BY
                         record_revision ASC NULLS LAST,
                         data_revision ASC NULLS LAST,
                         date_created ASC NULLS LAST,
                         record_revision_id ASC NULLS LAST
-                ) AS valid_to,
-                LEAD(1) OVER (
-                    PARTITION BY {record_partition_expr}
-                    ORDER BY
-                        record_revision ASC NULLS LAST,
-                        data_revision ASC NULLS LAST,
-                        date_created ASC NULLS LAST,
-                        record_revision_id ASC NULLS LAST
-                ) IS NULL AS is_current
-            FROM bronze_revisions
-            WHERE study_key = '{escaped_study_key}'
+                )
+            ) AS history_projection
             """
         self._connection.execute(per_study_history_query)  # nosem
         history_union_sql = self._build_combined_silver_union_sql(
@@ -492,29 +548,85 @@ class DuckDBIngestionWorkflow:
         return dt.isoformat()
 
     def _to_rows(
-        self, study_key: str, revisions: Iterable[RecordRevision]
+        self,
+        study_key: str,
+        revisions: Iterable[RecordRevision],
+        *,
+        mask_phi: bool | None = None,
     ) -> Iterable[tuple[Any, ...]]:
         """Internal helper to convert RecordRevision models into database rows."""
         self._validate_study_key(study_key)
+        effective_mask_phi = self._mask_phi if mask_phi is None else bool(mask_phi)
+        phi_context_cache: dict[str, tuple[set[str], SensitivityRegistry]] = {}
+
+        def _resolve_phi_context(sk: str) -> tuple[set[str], SensitivityRegistry]:
+            if sk not in phi_context_cache:
+                pipeline = resolve_enrichment_pipeline(sk)
+                custom_keys = set(pipeline.phi_keys) if pipeline is not None else set()
+                phi_context_cache[sk] = (
+                    custom_keys,
+                    build_study_sensitivity_registry(custom_keys),
+                )
+            return phi_context_cache[sk]
+
         for revision in revisions:
             raw_study_key = getattr(revision, "study_key", None)
             rev_study_key = self._validate_study_key(raw_study_key) if raw_study_key else study_key
+            rev_study_str = str(rev_study_key)
             deleted_val = getattr(revision, "deleted", False)
+
+            record_oid = self._optional_str(getattr(revision, "record_oid", None))
+            form_key = self._optional_str(getattr(revision, "form_key", None))
+            subject_key = self._optional_str(getattr(revision, "subject_key", None))
+            record_status = self._optional_str(getattr(revision, "record_status", None))
+            user_val = self._optional_str(getattr(revision, "user", None))
+            role_val = self._optional_str(getattr(revision, "role", None))
+            reason_val = self._optional_str(getattr(revision, "reason_for_change", None))
+
+            if effective_mask_phi:
+                custom_phi_keys, active_registry = _resolve_phi_context(rev_study_str)
+                raw_str_map: dict[str, Any] = {
+                    k: v
+                    for k, v in (
+                        ("record_oid", record_oid),
+                        ("form_key", form_key),
+                        ("subject_key", subject_key),
+                        ("record_status", record_status),
+                        ("user", user_val),
+                        ("role", role_val),
+                        ("reason_for_change", reason_val),
+                    )
+                    if v is not None
+                }
+                if raw_str_map:
+                    masked_map = mask_clinical_phi(raw_str_map, registry=active_registry)
+                    if custom_phi_keys:
+                        masked_map = mask_custom_phi_recursive(masked_map, custom_phi_keys)
+                    record_oid = masked_map.get("record_oid")
+                    form_key = masked_map.get("form_key")
+                    subject_key = masked_map.get("subject_key")
+                    record_status = masked_map.get("record_status")
+                    user_val = masked_map.get("user")
+                    role_val = masked_map.get("role")
+                    reason_val = masked_map.get("reason_for_change")
+                    if isinstance(reason_val, str) and reason_val != "***MASKED***":
+                        reason_val = sanitize_diagnostic_text(reason_val, registry=active_registry)
+
             yield (
-                str(rev_study_key),
+                rev_study_str,
                 self._optional_int(getattr(revision, "record_revision_id", None)),
                 self._optional_int(getattr(revision, "record_id", None)),
-                self._optional_str(getattr(revision, "record_oid", None)),
-                self._optional_str(getattr(revision, "form_key", None)),
-                self._optional_str(getattr(revision, "subject_key", None)),
+                record_oid,
+                form_key,
+                subject_key,
                 self._optional_int(getattr(revision, "site_id", None)),
                 self._optional_int(getattr(revision, "interval_id", None)),
-                self._optional_str(getattr(revision, "record_status", None)),
+                record_status,
                 self._optional_int(getattr(revision, "record_revision", None)),
                 self._optional_int(getattr(revision, "data_revision", None)),
-                self._optional_str(getattr(revision, "user", None)),
-                self._optional_str(getattr(revision, "role", None)),
-                self._optional_str(getattr(revision, "reason_for_change", None)),
+                user_val,
+                role_val,
+                reason_val,
                 False if deleted_val is None else bool(deleted_val),
                 self._optional_timestamp(getattr(revision, "date_created", None)),
                 self._optional_timestamp(getattr(revision, "last_updated", None)),

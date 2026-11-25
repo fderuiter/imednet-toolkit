@@ -51,6 +51,7 @@ from imednet.cli.utils import (
 
 if TYPE_CHECKING:
     from imednet.cli.utils import is_interactive_terminal
+    from imednet.cli.utils.export import export_list_to_file, resolve_records_export_target
 
 __all__ = [
     "NON_INTERACTIVE_ENV",
@@ -70,6 +71,7 @@ __all__ = [
     "console",
     "display_list",
     "emit_json",
+    "export_list_to_file",
     "fetching_status",
     "format_job_progress",
     "is_dumb_terminal",
@@ -88,6 +90,7 @@ __all__ = [
     "resolve_endpoint_filter_attributes",
     "resolve_hybrid_study_and_key",
     "resolve_output_format",
+    "resolve_records_export_target",
     "resolve_study_key",
     "simulation_mode_context",
     "supports_ansi_color",
@@ -100,11 +103,15 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    """Lazily resolve interactive terminal helpers from ``imednet.cli.utils``."""
+    """Lazily resolve interactive terminal and file export helpers from ``imednet.cli.utils``."""
     if name == "is_interactive_terminal":
         from imednet.cli.utils import is_interactive_terminal
 
         return is_interactive_terminal
+    if name in {"export_list_to_file", "resolve_records_export_target"}:
+        from imednet.cli.utils import export as _cli_export
+
+        return getattr(_cli_export, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
