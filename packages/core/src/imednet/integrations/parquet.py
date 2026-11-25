@@ -19,7 +19,7 @@ from ._export_contracts import (
     delete_superseded_hive_files,
     snapshot_hive_partition_files,
 )
-from .enrichment import resolve_enrichment_pipeline
+from .enrichment import resolve_sink_enrichment_pipeline, resolve_sink_phi_keys
 from .export import (
     SdtmKeyTuple,
     _append_jsonl_manifest,
@@ -42,6 +42,7 @@ from .export import (
     _mask_df,
     _project_records_whitelist,
     _record_mapper,
+    _seed_mapper_enrichment,
     _stream_records_across_forms,
 )
 from .parquet_engine import PyArrowDatasetPartitionedStorageEngine
@@ -361,10 +362,16 @@ def export_to_hive_parquet(
         mapper = _build_record_mapper(
             sdk, chunk_size=config.batch_size, mask_phi=effective_mask_phi
         )
-        if hasattr(mapper, "_active_study_key"):
-            mapper._active_study_key = study_key
-        pipeline = resolve_enrichment_pipeline(study_key)
-    phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
+        pipeline = resolve_sink_enrichment_pipeline(study_key, config=config)
+        _seed_mapper_enrichment(mapper, study_key, pipeline, config=config)
+        phi_keys: set[str] = (
+            resolve_sink_phi_keys(
+                study_key,
+                config=config,
+                phi_keys=getattr(pipeline, "phi_keys", None),
+            )
+            or set()
+        )
     has_native_enrichment = callable(getattr(mapper, "_get_enrichment_pipeline", None))
     storage_engine = PyArrowDatasetPartitionedStorageEngine()
     effective_use_labels = config.use_labels_as_columns

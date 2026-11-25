@@ -134,17 +134,23 @@ def _sanitize_base_url_for_path(url: str) -> str:
         return "default"
 
 
+_SAFE_HOST_ENTRY_RE = re.compile(r"^[a-zA-Z0-9_.-]+$")
+_MAX_MULTI_ORIGIN_HOST_SCAN = 64
+
+
 def _get_fernet_key(fallback_key: str | None = None) -> bytes:
     """Retrieve and derive a valid 32-byte base64-encoded Fernet key."""
     raw_key = (
-        os.environ.get("IMEDNET_ENCRYPTION_KEY")
+        os.environ.get("IMEDNET_CONFIG_ENCRYPTION_KEY")
+        or os.environ.get("IMEDNET_ENCRYPTION_KEY")
         or os.environ.get("IMEDNET_SECURITY_KEY")
         or fallback_key
         or get_security_key_context()
     )
     if not raw_key:
         raise ValueError(
-            "Encryption/decryption key is missing. Please set IMEDNET_ENCRYPTION_KEY or IMEDNET_SECURITY_KEY."
+            "Encryption/decryption key is missing. Please set "
+            "IMEDNET_CONFIG_ENCRYPTION_KEY, IMEDNET_ENCRYPTION_KEY or IMEDNET_SECURITY_KEY."
         )
 
     try:
@@ -257,6 +263,14 @@ def _get_raw_db_path(db_path: str | Path | None = None) -> Path:
 
     _bounded_cache_put(_RAW_DB_PATH_CACHE, key, resolved, _MAX_RAW_DB_PATH_CACHE)
     return resolved
+
+
+def _has_explicit_origin_context() -> bool:
+    """Return True when context or environment explicitly binds a target origin."""
+    if get_base_url_context() is not None:
+        return True
+    env_url = os.environ.get("IMEDNET_BASE_URL")
+    return bool(env_url is not None and env_url.strip())
 
 
 def _resolve_effective_base_url(pinned_base_url: str | None = None) -> tuple[str, bool]:
@@ -708,6 +722,81 @@ class ConfigVersionStore:
                     return resolved
             has_localhost_legacy = bool(study_key and study_key in lh_subdirs)
 
+        if not _has_explicit_origin_context():
+            skipped_entries = {host_name, "localhost", layout.db_name, ".", ".."}
+            scanned = 0
+            matched_candidates: list[tuple[Path, StudyConfiguration]] = []
+            legacy_host_candidates: list[Path] = []
+            for entry_name in sorted(base_entries):
+                if (
+                    entry_name in skipped_entries
+                    or entry_name.startswith(".")
+                    or not _SAFE_HOST_ENTRY_RE.match(entry_name)
+                ):
+                    continue
+                if scanned >= _MAX_MULTI_ORIGIN_HOST_SCAN:
+                    break
+                scanned += 1
+                try:
+                    cand_layout = _get_origin_layout(
+                        raw_db_path,
+                        base_url_override=f"https://{entry_name}",
+                    )
+                except PathTraversalValidationError:
+                    continue
+                cand_entries, cand_subdirs = _get_host_dir_listing(
+                    cand_layout.host_dir,
+                    layout.db_name,
+                )
+                if cand_layout.db_name in cand_entries:
+                    resolved = cls._read_committed_from_sqlite_path(
+                        cand_layout.canonical_db_path,
+                        study_key,
+                        raw_db_path=raw_db_path,
+                    )
+                    if resolved is not None:
+                        matched_candidates.append((cand_layout.canonical_db_path, resolved))
+                if study_key and study_key in cand_subdirs:
+                    legacy_host_candidates.append(cand_layout.host_dir / study_key / layout.db_name)
+
+            if len(matched_candidates) == 1:
+                return matched_candidates[0][1]
+            if len(matched_candidates) > 1:
+                best_cfg = matched_candidates[0][1]
+                best_ts = ""
+                for cand_db_path, cand_cfg in matched_candidates:
+                    ts = ""
+                    try:
+                        with sqlite_connection(cand_db_path, timeout=30.0) as conn:
+                            row = conn.execute(
+                                """
+                                SELECT c.timestamp
+                                FROM config_commits c
+                                WHERE c.study_key = ?
+                                ORDER BY c.timestamp DESC, c.rowid DESC
+                                LIMIT 1
+                                """,
+                                (study_key,),
+                            ).fetchone()
+                            if row is not None and row[0] is not None:
+                                ts = str(row[0])
+                    except sqlite3.Error:
+                        ts = ""
+                    if ts >= best_ts:
+                        best_ts = ts
+                        best_cfg = cand_cfg
+                return best_cfg
+
+            for legacy_cand_path in legacy_host_candidates:
+                if legacy_cand_path.is_file():
+                    resolved = cls._read_committed_from_sqlite_path(
+                        legacy_cand_path,
+                        study_key,
+                        raw_db_path=raw_db_path,
+                    )
+                    if resolved is not None:
+                        return resolved
+
         has_flat_db = layout.flat_db_path is not None and layout.db_name in base_entries
         if (
             hasattr(cls.resolve_legacy_committed_config, "_mock_name")
@@ -942,7 +1031,8 @@ class ConfigVersionStore:
             self._sdk_security_key = sdk_sec_key
             if (
                 not (
-                    os.environ.get("IMEDNET_ENCRYPTION_KEY")
+                    os.environ.get("IMEDNET_CONFIG_ENCRYPTION_KEY")
+                    or os.environ.get("IMEDNET_ENCRYPTION_KEY")
                     or os.environ.get("IMEDNET_SECURITY_KEY")
                 )
                 and get_security_key_context() is None

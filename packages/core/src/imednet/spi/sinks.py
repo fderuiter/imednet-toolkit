@@ -7,6 +7,8 @@ from imednet.integrations.enrichment import (
     CentralizedMapper,
     EnrichmentPipeline,
     resolve_enrichment_pipeline,
+    resolve_sink_enrichment_pipeline,
+    resolve_sink_phi_keys,
     resolve_study_configuration,
 )
 from imednet.integrations.sink_base import (
@@ -101,6 +103,8 @@ __all__ = [
     "resolve_form_sdtm_domain",
     "resolve_max_buffered_records",
     "resolve_sdtm_domain",
+    "resolve_sink_enrichment_pipeline",
+    "resolve_sink_phi_keys",
     "resolve_study_configuration",
     "resolve_voided_sdtm_keys",
     "run_streaming_export",
