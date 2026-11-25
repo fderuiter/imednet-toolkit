@@ -221,12 +221,17 @@ class BaseRecordRequest(ImednetBaseModel):
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
-    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
+    Requires ``formKey`` or ``formId``, and a site identifier (``siteName`` or ``siteId``).
+    Optional ``formId``, ``subjectKey``, and ``subjectOid`` attributes are omitted when
     ``None`` so server-assigned subject keys continue working by default; when
-    explicitly supplied, they are preserved for enrollment and deduplication.
+    ``formId`` is supplied without ``formKey``, ``formKey=""`` is omitted.
     """
 
+    form_id: int | None = Field(
+        default=None,
+        alias="formId",
+        description="Numeric ID of the registration form",
+    )
     site_name: str = Field(
         "", alias="siteName", description="Name of the site where the subject is enrolled"
     )
@@ -246,6 +251,25 @@ class RegisterSubjectRequest(BaseRecordRequest):
         description="Optional subject OID",
     )
 
+    @field_validator("form_id", mode="before")
+    @classmethod
+    def _validate_optional_form_id(cls, value: Any) -> Any:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            raise ValueError("formId must be an integer")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            if stripped.lstrip("-").isdigit():
+                return int(stripped)
+        return value
+
     @field_validator("subject_key", "subject_oid", mode="before")
     @classmethod
     def _normalize_optional_subject_identifier(cls, value: Any) -> str | None:
@@ -259,6 +283,14 @@ class RegisterSubjectRequest(BaseRecordRequest):
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, Any]:
         serialized: dict[str, Any] = handler(self)
+        if self.form_id is None:
+            serialized.pop("form_id", None)
+            serialized.pop("formId", None)
+        if not self.form_key and (
+            self.form_id is not None or "form_key" not in self.model_fields_set
+        ):
+            serialized.pop("form_key", None)
+            serialized.pop("formKey", None)
         if self.site_id is None:
             serialized.pop("site_id", None)
             serialized.pop("siteId", None)
@@ -276,15 +308,23 @@ class RegisterSubjectRequest(BaseRecordRequest):
     def model_dump(self, **kwargs: Any) -> dict[str, Any]:
         """Serialize enrollment payload, omitting ``None`` optional attributes by default."""
         kwargs.setdefault("exclude_none", True)
+        extra_excludes: set[str] = set()
         if not self.site_name and self.site_id is not None:
+            extra_excludes.add("site_name")
+        if not self.form_key and (
+            self.form_id is not None or "form_key" not in self.model_fields_set
+        ):
+            extra_excludes.add("form_key")
+        if extra_excludes:
             raw_exclude = kwargs.get("exclude")
             if raw_exclude is None:
-                kwargs["exclude"] = {"site_name"}
+                kwargs["exclude"] = extra_excludes
             elif isinstance(raw_exclude, set):
-                kwargs["exclude"] = raw_exclude | {"site_name"}
+                kwargs["exclude"] = raw_exclude | extra_excludes
             elif isinstance(raw_exclude, dict):
                 merged = dict(raw_exclude)
-                merged["site_name"] = True
+                for field_name in extra_excludes:
+                    merged[field_name] = True
                 kwargs["exclude"] = merged
         return super().model_dump(**kwargs)
 

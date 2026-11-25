@@ -33,6 +33,14 @@ imednet.utils.batch\_coordinator module
    :members:
    :show-inheritance:
 
+imednet.utils.batch\_ledger module
+----------------------------------
+
+.. automodule:: imednet.utils.batch_ledger
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 imednet.utils.dates module
 --------------------------
 
@@ -157,6 +165,14 @@ imednet.utils.validators module
 -------------------------------
 
 .. automodule:: imednet.utils.validators
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
+imednet.utils.write\_pipeline module
+------------------------------------
+
+.. automodule:: imednet.utils.write_pipeline
    :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:

@@ -558,32 +558,71 @@ class DataDictionary(DictCompatMixin, BaseModel):
         res.extend(self.unassignedBusinessLogic)
         return res
 
-    def form_for_key(self, form_key: str) -> Form | None:
-        """Return the Form model matching ``form_key``, or None if absent."""
+    def form_for_key(self, form_key: str, study_key: str | None = None) -> Form | None:
+        """Return the Form model matching ``form_key`` (and ``study_key`` if partitioned)."""
+        if study_key is not None:
+            for form in self.forms:
+                f_sk = form.extraAttributes.get("studyKey") or form.extraAttributes.get("study_key")
+                if f_sk is not None and str(f_sk) == study_key and form.formKey == form_key:
+                    return form
         for form in self.forms:
+            if study_key is not None:
+                f_sk = form.extraAttributes.get("studyKey") or form.extraAttributes.get("study_key")
+                if f_sk is not None and str(f_sk) != study_key:
+                    continue
             if form.formKey == form_key:
                 return form
         return None
 
-    def variables_for_form(self, form_key: str) -> dict[str, Variable]:
+    def variables_for_form(
+        self, form_key: str, study_key: str | None = None
+    ) -> dict[str, Variable]:
         """Return a mapping of variable names to Variable definitions for ``form_key``."""
-        form = self.form_for_key(form_key)
+        form = self.form_for_key(form_key, study_key=study_key)
         if form is None:
             return {}
         return {var.variableName: var for var in form.variables if var.variableName}
 
-    def form_key_from_id(self, form_id: int | str) -> str | None:
+    def form_key_from_id(self, form_id: int | str, study_key: str | None = None) -> str | None:
         """Resolve a ``formKey`` from a numeric or string ``formId``."""
         if isinstance(form_id, bool) or form_id is None or form_id == "":
             return None
         target_str = str(form_id).strip()
         if not target_str:
             return None
+        if study_key is not None:
+            for form in self.forms:
+                f_sk = form.extraAttributes.get("studyKey") or form.extraAttributes.get("study_key")
+                if (
+                    f_sk is None
+                    or str(f_sk) != study_key
+                    or form.formId is None
+                    or form.formId == ""
+                ):
+                    continue
+                if form.formId == form_id or str(form.formId).strip() == target_str:
+                    return form.formKey
         for form in self.forms:
+            if study_key is not None:
+                f_sk = form.extraAttributes.get("studyKey") or form.extraAttributes.get("study_key")
+                if f_sk is not None and str(f_sk) != study_key:
+                    continue
             if form.formId is None or form.formId == "":
                 continue
             if form.formId == form_id or str(form.formId).strip() == target_str:
                 return form.formKey
+        return None
+
+    def form_id_for_key(self, form_key: str, study_key: str | None = None) -> int | None:
+        """Resolve a numeric ``formId`` from ``form_key`` when present."""
+        form = self.form_for_key(form_key, study_key=study_key)
+        if form is None or form.formId is None or isinstance(form.formId, bool):
+            return None
+        if isinstance(form.formId, int):
+            return form.formId
+        stripped = str(form.formId).strip()
+        if stripped.lstrip("-").isdigit():
+            return int(stripped)
         return None
 
     def _unassigned_rule_matches_form(

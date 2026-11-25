@@ -6,15 +6,18 @@ Encapsulates validation, header construction, and execution logic for record cre
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, TypeVar
+from unittest.mock import NonCallableMock
 
 from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.security import validate_header_value
 from imednet.utils.tabular import ensure_no_masked_sentinel
+from imednet.utils.write_pipeline import RawRecordEnvelope, WriteIngestionPipeline
 from imednet.validation.cache import (
+    BaseSchemaCache,
     ValidationSchemaProtocol,
     is_schema_record_prevalidated,
     validate_record_entry,
@@ -46,32 +49,84 @@ class RecordCreateOperation(Operation[T]):
         *,
         study_key: str | None = None,
         skip_validation: bool = False,
+        raw_envelopes: Sequence[RawRecordEnvelope] | None = None,
     ) -> None:
-        """Initialize the record creation operation.
-
-        Args:
-            path: The full API path for the request.
-            records_data: List of record data objects to create.
-            email_notify: Email notification setting.
-            schema: Optional validation schema (BaseSchemaCache or DataDictionary).
-            study_key: Optional study key used for study-partitioned schema lookup.
-            skip_validation: If True, skip per-record schema validation because
-                the caller has already validated the batch.
-
-        Raises:
-            ValidationError: If record data is invalid against the schema.
-            ClientError: If email_notify contains invalid characters.
-        """
+        """Initialize the record creation operation."""
         self.path = path
         self.records_data = records_data
         self.email_notify = email_notify
         self.schema = schema
         self.study_key = study_key if study_key is not None else _infer_study_key_from_path(path)
         self.skip_validation = skip_validation
+        self._raw_envelopes: list[RawRecordEnvelope] | None = (
+            list(raw_envelopes) if raw_envelopes is not None else None
+        )
 
+        self.headers = self._build_headers()
+        if self._raw_envelopes is None:
+            ensure_no_masked_sentinel(self.records_data)
+            self._validate()
+
+    def _bind_deferred_sync(self, client: RequesterProtocol) -> None:
+        if self._raw_envelopes is None:
+            return
+        envelopes = self._raw_envelopes
+        self._raw_envelopes = None
+
+        def _refresh(sk: str) -> None:
+            if isinstance(self.schema, BaseSchemaCache) and not isinstance(client, NonCallableMock):
+                from imednet.endpoints.forms import FormsEndpoint
+                from imednet.endpoints.variables import VariablesEndpoint
+
+                if not self.schema._is_async:
+                    self.schema.refresh(
+                        FormsEndpoint(client=client),
+                        VariablesEndpoint(client=client),
+                        study_key=sk,
+                    )
+                else:
+                    vars_list = VariablesEndpoint(client=client).list(study_key=sk)
+                    self.schema.populate(vars_list, study_key=sk)
+
+        self.records_data = WriteIngestionPipeline.bind(
+            envelopes,
+            schema=self.schema,
+            study_key=self.study_key,
+            refresh_sync=None if self.skip_validation else _refresh,
+        )
         ensure_no_masked_sentinel(self.records_data)
         self._validate()
-        self.headers = self._build_headers()
+
+    async def _bind_deferred_async(self, client: AsyncRequesterProtocol) -> None:
+        if self._raw_envelopes is None:
+            return
+        envelopes = self._raw_envelopes
+        self._raw_envelopes = None
+
+        async def _refresh_async(sk: str) -> None:
+            if isinstance(self.schema, BaseSchemaCache) and not isinstance(client, NonCallableMock):
+                from imednet.endpoints.forms import AsyncFormsEndpoint
+                from imednet.endpoints.variables import AsyncVariablesEndpoint
+
+                if self.schema._is_async:
+                    await self.schema.refresh(
+                        AsyncFormsEndpoint(async_client=client),
+                        AsyncVariablesEndpoint(async_client=client),
+                        study_key=sk,
+                    )
+                else:
+                    vars_ep = AsyncVariablesEndpoint(async_client=client)
+                    vars_list = [v async for v in vars_ep.list(study_key=sk)]
+                    self.schema.populate(vars_list, study_key=sk)
+
+        self.records_data = await WriteIngestionPipeline.bind_async(
+            envelopes,
+            schema=self.schema,
+            study_key=self.study_key,
+            refresh_async=None if self.skip_validation else _refresh_async,
+        )
+        ensure_no_masked_sentinel(self.records_data)
+        self._validate()
 
     def _validate(self) -> None:
         """Validate records against schema if provided and not already validated."""
@@ -140,6 +195,7 @@ class RecordCreateOperation(Operation[T]):
         Returns:
             The parsed response object.
         """
+        self._bind_deferred_sync(client)
         response = client.post(
             self.path,
             json=self.records_data,
@@ -161,6 +217,7 @@ class RecordCreateOperation(Operation[T]):
         Returns:
             The parsed response object.
         """
+        await self._bind_deferred_async(client)
         response = await client.post(
             self.path,
             json=self.records_data,

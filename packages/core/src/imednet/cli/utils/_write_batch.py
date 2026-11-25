@@ -103,6 +103,10 @@ def run_cli_batch_write(
                     "dry_run": args.dry_run,
                     "collect_errors": True,
                 }
+                if getattr(args, "resume", False):
+                    batch_kwargs["resume"] = True
+                if getattr(args, "ledger_path", None) is not None:
+                    batch_kwargs["ledger_path"] = args.ledger_path
                 if submit_in_progress is not None:
                     raw_summary, total_records = submit_in_progress(resolved_schema, batch_kwargs)
                 else:
@@ -138,6 +142,7 @@ def run_cli_batch_write(
         resource=resource,
         output_format=args.output_format,
         dry_run=args.dry_run,
+        wait_for_completion=bool(getattr(args, "wait", False)),
         skipped_count=lambda: skipped_count,
         total_records=lambda: total_records,
     )

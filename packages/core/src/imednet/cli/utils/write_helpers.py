@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import re
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -39,19 +37,9 @@ from imednet.utils.job_poller import (
     JobTimeoutError,
 )
 from imednet.utils.security import sanitize_diagnostic_payload
-from imednet.utils.tabular import (
-    _INT_LITERAL_RE,
-    _SLASH_SPACE_RE,
-    _TEXT_LIKE_TYPES,
-    MASKED_SENTINEL,
-    _coerce_clinical_value,
-    _contains_masked_sentinel,
-    _resolve_expected_var_type,
-    csv_text_to_records,
-    csv_to_records,
-    ensure_no_masked_sentinel,
-)
-from imednet.validation.cache import BaseSchemaCache, SchemaCache, ValidationSchemaProtocol
+from imednet.utils.tabular import ensure_no_masked_sentinel
+from imednet.utils.write_pipeline import RawRecordEnvelope, WriteIngestionPipeline
+from imednet.validation.cache import SchemaCache, ValidationSchemaProtocol
 
 from ..decorators import _redact_secrets
 from .args import add_output_format, add_simulation_arg, resolve_output_format
@@ -125,6 +113,18 @@ def add_write_common_args(
         "--email-notify",
         default=None,
         help="Optional email address or boolean flag for job completion notifications.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume an interrupted multi-chunk write batch using the local SQLite ledger.",
+    )
+    parser.add_argument(
+        "--ledger-path",
+        dest="ledger_path",
+        default=None,
+        help="Optional SQLite ledger file path for recording and resuming accepted batch chunks.",
     )
     add_output_format(parser)
     add_simulation_arg(parser)
@@ -238,77 +238,6 @@ def resolve_cli_schema(
     return load_offline_schema(schema_source, study_key=study_key)
 
 
-def _unquote_double_quoted_literal(raw_val: str) -> str | None:
-    """Return unescaped string if ``raw_val`` is wrapped in double quotes, else ``None``."""
-    stripped = raw_val.strip()
-    if len(stripped) < 2 or stripped[0] != '"' or stripped[-1] != '"':
-        return None
-    try:
-        loaded = json.loads(stripped)
-        if isinstance(loaded, str):
-            return loaded
-    except ValueError:
-        pass
-    return stripped[1:-1].replace('\\"', '"').replace("\\\\", "\\")
-
-
-def _resolve_cli_var_type(
-    schema: ValidationSchemaProtocol | None,
-    *,
-    form_key: str | None,
-    form_id: int | None,
-    var_name: str,
-    study_key: str | None = None,
-) -> str | None:
-    """Resolve normalized variable type from *schema* and optional form context."""
-    if schema is None:
-        return None
-    direct = _resolve_expected_var_type(
-        schema,
-        form_key,
-        form_id,
-        var_name,
-        study_key=study_key,
-    )
-    if direct is not None:
-        return direct
-    if form_key or form_id is not None:
-        return None
-
-    # Form-less update fallback: check if variable has a single unambiguous type across forms
-    candidate_fks: Sequence[str]
-    if isinstance(schema, BaseSchemaCache):
-        candidate_fks = list(schema.forms_for_study(study_key) if study_key else schema.forms)
-    else:
-        forms_attr = getattr(schema, "forms", None)
-        if isinstance(forms_attr, Sequence):
-            candidate_fks = [
-                str(getattr(f, "form_key", None) or getattr(f, "formKey", ""))
-                for f in forms_attr
-                if getattr(f, "form_key", None) or getattr(f, "formKey", None)
-            ]
-        else:
-            candidate_fks = []
-
-    matched_types: set[str] = set()
-    for fk in candidate_fks:
-        form_vars: Mapping[str, Any] = (
-            schema.variables_for_form(fk, study_key=study_key)
-            if isinstance(schema, BaseSchemaCache)
-            else schema.variables_for_form(fk)
-        )
-        if form_vars and var_name in form_vars:
-            raw = getattr(form_vars[var_name], "variable_type", None) or getattr(
-                form_vars[var_name], "variableType", None
-            )
-            if isinstance(raw, str) and raw.strip():
-                normalized = re.sub(r"[\s_-]+", " ", raw.strip().lower())
-                matched_types.add(_SLASH_SPACE_RE.sub("/", normalized))
-    if len(matched_types) == 1:
-        return next(iter(matched_types))
-    return None
-
-
 def parse_key_value_pairs(
     pairs: Sequence[str] | None,
     *,
@@ -317,89 +246,49 @@ def parse_key_value_pairs(
     form_id: int | None = None,
     study_key: str | None = None,
 ) -> dict[str, Any]:
-    """Parse repeatable ``KEY=VALUE`` pairs from ``-d/--data`` flags with optional schema types."""
-    if not pairs:
+    """Parse repeatable ``KEY=VALUE`` pairs from ``-d/--data`` flags via ``WriteIngestionPipeline``."""
+    raw_cli_map, cli_quoted = WriteIngestionPipeline.parse_raw_cli_pairs(pairs)
+    if not raw_cli_map:
         return {}
-    parsed: dict[str, Any] = {}
-    for item in pairs:
-        if "=" not in item:
-            raise ValueError(f"Invalid --data entry '{item}': expected KEY=VALUE format.")
-        raw_key, _, raw_val = item.partition("=")
-        key = raw_key.strip()
-        if not key:
-            raise ValueError(f"Invalid --data entry '{item}': variable name cannot be empty.")
-        if _contains_masked_sentinel(raw_val):
-            raise ValueError(
-                f"Variable '{key}' contains masked PHI sentinel '{MASKED_SENTINEL}' and cannot be submitted."
-            )
-        unquoted = _unquote_double_quoted_literal(raw_val)
-        if unquoted is not None:
-            if _contains_masked_sentinel(unquoted):
-                raise ValueError(
-                    f"Variable '{key}' contains masked PHI sentinel '{MASKED_SENTINEL}' and cannot be submitted."
-                )
-            parsed[key] = unquoted
-            continue
-
-        expected_var_type = _resolve_cli_var_type(
-            schema,
-            form_key=form_key,
-            form_id=form_id,
-            var_name=key,
-            study_key=study_key,
-        )
-        if expected_var_type in _TEXT_LIKE_TYPES:
-            parsed[key] = raw_val
-            continue
-        val_stripped = raw_val.strip()
-        if expected_var_type is None:
-            if _INT_LITERAL_RE.match(val_stripped):
-                parsed[key] = int(val_stripped)
-            else:
-                parsed[key] = _coerce_clinical_value(
-                    raw_val,
-                    from_csv_str=True,
-                    expected_var_type=None,
-                )
-        elif expected_var_type in {"checkbox", "check box"} and val_stripped.lower() in {
-            "true",
-            "false",
-        }:
-            parsed[key] = val_stripped.lower() == "true"
-        else:
-            parsed[key] = _coerce_clinical_value(
-                raw_val,
-                from_csv_str=True,
-                expected_var_type=expected_var_type,
-            )
-    return parsed
+    env_dict: dict[str, Any] = {}
+    if form_key:
+        env_dict["formKey"] = form_key
+    elif form_id is not None:
+        env_dict["formId"] = form_id
+    env = RawRecordEnvelope(
+        envelope=env_dict,
+        raw_data=raw_cli_map,
+        data_key="data",
+        source_kind="cli",
+        var_sources=dict.fromkeys(raw_cli_map, "cli"),
+        quoted_vars=frozenset(cli_quoted),
+    )
+    bound = WriteIngestionPipeline.bind(
+        [env],
+        schema=schema,
+        study_key=study_key,
+        allow_formless_cli_fallback=True,
+    )
+    return dict(bound[0].get("data", {}))
 
 
-def parse_json_records_text(raw_text: str, *, source_label: str) -> list[dict[str, Any]]:
-    """Parse a JSON object or JSON array of record payload dicts."""
-    try:
-        loaded = json.loads(raw_text)
-    except ValueError as exc:
-        raise ValueError(f"Invalid JSON in {source_label}: {exc}") from exc
-
-    if isinstance(loaded, dict):
-        if ("items" in loaded and ("schemaVersion" in loaded or "resource" in loaded)) or (
-            isinstance(loaded.get("data"), list)
-            and not any(k in loaded for k in ("formKey", "form_key", "formId", "form_id"))
-        ):
-            raise ValueError(
-                f"JSON payload in {source_label} is a list response envelope, "
-                "not a Record write payload or array of Record payloads."
-            )
-        items = [loaded]
-    elif isinstance(loaded, list) and all(isinstance(x, dict) for x in loaded):
-        items = list(loaded)
-    else:
-        raise ValueError(
-            f"JSON payload in {source_label} must be a JSON object or array of objects."
-        )
-    ensure_no_masked_sentinel(items)
-    return items
+def parse_json_records_text(
+    raw_text: str,
+    *,
+    source_label: str,
+    schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Parse a JSON object or JSON array of record payload dicts via ``WriteIngestionPipeline``."""
+    envelopes = WriteIngestionPipeline.read_json_text(
+        raw_text,
+        source_label=source_label,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+    )
+    return WriteIngestionPipeline.bind(envelopes, schema=schema, study_key=study_key)
 
 
 def parse_stdin_records_text(
@@ -411,23 +300,37 @@ def parse_stdin_records_text(
     default_form_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """Auto-detect and parse piped JSON or CSV record payloads from stdin text."""
-    cleaned = raw_text.lstrip("\ufeff")
-    stripped = cleaned.lstrip()
-    if not stripped:
-        raise ValueError("Empty input received from stdin ('-').")
-    if stripped[0] in {"{", "["}:
-        return parse_json_records_text(cleaned, source_label="stdin")
-    if "\n" not in stripped.rstrip():
-        try:
-            json.loads(stripped)
-        except ValueError:
-            pass
-        else:
-            raise ValueError("JSON payload in stdin must be a JSON object or array of objects.")
-    return csv_text_to_records(
-        cleaned,
-        schema=schema,
-        study_key=study_key,
+    envelopes = WriteIngestionPipeline.read_stdin_text(
+        raw_text,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+    )
+    return WriteIngestionPipeline.bind(envelopes, schema=schema, study_key=study_key)
+
+
+def _read_cli_raw_envelopes_from_path_or_stdin(
+    file_arg: str,
+    *,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+) -> list[RawRecordEnvelope]:
+    """Read raw uncoerced envelopes from ``'-'``, ``.csv``, ``.json``, or ``.parquet``."""
+    if file_arg == "-":
+        if is_tty(sys.stdin):
+            raise ValueError(
+                "Cannot read '-' from an interactive terminal (TTY) stdin; "
+                "pipe JSON or CSV data into stdin or pass a file path."
+            )
+        return WriteIngestionPipeline.read_stdin_text(
+            sys.stdin.read(),
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
+    file_path = Path(file_arg)
+    if not file_path.exists():
+        raise ValueError(f"Input file not found: '{file_arg}'")
+    return WriteIngestionPipeline.read_path(
+        file_path,
         default_form_key=default_form_key,
         default_form_id=default_form_id,
     )
@@ -441,34 +344,13 @@ def load_records_from_path_or_stdin(
     default_form_key: str | None = None,
     default_form_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Load record payloads from ``'-'`` (piped stdin JSON or CSV), ``.json``, or ``.csv``."""
-    if file_arg == "-":
-        if is_tty(sys.stdin):
-            raise ValueError(
-                "Cannot read '-' from an interactive terminal (TTY) stdin; "
-                "pipe JSON or CSV data into stdin or pass a file path."
-            )
-        return parse_stdin_records_text(
-            sys.stdin.read(),
-            schema=schema,
-            study_key=study_key,
-            default_form_key=default_form_key,
-            default_form_id=default_form_id,
-        )
-    file_path = Path(file_arg)
-    if not file_path.exists():
-        raise ValueError(f"Input file not found: '{file_arg}'")
-    if file_path.suffix.lower() == ".json":
-        return parse_json_records_text(
-            file_path.read_text(encoding="utf-8"), source_label=str(file_path)
-        )
-    return csv_to_records(
-        file_path,
-        schema=schema,
-        study_key=study_key,
+    """Load record payloads from ``'-'``, ``.json``, ``.parquet``, or ``.csv``."""
+    envelopes = _read_cli_raw_envelopes_from_path_or_stdin(
+        file_arg,
         default_form_key=default_form_key,
         default_form_id=default_form_id,
     )
+    return WriteIngestionPipeline.bind(envelopes, schema=schema, study_key=study_key)
 
 
 def _extract_subject_identifier(rec: Mapping[str, Any]) -> str | None:
@@ -538,23 +420,14 @@ def merge_inline_data_overrides(
     return merged
 
 
-def assemble_cli_write_records(
+def _apply_cli_envelope_overrides(
+    env: RawRecordEnvelope,
     args: argparse.Namespace,
     *,
-    schema: ValidationSchemaProtocol | None = None,
-    study_key: str | None = None,
-    is_subject_registration: bool = False,
-    is_update: bool = False,
-) -> list[dict[str, Any]]:
-    """Unify CLI payload assembly for ``records create/update`` and ``subjects register``."""
-    if args.input_file and args.json_payload:
-        raise ValueError("Cannot combine --file and --json.")
-
-    data_pairs: Sequence[str] | None = getattr(args, "data_pairs", None)
-    # Validate syntax and masked sentinels in -d flags up front even if input file is empty.
-    if data_pairs:
-        parse_key_value_pairs(data_pairs)
-
+    is_single: bool,
+) -> RawRecordEnvelope:
+    """Apply CLI identifier flags onto a :class:`RawRecordEnvelope` prior to schema binding."""
+    form_key_arg: str | None = getattr(args, "form_key", None)
     form_id_arg: int | None = getattr(args, "form_id", None)
     record_id_arg: int | None = getattr(args, "record_id", None)
     record_oid_arg: str | None = getattr(args, "record_oid", None)
@@ -568,27 +441,147 @@ def assemble_cli_write_records(
     site_id_arg: int | None = getattr(args, "site_id", None)
     interval_name_arg: str | None = getattr(args, "interval_name", None)
     interval_id_arg: int | None = getattr(args, "interval_id", None)
+    data_pairs: Sequence[str] | None = getattr(args, "data_pairs", None)
+
+    rec = dict(env.envelope)
+    if is_single:
+        if form_key_arg:
+            for k in ("form_key", "formId", "form_id"):
+                rec.pop(k, None)
+            rec["formKey"] = form_key_arg
+        elif form_id_arg is not None:
+            for k in ("form_id", "formKey", "form_key"):
+                rec.pop(k, None)
+            rec["formId"] = form_id_arg
+
+        if subject_key_arg:
+            rec.pop("subject_key", None)
+            rec["subjectKey"] = subject_key_arg
+        if subject_oid_arg:
+            rec.pop("subject_oid", None)
+            rec["subjectOid"] = subject_oid_arg
+        if not subject_key_arg and not subject_oid_arg and subject_id_arg is not None:
+            rec.pop("subject_id", None)
+            rec["subjectId"] = subject_id_arg
+
+        if site_name_arg:
+            for k in ("site_name", "siteId", "site_id"):
+                rec.pop(k, None)
+            rec["siteName"] = site_name_arg
+        elif site_id_arg is not None:
+            for k in ("site_id", "siteName", "site_name"):
+                rec.pop(k, None)
+            rec["siteId"] = site_id_arg
+    else:
+        if form_key_arg and not (rec.get("formKey") or rec.get("form_key")):
+            rec["formKey"] = form_key_arg
+        elif form_id_arg is not None and rec.get("formId") is None and rec.get("form_id") is None:
+            rec["formId"] = form_id_arg
+
+        if _extract_subject_identifier(rec) is None:
+            if subject_key_arg:
+                rec["subjectKey"] = subject_key_arg
+            if subject_oid_arg:
+                rec["subjectOid"] = subject_oid_arg
+            if not subject_key_arg and not subject_oid_arg and subject_id_arg is not None:
+                rec["subjectId"] = subject_id_arg
+
+        if site_name_arg and not (rec.get("siteName") or rec.get("site_name")):
+            rec["siteName"] = site_name_arg
+        elif site_id_arg is not None and rec.get("siteId") is None and rec.get("site_id") is None:
+            rec["siteId"] = site_id_arg
+
+    if record_id_arg is not None and rec.get("recordId") is None and rec.get("record_id") is None:
+        rec["recordId"] = record_id_arg
+    elif record_oid_arg and not (rec.get("recordOid") or rec.get("record_oid")):
+        rec["recordOid"] = record_oid_arg
+
+    if visit_id_arg is not None and rec.get("visitId") is None and rec.get("visit_id") is None:
+        rec["visitId"] = visit_id_arg
+
+    if interval_name_arg and not (rec.get("intervalName") or rec.get("interval_name")):
+        rec["intervalName"] = interval_name_arg
+    elif (
+        interval_id_arg is not None
+        and rec.get("intervalId") is None
+        and rec.get("interval_id") is None
+    ):
+        rec["intervalId"] = interval_id_arg
+
+    if record_status_arg:
+        rec["recordStatus"] = record_status_arg
+    if reason_for_change_arg:
+        rec["reasonForChange"] = reason_for_change_arg
+
+    updated = RawRecordEnvelope(
+        envelope=rec,
+        raw_data=dict(env.raw_data),
+        data_key=env.data_key,
+        source_kind=env.source_kind,
+        var_sources=dict(env.var_sources),
+        quoted_vars=env.quoted_vars,
+        study_key_hint=env.study_key_hint,
+        row_index=env.row_index,
+    )
+    if data_pairs:
+        updated = WriteIngestionPipeline.merge_cli_pairs_into_envelope(updated, data_pairs)
+    return updated
+
+
+def assemble_cli_write_records(
+    args: argparse.Namespace,
+    *,
+    schema: ValidationSchemaProtocol | None = None,
+    study_key: str | None = None,
+    is_subject_registration: bool = False,
+    is_update: bool = False,
+) -> list[dict[str, Any]]:
+    """Unify CLI payload assembly via ``RawRecordEnvelope`` and ``WriteIngestionPipeline``."""
+    if args.input_file and args.json_payload:
+        raise ValueError("Cannot combine --file and --json.")
+
+    data_pairs: Sequence[str] | None = getattr(args, "data_pairs", None)
+    if data_pairs:
+        WriteIngestionPipeline.parse_raw_cli_pairs(data_pairs)
+
+    form_id_arg: int | None = getattr(args, "form_id", None)
+    record_id_arg: int | None = getattr(args, "record_id", None)
+    record_oid_arg: str | None = getattr(args, "record_oid", None)
+    visit_id_arg: int | None = getattr(args, "visit_id", None)
+    record_status_arg: str | None = getattr(args, "record_status", None)
+    reason_for_change_arg: str | None = getattr(args, "reason_for_change", None)
+    subject_key_arg: str | None = getattr(args, "subject_key", None)
+    subject_oid_arg: str | None = getattr(args, "subject_oid", None)
+    site_name_arg: str | None = getattr(args, "site_name", None)
+    site_id_arg: int | None = getattr(args, "site_id", None)
+    interval_name_arg: str | None = getattr(args, "interval_name", None)
+    interval_id_arg: int | None = getattr(args, "interval_id", None)
 
     resolved_study_key = study_key or getattr(args, "study_key", None)
-    records: list[dict[str, Any]]
+    envelopes: list[RawRecordEnvelope]
     if args.input_file:
-        records = load_records_from_path_or_stdin(
+        envelopes = _read_cli_raw_envelopes_from_path_or_stdin(
             args.input_file,
-            schema=schema,
-            study_key=resolved_study_key,
             default_form_key=args.form_key,
             default_form_id=form_id_arg,
         )
     elif args.json_payload:
-        records = parse_json_records_text(args.json_payload, source_label="--json")
+        envelopes = WriteIngestionPipeline.read_json_text(
+            args.json_payload,
+            source_label="--json",
+            default_form_key=args.form_key,
+            default_form_id=form_id_arg,
+        )
     elif is_subject_registration:
         if (not args.form_key and form_id_arg is None) or (
             not site_name_arg and site_id_arg is None
         ):
             raise ValueError(
-                "Provide --file, --json, or both --form-key and --site-name to register a subject."
+                "Provide --file, --json, or (--form-key / --form-id) and (--site-name / --site-id) to register a subject."
             )
-        records = [{"data": {}}]
+        envelopes = [
+            RawRecordEnvelope(envelope={}, raw_data={}, data_key="data", source_kind="cli")
+        ]
     elif is_update:
         has_target = bool(
             record_id_arg is not None
@@ -606,83 +599,42 @@ def assemble_cli_write_records(
             raise ValueError(
                 "Provide -d/--data, --record-status, or --reason-for-change to update a record."
             )
-        records = [{}]
+        envelopes = [RawRecordEnvelope(envelope={}, raw_data={}, data_key="", source_kind="cli")]
     else:
         if not args.form_key and form_id_arg is None:
             raise ValueError(
                 "Provide --file, --json, or at least --form-key / --form-id to create a record."
             )
-        records = [{"data": {}}]
+        envelopes = [
+            RawRecordEnvelope(envelope={}, raw_data={}, data_key="data", source_kind="cli")
+        ]
 
-    if subject_key_arg and len(records) > 1:
-        existing_subjects = {
-            sid for r in records if (sid := _extract_subject_identifier(r)) is not None
-        }
-        missing_count = sum(1 for r in records if _extract_subject_identifier(r) is None)
-        if missing_count > 0 and (is_subject_registration or len(existing_subjects) > 1):
+    if (subject_key_arg or subject_oid_arg) and len(envelopes) > 1:
+        if is_subject_registration:
+            flag_label = "--subject-key" if subject_key_arg else "--subject-oid"
             raise ValueError(
-                "Cannot apply --subject-key across multi-Subject inputs lacking subject keys."
+                f"Cannot apply {flag_label} across multi-Subject inputs lacking subject keys."
+            )
+        existing_subjects = {
+            sid for e in envelopes if (sid := _extract_subject_identifier(e.envelope)) is not None
+        }
+        missing_count = sum(1 for e in envelopes if _extract_subject_identifier(e.envelope) is None)
+        if missing_count > 0 and len(existing_subjects) > 1:
+            flag_label = "--subject-key" if subject_key_arg else "--subject-oid"
+            raise ValueError(
+                f"Cannot apply {flag_label} across multi-Subject inputs lacking subject keys."
             )
 
-    resolved: list[dict[str, Any]] = []
-    for item in records:
-        rec = dict(item)
-        if args.form_key and not (rec.get("formKey") or rec.get("form_key")):
-            rec["formKey"] = args.form_key
-        elif form_id_arg is not None and rec.get("formId") is None and rec.get("form_id") is None:
-            rec["formId"] = form_id_arg
-
-        if (
-            record_id_arg is not None
-            and rec.get("recordId") is None
-            and rec.get("record_id") is None
-        ):
-            rec["recordId"] = record_id_arg
-        elif record_oid_arg and not (rec.get("recordOid") or rec.get("record_oid")):
-            rec["recordOid"] = record_oid_arg
-
-        if visit_id_arg is not None and rec.get("visitId") is None and rec.get("visit_id") is None:
-            rec["visitId"] = visit_id_arg
-
-        if _extract_subject_identifier(rec) is None:
-            if subject_key_arg:
-                rec["subjectKey"] = subject_key_arg
-            elif subject_oid_arg:
-                rec["subjectOid"] = subject_oid_arg
-            elif subject_id_arg is not None:
-                rec["subjectId"] = subject_id_arg
-
-        if site_name_arg and not (rec.get("siteName") or rec.get("site_name")):
-            rec["siteName"] = site_name_arg
-        elif site_id_arg is not None and rec.get("siteId") is None and rec.get("site_id") is None:
-            rec["siteId"] = site_id_arg
-
-        if interval_name_arg and not (rec.get("intervalName") or rec.get("interval_name")):
-            rec["intervalName"] = interval_name_arg
-        elif (
-            interval_id_arg is not None
-            and rec.get("intervalId") is None
-            and rec.get("interval_id") is None
-        ):
-            rec["intervalId"] = interval_id_arg
-
-        if record_status_arg:
-            rec["recordStatus"] = record_status_arg
-        if reason_for_change_arg:
-            rec["reasonForChange"] = reason_for_change_arg
-
-        if data_pairs:
-            rec = merge_inline_data_overrides(
-                rec,
-                data_pairs,
-                schema=schema,
-                study_key=resolved_study_key,
-                default_form_key=args.form_key,
-                default_form_id=form_id_arg,
-            )
-
-        resolved.append(rec)
-
+    is_single = len(envelopes) == 1
+    prepared_envelopes = [
+        _apply_cli_envelope_overrides(env, args, is_single=is_single) for env in envelopes
+    ]
+    resolved = WriteIngestionPipeline.bind(
+        prepared_envelopes,
+        schema=schema,
+        study_key=resolved_study_key,
+        allow_formless_cli_fallback=True,
+    )
     ensure_no_masked_sentinel(resolved)
     return resolved
 
@@ -782,8 +734,23 @@ def summary_from_job_failure(
                 partial.skipped_count = skipped_count
             return partial
     committed_jobs = getattr(exc, "jobs", None)
+    sibling_map = getattr(exc, "sibling_statuses", None)
     if isinstance(committed_jobs, list) and committed_jobs:
         jobs: list[Job] = [_sanitize_job_for_cli(j) for j in committed_jobs]
+    elif isinstance(sibling_map, Mapping) and sibling_map:
+        ordered_ids = getattr(exc, "batch_ids", None)
+        if isinstance(ordered_ids, list) and ordered_ids:
+            seen_bids: set[str] = set()
+            jobs = []
+            for bid in ordered_ids:
+                if bid in sibling_map and bid not in seen_bids:
+                    jobs.append(_sanitize_job_for_cli(sibling_map[bid]))
+                    seen_bids.add(bid)
+            for bid, st in sibling_map.items():
+                if bid not in seen_bids:
+                    jobs.append(_sanitize_job_for_cli(st))
+        else:
+            jobs = [_sanitize_job_for_cli(st) for st in sibling_map.values()]
     elif exc.status is not None:
         jobs = [_sanitize_job_for_cli(exc.status)]
     else:
@@ -853,6 +820,12 @@ def _summary_to_json_item(summary: BatchSubmissionSummary) -> dict[str, Any]:
     }
     if summary.unsubmitted_chunks:
         item["unsubmittedChunks"] = sanitize_diagnostic_payload(summary.unsubmitted_chunks)
+    if summary.resumed_chunks:
+        item["resumedChunks"] = summary.resumed_chunks
+    if summary.chunk_errors:
+        item["chunkErrors"] = {
+            str(idx): _redact_secrets(str(err)) for idx, err in summary.chunk_errors.items()
+        }
     return item
 
 
@@ -1058,6 +1031,23 @@ def _extract_failure_summary(
             skipped_count=skipped_count,
         )
 
+    if isinstance(exc, JobTimeoutError):
+        committed = getattr(exc, "jobs", None)
+        jobs_list = (
+            [_sanitize_job_for_cli(j) for j in committed]
+            if isinstance(committed, list) and committed
+            else []
+        )
+        return BatchSubmissionSummary(
+            study_key=study_key,
+            jobs=jobs_list,
+            chunk_sizes=[total_records] if jobs_list and total_records else [],
+            total_records=total_records,
+            skipped_count=skipped_count,
+            wait_for_completion=True,
+            has_error=True,
+        )
+
     return None
 
 
@@ -1068,6 +1058,7 @@ def execute_cli_write(
     resource: str,
     output_format: str | None = None,
     dry_run: bool = False,
+    wait_for_completion: bool = False,
     skipped_count: int | Callable[[], int] = 0,
     total_records: int | Callable[[], int] = 0,
 ) -> None:
@@ -1097,7 +1088,8 @@ def execute_cli_write(
             print_error(_redact_secrets(partial.validation_report.format_summary()))
             sys.exit(1)
 
-        if partial is not None and (partial.jobs or partial.unsubmitted_chunks):
+        is_poll_exc = isinstance(exc, (JobFailedError, JobTimeoutError))
+        if partial is not None and (partial.jobs or partial.unsubmitted_chunks or is_poll_exc):
             if resolved_format == "json":
                 emit_json([_summary_to_json_item(partial)], resource, status="failed")
             elif partial.jobs:
@@ -1125,6 +1117,7 @@ def execute_cli_write(
                 total_records=resolved_total,
                 skipped_count=resolved_skipped,
                 output_format=resolved_format,
+                wait_for_completion=wait_for_completion,
             )
 
         raise
@@ -1166,6 +1159,7 @@ def exit_cli_write_error(
     total_records: int = 0,
     skipped_count: int = 0,
     output_format: str | None = None,
+    wait_for_completion: bool = False,
 ) -> NoReturn:
     """Print redacted/PHI-masked batch or job failure diagnostics, emit JSON if needed, and exit 1."""
     effective_study_key = (
@@ -1183,12 +1177,27 @@ def exit_cli_write_error(
     )
     full_line, _ = _format_cli_write_exception(exc, partial=partial)
     print_error(full_line)
-    if (
-        resolve_output_format(output_format) == "json"
-        and partial is not None
-        and (partial.jobs or partial.unsubmitted_chunks or partial.validation_report is not None)
-    ):
-        emit_json([_summary_to_json_item(partial)], resource, status="failed")
+    is_poll_exc = isinstance(exc, (JobFailedError, JobTimeoutError))
+    if resolve_output_format(output_format) == "json":
+        if partial is not None and (
+            partial.jobs
+            or partial.unsubmitted_chunks
+            or partial.validation_report is not None
+            or is_poll_exc
+            or wait_for_completion
+        ):
+            emit_json([_summary_to_json_item(partial)], resource, status="failed")
+        elif wait_for_completion and not isinstance(exc, (AuthenticationError, UnauthorizedError)):
+            fallback_summary = BatchSubmissionSummary(
+                study_key=str(effective_study_key),
+                jobs=[],
+                chunk_sizes=[],
+                total_records=total_records,
+                skipped_count=skipped_count,
+                wait_for_completion=True,
+                has_error=True,
+            )
+            emit_json([_summary_to_json_item(fallback_summary)], resource, status="failed")
     sys.exit(1)
 
 

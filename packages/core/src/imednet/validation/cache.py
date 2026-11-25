@@ -135,6 +135,7 @@ class BaseSchemaCache(Generic[_TClient]):
         self._form_variables: dict[tuple[str, str] | str, dict[str, Variable]] = {}
         self._retired_form_variables: dict[tuple[str, str] | str, dict[str, Variable]] = {}
         self._form_id_to_key: dict[tuple[str, int] | int, str] = {}
+        self._form_key_to_id: dict[tuple[str, str] | str, int] = {}
         self._known_forms: set[tuple[str, str] | str] = set()
         self._refreshed_studies: set[str] = set()
 
@@ -191,6 +192,15 @@ class BaseSchemaCache(Generic[_TClient]):
             or (study_key == "" and isinstance(k, int))
         ]:
             del self._form_id_to_key[fid_key]
+        fk_to_id = getattr(self, "_form_key_to_id", None)
+        if fk_to_id is not None:
+            for fk_id_key in [
+                k
+                for k in fk_to_id
+                if (isinstance(k, tuple) and k[0] == study_key)
+                or (study_key == "" and isinstance(k, str))
+            ]:
+                del fk_to_id[fk_id_key]
         known_forms = getattr(self, "_known_forms", None)
         if known_forms is not None:
             for kf_key in [
@@ -218,6 +228,11 @@ class BaseSchemaCache(Generic[_TClient]):
         retired_bucket = retired_map.setdefault((sk, var.form_key), {})
         if var.form_id is not None:
             self._form_id_to_key[(sk, var.form_id)] = var.form_key
+            fk_to_id = getattr(self, "_form_key_to_id", None)
+            if fk_to_id is None:
+                fk_to_id = {}
+                self._form_key_to_id = fk_to_id
+            fk_to_id[(sk, var.form_key)] = var.form_id
         if var.variable_name is not None:
             if _is_retired_variable(var):
                 if var.variable_name not in form_bucket:
@@ -493,6 +508,57 @@ class BaseSchemaCache(Generic[_TClient]):
             studies = ", ".join(sorted(sk for sk, _ in matches))
             raise ValidationError(
                 f"Ambiguous form ID {fid_int} cached across multiple studies ({studies}); "
+                "specify study_key."
+            )
+        return None
+
+    def form_id_for_key(
+        self,
+        form_key: str,
+        study_key: str | None = None,
+    ) -> int | None:
+        """Resolve a numeric ``formId`` from ``form_key``, isolated by ``study_key``."""
+        if not form_key:
+            return None
+        fk_to_id: dict[tuple[str, str] | str, int] = getattr(self, "_form_key_to_id", None) or {}
+        refreshed: set[str] = getattr(self, "_refreshed_studies", None) or set()
+        if study_key is not None:
+            exact = fk_to_id.get((study_key, form_key))
+            if exact is not None:
+                return exact
+            if study_key not in refreshed:
+                unscoped = fk_to_id.get(("", form_key))
+                if unscoped is not None:
+                    return unscoped
+                legacy = fk_to_id.get(form_key)
+                if legacy is not None:
+                    return legacy
+            return None
+
+        ctx_study = get_study_context()
+        if ctx_study:
+            ctx_exact = fk_to_id.get((ctx_study, form_key))
+            if ctx_exact is not None:
+                return ctx_exact
+            if ctx_study in refreshed:
+                return None
+
+        if form_key in fk_to_id:
+            return fk_to_id[form_key]
+        if ("", form_key) in fk_to_id:
+            return fk_to_id[("", form_key)]
+
+        matches = [
+            (k[0], fid)
+            for k, fid in fk_to_id.items()
+            if isinstance(k, tuple) and k[0] != "" and k[1] == form_key
+        ]
+        if len(matches) == 1:
+            return matches[0][1]
+        if len(matches) > 1:
+            studies = ", ".join(sorted(sk for sk, _ in matches))
+            raise ValidationError(
+                f"Ambiguous form '{form_key}' cached across multiple studies ({studies}); "
                 "specify study_key."
             )
         return None

@@ -6,7 +6,7 @@ They are architecturally linked to the core execution engine.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from importlib import import_module
 from typing import (
     TYPE_CHECKING,
@@ -465,9 +465,34 @@ class SyncSDKConvenienceMixin:
         skip_validation: bool = False,
     ) -> Job:
         """Create records in the specified study."""
-        from imednet.utils.tabular import normalize_records_input
+        from imednet.utils.batch_coordinator import _refresh_schema_adapter_sync
+        from imednet.utils.write_pipeline import WriteIngestionPipeline
+        from imednet.validation.cache import is_schema_record_prevalidated
 
-        normalized = normalize_records_input(records_data, schema=schema)
+        if (
+            schema is not None
+            and isinstance(records_data, Sequence)
+            and not isinstance(records_data, (str, bytes))
+            and bool(records_data)
+            and all(
+                isinstance(r, dict) and is_schema_record_prevalidated(schema, r)
+                for r in records_data
+            )
+        ):
+            normalized: RecordsInput = records_data
+        else:
+            envelopes = WriteIngestionPipeline.read_input(records_data)
+            adapter = _resolve_convenience_schema_adapter(self, is_async=False)
+            normalized = WriteIngestionPipeline.bind(
+                envelopes,
+                schema=schema,
+                study_key=study_key,
+                refresh_sync=(
+                    None
+                    if skip_validation
+                    else lambda sk: _refresh_schema_adapter_sync(schema, adapter, sk)
+                ),
+            )
         if skip_validation:
             return self.records.create(
                 study_key,
@@ -499,6 +524,10 @@ class SyncSDKConvenienceMixin:
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        ledger: Any = None,
+        ledger_path: Any = None,
+        resume: bool = False,
+        on_error: Any = "raise",
     ) -> BatchSubmissionSummary:
         """Validate once and submit records in bounded chunks (default 100 per POST)."""
         from imednet.core.context import _safe_context_attr
@@ -533,6 +562,10 @@ class SyncSDKConvenienceMixin:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            ledger=ledger,
+            ledger_path=ledger_path,
+            resume=resume,
+            on_error=on_error,
         )
 
     @_trace_method
@@ -654,9 +687,34 @@ class AsyncSDKConvenienceMixin:
         skip_validation: bool = False,
     ) -> Job:
         """Asynchronously create records in the specified study."""
-        from imednet.utils.tabular import normalize_records_input
+        from imednet.utils.batch_coordinator import _refresh_schema_adapter_async
+        from imednet.utils.write_pipeline import WriteIngestionPipeline
+        from imednet.validation.cache import is_schema_record_prevalidated
 
-        normalized = normalize_records_input(records_data, schema=schema)
+        if (
+            schema is not None
+            and isinstance(records_data, Sequence)
+            and not isinstance(records_data, (str, bytes))
+            and bool(records_data)
+            and all(
+                isinstance(r, dict) and is_schema_record_prevalidated(schema, r)
+                for r in records_data
+            )
+        ):
+            normalized: RecordsInput = records_data
+        else:
+            envelopes = WriteIngestionPipeline.read_input(records_data)
+            adapter = _resolve_convenience_schema_adapter(self, is_async=True)
+            normalized = await WriteIngestionPipeline.bind_async(
+                envelopes,
+                schema=schema,
+                study_key=study_key,
+                refresh_async=(
+                    None
+                    if skip_validation
+                    else lambda sk: _refresh_schema_adapter_async(schema, adapter, sk)
+                ),
+            )
         if skip_validation:
             return await self.records.create(
                 study_key,
@@ -688,6 +746,10 @@ class AsyncSDKConvenienceMixin:
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        ledger: Any = None,
+        ledger_path: Any = None,
+        resume: bool = False,
+        on_error: Any = "raise",
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once and submit records in bounded chunks."""
         from imednet.core.context import _safe_context_attr
@@ -722,6 +784,10 @@ class AsyncSDKConvenienceMixin:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            ledger=ledger,
+            ledger_path=ledger_path,
+            resume=resume,
+            on_error=on_error,
         )
 
     @_async_trace_method

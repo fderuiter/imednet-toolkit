@@ -235,6 +235,8 @@ class JobFailedError(ImednetError):
         result_error: str | None = None,
         poll_summary: JobPollSummary | None = None,
         partial_summary: Any | None = None,
+        batch_ids: list[str] | None = None,
+        sibling_statuses: dict[str, JobStatus] | None = None,
     ) -> None:
         """Initialize the JobFailedError with attached record and batch diagnostics."""
         resolved_errors = (
@@ -263,6 +265,58 @@ class JobFailedError(ImednetError):
         self.result_error = resolved_result_error
         self.poll_summary = poll_summary
         self.partial_summary = partial_summary
+        self._batch_ids = list(batch_ids) if batch_ids is not None else None
+        self._sibling_statuses = dict(sibling_statuses) if sibling_statuses is not None else None
+
+    @property
+    def batch_ids(self) -> list[str]:
+        """Return all accepted batch IDs associated with this job failure."""
+        if self._batch_ids is not None:
+            return list(self._batch_ids)
+        partial_bids = getattr(self.partial_summary, "batch_ids", None)
+        if isinstance(partial_bids, list) and partial_bids:
+            return list(partial_bids)
+        if self.poll_summary is not None:
+            seen = list(
+                dict.fromkeys(
+                    [
+                        *self.poll_summary.terminal_statuses.keys(),
+                        *self.poll_summary.failures.keys(),
+                    ]
+                )
+            )
+            if seen:
+                return seen
+        bid = getattr(self.status, "batch_id", "")
+        return [bid] if bid else []
+
+    @batch_ids.setter
+    def batch_ids(self, value: list[str] | None) -> None:
+        self._batch_ids = list(value) if value is not None else None
+
+    @property
+    def sibling_statuses(self) -> dict[str, JobStatus]:
+        """Return all settled sibling ``JobStatus`` items keyed by ``batchId``."""
+        if self._sibling_statuses is not None:
+            return dict(self._sibling_statuses)
+        if self.poll_summary is not None:
+            return dict(self.poll_summary.terminal_statuses)
+        if isinstance(self.status, JobStatus) and self.status.batch_id:
+            return {self.status.batch_id: self.status}
+        return {}
+
+    @sibling_statuses.setter
+    def sibling_statuses(self, value: dict[str, JobStatus] | None) -> None:
+        self._sibling_statuses = dict(value) if value is not None else None
+
+    @property
+    def job_statuses(self) -> dict[str, JobStatus]:
+        """Alias for :attr:`sibling_statuses`."""
+        return self.sibling_statuses
+
+    @job_statuses.setter
+    def job_statuses(self, value: dict[str, JobStatus] | None) -> None:
+        self._sibling_statuses = dict(value) if value is not None else None
 
 
 def evaluate_job_state(
@@ -636,15 +690,19 @@ class BaseJobPoller:
         exc: Exception,
         *,
         study_key: str,
+        batch_ids: list[str],
         failed_batch_id: str | None,
         results: dict[str, JobStatus],
         failures: dict[str, Exception],
         start: float,
     ) -> None:
-        """Attach partial :class:`JobPollSummary` and failing ``batch_id`` onto ``exc``."""
+        """Attach partial :class:`JobPollSummary`, ``batch_ids``, and sibling statuses onto ``exc``."""
         summary = self._build_poll_summary(study_key, dict(results), dict(failures), start)
         try:
             exc.poll_summary = summary  # type: ignore[attr-defined]
+            exc.batch_ids = list(batch_ids)  # type: ignore[attr-defined]
+            exc.sibling_statuses = dict(summary.terminal_statuses)  # type: ignore[attr-defined]
+            exc.job_statuses = dict(summary.terminal_statuses)  # type: ignore[attr-defined]
             if failed_batch_id and not getattr(exc, "batch_id", None):
                 exc.batch_id = failed_batch_id  # type: ignore[attr-defined]
         except (AttributeError, TypeError):
@@ -806,6 +864,7 @@ class JobPoller(BaseJobPoller):
             self._attach_fail_fast_context(
                 first_failure,
                 study_key=study_key,
+                batch_ids=batch_ids,
                 failed_batch_id=first_failure_batch_id,
                 results=results,
                 failures=failures,
@@ -929,6 +988,7 @@ class AsyncJobPoller(BaseJobPoller):
                         self._attach_fail_fast_context(
                             triggering_exc,
                             study_key=study_key,
+                            batch_ids=batch_ids,
                             failed_batch_id=triggering_batch_id,
                             results=results,
                             failures=failures,

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Awaitable, Callable
+import os
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union
 
@@ -11,6 +12,7 @@ from imednet.spi.models import Job
 from imednet.spi.utils import (
     AsyncBatchCoordinator,
     BatchCoordinator,
+    BatchExecutionLedger,
     BatchSubmissionSummary,
     JobProgressHandler,
     extract_single_submitted_job,
@@ -49,6 +51,10 @@ class WorkflowBatchSpec:
     on_progress: JobProgressHandler | None = None
     dry_run: bool = False
     collect_errors: bool = False
+    ledger: BatchExecutionLedger | None = None
+    ledger_path: str | os.PathLike[str] | None = None
+    resume: bool = False
+    on_error: Literal["raise", "collect"] = "raise"
 
 
 def ensure_sync_workflow_mode(
@@ -64,7 +70,7 @@ def ensure_sync_workflow_mode(
 
 
 def enforce_single_job_records(
-    records_data: list[dict[str, Any]],
+    records_data: Sequence[Any],
     chunk_size: int,
     dry_run: bool,
     pair: tuple[str, str] | None,
@@ -209,6 +215,10 @@ def _coordinator_submit_kwargs(
         "require_batch_id": spec.require_batch_id,
         "dry_run": spec.dry_run,
         "collect_errors": spec.collect_errors,
+        "ledger": spec.ledger,
+        "ledger_path": spec.ledger_path,
+        "resume": spec.resume,
+        "on_error": spec.on_error,
     }
 
 

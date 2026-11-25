@@ -191,12 +191,15 @@ class BaseRecordRequest(ImednetBaseModel):
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
-    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
+    Requires ``formKey`` or ``formId``, and a site identifier (``siteName`` or ``siteId``).
+    Optional ``formId``, ``subjectKey``, and ``subjectOid`` attributes are omitted when
     ``None`` so server-assigned subject keys continue working by default; when
-    explicitly supplied, they are preserved for enrollment and deduplication.
+    ``formId`` is supplied without ``formKey``, ``formKey=""`` is omitted.
     """
 
+    form_id: int | None = Field(
+        default=None, alias="formId", description="Numeric ID of the registration form"
+    )
     site_name: str = Field(
         "", alias="siteName", description="Name of the site where the subject is enrolled"
     )
@@ -218,6 +221,8 @@ class RegisterSubjectRequest(BaseRecordRequest):
         form_key: str = "",
         formKey: str = "",
         data: RecordData | dict[str, Any] = ...,
+        form_id: int | None = None,
+        formId: int | None = None,
         site_name: str = "",
         siteName: str = "",
         site_id: int | None = None,
@@ -227,6 +232,9 @@ class RegisterSubjectRequest(BaseRecordRequest):
         subject_oid: str | None = None,
         subjectOid: str | None = None,
     ) -> None: ...
+    @field_validator("form_id", mode="before")
+    @classmethod
+    def _validate_optional_form_id(cls, value: Any) -> Any: ...
     @field_validator("subject_key", "subject_oid", mode="before")
     @classmethod
     def _normalize_optional_subject_identifier(cls, value: Any) -> str | None: ...

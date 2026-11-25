@@ -57,9 +57,15 @@ Environment Variables
    * - IMEDNET_ENCRYPTION_KEY
      - Fernet key or passphrase used by ``ConfigVersionStore`` to encrypt and decrypt ``StudyConfiguration`` payloads at rest (falls back to ``IMEDNET_SECURITY_KEY``).
      - None
+   * - IMEDNET_CONFIG_ENCRYPTION_KEY
+     - Optional override key or passphrase used by ``ConfigVersionStore`` to encrypt and decrypt ``StudyConfiguration`` payloads at rest (checked before ``IMEDNET_ENCRYPTION_KEY``).
+     - None
    * - IMEDNET_CONFIG_DB_PATH
      - Base SQLite ledger path for ``ConfigVersionStore`` prior to dynamic host and ``Study`` directory scoping.
      - ``~/.imednet/config_versions.sqlite3``
+   * - IMEDNET_BATCH_LEDGER_PATH
+     - Optional SQLite database path for ``BatchExecutionLedger`` when resuming multi-chunk ``Record`` or ``Subject`` writes with ``resume=True`` / ``--resume``.
+     - ``.imednet/batch_ledger.sqlite3``
    * - IMEDNET_WORKFLOW_LEDGER_PATH
      - Filesystem path for ``FileStateProvider`` / ``ExtractionStateLedger`` incremental high-water mark checkpoints.
      - ``.imednet_workflow_state.json``

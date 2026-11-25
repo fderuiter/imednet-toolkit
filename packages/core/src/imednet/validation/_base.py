@@ -2,17 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
-
-def _extract_form_ref(record: Mapping[str, Any]) -> tuple[str | None, Any]:
-    """Extract (form_key, form_id) from a record payload without coalescing None to 0."""
-    raw_fk = record.get("formKey") or record.get("form_key")
-    fk = str(raw_fk) if raw_fk else None
-    raw_fid = record.get("formId") if record.get("formId") is not None else record.get("form_id")
-    fid = None if raw_fid == "" else raw_fid
-    return fk, fid
+from imednet.utils.write_pipeline import _extract_form_ref
 
 
 class _ValidatorMixin:
@@ -62,3 +54,6 @@ class _ValidatorMixin:
             from .cache import validate_record_data
 
             validate_record_data(self.schema, form_key, data, study_key=study_key)
+
+
+__all__ = ["_ValidatorMixin", "_extract_form_ref"]

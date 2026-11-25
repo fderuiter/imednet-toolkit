@@ -3,17 +3,21 @@
 import asyncio
 import functools
 import inspect
+import os
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from imednet.spi.models import Job, RegisterSubjectRequest
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
+    BatchExecutionLedger,
     BatchSubmissionSummary,
     JobProgressHandler,
     RecordsInput,
+    WriteIngestionPipeline,
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
+    resolve_opt_in_ledger,
     validate_subject_registration_sites,
 )
 from imednet.spi.validation import BaseSchemaCache, ValidationSchemaProtocol
@@ -90,22 +94,85 @@ class RegisterSubjectsWorkflow:
 
     def _prepare_registration_batch(
         self,
+        study_key: str,
         chunk_size: int | None,
         filter_enrolled: bool | None,
         skip_existing: bool,
         schema: ValidationSchemaProtocol | None,
         dry_run: bool,
         single_job_method: tuple[str, str] | None,
-    ) -> tuple[int, bool, bool]:
-        """Resolve chunk size, offline dry-run flag, and active enrolled-subject filter flag."""
+        *,
+        ledger: BatchExecutionLedger | None = None,
+        ledger_path: str | os.PathLike[str] | None = None,
+        resume: bool = False,
+    ) -> tuple[int, bool, bool, BatchExecutionLedger | None]:
+        """Resolve chunk size, offline dry-run flag, enrolled filter flag, and opt-in ledger."""
         eff_chunk = prepare_batch_preflight(
             chunk_size, self._batch_size, dry_run, single_job_method
         )
         offline_dry_run = _is_offline_schema_dry_run(dry_run, schema)
+        active_ledger = resolve_opt_in_ledger(
+            ledger=ledger,
+            ledger_path=ledger_path,
+            resume=resume,
+        )
+        resuming_existing_run = bool(
+            resume and active_ledger is not None and active_ledger.has_run(study_key)
+        )
         should_filter = (
-            (self._filter_enrolled if filter_enrolled is None else filter_enrolled) or skip_existing
-        ) and not offline_dry_run
-        return eff_chunk, offline_dry_run, should_filter
+            (
+                (self._filter_enrolled if filter_enrolled is None else filter_enrolled)
+                or skip_existing
+            )
+            and not offline_dry_run
+            and not resuming_existing_run
+        )
+        return eff_chunk, offline_dry_run, should_filter, active_ledger
+
+    @staticmethod
+    def _maybe_refresh_subject_schema_sync(
+        sdk: "ImednetFacade",
+        study_key: str,
+        subjects: SubjectInputs,
+        schema: ValidationSchemaProtocol | None,
+        *,
+        offline_dry_run: bool,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
+    ) -> None:
+        """Refresh a cold ``BaseSchemaCache`` before binding subject ``data`` variables."""
+        if offline_dry_run or not isinstance(schema, BaseSchemaCache):
+            return
+        envelopes = WriteIngestionPipeline.read_input(
+            subjects,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
+        if WriteIngestionPipeline.needs_schema_refresh(schema, envelopes, study_key=study_key):
+            schema.populate(sdk.get_variables(study_key=study_key), study_key=study_key)
+
+    @staticmethod
+    async def _maybe_refresh_subject_schema_async(
+        sdk: "AsyncImednetFacade",
+        study_key: str,
+        subjects: SubjectInputs,
+        schema: ValidationSchemaProtocol | None,
+        *,
+        offline_dry_run: bool,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
+    ) -> None:
+        """Asynchronously refresh a cold ``BaseSchemaCache`` before binding subject ``data``."""
+        if offline_dry_run or not isinstance(schema, BaseSchemaCache):
+            return
+        envelopes = WriteIngestionPipeline.read_input(
+            subjects,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
+        if WriteIngestionPipeline.needs_schema_refresh(schema, envelopes, study_key=study_key):
+            variables = await sdk.async_get_variables(study_key=study_key)
+            schema.populate(variables, study_key=study_key)
 
     @staticmethod
     def _build_registration_spec(
@@ -122,6 +189,10 @@ class RegisterSubjectsWorkflow:
         schema: ValidationSchemaProtocol | None,
         options: tuple[bool, int, int, JobProgressHandler | None, bool, bool],
         single_job_method: tuple[str, str] | None,
+        ledger: BatchExecutionLedger | None = None,
+        ledger_path: str | os.PathLike[str] | None = None,
+        resume: bool = False,
+        on_error: Literal["raise", "collect"] = "raise",
     ) -> WorkflowBatchSpec:
         """Validate sites, filter enrolled subjects, and assemble a batch submission spec."""
         wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors = options
@@ -146,6 +217,10 @@ class RegisterSubjectsWorkflow:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            ledger=ledger,
+            ledger_path=ledger_path,
+            resume=resume,
+            on_error=on_error,
         )
 
     def register_subjects_batch(
@@ -161,20 +236,50 @@ class RegisterSubjectsWorkflow:
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        ledger: BatchExecutionLedger | None = None,
+        ledger_path: str | os.PathLike[str] | None = None,
+        resume: bool = False,
+        on_error: Literal["raise", "collect"] = "raise",
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Validate sites once, optionally filter enrolled subjects, and submit in bounded chunks."""
         self._ensure_sync_mode("register_subjects_batch", "async_register_subjects_batch")
-        eff_chunk, offline_dry_run, should_filter = self._prepare_registration_batch(
-            chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
+        eff_chunk, offline_dry_run, should_filter, active_ledger = self._prepare_registration_batch(
+            study_key,
+            chunk_size,
+            filter_enrolled,
+            skip_existing,
+            schema,
+            dry_run,
+            _single_job_method,
+            ledger=ledger,
+            ledger_path=ledger_path,
+            resume=resume,
         )
         sdk = cast("ImednetFacade", self._sdk)
         sites = None if offline_dry_run else sdk.get_sites(study_key=study_key)
-        pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
+        self._maybe_refresh_subject_schema_sync(
+            sdk,
+            study_key,
+            subjects,
+            schema,
+            offline_dry_run=offline_dry_run,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
+        pairs = normalize_subject_registration_inputs(
+            subjects,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+            schema=schema,
+            study_key=study_key,
+        )
         existing = sdk.get_subjects(study_key=study_key) if should_filter else None
         opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
         spec = self._build_registration_spec(
@@ -188,6 +293,10 @@ class RegisterSubjectsWorkflow:
             schema=schema,
             options=opts,
             single_job_method=_single_job_method,
+            ledger=active_ledger,
+            ledger_path=ledger_path,
+            resume=resume,
+            on_error=on_error,
         )
         submitter = build_keyword_record_chunk_submitter(
             sdk.create_record, study_key, email_notify=email_notify, schema=schema
@@ -206,6 +315,8 @@ class RegisterSubjectsWorkflow:
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -224,6 +335,8 @@ class RegisterSubjectsWorkflow:
             filter_enrolled=filter_enrolled,
             skip_existing=skip_existing,
             subject_key_field=subject_key_field,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
             schema=schema,
             on_progress=on_progress,
             dry_run=dry_run,
@@ -245,10 +358,16 @@ class RegisterSubjectsWorkflow:
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        ledger: BatchExecutionLedger | None = None,
+        ledger_path: str | os.PathLike[str] | None = None,
+        resume: bool = False,
+        on_error: Literal["raise", "collect"] = "raise",
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Asynchronously register subjects using either ``AsyncImednetFacade`` or ``ImednetFacade``."""
@@ -265,20 +384,50 @@ class RegisterSubjectsWorkflow:
                 filter_enrolled=filter_enrolled,
                 skip_existing=skip_existing,
                 subject_key_field=subject_key_field,
+                default_form_key=default_form_key,
+                default_form_id=default_form_id,
                 schema=schema,
                 on_progress=on_progress,
                 dry_run=dry_run,
                 collect_errors=collect_errors,
+                ledger=ledger,
+                ledger_path=ledger_path,
+                resume=resume,
+                on_error=on_error,
                 _single_job_method=_single_job_method,
             )
             return await asyncio.to_thread(sync_call)
 
-        eff_chunk, offline_dry_run, should_filter = self._prepare_registration_batch(
-            chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
+        eff_chunk, offline_dry_run, should_filter, active_ledger = self._prepare_registration_batch(
+            study_key,
+            chunk_size,
+            filter_enrolled,
+            skip_existing,
+            schema,
+            dry_run,
+            _single_job_method,
+            ledger=ledger,
+            ledger_path=ledger_path,
+            resume=resume,
         )
         sdk = cast("AsyncImednetFacade", self._sdk)
         sites = None if offline_dry_run else await sdk.async_get_sites(study_key=study_key)
-        pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
+        await self._maybe_refresh_subject_schema_async(
+            sdk,
+            study_key,
+            subjects,
+            schema,
+            offline_dry_run=offline_dry_run,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
+        pairs = normalize_subject_registration_inputs(
+            subjects,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+            schema=schema,
+            study_key=study_key,
+        )
         existing = await sdk.async_get_subjects(study_key=study_key) if should_filter else None
         opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
         spec = self._build_registration_spec(
@@ -292,6 +441,10 @@ class RegisterSubjectsWorkflow:
             schema=schema,
             options=opts,
             single_job_method=_single_job_method,
+            ledger=active_ledger,
+            ledger_path=ledger_path,
+            resume=resume,
+            on_error=on_error,
         )
         submitter = build_keyword_record_chunk_submitter(
             sdk.async_create_record, study_key, email_notify=email_notify, schema=schema
@@ -310,6 +463,8 @@ class RegisterSubjectsWorkflow:
         filter_enrolled: bool | None = None,
         skip_existing: bool = False,
         subject_key_field: str | None = None,
+        default_form_key: str | None = None,
+        default_form_id: int | None = None,
         schema: ValidationSchemaProtocol | None = None,
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
@@ -327,6 +482,8 @@ class RegisterSubjectsWorkflow:
             filter_enrolled=filter_enrolled,
             skip_existing=skip_existing,
             subject_key_field=subject_key_field,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
             schema=schema,
             on_progress=on_progress,
             dry_run=dry_run,

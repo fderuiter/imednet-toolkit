@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 try:
     import pandas as pd
@@ -288,6 +288,9 @@ def import_records_csv(
     on_progress: JobProgressHandler | None = None,
     dry_run: bool = False,
     collect_errors: bool = False,
+    ledger_path: str | os.PathLike[str] | None = None,
+    resume: bool = False,
+    on_error: Literal["raise", "collect"] = "raise",
 ) -> BatchSubmissionSummary:
     """Import records from a CSV file into ``study_key`` using stdlib CSV parsing.
 
@@ -296,28 +299,50 @@ def import_records_csv(
     ``packages/core`` even when ``pandas`` is not installed, and rejects
     ``***MASKED***`` sentinels before any HTTP request is sent.
     """
-    records = csv_to_records(file_path, schema=schema, study_key=study_key)
+    from .write_pipeline import WriteIngestionPipeline
+
+    envelopes = WriteIngestionPipeline.read_path(file_path)
     effective_schema = schema
-    if records and effective_schema is None and not skip_validation:
+    if envelopes and effective_schema is None and not skip_validation:
         from imednet.datadict.loaders.api import can_load_from_api, load_from_api
 
         if can_load_from_api(sdk):
             effective_schema = load_from_api(sdk, study_key)
-            records = csv_to_records(file_path, schema=effective_schema, study_key=study_key)
-    return sdk.records.create_batch(
-        study_key,
-        records,
-        email_notify=email_notify,
+
+    def _refresh_cache(sk: str) -> None:
+        from imednet.validation.cache import BaseSchemaCache
+
+        if isinstance(effective_schema, BaseSchemaCache):
+            forms_ep = getattr(sdk, "forms", None)
+            vars_ep = getattr(sdk, "variables", None)
+            if forms_ep is not None and vars_ep is not None:
+                effective_schema.refresh(forms_ep, vars_ep, study_key=sk)
+
+    records = WriteIngestionPipeline.bind(
+        envelopes,
         schema=effective_schema,
-        chunk_size=chunk_size,
-        skip_validation=skip_validation,
-        wait_for_completion=wait_for_completion,
-        timeout=timeout,
-        interval=interval,
-        on_progress=on_progress,
-        dry_run=dry_run,
-        collect_errors=collect_errors,
+        study_key=study_key,
+        refresh_sync=_refresh_cache,
     )
+    batch_kwargs: dict[str, Any] = {
+        "email_notify": email_notify,
+        "schema": effective_schema,
+        "chunk_size": chunk_size,
+        "skip_validation": skip_validation,
+        "wait_for_completion": wait_for_completion,
+        "timeout": timeout,
+        "interval": interval,
+        "on_progress": on_progress,
+        "dry_run": dry_run,
+        "collect_errors": collect_errors,
+    }
+    if ledger_path is not None:
+        batch_kwargs["ledger_path"] = ledger_path
+    if resume:
+        batch_kwargs["resume"] = resume
+    if on_error != "raise":
+        batch_kwargs["on_error"] = on_error
+    return sdk.records.create_batch(study_key, records, **batch_kwargs)
 
 
 def export_records_csv(

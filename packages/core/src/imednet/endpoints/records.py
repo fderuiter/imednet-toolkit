@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import NonCallableMock
 
 from imednet.core.endpoint.dispatch import execute_operation
@@ -21,11 +23,12 @@ from imednet.utils.batch_coordinator import (
     _submit_records_batch_async,
     _submit_records_batch_sync,
 )
+from imednet.utils.batch_ledger import BatchExecutionLedger
 from imednet.utils.job_poller import JobProgressHandler
 from imednet.utils.record_filter_eval import RECORDS_FILTER_ATTRIBUTES
-from imednet.utils.tabular import normalize_records_input
 from imednet.utils.typing import RecordsInput
-from imednet.validation.cache import ValidationSchemaProtocol
+from imednet.utils.write_pipeline import WriteIngestionPipeline
+from imednet.validation.cache import ValidationSchemaProtocol, is_schema_record_prevalidated
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -95,8 +98,39 @@ class RecordsOperationDef:
             The background job for the creation operation.
         """
         self._validate_study_key(study_key)  # type: ignore
-        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         path = self._get_endpoint_path(study_key)  # type: ignore
+        if (
+            schema is not None
+            and isinstance(records_data, Sequence)
+            and not isinstance(records_data, (str, bytes))
+            and bool(records_data)
+            and all(
+                isinstance(r, dict) and is_schema_record_prevalidated(schema, r)
+                for r in records_data
+            )
+        ):
+            return RecordCreateOperation[Job](
+                path=path,
+                records_data=list(records_data),  # type: ignore[arg-type]
+                email_notify=email_notify,
+                schema=schema,
+                study_key=study_key,
+                skip_validation=skip_validation,
+            )
+        envelopes = WriteIngestionPipeline.read_input(records_data)
+        if not skip_validation and WriteIngestionPipeline.needs_schema_refresh(
+            schema, envelopes, study_key=study_key
+        ):
+            return RecordCreateOperation[Job](
+                path=path,
+                records_data=[],
+                email_notify=email_notify,
+                schema=schema,
+                study_key=study_key,
+                skip_validation=skip_validation,
+                raw_envelopes=envelopes,
+            )
+        normalized = WriteIngestionPipeline.bind(envelopes, schema=schema, study_key=study_key)
         return RecordCreateOperation[Job](
             path=path,
             records_data=normalized,
@@ -125,6 +159,10 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        ledger: BatchExecutionLedger | None = None,
+        ledger_path: str | os.PathLike[str] | None = None,
+        resume: bool = False,
+        on_error: Literal["raise", "collect"] = "raise",
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and optionally poll jobs."""
         return _submit_records_batch_sync(
@@ -149,6 +187,10 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            ledger=ledger,
+            ledger_path=ledger_path,
+            resume=resume,
+            on_error=on_error,
         )
 
     def to_dataframe(
@@ -198,6 +240,10 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        ledger: BatchExecutionLedger | None = None,
+        ledger_path: str | os.PathLike[str] | None = None,
+        resume: bool = False,
+        on_error: Literal["raise", "collect"] = "raise",
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit records in bounded chunks, and optionally poll."""
         return await _submit_records_batch_async(
@@ -222,6 +268,10 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            ledger=ledger,
+            ledger_path=ledger_path,
+            resume=resume,
+            on_error=on_error,
         )
 
     async def to_dataframe(

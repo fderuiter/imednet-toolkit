@@ -48,6 +48,11 @@ if TYPE_CHECKING:
         poll_facade_single_sync,
         validate_single_job_preflight,
     )
+    from imednet.utils.batch_ledger import (
+        BatchExecutionLedger,
+        LedgerChunkRecord,
+        resolve_opt_in_ledger,
+    )
     from imednet.utils.dates import (
         format_iso_datetime,
         normalize_iso_date,
@@ -135,12 +140,19 @@ if TYPE_CHECKING:
         validate_path_segment,
     )
     from imednet.utils.validators import is_boolean_token, is_missing_value, parse_bool
+    from imednet.utils.write_pipeline import (
+        RawRecordEnvelope,
+        WriteIngestionPipeline,
+        compute_chunk_sha256,
+        compute_sequence_sha256,
+    )
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "ALLOWED_OPERATORS": ("imednet.utils.filters", "ALLOWED_OPERATORS"),
     "AsyncBatchCoordinator": ("imednet.utils.batch_coordinator", "AsyncBatchCoordinator"),
     "AsyncJobPoller": ("imednet.utils.job_poller", "AsyncJobPoller"),
     "BatchCoordinator": ("imednet.utils.batch_coordinator", "BatchCoordinator"),
+    "BatchExecutionLedger": ("imednet.utils.batch_ledger", "BatchExecutionLedger"),
     "BatchSubmissionSummary": ("imednet.utils.batch_coordinator", "BatchSubmissionSummary"),
     "CompiledRecordPredicate": (
         "imednet.utils.record_filter_eval",
@@ -167,6 +179,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "JobStatusEvent": ("imednet.utils.job_poller", "JobStatusEvent"),
     "JobTimeoutError": ("imednet.utils.job_poller", "JobTimeoutError"),
     "JsonDict": ("imednet.utils.typing", "JsonDict"),
+    "LedgerChunkRecord": ("imednet.utils.batch_ledger", "LedgerChunkRecord"),
     "MASKED_SENTINEL": ("imednet.utils.tabular", "MASKED_SENTINEL"),
     "ORDERED_FILTER_OPERATORS": ("imednet.utils.filters", "ORDERED_FILTER_OPERATORS"),
     "PathTraversalValidationError": ("imednet.errors", "PathTraversalValidationError"),
@@ -175,10 +188,12 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "RECORDS_FILTER_ATTRIBUTES",
     ),
     "REVISION_DATE_ATTRIBUTES": ("imednet.utils.filters", "REVISION_DATE_ATTRIBUTES"),
+    "RawRecordEnvelope": ("imednet.utils.write_pipeline", "RawRecordEnvelope"),
     "RecordsInput": ("imednet.utils.typing", "RecordsInput"),
     "RestrictedAstEvaluator": ("imednet.utils.evaluator", "RestrictedAstEvaluator"),
     "SensitivityRegistry": ("imednet.utils.security", "SensitivityRegistry"),
     "TabularBatchStamp": ("imednet.integrations.sink_base", "TabularBatchStamp"),
+    "WriteIngestionPipeline": ("imednet.utils.write_pipeline", "WriteIngestionPipeline"),
     "build_filter_string": ("imednet.utils.filters", "build_filter_string"),
     "build_study_sensitivity_registry": (
         "imednet.utils.security",
@@ -189,6 +204,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "imednet.utils.record_filter_eval",
         "compile_record_predicate",
     ),
+    "compute_chunk_sha256": ("imednet.utils.write_pipeline", "compute_chunk_sha256"),
+    "compute_sequence_sha256": ("imednet.utils.write_pipeline", "compute_sequence_sha256"),
     "csv_to_records": ("imednet.utils.pandas", "csv_to_records"),
     "dataframe_to_records": ("imednet.utils.pandas", "dataframe_to_records"),
     "delegates_to_sdk_retry_policy": (
@@ -269,6 +286,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "imednet.integrations.enrichment",
         "resolve_enrichment_pipeline",
     ),
+    "resolve_opt_in_ledger": ("imednet.utils.batch_ledger", "resolve_opt_in_ledger"),
     "resolve_sdk_base_url": ("imednet.utils.url", "resolve_sdk_base_url"),
     "resolve_sdk_result_fetcher": ("imednet.utils.job_poller", "resolve_sdk_result_fetcher"),
     "resolve_study_configuration": (
@@ -330,6 +348,7 @@ __all__ = [
     "AsyncBatchCoordinator",
     "AsyncJobPoller",
     "BatchCoordinator",
+    "BatchExecutionLedger",
     "BatchSubmissionSummary",
     "CompiledRecordPredicate",
     "DefaultRetryPolicy",
@@ -348,15 +367,20 @@ __all__ = [
     "JobStatusEvent",
     "JobTimeoutError",
     "JsonDict",
+    "LedgerChunkRecord",
     "PathTraversalValidationError",
+    "RawRecordEnvelope",
     "RecordsInput",
     "RestrictedAstEvaluator",
     "SensitivityRegistry",
     "TabularBatchStamp",
+    "WriteIngestionPipeline",
     "build_filter_string",
     "build_study_sensitivity_registry",
     "chunk_records",
     "compile_record_predicate",
+    "compute_chunk_sha256",
+    "compute_sequence_sha256",
     "csv_to_records",
     "dataframe_to_records",
     "delegates_to_sdk_retry_policy",
@@ -410,6 +434,7 @@ __all__ = [
     "reset_base_url_context",
     "reset_security_key_context",
     "resolve_enrichment_pipeline",
+    "resolve_opt_in_ledger",
     "resolve_sdk_base_url",
     "resolve_sdk_result_fetcher",
     "resolve_study_configuration",

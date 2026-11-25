@@ -394,12 +394,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     # 4. records import
     import_parser = sub.add_parser(
         "import",
-        help="Import study records from a CSV or JSON file (or '-' for stdin).",
+        help="Import study records from a CSV, JSON, or Parquet file (or '-' for stdin).",
     )
     add_study_key_args(import_parser)
     import_parser.add_argument(
         "file",
-        help="Path to CSV or JSON file to import ('-' for stdin JSON or CSV).",
+        help="Path to CSV, JSON, or Parquet file to import ('-' for stdin JSON or CSV).",
     )
     add_write_common_args(import_parser)
 
@@ -411,7 +411,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             resolved_schema: Any,
             batch_kwargs: dict[str, Any],
         ) -> tuple[Any, int]:
-            if args.file == "-" or input_path.suffix.lower() == ".json":
+            if args.file == "-" or input_path.suffix.lower() in {".json", ".parquet", ".pq"}:
                 payload = load_records_from_path_or_stdin(
                     args.file,
                     schema=resolved_schema,

@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from ...sdk import ImednetSDK
+from ...utils.batch_ledger import resolve_opt_in_ledger
 from ...utils.enrollment import (
     filter_existing_subject_registrations,
     normalize_subject_registration_inputs,
@@ -66,7 +67,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "--file",
         dest="input_file",
         default=None,
-        help="Path to CSV or JSON file of subject registration requests ('-' for stdin JSON or CSV).",
+        help="Path to CSV, JSON, or Parquet file of subject registration requests ('-' for stdin).",
     )
     register_parser.add_argument(
         "--json",
@@ -77,7 +78,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     register_parser.add_argument(
         "--form-key",
         default=None,
-        help="Registration form key (formKey) for inline registration or file default.",
+        help="Registration form key (formKey) for inline registration or file override/default.",
+    )
+    register_parser.add_argument(
+        "--form-id",
+        type=int,
+        default=None,
+        help="Registration form ID (formId) for inline registration or file override/default.",
     )
     register_parser.add_argument(
         "--site-name",
@@ -93,12 +100,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     register_parser.add_argument(
         "--subject-key",
         default=None,
-        help="Subject key (subjectKey) for inline registration.",
+        help="Subject key (subjectKey) for inline registration or single-item override.",
     )
     register_parser.add_argument(
         "--subject-oid",
         default=None,
-        help="Subject OID (subjectOid) for inline registration.",
+        help="Subject OID (subjectOid) for inline registration or single-item override.",
     )
     register_parser.add_argument(
         "-d",
@@ -140,6 +147,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             normalized_pairs = normalize_subject_registration_inputs(
                 raw_inputs,
                 default_form_key=args.form_key,
+                default_form_id=args.form_id,
                 default_site_name=args.site_name,
                 default_site_id=args.site_id,
                 schema=resolved_schema,
@@ -148,15 +156,25 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             sites = None if offline_dry_run else list(sdk.sites.list(args.study_key))
             validate_subject_registration_sites(normalized_pairs, sites)
 
+            opt_ledger = resolve_opt_in_ledger(
+                ledger_path=getattr(args, "ledger_path", None),
+                resume=bool(getattr(args, "resume", False)),
+            )
+            resuming_existing = bool(
+                getattr(args, "resume", False)
+                and opt_ledger is not None
+                and opt_ledger.has_run(args.study_key)
+            )
+            eff_skip = bool(args.skip_existing and not resuming_existing)
             existing_subjects = (
                 list(sdk.subjects.list(args.study_key))
-                if (args.skip_existing and not offline_dry_run)
+                if (eff_skip and not offline_dry_run)
                 else None
             )
             return filter_existing_subject_registrations(
                 normalized_pairs,
                 existing_subjects,
-                should_filter=args.skip_existing,
+                should_filter=eff_skip,
                 subject_key_field=args.subject_key_field,
             )
 
@@ -173,10 +191,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if (
             not args.input_file
             and not args.json_payload
-            and (not args.form_key or (not args.site_name and args.site_id is None))
+            and (
+                (not args.form_key and args.form_id is None)
+                or (not args.site_name and args.site_id is None)
+            )
         ):
             print_error(
-                "Error: Provide --file, --json, or both --form-key and --site-name to register subjects."
+                "Error: Provide --file, --json, or (--form-key / --form-id) and (--site-name / --site-id) to register subjects."
             )
             sys.exit(1)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
