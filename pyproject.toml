@@ -169,7 +169,7 @@ quote-style = "preserve"
 [tool.pytest.ini_options]
 addopts = "--junitxml=reports/junit.xml -ra --ignore=tests/live"
 asyncio_mode = "auto"
-log_cli = true
+log_cli = false
 log_cli_level = "INFO"
 testpaths = ["tests", "packages/plugins-sinks/tests", "packages/plugins-tui/tests"]
 markers = [

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import time
 import uuid
@@ -21,7 +20,10 @@ from imednet.spi.models import (
 )
 from imednet.spi.utils import redact_sensitive_payload, redact_sensitive_text, sqlite_connection
 
+from ._default_paths import expand_user_path, resolve_default_imednet_path
+
 DEFAULT_TRIAGE_DB_PATH = Path.home() / ".imednet" / "triage.sqlite3"
+_INITIAL_DEFAULT_TRIAGE_DB_PATH = DEFAULT_TRIAGE_DB_PATH
 _LATEST_SCHEMA_VERSION = 2
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _RETRY_BASE_DELAY_SECONDS = 0.05
@@ -45,12 +47,16 @@ class TriageStore:
             timeout: Maximum time to wait for a database connection.
             retry_attempts: Number of write retry attempts.
         """
-        raw_path = (
-            db_path
-            if db_path is not None
-            else os.environ.get("IMEDNET_TRIAGE_DB_PATH", DEFAULT_TRIAGE_DB_PATH)
+        self.db_path = (
+            resolve_default_imednet_path(
+                "triage.sqlite3",
+                env_var="IMEDNET_TRIAGE_DB_PATH",
+                current_default=DEFAULT_TRIAGE_DB_PATH,
+                initial_default=_INITIAL_DEFAULT_TRIAGE_DB_PATH,
+            )
+            if db_path is None
+            else expand_user_path(db_path)
         )
-        self.db_path = Path(raw_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._timeout = timeout
         self._retry_attempts = retry_attempts

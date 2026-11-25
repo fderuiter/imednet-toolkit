@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from imednet.models.record_revisions import RecordRevision
 from imednet.models.records import Record
 from imednet.models.subjects import Subject
@@ -140,6 +142,7 @@ def test_extract_records_by_criteria_no_filters() -> None:
     sdk.get_visits.assert_not_called()
 
 
+@pytest.mark.performance
 def test_extract_records_by_criteria_scaling_benchmark() -> None:
     """Benchmark constant-time set lookups with 1,000 subjects, 2,000 visits, and 10,000 records."""
     import time
@@ -180,6 +183,29 @@ def test_extract_records_by_criteria_scaling_benchmark() -> None:
     # Set lookups execute membership filtering in sub-0.1s (typically ~0.01s),
     # eliminating the 0.31s+ quadratic linear scan latency.
     assert elapsed < 0.15
+
+
+def test_extract_records_by_criteria_set_membership_filtering() -> None:
+    """Deterministic verification of subject and visit intersection filtering without timing assertions."""
+    sdk = MagicMock()
+    subjects = [Subject(subject_key=f"SUBJ_{i}") for i in range(20)]
+    visits = [Visit(visit_id=i, subject_key=f"SUBJ_{i % 20}") for i in range(30)]
+    records = [
+        Record(record_id=i, subject_key=f"SUBJ_{i % 25}", visit_id=i % 40) for i in range(100)
+    ]
+
+    sdk.get_subjects.return_value = subjects
+    sdk.get_visits.return_value = visits
+    sdk.get_records.return_value = records
+
+    wf = DataExtractionWorkflow(sdk)
+    result = wf.extract_records_by_criteria(
+        "STUDY",
+        subject_filter={"site": "SITE01"},
+        visit_filter={"type": "scheduled"},
+    )
+    expected_count = sum(1 for i in range(100) if (i % 25) < 20 and (i % 40) < 30)
+    assert len(result) == expected_count
 
 
 def test_extract_audit_trail_builds_filters_and_dates() -> None:
@@ -261,8 +287,6 @@ def test_extract_audit_trail_emits_single_date_created_http_filter_and_filters_l
 def test_data_extraction_date_helpers_and_progress_callbacks() -> None:
     """Test date parsing/comparison helpers, progress callbacks, and compound date bounds."""
     from datetime import UTC, date, datetime
-
-    import pytest
 
     from imednet_workflows.data_extraction import (
         _matches_local_date_bound,

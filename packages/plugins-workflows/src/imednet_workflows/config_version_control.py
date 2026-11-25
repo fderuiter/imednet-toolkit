@@ -40,6 +40,9 @@ from imednet.spi.utils import (
     validate_partition_key,
 )
 
+from ._default_paths import _ORIG_PATH_HOME_FUNC
+from ._default_paths import expand_user_path as _expand_path_with_home
+
 _MAX_RAW_DB_PATH_CACHE = 64
 _MAX_ORIGIN_LAYOUT_CACHE = 128
 _MAX_DIR_CACHE_SIZE = 128
@@ -47,7 +50,6 @@ _MAX_HEAD_INDEX_CACHE = 64
 _MAX_COMMITTED_CONFIG_CACHE = 256
 _COARSE_MTIME_GUARD_NS = 20_000_000
 
-_ORIG_PATH_HOME_FUNC = getattr(Path.home, "__func__", Path.home)
 _CACHE_LOCK = RLock()
 _WRITE_GENERATION = 0
 
@@ -106,6 +108,20 @@ def _bump_write_generation() -> None:
     global _WRITE_GENERATION
     with _CACHE_LOCK:
         _WRITE_GENERATION += 1
+
+
+def clear_config_version_store_caches() -> None:
+    """Clear all module-level path, layout, directory, head, and config caches."""
+    global _WRITE_GENERATION
+    with _CACHE_LOCK:
+        _WRITE_GENERATION += 1
+        _RAW_DB_PATH_CACHE.clear()
+        _ORIGIN_LAYOUT_CACHE.clear()
+        _BASE_DIR_ENTRIES_CACHE.clear()
+        _HOST_SUBDIR_CACHE.clear()
+        _HEAD_INDEX_CACHE.clear()
+        _COMMITTED_CONFIG_CACHE.clear()
+        _sanitize_base_url_for_path.cache_clear()
 
 
 def _sha256_of(content: str) -> str:
@@ -186,18 +202,6 @@ def _decrypt_payload(encrypted_payload: str, *, fallback_key: str | None = None)
             "Configuration data integrity check failed: "
             "Decryption failed - decryption key is incorrect or missing, or data is corrupted."
         ) from exc
-
-
-def _expand_path_with_home(raw_path: str | Path) -> Path:
-    """Expand ``raw_path`` honoring monkeypatched ``Path.home()`` as well as ``HOME``."""
-    raw_str = os.fspath(raw_path)
-    home_fn = Path.home
-    if getattr(home_fn, "__func__", home_fn) is not _ORIG_PATH_HOME_FUNC:
-        if raw_str == "~":
-            return Path(home_fn())
-        if raw_str.startswith(("~/", "~\\")):
-            return Path(home_fn()) / raw_str[2:]
-    return Path(raw_path).expanduser()
 
 
 def _get_raw_db_path(db_path: str | Path | None = None) -> Path:

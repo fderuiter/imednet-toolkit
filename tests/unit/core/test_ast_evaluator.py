@@ -399,6 +399,7 @@ def test_restricted_ast_evaluator_class() -> None:
     assert evaluator.evaluate({"x": 10}) == 21.0
 
 
+@pytest.mark.performance
 def test_evaluator_performance_under_5ms_per_record() -> None:
     """Verify evaluation speed constraint: must execute in < 5ms per record."""
     expr = "float(payload.get('result', 0)) * 2.5 + state.get('offset', 1.0)"

@@ -31,6 +31,11 @@ from imednet.spi.utils import (
 )
 
 from . import _airflow_cas
+from ._default_paths import (
+    expand_user_path,
+    is_default_ledger_sentinel,
+    resolve_default_ledger_path,
+)
 
 
 def _sanitize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -387,6 +392,8 @@ DEFAULT_LEDGER_PATH: str = os.environ.get(
     "IMEDNET_WORKFLOW_LEDGER_PATH",
     str(Path.home() / ".imednet" / "pipeline_ledger.json"),
 )
+_INITIAL_DEFAULT_LEDGER_PATH: str = DEFAULT_LEDGER_PATH
+_IMPORT_DEFAULT_LEDGER_PATH: str = DEFAULT_LEDGER_PATH
 DEFAULT_LEASE_TTL_SECONDS: float = 3600.0
 
 
@@ -532,9 +539,17 @@ class FileStateProvider(BaseStateProvider):
             ledger_path: Path to the JSON file where state is persisted.
             lease_ttl_seconds: Lease duration in seconds for active RUNNING transactions.
         """
-        if ledger_path == DEFAULT_LEDGER_PATH and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
-            ledger_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
-        self.ledger_path = Path(ledger_path)
+        if is_default_ledger_sentinel(
+            ledger_path,
+            current_default=DEFAULT_LEDGER_PATH,
+            initial_default=_INITIAL_DEFAULT_LEDGER_PATH,
+            import_default=_IMPORT_DEFAULT_LEDGER_PATH,
+        ):
+            ledger_path = resolve_default_ledger_path(
+                current_default=DEFAULT_LEDGER_PATH,
+                initial_default=_INITIAL_DEFAULT_LEDGER_PATH,
+            )
+        self.ledger_path = expand_user_path(ledger_path)
         self._lock_path = self.ledger_path.with_suffix(".lock")
         self.lease_ttl_seconds = lease_ttl_seconds
 
@@ -2261,11 +2276,19 @@ def get_state_provider(
     ledger_path: str | Path = DEFAULT_LEDGER_PATH,
 ) -> BaseStateProvider:
     """Factory to get the appropriate state provider based on environment."""
-    if ledger_path is not None and ledger_path != DEFAULT_LEDGER_PATH:
+    is_default = ledger_path is None or is_default_ledger_sentinel(
+        ledger_path,
+        current_default=DEFAULT_LEDGER_PATH,
+        initial_default=_INITIAL_DEFAULT_LEDGER_PATH,
+        import_default=_IMPORT_DEFAULT_LEDGER_PATH,
+    )
+    if not is_default:
         return FileStateProvider(ledger_path)
     if "AIRFLOW_CTX_TASK_ID" in os.environ or os.environ.get("USE_AIRFLOW_STATE_PROVIDER") == "1":
         return AirflowStateProvider()
-    resolved_path: str | Path = DEFAULT_LEDGER_PATH if ledger_path is None else ledger_path
-    if resolved_path == DEFAULT_LEDGER_PATH and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
-        resolved_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
-    return FileStateProvider(resolved_path)
+    return FileStateProvider(
+        resolve_default_ledger_path(
+            current_default=DEFAULT_LEDGER_PATH,
+            initial_default=_INITIAL_DEFAULT_LEDGER_PATH,
+        )
+    )

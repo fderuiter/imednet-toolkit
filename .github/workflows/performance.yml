@@ -63,6 +63,15 @@ jobs:
             .venv
           key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
 
+      - name: Restore Performance Baseline Cache
+        id: restore-perf-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: reports/performance_cache.json
+          key: perf-baseline-${{ runner.os }}-restore-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            perf-baseline-${{ runner.os }}-
+
       - name: Run Performance Suite
         env:
           IMEDNET_POSTMAN_PATH: ${{ github.workspace }}/imednet.postman_collection.json
@@ -73,10 +82,21 @@ jobs:
         if: always()
         run: python scripts/aggregate_verification.py --report-dir reports/verification --expect-track performance
 
+      - name: Save Performance Baseline Cache
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          hashFiles('reports/performance_cache.json') != '' &&
+          steps.restore-perf-cache.outputs.cache-matched-key != format('perf-baseline-{0}-{1}', runner.os, hashFiles('reports/performance_cache.json'))
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: reports/performance_cache.json
+          key: perf-baseline-${{ runner.os }}-${{ hashFiles('reports/performance_cache.json') }}
+
       - name: Save Verification Artifact
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: performance-report
-          path: reports/verification/performance_report.json
+          path: reports/performance_report.json
           if-no-files-found: error

@@ -265,6 +265,29 @@ def clear_study_context() -> None:
     _active_study.set(None)
 
 
+def clear_base_url_context() -> None:
+    """Clear the active base URL for the current thread/task context."""
+    _active_base_url.set(None)
+
+
+def clear_security_key_context() -> None:
+    """Clear the active SDK security key for the current thread/task context."""
+    _active_security_key.set(None)
+
+
+def clear_strict_mode_context() -> None:
+    """Clear the active strict validation mode for the current thread/task context."""
+    _active_strict_mode.set(None)
+
+
+def clear_all_contexts() -> None:
+    """Clear all active SDK study, origin, security-key, and strict-mode contexts."""
+    _active_study.set(None)
+    _active_base_url.set(None)
+    _active_security_key.set(None)
+    _active_strict_mode.set(None)
+
+
 def get_study_context() -> str | None:
     """Get the current study key for the active thread/task context."""
     return _active_study.get()

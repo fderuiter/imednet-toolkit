@@ -68,8 +68,7 @@ def test_airflow_export_forwards_arguments(func_name: str) -> None:
         mock_base_func.assert_called_once_with(*args, **kwargs)
 
 
-@pytest.mark.parametrize("func_name", EXPORT_FUNCTIONS)
-def test_spi_export_delegation_with_dispatcher_binding(func_name: str) -> None:
+def test_spi_export_delegation_with_dispatcher_binding() -> None:
     """Resolve real SPI bindings independently of package attribute import order."""
     script = '''
 import importlib
@@ -84,16 +83,17 @@ import imednet.spi as spi
 importlib.reload(spi)
 assert spi.export is integrations.export
 from apache_airflow_providers_imednet import export
-with patch("imednet.integrations.export." + FUNC, return_value=None) as destination:
-    getattr(export, FUNC)("synthetic-study", path="synthetic-output")
-    destination.assert_called_once_with("synthetic-study", path="synthetic-output")
-with patch("imednet.integrations.export." + FUNC, side_effect=ImportError("optional-driver")):
-    try:
-        getattr(export, FUNC)("synthetic-study")
-    except ImportError as error:
-        assert str(error) == "optional-driver"
-    else:
-        raise AssertionError("dependency error was swallowed")
+for func_name in FUNCS:
+    with patch("imednet.integrations.export." + func_name, return_value=None) as destination:
+        getattr(export, func_name)("synthetic-study", path="synthetic-output")
+        destination.assert_called_once_with("synthetic-study", path="synthetic-output")
+    with patch("imednet.integrations.export." + func_name, side_effect=ImportError("optional-driver")):
+        try:
+            getattr(export, func_name)("synthetic-study")
+        except ImportError as error:
+            assert str(error) == "optional-driver"
+        else:
+            raise AssertionError(f"dependency error was swallowed for {func_name}")
 '''
     repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
@@ -109,7 +109,7 @@ with patch("imednet.integrations.export." + FUNC, side_effect=ImportError("optio
             env["PYTHONPATH"] = os.pathsep.join(package_paths)
 
     result = subprocess.run(
-        [sys.executable, "-c", "FUNC = " + repr(func_name) + "\n" + script],
+        [sys.executable, "-c", "FUNCS = " + repr(list(EXPORT_FUNCTIONS)) + "\n" + script],
         cwd=repo_root,
         env=env,
         capture_output=True,

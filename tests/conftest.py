@@ -27,40 +27,25 @@ if os.environ.get("IMEDNET_TEST_WHEELS") != "1":
         sys.path.insert(0, str(source_root))
 
 
+from tests.utils.isolation import (  # noqa: E402
+    ISOLATION_ACTIVE_ATTR,
+    apply_track_marker_skips,
+    isolate_home_directory,
+    register_track_options,
+    reset_all_runtime_contexts,
+    reset_default_simulation_state_if_loaded,
+    reset_workflow_store_caches,
+)
+
+
 def pytest_addoption(parser):
     """Add custom command-line options for running specific test tracks."""
-    parser.addoption("--run-fuzzing", action="store_true", default=False, help="run fuzzing tests")
-    parser.addoption(
-        "--run-performance", action="store_true", default=False, help="run performance tests"
-    )
-    parser.addoption(
-        "--update-perf-baseline",
-        action="store_true",
-        default=False,
-        help="recompute and overwrite committed performance baseline ratios",
-    )
+    register_track_options(parser)
 
 
 def pytest_collection_modifyitems(config, items):
     """Skip fuzzing and performance tests unless explicitly requested via CLI options or marker filter."""
-    skip_fuzzing = pytest.mark.skip(reason="need --run-fuzzing option or -m fuzzing to run")
-    skip_performance = pytest.mark.skip(
-        reason="need --run-performance option or -m performance to run"
-    )
-
-    marker_expr = config.getoption("-m")
-
-    for item in items:
-        if "fuzzing" in item.keywords:
-            if not config.getoption("--run-fuzzing") and "fuzzing" not in marker_expr:
-                item.add_marker(skip_fuzzing)
-        if "performance" in item.keywords:
-            if (
-                not config.getoption("--run-performance")
-                and not config.getoption("--update-perf-baseline")
-                and "performance" not in marker_expr
-            ):
-                item.add_marker(skip_performance)
+    apply_track_marker_skips(config, items)
 
 
 @pytest.fixture(autouse=True)
@@ -101,17 +86,25 @@ def _is_live_test(node: object) -> bool:
 
 
 @pytest.fixture(autouse=True)
-def reset_study_context_between_tests():
-    """Reset global study and governance contexts before and after each test to ensure isolation."""
-    from imednet.core.context import _active_base_url, _active_security_key, clear_study_context
-
-    clear_study_context()
-    _active_base_url.set(None)
-    _active_security_key.set(None)
+def isolate_home_and_store_caches_between_tests(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Redirect HOME/USERPROFILE into per-test tmp_path and clear workflow store caches."""
+    setattr(request.node, ISOLATION_ACTIVE_ATTR, True)
+    isolate_home_directory(monkeypatch, tmp_path)
+    reset_workflow_store_caches()
     yield
-    clear_study_context()
-    _active_base_url.set(None)
-    _active_security_key.set(None)
+    reset_workflow_store_caches()
+
+
+@pytest.fixture(autouse=True)
+def reset_study_context_between_tests():
+    """Reset global study, origin, security-key, and strict-mode contexts between tests."""
+    reset_all_runtime_contexts()
+    yield
+    reset_all_runtime_contexts()
 
 
 @pytest.fixture(autouse=True)
@@ -127,13 +120,9 @@ def reset_circuit_breaker_between_tests():
 @pytest.fixture(autouse=True)
 def reset_simulation_state_between_tests():
     """Reset the global default simulation state between tests when initialized."""
-    from imednet.simulation import state as sim_state_mod
-
-    if sim_state_mod._default_state is not None:
-        sim_state_mod.reset_default_simulation_state()
+    reset_default_simulation_state_if_loaded()
     yield
-    if sim_state_mod._default_state is not None:
-        sim_state_mod.reset_default_simulation_state()
+    reset_default_simulation_state_if_loaded()
 
 
 def _is_closed_stream_handler(handler: logging.Handler) -> bool:

@@ -43,12 +43,14 @@ from imednet.spi.utils import (
 )
 from imednet.spi.utils import get_sqlite_connection as _spi_get_sqlite_connection
 
+from ._default_paths import expand_user_path, resolve_default_imednet_path
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
 
 DEFAULT_CACHE_DIR = Path.home() / ".imednet" / "cache"
+_INITIAL_DEFAULT_CACHE_DIR = DEFAULT_CACHE_DIR
 _MISSING_ID_BATCH_SIZE = 100
 _EPOCH_FLOOR_WATERMARK = "1970-01-01T00:00:00Z"
 
@@ -241,7 +243,15 @@ class CachedRecordsLoader:
         self._sdk = sdk
         self._base_url = resolve_sdk_base_url(sdk)
         self._tx_state = threading.local()
-        base_dir = DEFAULT_CACHE_DIR if cache_dir is None else Path(cache_dir).expanduser()
+        base_dir = (
+            resolve_default_imednet_path(
+                "cache",
+                current_default=DEFAULT_CACHE_DIR,
+                initial_default=_INITIAL_DEFAULT_CACHE_DIR,
+            )
+            if cache_dir is None
+            else expand_user_path(cache_dir)
+        )
         self.db_path = base_dir / database_name
         self._retry_attempts = retry_attempts
         lock_path = Path(f"{self.db_path}.lock")

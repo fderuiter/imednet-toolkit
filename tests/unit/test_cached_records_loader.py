@@ -385,6 +385,7 @@ def test_write_transactions_acquire_file_lock(tmp_path: Path) -> None:
     assert loader.lock.is_locked is False
 
 
+@pytest.mark.performance
 def test_lock_hold_duration_below_threshold(tmp_path: Path) -> None:
     """Verify that file lock hold duration is well below 50ms for typical batch sync operations."""
     import time
@@ -426,6 +427,42 @@ def test_lock_hold_duration_below_threshold(tmp_path: Path) -> None:
     assert len(hold_durations) == 1
     # 50 milliseconds = 0.05 seconds
     assert hold_durations[0] < 0.05, f"Lock held for {hold_durations[0]:.4f}s which exceeds 50ms"
+
+
+def test_sync_records_reconcile_acquires_single_lock_batch(tmp_path: Path) -> None:
+    """Deterministic check that sync_records(reconcile=True) acquires and releases the file lock once."""
+    from unittest.mock import patch
+
+    sdk = MagicMock()
+    records = [_record(i, f"2024-01-{(i % 28) + 1:02d} 00:00:00+00:00") for i in range(1, 21)]
+    projected = [
+        Record(study_key="STUDY", record_id=i, form_key="FORM", record_data=None)
+        for i in range(1, 21)
+    ]
+    sdk.get_records.side_effect = [records, projected]
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    events: list[str] = []
+    original_acquire = loader.lock.acquire
+    original_release = loader.lock.release
+
+    def _spy_acquire(*args, **kwargs):
+        events.append("acquire")
+        return original_acquire(*args, **kwargs)
+
+    def _spy_release(*args, **kwargs):
+        events.append("release")
+        return original_release(*args, **kwargs)
+
+    with (
+        patch.object(loader.lock, "acquire", side_effect=_spy_acquire),
+        patch.object(loader.lock, "release", side_effect=_spy_release),
+    ):
+        loader.sync_records("STUDY", reconcile=True)
+
+    assert len(list(loader.iter_cached_records("STUDY"))) == 20
+    assert events == ["acquire", "release"]
+    assert loader.lock.is_locked is False
 
 
 def test_cached_loader_http_contract_iso_timestamp_and_lowercase_bool(tmp_path: Path) -> None:

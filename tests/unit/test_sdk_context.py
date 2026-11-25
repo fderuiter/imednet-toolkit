@@ -255,3 +255,207 @@ async def test_sync_sdk_rejects_async_context_via_async_with():
     with pytest.raises(TypeError, match="synchronous client"):
         async with sdk:
             pass  # pragma: no cover
+
+
+def test_sdk_context_scoping_close_nested_and_failed_init():
+    """Verify SDK __init__ preserves ambient ContextVars and close/__exit__ scopes governance/strict contexts."""
+    from imednet.core.context import (
+        get_base_url_context,
+        get_security_key_context,
+        is_strict_mode,
+        reset_base_url_context,
+        reset_security_key_context,
+        set_base_url_context,
+        set_security_key_context,
+    )
+
+    prior_url = set_base_url_context("https://prior.example.test")
+    prior_sec = set_security_key_context("prior-sec-key")  # pragma: allowlist secret
+    try:
+        # Failed SDK initialization leaves prior ContextVars untouched
+        with pytest.raises(ConfigurationError):
+            ImednetSDK(api_key="", security_key="")
+        assert get_base_url_context() == "https://prior.example.test"
+        assert get_security_key_context() == "prior-sec-key"  # pragma: allowlist secret
+
+        # SDK __init__ never mutates ambient base_url or security_key ContextVars (#2158 invariant)
+        outer = ImednetSDK(
+            api_key="outer-key",  # pragma: allowlist secret
+            security_key="outer-sec",  # pragma: allowlist secret
+            base_url="https://outer.example.test",
+            strict_mode=True,
+        )
+        assert get_base_url_context() == "https://prior.example.test"
+        assert get_security_key_context() == "prior-sec-key"  # pragma: allowlist secret
+        assert is_strict_mode() is False
+
+        with outer:
+            assert get_base_url_context() == "https://outer.example.test"
+            assert get_security_key_context() == "outer-sec"  # pragma: allowlist secret
+            assert is_strict_mode() is True
+            # Nested same-instance `with outer:` preserves outer context on inner exit
+            with outer:
+                assert get_base_url_context() == "https://outer.example.test"
+                assert is_strict_mode() is True
+            assert get_base_url_context() == "https://outer.example.test"
+            assert is_strict_mode() is True
+
+            # Nested cross-instance `with inner:` overrides inside block and restores outer on exit
+            with ImednetSDK(
+                api_key="inner-key",  # pragma: allowlist secret
+                security_key="inner-sec",  # pragma: allowlist secret
+                base_url="https://inner.example.test",
+                strict_mode=False,
+            ):
+                assert get_base_url_context() == "https://inner.example.test"
+                assert get_security_key_context() == "inner-sec"  # pragma: allowlist secret
+                assert is_strict_mode() is False
+            assert get_base_url_context() == "https://outer.example.test"
+            assert get_security_key_context() == "outer-sec"  # pragma: allowlist secret
+            assert is_strict_mode() is True
+
+        assert get_base_url_context() == "https://prior.example.test"
+        assert get_security_key_context() == "prior-sec-key"  # pragma: allowlist secret
+        assert is_strict_mode() is False
+
+        # Manual __enter__() followed by explicit close() drains active tokens cleanly
+        manual_sdk = ImednetSDK(
+            api_key="manual-key",  # pragma: allowlist secret
+            security_key="manual-sec",  # pragma: allowlist secret
+            base_url="https://manual.example.test",
+            strict_mode=True,
+        )
+        manual_sdk.__enter__()
+        assert get_base_url_context() == "https://manual.example.test"
+        assert is_strict_mode() is True
+        manual_sdk.close()
+        assert get_base_url_context() == "https://prior.example.test"
+        assert is_strict_mode() is False
+
+        # Injected pre-built Client propagates its base_url inside `with sdk:` without mutating on __init__
+        injected_client = Client(
+            api_key="inj-key",  # pragma: allowlist secret
+            security_key="inj-sec",  # pragma: allowlist secret
+            base_url="https://injected.example.test",
+        )
+        sdk_injected = ImednetSDK(client=injected_client)
+        assert sdk_injected._base_url == "https://injected.example.test"
+        assert get_base_url_context() == "https://prior.example.test"
+        with sdk_injected:
+            assert get_base_url_context() == "https://injected.example.test"
+        assert get_base_url_context() == "https://prior.example.test"
+    finally:
+        reset_security_key_context(prior_sec)
+        reset_base_url_context(prior_url)
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_context_scoping_and_aclose():
+    """Verify AsyncImednetSDK context scoping across async with, nested blocks, aclose(), and injected client."""
+    from imednet.core.context import (
+        get_base_url_context,
+        is_strict_mode,
+        reset_base_url_context,
+        set_base_url_context,
+    )
+
+    prior_url = set_base_url_context("https://async-prior.example.test")
+    try:
+        sdk = AsyncImednetSDK(
+            api_key="async-key",  # pragma: allowlist secret
+            security_key="async-sec",  # pragma: allowlist secret
+            base_url="https://async-sdk.example.test",
+            strict_mode=True,
+        )
+        assert get_base_url_context() == "https://async-prior.example.test"
+        assert is_strict_mode() is False
+
+        async with sdk:
+            assert get_base_url_context() == "https://async-sdk.example.test"
+            assert is_strict_mode() is True
+            async with sdk:
+                assert get_base_url_context() == "https://async-sdk.example.test"
+            assert get_base_url_context() == "https://async-sdk.example.test"
+            assert is_strict_mode() is True
+
+        assert get_base_url_context() == "https://async-prior.example.test"
+        assert is_strict_mode() is False
+
+        # Manual __aenter__() followed by explicit await aclose() drains tokens
+        manual_async = AsyncImednetSDK(
+            api_key="async-manual-key",  # pragma: allowlist secret
+            security_key="async-manual-sec",  # pragma: allowlist secret
+            base_url="https://async-manual.example.test",
+            strict_mode=True,
+        )
+        await manual_async.__aenter__()
+        assert get_base_url_context() == "https://async-manual.example.test"
+        assert is_strict_mode() is True
+        await manual_async.aclose()
+        assert get_base_url_context() == "https://async-prior.example.test"
+        assert is_strict_mode() is False
+
+        # Injected AsyncClient syncs base_url to AsyncImednetSDK context manager
+        injected_async = AsyncClient(
+            api_key="async-inj-key",  # pragma: allowlist secret
+            security_key="async-inj-sec",  # pragma: allowlist secret
+            base_url="https://async-injected.example.test",
+        )
+        async with AsyncImednetSDK(async_client=injected_async) as wrapped_async:
+            assert wrapped_async._base_url == "https://async-injected.example.test"
+            assert get_base_url_context() == "https://async-injected.example.test"
+        assert get_base_url_context() == "https://async-prior.example.test"
+    finally:
+        reset_base_url_context(prior_url)
+
+
+def test_default_stores_follow_dynamic_home_redirection(tmp_path, monkeypatch):
+    """Verify all default local SQLite/JSON stores resolve under the active HOME directory."""
+    from pathlib import Path
+
+    from imednet.integrations.parquet import _build_record_mapper
+    from imednet_workflows.cached_loader import CachedRecordsLoader
+    from imednet_workflows.config_version_control import (
+        ConfigVersionStore,
+        clear_config_version_store_caches,
+    )
+    from imednet_workflows.schema_profiler import SchemaProfiler
+    from imednet_workflows.state_ledger import FileStateProvider, get_state_provider
+    from imednet_workflows.triage_store import TriageStore
+
+    custom_home = tmp_path / "custom_home"
+    custom_home.mkdir()
+    monkeypatch.setenv("HOME", str(custom_home))
+    monkeypatch.setenv("USERPROFILE", str(custom_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: custom_home))
+    monkeypatch.delenv("AIRFLOW_CTX_TASK_ID", raising=False)
+    clear_config_version_store_caches()
+
+    sdk = MagicMock()
+    sdk._base_url = "https://home-test.example.test"
+    sdk.get_records.return_value = []
+
+    loader = CachedRecordsLoader(sdk)
+    assert custom_home in loader.db_path.parents
+
+    mapper = _build_record_mapper(sdk, chunk_size=100)
+    assert mapper._loader is not None
+    assert custom_home in mapper._loader.db_path.parents
+
+    profiler = SchemaProfiler(sdk)
+    assert list(profiler._iter_records("STUDY")) == []
+    assert profiler._loader is not None
+    assert custom_home in profiler._loader.db_path.parents
+
+    cfg_store = ConfigVersionStore()
+    assert custom_home in cfg_store.db_path.parents
+
+    triage = TriageStore()
+    assert custom_home in triage.db_path.parents
+
+    ledger = FileStateProvider()
+    assert custom_home in ledger.ledger_path.parents
+
+    via_factory = get_state_provider()
+    assert isinstance(via_factory, FileStateProvider)
+    assert custom_home in via_factory.ledger_path.parents

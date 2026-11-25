@@ -1252,6 +1252,7 @@ def test_cli_run_tui_command_high_contrast_leaves_environ_unchanged(
         assert dict(os.environ) == env_before
 
 
+@pytest.mark.performance
 @pytest.mark.asyncio
 async def test_job_monitor_bounded_concurrent_polling_duration_and_limit() -> None:
     """Verify tracked jobs execute concurrently within one round-trip window bounded by semaphore."""
@@ -1394,6 +1395,7 @@ async def test_job_monitor_preserves_registration_order() -> None:
     assert pos1 < pos2 < pos3
 
 
+@pytest.mark.performance
 @pytest.mark.asyncio
 async def test_job_monitor_sync_facade_bounded_concurrency() -> None:
     """Verify synchronous get_job() facade calls execute concurrently across worker threads."""
@@ -1420,6 +1422,70 @@ async def test_job_monitor_sync_facade_bounded_concurrency() -> None:
     assert elapsed < 2.0
     rendered = str(monitor.render())
     assert "Active & Recent Jobs (5)" in rendered
+    for jid in job_ids:
+        assert jid in rendered
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_concurrent_polling_executes_in_parallel() -> None:
+    """Deterministic functional verification of concurrent async job polling without wall-clock assertions."""
+    active_count = 0
+    max_seen = 0
+    all_started = asyncio.Event()
+
+    async def _get_job_async(study_key: str, batch_id: str) -> JobStatus:
+        nonlocal active_count, max_seen
+        assert study_key == "STUDY-CONC-DET"
+        active_count += 1
+        max_seen = max(max_seen, active_count)
+        if active_count == JobMonitor.MAX_CONCURRENT_POLLS:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=5.0)
+        active_count -= 1
+        return JobStatus(batch_id=batch_id, state=JobState.COMPLETED)
+
+    sdk = MagicMock(spec=AsyncImednetFacade)
+    sdk.async_get_job = _get_job_async
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-CONC-DET"
+    job_ids = [f"BATCH-DET-{i}" for i in range(JobMonitor.MAX_CONCURRENT_POLLS)]
+    for jid in job_ids:
+        monitor.track_job(jid)
+
+    await monitor.refresh_jobs()
+    assert max_seen == JobMonitor.MAX_CONCURRENT_POLLS
+    rendered = str(monitor.render())
+    for jid in job_ids:
+        assert jid in rendered
+
+
+@pytest.mark.asyncio
+async def test_job_monitor_sync_facade_executes_across_worker_threads() -> None:
+    """Deterministic functional verification of sync facade thread dispatch without elapsed-time assertions."""
+    barrier = threading.Barrier(JobMonitor.MAX_CONCURRENT_POLLS, timeout=5.0)
+    thread_ids: set[int] = set()
+    thread_lock = threading.Lock()
+
+    def sync_get_job(study_key: str, batch_id: str) -> JobStatus:
+        assert study_key == "STUDY-SYNC-DET"
+        with thread_lock:
+            thread_ids.add(threading.get_ident())
+        barrier.wait()
+        return JobStatus(batch_id=batch_id, state=JobState.RUNNING)
+
+    sdk = MagicMock(spec=ImednetFacade)
+    sdk.get_job = sync_get_job
+
+    monitor = JobMonitor(sdk)
+    monitor.current_study_key = "STUDY-SYNC-DET"
+    job_ids = [f"BATCH-SYNC-DET-{i}" for i in range(JobMonitor.MAX_CONCURRENT_POLLS)]
+    for jid in job_ids:
+        monitor.track_job(jid)
+
+    await monitor.refresh_jobs()
+    assert len(thread_ids) == JobMonitor.MAX_CONCURRENT_POLLS
+    rendered = str(monitor.render())
     for jid in job_ids:
         assert jid in rendered
 

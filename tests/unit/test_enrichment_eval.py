@@ -316,6 +316,7 @@ def test_enrichment_pipeline_active_rules_preservation() -> None:
     assert result["nested_tuple"][0]["age_in_months"] == 36
 
 
+@pytest.mark.performance
 def test_arrow_conversion_speed_and_bypass() -> None:
     """Test that empty rule bypass eliminates traversal delay and speeds up Arrow conversion."""
     pipeline_empty = EnrichmentPipeline(StudyConfiguration(study_key="STUDY-BENCH"))
@@ -359,6 +360,39 @@ def test_arrow_conversion_speed_and_bypass() -> None:
     assert elapsed_arrow < 1.0, (
         f"Expected 500-record Arrow conversion < 1.0s, took {elapsed_arrow:.4f}s"
     )
+
+
+def test_empty_enrichment_pipeline_returns_identical_record_and_converts_arrow() -> None:
+    """Deterministic check for empty rule identity bypass and Arrow conversion schema."""
+    pipeline_empty = EnrichmentPipeline(StudyConfiguration(study_key="STUDY-DET"))
+    assert pipeline_empty._has_rules is False
+
+    test_record = {
+        "record_id": 1,
+        "subject_key": "SUBJ-001",
+        "study_key": "STUDY-DET",
+        "form_id": 10,
+        "visit_id": 20,
+        "deleted": False,
+        "record_data": {"aeterm": "Headache", "sub_dict": {"k1": "v1"}},
+    }
+    assert pipeline_empty.process(test_record) is test_record
+
+    records = [
+        Record(
+            record_id=i,
+            subject_key=f"SUBJ-{i:03d}",
+            study_key="STUDY-DET",
+            form_id=10,
+            visit_id=1,
+            deleted=False,
+            record_data={"aeterm": f"Term-{i}"},
+        )
+        for i in range(1, 6)
+    ]
+    table = _records_to_arrow_table(records)
+    assert table.num_rows == 5
+    assert "record_id" in table.column_names
 
 
 def test_centralized_mapper_cached_fields_and_shared_pipeline() -> None:

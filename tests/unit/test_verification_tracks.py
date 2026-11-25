@@ -142,6 +142,74 @@ def test_performance_suite_update_baseline_rewrites_committed_ratios(
     assert report.status == "passed"
 
 
+def test_performance_suite_persists_cache_mirrors_report_and_flags_cached_regression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_path = tmp_path / "performance_baseline.json"
+    baseline_payload = {
+        "version": "1.0",
+        "record_count": 50,
+        "calibration_iterations": 100,
+        "median_runs": 3,
+        "max_regression_tolerance": 0.45,
+        "reference_calibration_seconds": 0.05,
+        "metrics": {
+            "record_generation_latency": {"static_ceiling_seconds": 4.5, "normalized_ratio": 10.0},
+            "mongo_conversion_latency": {"static_ceiling_seconds": 1.0, "normalized_ratio": 10.0},
+            "snowflake_arrow_conversion_latency": {
+                "static_ceiling_seconds": 2.0,
+                "normalized_ratio": 10.0,
+            },
+            "neo4j_conversion_latency": {"static_ceiling_seconds": 1.0, "normalized_ratio": 10.0},
+        },
+    }
+    baseline_path.write_text(json.dumps(baseline_payload), encoding="utf-8")
+    monkeypatch.setattr(test_performance, "calibrate_runner_cpu", lambda **_: 0.05)
+
+    sample = {
+        "record_generation_latency": 0.10,
+        "mongo_conversion_latency": 0.05,
+        "snowflake_arrow_conversion_latency": 0.075,
+        "neo4j_conversion_latency": 0.025,
+    }
+    monkeypatch.setattr(test_performance, "run_benchmarks", lambda _rc=50: dict(sample))
+
+    report_dir = tmp_path / "reports" / "verification"
+    cache_path = tmp_path / "reports" / "performance_cache.json"
+    mirror_path = tmp_path / "reports" / "performance_report.json"
+
+    test_performance.evaluate_performance_suite(
+        baseline_path=baseline_path,
+        update_baseline=False,
+        report_dir=report_dir,
+        cache_path=cache_path,
+        artifact_report_path=mirror_path,
+    )
+    assert cache_path.exists()
+    assert mirror_path.exists()
+    cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert cached_payload["metrics"]["record_generation_latency"][
+        "normalized_ratio"
+    ] == pytest.approx(2.0)
+
+    # Regress record_generation_latency against cached baseline while staying within static/committed bounds
+    regressed = dict(sample)
+    regressed["record_generation_latency"] = 0.20  # ratio 4.0 > 2.0 * 1.45
+    monkeypatch.setattr(test_performance, "run_benchmarks", lambda _rc=50: dict(regressed))
+    with pytest.raises(AssertionError, match="exceeds cached baseline"):
+        test_performance.evaluate_performance_suite(
+            baseline_path=baseline_path,
+            update_baseline=False,
+            report_dir=report_dir,
+            cache_path=cache_path,
+            artifact_report_path=mirror_path,
+        )
+    failed_mirror = VerificationReport.model_validate_json(mirror_path.read_text(encoding="utf-8"))
+    assert failed_mirror.status == "failed"
+    assert any(v.violation_type == "cached_baseline_regression" for v in failed_mirror.violations)
+
+
 def test_postman_drift_checks_all_endpoints_and_records_every_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -204,8 +272,14 @@ def test_verification_workflows_enforce_reports_caching_and_deep_fuzzing() -> No
         for s in perf_steps
     )
     perf_upload = next(s for s in perf_steps if s.get("name") == "Save Verification Artifact")
-    assert perf_upload["with"]["path"] == "reports/verification/performance_report.json"
+    assert perf_upload["with"]["path"] == "reports/performance_report.json"
     assert perf_upload["with"]["if-no-files-found"] == "error"
+    perf_restore = next(
+        s for s in perf_steps if s.get("name") == "Restore Performance Baseline Cache"
+    )
+    assert perf_restore["with"]["path"] == "reports/performance_cache.json"
+    perf_save = next(s for s in perf_steps if s.get("name") == "Save Performance Baseline Cache")
+    assert perf_save["with"]["path"] == "reports/performance_cache.json"
 
     expected_restore_key = (
         "fuzz-corpus-${{ runner.os }}-sha256-restore-${{ github.run_id }}-${{ github.run_attempt }}"
