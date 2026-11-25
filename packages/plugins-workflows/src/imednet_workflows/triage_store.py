@@ -21,10 +21,25 @@ from imednet.spi.models import (
 )
 from imednet.spi.utils import redact_sensitive_payload, redact_sensitive_text, sqlite_connection
 
-DEFAULT_TRIAGE_DB_PATH = Path.home() / ".imednet" / "triage.sqlite3"
+_ORIG_PATH_HOME_FUNC = getattr(Path.home, "__func__", Path.home)
+_INITIAL_DEFAULT_TRIAGE_DB_PATH = Path.home() / ".imednet" / "triage.sqlite3"
+DEFAULT_TRIAGE_DB_PATH = _INITIAL_DEFAULT_TRIAGE_DB_PATH
 _LATEST_SCHEMA_VERSION = 2
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _RETRY_BASE_DELAY_SECONDS = 0.05
+
+
+def _resolve_default_triage_db_path() -> Path:
+    """Resolve default triage SQLite path dynamically honoring monkeypatches and HOME."""
+    if DEFAULT_TRIAGE_DB_PATH != _INITIAL_DEFAULT_TRIAGE_DB_PATH:
+        return Path(DEFAULT_TRIAGE_DB_PATH).expanduser()
+    home_fn = Path.home
+    if getattr(home_fn, "__func__", home_fn) is not _ORIG_PATH_HOME_FUNC:
+        return Path(home_fn()) / ".imednet" / "triage.sqlite3"
+    env_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    if env_home:
+        return Path(env_home) / ".imednet" / "triage.sqlite3"
+    return Path(home_fn()) / ".imednet" / "triage.sqlite3"
 
 
 class TriageStore:
@@ -45,10 +60,11 @@ class TriageStore:
             timeout: Maximum time to wait for a database connection.
             retry_attempts: Number of write retry attempts.
         """
+        env_db_path = os.environ.get("IMEDNET_TRIAGE_DB_PATH")
         raw_path = (
             db_path
             if db_path is not None
-            else os.environ.get("IMEDNET_TRIAGE_DB_PATH", DEFAULT_TRIAGE_DB_PATH)
+            else (env_db_path if env_db_path is not None else _resolve_default_triage_db_path())
         )
         self.db_path = Path(raw_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

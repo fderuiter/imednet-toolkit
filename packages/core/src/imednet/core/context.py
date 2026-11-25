@@ -52,6 +52,11 @@ def get_base_url_context() -> str | None:
     return _active_base_url.get()
 
 
+def clear_base_url_context() -> None:
+    """Clear the active base URL for the current thread/task context."""
+    _active_base_url.set(None)
+
+
 def set_security_key_context(security_key: str | None) -> contextvars.Token[str | None]:
     """Set the active SDK security key for the current thread/task context."""
     return _active_security_key.set(security_key)
@@ -65,6 +70,11 @@ def reset_security_key_context(token: contextvars.Token[str | None]) -> None:
 def get_security_key_context() -> str | None:
     """Get the current SDK security key for the active thread/task context."""
     return _active_security_key.get()
+
+
+def clear_security_key_context() -> None:
+    """Clear the active SDK security key for the current thread/task context."""
+    _active_security_key.set(None)
 
 
 @contextmanager
@@ -177,6 +187,11 @@ def set_strict_mode_context(strict_mode: bool) -> contextvars.Token[bool | None]
 def reset_strict_mode_context(token: contextvars.Token[bool | None]) -> None:
     """Reset the active strict validation mode using a token from :func:`set_strict_mode_context`."""
     _active_strict_mode.reset(token)
+
+
+def clear_strict_mode_context() -> None:
+    """Clear the active strict validation mode for the current thread/task context."""
+    _active_strict_mode.set(None)
 
 
 _DEFAULT_ENVIRON = os.environ

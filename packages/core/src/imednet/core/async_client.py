@@ -58,7 +58,10 @@ class AsyncClient(HTTPClientBase[httpx.AsyncClient, AsyncRequestExecutor]):
 
     async def aclose(self) -> None:
         """Close the underlying async HTTP client."""
-        await self._client.aclose()
+        try:
+            await self._client.aclose()
+        finally:
+            self._reset_client_context()
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """Internal method to dispatch an asynchronous request via the executor."""

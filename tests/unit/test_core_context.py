@@ -3,9 +3,18 @@
 import pytest
 
 from imednet.core.context import (
+    clear_base_url_context,
+    clear_security_key_context,
+    clear_strict_mode_context,
+    get_base_url_context,
     get_current_study,
+    get_security_key_context,
     get_study_context,
+    is_strict_mode,
     reset_study_context,
+    set_base_url_context,
+    set_security_key_context,
+    set_strict_mode_context,
     set_study_context,
     study_context,
 )
@@ -36,3 +45,26 @@ def test_study_context_manager_restores_previous_context() -> None:
         with study_context("INNER"):
             assert get_current_study() == "INNER"
         assert get_current_study() == "OUTER"
+
+
+def test_clear_base_url_strict_mode_and_security_key_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify explicit clear helpers reset base_url, strict_mode, and security_key ContextVars."""
+    monkeypatch.delenv("IMEDNET_STRICT_MODE", raising=False)
+
+    set_base_url_context("https://edc.prod.imednet.test")
+    set_strict_mode_context(True)
+    set_security_key_context("sec-123")
+
+    assert get_base_url_context() == "https://edc.prod.imednet.test"
+    assert is_strict_mode() is True
+    assert get_security_key_context() == "sec-123"
+
+    clear_base_url_context()
+    clear_strict_mode_context()
+    clear_security_key_context()
+
+    assert get_base_url_context() is None
+    assert is_strict_mode() is False
+    assert get_security_key_context() is None

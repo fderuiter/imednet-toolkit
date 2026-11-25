@@ -256,10 +256,42 @@ class _BaseSDK:
         self._base_url = sanitize_base_url(raw_base_url)
         self._strict_mode_tokens = []
         self._governance_tokens: list[tuple[Any, Any]] = []
-        set_base_url_context(self._base_url)
-        if isinstance(self._security_key, str) and self._security_key.strip():
+        self._init_base_url_token: Any = set_base_url_context(self._base_url)
+        self._init_security_key_token: Any = (
             set_security_key_context(self._security_key)
+            if isinstance(self._security_key, str) and self._security_key.strip()
+            else None
+        )
         return resolved
+
+    def _reset_sdk_context(self) -> None:
+        """Restore governance and init ContextVar tokens set by this SDK instance."""
+        from contextlib import suppress
+
+        from .core.context import reset_base_url_context, reset_security_key_context
+
+        governance_tokens = getattr(self, "_governance_tokens", None)
+        if governance_tokens:
+            while governance_tokens:
+                token_base, token_sec = governance_tokens.pop()
+                if token_sec is not None:
+                    with suppress(ValueError, RuntimeError):
+                        reset_security_key_context(token_sec)
+                if token_base is not None:
+                    with suppress(ValueError, RuntimeError):
+                        reset_base_url_context(token_base)
+
+        init_sec_token = getattr(self, "_init_security_key_token", None)
+        if init_sec_token is not None:
+            self._init_security_key_token = None
+            with suppress(ValueError, RuntimeError):
+                reset_security_key_context(init_sec_token)
+
+        init_base_token = getattr(self, "_init_base_url_token", None)
+        if init_base_token is not None:
+            self._init_base_url_token = None
+            with suppress(ValueError, RuntimeError):
+                reset_base_url_context(init_base_token)
 
     def _enter_strict_mode(self) -> None:
         """Push this SDK's strict_mode and governance context onto the active task/thread context."""
@@ -455,41 +487,53 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
             has_injected_transport=transport is not None,
         )
 
-        if client is not None:
-            self._client = client
-            injected_url = getattr(client, "base_url", None)
-            injected_sim = getattr(client, "simulation_mode", False) is True
-            if (
-                self.config.base_url is None
-                and isinstance(injected_url, str)
-                and injected_url.strip()
-            ) or (injected_sim and not self.config.simulation_mode):
-                from dataclasses import replace
-
-                self.config = replace(
-                    self.config,
-                    base_url=self.config.base_url or injected_url,
-                    simulation_mode=self.config.simulation_mode or injected_sim,
+        self._owns_client = client is None
+        try:
+            if client is not None:
+                self._client = client
+                injected_url = getattr(client, "base_url", None)
+                injected_sim = getattr(client, "simulation_mode", False) is True
+                has_injected_url = (
+                    self.config.base_url is None
+                    and isinstance(injected_url, str)
+                    and bool(injected_url.strip())
                 )
-        else:
-            retry_config = self._resolve_retry_config(
-                retry_config=retry_config,
-                retries=retries,
-                backoff_factor=backoff_factor,
-                retry_policy=retry_policy,
-            )
+                if has_injected_url or (injected_sim and not self.config.simulation_mode):
+                    from dataclasses import replace
 
-            self._client = ClientFactory.create_client(
-                config=resolved_config,
-                timeout=resolved_config.timeout,
-                retry_config=retry_config,
-                transport=transport,
-                auth=auth,
-            )
+                    self.config = replace(
+                        self.config,
+                        base_url=self.config.base_url or injected_url,
+                        simulation_mode=self.config.simulation_mode or injected_sim,
+                    )
+                    if has_injected_url and isinstance(injected_url, str):
+                        from .core.context import set_base_url_context
+                        from .utils.url import sanitize_base_url
 
-        self._init_endpoints()
-        self.workflows = cast(SyncWorkflowsNamespaceProtocol, self._init_workflows())
-        self.sinks = cast("SinksNamespaceProtocol | None", self._init_sinks())
+                        self._base_url = sanitize_base_url(injected_url)
+                        self._governance_tokens.append((set_base_url_context(self._base_url), None))
+            else:
+                retry_config = self._resolve_retry_config(
+                    retry_config=retry_config,
+                    retries=retries,
+                    backoff_factor=backoff_factor,
+                    retry_policy=retry_policy,
+                )
+
+                self._client = ClientFactory.create_client(
+                    config=resolved_config,
+                    timeout=resolved_config.timeout,
+                    retry_config=retry_config,
+                    transport=transport,
+                    auth=auth,
+                )
+
+            self._init_endpoints()
+            self.workflows = cast(SyncWorkflowsNamespaceProtocol, self._init_workflows())
+            self.sinks = cast("SinksNamespaceProtocol | None", self._init_sinks())
+        except BaseException:
+            self._reset_sdk_context()
+            raise
 
     @property
     def auth(self) -> AuthStrategy | None:
@@ -542,9 +586,9 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Cleanup resources when exiting context."""
         try:
-            self.close()
-        finally:
             self._exit_strict_mode()
+        finally:
+            self.close()
 
     async def __aenter__(self) -> ImednetSDK:
         """Prevent accidental ``async with`` usage on the synchronous client."""
@@ -564,7 +608,16 @@ class ImednetSDK(_BaseSDK, SyncSDKConvenienceMixin):
 
     def close(self) -> None:
         """Close the synchronous client connection and free resources."""
-        self._client.close()
+        if getattr(self, "_owns_client", True):
+            try:
+                self._client.close()
+            finally:
+                self._reset_sdk_context()
+        else:
+            try:
+                self._reset_sdk_context()
+            finally:
+                self._client.close()
 
     async def aclose(self) -> None:
         """Asynchronous close is not supported on the synchronous SDK."""
@@ -635,41 +688,53 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
             has_injected_transport=transport is not None,
         )
 
-        if async_client is not None:
-            self._async_client = async_client
-            injected_url = getattr(async_client, "base_url", None)
-            injected_sim = getattr(async_client, "simulation_mode", False) is True
-            if (
-                self.config.base_url is None
-                and isinstance(injected_url, str)
-                and injected_url.strip()
-            ) or (injected_sim and not self.config.simulation_mode):
-                from dataclasses import replace
-
-                self.config = replace(
-                    self.config,
-                    base_url=self.config.base_url or injected_url,
-                    simulation_mode=self.config.simulation_mode or injected_sim,
+        self._owns_client = async_client is None
+        try:
+            if async_client is not None:
+                self._async_client = async_client
+                injected_url = getattr(async_client, "base_url", None)
+                injected_sim = getattr(async_client, "simulation_mode", False) is True
+                has_injected_url = (
+                    self.config.base_url is None
+                    and isinstance(injected_url, str)
+                    and bool(injected_url.strip())
                 )
-        else:
-            retry_config = self._resolve_retry_config(
-                retry_config=retry_config,
-                retries=retries,
-                backoff_factor=backoff_factor,
-                retry_policy=retry_policy,
-            )
+                if has_injected_url or (injected_sim and not self.config.simulation_mode):
+                    from dataclasses import replace
 
-            self._async_client = ClientFactory.create_async_client(
-                config=resolved_config,
-                timeout=resolved_config.timeout,
-                retry_config=retry_config,
-                transport=transport,
-                auth=auth,
-            )
+                    self.config = replace(
+                        self.config,
+                        base_url=self.config.base_url or injected_url,
+                        simulation_mode=self.config.simulation_mode or injected_sim,
+                    )
+                    if has_injected_url and isinstance(injected_url, str):
+                        from .core.context import set_base_url_context
+                        from .utils.url import sanitize_base_url
 
-        self._init_endpoints()
-        self.workflows = cast(AsyncWorkflowsNamespaceProtocol, self._init_workflows())
-        self.sinks = cast("AsyncSinksNamespaceProtocol | None", self._init_sinks())
+                        self._base_url = sanitize_base_url(injected_url)
+                        self._governance_tokens.append((set_base_url_context(self._base_url), None))
+            else:
+                retry_config = self._resolve_retry_config(
+                    retry_config=retry_config,
+                    retries=retries,
+                    backoff_factor=backoff_factor,
+                    retry_policy=retry_policy,
+                )
+
+                self._async_client = ClientFactory.create_async_client(
+                    config=resolved_config,
+                    timeout=resolved_config.timeout,
+                    retry_config=retry_config,
+                    transport=transport,
+                    auth=auth,
+                )
+
+            self._init_endpoints()
+            self.workflows = cast(AsyncWorkflowsNamespaceProtocol, self._init_workflows())
+            self.sinks = cast("AsyncSinksNamespaceProtocol | None", self._init_sinks())
+        except BaseException:
+            self._reset_sdk_context()
+            raise
 
     @property
     def auth(self) -> AuthStrategy | None:
@@ -745,13 +810,22 @@ class AsyncImednetSDK(_BaseSDK, AsyncSDKConvenienceMixin):
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Exit the asynchronous context manager and close the client."""
         try:
-            await self.aclose()
-        finally:
             self._exit_strict_mode()
+        finally:
+            await self.aclose()
 
     async def aclose(self) -> None:
         """Close the underlying asynchronous client and free resources."""
-        await self._async_client.aclose()
+        if getattr(self, "_owns_client", True):
+            try:
+                await self._async_client.aclose()
+            finally:
+                self._reset_sdk_context()
+        else:
+            try:
+                self._reset_sdk_context()
+            finally:
+                await self._async_client.aclose()
 
 
 __all__ = ["AsyncImednetSDK", "ImednetSDK"]

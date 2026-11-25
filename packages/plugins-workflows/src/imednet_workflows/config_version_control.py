@@ -93,6 +93,20 @@ def _bump_write_generation() -> None:
         _WRITE_GENERATION += 1
 
 
+def clear_config_version_store_caches() -> None:
+    """Clear all module-level path, directory, and SQLite caches for test isolation."""
+    global _WRITE_GENERATION
+    with _CACHE_LOCK:
+        _RAW_DB_PATH_CACHE.clear()
+        _ORIGIN_LAYOUT_CACHE.clear()
+        _BASE_DIR_ENTRIES_CACHE.clear()
+        _HOST_SUBDIR_CACHE.clear()
+        _HEAD_INDEX_CACHE.clear()
+        _COMMITTED_CONFIG_CACHE.clear()
+        _sanitize_base_url_for_path.cache_clear()
+        _WRITE_GENERATION += 1
+
+
 def _sha256_of(content: str) -> str:
     """Return the SHA-256 hex digest of the given string content."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()

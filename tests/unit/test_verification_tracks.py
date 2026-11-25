@@ -142,6 +142,80 @@ def test_performance_suite_update_baseline_rewrites_committed_ratios(
     assert report.status == "passed"
 
 
+def test_performance_suite_persists_cache_and_mirrors_default_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_path = tmp_path / "performance_baseline.json"
+    baseline_payload = {
+        "version": "1.0",
+        "record_count": 20,
+        "calibration_iterations": 50,
+        "median_runs": 1,
+        "max_regression_tolerance": 0.45,
+        "reference_calibration_seconds": 0.01,
+        "metrics": {
+            m: {"static_ceiling_seconds": 5.0, "normalized_ratio": 10.0}
+            for m in test_performance.BENCHMARK_METRICS
+        },
+    }
+    baseline_path.write_text(json.dumps(baseline_payload), encoding="utf-8")
+
+    verification_dir = tmp_path / "reports" / "verification"
+    mirrored_report = tmp_path / "reports" / "performance_report.json"
+    cache_file = tmp_path / "reports" / "performance_cache.json"
+
+    monkeypatch.setenv("IMEDNET_VERIFICATION_REPORT_DIR", str(verification_dir))
+    monkeypatch.setattr(test_performance, "PERFORMANCE_REPORT_FILE", mirrored_report)
+    monkeypatch.setattr(test_performance, "PERFORMANCE_CACHE_FILE", cache_file)
+    monkeypatch.setattr(test_performance, "calibrate_runner_cpu", lambda **_: 0.10)
+    monkeypatch.setattr(
+        test_performance,
+        "run_benchmarks",
+        lambda _rc=20: {
+            "record_generation_latency": 0.20,
+            "mongo_conversion_latency": 0.05,
+            "snowflake_arrow_conversion_latency": 0.10,
+            "neo4j_conversion_latency": 0.02,
+        },
+    )
+
+    test_performance.evaluate_performance_suite(baseline_path=baseline_path)
+
+    assert cache_file.exists()
+    assert mirrored_report.exists()
+    cached = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert "metrics" in cached
+    assert cached["metrics"]["record_generation_latency"]["normalized_ratio"] == pytest.approx(2.0)
+
+    # Second run restores cached metrics and records cached ratios in the report
+    test_performance.evaluate_performance_suite(baseline_path=baseline_path)
+    report = VerificationReport.model_validate_json(mirrored_report.read_text(encoding="utf-8"))
+    assert report.status == "passed"
+    assert any(m.name == "record_generation_latency_cached_ratio" for m in report.metrics)
+    assert any(m.name == "record_generation_latency_cached_diff_pct" for m in report.metrics)
+
+    # Third run detects regression relative to restored main cache even when below committed ceiling
+    monkeypatch.setattr(
+        test_performance,
+        "run_benchmarks",
+        lambda _rc=20: {
+            "record_generation_latency": 0.40,
+            "mongo_conversion_latency": 0.05,
+            "snowflake_arrow_conversion_latency": 0.10,
+            "neo4j_conversion_latency": 0.02,
+        },
+    )
+    with pytest.raises(AssertionError, match="exceeds cached baseline"):
+        test_performance.evaluate_performance_suite(baseline_path=baseline_path)
+
+    failed_report = VerificationReport.model_validate_json(
+        mirrored_report.read_text(encoding="utf-8")
+    )
+    assert failed_report.status == "failed"
+    assert any(v.violation_type == "cached_baseline_regression" for v in failed_report.violations)
+
+
 def test_postman_drift_checks_all_endpoints_and_records_every_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -206,6 +280,22 @@ def test_verification_workflows_enforce_reports_caching_and_deep_fuzzing() -> No
     perf_upload = next(s for s in perf_steps if s.get("name") == "Save Verification Artifact")
     assert perf_upload["with"]["path"] == "reports/verification/performance_report.json"
     assert perf_upload["with"]["if-no-files-found"] == "error"
+
+    perf_cache_restore = next(
+        s for s in perf_steps if s.get("name") == "Restore Performance Baseline Cache"
+    )
+    assert perf_cache_restore["uses"].startswith("actions/cache/restore@")
+    assert perf_cache_restore["with"]["path"] == "reports/performance_cache.json"
+
+    perf_cache_save = next(
+        s for s in perf_steps if s.get("name") == "Save Performance Baseline Cache"
+    )
+    assert perf_cache_save["uses"].startswith("actions/cache/save@")
+    assert perf_cache_save["with"]["path"] == "reports/performance_cache.json"
+
+    perf_direct_upload = next(s for s in perf_steps if s.get("name") == "Upload Performance Report")
+    assert perf_direct_upload["with"]["path"] == "reports/performance_report.json"
+    assert perf_direct_upload["with"]["if-no-files-found"] == "error"
 
     expected_restore_key = (
         "fuzz-corpus-${{ runner.os }}-sha256-restore-${{ github.run_id }}-${{ github.run_attempt }}"

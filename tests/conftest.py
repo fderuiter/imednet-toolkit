@@ -29,6 +29,9 @@ if os.environ.get("IMEDNET_TEST_WHEELS") != "1":
 
 def pytest_addoption(parser):
     """Add custom command-line options for running specific test tracks."""
+    if getattr(parser, "_imednet_options_registered", False):
+        return
+    parser._imednet_options_registered = True
     parser.addoption("--run-fuzzing", action="store_true", default=False, help="run fuzzing tests")
     parser.addoption(
         "--run-performance", action="store_true", default=False, help="run performance tests"
@@ -43,12 +46,15 @@ def pytest_addoption(parser):
 
 def pytest_collection_modifyitems(config, items):
     """Skip fuzzing and performance tests unless explicitly requested via CLI options or marker filter."""
+    if getattr(config, "_imednet_items_modified", False):
+        return
+    config._imednet_items_modified = True
     skip_fuzzing = pytest.mark.skip(reason="need --run-fuzzing option or -m fuzzing to run")
     skip_performance = pytest.mark.skip(
         reason="need --run-performance option or -m performance to run"
     )
 
-    marker_expr = config.getoption("-m")
+    marker_expr = config.getoption("-m") or ""
 
     for item in items:
         if "fuzzing" in item.keywords:
@@ -101,13 +107,61 @@ def _is_live_test(node: object) -> bool:
 
 
 @pytest.fixture(autouse=True)
+def isolate_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Redirect HOME and default ~/.imednet caches into a per-test temporary directory."""
+    test_home = tmp_path / "home"
+    test_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(test_home))
+    monkeypatch.setenv("USERPROFILE", str(test_home))
+
+    if "IMEDNET_WORKFLOW_LEDGER_PATH" not in os.environ:
+        isolated_ledger = str(test_home / ".imednet" / "pipeline_ledger.json")
+        for mod_name in (
+            "imednet_workflows",
+            "imednet_workflows.state_ledger",
+            "imednet_workflows.cli",
+            "imednet_workflows.wizard",
+            "test_state_ledger",
+            "tests.unit.test_state_ledger",
+        ):
+            mod = sys.modules.get(mod_name)
+            if mod is not None and "DEFAULT_LEDGER_PATH" in getattr(mod, "__dict__", {}):
+                monkeypatch.setattr(mod, "DEFAULT_LEDGER_PATH", isolated_ledger)
+
+    yield
+
+
+@pytest.fixture(autouse=True)
 def reset_study_context_between_tests():
-    """Reset the global study context before and after each test to ensure isolation."""
-    from imednet.core.context import clear_study_context
+    """Reset all ContextVar states before and after each test to ensure isolation."""
+    from imednet.core.context import (
+        clear_base_url_context,
+        clear_security_key_context,
+        clear_strict_mode_context,
+        clear_study_context,
+    )
 
     clear_study_context()
+    clear_base_url_context()
+    clear_strict_mode_context()
+    clear_security_key_context()
     yield
     clear_study_context()
+    clear_base_url_context()
+    clear_strict_mode_context()
+    clear_security_key_context()
+
+
+@pytest.fixture(autouse=True)
+def reset_store_caches_between_tests():
+    """Reset module-level workflow store caches before and after each test when loaded."""
+    mod = sys.modules.get("imednet_workflows.config_version_control")
+    if mod is not None:
+        mod.clear_config_version_store_caches()
+    yield
+    mod = sys.modules.get("imednet_workflows.config_version_control")
+    if mod is not None:
+        mod.clear_config_version_store_caches()
 
 
 @pytest.fixture(autouse=True)
@@ -122,14 +176,16 @@ def reset_circuit_breaker_between_tests():
 
 @pytest.fixture(autouse=True)
 def reset_simulation_state_between_tests():
-    """Reset the global default simulation state between tests when initialized."""
-    from imednet.simulation import state as sim_state_mod
-
-    if sim_state_mod._default_state is not None:
+    """Reset the global default simulation state before and after each test when initialized."""
+    sim_state_mod = sys.modules.get("imednet.simulation.state")
+    if sim_state_mod is not None and sim_state_mod._default_state is not None:
         sim_state_mod.reset_default_simulation_state()
+        sim_state_mod._default_state = None
     yield
-    if sim_state_mod._default_state is not None:
+    sim_state_mod = sys.modules.get("imednet.simulation.state")
+    if sim_state_mod is not None and sim_state_mod._default_state is not None:
         sim_state_mod.reset_default_simulation_state()
+        sim_state_mod._default_state = None
 
 
 def _is_closed_stream_handler(handler: logging.Handler) -> bool:

@@ -75,7 +75,10 @@ class Client(HTTPClientBase[httpx.Client, SyncRequestExecutor]):
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
-        self._client.close()
+        try:
+            self._client.close()
+        finally:
+            self._reset_client_context()
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """Internal method to dispatch a request via the executor."""

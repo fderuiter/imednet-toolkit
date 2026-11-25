@@ -339,7 +339,20 @@ DEFAULT_LEDGER_PATH: str = os.environ.get(
     "IMEDNET_WORKFLOW_LEDGER_PATH",
     str(Path.home() / ".imednet" / "pipeline_ledger.json"),
 )
+_INITIAL_DEFAULT_LEDGER_PATH: str = DEFAULT_LEDGER_PATH
 DEFAULT_LEASE_TTL_SECONDS: float = 3600.0
+
+
+def _resolve_default_ledger_path() -> str:
+    """Resolve the default ledger path honoring env overrides, monkeypatches, and HOME."""
+    if "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
+        return os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
+    if DEFAULT_LEDGER_PATH != _INITIAL_DEFAULT_LEDGER_PATH:
+        return DEFAULT_LEDGER_PATH
+    env_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    if env_home:
+        return str(Path(env_home) / ".imednet" / "pipeline_ledger.json")
+    return str(Path.home() / ".imednet" / "pipeline_ledger.json")
 
 
 def _normalize_optional_utc(ts: datetime | None) -> datetime | None:
@@ -430,8 +443,8 @@ class FileStateProvider(BaseStateProvider):
             ledger_path: Path to the JSON file where state is persisted.
             lease_ttl_seconds: Lease duration in seconds for active RUNNING transactions.
         """
-        if ledger_path == DEFAULT_LEDGER_PATH and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
-            ledger_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
+        if ledger_path in (DEFAULT_LEDGER_PATH, _INITIAL_DEFAULT_LEDGER_PATH):
+            ledger_path = _resolve_default_ledger_path()
         self.ledger_path = Path(ledger_path)
         self._lock_path = self.ledger_path.with_suffix(".lock")
         self.lease_ttl_seconds = lease_ttl_seconds
@@ -1937,6 +1950,6 @@ def get_state_provider(
     """Factory to get the appropriate state provider based on environment."""
     if "AIRFLOW_CTX_TASK_ID" in os.environ or os.environ.get("USE_AIRFLOW_STATE_PROVIDER") == "1":
         return AirflowStateProvider()
-    if ledger_path == DEFAULT_LEDGER_PATH and "IMEDNET_WORKFLOW_LEDGER_PATH" in os.environ:
-        ledger_path = os.environ["IMEDNET_WORKFLOW_LEDGER_PATH"]
+    if ledger_path in (DEFAULT_LEDGER_PATH, _INITIAL_DEFAULT_LEDGER_PATH):
+        ledger_path = _resolve_default_ledger_path()
     return FileStateProvider(ledger_path)

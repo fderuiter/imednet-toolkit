@@ -22,7 +22,7 @@ def test_retry_contract_by_method_class() -> None:
         api_key="k",
         security_key="s",
         base_url="https://example.com",
-        retry_config=RetryConfig(retries=2),
+        retry_config=RetryConfig(retries=2, backoff_factor=0.0),
     )
 
     get_route = respx.get("/retry-get").mock(return_value=httpx.Response(503))
@@ -180,7 +180,12 @@ def test_status_code_error_mapping_contract(
     status_code: int, exception_type: type[Exception]
 ) -> None:
     """Test that status code error mapping contract."""
-    sdk = ImednetSDK(api_key="k", security_key="s", base_url="https://example.com")
+    sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://example.com",
+        retry_config=RetryConfig(retries=0),
+    )
     respx.get("/error-map").mock(return_value=httpx.Response(status_code, json={"error": "x"}))
 
     with pytest.raises(exception_type):

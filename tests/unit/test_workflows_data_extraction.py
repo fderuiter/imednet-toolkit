@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from imednet.models.record_revisions import RecordRevision
 from imednet.models.records import Record
 from imednet.models.subjects import Subject
@@ -140,6 +142,34 @@ def test_extract_records_by_criteria_no_filters() -> None:
     sdk.get_visits.assert_not_called()
 
 
+def test_extract_records_by_criteria_set_membership_filtering() -> None:
+    """Verify set-based criteria filtering returns exact subject and visit intersection."""
+    sdk = MagicMock()
+    subjects = [Subject(subject_key=f"SUBJ_{i}") for i in range(50)]
+    visits = [Visit(visit_id=i, subject_key=f"SUBJ_{i % 50}") for i in range(100)]
+    records = [
+        Record(record_id=i, subject_key=f"SUBJ_{i % 60}", visit_id=i % 125) for i in range(500)
+    ]
+
+    sdk.get_subjects.return_value = subjects
+    sdk.get_visits.return_value = visits
+    sdk.get_records.return_value = records
+
+    wf = DataExtractionWorkflow(sdk)
+    result = wf.extract_records_by_criteria(
+        "STUDY",
+        subject_filter={"site": "SITE01"},
+        visit_filter={"type": "scheduled"},
+    )
+
+    expected_subjects = {s.subject_key for s in subjects}
+    expected_visits = {v.visit_id for v in visits}
+    assert all(r.subject_key in expected_subjects and r.visit_id in expected_visits for r in result)
+    expected_count = sum(1 for i in range(500) if (i % 60) < 50 and (i % 125) < 100)
+    assert len(result) == expected_count
+
+
+@pytest.mark.performance
 def test_extract_records_by_criteria_scaling_benchmark() -> None:
     """Benchmark constant-time set lookups with 1,000 subjects, 2,000 visits, and 10,000 records."""
     import time

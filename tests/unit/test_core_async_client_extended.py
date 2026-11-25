@@ -15,7 +15,10 @@ from imednet.core.retry import RetryConfig
 async def test_async_request_retries():
     """Test that async request retries asynchronously."""
     async with AsyncClient(
-        "k", "s", base_url="https://api.test", retry_config=RetryConfig(retries=1)
+        "k",
+        "s",
+        base_url="https://api.test",
+        retry_config=RetryConfig(retries=1, backoff_factor=0.0),
     ) as client:
         calls = {"count": 0}
 
@@ -49,7 +52,12 @@ async def test_async_request_retries():
 )
 async def test_async_request_error_mapping(status, exc):
     """Test that async request error mapping asynchronously."""
-    async with AsyncClient("k", "s", base_url="https://api.test") as client:
+    async with AsyncClient(
+        "k",
+        "s",
+        base_url="https://api.test",
+        retry_config=RetryConfig(retries=0),
+    ) as client:
         with respx.mock(assert_all_called=True, assert_all_mocked=True) as respx_mock:
             respx_mock.get("https://api.test/some").respond(
                 status_code=status, json={"error": status}

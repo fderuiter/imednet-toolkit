@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator
@@ -42,8 +43,25 @@ from .chunked_pipeline import DEFAULT_CHUNK_SIZE
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
 
-DEFAULT_CACHE_DIR = Path.home() / ".imednet" / "cache"
+_ORIG_PATH_HOME_FUNC = getattr(Path.home, "__func__", Path.home)
+_INITIAL_DEFAULT_CACHE_DIR = Path.home() / ".imednet" / "cache"
+DEFAULT_CACHE_DIR = _INITIAL_DEFAULT_CACHE_DIR
 _MISSING_ID_BATCH_SIZE = 100
+
+
+def _resolve_default_cache_dir() -> Path:
+    """Resolve the default cache directory dynamically honoring monkeypatches and HOME."""
+    if DEFAULT_CACHE_DIR != _INITIAL_DEFAULT_CACHE_DIR:
+        return Path(DEFAULT_CACHE_DIR).expanduser()
+    home_fn = Path.home
+    if getattr(home_fn, "__func__", home_fn) is not _ORIG_PATH_HOME_FUNC:
+        return Path(home_fn()) / ".imednet" / "cache"
+    env_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    if env_home:
+        return Path(env_home) / ".imednet" / "cache"
+    return Path(home_fn()) / ".imednet" / "cache"
+
+
 _EPOCH_FLOOR_WATERMARK = "1970-01-01T00:00:00Z"
 
 _T = TypeVar("_T")
@@ -247,7 +265,9 @@ class CachedRecordsLoader:
         self._sdk = sdk
         self._base_url = resolve_sdk_base_url(sdk)
         self._tx_state = threading.local()
-        base_dir = DEFAULT_CACHE_DIR if cache_dir is None else Path(cache_dir).expanduser()
+        base_dir = (
+            _resolve_default_cache_dir() if cache_dir is None else Path(cache_dir).expanduser()
+        )
         self.db_path = base_dir / database_name
         self._retry_attempts = retry_attempts
         lock_path = Path(f"{self.db_path}.lock")

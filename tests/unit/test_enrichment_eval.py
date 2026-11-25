@@ -316,6 +316,35 @@ def test_enrichment_pipeline_active_rules_preservation() -> None:
     assert result["nested_tuple"][0]["age_in_months"] == 36
 
 
+def test_arrow_conversion_empty_rule_bypass() -> None:
+    """Verify empty rule bypass returns input identity and Arrow conversion preserves schema."""
+    pipeline_empty = EnrichmentPipeline(StudyConfiguration(study_key="STUDY-BENCH"))
+    assert pipeline_empty._has_rules is False
+
+    test_record = {
+        "record_id": 1,
+        "subject_key": "SUBJ-001",
+        "study_key": "STUDY-BENCH",
+        "form_id": 10,
+        "visit_id": 20,
+        "deleted": False,
+        "record_data": {
+            "unvnum": "1",
+            "aeterm": "Headache",
+            "aeser": "No",
+            "sub_dict": {"k1": "v1", "k2": "v2"},
+        },
+    }
+
+    assert pipeline_empty.process(test_record) is test_record
+
+    records = [Record.model_validate(fake_record()) for _ in range(25)]
+    table = _records_to_arrow_table(records)
+    assert table.num_rows == 25
+    assert "record_id" in table.column_names
+
+
+@pytest.mark.performance
 def test_arrow_conversion_speed_and_bypass() -> None:
     """Test that empty rule bypass eliminates traversal delay and speeds up Arrow conversion."""
     pipeline_empty = EnrichmentPipeline(StudyConfiguration(study_key="STUDY-BENCH"))

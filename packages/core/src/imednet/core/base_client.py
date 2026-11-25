@@ -122,40 +122,68 @@ class BaseClient:
         self._base_url = httpx.URL(self.base_url)
         from imednet.core.context import set_base_url_context, set_security_key_context
 
-        set_base_url_context(self.base_url)
-        if isinstance(resolved_config.security_key, str) and resolved_config.security_key.strip():
-            set_security_key_context(resolved_config.security_key)
-
-        self.timeout = (
-            timeout
-            if isinstance(timeout, httpx.Timeout)
-            else httpx.Timeout(resolved_config.timeout)
+        self._init_base_url_token: contextvars.Token[str | None] | None = set_base_url_context(
+            self.base_url
         )
-        self.retry_config = retry_config or RetryConfig()
+        self._init_security_key_token: contextvars.Token[str | None] | None = (
+            set_security_key_context(resolved_config.security_key)
+            if isinstance(resolved_config.security_key, str)
+            and resolved_config.security_key.strip()
+            else None
+        )
 
-        if auth is not None:
-            self.auth = auth
-        elif self.simulation_mode:
-            self.auth = ApiKeyAuth(
-                resolved_config.api_key or "SIMULATED_KEY",
-                resolved_config.security_key or "SIMULATED_KEY",
+        try:
+            self.timeout = (
+                timeout
+                if isinstance(timeout, httpx.Timeout)
+                else httpx.Timeout(resolved_config.timeout)
             )
-        elif resolved_config.oidc_token:
-            self.auth = OIDCAuth(resolved_config.oidc_token)
-        else:
-            self.auth = ApiKeyAuth(
-                resolved_config.api_key or "", resolved_config.security_key or ""
-            )
+            self.retry_config = retry_config or RetryConfig()
 
-        self._client = self._create_client(self.auth)
-        self._tracer: Tracer | None = None
+            if auth is not None:
+                self.auth = auth
+            elif self.simulation_mode:
+                self.auth = ApiKeyAuth(
+                    resolved_config.api_key or "SIMULATED_KEY",
+                    resolved_config.security_key or "SIMULATED_KEY",
+                )
+            elif resolved_config.oidc_token:
+                self.auth = OIDCAuth(resolved_config.oidc_token)
+            else:
+                self.auth = ApiKeyAuth(
+                    resolved_config.api_key or "", resolved_config.security_key or ""
+                )
 
-        if tracer is not None:
-            self._tracer = tracer
-        elif trace is not None:
-            self._tracer = trace.get_tracer(__name__)
-        else:
-            self._tracer = None
+            self._client = self._create_client(self.auth)
+            self._tracer: Tracer | None = None
+
+            if tracer is not None:
+                self._tracer = tracer
+            elif trace is not None:
+                self._tracer = trace.get_tracer(__name__)
+            else:
+                self._tracer = None
+        except BaseException:
+            self._reset_client_context()
+            raise
+
+    def _reset_client_context(self) -> None:
+        """Restore ContextVar tokens pushed during client initialization."""
+        from contextlib import suppress
+
+        from imednet.core.context import reset_base_url_context, reset_security_key_context
+
+        sec_token = getattr(self, "_init_security_key_token", None)
+        if sec_token is not None:
+            self._init_security_key_token = None
+            with suppress(ValueError, RuntimeError):
+                reset_security_key_context(sec_token)
+
+        base_token = getattr(self, "_init_base_url_token", None)
+        if base_token is not None:
+            self._init_base_url_token = None
+            with suppress(ValueError, RuntimeError):
+                reset_base_url_context(base_token)
 
     def _create_client(self, auth: AuthStrategy) -> Any:
         """Create the underlying HTTP client (to be implemented by subclasses)."""

@@ -38,6 +38,9 @@ pytestmark = pytest.mark.performance
 
 
 BASELINE_FILE = Path(__file__).resolve().parent / "baselines" / "performance_baseline.json"
+REPORTS_DIR = Path(__file__).resolve().parents[2] / "reports"
+PERFORMANCE_CACHE_FILE = REPORTS_DIR / "performance_cache.json"
+PERFORMANCE_REPORT_FILE = REPORTS_DIR / "performance_report.json"
 BENCHMARK_METRICS = (
     "record_generation_latency",
     "mongo_conversion_latency",
@@ -242,6 +245,7 @@ def evaluate_performance_suite(
     runs: int | None = None,
     record_count: int | None = None,
     report_dir: Path | str | None = None,
+    cache_path: Path | str | None = None,
 ) -> dict[str, float]:
     """Run calibrated median benchmarks, enforce static ceilings and baseline ratios, and emit report."""
     assert baseline_path.exists(), f"Committed performance baseline missing: {baseline_path}"
@@ -256,7 +260,27 @@ def evaluate_performance_suite(
     calibration_iterations = int(baseline_data.get("calibration_iterations", 5000))
     tolerance = float(baseline_data.get("max_regression_tolerance", 0.45))
 
-    with VerificationReporter(
+    effective_cache_path = (
+        Path(cache_path)
+        if cache_path is not None
+        else (
+            Path(report_dir) / "performance_cache.json"
+            if report_dir is not None
+            else PERFORMANCE_CACHE_FILE
+        )
+    )
+    mirror_report_path = PERFORMANCE_REPORT_FILE if report_dir is None else None
+
+    cached_metrics: dict[str, dict[str, float]] = {}
+    if effective_cache_path.exists():
+        try:
+            raw_cache = json.loads(effective_cache_path.read_text(encoding="utf-8"))
+            if isinstance(raw_cache, dict) and isinstance(raw_cache.get("metrics"), dict):
+                cached_metrics = raw_cache["metrics"]
+        except (OSError, ValueError, TypeError):
+            cached_metrics = {}
+
+    reporter = VerificationReporter(
         "performance",
         report_dir=report_dir,
         passed_summary=(
@@ -264,82 +288,149 @@ def evaluate_performance_suite(
             "static ceilings and CPU-normalized baseline ratios."
         ),
         failed_summary="Performance benchmark suite detected latency ceiling or baseline ratio regressions.",
-    ) as reporter:
-        print("Running SDK Observability & Performance Suite...")
-        calibration_latency = calibrate_runner_cpu(
-            runs=effective_runs,
-            iterations=calibration_iterations,
-        )
-        median_results = measure_median_benchmarks(
-            runs=effective_runs,
-            record_count=effective_record_count,
-        )
+    )
+    try:
+        with reporter:
+            print("Running SDK Observability & Performance Suite...")
+            calibration_latency = calibrate_runner_cpu(
+                runs=effective_runs,
+                iterations=calibration_iterations,
+            )
+            median_results = measure_median_benchmarks(
+                runs=effective_runs,
+                record_count=effective_record_count,
+            )
 
-        reporter.add_metric("calibration_latency", calibration_latency, unit="seconds")
-        current_ratios = {
-            metric: median_results[metric] / calibration_latency for metric in BENCHMARK_METRICS
-        }
+            reporter.add_metric("calibration_latency", calibration_latency, unit="seconds")
+            current_ratios = {
+                metric: median_results[metric] / calibration_latency for metric in BENCHMARK_METRICS
+            }
 
-        for metric in BENCHMARK_METRICS:
-            reporter.add_metric(metric, median_results[metric], unit="seconds")
-            reporter.add_metric(f"{metric}_ratio", current_ratios[metric], unit="ratio")
-
-        metrics_cfg = baseline_data.get("metrics", {})
-        for metric in BENCHMARK_METRICS:
-            if metric not in metrics_cfg:
-                reporter.add_violation(
-                    "missing_baseline",
-                    f"{metric}: missing configuration in {baseline_path.name}",
-                )
-                continue
-            ceiling = float(metrics_cfg[metric]["static_ceiling_seconds"])
-            if median_results[metric] > ceiling:
-                reporter.add_violation(
-                    "static_ceiling_exceeded",
-                    f"{metric}: median {median_results[metric]:.4f}s exceeds static ceiling {ceiling:.4f}s",
-                )
-
-        if update_baseline and not reporter.violations:
-            baseline_data["reference_calibration_seconds"] = round(calibration_latency, 6)
             for metric in BENCHMARK_METRICS:
-                metrics_cfg[metric]["normalized_ratio"] = round(current_ratios[metric], 4)
-            baseline_path.parent.mkdir(parents=True, exist_ok=True)
-            baseline_path.write_text(json.dumps(baseline_data, indent=2) + "\n", encoding="utf-8")
-            reporter.set_summary("Updated committed CPU-normalized performance baseline ratios.")
-        elif not update_baseline:
+                reporter.add_metric(metric, median_results[metric], unit="seconds")
+                reporter.add_metric(f"{metric}_ratio", current_ratios[metric], unit="ratio")
+                cached_entry = cached_metrics.get(metric)
+                if isinstance(cached_entry, dict) and "normalized_ratio" in cached_entry:
+                    reporter.add_metric(
+                        f"{metric}_cached_ratio",
+                        float(cached_entry["normalized_ratio"]),
+                        unit="ratio",
+                    )
+
+            metrics_cfg = baseline_data.get("metrics", {})
             for metric in BENCHMARK_METRICS:
                 if metric not in metrics_cfg:
-                    continue
-                baseline_ratio = float(metrics_cfg[metric]["normalized_ratio"])
-                allowed_ratio = baseline_ratio * (1.0 + tolerance)
-                diff_pct = (
-                    ((current_ratios[metric] - baseline_ratio) / baseline_ratio) * 100.0
-                    if baseline_ratio > 0
-                    else 0.0
-                )
-                if current_ratios[metric] > allowed_ratio:
                     reporter.add_violation(
-                        "baseline_regression",
-                        f"{metric}: normalized ratio {current_ratios[metric]:.4f} "
-                        f"(median {median_results[metric]:.4f}s) exceeds baseline "
-                        f"{baseline_ratio:.4f} by {diff_pct:.1f}% (> {tolerance * 100:.0f}%)",
+                        "missing_baseline",
+                        f"{metric}: missing configuration in {baseline_path.name}",
                     )
-                else:
-                    print(
-                        f"{metric} OK: median={median_results[metric]:.4f}s, "
-                        f"ratio={current_ratios[metric]:.4f} "
-                        f"(baseline={baseline_ratio:.4f}, diff={diff_pct:+.1f}%)"
+                    continue
+                ceiling = float(metrics_cfg[metric]["static_ceiling_seconds"])
+                if median_results[metric] > ceiling:
+                    reporter.add_violation(
+                        "static_ceiling_exceeded",
+                        f"{metric}: median {median_results[metric]:.4f}s exceeds static ceiling {ceiling:.4f}s",
                     )
 
-        if reporter.violations:
-            degradations = [v.message for v in reporter.violations]
-            reporter.set_summary(
-                f"Detected {len(degradations)} performance violation(s) across "
-                f"{len(BENCHMARK_METRICS)} benchmarks."
+            if update_baseline and not reporter.violations:
+                baseline_data["reference_calibration_seconds"] = round(calibration_latency, 6)
+                for metric in BENCHMARK_METRICS:
+                    metrics_cfg[metric]["normalized_ratio"] = round(current_ratios[metric], 4)
+                baseline_path.parent.mkdir(parents=True, exist_ok=True)
+                baseline_path.write_text(
+                    json.dumps(baseline_data, indent=2) + "\n", encoding="utf-8"
+                )
+                reporter.set_summary(
+                    "Updated committed CPU-normalized performance baseline ratios."
+                )
+            elif not update_baseline:
+                for metric in BENCHMARK_METRICS:
+                    if metric not in metrics_cfg:
+                        continue
+                    baseline_ratio = float(metrics_cfg[metric]["normalized_ratio"])
+                    allowed_ratio = baseline_ratio * (1.0 + tolerance)
+                    diff_pct = (
+                        ((current_ratios[metric] - baseline_ratio) / baseline_ratio) * 100.0
+                        if baseline_ratio > 0
+                        else 0.0
+                    )
+                    if current_ratios[metric] > allowed_ratio:
+                        reporter.add_violation(
+                            "baseline_regression",
+                            f"{metric}: normalized ratio {current_ratios[metric]:.4f} "
+                            f"(median {median_results[metric]:.4f}s) exceeds baseline "
+                            f"{baseline_ratio:.4f} by {diff_pct:.1f}% (> {tolerance * 100:.0f}%)",
+                        )
+                    else:
+                        print(
+                            f"{metric} OK: median={median_results[metric]:.4f}s, "
+                            f"ratio={current_ratios[metric]:.4f} "
+                            f"(baseline={baseline_ratio:.4f}, diff={diff_pct:+.1f}%)"
+                        )
+
+                    cached_entry = cached_metrics.get(metric)
+                    if isinstance(cached_entry, dict) and "normalized_ratio" in cached_entry:
+                        cached_ratio = float(cached_entry["normalized_ratio"])
+                        if cached_ratio > 0:
+                            cached_diff_pct = (
+                                (current_ratios[metric] - cached_ratio) / cached_ratio
+                            ) * 100.0
+                            reporter.add_metric(
+                                f"{metric}_cached_diff_pct",
+                                cached_diff_pct,
+                                unit="percent",
+                            )
+                            if current_ratios[metric] > cached_ratio * (1.0 + tolerance):
+                                reporter.add_violation(
+                                    "cached_baseline_regression",
+                                    f"{metric}: normalized ratio {current_ratios[metric]:.4f} "
+                                    f"(median {median_results[metric]:.4f}s) exceeds cached baseline "
+                                    f"{cached_ratio:.4f} by {cached_diff_pct:.1f}% (> {tolerance * 100:.0f}%)",
+                                )
+
+            if not reporter.violations:
+                cache_payload = {
+                    "calibration_seconds": round(calibration_latency, 6),
+                    "record_count": effective_record_count,
+                    "median_runs": effective_runs,
+                    "metrics": {
+                        metric: {
+                            "median_seconds": round(median_results[metric], 6),
+                            "normalized_ratio": round(current_ratios[metric], 4),
+                        }
+                        for metric in BENCHMARK_METRICS
+                    },
+                }
+                effective_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                effective_cache_path.write_text(
+                    json.dumps(cache_payload, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+            if reporter.violations:
+                degradations = [v.message for v in reporter.violations]
+                reporter.set_summary(
+                    f"Detected {len(degradations)} performance violation(s) across "
+                    f"{len(BENCHMARK_METRICS)} benchmarks."
+                )
+                assert not degradations, "Performance Regressions Detected:\n" + "\n".join(
+                    degradations
+                )
+
+            return median_results
+    finally:
+        written_report = reporter.last_report_path
+        if (
+            mirror_report_path is not None
+            and written_report is not None
+            and written_report.exists()
+            and written_report.resolve() != mirror_report_path.resolve()
+        ):
+            mirror_report_path.parent.mkdir(parents=True, exist_ok=True)
+            mirror_report_path.write_text(
+                written_report.read_text(encoding="utf-8"),
+                encoding="utf-8",
             )
-            assert not degradations, "Performance Regressions Detected:\n" + "\n".join(degradations)
-
-        return median_results
 
 
 def test_performance_suite(request: pytest.FixtureRequest):

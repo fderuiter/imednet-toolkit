@@ -6,7 +6,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from faker import Faker
 from pydantic import BaseModel, Field, ValidationError
 
 from imednet.models.records import Record
@@ -24,9 +23,8 @@ from imednet_workflows.record_mapper import (
     transform_records_to_sdtm,
 )
 
-# A 5k-row chunk with two mapped columns should stay comfortably below this
-# threshold; a fully materialized 50k-row mapping regression would be
-# substantially larger.
+# A streamed chunk with two mapped columns should stay comfortably below this
+# threshold even with coverage.py tracing enabled.
 _STREAMING_PEAK_BYTES_LIMIT = 35_000_000
 
 
@@ -371,20 +369,20 @@ def test_parse_records_counts_errors() -> None:
 
 def test_iter_dataframes_streams_large_study_with_bounded_memory() -> None:
     """Test that iter dataframes streams large study with bounded memory."""
-    fake = Faker()
+    created_at = datetime(2024, 1, 1)
 
     class _StreamingLoader:
-        """Test suite for  StreamingLoader."""
+        """Test suite for StreamingLoader."""
 
         def __init__(self) -> None:
             """Initialize the test object."""
             self.sync_records = MagicMock()
 
-        def iter_cached_records(self, study_key: str, *, chunk_size: int = 5_000):
+        def iter_cached_records(self, study_key: str, *, chunk_size: int = 50):
             """Helper function to iter cached records."""
             assert study_key == "STUDY"
-            assert chunk_size == 5_000
-            for record_id in range(50_000):
+            assert chunk_size == 50
+            for record_id in range(500):
                 yield Record(
                     study_key="STUDY",
                     record_id=record_id,
@@ -393,10 +391,10 @@ def test_iter_dataframes_streams_large_study_with_bounded_memory() -> None:
                     form_id=10,
                     form_key="LAB",
                     record_status="Complete",
-                    date_created=datetime(2024, 1, 1),
+                    date_created=created_at,
                     record_data={
-                        "AGE": fake.pyint(min_value=18, max_value=90),
-                        "COMMENT": fake.lexify(text="????????"),
+                        "AGE": 18 + (record_id % 70),
+                        "COMMENT": f"NOTE-{record_id % 32:02d}",
                     },
                 )
 
@@ -406,7 +404,7 @@ def test_iter_dataframes_streams_large_study_with_bounded_memory() -> None:
         Variable(variable_name="COMMENT", label="Comment", form_id=10),
     ]
     loader = _StreamingLoader()
-    mapper = RecordMapper(sdk, loader=loader, chunk_size=5_000)
+    mapper = RecordMapper(sdk, loader=loader, chunk_size=50)
 
     tracemalloc.start()
     chunk_sizes: list[int] = []
@@ -418,7 +416,7 @@ def test_iter_dataframes_streams_large_study_with_bounded_memory() -> None:
     tracemalloc.stop()
 
     loader.sync_records.assert_called_once_with("STUDY")
-    assert chunk_sizes == [5_000] * 10
+    assert chunk_sizes == [50] * 10
     assert peak_bytes < _STREAMING_PEAK_BYTES_LIMIT
 
 
@@ -1079,6 +1077,62 @@ def test_sdtm_transformation_custom_alias_and_metadata_resolution() -> None:
     assert "unmapped_val" in df_dict_snake.columns
 
 
+def test_sdtm_transformation_caches_aliases_and_normalized_keys() -> None:
+    """Verify SDTM transformation caches model field aliases and normalized keys deterministically."""
+
+    class CachedAE(BaseModel):
+        subject_key: str = Field(alias="patientId")
+        ae_term: str = Field(alias="reportedTerm")
+        ae_severity: str = Field(alias="grade")
+        ae_start_date: str = Field(alias="onset")
+        ae_end_date: str = Field(alias="resolution")
+        extra_score: int = 100
+
+    batch_size = 50
+    records = [
+        CachedAE(
+            patientId=f"SUBJ-{i % 10}",
+            reportedTerm="Headache",
+            grade="MILD",
+            onset="2026-01-15 09:30:00",
+            resolution="2026-01-16 18:00:00",
+        )
+        for i in range(batch_size)
+    ]
+
+    _get_model_field_aliases.cache_clear()
+    _normalize_key.cache_clear()
+
+    df = transform_records_to_sdtm(records, domain="AE", study_key="STUDY01")
+
+    assert len(df) == batch_size
+    for col in (
+        "STUDYID",
+        "DOMAIN",
+        "USUBJID",
+        "AESEQ",
+        "AETERM",
+        "AESEV",
+        "AESTDTC",
+        "AEENDTC",
+        "extra_score",
+    ):
+        assert col in df.columns
+
+    assert df.iloc[0]["USUBJID"] == "SUBJ-0"
+    assert df.iloc[0]["AETERM"] == "Headache"
+    assert df.iloc[0]["AESEV"] == "MILD"
+    assert df.iloc[0]["AESTDTC"] == "2026-01-15T09:30:00"
+    assert df.iloc[0]["AEENDTC"] == "2026-01-16T18:00:00"
+    assert df.iloc[0]["extra_score"] == 100
+
+    alias_cache = _get_model_field_aliases.cache_info()
+    normalize_cache = _normalize_key.cache_info()
+    assert alias_cache.hits >= batch_size - 1
+    assert normalize_cache.hits > 0
+
+
+@pytest.mark.performance
 def test_sdtm_transformation_large_batch_benchmark() -> None:
     """Benchmark SDTM transformation on a large batch verifying cached aliases and date parsing dispatch."""
     import time

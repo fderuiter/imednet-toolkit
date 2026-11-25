@@ -385,6 +385,45 @@ def test_write_transactions_acquire_file_lock(tmp_path: Path) -> None:
     assert loader.lock.is_locked is False
 
 
+def test_sync_records_reconcile_acquires_lock_once(tmp_path: Path) -> None:
+    """Verify reconciled batch sync acquires and releases the file lock once."""
+    from unittest.mock import patch
+
+    sdk = MagicMock()
+    records = [_record(i, f"2024-01-{(i % 28) + 1:02d} 00:00:00+00:00") for i in range(1, 21)]
+    projected = [
+        Record(study_key="STUDY", record_id=i, form_key="FORM", record_data=None)
+        for i in range(1, 21)
+    ]
+    sdk.get_records.side_effect = [records, projected]
+    loader = CachedRecordsLoader(sdk, cache_dir=tmp_path)
+
+    acquire_count = 0
+    release_count = 0
+    original_acquire = loader.lock.acquire
+    original_release = loader.lock.release
+
+    def _counting_acquire(*args, **kwargs):
+        nonlocal acquire_count
+        acquire_count += 1
+        return original_acquire(*args, **kwargs)
+
+    def _counting_release(*args, **kwargs):
+        nonlocal release_count
+        release_count += 1
+        return original_release(*args, **kwargs)
+
+    with (
+        patch.object(loader.lock, "acquire", side_effect=_counting_acquire),
+        patch.object(loader.lock, "release", side_effect=_counting_release),
+    ):
+        loader.sync_records("STUDY", reconcile=True)
+
+    assert acquire_count == 1
+    assert release_count == 1
+
+
+@pytest.mark.performance
 def test_lock_hold_duration_below_threshold(tmp_path: Path) -> None:
     """Verify that file lock hold duration is well below 50ms for typical batch sync operations."""
     import time
