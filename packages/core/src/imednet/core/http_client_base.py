@@ -75,8 +75,13 @@ class _OriginScopedAuth(httpx.Auth):
         """Inject credentials for same-origin requests and strip them cross-origin."""
         auth_headers = self._strategy.get_headers()
         if _url_origin(request.url) == self._origin:
-            for key, value in auth_headers.items():
-                request.headers[key] = value
+            if auth_headers:
+                for key, value in auth_headers.items():
+                    request.headers[key] = value
+            else:
+                for existing in list(request.headers.keys()):
+                    if existing.lower() == "authorization":
+                        del request.headers[existing]
         else:
             blocked = _CREDENTIAL_HEADER_NAMES | {key.lower() for key in auth_headers}
             for existing in list(request.headers.keys()):
