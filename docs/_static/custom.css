@@ -164,11 +164,24 @@ input.toctree-checkbox {
     }
 }
 
+table.domainindex-table td:first-child {
+    width: 28px;
+    min-width: 28px;
+    white-space: nowrap;
+}
+
 img.toggler {
-    cursor: pointer;
-    padding: 4px;
+    display: inline-block;
+    box-sizing: content-box;
+    width: 11px;
+    height: 11px;
+    min-width: 11px;
+    min-height: 11px;
+    max-width: none;
+    padding: 7px;
     border-radius: 4px;
     vertical-align: middle;
+    cursor: pointer;
 }
 
 body[data-theme="dark"] img.toggler {
