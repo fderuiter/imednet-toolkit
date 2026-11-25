@@ -97,7 +97,6 @@ class BasePaginator(Generic[ClientT]):
         self._remaining_limit: int | None = self._explicit_limit
         self._cursor: int | None = None
         self._remaining_in_page: int = 0
-        self._exhausted = False
 
     @property
     def cursor(self) -> int | None:

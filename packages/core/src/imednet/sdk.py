@@ -246,7 +246,6 @@ class _BaseSDK:
         from .utils.url import sanitize_base_url
 
         self.config = resolved
-        self._api_key = resolved.api_key
         self._security_key = resolved.security_key
         raw_base_url = (
             resolved.base_url
