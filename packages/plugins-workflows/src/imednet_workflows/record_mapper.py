@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import heapq
 import inspect
+import itertools
 import logging
 import types
 from collections.abc import Iterable, Iterator
@@ -52,6 +53,7 @@ from imednet.spi.utils import (
     stamp_tabular_batch,
 )
 
+from ._filter_bounds import build_single_item_variable_filters
 from .cached_loader import CachedRecordsLoader
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE, ChunkedRecordPipeline, iter_chunks
 
@@ -390,21 +392,7 @@ class RecordMapper:
         if form_whitelist is not None and len(form_whitelist) == 0:
             return [], {}
 
-        filters: dict[str, Any] = {}
-        if form_whitelist is not None:
-            filters["formId"] = (
-                form_whitelist[0] if len(form_whitelist) == 1 else list(form_whitelist)
-            )
-            if (
-                variable_whitelist is not None
-                and len(variable_whitelist) == 1
-                and len(form_whitelist) == 1
-            ):
-                filters["variableName"] = variable_whitelist[0]
-        elif variable_whitelist is not None:
-            filters["variableName"] = (
-                variable_whitelist[0] if len(variable_whitelist) == 1 else list(variable_whitelist)
-            )
+        filters = build_single_item_variable_filters(form_whitelist, variable_whitelist)
 
         from unittest.mock import NonCallableMock
 
@@ -456,25 +444,73 @@ class RecordMapper:
         return create_model("RecordData", __base__=BaseModel, **fields)  # type: ignore
 
     @staticmethod
+    def _coerce_form_id_scalar(value: Any) -> int:
+        """Validate and coerce a scalar formId filter item to an integer."""
+        if isinstance(value, bool) or value is None:
+            raise ValueError(f"Invalid formId filter value: {value!r}")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and (
+                stripped.isdigit() or (stripped.startswith("-") and stripped[1:].isdigit())
+            ):
+                return int(stripped)
+        raise ValueError(f"Invalid formId filter value: {value!r}")
+
+    @classmethod
     def _extract_form_ids(
+        cls,
         filters: dict[str, Any | tuple[str, Any] | list[Any]],
-    ) -> tuple[list[Any] | None, dict[str, Any | tuple[str, Any] | list[Any]]]:
-        """Extract scalar or multi-item formId filters and strip variable filters for /records."""
+    ) -> tuple[list[int] | None, dict[str, Any | tuple[str, Any] | list[Any]], list[int] | None]:
+        """Extract and coerce formId filters while preserving raw list arity for validation."""
         cleaned = dict(filters)
         cleaned.pop("variableNames", None)
         cleaned.pop("variableName", None)
 
-        if "formId" not in cleaned:
-            return None, cleaned
+        has_camel = "formId" in cleaned
+        has_snake = "form_id" in cleaned
+        if has_camel and has_snake:
+            raise ValueError("Duplicate filter attribute 'formId' in AND clause")
+        if not has_camel and not has_snake:
+            return None, cleaned, None
 
-        raw_form_id = cleaned.get("formId")
+        key = "formId" if has_camel else "form_id"
+        raw_form_id = cleaned[key]
         if isinstance(raw_form_id, (list, set)):
-            cleaned.pop("formId")
-            return list(dict.fromkeys(raw_form_id)), cleaned
-        if not isinstance(raw_form_id, tuple):
-            cleaned.pop("formId")
-            return [raw_form_id], cleaned
-        return None, cleaned
+            items = list(raw_form_id)
+            if not items:
+                cleaned.pop(key)
+                return [], cleaned, []
+            if any(isinstance(item, tuple) for item in items):
+                if not all(isinstance(item, tuple) for item in items):
+                    raise ValueError(
+                        f"Filter list for '{key}' cannot mix operator tuples and scalar values"
+                    )
+                coerced_tuples: list[tuple[str, int]] = []
+                for item in items:
+                    if len(item) != 2:
+                        raise ValueError(
+                            f"Filter tuple for '{key}' must have exactly 2 elements (operator, value), got {len(item)}"
+                        )
+                    coerced_tuples.append((item[0], cls._coerce_form_id_scalar(item[1])))
+                cleaned[key] = coerced_tuples
+                return None, cleaned, None
+            coerced_all = [cls._coerce_form_id_scalar(item) for item in items]
+            cleaned.pop(key)
+            return list(dict.fromkeys(coerced_all)), cleaned, coerced_all
+
+        if isinstance(raw_form_id, tuple):
+            if len(raw_form_id) != 2:
+                raise ValueError(
+                    f"Filter tuple for '{key}' must have exactly 2 elements (operator, value), got {len(raw_form_id)}"
+                )
+            cleaned[key] = (raw_form_id[0], cls._coerce_form_id_scalar(raw_form_id[1]))
+            return None, cleaned, None
+
+        coerced_single = cls._coerce_form_id_scalar(raw_form_id)
+        cleaned.pop(key)
+        return [coerced_single], cleaned, [coerced_single]
 
     def _is_mock_sdk_or_callable(self, fn: Any = None) -> bool:
         """Return True when ``self.sdk`` or *fn* is a unittest mock object."""
@@ -569,9 +605,17 @@ class RecordMapper:
                     visit_key,
                 )
 
-        form_id_list, filters = self._extract_form_ids(raw_filters)
-        if form_id_list is not None and len(form_id_list) == 0:
-            return
+        form_id_list, filters, raw_coerced_forms = self._extract_form_ids(raw_filters)
+        if form_id_list is not None:
+            validation_filters = dict(filters)
+            if raw_coerced_forms is not None:
+                validation_filters["formId"] = raw_coerced_forms
+            predicate = compile_record_predicate(
+                extra_filters=validation_filters,
+                record_data_filter=record_data_filter,
+            )
+            if predicate.always_empty:
+                return iter(())
         if sort is not None and "sort" not in filters:
             filters["sort"] = sort
 
@@ -583,76 +627,79 @@ class RecordMapper:
             else self.sdk.get_records
         )
 
-        try:
-            if form_id_list is not None:
-                if group_by_subject and len(form_id_list) > 1:
-                    yield from self._merge_form_record_streams(
-                        fetch_fn,
-                        study_key=study_key,
-                        form_id_list=form_id_list,
-                        record_data_filter=record_data_filter,
-                        filters=filters,
-                        include_deleted=effective_include_deleted,
-                    )
-                    return
-                for fid in form_id_list:
-                    raw_form_records = fetch_fn(
-                        study_key=study_key,
-                        record_data_filter=record_data_filter,
-                        **filters,
-                        formId=fid,
-                    )
-                    if group_by_subject and (
-                        isinstance(raw_form_records, (list, tuple))
-                        or (
-                            self._is_mock_sdk_or_callable(fetch_fn)
-                            and not isinstance(raw_form_records, types.GeneratorType)
+        def _stream() -> Iterator[RecordModel]:
+            try:
+                if form_id_list is not None:
+                    if group_by_subject and len(form_id_list) > 1:
+                        yield from self._merge_form_record_streams(
+                            fetch_fn,
+                            study_key=study_key,
+                            form_id_list=form_id_list,
+                            record_data_filter=record_data_filter,
+                            filters=filters,
+                            include_deleted=effective_include_deleted,
                         )
-                    ):
-                        materialized_form = [
-                            rec
-                            for rec in raw_form_records
-                            if effective_include_deleted or not is_record_deleted(rec)
-                        ]
-                        materialized_form.sort(key=lambda r: _extract_stream_usubjid_and_id(r))
-                        yield from materialized_form
-                        continue
-                    for rec in raw_form_records:
-                        if not effective_include_deleted and is_record_deleted(rec):
+                        return
+                    for fid in form_id_list:
+                        raw_form_records = fetch_fn(
+                            study_key=study_key,
+                            record_data_filter=record_data_filter,
+                            **filters,
+                            formId=fid,
+                        )
+                        if group_by_subject and (
+                            isinstance(raw_form_records, (list, tuple))
+                            or (
+                                self._is_mock_sdk_or_callable(fetch_fn)
+                                and not isinstance(raw_form_records, types.GeneratorType)
+                            )
+                        ):
+                            materialized_form = [
+                                rec
+                                for rec in raw_form_records
+                                if effective_include_deleted or not is_record_deleted(rec)
+                            ]
+                            materialized_form.sort(key=lambda r: _extract_stream_usubjid_and_id(r))
+                            yield from materialized_form
                             continue
-                        yield rec
-                return
+                        for rec in raw_form_records:
+                            if not effective_include_deleted and is_record_deleted(rec):
+                                continue
+                            yield rec
+                    return
 
-            raw_records = fetch_fn(
-                study_key=study_key,
-                record_data_filter=record_data_filter,
-                **filters,
-            )
-            if group_by_subject and (
-                isinstance(raw_records, (list, tuple))
-                or (
-                    self._is_mock_sdk_or_callable(fetch_fn)
-                    and not isinstance(raw_records, types.GeneratorType)
+                raw_records = fetch_fn(
+                    study_key=study_key,
+                    record_data_filter=record_data_filter,
+                    **filters,
                 )
-            ):
-                materialized = [
-                    rec
-                    for rec in raw_records
-                    if effective_include_deleted or not is_record_deleted(rec)
-                ]
-                materialized.sort(key=lambda r: _extract_stream_usubjid_and_id(r))
-                yield from materialized
+                if group_by_subject and (
+                    isinstance(raw_records, (list, tuple))
+                    or (
+                        self._is_mock_sdk_or_callable(fetch_fn)
+                        and not isinstance(raw_records, types.GeneratorType)
+                    )
+                ):
+                    materialized = [
+                        rec
+                        for rec in raw_records
+                        if effective_include_deleted or not is_record_deleted(rec)
+                    ]
+                    materialized.sort(key=lambda r: _extract_stream_usubjid_and_id(r))
+                    yield from materialized
+                    return
+
+                for rec in raw_records:
+                    if not effective_include_deleted and is_record_deleted(rec):
+                        continue
+                    yield rec
+            except ValueError:
+                raise
+            except Exception as exc:  # pragma: no cover - unexpected
+                logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
                 return
 
-            for rec in raw_records:
-                if not effective_include_deleted and is_record_deleted(rec):
-                    continue
-                yield rec
-        except ValueError:
-            raise
-        except Exception as exc:  # pragma: no cover - unexpected
-            logger.error("Failed to fetch records for study '%s': %s", study_key, exc)
-            return
+        return _stream()
 
     def _fetch_records(
         self,
@@ -736,21 +783,28 @@ class RecordMapper:
                 is_custom_sort = not is_sdtm_subject_sort
 
             if callable(sync_method) and callable(bound_iter) and not is_custom_sort:
-                form_id_list, remaining_filters = self._extract_form_ids(raw_filters)
-                if form_id_list is not None and len(form_id_list) == 0:
-                    return iter(())
-                form_ids: set[Any] | None = set(form_id_list) if form_id_list is not None else None
-                if form_id_list is not None and remaining_filters:
-                    compile_record_predicate(
-                        extra_filters={**remaining_filters, "formId": form_id_list[0]},
-                        record_data_filter=record_data_filter,
-                    )
+                cleaned_raw = dict(raw_filters)
+                if visit_key is not None:
+                    try:
+                        cleaned_raw["visitId"] = int(visit_key)
+                    except ValueError:
+                        logger.warning(
+                            "Invalid visit_key '%s'. Should be convertible to int. Fetching all records.",
+                            visit_key,
+                        )
+                form_id_list, remaining_filters, raw_coerced_forms = self._extract_form_ids(
+                    cleaned_raw
+                )
+                compile_filters = dict(remaining_filters)
+                if raw_coerced_forms is not None:
+                    compile_filters["formId"] = raw_coerced_forms
                 predicate = compile_record_predicate(
-                    extra_filters=remaining_filters,
+                    extra_filters=compile_filters,
                     record_data_filter=record_data_filter,
                 )
                 if predicate.always_empty:
                     return iter(())
+                form_ids: set[int] | None = set(form_id_list) if form_id_list is not None else None
 
                 sync_method(study_key)
                 iter_kwargs: dict[str, Any] = {"chunk_size": self._pipeline.chunk_size}
@@ -758,7 +812,7 @@ class RecordMapper:
                     iter_kwargs["order_by_subject"] = True
                 return self._filter_records(
                     bound_iter(study_key, **iter_kwargs),
-                    visit_key=visit_key,
+                    visit_key=None,
                     form_ids=form_ids,
                     include_deleted=effective_include_deleted,
                     predicate=predicate,
@@ -797,12 +851,16 @@ class RecordMapper:
                     visit_key,
                 )
 
+        normalized_form_ids: set[int] | None = (
+            {self._coerce_form_id_scalar(fid) for fid in form_ids} if form_ids is not None else None
+        )
+
         for record in records:
             if not effective_include_deleted and is_record_deleted(record):
                 continue
             if visit_id is not None and record.visit_id != visit_id:
                 continue
-            if form_ids is not None and record.form_id not in form_ids:
+            if normalized_form_ids is not None and record.form_id not in normalized_form_ids:
                 continue
             emitted: RecordModel = record
             if predicate is not None:
@@ -1700,6 +1758,17 @@ class RecordMapper:
         )
         if normalizer.remaps_usubjid:
             source_is_ordered = False
+        elif (
+            not source_is_ordered
+            and self._loader is None
+            and not force_drain_ungrouped_loader
+            and self._is_mock_sdk_or_callable()
+        ):
+            records, source_is_ordered = self._peek_mock_sdtm_stream_order(
+                records,
+                normalizer,
+                chunk_size=self._pipeline.chunk_size,
+            )
         seq_counters: dict[str, int] = {}
         for df in _iter_sorted_sdtm_frames(
             records,
@@ -1710,6 +1779,42 @@ class RecordMapper:
         ):
             if not df.empty:
                 yield df
+
+    @staticmethod
+    def _peek_mock_sdtm_stream_order(
+        records: Iterable[Any],
+        normalizer: _SdtmNormalizer,
+        *,
+        chunk_size: int,
+    ) -> tuple[Iterable[Any], bool]:
+        """Peek up to the first chunk boundary on mock SDK streams to detect Subject order."""
+        rec_iter = iter(records)
+        peeked: list[Any] = []
+        last_usubjid: str | None = None
+        current_subj_rows = 0
+        completed_rows = 0
+
+        for idx, rec in enumerate(rec_iter):
+            peeked.append(rec)
+            prepared = normalizer.prepare_record(rec, idx)
+            if prepared is None:
+                continue
+            if last_usubjid is None:
+                last_usubjid = prepared.usubjid
+                current_subj_rows = 1
+                continue
+            if prepared.usubjid == last_usubjid:
+                current_subj_rows += 1
+                continue
+            if prepared.usubjid < last_usubjid:
+                return itertools.chain(peeked, rec_iter), False
+            completed_rows += current_subj_rows
+            last_usubjid = prepared.usubjid
+            current_subj_rows = 1
+            if completed_rows >= chunk_size:
+                break
+
+        return itertools.chain(peeked, rec_iter), True
 
     def _try_fetch_study_forms_for_sdtm(self, study_key: str) -> list[Any]:
         """Return concrete Study Forms when ``self.sdk.forms.list`` yields non-mock Form entries."""

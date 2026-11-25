@@ -262,16 +262,18 @@ def test_external_result_url_ssrf_and_scheme_violations_fail_closed(unsafe_url: 
 async def test_external_result_url_dns_private_ip_and_cross_origin_redirects_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """DNS resolution to metadata/private IPs and cross-origin redirects raise JobFailedError."""
+    """Cross-origin HTTPS storage redirects strip credentials while private/HTTP targets fail closed."""
+    from imednet.errors import ImednetError
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "edc.synthetic.imednet.test":
             batch_id = request.url.path.rsplit("/", 1)[-1]
-            target = (
-                "https://rebind.synthetic.example/results.json"
-                if batch_id == "B-DNS"
-                else "https://s3.synthetic.example/redirect"
-            )
+            if batch_id == "B-DNS":
+                target = "https://rebind.synthetic.example/results.json"
+            elif batch_id == "B-HTTP-REDIRECT":
+                target = "https://s3.synthetic.example/redirect-http"
+            else:
+                target = "https://s3.synthetic.example/redirect"
             return httpx.Response(
                 200,
                 json={
@@ -283,9 +285,18 @@ async def test_external_result_url_dns_private_ip_and_cross_origin_redirects_fai
                 },
             )
         if str(request.url) == "https://s3.synthetic.example/redirect":
+            assert CREDENTIAL_HEADERS.isdisjoint({k.lower() for k in request.headers})
             return httpx.Response(
                 302,
-                headers={"Location": "https://attacker.synthetic.example/steal"},
+                headers={"Location": "https://cdn.synthetic.example/results.json"},
+            )
+        if str(request.url) == "https://cdn.synthetic.example/results.json":
+            assert CREDENTIAL_HEADERS.isdisjoint({k.lower() for k in request.headers})
+            return httpx.Response(200, json=[{"recordId": 1, "status": "PASS"}])
+        if str(request.url) == "https://s3.synthetic.example/redirect-http":
+            return httpx.Response(
+                302,
+                headers={"Location": "http://cdn.synthetic.example/insecure.json"},
             )
         if str(request.url) == "https://s3.synthetic.example/same-origin-start":
             return httpx.Response(
@@ -304,9 +315,16 @@ async def test_external_result_url_dns_private_ip_and_cross_origin_redirects_fai
         transport=httpx.MockTransport(handler),
     ) as sdk:
         poller = AsyncJobPoller(sdk.jobs.get, fetch_result=sdk.jobs.fetch_result)
-        # Cross-origin redirect fails closed with JobFailedError
-        with pytest.raises(JobFailedError, match="Cross-origin redirects are not allowed"):
-            await poller.run("STUDY1", "B-REDIRECT", interval=0, timeout=5)
+        # Cross-origin 302 redirect to public HTTPS storage succeeds with credentials stripped
+        redirected_status = await poller.run("STUDY1", "B-REDIRECT", interval=0, timeout=5)
+        assert redirected_status.results == [{"recordId": 1, "status": "PASS"}]
+
+        # Cross-origin 302 redirect to non-HTTPS fails closed with JobFailedError (ImednetError)
+        with pytest.raises(JobFailedError, match="External URL must use https") as http_exc:
+            await poller.run("STUDY1", "B-HTTP-REDIRECT", interval=0, timeout=5)
+        assert isinstance(http_exc.value, ImednetError)
+        assert isinstance(http_exc.value.__cause__, ImednetError)
+        assert isinstance(http_exc.value.__cause__, ValueError)
 
         # Same-origin HTTPS redirect succeeds without leaking credentials
         same_origin_resp = await sdk._async_client.fetch_external_url(
@@ -323,8 +341,11 @@ async def test_external_result_url_dns_private_ip_and_cross_origin_redirects_fai
                 (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port))
             ],
         )
-        with pytest.raises(JobFailedError, match="Blocked non-public IP"):
+        with pytest.raises(JobFailedError, match="Blocked non-public IP") as dns_exc:
             await poller.run("STUDY1", "B-DNS", interval=0, timeout=5)
+        assert isinstance(dns_exc.value, ImednetError)
+        assert isinstance(dns_exc.value.__cause__, ImednetError)
+        assert isinstance(dns_exc.value.__cause__, ValueError)
 
 
 @pytest.mark.asyncio
@@ -862,3 +883,109 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
         async_studies = await async_sdk.async_get_studies()
         assert len(async_studies) == 1
         assert async_studies[0].study_key == "STUDY1"
+
+
+@pytest.mark.asyncio
+async def test_job_errors_inherit_imednet_error_and_private_same_origin_result_url_redirects() -> (
+    None
+):
+    """Job/resultUrl errors inherit ImednetError, and private base_url resultUrl + 302 storage hops work."""
+    from imednet.errors import ImednetError
+    from imednet.models.jobs import (
+        InvalidJobStateError,
+        InvalidJobTransitionError,
+        JobStatus,
+        normalize_job_state,
+        validate_job_transition,
+    )
+    from imednet.utils.job_poller import JobTimeoutError
+
+    # 1. Verify ImednetError + stdlib dual inheritance across Job and resultUrl exceptions
+    with pytest.raises(InvalidJobStateError) as state_exc:
+        normalize_job_state("NOT_A_STATE")
+    assert isinstance(state_exc.value, ImednetError)
+    assert isinstance(state_exc.value, ValueError)
+
+    with pytest.raises(InvalidJobTransitionError) as trans_exc:
+        validate_job_transition("COMPLETED", "RUNNING")
+    assert isinstance(trans_exc.value, ImednetError)
+    assert isinstance(trans_exc.value, ValueError)
+
+    timeout_err = JobTimeoutError("timed out")
+    assert isinstance(timeout_err, ImednetError)
+    assert isinstance(timeout_err, TimeoutError)
+
+    failed_err = JobFailedError("Job B-ERR failed", JobStatus(batchId="B-ERR", state="FAILED"))
+    assert isinstance(failed_err, ImednetError)
+
+    # 2. Private base_url same-origin resultUrl and 302 redirect to public HTTPS storage
+    private_base = "https://10.24.8.15/subpath"
+    seen_requests: list[tuple[str, dict[str, str]]] = []
+
+    def private_handler(req: httpx.Request) -> httpx.Response:
+        hdrs = {k.lower(): v for k, v in req.headers.items()}
+        seen_requests.append((str(req.url), hdrs))
+        if str(req.url) == "https://10.24.8.15/subpath/results/direct.json":
+            assert hdrs["x-api-key"] == "priv-key"
+            assert hdrs["x-imn-security-key"] == "priv-sec"
+            return httpx.Response(200, json=[{"recordId": 101, "status": "PASS"}])
+        if str(req.url) == "https://10.24.8.15/subpath/results/redirect.json":
+            assert hdrs["x-api-key"] == "priv-key"
+            return httpx.Response(
+                302,
+                headers={"Location": "https://storage.synthetic.example/signed/batch.json"},
+            )
+        if str(req.url) == "https://10.24.8.15/subpath/results/http_redirect.json":
+            return httpx.Response(
+                302,
+                headers={"Location": "http://storage.synthetic.example/signed/insecure.json"},
+            )
+        if str(req.url) == "https://storage.synthetic.example/signed/batch.json":
+            assert CREDENTIAL_HEADERS.isdisjoint(hdrs)
+            return httpx.Response(200, json=[{"recordId": 202, "status": "PASS"}])
+        return httpx.Response(404)
+
+    with ImednetSDK(
+        api_key="priv-key",  # pragma: allowlist secret
+        security_key="priv-sec",  # pragma: allowlist secret
+        base_url=private_base,
+        retries=0,
+        transport=httpx.MockTransport(private_handler),
+    ) as sync_sdk:
+        direct_resp = sync_sdk.jobs.fetch_result("https://10.24.8.15/subpath/results/direct.json")
+        assert direct_resp.json() == [{"recordId": 101, "status": "PASS"}]
+
+        redir_resp = sync_sdk.jobs.fetch_result("https://10.24.8.15/subpath/results/redirect.json")
+        assert redir_resp.json() == [{"recordId": 202, "status": "PASS"}]
+
+        # Untrusted private IP, http:// cross-origin redirect, and malformed URLs raise ImednetError + ValueError
+        for bad_url in (
+            "https://10.99.99.99/results/untrusted.json",
+            "https://10.24.8.15/subpath/results/http_redirect.json",
+            "https://[::1/malformed",
+            "https://storage.synthetic.example:99999/bad-port",
+        ):
+            with pytest.raises(ImednetError) as untrusted_exc:
+                sync_sdk.jobs.fetch_result(bad_url)
+            assert isinstance(untrusted_exc.value, ValueError)
+
+    async with AsyncImednetSDK(
+        api_key="priv-key",  # pragma: allowlist secret
+        security_key="priv-sec",  # pragma: allowlist secret
+        base_url=private_base,
+        retries=0,
+        transport=httpx.MockTransport(private_handler),
+    ) as async_sdk:
+        async_direct = await async_sdk.jobs.fetch_result(
+            "https://10.24.8.15/subpath/results/direct.json"
+        )
+        assert async_direct.json() == [{"recordId": 101, "status": "PASS"}]
+
+        async_redir = await async_sdk.jobs.fetch_result(
+            "https://10.24.8.15/subpath/results/redirect.json"
+        )
+        assert async_redir.json() == [{"recordId": 202, "status": "PASS"}]
+
+        with pytest.raises(ImednetError) as async_untrusted_exc:
+            await async_sdk.jobs.fetch_result("https://192.168.1.50/results/untrusted.json")
+        assert isinstance(async_untrusted_exc.value, ValueError)

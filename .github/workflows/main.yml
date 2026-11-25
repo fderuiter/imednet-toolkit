@@ -233,6 +233,7 @@ jobs:
 
       - name: Run Quality & Security Checks
         run: |
+          uvx --from "detect-secrets==1.5.0" python scripts/run_secret_scan.py .
           uvx --from "semgrep==1.185.0" semgrep scan --config p/security-audit --metrics off --error packages
           uvx --from "vulture>=2.11" vulture packages vulture_whitelist.py --min-confidence 80 --exclude "**/tests/**,**/docs/**,**/scripts/**"
           uvx --from "pylint>=3.0.0" pylint --rcfile=pyproject.toml --disable=all --enable=similarities --min-similarity-lines=20 --ignore-paths='.*/tests/.*,.*/docs/.*,.*/scripts/.*,.*/models/.*,tests/.*,docs/.*,scripts/.*,.*\.json$' --ignore-patterns='.*monitor.*,.*integrations.*,.*sinks.*,.*testing.*' packages

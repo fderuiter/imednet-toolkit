@@ -59,8 +59,10 @@ def test_list_preserves_explicit_size_override(dummy_client):
     assert requested_params[1]["size"] == 50
 
 
-def test_queries_endpoint_is_list_only_and_rejects_undocumented_filters(dummy_client):
-    """Test that QueriesEndpoint exposes no get method and rejects annotationId/status."""
+def test_queries_endpoint_is_list_only_and_rejects_undocumented_filters(
+    dummy_client, paginator_factory
+):
+    """Test that QueriesEndpoint exposes no get method, accepts annotationId, and rejects status."""
     ep = queries.QueriesEndpoint(dummy_client)
     async_ep = queries.AsyncQueriesEndpoint(dummy_client)
 
@@ -68,8 +70,11 @@ def test_queries_endpoint_is_list_only_and_rejects_undocumented_filters(dummy_cl
     assert not hasattr(async_ep, "get")
     assert not hasattr(queries.QueriesOperationDef, "_id_param")
 
-    with pytest.raises(ConfigurationError, match="annotationId"):
-        ep.list("S1", annotationId=1)
+    capture = paginator_factory(queries, [{"annotationId": 701, "status": "OPEN"}])
+    assert len(ep.list("S1", annotationId=701)) == 1
+    assert capture["params"]["filter"] == "annotationId==701"
+    assert len(ep.list("S1", annotation_id=701)) == 1
+    assert capture["params"]["filter"] == "annotationId==701"
 
     with pytest.raises(ConfigurationError, match="status"):
         ep.list("S1", status="OPEN")

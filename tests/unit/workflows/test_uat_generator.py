@@ -737,3 +737,287 @@ def test_seeded_datetime_determinism_and_locale_compat(mock_snapshot):
     res2 = gen2.generate(spec, mock_snapshot)
     assert res1[0].payloads[0]["data"]["DT"] == res2[0].payloads[0]["data"]["DT"]
     assert res1[0].payloads[0]["data"]["DT"].endswith("T12:00:00+00:00")
+
+
+def test_register_subject_boundary_and_coded_all_unique_placeholders_and_1to1_resolution(
+    mock_snapshot,
+):
+    """REGISTER_SUBJECT allocates unique placeholders when payloads exceed subject_pool and resolves 1-to-1."""
+    spec = UATSpecification(
+        study_key="STUDY",
+        study_name="Study",
+        subject_specs=[
+            UATSubjectSpec(site_name="Test Site", subject_count=1, subject_key_prefix="UAT-TEST-")
+        ],
+        form_specs=[
+            UATFormSpec(
+                form_key="F_DM",
+                form_name="Demographics",
+                form_type="Enrollment",
+                test_type=RecordTestType.REGISTER_SUBJECT,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="V_AGE",
+                        variable_key="V_AGE",
+                        variable_type="Integer",
+                        form_key="F_DM",
+                        strategy=VariableTestStrategy.BOUNDARY,
+                        min_value=18,
+                        max_value=65,
+                    )
+                ],
+            ),
+            UATFormSpec(
+                form_key="F_VS",
+                form_name="Vitals",
+                form_type="Standard",
+                test_type=RecordTestType.CREATE_NEW_RECORD,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="VISIT_CODE",
+                        variable_key="VC",
+                        variable_type="Integer",
+                        form_key="F_VS",
+                        strategy=VariableTestStrategy.CODED_ALL,
+                        coded_values=["1", "2"],
+                    )
+                ],
+            ),
+        ],
+    )
+
+    gen = SyntheticRecordGenerator(seed=11)
+    record_sets = gen.generate(spec, mock_snapshot)
+    reg_rs, data_rs = record_sets
+    assert reg_rs.subject_keys == ["UAT-TEST-001", "UAT-TEST-002"]
+    assert all("subjectKey" not in p for p in reg_rs.payloads)
+    assert [p["data"]["VISIT_CODE"] for p in data_rs.payloads] == [1, 2]
+    assert all(isinstance(p["data"]["VISIT_CODE"], int) for p in data_rs.payloads)
+
+    # 1-to-1 resolution retains both enrolled keys without dropping via setdefault
+    gen.resolve_subject_keys(record_sets, ["SUBJ-1001", "SUBJ-1002"])
+    assert reg_rs.subject_keys == ["SUBJ-1001", "SUBJ-1002"]
+    assert data_rs.subject_keys == ["SUBJ-1001", "SUBJ-1002"]
+    assert [p["subjectKey"] for p in data_rs.payloads] == ["SUBJ-1001", "SUBJ-1002"]
+
+    # Also test CODED_ALL on REGISTER_SUBJECT (3 payloads vs subject_count=1) + explicit registration_placeholders queue
+    spec_coded_reg = UATSpecification(
+        study_key="STUDY",
+        study_name="Study",
+        subject_specs=[
+            UATSubjectSpec(site_name="Test Site", subject_count=1, subject_key_prefix="ENR-")
+        ],
+        form_specs=[
+            UATFormSpec(
+                form_key="F_DM",
+                form_name="Demographics",
+                form_type="Enrollment",
+                test_type=RecordTestType.REGISTER_SUBJECT,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="ARM_NUM",
+                        variable_key="ARM",
+                        variable_type="Integer",
+                        form_key="F_DM",
+                        strategy=VariableTestStrategy.CODED_ALL,
+                        coded_values=["10", "20", "30"],
+                    )
+                ],
+            )
+        ],
+    )
+    coded_rs = gen.generate(spec_coded_reg, mock_snapshot)
+    assert coded_rs[0].subject_keys == ["ENR-001", "ENR-002", "ENR-003"]
+    assert [p["data"]["ARM_NUM"] for p in coded_rs[0].payloads] == [10, 20, 30]
+
+    # Duplicate placeholder queue in registration_placeholders binds 1-to-1 sequentially
+    dup_data_rs = coded_rs[0].model_copy(
+        update={
+            "test_type": RecordTestType.CREATE_NEW_RECORD,
+            "subject_keys": ["DUP-PH", "DUP-PH", "EXTRA-PH"],
+            "payloads": [
+                {"formKey": "F_VS", "subjectKey": "DUP-PH", "data": {"X": 1}},
+                {"formKey": "F_VS", "subjectKey": "DUP-PH", "data": {"X": 2}},
+                {"formKey": "F_VS", "subjectKey": "EXTRA-PH", "data": {"X": 3}},
+            ],
+        }
+    )
+    gen.resolve_subject_keys(
+        [dup_data_rs],
+        ["SUBJ-A", "SUBJ-B"],
+        placeholder_keys=["DUP-PH", "DUP-PH"],
+        preserved_keys={"EXTRA-PH"},
+    )
+    assert [p["subjectKey"] for p in dup_data_rs.payloads] == ["SUBJ-A", "SUBJ-B", "EXTRA-PH"]
+
+    # Fallback mapping when placeholder_keys count differs from enrolled_subject_keys and extra subject_keys exist
+    extra_keys_rs = dup_data_rs.model_copy(
+        update={
+            "subject_keys": ["P1", "P2", "P1"],
+            "payloads": [{"formKey": "F_VS", "subjectKey": "P1", "data": {"X": 1}}],
+        }
+    )
+    assert gen.resolve_subject_keys([extra_keys_rs], []) == {}
+    gen.resolve_subject_keys(
+        [extra_keys_rs],
+        ["SUBJ-ONLY"],
+        placeholder_keys=["P1", "P2"],
+    )
+    assert extra_keys_rs.subject_keys == ["SUBJ-ONLY", "SUBJ-ONLY", "SUBJ-ONLY"]
+
+
+def test_generator_schema_only_enrichment_and_contracts_scalar_coercion_edges(mock_snapshot):
+    """Enrich UATFormSpec from schema when data_dictionary is None and verify _contracts scalar/site helpers."""
+    import math
+
+    from imednet.datadict import Choice, DataDictionary
+    from imednet.datadict import Form as DDForm
+    from imednet.datadict import Variable as DDVariable
+    from imednet_workflows.uat._contracts import (
+        coerce_optional_bool,
+        coerce_variable_scalar,
+        extract_subject_site_id,
+        is_enrollment_form_key,
+        is_retired_variable_def,
+        lookup_schema_form_variables,
+        resolve_enriched_variable_type,
+        subject_has_keyword,
+        subject_matches_site,
+    )
+
+    schema_dd = DataDictionary(
+        forms=[
+            DDForm(
+                formKey="F_SCHEMA",
+                extraAttributes={"formType": "Enrollment"},
+                variables=[
+                    DDVariable(
+                        variableName="INT_CHOICE",
+                        variableType="Coded",
+                        extraAttributes={"odmDataType": "integer"},
+                        choices=[
+                            Choice(choiceText="Low", choiceValue="1"),
+                            Choice(choiceText="High", choiceValue="2"),
+                        ],
+                    ),
+                    DDVariable(
+                        variableName="FLT_CHOICE",
+                        variableType="Float",
+                        choices=[Choice(choiceText="Dose", choiceValue="5")],
+                    ),
+                    DDVariable(
+                        variableName="BOOL_FIXED",
+                        variableType="Boolean",
+                    ),
+                    DDVariable(
+                        variableName="CALC_FIXED",
+                        variableType="Calculation",
+                    ),
+                ],
+            )
+        ]
+    )
+
+    spec = UATSpecification(
+        study_key="S1",
+        study_name="S1",
+        form_specs=[
+            UATFormSpec(
+                form_key="F_SCHEMA",
+                form_name="Schema Form",
+                form_type="Standard",
+                test_type=RecordTestType.CREATE_NEW_RECORD,
+                subject_count=1,
+                variables=[
+                    UATVariableSpec(
+                        variable_name="INT_CHOICE",
+                        variable_key="V1",
+                        variable_type="Coded",
+                        form_key="F_SCHEMA",
+                        strategy=VariableTestStrategy.CODED_ALL,
+                    ),
+                    UATVariableSpec(
+                        variable_name="FLT_CHOICE",
+                        variable_key="V2",
+                        variable_type="Float",
+                        form_key="F_SCHEMA",
+                        strategy=VariableTestStrategy.FIXED,
+                        fixed_value="5",
+                    ),
+                    UATVariableSpec(
+                        variable_name="BOOL_FIXED",
+                        variable_key="V3",
+                        variable_type="Boolean",
+                        form_key="F_SCHEMA",
+                        strategy=VariableTestStrategy.FIXED,
+                        fixed_value="yes",
+                    ),
+                    UATVariableSpec(
+                        variable_name="CALC_FIXED",
+                        variable_key="V4",
+                        variable_type="Calculation",
+                        form_key="F_SCHEMA",
+                        strategy=VariableTestStrategy.FIXED,
+                        fixed_value="12.5",
+                    ),
+                ],
+            )
+        ],
+    )
+
+    gen = SyntheticRecordGenerator(seed=5)
+    record_sets = gen.generate(spec, mock_snapshot, schema=schema_dd)
+    assert len(record_sets[0].payloads) == 2
+    p0, p1 = record_sets[0].payloads
+    assert p0["data"]["INT_CHOICE"] == 1 and isinstance(p0["data"]["INT_CHOICE"], int)
+    assert p1["data"]["INT_CHOICE"] == 2 and isinstance(p1["data"]["INT_CHOICE"], int)
+    assert p0["data"]["FLT_CHOICE"] == 5 and isinstance(p0["data"]["FLT_CHOICE"], int)
+    assert p0["data"]["BOOL_FIXED"] is True
+    assert p0["data"]["CALC_FIXED"] == pytest.approx(12.5)
+
+    # Edge branches in uat._contracts
+    assert coerce_optional_bool("0") is False
+    assert coerce_optional_bool("1") is True
+    assert coerce_optional_bool(42) is None
+    assert coerce_variable_scalar("Integer", None) == ""
+    assert coerce_variable_scalar("Integer", "") == ""
+    assert coerce_variable_scalar("Integer", True) == 1
+    assert coerce_variable_scalar("Integer", 7.9) == 7
+    assert coerce_variable_scalar("Integer", "not_int") == "not_int"
+    assert coerce_variable_scalar("Float", True) is True
+    assert coerce_variable_scalar("Float", 4, has_choices=False) == pytest.approx(4.0)
+    assert coerce_variable_scalar("Float", 4, has_choices=True) == 4
+    assert coerce_variable_scalar("Float", math.inf) == "inf"
+    assert coerce_variable_scalar("Float", "bad") == "bad"
+    assert coerce_variable_scalar("Boolean", 0) is False
+    assert coerce_variable_scalar("Boolean", "false") is False
+    assert coerce_variable_scalar("Boolean", "maybe") == "maybe"
+    assert coerce_variable_scalar("Calculation", True) == pytest.approx(1.0)
+    assert coerce_variable_scalar("Calculation", "99") == 99
+    assert coerce_variable_scalar("Calculation", "bad") == "bad"
+    assert coerce_variable_scalar("Checkbox", True) is True
+
+    assert resolve_enriched_variable_type(None, None) == "Text"
+    assert is_retired_variable_def({"extraAttributes": {"deleted": "Yes"}}) is True
+    assert lookup_schema_form_variables(None, "F1") == {}
+    assert is_enrollment_form_key("", None, schema_dd) is False
+    assert is_enrollment_form_key("F_SCHEMA", None, schema_dd) is True
+    assert subject_has_keyword({"keywords": ["OTHER", "UAT"]}, "UAT") is True
+    assert extract_subject_site_id({"siteId": True}) is None
+    assert extract_subject_site_id({"siteId": "104"}) == 104
+    assert (
+        subject_matches_site(
+            {"siteName": "South Site", "siteId": 104}, site_name="South Site", site_id=104
+        )
+        is True
+    )
+    assert (
+        subject_matches_site(
+            {"siteName": "SITE", "siteId": 101}, site_name="South Site", site_id=104
+        )
+        is False
+    )
+    assert subject_matches_site({"siteId": 104}, site_id=104) is True

@@ -43,13 +43,13 @@ from imednet.spi.utils import (
 )
 from imednet.spi.utils import get_sqlite_connection as _spi_get_sqlite_connection
 
+from ._filter_bounds import build_delta_watermark_filter, plan_missing_record_id_bound
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE
 
 if TYPE_CHECKING:
     from imednet.spi.facade import ImednetFacade
 
 DEFAULT_CACHE_DIR = Path.home() / ".imednet" / "cache"
-_MISSING_ID_BATCH_SIZE = 100
 _EPOCH_FLOOR_WATERMARK = "1970-01-01T00:00:00Z"
 
 _T = TypeVar("_T")
@@ -84,7 +84,6 @@ class _LocalRecordMeta:
     date_modified: str | None
     form_key: str
     record_status: str
-    revision: int | None
     last_updated: str | None
 
 
@@ -104,19 +103,6 @@ def _normalize_status_token(value: Any) -> str:
     return str(raw).strip()
 
 
-def _normalize_optional_int(value: Any) -> int | None:
-    """Return integer value when positive/non-boolean, otherwise None."""
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    try:
-        parsed = int(str(value).strip())
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
 def _is_projected_record_updated(projected: Record, local_meta: _LocalRecordMeta) -> bool:
     """Return True when upstream lightweight projection metadata supersedes cached metadata."""
     proj_dm = _serialize_date_modified(projected.date_modified)
@@ -129,10 +115,6 @@ def _is_projected_record_updated(projected: Record, local_meta: _LocalRecordMeta
 
     proj_form_key = (projected.form_key or "").strip()
     if proj_form_key and proj_form_key != local_meta.form_key:
-        return True
-
-    proj_rev = _normalize_optional_int(getattr(projected, "revision", None))
-    if proj_rev is not None and proj_rev != local_meta.revision:
         return True
 
     proj_last_updated = _serialize_date_modified(getattr(projected, "last_updated", None))
@@ -1000,7 +982,6 @@ class CachedRecordsLoader:
                     json_extract(payload, '$.recordStatus'),
                     json_extract(payload, '$.record_status')
                 ) AS record_status,
-                json_extract(payload, '$.revision') AS revision,
                 COALESCE(
                     json_extract(payload, '$.lastUpdated'),
                     json_extract(payload, '$.last_updated')
@@ -1017,7 +998,6 @@ class CachedRecordsLoader:
                 date_modified=_serialize_date_modified(row["date_modified"]),
                 form_key=str(row["form_key"] or "").strip(),
                 record_status=_normalize_status_token(row["record_status"]),
-                revision=_normalize_optional_int(row["revision"]),
                 last_updated=_serialize_date_modified(row["last_updated"]),
             )
         return metadata
@@ -1091,7 +1071,7 @@ class CachedRecordsLoader:
 
     def _fetch_delta_records(self, study_key: str, high_water_mark: str | None) -> list[Record]:
         """Fetch records from the API that have been modified since the high water mark."""
-        if not high_water_mark:
+        if not high_water_mark or not high_water_mark.strip():
             records = self._list_records(
                 study_key=study_key,
                 record_data_filter=None,
@@ -1101,7 +1081,7 @@ class CachedRecordsLoader:
 
         # Use >= to avoid missing updates that share the high-water-mark timestamp.
         # _upsert_records_unlocked keeps refresh idempotent by deduplicating on (base_url, study_key, record_id).
-        delta_filter = build_filter_string({"date_modified": (">=", high_water_mark)})
+        delta_filter = build_delta_watermark_filter(high_water_mark)
         return self._list_records_with_filter_override(
             study_key=study_key,
             filter_string=delta_filter,
@@ -1116,18 +1096,12 @@ class CachedRecordsLoader:
         """Fetch full record payloads for upstream active IDs missing or stale in local cache."""
         if not missing_ids:
             return []
-        sorted_ids = sorted(missing_ids)
-        fetched: list[Record] = []
-        for idx in range(0, len(sorted_ids), _MISSING_ID_BATCH_SIZE):
-            batch_ids = sorted_ids[idx : idx + _MISSING_ID_BATCH_SIZE]
-            batch_set = set(batch_ids)
-            records = self._list_records(
-                study_key=study_key,
-                record_id=batch_ids,
-                record_data_filter=None,
-            )
-            fetched.extend(record for record in records if record.record_id in batch_set)
-        return fetched
+        records = self._list_records(
+            study_key=study_key,
+            record_id=plan_missing_record_id_bound(missing_ids),
+            record_data_filter=None,
+        )
+        return [record for record in records if record.record_id in missing_ids]
 
     def _execute_with_retry_ownership(
         self,

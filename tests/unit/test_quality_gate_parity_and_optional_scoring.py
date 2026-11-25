@@ -957,6 +957,7 @@ def test_consecutive_incremental_sparse_runs_advance_watermarks_and_preserve_min
         "owner_pid",
         "owner_host",
         "lease_expires_at",
+        "lease_id",
     }
 
 

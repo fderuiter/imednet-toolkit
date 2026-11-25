@@ -169,23 +169,38 @@ def test_compile_record_predicate_metadata_and_data_operators() -> None:
     )
     assert combined_pred.matches(rec) is True
 
-    # Comparison operators across numbers, numeric strings, booleans, dates, nested paths, and lists
+    # Comparison operators across numbers, numeric strings, booleans, dates, and lists
     rich_data_pred = compile_record_predicate(
         record_data_filter=(
-            "AGE>=45;WEIGHT<80;SMOKER==false;SCORE_STR>100;"
-            "VISIT_DATE>=2026-01-10;NESTED.LAB.HGB<=14.0;"
-            "NESTED.dotted.leaf==ok;TAGS!=scalar"
+            "AGE>=45;WEIGHT<80;SMOKER==false;SCORE_STR>100;VISIT_DATE>=2026-01-10;TAGS!=scalar"
         )
     )
     assert rich_data_pred.matches(rec) is True
+
+    # Nested paths are NOT traversed when splitting on dots is disabled
+    assert compile_record_predicate(record_data_filter="NESTED.LAB.HGB<=14.0").matches(rec) is False
+    assert (
+        compile_record_predicate(record_data_filter="NESTED.dotted.leaf==ok").matches(rec) is False
+    )
 
     # Regex and OR clauses
     regex_or_pred = compile_record_predicate(record_data_filter='NOTES=~"seasonal.*stable",AGE<18')
     assert regex_or_pred.matches(rec) is True
 
-    # Null/missing/container edge cases
+    # Null/missing/container edge cases: != returns True on None or omitted values
     assert compile_record_predicate(record_data_filter="EMPTY_VAL==none").matches(rec) is False
-    assert compile_record_predicate(record_data_filter="MISSING_VAR!=1").matches(rec) is False
+    assert compile_record_predicate(record_data_filter="EMPTY_VAL!=none").matches(rec) is True
+    assert compile_record_predicate(record_data_filter="MISSING_VAR!=1").matches(rec) is True
+    assert compile_record_predicate(record_data_filter="MISSING_VAR==1").matches(rec) is False
+    assert compile_record_predicate(record_data_filter="MISSING_VAR>1").matches(rec) is False
+    assert (
+        compile_record_predicate(extra_filters={"filter": "parentRecordId!=99"}).matches(rec)
+        is True
+    )
+    assert (
+        compile_record_predicate(extra_filters={"filter": "parentRecordId==99"}).matches(rec)
+        is False
+    )
     assert compile_record_predicate(record_data_filter="TAGS=~a").matches(rec) is False
     assert compile_record_predicate(record_data_filter="SMOKER==yes").matches(rec) is False
     assert compile_record_predicate(record_data_filter="SMOKER!=yes").matches(rec) is True
@@ -215,6 +230,92 @@ def test_compile_record_predicate_metadata_and_data_operators() -> None:
     assert projected.record_data == {}
     assert rec.record_data["AGE"] == 45
     assert projected.record_status == RecordStatus.RECORD_COMPLETE
+
+
+def test_compile_record_predicate_strict_rest_contract_parity() -> None:
+    """Verify exact case-sensitive keys, strict booleans, literal quotes, and record.deleted."""
+    # Requirement 1: Exact case-sensitive membership in recordData without dotted splitting
+    rec_keys = _make_record(
+        recordData={
+            "AESER": "Serious",
+            "aeTerm": "Headache",
+            "A": {"B": "val"},
+            "FLAT.KEY": "val",
+            "DOSE": 10,
+            "VISIT_CODE": "2026-02-01",
+        }
+    )
+    assert compile_record_predicate(record_data_filter="aeser==Serious").matches(rec_keys) is False
+    assert compile_record_predicate(record_data_filter="AESER==Serious").matches(rec_keys) is True
+    assert (
+        compile_record_predicate(record_data_filter="ae_term==Headache").matches(rec_keys) is False
+    )
+    assert compile_record_predicate(record_data_filter="aeTerm==Headache").matches(rec_keys) is True
+    assert compile_record_predicate(record_data_filter="A.B==val").matches(rec_keys) is False
+    assert compile_record_predicate(record_data_filter="FLAT.KEY==val").matches(rec_keys) is True
+
+    # Requirement 2: Strict lowercase unquoted booleans and literal quoted strings
+    assert (
+        compile_record_predicate(extra_filters={"filter": "deleted==FALSE"}).matches(rec_keys)
+        is False
+    )
+    assert (
+        compile_record_predicate(extra_filters={"filter": 'deleted=="false"'}).matches(rec_keys)
+        is False
+    )
+    assert (
+        compile_record_predicate(extra_filters={"filter": "deleted==false"}).matches(rec_keys)
+        is True
+    )
+    assert compile_record_predicate(record_data_filter='DOSE=="010.00"').matches(rec_keys) is False
+    assert compile_record_predicate(record_data_filter="DOSE==010.00").matches(rec_keys) is True
+    assert (
+        compile_record_predicate(record_data_filter='VISIT_CODE=="2026-02-01T00:00:00Z"').matches(
+            rec_keys
+        )
+        is False
+    )
+
+    # Requirement 4 & 5: Direct record.deleted lookup and verbatim recordStatus matching
+    active_with_deleted_status = _make_record(deleted=False, recordStatus="deleted")
+    assert (
+        compile_record_predicate(extra_filters={"filter": "deleted==false"}).matches(
+            active_with_deleted_status
+        )
+        is True
+    )
+    assert (
+        compile_record_predicate(extra_filters={"filter": "deleted==true"}).matches(
+            active_with_deleted_status
+        )
+        is False
+    )
+
+    unset_deleted_rec = _make_record(deleted=None, recordStatus="COMPLETE")
+    assert (
+        compile_record_predicate(extra_filters={"filter": "deleted==false"}).matches(
+            unset_deleted_rec
+        )
+        is False
+    )
+    assert (
+        compile_record_predicate(extra_filters={"filter": "deleted!=false"}).matches(
+            unset_deleted_rec
+        )
+        is True
+    )
+    assert (
+        compile_record_predicate(extra_filters={"filter": "recordStatus==COMPLETE"}).matches(
+            unset_deleted_rec
+        )
+        is True
+    )
+    assert (
+        compile_record_predicate(
+            extra_filters={"filter": 'recordStatus=="Record Complete"'}
+        ).matches(unset_deleted_rec)
+        is False
+    )
 
 
 @pytest.mark.parametrize(

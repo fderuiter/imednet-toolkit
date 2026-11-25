@@ -12,6 +12,7 @@ class QueriesOperationDef:
     PAGE_SIZE = 500
     FILTER_ATTRIBUTES = frozenset(
         {
+            "annotationId",
             "subjectId",
             "subjectOid",
             "annotationType",

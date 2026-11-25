@@ -4,15 +4,63 @@ from __future__ import annotations
 
 import logging
 import random
-import re
 from datetime import UTC, date, datetime
 from typing import Any
 
 from pydantic import Field
 
 from imednet.spi.models import ImednetBaseModel
-from imednet.spi.validation import DataDictionary, extract_variable_constraints
+from imednet.spi.validation import (
+    DataDictionary,
+    ValidationSchemaProtocol,
+    extract_variable_constraints,
+)
 
+from ._contracts import (
+    BOOL_TYPES as _BOOL_TYPES,
+)
+from ._contracts import (
+    CALC_TYPES as _CALC_TYPES,
+)
+from ._contracts import (
+    DATE_TYPES as _DATE_TYPES,
+)
+from ._contracts import (
+    DATETIME_TYPES as _DATETIME_TYPES,
+)
+from ._contracts import (
+    FLOAT_TYPES as _FLOAT_TYPES,
+)
+from ._contracts import (
+    INT_TYPES as _INT_TYPES,
+)
+from ._contracts import (
+    MEMO_TYPES as _MEMO_TYPES,
+)
+from ._contracts import (
+    MULTI_CHOICE_TYPES as _MULTI_CHOICE_TYPES,
+)
+from ._contracts import (
+    SINGLE_CHOICE_TYPES as _SINGLE_CHOICE_TYPES,
+)
+from ._contracts import (
+    SKIP_EMPTY_TYPES as _SKIP_EMPTY_TYPES,
+)
+from ._contracts import (
+    TEXT_TYPES as _TEXT_TYPES,
+)
+from ._contracts import (
+    TIME_TYPES as _TIME_TYPES,
+)
+from ._contracts import (
+    YES_NO_TYPES as _YES_NO_TYPES,
+)
+from ._contracts import (
+    coerce_variable_scalar,
+    lookup_schema_form_variables,
+    normalize_variable_type,
+    resolve_enriched_variable_type,
+)
 from .inspector import StudySnapshot
 from .models import (
     RecordTestType,
@@ -24,70 +72,7 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-_TYPE_SEP_RE = re.compile(r"[\s_-]+")
-_SLASH_SPACE_RE = re.compile(r"\s*/\s*")
-
-_INT_TYPES = frozenset({"number", "integer", "int"})
-_FLOAT_TYPES = frozenset({"float", "decimal", "double", "numeric", "slider"})
-_BOOL_TYPES = frozenset({"boolean", "bool"})
-_YES_NO_TYPES = frozenset({"yes/no", "yesno", "yes no", "true/false", "truefalse", "true false"})
-_SINGLE_CHOICE_TYPES = frozenset(
-    {
-        "coded",
-        "radio",
-        "radiobutton",
-        "radio button",
-        "single select",
-        "singleselect",
-        "dropdown",
-        "drop down",
-        "dropdownlist",
-        "dropdown list",
-        "select",
-        "sql",
-    }
-)
-_MULTI_CHOICE_TYPES = frozenset({"checkbox", "check box", "multi select", "multiselect"})
-_TEXT_TYPES = frozenset({"text", "string", "alphanumeric"})
-_MEMO_TYPES = frozenset({"textarea", "text area", "memo", "notes", "note"})
-_CALC_TYPES = frozenset({"calculation", "calc", "calculated"})
-_DATE_TYPES = frozenset(
-    {
-        "date",
-        "partialdate",
-        "incompletedate",
-        "date ymd",
-        "date mdy",
-        "date dmy",
-        "date/time precision",
-        "datetime precision",
-        "date time precision",
-    }
-)
-_DATETIME_TYPES = frozenset(
-    {
-        "datetime",
-        "partialdatetime",
-        "incompletedatetime",
-        "date/time",
-        "date time",
-        "durationdatetime",
-        "intervaldatetime",
-    }
-)
-_SKIP_EMPTY_TYPES = frozenset(
-    {"signature", "file", "upload", "fileupload", "file upload", "descriptive", "label"}
-)
-
-
-def _normalize_var_type(var_type: str | None) -> str:
-    """Normalize variable type string for canonical taxonomy matching."""
-    if not var_type:
-        return ""
-    cleaned = _TYPE_SEP_RE.sub(" ", var_type.strip().lower())
-    if "/" in cleaned:
-        cleaned = _SLASH_SPACE_RE.sub("/", cleaned)
-    return cleaned
+_normalize_var_type = normalize_variable_type
 
 
 class GeneratedRecordSet(ImednetBaseModel):
@@ -151,60 +136,43 @@ class SyntheticRecordGenerator:
         return " ".join(sentences)
 
     def _enrich_form_spec(
-        self, form_spec: UATFormSpec, data_dictionary: DataDictionary | None
+        self,
+        form_spec: UATFormSpec,
+        data_dictionary: DataDictionary | None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
+        study_key: str | None = None,
     ) -> UATFormSpec:
-        """Enrich variable specs with DataDictionary choices/bounds without mutating caller spec."""
-        if data_dictionary is None:
-            return form_spec
-        dd_vars = data_dictionary.variables_for_form(form_spec.form_key)
-        if not dd_vars:
+        """Enrich variable specs with DataDictionary/schema choices and bounds without mutation."""
+        dd_vars = lookup_schema_form_variables(
+            data_dictionary,
+            form_spec.form_key,
+            study_key=study_key,
+        )
+        schema_vars = (
+            lookup_schema_form_variables(
+                schema,
+                form_spec.form_key,
+                study_key=study_key,
+            )
+            if schema is not None and schema is not data_dictionary
+            else {}
+        )
+        if not dd_vars and not schema_vars:
             return form_spec
 
         enriched_vars: list[UATVariableSpec] = []
         changed = False
         for v in form_spec.variables:
-            dd_var = dd_vars.get(v.variable_name)
-            if dd_var is None:
+            source_var = dd_vars.get(v.variable_name) or schema_vars.get(v.variable_name)
+            if source_var is None:
                 enriched_vars.append(v)
                 continue
-            constraints = extract_variable_constraints(dd_var)
+            constraints = extract_variable_constraints(source_var)
             updates: dict[str, Any] = {}
-            dd_extra = getattr(dd_var, "extraAttributes", None)
-            raw_odm_dt = dd_extra.get("odmDataType") if isinstance(dd_extra, dict) else None
-            dd_type = (
-                raw_odm_dt.strip()
-                if isinstance(raw_odm_dt, str) and raw_odm_dt.strip()
-                else getattr(dd_var, "variable_type", getattr(dd_var, "variableType", None))
-            )
-            snap_norm = _normalize_var_type(v.variable_type)
-            dd_norm = _normalize_var_type(dd_type)
-            if dd_type and (
-                not snap_norm
-                or (
-                    snap_norm == "coded"
-                    and (
-                        dd_norm in _SINGLE_CHOICE_TYPES
-                        or dd_norm in _MULTI_CHOICE_TYPES
-                        or dd_norm in _YES_NO_TYPES
-                    )
-                )
-                or (snap_norm == "text" and dd_norm != "text")
-                or (
-                    snap_norm in {"date", "datetime", "time"}
-                    and dd_norm
-                    in {
-                        "partialdate",
-                        "incompletedate",
-                        "partialdatetime",
-                        "incompletedatetime",
-                        "durationdatetime",
-                        "intervaldatetime",
-                        "partialtime",
-                        "incompletetime",
-                    }
-                )
-            ):
-                updates["variable_type"] = dd_type
+            resolved_type = resolve_enriched_variable_type(v.variable_type, source_var)
+            if resolved_type != v.variable_type:
+                updates["variable_type"] = resolved_type
             if not v.coded_values and constraints.choices:
                 updates["coded_values"] = list(constraints.choices)
             if v.min_value is None and constraints.min_value is not None:
@@ -232,6 +200,7 @@ class SyntheticRecordGenerator:
         *,
         subject_keys: list[str] | None = None,
         data_dictionary: DataDictionary | None = None,
+        schema: ValidationSchemaProtocol | None = None,
     ) -> list[GeneratedRecordSet]:
         """Generate all record payloads for the enabled forms in the spec.
 
@@ -244,17 +213,37 @@ class SyntheticRecordGenerator:
 
         # Phase 1: Enrollment/registration forms
         for form_spec in spec.forms_by_type(RecordTestType.REGISTER_SUBJECT):
-            enriched = self._enrich_form_spec(form_spec, active_dd)
-            results.append(self._generate_registration_set(spec, enriched, snapshot, subject_pool))
+            enriched = self._enrich_form_spec(
+                form_spec,
+                active_dd,
+                schema=schema,
+                study_key=spec.study_key,
+            )
+            reg_set = self._generate_registration_set(spec, enriched, snapshot, subject_pool)
+            if not subject_keys:
+                for sk in reg_set.subject_keys:
+                    if sk and sk not in subject_pool:
+                        subject_pool.append(sk)
+            results.append(reg_set)
 
         # Phase 2: Scheduled forms
         for form_spec in spec.forms_by_type(RecordTestType.UPDATE_SCHEDULED_RECORD):
-            enriched = self._enrich_form_spec(form_spec, active_dd)
+            enriched = self._enrich_form_spec(
+                form_spec,
+                active_dd,
+                schema=schema,
+                study_key=spec.study_key,
+            )
             results.append(self._generate_scheduled_set(spec, enriched, snapshot, subject_pool))
 
         # Phase 3: Unscheduled forms
         for form_spec in spec.forms_by_type(RecordTestType.CREATE_NEW_RECORD):
-            enriched = self._enrich_form_spec(form_spec, active_dd)
+            enriched = self._enrich_form_spec(
+                form_spec,
+                active_dd,
+                schema=schema,
+                study_key=spec.study_key,
+            )
             results.append(self._generate_unscheduled_set(spec, enriched, snapshot, subject_pool))
 
         return results
@@ -274,35 +263,66 @@ class SyntheticRecordGenerator:
 
         preserved = preserved_keys or set()
         key_map: dict[str, str] = {pk: pk for pk in preserved}
+        enrolled_queues: dict[str, list[str]] = {}
         if placeholder_keys is not None and len(placeholder_keys) == len(clean_enrolled):
             for placeholder, enrolled in zip(placeholder_keys, clean_enrolled, strict=False):
                 if placeholder and placeholder not in preserved:
                     key_map.setdefault(placeholder, enrolled)
+                    enrolled_queues.setdefault(placeholder, []).append(enrolled)
         else:
-            candidates: list[str] = []
-            seen: set[str] = set()
-            if placeholder_keys:
-                for sk in placeholder_keys:
-                    if sk and sk not in preserved and sk not in seen:
-                        seen.add(sk)
-                        candidates.append(sk)
+            reg_slots = (
+                [
+                    sk
+                    for rs in record_sets
+                    if rs.test_type == RecordTestType.REGISTER_SUBJECT
+                    for sk in rs.subject_keys
+                    if sk and sk not in preserved
+                ]
+                if placeholder_keys is None
+                else []
+            )
+            if reg_slots and len(reg_slots) == len(clean_enrolled):
+                for placeholder, enrolled in zip(reg_slots, clean_enrolled, strict=False):
+                    key_map.setdefault(placeholder, enrolled)
+                    enrolled_queues.setdefault(placeholder, []).append(enrolled)
             else:
-                for rs in record_sets:
-                    for sk in rs.subject_keys:
+                candidates: list[str] = []
+                seen: set[str] = set()
+                if placeholder_keys:
+                    for sk in placeholder_keys:
                         if sk and sk not in preserved and sk not in seen:
                             seen.add(sk)
                             candidates.append(sk)
-            for idx, placeholder in enumerate(candidates):
-                key_map[placeholder] = clean_enrolled[idx % len(clean_enrolled)]
+                else:
+                    for rs in record_sets:
+                        for sk in rs.subject_keys:
+                            if sk and sk not in preserved and sk not in seen:
+                                seen.add(sk)
+                                candidates.append(sk)
+                for idx, placeholder in enumerate(candidates):
+                    enrolled = clean_enrolled[idx % len(clean_enrolled)]
+                    key_map[placeholder] = enrolled
+                    enrolled_queues[placeholder] = [enrolled]
 
+        reg_cursor: dict[str, int] = {}
         for rs in record_sets:
             if rs.test_type == RecordTestType.REGISTER_SUBJECT:
-                rs.subject_keys = [key_map.get(sk, sk) for sk in rs.subject_keys]
+                resolved_reg_keys: list[str] = []
+                for sk in rs.subject_keys:
+                    if sk in enrolled_queues:
+                        q = enrolled_queues[sk]
+                        pos = reg_cursor.get(sk, 0)
+                        resolved_reg_keys.append(q[pos] if pos < len(q) else q[pos % len(q)])
+                        reg_cursor[sk] = pos + 1
+                    else:
+                        resolved_reg_keys.append(key_map.get(sk, sk))
+                rs.subject_keys = resolved_reg_keys
                 for payload in rs.payloads:
                     payload.pop("subjectKey", None)
                     payload.pop("subject_key", None)
                 continue
 
+            data_cursor: dict[str, int] = {}
             new_subject_keys: list[str] = []
             for idx, payload in enumerate(rs.payloads):
                 orig_key = (
@@ -310,16 +330,28 @@ class SyntheticRecordGenerator:
                     if idx < len(rs.subject_keys)
                     else payload.get("subjectKey")
                 )
-                mapped = key_map.get(orig_key) if isinstance(orig_key, str) else None
-                resolved_key: str = (
-                    mapped if mapped is not None else clean_enrolled[idx % len(clean_enrolled)]
-                )
+                if isinstance(orig_key, str) and orig_key in enrolled_queues:
+                    q = enrolled_queues[orig_key]
+                    pos = data_cursor.get(orig_key, 0)
+                    resolved_key = q[pos % len(q)]
+                    data_cursor[orig_key] = pos + 1
+                else:
+                    mapped = key_map.get(orig_key) if isinstance(orig_key, str) else None
+                    resolved_key = (
+                        mapped if mapped is not None else clean_enrolled[idx % len(clean_enrolled)]
+                    )
                 payload["subjectKey"] = resolved_key
                 new_subject_keys.append(resolved_key)
 
             if len(rs.subject_keys) > len(new_subject_keys):
                 for extra_key in rs.subject_keys[len(new_subject_keys) :]:
-                    new_subject_keys.append(key_map.get(extra_key, extra_key))
+                    if extra_key in enrolled_queues:
+                        q = enrolled_queues[extra_key]
+                        pos = data_cursor.get(extra_key, 0)
+                        new_subject_keys.append(q[pos % len(q)])
+                        data_cursor[extra_key] = pos + 1
+                    else:
+                        new_subject_keys.append(key_map.get(extra_key, extra_key))
             rs.subject_keys = new_subject_keys
 
         return key_map
@@ -335,43 +367,40 @@ class SyntheticRecordGenerator:
         return pool
 
     @staticmethod
+    def _allocate_subject_keys(
+        spec: UATSpecification,
+        form_spec: UATFormSpec,
+        subject_pool: list[str],
+        count: int,
+    ) -> list[str]:
+        """Allocate ``count`` placeholder subject keys (unique for REGISTER_SUBJECT)."""
+        if count <= 0:
+            return []
+        if form_spec.test_type != RecordTestType.REGISTER_SUBJECT:
+            return [subject_pool[i % len(subject_pool)] for i in range(count)]
+        if count <= len(subject_pool):
+            return list(subject_pool[:count])
+
+        allocated = list(subject_pool)
+        seen = set(allocated)
+        prefix = spec.subject_specs[0].subject_key_prefix if spec.subject_specs else "UAT-TEST-"
+        seq = len(allocated) + 1
+        while len(allocated) < count:
+            candidate = f"{prefix}{seq:03d}"
+            seq += 1
+            if candidate not in seen:
+                seen.add(candidate)
+                allocated.append(candidate)
+        return allocated
+
+    @staticmethod
     def _coerce_fixed_value(var_spec: UATVariableSpec) -> Any:
         """Coerce a FIXED strategy value to match the variable's canonical scalar type."""
-        raw = var_spec.fixed_value
-        if raw is None:
-            return ""
-        v_norm = _normalize_var_type(var_spec.variable_type)
-        if v_norm in _INT_TYPES:
-            if isinstance(raw, bool):
-                return int(raw)
-            if isinstance(raw, int):
-                return raw
-            try:
-                return int(float(raw))
-            except (TypeError, ValueError):
-                return raw
-        if v_norm in _FLOAT_TYPES:
-            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-                return float(raw)
-            try:
-                return float(raw)
-            except (TypeError, ValueError):
-                return raw
-        if v_norm in _BOOL_TYPES:
-            if isinstance(raw, bool):
-                return raw
-            if isinstance(raw, (int, float)):
-                return bool(raw)
-            if isinstance(raw, str):
-                low = raw.strip().lower()
-                if low in {"true", "1", "yes"}:
-                    return True
-                if low in {"false", "0", "no"}:
-                    return False
-            return raw
-        if isinstance(raw, (int, float, bool)) and v_norm in _CALC_TYPES:
-            return int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else float(raw)
-        return str(raw)
+        return coerce_variable_scalar(
+            var_spec.variable_type,
+            var_spec.fixed_value,
+            has_choices=bool(var_spec.coded_values),
+        )
 
     @staticmethod
     def _boundary_scalar(var_spec: UATVariableSpec, *, is_max: bool) -> int | float:
@@ -416,6 +445,12 @@ class SyntheticRecordGenerator:
             return "1" if v_norm in {"multi select", "multiselect"} else True
 
         if v_norm in _BOOL_TYPES:
+            if var_spec.coded_values:
+                return coerce_variable_scalar(
+                    v_type,
+                    self._rng.choice(var_spec.coded_values),
+                    has_choices=True,
+                )
             return self._rng.choice([True, False])
 
         if v_norm in _YES_NO_TYPES:
@@ -431,11 +466,11 @@ class SyntheticRecordGenerator:
 
         if v_norm in _INT_TYPES:
             if var_spec.coded_values:
-                chosen = self._rng.choice(var_spec.coded_values)
-                try:
-                    return int(float(chosen))
-                except (TypeError, ValueError):
-                    return chosen
+                return coerce_variable_scalar(
+                    v_type,
+                    self._rng.choice(var_spec.coded_values),
+                    has_choices=True,
+                )
             min_i = int(var_spec.min_value) if var_spec.min_value is not None else 1
             max_i = int(var_spec.max_value) if var_spec.max_value is not None else max(100, min_i)
             max_i = max(max_i, min_i)
@@ -443,13 +478,11 @@ class SyntheticRecordGenerator:
 
         if v_norm in _FLOAT_TYPES:
             if var_spec.coded_values:
-                chosen_f = self._rng.choice(var_spec.coded_values)
-                if isinstance(chosen_f, str) and chosen_f.strip().lstrip("+-").isdigit():
-                    return int(chosen_f.strip())
-                try:
-                    return float(chosen_f)
-                except (TypeError, ValueError):
-                    return chosen_f
+                return coerce_variable_scalar(
+                    v_type,
+                    self._rng.choice(var_spec.coded_values),
+                    has_choices=True,
+                )
             min_f = float(var_spec.min_value) if var_spec.min_value is not None else 1.0
             max_f = (
                 float(var_spec.max_value) if var_spec.max_value is not None else max(100.0, min_f)
@@ -470,7 +503,7 @@ class SyntheticRecordGenerator:
                 return f"{date.today().isoformat()}T12:00:00+00:00"
             return datetime.now(UTC).isoformat()
 
-        if v_norm in {"time", "partialtime", "incompletetime"}:
+        if v_norm in _TIME_TYPES:
             return "12:00:00"
 
         if v_norm == "uri":
@@ -484,6 +517,12 @@ class SyntheticRecordGenerator:
             return text[:max_memo_len]
 
         if v_norm in _CALC_TYPES:
+            if var_spec.coded_values:
+                return coerce_variable_scalar(
+                    v_type,
+                    self._rng.choice(var_spec.coded_values),
+                    has_choices=True,
+                )
             min_c = float(var_spec.min_value) if var_spec.min_value is not None else 1.0
             max_c = (
                 float(var_spec.max_value) if var_spec.max_value is not None else max(100.0, min_c)
@@ -523,14 +562,21 @@ class SyntheticRecordGenerator:
         if coded_all_vars:
             var_spec = coded_all_vars[0]
             payloads = []
-            used_subjects = []
-            for i, code in enumerate(var_spec.coded_values):
-                subj_key = subject_pool[i % len(subject_pool)]
-                used_subjects.append(subj_key)
+            used_subjects = self._allocate_subject_keys(
+                spec,
+                form_spec,
+                subject_pool,
+                len(var_spec.coded_values),
+            )
+            for code in var_spec.coded_values:
                 data = {}
                 for v in form_spec.variables:
                     if v.variable_key == var_spec.variable_key:
-                        data[v.variable_name] = code
+                        data[v.variable_name] = coerce_variable_scalar(
+                            v.variable_type,
+                            code,
+                            has_choices=True,
+                        )
                     else:
                         val = self._generate_value(v, spec)
                         if val is not None:
@@ -540,7 +586,7 @@ class SyntheticRecordGenerator:
 
         if any(v.strategy == VariableTestStrategy.BOUNDARY for v in form_spec.variables):
             payloads = []
-            used_subjects = []
+            used_subjects = self._allocate_subject_keys(spec, form_spec, subject_pool, 2)
             # Min boundary
             data_min: dict[str, Any] = {}
             for v in form_spec.variables:
@@ -554,7 +600,6 @@ class SyntheticRecordGenerator:
                     if val is not None:
                         data_min[v.variable_name] = val
             payloads.append(data_min)
-            used_subjects.append(subject_pool[0])
 
             # Max boundary
             data_max: dict[str, Any] = {}
@@ -569,14 +614,16 @@ class SyntheticRecordGenerator:
                     if val is not None:
                         data_max[v.variable_name] = val
             payloads.append(data_max)
-            used_subjects.append(subject_pool[1 % len(subject_pool)])
             return payloads, warnings, used_subjects
 
         payloads = []
-        used_subjects = []
-        for i in range(form_spec.subject_count):
-            subj_key = subject_pool[i % len(subject_pool)]
-            used_subjects.append(subj_key)
+        used_subjects = self._allocate_subject_keys(
+            spec,
+            form_spec,
+            subject_pool,
+            form_spec.subject_count,
+        )
+        for _ in range(form_spec.subject_count):
             data = {}
             for v in form_spec.variables:
                 val = self._generate_value(v, spec)

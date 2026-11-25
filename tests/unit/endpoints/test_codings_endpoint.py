@@ -40,8 +40,10 @@ def test_list_repeatable_coding_filters_transport(dummy_client, paginator_factor
     assert result[0].dictionary_name == "MedDRA"
 
 
-def test_codings_endpoint_is_list_only_and_rejects_undocumented_filters(dummy_client):
-    """Test that CodingsEndpoint exposes no get method and rejects codingId/status filters."""
+def test_codings_endpoint_is_list_only_and_rejects_undocumented_filters(
+    dummy_client, paginator_factory
+):
+    """Test that CodingsEndpoint exposes no get method, accepts codingId, and rejects status."""
     ep = codings.CodingsEndpoint(dummy_client)
     async_ep = codings.AsyncCodingsEndpoint(dummy_client)
 
@@ -49,8 +51,11 @@ def test_codings_endpoint_is_list_only_and_rejects_undocumented_filters(dummy_cl
     assert not hasattr(async_ep, "get")
     assert not hasattr(codings.CodingsOperationDef, "_id_param")
 
-    with pytest.raises(ConfigurationError, match="codingId"):
-        ep.list(study_key="S1", codingId=1)
+    capture = paginator_factory(codings, [{"codingId": 101, "dictionaryName": "MedDRA"}])
+    assert len(ep.list(study_key="S1", codingId=101)) == 1
+    assert capture["params"]["filter"] == "codingId==101"
+    assert len(ep.list(study_key="S1", coding_id=101)) == 1
+    assert capture["params"]["filter"] == "codingId==101"
 
     with pytest.raises(ConfigurationError, match="status"):
         ep.list(study_key="S1", status="open")

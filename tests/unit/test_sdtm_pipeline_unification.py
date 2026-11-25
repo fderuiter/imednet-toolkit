@@ -955,6 +955,7 @@ def test_core_standards_profiles_domain_dict_and_normalizer_branches(
     normalizer = CategoricalNormalizer(
         cdisc_ct={"AEOUT": {"RECOVERED/RESOLVED"}},
         date_fields={"AESTDTC"},
+        boolean_fields={"AESER"},
     )
     norm_res = normalizer.normalize_record(
         {

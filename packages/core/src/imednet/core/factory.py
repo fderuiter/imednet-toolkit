@@ -21,9 +21,13 @@ if TYPE_CHECKING:
 def _default_auth(config: Config, *, has_transport: bool = False) -> AuthStrategy:
     """Resolve the existing OIDC-before-key default policy once."""
     if config.oidc_token:
-        from imednet.auth.oidc import OIDCAuth
+        from imednet.auth.oidc import build_oidc_auth
 
-        return OIDCAuth(config.oidc_token)
+        return build_oidc_auth(
+            config.oidc_token,
+            api_key=config.api_key,
+            security_key=config.security_key,
+        )
     if has_transport and (not config.api_key or not config.security_key):
         return ApiKeyAuth(config.api_key or "", config.security_key or "")
     if not config.api_key and not config.security_key:

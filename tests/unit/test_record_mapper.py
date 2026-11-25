@@ -276,8 +276,7 @@ def test_dataframe_multi_form_and_variable_whitelists_batch_without_mixed_connec
             form_whitelist=[10, 20],
         )
 
-        var_filter = var_route.calls.last.request.url.params["filter"]
-        assert var_filter == "formId==10,formId==20"
+        assert "filter" not in var_route.calls.last.request.url.params
         assert len(rec_calls) == 2
         assert rec_calls[0]["filter"] == "formId==10"
         assert rec_calls[1]["filter"] == "formId==20"

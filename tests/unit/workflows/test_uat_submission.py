@@ -1492,3 +1492,103 @@ def test_submit_forwards_schema_to_sdk_create_record(mock_sdk):
     assert mock_sdk.create_record.call_count == 2
     assert mock_sdk.create_record.call_args_list[0].kwargs["schema"] is dd
     assert mock_sdk.create_record.call_args_list[1].kwargs["schema"] is dd
+
+
+def test_submission_site_scoped_subject_isolation_south_site_never_reuses_other_site():
+    """BulkRecordSubmissionWorkflow never reuses UAT subjects from SITE when enrolling at South Site."""
+    import httpx
+
+    from imednet import ImednetSDK
+    from imednet.simulation import SimulationState, create_simulation_transport
+
+    state = SimulationState()
+    # Tag pre-existing SUB1 at SITE (siteId=101) with UAT
+    state.subjects[0]["keywords"] = [{"keywordName": "UAT", "keywordKey": "UAT"}]
+    state.sites.append(
+        {
+            "siteId": 104,
+            "studyKey": "STUDY",
+            "siteName": "South Site",
+            "siteEnrollmentStatus": "Enrollment Open",
+        }
+    )
+
+    sim_transport = create_simulation_transport(state)
+    sdk = ImednetSDK(
+        transport=httpx.MockTransport(sim_transport.handle_request),
+        simulation_mode=True,
+    )
+
+    wf = BulkRecordSubmissionWorkflow(sdk, skip_existing_subjects=True)
+    assert wf._find_existing_uat_subjects("STUDY", "UAT", site_name="SITE") == {"SUB1"}  # noqa: SLF001
+    assert wf._find_existing_uat_subjects("STUDY", "UAT", site_name="South Site") == set()  # noqa: SLF001
+    assert wf._find_existing_uat_subjects("STUDY", "UAT", site_id=104) == set()  # noqa: SLF001
+
+    rs_reg_south = GeneratedRecordSet(
+        form_key="F_DM",
+        form_name="Demographics",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[
+            {
+                "formKey": "F_DM",
+                "siteName": "South Site",
+                "siteId": 104,
+                "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+                "data": {"V_AGE": 34},
+            }
+        ],
+        subject_keys=["UAT-TEST-001"],
+    )
+    rs_data_south = GeneratedRecordSet(
+        form_key="F_AE",
+        form_name="Adverse Events",
+        test_type=RecordTestType.CREATE_NEW_RECORD,
+        payloads=[
+            {
+                "formKey": "F_AE",
+                "subjectKey": "UAT-TEST-001",
+                "data": {"V_TERM": "Headache"},
+            }
+        ],
+        subject_keys=["UAT-TEST-001"],
+    )
+
+    res = wf.submit("STUDY", [rs_reg_south, rs_data_south])
+    assert len(res.registration_batches) == 1
+    assert res.registration_batches[0].record_count == 1
+    assert res.enrolled_subject_keys == ["SUBJ-1001"]
+    assert "SUB1" not in res.enrolled_subject_keys
+    assert rs_data_south.payloads[0]["subjectKey"] == "SUBJ-1001"
+
+    enrolled_south = next(s for s in state.subjects if s["subjectKey"] == "SUBJ-1001")
+    assert enrolled_south["siteName"] == "South Site"
+    assert enrolled_south["siteId"] == 104
+
+    # Subsequent submission at South Site (matched by both siteName and siteId=104) reuses SUBJ-1001
+    rs_reg_reuse = GeneratedRecordSet(
+        form_key="F_DM",
+        form_name="Demographics",
+        test_type=RecordTestType.REGISTER_SUBJECT,
+        payloads=[
+            {
+                "formKey": "F_DM",
+                "siteName": "South Site",
+                "siteId": 104,
+                "keywords": [{"keywordName": "UAT", "keywordKey": "UAT"}],
+                "data": {"V_AGE": 40},
+            }
+        ],
+        subject_keys=["UAT-TEST-001"],
+    )
+    rs_data_reuse = GeneratedRecordSet(
+        form_key="F_AE",
+        form_name="Adverse Events",
+        test_type=RecordTestType.CREATE_NEW_RECORD,
+        payloads=[{"formKey": "F_AE", "subjectKey": "UAT-TEST-001", "data": {"V_TERM": "Fatigue"}}],
+        subject_keys=["UAT-TEST-001"],
+    )
+    res_reuse = BulkRecordSubmissionWorkflow(sdk, skip_existing_subjects=True).submit(
+        "STUDY", [rs_reg_reuse, rs_data_reuse]
+    )
+    assert len(res_reuse.registration_batches) == 0
+    assert res_reuse.enrolled_subject_keys == ["SUBJ-1001"]

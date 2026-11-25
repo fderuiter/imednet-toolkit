@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-import re
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -30,13 +28,16 @@ from imednet.spi.validation import (
     validate_records_batch,
 )
 
-from .generator import GeneratedRecordSet
-from .inspector import (
+from ._contracts import (
     is_disabled_form,
     is_enrollment_form,
     is_non_subject_form,
+    is_retired_variable_def,
     is_unscheduled_form,
+    lookup_schema_form_variables,
+    resolve_enriched_variable_type,
 )
+from .generator import GeneratedRecordSet
 from .models import (
     TERMINAL_UAT_STATES,
     InvalidUATStateTransitionError,
@@ -283,20 +284,47 @@ class UATSpecificationBuilder:
                 continue
 
             form_key_str = form.form_key or ""
-            dd_vars = active_dd.variables_for_form(form_key_str) if active_dd is not None else {}
+            dd_vars = lookup_schema_form_variables(
+                active_dd,
+                form_key_str,
+                study_key=snapshot.study_key,
+            )
 
             test_type = self._infer_test_type(form)
             variables = snapshot.variables_by_form.get(form_key_str, [])
-            var_specs = [
-                self._build_var_spec(
+            var_specs: list[UATVariableSpec] = []
+            seen_var_names: set[str] = set()
+            retired_snap_names: set[str] = set()
+            for v in variables:
+                vname = getattr(v, "variable_name", None) or getattr(v, "variableName", None)
+                if is_retired_variable_def(v):
+                    if isinstance(vname, str) and vname:
+                        retired_snap_names.add(vname)
+                    continue
+                vs = self._build_var_spec(
                     v,
-                    dd_var=dd_vars.get(getattr(v, "variable_name", "") or ""),
+                    dd_var=dd_vars.get(vname or ""),
                     form_key=form_key_str,
                 )
-                for v in variables
-                if getattr(v, "disabled", None) is not True
-                and getattr(v, "deleted", None) is not True
-            ]
+                seen_var_names.add(vs.variable_name)
+                var_specs.append(vs)
+
+            for dd_vname, dd_var in dd_vars.items():
+                if (
+                    not dd_vname
+                    or dd_vname in seen_var_names
+                    or dd_vname in retired_snap_names
+                    or is_retired_variable_def(dd_var)
+                ):
+                    continue
+                seen_var_names.add(dd_vname)
+                var_specs.append(
+                    self._build_var_spec(
+                        dd_var,
+                        dd_var=dd_var,
+                        form_key=form_key_str,
+                    )
+                )
             required_names = [vs.variable_name for vs in var_specs if vs.required]
 
             form_specs.append(
@@ -357,65 +385,7 @@ class UATSpecificationBuilder:
         )
 
         snap_type = getattr(variable, "variable_type", None)
-        dd_extra = (
-            getattr(source_dd_var, "extraAttributes", None) if source_dd_var is not None else None
-        )
-        raw_odm_dt = dd_extra.get("odmDataType") if isinstance(dd_extra, Mapping) else None
-        dd_type = (
-            raw_odm_dt.strip()
-            if isinstance(raw_odm_dt, str) and raw_odm_dt.strip()
-            else (
-                getattr(
-                    source_dd_var, "variable_type", getattr(source_dd_var, "variableType", None)
-                )
-                if source_dd_var is not None
-                else None
-            )
-        )
-        snap_norm = snap_type.strip().lower() if isinstance(snap_type, str) else ""
-        dd_norm = dd_type.strip().lower() if isinstance(dd_type, str) else ""
-        if dd_type and (
-            not snap_type
-            or (
-                snap_norm == "coded"
-                and dd_norm
-                in {
-                    "radio",
-                    "single select",
-                    "dropdown",
-                    "drop down",
-                    "dropdownlist",
-                    "dropdown list",
-                    "select",
-                    "checkbox",
-                    "check box",
-                    "multi select",
-                    "multiselect",
-                    "yes/no",
-                    "yesno",
-                    "yes no",
-                    "true/false",
-                }
-            )
-            or (snap_norm == "text" and dd_norm != "text")
-            or (
-                snap_norm in {"date", "datetime", "time"}
-                and dd_norm
-                in {
-                    "partialdate",
-                    "incompletedate",
-                    "partialdatetime",
-                    "incompletedatetime",
-                    "durationdatetime",
-                    "intervaldatetime",
-                    "partialtime",
-                    "incompletetime",
-                }
-            )
-        ):
-            resolved_type = dd_type
-        else:
-            resolved_type = snap_type or dd_type or "Text"
+        resolved_type = resolve_enriched_variable_type(snap_type, source_dd_var)
 
         constraints = extract_variable_constraints(source_dd_var)
         return UATVariableSpec(
@@ -559,78 +529,6 @@ def _collect_failed_batch_ids(poll_summary: Any) -> list[str]:
             if (is_failed or has_failed_records or has_result_error) and bid not in failed_ids:
                 failed_ids.append(bid)
     return failed_ids
-
-
-_TYPE_WORD_SEP_RE = re.compile(r"[\s_-]+")
-_INT_SCHEMA_TYPES = frozenset({"int", "integer", "number"})
-_FLOAT_SCHEMA_TYPES = frozenset({"float", "decimal", "double", "numeric", "slider", "calculation"})
-_BOOL_SCHEMA_TYPES = frozenset({"bool", "boolean"})
-
-
-def _coerce_payloads_for_validation(
-    validation_schema: ValidationSchemaProtocol,
-    payloads: list[dict[str, Any]],
-    *,
-    study_key: str,
-) -> list[dict[str, Any]]:
-    """Coerce synthetic string scalars to typed Python scalars expected by SchemaValidator."""
-    coerced_records: list[dict[str, Any]] = []
-    for rec in payloads:
-        raw_data = rec.get("data")
-        form_key = str(rec.get("formKey") or rec.get("form_key") or "")
-        if not isinstance(raw_data, dict) or not form_key:
-            coerced_records.append(dict(rec))
-            continue
-
-        vars_fn: Any = validation_schema.variables_for_form
-        try:
-            form_vars = vars_fn(form_key, study_key=study_key)
-        except TypeError:
-            form_vars = validation_schema.variables_for_form(form_key)
-
-        new_data: dict[str, Any] = {}
-        for var_name, val in raw_data.items():
-            var_meta = form_vars.get(var_name) if isinstance(form_vars, Mapping) else None
-            if var_meta is None or not isinstance(val, str) or val == "":
-                new_data[var_name] = val
-                continue
-
-            raw_type = getattr(var_meta, "variable_type", None) or getattr(
-                var_meta, "variableType", None
-            )
-            norm_type = (
-                _TYPE_WORD_SEP_RE.sub(" ", str(raw_type).strip().lower()) if raw_type else ""
-            )
-            stripped = val.strip()
-            if norm_type in _INT_SCHEMA_TYPES:
-                if stripped.lstrip("+-").isdigit():
-                    new_data[var_name] = int(stripped)
-                else:
-                    new_data[var_name] = val
-            elif norm_type in _FLOAT_SCHEMA_TYPES:
-                if getattr(var_meta, "choices", None) and stripped.lstrip("+-").isdigit():
-                    new_data[var_name] = int(stripped)
-                else:
-                    try:
-                        parsed_float = float(stripped)
-                        new_data[var_name] = parsed_float if math.isfinite(parsed_float) else val
-                    except ValueError:
-                        new_data[var_name] = val
-            elif norm_type in _BOOL_SCHEMA_TYPES:
-                low = stripped.lower()
-                if low in {"true", "yes", "1"}:
-                    new_data[var_name] = True
-                elif low in {"false", "no", "0"}:
-                    new_data[var_name] = False
-                else:
-                    new_data[var_name] = val
-            else:
-                new_data[var_name] = val
-
-        copied = dict(rec)
-        copied["data"] = new_data
-        coerced_records.append(copied)
-    return coerced_records
 
 
 def _apply_subject_count_override(
@@ -928,6 +826,8 @@ class UATWorkflow:
                 gen_kwargs: dict[str, Any] = {}
                 if effective_dd is not None:
                     gen_kwargs["data_dictionary"] = effective_dd
+                if schema is not None and schema is not effective_dd:
+                    gen_kwargs["schema"] = schema
                 if effective_seed != self._seed:
                     gen_kwargs["seed"] = effective_seed
                 record_sets = self.generate(spec, snapshot, **gen_kwargs)
@@ -975,14 +875,9 @@ class UATWorkflow:
                         if not isinstance(rs, NonCallableMock):
                             flat_payloads.extend(rs.payloads)
 
-                    coerced_payloads = _coerce_payloads_for_validation(
-                        validation_schema,
-                        flat_payloads,
-                        study_key=study_key,
-                    )
                     validation_report = validate_records_batch(
                         validation_schema,
-                        coerced_payloads,
+                        flat_payloads,
                         study_key=study_key,
                         collect_errors=True,
                     )
@@ -1186,18 +1081,24 @@ class UATWorkflow:
         snapshot: Any,
         *,
         data_dictionary: DataDictionary | None = None,
+        schema: ValidationSchemaProtocol | None = None,
         seed: int | None = None,
     ) -> list[GeneratedRecordSet]:
         """Create synthetic record payloads via SyntheticRecordGenerator."""
         effective_dd = data_dictionary if data_dictionary is not None else self._data_dictionary
+        gen_kwargs: dict[str, Any] = {}
+        if (
+            data_dictionary is not None or (seed is not None and seed != self._seed)
+        ) and effective_dd is not None:
+            gen_kwargs["data_dictionary"] = effective_dd
+        if schema is not None:
+            gen_kwargs["schema"] = schema
         if seed is not None and seed != self._seed:
             from .generator import SyntheticRecordGenerator
 
             gen = SyntheticRecordGenerator(seed=seed, data_dictionary=effective_dd)
-            return gen.generate(spec, snapshot, data_dictionary=effective_dd)
-        if data_dictionary is not None:
-            return self._generator.generate(spec, snapshot, data_dictionary=data_dictionary)
-        return self._generator.generate(spec, snapshot)
+            return gen.generate(spec, snapshot, **gen_kwargs)
+        return self._generator.generate(spec, snapshot, **gen_kwargs)
 
     def submit(
         self,
@@ -1290,11 +1191,7 @@ def _merge_snapshot_into_data_dictionary(
         fk = getattr(form, "form_key", None) or ""
         if not fk:
             continue
-        active_vars = [
-            v
-            for v in vars_by_form.get(fk, [])
-            if getattr(v, "disabled", None) is not True and getattr(v, "deleted", None) is not True
-        ]
+        active_vars = [v for v in vars_by_form.get(fk, []) if not is_retired_variable_def(v)]
         active_snap_forms.append((fk, form, active_vars))
         if fk not in existing_forms:
             needs_backfill = True

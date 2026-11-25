@@ -81,10 +81,10 @@ import math
 import re
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
@@ -97,6 +97,7 @@ from tenacity import wait_exponential
 from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
+from imednet.integrations.enrichment import resolve_sink_phi_keys
 from imednet.models.standards import (
     _SDTM_RECORDS_SORT,
     PROFILE_REGISTRY,
@@ -117,11 +118,6 @@ from imednet.models.standards import (
     resolve_standards_profile,
     validate_cdash_variable,
 )
-from imednet.utils.dates import (
-    format_iso_datetime,
-    normalize_utc_timestamp_bound,
-    parse_iso_datetime,
-)
 from imednet.utils.filters import (
     _parse_clause_operator,
     _snake_to_camel,
@@ -135,11 +131,20 @@ from imednet.utils.filters import (
 from imednet.utils.security import (
     SensitivityRegistry,
     _normalize_key,
+    build_study_sensitivity_registry,
     global_sensitivity_registry,
     mask_clinical_phi,
+    sanitize_diagnostic_text,
 )
 from imednet.utils.tabular import MASKED_SENTINEL
 from imednet.utils.url import redact_url_query
+
+from ._record_timestamp_bounds import (
+    RECORD_TIMESTAMP_ATTRIBUTES,
+    _combine_branch_with_watermark,
+    _merge_and_condition,
+    normalize_watermark_datetime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,29 +219,6 @@ class StateProviderProtocol(Protocol):
     ) -> None:
         """Persist SDTM sidecar lineage and monotonic sequence watermarks."""
         ...
-
-
-def normalize_watermark_datetime(value: datetime | str | None) -> datetime | None:
-    """Normalize a datetime or ISO-8601 date/timestamp string into UTC."""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=UTC)
-        return value.astimezone(UTC)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return None
-        try:
-            parsed = parse_iso_datetime(stripped)
-        except ValueError:
-            normalized_iso = normalize_utc_timestamp_bound(stripped, is_end=False)
-            parsed = parse_iso_datetime(normalized_iso)
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC)
-    raise ValueError(f"Watermark must be a datetime or ISO-8601 string, got {type(value).__name__}")
 
 
 def get_state_provider(
@@ -575,17 +557,27 @@ def has_valid_tabular_batch_stamp(
     return not (require_sanitized and not stamp.sanitized)
 
 
-def _mask_series_containers_default_phi(series: Any) -> Any:
+def _mask_series_containers_default_phi(
+    series: Any,
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> Any:
     """Mask nested container cells in a pandas Series without invoking scalar mask_clinical_phi."""
     values = series.tolist()
     if not any(isinstance(v, _CONTAINER_CELL_TYPES) for v in values):
         return series
+    active_reg = registry if registry is not None else global_sensitivity_registry
     pd_mod = sys.modules.get("pandas")
-    new_vals = [mask_clinical_phi(v) if isinstance(v, _CONTAINER_CELL_TYPES) else v for v in values]
+    new_vals = [
+        mask_clinical_phi(v, registry=active_reg) if isinstance(v, _CONTAINER_CELL_TYPES) else v
+        for v in values
+    ]
     if pd_mod is not None:
         return pd_mod.Series(new_vals, index=series.index, dtype=object)
     return series.apply(
-        lambda v: mask_clinical_phi(v) if isinstance(v, _CONTAINER_CELL_TYPES) else v
+        lambda v: (
+            mask_clinical_phi(v, registry=active_reg) if isinstance(v, _CONTAINER_CELL_TYPES) else v
+        )
     )
 
 
@@ -597,39 +589,54 @@ def _is_sdtm_birth_date_key(raw_key: str) -> bool:
     return norm in _SDTM_BIRTH_SOURCE_KEYS or norm.endswith("brthdtc")
 
 
-def _redact_mapping_for_sdtm(mapping_val: Mapping[Any, Any]) -> dict[Any, Any]:
+def _redact_mapping_for_sdtm(
+    mapping_val: Mapping[Any, Any],
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> dict[Any, Any]:
     """Redact PHI across a mapping while truncating birth-date fields to ISO year or None."""
+    active_reg = registry if registry is not None else global_sensitivity_registry
     out: dict[Any, Any] = {}
     for k, v in mapping_val.items():
         key_str = str(k)
-        if _is_sdtm_birth_date_key(key_str) and not global_sensitivity_registry.is_exempt(key_str):
+        if _is_sdtm_birth_date_key(key_str) and not active_reg.is_exempt(key_str):
             out[k] = format_iso8601_dtc(v, mask_phi=True)
-        elif global_sensitivity_registry.is_sensitive(key_str):
+        elif active_reg.is_sensitive(key_str):
             out[k] = MASKED_SENTINEL
         elif isinstance(v, Mapping):
-            out[k] = _redact_mapping_for_sdtm(v)
+            out[k] = _redact_mapping_for_sdtm(v, registry=active_reg)
         elif isinstance(v, list):
             out[k] = [
-                _redact_mapping_for_sdtm(elem)
+                _redact_mapping_for_sdtm(elem, registry=active_reg)
                 if isinstance(elem, Mapping)
-                else mask_clinical_phi(elem)
+                else mask_clinical_phi(elem, registry=active_reg)
                 for elem in v
             ]
         elif isinstance(v, tuple):
             out[k] = tuple(
-                _redact_mapping_for_sdtm(elem)
+                _redact_mapping_for_sdtm(elem, registry=active_reg)
                 if isinstance(elem, Mapping)
-                else mask_clinical_phi(elem)
+                else mask_clinical_phi(elem, registry=active_reg)
                 for elem in v
             )
         else:
-            out[k] = mask_clinical_phi(v)
+            out[k] = mask_clinical_phi(v, registry=active_reg)
     return out
 
 
-def _redact_dataframe_batch(df: Any, pd_mod: Any, *, as_sdtm: bool = False) -> Any:
+def _redact_dataframe_batch(
+    df: Any,
+    pd_mod: Any,
+    *,
+    as_sdtm: bool = False,
+    registry: SensitivityRegistry | None = None,
+    phi_keys: Collection[str] | None = None,
+) -> Any:
     """Return a PHI-redacted copy of a pandas DataFrame without mutating caller state."""
-    if getattr(df, "attrs", {}).get("imednet_sdtm_redacted") is True:
+    active_reg = registry if registry is not None else global_sensitivity_registry
+    if getattr(df, "attrs", {}).get("imednet_sdtm_redacted") is True and (
+        not phi_keys or has_valid_tabular_batch_stamp(df, mask_phi=True, phi_keys=phi_keys)
+    ):
         return df
 
     masked = df.copy()
@@ -637,8 +644,7 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any, *, as_sdtm: bool = False) -> A
         [
             col
             for col in masked.columns
-            if _is_sdtm_birth_date_key(str(col))
-            and not global_sensitivity_registry.is_exempt(str(col))
+            if _is_sdtm_birth_date_key(str(col)) and not active_reg.is_exempt(str(col))
         ]
         if as_sdtm
         else []
@@ -652,7 +658,7 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any, *, as_sdtm: bool = False) -> A
         dict.fromkeys(
             col
             for col in masked.columns
-            if col not in birth_col_set and global_sensitivity_registry.is_sensitive(str(col))
+            if col not in birth_col_set and active_reg.is_sensitive(str(col))
         )
     )
     for col in sensitive_cols:
@@ -674,20 +680,28 @@ def _redact_dataframe_batch(df: Any, pd_mod: Any, *, as_sdtm: bool = False) -> A
     for col in object_cols:
         target = masked[col]
         if hasattr(target, "columns"):
-            masked[col] = target.apply(_mask_series_containers_default_phi)
+            masked[col] = target.apply(
+                lambda s: _mask_series_containers_default_phi(s, registry=active_reg)
+            )
         else:
-            masked[col] = _mask_series_containers_default_phi(target)
+            masked[col] = _mask_series_containers_default_phi(target, registry=active_reg)
     if as_sdtm:
         masked.attrs["imednet_sdtm_redacted"] = True
     return masked
 
 
-def _redact_single_record(item: Any, *, as_sdtm: bool = False) -> Any:
+def _redact_single_record(
+    item: Any,
+    *,
+    as_sdtm: bool = False,
+    registry: SensitivityRegistry | None = None,
+) -> Any:
     """Redact PHI on a single Mapping, Pydantic model, or record-like object."""
+    active_reg = registry if registry is not None else global_sensitivity_registry
     if isinstance(item, Mapping):
         if as_sdtm:
-            return _redact_mapping_for_sdtm(item)
-        return mask_clinical_phi(dict(item))
+            return _redact_mapping_for_sdtm(item, registry=active_reg)
+        return mask_clinical_phi(dict(item), registry=active_reg)
     if isinstance(item, NonCallableMock):
         return item
 
@@ -698,19 +712,21 @@ def _redact_single_record(item: Any, *, as_sdtm: bool = False) -> Any:
         record_data = getattr(item, "record_data", None)
         if isinstance(record_data, dict):
             masked_rd = (
-                _redact_mapping_for_sdtm(record_data) if as_sdtm else mask_clinical_phi(record_data)
+                _redact_mapping_for_sdtm(record_data, registry=active_reg)
+                if as_sdtm
+                else mask_clinical_phi(record_data, registry=active_reg)
             )
             if masked_rd != record_data:
                 updates["record_data"] = masked_rd
         for field_name in model_fields:
-            if field_name == "record_data" or global_sensitivity_registry.is_exempt(field_name):
+            if field_name == "record_data" or active_reg.is_exempt(field_name):
                 continue
             if as_sdtm and _is_sdtm_birth_date_key(field_name):
                 val = getattr(item, field_name, None)
                 redacted_year = format_iso8601_dtc(val, mask_phi=True)
                 if redacted_year != val:
                     updates[field_name] = redacted_year
-            elif global_sensitivity_registry.is_sensitive(field_name):
+            elif active_reg.is_sensitive(field_name):
                 val = getattr(item, field_name, None)
                 if val is not None and val != MASKED_SENTINEL:
                     updates[field_name] = MASKED_SENTINEL
@@ -719,7 +735,9 @@ def _redact_single_record(item: Any, *, as_sdtm: bool = False) -> Any:
     record_data = getattr(item, "record_data", None)
     if isinstance(record_data, dict):
         masked_rd = (
-            _redact_mapping_for_sdtm(record_data) if as_sdtm else mask_clinical_phi(record_data)
+            _redact_mapping_for_sdtm(record_data, registry=active_reg)
+            if as_sdtm
+            else mask_clinical_phi(record_data, registry=active_reg)
         )
         if masked_rd != record_data:
             copied = copy.copy(item)
@@ -733,26 +751,58 @@ def redact_batch_records(
     *,
     mask_phi: bool = True,
     as_sdtm: bool = False,
+    study_key: str | None = None,
+    config: SinkConfig | None = None,
+    phi_keys: Collection[str] | None = None,
 ) -> Any:
-    """Apply default SensitivityRegistry PHI redaction across a batch of records or DataFrame."""
+    """Apply Study-scoped SensitivityRegistry PHI redaction across a batch of records or DataFrame."""
     if not mask_phi or records is None:
+        return records
+    if isinstance(records, (str, bytes)):
         return records
 
     pd_mod = sys.modules.get("pandas")
-    if pd_mod is not None and isinstance(records, pd_mod.DataFrame):
-        return _redact_dataframe_batch(records, pd_mod, as_sdtm=as_sdtm)
+    is_df = pd_mod is not None and isinstance(records, pd_mod.DataFrame)
+    materialized = records
+    if (
+        not is_df
+        and not isinstance(records, (Mapping, Collection))
+        and isinstance(records, Iterable)
+    ):
+        materialized = list(records)
 
-    if isinstance(records, Mapping):
+    resolved_phi = resolve_sink_phi_keys(
+        study_key,
+        config=config,
+        records=materialized,
+        phi_keys=phi_keys,
+    )
+    active_registry = build_study_sensitivity_registry(resolved_phi)
+
+    if is_df:
+        return _redact_dataframe_batch(
+            materialized,
+            pd_mod,
+            as_sdtm=as_sdtm,
+            registry=active_registry,
+            phi_keys=resolved_phi,
+        )
+
+    if isinstance(materialized, Mapping):
         if as_sdtm:
-            return _redact_mapping_for_sdtm(records)
-        return mask_clinical_phi(dict(records))
-    if isinstance(records, (str, bytes)):
-        return records
-    if isinstance(records, tuple):
-        return tuple(_redact_single_record(item, as_sdtm=as_sdtm) for item in records)
-    if isinstance(records, Iterable):
-        return [_redact_single_record(item, as_sdtm=as_sdtm) for item in records]
-    return records
+            return _redact_mapping_for_sdtm(materialized, registry=active_registry)
+        return mask_clinical_phi(dict(materialized), registry=active_registry)
+    if isinstance(materialized, tuple):
+        return tuple(
+            _redact_single_record(item, as_sdtm=as_sdtm, registry=active_registry)
+            for item in materialized
+        )
+    if isinstance(materialized, Iterable):
+        return [
+            _redact_single_record(item, as_sdtm=as_sdtm, registry=active_registry)
+            for item in materialized
+        ]
+    return materialized
 
 
 class ExportSink(ABC):
@@ -816,16 +866,32 @@ class ExportSink(ABC):
             self._circuit_breaker = breaker
         return breaker
 
-    def redact_batch(self, records: Sequence[Any]) -> Any:
+    def redact_batch(
+        self,
+        records: Sequence[Any],
+        *,
+        study_key: str | None = None,
+        config: SinkConfig | None = None,
+        phi_keys: Collection[str] | None = None,
+    ) -> Any:
         """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
-        should_mask = getattr(self.config, "mask_phi", True) is not False
-        raw_domain = getattr(self.config, "sdtm_domain", None)
-        is_sdtm = getattr(self.config, "as_sdtm", False) is True or (
+        active_cfg = config if config is not None else getattr(self, "config", None)
+        should_mask = getattr(active_cfg, "mask_phi", True) is not False
+        raw_domain = getattr(active_cfg, "sdtm_domain", None)
+        is_sdtm = getattr(active_cfg, "as_sdtm", False) is True or (
             isinstance(raw_domain, str) and bool(raw_domain.strip())
         )
         if is_sdtm and getattr(self, "_delegates_sdtm_redaction", False):
             return records
-        return redact_batch_records(records, mask_phi=should_mask, as_sdtm=is_sdtm)
+        active_sk = study_key if study_key is not None else getattr(active_cfg, "study_key", None)
+        return redact_batch_records(
+            records,
+            mask_phi=should_mask,
+            as_sdtm=is_sdtm,
+            study_key=active_sk,
+            config=active_cfg,
+            phi_keys=phi_keys,
+        )
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -1255,6 +1321,7 @@ def _extract_record_for_standards(
     form_domain_map: Mapping[Any, str] | None = None,
     study_config: Any = None,
     pipeline: Any = None,
+    lookup_keys_lower: frozenset[str] = frozenset(),
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """Return ``(domain, raw_data, canonical_data)`` without mutating ``record``."""
     raw_domain: str | None = None
@@ -1264,8 +1331,8 @@ def _extract_record_for_standards(
     if hasattr(record, "record_data") and getattr(record, "record_data", None) is not None:
         rd = getattr(record, "record_data", None)
         raw_data = dict(rd) if isinstance(rd, Mapping) else {}
-        raw_domain = getattr(record, "form_key", None)
-        subject_val = getattr(record, "subject_key", None)
+        raw_domain = getattr(record, "form_key", None) or getattr(record, "formKey", None)
+        subject_val = getattr(record, "subject_key", None) or getattr(record, "subjectKey", None)
     elif isinstance(record, Mapping):
         raw_domain = (
             record.get("DOMAIN")
@@ -1379,6 +1446,7 @@ def _extract_record_for_standards(
                 continue
             primary_key = aliases[0]
             found_val: Any = None
+            matched_cand: str | None = None
             has_val = False
             if primary_key in canonical and canonical[primary_key] is not None:
                 found_val = canonical[primary_key]
@@ -1387,17 +1455,33 @@ def _extract_record_for_standards(
                 for cand in [sdtm_var, *aliases]:
                     if cand in source_data:
                         found_val = source_data[cand]
+                        matched_cand = cand
                         has_val = True
                         break
                     if cand.lower() in lower_raw:
                         found_val = lower_raw[cand.lower()]
+                        matched_cand = cand
                         has_val = True
                         break
             if has_val:
-                canonical.setdefault(primary_key, found_val)
+                cand_governed_by_lookup = (
+                    matched_cand is not None
+                    and matched_cand.lower() in lookup_keys_lower
+                    and primary_key.lower() not in lookup_keys_lower
+                )
+                if not cand_governed_by_lookup:
+                    canonical.setdefault(primary_key, found_val)
                 if domain == "DM" and sdtm_var == "BRTHDTC":
                     canonical.setdefault("birthDate", found_val)
-                elif domain == "DM" and sdtm_var == "ETHNIC":
+                elif (
+                    domain == "DM"
+                    and sdtm_var == "ETHNIC"
+                    and not (
+                        matched_cand is not None
+                        and matched_cand.lower() in lookup_keys_lower
+                        and "ethnicity" not in lookup_keys_lower
+                    )
+                ):
                     canonical.setdefault("ethnicity", found_val)
 
     return domain, raw_data, canonical
@@ -1438,10 +1522,18 @@ def evaluate_standards_readiness(
 
     merged_lookups: dict[str, dict[str, str]] = {}
     cfg_lookups = getattr(study_cfg, "terminology_lookups", None)
+    pipeline_has_terminology = bool(pipeline is not None and getattr(pipeline, "terminology", None))
     if isinstance(cfg_lookups, Mapping):
         for tbl_name, tbl_vals in cfg_lookups.items():
             if isinstance(tbl_vals, Mapping):
-                merged_lookups[str(tbl_name)] = {str(k): str(v) for k, v in tbl_vals.items()}
+                copied_tbl = {str(k): str(v) for k, v in tbl_vals.items()}
+                if pipeline_has_terminology:
+                    upper_keys = {k.strip().upper() for k in copied_tbl}
+                    for mapped_val in list(copied_tbl.values()):
+                        if mapped_val.strip() and mapped_val.strip().upper() not in upper_keys:
+                            copied_tbl.setdefault(mapped_val, mapped_val)
+                            upper_keys.add(mapped_val.strip().upper())
+                merged_lookups[str(tbl_name)] = copied_tbl
     extra_lookups = (
         extra.get("terminology_lookups")
         if isinstance(extra, Mapping) and isinstance(extra.get("terminology_lookups"), Mapping)
@@ -1452,8 +1544,22 @@ def evaluate_standards_readiness(
             for tbl_name, tbl_vals in explicit_map.items():
                 if isinstance(tbl_vals, Mapping):
                     dest_tbl = merged_lookups.setdefault(str(tbl_name), {})
-                    dest_tbl.update({str(k): str(v) for k, v in tbl_vals.items()})
+                    explicit_pairs = {str(k): str(v) for k, v in tbl_vals.items()}
+                    dest_tbl.update(explicit_pairs)
+                    if (
+                        pipeline_has_terminology
+                        and isinstance(cfg_lookups, Mapping)
+                        and tbl_name in cfg_lookups
+                    ):
+                        upper_keys = {k.strip().upper() for k in dest_tbl}
+                        for mapped_val in list(explicit_pairs.values()):
+                            if mapped_val.strip() and mapped_val.strip().upper() not in upper_keys:
+                                dest_tbl.setdefault(mapped_val, mapped_val)
+                                upper_keys.add(mapped_val.strip().upper())
     lookups: dict[str, dict[str, str]] | None = merged_lookups or None
+    lookup_keys_lower: frozenset[str] = (
+        frozenset(k.lower() for k in lookups) if lookups is not None else frozenset()
+    )
 
     effective_form_map: dict[Any, str] = build_form_sdtm_domain_map(None, study_config=study_cfg)
     if form_domain_map:
@@ -1478,6 +1584,7 @@ def evaluate_standards_readiness(
             form_domain_map=effective_form_map or None,
             study_config=study_cfg,
             pipeline=pipeline,
+            lookup_keys_lower=lookup_keys_lower,
         )
         if target_dom and domain != target_dom:
             continue
@@ -1501,7 +1608,7 @@ def evaluate_standards_readiness(
     if cdash_warnings:
         report.warnings = [*report.warnings, *cdash_warnings]
     if config is not None and getattr(config, "mask_phi", True) is True and report.warnings:
-        report.warnings = [mask_clinical_phi(w) for w in report.warnings]
+        report.warnings = [sanitize_diagnostic_text(mask_clinical_phi(w)) for w in report.warnings]
     return report
 
 
@@ -1878,167 +1985,6 @@ def _split_top_level(expr: str, sep: str) -> list[str]:
     return raw_parts
 
 
-def _merge_and_condition(target: dict[str, Any], key: str, condition: Any) -> None:
-    """Merge an AND filter condition onto ``target``, rejecting duplicate AND attributes."""
-    camel_key = _snake_to_camel(key)
-    for existing in target:
-        if _snake_to_camel(existing) == camel_key:
-            raise ValueError(f"Duplicate filter attribute '{camel_key}' in AND clause")
-    target[key] = condition
-
-
-def _coerce_date_modified_clauses(raw_cond: Any) -> list[tuple[str, datetime]]:
-    """Normalize a branch's ``dateModified`` value into ``[(operator, utc_datetime), ...]``."""
-    raw_items: list[tuple[str, Any]]
-    if isinstance(raw_cond, list):
-        raw_items = []
-        for item in raw_cond:
-            if isinstance(item, tuple) and len(item) == 2:
-                raw_items.append((item[0], item[1]))
-            else:
-                raw_items.append(("==", item))
-    elif isinstance(raw_cond, tuple):
-        if len(raw_cond) != 2:
-            raise ValueError(
-                f"Filter tuple for 'dateModified' must have 2 elements, got {len(raw_cond)}"
-            )
-        raw_items = [(raw_cond[0], raw_cond[1])]
-    else:
-        raw_items = [("==", raw_cond)]
-
-    parsed: list[tuple[str, datetime]] = []
-    for op, val in raw_items:
-        validate_filter_operator(op, allow_regex=False)
-        dt = normalize_watermark_datetime(val)
-        if dt is None:
-            raise ValueError(f"Invalid dateModified filter value: {val!r}")
-        parsed.append((op, dt))
-    return parsed
-
-
-def _combine_branch_with_watermark(
-    branch: dict[str, Any],
-    norm_wm: datetime | None,
-) -> tuple[dict[str, Any], Callable[[Any], bool] | None] | None:
-    """Combine a branch filter dict with ``norm_wm`` using at most one ``dateModified`` key.
-
-    Returns ``None`` when the combined ``dateModified`` bounds are unsatisfiable
-    so callers can skip issuing an upstream request for an empty intersection.
-    """
-    out = dict(branch)
-    dm_keys = [k for k in out if _snake_to_camel(k) == "dateModified"]
-    if len(dm_keys) > 1:
-        raise ValueError("Duplicate filter attribute 'dateModified' in AND clause")
-
-    clauses: list[tuple[str, datetime]] = []
-    if dm_keys:
-        raw_existing = out.pop(dm_keys[0])
-        # Preserve original non-list condition directly when watermark is absent
-        if norm_wm is None and not isinstance(raw_existing, list):
-            _coerce_date_modified_clauses(raw_existing)
-            out["dateModified"] = raw_existing
-            return out, None
-        clauses.extend(_coerce_date_modified_clauses(raw_existing))
-
-    if norm_wm is not None:
-        clauses.append((">=", norm_wm))
-
-    if not clauses:
-        return out, None
-
-    lower: tuple[datetime, bool] | None = None
-    upper: tuple[datetime, bool] | None = None
-    exact: datetime | None = None
-    excluded: set[datetime] = set()
-
-    for op, dt in clauses:
-        if op == "==":
-            if exact is not None and exact != dt:
-                return None
-            exact = dt
-        elif op in (">=", ">"):
-            strict = op == ">"
-            if lower is None or dt > lower[0] or (dt == lower[0] and strict and not lower[1]):
-                lower = (dt, strict)
-        elif op in ("<=", "<"):
-            strict = op == "<"
-            if upper is None or dt < upper[0] or (dt == upper[0] and strict and not upper[1]):
-                upper = (dt, strict)
-        elif op == "!=":
-            excluded.add(dt)
-
-    if lower is not None:
-        for ex in list(excluded):
-            if ex < lower[0] or (ex == lower[0] and lower[1]):
-                excluded.discard(ex)
-            elif ex == lower[0] and not lower[1]:
-                lower = (lower[0], True)
-                excluded.discard(ex)
-
-    if upper is not None:
-        for ex in list(excluded):
-            if ex > upper[0] or (ex == upper[0] and upper[1]):
-                excluded.discard(ex)
-            elif ex == upper[0] and not upper[1]:
-                upper = (upper[0], True)
-                excluded.discard(ex)
-
-    if exact is not None:
-        if exact in excluded:
-            return None
-        if lower is not None and (exact < lower[0] or (exact == lower[0] and lower[1])):
-            return None
-        if upper is not None and (exact > upper[0] or (exact == upper[0] and upper[1])):
-            return None
-        out["dateModified"] = ("==", format_iso_datetime(exact))
-        return out, None
-
-    if lower is not None and upper is not None:
-        if lower[0] > upper[0]:
-            return None
-        if lower[0] == upper[0]:
-            if lower[1] or upper[1] or lower[0] in excluded:
-                return None
-            out["dateModified"] = ("==", format_iso_datetime(lower[0]))
-            return out, None
-
-    residual_upper: tuple[datetime, bool] | None = None
-    if lower is not None:
-        out["dateModified"] = (
-            ">" if lower[1] else ">=",
-            format_iso_datetime(lower[0]),
-        )
-        residual_upper = upper
-    elif upper is not None:
-        out["dateModified"] = (
-            "<" if upper[1] else "<=",
-            format_iso_datetime(upper[0]),
-        )
-    elif excluded:
-        first_ex = min(excluded)
-        excluded.discard(first_ex)
-        out["dateModified"] = ("!=", format_iso_datetime(first_ex))
-
-    if residual_upper is None and not excluded:
-        return out, None
-
-    frozen_excluded = frozenset(excluded)
-
-    def _post_predicate(record: Any) -> bool:
-        rec_ts = extract_record_timestamp(record)
-        if rec_ts is None:
-            return False
-        if residual_upper is not None:
-            bound_dt, is_strict = residual_upper
-            if is_strict and not (rec_ts < bound_dt):
-                return False
-            if not is_strict and not (rec_ts <= bound_dt):
-                return False
-        return rec_ts not in frozen_excluded
-
-    return out, _post_predicate
-
-
 def _expand_scalar_list_branches(base: dict[str, Any]) -> list[dict[str, Any]]:
     """Expand scalar list/set values into separate AND-safe filter dicts."""
     list_keys: list[str] = []
@@ -2108,6 +2054,7 @@ def _resolve_record_query_branches(
                         and_parts,
                         model=Record,
                         allowed_attributes=allowed_attrs,
+                        multi_bound_attributes=RECORD_TIMESTAMP_ATTRIBUTES,
                     )
                 ]
     elif isinstance(record_filter, Mapping):
@@ -2183,6 +2130,7 @@ def _resolve_record_query_branches(
                         flat_and,
                         model=Record,
                         allowed_attributes=allowed_attrs,
+                        multi_bound_attributes=RECORD_TIMESTAMP_ATTRIBUTES,
                     )
                 ]
 
@@ -2406,6 +2354,7 @@ def _enforce_batch_standards_readiness(
     standards_profile: Any,
     min_standards_score: float | None,
     sdtm_domain: str | None,
+    form_domain_map: Mapping[Any, str] | None = None,
 ) -> None:
     """Evaluate batch standards readiness, log masked warnings, and enforce min_standards_score."""
     report = evaluate_standards_readiness(
@@ -2414,13 +2363,16 @@ def _enforce_batch_standards_readiness(
         config=config,
         standards_profile=standards_profile,
         sdtm_domain=sdtm_domain,
+        form_domain_map=form_domain_map,
     )
     profile_obj = resolve_standards_profile(standards_profile)
     for warning_msg in report.warnings:
         logger.warning(
             "Standards readiness warning in batch %s: %s",
             batch_id,
-            mask_clinical_phi(warning_msg) if config.mask_phi else warning_msg,
+            sanitize_diagnostic_text(mask_clinical_phi(warning_msg))
+            if config.mask_phi
+            else warning_msg,
         )
     if min_standards_score is not None and report.score < min_standards_score:
         error_fields = sorted({v.field for v in report.violations if v.severity.upper() == "ERROR"})
@@ -2624,6 +2576,63 @@ def _read_provider_lineage_payload(
     return lineage, watermarks
 
 
+class _ScopedSeqOverrides(dict[str, int]):
+    """Scoped ``domain:usubjid:record_id -> seq_val`` overrides compatible with ``dict[str, int]``.
+
+    Dictionary iteration and ``dict.update(...)`` expose only scoped string keys so
+    downstream sinks (`warehouse`, `document`, `graph`) preserve per-`(domain, usubjid, record_id)`
+    isolation without modifying caller contracts, while direct indexing also accepts
+    ``(domain, usubjid, record_id)`` tuples and unambiguous legacy ``record_id`` lookups.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._by_record_id: dict[str, int | None] = {}
+
+    def set_scoped(self, domain: str, usubjid: str, record_id: str, seq_val: int) -> None:
+        from imednet.models.sdtm import format_scoped_seq_override_key
+
+        scoped_key = format_scoped_seq_override_key(domain, usubjid, record_id)
+        super().__setitem__(scoped_key, seq_val)
+        if record_id not in self._by_record_id:
+            self._by_record_id[record_id] = seq_val
+        elif self._by_record_id[record_id] != seq_val:
+            self._by_record_id[record_id] = None
+
+    def _resolve_lookup_key(self, key: Any) -> str | None:
+        if isinstance(key, tuple) and len(key) == 3:
+            from imednet.models.sdtm import format_scoped_seq_override_key
+
+            cand = format_scoped_seq_override_key(str(key[0]), str(key[1]), str(key[2]))
+            return cand if super().__contains__(cand) else None
+        if isinstance(key, str) and super().__contains__(key):
+            return key
+        return None
+
+    def __contains__(self, key: object) -> bool:
+        if self._resolve_lookup_key(key) is not None:
+            return True
+        if isinstance(key, str) and ":" not in key:
+            return self._by_record_id.get(key) is not None
+        return False
+
+    def __getitem__(self, key: Any) -> int:
+        resolved = self._resolve_lookup_key(key)
+        if resolved is not None:
+            return super().__getitem__(resolved)
+        if isinstance(key, str) and ":" not in key:
+            legacy_val = self._by_record_id.get(key)
+            if legacy_val is not None:
+                return legacy_val
+        raise KeyError(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:  # type: ignore[override]
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+
 def rehydrate_sdtm_lineage(
     sink_or_config: Any,
     *,
@@ -2668,7 +2677,7 @@ def rehydrate_sdtm_lineage(
                 watermarks[str(wk)] = max(watermarks.get(str(wk), 0), wv)
 
     domain_seq_counters: dict[str, dict[str, int]] = {}
-    seq_overrides: dict[str, int] = {}
+    seq_overrides = _ScopedSeqOverrides()
 
     for wk, wv in watermarks.items():
         dom_part, sep, subj_part = wk.partition(":")
@@ -2681,7 +2690,7 @@ def rehydrate_sdtm_lineage(
         usubjid = str(entry.get("usubjid") or "")
         seq_val = entry.get("seq_val")
         if dom and dom != "DM" and isinstance(seq_val, int) and not isinstance(seq_val, bool):
-            seq_overrides[rec_id_str] = seq_val
+            seq_overrides.set_scoped(dom, usubjid, rec_id_str, seq_val)
             dom_map = domain_seq_counters.setdefault(dom, {})
             dom_map[usubjid] = max(dom_map.get(usubjid, 0), seq_val)
 
@@ -2966,18 +2975,18 @@ def run_streaming_export(
         )
         exclude_deleted_upstream = (not opts["include_deleted"]) and (not reconcile_voided)
 
-        study_forms = (
-            _try_fetch_study_forms(sdk, study_key)
-            if (opts["as_sdtm"] or opts["sdtm_domain"] is not None)
-            else []
+        check_standards = (
+            opts["standards_profile"] is not None or opts["min_standards_score"] is not None
         )
+        need_form_map = bool(opts["as_sdtm"] or opts["sdtm_domain"] is not None or check_standards)
+        study_forms = _try_fetch_study_forms(sdk, study_key) if need_form_map else []
         active_form_map: dict[Any, str] = (
             build_form_sdtm_domain_map(
                 study_forms,
                 study_config=study_cfg_override,
                 study_key=study_key,
             )
-            if (opts["as_sdtm"] or opts["sdtm_domain"] is not None)
+            if need_form_map
             else {}
         )
         if active_form_map:
@@ -3112,9 +3121,18 @@ def run_streaming_export(
                     exported_timestamps.append(rec_ts)
                 yield rec
 
-        filtered_records: Iterable[Any] = _track_accepted(
-            gate_fn(sdk, study_key, _observe_and_route(), config)
+        gated_stream = (
+            apply_quality_gate(
+                sdk,
+                study_key,
+                _observe_and_route(),
+                config,
+                forms=study_forms or None,
+            )
+            if gate_fn is apply_quality_gate
+            else gate_fn(sdk, study_key, _observe_and_route(), config)
         )
+        filtered_records: Iterable[Any] = _track_accepted(gated_stream)
         if opts["as_sdtm"]:
             filtered_records = iter_subject_ordered_sdtm_records(
                 filtered_records,
@@ -3125,9 +3143,6 @@ def run_streaming_export(
                 mask_phi=getattr(config, "mask_phi", True) is not False,
                 source_is_ordered=source_is_ordered,
             )
-        check_standards = (
-            opts["standards_profile"] is not None or opts["min_standards_score"] is not None
-        )
         for index, batch in enumerate(batches_fn(filtered_records, opts["batch_size"])):
             batch_id = f"{prefix}/{index}"
             if check_standards and batch:
@@ -3139,6 +3154,7 @@ def run_streaming_export(
                     standards_profile=opts["standards_profile"],
                     min_standards_score=opts["min_standards_score"],
                     sdtm_domain=opts["sdtm_domain"],
+                    form_domain_map=active_form_map or None,
                 )
             total_written += sink_obj.write_batch(batch, batch_id=batch_id)
 

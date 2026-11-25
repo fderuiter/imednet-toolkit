@@ -819,18 +819,24 @@ def test_oidc_edge_cases_malformed_tokens():
     assert auth2.get_user_roles() == []
 
     # 3. Invalid base64 in signature
+    from imednet.errors import UnauthorizedError
+
     bad_jwt3 = f"{h}.eyJzdWIiOiIxIn0.???invalid_b64???"
     auth3 = OIDCAuth(bad_jwt3, public_key=b"secret")
     assert auth3.get_user_roles() == []
-    assert auth3.get_headers() == {}
+    with pytest.raises(UnauthorizedError):
+        auth3.get_headers()
 
 
 async def test_oidc_fail_closed_headers_same_origin_stripping_and_opaque_contracts(monkeypatch):
-    """Rejected or blank tokens emit {} headers and strip residual same-origin Authorization."""
+    """Rejected or blank tokens raise ImednetError and empty strategies strip residual Authorization."""
     import base64
     import hashlib
     import hmac
     import json
+
+    from imednet.auth.strategy import AuthStrategy
+    from imednet.errors import ConfigurationError, ImednetError, UnauthorizedError
 
     secret = b"fail-closed-shared-secret-key"
 
@@ -846,22 +852,28 @@ async def test_oidc_fail_closed_headers_same_origin_stripping_and_opaque_contrac
         sig = hmac.new(secret, f"{h_hs}.{p_b64}".encode("ascii"), hashlib.sha256).digest()
         return f"{h_hs}.{p_b64}.{b64url(sig)}"
 
-    # 1. Blank, whitespace, newline, and non-string tokens fail closed
+    # 1. Blank, whitespace, newline, and non-string tokens raise ConfigurationError (ImednetError)
     for bad_token in ("", "   ", "\t\n", "tok\r\nX-Injected: 1", None):
         bad_auth = OIDCAuth(bad_token)  # type: ignore[arg-type]
-        assert bad_auth.get_headers() == {}
+        with pytest.raises(ConfigurationError) as cfg_exc:
+            bad_auth.get_headers()
+        assert isinstance(cfg_exc.value, ImednetError)
         assert bad_auth.claims == {}
         assert bad_auth.get_user_id() is None
         assert bad_auth.get_user_roles() == []
         assert bad_auth._decode_token_claims(bad_token) == {}  # type: ignore[arg-type]
 
-    # 2. Unconfigured 1-part and 2-part opaque tokens keep Bearer pass-through
+    # 2. Unconfigured 1-part and 2-part opaque tokens keep Bearer pass-through, except alg=none
     for opaque_tok in ("opaque-bearer-token", "eyJhbGciOiJSUzI1NiJ9.two_segment_synthetic"):
         opaque_auth = OIDCAuth(opaque_tok)
         assert opaque_auth.get_headers() == {"Authorization": f"Bearer {opaque_tok}"}
         assert opaque_auth.claims == {}
         assert opaque_auth.get_user_id() is None
         assert opaque_auth.get_user_roles() == []
+
+    two_part_none = OIDCAuth(f"{h_none}.{p_admin}")
+    with pytest.raises(UnauthorizedError):
+        two_part_none.get_headers()
 
     # 3. Opaque tokens are rejected when ANY verification option is configured (kwargs or env)
     for verify_kwargs in (
@@ -875,14 +887,16 @@ async def test_oidc_fail_closed_headers_same_origin_stripping_and_opaque_contrac
         {"algorithms": []},
     ):
         rejected_opaque = OIDCAuth("opaque-bearer-token", **verify_kwargs)
-        assert rejected_opaque.get_headers() == {}
+        with pytest.raises((ConfigurationError, UnauthorizedError)):
+            rejected_opaque.get_headers()
         assert rejected_opaque.claims == {}
 
     monkeypatch.setenv("IMEDNET_OIDC_AUDIENCE", "env-audience")
-    assert OIDCAuth("opaque-bearer-token").get_headers() == {}
+    with pytest.raises(UnauthorizedError):
+        OIDCAuth("opaque-bearer-token").get_headers()
     monkeypatch.delenv("IMEDNET_OIDC_AUDIENCE")
 
-    # 4. Rejected 3-part JWTs (alg=none, missing segment, unconfigured 3-part, forged sig) fail closed
+    # 4. Rejected 3-part JWTs (alg=none, missing segment, unconfigured 3-part, forged sig) raise ImednetError
     for rejected_jwt, key_opt in (
         (f"{h_none}.{p_admin}.unsigned", None),
         (f"{h_hs}.{p_admin}.", secret),
@@ -890,7 +904,9 @@ async def test_oidc_fail_closed_headers_same_origin_stripping_and_opaque_contrac
         (f"{h_hs}.{p_admin}.wrong_sig", secret),
     ):
         rej = OIDCAuth(rejected_jwt, public_key=key_opt)
-        assert rej.get_headers() == {}
+        with pytest.raises((ConfigurationError, UnauthorizedError)) as rej_exc:
+            rej.get_headers()
+        assert isinstance(rej_exc.value, ImednetError)
         assert rej.claims == {}
         assert rej.get_user_roles() == []
         assert rej.get_user_id() is None
@@ -908,7 +924,7 @@ async def test_oidc_fail_closed_headers_same_origin_stripping_and_opaque_contrac
     assert empty_claims_auth.claims == {}
     assert empty_claims_auth.get_headers() == {"Authorization": f"Bearer {empty_claims_jwt}"}
 
-    # 6. _OriginScopedAuth strips residual same-origin Authorization headers when get_headers() == {}
+    # 6. Forged OIDCAuth raises UnauthorizedError before dispatching, and empty AuthStrategy strips residual Authorization
     captured_sync: list[dict[str, str]] = []
     captured_async: list[dict[str, str]] = []
 
@@ -927,7 +943,35 @@ async def test_oidc_fail_closed_headers_same_origin_stripping_and_opaque_contrac
         base_url="https://edc.imednet.example",
         transport=httpx.MockTransport(sync_handler),
     ) as sync_client:
-        sync_client.get(
+        with pytest.raises(UnauthorizedError):
+            sync_client.get(
+                "/studies",
+                headers={"Authorization": "Bearer residual-stale-jwt", "X-Trace": "keep"},
+            )
+    assert captured_sync == []
+
+    async with AsyncClient(
+        auth=forged_auth,
+        base_url="https://edc.imednet.example",
+        transport=AsyncSpyTransport(),
+    ) as async_client:
+        with pytest.raises(UnauthorizedError):
+            await async_client.get(
+                "/studies",
+                headers={"authorization": "Bearer residual-async-jwt", "X-Trace": "keep-async"},
+            )
+    assert captured_async == []
+
+    class _EmptyAuth(AuthStrategy):
+        def get_headers(self) -> dict[str, str]:
+            return {}
+
+    with Client(
+        auth=_EmptyAuth(),
+        base_url="https://edc.imednet.example",
+        transport=httpx.MockTransport(sync_handler),
+    ) as empty_sync_client:
+        empty_sync_client.get(
             "/studies",
             headers={"Authorization": "Bearer residual-stale-jwt", "X-Trace": "keep"},
         )
@@ -936,11 +980,11 @@ async def test_oidc_fail_closed_headers_same_origin_stripping_and_opaque_contrac
     assert captured_sync[0]["x-trace"] == "keep"
 
     async with AsyncClient(
-        auth=forged_auth,
+        auth=_EmptyAuth(),
         base_url="https://edc.imednet.example",
         transport=AsyncSpyTransport(),
-    ) as async_client:
-        await async_client.get(
+    ) as empty_async_client:
+        await empty_async_client.get(
             "/studies",
             headers={"authorization": "Bearer residual-async-jwt", "X-Trace": "keep-async"},
         )
@@ -1043,22 +1087,28 @@ def test_oidc_live_expiry_rechecks_headers_claims_and_blocks_commit_config(monke
         assert auth.get_user_id() == "lead-dm"
 
         # 2. Exact RFC 7519 Section 4.1.4 boundary: now == exp + leeway (t0 + 35.0) -> expired
+        from imednet.errors import UnauthorizedError
+
         current_clock[0] = t0 + 35.0
         assert auth.claims == {}
-        assert auth.get_headers() == {}
+        with pytest.raises(UnauthorizedError):
+            auth.get_headers()
         assert auth.get_user_id() is None
         assert auth.get_user_roles() == []
 
         with pytest.raises(PermissionError, match="manager or admin role"):
             store.commit_config("STUDY-LIVE-EXP", _make_cfg("2.0.0"), desc="expired-v2", sdk=sdk)
 
-        sdk._client.get("/studies", headers={"Authorization": "Bearer stale-header"})
-        assert "authorization" not in captured_headers[-1]
+        prior_req_count = len(captured_headers)
+        with pytest.raises(UnauthorizedError):
+            sdk._client.get("/studies", headers={"Authorization": "Bearer stale-header"})
+        assert len(captured_headers) == prior_req_count
 
         # 3. Clock skewed before nbf - leeway (t0 - 16.0 < (t0 - 10.0) - 5.0) -> inactive
         current_clock[0] = t0 - 16.0
         assert auth.claims == {}
-        assert auth.get_headers() == {}
+        with pytest.raises(UnauthorizedError):
+            auth.get_headers()
         assert auth.get_user_roles() == []
 
 
@@ -1075,6 +1125,7 @@ def test_oidc_strict_claim_types_and_crypto_decoder_edge_cases():
     from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 
     from imednet.auth.oidc import _verify_token_signature
+    from imednet.errors import ConfigurationError, UnauthorizedError
 
     secret = b"strict-claim-validation-secret"
 
@@ -1094,25 +1145,29 @@ def test_oidc_strict_claim_types_and_crypto_decoder_edge_cases():
     for bad_num in (True, False, float("nan"), float("inf"), float("-inf"), "12345", None, [], {}):
         exp_tok = sign_claims({"sub": "u", "roles": ["admin"], "exp": bad_num})
         exp_auth = OIDCAuth(exp_tok, public_key=secret)
-        assert exp_auth.get_headers() == {}
+        with pytest.raises(UnauthorizedError):
+            exp_auth.get_headers()
         assert exp_auth.claims == {}
         assert exp_auth.get_user_roles() == []
 
         nbf_tok = sign_claims({"sub": "u", "roles": ["admin"], "nbf": bad_num})
         nbf_auth = OIDCAuth(nbf_tok, public_key=secret)
-        assert nbf_auth.get_headers() == {}
+        with pytest.raises(UnauthorizedError):
+            nbf_auth.get_headers()
         assert nbf_auth.claims == {}
         assert nbf_auth.get_user_roles() == []
 
     valid_tok = sign_claims({"sub": "u", "roles": ["admin"], "exp": now + 300})
     for bad_leeway in (True, False, -0.1, float("nan"), float("inf")):
         bad_lw_auth = OIDCAuth(valid_tok, public_key=secret, leeway=bad_leeway)  # type: ignore[arg-type]
-        assert bad_lw_auth.get_headers() == {}
+        with pytest.raises(ConfigurationError):
+            bad_lw_auth.get_headers()
         assert bad_lw_auth.claims == {}
 
     # Exact exp boundary rejection in _decode_token_claims when now >= exp + leeway
     already_at_exp = sign_claims({"sub": "u", "roles": ["admin"], "exp": now - 0.001})
-    assert OIDCAuth(already_at_exp, public_key=secret).get_headers() == {}
+    with pytest.raises(UnauthorizedError):
+        OIDCAuth(already_at_exp, public_key=secret).get_headers()
 
     # 2. RFC 7519 Section 4.1.3 'aud' validation (string or non-empty list of non-empty strings)
     for bad_aud in (
@@ -1131,22 +1186,22 @@ def test_oidc_strict_claim_types_and_crypto_decoder_edge_cases():
         aud_tok = sign_claims({"sub": "u", "roles": ["admin"], "aud": bad_aud, "exp": now + 300})
         for aud_cfg in (None, "expected"):
             aud_auth = OIDCAuth(aud_tok, public_key=secret, audience=aud_cfg)
-            assert aud_auth.get_headers() == {}
+            with pytest.raises(UnauthorizedError):
+                aud_auth.get_headers()
             assert aud_auth.claims == {}
             assert aud_auth.get_user_roles() == []
 
     # Missing 'aud' when audience is configured, and invalid expected audience configurations
     no_aud_tok = sign_claims({"sub": "u", "roles": ["admin"], "exp": now + 300})
-    assert OIDCAuth(no_aud_tok, public_key=secret, audience="expected").get_headers() == {}
+    with pytest.raises(UnauthorizedError):
+        OIDCAuth(no_aud_tok, public_key=secret, audience="expected").get_headers()
     for bad_expected_aud in ("", "   ", [], [123], {"expected": 1}):
-        assert (
+        with pytest.raises(ConfigurationError):
             OIDCAuth(
                 sign_claims({"sub": "u", "aud": "expected", "exp": now + 300}),
                 public_key=secret,
                 audience=bad_expected_aud,  # type: ignore[arg-type]
             ).get_headers()
-            == {}
-        )
 
     # Valid string-list 'aud' with tuple/list audience config
     multi_aud_tok = sign_claims(
@@ -1165,21 +1220,20 @@ def test_oidc_strict_claim_types_and_crypto_decoder_edge_cases():
         iss_tok = sign_claims({"sub": "u", "roles": ["admin"], "iss": bad_iss, "exp": now + 300})
         for iss_cfg in (None, "https://idp.example"):
             iss_auth = OIDCAuth(iss_tok, public_key=secret, issuer=iss_cfg)
-            assert iss_auth.get_headers() == {}
+            with pytest.raises(UnauthorizedError):
+                iss_auth.get_headers()
             assert iss_auth.claims == {}
 
     valid_iss_tok = sign_claims(
         {"sub": "u", "roles": ["admin"], "iss": "https://idp.example", "exp": now + 300}
     )
     for bad_expected_iss in ("", "   ", 123):
-        assert (
+        with pytest.raises(ConfigurationError):
             OIDCAuth(
                 valid_iss_tok,
                 public_key=secret,
                 issuer=bad_expected_iss,  # type: ignore[arg-type]
             ).get_headers()
-            == {}
-        )
 
     # 4. get_user_id and get_user_roles reject dicts, booleans, and non-string items
     for bad_id in (True, False, 123, ["user"], {"user": "admin"}, "   "):
@@ -1225,22 +1279,27 @@ def test_oidc_strict_claim_types_and_crypto_decoder_edge_cases():
 
     # 5. Header/payload non-dict JSON, invalid alg, invalid signature b64, non-dict JWKS, and crypto paths
     list_h = b64url(b"[1, 2]")
-    assert OIDCAuth(f"{list_h}.eyJzdWIiOiIxIn0.c2ln", public_key=secret).get_headers() == {}
+    with pytest.raises(UnauthorizedError):
+        OIDCAuth(f"{list_h}.eyJzdWIiOiIxIn0.c2ln", public_key=secret).get_headers()
 
     for bad_hdr in ({"typ": "JWT"}, {"alg": 123}, {"alg": ""}):
         bh = b64url(json.dumps(bad_hdr).encode("utf-8"))
-        assert OIDCAuth(f"{bh}.eyJzdWIiOiIxIn0.c2ln", public_key=secret).get_headers() == {}
+        with pytest.raises(UnauthorizedError):
+            OIDCAuth(f"{bh}.eyJzdWIiOiIxIn0.c2ln", public_key=secret).get_headers()
 
     # 1-char base64 signature triggers binascii.Error after key resolution
-    assert OIDCAuth(f"{h_hs}.eyJzdWIiOiIxIn0.a", public_key=secret).get_headers() == {}
+    with pytest.raises(UnauthorizedError):
+        OIDCAuth(f"{h_hs}.eyJzdWIiOiIxIn0.a", public_key=secret).get_headers()
 
     # Validly signed non-dict payload ("[1, 2]") and invalid JSON payload
-    assert OIDCAuth(sign_claims([1, 2]), public_key=secret).get_headers() == {}
+    with pytest.raises(UnauthorizedError):
+        OIDCAuth(sign_claims([1, 2]), public_key=secret).get_headers()
     non_json_p = b64url(b"not-valid-json")
     non_json_sig = b64url(
         hmac.new(secret, f"{h_hs}.{non_json_p}".encode("ascii"), hashlib.sha256).digest()
     )
-    assert OIDCAuth(f"{h_hs}.{non_json_p}.{non_json_sig}", public_key=secret).get_headers() == {}
+    with pytest.raises(UnauthorizedError):
+        OIDCAuth(f"{h_hs}.{non_json_p}.{non_json_sig}", public_key=secret).get_headers()
 
     # Remote JWKS returning a JSON array rather than object
     rsa_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -1249,13 +1308,11 @@ def test_oidc_strict_claim_types_and_crypto_decoder_edge_cases():
     h_rs = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode("utf-8"))
     with respx.mock:
         respx.get("https://auth.imednet.example/list-jwks.json").respond(200, json=[1, 2, 3])
-        assert (
+        with pytest.raises(ConfigurationError):
             OIDCAuth(
                 f"{h_rs}.eyJzdWIiOiIxIn0.c2ln",
                 jwks_url="https://auth.imednet.example/list-jwks.json",
             ).get_headers()
-            == {}
-        )
 
     # Direct _verify_token_signature negative and DER-ECDSA branches
     msg = b"header.payload"
@@ -1350,23 +1407,42 @@ async def test_single_load_config_and_pre_resolved_config_and_oidc_precedence(mo
             assert len(calls) == 0
             assert pre_sdk.config is resolved
             assert isinstance(pre_sdk.auth, OIDCAuth)
-            assert pre_sdk.auth.get_headers() == {"Authorization": "Bearer preferred-oidc-token"}
+            assert pre_sdk.auth.get_headers() == {
+                "x-api-key": "fallback-key",
+                "x-imn-security-key": "fallback-sec",
+                "Authorization": "Bearer preferred-oidc-token",
+            }
             assert pre_sdk._client.timeout == httpx.Timeout(61.0)
 
         async with AsyncImednetSDK(config=resolved) as pre_async_sdk:
             assert len(calls) == 0
             assert pre_async_sdk.config is resolved
             assert isinstance(pre_async_sdk.auth, OIDCAuth)
+            assert pre_async_sdk.auth.get_headers() == {
+                "x-api-key": "fallback-key",
+                "x-imn-security-key": "fallback-sec",
+                "Authorization": "Bearer preferred-oidc-token",
+            }
             assert pre_async_sdk._async_client.timeout == httpx.Timeout(61.0)
 
         with ClientFactory.create_client(resolved) as factory_client:
             assert len(calls) == 0
             assert factory_client.config is resolved
+            assert factory_client.auth.get_headers() == {
+                "x-api-key": "fallback-key",
+                "x-imn-security-key": "fallback-sec",
+                "Authorization": "Bearer preferred-oidc-token",
+            }
             assert factory_client.timeout == httpx.Timeout(61.0)
 
         async with ClientFactory.create_async_client(resolved) as factory_async:
             assert len(calls) == 0
             assert factory_async.config is resolved
+            assert factory_async.auth.get_headers() == {
+                "x-api-key": "fallback-key",
+                "x-imn-security-key": "fallback-sec",
+                "Authorization": "Bearer preferred-oidc-token",
+            }
             assert factory_async.timeout == httpx.Timeout(61.0)
 
         # 5. ADR 0005 precedence: explicit oidc_token > credential_source > env
@@ -1459,3 +1535,113 @@ async def test_strict_mode_isolated_per_sdk_without_env_mutation(monkeypatch):
         assert len(lenient_items) == 1
         assert lenient_items[0].study_key == "S-STRICT"
         assert "IMEDNET_STRICT_MODE" not in os.environ
+
+
+async def test_client_and_async_client_compose_api_keys_with_oidc_and_reject_bad_jwts(monkeypatch):
+    """Client and AsyncClient emit API keys + Bearer together on same-origin and reject alg='none'/expired JWTs."""
+    import base64
+    import json
+    import time
+    from types import SimpleNamespace
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    from imednet.core.context import extract_sdk_security_key
+    from imednet.errors import ImednetError, UnauthorizedError
+
+    rsa_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_pub_pem = (
+        rsa_priv.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("ascii")
+    )
+    monkeypatch.setenv("IMEDNET_OIDC_PUBLIC_KEY", rsa_pub_pem)
+
+    def b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+    h_rs = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode("utf-8"))
+    h_none = b64url(json.dumps({"alg": "none", "typ": "JWT"}).encode("utf-8"))
+    now = time.time()
+
+    def make_rs_jwt(exp: float) -> str:
+        p = b64url(json.dumps({"sub": "dm-1", "roles": ["admin"], "exp": exp}).encode("utf-8"))
+        sig = rsa_priv.sign(
+            f"{h_rs}.{p}".encode("ascii"),
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+        return f"{h_rs}.{p}.{b64url(sig)}"
+
+    valid_jwt = make_rs_jwt(now + 600.0)
+    expired_jwt = make_rs_jwt(now - 60.0)
+    p_dm = b64url(b'{"sub":"dm-1"}')
+    none_jwt = f"{h_none}.{p_dm}.unsigned"
+
+    seen_sync: list[tuple[str, dict[str, str]]] = []
+    seen_async: list[tuple[str, dict[str, str]]] = []
+
+    def sync_handler(req: httpx.Request) -> httpx.Response:
+        seen_sync.append((str(req.url), {k.lower(): v for k, v in req.headers.items()}))
+        return httpx.Response(200, json={"ok": True})
+
+    class AsyncCaptureTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, req: httpx.Request) -> httpx.Response:
+            seen_async.append((str(req.url), {k.lower(): v for k, v in req.headers.items()}))
+            return httpx.Response(200, json={"ok": True})
+
+    with Client(
+        api_key="imn-key-1",  # pragma: allowlist secret
+        security_key="imn-sec-1",  # pragma: allowlist secret
+        oidc_token=valid_jwt,
+        base_url="https://edc.imednet.example",
+        transport=httpx.MockTransport(sync_handler),
+    ) as client:
+        assert extract_sdk_security_key(client) == "imn-sec-1"
+        assert extract_sdk_security_key(SimpleNamespace(auth=client.auth)) == "imn-sec-1"
+        client.get("/api/v1/edc/studies")
+        client.fetch_external_url("https://cdn.synthetic.example/results.json")
+
+    assert seen_sync[0][1]["x-api-key"] == "imn-key-1"
+    assert seen_sync[0][1]["x-imn-security-key"] == "imn-sec-1"
+    assert seen_sync[0][1]["authorization"] == f"Bearer {valid_jwt}"
+    for cred_hdr in ("x-api-key", "x-imn-security-key", "authorization"):
+        assert cred_hdr not in seen_sync[1][1]
+
+    async with AsyncClient(
+        api_key="imn-key-2",  # pragma: allowlist secret
+        security_key="imn-sec-2",  # pragma: allowlist secret
+        oidc_token=valid_jwt,
+        base_url="https://edc.imednet.example",
+        transport=AsyncCaptureTransport(),
+    ) as aclient:
+        await aclient.get("/api/v1/edc/studies")
+        await aclient.fetch_external_url("https://cdn.synthetic.example/results.json")
+
+    assert seen_async[0][1]["x-api-key"] == "imn-key-2"
+    assert seen_async[0][1]["x-imn-security-key"] == "imn-sec-2"
+    assert seen_async[0][1]["authorization"] == f"Bearer {valid_jwt}"
+    for cred_hdr in ("x-api-key", "x-imn-security-key", "authorization"):
+        assert cred_hdr not in seen_async[1][1]
+
+    # alg="none" (with or without trailing signature) and expired JWTs raise ImednetError
+    for rejected_none_jwt in (none_jwt, f"{h_none}.{p_dm}."):
+        with Client(
+            api_key="imn-key-1",  # pragma: allowlist secret
+            security_key="imn-sec-1",  # pragma: allowlist secret
+            oidc_token=rejected_none_jwt,
+            base_url="https://edc.imednet.example",
+            transport=httpx.MockTransport(sync_handler),
+        ) as bad_none_client:
+            with pytest.raises(UnauthorizedError, match="none") as none_exc:
+                bad_none_client.get("/api/v1/edc/studies")
+            assert isinstance(none_exc.value, ImednetError)
+
+    exp_auth = OIDCAuth(expired_jwt)
+    with pytest.raises(UnauthorizedError) as exp_exc:
+        exp_auth.get_headers()
+    assert isinstance(exp_exc.value, ImednetError)

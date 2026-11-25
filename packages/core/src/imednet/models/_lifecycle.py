@@ -6,9 +6,9 @@ import re
 from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidatorFunctionWrapHandler
 
 StatusEnumT = TypeVar("StatusEnumT", bound=Enum)
 
@@ -61,11 +61,17 @@ def coerce_status(
 def coerce_field_status(
     enum_cls: type[StatusEnumT],
     value: object,
+    handler: ValidatorFunctionWrapHandler,
 ) -> StatusEnumT | str | None:
-    """Coerce raw Pydantic field input into a normalized enum member or string."""
-    if value is None or isinstance(value, (enum_cls, str)):
-        return coerce_status(enum_cls, value)
-    return coerce_status(enum_cls, str(value))
+    """Validate status field preserving verbatim strings unless matching an enum .value."""
+    if value is None or isinstance(value, enum_cls):
+        return cast("StatusEnumT | None", handler(value))
+    text = value if isinstance(value, str) else str(value)
+    stripped = text.strip()
+    for member in enum_cls:
+        if member.value == stripped:
+            return member
+    return stripped
 
 
 def build_terminal_transition_map(
@@ -97,10 +103,18 @@ def _coerce_validated_transition(
     if dst is None or (isinstance(dst, str) and not dst.strip()):
         raise ValueError(f"Invalid target {status_label} status: {to_status!r}")
 
-    if deleted is True or src == deleted_member:
+    is_soft_deleted = deleted if deleted is not None else src == deleted_member
+    if is_soft_deleted:
         raise ValueError(
             f"Cannot transition soft-deleted {entity_label} from {deleted_member.value} to {dst!s}."
         )
+
+    if deleted is False and src == deleted_member:
+        if dst != deleted_member and from_status == to_status:
+            raise ValueError(
+                f"Cannot transition {status_label} status from {from_status!s} to {dst!s}."
+            )
+        return dst
 
     if isinstance(src, enum_cls) and isinstance(dst, enum_cls):
         permitted = allowed_transitions.get(src, set())
@@ -168,8 +182,10 @@ def is_entity_deleted(
     status: object,
     deleted_member: StatusEnumT,
 ) -> bool:
-    """Return True when an entity has ``deleted=True`` or the terminal DELETED status."""
-    return deleted is True or status == deleted_member
+    """Return True when ``deleted=True`` or when ``deleted is None`` and status resolves to DELETED."""
+    if deleted is not None:
+        return deleted
+    return coerce_status(type(deleted_member), status) == deleted_member
 
 
 def resolve_effective_status(
@@ -195,11 +211,7 @@ def apply_entity_transition(
 ) -> StatusEnumT | str:
     """Validate and apply a status transition on *instance*, enforcing soft-delete invariants."""
     current_status: StatusEnumT | str | None = getattr(instance, status_field)
-    currently_deleted = is_entity_deleted(
-        getattr(instance, "deleted", None),
-        current_status,
-        deleted_member,
-    )
+    raw_deleted: bool | None = getattr(instance, "deleted", None)
     normalized = _coerce_validated_transition(
         enum_cls,
         allowed_transitions,
@@ -207,7 +219,7 @@ def apply_entity_transition(
         entity_label,
         current_status,
         target_status,
-        deleted=currently_deleted,
+        deleted=raw_deleted,
     )
     BaseModel.__setattr__(instance, status_field, normalized)
     if normalized == deleted_member:
@@ -228,7 +240,11 @@ def setattr_with_soft_delete_guard(
     """Enforce terminal soft-delete invariants on post-initialization attribute mutation."""
     state = instance.__dict__
     initialized = "deleted" in state or status_field in state
-    currently_deleted = state.get("deleted") is True or state.get(status_field) == deleted_member
+    currently_deleted = is_entity_deleted(
+        state.get("deleted"),
+        state.get(status_field),
+        deleted_member,
+    )
     if initialized and currently_deleted:
         if name == "deleted" and value is not True:
             raise ValueError(f"Cannot restore a soft-deleted {entity_label} by clearing deleted.")

@@ -67,7 +67,7 @@ above are useful for diagnostics.
 Install with ``uv sync --locked --all-packages --all-extras`` or the setup wizard;
 no real credentials or live EDC access are required. Run pre-commit first and
 ``uvx hatch run quality:all`` as well for the full-workspace formatting, Ruff,
-and non-mutating ``typos --force-exclude`` checks alongside the package-scoped
+non-mutating ``typos --force-exclude``, and ``detect-secrets`` checks alongside the package-scoped
 security, dead-code, and similarity gates. The ``global-lint`` job runs the
 same pinned Ruff and non-mutating ``typos --force-exclude .`` checks across the
 repository; package/Python matrix jobs supplement the full workspace gate. Duplicate global

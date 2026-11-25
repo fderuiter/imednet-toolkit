@@ -11,6 +11,7 @@ from pydantic import (
     Field,
     RootModel,
     SerializerFunctionWrapHandler,
+    ValidatorFunctionWrapHandler,
     field_validator,
     model_serializer,
 )
@@ -138,11 +139,15 @@ class Record(ImednetBaseModel):
     record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
     deleted: bool | None = Field(default=None, alias="deleted")
 
-    @field_validator("record_status", mode="before")
+    @field_validator("record_status", mode="wrap")
     @classmethod
-    def _validate_record_status(cls, value: Any) -> RecordStatus | str | None:
-        """Normalize known record statuses and preserve custom study strings."""
-        return coerce_field_status(RecordStatus, value)
+    def _validate_record_status(
+        cls,
+        value: Any,
+        handler: ValidatorFunctionWrapHandler,
+    ) -> RecordStatus | str | None:
+        """Preserve verbatim record statuses unless matching an exact RecordStatus value."""
+        return coerce_field_status(RecordStatus, value, handler)
 
     @property
     def is_deleted(self) -> bool:
@@ -159,7 +164,7 @@ class Record(ImednetBaseModel):
         return is_valid_record_transition(
             self.record_status,
             target_status,
-            deleted=self.is_deleted,
+            deleted=self.deleted,
         )
 
     def transition_to(self, target_status: RecordStatus | str) -> RecordStatus | str:
