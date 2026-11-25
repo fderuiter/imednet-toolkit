@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,7 @@ class ImednetError(Exception):
         message: str = "",
         status_code: int | None = None,
         code: int | None = None,
-        status: str | None = None,
+        status: Any = None,
         *,
         diagnostic_context: DiagnosticContext | None = None,
     ) -> None:
@@ -48,7 +49,7 @@ class ImednetError(Exception):
         self.message = message
         self.status_code = status_code
         self.code = code
-        self.status = status
+        self.status: Any = status
         self.diagnostic_context: DiagnosticContext = (
             diagnostic_context if diagnostic_context is not None else DiagnosticContext()
         )

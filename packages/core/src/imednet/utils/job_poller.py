@@ -14,6 +14,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, NoReturn, Protocol, cast, runtime_checkable
 
+from imednet.errors.base import ImednetError
+from imednet.errors.client import ClientError
 from imednet.models.jobs import (
     InvalidJobStateError,
     InvalidJobTransitionError,
@@ -148,8 +150,12 @@ class JobPollSummary:
         return combined
 
 
-class JobTimeoutError(TimeoutError):
+class JobTimeoutError(ImednetError, TimeoutError):
     """Raised when a job does not finish before the timeout."""
+
+
+class _ResultPayloadError(ClientError, ValueError):
+    """Raised when a terminal job resultUrl payload is non-JSON or malformed."""
 
 
 def _extract_record_errors(status: JobStatus | Any) -> list[dict[str, Any]]:
@@ -217,7 +223,7 @@ def _format_job_failure_details(
     return base_message
 
 
-class JobFailedError(Exception):
+class JobFailedError(ImednetError):
     """Raised when a job fails, is cancelled, has failed records, or fails fetching resultUrl."""
 
     def __init__(
@@ -321,16 +327,16 @@ def _attach_fetched_result(status: JobStatus | Any, res: Any) -> JobStatus | Any
         elif isinstance(res, (str, bytes)):
             parsed = json.loads(res)
         else:
-            raise ValueError(f"Unsupported resultUrl response type: {type(res).__name__}")
+            raise _ResultPayloadError(f"Unsupported resultUrl response type: {type(res).__name__}")
         if not isinstance(parsed, (dict, list)):
-            raise ValueError(
+            raise _ResultPayloadError(
                 f"Expected JSON object or array from resultUrl, got {type(parsed).__name__}"
             )
     except Exception as exc:
         redacted_err = sanitize_diagnostic_text(str(exc)) or "Invalid JSON in resultUrl body"
         status.results = None
         status.result_error = redacted_err
-        raise ValueError(f"Non-JSON resultUrl response: {redacted_err}") from exc
+        raise _ResultPayloadError(f"Non-JSON resultUrl response: {redacted_err}") from exc
 
     status.results = parsed
     return status

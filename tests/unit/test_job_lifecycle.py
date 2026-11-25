@@ -305,8 +305,13 @@ def test_airflow_job_sensor_stale_response_protection(monkeypatch: pytest.Monkey
         assert bool(done_poke) is True
         assert getattr(done_poke, "is_done", done_poke) is True
         assert done_poke.xcom_value is not None
-        assert done_poke.xcom_value["batch_id"] == "B"
+        assert done_poke.xcom_value["batchId"] == "B"
         assert done_poke.xcom_value["state"] == "COMPLETED"
+        assert "jobId" in done_poke.xcom_value
+        assert "totalRecords" in done_poke.xcom_value
+        assert "successfulRecords" in done_poke.xcom_value
+        assert "failedRecords" in done_poke.xcom_value
+        assert "record_total_count" not in done_poke.xcom_value
         assert "results" not in done_poke.xcom_value
 
         # 3. Subsequent stale non-terminal poke -> succeeds deterministically with cached summary

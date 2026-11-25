@@ -1291,7 +1291,8 @@ def test_airflow3_db_connection_templated_sensor_xcom_parity_and_soft_fail(
     summary = xcoms["sensor_sync_ok"]
     assert isinstance(summary, dict)
     assert "results" not in summary
-    assert summary["batch_id"] == "BATCH_OK"
+    assert "record_total_count" not in summary
+    assert summary["batchId"] == "BATCH_OK"
     assert summary["state"] == "COMPLETED"
     assert "Jane Clinical" not in repr(summary)
     assert "SUBJ-001" not in repr(summary)

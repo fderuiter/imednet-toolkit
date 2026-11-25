@@ -63,7 +63,15 @@ def test_job_sensor(monkeypatch):
     poke_res = sensor.poke({})
     assert isinstance(poke_res, _airflow_compat.PokeReturnValue)
     assert bool(poke_res) is True
-    assert poke_res.xcom_value == {"study_key": "S", "batch_id": "B", "state": "COMPLETED"}
+    assert poke_res.xcom_value == {
+        "studyKey": "S",
+        "batchId": "B",
+        "jobId": None,
+        "state": "COMPLETED",
+        "totalRecords": None,
+        "successfulRecords": None,
+        "failedRecords": None,
+    }
     sdk.jobs.get.assert_called_once_with("S", "B")
     sensors.ImednetHook.assert_called_once_with("imednet_default")
     hook_inst.get_sdk_client.assert_called_once_with()

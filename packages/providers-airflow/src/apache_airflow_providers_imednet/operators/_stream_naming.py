@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from collections.abc import Mapping
@@ -161,6 +162,98 @@ def resolve_export_target_identifier(
     return sanitize_stream_segment("_".join(sanitized_parts), max_len=80)
 
 
+_SHARD_DISCRIMINATOR_KEYS: tuple[str, ...] = (
+    "record_filter",
+    "record_data_filter",
+    "filter",
+    "form_key",
+    "form_keys",
+    "forms",
+    "interval_name",
+    "interval_names",
+    "intervals",
+    "site_name",
+    "site_names",
+    "sites",
+    "subject_key",
+    "subject_keys",
+    "subjects",
+)
+
+
+def _canonicalize_discriminator_value(value: Any) -> Any:
+    """Normalize a shard discriminator value into deterministic JSON-safe data for hashing."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        return redact_uri(stripped) if "://" in stripped else stripped
+    if isinstance(value, Mapping):
+        return {
+            str(k): _canonicalize_discriminator_value(v)
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (set, frozenset)):
+        items = [_canonicalize_discriminator_value(v) for v in value]
+        return sorted(items, key=lambda item: json.dumps(item, sort_keys=True, default=str))
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_discriminator_value(v) for v in value]
+    if isinstance(value, Enum):
+        return value.value
+    return value
+
+
+def _is_non_empty_discriminator(value: Any) -> bool:
+    """Return True when *value* carries a meaningful non-empty shard slice constraint."""
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        return len(value) > 0
+    return True
+
+
+def resolve_shard_discriminator_hash(
+    operator: Any,
+    runtime_kwargs: Mapping[str, Any] | None = None,
+) -> str:
+    """Compute a deterministic hash token when shard slice filters are configured."""
+    kwargs = runtime_kwargs or {}
+    discriminators: dict[str, Any] = {}
+
+    for key in _SHARD_DISCRIMINATOR_KEYS:
+        raw_val = (
+            kwargs[key]
+            if key in kwargs and kwargs[key] is not None
+            else getattr(operator, key, None)
+        )
+        if _is_non_empty_discriminator(raw_val):
+            discriminators[key] = _canonicalize_discriminator_value(raw_val)
+
+    raw_domain = (
+        kwargs.get("sdtm_domain")
+        or kwargs.get("domain")
+        or getattr(operator, "sdtm_domain", None)
+        or getattr(operator, "domain", None)
+    )
+    if _is_non_empty_discriminator(raw_domain):
+        discriminators["sdtm_domain"] = _canonicalize_discriminator_value(str(raw_domain))
+    else:
+        raw_as_sdtm = kwargs.get("as_sdtm", getattr(operator, "as_sdtm", False))
+        if bool(raw_as_sdtm):
+            discriminators["as_sdtm"] = True
+
+    raw_include_deleted = kwargs.get("include_deleted", getattr(operator, "include_deleted", False))
+    if bool(raw_include_deleted):
+        discriminators["include_deleted"] = True
+
+    if not discriminators:
+        return ""
+
+    canonical = json.dumps(discriminators, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return f"shard_{digest}"
+
+
 def build_default_airflow_stream_name(
     operator: Any,
     dest: str,
@@ -170,7 +263,7 @@ def build_default_airflow_stream_name(
     runtime_kwargs: Mapping[str, Any] | None = None,
     conn_settings: Mapping[str, Any] | None = None,
 ) -> str:
-    """Return a target-scoped default stream name invariant across mapped task indexes."""
+    """Return a target- and shard-scoped default stream name invariant across mapped task indexes."""
     clean_dest = sanitize_stream_segment(dest, max_len=32) or "records"
     base = f"airflow_{clean_dest}" if sink_prefix else clean_dest
     segments: list[str] = [base]
@@ -204,6 +297,10 @@ def build_default_airflow_stream_name(
     )
     if target_seg:
         segments.append(target_seg)
+
+    shard_seg = resolve_shard_discriminator_hash(operator, effective_kwargs)
+    if shard_seg:
+        segments.append(shard_seg)
 
     return "_".join(segments)
 
@@ -268,6 +365,8 @@ def seed_pre_upgrade_watermark(
         return None
 
     if provider is None:
+        return None
+    if re.search(r"_shard_[0-9a-f]{12}$", scoped_stream):
         return None
 
     study_key = str(getattr(operator, "study_key", ""))

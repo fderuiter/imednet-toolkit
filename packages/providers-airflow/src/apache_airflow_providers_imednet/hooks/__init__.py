@@ -518,6 +518,9 @@ class ImednetHook(BaseHook):
             return None
 
         port = cls._port_or_none(getattr(conn, "port", None))
+        raw_schema = cls._string_or_none(getattr(conn, "schema", None))
+        schema_subpath = raw_schema.strip("/") if raw_schema else ""
+
         if raw_host.startswith(("http://", "https://")):
             parsed = urlsplit(raw_host)
             scheme = parsed.scheme
@@ -530,6 +533,9 @@ class ImednetHook(BaseHook):
             conn_scheme = (cls._string_or_none(getattr(conn, "conn_type", None)) or "").lower()
             if extra_scheme in {"http", "https"}:
                 scheme = extra_scheme
+            elif conn_scheme == "http" and schema_subpath.lower() in {"http", "https"}:
+                scheme = schema_subpath.lower()
+                schema_subpath = ""
             elif conn_scheme in {"http", "https"}:
                 scheme = conn_scheme
             else:
@@ -540,6 +546,12 @@ class ImednetHook(BaseHook):
             netloc = (
                 f"{host_only}:{port}" if port is not None and ":" not in host_only else host_only
             )
+
+        if schema_subpath:
+            clean_path = path.rstrip("/")
+            target_suffix = f"/{schema_subpath}"
+            if clean_path != target_suffix and not clean_path.endswith(target_suffix):
+                path = f"{clean_path}{target_suffix}"
 
         return sanitize_base_url(f"{scheme}://{netloc}{path}")
 

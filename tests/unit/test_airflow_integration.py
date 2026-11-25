@@ -990,3 +990,87 @@ def test_export_operator_rejects_secrets_in_templated_filter_fields(monkeypatch)
     op = ImednetExportOperator(task_id="ok", study_key="STUDY-1")
     with pytest.raises(AirflowException, match="stream_name"):
         op.stream_name = "postgresql://user:pass@db.example/prod"  # pragma: allowlist secret
+
+
+def test_hook_conn_schema_subpath_regex_filters_and_mapped_study_shard_streams(monkeypatch):
+    """ImednetHook preserves conn.schema subpaths, ExportOperator accepts TOKEN=~pos, and Study shards get distinct stream_name values."""
+    from types import SimpleNamespace
+
+    monkeypatch.delitem(sys.modules, "apache_airflow_providers_imednet", raising=False)
+    monkeypatch.delitem(sys.modules, "airflow.providers.imednet", raising=False)
+
+    _setup_airflow(monkeypatch)
+    from apache_airflow_providers_imednet import ImednetExportOperator
+    from apache_airflow_providers_imednet.hooks import ImednetHook
+
+    # 1. conn.schema reverse-proxy subpath preservation before sanitize_base_url
+    proxy_conn = SimpleNamespace(
+        conn_type="imednet",
+        host="edc.corp.example.org",
+        schema="subpath/api/v1/edc",
+        port=None,
+        login="k",
+        password="s",
+        extra_dejson={},
+    )
+    assert (
+        ImednetHook._resolve_connection_base_url(proxy_conn, {})
+        == "https://edc.corp.example.org/subpath"
+    )
+
+    # 2. TOKEN=~pos and TOKEN==1 clinical Variable filters are accepted without raising
+    regex_op_a = ImednetExportOperator(
+        task_id="sharded_export",
+        study_key="STUDY-SHARD",
+        destination="snowflake",
+        incremental=True,
+        record_data_filter="TOKEN=~pos",
+        export_kwargs={"database": "CLIN", "schema": "RAW", "table": "RECORDS"},
+    )
+    regex_op_b = ImednetExportOperator(
+        task_id="sharded_export",
+        study_key="STUDY-SHARD",
+        destination="snowflake",
+        incremental=True,
+        record_data_filter="TOKEN==1",
+        export_kwargs={"database": "CLIN", "schema": "RAW", "table": "RECORDS"},
+    )
+    assert regex_op_a.record_data_filter == "TOKEN=~pos"
+    assert regex_op_b.record_data_filter == "TOKEN==1"
+
+    # 3. Mapped shards targeting different slices of the same Study receive distinct stream_name values
+    ctx = {"dag_id": "clinical_sync"}
+    stream_a = regex_op_a._default_airflow_stream_name(
+        "snowflake",
+        sink_prefix=True,
+        context=ctx,
+        conn_settings={},
+    )
+    stream_b = regex_op_b._default_airflow_stream_name(
+        "snowflake",
+        sink_prefix=True,
+        context=ctx,
+        conn_settings={},
+    )
+    assert stream_a != stream_b
+
+    # Also verify export_kwargs-mapped shards (e.g. record_filter or domain) isolate stream_name
+    shard_kw_1 = ImednetExportOperator(
+        task_id="mapped_domain_export",
+        study_key="STUDY-SHARD",
+        destination="duckdb",
+        output_path="/tmp/study.duckdb",
+        incremental=True,
+        export_kwargs={"record_filter": {"formKey": "AE"}},
+    )
+    shard_kw_2 = ImednetExportOperator(
+        task_id="mapped_domain_export",
+        study_key="STUDY-SHARD",
+        destination="duckdb",
+        output_path="/tmp/study.duckdb",
+        incremental=True,
+        export_kwargs={"record_filter": {"formKey": "CM"}},
+    )
+    assert shard_kw_1._default_airflow_stream_name(
+        "duckdb", context=ctx, conn_settings={}
+    ) != shard_kw_2._default_airflow_stream_name("duckdb", context=ctx, conn_settings={})

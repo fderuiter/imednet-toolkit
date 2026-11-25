@@ -17,7 +17,7 @@ import httpx
 
 from imednet.auth.api_key import ApiKeyAuth
 from imednet.auth.credentials import CredentialSource
-from imednet.auth.oidc import OIDCAuth
+from imednet.auth.oidc import build_oidc_auth
 from imednet.auth.strategy import AuthStrategy
 from imednet.config import Config, load_config, merge_config_overrides
 from imednet.constants import DEFAULT_BASE_URL
@@ -141,7 +141,11 @@ class BaseClient:
                 resolved_config.security_key or "SIMULATED_KEY",
             )
         elif resolved_config.oidc_token:
-            self.auth = OIDCAuth(resolved_config.oidc_token)
+            self.auth = build_oidc_auth(
+                resolved_config.oidc_token,
+                api_key=resolved_config.api_key,
+                security_key=resolved_config.security_key,
+            )
         else:
             self.auth = ApiKeyAuth(
                 resolved_config.api_key or "", resolved_config.security_key or ""

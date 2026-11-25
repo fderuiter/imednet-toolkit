@@ -11,6 +11,7 @@ from imednet.errors import (
     ForbiddenError,
     NotFoundError,
     ServerError,
+    UnauthorizedError,
     ValidationError,
     get_error_class,
 )
@@ -103,7 +104,8 @@ def test_api_error_nested_validation_envelope():
         }
     }
     err_cls = get_error_class(400, payload)
-    assert err_cls is ValidationError
+    assert err_cls is BadRequestError
+    assert issubclass(err_cls, ValidationError)
 
     err = err_cls(payload, status_code=400)
     assert isinstance(err, ValidationError)
@@ -119,7 +121,7 @@ def test_api_error_nested_validation_envelope():
 @pytest.mark.parametrize(
     ("status_code", "error_code", "meta_status", "description", "expected_cls"),
     [
-        (400, "1000", "BAD_REQUEST", "Field raised validation errors", ValidationError),
+        (400, "1000", "BAD_REQUEST", "Field raised validation errors", BadRequestError),
         (
             500,
             "9000",
@@ -132,14 +134,14 @@ def test_api_error_nested_validation_envelope():
             "9000",
             "BAD_REQUEST",
             "Unknown error. Please contact Mednet support for assistance.",
-            ServerError,
+            BadRequestError,
         ),
         (
             401,
             "9001",
             "UNAUTHORIZED",
             "Unauthorized error. Insufficient permission to retrieve data.",
-            AuthenticationError,
+            UnauthorizedError,
         ),
         (
             403,
@@ -184,12 +186,16 @@ def test_get_error_class_metadata_status_and_fallbacks():
         is BadRequestError
     )
     assert get_error_class(200, {"metadata": {"status": "UNAUTHORIZED"}}) is AuthenticationError
+    assert get_error_class(401, {"metadata": {"status": "UNAUTHORIZED"}}) is UnauthorizedError
+    assert get_error_class(403, {"metadata": {"status": "UNAUTHORIZED"}}) is ForbiddenError
     assert get_error_class(200, {"metadata": {"status": "FORBIDDEN"}}) is ForbiddenError
     assert get_error_class(200, {"metadata": {"status": "NOT_FOUND"}}) is NotFoundError
 
     # Legacy flat status overrides
-    assert get_error_class(400, {"status": "validation_error"}) is ValidationError
-    assert get_error_class(401, {"status": "authentication_failed"}) is AuthenticationError
+    assert get_error_class(400, {"status": "validation_error"}) is BadRequestError
+    assert get_error_class(401, {"status": "authentication_failed"}) is UnauthorizedError
+    assert get_error_class(200, {"status": "validation_error"}) is ValidationError
+    assert get_error_class(200, {"status": "authentication_failed"}) is AuthenticationError
 
     # Top-level flat fallback attributes
     flat_err = ValidationError(
@@ -286,7 +292,8 @@ def test_api_error_nested_variable_details_and_sensitive_field_value_redaction()
         }
     }
     err_cls = get_error_class(400, payload)
-    assert err_cls is ValidationError
+    assert err_cls is BadRequestError
+    assert issubclass(err_cls, ValidationError)
 
     err = err_cls(payload, status_code=400)
     assert err.code == 1000
@@ -402,7 +409,8 @@ def test_clinical_variables_and_prose_preserved_while_credentials_redacted(monke
     }
 
     err_cls = get_error_class(400, clinical_payload)
-    assert err_cls is ValidationError
+    assert err_cls is BadRequestError
+    assert issubclass(err_cls, ValidationError)
     api_err = err_cls(clinical_payload, status_code=400)
     assert api_err.code == 1000
     assert api_err.description is not None
@@ -537,6 +545,18 @@ def test_diagnostic_context_immutability_retry_after_and_cli_forbidden(
     assert get_error_class(403, forbidden_list_payload) is ForbiddenError
     assert (
         get_error_class(
+            403,
+            {
+                "metadata": {
+                    "status": "UNAUTHORIZED",
+                    "error": [{"description": "Insufficient study permission."}],
+                }
+            },
+        )
+        is ForbiddenError
+    )
+    assert (
+        get_error_class(
             401,
             {
                 "metadata": {
@@ -545,8 +565,9 @@ def test_diagnostic_context_immutability_retry_after_and_cli_forbidden(
                 }
             },
         )
-        is AuthenticationError
+        is UnauthorizedError
     )
+    assert issubclass(UnauthorizedError, AuthenticationError)
 
     # CLI @with_sdk prints Permission Denied: when SDK raises 403 + 9001
     fake_sdk = MagicMock()

@@ -87,11 +87,15 @@ def _resolve_code_error(code: str, *, is_forbidden: bool) -> type[ApiError] | No
 def get_error_class(status_code: int, response_body: Any = None) -> type[ApiError]:
     """Get error class for status code and response payload.
 
-    Inspects nested ``metadata.error`` (dict or list) and ``metadata.status`` first,
-    preserving ``ForbiddenError`` on HTTP 403 or ``FORBIDDEN`` responses with code ``9001``,
-    then legacy top-level keys, and finally falls back to HTTP status mappings.
+    Routes HTTP 400, 401, and 403 directly to ``BadRequestError``,
+    ``UnauthorizedError``, and ``ForbiddenError`` regardless of nested error codes,
+    then inspects nested ``metadata.error`` and ``metadata.status`` for envelope or
+    other status codes, and finally falls back to HTTP status mappings.
     Defaults to generic ``ApiError`` for unmapped client/server errors.
     """
+    if status_code in (400, 401, 403):
+        return STATUS_TO_ERROR[status_code]
+
     if isinstance(response_body, dict):
         metadata = response_body.get("metadata")
         meta_status_upper = ""
@@ -106,11 +110,7 @@ def get_error_class(status_code: int, response_body: Any = None) -> type[ApiErro
             if isinstance(raw_top_status, str) and raw_top_status.strip()
             else ""
         )
-        is_forbidden = (
-            status_code == 403
-            or meta_status_upper == "FORBIDDEN"
-            or top_status_upper == "FORBIDDEN"
-        )
+        is_forbidden = meta_status_upper == "FORBIDDEN" or top_status_upper == "FORBIDDEN"
 
         if isinstance(metadata, dict):
             for nested_code in _extract_error_codes(metadata.get("error")):
@@ -135,12 +135,10 @@ def get_error_class(status_code: int, response_body: Any = None) -> type[ApiErro
                 if mapped_item_cls is not None:
                     return mapped_item_cls
 
-        status = response_body.get("status")
-        # Identify specific subclasses based on legacy top-level status
-        if status_code == 400 and status == "validation_error":
-            return ValidationError
-        if status_code == 401 and status == "authentication_failed":
-            return AuthenticationError
+        if top_status_upper:
+            mapped_top_status_cls = METADATA_STATUS_TO_ERROR.get(top_status_upper)
+            if mapped_top_status_cls is not None:
+                return mapped_top_status_cls
 
     error_cls = STATUS_TO_ERROR.get(status_code)
     if error_cls:

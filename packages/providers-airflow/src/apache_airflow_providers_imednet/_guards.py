@@ -32,7 +32,7 @@ _CREDENTIAL_KEY_EXPR = (
 
 _SINGLE_ASSIGNMENT_SECRET_RE = re.compile(
     rf"(?i)(?<![a-z0-9_])([\"']?)(?<![a-z0-9_])({_CREDENTIAL_KEY_EXPR})(?![a-z0-9_])\1"
-    r"\s*(?<![=!<>])[:=](?!=)\s*"
+    r"\s*(?<![=!<>])[:=](?![=~])\s*"
     r"(?:([\"'])(?!\*{3})(?:[^\"'\r\n]+)\3|(?:(?:bearer|basic)\s+)?(?!\*{3})[^\s,;\"')\]}&]+)"
 )
 
@@ -83,33 +83,102 @@ def validate_non_secret_identifier(
     return value
 
 
+_JOB_SUMMARY_KEY_ALIASES: dict[str, str] = {
+    "batch_id": "batchId",
+    "job_id": "jobId",
+    "study_key": "studyKey",
+    "date_created": "dateCreated",
+    "date_started": "dateStarted",
+    "date_finished": "dateFinished",
+    "result_url": "resultUrl",
+    "result_error": "resultError",
+    "record_total_count": "totalRecords",
+    "total_records": "totalRecords",
+    "record_success_count": "successfulRecords",
+    "successful_records": "successfulRecords",
+    "record_failure_count": "failedRecords",
+    "failed_records": "failedRecords",
+}
+
+
+def _int_or_none(value: Any) -> int | None:
+    """Return an integer count when *value* is a non-boolean int, else None."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _normalize_job_summary_mapping(mapping: Mapping[Any, Any]) -> dict[str, Any]:
+    """Strip ``results`` and normalize snake_case Job keys to REST camelCase aliases."""
+    normalized: dict[str, Any] = {}
+    for raw_key, val in mapping.items():
+        key_str = str(raw_key)
+        if key_str == "results":
+            continue
+        target_key = _JOB_SUMMARY_KEY_ALIASES.get(key_str, key_str)
+        if target_key == key_str or target_key not in normalized or normalized[target_key] is None:
+            normalized[target_key] = val
+    return normalized
+
+
 def build_job_summary(status: Any, *, study_key: str, batch_id: str) -> dict[str, Any]:
-    """Project a compact, ``results``-free, PHI-masked ``Job`` summary dictionary."""
+    """Project a compact, ``results``-free, PHI-masked camelCase ``Job`` summary dictionary."""
+    raw_batch = getattr(status, "batch_id", getattr(status, "batchId", None))
+    resolved_batch_id = raw_batch if isinstance(raw_batch, str) and raw_batch else batch_id
+
     model_dump = getattr(status, "model_dump", None)
     if callable(model_dump):
         try:
-            dumped = model_dump(mode="json", exclude={"results"})
+            dumped = model_dump(mode="json", by_alias=True, exclude={"results"})
         except TypeError:
-            dumped = model_dump(mode="json")
+            try:
+                dumped = model_dump(mode="json", by_alias=True)
+            except TypeError:
+                dumped = model_dump(mode="json")
         if isinstance(dumped, Mapping):
-            summary = {str(k): v for k, v in dumped.items() if str(k) != "results"}
+            summary = _normalize_job_summary_mapping(dumped)
+            if not summary.get("batchId"):
+                summary["batchId"] = resolved_batch_id
+            for attr_name, camel_key in (
+                ("total_records", "totalRecords"),
+                ("successful_records", "successfulRecords"),
+                ("failed_records", "failedRecords"),
+            ):
+                computed = _int_or_none(getattr(status, attr_name, None))
+                if computed is not None:
+                    summary[camel_key] = computed
             return cast(dict[str, Any], mask_clinical_phi(summary))
 
     raw_state = getattr(status, "state", None)
     state_val = getattr(raw_state, "value", raw_state)
-    raw_batch = getattr(status, "batch_id", None)
+    raw_job_id = getattr(status, "job_id", getattr(status, "jobId", None))
+    job_id_val = (
+        raw_job_id
+        if isinstance(raw_job_id, (str, int)) and not isinstance(raw_job_id, bool)
+        else None
+    )
     fallback_summary: dict[str, Any] = {
-        "study_key": study_key,
-        "batch_id": raw_batch if isinstance(raw_batch, str) and raw_batch else batch_id,
+        "studyKey": study_key,
+        "batchId": resolved_batch_id,
+        "jobId": job_id_val,
         "state": str(state_val) if state_val is not None else None,
+        "totalRecords": _int_or_none(
+            getattr(status, "total_records", getattr(status, "totalRecords", None))
+        ),
+        "successfulRecords": _int_or_none(
+            getattr(status, "successful_records", getattr(status, "successfulRecords", None))
+        ),
+        "failedRecords": _int_or_none(
+            getattr(status, "failed_records", getattr(status, "failedRecords", None))
+        ),
     }
     return cast(dict[str, Any], mask_clinical_phi(fallback_summary))
 
 
 def sanitize_job_summary(summary: Any) -> Any:
-    """Strip any ``results`` payload and apply ``mask_clinical_phi`` to a Job summary."""
+    """Strip any ``results`` payload, normalize keys to camelCase, and mask clinical PHI."""
     if isinstance(summary, Mapping):
-        cleaned = {str(k): v for k, v in summary.items() if str(k) != "results"}
+        cleaned = _normalize_job_summary_mapping(summary)
         return mask_clinical_phi(cleaned)
     return mask_clinical_phi(summary)
 
