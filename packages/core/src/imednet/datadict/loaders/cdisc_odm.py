@@ -3,12 +3,30 @@
 from __future__ import annotations
 
 import json
+import warnings as py_warnings
 from pathlib import Path
-from typing import Any, BinaryIO, TextIO
+from typing import Any, BinaryIO, Literal, TextIO
 
 import defusedxml.ElementTree as ET  # noqa: N817
 from defusedxml.common import DefusedXmlException
 
+from ..exchange import (
+    OdmAdminData,
+    OdmAnnotation,
+    OdmArchive,
+    OdmAuditRecord,
+    OdmClinicalData,
+    OdmFlag,
+    OdmFormData,
+    OdmItemData,
+    OdmItemGroupData,
+    OdmLocation,
+    OdmMetaDataVersionRef,
+    OdmReferenceData,
+    OdmStudyEventData,
+    OdmSubjectData,
+    OdmUser,
+)
 from ..logic import parse_logic_xml
 from ..models import (
     BusinessLogicRule,
@@ -184,6 +202,51 @@ KNOWN_FORMAL_EXPRESSION_ATTRIBUTES = {
     "context",
 }
 
+NON_METADATA_ODM_CONTAINERS = {
+    "clinicaldata",
+    "admindata",
+    "referencedata",
+    "association",
+}
+
+NON_METADATA_ODM_DESCENDANTS = {
+    "subjectdata",
+    "studyeventdata",
+    "formdata",
+    "itemgroupdata",
+    "itemdata",
+    "auditrecord",
+    "auditrecords",
+    "annotation",
+    "annotations",
+    "signature",
+    "signatures",
+    "user",
+    "location",
+    "signaturedef",
+}
+
+KNOWN_STUDY_CHILD_TAGS = {
+    "globalvariables",
+    "basicdefinitions",
+    "metadataversion",
+}
+
+KNOWN_MDV_CHILD_TAGS = {
+    "include",
+    "protocol",
+    "studyeventdef",
+    "formdef",
+    "itemgroupdef",
+    "itemdef",
+    "codelist",
+    "imputationmethod",
+    "presentation",
+    "conditiondef",
+    "methoddef",
+    "alias",
+}
+
 SUPPORTED_DATA_TYPES = {
     "text",
     "string",
@@ -324,8 +387,10 @@ def _extract_unmapped_attributes(
     return extra
 
 
-def _read_source_content(source: Path | str | TextIO | BinaryIO) -> bytes:
-    """Read XML content from path, string, or stream into bytes."""
+def _read_source_content(source: Path | str | bytes | bytearray | TextIO | BinaryIO) -> bytes:
+    """Read XML content from path, string, bytes, or stream into bytes."""
+    if isinstance(source, (bytes, bytearray)):
+        return bytes(source)
     if isinstance(source, Path):
         if not _safe_is_file(source):
             raise FileNotFoundError(f"Target file '{source}' does not exist")
@@ -825,7 +890,7 @@ def _parse_formal_rule_element(
 
 
 def load_from_cdisc_odm(
-    source: Path | str | TextIO | BinaryIO,
+    source: Path | str | bytes | bytearray | TextIO | BinaryIO,
     *,
     study_key: str | None = None,
     strict: bool = False,
@@ -865,8 +930,16 @@ def load_from_cdisc_odm(
     if _local_tag(root).lower() != "odm":
         record_warning(f"Root XML tag is '{_local_tag(root)}', expected 'ODM'.")
 
+    _check_unparsed_containers_in_metadata_loader(root, record_warning)
+
     # 2. Extract Study metadata & BasicDefinitions MeasurementUnits
-    study_elem = _find_first_child(root, "Study")
+    study_elems = _find_children(root, "Study")
+    if len(study_elems) > 1:
+        record_warning(
+            f"Multiple 'Study' elements ({len(study_elems)}) found in ODM document; "
+            "only the first Study is loaded by load_from_cdisc_odm."
+        )
+    study_elem = study_elems[0] if study_elems else None
     study_oid: str | None = None
     study_name: str | None = None
     study_description: str | None = None
@@ -1572,3 +1645,720 @@ def load_from_cdisc_odm(
         forms=forms,
         unassignedBusinessLogic=unassigned_logic,
     )
+
+
+def _check_unparsed_containers_in_metadata_loader(
+    root: ET.Element,
+    record_warning: Any,
+) -> None:
+    """Report non-metadata ODM containers or unknown elements in ``load_from_cdisc_odm``."""
+    unparsed_top_tags: list[str] = []
+    for child in root:
+        c_tag = _local_tag(child)
+        c_low = c_tag.lower()
+        if c_low == "study":
+            for s_child in child:
+                sc_tag = _local_tag(s_child)
+                sc_low = sc_tag.lower()
+                if sc_low not in KNOWN_STUDY_CHILD_TAGS:
+                    record_warning(
+                        f"Unsupported child element '<{sc_tag}>' under <Study> in load_from_cdisc_odm."
+                    )
+                elif sc_low == "metadataversion":
+                    for mdv_child in s_child:
+                        mc_tag = _local_tag(mdv_child)
+                        if mc_tag.lower() not in KNOWN_MDV_CHILD_TAGS:
+                            record_warning(
+                                f"Unsupported child element '<{mc_tag}>' under <MetaDataVersion> "
+                                "in load_from_cdisc_odm."
+                            )
+        elif c_low in NON_METADATA_ODM_CONTAINERS or c_low in NON_METADATA_ODM_DESCENDANTS:
+            if c_tag not in unparsed_top_tags:
+                unparsed_top_tags.append(c_tag)
+        else:
+            record_warning(f"Unknown child element '<{c_tag}>' under <ODM>.")
+
+    if unparsed_top_tags:
+        tags_str = ", ".join(f"<{t}>" for t in unparsed_top_tags)
+        msg = (
+            f"Unparsed non-metadata ODM container(s) {tags_str} encountered in "
+            "load_from_cdisc_odm; use load_odm_archive() to parse full ODM 1.3.2 archives."
+        )
+        record_warning(msg)
+        py_warnings.warn(msg, UserWarning, stacklevel=3)
+    else:
+        for desc in root.iter():
+            if desc is root:
+                continue
+            d_tag = _local_tag(desc)
+            if d_tag.lower() in NON_METADATA_ODM_DESCENDANTS:
+                msg = (
+                    f"Unparsed clinical/audit ODM element '<{d_tag}>' encountered in "
+                    "load_from_cdisc_odm; use load_odm_archive() to parse full ODM 1.3.2 archives."
+                )
+                record_warning(msg)
+                py_warnings.warn(msg, UserWarning, stacklevel=3)
+
+
+def _parse_audit_record_elem(elem: ET.Element, record_warning: Any) -> OdmAuditRecord:
+    user_ref = _find_first_child(elem, "UserRef")
+    loc_ref = _find_first_child(elem, "LocationRef")
+    dt_elem = _find_first_child(elem, "DateTimeStamp")
+    rfc_elem = _find_first_child(elem, "ReasonForChange")
+    sid_elem = _find_first_child(elem, "SourceID")
+
+    for child in elem:
+        ctag = _local_tag(child)
+        if ctag.lower() not in {
+            "userref",
+            "locationref",
+            "datetimestamp",
+            "reasonforchange",
+            "sourceid",
+        }:
+            record_warning(f"Unknown child element '<{ctag}>' inside <AuditRecord>.")
+
+    user_oid = (_get_attr(user_ref, "UserOID") if user_ref is not None else None) or ""
+    if not user_oid:
+        record_warning("<AuditRecord> is missing required UserRef/@UserOID.")
+        user_oid = "USR.UNKNOWN"
+
+    loc_oid = (_get_attr(loc_ref, "LocationOID") if loc_ref is not None else None) or ""
+    if not loc_oid:
+        record_warning("<AuditRecord> is missing required LocationRef/@LocationOID.")
+        loc_oid = "LOC.UNKNOWN"
+
+    dt_val = dt_elem.text.strip() if (dt_elem is not None and dt_elem.text) else ""
+    if not dt_val:
+        record_warning("<AuditRecord> is missing required <DateTimeStamp> text.")
+        dt_val = "1970-01-01T00:00:00Z"
+
+    return OdmAuditRecord(
+        id=_get_attr(elem, "ID"),
+        editPoint=_get_attr(elem, "EditPoint"),
+        usedImputationMethod=_get_attr(elem, "UsedImputationMethod"),
+        userOID=user_oid,
+        locationOID=loc_oid,
+        dateTimeStamp=dt_val,
+        reasonForChange=(rfc_elem.text.strip() if rfc_elem is not None and rfc_elem.text else None),
+        sourceID=(sid_elem.text.strip() if sid_elem is not None and sid_elem.text else None),
+    )
+
+
+def _parse_annotation_elem(
+    elem: ET.Element,
+    fallback_seq: int,
+    known_codelists: set[str],
+    record_warning: Any,
+) -> OdmAnnotation:
+    for child in elem:
+        ctag = _local_tag(child)
+        if ctag.lower() not in {"comment", "flag"}:
+            record_warning(f"Unknown child element '<{ctag}>' inside <Annotation>.")
+
+    seq_raw = _get_attr(elem, "SeqNum")
+    seq_num = fallback_seq
+    if seq_raw is not None and seq_raw.strip().lstrip("-").isdigit():
+        seq_num = int(seq_raw.strip())
+    elif seq_raw is not None:
+        record_warning(f"Invalid SeqNum '{seq_raw}' on <Annotation>.")
+
+    comment_elem = _find_first_child(elem, "Comment")
+    comment_text = (
+        comment_elem.text if (comment_elem is not None and comment_elem.text is not None) else None
+    )
+    sponsor_or_site = _get_attr(comment_elem, "SponsorOrSite") if comment_elem is not None else None
+
+    flags: list[OdmFlag] = []
+    for flg_elem in _find_children(elem, "Flag"):
+        fv_elem = _find_first_child(flg_elem, "FlagValue")
+        ft_elem = _find_first_child(flg_elem, "FlagType")
+        if fv_elem is None:
+            record_warning("<Flag> inside <Annotation> is missing <FlagValue>.")
+            continue
+        fv_cl = (_get_attr(fv_elem, "CodeListOID") or "").strip()
+        if fv_cl and known_codelists and fv_cl not in known_codelists:
+            record_warning(
+                f"FlagValue CodeListOID '{fv_cl}' on <Annotation> was not found in MetaDataVersion."
+            )
+        ft_cl = (_get_attr(ft_elem, "CodeListOID") or "").strip() if ft_elem is not None else None
+        if ft_cl and known_codelists and ft_cl not in known_codelists:
+            record_warning(
+                f"FlagType CodeListOID '{ft_cl}' on <Annotation> was not found in MetaDataVersion."
+            )
+        flags.append(
+            OdmFlag(
+                flagValue=(fv_elem.text.strip() if fv_elem.text else ""),
+                flagValueCodeListOID=fv_cl or "CL.IMEDNET_FLAG_VALUE",
+                flagType=(ft_elem.text.strip() if ft_elem is not None and ft_elem.text else None),
+                flagTypeCodeListOID=ft_cl or None,
+            )
+        )
+
+    return OdmAnnotation(
+        seqNum=seq_num,
+        id=_get_attr(elem, "ID"),
+        transactionType=_get_attr(elem, "TransactionType"),
+        comment=comment_text,
+        sponsorOrSite=sponsor_or_site,
+        flags=tuple(flags),
+    )
+
+
+def _parse_item_data_elem(
+    elem: ET.Element,
+    *,
+    known_item_oids: set[str],
+    known_codelists: set[str],
+    known_user_oids: set[str],
+    known_loc_oids: set[str],
+    record_warning: Any,
+) -> OdmItemData:
+    for child in elem:
+        ctag = _local_tag(child)
+        if ctag.lower() not in {"auditrecord", "measurementunitref", "annotation"}:
+            record_warning(f"Unknown child element '<{ctag}>' inside <ItemData>.")
+
+    item_oid = (_get_attr(elem, "ItemOID") or "").strip()
+    if not item_oid:
+        record_warning("<ItemData> is missing required ItemOID attribute.")
+    elif known_item_oids and item_oid not in known_item_oids:
+        record_warning(f"ItemData ItemOID '{item_oid}' was not found in MetaDataVersion.")
+
+    raw_val = _get_attr(elem, "Value")
+    is_null_attr = (_get_attr(elem, "IsNull") or "").strip().lower()
+    is_null = is_null_attr == "yes" or (raw_val is None and is_null_attr != "no")
+
+    ar_elem = _find_first_child(elem, "AuditRecord")
+    ar_obj = _parse_audit_record_elem(ar_elem, record_warning) if ar_elem is not None else None
+    if ar_obj is not None:
+        if known_user_oids and ar_obj.user_oid not in known_user_oids:
+            record_warning(f"AuditRecord UserOID '{ar_obj.user_oid}' not found in AdminData.")
+        if known_loc_oids and ar_obj.location_oid not in known_loc_oids:
+            record_warning(
+                f"AuditRecord LocationOID '{ar_obj.location_oid}' not found in AdminData."
+            )
+
+    mu_elem = _find_first_child(elem, "MeasurementUnitRef")
+    mu_oid = _get_attr(mu_elem, "MeasurementUnitOID") if mu_elem is not None else None
+
+    anns = tuple(
+        _parse_annotation_elem(ann_el, idx, known_codelists, record_warning)
+        for idx, ann_el in enumerate(_find_children(elem, "Annotation"), 1)
+    )
+
+    return OdmItemData(
+        itemOID=item_oid or "UNKNOWN",
+        value=None if is_null else raw_val,
+        isNull=is_null,
+        transactionType=_get_attr(elem, "TransactionType"),
+        auditRecordID=_get_attr(elem, "AuditRecordID"),
+        annotationID=_get_attr(elem, "AnnotationID"),
+        measurementUnitOID=mu_oid,
+        auditRecord=ar_obj,
+        annotations=anns,
+    )
+
+
+def _parse_item_group_data_elem(
+    elem: ET.Element,
+    *,
+    known_ig_oids: set[str],
+    known_item_oids: set[str],
+    known_codelists: set[str],
+    known_user_oids: set[str],
+    known_loc_oids: set[str],
+    record_warning: Any,
+) -> OdmItemGroupData:
+    for child in elem:
+        ctag = _local_tag(child)
+        if ctag.lower() not in {"auditrecord", "annotation", "itemdata"}:
+            record_warning(f"Unknown child element '<{ctag}>' inside <ItemGroupData>.")
+
+    ig_oid = (_get_attr(elem, "ItemGroupOID") or "").strip()
+    if not ig_oid:
+        record_warning("<ItemGroupData> is missing required ItemGroupOID attribute.")
+    elif known_ig_oids and ig_oid not in known_ig_oids:
+        record_warning(f"ItemGroupData ItemGroupOID '{ig_oid}' was not found in MetaDataVersion.")
+
+    ar_elem = _find_first_child(elem, "AuditRecord")
+    ar_obj = _parse_audit_record_elem(ar_elem, record_warning) if ar_elem is not None else None
+    if ar_obj is not None:
+        if known_user_oids and ar_obj.user_oid not in known_user_oids:
+            record_warning(f"AuditRecord UserOID '{ar_obj.user_oid}' not found in AdminData.")
+        if known_loc_oids and ar_obj.location_oid not in known_loc_oids:
+            record_warning(
+                f"AuditRecord LocationOID '{ar_obj.location_oid}' not found in AdminData."
+            )
+
+    anns = tuple(
+        _parse_annotation_elem(ann_el, idx, known_codelists, record_warning)
+        for idx, ann_el in enumerate(_find_children(elem, "Annotation"), 1)
+    )
+    items = tuple(
+        _parse_item_data_elem(
+            it_el,
+            known_item_oids=known_item_oids,
+            known_codelists=known_codelists,
+            known_user_oids=known_user_oids,
+            known_loc_oids=known_loc_oids,
+            record_warning=record_warning,
+        )
+        for it_el in _find_children(elem, "ItemData")
+    )
+
+    return OdmItemGroupData(
+        itemGroupOID=ig_oid or "UNKNOWN",
+        itemGroupRepeatKey=_get_attr(elem, "ItemGroupRepeatKey"),
+        transactionType=_get_attr(elem, "TransactionType"),
+        auditRecord=ar_obj,
+        annotations=anns,
+        items=items,
+    )
+
+
+def _parse_form_data_elem(
+    elem: ET.Element,
+    *,
+    known_form_oids: set[str],
+    known_ig_oids: set[str],
+    known_item_oids: set[str],
+    known_codelists: set[str],
+    known_user_oids: set[str],
+    known_loc_oids: set[str],
+    record_warning: Any,
+) -> OdmFormData:
+    for child in elem:
+        ctag = _local_tag(child)
+        if ctag.lower() not in {"auditrecord", "annotation", "itemgroupdata"}:
+            record_warning(f"Unknown child element '<{ctag}>' inside <FormData>.")
+
+    form_oid = (_get_attr(elem, "FormOID") or "").strip()
+    if not form_oid:
+        record_warning("<FormData> is missing required FormOID attribute.")
+    elif known_form_oids and form_oid not in known_form_oids:
+        record_warning(f"FormData FormOID '{form_oid}' was not found in MetaDataVersion.")
+
+    ar_elem = _find_first_child(elem, "AuditRecord")
+    ar_obj = _parse_audit_record_elem(ar_elem, record_warning) if ar_elem is not None else None
+    anns = tuple(
+        _parse_annotation_elem(ann_el, idx, known_codelists, record_warning)
+        for idx, ann_el in enumerate(_find_children(elem, "Annotation"), 1)
+    )
+    igs = tuple(
+        _parse_item_group_data_elem(
+            ig_el,
+            known_ig_oids=known_ig_oids,
+            known_item_oids=known_item_oids,
+            known_codelists=known_codelists,
+            known_user_oids=known_user_oids,
+            known_loc_oids=known_loc_oids,
+            record_warning=record_warning,
+        )
+        for ig_el in _find_children(elem, "ItemGroupData")
+    )
+    return OdmFormData(
+        formOID=form_oid or "UNKNOWN",
+        formRepeatKey=_get_attr(elem, "FormRepeatKey"),
+        transactionType=_get_attr(elem, "TransactionType"),
+        auditRecord=ar_obj,
+        annotations=anns,
+        itemGroups=igs,
+    )
+
+
+def _parse_admin_data_elem(elem: ET.Element, record_warning: Any) -> OdmAdminData:
+    for child in elem:
+        ctag = _local_tag(child)
+        if ctag.lower() not in {"user", "location", "signaturedef"}:
+            record_warning(f"Unknown child element '<{ctag}>' inside <AdminData>.")
+
+    users: list[OdmUser] = []
+    for u_el in _find_children(elem, "User"):
+        u_oid = (_get_attr(u_el, "OID") or "").strip()
+        if not u_oid:
+            record_warning("<User> inside <AdminData> is missing required OID attribute.")
+            continue
+        loc_refs = tuple(
+            ref_oid
+            for lr in _find_children(u_el, "LocationRef")
+            if (ref_oid := (_get_attr(lr, "LocationOID") or "").strip())
+        )
+
+        def _child_txt(parent_el: ET.Element, tag: str) -> str | None:
+            found = _find_first_child(parent_el, tag)
+            return found.text.strip() if (found is not None and found.text) else None
+
+        users.append(
+            OdmUser(
+                oid=u_oid,
+                userType=_get_attr(u_el, "UserType"),
+                loginName=_child_txt(u_el, "LoginName"),
+                displayName=_child_txt(u_el, "DisplayName"),
+                fullName=_child_txt(u_el, "FullName"),
+                firstName=_child_txt(u_el, "FirstName"),
+                lastName=_child_txt(u_el, "LastName"),
+                organization=_child_txt(u_el, "Organization"),
+                email=_child_txt(u_el, "Email"),
+                phone=_child_txt(u_el, "Phone"),
+                locationRefs=loc_refs,
+            )
+        )
+
+    locations: list[OdmLocation] = []
+    for loc_el in _find_children(elem, "Location"):
+        loc_oid = (_get_attr(loc_el, "OID") or "").strip()
+        loc_name = (_get_attr(loc_el, "Name") or loc_oid).strip()
+        if not loc_oid:
+            record_warning("<Location> inside <AdminData> is missing required OID attribute.")
+            continue
+        mdv_refs: list[OdmMetaDataVersionRef] = []
+        for mr_el in _find_children(loc_el, "MetaDataVersionRef"):
+            s_oid = (_get_attr(mr_el, "StudyOID") or "").strip()
+            m_oid = (_get_attr(mr_el, "MetaDataVersionOID") or "").strip()
+            eff = (_get_attr(mr_el, "EffectiveDate") or "1970-01-01").strip()
+            if s_oid and m_oid:
+                mdv_refs.append(
+                    OdmMetaDataVersionRef(
+                        studyOID=s_oid,
+                        metaDataVersionOID=m_oid,
+                        effectiveDate=eff,
+                    )
+                )
+        locations.append(
+            OdmLocation(
+                oid=loc_oid,
+                name=loc_name,
+                locationType=_get_attr(loc_el, "LocationType") or "Site",
+                metaDataVersionRefs=tuple(mdv_refs),
+            )
+        )
+
+    return OdmAdminData(
+        studyOID=_get_attr(elem, "StudyOID"),
+        users=tuple(users),
+        locations=tuple(locations),
+    )
+
+
+def load_odm_archive(
+    source: Path | str | bytes | bytearray | TextIO | BinaryIO,
+    *,
+    study_key: str | None = None,
+    strict: bool = False,
+    no_raw_xml: bool = False,
+) -> OdmArchive:
+    """Parse a full CDISC ODM 1.3 / 1.3.2 XML snapshot into a read-only :class:`OdmArchive`.
+
+    Enforces ``defusedxml`` parsing and preserves ``DataDictionary`` metadata alongside
+    ``<AdminData>``, ``<ReferenceData>``, ``<ClinicalData>``, ``<AuditRecord>``, and
+    ``<Annotation>`` elements.
+    """
+    warnings: list[str] = []
+
+    def record_warning(msg: str) -> None:
+        warnings.append(msg)
+        if strict:
+            raise ValueError(f"Strict loading error: {msg}")
+
+    content = _read_source_content(source)
+    try:
+        root = ET.fromstring(content)
+    except DefusedXmlException:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Failed to parse CDISC ODM XML: {exc}") from exc
+
+    if _local_tag(root).lower() != "odm":
+        record_warning(f"Root XML tag is '{_local_tag(root)}', expected 'ODM'.")
+
+    # Build a metadata-only copy of the root containing only <Study> for DataDictionary extraction
+    study_only_root = ET.fromstring(b'<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3"/>')
+    study_only_root.attrib.update(root.attrib)
+    for child in root:
+        ctag = _local_tag(child)
+        clow = ctag.lower()
+        if clow == "study":
+            study_only_root.append(child)
+        elif clow not in {"admindata", "referencedata", "clinicaldata"}:
+            record_warning(f"Unknown top-level element '<{ctag}>' under <ODM>.")
+
+    dd = load_from_cdisc_odm(
+        ET.tostring(study_only_root, encoding="utf-8"),
+        study_key=study_key,
+        strict=strict,
+        no_raw_xml=no_raw_xml,
+    )
+    warnings.extend(dd.metadata.validationWarnings)
+
+    # Collect known metadata OIDs from <Study>/<MetaDataVersion> for reference checks
+    known_mdv_oids: set[str] = set()
+    known_se_oids: set[str] = set()
+    known_form_oids: set[str] = set()
+    known_ig_oids: set[str] = set()
+    known_item_oids: set[str] = set()
+    known_codelists: set[str] = set()
+    first_mdv_oid = "MDV.001"
+    first_mdv_name: str | None = None
+
+    for idx_m, mdv_el in enumerate(_find_descendants(study_only_root, "MetaDataVersion")):
+        m_oid = (_get_attr(mdv_el, "OID") or "").strip()
+        if m_oid:
+            known_mdv_oids.add(m_oid)
+            if idx_m == 0:
+                first_mdv_oid = m_oid
+                first_mdv_name = _get_attr(mdv_el, "Name")
+        for se_el in _find_children(mdv_el, "StudyEventDef"):
+            if oid := (_get_attr(se_el, "OID") or "").strip():
+                known_se_oids.add(oid)
+        for fd_el in _find_children(mdv_el, "FormDef"):
+            if oid := (_get_attr(fd_el, "OID") or "").strip():
+                known_form_oids.add(oid)
+        for ig_el in _find_children(mdv_el, "ItemGroupDef"):
+            if oid := (_get_attr(ig_el, "OID") or "").strip():
+                known_ig_oids.add(oid)
+        for it_el in _find_children(mdv_el, "ItemDef"):
+            if oid := (_get_attr(it_el, "OID") or "").strip():
+                known_item_oids.add(oid)
+        for cl_el in _find_children(mdv_el, "CodeList"):
+            if oid := (_get_attr(cl_el, "OID") or "").strip():
+                known_codelists.add(oid)
+
+    admin_containers: list[OdmAdminData] = []
+    known_user_oids: set[str] = set()
+    known_loc_oids: set[str] = set()
+    for admin_el in _find_children(root, "AdminData"):
+        parsed_admin = _parse_admin_data_elem(admin_el, record_warning)
+        admin_containers.append(parsed_admin)
+        for u in parsed_admin.users:
+            known_user_oids.add(u.oid)
+        for loc in parsed_admin.locations:
+            known_loc_oids.add(loc.oid)
+            for mref in loc.metadata_version_refs:
+                if known_mdv_oids and mref.metadata_version_oid not in known_mdv_oids:
+                    record_warning(
+                        f"Location '{loc.oid}' references unknown MetaDataVersionOID "
+                        f"'{mref.metadata_version_oid}'."
+                    )
+        for u in parsed_admin.users:
+            for lref in u.location_refs:
+                if known_loc_oids and lref not in known_loc_oids:
+                    record_warning(
+                        f"User '{u.oid}' references unknown LocationOID '{lref}' in AdminData."
+                    )
+
+    ref_containers: list[OdmReferenceData] = []
+    for ref_el in _find_children(root, "ReferenceData"):
+        for child in ref_el:
+            ctag = _local_tag(child)
+            if ctag.lower() not in {"itemgroupdata", "auditrecords", "annotations"}:
+                record_warning(f"Unknown child element '<{ctag}>' inside <ReferenceData>.")
+        r_study = (_get_attr(ref_el, "StudyOID") or dd.metadata.studyKey or "STUDY_001").strip()
+        r_mdv = (_get_attr(ref_el, "MetaDataVersionOID") or first_mdv_oid).strip()
+        if known_mdv_oids and r_mdv not in known_mdv_oids:
+            record_warning(f"ReferenceData references unknown MetaDataVersionOID '{r_mdv}'.")
+        ref_igs = tuple(
+            _parse_item_group_data_elem(
+                ig_el,
+                known_ig_oids=known_ig_oids,
+                known_item_oids=known_item_oids,
+                known_codelists=known_codelists,
+                known_user_oids=known_user_oids,
+                known_loc_oids=known_loc_oids,
+                record_warning=record_warning,
+            )
+            for ig_el in _find_children(ref_el, "ItemGroupData")
+        )
+        ref_containers.append(
+            OdmReferenceData(
+                studyOID=r_study,
+                metaDataVersionOID=r_mdv,
+                itemGroups=ref_igs,
+            )
+        )
+
+    clin_containers: list[OdmClinicalData] = []
+    for clin_el in _find_children(root, "ClinicalData"):
+        for child in clin_el:
+            ctag = _local_tag(child)
+            if ctag.lower() not in {"subjectdata", "auditrecords", "signatures", "annotations"}:
+                record_warning(f"Unknown child element '<{ctag}>' inside <ClinicalData>.")
+
+        c_study = (_get_attr(clin_el, "StudyOID") or dd.metadata.studyKey or "STUDY_001").strip()
+        c_mdv = (_get_attr(clin_el, "MetaDataVersionOID") or first_mdv_oid).strip()
+        if known_mdv_oids and c_mdv not in known_mdv_oids:
+            record_warning(f"ClinicalData references unknown MetaDataVersionOID '{c_mdv}'.")
+
+        subjects: list[OdmSubjectData] = []
+        for subj_el in _find_children(clin_el, "SubjectData"):
+            for child in subj_el:
+                ctag = _local_tag(child)
+                if ctag.lower() not in {
+                    "auditrecord",
+                    "investigatorref",
+                    "siteref",
+                    "annotation",
+                    "studyeventdata",
+                    "formdata",
+                }:
+                    record_warning(f"Unknown child element '<{ctag}>' inside <SubjectData>.")
+
+            sk = (_get_attr(subj_el, "SubjectKey") or "").strip()
+            if not sk:
+                record_warning("<SubjectData> is missing required SubjectKey attribute.")
+                sk = "UNKNOWN"
+
+            inv_el = _find_first_child(subj_el, "InvestigatorRef")
+            inv_oid = (_get_attr(inv_el, "UserOID") or "").strip() if inv_el is not None else None
+            if inv_oid and known_user_oids and inv_oid not in known_user_oids:
+                record_warning(
+                    f"SubjectData '{sk}' InvestigatorRef '{inv_oid}' not found in AdminData."
+                )
+
+            site_el = _find_first_child(subj_el, "SiteRef")
+            site_oid = (
+                (_get_attr(site_el, "LocationOID") or "").strip() if site_el is not None else None
+            )
+            if site_oid and known_loc_oids and site_oid not in known_loc_oids:
+                record_warning(f"SubjectData '{sk}' SiteRef '{site_oid}' not found in AdminData.")
+
+            s_ar_el = _find_first_child(subj_el, "AuditRecord")
+            s_ar = (
+                _parse_audit_record_elem(s_ar_el, record_warning) if s_ar_el is not None else None
+            )
+            s_anns = tuple(
+                _parse_annotation_elem(ann_el, idx, known_codelists, record_warning)
+                for idx, ann_el in enumerate(_find_children(subj_el, "Annotation"), 1)
+            )
+
+            study_events: list[OdmStudyEventData] = []
+            for se_el in _find_children(subj_el, "StudyEventData"):
+                for child in se_el:
+                    ctag = _local_tag(child)
+                    if ctag.lower() not in {"auditrecord", "annotation", "formdata"}:
+                        record_warning(f"Unknown child element '<{ctag}>' inside <StudyEventData>.")
+                se_oid = (_get_attr(se_el, "StudyEventOID") or "").strip()
+                if not se_oid:
+                    record_warning("<StudyEventData> is missing required StudyEventOID attribute.")
+                elif known_se_oids and se_oid not in known_se_oids:
+                    record_warning(
+                        f"StudyEventData StudyEventOID '{se_oid}' was not found in MetaDataVersion."
+                    )
+                se_ar_el = _find_first_child(se_el, "AuditRecord")
+                se_ar = (
+                    _parse_audit_record_elem(se_ar_el, record_warning)
+                    if se_ar_el is not None
+                    else None
+                )
+                se_anns = tuple(
+                    _parse_annotation_elem(ann_el, idx, known_codelists, record_warning)
+                    for idx, ann_el in enumerate(_find_children(se_el, "Annotation"), 1)
+                )
+                se_forms = tuple(
+                    _parse_form_data_elem(
+                        fd_el,
+                        known_form_oids=known_form_oids,
+                        known_ig_oids=known_ig_oids,
+                        known_item_oids=known_item_oids,
+                        known_codelists=known_codelists,
+                        known_user_oids=known_user_oids,
+                        known_loc_oids=known_loc_oids,
+                        record_warning=record_warning,
+                    )
+                    for fd_el in _find_children(se_el, "FormData")
+                )
+                study_events.append(
+                    OdmStudyEventData(
+                        studyEventOID=se_oid or "SE.UNSCHEDULED",
+                        studyEventRepeatKey=_get_attr(se_el, "StudyEventRepeatKey"),
+                        transactionType=_get_attr(se_el, "TransactionType"),
+                        auditRecord=se_ar,
+                        annotations=se_anns,
+                        forms=se_forms,
+                    )
+                )
+
+            direct_forms = tuple(
+                _parse_form_data_elem(
+                    fd_el,
+                    known_form_oids=known_form_oids,
+                    known_ig_oids=known_ig_oids,
+                    known_item_oids=known_item_oids,
+                    known_codelists=known_codelists,
+                    known_user_oids=known_user_oids,
+                    known_loc_oids=known_loc_oids,
+                    record_warning=record_warning,
+                )
+                for fd_el in _find_children(subj_el, "FormData")
+            )
+
+            subjects.append(
+                OdmSubjectData(
+                    subjectKey=sk,
+                    transactionType=_get_attr(subj_el, "TransactionType"),
+                    investigatorUserOID=inv_oid or None,
+                    siteLocationOID=site_oid or None,
+                    auditRecord=s_ar,
+                    annotations=s_anns,
+                    studyEvents=tuple(study_events),
+                    forms=direct_forms,
+                )
+            )
+
+        global_audits: list[OdmAuditRecord] = []
+        for ars_el in _find_children(clin_el, "AuditRecords"):
+            for ar_el in _find_children(ars_el, "AuditRecord"):
+                parsed_ar = _parse_audit_record_elem(ar_el, record_warning)
+                if known_user_oids and parsed_ar.user_oid not in known_user_oids:
+                    record_warning(
+                        f"AuditRecord UserOID '{parsed_ar.user_oid}' not found in AdminData."
+                    )
+                if known_loc_oids and parsed_ar.location_oid not in known_loc_oids:
+                    record_warning(
+                        f"AuditRecord LocationOID '{parsed_ar.location_oid}' not found in AdminData."
+                    )
+                global_audits.append(parsed_ar)
+
+        global_anns: list[OdmAnnotation] = []
+        for anns_el in _find_children(clin_el, "Annotations"):
+            for idx_a, ann_el in enumerate(_find_children(anns_el, "Annotation"), 1):
+                global_anns.append(
+                    _parse_annotation_elem(ann_el, idx_a, known_codelists, record_warning)
+                )
+
+        clin_containers.append(
+            OdmClinicalData(
+                studyOID=c_study,
+                metaDataVersionOID=c_mdv,
+                subjects=tuple(subjects),
+                auditRecords=tuple(global_audits),
+                annotations=tuple(global_anns),
+            )
+        )
+
+    file_type_raw = (_get_attr(root, "FileType") or "Snapshot").strip()
+    file_type_val: Literal["Snapshot", "Transactional"] = (
+        "Transactional" if file_type_raw == "Transactional" else "Snapshot"
+    )
+
+    return OdmArchive(
+        fileOID=_get_attr(root, "FileOID") or "IMEDNET_ODM_EXPORT",
+        fileType=file_type_val,
+        odmVersion=_get_attr(root, "ODMVersion") or "1.3.2",
+        creationDateTime=_get_attr(root, "CreationDateTime"),
+        asOfDateTime=_get_attr(root, "AsOfDateTime"),
+        originator=_get_attr(root, "Originator"),
+        sourceSystem=_get_attr(root, "SourceSystem"),
+        sourceSystemVersion=_get_attr(root, "SourceSystemVersion"),
+        description=_get_attr(root, "Description"),
+        metaDataVersionOID=first_mdv_oid,
+        metaDataVersionName=first_mdv_name,
+        dataDictionary=dd,
+        adminData=tuple(admin_containers),
+        referenceData=tuple(ref_containers),
+        clinicalData=tuple(clin_containers),
+        validationWarnings=tuple(dict.fromkeys(warnings)),
+    )
+
+
+load_cdisc_odm_archive = load_odm_archive

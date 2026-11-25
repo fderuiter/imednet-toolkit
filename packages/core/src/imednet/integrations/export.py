@@ -7015,14 +7015,30 @@ def export_to_hive_parquet(*args: Any, **kwargs: Any) -> None:
     return _hive_export(*args, **kwargs)
 
 
+def export_to_odm(*args: Any, **kwargs: Any) -> None:
+    """Export study snapshot to CDISC ODM 1.3.2 XML."""
+    from .cdisc_export import export_to_odm as _odm_export
+
+    return _odm_export(*args, **kwargs)
+
+
+def export_to_dataset_json(*args: Any, **kwargs: Any) -> None:
+    """Export study clinical datasets to CDISC Dataset-JSON v1.1."""
+    from .cdisc_export import export_to_dataset_json as _dsj_export
+
+    return _dsj_export(*args, **kwargs)
+
+
 _UNPATCHED_EXPORTS: dict[str, Callable[..., Any]] = {
     "export_to_csv": export_to_csv,
+    "export_to_dataset_json": export_to_dataset_json,
     "export_to_duckdb": export_to_duckdb,
     "export_to_duckdb_by_form": export_to_duckdb_by_form,
     "export_to_excel": export_to_excel,
     "export_to_hive_parquet": export_to_hive_parquet,
     "export_to_json": export_to_json,
     "export_to_long_sql": export_to_long_sql,
+    "export_to_odm": export_to_odm,
     "export_to_parquet": export_to_parquet,
     "export_to_sql": export_to_sql,
     "export_to_sql_by_form": export_to_sql_by_form,

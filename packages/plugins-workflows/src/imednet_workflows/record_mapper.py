@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 from pydantic import BaseModel, Field, ValidationError, create_model
 
+from imednet.spi.cdisc import (
+    DatasetJsonEnvelope,
+    build_dataset_json_envelope,
+)
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
 from imednet.spi.models import (
@@ -147,6 +151,58 @@ def transform_records_to_sdtm(
         phi_keys=phi_keys,
         registry=registry,
         pipeline=resolved_pipeline,
+    )
+
+
+def transform_records_to_dataset_json(
+    records: Iterable[Any],
+    study_key: str,
+    *,
+    forms: Iterable[Any] = (),
+    variables: Iterable[Any] = (),
+    as_sdtm: bool = False,
+    domain: str | None = None,
+    use_labels_as_columns: bool = False,
+    variable_whitelist: list[str] | None = None,
+    form_whitelist: list[int] | None = None,
+    naming_convention: str | None = None,
+    preserve_record_id: bool = False,
+    include_deleted: bool = False,
+    mask_phi: bool = True,
+    enrichment_pipeline: EnrichmentPipeline | None = _UNSET_PIPELINE,
+    phi_keys: Iterable[str] | None = None,
+    metadata_version_oid: str = "MDV.001",
+    file_oid: str | None = None,
+    creation_datetime: str | None = None,
+) -> DatasetJsonEnvelope:
+    """Transform clinical records into a CDISC Dataset-JSON v1.1 envelope."""
+    resolved_pipeline = (
+        enrichment_pipeline
+        if enrichment_pipeline is not _UNSET_PIPELINE
+        else resolve_enrichment_pipeline(study_key)
+    )
+    resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
+    if resolved_pipeline is not None and getattr(resolved_pipeline, "phi_keys", None):
+        resolved_phi.update(resolved_pipeline.phi_keys)
+    return build_dataset_json_envelope(
+        study_key,
+        records=records,
+        forms=tuple(forms),
+        variables=tuple(variables),
+        as_sdtm=as_sdtm,
+        sdtm_domain=domain,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        naming_convention=naming_convention,
+        preserve_record_id=preserve_record_id,
+        include_deleted=include_deleted,
+        mask_phi=mask_phi,
+        custom_phi_keys=resolved_phi or None,
+        enrichment_pipeline=resolved_pipeline,
+        metadata_version_oid=metadata_version_oid,
+        file_oid=file_oid,
+        creation_datetime=creation_datetime,
     )
 
 
@@ -1938,13 +1994,120 @@ class RecordMapper:
             )
         return combined
 
+    def to_dataset_json(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
+        self._active_study_key = study_key
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
+        effective_include_deleted = (
+            self._include_deleted if include_deleted is None else include_deleted
+        )
+        pipeline = self._get_enrichment_pipeline(study_key)
+        pipeline_phi_keys = set(pipeline.phi_keys) if pipeline is not None else set()
+
+        study_forms = self._iter_sdk_lookup_items(study_key, "forms", "get_forms")
+        if not (as_sdtm or domain):
+            self._fetch_variable_metadata(
+                study_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+            )
+            study_vars: list[Any] = list(self._last_variables)
+        else:
+            study_vars = []
+
+        extra_filters: dict[str, Any] = {}
+        if form_whitelist is not None:
+            extra_filters["formId"] = form_whitelist
+
+        record_stream: Iterable[Any] = (
+            records
+            if records is not None
+            else self._iter_records(
+                study_key,
+                visit_key=visit_key,
+                extra_filters=extra_filters or None,
+                include_deleted=effective_include_deleted,
+            )
+        )
+        return build_dataset_json_envelope(
+            study_key,
+            records=record_stream,
+            forms=study_forms,
+            variables=study_vars,
+            as_sdtm=as_sdtm,
+            sdtm_domain=domain,
+            use_labels_as_columns=use_labels_as_columns,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            naming_convention=naming_convention,
+            preserve_record_id=preserve_record_id,
+            include_deleted=effective_include_deleted,
+            mask_phi=should_mask,
+            custom_phi_keys=pipeline_phi_keys or None,
+            enrichment_pipeline=pipeline,
+            metadata_version_oid=metadata_version_oid,
+            file_oid=file_oid,
+            creation_datetime=creation_datetime,
+        )
+
+    def sdtm_dataset_json(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Emit a CDISC Dataset-JSON v1.1 envelope for a specific SDTM domain."""
+        return self.to_dataset_json(
+            study_key=study_key,
+            visit_key=visit_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            as_sdtm=True,
+            domain=domain,
+            preserve_record_id=preserve_record_id,
+            mask_phi=mask_phi,
+            include_deleted=include_deleted,
+            metadata_version_oid=metadata_version_oid,
+            file_oid=file_oid,
+            creation_datetime=creation_datetime,
+        )
+
 
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
     "SDTM_DOMAIN_SPECS",
+    "DatasetJsonEnvelope",
     "RecordMapper",
     "_SdtmNormalizer",
     "_iter_sorted_sdtm_frames",
     "format_iso8601_dtc",
+    "transform_records_to_dataset_json",
     "transform_records_to_sdtm",
 ]

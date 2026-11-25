@@ -466,7 +466,7 @@ Extras naming:
 Public API exposure
 ~~~~~~~~~~~~~~~~~~~
 
-* :mod:`imednet.integrations` registers all 10 tabular helpers on
+* :mod:`imednet.integrations` registers all 12 tabular and CDISC exchange helpers on
   :class:`~imednet.integrations.dispatcher.ExportRegistry`, while
   :mod:`imednet.spi.sinks` (and :mod:`imednet.spi.sink_base`) defines shared
   sink contracts (:class:`~imednet.spi.sink_base.SinkConfig`,
@@ -480,13 +480,13 @@ Public API exposure
   * :mod:`imednet_sinks.graph`
   * :mod:`imednet_sinks.warehouse`
 
-* :mod:`apache_airflow_providers_imednet.export` wraps all 10 tabular helpers
-  (``export_to_csv``, ``export_to_duckdb``, ``export_to_duckdb_by_form``,
-  ``export_to_excel``, ``export_to_hive_parquet``, ``export_to_json``,
-  ``export_to_long_sql``, ``export_to_parquet``, ``export_to_sql``, and
-  ``export_to_sql_by_form``).
+* :mod:`apache_airflow_providers_imednet.export` wraps all 12 tabular and CDISC exchange helpers
+  (``export_to_csv``, ``export_to_dataset_json``, ``export_to_duckdb``,
+  ``export_to_duckdb_by_form``, ``export_to_excel``, ``export_to_hive_parquet``,
+  ``export_to_json``, ``export_to_long_sql``, ``export_to_odm``, ``export_to_parquet``,
+  ``export_to_sql``, and ``export_to_sql_by_form``).
   :class:`~apache_airflow_providers_imednet.operators.export.ImednetExportOperator`
-  dispatches those 10 tabular targets alongside ``mongodb``, ``neo4j``, and
+  dispatches those 12 core targets alongside ``mongodb``, ``neo4j``, and
   ``snowflake`` plugin sinks resolved dynamically via ``sdk.sinks`` at runtime
   (keeping ``apache_airflow_providers_imednet`` decoupled from ``imednet_sinks``),
   while :meth:`~apache_airflow_providers_imednet.hooks.ImednetHook.resolve_destination_connection`

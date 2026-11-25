@@ -138,11 +138,13 @@ Snowflake (warehouse-native export):
 Incremental streaming checkpoints
 ---------------------------------
 
-Warehouse, document, graph, and all 10 tabular exporters in :mod:`imednet.integrations`
+Warehouse, document, graph, and all 12 tabular and standards exporters in :mod:`imednet.integrations`
 (:func:`~imednet.integrations.export_to_parquet`,
 :func:`~imednet.integrations.export_to_csv`,
 :func:`~imednet.integrations.export_to_excel`,
 :func:`~imednet.integrations.export_to_json`,
+:func:`~imednet.integrations.export_to_odm`,
+:func:`~imednet.integrations.export_to_dataset_json`,
 :func:`~imednet.integrations.export_to_sql`,
 :func:`~imednet.integrations.export_to_sql_by_form`,
 :func:`~imednet.integrations.export_to_long_sql`,
@@ -163,7 +165,7 @@ and filter options on :class:`~imednet.spi.sink_base.SinkConfig`,
 * ``include_deleted`` (``bool``) – Include voided (``deleted=True``) ``Record`` items directly in batches instead of reconciling deletes separately.
 
 When ``incremental=True`` (or ``modified_since`` / ``state_provider`` is supplied),
-``idempotent=True``, and ``include_deleted=False``, all 10 tabular helpers perform
+``idempotent=True``, and ``include_deleted=False``, all 12 tabular and standards helpers perform
 keyed ``recordId`` (``recordId``, ``record_id``, or ``RECORD_ID``) upserts and prune
 newly voided (``deleted=True``) ``Record`` items without duplicating history:
 
@@ -177,6 +179,13 @@ newly voided (``deleted=True``) ``Record`` items without duplicating history:
   prune superseded and ``deleted=True`` ``Record`` entries across Excel workbooks, flat
   JSON arrays, and hierarchical ``Subject → Visit → Form`` JSON archives
   (``hierarchical=True``), and atomically rewrite the target file.
+* **CDISC ODM 1.3.2 and Dataset-JSON v1.1** (:func:`~imednet.integrations.export_to_odm`,
+  :func:`~imednet.integrations.export_to_dataset_json`): merge incremental ``Record``
+  deltas by deterministic ``recordId`` / ``ItemGroupRepeatKey`` identifiers, prune
+  newly voided ``deleted=True`` ``Record`` entries via ``reconcile_deleted``, validate
+  against bundled CDISC schemas, write to a ``.tmp`` file, and atomically replace the
+  destination archive or per-domain Dataset-JSON files on ``flush()`` with PHI masking
+  enabled by default.
 * **SQL and DuckDB** (:func:`~imednet.integrations.export_to_sql`,
   :func:`~imednet.integrations.export_to_sql_by_form`,
   :func:`~imednet.integrations.export_to_long_sql`,

@@ -48,7 +48,10 @@ class ExportRegistry:
     def get_tabular(self, target_type: str) -> Callable[..., Any] | None:
         """Retrieve a registered tabular function, or None if not found."""
         with self._lock:
-            return self._tabular_targets.get(target_type)
+            found = self._tabular_targets.get(target_type)
+            if found is not None or "-" not in target_type:
+                return found
+            return self._tabular_targets.get(target_type.replace("-", "_"))
 
     def get_sink(self, target_type: str) -> type[ExportSink] | None:
         """Retrieve a registered sink class, or None if not found."""

@@ -394,7 +394,7 @@ def resolve_sink_enrichment_pipeline(
     config: Any | None = None,
     records: Any = None,
 ) -> Any | None:
-    """Resolve an enrichment pipeline from ``SinkConfig.extra``, ``study_key``, or Record ``study_key``s."""
+    """Resolve an enrichment pipeline from ``SinkConfig.extra``, ``study_key``, or Record ``study_key`` values."""
     extra = getattr(config, "extra", None) if config is not None else None
     extra_map = extra if isinstance(extra, Mapping) else None
     if extra_map is not None:

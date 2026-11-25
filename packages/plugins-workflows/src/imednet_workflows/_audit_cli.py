@@ -8,6 +8,7 @@ import json
 import sys
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from imednet.spi.cli import (
@@ -40,6 +41,21 @@ from imednet.spi.utils import (
 
 if TYPE_CHECKING:
     from imednet import ImednetSDK
+
+
+def _resolve_audit_odm_target(output: str) -> Path | None:
+    """Resolve an ``odm`` or ``.xml`` output argument for ``extract-audit-trail``."""
+    raw = output.strip()
+    if not raw:
+        return None
+    if raw.lower() == "odm":
+        return Path("audit_trail.xml")
+    candidate = Path(raw)
+    if candidate.suffix.lower() == ".xml" and candidate.name != candidate.suffix:
+        if candidate.exists() and candidate.is_dir():
+            return None
+        return candidate
+    return None
 
 
 def setup_audit_parsers(
@@ -110,7 +126,7 @@ def setup_audit_parsers(
         "-o",
         "--output",
         default=None,
-        help="Export audit trail directly to file ('csv', 'json', or a .csv/.json path).",
+        help="Export audit trail directly to file ('csv', 'json', 'odm', or a .csv/.json/.xml path).",
     )
     add_output_format(audit_parser)
     add_simulation_arg(audit_parser)
@@ -183,6 +199,22 @@ def setup_audit_parsers(
                 sys.exit(1)
 
         if output:
+            odm_target = _resolve_audit_odm_target(output)
+            if odm_target is not None:
+                from imednet.spi.cdisc import build_odm_archive, to_odm_file
+
+                custom_phi = resolve_custom_phi_fields(study_key) if mask_phi else set()
+                archive = build_odm_archive(
+                    study_key,
+                    revisions=revisions,
+                    mask_phi=mask_phi,
+                    custom_phi_keys=custom_phi or None,
+                )
+                to_odm_file(
+                    archive, odm_target, mask_phi=mask_phi, custom_phi_keys=custom_phi or None
+                )
+                emit_line(f"Saved {len(revisions)} audit_trail to {odm_target}")
+                return
             export_list_to_file(
                 revisions,
                 "audit_trail",
@@ -236,10 +268,10 @@ def setup_audit_parsers(
                 normalize_utc_timestamp_bound(args.end_date, is_end=True)
             if output_arg:
                 resolved_out = resolve_records_export_target(output_arg, "audit_trail")
-                if resolved_out is None:
+                if resolved_out is None and _resolve_audit_odm_target(output_arg) is None:
                     raise ValueError(
-                        f"Invalid output format: '{output_arg}'. Supported: csv, json, "
-                        "or explicit .csv/.json file paths."
+                        f"Invalid output format: '{output_arg}'. Supported: csv, json, odm, "
+                        "or explicit .csv/.json/.xml file paths."
                     )
         except ValueError as exc:
             sanitized_err = redact_cli_secrets(
