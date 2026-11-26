@@ -320,6 +320,7 @@ constraint-dependencies = [
     "soupsieve>=4.1.1",
     "mako>=1.4.2",
     "opentelemetry-api>=1.45.2",
+    "apache-airflow-providers-smtp>=3.2.2",
 ]
 
 [tool.uv.workspace]

@@ -1,9 +1,12 @@
 """Automated accessibility and contrast ratio regression tests for documentation theme."""
 
+import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -2087,6 +2090,26 @@ def test_scroll_padding_reduced_motion_and_back_to_top_focus_transfer() -> None:
         assert payload["presetRes"]["startupTabindex"] == "0"
 
 
+@contextlib.contextmanager
+def _single_core_chromium_affinity() -> Iterator[None]:
+    """Pin Playwright/Chromium subprocess tree to one vCPU to avoid vCPU TSC-skew SIGTRAPs."""
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        yield
+        return
+    try:
+        original_affinity = os.sched_getaffinity(0)
+        if len(original_affinity) > 1:
+            os.sched_setaffinity(0, {min(original_affinity)})
+    except OSError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.sched_setaffinity(0, original_affinity)
+
+
 def _launch_chromium_for_accessibility(playwright_instance: object) -> object:
     """Launch headless Chromium with CI-safe flags and local binary fallbacks."""
     launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
@@ -2123,7 +2146,6 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
     """Verify computed contrast, Mermaid scaling/ARIA, SC 2.5.3 names, and roving tabindex in Chromium."""
     import functools
     import lzma
-    import os
     import sys
     import threading
     from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -2328,7 +2350,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
     """
 
     try:
-        with sync_playwright() as pw:
+        with _single_core_chromium_affinity(), sync_playwright() as pw:
             browser = _launch_chromium_for_accessibility(pw)
             try:
                 context = browser.new_context(viewport={"width": 1280, "height": 900})
@@ -2347,7 +2369,10 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     else:
                         route.abort()  # type: ignore[attr-defined]
 
-                context.route("**/*", _route_handler)
+                context.route(
+                    re.compile(rf"^https?://(?!127\.0\.0\.1:{port}/)"),
+                    _route_handler,
+                )
 
                 # --------------------------------------------------------------
                 # 1. Pyodide controls: light, dark, prefers-contrast, forced-colors

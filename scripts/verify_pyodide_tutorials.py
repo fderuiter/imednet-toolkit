@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import json
+import os
 import re
 import shutil
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -155,6 +157,26 @@ def verify_built_tutorial_html(html_dir: Path) -> list[str]:
     return errors
 
 
+@contextlib.contextmanager
+def _single_core_chromium_affinity() -> Iterator[None]:
+    """Pin Chromium subprocesses to a single vCPU to avoid cross-core clock-skew SIGTRAPs."""
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        yield
+        return
+    try:
+        original_affinity = os.sched_getaffinity(0)
+        if len(original_affinity) > 1:
+            os.sched_setaffinity(0, {min(original_affinity)})
+    except OSError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.sched_setaffinity(0, original_affinity)
+
+
 def _launch_browser(playwright_instance: Any) -> Any:
     """Launch headless Chromium using Playwright's browser cache or pre-installed system Chrome."""
     launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
@@ -225,7 +247,7 @@ def verify_tutorials_in_browser(
         screenshot_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        with sync_playwright() as playwright_instance:
+        with _single_core_chromium_affinity(), sync_playwright() as playwright_instance:
             browser = _launch_browser(playwright_instance)
             try:
                 context = browser.new_context(viewport={"width": 1440, "height": 1100})
