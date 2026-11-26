@@ -90,17 +90,20 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from unittest.mock import NonCallableMock
 
 from imednet.errors import ExportBatchError, ExportConfigurationError
-from imednet.sdk import ImednetSDK
+from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.spi.sink_base import _require_optional_dep, is_record_deleted
 from imednet.spi.sinks import (
+    AsyncExportSink,
     CentralizedMapper,
     ExportSink,
     SinkConfig,
     apply_quality_gate,
+    async_apply_quality_gate,
+    async_run_streaming_export,
     bind_sdtm_stream_metadata,
     build_sink_mapper,
     commit_sdtm_lineage,
@@ -114,7 +117,13 @@ from imednet.spi.sinks import (
     run_streaming_export,
     should_preserve_sdtm_record_id,
 )
-from imednet.spi.utils import flatten, global_sensitivity_registry, mask_clinical_phi
+from imednet.spi.utils import (
+    flatten,
+    global_sensitivity_registry,
+    is_async_facade,
+    mask_clinical_phi,
+    maybe_to_thread,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1196,56 +1205,46 @@ def _records_to_arrow_table(
     return pa.Table.from_pylist(rows)
 
 
-class SnowflakeExportSink(ExportSink):
-    """Stage Parquet files and bulk-load them into Snowflake.
+class _SnowflakeSinkCoreMixin:
+    """Shared Snowflake staging, schema evolution, SQL generation, and SDTM lineage logic."""
 
-    Parameters
-    ----------
-    config:
-        :class:`SnowflakeSinkConfig` containing all connection details and
-        staging paths.
+    config: SinkConfig
+    _cfg: SnowflakeSinkConfig
+    _seq_counters: dict[str, int]
+    _domain_seq_counters: dict[str, dict[str, int]]
+    _record_seqs: dict[str, int]
+    _form_domain_map_ref: dict[Any, str]
+    _seq_overrides_ref: dict[str, int]
+    _lineage_out_ref: dict[str, dict[str, Any]]
+    _mapper: CentralizedMapper | None
+    _mapper_key: tuple[Any, ...] | None
+    _ensured_tables: set[str]
+    _conn: Any
+    _tmp_dir: tempfile.TemporaryDirectory[str] | None
+    _staging_dir: str
 
-    Raises:
-        ~imednet.errors.ExportConfigurationError: When the Snowflake connector cannot be initialised or the required
-            configuration values are missing.
-        ImportError: When ``snowflake-connector-python`` or ``pyarrow`` are not installed.
-    """
-
-    _delegates_sdtm_redaction = True
-    reconciles_deleted_on_full_sync = True
-
-    def __init__(self, config: SnowflakeSinkConfig) -> None:
-        """Initialize the Snowflake export sink.
-
-        Args:
-            config: Mandatory Snowflake-specific sink configuration.
-        """
-        super().__init__(config)
-        self._cfg: SnowflakeSinkConfig = config
-        self._seq_counters: dict[str, int] = {}
-        self._domain_seq_counters: dict[str, dict[str, int]] = {}
-        self._record_seqs: dict[str, int] = {}
-        self._form_domain_map_ref: dict[Any, str] = {}
-        self._seq_overrides_ref: dict[str, int] = {}
-        self._lineage_out_ref: dict[str, dict[str, Any]] = {}
-        self._mapper: CentralizedMapper | None = None
-        self._mapper_key: tuple[Any, ...] | None = None
-        self._ensured_tables: set[str] = set()
-        self._conn: Any = None
-        self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
-        self._connect()
+    def _init_warehouse_state(self, config: SnowflakeSinkConfig) -> None:
+        """Initialize shared Snowflake mapping, DDL cache, and connection attributes."""
+        self._cfg = config
+        self._seq_counters = {}
+        self._domain_seq_counters = {}
+        self._record_seqs = {}
+        self._form_domain_map_ref = {}
+        self._seq_overrides_ref = {}
+        self._lineage_out_ref = {}
+        self._mapper = None
+        self._mapper_key = None
+        self._ensured_tables = set()
+        self._conn = None
+        self._tmp_dir = None
 
     def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
         """Hydrate and bind SDTM sequence counters into transactional stream metadata."""
         if self._cfg.as_sdtm:
             bind_sdtm_stream_metadata(metadata, self._seq_counters, self._record_seqs)
 
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
-
-    def _connect(self) -> None:
-        """Establish connection to Snowflake and initialize local staging."""
+    def _validate_required_snowflake_config(self) -> None:
+        """Validate mandatory Snowflake connection and staging parameters."""
         cfg = self._cfg
         missing = [
             name
@@ -1264,9 +1263,12 @@ class SnowflakeExportSink(ExportSink):
             raise ExportConfigurationError(
                 f"SnowflakeSinkConfig is missing required fields: {missing}"
             )
-
         cfg.validate_identifiers(require_coordinates=True)
 
+    def _connect(self) -> None:
+        """Establish connection to Snowflake and initialize local staging."""
+        self._validate_required_snowflake_config()
+        cfg = self._cfg
         snowflake = _require_optional_dep("snowflake.connector", "snowflake")
         logger.debug("Connecting to Snowflake account=%s database=%s", cfg.account, cfg.database)
         try:
@@ -1283,18 +1285,13 @@ class SnowflakeExportSink(ExportSink):
                 f"Cannot connect to Snowflake account '{cfg.account}': {exc}"
             ) from exc
 
-        # Set up local staging directory
         if cfg.local_staging_dir:
             resolved_staging_dir = os.fspath(cfg.local_staging_dir)
             Path(resolved_staging_dir).mkdir(parents=True, exist_ok=True)
-            self._staging_dir: str = resolved_staging_dir
+            self._staging_dir = resolved_staging_dir
         else:
             self._tmp_dir = tempfile.TemporaryDirectory()
             self._staging_dir = self._tmp_dir.name
-
-    # ------------------------------------------------------------------
-    # ExportSink interface
-    # ------------------------------------------------------------------
 
     def _table_exists(self, cur: Any, target_table: str) -> bool:
         """Return ``True`` when *target_table* was ensured or exists in ``INFORMATION_SCHEMA``."""
@@ -1459,37 +1456,12 @@ class SnowflakeExportSink(ExportSink):
             self._mapper.post_processor = post_proc
         return self._mapper
 
-    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
-        """Write *records* to Snowflake via Parquet staging, DDL evolution, and MERGE INTO (or COPY INTO)."""
-        if not records:
-            return 0
-
+    def _prepare_arrow_batch(
+        self,
+        active_records: Sequence[Any],
+    ) -> tuple[Any, list[str], dict[str, dict[str, Any]]]:
+        """Map *active_records* into an Arrow table and return ``(arrow_table, merge_columns, lineage_out)``."""
         cfg = self._cfg
-        cfg.validate_identifiers(require_coordinates=True)
-
-        safe_batch = _BATCH_UNSAFE_PATTERN.sub("_", batch_id).strip("_")
-        if not safe_batch:
-            raise ExportBatchError(
-                f"Batch identifier {batch_id!r} resolved to an empty string after sanitization.",
-                batch_id=batch_id,
-            )
-
-        active_records: Sequence[Any] = records
-        should_reconcile_in_batch = self.config.idempotent and (
-            not cfg.include_deleted or (cfg.as_sdtm and cfg.hard_delete)
-        )
-        if should_reconcile_in_batch:
-            voided_records = [r for r in records if is_record_deleted(r)]
-            if voided_records:
-                self.reconcile_deleted(voided_records, batch_id=batch_id)
-                active_records = [r for r in records if not is_record_deleted(r)]
-                if not active_records:
-                    return 0
-        elif not cfg.include_deleted:
-            active_records = [r for r in records if not is_record_deleted(r)]
-            if not active_records:
-                return 0
-
         seq_overrides: dict[str, int] | None = None
         if cfg.as_sdtm:
             rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
@@ -1528,6 +1500,344 @@ class SnowflakeExportSink(ExportSink):
             naming_convention=cfg.naming_convention,
         )
         merge_columns = _resolve_merge_columns(arrow_table)
+        return arrow_table, merge_columns, lineage_out
+
+    def _execute_staged_load_sync(
+        self,
+        local_path: Path,
+        stage_path: str,
+        arrow_table: Any,
+        merge_columns: list[str],
+        active_record_count: int,
+        batch_id: str,
+    ) -> int:
+        """Execute ``PUT``, schema evolution DDL, and staged ``MERGE INTO`` (or ``COPY INTO``) in Snowflake."""
+        cfg = self._cfg
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/' "
+                f"AUTO_COMPRESS = FALSE OVERWRITE = TRUE"
+            )  # nosem
+            target_table = (
+                f"{_quote_identifier(cfg.database)}."
+                f"{_quote_identifier(cfg.schema)}."
+                f"{_quote_identifier(cfg.table)}"
+            )
+            self._ensure_table_schema(cur, target_table, arrow_table, merge_columns)
+
+            if self.config.idempotent:
+                staging_table = (
+                    f"{_quote_identifier(cfg.database)}."
+                    f"{_quote_identifier(cfg.schema)}."
+                    f"{_quote_identifier(f'{cfg.table}__imednet_stage')}"
+                )
+                cur.execute(
+                    f"CREATE OR REPLACE TEMPORARY TABLE {staging_table} LIKE {target_table}"
+                )  # nosem
+                cur.execute(
+                    f"COPY INTO {staging_table} "
+                    f"FROM '{stage_path}' "
+                    f"FILE_FORMAT = (TYPE = PARQUET) "
+                    f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
+                    f"FORCE = TRUE"
+                )  # nosem
+                insert_cols = ", ".join(_quote_identifier(col.upper()) for col in merge_columns)
+                insert_vals = ", ".join(
+                    f"source.{_quote_identifier(col.upper())}" for col in merge_columns
+                )
+                deleted_col = next(
+                    (c for c in ("deleted", "DELETED") if c in merge_columns),
+                    None,
+                )
+                merge_partitions = (
+                    _resolve_sdtm_domain_merge_partitions(
+                        arrow_table,
+                        merge_columns,
+                        sdtm_domain=cfg.sdtm_domain,
+                    )
+                    if cfg.as_sdtm
+                    else [
+                        (
+                            None,
+                            _resolve_merge_keys(
+                                merge_columns,
+                                as_sdtm=False,
+                                naming_convention=cfg.naming_convention,
+                            ),
+                        )
+                    ]
+                )
+                for domain_filter, merge_keys in merge_partitions:
+                    non_key_cols = [col for col in merge_columns if col not in merge_keys]
+                    if non_key_cols:
+                        update_clause = ", ".join(
+                            f"target.{_quote_identifier(col.upper())} = "
+                            f"source.{_quote_identifier(col.upper())}"
+                            for col in non_key_cols
+                        )
+                    else:
+                        first_key = _quote_identifier(merge_keys[0].upper())
+                        update_clause = f"target.{first_key} = source.{first_key}"
+
+                    if not cfg.as_sdtm and cfg.naming_convention in (None, "snake_case"):
+                        partition_expr = "study_key, record_id"
+                        order_expr = (
+                            "ORDER BY date_modified DESC NULLS LAST"
+                            if "date_modified" in merge_columns
+                            else "ORDER BY record_id"
+                        )
+                        on_expr = (
+                            "target.study_key = source.study_key "
+                            "AND target.record_id = source.record_id"
+                        )
+                    else:
+                        partition_expr = ", ".join(_quote_identifier(k.upper()) for k in merge_keys)
+                        modified_col = next(
+                            (
+                                c
+                                for c in ("date_modified", "dateModified", "DATE_MODIFIED")
+                                if c in merge_columns
+                            ),
+                            None,
+                        )
+                        order_expr = (
+                            f"ORDER BY {_quote_identifier(modified_col.upper())} DESC NULLS LAST"
+                            if modified_col is not None
+                            else f"ORDER BY {_quote_identifier(merge_keys[-1].upper())}"
+                        )
+                        on_expr = " AND ".join(
+                            f"target.{_quote_identifier(k.upper())} = "
+                            f"source.{_quote_identifier(k.upper())}"
+                            for k in merge_keys
+                        )
+                    if cfg.hard_delete and deleted_col is not None:
+                        quoted_del = _quote_identifier(deleted_col.upper())
+                        matched_clause = (
+                            f"WHEN MATCHED AND COALESCE(source.{quoted_del}, FALSE) = TRUE THEN DELETE "  # noqa: S608
+                            f"WHEN MATCHED THEN UPDATE SET {update_clause} "
+                            f"WHEN NOT MATCHED AND COALESCE(source.{quoted_del}, FALSE) = FALSE "
+                            f"THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+                        )
+                    else:
+                        matched_clause = (
+                            f"WHEN MATCHED THEN UPDATE SET {update_clause} "  # noqa: S608
+                            f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+                        )
+                    if domain_filter is None:
+                        cur.execute(
+                            f"MERGE INTO {target_table} AS target "  # noqa: S608
+                            f"USING ("
+                            f"SELECT * FROM {staging_table} "
+                            f"QUALIFY ROW_NUMBER() OVER ("
+                            f"PARTITION BY {partition_expr} {order_expr}"
+                            f") = 1"
+                            f") AS source "
+                            f"ON {on_expr} "
+                            f"{matched_clause}"
+                        )  # nosem
+                    else:
+                        cur.execute(
+                            f"MERGE INTO {target_table} AS target "  # noqa: S608
+                            f"USING ("
+                            f'SELECT * FROM {staging_table} WHERE "DOMAIN" = %s '
+                            f"QUALIFY ROW_NUMBER() OVER ("
+                            f"PARTITION BY {partition_expr} {order_expr}"
+                            f") = 1"
+                            f") AS source "
+                            f"ON {on_expr} "
+                            f"{matched_clause}",
+                            [domain_filter],
+                        )  # nosem
+            else:
+                cur.execute(
+                    f"COPY INTO {target_table} "
+                    f"FROM '{stage_path}' "
+                    f"FILE_FORMAT = (TYPE = PARQUET) "
+                    f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
+                    f"FORCE = TRUE"
+                )  # nosem
+            rows_loaded = getattr(arrow_table, "num_rows", active_record_count)
+            if not isinstance(rows_loaded, int):
+                rows_loaded = active_record_count
+            logger.debug(
+                "Loaded batch %s (%d rows) via stage %s",
+                batch_id,
+                rows_loaded,
+                stage_path,
+            )
+            self._append_manifest(batch_id, stage_path, rows_loaded)
+            return int(rows_loaded)
+        finally:
+            cur.close()
+
+    def _execute_sdtm_reconcile_sync(
+        self,
+        target_table: str,
+        sdtm_entries: Sequence[dict[str, Any]],
+        batch_id: str,
+    ) -> int:
+        """Delete voided SDTM rows from *target_table* synchronously."""
+        cur = self._conn.cursor()
+        deleted = 0
+        try:
+            if not self._table_exists(cur, target_table):
+                return 0
+            for entry in sdtm_entries:
+                st_id = entry.get("study_id")
+                dom = str(entry.get("domain") or "").strip().upper()
+                usubj = entry.get("usubjid")
+                seq_col = entry.get("seq_col")
+                seq_val = entry.get("seq_val")
+                if not st_id or not dom or not usubj:
+                    continue
+                if dom == "DM" or seq_col is None:
+                    cur.execute(
+                        f"DELETE FROM {target_table} "  # noqa: S608
+                        'WHERE "STUDYID" = %s AND "DOMAIN" = %s AND "USUBJID" = %s',
+                        [st_id, dom, usubj],
+                    )  # nosem
+                    deleted += 1
+                elif seq_val is not None and _IDENTIFIER_PATTERN.match(str(seq_col)):
+                    q_seq = _quote_identifier(str(seq_col).upper())
+                    cur.execute(
+                        f"DELETE FROM {target_table} "  # noqa: S608
+                        f'WHERE "STUDYID" = %s AND "DOMAIN" = %s '
+                        f'AND "USUBJID" = %s AND {q_seq} = %s',
+                        [st_id, dom, usubj, int(seq_val)],
+                    )  # nosem
+                    deleted += 1
+            logger.debug("Reconciled %d voided SDTM records in batch %s", deleted, batch_id)
+            return deleted
+        except Exception as exc:
+            if getattr(exc, "errno", None) == 2003 or getattr(exc, "sqlstate", None) == "42S02":
+                logger.debug(
+                    "Skipping voided SDTM record reconciliation for %s (table does not exist yet)",
+                    target_table,
+                )
+                return 0
+            raise
+        finally:
+            cur.close()
+
+    def _execute_record_reconcile_sync(
+        self,
+        target_table: str,
+        where_clause: str,
+        record_ids: Sequence[Any],
+        batch_id: str,
+    ) -> int:
+        """Delete voided record rows by ``RECORD_ID`` from *target_table* synchronously."""
+        cur = self._conn.cursor()
+        try:
+            if not self._table_exists(cur, target_table):
+                return 0
+            cur.execute(
+                f"DELETE FROM {target_table} "  # noqa: S608
+                f"WHERE {where_clause}",
+                [self._cfg.study_key, *record_ids],
+            )  # nosem
+            logger.debug("Reconciled %d voided records in batch %s", len(record_ids), batch_id)
+            return len(record_ids)
+        except Exception as exc:
+            if getattr(exc, "errno", None) == 2003 or getattr(exc, "sqlstate", None) == "42S02":
+                logger.debug(
+                    "Skipping voided record reconciliation for %s (table does not exist yet)",
+                    target_table,
+                )
+                return 0
+            raise
+        finally:
+            cur.close()
+
+    def _close_sync(self) -> None:
+        """Close the Snowflake connection and clean up temporary staging files."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
+        if self._tmp_dir is not None:
+            try:
+                self._tmp_dir.cleanup()
+            finally:
+                self._tmp_dir = None
+
+    def _append_manifest(self, batch_id: str, stage_path: str, row_count: int) -> None:
+        """Append a manifest entry for the loaded batch (JSON-lines format)."""
+        manifest_path = self._cfg.manifest_path or self._cfg.extra.get("manifest_path")
+        if not manifest_path:
+            return
+        entry = {
+            "batch_id": batch_id,
+            "stage_path": stage_path,
+            "row_count": row_count,
+            "loaded_at": datetime.now(tz=UTC).isoformat(),
+        }
+        with open(manifest_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + os.linesep)
+
+
+class SnowflakeExportSink(_SnowflakeSinkCoreMixin, ExportSink):
+    """Stage Parquet files and bulk-load them into Snowflake.
+
+    Parameters
+    ----------
+    config:
+        :class:`SnowflakeSinkConfig` containing all connection details and
+        staging paths.
+
+    Raises:
+        ~imednet.errors.ExportConfigurationError: When the Snowflake connector cannot be initialised or the required
+            configuration values are missing.
+        ImportError: When ``snowflake-connector-python`` or ``pyarrow`` are not installed.
+    """
+
+    _delegates_sdtm_redaction = True
+    reconciles_deleted_on_full_sync = True
+
+    def __init__(self, config: SnowflakeSinkConfig) -> None:
+        """Initialize the Snowflake export sink.
+
+        Args:
+            config: Mandatory Snowflake-specific sink configuration.
+        """
+        super().__init__(config)
+        self._init_warehouse_state(config)
+        self._connect()
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Write *records* to Snowflake via Parquet staging, DDL evolution, and MERGE INTO (or COPY INTO)."""
+        if not records:
+            return 0
+
+        cfg = self._cfg
+        cfg.validate_identifiers(require_coordinates=True)
+
+        safe_batch = _BATCH_UNSAFE_PATTERN.sub("_", batch_id).strip("_")
+        if not safe_batch:
+            raise ExportBatchError(
+                f"Batch identifier {batch_id!r} resolved to an empty string after sanitization.",
+                batch_id=batch_id,
+            )
+
+        active_records: Sequence[Any] = records
+        should_reconcile_in_batch = self.config.idempotent and (
+            not cfg.include_deleted or (cfg.as_sdtm and cfg.hard_delete)
+        )
+        if should_reconcile_in_batch:
+            voided_records = [r for r in records if is_record_deleted(r)]
+            if voided_records:
+                self.reconcile_deleted(voided_records, batch_id=batch_id)
+                active_records = [r for r in records if not is_record_deleted(r)]
+                if not active_records:
+                    return 0
+        elif not cfg.include_deleted:
+            active_records = [r for r in records if not is_record_deleted(r)]
+            if not active_records:
+                return 0
+
+        arrow_table, merge_columns, lineage_out = self._prepare_arrow_batch(active_records)
         local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
         pq = _require_optional_dep("pyarrow.parquet", "snowflake")
         pq.write_table(arrow_table, str(local_path))
@@ -1535,166 +1845,14 @@ class SnowflakeExportSink(ExportSink):
         stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{safe_batch}.parquet"
 
         def execute_export() -> int:
-            """Execute PUT, schema evolution DDL, and staged MERGE INTO (or COPY INTO) in Snowflake."""
-            cur = self._conn.cursor()
-            try:
-                cur.execute(
-                    f"PUT file://{local_path} '@{cfg.stage}/{cfg.stage_prefix}/' "
-                    f"AUTO_COMPRESS = FALSE OVERWRITE = TRUE"
-                )  # nosem
-                target_table = (
-                    f"{_quote_identifier(cfg.database)}."
-                    f"{_quote_identifier(cfg.schema)}."
-                    f"{_quote_identifier(cfg.table)}"
-                )
-                self._ensure_table_schema(cur, target_table, arrow_table, merge_columns)
-
-                if self.config.idempotent:
-                    staging_table = (
-                        f"{_quote_identifier(cfg.database)}."
-                        f"{_quote_identifier(cfg.schema)}."
-                        f"{_quote_identifier(f'{cfg.table}__imednet_stage')}"
-                    )
-                    cur.execute(
-                        f"CREATE OR REPLACE TEMPORARY TABLE {staging_table} LIKE {target_table}"
-                    )  # nosem
-                    cur.execute(
-                        f"COPY INTO {staging_table} "
-                        f"FROM '{stage_path}' "
-                        f"FILE_FORMAT = (TYPE = PARQUET) "
-                        f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
-                        f"FORCE = TRUE"
-                    )  # nosem
-                    insert_cols = ", ".join(_quote_identifier(col.upper()) for col in merge_columns)
-                    insert_vals = ", ".join(
-                        f"source.{_quote_identifier(col.upper())}" for col in merge_columns
-                    )
-                    deleted_col = next(
-                        (c for c in ("deleted", "DELETED") if c in merge_columns),
-                        None,
-                    )
-                    merge_partitions = (
-                        _resolve_sdtm_domain_merge_partitions(
-                            arrow_table,
-                            merge_columns,
-                            sdtm_domain=cfg.sdtm_domain,
-                        )
-                        if cfg.as_sdtm
-                        else [
-                            (
-                                None,
-                                _resolve_merge_keys(
-                                    merge_columns,
-                                    as_sdtm=False,
-                                    naming_convention=cfg.naming_convention,
-                                ),
-                            )
-                        ]
-                    )
-                    for domain_filter, merge_keys in merge_partitions:
-                        non_key_cols = [col for col in merge_columns if col not in merge_keys]
-                        if non_key_cols:
-                            update_clause = ", ".join(
-                                f"target.{_quote_identifier(col.upper())} = "
-                                f"source.{_quote_identifier(col.upper())}"
-                                for col in non_key_cols
-                            )
-                        else:
-                            first_key = _quote_identifier(merge_keys[0].upper())
-                            update_clause = f"target.{first_key} = source.{first_key}"
-
-                        if not cfg.as_sdtm and cfg.naming_convention in (None, "snake_case"):
-                            partition_expr = "study_key, record_id"
-                            order_expr = (
-                                "ORDER BY date_modified DESC NULLS LAST"
-                                if "date_modified" in merge_columns
-                                else "ORDER BY record_id"
-                            )
-                            on_expr = (
-                                "target.study_key = source.study_key "
-                                "AND target.record_id = source.record_id"
-                            )
-                        else:
-                            partition_expr = ", ".join(
-                                _quote_identifier(k.upper()) for k in merge_keys
-                            )
-                            modified_col = next(
-                                (
-                                    c
-                                    for c in ("date_modified", "dateModified", "DATE_MODIFIED")
-                                    if c in merge_columns
-                                ),
-                                None,
-                            )
-                            order_expr = (
-                                f"ORDER BY {_quote_identifier(modified_col.upper())} DESC NULLS LAST"
-                                if modified_col is not None
-                                else f"ORDER BY {_quote_identifier(merge_keys[-1].upper())}"
-                            )
-                            on_expr = " AND ".join(
-                                f"target.{_quote_identifier(k.upper())} = "
-                                f"source.{_quote_identifier(k.upper())}"
-                                for k in merge_keys
-                            )
-                        if cfg.hard_delete and deleted_col is not None:
-                            quoted_del = _quote_identifier(deleted_col.upper())
-                            matched_clause = (
-                                f"WHEN MATCHED AND COALESCE(source.{quoted_del}, FALSE) = TRUE THEN DELETE "  # noqa: S608
-                                f"WHEN MATCHED THEN UPDATE SET {update_clause} "
-                                f"WHEN NOT MATCHED AND COALESCE(source.{quoted_del}, FALSE) = FALSE "
-                                f"THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
-                            )
-                        else:
-                            matched_clause = (
-                                f"WHEN MATCHED THEN UPDATE SET {update_clause} "  # noqa: S608
-                                f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
-                            )
-                        if domain_filter is None:
-                            cur.execute(
-                                f"MERGE INTO {target_table} AS target "  # noqa: S608
-                                f"USING ("
-                                f"SELECT * FROM {staging_table} "
-                                f"QUALIFY ROW_NUMBER() OVER ("
-                                f"PARTITION BY {partition_expr} {order_expr}"
-                                f") = 1"
-                                f") AS source "
-                                f"ON {on_expr} "
-                                f"{matched_clause}"
-                            )  # nosem
-                        else:
-                            cur.execute(
-                                f"MERGE INTO {target_table} AS target "  # noqa: S608
-                                f"USING ("
-                                f'SELECT * FROM {staging_table} WHERE "DOMAIN" = %s '
-                                f"QUALIFY ROW_NUMBER() OVER ("
-                                f"PARTITION BY {partition_expr} {order_expr}"
-                                f") = 1"
-                                f") AS source "
-                                f"ON {on_expr} "
-                                f"{matched_clause}",
-                                [domain_filter],
-                            )  # nosem
-                else:
-                    cur.execute(
-                        f"COPY INTO {target_table} "
-                        f"FROM '{stage_path}' "
-                        f"FILE_FORMAT = (TYPE = PARQUET) "
-                        f"MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
-                        f"FORCE = TRUE"
-                    )  # nosem
-                rows_loaded = getattr(arrow_table, "num_rows", len(active_records))
-                if not isinstance(rows_loaded, int):
-                    rows_loaded = len(active_records)
-                logger.debug(
-                    "Loaded batch %s (%d rows) via stage %s",
-                    batch_id,
-                    rows_loaded,
-                    stage_path,
-                )
-                self._append_manifest(batch_id, stage_path, rows_loaded)
-                return int(rows_loaded)
-            finally:
-                cur.close()
+            return self._execute_staged_load_sync(
+                local_path,
+                stage_path,
+                arrow_table,
+                merge_columns,
+                len(active_records),
+                batch_id,
+            )
 
         written_total = self._execute_with_retry("export_warehouse", batch_id, execute_export)
         if cfg.as_sdtm and lineage_out:
@@ -1729,53 +1887,159 @@ class SnowflakeExportSink(ExportSink):
             if not sdtm_entries:
                 return 0
 
-            def execute_sdtm_reconcile() -> int:
-                cur = self._conn.cursor()
-                deleted = 0
-                try:
-                    if not self._table_exists(cur, target_table):
-                        return 0
-                    for entry in sdtm_entries:
-                        st_id = entry.get("study_id")
-                        dom = str(entry.get("domain") or "").strip().upper()
-                        usubj = entry.get("usubjid")
-                        seq_col = entry.get("seq_col")
-                        seq_val = entry.get("seq_val")
-                        if not st_id or not dom or not usubj:
-                            continue
-                        if dom == "DM" or seq_col is None:
-                            cur.execute(
-                                f"DELETE FROM {target_table} "  # noqa: S608
-                                'WHERE "STUDYID" = %s AND "DOMAIN" = %s AND "USUBJID" = %s',
-                                [st_id, dom, usubj],
-                            )  # nosem
-                            deleted += 1
-                        elif seq_val is not None and _IDENTIFIER_PATTERN.match(str(seq_col)):
-                            q_seq = _quote_identifier(str(seq_col).upper())
-                            cur.execute(
-                                f"DELETE FROM {target_table} "  # noqa: S608
-                                f'WHERE "STUDYID" = %s AND "DOMAIN" = %s '
-                                f'AND "USUBJID" = %s AND {q_seq} = %s',
-                                [st_id, dom, usubj, int(seq_val)],
-                            )  # nosem
-                            deleted += 1
-                    logger.debug("Reconciled %d voided SDTM records in batch %s", deleted, batch_id)
-                    return deleted
-                except Exception as exc:
-                    if (
-                        getattr(exc, "errno", None) == 2003
-                        or getattr(exc, "sqlstate", None) == "42S02"
-                    ):
-                        logger.debug(
-                            "Skipping voided SDTM record reconciliation for %s (table does not exist yet)",
-                            target_table,
-                        )
-                        return 0
-                    raise
-                finally:
-                    cur.close()
-
             return self._execute_with_retry(
+                "reconcile_warehouse_deleted",
+                batch_id,
+                lambda: self._execute_sdtm_reconcile_sync(target_table, sdtm_entries, batch_id),
+            )
+
+        if not record_ids:
+            return 0
+
+        placeholders = ", ".join(["%s"] * len(record_ids))
+        if cfg.as_sdtm or cfg.naming_convention == "sdtm":
+            where_clause = f'"STUDYID" = %s AND "RECORD_ID" IN ({placeholders})'
+        elif cfg.naming_convention == "camelCase":
+            where_clause = f'"STUDYKEY" = %s AND "RECORDID" IN ({placeholders})'
+        else:
+            where_clause = f"STUDY_KEY = %s AND RECORD_ID IN ({placeholders})"
+
+        return self._execute_with_retry(
+            "reconcile_warehouse_deleted",
+            batch_id,
+            lambda: self._execute_record_reconcile_sync(
+                target_table,
+                where_clause,
+                record_ids,
+                batch_id,
+            ),
+        )
+
+    def close(self) -> None:
+        """Close the Snowflake connection and clean up temporary staging files."""
+        self._close_sync()
+
+
+class AsyncSnowflakeExportSink(_SnowflakeSinkCoreMixin, AsyncExportSink):
+    """Asynchronously stage Parquet files and bulk-load them into Snowflake without blocking the event loop."""
+
+    _delegates_sdtm_redaction = True
+    reconciles_deleted_on_full_sync = True
+
+    def __init__(self, config: SnowflakeSinkConfig) -> None:
+        """Initialize the asynchronous Snowflake export sink."""
+        super().__init__(config)
+        self._init_warehouse_state(config)
+        self._validate_required_snowflake_config()
+        _require_optional_dep("snowflake.connector", "snowflake")
+        self._staging_dir = ""
+        self._connected: bool = False
+
+    async def __aenter__(self) -> Self:
+        """Establish Snowflake connection and local staging without blocking the event loop."""
+        await self._ensure_connected()
+        return await super().__aenter__()
+
+    async def _ensure_connected(self) -> None:
+        """Lazily initialize the Snowflake connection and staging directory off the event loop."""
+        if self._connected and self._conn is not None:
+            return
+        await maybe_to_thread(self._connect)
+        self._connected = True
+
+    async def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Asynchronously stage *records* to Parquet and execute Snowflake ``PUT`` + ``MERGE INTO``/``COPY INTO``."""
+        await self._ensure_connected()
+        if not records:
+            return 0
+
+        cfg = self._cfg
+        cfg.validate_identifiers(require_coordinates=True)
+
+        safe_batch = _BATCH_UNSAFE_PATTERN.sub("_", batch_id).strip("_")
+        if not safe_batch:
+            raise ExportBatchError(
+                f"Batch identifier {batch_id!r} resolved to an empty string after sanitization.",
+                batch_id=batch_id,
+            )
+
+        active_records: Sequence[Any] = records
+        should_reconcile_in_batch = self.config.idempotent and (
+            not cfg.include_deleted or (cfg.as_sdtm and cfg.hard_delete)
+        )
+        if should_reconcile_in_batch:
+            voided_records = [r for r in records if is_record_deleted(r)]
+            if voided_records:
+                await self.reconcile_deleted(voided_records, batch_id=batch_id)
+                active_records = [r for r in records if not is_record_deleted(r)]
+                if not active_records:
+                    return 0
+        elif not cfg.include_deleted:
+            active_records = [r for r in records if not is_record_deleted(r)]
+            if not active_records:
+                return 0
+
+        arrow_table, merge_columns, lineage_out = self._prepare_arrow_batch(active_records)
+        local_path = Path(self._staging_dir) / f"{safe_batch}.parquet"
+        pq = _require_optional_dep("pyarrow.parquet", "snowflake")
+        await maybe_to_thread(pq.write_table, arrow_table, str(local_path))
+
+        stage_path = f"@{cfg.stage}/{cfg.stage_prefix}/{safe_batch}.parquet"
+
+        async def execute_export() -> int:
+            return await maybe_to_thread(
+                self._execute_staged_load_sync,
+                local_path,
+                stage_path,
+                arrow_table,
+                merge_columns,
+                len(active_records),
+                batch_id,
+            )
+
+        written_total = await self._execute_with_retry("export_warehouse", batch_id, execute_export)
+        if cfg.as_sdtm and lineage_out:
+            commit_sdtm_lineage(self, lineage_out)
+        return written_total
+
+    async def flush(self) -> None:
+        """No-op: each batch is committed individually."""
+
+    async def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Asynchronously delete newly voided rows from Snowflake when running idempotently."""
+        if not self.config.idempotent or not records:
+            return 0
+        await self._ensure_connected()
+        cfg = self._cfg
+        cfg.validate_identifiers(require_coordinates=True)
+        target_table = (
+            f"{_quote_identifier(cfg.database)}."
+            f"{_quote_identifier(cfg.schema)}."
+            f"{_quote_identifier(cfg.table)}"
+        )
+
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if cfg.as_sdtm and (not should_preserve_sdtm_record_id(cfg) or not record_ids):
+            sdtm_entries = resolve_voided_sdtm_keys(
+                records,
+                self,
+                study_key=getattr(self, "_active_study_key", None) or cfg.study_key,
+                stream_name=getattr(self, "_active_stream_name", None) or cfg.stream_name,
+                sdtm_domain=cfg.sdtm_domain,
+                form_domain_map=getattr(self, "_active_form_domain_map", None),
+            )
+            if not sdtm_entries:
+                return 0
+
+            async def execute_sdtm_reconcile() -> int:
+                return await maybe_to_thread(
+                    self._execute_sdtm_reconcile_sync,
+                    target_table,
+                    sdtm_entries,
+                    batch_id,
+                )
+
+            return await self._execute_with_retry(
                 "reconcile_warehouse_deleted",
                 batch_id,
                 execute_sdtm_reconcile,
@@ -1785,7 +2049,6 @@ class SnowflakeExportSink(ExportSink):
             return 0
 
         placeholders = ", ".join(["%s"] * len(record_ids))
-
         if cfg.as_sdtm or cfg.naming_convention == "sdtm":
             where_clause = f'"STUDYID" = %s AND "RECORD_ID" IN ({placeholders})'
         elif cfg.naming_convention == "camelCase":
@@ -1793,71 +2056,40 @@ class SnowflakeExportSink(ExportSink):
         else:
             where_clause = f"STUDY_KEY = %s AND RECORD_ID IN ({placeholders})"
 
-        def execute_reconcile() -> int:
-            cur = self._conn.cursor()
-            try:
-                if not self._table_exists(cur, target_table):
-                    return 0
-                cur.execute(
-                    f"DELETE FROM {target_table} "  # noqa: S608
-                    f"WHERE {where_clause}",
-                    [cfg.study_key, *record_ids],
-                )  # nosem
-                logger.debug("Reconciled %d voided records in batch %s", len(record_ids), batch_id)
-                return len(record_ids)
-            except Exception as exc:
-                if getattr(exc, "errno", None) == 2003 or getattr(exc, "sqlstate", None) == "42S02":
-                    logger.debug(
-                        "Skipping voided record reconciliation for %s (table does not exist yet)",
-                        target_table,
-                    )
-                    return 0
-                raise
-            finally:
-                cur.close()
+        async def execute_reconcile() -> int:
+            return await maybe_to_thread(
+                self._execute_record_reconcile_sync,
+                target_table,
+                where_clause,
+                record_ids,
+                batch_id,
+            )
 
-        return self._execute_with_retry("reconcile_warehouse_deleted", batch_id, execute_reconcile)
+        return await self._execute_with_retry(
+            "reconcile_warehouse_deleted",
+            batch_id,
+            execute_reconcile,
+        )
 
-    def close(self) -> None:
-        """Close the Snowflake connection and clean up temporary staging files."""
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            finally:
-                self._conn = None
-        if self._tmp_dir is not None:
-            try:
-                self._tmp_dir.cleanup()
-            finally:
-                self._tmp_dir = None
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _append_manifest(self, batch_id: str, stage_path: str, row_count: int) -> None:
-        """Append a manifest entry for the loaded batch (JSON-lines format)."""
-        manifest_path = self._cfg.manifest_path or self._cfg.extra.get("manifest_path")
-        if not manifest_path:
-            return
-        entry = {
-            "batch_id": batch_id,
-            "stage_path": stage_path,
-            "row_count": row_count,
-            "loaded_at": datetime.now(tz=UTC).isoformat(),
-        }
-        with open(manifest_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + os.linesep)
+    async def close(self) -> None:
+        """Asynchronously close the Snowflake connection and clean up temporary staging files."""
+        await maybe_to_thread(self._close_sync)
+        self._connected = False
 
 
 def export_to_snowflake(
-    sdk: ImednetSDK,
+    sdk: ImednetFacade,
     study_key: str,
     *,
     config: SnowflakeSinkConfig,
     mask_phi: bool | None = None,
 ) -> int:
     """Export study records to Snowflake using :class:`SnowflakeExportSink`."""
+    if is_async_facade(sdk):
+        raise TypeError(
+            "export_to_snowflake() requires a synchronous ImednetSDK (ImednetFacade); "
+            "use await async_export_to_snowflake(...) with AsyncImednetSDK."
+        )
     resolved_cfg = replace(config, mask_phi=mask_phi) if mask_phi is not None else config
 
     run_id = uuid.uuid4().hex[:12]
@@ -1872,4 +2104,37 @@ def export_to_snowflake(
     )
 
 
-__all__ = ["SnowflakeExportSink", "SnowflakeSinkConfig", "export_to_snowflake"]
+async def async_export_to_snowflake(
+    sdk: AsyncImednetFacade,
+    study_key: str,
+    *,
+    config: SnowflakeSinkConfig,
+    mask_phi: bool | None = None,
+) -> int:
+    """Asynchronously export study records to Snowflake using :class:`AsyncSnowflakeExportSink`."""
+    if not is_async_facade(sdk):
+        raise TypeError(
+            "async_export_to_snowflake() requires an AsyncImednetSDK (AsyncImednetFacade); "
+            "use export_to_snowflake(...) with ImednetSDK."
+        )
+    resolved_cfg = replace(config, mask_phi=mask_phi) if mask_phi is not None else config
+
+    run_id = uuid.uuid4().hex[:12]
+    return await async_run_streaming_export(
+        sdk,
+        study_key,
+        lambda: AsyncSnowflakeExportSink(config=resolved_cfg),
+        resolved_cfg,
+        stream_name=f"snowflake_{resolved_cfg.table}",
+        batch_id_prefix=f"{study_key}/records/{run_id}",
+        quality_gate_fn=async_apply_quality_gate,
+    )
+
+
+__all__ = [
+    "AsyncSnowflakeExportSink",
+    "SnowflakeExportSink",
+    "SnowflakeSinkConfig",
+    "async_export_to_snowflake",
+    "export_to_snowflake",
+]

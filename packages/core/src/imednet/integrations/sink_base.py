@@ -75,13 +75,24 @@ from __future__ import annotations
 import contextlib
 import copy
 import functools
+import inspect
 import itertools
 import logging
 import math
 import re
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -89,7 +100,7 @@ from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast, runtime_checkable
 from unittest.mock import NonCallableMock
 
 from tenacity import wait_exponential
@@ -105,6 +116,7 @@ from imednet.models.standards import (
     StandardsProfile,
     StandardsReadinessReport,
     StandardsReadinessValidator,
+    async_iter_subject_ordered_sdtm_records,
     build_form_sdtm_domain_map,
     extract_record_form_ref,
     filter_forms_by_sdtm_domain,
@@ -117,6 +129,12 @@ from imednet.models.standards import (
     resolve_sdtm_domain,
     resolve_standards_profile,
     validate_cdash_variable,
+)
+from imednet.utils.async_bridge import (
+    SyncToAsyncFacadeAdapter,
+    call_async_facade_method,
+    is_async_facade,
+    run_sync_over_async,
 )
 from imednet.utils.filters import (
     _parse_clause_operator,
@@ -145,6 +163,9 @@ from ._record_timestamp_bounds import (
     _merge_and_condition,
     normalize_watermark_datetime,
 )
+
+if TYPE_CHECKING:
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 logger = logging.getLogger(__name__)
 
@@ -1039,7 +1060,7 @@ class ExportSink(ABC):
     # Context-manager support
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> ExportSink:
+    def __enter__(self) -> Self:
         """Enter the context manager, returning the sink instance."""
         return self
 
@@ -1055,6 +1076,180 @@ class ExportSink(ABC):
                 self.flush()
         finally:
             self.close()
+
+
+class AsyncExportSink(ABC):
+    """Abstract base class for native asynchronous export sinks.
+
+    Subclasses **must** implement :meth:`write_batch`, :meth:`flush`, and
+    :meth:`close` as coroutines.  The async context-manager protocol and
+    automatic PHI redaction wrapper are provided by this class.
+    """
+
+    _skip_auto_redact_batch: bool = False
+    _delegates_sdtm_redaction: bool = False
+    reconciles_deleted_on_full_sync: bool = False
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Automatically wrap concrete ``write_batch`` coroutines with PHI redaction."""
+        super().__init_subclass__(**kwargs)
+        if cls.__dict__.get("_skip_auto_redact_batch", False):
+            return
+        raw_write_batch = cls.__dict__.get("write_batch")
+        if raw_write_batch is None or getattr(raw_write_batch, "__isabstractmethod__", False):
+            return
+        if getattr(raw_write_batch, "_phi_redaction_wrapped", False):
+            return
+
+        @functools.wraps(raw_write_batch)
+        async def _wrapped_write_batch(
+            self: AsyncExportSink,
+            records: Sequence[Any],
+            *,
+            batch_id: str,
+        ) -> int:
+            redacted = self.redact_batch(records)
+            return cast(int, await raw_write_batch(self, redacted, batch_id=batch_id))
+
+        _wrapped_write_batch._phi_redaction_wrapped = True  # type: ignore[attr-defined]
+        cls.write_batch = _wrapped_write_batch  # type: ignore[method-assign]
+
+    def __init__(self, config: SinkConfig) -> None:
+        """Initialize the asynchronous export sink with a configuration."""
+        self.config: SinkConfig = config
+        self._circuit_breaker: CircuitBreaker = CircuitBreaker()
+        self._sdtm_lineage: dict[str, dict[str, Any]] = {}
+        self._sdtm_seq_watermarks: dict[str, int] = {}
+
+    def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
+        """Bind mutable checkpoint metadata for the active streaming run."""
+        _ = metadata
+
+    def _get_circuit_breaker(self) -> CircuitBreaker:
+        """Return this sink's isolated circuit breaker, initializing lazily if needed."""
+        breaker = getattr(self, "_circuit_breaker", None)
+        if breaker is None:
+            breaker = CircuitBreaker()
+            self._circuit_breaker = breaker
+        return breaker
+
+    def redact_batch(
+        self,
+        records: Sequence[Any],
+        *,
+        study_key: str | None = None,
+        config: SinkConfig | None = None,
+        phi_keys: Collection[str] | None = None,
+    ) -> Any:
+        """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
+        active_cfg = config if config is not None else getattr(self, "config", None)
+        should_mask = getattr(active_cfg, "mask_phi", True) is not False
+        raw_domain = getattr(active_cfg, "sdtm_domain", None)
+        is_sdtm = getattr(active_cfg, "as_sdtm", False) is True or (
+            isinstance(raw_domain, str) and bool(raw_domain.strip())
+        )
+        if is_sdtm and getattr(self, "_delegates_sdtm_redaction", False):
+            return records
+        active_sk = study_key if study_key is not None else getattr(active_cfg, "study_key", None)
+        return redact_batch_records(
+            records,
+            mask_phi=should_mask,
+            as_sdtm=is_sdtm,
+            study_key=active_sk,
+            config=active_cfg,
+            phi_keys=phi_keys,
+        )
+
+    @abstractmethod
+    async def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Asynchronously write one batch of records to the destination."""
+        ...
+
+    @abstractmethod
+    async def flush(self) -> None:
+        """Asynchronously flush any internal buffers to the destination."""
+        ...
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Asynchronously release all resources held by this sink."""
+        ...
+
+    async def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Asynchronously reconcile newly voided records in idempotent targets."""
+        _ = (records, batch_id)
+        return 0
+
+    async def _execute_with_retry(
+        self,
+        operation_name: str,
+        batch_id: str,
+        execute_fn: Callable[[], Awaitable[int]],
+    ) -> int:
+        """Execute an async batch operation with configured retries and telemetry."""
+        from imednet.core.operations.executor import UniversalExecutor
+        from imednet.core.retry import RetryConfig
+        from imednet.errors import ExportBatchError
+
+        attempts = 0
+        last_raw_exc: Exception | None = None
+
+        async def execute_batch() -> int:
+            nonlocal attempts, last_raw_exc
+            attempts += 1
+            try:
+                return await execute_fn()
+            except ExportConfigurationError as exc:
+                last_raw_exc = exc
+                raise ExportConfigurationError("Invalid export configuration.") from None
+            except TypeError as exc:
+                last_raw_exc = exc
+                raise TypeError("Invalid export batch input.") from None
+            except ValueError as exc:
+                last_raw_exc = exc
+                raise ValueError("Invalid export batch input.") from None
+            except Exception as exc:
+                last_raw_exc = exc
+                raise RuntimeError("Export destination operation failed.") from None
+
+        executor = UniversalExecutor(
+            retry_config=RetryConfig(
+                retries=self.config.max_retries,
+                backoff_factor=self.config.retry_backoff,
+                retry_policy=_SinkRetryPolicy(),
+            ),
+            wait_strategy=wait_exponential(multiplier=self.config.retry_backoff),
+            tracer=self.config.tracer,
+            operation_name=operation_name,
+            circuit_breaker=self._get_circuit_breaker(),
+            batch_id=batch_id,
+        )
+        try:
+            return await executor.execute_async(execute_batch)
+        except Exception as exec_err:
+            root_exc = last_raw_exc if last_raw_exc is not None else exec_err
+            sanitized_cause = _sanitize_batch_cause(root_exc)
+            raise ExportBatchError(
+                f"Batch {batch_id!r} failed after {attempts} attempts.",
+                batch_id=batch_id,
+            ) from sanitized_cause
+
+    async def __aenter__(self) -> Self:
+        """Enter the async context manager, returning the sink instance."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the async context manager, flushing and closing the sink."""
+        try:
+            if exc_type is None:
+                await self.flush()
+        finally:
+            await self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1612,6 +1807,130 @@ def evaluate_standards_readiness(
     return report
 
 
+def _populate_quality_gate_schema(
+    schema: Any,
+    study_key: str,
+    variables: Iterable[Any],
+    forms: Iterable[Any] | None,
+) -> None:
+    """Populate a SchemaCache / AsyncSchemaCache from explicit ``variables`` and ``forms``."""
+    form_key_by_id: dict[int, str] = {}
+    for form in forms or ():
+        fid = getattr(form, "form_id", None)
+        fk_val = getattr(form, "form_key", None)
+        if (
+            isinstance(fid, int)
+            and not isinstance(fid, bool)
+            and isinstance(fk_val, str)
+            and fk_val
+        ):
+            form_key_by_id[fid] = fk_val
+
+    prepared_vars: list[Any] = []
+    for var in variables:
+        prepared_var = var
+        var_fk = getattr(var, "form_key", None)
+        var_fid = getattr(var, "form_id", None)
+        if not var_fk and isinstance(var_fid, int) and var_fid in form_key_by_id:
+            resolved_fk = form_key_by_id[var_fid]
+            model_copy = getattr(var, "model_copy", None)
+            if callable(model_copy):
+                prepared_var = model_copy(update={"form_key": resolved_fk})
+            else:
+                cloned = copy.copy(var)
+                cloned.form_key = resolved_fk
+                prepared_var = cloned
+        prepared_vars.append(prepared_var)
+
+    schema.populate(prepared_vars, study_key=study_key)
+    for fid, fk_val in form_key_by_id.items():
+        schema._form_id_to_key[(study_key, fid)] = fk_val
+
+
+def _evaluate_quality_gate_record(
+    record: Any,
+    *,
+    schema: Any,
+    study_key: str,
+    config: SinkConfig,
+    cfg_domain: str | None,
+    study_cfg: Any,
+    gate_form_map: Mapping[Any, str],
+    seen_gate_cdash: set[tuple[str, str]],
+) -> bool:
+    """Return True if ``record`` passes schema readiness and log optional CDASH warnings."""
+    from imednet.core.context import reset_study_context, set_study_context
+    from imednet.validation.cache import calculate_readiness_score
+
+    if hasattr(record, "model_dump"):
+        rec_dict = record.model_dump()
+    elif hasattr(record, "__dict__"):
+        rec_dict = {
+            "form_key": getattr(record, "form_key", None),
+            "form_id": getattr(record, "form_id", None),
+            "record_data": getattr(record, "record_data", None),
+            "recordData": getattr(record, "recordData", None),
+            "data": getattr(record, "data", {}),
+            "record_id": getattr(record, "record_id", None),
+        }
+    elif isinstance(record, dict):
+        rec_dict = record
+    else:
+        rec_dict = {"data": {}}
+
+    ctx_token = set_study_context(study_key)
+    try:
+        fk = rec_dict.get("formKey") or rec_dict.get("form_key")
+        if not fk:
+            fid = rec_dict.get("formId") or rec_dict.get("form_id") or 0
+            fk = schema.form_key_from_id(fid)
+
+        if not fk:
+            logger.info("Dropped record %s: Unknown form", rec_dict.get("record_id", "Unknown"))
+            return False
+
+        data = rec_dict.get("record_data")
+        if data is None:
+            data = rec_dict.get("recordData")
+        if data is None:
+            data = rec_dict.get("data", {})
+        if not isinstance(data, Mapping):
+            data = {}
+        score, reasons = calculate_readiness_score(schema, fk, dict(data))
+    finally:
+        reset_study_context(ctx_token)
+
+    if score < config.min_schema_readiness_score:
+        logger.info(
+            "Dropped record %s (Score: %.1f < %.1f). Reasons: %s",
+            rec_dict.get("record_id", "Unknown"),
+            score,
+            config.min_schema_readiness_score,
+            "; ".join(reasons),
+        )
+        return False
+
+    if isinstance(data, Mapping):
+        domain_for_cdash = (
+            resolve_sdtm_domain(cfg_domain, fallback="AE")
+            if cfg_domain
+            else resolve_form_sdtm_domain(
+                str(fk),
+                study_config=study_cfg,
+                form_domain_map=gate_form_map or None,
+                fallback="AE",
+            )
+        )
+        for field_key in data:
+            pair = (domain_for_cdash, str(field_key))
+            if pair not in seen_gate_cdash:
+                seen_gate_cdash.add(pair)
+                valid_cdash, cdash_msg = validate_cdash_variable(str(field_key), domain_for_cdash)
+                if not valid_cdash and cdash_msg:
+                    logger.warning("CDASH naming warning (%s): %s", domain_for_cdash, cdash_msg)
+    return True
+
+
 def apply_quality_gate(
     sdk: Any,
     study_key: str,
@@ -1658,122 +1977,117 @@ def apply_quality_gate(
             yield record
         return
 
-    from imednet.core.context import reset_study_context, set_study_context
-    from imednet.validation.cache import SchemaValidator, calculate_readiness_score
+    from imednet.validation.cache import SchemaValidator
 
     validator = SchemaValidator(sdk)
     if variables is None:
         validator.refresh(study_key)
     else:
-        form_key_by_id: dict[int, str] = {}
-        for form in forms or ():
-            fid = getattr(form, "form_id", None)
-            fk_val = getattr(form, "form_key", None)
-            if (
-                isinstance(fid, int)
-                and not isinstance(fid, bool)
-                and isinstance(fk_val, str)
-                and fk_val
-            ):
-                form_key_by_id[fid] = fk_val
-
-        prepared_vars: list[Any] = []
-        for var in variables:
-            prepared_var = var
-            var_fk = getattr(var, "form_key", None)
-            var_fid = getattr(var, "form_id", None)
-            if not var_fk and isinstance(var_fid, int) and var_fid in form_key_by_id:
-                resolved_fk = form_key_by_id[var_fid]
-                model_copy = getattr(var, "model_copy", None)
-                if callable(model_copy):
-                    prepared_var = model_copy(update={"form_key": resolved_fk})
-                else:
-                    cloned = copy.copy(var)
-                    cloned.form_key = resolved_fk
-                    prepared_var = cloned
-            prepared_vars.append(prepared_var)
-
-        validator.schema.populate(prepared_vars, study_key=study_key)
-        for fid, fk_val in form_key_by_id.items():
-            validator.schema._form_id_to_key[(study_key, fid)] = fk_val
+        _populate_quality_gate_schema(validator.schema, study_key, variables, forms)
 
     seen_gate_cdash: set[tuple[str, str]] = set()
-
     dropped_count = 0
 
     for record in records:
-        if hasattr(record, "model_dump"):
-            rec_dict = record.model_dump()
-        elif hasattr(record, "__dict__"):
-            rec_dict = {
-                "form_key": getattr(record, "form_key", None),
-                "form_id": getattr(record, "form_id", None),
-                "record_data": getattr(record, "record_data", None),
-                "recordData": getattr(record, "recordData", None),
-                "data": getattr(record, "data", {}),
-                "record_id": getattr(record, "record_id", None),
-            }
-        elif isinstance(record, dict):
-            rec_dict = record
+        if _evaluate_quality_gate_record(
+            record,
+            schema=validator.schema,
+            study_key=study_key,
+            config=config,
+            cfg_domain=cfg_domain,
+            study_cfg=study_cfg,
+            gate_form_map=gate_form_map,
+            seen_gate_cdash=seen_gate_cdash,
+        ):
+            yield record
         else:
-            rec_dict = {"data": {}}
-
-        ctx_token = set_study_context(study_key)
-        try:
-            fk = rec_dict.get("formKey") or rec_dict.get("form_key")
-            if not fk:
-                fid = rec_dict.get("formId") or rec_dict.get("form_id") or 0
-                fk = validator.schema.form_key_from_id(fid)
-
-            if not fk:
-                logger.info("Dropped record %s: Unknown form", rec_dict.get("record_id", "Unknown"))
-                dropped_count += 1
-                continue
-
-            data = rec_dict.get("record_data")
-            if data is None:
-                data = rec_dict.get("recordData")
-            if data is None:
-                data = rec_dict.get("data", {})
-            if not isinstance(data, Mapping):
-                data = {}
-            score, reasons = calculate_readiness_score(validator.schema, fk, dict(data))
-        finally:
-            reset_study_context(ctx_token)
-
-        if score < config.min_schema_readiness_score:
-            logger.info(
-                "Dropped record %s (Score: %.1f < %.1f). Reasons: %s",
-                rec_dict.get("record_id", "Unknown"),
-                score,
-                config.min_schema_readiness_score,
-                "; ".join(reasons),
-            )
             dropped_count += 1
-            continue
 
-        if isinstance(data, Mapping):
-            domain_for_cdash = (
-                resolve_sdtm_domain(cfg_domain, fallback="AE")
-                if cfg_domain
-                else resolve_form_sdtm_domain(
-                    str(fk),
-                    study_config=study_cfg,
-                    form_domain_map=gate_form_map or None,
-                    fallback="AE",
-                )
+    if dropped_count > 0:
+        logger.info("Quality gate dropped %d records in total.", dropped_count)
+
+
+async def async_apply_quality_gate(
+    sdk: AsyncImednetFacade,
+    study_key: str,
+    records: AsyncIterable[Any] | Iterable[Any],
+    config: SinkConfig,
+    *,
+    variables: Iterable[Any] | None = None,
+    forms: Iterable[Any] | None = None,
+) -> AsyncIterator[Any]:
+    """Asynchronously filter records based on schema readiness and optional CDASH checks."""
+
+    async def _as_async(source: AsyncIterable[Any] | Iterable[Any]) -> AsyncIterator[Any]:
+        if isinstance(source, AsyncIterable):
+            async for item in source:
+                yield item
+        else:
+            for item in source:
+                yield item
+
+    cfg_profile = getattr(config, "standards_profile", None)
+    cfg_domain = getattr(config, "sdtm_domain", None)
+
+    if not config.quality_gate_enabled and cfg_profile is None:
+        async for record in _as_async(records):
+            yield record
+        return
+
+    from imednet.integrations.enrichment import resolve_study_configuration
+
+    extra = getattr(config, "extra", None)
+    study_cfg: Any = (
+        extra.get("study_config")
+        if isinstance(extra, Mapping) and extra.get("study_config") is not None
+        else resolve_study_configuration(study_key)
+    )
+    gate_form_map = build_form_sdtm_domain_map(forms, study_config=study_cfg)
+
+    if not config.quality_gate_enabled:
+        seen_cdash: set[tuple[str, str]] = set()
+        async for record in _as_async(records):
+            domain, raw_data, _ = _extract_record_for_standards(
+                record,
+                configured_domain=cfg_domain,
+                form_domain_map=gate_form_map or None,
+                study_config=study_cfg,
             )
-            for field_key in data:
-                pair = (domain_for_cdash, str(field_key))
-                if pair not in seen_gate_cdash:
-                    seen_gate_cdash.add(pair)
-                    valid_cdash, cdash_msg = validate_cdash_variable(
-                        str(field_key), domain_for_cdash
-                    )
+            for field_key in raw_data:
+                pair = (domain, str(field_key))
+                if pair not in seen_cdash:
+                    seen_cdash.add(pair)
+                    valid_cdash, cdash_msg = validate_cdash_variable(str(field_key), domain)
                     if not valid_cdash and cdash_msg:
-                        logger.warning("CDASH naming warning (%s): %s", domain_for_cdash, cdash_msg)
+                        logger.warning("CDASH naming warning (%s): %s", domain, cdash_msg)
+            yield record
+        return
 
-        yield record
+    from imednet.validation.cache import AsyncSchemaValidator
+
+    validator = AsyncSchemaValidator(sdk)
+    if variables is None:
+        await validator.refresh(study_key)
+    else:
+        _populate_quality_gate_schema(validator.schema, study_key, variables, forms)
+
+    seen_gate_cdash: set[tuple[str, str]] = set()
+    dropped_count = 0
+
+    async for record in _as_async(records):
+        if _evaluate_quality_gate_record(
+            record,
+            schema=validator.schema,
+            study_key=study_key,
+            config=config,
+            cfg_domain=cfg_domain,
+            study_cfg=study_cfg,
+            gate_form_map=gate_form_map,
+            seen_gate_cdash=seen_gate_cdash,
+        ):
+            yield record
+        else:
+            dropped_count += 1
 
     if dropped_count > 0:
         logger.info("Quality gate dropped %d records in total.", dropped_count)
@@ -1790,6 +2104,33 @@ def iter_batches(records: Iterable[Any], batch_size: int) -> Iterator[list[Any]]
             batch = list(itertools.islice(iterator, batch_size))
             if not batch:
                 break
+            yield batch
+
+    return _generate()
+
+
+def async_iter_batches(
+    records: AsyncIterable[Any] | Iterable[Any], batch_size: int
+) -> AsyncIterator[list[Any]]:
+    """Asynchronously yield ``records`` lazily in fixed-size batches of ``batch_size``."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be greater than 0")
+
+    async def _generate() -> AsyncIterator[list[Any]]:
+        batch: list[Any] = []
+        if isinstance(records, AsyncIterable):
+            async for item in records:
+                batch.append(item)
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+        else:
+            for item in records:
+                batch.append(item)
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+        if batch:
             yield batch
 
     return _generate()
@@ -1919,6 +2260,114 @@ class BoundedFormBufferRouter:
                 self._flush_active_form(fk)
             if self._on_flush_voided is not None and self._voided[fk]:
                 self._flush_voided_form(fk)
+
+
+class AsyncBoundedFormBufferRouter:
+    """Asynchronously buffer per-form records and flush on batch size or memory ceiling."""
+
+    def __init__(
+        self,
+        form_keys: Sequence[str],
+        *,
+        batch_size: int,
+        max_buffered_records: int | None = None,
+        on_flush_active: Callable[[str, list[Any], int], Awaitable[None]],
+        on_flush_voided: Callable[[str, list[Any], int], Awaitable[None]] | None = None,
+    ) -> None:
+        """Initialize per-form async buffers and global ceiling tracking."""
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
+        self._form_keys = list(dict.fromkeys(form_keys))
+        self.batch_size = batch_size
+        self.ceiling = resolve_max_buffered_records(batch_size, max_buffered_records)
+        self._on_flush_active = on_flush_active
+        self._on_flush_voided = on_flush_voided
+        self._active: dict[str, list[Any]] = {fk: [] for fk in self._form_keys}
+        self._voided: dict[str, list[Any]] = {fk: [] for fk in self._form_keys}
+        self._active_batch_idx: dict[str, int] = dict.fromkeys(self._form_keys, 0)
+        self._voided_batch_idx: dict[str, int] = dict.fromkeys(self._form_keys, 0)
+        self.total_buffered = 0
+        self.peak_buffered = 0
+
+    async def add_active(self, form_key: str, record: Any) -> None:
+        """Append an active record to ``form_key`` and flush if thresholds are met."""
+        buf = self._active[form_key]
+        buf.append(record)
+        self.total_buffered += 1
+        self.peak_buffered = max(self.peak_buffered, self.total_buffered)
+        if len(buf) >= self.batch_size:
+            await self._flush_active_form(form_key)
+        elif self.total_buffered >= self.ceiling:
+            await self._evict_largest()
+
+    async def add_voided(self, form_key: str, record: Any) -> None:
+        """Append a voided record to ``form_key`` and flush if thresholds are met."""
+        if self._on_flush_voided is None:
+            return
+        buf = self._voided[form_key]
+        buf.append(record)
+        self.total_buffered += 1
+        self.peak_buffered = max(self.peak_buffered, self.total_buffered)
+        if len(buf) >= self.batch_size:
+            await self._flush_voided_form(form_key)
+        elif self.total_buffered >= self.ceiling:
+            await self._evict_largest()
+
+    async def _flush_active_form(self, form_key: str) -> None:
+        buf = self._active[form_key]
+        if not buf:
+            return
+        batch = list(buf)
+        buf.clear()
+        self.total_buffered -= len(batch)
+        idx = self._active_batch_idx[form_key]
+        self._active_batch_idx[form_key] = idx + 1
+        await self._on_flush_active(form_key, batch, idx)
+
+    async def _flush_voided_form(self, form_key: str) -> None:
+        if self._on_flush_voided is None:
+            return
+        buf = self._voided[form_key]
+        if not buf:
+            return
+        batch = list(buf)
+        buf.clear()
+        self.total_buffered -= len(batch)
+        idx = self._voided_batch_idx[form_key]
+        self._voided_batch_idx[form_key] = idx + 1
+        await self._on_flush_voided(form_key, batch, idx)
+
+    async def _evict_largest(self) -> None:
+        while self.total_buffered >= self.ceiling:
+            best_kind: str | None = None
+            best_key: str | None = None
+            best_len = 0
+            for fk in self._form_keys:
+                a_len = len(self._active[fk])
+                if a_len > best_len:
+                    best_len = a_len
+                    best_kind = "active"
+                    best_key = fk
+                if self._on_flush_voided is not None:
+                    v_len = len(self._voided[fk])
+                    if v_len > best_len:
+                        best_len = v_len
+                        best_kind = "voided"
+                        best_key = fk
+            if best_key is None or best_len == 0:
+                break
+            if best_kind == "voided":
+                await self._flush_voided_form(best_key)
+            else:
+                await self._flush_active_form(best_key)
+
+    async def flush_all(self) -> None:
+        """Flush all remaining buffered active and voided records in form order."""
+        for fk in self._form_keys:
+            if self._active[fk]:
+                await self._flush_active_form(fk)
+            if self._on_flush_voided is not None and self._voided[fk]:
+                await self._flush_voided_form(fk)
 
 
 def extract_record_timestamp(record: Any) -> datetime | None:
@@ -2221,6 +2670,98 @@ def iter_filtered_sdk_records(
             yield record
 
 
+async def async_iter_filtered_sdk_records(
+    sdk: Any,
+    study_key: str,
+    *,
+    watermark: datetime | str | None = None,
+    record_filter: dict[str, Any] | str | Sequence[str] | None = None,
+    record_data_filter: str | None = None,
+    exclude_deleted_upstream: bool = True,
+    sort: str | None = None,
+) -> AsyncIterator[Any]:
+    """Asynchronously yield records from ``sdk.records.list`` or ``sdk.get_records``."""
+    validated_rdf = (
+        _validate_record_data_filter_input(record_data_filter)
+        if record_data_filter is not None
+        else None
+    )
+
+    resolved = _resolve_record_query_branches(
+        record_filter=record_filter,
+        watermark=watermark,
+        exclude_deleted_upstream=exclude_deleted_upstream,
+    )
+    if not resolved:
+        return
+
+    deduplicate = len(resolved) > 1
+    seen_ids: set[Any] = set()
+
+    use_records_ep = False
+    if isinstance(sdk, NonCallableMock):
+        mock_children = getattr(sdk, "_mock_children", {})
+        inst_vars = vars(sdk)
+        has_records_ep = "records" in mock_children or "records" in inst_vars
+        has_get_records = (
+            "get_records" in inst_vars
+            or "async_get_records" in inst_vars
+            or "get_records" in mock_children
+            or "async_get_records" in mock_children
+        )
+        use_records_ep = has_records_ep or not has_get_records
+    else:
+        records_ep = getattr(sdk, "records", None)
+        use_records_ep = records_ep is not None and callable(getattr(records_ep, "list", None))
+
+    for branch, post_predicate in resolved:
+        call_kwargs = dict(branch)
+        if sort and "sort" not in call_kwargs:
+            call_kwargs["sort"] = sort
+        if validated_rdf is not None:
+            call_kwargs["record_data_filter"] = validated_rdf
+        elif use_records_ep:
+            call_kwargs["record_data_filter"] = None
+
+        if use_records_ep:
+            page_source = sdk.records.list(
+                study_key=study_key,
+                **call_kwargs,
+            )
+            if inspect.isawaitable(page_source):
+                page_source = await page_source
+        else:
+            page_source = await call_async_facade_method(
+                sdk,
+                "get_records",
+                study_key=study_key,
+                **call_kwargs,
+            )
+
+        if isinstance(page_source, AsyncIterable):
+            async for record in page_source:
+                if post_predicate is not None and not post_predicate(record):
+                    continue
+                if deduplicate:
+                    rec_id = extract_record_id(record)
+                    if rec_id is not None:
+                        if rec_id in seen_ids:
+                            continue
+                        seen_ids.add(rec_id)
+                yield record
+        else:
+            for record in page_source:
+                if post_predicate is not None and not post_predicate(record):
+                    continue
+                if deduplicate:
+                    rec_id = extract_record_id(record)
+                    if rec_id is not None:
+                        if rec_id in seen_ids:
+                            continue
+                        seen_ids.add(rec_id)
+                yield record
+
+
 def _extract_safe_config_options(config: Any) -> dict[str, Any]:
     """Extract streaming and filter options safely from SinkConfig or mock objects."""
     is_real_cfg = isinstance(config, SinkConfig)
@@ -2395,6 +2936,34 @@ def _is_bound_real_records_endpoint(sdk: Any) -> bool:
     return getattr(list_attr, "__func__", None) is RecordsEndpoint.list
 
 
+def _is_bound_real_async_records_endpoint(sdk: Any) -> bool:
+    """Return True when ``sdk`` uses an unmocked real ``AsyncRecordsEndpoint`` or sync adapter."""
+    from imednet.endpoints.records import AsyncRecordsEndpoint
+
+    if isinstance(sdk, SyncToAsyncFacadeAdapter):
+        return _is_bound_real_records_endpoint(sdk.sync_sdk)
+    records_ep = getattr(sdk, "records", None)
+    if not isinstance(records_ep, AsyncRecordsEndpoint):
+        return False
+    list_attr = getattr(records_ep, "list", None)
+    return getattr(list_attr, "__func__", None) is AsyncRecordsEndpoint.list
+
+
+def _filter_valid_study_forms(items: Iterable[Any], *, is_mock_sdk: bool) -> list[Any]:
+    """Filter fetched study forms while ignoring auto-created MagicMock placeholders."""
+    if is_mock_sdk:
+        return [
+            f
+            for f in items
+            if not isinstance(f, NonCallableMock)
+            and (
+                (isinstance(f, Mapping) and (f.get("formKey") or f.get("form_key")))
+                or isinstance(getattr(f, "form_key", None), str)
+            )
+        ]
+    return [f for f in items if f is not None]
+
+
 def _try_fetch_study_forms(sdk: Any, study_key: str) -> list[Any]:
     """Safely fetch concrete Study Forms when ``sdk.forms.list`` is available and non-mocked."""
     if sdk is None or isinstance(sdk, NonCallableMock):
@@ -2412,22 +2981,80 @@ def _try_fetch_study_forms(sdk: Any, study_key: str) -> list[Any]:
             items = list(candidate)
         except Exception:
             return []
-        return [
-            f
-            for f in items
-            if not isinstance(f, NonCallableMock)
-            and (
-                (isinstance(f, Mapping) and (f.get("formKey") or f.get("form_key")))
-                or isinstance(getattr(f, "form_key", None), str)
-            )
-        ]
+        return _filter_valid_study_forms(items, is_mock_sdk=True)
 
     forms_ep = getattr(sdk, "forms", None)
     list_fn = getattr(forms_ep, "list", None) if forms_ep is not None else None
     if not callable(list_fn):
         return []
     try:
-        return [f for f in list_fn(study_key=study_key) if f is not None]
+        return _filter_valid_study_forms(list_fn(study_key=study_key), is_mock_sdk=False)
+    except Exception:
+        return []
+
+
+async def _async_try_fetch_study_forms(sdk: Any, study_key: str) -> list[Any]:
+    """Safely fetch Study Forms asynchronously when ``sdk.forms.list`` or ``get_forms`` exists."""
+    if sdk is None:
+        return []
+    if isinstance(sdk, SyncToAsyncFacadeAdapter):
+        return _try_fetch_study_forms(sdk.sync_sdk, study_key)
+
+    is_mock_sdk = isinstance(sdk, NonCallableMock)
+    if is_mock_sdk:
+        mock_children = getattr(sdk, "_mock_children", {})
+        inst_vars = vars(sdk)
+        has_forms_ep = "forms" in mock_children or "forms" in inst_vars
+        has_get_forms = (
+            "get_forms" in inst_vars
+            or "async_get_forms" in inst_vars
+            or "get_forms" in mock_children
+            or "async_get_forms" in mock_children
+        )
+        if not has_forms_ep and has_get_forms:
+            try:
+                fetched = await call_async_facade_method(sdk, "get_forms", study_key=study_key)
+                if isinstance(fetched, NonCallableMock):
+                    return []
+                return _filter_valid_study_forms(list(fetched), is_mock_sdk=True)
+            except Exception:
+                return []
+        forms_ep = getattr(sdk, "forms", None)
+        list_fn = getattr(forms_ep, "list", None) if forms_ep is not None else None
+        if list_fn is None:
+            return []
+        try:
+            candidate = list_fn(study_key=study_key)
+            if inspect.isawaitable(candidate):
+                candidate = await candidate
+            if isinstance(candidate, NonCallableMock):
+                return []
+            if isinstance(candidate, AsyncIterable):
+                items = [item async for item in candidate]
+            else:
+                items = list(candidate)
+        except Exception:
+            return []
+        return _filter_valid_study_forms(items, is_mock_sdk=True)
+
+    forms_ep = getattr(sdk, "forms", None)
+    list_fn = getattr(forms_ep, "list", None) if forms_ep is not None else None
+    if callable(list_fn):
+        try:
+            candidate = list_fn(study_key=study_key)
+            if inspect.isawaitable(candidate):
+                candidate = await candidate
+            if isinstance(candidate, AsyncIterable):
+                items = [item async for item in candidate]
+            else:
+                items = list(candidate)
+            return _filter_valid_study_forms(items, is_mock_sdk=False)
+        except Exception:
+            return []
+
+    try:
+        fetched = await call_async_facade_method(sdk, "get_forms", study_key=study_key)
+        return _filter_valid_study_forms(list(fetched), is_mock_sdk=False)
     except Exception:
         return []
 
@@ -2496,7 +3123,7 @@ def _resolve_lineage_target(
 ) -> tuple[Any, SinkConfig | Any, str, str, dict[str, Any] | None]:
     """Resolve ``(provider, cfg, resolved_study, resolved_stream, active_tx)`` for SDTM lineage."""
     is_sink = (
-        isinstance(sink_or_config, ExportSink)
+        isinstance(sink_or_config, (ExportSink, AsyncExportSink))
         or hasattr(sink_or_config, "write_batch")
         or hasattr(sink_or_config, "_active_tx")
         or hasattr(sink_or_config, "_sdtm_lineage")
@@ -2626,7 +3253,7 @@ class _ScopedSeqOverrides(dict[str, int]):
                 return legacy_val
         raise KeyError(key)
 
-    def get(self, key: Any, default: Any = None) -> Any:  # type: ignore[override]
+    def get(self, key: Any, default: Any = None) -> Any:  # type: ignore[override, unused-ignore]
         try:
             return self.__getitem__(key)
         except KeyError:
@@ -2729,7 +3356,7 @@ def commit_sdtm_lineage(
             wm_updates[wm_key] = max(wm_updates.get(wm_key, 0), seq_val)
 
     is_sink = (
-        isinstance(sink_or_config, ExportSink)
+        isinstance(sink_or_config, (ExportSink, AsyncExportSink))
         or hasattr(sink_or_config, "write_batch")
         or hasattr(sink_or_config, "_active_tx")
         or hasattr(sink_or_config, "_sdtm_lineage")
@@ -2882,29 +3509,118 @@ def resolve_voided_sdtm_keys(
     return resolved_keys
 
 
-def run_streaming_export(
-    sdk: Any,
+class _SyncExportSinkAdapter(AsyncExportSink):
+    """Internal adapter delegating :class:`AsyncExportSink` lifecycle to a sync :class:`ExportSink`."""
+
+    _skip_auto_redact_batch = True
+    _sync_sink: ExportSink
+
+    def __init__(self, sync_sink: ExportSink) -> None:
+        object.__setattr__(self, "_sync_sink", sync_sink)
+        super().__init__(cast(SinkConfig, getattr(sync_sink, "config", None)))
+
+    @property
+    def reconciles_deleted_on_full_sync(self) -> bool:  # type: ignore[override]
+        return bool(getattr(self._sync_sink, "reconciles_deleted_on_full_sync", False))
+
+    def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
+        bind_fn = getattr(self._sync_sink, "bind_stream_metadata", None)
+        if callable(bind_fn):
+            bind_fn(metadata)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name.startswith("_active_"):
+            with contextlib.suppress(Exception):
+                setattr(self._sync_sink, name, value)
+        object.__setattr__(self, name, value)
+
+    async def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        return self._sync_sink.write_batch(records, batch_id=batch_id)
+
+    async def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        return self._sync_sink.reconcile_deleted(records, batch_id=batch_id)
+
+    async def flush(self) -> None:
+        self._sync_sink.flush()
+
+    async def close(self) -> None:
+        self._sync_sink.close()
+
+    async def __aenter__(self) -> _SyncExportSinkAdapter:
+        enter_fn = getattr(self._sync_sink, "__enter__", None)
+        if callable(enter_fn):
+            enter_fn()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        exit_fn = getattr(self._sync_sink, "__exit__", None)
+        if callable(exit_fn):
+            exit_fn(exc_type, exc_val, exc_tb)
+            return
+        try:
+            if exc_type is None:
+                self._sync_sink.flush()
+        finally:
+            self._sync_sink.close()
+
+
+async def _ensure_async_stream(source: Any) -> AsyncIterator[Any]:
+    """Yield items asynchronously from an ``AsyncIterable``, ``Awaitable``, or ``Iterable``."""
+    resolved = await source if inspect.isawaitable(source) else source
+    if isinstance(resolved, AsyncIterable):
+        async for item in resolved:
+            yield item
+    else:
+        for item in resolved:
+            yield item
+
+
+async def async_run_streaming_export(
+    sdk: AsyncImednetFacade,
     study_key: str,
-    sink: ExportSink | Callable[[], ExportSink],
+    sink: AsyncExportSink | Callable[[], AsyncExportSink],
     config: SinkConfig,
     *,
     stream_name: str | None = None,
     batch_id_prefix: str | None = None,
     default_provider_name: str | None = None,
-    records_source: Callable[[datetime | None, bool], Iterable[Any]] | None = None,
-    quality_gate_fn: Callable[[Any, str, Iterable[Any], SinkConfig], Iterable[Any]] | None = None,
-    iter_batches_fn: Callable[[Iterable[Any], int], Iterable[Sequence[Any]]] | None = None,
+    records_source: (
+        Callable[
+            [datetime | None, bool],
+            AsyncIterable[Any] | Iterable[Any] | Awaitable[Iterable[Any]],
+        ]
+        | None
+    ) = None,
+    quality_gate_fn: Callable[..., Any] | None = None,
+    iter_batches_fn: Callable[..., Any] | None = None,
+    _caller_sdk: Any = None,
 ) -> int:
-    """Stream paginated records into ``sink`` in fixed-size batches with checkpointing.
+    """Asynchronously stream paginated records into ``sink`` with checkpointing and audit gates.
 
-    Commits ledger checkpoints only after all batches and ``sink.flush()`` succeed.
+    Commits ledger checkpoints strictly after all batches and ``await sink.flush()`` succeed.
     """
+    if type(sdk).__name__ == "ImednetSDK" or (
+        sdk is not None
+        and not isinstance(sdk, (NonCallableMock, SyncToAsyncFacadeAdapter))
+        and not is_async_facade(sdk)
+    ):
+        raise TypeError(
+            "async_run_streaming_export() requires an AsyncImednetFacade or AsyncImednetSDK; "
+            "use run_streaming_export() for synchronous SDK instances."
+        )
+
     opts = _extract_safe_config_options(config)
     use_checkpoint = opts["incremental"] or opts["state_provider"] is not None
-    gate_fn = quality_gate_fn or apply_quality_gate
-    batches_fn = iter_batches_fn or iter_batches
+    gate_fn = quality_gate_fn or async_apply_quality_gate
+    batches_fn = iter_batches_fn or async_iter_batches
     prefix = batch_id_prefix or f"{study_key}/records"
     resolved_stream = opts["stream_name"] or stream_name or "records"
+    gov_sdk = _caller_sdk if _caller_sdk is not None else sdk
 
     provider: StateProviderProtocol | None = None
     if use_checkpoint:
@@ -2930,8 +3646,8 @@ def run_streaming_export(
         else None
     )
 
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(sdk_governance_context(sdk))
+    async with contextlib.AsyncExitStack() as stack:
+        stack.enter_context(sdk_governance_context(gov_sdk))
         tx: dict[str, Any] | None = None
         if provider is not None:
             tx = stack.enter_context(
@@ -2947,11 +3663,11 @@ def run_streaming_export(
         else:
             watermark = opts["modified_since"]
 
-        if isinstance(sink, ExportSink) or hasattr(sink, "write_batch"):
-            sink_obj = cast(ExportSink, sink)
+        if isinstance(sink, AsyncExportSink) or hasattr(sink, "write_batch"):
+            sink_obj = cast(AsyncExportSink, sink)
         else:
             sink_obj = sink()
-        stack.enter_context(sink_obj)
+        await stack.enter_async_context(sink_obj)
 
         with contextlib.suppress(Exception):
             sink_obj._active_state_provider = provider  # type: ignore[attr-defined]
@@ -2979,7 +3695,7 @@ def run_streaming_export(
             opts["standards_profile"] is not None or opts["min_standards_score"] is not None
         )
         need_form_map = bool(opts["as_sdtm"] or opts["sdtm_domain"] is not None or check_standards)
-        study_forms = _try_fetch_study_forms(sdk, study_key) if need_form_map else []
+        study_forms = await _async_try_fetch_study_forms(sdk, study_key) if need_form_map else []
         active_form_map: dict[Any, str] = (
             build_form_sdtm_domain_map(
                 study_forms,
@@ -2997,10 +3713,12 @@ def run_streaming_export(
         source_is_ordered = False
 
         if records_source is not None:
-            raw_records = records_source(watermark, exclude_deleted_upstream)
+            raw_records: AsyncIterable[Any] = _ensure_async_stream(
+                records_source(watermark, exclude_deleted_upstream)
+            )
             source_is_ordered = bool(getattr(records_source, "_sdtm_source_is_ordered", False))
         else:
-            source_is_ordered = bool(opts["as_sdtm"] and _is_bound_real_records_endpoint(sdk))
+            source_is_ordered = bool(opts["as_sdtm"] and _is_bound_real_async_records_endpoint(sdk))
             if opts["sdtm_domain"] is not None:
                 if study_forms:
                     matched_forms = filter_forms_by_sdtm_domain(
@@ -3010,13 +3728,13 @@ def run_streaming_export(
                         study_key=study_key,
                     )
                     if not matched_forms:
-                        raw_records = iter(())
+                        raw_records = _ensure_async_stream(())
                     else:
                         upstream_filter = merge_form_ids_into_record_filter(
                             opts["record_filter"],
                             matched_forms,
                         )
-                        base_iter = iter_filtered_sdk_records(
+                        base_aiter = async_iter_filtered_sdk_records(
                             sdk,
                             study_key,
                             watermark=watermark,
@@ -3027,7 +3745,7 @@ def run_streaming_export(
                         )
                         raw_records = (
                             item
-                            for item in base_iter
+                            async for item in base_aiter
                             if record_matches_sdtm_domain(
                                 item,
                                 opts["sdtm_domain"],
@@ -3037,7 +3755,7 @@ def run_streaming_export(
                             )
                         )
                 else:
-                    base_iter = iter_filtered_sdk_records(
+                    base_aiter = async_iter_filtered_sdk_records(
                         sdk,
                         study_key,
                         watermark=watermark,
@@ -3048,7 +3766,7 @@ def run_streaming_export(
                     )
                     raw_records = (
                         item
-                        for item in base_iter
+                        async for item in base_aiter
                         if record_matches_sdtm_domain(
                             item,
                             opts["sdtm_domain"],
@@ -3058,7 +3776,7 @@ def run_streaming_export(
                         )
                     )
             else:
-                raw_records = iter_filtered_sdk_records(
+                raw_records = async_iter_filtered_sdk_records(
                     sdk,
                     study_key,
                     watermark=watermark,
@@ -3073,9 +3791,9 @@ def run_streaming_export(
         pending_gate: dict[int, list[tuple[Any, datetime | None]]] = {}
         exported_timestamps: list[datetime] = []
 
-        def _observe_and_route() -> Iterator[Any]:
+        async def _observe_and_route() -> AsyncIterator[Any]:
             nonlocal total_reconciled, voided_batch_idx
-            for rec in raw_records:
+            async for rec in raw_records:
                 rec_ts = extract_record_timestamp(rec)
 
                 if not opts["include_deleted"] and is_record_deleted(rec):
@@ -3084,7 +3802,7 @@ def run_streaming_export(
                             exported_timestamps.append(rec_ts)
                         pending_voided.append(rec)
                         if len(pending_voided) >= opts["batch_size"]:
-                            total_reconciled += sink_obj.reconcile_deleted(
+                            total_reconciled += await sink_obj.reconcile_deleted(
                                 list(pending_voided),
                                 batch_id=f"{prefix}/voided/{voided_batch_idx}",
                             )
@@ -3113,28 +3831,31 @@ def run_streaming_export(
                             del pending_gate[obj_id]
                         return
 
-        def _track_accepted(records_iter: Iterable[Any]) -> Iterator[Any]:
-            for rec in records_iter:
+        async def _track_accepted(records_aiter: AsyncIterable[Any]) -> AsyncIterator[Any]:
+            async for rec in records_aiter:
                 _pop_accepted_candidate(rec)
                 rec_ts = extract_record_timestamp(rec)
                 if rec_ts is not None:
                     exported_timestamps.append(rec_ts)
                 yield rec
 
-        gated_stream = (
-            apply_quality_gate(
+        if gate_fn in (async_apply_quality_gate, apply_quality_gate):
+            gated_stream: AsyncIterable[Any] = async_apply_quality_gate(
                 sdk,
                 study_key,
                 _observe_and_route(),
                 config,
                 forms=study_forms or None,
             )
-            if gate_fn is apply_quality_gate
-            else gate_fn(sdk, study_key, _observe_and_route(), config)
-        )
-        filtered_records: Iterable[Any] = _track_accepted(gated_stream)
+        elif inspect.isasyncgenfunction(gate_fn):
+            gated_stream = gate_fn(gov_sdk, study_key, _observe_and_route(), config)
+        else:
+            observed_list = [item async for item in _observe_and_route()]
+            gated_stream = _ensure_async_stream(gate_fn(gov_sdk, study_key, observed_list, config))
+
+        filtered_records: AsyncIterable[Any] = _track_accepted(gated_stream)
         if opts["as_sdtm"]:
-            filtered_records = iter_subject_ordered_sdtm_records(
+            filtered_records = async_iter_subject_ordered_sdtm_records(
                 filtered_records,
                 study_key=study_key,
                 sdtm_domain=opts["sdtm_domain"],
@@ -3143,8 +3864,24 @@ def run_streaming_export(
                 mask_phi=getattr(config, "mask_phi", True) is not False,
                 source_is_ordered=source_is_ordered,
             )
-        for index, batch in enumerate(batches_fn(filtered_records, opts["batch_size"])):
+
+        if batches_fn in (async_iter_batches, iter_batches):
+            batch_stream: AsyncIterable[Sequence[Any]] = async_iter_batches(
+                filtered_records,
+                opts["batch_size"],
+            )
+        elif inspect.isasyncgenfunction(batches_fn):
+            batch_stream = batches_fn(filtered_records, opts["batch_size"])
+        else:
+            materialized_filtered = [item async for item in filtered_records]
+            batch_stream = _ensure_async_stream(
+                batches_fn(materialized_filtered, opts["batch_size"])
+            )
+
+        index = 0
+        async for batch in batch_stream:
             batch_id = f"{prefix}/{index}"
+            index += 1
             if check_standards and batch:
                 _enforce_batch_standards_readiness(
                     batch,
@@ -3156,10 +3893,10 @@ def run_streaming_export(
                     sdtm_domain=opts["sdtm_domain"],
                     form_domain_map=active_form_map or None,
                 )
-            total_written += sink_obj.write_batch(batch, batch_id=batch_id)
+            total_written += await sink_obj.write_batch(batch, batch_id=batch_id)
 
         if pending_voided:
-            total_reconciled += sink_obj.reconcile_deleted(
+            total_reconciled += await sink_obj.reconcile_deleted(
                 list(pending_voided),
                 batch_id=f"{prefix}/voided/{voided_batch_idx}",
             )
@@ -3184,6 +3921,57 @@ def run_streaming_export(
                 tx["new_timestamp"] = max_ts
 
     return total_written
+
+
+def run_streaming_export(
+    sdk: ImednetFacade,
+    study_key: str,
+    sink: ExportSink | Callable[[], ExportSink],
+    config: SinkConfig,
+    *,
+    stream_name: str | None = None,
+    batch_id_prefix: str | None = None,
+    default_provider_name: str | None = None,
+    records_source: Callable[[datetime | None, bool], Iterable[Any]] | None = None,
+    quality_gate_fn: Callable[[Any, str, Iterable[Any], SinkConfig], Iterable[Any]] | None = None,
+    iter_batches_fn: Callable[[Iterable[Any], int], Iterable[Sequence[Any]]] | None = None,
+) -> int:
+    """Stream paginated records into ``sink`` in fixed-size batches with checkpointing.
+
+    Commits ledger checkpoints only after all batches and ``sink.flush()`` succeed.
+    """
+    if type(sdk).__name__ == "AsyncImednetSDK" or (
+        sdk is not None
+        and not isinstance(sdk, (NonCallableMock, SyncToAsyncFacadeAdapter))
+        and is_async_facade(sdk)
+    ):
+        raise TypeError(
+            "run_streaming_export() does not accept AsyncImednetSDK; "
+            "use await async_run_streaming_export(...) instead."
+        )
+
+    adapted_sdk: Any = SyncToAsyncFacadeAdapter(sdk) if sdk is not None else None
+
+    def _make_async_sink() -> AsyncExportSink:
+        if isinstance(sink, ExportSink) or hasattr(sink, "write_batch"):
+            return _SyncExportSinkAdapter(cast(ExportSink, sink))
+        return _SyncExportSinkAdapter(sink())
+
+    return run_sync_over_async(
+        lambda: async_run_streaming_export(
+            adapted_sdk,
+            study_key,
+            _make_async_sink,
+            config,
+            stream_name=stream_name,
+            batch_id_prefix=batch_id_prefix,
+            default_provider_name=default_provider_name,
+            records_source=records_source,
+            quality_gate_fn=quality_gate_fn,
+            iter_batches_fn=iter_batches_fn,
+            _caller_sdk=sdk,
+        )
+    )
 
 
 def is_incremental_sink_config(config: Any) -> bool:
@@ -3243,6 +4031,8 @@ __all__ = [
     "DEFAULT_MAX_BUFFERED_RECORDS",
     "STATE_PROVIDER_ENTRY_POINT_GROUP",
     "_SDTM_RECORDS_SORT",
+    "AsyncBoundedFormBufferRouter",
+    "AsyncExportSink",
     "BoundedFormBufferRouter",
     "ExportSink",
     "SinkConfig",
@@ -3251,6 +4041,11 @@ __all__ = [
     "_redact_uri",
     "_require_optional_dep",
     "apply_quality_gate",
+    "async_apply_quality_gate",
+    "async_iter_batches",
+    "async_iter_filtered_sdk_records",
+    "async_iter_subject_ordered_sdtm_records",
+    "async_run_streaming_export",
     "bind_sdtm_stream_metadata",
     "build_form_sdtm_domain_map",
     "build_record_query_branches",

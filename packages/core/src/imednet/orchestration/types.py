@@ -63,14 +63,18 @@ Example::
 
 from __future__ import annotations
 
-from typing import Any, Protocol, TypedDict, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, TypeVar, runtime_checkable
+
+if TYPE_CHECKING:
+    from imednet.orchestration.logging import StudyContextLogAdapter
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 T_Output = TypeVar("T_Output", covariant=True)
 
 
 @runtime_checkable
 class StudyWorkerCallable(Protocol[T_Output]):
-    """Defines the explicit signature required for injected pipeline tasks.
+    """Defines the explicit signature required for injected synchronous pipeline tasks.
 
     Pipeline callables injected into ``MultiStudyOrchestrator.execute_pipeline``
     must conform to this protocol.
@@ -79,8 +83,8 @@ class StudyWorkerCallable(Protocol[T_Output]):
     def __call__(
         self,
         study_key: str,
-        sdk_client: Any,
-        logger: Any,
+        sdk_client: ImednetFacade,
+        logger: StudyContextLogAdapter,
         *args: Any,
         **kwargs: Any,
     ) -> T_Output:
@@ -88,7 +92,38 @@ class StudyWorkerCallable(Protocol[T_Output]):
 
         Args:
             study_key: The identifier of the study being processed.
-            sdk_client: A shared (read-only) instance of the iMednet SDK.
+            sdk_client: A shared (read-only) synchronous SDK facade instance.
+            logger: A study-specific logger instance.
+            *args: Variable positional arguments passed to the pipeline.
+            **kwargs: Variable keyword arguments passed to the pipeline.
+
+        Returns:
+            The output of the pipeline task of type T_Output.
+        """
+        ...
+
+
+@runtime_checkable
+class AsyncStudyWorkerCallable(Protocol[T_Output]):
+    """Defines the explicit signature required for injected asynchronous pipeline tasks.
+
+    Pipeline callables injected into ``AsyncMultiStudyOrchestrator.execute_pipeline``
+    must conform to this protocol.
+    """
+
+    async def __call__(
+        self,
+        study_key: str,
+        sdk_client: AsyncImednetFacade,
+        logger: StudyContextLogAdapter,
+        *args: Any,
+        **kwargs: Any,
+    ) -> T_Output:
+        """Asynchronously invoke the pipeline task for a specific study context.
+
+        Args:
+            study_key: The identifier of the study being processed.
+            sdk_client: A shared (read-only) asynchronous SDK facade instance.
             logger: A study-specific logger instance.
             *args: Variable positional arguments passed to the pipeline.
             **kwargs: Variable keyword arguments passed to the pipeline.
@@ -109,6 +144,7 @@ class OrchestratorResult(TypedDict, total=False):
 
 
 __all__ = [
+    "AsyncStudyWorkerCallable",
     "OrchestratorResult",
     "StudyWorkerCallable",
     "T_Output",

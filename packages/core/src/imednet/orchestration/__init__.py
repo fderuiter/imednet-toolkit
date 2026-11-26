@@ -53,10 +53,20 @@ Errors
 from __future__ import annotations
 
 from imednet.orchestration.logging import StudyContextLogAdapter, make_study_logger
-from imednet.orchestration.orchestrator import MultiStudyOrchestrator
-from imednet.orchestration.types import OrchestratorResult, StudyWorkerCallable, T_Output
+from imednet.orchestration.orchestrator import (
+    AsyncMultiStudyOrchestrator,
+    MultiStudyOrchestrator,
+)
+from imednet.orchestration.types import (
+    AsyncStudyWorkerCallable,
+    OrchestratorResult,
+    StudyWorkerCallable,
+    T_Output,
+)
 
 __all__ = [
+    "AsyncMultiStudyOrchestrator",
+    "AsyncStudyWorkerCallable",
     "MultiStudyOrchestrator",
     "OrchestratorResult",
     "StudyContextLogAdapter",

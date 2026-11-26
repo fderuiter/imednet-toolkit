@@ -9,6 +9,7 @@ from __future__ import annotations
 from .diff import DiffItem, DiffReport, diff
 from .emit import sort_data_dictionary, to_file, to_json, to_odm_file, to_odm_xml
 from .loaders import (
+    async_load_from_api,
     load_from_api,
     load_from_cdisc_odm,
     load_from_csv,
@@ -59,6 +60,7 @@ __all__ = [
     "RuleEvaluationResult",
     "Variable",
     "VariableConstraints",
+    "async_load_from_api",
     "diff",
     "extract_variable_constraints",
     "get_schema",

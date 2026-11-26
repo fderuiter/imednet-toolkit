@@ -25,6 +25,14 @@ imednet.utils.ast\_eval module
    :members:
    :show-inheritance:
 
+imednet.utils.async\_bridge module
+----------------------------------
+
+.. automodule:: imednet.utils.async_bridge
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 imednet.utils.batch\_coordinator module
 ---------------------------------------
 

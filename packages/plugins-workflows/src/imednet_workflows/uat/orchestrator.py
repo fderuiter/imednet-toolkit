@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -16,8 +18,10 @@ from pydantic import Field, field_serializer
 
 from imednet.spi.models import ImednetBaseModel
 from imednet.spi.utils import (
+    call_async_facade_method,
     is_site_enrollment_eligible,
     normalize_subject_registration_inputs,
+    run_sync_over_async,
     validate_subject_registration_sites,
 )
 from imednet.spi.validation import (
@@ -51,11 +55,11 @@ from .models import (
     normalize_uat_state,
     validate_uat_transition,
 )
-from .submission import SubmissionResult
+from .submission import SubmissionResult, is_unconfigured_mock_method
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
-    from imednet.spi.utils import JobProgressCallback
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+    from imednet.spi.utils import JobProgressCallback, JobProgressHandler
 
     from .inspector import StudySnapshot
 
@@ -575,6 +579,10 @@ def _validate_spec_sites(snapshot: Any, spec: UATSpecification, *, custom_spec: 
     validate_subject_registration_sites(normalized_pairs, snapshot_sites)
 
 
+async def _await_step(val: Any) -> Any:
+    return await val if inspect.isawaitable(val) else val
+
+
 class UATWorkflow:
     """End-to-end UAT execution coordinator.
 
@@ -702,6 +710,36 @@ class UATWorkflow:
         seed: int | None = None,
         dry_run: bool = False,
     ) -> UATRunResult:
+        """Execute the full UAT pipeline synchronously."""
+        return run_sync_over_async(
+            lambda: self._run_async(
+                study_key,
+                spec=spec,
+                subject_count=subject_count,
+                site_name=site_name,
+                enabled_form_keys=enabled_form_keys,
+                email_notify=email_notify,
+                data_dictionary=data_dictionary,
+                schema=schema,
+                seed=seed,
+                dry_run=dry_run,
+            )
+        )
+
+    async def _run_async(
+        self,
+        study_key: str,
+        *,
+        spec: UATSpecification | None = None,
+        subject_count: int | None = None,
+        site_name: str | None = None,
+        enabled_form_keys: list[str] | None = None,
+        email_notify: bool | str | None = None,
+        data_dictionary: DataDictionary | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        seed: int | None = None,
+        dry_run: bool = False,
+    ) -> UATRunResult:
         """Execute the full UAT pipeline in an isolated context and return a UATRunResult."""
         started_at = datetime.now(UTC)
         run_id = str(uuid.uuid4())
@@ -755,7 +793,7 @@ class UATWorkflow:
                         spec_site_names=spec_sites,
                     )
                 else:
-                    snapshot = self.inspect(study_key)
+                    snapshot = await _await_step(self.inspect(study_key))
                 phase_durations[UATRunPhase.INSPECT] = time.monotonic() - t0
 
                 # 2. Build or Validate Spec
@@ -777,7 +815,7 @@ class UATWorkflow:
                         build_kwargs["seed"] = effective_seed
                     if effective_dd is not None:
                         build_kwargs["data_dictionary"] = effective_dd
-                    spec = self.build_spec(snapshot, **build_kwargs)
+                    spec = await _await_step(self.build_spec(snapshot, **build_kwargs))
                 else:
                     if subject_count is not None and not isinstance(spec, NonCallableMock):
                         spec = _apply_subject_count_override(spec, subject_count)
@@ -830,7 +868,7 @@ class UATWorkflow:
                     gen_kwargs["schema"] = schema
                 if effective_seed != self._seed:
                     gen_kwargs["seed"] = effective_seed
-                record_sets = self.generate(spec, snapshot, **gen_kwargs)
+                record_sets = await _await_step(self.generate(spec, snapshot, **gen_kwargs))
                 phase_durations[UATRunPhase.GENERATE] = time.monotonic() - t0
 
                 is_real_spec = not isinstance(spec, NonCallableMock)
@@ -931,24 +969,29 @@ class UATWorkflow:
                     )
                 )
                 if effective_submit_schema is not None:
-                    submission_result = self.submit(
-                        study_key,
-                        record_sets,
-                        email_notify=email_notify,
-                        schema=effective_submit_schema,
+                    submitted: SubmissionResult = await _await_step(
+                        self.submit(
+                            study_key,
+                            record_sets,
+                            email_notify=email_notify,
+                            schema=effective_submit_schema,
+                        )
                     )
                 else:
-                    submission_result = self.submit(
-                        study_key,
-                        record_sets,
-                        email_notify=email_notify,
+                    submitted = await _await_step(
+                        self.submit(
+                            study_key,
+                            record_sets,
+                            email_notify=email_notify,
+                        )
                     )
+                submission_result = submitted
                 phase_durations[UATRunPhase.SUBMIT] = time.monotonic() - t0
 
                 # 5. Monitor
                 self.transition_to(UATWorkflowState.MONITORING)
                 t0 = time.monotonic()
-                poll_summary = self.monitor(study_key, submission_result)
+                poll_summary = await _await_step(self.monitor(study_key, submitted))
                 phase_durations[UATRunPhase.MONITOR] = time.monotonic() - t0
 
                 if _poll_summary_failed(poll_summary):
@@ -1169,6 +1212,171 @@ class UATWorkflow:
         )
 
 
+class AsyncUATWorkflow(UATWorkflow):
+    """Asynchronous end-to-end UAT execution coordinator."""
+
+    supports_async = True
+    _sdk: AsyncImednetFacade  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        sdk: AsyncImednetFacade,
+        *,
+        batch_size: int = 100,
+        poll_interval: float = 10.0,
+        poll_timeout: float = 600.0,
+        seed: int | None = None,
+        data_dictionary: DataDictionary | None = None,
+        on_progress: JobProgressHandler | None = None,
+        on_phase_change: Callable[[UATWorkflowState], None] | None = None,
+    ) -> None:
+        """Initialize the async UAT workflow orchestrator."""
+        from .inspector import AsyncStudySchemaInspector
+
+        super().__init__(
+            sdk,  # type: ignore[arg-type]
+            batch_size=batch_size,
+            poll_interval=poll_interval,
+            poll_timeout=poll_timeout,
+            seed=seed,
+            data_dictionary=data_dictionary,
+            on_progress=on_progress,  # type: ignore[arg-type]
+            on_phase_change=on_phase_change,
+        )
+        self._inspector = AsyncStudySchemaInspector(sdk)  # type: ignore[assignment]
+
+    def _create_submitter(self) -> Any:
+        from .submission import AsyncBulkRecordSubmissionWorkflow
+
+        return AsyncBulkRecordSubmissionWorkflow(
+            self._sdk,
+            batch_size=self._batch_size,
+            registration_timeout=self._poll_timeout,
+            registration_poll_interval=self._poll_interval,
+        )
+
+    def _create_poller(self) -> Any:
+        from imednet.spi.utils import AsyncJobPoller
+
+        return AsyncJobPoller(
+            get_job=functools.partial(call_async_facade_method, self._sdk, "get_job")
+        )
+
+    async def run(  # type: ignore[override]
+        self,
+        study_key: str,
+        *,
+        spec: UATSpecification | None = None,
+        subject_count: int | None = None,
+        site_name: str | None = None,
+        enabled_form_keys: list[str] | None = None,
+        email_notify: bool | str | None = None,
+        data_dictionary: DataDictionary | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        seed: int | None = None,
+        dry_run: bool = False,
+    ) -> UATRunResult:
+        """Asynchronously execute the full UAT pipeline and return a UATRunResult."""
+        return await self._run_async(
+            study_key,
+            spec=spec,
+            subject_count=subject_count,
+            site_name=site_name,
+            enabled_form_keys=enabled_form_keys,
+            email_notify=email_notify,
+            data_dictionary=data_dictionary,
+            schema=schema,
+            seed=seed,
+            dry_run=dry_run,
+        )
+
+    async def inspect(self, study_key: str) -> Any:
+        """Asynchronously fetch study metadata via AsyncStudySchemaInspector."""
+        return await _await_step(self._inspector.inspect(study_key))
+
+    async def submit(  # type: ignore[override]
+        self,
+        study_key: str,
+        record_sets: list[GeneratedRecordSet],
+        email_notify: bool | str | None = None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> SubmissionResult:
+        """Asynchronously execute the two-phase bulk submission."""
+        active = self._active_context.get()
+        submitter = (
+            self._submitter
+            if self._submitter is not None
+            else (
+                active.submitter
+                if active is not None and active.submitter is not None
+                else self._create_submitter()
+            )
+        )
+        active_dd = schema if schema is not None else self._data_dictionary
+        if active_dd is not None:
+            res = submitter.submit(
+                study_key, record_sets, email_notify=email_notify, schema=active_dd
+            )
+        else:
+            res = submitter.submit(study_key, record_sets, email_notify=email_notify)
+        return await _await_step(res)  # type: ignore[no-any-return]
+
+    async def monitor(self, study_key: str, submission_result: SubmissionResult) -> Any:
+        """Asynchronously poll all resulting jobs to completion."""
+        if self._poller is not None:
+            if hasattr(self._poller, "async_poll_many") and not is_unconfigured_mock_method(
+                getattr(self._poller, "async_poll_many", None)
+            ):
+                return await _await_step(
+                    self._poller.async_poll_many(
+                        study_key,
+                        submission_result.all_batch_ids,
+                        interval=self._poll_interval,
+                        timeout=self._poll_timeout,
+                        on_progress=self._on_progress,
+                    )
+                )
+            return await _await_step(
+                self._poller.poll_many(
+                    study_key,
+                    submission_result.all_batch_ids,
+                    interval=self._poll_interval,
+                    timeout=self._poll_timeout,
+                    on_progress=self._on_progress,
+                )
+            )
+        from imednet.spi.utils import JobPollSummary
+
+        if not is_unconfigured_mock_method(
+            getattr(self._sdk, "poll_jobs", None)
+        ) or not is_unconfigured_mock_method(getattr(self._sdk, "async_poll_jobs", None)):
+            candidate = await call_async_facade_method(
+                self._sdk,
+                "poll_jobs",
+                study_key,
+                submission_result.all_batch_ids,
+                interval=self._poll_interval,
+                timeout=self._poll_timeout,
+                on_progress=self._on_progress,
+            )
+            if isinstance(candidate, JobPollSummary):
+                return candidate
+        active = self._active_context.get()
+        poller = (
+            active.poller
+            if active is not None and active.poller is not None
+            else self._create_poller()
+        )
+        return await poller.async_poll_many(
+            study_key,
+            submission_result.all_batch_ids,
+            interval=self._poll_interval,
+            timeout=self._poll_timeout,
+            on_progress=self._on_progress,
+        )
+
+
 def _merge_snapshot_into_data_dictionary(
     data_dictionary: DataDictionary,
     snapshot: Any,
@@ -1272,6 +1480,7 @@ def _merge_snapshot_into_data_dictionary(
 UATRunResult.model_rebuild()
 
 __all__ = [
+    "AsyncUATWorkflow",
     "InvalidUATStateTransitionError",
     "UATRunPhase",
     "UATRunResult",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import math
 import re
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -2327,79 +2327,79 @@ def _resolve_sdtm_pipeline(
     return resolve_enrichment_pipeline(study_key)
 
 
-def iter_subject_ordered_sdtm_records(
-    records: Iterable[Any],
-    *,
-    study_key: str,
-    sdtm_domain: str | None = None,
-    form_domain_map: Mapping[Any, str] | None = None,
-    study_config: Any | None = None,
-    pipeline: Any = _UNSET_PIPELINE,
-    mask_phi: bool = True,
-    source_is_ordered: bool = False,
-) -> Iterator[Any]:
-    """Yield active Study Records grouped by Subject and ordered chronologically per SDTM domain.
+class _SdtmSubjectStreamOrderer:
+    """Shared state and sorting helpers for subject-ordered SDTM record streams."""
 
-    When ``source_is_ordered`` is ``True`` (upstream pagination uses ``_SDTM_RECORDS_SORT``
-    and ``StudyConfiguration`` does not remap ``USUBJID``), buffers at most one Subject's
-    Records in memory at a time so streaming ``batch_size=1`` / ``chunk_size=1`` exports
-    assign identical ``<DOM>SEQ`` values to full-batch runs.
-    """
-    resolved_pipeline = _resolve_sdtm_pipeline(study_key, pipeline)
-    resolved_cfg = study_config
-    if resolved_cfg is None and resolved_pipeline is not None:
-        resolved_cfg = getattr(resolved_pipeline, "config", None)
-    cfg_lookup = _extract_study_config_form_domains(
-        study_config=resolved_cfg,
-        study_key=study_key if resolved_cfg is None else None,
-    )
-    target_dom = (
-        resolve_sdtm_domain(sdtm_domain, fallback="")
-        if isinstance(sdtm_domain, str) and sdtm_domain.strip()
-        else ""
-    )
+    def __init__(
+        self,
+        *,
+        study_key: str,
+        sdtm_domain: str | None = None,
+        form_domain_map: Mapping[Any, str] | None = None,
+        study_config: Any | None = None,
+        pipeline: Any = _UNSET_PIPELINE,
+        mask_phi: bool = True,
+        source_is_ordered: bool = False,
+    ) -> None:
+        self.study_key = study_key
+        self.form_domain_map = form_domain_map
+        self.mask_phi = mask_phi
+        self.resolved_pipeline = _resolve_sdtm_pipeline(study_key, pipeline)
+        resolved_cfg = study_config
+        if resolved_cfg is None and self.resolved_pipeline is not None:
+            resolved_cfg = getattr(self.resolved_pipeline, "config", None)
+        self.cfg_lookup = _extract_study_config_form_domains(
+            study_config=resolved_cfg,
+            study_key=study_key if resolved_cfg is None else None,
+        )
+        self.target_dom = (
+            resolve_sdtm_domain(sdtm_domain, fallback="")
+            if isinstance(sdtm_domain, str) and sdtm_domain.strip()
+            else ""
+        )
+        self.normalizers: dict[str, _SdtmNormalizer] = {}
 
-    normalizers: dict[str, _SdtmNormalizer] = {}
+        remaps_usubjid = False
+        all_rules = (
+            getattr(self.resolved_pipeline, "all_mappings", None)
+            if self.resolved_pipeline is not None
+            else None
+        )
+        if all_rules is None and self.resolved_pipeline is not None:
+            mappings_dict = getattr(self.resolved_pipeline, "mappings", None)
+            if isinstance(mappings_dict, Mapping):
+                all_rules = list(mappings_dict.values())
+        if all_rules:
+            for rule in all_rules:
+                if (
+                    getattr(rule, "target_field", None)
+                    and str(rule.target_field).strip().upper() == "USUBJID"
+                ):
+                    remaps_usubjid = True
+                    break
 
-    def _get_normalizer(dom: str) -> _SdtmNormalizer:
-        norm = normalizers.get(dom)
+        self.effective_ordered = bool(source_is_ordered and not remaps_usubjid)
+
+    def _get_normalizer(self, dom: str) -> _SdtmNormalizer:
+        norm = self.normalizers.get(dom)
         if norm is None:
             norm = _SdtmNormalizer(
                 domain=dom,
-                study_key=study_key,
+                study_key=self.study_key,
                 include_deleted=True,
-                mask_phi=mask_phi,
-                pipeline=resolved_pipeline,
+                mask_phi=self.mask_phi,
+                pipeline=self.resolved_pipeline,
             )
-            normalizers[dom] = norm
+            self.normalizers[dom] = norm
         return norm
 
-    remaps_usubjid = False
-    all_rules = (
-        getattr(resolved_pipeline, "all_mappings", None) if resolved_pipeline is not None else None
-    )
-    if all_rules is None and resolved_pipeline is not None:
-        mappings_dict = getattr(resolved_pipeline, "mappings", None)
-        if isinstance(mappings_dict, Mapping):
-            all_rules = list(mappings_dict.values())
-    if all_rules:
-        for rule in all_rules:
-            if (
-                getattr(rule, "target_field", None)
-                and str(rule.target_field).strip().upper() == "USUBJID"
-            ):
-                remaps_usubjid = True
-                break
-
-    effective_ordered = bool(source_is_ordered and not remaps_usubjid)
-
-    def _resolve_rec_domain(rec: Any) -> str:
-        if target_dom:
-            return target_dom
+    def _resolve_rec_domain(self, rec: Any) -> str:
+        if self.target_dom:
+            return self.target_dom
         dom = resolve_form_sdtm_domain(
             rec,
-            form_domain_map=form_domain_map,
-            _cfg_lookup=cfg_lookup,
+            form_domain_map=self.form_domain_map,
+            _cfg_lookup=self.cfg_lookup,
             fallback="",
         )
         if dom:
@@ -2407,9 +2407,9 @@ def iter_subject_ordered_sdtm_records(
         _, fk = extract_record_form_ref(rec)
         return resolve_sdtm_domain(fk, fallback="AE")
 
-    def _prepare_entry(rec: Any, idx: int) -> tuple[str, str, tuple[Any, ...], int, Any]:
-        dom = _resolve_rec_domain(rec)
-        norm = _get_normalizer(dom)
+    def prepare_entry(self, rec: Any, idx: int) -> tuple[str, str, tuple[Any, ...], int, Any]:
+        dom = self._resolve_rec_domain(rec)
+        norm = self._get_normalizer(dom)
         prepared = norm.prepare_record(rec, idx)
         if prepared is not None:
             return (prepared.usubjid, dom, prepared.sort_key, idx, rec)
@@ -2417,14 +2417,14 @@ def iter_subject_ordered_sdtm_records(
         fallback_sk = ((1, ""), (), rec_id_sk, idx)
         return (usubj, dom, fallback_sk, idx, rec)
 
-    def _sort_subject_entries(
+    @staticmethod
+    def sort_subject_entries(
         entries: list[tuple[str, str, tuple[Any, ...], int, Any]],
     ) -> Iterator[Any]:
         if len(entries) <= 1:
             for item in entries:
                 yield item[4]
             return
-        # Group per domain within Subject so each domain's records arrive in exact sort_key order
         by_dom: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {}
         dom_order: list[str] = []
         for entry in entries:
@@ -2445,13 +2445,42 @@ def iter_subject_ordered_sdtm_records(
             for item in d_items:
                 yield item[4]
 
-    if not effective_ordered or isinstance(records, (list, tuple)):
+
+def iter_subject_ordered_sdtm_records(
+    records: Iterable[Any],
+    *,
+    study_key: str,
+    sdtm_domain: str | None = None,
+    form_domain_map: Mapping[Any, str] | None = None,
+    study_config: Any | None = None,
+    pipeline: Any = _UNSET_PIPELINE,
+    mask_phi: bool = True,
+    source_is_ordered: bool = False,
+) -> Iterator[Any]:
+    """Yield active Study Records grouped by Subject and ordered chronologically per SDTM domain.
+
+    When ``source_is_ordered`` is ``True`` (upstream pagination uses ``_SDTM_RECORDS_SORT``
+    and ``StudyConfiguration`` does not remap ``USUBJID``), buffers at most one Subject's
+    Records in memory at a time so streaming ``batch_size=1`` / ``chunk_size=1`` exports
+    assign identical ``<DOM>SEQ`` values to full-batch runs.
+    """
+    orderer = _SdtmSubjectStreamOrderer(
+        study_key=study_key,
+        sdtm_domain=sdtm_domain,
+        form_domain_map=form_domain_map,
+        study_config=study_config,
+        pipeline=pipeline,
+        mask_phi=mask_phi,
+        source_is_ordered=source_is_ordered,
+    )
+
+    if not orderer.effective_ordered or isinstance(records, (list, tuple)):
         grouped_all: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {}
         for idx, rec in enumerate(records):
-            entry = _prepare_entry(rec, idx)
+            entry = orderer.prepare_entry(rec, idx)
             grouped_all.setdefault(entry[0], []).append(entry)
         for usubjid in sorted(grouped_all):
-            yield from _sort_subject_entries(grouped_all[usubjid])
+            yield from orderer.sort_subject_entries(grouped_all[usubjid])
         return
 
     rec_iter = iter(records)
@@ -2461,7 +2490,7 @@ def iter_subject_ordered_sdtm_records(
     idx = 0
 
     for rec in rec_iter:
-        entry = _prepare_entry(rec, idx)
+        entry = orderer.prepare_entry(rec, idx)
         idx += 1
         usubjid = entry[0]
 
@@ -2476,17 +2505,16 @@ def iter_subject_ordered_sdtm_records(
 
         if usubjid < current_usubjid:
             if not yielded_any:
-                # Stream was not actually ordered by Subject: drain and sort all Subjects safely.
                 fallback_groups: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {
                     current_usubjid: current_entries,
                 }
                 fallback_groups.setdefault(usubjid, []).append(entry)
                 for tail_rec in rec_iter:
-                    tail_entry = _prepare_entry(tail_rec, idx)
+                    tail_entry = orderer.prepare_entry(tail_rec, idx)
                     idx += 1
                     fallback_groups.setdefault(tail_entry[0], []).append(tail_entry)
                 for subj_key in sorted(fallback_groups):
-                    yield from _sort_subject_entries(fallback_groups[subj_key])
+                    yield from orderer.sort_subject_entries(fallback_groups[subj_key])
                 return
             raise ValueError(
                 f"Non-monotonic USUBJID order in SDTM stream with source_is_ordered=True: "
@@ -2497,10 +2525,103 @@ def iter_subject_ordered_sdtm_records(
         current_usubjid = usubjid
         current_entries = [entry]
         yielded_any = True
-        yield from _sort_subject_entries(finished)
+        yield from orderer.sort_subject_entries(finished)
 
     if current_entries:
-        yield from _sort_subject_entries(current_entries)
+        yield from orderer.sort_subject_entries(current_entries)
+
+
+async def async_iter_subject_ordered_sdtm_records(
+    records: AsyncIterable[Any] | Iterable[Any],
+    *,
+    study_key: str,
+    sdtm_domain: str | None = None,
+    form_domain_map: Mapping[Any, str] | None = None,
+    study_config: Any | None = None,
+    pipeline: Any = _UNSET_PIPELINE,
+    mask_phi: bool = True,
+    source_is_ordered: bool = False,
+) -> AsyncIterator[Any]:
+    """Asynchronously yield Study Records grouped by Subject and ordered chronologically per domain."""
+    orderer = _SdtmSubjectStreamOrderer(
+        study_key=study_key,
+        sdtm_domain=sdtm_domain,
+        form_domain_map=form_domain_map,
+        study_config=study_config,
+        pipeline=pipeline,
+        mask_phi=mask_phi,
+        source_is_ordered=source_is_ordered,
+    )
+
+    async def _as_async(source: AsyncIterable[Any] | Iterable[Any]) -> AsyncIterator[Any]:
+        if isinstance(source, AsyncIterable):
+            async for item in source:
+                yield item
+        else:
+            for item in source:
+                yield item
+
+    if not orderer.effective_ordered or isinstance(records, (list, tuple)):
+        grouped_all: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {}
+        idx = 0
+        async for rec in _as_async(records):
+            entry = orderer.prepare_entry(rec, idx)
+            idx += 1
+            grouped_all.setdefault(entry[0], []).append(entry)
+        for usubjid in sorted(grouped_all):
+            for sorted_rec in orderer.sort_subject_entries(grouped_all[usubjid]):
+                yield sorted_rec
+        return
+
+    rec_aiter = _as_async(records).__aiter__()
+    current_usubjid: str | None = None
+    current_entries: list[tuple[str, str, tuple[Any, ...], int, Any]] = []
+    yielded_any = False
+    idx = 0
+
+    async for rec in rec_aiter:
+        entry = orderer.prepare_entry(rec, idx)
+        idx += 1
+        usubjid = entry[0]
+
+        if current_usubjid is None:
+            current_usubjid = usubjid
+            current_entries = [entry]
+            continue
+
+        if usubjid == current_usubjid:
+            current_entries.append(entry)
+            continue
+
+        if usubjid < current_usubjid:
+            if not yielded_any:
+                fallback_groups: dict[str, list[tuple[str, str, tuple[Any, ...], int, Any]]] = {
+                    current_usubjid: current_entries,
+                }
+                fallback_groups.setdefault(usubjid, []).append(entry)
+                async for tail_rec in rec_aiter:
+                    tail_entry = orderer.prepare_entry(tail_rec, idx)
+                    idx += 1
+                    fallback_groups.setdefault(tail_entry[0], []).append(tail_entry)
+                for subj_key in sorted(fallback_groups):
+                    for sorted_rec in orderer.sort_subject_entries(fallback_groups[subj_key]):
+                        yield sorted_rec
+                return
+            raise ValueError(
+                f"Non-monotonic USUBJID order in SDTM stream with source_is_ordered=True: "
+                f"{usubjid!r} arrived after {current_usubjid!r}."
+            )
+
+        finished = current_entries
+        current_usubjid = usubjid
+        current_entries = [entry]
+        yielded_any = True
+        for sorted_rec in orderer.sort_subject_entries(finished):
+            yield sorted_rec
+
+    if current_entries:
+        for sorted_rec in orderer.sort_subject_entries(current_entries):
+            yield sorted_rec
 
 
 def get_sdtm_domain_variables(domain: str) -> list[str]:
@@ -2647,6 +2768,7 @@ __all__ = [
     "_collapse_alnum_key",
     "_extract_stream_usubjid_and_id",
     "_iter_sorted_sdtm_frames",
+    "async_iter_subject_ordered_sdtm_records",
     "build_form_sdtm_domain_map",
     "extract_record_form_ref",
     "filter_forms_by_sdtm_domain",

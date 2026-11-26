@@ -33,6 +33,11 @@ mongodb = "imednet_sinks.document:MongoDbExportSink"
 neo4j = "imednet_sinks.graph:Neo4jExportSink"
 snowflake = "imednet_sinks.warehouse:SnowflakeExportSink"
 
+[project.entry-points."imednet.async_sinks"]
+mongodb = "imednet_sinks.document:AsyncMongoDbExportSink"
+neo4j = "imednet_sinks.graph:AsyncNeo4jExportSink"
+snowflake = "imednet_sinks.warehouse:AsyncSnowflakeExportSink"
+
 [project.entry-points."imednet.sink_configs"]
 mongodb = "imednet_sinks.document:MongoDbSinkConfig"
 neo4j = "imednet_sinks.graph:Neo4jSinkConfig"

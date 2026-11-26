@@ -5,28 +5,24 @@ from __future__ import annotations
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-from .data_extraction import DataExtractionWorkflow
-from .duckdb_centralizer import DuckDBIngestionWorkflow
-from .query_management import QueryManagementWorkflow
-from .record_mapper import RecordMapper
-from .record_update import RecordUpdateWorkflow
-from .register_subjects import RegisterSubjectsWorkflow
-from .subject_data import SubjectDataWorkflow
-from .uat import StudySchemaInspector, UATWorkflow
+from .data_extraction import AsyncDataExtractionWorkflow, DataExtractionWorkflow
+from .duckdb_centralizer import AsyncDuckDBIngestionWorkflow, DuckDBIngestionWorkflow
+from .query_management import AsyncQueryManagementWorkflow, QueryManagementWorkflow
+from .record_mapper import AsyncRecordMapper, RecordMapper
+from .record_update import AsyncRecordUpdateWorkflow, RecordUpdateWorkflow
+from .register_subjects import AsyncRegisterSubjectsWorkflow, RegisterSubjectsWorkflow
+from .subject_data import AsyncSubjectDataWorkflow, SubjectDataWorkflow
+from .uat import AsyncStudySchemaInspector, AsyncUATWorkflow, StudySchemaInspector, UATWorkflow
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 
 class Workflows:
     """Namespace for accessing workflow classes."""
 
     def __init__(self, sdk_instance: ImednetFacade):
-        """Initialize the workflows namespace.
-
-        Args:
-            sdk_instance: An instance of the iMednet SDK facade.
-        """
+        """Initialize the workflows namespace."""
         self._sdk = sdk_instance
         self.data_extraction = DataExtractionWorkflow(sdk_instance)
         self.query_management = QueryManagementWorkflow(sdk_instance)
@@ -43,4 +39,25 @@ class Workflows:
         return DuckDBIngestionWorkflow(self._sdk)
 
 
-__all__ = ["Workflows"]
+class AsyncWorkflows:
+    """Namespace for accessing asynchronous workflow classes."""
+
+    def __init__(self, sdk_instance: AsyncImednetFacade):
+        """Initialize the async workflows namespace."""
+        self._sdk = sdk_instance
+        self.data_extraction = AsyncDataExtractionWorkflow(sdk_instance)
+        self.query_management = AsyncQueryManagementWorkflow(sdk_instance)
+        self.record_mapper = AsyncRecordMapper(sdk_instance)
+        self.record_update = AsyncRecordUpdateWorkflow(sdk_instance)
+        self.register_subjects = AsyncRegisterSubjectsWorkflow(sdk_instance)
+        self.subject_data = AsyncSubjectDataWorkflow(sdk_instance)
+        self.uat_inspector = AsyncStudySchemaInspector(sdk_instance)
+        self.uat = AsyncUATWorkflow(sdk_instance)
+
+    @cached_property
+    def duckdb_centralizer(self) -> AsyncDuckDBIngestionWorkflow:
+        """Asynchronous incremental record centralization pipeline using DuckDB."""
+        return AsyncDuckDBIngestionWorkflow(self._sdk)
+
+
+__all__ = ["AsyncWorkflows", "Workflows"]

@@ -19,6 +19,8 @@ from typing import (
     overload,
 )
 
+from typing_extensions import deprecated
+
 from imednet.utils.typing import FilterValue, RecordsInput
 
 DEFAULT_BATCH_CHUNK_SIZE = 100
@@ -177,11 +179,19 @@ def _configure_list_convenience_callable(
 class _ListOperation(Generic[T, R_co]):
     """Descriptor that provides convenience list methods on the SDK."""
 
-    def __init__(self, endpoint_name: str, name: str, is_async: bool = False) -> None:
+    def __init__(
+        self,
+        endpoint_name: str,
+        name: str,
+        is_async: bool = False,
+        *,
+        deprecated_instead: str | None = None,
+    ) -> None:
         """Initialize the list operation descriptor without importing model classes eagerly."""
         self.endpoint_name = endpoint_name
         self.name = name
         self.is_async = is_async
+        self.deprecated_instead = deprecated_instead
         self._model_cls_cache: Any = None
         self._unbound_cache: Callable[..., Any] | None = None
         doc = f"Asynchronously list {endpoint_name}." if is_async else f"List {endpoint_name}."
@@ -190,6 +200,11 @@ class _ListOperation(Generic[T, R_co]):
         self.__name__ = name
         self.__qualname__ = f"{owner_name}.{name}"
         self.__doc__ = doc
+        if deprecated_instead is not None:
+            self.__deprecated__ = (
+                f"'{owner_name}.{name}' is deprecated; "
+                f"use 'await sdk.{deprecated_instead}(...)' instead."
+            )
 
     def _resolve_model_cls(self) -> Any:
         """Import and cache the endpoint model class on first signature or call access."""
@@ -215,6 +230,15 @@ class _ListOperation(Generic[T, R_co]):
             async def _template_async(
                 self: Any, study_key: str | None = None, **filters: FilterValue
             ) -> list[Any]:
+                if op.deprecated_instead is not None:
+                    import warnings
+
+                    warnings.warn(
+                        f"'{type(self).__name__}.{op.name}' is deprecated; "
+                        f"use 'await sdk.{op.deprecated_instead}(...)' instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
                 return await op._invoke_async(self, study_key, filters)
 
             template_fn: Callable[..., Any] = _template_async
@@ -227,7 +251,7 @@ class _ListOperation(Generic[T, R_co]):
 
             template_fn = _template_sync
 
-        self._unbound_cache = _configure_list_convenience_callable(
+        configured = _configure_list_convenience_callable(
             template_fn,
             template_fn,
             name=self.name,
@@ -236,6 +260,9 @@ class _ListOperation(Generic[T, R_co]):
             model_cls=self._resolve_model_cls(),
             bound=False,
         )
+        if self.deprecated_instead is not None:
+            configured.__deprecated__ = getattr(self, "__deprecated__", "")  # type: ignore[attr-defined]
+        self._unbound_cache = configured
         return self._unbound_cache
 
     @property
@@ -322,9 +349,18 @@ class _ListOperation(Generic[T, R_co]):
                 study_key: str | None = None, **filters: FilterValue
             ) -> list[T]:
                 """Execute the asynchronous list operation and return a list of items."""
+                if self.deprecated_instead is not None:
+                    import warnings
+
+                    warnings.warn(
+                        f"'{owner_cls_name}.{self.name}' is deprecated; "
+                        f"use 'await sdk.{self.deprecated_instead}(...)' instead.",
+                        DeprecationWarning,
+                        stacklevel=3,
+                    )
                 return await self._invoke_async(instance, study_key, dict(filters))
 
-            return _configure_list_convenience_callable(
+            configured_async = _configure_list_convenience_callable(
                 async_wrapper,
                 unbound,
                 name=self.name,
@@ -333,6 +369,12 @@ class _ListOperation(Generic[T, R_co]):
                 model_cls=model_cls,
                 bound=True,
             )
+            if self.deprecated_instead is not None:
+                configured_async.__deprecated__ = (  # type: ignore[attr-defined]
+                    f"'{owner_cls_name}.{self.name}' is deprecated; "
+                    f"use 'await sdk.{self.deprecated_instead}(...)' instead."
+                )
+            return configured_async
 
         @_trace_method
         def sync_wrapper(study_key: str | None = None, **filters: FilterValue) -> list[T]:
@@ -399,25 +441,27 @@ def _resolve_convenience_schema_adapter(instance: Any, *, is_async: bool) -> Any
 
 
 def _should_prefer_convenience_poll_many(instance: Any, *, is_async: bool) -> bool:
-    """Prefer ``poll_jobs``/``async_poll_jobs`` unless single-job polling was explicitly mocked."""
+    """Prefer ``poll_jobs`` unless single-job polling was explicitly mocked."""
     from imednet.core.context import _safe_context_attr
 
-    many_attr = "async_poll_jobs" if is_async else "poll_jobs"
-    single_attr = "async_poll_job" if is_async else "poll_job"
-    if not callable(_safe_context_attr(instance, many_attr)):
+    if not callable(_safe_context_attr(instance, "poll_jobs")) and (
+        not is_async or not callable(_safe_context_attr(instance, "async_poll_jobs"))
+    ):
         return False
     try:
         inst_dict = object.__getattribute__(instance, "__dict__")
     except AttributeError:
         inst_dict = {}
-    if single_attr in inst_dict and many_attr not in inst_dict:
+    has_many_override = "poll_jobs" in inst_dict or (is_async and "async_poll_jobs" in inst_dict)
+    has_single_override = "poll_job" in inst_dict or (is_async and "async_poll_job" in inst_dict)
+    if has_single_override and not has_many_override:
         return False
     jobs_obj = _safe_context_attr(instance, "jobs")
     try:
         jobs_dict = object.__getattribute__(jobs_obj, "__dict__") if jobs_obj is not None else {}
     except AttributeError:
         jobs_dict = {}
-    return not ("poll" in jobs_dict and "poll_many" not in jobs_dict and many_attr not in inst_dict)
+    return not ("poll" in jobs_dict and "poll_many" not in jobs_dict and not has_many_override)
 
 
 class SyncSDKConvenienceMixin:
@@ -601,50 +645,50 @@ class AsyncSDKConvenienceMixin:
         jobs: AsyncJobsEndpoint
         _async_client: Any
 
-    async_get_codings: _ListOperation[Coding, Coroutine[Any, Any, list[Coding]]] = _ListOperation(
-        "codings", "async_get_codings", is_async=True
+    get_codings: _ListOperation[Coding, Coroutine[Any, Any, list[Coding]]] = _ListOperation(
+        "codings", "get_codings", is_async=True
     )
-    async_get_forms: _ListOperation[Form, Coroutine[Any, Any, list[Form]]] = _ListOperation(
-        "forms", "async_get_forms", is_async=True
+    get_forms: _ListOperation[Form, Coroutine[Any, Any, list[Form]]] = _ListOperation(
+        "forms", "get_forms", is_async=True
     )
-    async_get_intervals: _ListOperation[Interval, Coroutine[Any, Any, list[Interval]]] = (
-        _ListOperation("intervals", "async_get_intervals", is_async=True)
+    get_intervals: _ListOperation[Interval, Coroutine[Any, Any, list[Interval]]] = _ListOperation(
+        "intervals", "get_intervals", is_async=True
     )
-    async_get_queries: _ListOperation[Query, Coroutine[Any, Any, list[Query]]] = _ListOperation(
-        "queries", "async_get_queries", is_async=True
+    get_queries: _ListOperation[Query, Coroutine[Any, Any, list[Query]]] = _ListOperation(
+        "queries", "get_queries", is_async=True
     )
-    async_get_record_revisions: _ListOperation[
+    get_record_revisions: _ListOperation[
         RecordRevision, Coroutine[Any, Any, list[RecordRevision]]
-    ] = _ListOperation("record_revisions", "async_get_record_revisions", is_async=True)
-    async_get_records: _ListOperation[Record, Coroutine[Any, Any, list[Record]]] = _ListOperation(
-        "records", "async_get_records", is_async=True
+    ] = _ListOperation("record_revisions", "get_record_revisions", is_async=True)
+    get_records: _ListOperation[Record, Coroutine[Any, Any, list[Record]]] = _ListOperation(
+        "records", "get_records", is_async=True
     )
-    async_get_sites: _ListOperation[Site, Coroutine[Any, Any, list[Site]]] = _ListOperation(
-        "sites", "async_get_sites", is_async=True
+    get_sites: _ListOperation[Site, Coroutine[Any, Any, list[Site]]] = _ListOperation(
+        "sites", "get_sites", is_async=True
     )
-    async_get_studies: _ListOperation[Study, Coroutine[Any, Any, list[Study]]] = _ListOperation(
-        "studies", "async_get_studies", is_async=True
+    get_studies: _ListOperation[Study, Coroutine[Any, Any, list[Study]]] = _ListOperation(
+        "studies", "get_studies", is_async=True
     )
-    async_get_subjects: _ListOperation[Subject, Coroutine[Any, Any, list[Subject]]] = (
-        _ListOperation("subjects", "async_get_subjects", is_async=True)
+    get_subjects: _ListOperation[Subject, Coroutine[Any, Any, list[Subject]]] = _ListOperation(
+        "subjects", "get_subjects", is_async=True
     )
-    async_get_users: _ListOperation[User, Coroutine[Any, Any, list[User]]] = _ListOperation(
-        "users", "async_get_users", is_async=True
+    get_users: _ListOperation[User, Coroutine[Any, Any, list[User]]] = _ListOperation(
+        "users", "get_users", is_async=True
     )
-    async_get_variables: _ListOperation[Variable, Coroutine[Any, Any, list[Variable]]] = (
-        _ListOperation("variables", "async_get_variables", is_async=True)
+    get_variables: _ListOperation[Variable, Coroutine[Any, Any, list[Variable]]] = _ListOperation(
+        "variables", "get_variables", is_async=True
     )
-    async_get_visits: _ListOperation[Visit, Coroutine[Any, Any, list[Visit]]] = _ListOperation(
-        "visits", "async_get_visits", is_async=True
+    get_visits: _ListOperation[Visit, Coroutine[Any, Any, list[Visit]]] = _ListOperation(
+        "visits", "get_visits", is_async=True
     )
 
     @_async_trace_method
-    async def async_get_job(self, study_key: str, batch_id: str) -> JobStatus:
+    async def get_job(self, study_key: str, batch_id: str) -> JobStatus:
         """Asynchronously get job status."""
         return await self.jobs.get(study_key, batch_id)
 
     @_async_trace_method
-    async def async_create_record(
+    async def create_record(
         self,
         study_key: str,
         records_data: RecordsInput,
@@ -673,7 +717,7 @@ class AsyncSDKConvenienceMixin:
         )
 
     @_async_trace_method
-    async def async_create_records_batch(
+    async def create_records_batch(
         self,
         study_key: str,
         records_data: RecordsInput,
@@ -693,16 +737,31 @@ class AsyncSDKConvenienceMixin:
         from imednet.core.context import _safe_context_attr
         from imednet.utils.batch_coordinator import _submit_records_batch_async
 
-        poll_single_fn = (
-            (lambda *args, **kwargs: self.async_poll_job(*args, **kwargs))
-            if callable(_safe_context_attr(self, "async_poll_job"))
-            else None
-        )
-        poll_many_fn = (
-            (lambda *args, **kwargs: self.async_poll_jobs(*args, **kwargs))
-            if callable(_safe_context_attr(self, "async_poll_jobs"))
-            else None
-        )
+        try:
+            inst_dict = object.__getattribute__(self, "__dict__")
+        except AttributeError:
+            inst_dict = {}
+
+        poll_single_fn: Callable[..., Any] | None
+        if "async_poll_job" in inst_dict and "poll_job" not in inst_dict:
+            poll_single_fn = inst_dict["async_poll_job"]
+        elif callable(_safe_context_attr(self, "poll_job")):
+            poll_single_fn = self.poll_job
+        elif callable(_safe_context_attr(self, "async_poll_job")):
+            poll_single_fn = self.async_poll_job
+        else:
+            poll_single_fn = None
+
+        poll_many_fn: Callable[..., Any] | None
+        if "async_poll_jobs" in inst_dict and "poll_jobs" not in inst_dict:
+            poll_many_fn = inst_dict["async_poll_jobs"]
+        elif callable(_safe_context_attr(self, "poll_jobs")):
+            poll_many_fn = self.poll_jobs
+        elif callable(_safe_context_attr(self, "async_poll_jobs")):
+            poll_many_fn = self.async_poll_jobs
+        else:
+            poll_many_fn = None
+
         return await _submit_records_batch_async(
             study_key,
             records_data,
@@ -725,7 +784,7 @@ class AsyncSDKConvenienceMixin:
         )
 
     @_async_trace_method
-    async def async_poll_job(
+    async def poll_job(
         self,
         study_key: str,
         batch_id: str,
@@ -750,7 +809,7 @@ class AsyncSDKConvenienceMixin:
         )
 
     @_async_trace_method
-    async def async_poll_jobs(
+    async def poll_jobs(
         self,
         study_key: str,
         batch_ids: list[str],
@@ -762,6 +821,227 @@ class AsyncSDKConvenienceMixin:
         resolve_results: bool = False,
     ) -> JobPollSummary:
         """Asynchronously poll multiple jobs concurrently, optionally resolving ``resultUrl`` payloads."""
+        if resolve_results:
+            return await self.jobs.poll_many(
+                study_key,
+                batch_ids,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+                fail_fast=fail_fast,
+                resolve_results=True,
+            )
+        return await self.jobs.poll_many(
+            study_key,
+            batch_ids,
+            interval=interval,
+            timeout=timeout,
+            on_progress=on_progress,
+            fail_fast=fail_fast,
+        )
+
+    # Deprecated ``async_*`` compatibility aliases kept on AsyncImednetSDK
+    async_get_codings: _ListOperation[Coding, Coroutine[Any, Any, list[Coding]]] = _ListOperation(
+        "codings", "async_get_codings", is_async=True, deprecated_instead="get_codings"
+    )
+    async_get_forms: _ListOperation[Form, Coroutine[Any, Any, list[Form]]] = _ListOperation(
+        "forms", "async_get_forms", is_async=True, deprecated_instead="get_forms"
+    )
+    async_get_intervals: _ListOperation[Interval, Coroutine[Any, Any, list[Interval]]] = (
+        _ListOperation(
+            "intervals",
+            "async_get_intervals",
+            is_async=True,
+            deprecated_instead="get_intervals",
+        )
+    )
+    async_get_queries: _ListOperation[Query, Coroutine[Any, Any, list[Query]]] = _ListOperation(
+        "queries", "async_get_queries", is_async=True, deprecated_instead="get_queries"
+    )
+    async_get_record_revisions: _ListOperation[
+        RecordRevision, Coroutine[Any, Any, list[RecordRevision]]
+    ] = _ListOperation(
+        "record_revisions",
+        "async_get_record_revisions",
+        is_async=True,
+        deprecated_instead="get_record_revisions",
+    )
+    async_get_records: _ListOperation[Record, Coroutine[Any, Any, list[Record]]] = _ListOperation(
+        "records", "async_get_records", is_async=True, deprecated_instead="get_records"
+    )
+    async_get_sites: _ListOperation[Site, Coroutine[Any, Any, list[Site]]] = _ListOperation(
+        "sites", "async_get_sites", is_async=True, deprecated_instead="get_sites"
+    )
+    async_get_studies: _ListOperation[Study, Coroutine[Any, Any, list[Study]]] = _ListOperation(
+        "studies", "async_get_studies", is_async=True, deprecated_instead="get_studies"
+    )
+    async_get_subjects: _ListOperation[Subject, Coroutine[Any, Any, list[Subject]]] = (
+        _ListOperation(
+            "subjects",
+            "async_get_subjects",
+            is_async=True,
+            deprecated_instead="get_subjects",
+        )
+    )
+    async_get_users: _ListOperation[User, Coroutine[Any, Any, list[User]]] = _ListOperation(
+        "users", "async_get_users", is_async=True, deprecated_instead="get_users"
+    )
+    async_get_variables: _ListOperation[Variable, Coroutine[Any, Any, list[Variable]]] = (
+        _ListOperation(
+            "variables",
+            "async_get_variables",
+            is_async=True,
+            deprecated_instead="get_variables",
+        )
+    )
+    async_get_visits: _ListOperation[Visit, Coroutine[Any, Any, list[Visit]]] = _ListOperation(
+        "visits", "async_get_visits", is_async=True, deprecated_instead="get_visits"
+    )
+
+    @deprecated("Use 'await sdk.get_job(...)' instead.")
+    @_async_trace_method
+    async def async_get_job(self, study_key: str, batch_id: str) -> JobStatus:
+        """Deprecated alias for :meth:`get_job`."""
+        return await self.jobs.get(study_key, batch_id)
+
+    @deprecated("Use 'await sdk.create_record(...)' instead.")
+    @_async_trace_method
+    async def async_create_record(
+        self,
+        study_key: str,
+        records_data: RecordsInput,
+        email_notify: bool | str | None = None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
+        skip_validation: bool = False,
+    ) -> Job:
+        """Deprecated alias for :meth:`create_record`."""
+        from imednet.utils.tabular import normalize_records_input
+
+        normalized = normalize_records_input(records_data, schema=schema)
+        if skip_validation:
+            return await self.records.create(
+                study_key,
+                normalized,
+                email_notify=email_notify,
+                schema=schema,
+                skip_validation=True,
+            )
+        return await self.records.create(
+            study_key,
+            normalized,
+            email_notify=email_notify,
+            schema=schema,
+        )
+
+    @deprecated("Use 'await sdk.create_records_batch(...)' instead.")
+    @_async_trace_method
+    async def async_create_records_batch(
+        self,
+        study_key: str,
+        records_data: RecordsInput,
+        email_notify: bool | str | None = None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
+        chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        skip_validation: bool = False,
+        wait_for_completion: bool = False,
+        timeout: float = 300.0,
+        interval: float = 5.0,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> BatchSubmissionSummary:
+        """Deprecated alias for :meth:`create_records_batch`."""
+        from imednet.core.context import _safe_context_attr
+        from imednet.utils.batch_coordinator import _submit_records_batch_async
+
+        try:
+            inst_dict = object.__getattribute__(self, "__dict__")
+        except AttributeError:
+            inst_dict = {}
+
+        poll_single_fn: Callable[..., Any] | None
+        if "poll_job" in inst_dict and "async_poll_job" not in inst_dict:
+            poll_single_fn = inst_dict["poll_job"]
+        elif callable(_safe_context_attr(self, "async_poll_job")):
+            poll_single_fn = self.async_poll_job
+        elif callable(_safe_context_attr(self, "poll_job")):
+            poll_single_fn = self.poll_job
+        else:
+            poll_single_fn = None
+
+        poll_many_fn: Callable[..., Any] | None
+        if "poll_jobs" in inst_dict and "async_poll_jobs" not in inst_dict:
+            poll_many_fn = inst_dict["poll_jobs"]
+        elif callable(_safe_context_attr(self, "async_poll_jobs")):
+            poll_many_fn = self.async_poll_jobs
+        elif callable(_safe_context_attr(self, "poll_jobs")):
+            poll_many_fn = self.poll_jobs
+        else:
+            poll_many_fn = None
+
+        return await _submit_records_batch_async(
+            study_key,
+            records_data,
+            email_notify,
+            validate_study_key_fn=lambda sk: _validate_convenience_study_key(self.records, sk),
+            create_records_fn=lambda *args, **kwargs: self.records.create(*args, **kwargs),
+            poll_single_fn=poll_single_fn,
+            poll_many_fn=poll_many_fn,
+            sdk=_resolve_convenience_schema_adapter(self, is_async=True),
+            prefer_poll_many=_should_prefer_convenience_poll_many(self, is_async=True),
+            schema=schema,
+            chunk_size=chunk_size,
+            skip_validation=skip_validation,
+            wait_for_completion=wait_for_completion,
+            timeout=timeout,
+            interval=interval,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
+        )
+
+    @deprecated("Use 'await sdk.poll_job(...)' instead.")
+    @_async_trace_method
+    async def async_poll_job(
+        self,
+        study_key: str,
+        batch_id: str,
+        *,
+        interval: float = 5,
+        timeout: float = 300,
+        on_progress: JobProgressHandler | None = None,
+        resolve_results: bool = False,
+    ) -> JobStatus:
+        """Deprecated alias for :meth:`poll_job`."""
+        if resolve_results:
+            return await self.jobs.poll(
+                study_key,
+                batch_id,
+                interval=interval,
+                timeout=timeout,
+                on_progress=on_progress,
+                resolve_results=True,
+            )
+        return await self.jobs.poll(
+            study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
+        )
+
+    @deprecated("Use 'await sdk.poll_jobs(...)' instead.")
+    @_async_trace_method
+    async def async_poll_jobs(
+        self,
+        study_key: str,
+        batch_ids: list[str],
+        *,
+        interval: float = 5.0,
+        timeout: float = 300.0,
+        on_progress: JobProgressHandler | None = None,
+        fail_fast: bool = False,
+        resolve_results: bool = False,
+    ) -> JobPollSummary:
+        """Deprecated alias for :meth:`poll_jobs`."""
         if resolve_results:
             return await self.jobs.poll_many(
                 study_key,

@@ -66,6 +66,7 @@ Usage
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import logging
 import math
@@ -76,20 +77,23 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from unittest.mock import NonCallableMock
 
 from imednet.errors import ExportConfigurationError
-from imednet.sdk import ImednetSDK
+from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.spi.sink_base import (
     _redact_uri,
     _require_optional_dep,
 )
 from imednet.spi.sinks import (
+    AsyncExportSink,
     CentralizedMapper,
     ExportSink,
     SinkConfig,
     apply_quality_gate,
+    async_apply_quality_gate,
+    async_run_streaming_export,
     bind_sdtm_stream_metadata,
     build_sink_mapper,
     commit_sdtm_lineage,
@@ -102,6 +106,7 @@ from imednet.spi.sinks import (
     run_streaming_export,
     should_preserve_sdtm_record_id,
 )
+from imednet.spi.utils import is_async_facade
 
 _CYPHER_PROP_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -131,7 +136,7 @@ class Neo4jSinkConfig(SinkConfig):
 
     def __post_init__(self) -> None:
         """Validate Neo4j config properties after initialization."""
-        super().__post_init__()  # type: ignore[no-untyped-call]
+        super().__post_init__()
         if not self.uri or not isinstance(self.uri, str) or not self.uri.strip():
             raise ValueError("uri must be a non-empty string")
         if not self.auth or not isinstance(self.auth, tuple) or len(self.auth) != 2:
@@ -449,71 +454,41 @@ def _record_to_row(
     return mapper.map_record(record, study_key=study_key)
 
 
-class Neo4jExportSink(ExportSink):
-    """Export iMednet records as Neo4j graph nodes and relationships.
+class _Neo4jSinkCoreMixin:
+    """Shared graph-row mapping, Cypher partitioning, and SDTM lineage logic for Neo4j sinks."""
 
-    Parameters
-    ----------
-    config:
-        Mandatory :class:`Neo4jSinkConfig`.
+    config: SinkConfig
+    _uri: str
+    _auth: tuple[str, str]
+    _study_key: str
+    _seq_counters: dict[str, int]
+    _domain_seq_counters: dict[str, dict[str, int]]
+    _record_seqs: dict[str, int]
+    _form_domain_map_ref: dict[Any, str]
+    _seq_overrides_ref: dict[str, int]
+    _lineage_out_ref: dict[str, dict[str, Any]]
+    _mapper: CentralizedMapper | None
+    _mapper_key: tuple[Any, ...] | None
 
-    Raises:
-        ~imednet.errors.ExportConfigurationError: When the driver cannot connect to the database.
-        ImportError: When the ``neo4j`` package is not installed.
-    """
-
-    _delegates_sdtm_redaction = True
-    reconciles_deleted_on_full_sync = True
-
-    def __init__(self, config: Neo4jSinkConfig) -> None:
-        """Initialize the Neo4j export sink.
-
-        Args:
-            config: Mandatory Neo4j-specific sink configuration.
-        """
-        super().__init__(config)
-        self.config: Neo4jSinkConfig = config
-        self._uri = self.config.uri
-        self._auth = self.config.auth
-        self._study_key = self.config.study_key
-        self._seq_counters: dict[str, int] = {}
-        self._domain_seq_counters: dict[str, dict[str, int]] = {}
-        self._record_seqs: dict[str, int] = {}
-        self._form_domain_map_ref: dict[Any, str] = {}
-        self._seq_overrides_ref: dict[str, int] = {}
-        self._lineage_out_ref: dict[str, dict[str, Any]] = {}
-        self._mapper: CentralizedMapper | None = None
-        self._mapper_key: tuple[Any, ...] | None = None
-        self._driver: Any = None
-        self._connect()
+    def _init_graph_state(self, config: Neo4jSinkConfig) -> None:
+        """Initialize shared Neo4j mapping and SDTM lineage state."""
+        self.config = config
+        self._uri = config.uri
+        self._auth = config.auth
+        self._study_key = config.study_key
+        self._seq_counters = {}
+        self._domain_seq_counters = {}
+        self._record_seqs = {}
+        self._form_domain_map_ref = {}
+        self._seq_overrides_ref = {}
+        self._lineage_out_ref = {}
+        self._mapper = None
+        self._mapper_key = None
 
     def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
         """Hydrate and bind SDTM sequence counters into transactional stream metadata."""
         if self.config.as_sdtm:
             bind_sdtm_stream_metadata(metadata, self._seq_counters, self._record_seqs)
-
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
-
-    def _connect(self) -> None:
-        """Establish connection to Neo4j and verify connectivity."""
-        neo4j_mod = _require_optional_dep("neo4j", "neo4j")
-        redacted = _redact_uri(self._uri)
-        logger.debug("Connecting to Neo4j at %s", redacted)
-        try:
-            self._driver = neo4j_mod.GraphDatabase.driver(self._uri, auth=self._auth)
-            self._driver.verify_connectivity()
-        except Exception as exc:
-            if self._driver is not None:
-                with contextlib.suppress(Exception):
-                    self._driver.close()
-                self._driver = None
-            raise ExportConfigurationError(f"Cannot connect to Neo4j at {redacted}: {exc}") from exc
-
-    # ------------------------------------------------------------------
-    # ExportSink interface
-    # ------------------------------------------------------------------
 
     def _get_mapper(
         self,
@@ -562,11 +537,20 @@ class Neo4jExportSink(ExportSink):
             self._mapper.post_processor = post_proc
         return self._mapper
 
-    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
-        """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
-        if not records:
-            return 0
+    def _prepare_cypher_batches(
+        self,
+        records: Sequence[Any],
+    ) -> tuple[
+        list[dict[str, Any]] | None,
+        list[tuple[str, list[dict[str, Any]]]],
+        dict[str, dict[str, Any]],
+        str,
+    ]:
+        """Map *records* and partition Cypher statements.
 
+        Returns ``(None, [], lineage_out, database)`` if *records* raises a non-config
+        mapping error (caller routes ``TypeError`` through ``_execute_with_retry``).
+        """
         seq_overrides: dict[str, int] | None = None
         if self.config.as_sdtm:
             rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
@@ -578,7 +562,7 @@ class Neo4jExportSink(ExportSink):
         post_proc = _post_process_graph_sdtm if self.config.as_sdtm else _post_process_graph
         mapper = self._get_mapper(post_proc, seq_overrides)
         lineage_out = self._lineage_out_ref
-        database = getattr(self.config, "database", "neo4j")
+        database = str(getattr(self.config, "database", "neo4j"))
         try:
             if self.config.as_sdtm:
                 raw_sdtm_rows = mapper.map_batch(records, study_key=self._study_key)
@@ -605,14 +589,10 @@ class Neo4jExportSink(ExportSink):
         except ExportConfigurationError:
             raise
         except Exception:
-
-            def _raise_malformed() -> int:
-                raise TypeError("Malformed Neo4j record batch payload.") from None
-
-            return self._execute_with_retry("export_graph", batch_id, _raise_malformed)
+            return None, [], lineage_out, database
 
         if not mapped_rows:
-            return 0
+            return [], [], lineage_out, database
 
         cypher_batches: list[tuple[str, list[dict[str, Any]]]] = []
         if self.config.as_sdtm:
@@ -665,6 +645,154 @@ class Neo4jExportSink(ExportSink):
             cypher_batches.append(
                 (merge_cypher if self.config.idempotent else create_cypher, mapped_rows)
             )
+        return mapped_rows, cypher_batches, lineage_out, database
+
+    def _build_reconcile_plan(
+        self,
+        records: Sequence[Any],
+    ) -> tuple[str, list[tuple[str, dict[str, Any]]], int, bool]:
+        """Build ``(database, [(cypher, params), ...], expected_count, is_sdtm)`` for voided records."""
+        cfg = (
+            self.config
+            if isinstance(self.config, Neo4jSinkConfig)
+            else Neo4jSinkConfig(study_key=self._study_key, uri=self._uri, auth=self._auth)
+        )
+        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+        if cfg.as_sdtm and (not should_preserve_sdtm_record_id(cfg) or not record_ids):
+            sdtm_entries = resolve_voided_sdtm_keys(
+                records,
+                self,
+                study_key=getattr(self, "_active_study_key", None) or self._study_key,
+                stream_name=getattr(self, "_active_stream_name", None) or cfg.stream_name,
+                sdtm_domain=cfg.sdtm_domain,
+                form_domain_map=getattr(self, "_active_form_domain_map", None),
+            )
+            if not sdtm_entries:
+                return cfg.database, [], 0, True
+            grouped_keys: dict[str | None, list[dict[str, Any]]] = {}
+            for entry in sdtm_entries:
+                dom = str(entry.get("domain") or "").strip().upper()
+                raw_seq_col = entry.get("seq_col")
+                seq_col = (
+                    None
+                    if dom == "DM" or not raw_seq_col
+                    else (
+                        str(raw_seq_col)
+                        if _SDTM_SEQ_PROP_PATTERN.fullmatch(str(raw_seq_col))
+                        else None
+                    )
+                )
+                if dom != "DM" and (seq_col is None or entry.get("seq_val") is None):
+                    continue
+                grouped_keys.setdefault(seq_col, []).append(entry)
+            if not grouped_keys:
+                return cfg.database, [], 0, True
+            total_keys = sum(len(v) for v in grouped_keys.values())
+            statements: list[tuple[str, dict[str, Any]]] = []
+            for seq_col, part_entries in grouped_keys.items():
+                if seq_col is None:
+                    del_cypher = (
+                        "UNWIND $keys AS k\n"
+                        "MATCH (r:Record {STUDYID: k.study_id, DOMAIN: k.domain, USUBJID: k.usubjid})\n"
+                        "DETACH DELETE r\n"
+                    )
+                else:
+                    del_cypher = (
+                        "UNWIND $keys AS k\n"
+                        f"MATCH (r:Record {{STUDYID: k.study_id, DOMAIN: k.domain, USUBJID: k.usubjid, {seq_col}: k.seq_val}})\n"
+                        "DETACH DELETE r\n"
+                    )
+                statements.append((del_cypher, {"keys": part_entries}))
+            return cfg.database, statements, total_keys, True
+
+        if not record_ids:
+            return cfg.database, [], 0, False
+
+        delete_cypher = _DELETE_RECORD_CYPHER
+        if cfg.naming_convention == "camelCase":
+            delete_cypher = (
+                "UNWIND $record_ids AS rid\n"
+                "MATCH (r:Record {recordId: rid, studyKey: $study_key})\n"
+                "DETACH DELETE r\n"
+            )
+        elif cfg.as_sdtm or cfg.naming_convention == "sdtm":
+            delete_cypher = (
+                "UNWIND $record_ids AS rid\n"
+                "MATCH (r:Record {RECORD_ID: rid, STUDYID: $study_key})\n"
+                "DETACH DELETE r\n"
+            )
+        return (
+            cfg.database,
+            [(delete_cypher, {"record_ids": record_ids, "study_key": self._study_key})],
+            len(record_ids),
+            False,
+        )
+
+
+class Neo4jExportSink(_Neo4jSinkCoreMixin, ExportSink):
+    """Export iMednet records as Neo4j graph nodes and relationships.
+
+    Parameters
+    ----------
+    config:
+        Mandatory :class:`Neo4jSinkConfig`.
+
+    Raises:
+        ~imednet.errors.ExportConfigurationError: When the driver cannot connect to the database.
+        ImportError: When the ``neo4j`` package is not installed.
+    """
+
+    _delegates_sdtm_redaction = True
+    reconciles_deleted_on_full_sync = True
+
+    def __init__(self, config: Neo4jSinkConfig) -> None:
+        """Initialize the Neo4j export sink.
+
+        Args:
+            config: Mandatory Neo4j-specific sink configuration.
+        """
+        super().__init__(config)
+        self._init_graph_state(config)
+        self._driver: Any = None
+        self._connect()
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def _connect(self) -> None:
+        """Establish connection to Neo4j and verify connectivity."""
+        neo4j_mod = _require_optional_dep("neo4j", "neo4j")
+        redacted = _redact_uri(self._uri)
+        logger.debug("Connecting to Neo4j at %s", redacted)
+        try:
+            self._driver = neo4j_mod.GraphDatabase.driver(self._uri, auth=self._auth)
+            self._driver.verify_connectivity()
+        except Exception as exc:
+            if self._driver is not None:
+                with contextlib.suppress(Exception):
+                    self._driver.close()
+                self._driver = None
+            raise ExportConfigurationError(f"Cannot connect to Neo4j at {redacted}: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # ExportSink interface
+    # ------------------------------------------------------------------
+
+    def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Write *records* to Neo4j using MERGE (idempotent) or CREATE."""
+        if not records:
+            return 0
+
+        mapped_rows, cypher_batches, lineage_out, database = self._prepare_cypher_batches(records)
+        if mapped_rows is None:
+
+            def _raise_malformed() -> int:
+                raise TypeError("Malformed Neo4j record batch payload.") from None
+
+            return self._execute_with_retry("export_graph", batch_id, _raise_malformed)
+        if not mapped_rows:
+            return 0
 
         def execute_export() -> int:
             """Execute Cypher transaction to write or merge records in Neo4j."""
@@ -686,94 +814,21 @@ class Neo4jExportSink(ExportSink):
         """Delete newly voided Record nodes from Neo4j when running idempotently."""
         if not self.config.idempotent or not records:
             return 0
-        cfg = (
-            self.config
-            if isinstance(self.config, Neo4jSinkConfig)
-            else Neo4jSinkConfig(study_key=self._study_key, uri=self._uri, auth=self._auth)
-        )
-        record_ids = [rid for r in records if (rid := extract_record_id(r)) is not None]
-        if cfg.as_sdtm and (not should_preserve_sdtm_record_id(cfg) or not record_ids):
-            sdtm_entries = resolve_voided_sdtm_keys(
-                records,
-                self,
-                study_key=getattr(self, "_active_study_key", None) or self._study_key,
-                stream_name=getattr(self, "_active_stream_name", None) or cfg.stream_name,
-                sdtm_domain=cfg.sdtm_domain,
-                form_domain_map=getattr(self, "_active_form_domain_map", None),
-            )
-            if not sdtm_entries:
-                return 0
-            grouped_keys: dict[str | None, list[dict[str, Any]]] = {}
-            for entry in sdtm_entries:
-                dom = str(entry.get("domain") or "").strip().upper()
-                raw_seq_col = entry.get("seq_col")
-                seq_col = (
-                    None
-                    if dom == "DM" or not raw_seq_col
-                    else (
-                        str(raw_seq_col)
-                        if _SDTM_SEQ_PROP_PATTERN.fullmatch(str(raw_seq_col))
-                        else None
-                    )
-                )
-                if dom != "DM" and (seq_col is None or entry.get("seq_val") is None):
-                    continue
-                grouped_keys.setdefault(seq_col, []).append(entry)
-            if not grouped_keys:
-                return 0
-            total_keys = sum(len(v) for v in grouped_keys.values())
-
-            def execute_sdtm_reconcile() -> int:
-                with self._driver.session(database=cfg.database) as session:
-                    for seq_col, part_entries in grouped_keys.items():
-                        if seq_col is None:
-                            del_cypher = (
-                                "UNWIND $keys AS k\n"
-                                "MATCH (r:Record {STUDYID: k.study_id, DOMAIN: k.domain, USUBJID: k.usubjid})\n"
-                                "DETACH DELETE r\n"
-                            )
-                        else:
-                            del_cypher = (
-                                "UNWIND $keys AS k\n"
-                                f"MATCH (r:Record {{STUDYID: k.study_id, DOMAIN: k.domain, USUBJID: k.usubjid, {seq_col}: k.seq_val}})\n"
-                                "DETACH DELETE r\n"
-                            )
-                        session.run(del_cypher, keys=part_entries)
-                logger.debug("Reconciled %d voided SDTM records in batch %s", total_keys, batch_id)
-                return total_keys
-
-            return self._execute_with_retry(
-                "reconcile_graph_deleted",
-                batch_id,
-                execute_sdtm_reconcile,
-            )
-
-        if not record_ids:
+        database, statements, expected_count, is_sdtm = self._build_reconcile_plan(records)
+        if not statements:
             return 0
 
-        delete_cypher = _DELETE_RECORD_CYPHER
-        if cfg.naming_convention == "camelCase":
-            delete_cypher = (
-                "UNWIND $record_ids AS rid\n"
-                "MATCH (r:Record {recordId: rid, studyKey: $study_key})\n"
-                "DETACH DELETE r\n"
-            )
-        elif cfg.as_sdtm or cfg.naming_convention == "sdtm":
-            delete_cypher = (
-                "UNWIND $record_ids AS rid\n"
-                "MATCH (r:Record {RECORD_ID: rid, STUDYID: $study_key})\n"
-                "DETACH DELETE r\n"
-            )
-
         def execute_reconcile() -> int:
-            with self._driver.session(database=cfg.database) as session:
-                session.run(
-                    delete_cypher,
-                    record_ids=record_ids,
-                    study_key=self._study_key,
+            with self._driver.session(database=database) as session:
+                for del_cypher, params in statements:
+                    session.run(del_cypher, **params)
+            if is_sdtm:
+                logger.debug(
+                    "Reconciled %d voided SDTM records in batch %s", expected_count, batch_id
                 )
-            logger.debug("Reconciled %d voided records in batch %s", len(record_ids), batch_id)
-            return len(record_ids)
+            else:
+                logger.debug("Reconciled %d voided records in batch %s", expected_count, batch_id)
+            return expected_count
 
         return self._execute_with_retry("reconcile_graph_deleted", batch_id, execute_reconcile)
 
@@ -786,8 +841,152 @@ class Neo4jExportSink(ExportSink):
                 self._driver = None
 
 
+class AsyncNeo4jExportSink(_Neo4jSinkCoreMixin, AsyncExportSink):
+    """Asynchronously export iMednet records to Neo4j via native ``neo4j.AsyncGraphDatabase``."""
+
+    _delegates_sdtm_redaction = True
+    reconciles_deleted_on_full_sync = True
+
+    def __init__(self, config: Neo4jSinkConfig) -> None:
+        """Initialize the asynchronous Neo4j export sink."""
+        super().__init__(config)
+        self._init_graph_state(config)
+        _require_optional_dep("neo4j", "neo4j")
+        self._driver: Any = None
+        self._connected: bool = False
+
+    async def __aenter__(self) -> Self:
+        """Connect to Neo4j asynchronously when entering the sink context."""
+        await self._connect()
+        return await super().__aenter__()
+
+    async def _connect(self) -> None:
+        """Establish a native async connection to Neo4j and verify connectivity."""
+        if self._connected and self._driver is not None:
+            return
+        neo4j_mod = _require_optional_dep("neo4j", "neo4j")
+        redacted = _redact_uri(self._uri)
+        logger.debug("Connecting asynchronously to Neo4j at %s", redacted)
+        try:
+            async_graph_db = getattr(neo4j_mod, "AsyncGraphDatabase", None)
+            if async_graph_db is None:
+                raise ImportError("neo4j.AsyncGraphDatabase requires neo4j>=5.0.")
+            self._driver = async_graph_db.driver(self._uri, auth=self._auth)
+            await self._driver.verify_connectivity()
+            self._connected = True
+        except Exception as exc:
+            if self._driver is not None:
+                with contextlib.suppress(Exception):
+                    await self._driver.close()
+                self._driver = None
+            self._connected = False
+            raise ExportConfigurationError(f"Cannot connect to Neo4j at {redacted}: {exc}") from exc
+
+    async def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Asynchronously write *records* to Neo4j using MERGE (idempotent) or CREATE."""
+        await self._connect()
+        if not records:
+            return 0
+
+        mapped_rows, cypher_batches, lineage_out, database = self._prepare_cypher_batches(records)
+        if mapped_rows is None:
+
+            async def _raise_malformed() -> int:
+                raise TypeError("Malformed Neo4j record batch payload.") from None
+
+            return await self._execute_with_retry("export_graph", batch_id, _raise_malformed)
+        if not mapped_rows:
+            return 0
+
+        async def execute_export() -> int:
+            async with self._driver.session(database=database) as session:
+                for part_cypher, part_rows in cypher_batches:
+                    res = await session.run(part_cypher, rows=part_rows)
+                    consume = getattr(res, "consume", None)
+                    if callable(consume):
+                        maybe_coro = consume()
+                        if inspect.isawaitable(maybe_coro):
+                            await maybe_coro
+            logger.debug("Wrote async batch %s (%d records)", batch_id, len(mapped_rows))
+            return len(mapped_rows)
+
+        written_total = await self._execute_with_retry("export_graph", batch_id, execute_export)
+        if self.config.as_sdtm and lineage_out:
+            commit_sdtm_lineage(self, lineage_out)
+        return written_total
+
+    async def flush(self) -> None:
+        """No-op: Neo4j writes are committed per transaction."""
+
+    async def reconcile_deleted(self, records: Sequence[Any], *, batch_id: str) -> int:
+        """Asynchronously delete newly voided Record nodes from Neo4j when running idempotently."""
+        if not self.config.idempotent or not records:
+            return 0
+        await self._connect()
+        database, statements, expected_count, is_sdtm = self._build_reconcile_plan(records)
+        if not statements:
+            return 0
+
+        async def execute_reconcile() -> int:
+            async with self._driver.session(database=database) as session:
+                for del_cypher, params in statements:
+                    res = await session.run(del_cypher, **params)
+                    consume = getattr(res, "consume", None)
+                    if callable(consume):
+                        maybe_coro = consume()
+                        if inspect.isawaitable(maybe_coro):
+                            await maybe_coro
+            if is_sdtm:
+                logger.debug(
+                    "Reconciled %d voided SDTM records in async batch %s", expected_count, batch_id
+                )
+            else:
+                logger.debug(
+                    "Reconciled %d voided records in async batch %s", expected_count, batch_id
+                )
+            return expected_count
+
+        return await self._execute_with_retry(
+            "reconcile_graph_deleted",
+            batch_id,
+            execute_reconcile,
+        )
+
+    async def close(self) -> None:
+        """Asynchronously close the underlying Neo4j ``AsyncDriver``."""
+        if self._driver is not None:
+            try:
+                await self._driver.close()
+            finally:
+                self._driver = None
+                self._connected = False
+
+
+def _resolve_neo4j_config(
+    study_key: str,
+    uri: str,
+    auth: tuple[str, str],
+    *,
+    config: Neo4jSinkConfig | None,
+    mask_phi: bool | None,
+    kwargs: dict[str, Any],
+) -> Neo4jSinkConfig:
+    """Resolve explicit or keyword-constructed ``Neo4jSinkConfig``."""
+    if config is None:
+        kwargs.setdefault("mask_phi", True if mask_phi is None else mask_phi)
+        return Neo4jSinkConfig(
+            study_key=study_key,
+            uri=uri,
+            auth=auth,
+            **kwargs,
+        )
+    if mask_phi is not None:
+        return replace(config, mask_phi=mask_phi)
+    return config
+
+
 def export_to_neo4j(
-    sdk: ImednetSDK,
+    sdk: ImednetFacade,
     study_key: str,
     uri: str = "",
     auth: tuple[str, str] = ("", ""),
@@ -797,17 +996,19 @@ def export_to_neo4j(
     **kwargs: Any,
 ) -> int:
     """Export study records to Neo4j using :class:`Neo4jExportSink`."""
-    if config is None:
-        kwargs.setdefault("mask_phi", True if mask_phi is None else mask_phi)
-        config = Neo4jSinkConfig(
-            study_key=study_key,
-            uri=uri,
-            auth=auth,
-            **kwargs,
+    if is_async_facade(sdk):
+        raise TypeError(
+            "export_to_neo4j() requires a synchronous ImednetSDK (ImednetFacade); "
+            "use await async_export_to_neo4j(...) with AsyncImednetSDK."
         )
-    elif mask_phi is not None:
-        config = replace(config, mask_phi=mask_phi)
-    resolved_cfg = config
+    resolved_cfg = _resolve_neo4j_config(
+        study_key,
+        uri,
+        auth,
+        config=config,
+        mask_phi=mask_phi,
+        kwargs=kwargs,
+    )
     return run_streaming_export(
         sdk,
         study_key,
@@ -818,4 +1019,44 @@ def export_to_neo4j(
     )
 
 
-__all__ = ["Neo4jExportSink", "Neo4jSinkConfig", "export_to_neo4j"]
+async def async_export_to_neo4j(
+    sdk: AsyncImednetFacade,
+    study_key: str,
+    uri: str = "",
+    auth: tuple[str, str] = ("", ""),
+    *,
+    config: Neo4jSinkConfig | None = None,
+    mask_phi: bool | None = None,
+    **kwargs: Any,
+) -> int:
+    """Asynchronously export study records to Neo4j using :class:`AsyncNeo4jExportSink`."""
+    if not is_async_facade(sdk):
+        raise TypeError(
+            "async_export_to_neo4j() requires an AsyncImednetSDK (AsyncImednetFacade); "
+            "use export_to_neo4j(...) with ImednetSDK."
+        )
+    resolved_cfg = _resolve_neo4j_config(
+        study_key,
+        uri,
+        auth,
+        config=config,
+        mask_phi=mask_phi,
+        kwargs=kwargs,
+    )
+    return await async_run_streaming_export(
+        sdk,
+        study_key,
+        lambda: AsyncNeo4jExportSink(config=resolved_cfg),
+        resolved_cfg,
+        stream_name=f"neo4j_{resolved_cfg.database}",
+        quality_gate_fn=async_apply_quality_gate,
+    )
+
+
+__all__ = [
+    "AsyncNeo4jExportSink",
+    "Neo4jExportSink",
+    "Neo4jSinkConfig",
+    "async_export_to_neo4j",
+    "export_to_neo4j",
+]

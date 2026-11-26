@@ -37,6 +37,7 @@ from .plugins import (
     SyncWorkflowsNamespaceProtocol,
 )
 from .sdk_convenience import AsyncSDKConvenienceMixin, SyncSDKConvenienceMixin
+from .utils.async_bridge import is_async_facade
 
 if TYPE_CHECKING:
     from .core.async_client import AsyncClient
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from .endpoints.users import AsyncUsersEndpoint, UsersEndpoint
     from .endpoints.variables import AsyncVariablesEndpoint, VariablesEndpoint
     from .endpoints.visits import AsyncVisitsEndpoint, VisitsEndpoint
+    from .spi.facade import AsyncImednetFacade, ImednetFacade
 
 
 class WorkflowPluginProtocol(PluginProtocol):
@@ -103,15 +105,19 @@ class WorkflowRegistry:
                     "Please resolve the conflict."
                 )
             self._entry_points[ep.name] = ep
+        self._async_entry_points: dict[str, EntryPoint] = {}
+        for ep in entry_points(group="imednet.async_workflows"):
+            if ep.name in self._async_entry_points:
+                raise PluginLoadError(
+                    f"Multiple async workflows registered under the name '{ep.name}'. "
+                    "Please resolve the conflict."
+                )
+            self._async_entry_points[ep.name] = ep
         self._loaded_workflows: dict[str, Any] = {}
 
     def _is_async_sdk(self) -> bool:
         """Return True when the bound SDK is asynchronous."""
-        if isinstance(self._sdk, AsyncImednetSDK):
-            return True
-        return hasattr(self._sdk, "async_create_record") and not callable(
-            getattr(self._sdk, "create_record", None)
-        )
+        return isinstance(self._sdk, AsyncImednetSDK) or is_async_facade(self._sdk)
 
     def _raise_sync_only_error(self, name: str) -> Never:
         """Raise TypeError with actionable guidance when a sync-only workflow is requested on AsyncImednetSDK."""
@@ -141,10 +147,15 @@ class WorkflowRegistry:
         if name in self._loaded_workflows:
             return self._loaded_workflows[name]
 
-        if name not in self._entry_points:
+        is_async = self._is_async_sdk()
+        from_async_group = False
+        if is_async and name in self._async_entry_points:
+            ep = self._async_entry_points[name]
+            from_async_group = True
+        elif name in self._entry_points:
+            ep = self._entry_points[name]
+        else:
             raise ImportError(f"Workflow '{name}' not found. Please install the required package.")
-
-        ep = self._entry_points[name]
 
         try:
             workflow_factory = ep.load()
@@ -159,8 +170,7 @@ class WorkflowRegistry:
                 f"that accepts an SDK instance; got {type(workflow_factory).__name__}."
             )
 
-        is_async = self._is_async_sdk()
-        if is_async:
+        if is_async and not from_async_group:
             if (
                 name in _SYNC_ONLY_WORKFLOW_NAMES
                 or getattr(workflow_factory, "supports_async", None) is False
@@ -176,7 +186,7 @@ class WorkflowRegistry:
                 "Failed to instantiate workflows from the discovered plugin entry point."
             ) from error
 
-        if is_async and not _factory_supports_async(workflow_instance):
+        if is_async and not from_async_group and not _factory_supports_async(workflow_instance):
             self._raise_sync_only_error(name)
 
         self._loaded_workflows[name] = workflow_instance
@@ -351,7 +361,7 @@ class _BaseSDK:
 
         try:
             sinks_factory = cast(SinksPluginProtocol, sinks_plugin)
-            return sinks_factory(cast(Any, self))
+            return sinks_factory(cast("ImednetFacade | AsyncImednetFacade", self))
         except TypeError as error:
             raise PluginLoadError(
                 "Failed to instantiate sinks from the discovered plugin entry point."

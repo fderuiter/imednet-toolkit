@@ -2307,7 +2307,9 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
         This method never raises :class:`~imednet.errors.ValidationError`;
         any API errors bubble up as :class:`~imednet.errors.ApiError`.
         """
-        variables = await self._sdk.async_get_variables(study_key=study_key)
+        from ..utils.async_bridge import call_async_facade_method
+
+        variables = await call_async_facade_method(self._sdk, "get_variables", study_key=study_key)
         self._refresh_common(variables, study_key=study_key)
 
     async def validate_record(self, study_key: str, record: dict[str, Any]) -> None:

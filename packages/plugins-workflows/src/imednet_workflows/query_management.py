@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -15,13 +16,22 @@ from imednet.spi.models import (
     TriageStatus,
     calculate_legacy_status,
 )
-from imednet.spi.utils import normalize_iso_date, parse_iso_datetime
+from imednet.spi.utils import (
+    SyncToAsyncFacadeAdapter,
+    call_async_facade_method,
+    is_async_facade,
+    maybe_to_thread,
+    normalize_iso_date,
+    parse_iso_datetime,
+    run_sync_over_async,
+)
 
 from ._filter_bounds import filter_queries_by_subject_keys, plan_site_subject_query_filters
+from ._workflow_helpers import ensure_sync_workflow_mode
 from .triage_store import TriageStore
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade, TriageStoreProtocol
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade, TriageStoreProtocol
 
 
 class QueryStateCounts(dict[str, int]):
@@ -45,20 +55,8 @@ class QueryStateCounts(dict[str, int]):
             return default
 
 
-class QueryManagementWorkflow:
-    """Provides methods for common query management tasks.
-
-    Args:
-        sdk: An instance of the ImednetSDK.
-    """
-
-    def __init__(self, sdk: ImednetFacade):
-        """Initialize the query management workflow.
-
-        Args:
-            sdk: An instance of the iMednet SDK facade.
-        """
-        self._sdk = sdk
+class _QueryManagementBase:
+    """Shared discrepancy lifecycle classification and triage mapping helpers."""
 
     @staticmethod
     def _resolve_query_status(query: Any) -> QueryStatus:
@@ -83,141 +81,6 @@ class QueryManagementWorkflow:
         if include_answered:
             return resolved in (QueryStatus.OPEN, QueryStatus.ANSWERED)
         return resolved == QueryStatus.OPEN
-
-    def get_open_queries(
-        self,
-        study_key: str,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
-        include_answered: bool = False,
-        **kwargs: Any,
-    ) -> list[Query]:
-        """Retrieves open queries for a given study, optionally including answered queries.
-
-        Note:
-            This method fetches queries based on ``additional_filter`` and then
-            filters for ``OPEN`` (and ``ANSWERED`` when ``include_answered=True``)
-            client-side.
-
-        Args:
-            study_key: The key identifying the study.
-            additional_filter: An optional dictionary of conditions to apply via the API.
-            include_answered: When True, include ``ANSWERED`` queries alongside ``OPEN`` queries.
-            **kwargs: Additional keyword arguments passed directly to ``sdk.queries.list``.
-
-        Returns:
-            A list of matching Query objects.
-        """
-        filters = dict(additional_filter) if additional_filter else {}
-        all_matching_queries = self._sdk.get_queries(study_key, **filters, **kwargs)
-        return [
-            query
-            for query in all_matching_queries
-            if self._is_query_open(query, include_answered=include_answered)
-        ]
-
-    def get_unresolved_queries(
-        self,
-        study_key: str,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
-        **kwargs: Any,
-    ) -> list[Query]:
-        """Retrieves all unresolved (``OPEN`` and ``ANSWERED``) queries for a given study.
-
-        Args:
-            study_key: The key identifying the study.
-            additional_filter: An optional dictionary of conditions to apply via the API.
-            **kwargs: Additional keyword arguments passed directly to ``sdk.queries.list``.
-
-        Returns:
-            A list of ``OPEN`` and ``ANSWERED`` Query objects matching the criteria.
-        """
-        return self.get_open_queries(
-            study_key,
-            additional_filter=additional_filter,
-            include_answered=True,
-            **kwargs,
-        )
-
-    def get_queries_for_subject(
-        self,
-        study_key: str,
-        subject_key: str,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
-        **kwargs: Any,
-    ) -> list[Query]:
-        """Retrieves all queries for a specific subject within a study.
-
-        Args:
-            study_key: The key identifying the study.
-            subject_key: The key identifying the subject.
-            additional_filter: An optional dictionary of conditions to combine
-                with the subject filter.
-            **kwargs: Additional keyword arguments passed directly to `sdk.queries.list`.
-
-        Returns:
-            A list of Query objects for the specified subject.
-        """
-        # Build filter dictionary
-        final_filter_dict: dict[str, Any] = {"subject_key": subject_key}
-        if additional_filter:
-            final_filter_dict.update(additional_filter)
-
-        return list(self._sdk.get_queries(study_key, **final_filter_dict, **kwargs))
-
-    def get_queries_by_site(
-        self,
-        study_key: str,
-        site_key: str,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
-        **kwargs: Any,
-    ) -> list[Query]:
-        """Retrieves all queries for active, keyed subjects at a specific site within a study.
-
-        Args:
-            study_key: The key identifying the study.
-            site_key: The name of the site.
-            additional_filter: Extra conditions to combine with the subject filter.
-            **kwargs: Additional keyword arguments passed directly to `sdk.queries.list`.
-
-        Returns:
-            A list of Query objects for the specified site.
-        """
-        subjects = self._sdk.get_subjects(study_key, site_name=site_key)
-        subject_keys, final_filter_dict, filter_locally = plan_site_subject_query_filters(
-            subjects,
-            additional_filter,
-            kwargs,
-        )
-        if not subject_keys:
-            return []
-
-        queries = self._sdk.get_queries(study_key, **final_filter_dict, **kwargs)
-        if not filter_locally:
-            return list(queries)
-        return filter_queries_by_subject_keys(queries, subject_keys)
-
-    def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
-        """Counts queries grouped by their current QueryStatus values.
-
-        The discrepancy lifecycle state is evaluated in linear time directly from
-        each Query's status attribute, with fallback calculation for legacy payloads.
-
-        Args:
-            study_key: The key identifying the study.
-            **kwargs: Additional keyword arguments passed directly to `sdk.queries.list`
-                      (e.g., for initial filtering before counting).
-
-        Returns:
-            A dictionary with QueryStatus values as keys and their respective counts.
-        """
-        all_queries = self._sdk.get_queries(study_key, **kwargs)
-        state_counts = QueryStateCounts({s.value: 0 for s in QueryStatus})
-
-        for query in all_queries:
-            status_key = self._resolve_query_status(query).value
-            state_counts[status_key] += 1
-
-        return state_counts
 
     @staticmethod
     def _resolve_triage_store(
@@ -366,41 +229,16 @@ class QueryManagementWorkflow:
             annotations=annotations,
         )
 
-    def sync_queries_to_triage(
+    def _persist_triage_queries_sync(
         self,
         study_key: str,
-        store: TriageStoreProtocol | str | Path | None = None,
+        queries: Iterable[Query],
+        store: TriageStoreProtocol | str | Path | None,
         *,
-        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
-        unresolved_only: bool = False,
-        default_severity: str = "medium",
-        **kwargs: Any,
+        default_severity: str,
     ) -> list[TriageItem]:
-        """Synchronize clinical queries for a study into a local TriageStore queue.
-
-        Args:
-            study_key: The key identifying the study.
-            store: Target ``TriageStore`` instance, SQLite database path, or ``None`` to
-                instantiate via the registered ``imednet.stores`` ``TriageStore`` entry point.
-            additional_filter: Optional API filter conditions passed to query retrieval.
-            unresolved_only: When True, sync only ``OPEN`` and ``ANSWERED`` queries.
-            default_severity: Severity assigned to newly discovered triage items.
-            **kwargs: Additional keyword arguments forwarded to ``sdk.get_queries``.
-
-        Returns:
-            The synchronized list of ``TriageItem`` entries queued for ``study_key``.
-        """
+        """Persist fetched queries into the resolved TriageStore synchronously."""
         target_store = self._resolve_triage_store(store)
-        if unresolved_only:
-            queries = self.get_unresolved_queries(
-                study_key,
-                additional_filter=additional_filter,
-                **kwargs,
-            )
-        else:
-            filters = dict(additional_filter) if additional_filter else {}
-            queries = list(self._sdk.get_queries(study_key, **filters, **kwargs))
-
         for idx, query in enumerate(queries, start=1):
             item_id = self._build_triage_item_id(query, study_key, idx)
             existing = target_store.get_triage_item(item_id)
@@ -412,8 +250,287 @@ class QueryManagementWorkflow:
                 default_severity=default_severity,
             )
             target_store.upsert_item(triage_item)
-
         return target_store.get_queue(study_key)
+
+
+class AsyncQueryManagementWorkflow(_QueryManagementBase):
+    """Canonical asynchronous workflow for clinical discrepancy management."""
+
+    supports_async = True
+
+    def __init__(self, sdk: AsyncImednetFacade) -> None:
+        """Initialize the asynchronous query management workflow."""
+        self._sdk = sdk
+
+    async def get_open_queries(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        include_answered: bool = False,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Asynchronously retrieve open queries (and optionally answered queries)."""
+        filters = dict(additional_filter) if additional_filter else {}
+        all_matching_queries = await call_async_facade_method(
+            self._sdk, "get_queries", study_key, **filters, **kwargs
+        )
+        return [
+            query
+            for query in all_matching_queries
+            if self._is_query_open(query, include_answered=include_answered)
+        ]
+
+    async def get_unresolved_queries(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Asynchronously retrieve all unresolved (OPEN and ANSWERED) queries."""
+        return await self.get_open_queries(
+            study_key,
+            additional_filter=additional_filter,
+            include_answered=True,
+            **kwargs,
+        )
+
+    async def get_queries_for_subject(
+        self,
+        study_key: str,
+        subject_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Asynchronously retrieve all queries for a specific subject within a study."""
+        final_filter_dict: dict[str, Any] = {"subject_key": subject_key}
+        if additional_filter:
+            final_filter_dict.update(additional_filter)
+        return list(
+            await call_async_facade_method(
+                self._sdk, "get_queries", study_key, **final_filter_dict, **kwargs
+            )
+        )
+
+    async def get_queries_by_site(
+        self,
+        study_key: str,
+        site_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Asynchronously retrieve all queries for active, keyed subjects at a site."""
+        subjects = await call_async_facade_method(
+            self._sdk, "get_subjects", study_key, site_name=site_key
+        )
+        subject_keys, final_filter_dict, filter_locally = plan_site_subject_query_filters(
+            subjects,
+            additional_filter,
+            kwargs,
+        )
+        if not subject_keys:
+            return []
+
+        queries = await call_async_facade_method(
+            self._sdk, "get_queries", study_key, **final_filter_dict, **kwargs
+        )
+        if not filter_locally:
+            return list(queries)
+        return filter_queries_by_subject_keys(queries, subject_keys)
+
+    async def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
+        """Asynchronously count queries grouped by their current QueryStatus values."""
+        all_queries = await call_async_facade_method(self._sdk, "get_queries", study_key, **kwargs)
+        state_counts = QueryStateCounts({s.value: 0 for s in QueryStatus})
+        for query in all_queries:
+            status_key = self._resolve_query_status(query).value
+            state_counts[status_key] += 1
+        return state_counts
+
+    async def sync_queries_to_triage(
+        self,
+        study_key: str,
+        store: TriageStoreProtocol | str | Path | None = None,
+        *,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        unresolved_only: bool = False,
+        default_severity: str = "medium",
+        **kwargs: Any,
+    ) -> list[TriageItem]:
+        """Asynchronously synchronize clinical queries into a local TriageStore queue."""
+        if unresolved_only:
+            queries = await self.get_unresolved_queries(
+                study_key,
+                additional_filter=additional_filter,
+                **kwargs,
+            )
+        else:
+            filters = dict(additional_filter) if additional_filter else {}
+            queries = list(
+                await call_async_facade_method(
+                    self._sdk, "get_queries", study_key, **filters, **kwargs
+                )
+            )
+        return await maybe_to_thread(
+            self._persist_triage_queries_sync,
+            study_key,
+            queries,
+            store,
+            default_severity=default_severity,
+        )
+
+
+class QueryManagementWorkflow(_QueryManagementBase):
+    """Provides methods for common query management tasks.
+
+    Args:
+        sdk: An instance of the synchronous ImednetSDK.
+    """
+
+    def __init__(self, sdk: ImednetFacade) -> None:
+        """Initialize the query management workflow."""
+        self._sdk = sdk
+        self._async_core = AsyncQueryManagementWorkflow(SyncToAsyncFacadeAdapter(sdk))
+
+    def get_open_queries(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        include_answered: bool = False,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Retrieves open queries for a given study, optionally including answered queries."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "QueryManagementWorkflow",
+            "get_open_queries",
+            "get_open_queries",
+        )
+        return run_sync_over_async(
+            lambda: self._async_core.get_open_queries(
+                study_key,
+                additional_filter=additional_filter,
+                include_answered=include_answered,
+                **kwargs,
+            )
+        )
+
+    def get_unresolved_queries(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Retrieves all unresolved (``OPEN`` and ``ANSWERED``) queries for a given study."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "QueryManagementWorkflow",
+            "get_unresolved_queries",
+            "get_unresolved_queries",
+        )
+        return self.get_open_queries(
+            study_key,
+            additional_filter=additional_filter,
+            include_answered=True,
+            **kwargs,
+        )
+
+    def get_queries_for_subject(
+        self,
+        study_key: str,
+        subject_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Retrieves all queries for a specific subject within a study."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "QueryManagementWorkflow",
+            "get_queries_for_subject",
+            "get_queries_for_subject",
+        )
+        return run_sync_over_async(
+            lambda: self._async_core.get_queries_for_subject(
+                study_key,
+                subject_key,
+                additional_filter=additional_filter,
+                **kwargs,
+            )
+        )
+
+    def get_queries_by_site(
+        self,
+        study_key: str,
+        site_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Retrieves all queries for active, keyed subjects at a specific site within a study."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "QueryManagementWorkflow",
+            "get_queries_by_site",
+            "get_queries_by_site",
+        )
+        return run_sync_over_async(
+            lambda: self._async_core.get_queries_by_site(
+                study_key,
+                site_key,
+                additional_filter=additional_filter,
+                **kwargs,
+            )
+        )
+
+    def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
+        """Counts queries grouped by their current QueryStatus values."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "QueryManagementWorkflow",
+            "get_query_state_counts",
+            "get_query_state_counts",
+        )
+        return run_sync_over_async(
+            lambda: self._async_core.get_query_state_counts(study_key, **kwargs)
+        )
+
+    def sync_queries_to_triage(
+        self,
+        study_key: str,
+        store: TriageStoreProtocol | str | Path | None = None,
+        *,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        unresolved_only: bool = False,
+        default_severity: str = "medium",
+        **kwargs: Any,
+    ) -> list[TriageItem]:
+        """Synchronize clinical queries for a study into a local TriageStore queue."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "QueryManagementWorkflow",
+            "sync_queries_to_triage",
+            "sync_queries_to_triage",
+        )
+        if unresolved_only and "get_unresolved_queries" in vars(self):
+            queries = self.get_unresolved_queries(
+                study_key,
+                additional_filter=additional_filter,
+                **kwargs,
+            )
+            return self._persist_triage_queries_sync(
+                study_key,
+                queries,
+                store,
+                default_severity=default_severity,
+            )
+        return run_sync_over_async(
+            lambda: self._async_core.sync_queries_to_triage(
+                study_key,
+                store=store,
+                additional_filter=additional_filter,
+                unresolved_only=unresolved_only,
+                default_severity=default_severity,
+                **kwargs,
+            )
+        )
 
 
 # Integration:

@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import NonCallableMock
 
 from pydantic import BaseModel
+
+from imednet.utils.async_bridge import (
+    SyncToAsyncFacadeAdapter,
+    is_async_facade,
+    run_sync_over_async,
+)
 
 from ..models import (
     DataDictionary,
@@ -21,6 +28,9 @@ from ..normalize import (
     normalize_variable_type,
     to_camel_case,
 )
+
+if TYPE_CHECKING:
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 _EXCLUDED_FORM_EXTRA_KEYS = {
     "studyKey",
@@ -241,49 +251,13 @@ def _build_datadict_from_items(
     )
 
 
-def _fetch_sync_collection(
-    sdk: Any,
-    study_key: str,
-    *,
-    endpoint_attr: str,
-    facade_method: str,
-) -> Iterable[Any]:
-    if isinstance(sdk, NonCallableMock):
-        mock_children = getattr(sdk, "_mock_children", {})
-        obj_vars = vars(sdk)
-        has_ep = endpoint_attr in mock_children or endpoint_attr in obj_vars
-        has_facade = facade_method in mock_children or facade_method in obj_vars
-        if has_facade and not has_ep:
-            return cast_iterable(getattr(sdk, facade_method)(study_key=study_key))
-        if has_ep:
-            return cast_iterable(getattr(sdk, endpoint_attr).list(study_key=study_key))
-        return ()
-
-    ep = getattr(sdk, endpoint_attr, None)
-    if ep is not None and callable(getattr(ep, "list", None)):
-        return cast_iterable(ep.list(study_key=study_key))
-    fn = getattr(sdk, facade_method, None)
-    if callable(fn):
-        return cast_iterable(fn(study_key=study_key))
-    return ()
-
-
-def cast_iterable(value: Any) -> Iterable[Any]:
-    """Coerce an endpoint return value into a synchronous Iterable."""
-    if value is None:
-        return ()
-    if isinstance(value, Iterable):
-        return value
-    return ()
-
-
 async def _fetch_async_collection(
     sdk: Any,
     study_key: str,
     *,
     endpoint_attr: str,
-    async_facade_method: str,
-    sync_facade_method: str,
+    facade_method: str,
+    legacy_async_method: str,
 ) -> list[Any]:
     async def _consume(candidate: Any) -> list[Any]:
         if candidate is None:
@@ -300,83 +274,117 @@ async def _fetch_async_collection(
     if isinstance(sdk, NonCallableMock):
         mock_children = getattr(sdk, "_mock_children", {})
         obj_vars = vars(sdk)
-        if async_facade_method in mock_children or async_facade_method in obj_vars:
-            return await _consume(getattr(sdk, async_facade_method)(study_key=study_key))
+        if legacy_async_method in mock_children or legacy_async_method in obj_vars:
+            return await _consume(getattr(sdk, legacy_async_method)(study_key=study_key))
         if endpoint_attr in mock_children or endpoint_attr in obj_vars:
             return await _consume(getattr(sdk, endpoint_attr).list(study_key=study_key))
-        if sync_facade_method in mock_children or sync_facade_method in obj_vars:
-            return await _consume(getattr(sdk, sync_facade_method)(study_key=study_key))
+        if facade_method in mock_children or facade_method in obj_vars:
+            return await _consume(getattr(sdk, facade_method)(study_key=study_key))
         return []
+
+    try:
+        inst_dict = object.__getattribute__(sdk, "__dict__")
+    except AttributeError:
+        inst_dict = {}
+
+    if legacy_async_method in inst_dict and facade_method not in inst_dict:
+        return await _consume(inst_dict[legacy_async_method](study_key=study_key))
 
     ep = getattr(sdk, endpoint_attr, None)
     if ep is not None and callable(getattr(ep, "list", None)):
         return await _consume(ep.list(study_key=study_key))
-    async_fn = getattr(sdk, async_facade_method, None)
-    if callable(async_fn):
-        return await _consume(async_fn(study_key=study_key))
-    sync_fn = getattr(sdk, sync_facade_method, None)
-    if callable(sync_fn):
-        return await _consume(sync_fn(study_key=study_key))
+    facade_fn = getattr(sdk, facade_method, None)
+    if callable(facade_fn):
+        return await _consume(facade_fn(study_key=study_key))
+    legacy_fn = getattr(sdk, legacy_async_method, None)
+    if callable(legacy_fn):
+        return await _consume(legacy_fn(study_key=study_key))
     return []
 
 
-def load_from_api(
-    sdk: Any,
+async def async_load_from_api(
+    sdk: AsyncImednetFacade,
     study_key: str,
     *,
     no_raw_xml: bool = False,
 ) -> DataDictionary:
-    """Extract data dictionary metadata from live iMednet API via the SDK.
+    """Asynchronously extract data dictionary metadata from live iMednet API via the SDK.
 
     Note: The iMednet REST API exposes study forms and variables endpoints, but does
     not offer direct REST endpoints for business logic rules or choice code lists.
-    This loader extracts available forms and variables and returns a canonical
-    DataDictionary with documented partial structure (empty logic and choices).
+    This canonical async loader extracts available forms and variables concurrently
+    and returns a canonical :class:`DataDictionary` with documented partial structure.
 
     Args:
-        sdk: Initialized ImednetSDK or ImednetFacade instance.
+        sdk: Initialized :class:`AsyncImednetSDK` or :class:`AsyncImednetFacade` instance.
         study_key: Unique study identifier.
         no_raw_xml: Whether to omit raw XML (reserved for export jobs).
 
     Returns:
-        Canonical DataDictionary representation.
+        Canonical :class:`DataDictionary` representation.
     """
     _ = no_raw_xml
-    forms_list = _fetch_sync_collection(
-        sdk,
-        study_key,
-        endpoint_attr="forms",
-        facade_method="get_forms",
-    )
-    variables_list = _fetch_sync_collection(
-        sdk,
-        study_key,
-        endpoint_attr="variables",
-        facade_method="get_variables",
+    if type(sdk).__name__ == "ImednetSDK":
+        raise TypeError(
+            "async_load_from_api requires an AsyncImednetSDK or AsyncImednetFacade instance; "
+            "for synchronous ImednetSDK, call load_from_api(sdk, study_key) instead."
+        )
+    if not isinstance(sdk, SyncToAsyncFacadeAdapter) and not can_load_from_api(sdk):
+        raise TypeError(
+            "sdk must expose forms and variables endpoints or AsyncImednetFacade methods."
+        )
+
+    forms_list, variables_list = await asyncio.gather(
+        _fetch_async_collection(
+            sdk,
+            study_key,
+            endpoint_attr="forms",
+            facade_method="get_forms",
+            legacy_async_method="async_get_forms",
+        ),
+        _fetch_async_collection(
+            sdk,
+            study_key,
+            endpoint_attr="variables",
+            facade_method="get_variables",
+            legacy_async_method="async_get_variables",
+        ),
     )
     return _build_datadict_from_items(study_key, forms_list, variables_list)
 
 
-async def async_load_from_api(
-    sdk: Any,
+def load_from_api(
+    sdk: ImednetFacade,
     study_key: str,
     *,
     no_raw_xml: bool = False,
 ) -> DataDictionary:
-    """Asynchronously extract data dictionary metadata from live iMednet API."""
-    _ = no_raw_xml
-    forms_list = await _fetch_async_collection(
-        sdk,
-        study_key,
-        endpoint_attr="forms",
-        async_facade_method="async_get_forms",
-        sync_facade_method="get_forms",
+    """Extract data dictionary metadata from live iMednet API via the synchronous SDK.
+
+    Delegates to the canonical :func:`async_load_from_api` pipeline over a
+    sync-to-async facade adapter while safely handling active event loops in
+    Jupyter and Pyodide.
+
+    Args:
+        sdk: Initialized :class:`ImednetSDK` or :class:`ImednetFacade` instance.
+        study_key: Unique study identifier.
+        no_raw_xml: Whether to omit raw XML (reserved for export jobs).
+
+    Returns:
+        Canonical :class:`DataDictionary` representation.
+
+    Raises:
+        TypeError: If an :class:`AsyncImednetSDK` or async facade is passed.
+    """
+    if is_async_facade(sdk):
+        raise TypeError(
+            "load_from_api requires a synchronous ImednetSDK or ImednetFacade instance; "
+            "for AsyncImednetSDK, await async_load_from_api(sdk, study_key) instead."
+        )
+    if not can_load_from_api(sdk):
+        raise TypeError("sdk must expose forms and variables endpoints or ImednetFacade methods.")
+
+    adapter = SyncToAsyncFacadeAdapter(sdk)
+    return run_sync_over_async(
+        lambda: async_load_from_api(adapter, study_key, no_raw_xml=no_raw_xml)
     )
-    variables_list = await _fetch_async_collection(
-        sdk,
-        study_key,
-        endpoint_attr="variables",
-        async_facade_method="async_get_variables",
-        sync_facade_method="get_variables",
-    )
-    return _build_datadict_from_items(study_key, forms_list, variables_list)

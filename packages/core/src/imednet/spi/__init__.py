@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import imednet.integrations.export as export_helpers
-    from imednet.integrations import export
+    from imednet.integrations import async_export, export
 
     from . import (
         cli,
@@ -41,7 +41,7 @@ _LAZY_SUBMODULES: dict[str, str] = {
     "validation": "imednet.spi.validation",
 }
 
-for _lazy_name in (*_LAZY_SUBMODULES, "export"):
+for _lazy_name in (*_LAZY_SUBMODULES, "export", "async_export"):
     globals().pop(_lazy_name, None)
 
 
@@ -49,9 +49,9 @@ if not TYPE_CHECKING:
 
     def __getattr__(name: str) -> Any:
         """Lazily load SPI submodules and export helpers on demand."""
-        if name == "export":
+        if name in ("export", "async_export"):
             integrations_mod = _import_module("imednet.integrations")  # nosem
-            val = integrations_mod.export
+            val = getattr(integrations_mod, name)
             globals()[name] = val
             return val
         try:
@@ -69,6 +69,7 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    "async_export",
     "cli",
     "constants",
     "endpoints",
