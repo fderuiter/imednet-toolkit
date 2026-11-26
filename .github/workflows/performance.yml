@@ -38,30 +38,24 @@ jobs:
           python-version: '3.11'
 
       - name: Restore Workspace Dependencies
-        id: cache-uv
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-py3.11-
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
 
       - name: Install Dependencies
         run: |
-          python -m pip install uv hatch
           uv sync --locked --all-packages --all-extras
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-
-      - name: Save Workspace Dependencies
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache-uv.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cache/uv
-            .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
 
       - name: Run Performance Suite
         env:

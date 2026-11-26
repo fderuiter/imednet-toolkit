@@ -737,3 +737,196 @@ def test_default_phi_masking_across_odm_clinical_audit_annotation_and_admin() ->
     assert "jane@clinic.example" not in masked_xml
     assert "john.doe@clinic.example" not in masked_xml
     assert "***MASKED***" in masked_xml
+
+
+def test_cdisc_builder_edge_cases_coercions_and_validators(tmp_path: Path) -> None:
+    """Exercise OID/datetime helpers, fallback metadata, commentless queries, coercions, and validator error paths."""
+    from datetime import UTC, date, datetime
+    from decimal import Decimal
+
+    from imednet.datadict.cdisc_builders import (
+        UNSCHEDULED_EVENT_OID,
+        _coerce_dataset_json_cell,
+        build_datadict_from_sdk_metadata,
+        make_oid_slug,
+        make_study_event_oid,
+        make_xml_ncname,
+        map_queries_to_annotations,
+        map_sites_and_users_to_admin_data,
+        normalize_odm_datetime,
+    )
+
+    assert make_oid_slug(None, fallback="DEF") == "DEF"
+    assert make_xml_ncname("9BAD", "part:1") == "ID_9BAD_part_1"
+    assert make_study_event_oid(None) == UNSCHEDULED_EVENT_OID
+    assert make_study_event_oid("0") == UNSCHEDULED_EVENT_OID
+    assert make_study_event_oid("SE.CUSTOM") == "SE.CUSTOM"
+
+    assert normalize_odm_datetime(None, fallback="EPOCH") == "EPOCH"
+    assert normalize_odm_datetime("   ", fallback="EPOCH") == "EPOCH"
+    assert normalize_odm_datetime(date(2026, 5, 1)) == "2026-05-01T00:00:00Z"
+    assert normalize_odm_datetime("05-13-2026 14:06:50") == "2026-05-13T14:06:50Z"
+    assert normalize_odm_datetime("2026-05-13") == "2026-05-13T00:00:00Z"
+    assert normalize_odm_datetime("not-a-timestamp") == "not-a-timestamp"
+
+    # Metadata builder with choices, formId-only variables, and orphan formKey variables
+    dd = build_datadict_from_sdk_metadata(
+        "EDGE_STUDY",
+        forms=[
+            {"formId": 10, "formName": "IdOnlyForm"},
+            {"formKey": "", "formId": None},
+            {"formKey": "FORM_10", "formId": 10},
+        ],
+        variables=[
+            {"variableName": ""},
+            {
+                "variableName": "STATUS_CD",
+                "variableType": " integer ",
+                "formId": 10,
+                "choices": [
+                    {"value": 1, "label": "Active"},
+                    {"value": 2},
+                ],
+            },
+            {
+                "variableName": "ORPHAN_VAR",
+                "variableType": "float",
+                "formKey": "ORPHAN_FORM",
+            },
+        ],
+        intervals=[
+            {"intervalName": None, "intervalId": None},
+            {"intervalName": "Screening", "forms": [{"formKey": "FORM_10"}]},
+            {"intervalName": "Screening", "forms": []},
+        ],
+    )
+    form_keys = {f.formKey for f in dd.forms}
+    assert {"FORM_10", "ORPHAN_FORM"} <= form_keys
+
+    # AdminData default fallback when no sites/users provided, plus inferred tokens
+    empty_admin = map_sites_and_users_to_admin_data("EDGE_STUDY")
+    assert empty_admin.locations[0].oid == "LOC.DEFAULT_SITE"
+    assert empty_admin.users[0].oid == "USR.SYSTEM"
+
+    inferred_admin = map_sites_and_users_to_admin_data(
+        "EDGE_STUDY",
+        sites=[{"siteId": None, "siteName": None}],
+        users=[{"login": None, "userId": None}],
+        inferred_site_tokens=[(None, None), ("SITE_99", "Site Ninety-Nine")],
+        inferred_user_tokens=[None, "   ", "auditor_bot"],
+    )
+    assert any(loc.oid == "LOC.SITE_99" for loc in inferred_admin.locations)
+    assert any(u.oid == "USR.auditor_bot" for u in inferred_admin.users)
+
+    # Queries without comments across record+var, record-only, subject-only, and unattached scopes
+    by_rv, by_r, by_s, unattached = map_queries_to_annotations(
+        [
+            {"annotationId": 1, "recordId": 10, "variable": "V1", "description": "Check V1"},
+            {"annotationId": 2, "recordId": 10, "description": "Record query"},
+            {"annotationId": 3, "subjectKey": "SUBJ-1", "description": ""},
+            {"annotationId": 4, "description": "Study-level note", "type": "Manual"},
+        ],
+        mask_phi=True,
+    )
+    assert (10, "V1") in by_rv
+    assert 10 in by_r
+    assert "SUBJ-1" in by_s
+    assert len(unattached) == 1
+
+    # Archive with undeclared forms/vars, scalar formatting, and include_deleted=True
+    edge_archive = build_odm_archive(
+        "EDGE_STUDY",
+        records=[
+            {
+                "recordId": 10,
+                "subjectKey": "SUBJ-1",
+                "formKey": "NEW_FORM",
+                "visitId": 77,
+                "deleted": True,
+                "recordData": {
+                    "BOOL_F": False,
+                    "NAN_F": float("nan"),
+                    "DT_F": datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                    "DATE_F": date(2026, 3, 1),
+                    "OBJ_F": ["a", "b"],
+                    "EMPTY_F": "",
+                },
+            }
+        ],
+        queries=[
+            {"annotationId": 11, "recordId": 10, "description": "Record level"},
+            {"annotationId": 12, "subjectKey": "SUBJ-2", "description": "Subject level"},
+        ],
+        include_deleted=True,
+        mask_phi=False,
+    )
+    xml_bytes = to_odm_xml(edge_archive).encode("utf-8")
+    assert validate_odm_xml(xml_bytes) == []
+
+    # Coercion helpers across boolean/integer/float/string edge cases
+    assert _coerce_dataset_json_cell("yes", "boolean") is True
+    assert _coerce_dataset_json_cell("no", "boolean") is False
+    assert _coerce_dataset_json_cell("unknown", "boolean") is None
+    assert _coerce_dataset_json_cell(True, "integer") == 1
+    assert _coerce_dataset_json_cell(4.0, "integer") == 4
+    assert _coerce_dataset_json_cell("42", "integer") == 42
+    assert _coerce_dataset_json_cell("bad", "integer") is None
+    assert _coerce_dataset_json_cell(True, "float") == 1.0
+    assert _coerce_dataset_json_cell(Decimal("2.5"), "float") == 2.5
+    assert _coerce_dataset_json_cell("3.25", "float") == 3.25
+    assert _coerce_dataset_json_cell("bad", "float") is None
+
+    # Auto-domain SDTM Dataset-JSON (with records and empty-records fallback) + labels/enrichment CDASH
+    auto_sdtm = build_dataset_json_envelope(
+        "EDGE_STUDY",
+        records=[
+            {
+                "recordId": 1,
+                "subjectKey": "SUBJ-1",
+                "formKey": "VS",
+                "recordData": {"VSTESTCD": "HR", "VSORRES": "72"},
+            }
+        ],
+        as_sdtm=True,
+        preserve_record_id=True,
+        variable_whitelist=["STUDYID", "DOMAIN", "USUBJID", "VSSEQ", "RECORD_ID"],
+    )
+    assert validate_dataset_json(auto_sdtm) == []
+
+    empty_sdtm = build_dataset_json_envelope("EDGE_STUDY", records=[], as_sdtm=True)
+    assert "IG.DM" in empty_sdtm.clinical_data.item_group_data
+
+    class _DummyPipeline:
+        def process(self, data: dict[str, object], *, mask_phi: bool = True) -> dict[str, object]:
+            return {**data, "DERIVED_COL": "ok" if mask_phi else "raw"}
+
+    labeled_cdash = build_dataset_json_envelope(
+        "EDGE_STUDY",
+        data_dictionary=dd,
+        records=[
+            {
+                "recordId": 5,
+                "subjectKey": "SUBJ-1",
+                "formKey": "FORM_10",
+                "recordData": {"STATUS_CD": "non_int_fallback"},
+            }
+        ],
+        use_labels_as_columns=True,
+        enrichment_pipeline=_DummyPipeline(),
+    )
+    assert validate_dataset_json(labeled_cdash) == []
+
+    # Negative validation paths for validate_dataset_json and validate_odm_xml
+    assert validate_dataset_json(tmp_path / "missing.json")
+    assert validate_dataset_json("[1, 2, 3]") == ["Dataset-JSON root must be a JSON object"]
+    assert validate_dataset_json(12345)  # type: ignore[arg-type]
+    assert validate_dataset_json({"datasetJSONVersion": "1.1.0"})
+
+    mismatch_dict = auto_sdtm.to_json_dict()
+    mismatch_dict["clinicalData"]["itemGroupData"]["IG.VS"]["itemData"][0][0] = "not-an-int"
+    assert any("does not match declared type" in e for e in validate_dataset_json(mismatch_dict))
+
+    assert validate_odm_xml(tmp_path / "missing.xml")
+    assert validate_odm_xml("<<<not xml")
+    assert validate_odm_xml("<WrongRoot/>") == ["Root element must be ODM, got 'WrongRoot'"]
+    assert validate_odm_xml(12345)  # type: ignore[arg-type]

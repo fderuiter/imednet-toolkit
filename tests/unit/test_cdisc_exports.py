@@ -744,3 +744,168 @@ def test_cli_export_odm_and_dataset_json_and_datadict_archive(
     app(["datadict", "to-odm", str(archive_json_path), "-o", str(roundtrip_xml_path)])
     assert validate_odm_xml(roundtrip_xml_path) == []
     assert load_odm_archive(roundtrip_xml_path) == load_odm_archive(odm_cli_out)
+
+
+def test_cdisc_sink_config_manifests_corrupt_recovery_and_schema_widening(tmp_path: Path) -> None:
+    """Verify SinkConfig overrides, JSONL checksum manifests, corrupt archive recovery, and Dataset-JSON column widening."""
+    from imednet.integrations.cdisc_export import (
+        _build_cdisc_sink_config,
+        _DatasetJsonSink,
+        _merge_dataset_json_item_groups,
+        _OdmArchiveSink,
+    )
+
+    base_cfg = SinkConfig(study_key="S1", mask_phi=True)
+    overridden = _build_cdisc_sink_config(
+        "S1",
+        config=base_cfg,
+        mask_phi=False,
+        as_sdtm=True,
+        sdtm_domain="AE",
+        naming_convention="snake_case",
+        preserve_record_id=True,
+        kwargs={"batch_size": 25, "custom_tag": "v1"},
+    )
+    assert overridden.mask_phi is False
+    assert overridden.as_sdtm is True
+    assert overridden.sdtm_domain == "AE"
+    assert overridden.naming_convention == "snake_case"
+    assert overridden.preserve_record_id is True
+    assert overridden.batch_size == 25
+    assert overridden.extra["custom_tag"] == "v1"
+
+    fresh_cfg = _build_cdisc_sink_config(
+        "S1",
+        config=None,
+        mask_phi=True,
+        as_sdtm=True,
+        sdtm_domain="DM",
+        naming_convention="camelCase",
+        preserve_record_id=False,
+        kwargs={"extra": {"seed": 1}, "another_opt": 2},
+    )
+    assert fresh_cfg.extra == {"seed": 1, "another_opt": 2}
+
+    records = {
+        1: Record(
+            record_id=1,
+            study_key="CDISC_STUDY",
+            subject_id=500,
+            subject_key="SUBJ-100",
+            site_id=1,
+            form_id=102,
+            form_key="VS",
+            visit_id=600,
+            date_modified="2026-02-01T10:05:00Z",
+            record_data={"SYSBP": 120, "DIABP": 80},
+        )
+    }
+    sdk = _build_stateful_cdisc_sdk(records)
+
+    # Corrupt ODM file recovery + manifest emission + dict/unkeyed batch staging + idempotent flush
+    corrupt_odm = tmp_path / "corrupt.odm.xml"
+    corrupt_odm.write_text("<<<corrupt xml", encoding="utf-8")
+    manifest_jsonl = tmp_path / "manifests" / "cdisc.jsonl"
+
+    inc_cfg = SinkConfig(study_key="CDISC_STUDY", incremental=True, idempotent=True)
+    odm_sink = _OdmArchiveSink(
+        sdk,
+        "CDISC_STUDY",
+        corrupt_odm,
+        inc_cfg,
+        variable_whitelist=["SYSBP"],
+        manifest_path=str(manifest_jsonl),
+    )
+    assert (
+        odm_sink.write_batch(
+            [
+                {
+                    "recordId": 1,
+                    "subjectKey": "SUBJ-100",
+                    "formKey": "VS",
+                    "recordData": {"SYSBP": 120, "DIABP": 80},
+                },
+                {
+                    "subjectKey": "SUBJ-100",
+                    "formKey": "VS",
+                    "record_data": {"SYSBP": 118, "DIABP": 76},
+                },
+            ],
+            batch_id="b1",
+        )
+        == 2
+    )
+    odm_sink.flush()
+    odm_sink.flush()  # Second flush is a safe no-op
+    odm_sink.close()
+    assert validate_odm_xml(corrupt_odm) == []
+    assert manifest_jsonl.is_file()
+
+    # Empty incremental flush on existing ODM and Dataset-JSON files returns cleanly without rewriting
+    noop_odm_sink = _OdmArchiveSink(sdk, "CDISC_STUDY", corrupt_odm, inc_cfg)
+    noop_odm_sink.flush()
+
+    dj_dir = tmp_path / "dj_domains"
+    dj_dir.mkdir()
+    (dj_dir / "broken.json").write_text("{not json", encoding="utf-8")
+    dj_sink = _DatasetJsonSink(
+        sdk,
+        "CDISC_STUDY",
+        dj_dir,
+        inc_cfg,
+        manifest_path=str(manifest_jsonl),
+    )
+    dj_sink.write_batch(
+        [{"subjectKey": "SUBJ-100", "formKey": "VS", "recordData": {"SYSBP": 121}}],
+        batch_id="dj-b1",
+    )
+    dj_sink.flush()
+    dj_sink.flush()
+    dj_sink.close()
+    assert validate_dataset_json(dj_dir / "vs.json") == []
+
+    noop_dj_sink = _DatasetJsonSink(sdk, "CDISC_STUDY", dj_dir / "vs.json", inc_cfg)
+    noop_dj_sink.flush()
+
+    # Verify _merge_dataset_json_item_groups widens mismatched column types to string and appends new columns
+    prior_grp = DatasetJsonItemGroup(
+        records=1,
+        name="VS",
+        label="Vital Signs",
+        items=(
+            DatasetJsonItem(
+                OID="ITEMGROUPDATASEQ", name="ITEMGROUPDATASEQ", label="Seq", type="integer"
+            ),
+            DatasetJsonItem(
+                OID="IT.VS.recordId", name="recordId", label="ID", type="integer", keySequence=1
+            ),
+            DatasetJsonItem(OID="IT.VS.VAL", name="VAL", label="Val", type="integer"),
+        ),
+        itemData=((1, 10, 120),),
+    )
+    delta_grp = DatasetJsonItemGroup(
+        records=1,
+        name="VS",
+        label="Vital Signs",
+        items=(
+            DatasetJsonItem(
+                OID="ITEMGROUPDATASEQ", name="ITEMGROUPDATASEQ", label="Seq", type="integer"
+            ),
+            DatasetJsonItem(
+                OID="IT.VS.recordId", name="recordId", label="ID", type="integer", keySequence=1
+            ),
+            DatasetJsonItem(OID="IT.VS.VAL", name="VAL", label="Val", type="string"),
+            DatasetJsonItem(OID="IT.VS.NEW_COL", name="NEW_COL", label="New", type="string"),
+        ),
+        itemData=((1, 11, "125+", "added"),),
+    )
+    merged_grp = _merge_dataset_json_item_groups(
+        prior_grp,
+        delta_grp,
+        voided_record_ids=set(),
+        voided_sdtm_keys=set(),
+    )
+    merged_types = {it.name: it.type for it in merged_grp.items}
+    assert merged_types["VAL"] == "string"
+    assert "NEW_COL" in merged_types
+    assert merged_grp.records == 2

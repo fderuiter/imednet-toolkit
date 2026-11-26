@@ -411,7 +411,7 @@ def test_user_from_json_roles_timestamp_arrays_and_strict_mode(monkeypatch):
         )
 
 
-def test_bundled_and_local_fallback_contract_resolution(monkeypatch):
+def test_bundled_and_local_fallback_contract_resolution(monkeypatch, tmp_path):
     """Verify bundled resource loading and local workspace fallback when env vars are unset."""
     monkeypatch.delenv("IMEDNET_OPENAPI_PATH", raising=False)
     monkeypatch.delenv("IMEDNET_POSTMAN_PATH", raising=False)
@@ -435,7 +435,9 @@ def test_bundled_and_local_fallback_contract_resolution(monkeypatch):
     assert "Record" in contract_fallback.models
 
     # Exercise local dev checkout fallback when bundled resource reports is_file() == False
+    # even when cwd is outside the repository root (e.g. tmp_path in wheel mode).
     monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
+    monkeypatch.chdir(tmp_path)
 
     class NonFileResource:
         def is_file(self) -> bool:
