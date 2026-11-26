@@ -9,6 +9,14 @@ imednet.integrations package
 Submodules
 ----------
 
+imednet.integrations.cdisc\_export module
+-----------------------------------------
+
+.. automodule:: imednet.integrations.cdisc_export
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 imednet.integrations.dispatcher module
 --------------------------------------
 

@@ -37,12 +37,17 @@ SDK and exporters resolve together using their upstream requirements.
      - OpenTelemetry API 1.45.2
      - >=1.45.2
      - Airflow and its telemetry SDK/exporters
+   * - PYSEC-2026-4396
+     - Airflow SMTP provider 3.2.2
+     - >=3.2.2
+     - Airflow → Airflow SMTP provider
 
 Soup Sieve 4.0 fixes the reported descendant-combinator issue, but later
 selector denial-of-service advisories also affect 4.0.1 and 4.1. Use 4.1.1 or
 newer, retaining the upstream default selector protections. Mako 1.4.2 fixes
 Windows drive-letter traversal. OpenTelemetry API 1.45.1 fixes tracestate parsing;
-1.45.2 also fixes traceparent parsing.
+1.45.2 also fixes traceparent parsing. Apache Airflow SMTP provider 3.2.2 fixes
+SMTP header handling.
 
 Audit the lock independently of the scanner environment, including every
 workspace member and optional extra, with no ignored advisories:
@@ -59,8 +64,8 @@ The export contains exact external pins and platform markers; workspace source
 packages are omitted because they are not registry dependencies. ``--no-deps``
 audits the already resolved graph without re-resolving it. The auditor evaluates
 markers for the current host; inspect the universal lock and run supported
-platform checks as well. Unit regressions check every locked copy of the three
-affected packages, including copies for other platforms.
+platform checks as well. Unit regressions check every locked copy of the four
+constrained packages, including copies for other platforms.
 The Pipeline quality job runs this same independent audit before the detached
 scanner gate. It cannot inherit the scanner-only advisory exceptions.
 
@@ -75,6 +80,7 @@ Maintainer advisories:
 * `Mako drive-letter traversal <https://github.com/sqlalchemy/mako/security/advisories/GHSA-5639-2j2p-m4mx>`_
 * `OpenTelemetry tracestate parsing <https://github.com/open-telemetry/opentelemetry-python/security/advisories/GHSA-xcq7-p3pf-p88h>`_
 * `OpenTelemetry traceparent parsing <https://github.com/open-telemetry/opentelemetry-python/security/advisories/GHSA-mf5v-w3w3-f6cg>`_
+* `Airflow SMTP provider header handling <https://github.com/advisories/GHSA-799x-qp47-8qwq>`_
 
 Scanner-only upstream exceptions
 --------------------------------

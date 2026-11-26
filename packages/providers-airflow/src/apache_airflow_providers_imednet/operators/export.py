@@ -29,10 +29,12 @@ logger = logging.getLogger(__name__)
 # Fallback mapping for tabular exports if the user explicitly needs them or backward compatibility
 _TABULAR_EXPORTS = {
     "csv": export.export_to_csv,
+    "dataset_json": export.export_to_dataset_json,
     "parquet": export.export_to_parquet,
     "hive_parquet": export.export_to_hive_parquet,
     "excel": export.export_to_excel,
     "json": export.export_to_json,
+    "odm": export.export_to_odm,
     "sql": export.export_to_sql,
     "sql_by_form": export.export_to_sql_by_form,
     "long_sql": export.export_to_long_sql,
@@ -445,7 +447,10 @@ class ImednetExportOperator(BaseOperator):
             dest = self.export_func.replace("export_to_", "")
         elif not dest:
             dest = "csv"
-        return dest.lower().strip()
+        normalized = dest.lower().strip()
+        if normalized == "dataset-json":
+            return "dataset_json"
+        return normalized
 
     def _get_sdk(self) -> ImednetSDK:
         """Resolve the SDK client from the configured Airflow connection at execute time."""

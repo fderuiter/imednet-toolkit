@@ -111,8 +111,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Hatch
-        run: python -m pip install --upgrade pip hatch
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
 
       - name: Tighten Internal Dependencies
         run: python scripts/tighten_dependencies.py --rewrite
@@ -121,8 +123,15 @@ jobs:
         env:
           PACKAGE: ${{ matrix.package }}
         run: |
+          case "$PACKAGE" in
+            core|plugins-workflows|providers-airflow|plugins-sinks|plugins-tui) ;;
+            *)
+              echo "Unexpected release package: $PACKAGE" >&2
+              exit 1
+              ;;
+          esac
           cd "packages/$PACKAGE"
-          hatch build
+          uvx --from "hatch==1.18.2" hatch build
 
       - name: Restore Internal Dependencies
         if: always()
@@ -146,7 +155,7 @@ jobs:
     environment: pypi
     permissions:
       id-token: write # Mandatory for trusted publishing
-      attestations: write
+      attestations: write # Required to sign SLSA build provenance attestations
       contents: read
     strategy:
       fail-fast: false
@@ -172,6 +181,6 @@ jobs:
           subject-path: 'dist/*'
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           skip-existing: true

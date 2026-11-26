@@ -21,11 +21,11 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: read
+      pull-requests: read # Required to inspect PR title metadata via the GitHub API
     steps:
       - name: Validate PR title
-        if: ${{ !contains(github.event.pull_request.user.login, '[bot]') }}
-        uses: amannn/action-semantic-pull-request@2252a14e810aa9b85c2d560bd7070c802206ecf6 # v6
+        if: "!contains(github.event.pull_request.user.login, '[bot]')"
+        uses: amannn/action-semantic-pull-request@2252a14e810aa9b85c2d560bd7070c802206ecf6 # v6.1.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -40,9 +40,6 @@ jobs:
             perf
             revert
 
-  # ------------------------------------------------------------------
-  # JOB 1: QUALITY GATE (Runs per package)
-  # ------------------------------------------------------------------
   # ------------------------------------------------------------------
   # JOB 0.1: GLOBAL LINTING (Runs unconditionally)
   # ------------------------------------------------------------------
@@ -83,8 +80,9 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Cache pre-commit environments
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore pre-commit environments
+        id: cache-pre-commit
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
@@ -96,6 +94,12 @@ jobs:
           enable-cache: "false"
       - name: Run pre-commit hooks
         run: uvx --from "pre-commit==4.7.0" pre-commit run --all-files --show-diff-on-failure
+      - name: Save pre-commit environments
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache-pre-commit.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
 
   # ------------------------------------------------------------------
   # JOB 0.5: DETECT CHANGES & PLAN
@@ -153,10 +157,10 @@ jobs:
     name: OpenSSF Scorecard
     runs-on: ubuntu-latest
     permissions:
-      security-events: write
-      id-token: write
-      contents: read
-      actions: read
+      security-events: write # Required to upload Scorecard SARIF results to code scanning
+      id-token: write # Required by ossf/scorecard-action for OIDC provenance when publishing on main
+      contents: read # Required to inspect repository contents
+      actions: read # Required to audit GitHub Actions workflow configurations
     steps:
       - name: "Checkout code"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -182,6 +186,9 @@ jobs:
         with:
           sarif_file: results.sarif
 
+  # ------------------------------------------------------------------
+  # JOB 1: QUALITY GATE (Workspace Quality & Security)
+  # ------------------------------------------------------------------
   quality:
     name: Workspace Quality & Security
     needs: [pre-commit]
@@ -196,36 +203,45 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Workspace Dependencies
+        id: cache-uv
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-py3.11-
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: "false"
       - name: Install Dependencies
         run: uv sync --locked --all-packages --all-extras
+      - name: Save Workspace Dependencies
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache-uv.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: uv-venv-${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
 
       - name: Audit locked workspace dependencies
         run: |
           uv export --locked --all-packages --all-extras --no-emit-workspace \
             --no-hashes --format requirements-txt --output-file "$RUNNER_TEMP/imednet-locked.txt"
-          uvx pip-audit -s osv --timeout 60 --disable-pip --no-deps \
+          uvx --from "pip-audit==2.10.1" pip-audit -s osv --timeout 60 --disable-pip --no-deps \
             -r "$RUNNER_TEMP/imednet-locked.txt"
 
       - name: Run Quality & Security Checks
         run: |
           uvx --from "detect-secrets==1.5.0" python scripts/run_secret_scan.py .
           uvx --from "semgrep==1.185.0" semgrep scan --config p/security-audit --metrics off --error packages
-          uvx --from "vulture>=2.11" vulture packages vulture_whitelist.py --min-confidence 80 --exclude "**/tests/**,**/docs/**,**/scripts/**"
-          uvx --from "pylint>=3.0.0" pylint --rcfile=pyproject.toml --disable=all --enable=similarities --min-similarity-lines=20 --ignore-paths='.*/tests/.*,.*/docs/.*,.*/scripts/.*,.*/models/.*,tests/.*,docs/.*,scripts/.*,.*\.json$' --ignore-patterns='.*monitor.*,.*integrations.*,.*sinks.*,.*testing.*' packages
-          uvx --from "pylint>=3.0.0" pylint --rcfile=pyproject.toml --disable=all --enable=duplicate-code packages
+          uvx --from "vulture==2.16" vulture packages vulture_whitelist.py --min-confidence 80 --exclude "**/tests/**,**/docs/**,**/scripts/**"
+          uvx --from "pylint==4.1.4" pylint --rcfile=pyproject.toml --disable=all --enable=similarities --min-similarity-lines=20 --ignore-paths='.*/tests/.*,.*/docs/.*,.*/scripts/.*,.*/models/.*,tests/.*,docs/.*,scripts/.*,.*\.json$' --ignore-patterns='.*monitor.*,.*integrations.*,.*sinks.*,.*testing.*' packages
+          uvx --from "pylint==4.1.4" pylint --rcfile=pyproject.toml --disable=all --enable=duplicate-code packages
 
       - name: Run Canonical Workspace Verification
         run: |
@@ -259,20 +275,23 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Workspace Dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-py3.11-
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
       - name: Install Dependencies
         run: |
-          python -m pip install uv hatch
           uv sync --locked --all-packages --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Tighten Internal Dependencies
         run: python scripts/tighten_dependencies.py --rewrite
@@ -286,7 +305,7 @@ jobs:
               if [ -f "$package/pyproject.toml" ]; then
                 (
                   cd "$package"
-                  hatch build
+                  uvx --from "hatch==1.18.2" hatch build
                 )
               fi
             done
@@ -361,15 +380,16 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Workspace Dependencies
+        id: cache-uv
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-${{ matrix.python-version }}-
+            uv-venv-${{ runner.os }}-py${{ matrix.python-version }}-
 
       - name: Download Built Artifacts
         if: needs.plan.outputs.build_matrix != '[]'
@@ -379,14 +399,35 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
+
       - name: Install Dependencies
         run: |
-          python -m pip install uv hatch
           uv sync --locked --all-packages --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
+      - name: Save Python 3.13 Workspace Dependencies
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          matrix.package == 'core' &&
+          matrix.python-version == '3.13' &&
+          steps.cache-uv.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: uv-venv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install Built Wheels
+        if: needs.plan.outputs.build_matrix != '[]'
+        run: |
           if ls dist/*.whl 1> /dev/null 2>&1; then
-            uv pip install --force-reinstall --no-deps dist/*.whl
+            uv pip install --force-reinstall --no-cache --no-deps dist/*.whl
           fi
 
       - name: Run Tests
@@ -438,21 +479,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Workspace Dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-py3.11-
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
 
       - name: Install Dependencies
         run: |
-          python -m pip install uv hatch
           uv sync --locked --all-packages --all-extras
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Run Hermetic Integration Sandbox
         env:
@@ -493,9 +538,9 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.12-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.12"-
+            uv-venv-${{ runner.os }}-py3.12-
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
@@ -514,7 +559,7 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.12"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.12-${{ hashFiles('uv.lock') }}
 
       - name: Restore Fuzzing Corpus Cache
         id: restore-fuzz-corpus
@@ -572,15 +617,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Workspace Dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-py3.11-
 
       - name: Download Built Artifacts
         if: needs.plan.outputs.build_matrix != '[]'
@@ -621,15 +666,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache Workspace Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Workspace Dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-"3.11"-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-"3.11"-
+            uv-venv-${{ runner.os }}-py3.11-
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
@@ -645,15 +690,15 @@ jobs:
 
       - name: Verify Interactive Pyodide Tutorials
         run: |
-          uv run --no-project --with playwright playwright install --with-deps chromium
-          uv run --no-project --with playwright python scripts/verify_pyodide_tutorials.py --html-dir docs/_build/html
+          uv run --no-project --with "playwright==1.65.2" playwright install --with-deps chromium
+          uv run --no-project --with "playwright==1.65.2" python scripts/verify_pyodide_tutorials.py --html-dir docs/_build/html
 
       - name: Verify Documentation Accessibility and Diagrams in Chromium
         env:
           IMEDNET_REQUIRE_PLAYWRIGHT: "1"
           IMEDNET_BUILT_HTML_DIR: docs/_build/html
         run: |
-          uv run --with playwright pytest -o addopts="" tests/unit/test_docs_accessibility.py
+          uv run --with "playwright==1.65.2" pytest -o addopts="" tests/unit/test_docs_accessibility.py
           rm -rf reports coverage.xml .coverage* .pytest_cache test-results playwright-report
 
       - name: Assert Clean Working Tree
@@ -713,8 +758,8 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
-      pages: write
-      id-token: write
+      pages: write # Required to deploy built HTML documentation to GitHub Pages
+      id-token: write # Required for GitHub Pages OIDC deployment attestation
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

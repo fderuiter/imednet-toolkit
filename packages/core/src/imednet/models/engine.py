@@ -851,20 +851,20 @@ def get_contract() -> APIContract:
                 with importlib.resources.as_file(resource) as bundled_path:
                     builder.ingest_postman(str(bundled_path))
             else:
-                # Local dev checkout fallback
-                local_dev_candidates = (
-                    os.path.join(
+                # Local dev checkout fallback (editable src/ layout and workspace .venv wheel layout)
+                editable_root = os.path.dirname(
+                    os.path.dirname(
                         os.path.dirname(
                             os.path.dirname(
-                                os.path.dirname(
-                                    os.path.dirname(
-                                        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                                    )
-                                )
+                                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                             )
-                        ),
-                        "imednet.postman_collection.json",
-                    ),
+                        )
+                    )
+                )
+                venv_wheel_root = os.path.dirname(editable_root)
+                local_dev_candidates = (
+                    os.path.join(editable_root, "imednet.postman_collection.json"),
+                    os.path.join(venv_wheel_root, "imednet.postman_collection.json"),
                     os.path.join(os.getcwd(), "imednet.postman_collection.json"),
                 )
                 local_dev_path = next(

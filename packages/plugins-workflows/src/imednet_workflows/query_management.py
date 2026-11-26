@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from imednet.spi.cdisc import OdmAnnotation, map_queries_to_annotations
 from imednet.spi.models import (
     Query,
     QueryStatus,
@@ -15,7 +17,11 @@ from imednet.spi.models import (
     TriageStatus,
     calculate_legacy_status,
 )
-from imednet.spi.utils import normalize_iso_date, parse_iso_datetime
+from imednet.spi.utils import (
+    normalize_iso_date,
+    parse_iso_datetime,
+    resolve_enrichment_pipeline,
+)
 
 from ._filter_bounds import filter_queries_by_subject_keys, plan_site_subject_query_filters
 from .triage_store import TriageStore
@@ -414,6 +420,51 @@ class QueryManagementWorkflow:
             target_store.upsert_item(triage_item)
 
         return target_store.get_queue(study_key)
+
+    def extract_odm_annotations(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        *,
+        open_only: bool = False,
+        include_answered: bool = False,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **kwargs: Any,
+    ) -> list[OdmAnnotation]:
+        """Extract study Query and QueryComment histories mapped to ODM 1.3.2 ``<Annotation>`` models."""
+        if open_only:
+            queries = self.get_open_queries(
+                study_key,
+                additional_filter=additional_filter,
+                include_answered=include_answered,
+                **kwargs,
+            )
+        else:
+            filters = dict(additional_filter) if additional_filter else {}
+            queries = list(self._sdk.get_queries(study_key, **filters, **kwargs))
+
+        resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
+        if mask_phi:
+            pipeline = resolve_enrichment_pipeline(study_key)
+            if pipeline is not None and getattr(pipeline, "phi_keys", None):
+                resolved_phi.update(pipeline.phi_keys)
+
+        by_rec_var, by_rec, by_subj, unattached = map_queries_to_annotations(
+            queries,
+            mask_phi=mask_phi,
+            custom_phi_keys=resolved_phi or None,
+        )
+        ordered: list[OdmAnnotation] = []
+        for _key, anns in sorted(by_rec_var.items()):
+            ordered.extend(anns)
+        for _rid, anns in sorted(by_rec.items()):
+            ordered.extend(anns)
+        for _sk, anns in sorted(by_subj.items()):
+            ordered.extend(anns)
+        ordered.extend(unattached)
+        ordered.sort(key=lambda ann: ann.seq_num)
+        return ordered
 
 
 # Integration:
