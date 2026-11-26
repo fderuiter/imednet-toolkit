@@ -803,6 +803,27 @@ def _build_pruned_imports(
     return "\n\n".join(blocks).splitlines() if blocks else []
 
 
+def _iter_local_postman_candidates(module_file: str) -> list[str]:
+    """Build candidate paths for local workspace ``imednet.postman_collection.json`` discovery."""
+    candidates: list[str] = []
+    seen_dirs: set[str] = set()
+    current = os.path.dirname(os.path.abspath(module_file))
+    while current and current not in seen_dirs:
+        seen_dirs.add(current)
+        candidates.append(os.path.join(current, "imednet.postman_collection.json"))
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    if cwd and cwd not in seen_dirs:
+        candidates.append(os.path.join(cwd, "imednet.postman_collection.json"))
+    return candidates
+
+
 def get_contract() -> APIContract:
     """Load API schema contracts lazily.
 
@@ -852,21 +873,7 @@ def get_contract() -> APIContract:
                     builder.ingest_postman(str(bundled_path))
             else:
                 # Local dev checkout fallback
-                local_dev_candidates = (
-                    os.path.join(
-                        os.path.dirname(
-                            os.path.dirname(
-                                os.path.dirname(
-                                    os.path.dirname(
-                                        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                                    )
-                                )
-                            )
-                        ),
-                        "imednet.postman_collection.json",
-                    ),
-                    os.path.join(os.getcwd(), "imednet.postman_collection.json"),
-                )
+                local_dev_candidates = _iter_local_postman_candidates(__file__)
                 local_dev_path = next(
                     (candidate for candidate in local_dev_candidates if os.path.exists(candidate)),
                     None,

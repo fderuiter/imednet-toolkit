@@ -11,7 +11,10 @@ import re
 import shutil
 import sys
 import threading
-from collections.abc import Sequence
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Sequence
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -196,6 +199,107 @@ def verify_built_tutorial_html(html_dir: Path) -> list[str]:
     return errors
 
 
+CACHEABLE_UPSTREAM_PREFIXES: tuple[str, ...] = (
+    "https://cdn.jsdelivr.net/",
+    "https://pypi.org/",
+    "https://files.pythonhosted.org/",
+)
+
+
+class PyodideInitializationError(RuntimeError):
+    """Raised when the browser Pyodide runtime reports .thebe-status-failed."""
+
+
+def _is_recoverable_browser_error(exc: BaseException) -> bool:
+    """Return True when *exc* represents a transient renderer crash, timeout, or CDN init error."""
+    if isinstance(exc, (PyodideInitializationError, TimeoutError)):
+        return True
+    msg = f"{type(exc).__name__}: {exc}"
+    return any(
+        token in msg
+        for token in (
+            "Page crashed",
+            "Target closed",
+            "TargetClosedError",
+            "TimeoutError",
+            "Execution context was destroyed",
+            "net::ERR_",
+        )
+    )
+
+
+def _fetch_upstream_with_retry(
+    url: str,
+    cache: dict[str, tuple[int, str, bytes]],
+    cache_lock: threading.Lock,
+    max_attempts: int = 4,
+) -> tuple[int, str, bytes] | None:
+    """Fetch and memoize immutable Pyodide CDN / PyPI artifacts with bounded retry backoff."""
+    with cache_lock:
+        cached = cache.get(url)
+    if cached is not None:
+        return cached
+
+    for attempt in range(max_attempts):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "imednet-toolkit-pyodide-verify/1.2",
+                "Accept": "*/*",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
+                status = int(getattr(resp, "status", 200))
+                content_type = resp.headers.get("Content-Type") or "application/octet-stream"
+                body = resp.read()
+            if status == 200:
+                entry = (status, content_type, body)
+                with cache_lock:
+                    cache[url] = entry
+                return entry
+            if status not in (408, 429, 500, 502, 503, 504):
+                return (status, content_type, body)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (408, 429, 500, 502, 503, 504) or attempt + 1 >= max_attempts:
+                return None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt + 1 >= max_attempts:
+                return None
+        time.sleep(0.5 * (2**attempt))
+    return None
+
+
+def _install_upstream_cache_route(
+    context: Any,
+    cache: dict[str, tuple[int, str, bytes]],
+    cache_lock: threading.Lock,
+) -> None:
+    """Attach a Playwright route handler caching CDN and PyPI GET assets across browser restarts."""
+
+    def _handle_route(route: Any) -> None:
+        req = route.request
+        url = req.url
+        if req.method == "GET" and url.startswith(CACHEABLE_UPSTREAM_PREFIXES):
+            fetched = _fetch_upstream_with_retry(url, cache, cache_lock)
+            if fetched is not None:
+                status, content_type, body = fetched
+                with contextlib.suppress(Exception):
+                    route.fulfill(
+                        status=status,
+                        headers={
+                            "Content-Type": content_type,
+                            "Access-Control-Allow-Origin": "*",
+                        },
+                        body=body,
+                    )
+                return
+        with contextlib.suppress(Exception):
+            route.continue_()
+
+    context.route("**/*", _handle_route)
+
+
 def _launch_browser(playwright_instance: Any) -> Any:
     """Launch headless Chromium using Playwright's browser cache or pre-installed system Chrome."""
     _ensure_open_file_headroom()
@@ -203,6 +307,7 @@ def _launch_browser(playwright_instance: Any) -> Any:
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--disable-software-rasterizer",
         "--disable-features=BackForwardCache",
     ]
     try:
@@ -240,6 +345,27 @@ def _launch_browser(playwright_instance: Any) -> Any:
         raise
 
 
+def _wait_for_pyodide_ready(page: Any, timeout_ms: int, page_name: str) -> None:
+    """Wait for Pyodide launch button to reach ready state, failing fast on failed state."""
+    state_handle = page.wait_for_function(
+        """() => {
+            const btn = document.querySelector(".thebe-launch-button");
+            if (!btn) return false;
+            if (btn.classList.contains("thebe-status-ready")) return "ready";
+            if (btn.classList.contains("thebe-status-failed")) {
+                return "failed:" + (btn.getAttribute("title") || btn.textContent || "");
+            }
+            return false;
+        }""",
+        timeout=timeout_ms,
+    )
+    state_val = str(state_handle.json_value())
+    if state_val.startswith("failed:"):
+        raise PyodideInitializationError(
+            f"{page_name}: Pyodide runtime failed to initialize ({state_val[len('failed:') :].strip()})"
+        )
+
+
 def _run_cell_and_wait(page: Any, cell_index: int, timeout_ms: int) -> dict[str, str]:
     """Click Run on a transformed cell and wait until execution status settles."""
     cell_selector = f"#thebe-codecell-{cell_index}"
@@ -271,6 +397,64 @@ def _run_cell_and_wait(page: Any, cell_index: int, timeout_ms: int) -> dict[str,
     }
 
 
+def _run_tutorial_page_with_retry(
+    playwright_instance: Any,
+    *,
+    url: str,
+    timeout_ms: int,
+    upstream_cache: dict[str, tuple[int, str, bytes]],
+    upstream_cache_lock: threading.Lock,
+    verify_fn: Callable[[Any, dict[str, int], list[str]], None],
+    port: int,
+    init_script: str | None = None,
+    max_attempts: int = 3,
+) -> list[str]:
+    """Execute a tutorial page session in an isolated Chromium browser with full-session retries."""
+    for attempt in range(max_attempts):
+        browser = _launch_browser(playwright_instance)
+        context: Any = None
+        page: Any = None
+        wheel_responses: dict[str, int] = {}
+        attempt_errors: list[str] = []
+
+        def _record_wheel_response(
+            response: Any,
+            _store: dict[str, int] = wheel_responses,
+        ) -> None:
+            if response.url.endswith(".whl") and f"127.0.0.1:{port}" in response.url:
+                _store[Path(response.url).name] = response.status
+
+        try:
+            context = browser.new_context(viewport={"width": 1440, "height": 1100})
+            _install_upstream_cache_route(context, upstream_cache, upstream_cache_lock)
+            page = context.new_page()
+            if init_script is not None:
+                page.add_init_script(init_script)
+            page.on("response", _record_wheel_response)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            verify_fn(page, wheel_responses, attempt_errors)
+            return attempt_errors
+        except Exception as exc:
+            if not _is_recoverable_browser_error(exc) or attempt + 1 >= max_attempts:
+                raise
+            print(
+                f"Retrying {url} in fresh Chromium after transient failure "
+                f"(attempt {attempt + 1}/{max_attempts}): {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(1.0 * (attempt + 1))
+        finally:
+            if page is not None:
+                with contextlib.suppress(Exception):
+                    page.close()
+            if context is not None:
+                with contextlib.suppress(Exception):
+                    context.close()
+            with contextlib.suppress(Exception):
+                browser.close()
+    raise RuntimeError(f"Exhausted retries verifying {url}")
+
+
 def verify_tutorials_in_browser(
     html_dir: Path,
     timeout_ms: int = 120_000,
@@ -284,6 +468,8 @@ def verify_tutorials_in_browser(
     _ensure_open_file_headroom()
     mimetypes.init()
     errors: list[str] = []
+    upstream_cache: dict[str, tuple[int, str, bytes]] = {}
+    upstream_cache_lock = threading.Lock()
     handler = functools.partial(_QuietStaticHandler, directory=str(html_dir.resolve()))
     server = _QuietHTTPServer(("127.0.0.1", 0), handler)
     port = server.server_address[1]
@@ -295,79 +481,30 @@ def verify_tutorials_in_browser(
 
     try:
         with sync_playwright() as playwright_instance:
-            browser = _launch_browser(playwright_instance)
-            try:
-                context = browser.new_context(viewport={"width": 1440, "height": 1100})
-
-                def _open_tutorial_page(
-                    url: str,
-                    *,
-                    response_cb: Any,
-                    init_script: str | None = None,
-                ) -> Any:
-                    nonlocal browser, context
-                    for attempt in range(3):
-                        page = context.new_page()
-                        if init_script is not None:
-                            page.add_init_script(init_script)
-                        page.on("response", response_cb)
-                        try:
-                            page.goto(
-                                url,
-                                wait_until="domcontentloaded",
-                                timeout=timeout_ms,
-                            )
-                            return page
-                        except Exception as exc:
-                            msg = f"{type(exc).__name__}: {exc}"
-                            is_crash = (
-                                "Page crashed" in msg
-                                or "Target closed" in msg
-                                or "TargetClosedError" in msg
-                            )
-                            with contextlib.suppress(Exception):
-                                page.close()
-                            if not is_crash or attempt == 2:
-                                raise
-                            with contextlib.suppress(Exception):
-                                context.close()
-                            with contextlib.suppress(Exception):
-                                browser.close()
-                            browser = _launch_browser(playwright_instance)
-                            context = browser.new_context(viewport={"width": 1440, "height": 1100})
-                    raise RuntimeError(f"Failed to navigate to {url}")
-
-                # 1. Verify synchronous + mixed tutorial cells on tutorials/quick_start.html
-                qs_wheel_responses: dict[str, int] = {}
-
-                def _record_qs_response(response: Any) -> None:
-                    if response.url.endswith(".whl") and f"127.0.0.1:{port}" in response.url:
-                        qs_wheel_responses[Path(response.url).name] = response.status
-
-                qs_page = _open_tutorial_page(
-                    f"http://127.0.0.1:{port}/tutorials/quick_start.html",
-                    response_cb=_record_qs_response,
-                )
-
+            # 1. Verify synchronous + mixed tutorial cells on tutorials/quick_start.html
+            def _verify_quick_start(
+                qs_page: Any,
+                qs_wheel_responses: dict[str, int],
+                page_errors: list[str],
+            ) -> None:
                 launch_btn = qs_page.locator(".thebe-launch-button").first
                 initial_label = (launch_btn.text_content() or "").strip()
                 if LEGACY_BINDER_LABEL_PATTERN.search(initial_label):
-                    errors.append(
+                    page_errors.append(
                         f"quick_start.html: Launch button showed Binder label: '{initial_label}'"
                     )
 
                 launch_btn.click()
-                qs_page.wait_for_selector(
-                    ".thebe-launch-button.thebe-status-ready",
-                    timeout=timeout_ms,
-                )
+                _wait_for_pyodide_ready(qs_page, timeout_ms, "quick_start.html")
                 ready_label = (launch_btn.text_content() or "").strip()
                 if LEGACY_BINDER_LABEL_PATTERN.search(ready_label):
-                    errors.append(
+                    page_errors.append(
                         f"quick_start.html: Ready button showed Binder label: '{ready_label}'"
                     )
                 if ready_label not in ("Pyodide (WebAssembly): ready", "Pyodide Ready"):
-                    errors.append(f"quick_start.html: Unexpected ready button text '{ready_label}'")
+                    page_errors.append(
+                        f"quick_start.html: Unexpected ready button text '{ready_label}'"
+                    )
 
                 for prefix in EXPECTED_WHEEL_PREFIXES:
                     matched_statuses = [
@@ -376,26 +513,26 @@ def verify_tutorials_in_browser(
                         if name.startswith(prefix)
                     ]
                     if not matched_statuses or matched_statuses[-1] != 200:
-                        errors.append(
+                        page_errors.append(
                             f"quick_start.html: Expected HTTP 200 for wheel '{prefix}*', "
                             f"observed {qs_wheel_responses}"
                         )
 
                 cell_count = qs_page.locator(".thebelab-cell").count()
                 if cell_count != 3:
-                    errors.append(
+                    page_errors.append(
                         f"quick_start.html: Expected 3 interactive Python cells, found {cell_count}"
                     )
 
                 for idx in range(cell_count):
                     outcome = _run_cell_and_wait(qs_page, idx, timeout_ms)
                     if outcome["status"] != "Execution completed.":
-                        errors.append(
+                        page_errors.append(
                             f"quick_start.html cell {idx}: Expected 'Execution completed.', "
                             f"got '{outcome['status']}' (stderr: {outcome['stderr']!r})"
                         )
                     if "Traceback (most recent call last)" in outcome["stderr"]:
-                        errors.append(
+                        page_errors.append(
                             f"quick_start.html cell {idx}: Unexpected traceback in stderr:\n"
                             f"{outcome['stderr']}"
                         )
@@ -420,7 +557,9 @@ def verify_tutorials_in_browser(
                         plugin_outcome["status"] != "Execution completed."
                         or "PLUGINS_READY True True" not in plugin_outcome["stdout"]
                     ):
-                        errors.append(f"quick_start.html plugin check failed: {plugin_outcome}")
+                        page_errors.append(
+                            f"quick_start.html plugin check failed: {plugin_outcome}"
+                        )
 
                     editor.fill(
                         "import sys\n"
@@ -430,78 +569,75 @@ def verify_tutorials_in_browser(
                     )
                     exit_outcome = _run_cell_and_wait(qs_page, 2, timeout_ms)
                     if exit_outcome["status"] != "Execution completed with errors.":
-                        errors.append(
+                        page_errors.append(
                             f"quick_start.html SystemExit(1) status mismatch: {exit_outcome}"
                         )
                     if "BUFFERED_STDOUT" not in exit_outcome["stdout"]:
-                        errors.append(
+                        page_errors.append(
                             f"quick_start.html SystemExit(1) lost buffered stdout: {exit_outcome}"
                         )
                     if (
                         "Error: missing credentials" not in exit_outcome["stderr"]
                         or "SystemExit: 1" not in exit_outcome["stderr"]
                     ):
-                        errors.append(
+                        page_errors.append(
                             f"quick_start.html SystemExit(1) lost stderr/exit status: {exit_outcome}"
                         )
 
-                qs_page.close()
-                context.close()
-                browser.close()
-
-                # 2. Verify async tutorial cell on tutorials/async_quick_start.html
-                #    in a fresh Chromium process so WebAssembly Pyodide heaps are isolated
-                browser = _launch_browser(playwright_instance)
-                context = browser.new_context(viewport={"width": 1440, "height": 1100})
-                strip_url_root_script = """
-                    (() => {
-                        let _docOpts = {};
-                        Object.defineProperty(window, "DOCUMENTATION_OPTIONS", {
-                            configurable: true,
-                            enumerable: true,
-                            get() { return _docOpts; },
-                            set(val) {
-                                const copy = Object.assign({}, val || {});
-                                delete copy.URL_ROOT;
-                                _docOpts = copy;
-                            }
-                        });
-                    })();
-                    """
-                async_wheel_responses: dict[str, int] = {}
-
-                def _record_async_response(response: Any) -> None:
-                    if response.url.endswith(".whl") and f"127.0.0.1:{port}" in response.url:
-                        async_wheel_responses[Path(response.url).name] = response.status
-
-                async_page = _open_tutorial_page(
-                    f"http://127.0.0.1:{port}/tutorials/async_quick_start.html",
-                    response_cb=_record_async_response,
-                    init_script=strip_url_root_script,
+            errors.extend(
+                _run_tutorial_page_with_retry(
+                    playwright_instance,
+                    url=f"http://127.0.0.1:{port}/tutorials/quick_start.html",
+                    timeout_ms=timeout_ms,
+                    upstream_cache=upstream_cache,
+                    upstream_cache_lock=upstream_cache_lock,
+                    verify_fn=_verify_quick_start,
+                    port=port,
                 )
+            )
 
+            # 2. Verify async tutorial cell on tutorials/async_quick_start.html
+            #    in a fresh Chromium process while sharing cached CDN/PyPI bytes
+            strip_url_root_script = """
+                (() => {
+                    let _docOpts = {};
+                    Object.defineProperty(window, "DOCUMENTATION_OPTIONS", {
+                        configurable: true,
+                        enumerable: true,
+                        get() { return _docOpts; },
+                        set(val) {
+                            const copy = Object.assign({}, val || {});
+                            delete copy.URL_ROOT;
+                            _docOpts = copy;
+                        }
+                    });
+                })();
+                """
+
+            def _verify_async_quick_start(
+                async_page: Any,
+                async_wheel_responses: dict[str, int],
+                page_errors: list[str],
+            ) -> None:
                 url_root_absent = async_page.evaluate(
                     "() => typeof DOCUMENTATION_OPTIONS === 'undefined' || !('URL_ROOT' in DOCUMENTATION_OPTIONS)"
                 )
                 if not url_root_absent:
-                    errors.append(
+                    page_errors.append(
                         "async_quick_start.html: Failed to strip DOCUMENTATION_OPTIONS.URL_ROOT"
                     )
 
                 async_launch = async_page.locator(".thebe-launch-button").first
                 async_launch.click()
-                async_page.wait_for_selector(
-                    ".thebe-launch-button.thebe-status-ready",
-                    timeout=timeout_ms,
-                )
+                _wait_for_pyodide_ready(async_page, timeout_ms, "async_quick_start.html")
 
                 async_ready_label = (async_launch.text_content() or "").strip()
                 if LEGACY_BINDER_LABEL_PATTERN.search(async_ready_label):
-                    errors.append(
+                    page_errors.append(
                         f"async_quick_start.html: Ready button showed Binder label: '{async_ready_label}'"
                     )
                 if async_ready_label not in ("Pyodide (WebAssembly): ready", "Pyodide Ready"):
-                    errors.append(
+                    page_errors.append(
                         f"async_quick_start.html: Unexpected ready button text '{async_ready_label}'"
                     )
 
@@ -512,25 +648,25 @@ def verify_tutorials_in_browser(
                         if name.startswith(prefix)
                     ]
                     if not matched_statuses or matched_statuses[-1] != 200:
-                        errors.append(
+                        page_errors.append(
                             f"async_quick_start.html: Expected HTTP 200 via data-content_root for "
                             f"wheel '{prefix}*', observed {async_wheel_responses}"
                         )
 
                 async_cells = async_page.locator(".thebelab-cell").count()
                 if async_cells != 1:
-                    errors.append(
+                    page_errors.append(
                         f"async_quick_start.html: Expected 1 interactive Python cell, found {async_cells}"
                     )
                 else:
                     async_outcome = _run_cell_and_wait(async_page, 0, timeout_ms)
                     if async_outcome["status"] != "Execution completed.":
-                        errors.append(
+                        page_errors.append(
                             f"async_quick_start.html cell 0: Expected 'Execution completed.', "
                             f"got '{async_outcome['status']}' (stderr: {async_outcome['stderr']!r})"
                         )
                     if "Traceback (most recent call last)" in async_outcome["stderr"]:
-                        errors.append(
+                        page_errors.append(
                             f"async_quick_start.html cell 0: Unexpected traceback:\n"
                             f"{async_outcome['stderr']}"
                         )
@@ -538,7 +674,7 @@ def verify_tutorials_in_browser(
                         "DEMO-STUDY" not in async_outcome["stdout"]
                         or "COMPLETED" not in async_outcome["stdout"]
                     ):
-                        errors.append(
+                        page_errors.append(
                             f"async_quick_start.html cell 0: Missing expected simulated output, "
                             f"stdout was: {async_outcome['stdout']!r}"
                         )
@@ -549,10 +685,18 @@ def verify_tutorials_in_browser(
                         full_page=True,
                     )
 
-                async_page.close()
-                context.close()
-            finally:
-                browser.close()
+            errors.extend(
+                _run_tutorial_page_with_retry(
+                    playwright_instance,
+                    url=f"http://127.0.0.1:{port}/tutorials/async_quick_start.html",
+                    timeout_ms=timeout_ms,
+                    upstream_cache=upstream_cache,
+                    upstream_cache_lock=upstream_cache_lock,
+                    verify_fn=_verify_async_quick_start,
+                    port=port,
+                    init_script=strip_url_root_script,
+                )
+            )
     finally:
         server.shutdown()
         server.server_close()

@@ -1765,6 +1765,16 @@ def test_verify_built_tutorial_html_invariants(tmp_path: Path) -> None:
     assert LEGACY_BINDER_LABEL_PATTERN.search("Activate Interactive Runtime") is None
     assert LEGACY_BINDER_LABEL_PATTERN.search("Pyodide (WebAssembly): ready") is None
 
+    from scripts.verify_pyodide_tutorials import (
+        PyodideInitializationError,
+        _is_recoverable_browser_error,
+    )
+
+    assert _is_recoverable_browser_error(PyodideInitializationError("CDN timeout")) is True
+    assert _is_recoverable_browser_error(TimeoutError("wait_for_function timed out")) is True
+    assert _is_recoverable_browser_error(RuntimeError("Page crashed")) is True
+    assert _is_recoverable_browser_error(ValueError("assertion failure")) is False
+
 
 @pytest.mark.unit
 def test_high_contrast_and_mermaid_conf_tokens() -> None:
@@ -2107,6 +2117,7 @@ def _launch_chromium_for_accessibility(playwright_instance: object) -> object:
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--disable-software-rasterizer",
         "--disable-features=BackForwardCache",
     ]
     chromium = playwright_instance.chromium  # type: ignore[attr-defined]
@@ -2914,7 +2925,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 # --------------------------------------------------------------
                 # 3. Showcase SC 2.5.3 Label in Name & 4 roving tabindex tablists
                 # --------------------------------------------------------------
-                _reset_context()
+                _reset_context(restart_browser=True)
                 idx_page = context.new_page()
                 idx_page.goto(
                     f"http://127.0.0.1:{port}/index.html",
@@ -3931,7 +3942,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     assert hash_state["integrationHidden"] is True
 
                 idx_page.close()
-                _reset_context()
+                _reset_context(restart_browser=True)
 
                 # --------------------------------------------------------------
                 # 5. Keyboard navigation: .toctree-checkbox switches, responsive
@@ -5077,7 +5088,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 nav_page.emulate_media(forced_colors="none")
 
                 nav_page.close()
-                _reset_context()
+                _reset_context(restart_browser=True)
 
                 # --------------------------------------------------------------
                 # 6. Scroll-padding-top (C43), Shift+Tab SC 2.4.11 visibility &
@@ -5497,7 +5508,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     f"Duplicate Positional Arguments headerlink labels on how-to/cli.html: {cli_pos_labels}"
                 )
 
-                _reset_context()
+                _reset_context(restart_browser=True)
                 link_page = context.new_page()
                 try:
                     link_page.set_viewport_size({"width": 1280, "height": 800})

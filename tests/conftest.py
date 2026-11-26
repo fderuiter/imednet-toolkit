@@ -101,6 +101,22 @@ def _is_live_test(node: object) -> bool:
 
 
 @pytest.fixture(autouse=True)
+def preserve_working_directory_between_tests():
+    """Restore the process working directory after each test to prevent CWD leaks."""
+    try:
+        original_cwd = Path.cwd()
+    except OSError:
+        original_cwd = ROOT
+    yield
+    try:
+        target_cwd = original_cwd if original_cwd.is_dir() else ROOT
+        if Path.cwd() != target_cwd:
+            os.chdir(target_cwd)
+    except OSError:
+        os.chdir(ROOT)
+
+
+@pytest.fixture(autouse=True)
 def reset_study_context_between_tests():
     """Reset global study and governance contexts before and after each test to ensure isolation."""
     from imednet.core.context import _active_base_url, _active_security_key, clear_study_context
