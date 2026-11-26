@@ -435,6 +435,7 @@ def test_bundled_and_local_fallback_contract_resolution(monkeypatch):
     assert "Record" in contract_fallback.models
 
     # Exercise local dev checkout fallback when bundled resource reports is_file() == False
+    monkeypatch.chdir(ROOT_DIR)
     monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
 
     class NonFileResource:

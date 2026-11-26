@@ -2253,11 +2253,15 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
         f"Expected five aria-level='2' sidebar toctree captions on reference/contributing.html, got {contrib_sidebar_levels}"
     )
 
+    class _HighBacklogHTTPServer(ThreadingHTTPServer):
+        request_queue_size = 128
+        daemon_threads = True
+
     class _QuietHandler(SimpleHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             return
 
-    server = ThreadingHTTPServer(
+    server = _HighBacklogHTTPServer(
         ("127.0.0.1", 0),
         functools.partial(_QuietHandler, directory=str(html_dir)),
     )
@@ -2327,8 +2331,33 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
     };
     """
 
+    import contextlib
+
+    @contextlib.contextmanager
+    def _enter_playwright_pinned() -> object:
+        orig_cpus: set[int] | None = None
+        if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
+            try:
+                cpus = os.sched_getaffinity(0)
+                if len(cpus) > 1:
+                    orig_cpus = cpus
+                    os.sched_setaffinity(0, {min(cpus)})
+            except OSError:
+                orig_cpus = None
+        pw_cm = sync_playwright()
+        try:
+            pw_inst = pw_cm.__enter__()
+        finally:
+            if orig_cpus is not None:
+                with contextlib.suppress(OSError):
+                    os.sched_setaffinity(0, orig_cpus)
+        try:
+            yield pw_inst
+        finally:
+            pw_cm.__exit__(*sys.exc_info())
+
     try:
-        with sync_playwright() as pw:
+        with _enter_playwright_pinned() as pw:
             browser = _launch_chromium_for_accessibility(pw)
             try:
                 context = browser.new_context(viewport={"width": 1280, "height": 900})
@@ -2347,7 +2376,10 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     else:
                         route.abort()  # type: ignore[attr-defined]
 
-                context.route("**/*", _route_handler)
+                context.route(
+                    re.compile(rf"^(?!http://127\.0\.0\.1:{port}/|data:|blob:).+"),
+                    _route_handler,
+                )
 
                 # --------------------------------------------------------------
                 # 1. Pyodide controls: light, dark, prefers-contrast, forced-colors

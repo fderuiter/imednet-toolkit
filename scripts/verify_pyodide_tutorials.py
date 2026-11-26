@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import json
+import os
 import re
 import shutil
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,38 @@ class _QuietStaticHandler(SimpleHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         return
+
+
+class _TutorialHTTPServer(ThreadingHTTPServer):
+    """Multi-threaded local server with enlarged TCP listen backlog."""
+
+    request_queue_size = 128
+    daemon_threads = True
+
+
+@contextlib.contextmanager
+def _start_playwright(sync_playwright_fn: Any) -> Iterator[Any]:
+    """Start Playwright on a single CPU core on Linux to avoid vCPU TSC skew crashes."""
+    saved: set[int] | None = None
+    if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
+        try:
+            available = os.sched_getaffinity(0)
+            if len(available) > 1:
+                saved = available
+                os.sched_setaffinity(0, {min(available)})
+        except OSError:
+            saved = None
+    manager = sync_playwright_fn()
+    try:
+        instance = manager.__enter__()
+    finally:
+        if saved is not None:
+            with contextlib.suppress(OSError):
+                os.sched_setaffinity(0, saved)
+    try:
+        yield instance
+    finally:
+        manager.__exit__(*sys.exc_info())
 
 
 def verify_built_tutorial_html(html_dir: Path) -> list[str]:
@@ -216,7 +250,7 @@ def verify_tutorials_in_browser(
 
     errors: list[str] = []
     handler = functools.partial(_QuietStaticHandler, directory=str(html_dir.resolve()))
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server = _TutorialHTTPServer(("127.0.0.1", 0), handler)
     port = server.server_address[1]
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -225,7 +259,7 @@ def verify_tutorials_in_browser(
         screenshot_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        with sync_playwright() as playwright_instance:
+        with _start_playwright(sync_playwright) as playwright_instance:
             browser = _launch_browser(playwright_instance)
             try:
                 context = browser.new_context(viewport={"width": 1440, "height": 1100})

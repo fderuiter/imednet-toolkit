@@ -1,7 +1,7 @@
 """CLI End-to-End UX Coverage tests."""
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -246,7 +246,7 @@ def test_keyboard_interrupt_handling(runner, mock_sdk):
     assert "Aborted by user" in result.stderr
 
 
-def test_output_file_correctness_csv(runner, mock_sdk, tmp_path):
+def test_output_file_correctness_csv(runner, mock_sdk, tmp_path, monkeypatch):
     """Validate CSV output content and format."""
     mock_record = MagicMock()
     mock_record.record_id = 123
@@ -264,9 +264,8 @@ def test_output_file_correctness_csv(runner, mock_sdk, tmp_path):
 
     mock_sdk.records.list.return_value = [mock_record]
 
-    with patch("os.getcwd", return_value=str(tmp_path)):
-        os.chdir(tmp_path)
-        result = runner.invoke(app, ["records", "list", "STUDY", "--output", "csv"])
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["records", "list", "STUDY", "--output", "csv"])
 
     assert result.exit_code == 0
     csv_file = tmp_path / "records.csv"
@@ -277,15 +276,14 @@ def test_output_file_correctness_csv(runner, mock_sdk, tmp_path):
     assert "123,SUBJ1,FORM1,Active,2023-01-01" in content
 
 
-def test_output_file_correctness_json(runner, mock_sdk, tmp_path):
+def test_output_file_correctness_json(runner, mock_sdk, tmp_path, monkeypatch):
     """Validate JSON output content and format."""
     mock_record = MagicMock()
     mock_record.model_dump.return_value = {"id": 123, "status": "Active"}
     mock_sdk.records.list.return_value = [mock_record]
 
-    with patch("os.getcwd", return_value=str(tmp_path)):
-        os.chdir(tmp_path)
-        result = runner.invoke(app, ["records", "list", "STUDY", "--output", "json"])
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["records", "list", "STUDY", "--output", "json"])
 
     assert result.exit_code == 0
     json_file = tmp_path / "records.json"
