@@ -2087,13 +2087,33 @@ def test_scroll_padding_reduced_motion_and_back_to_top_focus_transfer() -> None:
         assert payload["presetRes"]["startupTabindex"] == "0"
 
 
+def _ensure_open_file_headroom(target_soft: int = 65536) -> None:
+    """Raise soft RLIMIT_NOFILE toward the hard limit so Chromium + HTTP threads avoid EMFILE."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        desired = target_soft if hard == resource.RLIM_INFINITY else min(hard, target_soft)
+        if soft < desired:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+    except Exception:
+        return
+
+
 def _launch_chromium_for_accessibility(playwright_instance: object) -> object:
     """Launch headless Chromium with CI-safe flags and local binary fallbacks."""
-    launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    _ensure_open_file_headroom()
+    launch_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-features=BackForwardCache",
+    ]
     chromium = playwright_instance.chromium  # type: ignore[attr-defined]
     try:
         return chromium.launch(headless=True, args=launch_args)
     except Exception:
+        ms_pw_dir = Path.home() / ".cache" / "ms-playwright"
         candidates = [
             "/usr/bin/google-chrome",
             "/usr/bin/chromium",
@@ -2101,8 +2121,15 @@ def _launch_chromium_for_accessibility(playwright_instance: object) -> object:
             *[
                 str(p)
                 for p in sorted(
-                    (Path.home() / ".cache" / "ms-playwright").glob(
-                        "chromium-*/chrome-linux*/chrome"
+                    ms_pw_dir.glob("chromium-*/chrome-linux*/chrome"),
+                    reverse=True,
+                )
+            ],
+            *[
+                str(p)
+                for p in sorted(
+                    ms_pw_dir.glob(
+                        "chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell"
                     ),
                     reverse=True,
                 )
@@ -2253,11 +2280,40 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
         f"Expected five aria-level='2' sidebar toctree captions on reference/contributing.html, got {contrib_sidebar_levels}"
     )
 
+    import mimetypes
+
+    _ensure_open_file_headroom()
+    mimetypes.init()
+
     class _QuietHandler(SimpleHTTPRequestHandler):
+        extensions_map = {
+            **SimpleHTTPRequestHandler.extensions_map,
+            ".html": "text/html; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".mjs": "application/javascript; charset=utf-8",
+            ".json": "application/json; charset=utf-8",
+            ".svg": "image/svg+xml",
+            ".png": "image/png",
+            ".ico": "image/x-icon",
+            ".whl": "application/zip",
+            ".wasm": "application/wasm",
+        }
+
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             return
 
-    server = ThreadingHTTPServer(
+    class _QuietHTTPServer(ThreadingHTTPServer):
+        request_queue_size = 128
+        daemon_threads = True
+
+        def handle_error(self, request: object, client_address: object) -> None:
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                return
+            super().handle_error(request, client_address)  # type: ignore[arg-type]
+
+    server = _QuietHTTPServer(
         ("127.0.0.1", 0),
         functools.partial(_QuietHandler, directory=str(html_dir)),
     )
@@ -2331,23 +2387,214 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
         with sync_playwright() as pw:
             browser = _launch_chromium_for_accessibility(pw)
             try:
-                context = browser.new_context(viewport={"width": 1280, "height": 900})
-                context.set_default_timeout(10_000)
+                from typing import Any
+                from urllib.parse import unquote, urlsplit
+
+                resolved_html_dir = html_dir.resolve()
+                local_origin_prefix = f"http://127.0.0.1:{port}/"
+                static_mime_types: dict[str, str] = {
+                    ".html": "text/html; charset=utf-8",
+                    ".css": "text/css; charset=utf-8",
+                    ".js": "application/javascript; charset=utf-8",
+                    ".mjs": "application/javascript; charset=utf-8",
+                    ".json": "application/json; charset=utf-8",
+                    ".svg": "image/svg+xml",
+                    ".png": "image/png",
+                    ".ico": "image/x-icon",
+                    ".woff": "font/woff",
+                    ".woff2": "font/woff2",
+                    ".ttf": "font/ttf",
+                    ".whl": "application/zip",
+                    ".wasm": "application/wasm",
+                    ".txt": "text/plain; charset=utf-8",
+                    ".xml": "application/xml; charset=utf-8",
+                }
+                asset_cache: dict[Path, tuple[str, bytes]] = {}
+
+                def _resolve_local_asset(req_url: str) -> tuple[str, bytes] | None:
+                    rel_path = unquote(urlsplit(req_url).path).lstrip("/")
+                    candidate = (resolved_html_dir / rel_path).resolve()
+                    if not candidate.is_relative_to(resolved_html_dir):
+                        return None
+                    if candidate.is_dir():
+                        candidate = (candidate / "index.html").resolve()
+                    cached = asset_cache.get(candidate)
+                    if cached is not None:
+                        return cached
+                    if not candidate.is_file():
+                        return None
+                    suffix = candidate.suffix.lower()
+                    content_type = (
+                        static_mime_types.get(suffix)
+                        or mimetypes.guess_type(candidate.name)[0]
+                        or "application/octet-stream"
+                    )
+                    loaded = (content_type, candidate.read_bytes())
+                    asset_cache[candidate] = loaded
+                    return loaded
 
                 def _route_handler(route: object) -> None:
                     req_url = route.request.url  # type: ignore[attr-defined]
                     if "mermaid" in req_url and req_url.endswith(".js"):
                         route.fulfill(  # type: ignore[attr-defined]
                             status=200,
-                            content_type="application/javascript",
+                            content_type="application/javascript; charset=utf-8",
                             body=mermaid_js_bytes,
                         )
-                    elif req_url.startswith((f"http://127.0.0.1:{port}/", "data:", "blob:")):
+                    elif req_url.startswith(local_origin_prefix):
+                        local_asset = _resolve_local_asset(req_url)
+                        if local_asset is None:
+                            route.fulfill(  # type: ignore[attr-defined]
+                                status=404,
+                                content_type="text/plain; charset=utf-8",
+                                body=b"Not Found",
+                            )
+                        else:
+                            content_type, body = local_asset
+                            route.fulfill(  # type: ignore[attr-defined]
+                                status=200,
+                                content_type=content_type,
+                                body=body,
+                            )
+                    elif req_url.startswith(("data:", "blob:")):
                         route.continue_()  # type: ignore[attr-defined]
                     else:
                         route.abort()  # type: ignore[attr-defined]
 
-                context.route("**/*", _route_handler)
+                def _new_raw_context() -> Any:
+                    nonlocal browser
+                    if not browser.is_connected():  # type: ignore[attr-defined]
+                        browser = _launch_chromium_for_accessibility(pw)
+                    ctx = browser.new_context(viewport={"width": 1280, "height": 900})  # type: ignore[attr-defined]
+                    ctx.set_default_timeout(10_000)
+                    ctx.route("**/*", _route_handler)
+                    return ctx
+
+                class _ResilientCDPSession:
+                    def __init__(self, raw_cdp: Any) -> None:
+                        self._raw_cdp = raw_cdp
+                        self._replay_commands: list[tuple[str, dict[str, Any] | None]] = []
+
+                    def send(self, method: str, params: dict[str, Any] | None = None) -> Any:
+                        if method in ("Page.enable", "Page.setFontSizes"):
+                            self._replay_commands.append((method, params))
+                        if params is None:
+                            return self._raw_cdp.send(method)
+                        return self._raw_cdp.send(method, params)
+
+                    def rebind(self, raw_ctx: Any, raw_page: Any) -> None:
+                        self._raw_cdp = raw_ctx.new_cdp_session(raw_page)
+                        for method, params in self._replay_commands:
+                            if params is None:
+                                self._raw_cdp.send(method)
+                            else:
+                                self._raw_cdp.send(method, params)
+
+                    def detach(self) -> None:
+                        try:
+                            self._raw_cdp.detach()
+                        except Exception:
+                            return
+
+                class _ResilientPage:
+                    def __init__(self, ctx_wrapper: Any, raw_page: Any) -> None:
+                        self._ctx_wrapper = ctx_wrapper
+                        self._raw_page = raw_page
+                        self._viewport: dict[str, int] | None = None
+                        self._media_state: dict[str, Any] = {}
+                        self._cdp_wrapper: _ResilientCDPSession | None = None
+
+                    def set_viewport_size(self, viewport_size: dict[str, int]) -> None:
+                        self._viewport = dict(viewport_size)
+                        self._raw_page.set_viewport_size(viewport_size)
+
+                    def emulate_media(self, **kwargs: Any) -> None:
+                        self._media_state.update(kwargs)
+                        self._raw_page.emulate_media(**kwargs)
+
+                    def goto(self, url: str, **kwargs: Any) -> Any:
+                        for attempt in range(3):
+                            try:
+                                return self._raw_page.goto(url, **kwargs)
+                            except Exception as exc:
+                                msg = f"{type(exc).__name__}: {exc}"
+                                is_crash = (
+                                    "Page crashed" in msg
+                                    or "Target closed" in msg
+                                    or "TargetClosedError" in msg
+                                )
+                                if not is_crash or attempt == 2:
+                                    raise
+                                try:
+                                    self._raw_page.close()
+                                except Exception:
+                                    pass
+                                raw_ctx = self._ctx_wrapper.ensure_raw_context(force_recreate=True)
+                                self._raw_page = raw_ctx.new_page()
+                                if self._viewport is not None:
+                                    self._raw_page.set_viewport_size(self._viewport)
+                                if self._media_state:
+                                    self._raw_page.emulate_media(**self._media_state)
+                                if self._cdp_wrapper is not None:
+                                    self._cdp_wrapper.rebind(raw_ctx, self._raw_page)
+                        return None
+
+                    def close(self) -> None:
+                        try:
+                            self._raw_page.close()
+                        except Exception:
+                            return
+
+                    def __getattr__(self, name: str) -> Any:
+                        return getattr(self._raw_page, name)
+
+                class _ResilientContext:
+                    def __init__(self, raw_ctx: Any) -> None:
+                        self._raw_ctx = raw_ctx
+
+                    def ensure_raw_context(self, *, force_recreate: bool = False) -> Any:
+                        if force_recreate or not browser.is_connected():  # type: ignore[attr-defined]
+                            try:
+                                self._raw_ctx.close()
+                            except Exception:
+                                pass
+                            self._raw_ctx = _new_raw_context()
+                        return self._raw_ctx
+
+                    def new_page(self) -> _ResilientPage:
+                        raw_ctx = self.ensure_raw_context()
+                        return _ResilientPage(self, raw_ctx.new_page())
+
+                    def new_cdp_session(self, page: Any) -> _ResilientCDPSession:
+                        raw_ctx = self.ensure_raw_context()
+                        raw_page = page._raw_page if isinstance(page, _ResilientPage) else page
+                        cdp = _ResilientCDPSession(raw_ctx.new_cdp_session(raw_page))
+                        if isinstance(page, _ResilientPage):
+                            page._cdp_wrapper = cdp
+                        return cdp
+
+                    def close(self) -> None:
+                        try:
+                            self._raw_ctx.close()
+                        except Exception:
+                            return
+
+                def _new_isolated_context() -> _ResilientContext:
+                    return _ResilientContext(_new_raw_context())
+
+                context: Any = _new_isolated_context()
+
+                def _reset_context(*, restart_browser: bool = False) -> Any:
+                    nonlocal browser, context
+                    context.close()
+                    if restart_browser or not browser.is_connected():  # type: ignore[attr-defined]
+                        try:
+                            browser.close()  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                        browser = _launch_chromium_for_accessibility(pw)
+                    context = _new_isolated_context()
+                    return context
 
                 # --------------------------------------------------------------
                 # 1. Pyodide controls: light, dark, prefers-contrast, forced-colors
@@ -2506,152 +2753,156 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 rendered_diagram_count = 0
                 overflowing_mobile_regions = 0
 
-                diag_page = context.new_page()
                 for rel_url in diagram_pages:
-                    diag_page.set_viewport_size({"width": 1280, "height": 900})
-                    diag_page.goto(
-                        f"http://127.0.0.1:{port}/{rel_url}",
-                        wait_until="load",
-                    )
-                    diag_page.wait_for_function(
-                        "() => Array.from(document.querySelectorAll('.mermaid')).every(m => m.querySelector('svg'))"
-                    )
-                    diag_page.add_script_tag(content=contrast_helper_js)
+                    _reset_context()
+                    diag_page = context.new_page()
+                    try:
+                        diag_page.set_viewport_size({"width": 1280, "height": 900})
+                        diag_page.goto(
+                            f"http://127.0.0.1:{port}/{rel_url}",
+                            wait_until="load",
+                        )
+                        diag_page.wait_for_function(
+                            "() => Array.from(document.querySelectorAll('.mermaid')).every(m => m.querySelector('svg'))"
+                        )
+                        diag_page.add_script_tag(content=contrast_helper_js)
 
-                    # Switch to dark mode dynamically (zero JS re-render) and inspect contrast & titles
-                    diag_page.evaluate("document.body.setAttribute('data-theme', 'dark')")
-                    diag_page.wait_for_timeout(50)
+                        # Switch to dark mode dynamically (zero JS re-render) and inspect contrast & titles
+                        diag_page.evaluate("document.body.setAttribute('data-theme', 'dark')")
+                        diag_page.wait_for_timeout(50)
 
-                    dark_audit = diag_page.evaluate(
-                        """() => {
-                            const h = window.__wcagHelpers;
-                            const results = [];
-                            document.querySelectorAll('.mermaid').forEach((container, idx) => {
-                                const svg = container.querySelector('svg');
-                                const titleEl = svg ? svg.querySelector('title') : null;
-                                const ariaLabel = svg ? svg.getAttribute('aria-label') : null;
-                                const hasError = !!(svg && svg.querySelector('.error-icon'));
+                        dark_audit = diag_page.evaluate(
+                            """() => {
+                                const h = window.__wcagHelpers;
+                                const results = [];
+                                document.querySelectorAll('.mermaid').forEach((container, idx) => {
+                                    const svg = container.querySelector('svg');
+                                    const titleEl = svg ? svg.querySelector('title') : null;
+                                    const ariaLabel = svg ? svg.getAttribute('aria-label') : null;
+                                    const hasError = !!(svg && svg.querySelector('.error-icon'));
 
-                                const containerBg = h.effectiveBg(container);
-                                const nodeBgSample = svg.querySelector('.node rect, .node polygon, .node circle, rect.actor');
-                                const nodeBg = nodeBgSample ? h.parseRgb(getComputedStyle(nodeBgSample).fill) : containerBg;
+                                    const containerBg = h.effectiveBg(container);
+                                    const nodeBgSample = svg.querySelector('.node rect, .node polygon, .node circle, rect.actor');
+                                    const nodeBg = nodeBgSample ? h.parseRgb(getComputedStyle(nodeBgSample).fill) : containerBg;
 
-                                let minTextContrast = Infinity;
-                                svg.querySelectorAll('.nodeLabel, text.actor > tspan, .messageText, .loopText > tspan, .labelText > tspan').forEach((t) => {
-                                    if (!(t.textContent || '').trim()) return;
-                                    const cs = getComputedStyle(t);
-                                    const fg = h.parseRgb(cs.color) || h.parseRgb(cs.fill);
-                                    if (!fg) return;
-                                    const isInsideBox = !!(t.closest('.node') || t.closest('text.actor') || t.classList.contains('labelText'));
-                                    const bg = isInsideBox && nodeBg ? nodeBg : containerBg;
-                                    minTextContrast = Math.min(minTextContrast, h.ratio(fg, bg));
-                                });
-
-                                svg.querySelectorAll('text.noteText, text.noteText > tspan').forEach((nt) => {
-                                    if (!(nt.textContent || '').trim()) return;
-                                    const noteRect = svg.querySelector('rect.note');
-                                    const bg = noteRect ? h.parseRgb(getComputedStyle(noteRect).fill) : containerBg;
-                                    const fg = h.parseRgb(getComputedStyle(nt).fill);
-                                    if (fg && bg) {
+                                    let minTextContrast = Infinity;
+                                    svg.querySelectorAll('.nodeLabel, text.actor > tspan, .messageText, .loopText > tspan, .labelText > tspan').forEach((t) => {
+                                        if (!(t.textContent || '').trim()) return;
+                                        const cs = getComputedStyle(t);
+                                        const fg = h.parseRgb(cs.color) || h.parseRgb(cs.fill);
+                                        if (!fg) return;
+                                        const isInsideBox = !!(t.closest('.node') || t.closest('text.actor') || t.classList.contains('labelText'));
+                                        const bg = isInsideBox && nodeBg ? nodeBg : containerBg;
                                         minTextContrast = Math.min(minTextContrast, h.ratio(fg, bg));
-                                    }
+                                    });
+
+                                    svg.querySelectorAll('text.noteText, text.noteText > tspan').forEach((nt) => {
+                                        if (!(nt.textContent || '').trim()) return;
+                                        const noteRect = svg.querySelector('rect.note');
+                                        const bg = noteRect ? h.parseRgb(getComputedStyle(noteRect).fill) : containerBg;
+                                        const fg = h.parseRgb(getComputedStyle(nt).fill);
+                                        if (fg && bg) {
+                                            minTextContrast = Math.min(minTextContrast, h.ratio(fg, bg));
+                                        }
+                                    });
+
+                                    svg.querySelectorAll('.edgeLabel span, .edgeLabel').forEach((el) => {
+                                        if (!(el.textContent || '').trim()) return;
+                                        const bg = h.effectiveBg(el);
+                                        const fg = h.parseRgb(getComputedStyle(el).color);
+                                        if (fg && bg) {
+                                            minTextContrast = Math.min(minTextContrast, h.ratio(fg, bg));
+                                        }
+                                    });
+
+                                    let minStrokeContrast = Infinity;
+                                    svg.querySelectorAll('.node rect, .node polygon, rect.actor, .edgePath .path, .flowchart-link, line[id^="actor"], .messageLine0, .messageLine1').forEach((s) => {
+                                        const stroke = h.parseRgb(getComputedStyle(s).stroke);
+                                        if (stroke && stroke.a > 0) {
+                                            minStrokeContrast = Math.min(minStrokeContrast, h.ratio(stroke, containerBg));
+                                        }
+                                    });
+
+                                    results.push({
+                                        idx,
+                                        hasError,
+                                        title: titleEl ? titleEl.textContent.trim() : '',
+                                        ariaLabel: ariaLabel || '',
+                                        minTextContrast,
+                                        minStrokeContrast
+                                    });
                                 });
-
-                                svg.querySelectorAll('.edgeLabel span, .edgeLabel').forEach((el) => {
-                                    if (!(el.textContent || '').trim()) return;
-                                    const bg = h.effectiveBg(el);
-                                    const fg = h.parseRgb(getComputedStyle(el).color);
-                                    if (fg && bg) {
-                                        minTextContrast = Math.min(minTextContrast, h.ratio(fg, bg));
-                                    }
-                                });
-
-                                let minStrokeContrast = Infinity;
-                                svg.querySelectorAll('.node rect, .node polygon, rect.actor, .edgePath .path, .flowchart-link, line[id^="actor"], .messageLine0, .messageLine1').forEach((s) => {
-                                    const stroke = h.parseRgb(getComputedStyle(s).stroke);
-                                    if (stroke && stroke.a > 0) {
-                                        minStrokeContrast = Math.min(minStrokeContrast, h.ratio(stroke, containerBg));
-                                    }
-                                });
-
-                                results.push({
-                                    idx,
-                                    hasError,
-                                    title: titleEl ? titleEl.textContent.trim() : '',
-                                    ariaLabel: ariaLabel || '',
-                                    minTextContrast,
-                                    minStrokeContrast
-                                });
-                            });
-                            return results;
-                        }"""
-                    )
-
-                    for item in dark_audit:
-                        rendered_diagram_count += 1
-                        assert item["hasError"] is False, (
-                            f"{rel_url} diagram {item['idx']} failed to parse"
-                        )
-                        assert item["title"], (
-                            f"{rel_url} diagram {item['idx']} missing <svg><title>"
-                        )
-                        assert item["ariaLabel"], (
-                            f"{rel_url} diagram {item['idx']} missing svg[aria-label]"
-                        )
-                        assert item["minTextContrast"] >= 4.5, (
-                            f"{rel_url} diagram {item['idx']} dark text contrast {item['minTextContrast']:.2f}:1 < 4.5:1"
-                        )
-                        assert item["minStrokeContrast"] >= 3.0, (
-                            f"{rel_url} diagram {item['idx']} dark stroke contrast {item['minStrokeContrast']:.2f}:1 < 3.0:1"
+                                return results;
+                            }"""
                         )
 
-                    # Mobile 375px viewport check: >= 12px effective text & scrollable region semantics
-                    diag_page.set_viewport_size({"width": 375, "height": 812})
-                    diag_page.evaluate("window.dispatchEvent(new Event('resize'))")
-                    diag_page.wait_for_timeout(80)
-
-                    mobile_audit = diag_page.evaluate(
-                        """() => {
-                            return Array.from(document.querySelectorAll('.mermaid')).map((container, idx) => {
-                                const svg = container.querySelector('svg');
-                                const vb = svg.viewBox && svg.viewBox.baseVal;
-                                const svgRect = svg.getBoundingClientRect();
-                                const scale = (vb && vb.width > 0) ? (svgRect.width / vb.width) : 1;
-                                let minEffectivePx = Infinity;
-                                svg.querySelectorAll('.nodeLabel, text.actor, .messageText, text.noteText').forEach((el) => {
-                                    if (!(el.textContent || '').trim()) return;
-                                    const fs = parseFloat(getComputedStyle(el).fontSize) || 16;
-                                    minEffectivePx = Math.min(minEffectivePx, fs * scale);
-                                });
-                                const overflowing = container.clientWidth > 0 && container.scrollWidth > container.clientWidth;
-                                return {
-                                    idx,
-                                    overflowX: getComputedStyle(container).overflowX,
-                                    minEffectivePx,
-                                    overflowing,
-                                    tabindex: container.getAttribute('tabindex'),
-                                    role: container.getAttribute('role'),
-                                    regionLabel: container.getAttribute('aria-label') || ''
-                                };
-                            });
-                        }"""
-                    )
-                    for m_item in mobile_audit:
-                        assert m_item["overflowX"] == "auto"
-                        assert m_item["minEffectivePx"] >= 12.0, (
-                            f"{rel_url} diagram {m_item['idx']} mobile text shrunk to {m_item['minEffectivePx']:.1f}px < 12px"
-                        )
-                        if m_item["overflowing"]:
-                            overflowing_mobile_regions += 1
-                            assert m_item["tabindex"] == "0", (
-                                f"{rel_url} overflowing diagram missing tabindex='0'"
+                        for item in dark_audit:
+                            rendered_diagram_count += 1
+                            assert item["hasError"] is False, (
+                                f"{rel_url} diagram {item['idx']} failed to parse"
                             )
-                            assert m_item["role"] == "region", (
-                                f"{rel_url} overflowing diagram missing role='region'"
+                            assert item["title"], (
+                                f"{rel_url} diagram {item['idx']} missing <svg><title>"
                             )
-                            assert m_item["regionLabel"], (
-                                f"{rel_url} overflowing diagram missing aria-label"
+                            assert item["ariaLabel"], (
+                                f"{rel_url} diagram {item['idx']} missing svg[aria-label]"
                             )
+                            assert item["minTextContrast"] >= 4.5, (
+                                f"{rel_url} diagram {item['idx']} dark text contrast {item['minTextContrast']:.2f}:1 < 4.5:1"
+                            )
+                            assert item["minStrokeContrast"] >= 3.0, (
+                                f"{rel_url} diagram {item['idx']} dark stroke contrast {item['minStrokeContrast']:.2f}:1 < 3.0:1"
+                            )
+
+                        # Mobile 375px viewport check: >= 12px effective text & scrollable region semantics
+                        diag_page.set_viewport_size({"width": 375, "height": 812})
+                        diag_page.evaluate("window.dispatchEvent(new Event('resize'))")
+                        diag_page.wait_for_timeout(80)
+
+                        mobile_audit = diag_page.evaluate(
+                            """() => {
+                                return Array.from(document.querySelectorAll('.mermaid')).map((container, idx) => {
+                                    const svg = container.querySelector('svg');
+                                    const vb = svg.viewBox && svg.viewBox.baseVal;
+                                    const svgRect = svg.getBoundingClientRect();
+                                    const scale = (vb && vb.width > 0) ? (svgRect.width / vb.width) : 1;
+                                    let minEffectivePx = Infinity;
+                                    svg.querySelectorAll('.nodeLabel, text.actor, .messageText, text.noteText').forEach((el) => {
+                                        if (!(el.textContent || '').trim()) return;
+                                        const fs = parseFloat(getComputedStyle(el).fontSize) || 16;
+                                        minEffectivePx = Math.min(minEffectivePx, fs * scale);
+                                    });
+                                    const overflowing = container.clientWidth > 0 && container.scrollWidth > container.clientWidth;
+                                    return {
+                                        idx,
+                                        overflowX: getComputedStyle(container).overflowX,
+                                        minEffectivePx,
+                                        overflowing,
+                                        tabindex: container.getAttribute('tabindex'),
+                                        role: container.getAttribute('role'),
+                                        regionLabel: container.getAttribute('aria-label') || ''
+                                    };
+                                });
+                            }"""
+                        )
+                        for m_item in mobile_audit:
+                            assert m_item["overflowX"] == "auto"
+                            assert m_item["minEffectivePx"] >= 12.0, (
+                                f"{rel_url} diagram {m_item['idx']} mobile text shrunk to {m_item['minEffectivePx']:.1f}px < 12px"
+                            )
+                            if m_item["overflowing"]:
+                                overflowing_mobile_regions += 1
+                                assert m_item["tabindex"] == "0", (
+                                    f"{rel_url} overflowing diagram missing tabindex='0'"
+                                )
+                                assert m_item["role"] == "region", (
+                                    f"{rel_url} overflowing diagram missing role='region'"
+                                )
+                                assert m_item["regionLabel"], (
+                                    f"{rel_url} overflowing diagram missing aria-label"
+                                )
+                    finally:
+                        diag_page.close()
 
                 assert rendered_diagram_count == 15, (
                     f"Expected 15 rendered Mermaid diagrams across built HTML, found {rendered_diagram_count}"
@@ -2659,11 +2910,11 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 assert overflowing_mobile_regions >= 2, (
                     "Expected wide workflow sequence diagrams to scroll horizontally on 375px viewport"
                 )
-                diag_page.close()
 
                 # --------------------------------------------------------------
                 # 3. Showcase SC 2.5.3 Label in Name & 4 roving tabindex tablists
                 # --------------------------------------------------------------
+                _reset_context()
                 idx_page = context.new_page()
                 idx_page.goto(
                     f"http://127.0.0.1:{port}/index.html",
@@ -3680,6 +3931,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     assert hash_state["integrationHidden"] is True
 
                 idx_page.close()
+                _reset_context()
 
                 # --------------------------------------------------------------
                 # 5. Keyboard navigation: .toctree-checkbox switches, responsive
@@ -4772,6 +5024,9 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     assert res["style"] == "solid" and res["width"] == "2px"
                     assert res["color"] == sys_hl_idx
                 nav_page.emulate_media(forced_colors="none")
+                nav_page.close()
+                _reset_context()
+                nav_page = context.new_page()
 
                 # 5e. Overflowing .table-wrapper focusable region & :focus-visible outline on mobile
                 nav_page.set_viewport_size({"width": 375, "height": 812})
@@ -4822,6 +5077,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 nav_page.emulate_media(forced_colors="none")
 
                 nav_page.close()
+                _reset_context()
 
                 # --------------------------------------------------------------
                 # 6. Scroll-padding-top (C43), Shift+Tab SC 2.4.11 visibility &
@@ -4979,6 +5235,13 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     traversed_pre_regions = 0
 
                     for vp_label, vp_w, vp_h, std_fs, expected_padding in viewport_matrix:
+                        cdp_session.detach()
+                        nav_page.close()
+                        _reset_context()
+                        nav_page = context.new_page()
+                        nav_page.emulate_media(reduced_motion="reduce")
+                        cdp_session = context.new_cdp_session(nav_page)
+                        cdp_session.send("Page.enable")
                         nav_page.set_viewport_size({"width": vp_w, "height": vp_h})
                         cdp_session.send(
                             "Page.setFontSizes",
@@ -5234,6 +5497,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     f"Duplicate Positional Arguments headerlink labels on how-to/cli.html: {cli_pos_labels}"
                 )
 
+                _reset_context()
                 link_page = context.new_page()
                 try:
                     link_page.set_viewport_size({"width": 1280, "height": 800})

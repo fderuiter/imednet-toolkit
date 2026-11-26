@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import json
 import re
@@ -56,7 +57,47 @@ LEGACY_BINDER_LABEL_PATTERN = re.compile(r"\bmybinder(?:\.org)?\b", re.IGNORECAS
 class _QuietStaticHandler(SimpleHTTPRequestHandler):
     """Static file HTTP handler suppressing per-request stderr noise."""
 
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        ".html": "text/html; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".js": "application/javascript; charset=utf-8",
+        ".mjs": "application/javascript; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".ico": "image/x-icon",
+        ".whl": "application/zip",
+        ".wasm": "application/wasm",
+    }
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        return
+
+
+class _QuietHTTPServer(ThreadingHTTPServer):
+    """Multi-threaded local static server with expanded listen backlog."""
+
+    request_queue_size = 128
+    daemon_threads = True
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)  # type: ignore[arg-type]
+
+
+def _ensure_open_file_headroom(target_soft: int = 65536) -> None:
+    """Raise soft RLIMIT_NOFILE toward the hard limit so Chromium + HTTP threads avoid EMFILE."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        desired = target_soft if hard == resource.RLIM_INFINITY else min(hard, target_soft)
+        if soft < desired:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+    except Exception:
         return
 
 
@@ -157,15 +198,39 @@ def verify_built_tutorial_html(html_dir: Path) -> list[str]:
 
 def _launch_browser(playwright_instance: Any) -> Any:
     """Launch headless Chromium using Playwright's browser cache or pre-installed system Chrome."""
-    launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    _ensure_open_file_headroom()
+    launch_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-features=BackForwardCache",
+    ]
     try:
         return playwright_instance.chromium.launch(headless=True, args=launch_args)
     except Exception:
-        for candidate in (
+        ms_pw_dir = Path.home() / ".cache" / "ms-playwright"
+        candidates = (
             "/usr/bin/google-chrome",
             "/usr/bin/chromium",
             "/usr/bin/chromium-browser",
-        ):
+            *[
+                str(p)
+                for p in sorted(
+                    ms_pw_dir.glob("chromium-*/chrome-linux*/chrome"),
+                    reverse=True,
+                )
+            ],
+            *[
+                str(p)
+                for p in sorted(
+                    ms_pw_dir.glob(
+                        "chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell"
+                    ),
+                    reverse=True,
+                )
+            ],
+        )
+        for candidate in candidates:
             if shutil.which(candidate) or Path(candidate).is_file():
                 return playwright_instance.chromium.launch(
                     headless=True,
@@ -212,11 +277,15 @@ def verify_tutorials_in_browser(
     screenshot_dir: Path | None = None,
 ) -> list[str]:
     """Serve built HTML locally and execute all interactive tutorial cells in headless Chromium."""
+    import mimetypes
+
     from playwright.sync_api import sync_playwright
 
+    _ensure_open_file_headroom()
+    mimetypes.init()
     errors: list[str] = []
     handler = functools.partial(_QuietStaticHandler, directory=str(html_dir.resolve()))
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server = _QuietHTTPServer(("127.0.0.1", 0), handler)
     port = server.server_address[1]
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -230,19 +299,54 @@ def verify_tutorials_in_browser(
             try:
                 context = browser.new_context(viewport={"width": 1440, "height": 1100})
 
+                def _open_tutorial_page(
+                    url: str,
+                    *,
+                    response_cb: Any,
+                    init_script: str | None = None,
+                ) -> Any:
+                    nonlocal browser, context
+                    for attempt in range(3):
+                        page = context.new_page()
+                        if init_script is not None:
+                            page.add_init_script(init_script)
+                        page.on("response", response_cb)
+                        try:
+                            page.goto(
+                                url,
+                                wait_until="domcontentloaded",
+                                timeout=timeout_ms,
+                            )
+                            return page
+                        except Exception as exc:
+                            msg = f"{type(exc).__name__}: {exc}"
+                            is_crash = (
+                                "Page crashed" in msg
+                                or "Target closed" in msg
+                                or "TargetClosedError" in msg
+                            )
+                            with contextlib.suppress(Exception):
+                                page.close()
+                            if not is_crash or attempt == 2:
+                                raise
+                            with contextlib.suppress(Exception):
+                                context.close()
+                            with contextlib.suppress(Exception):
+                                browser.close()
+                            browser = _launch_browser(playwright_instance)
+                            context = browser.new_context(viewport={"width": 1440, "height": 1100})
+                    raise RuntimeError(f"Failed to navigate to {url}")
+
                 # 1. Verify synchronous + mixed tutorial cells on tutorials/quick_start.html
-                qs_page = context.new_page()
                 qs_wheel_responses: dict[str, int] = {}
 
                 def _record_qs_response(response: Any) -> None:
                     if response.url.endswith(".whl") and f"127.0.0.1:{port}" in response.url:
                         qs_wheel_responses[Path(response.url).name] = response.status
 
-                qs_page.on("response", _record_qs_response)
-                qs_page.goto(
+                qs_page = _open_tutorial_page(
                     f"http://127.0.0.1:{port}/tutorials/quick_start.html",
-                    wait_until="domcontentloaded",
-                    timeout=timeout_ms,
+                    response_cb=_record_qs_response,
                 )
 
                 launch_btn = qs_page.locator(".thebe-launch-button").first
@@ -342,12 +446,14 @@ def verify_tutorials_in_browser(
                         )
 
                 qs_page.close()
+                context.close()
+                browser.close()
 
                 # 2. Verify async tutorial cell on tutorials/async_quick_start.html
-                #    with DOCUMENTATION_OPTIONS.URL_ROOT absent (Sphinx 7.2+/8.x simulation)
-                async_page = context.new_page()
-                async_page.add_init_script(
-                    """
+                #    in a fresh Chromium process so WebAssembly Pyodide heaps are isolated
+                browser = _launch_browser(playwright_instance)
+                context = browser.new_context(viewport={"width": 1440, "height": 1100})
+                strip_url_root_script = """
                     (() => {
                         let _docOpts = {};
                         Object.defineProperty(window, "DOCUMENTATION_OPTIONS", {
@@ -362,18 +468,16 @@ def verify_tutorials_in_browser(
                         });
                     })();
                     """
-                )
                 async_wheel_responses: dict[str, int] = {}
 
                 def _record_async_response(response: Any) -> None:
                     if response.url.endswith(".whl") and f"127.0.0.1:{port}" in response.url:
                         async_wheel_responses[Path(response.url).name] = response.status
 
-                async_page.on("response", _record_async_response)
-                async_page.goto(
+                async_page = _open_tutorial_page(
                     f"http://127.0.0.1:{port}/tutorials/async_quick_start.html",
-                    wait_until="domcontentloaded",
-                    timeout=timeout_ms,
+                    response_cb=_record_async_response,
+                    init_script=strip_url_root_script,
                 )
 
                 url_root_absent = async_page.evaluate(

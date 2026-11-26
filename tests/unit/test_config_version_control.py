@@ -1806,3 +1806,48 @@ def test_config_version_store_concurrent_cache_access_and_eviction_thread_safety
         t.join(timeout=20)
 
     assert errors == []
+
+
+def test_resolve_committed_study_keys_and_mapper_topology_invalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_sdk: MockSDK,
+) -> None:
+    """Verify resolve_committed_study_keys indexes committed studies and invalidates immediately on commit."""
+    from unittest.mock import patch
+
+    from imednet.integrations.enrichment import CentralizedMapper
+
+    db_file = tmp_path / "topo_test" / "config_versions.sqlite3"
+    monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_file))
+    monkeypatch.setenv("IMEDNET_SECURITY_KEY", "topo-secret-key")  # pragma: allowlist secret
+
+    empty_snap = ConfigVersionStore.resolve_committed_study_keys()
+    assert empty_snap is not None
+    assert empty_snap[1] == frozenset()
+
+    mapper = CentralizedMapper(mode="tabular", mask_phi=True)
+    row_before = mapper.map_record(
+        {"record_id": 1, "study_key": "STUDY-TOPO", "record_data": {"custom_mrn": "RAW-123"}}
+    )
+    assert row_before["record_data"]["custom_mrn"] == "RAW-123"
+
+    store = ConfigVersionStore(db_path=db_file)
+    cfg = StudyConfiguration(study_key="STUDY-TOPO", phi_fields=["custom_mrn"])
+    store.commit_config("STUDY-TOPO", cfg, desc="add custom_mrn phi", sdk=mock_sdk)
+
+    populated_snap = ConfigVersionStore.resolve_committed_study_keys()
+    assert populated_snap is not None
+    assert "STUDY-TOPO" in populated_snap[1]
+    assert populated_snap[0] != empty_snap[0]
+
+    # New mapper (or uncached study on same mapper) immediately sees newly committed study
+    fresh_mapper = CentralizedMapper(mode="tabular", mask_phi=True)
+    row_after = fresh_mapper.map_record(
+        {"record_id": 2, "study_key": "STUDY-TOPO", "record_data": {"custom_mrn": "RAW-123"}}
+    )
+    assert row_after["record_data"]["custom_mrn"] == "***MASKED***"
+
+    # Mocking get_history disables pre-indexing so mock-based tests fall back cleanly
+    with patch.object(ConfigVersionStore, "get_history", return_value=[]):
+        assert ConfigVersionStore.resolve_committed_study_keys() is None

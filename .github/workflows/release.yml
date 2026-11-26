@@ -111,8 +111,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Hatch
-        run: python -m pip install --upgrade pip hatch
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: "false"
 
       - name: Tighten Internal Dependencies
         run: python scripts/tighten_dependencies.py --rewrite
@@ -122,7 +124,8 @@ jobs:
           PACKAGE: ${{ matrix.package }}
         run: |
           cd "packages/$PACKAGE"
-          hatch build
+          uv build --out-dir dist
+          rm -f dist/.gitignore
 
       - name: Restore Internal Dependencies
         if: always()

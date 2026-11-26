@@ -521,24 +521,15 @@ class ConfigVersionStore:
         return candidates
 
     @classmethod
-    def _read_committed_from_sqlite_path(
+    def _read_head_index_for_sqlite_path(
         cls,
         candidate_path: Path,
-        study_key: str,
-        *,
-        raw_db_path: Path | None = None,
-    ) -> StudyConfiguration | None:
-        """Read and verify the latest committed StudyConfiguration for *study_key* from *candidate_path*."""
-        validate_partition_key(study_key)
+    ) -> tuple[tuple[Path, int, int, int, int, int, int, int, int, int], dict[str, str]] | None:
+        """Return ``(snap_key, head_index)`` for *candidate_path* or ``None`` if unreadable."""
         try:
             db_stat = os.stat(candidate_path)
         except OSError:
             return None
-
-        if hasattr(cls.get_head, "_mock_name"):
-            mocked_store = cls(db_path=raw_db_path) if raw_db_path is not None else cls()
-            head_id = mocked_store.get_head(study_key)
-            return mocked_store.rollback_config(study_key, head_id) if head_id else None
 
         wal_ino = 0
         wal_mtime_ns = 0
@@ -595,6 +586,31 @@ class ConfigVersionStore:
                 return None
             head_index = indexed
             _bounded_cache_put(_HEAD_INDEX_CACHE, snap_key, head_index, _MAX_HEAD_INDEX_CACHE)
+        return (snap_key, cast(dict[str, str], head_index))
+
+    @classmethod
+    def _read_committed_from_sqlite_path(
+        cls,
+        candidate_path: Path,
+        study_key: str,
+        *,
+        raw_db_path: Path | None = None,
+    ) -> StudyConfiguration | None:
+        """Read and verify the latest committed StudyConfiguration for *study_key* from *candidate_path*."""
+        validate_partition_key(study_key)
+        if hasattr(cls.get_head, "_mock_name"):
+            try:
+                os.stat(candidate_path)
+            except OSError:
+                return None
+            mocked_store = cls(db_path=raw_db_path) if raw_db_path is not None else cls()
+            head_id = mocked_store.get_head(study_key)
+            return mocked_store.rollback_config(study_key, head_id) if head_id else None
+
+        indexed_pair = cls._read_head_index_for_sqlite_path(candidate_path)
+        if indexed_pair is None:
+            return None
+        snap_key, head_index = indexed_pair
 
         head_id = head_index.get(study_key)
         if not head_id:
@@ -673,6 +689,43 @@ class ConfigVersionStore:
         return None
 
     @classmethod
+    def _scan_multi_origin_entries(
+        cls,
+        raw_db_path: Path,
+        layout: _OriginLayout,
+        base_entries: frozenset[str],
+    ) -> list[tuple[_OriginLayout, frozenset[str], frozenset[str]]]:
+        """Return ``(cand_layout, cand_entries, cand_subdirs)`` for discovered multi-origin host directories."""
+        if _has_explicit_origin_context():
+            return []
+        skipped_entries = {layout.host_dir.name, "localhost", layout.db_name, ".", ".."}
+        scanned = 0
+        discovered: list[tuple[_OriginLayout, frozenset[str], frozenset[str]]] = []
+        for entry_name in sorted(base_entries):
+            if (
+                entry_name in skipped_entries
+                or entry_name.startswith(".")
+                or not _SAFE_HOST_ENTRY_RE.match(entry_name)
+            ):
+                continue
+            if scanned >= _MAX_MULTI_ORIGIN_HOST_SCAN:
+                break
+            scanned += 1
+            try:
+                cand_layout = _get_origin_layout(
+                    raw_db_path,
+                    base_url_override=f"https://{entry_name}",
+                )
+            except PathTraversalValidationError:
+                continue
+            cand_entries, cand_subdirs = _get_host_dir_listing(
+                cand_layout.host_dir,
+                layout.db_name,
+            )
+            discovered.append((cand_layout, cand_entries, cand_subdirs))
+        return discovered
+
+    @classmethod
     def resolve_committed_config(cls, study_key: str) -> StudyConfiguration | None:
         """Read the latest committed :class:`StudyConfiguration` without creating empty DB files."""
         validate_partition_key(study_key)
@@ -722,32 +775,11 @@ class ConfigVersionStore:
                     return resolved
             has_localhost_legacy = bool(study_key and study_key in lh_subdirs)
 
-        if not _has_explicit_origin_context():
-            skipped_entries = {host_name, "localhost", layout.db_name, ".", ".."}
-            scanned = 0
+        multi_origins = cls._scan_multi_origin_entries(raw_db_path, layout, base_entries)
+        if multi_origins:
             matched_candidates: list[tuple[Path, StudyConfiguration]] = []
             legacy_host_candidates: list[Path] = []
-            for entry_name in sorted(base_entries):
-                if (
-                    entry_name in skipped_entries
-                    or entry_name.startswith(".")
-                    or not _SAFE_HOST_ENTRY_RE.match(entry_name)
-                ):
-                    continue
-                if scanned >= _MAX_MULTI_ORIGIN_HOST_SCAN:
-                    break
-                scanned += 1
-                try:
-                    cand_layout = _get_origin_layout(
-                        raw_db_path,
-                        base_url_override=f"https://{entry_name}",
-                    )
-                except PathTraversalValidationError:
-                    continue
-                cand_entries, cand_subdirs = _get_host_dir_listing(
-                    cand_layout.host_dir,
-                    layout.db_name,
-                )
+            for cand_layout, cand_entries, cand_subdirs in multi_origins:
                 if cand_layout.db_name in cand_entries:
                     resolved = cls._read_committed_from_sqlite_path(
                         cand_layout.canonical_db_path,
@@ -806,6 +838,87 @@ class ConfigVersionStore:
         ):
             return cls.resolve_legacy_committed_config(study_key)
         return None
+
+    @classmethod
+    def current_store_state_token(cls) -> tuple[Any, ...]:
+        """Return a fast in-memory state token capturing active store path, context, and write generation."""
+        home_fn = Path.home
+        is_home_patched = getattr(home_fn, "__func__", home_fn) is not _ORIG_PATH_HOME_FUNC
+        home_tok = (
+            os.fspath(home_fn())
+            if is_home_patched
+            else (os.environ.get("HOME") or os.environ.get("USERPROFILE") or "")
+        )
+        return (
+            _get_write_generation(),
+            os.environ.get("IMEDNET_CONFIG_DB_PATH") or "",
+            os.environ.get("IMEDNET_BASE_URL") or "",
+            get_base_url_context(),
+            get_study_context(),
+            is_home_patched,
+            home_tok,
+            time.monotonic_ns() // 50_000_000,
+        )
+
+    @classmethod
+    def resolve_committed_study_keys(
+        cls,
+    ) -> tuple[tuple[Any, ...], frozenset[str]] | None:
+        """Return ``(state_token, known_study_keys)`` across active SQLite/legacy paths, or ``None`` if mocked."""
+        if (
+            cls.get_history is not _ORIG_GET_HISTORY_FUNC
+            or cls.rollback_config is not _ORIG_ROLLBACK_CONFIG_FUNC
+            or cls.get_head is not _ORIG_GET_HEAD_FUNC
+            or getattr(cls.resolve_legacy_committed_config, "__func__", None)
+            is not _ORIG_RESOLVE_LEGACY_FUNC
+            or getattr(cls.resolve_committed_config, "__func__", None)
+            is not _ORIG_RESOLVE_COMMITTED_FUNC
+        ):
+            return None
+
+        token = cls.current_store_state_token()
+        try:
+            raw_db_path = _get_raw_db_path()
+            effective_url, allow_localhost_fallback = _resolve_effective_base_url()
+            layout = _get_origin_layout(raw_db_path, base_url_override=effective_url)
+        except PathTraversalValidationError:
+            return (token, frozenset())
+
+        base_entries = _get_base_dir_entries(layout.base_dir, layout.db_name)
+        if base_entries is None:
+            return (token, frozenset())
+
+        known_keys: set[str] = set()
+        db_candidates: list[Path] = []
+        if layout.host_dir.name in base_entries:
+            host_entries, host_subdirs = _get_host_dir_listing(layout.host_dir, layout.db_name)
+            if layout.db_name in host_entries:
+                db_candidates.append(layout.canonical_db_path)
+            known_keys.update(host_subdirs)
+
+        if allow_localhost_fallback and "localhost" in base_entries:
+            lh_layout = _get_origin_layout(raw_db_path, base_url_override="http://localhost")
+            lh_entries, lh_subdirs = _get_host_dir_listing(lh_layout.host_dir, lh_layout.db_name)
+            if lh_layout.db_name in lh_entries:
+                db_candidates.append(lh_layout.canonical_db_path)
+            known_keys.update(lh_subdirs)
+
+        for cand_layout, cand_entries, cand_subdirs in cls._scan_multi_origin_entries(
+            raw_db_path, layout, base_entries
+        ):
+            if cand_layout.db_name in cand_entries:
+                db_candidates.append(cand_layout.canonical_db_path)
+            known_keys.update(cand_subdirs)
+
+        if layout.flat_db_path is not None and layout.db_name in base_entries:
+            db_candidates.append(layout.flat_db_path)
+
+        for db_cand in db_candidates:
+            indexed_pair = cls._read_head_index_for_sqlite_path(db_cand)
+            if indexed_pair is not None:
+                known_keys.update(indexed_pair[1].keys())
+
+        return (token, frozenset(known_keys))
 
     def _get_get_dynamic_db_path(self) -> Path:
         """Resolve database path dynamically based on pinned or active base URL without splitting by study_context."""
@@ -1384,5 +1497,11 @@ class ConfigVersionStore:
             study_key=study_key,
         )
 
+
+_ORIG_GET_HISTORY_FUNC = ConfigVersionStore.get_history
+_ORIG_ROLLBACK_CONFIG_FUNC = ConfigVersionStore.rollback_config
+_ORIG_GET_HEAD_FUNC = ConfigVersionStore.get_head
+_ORIG_RESOLVE_LEGACY_FUNC = ConfigVersionStore.__dict__["resolve_legacy_committed_config"].__func__
+_ORIG_RESOLVE_COMMITTED_FUNC = ConfigVersionStore.__dict__["resolve_committed_config"].__func__
 
 __all__ = ["ConfigVersionStore"]

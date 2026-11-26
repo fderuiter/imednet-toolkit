@@ -127,14 +127,25 @@ def test_plan_ci_impact_maps_top_level_tests_without_building_wheels():
         [
             "tests/unit/cli/test_cli_forms.py",
             "tests/unit/test_batch_validation_and_polling.py",
+            "tests/unit/test_idempotent_syncs_and_sdtm_lineage.py",
             "tests/unit/test_keyed_upserts_and_watermark_recovery.py",
             "tests/unit/test_mode_safe_plugin_protocols.py",
+            "tests/unit/test_scoped_sdtm_enrichment_standards_contracts.py",
+            "tests/unit/test_spi_streaming_checkpoints.py",
             "tests/unit/test_tabular_import.py",
         ],
         packages,
     ) == {
         "build": [],
         "test": ["core", "plugins-workflows"],
+    }
+    assert plan_ci_impact(["tests/unit/test_airflow_cas_and_wildcards.py"], packages) == {
+        "build": [],
+        "test": ["plugins-workflows", "providers-airflow"],
+    }
+    assert plan_ci_impact(["tests/unit/test_sink_phi_resolution_unification.py"], packages) == {
+        "build": [],
+        "test": ["core", "plugins-sinks", "plugins-workflows"],
     }
     shared_test = plan_ci_impact(["tests/conftest.py"], packages)
     assert shared_test["build"] == []

@@ -249,6 +249,9 @@ def resolve_study_configuration(study_key: str | None) -> StudyConfiguration | N
     return None
 
 
+_DEFAULT_RESOLVE_STUDY_CONFIGURATION = resolve_study_configuration
+
+
 def resolve_enrichment_pipeline(study_key: str | None) -> "EnrichmentPipeline | None":
     """Return an :class:`EnrichmentPipeline` for *study_key* when committed rules exist."""
     study_cfg = resolve_study_configuration(study_key)
@@ -493,6 +496,7 @@ class CentralizedMapper:
 
     _cached_fields: list[tuple[str, str]] | None = None
     _cached_field_pairs: list[tuple[str, str]] | None = None
+    _cached_field_triples: list[tuple[str, str, str | None]] | None = None
     _DEFAULT_PIPELINE: Any = None
 
     def __init__(
@@ -560,6 +564,8 @@ class CentralizedMapper:
         self._record_seqs: dict[str, int] | None = record_seqs
         self._preserve_record_id = bool(preserve_record_id)
         self._pipeline_cache: dict[str, Any] = {}
+        self._store_keys_token: Any = None
+        self._store_known_keys: frozenset[str] | None = None
         self._sens_snapshot: frozenset[str] = frozenset()
         self._exempt_snapshot: frozenset[str] = frozenset()
         self._masked_meta_cache: dict[int, frozenset[str]] = {}
@@ -570,10 +576,18 @@ class CentralizedMapper:
                 self._pipeline_cache[study_config.study_key] = custom_pipeline
         else:
             self._default_pipeline = None
-        if CentralizedMapper._cached_fields is None:
+        if (
+            CentralizedMapper._cached_fields is None
+            or CentralizedMapper._cached_field_triples is None
+        ):
             pairs = [(f, _to_snake_case(f)) for f in ResourceRegistry.get_fields("Record")]
+            triples: list[tuple[str, str, str | None]] = []
+            for f, snake_key in pairs:
+                camel_f = format_variable_name(snake_key, "camelCase")
+                triples.append((f, snake_key, camel_f if camel_f not in {f, snake_key} else None))
             CentralizedMapper._cached_fields = pairs
             CentralizedMapper._cached_field_pairs = pairs
+            CentralizedMapper._cached_field_triples = triples
 
     def register_pipeline(self, study_key: str, pipeline: Any) -> None:
         """Register an explicit enrichment pipeline for *study_key*."""
@@ -607,6 +621,33 @@ class CentralizedMapper:
             self._masked_meta_cache[cache_key] = cached
         return cached
 
+    def _study_may_have_committed_config(self, sk: str) -> bool:
+        """Return False when active store topology proves *sk* has no committed config."""
+        if not sk or sk == "UNKNOWN":
+            return False
+        if resolve_study_configuration is not _DEFAULT_RESOLVE_STUDY_CONFIGURATION:
+            return True
+        store_cls = _get_config_store_cls()
+        if store_cls is None:
+            return False
+        tok_fn = getattr(store_cls, "current_store_state_token", None)
+        idx_fn = getattr(store_cls, "resolve_committed_study_keys", None)
+        if not callable(tok_fn) or not callable(idx_fn):
+            return True
+        try:
+            cur_tok = tok_fn()
+            if cur_tok != self._store_keys_token:
+                snap = idx_fn()
+                if snap is None:
+                    self._store_keys_token = None
+                    self._store_known_keys = None
+                    return True
+                self._store_keys_token, self._store_known_keys = snap
+            known = self._store_known_keys
+            return True if known is None else (sk in known)
+        except Exception:
+            return True
+
     def _resolve_pipeline_for_study(self, sk: str) -> Any:
         """Resolve and cache the active ``EnrichmentPipeline`` for *sk*."""
         if sk not in self._pipeline_cache:
@@ -618,9 +659,17 @@ class CentralizedMapper:
                     from imednet.core.context import sdk_governance_context
 
                     with sdk_governance_context(sdk_obj):
-                        resolved_cfg = resolve_study_configuration(sk)
+                        resolved_cfg = (
+                            resolve_study_configuration(sk)
+                            if self._study_may_have_committed_config(sk)
+                            else None
+                        )
                 else:
-                    resolved_cfg = resolve_study_configuration(sk)
+                    resolved_cfg = (
+                        resolve_study_configuration(sk)
+                        if self._study_may_have_committed_config(sk)
+                        else None
+                    )
                 self._pipeline_cache[sk] = (
                     EnrichmentPipeline(resolved_cfg)
                     if resolved_cfg is not None
@@ -761,10 +810,16 @@ class CentralizedMapper:
     def map_record(self, record: Any, study_key: str | None = None) -> dict[str, Any]:
         """Map a clinical record to the unified destination format."""
         fields = self._cached_fields
-        if fields is None:
+        triples = self._cached_field_triples
+        if fields is None or triples is None:
             fields = [(f, _to_snake_case(f)) for f in ResourceRegistry.get_fields("Record")]
+            triples = []
+            for f, snake_key in fields:
+                camel_f = format_variable_name(snake_key, "camelCase")
+                triples.append((f, snake_key, camel_f if camel_f not in {f, snake_key} else None))
             CentralizedMapper._cached_fields = fields
             CentralizedMapper._cached_field_pairs = fields
+            CentralizedMapper._cached_field_triples = triples
 
         is_mapping = isinstance(record, Mapping)
         resolved_study_key = (
@@ -823,15 +878,18 @@ class CentralizedMapper:
 
         active_conv = self.naming_convention
         mapped: dict[str, Any] = {}
-        for f, snake_key in fields:
+        rec_cls = type(record)
+        pydantic_fields: Any = None if is_mapping else getattr(rec_cls, "model_fields", None)
+        has_pydantic_extra = (
+            False if pydantic_fields is None else bool(getattr(record, "__pydantic_extra__", None))
+        )
+        for f, snake_key, camel_opt in triples:
             if is_mapping:
                 val = record.get(f)
                 if val is None and snake_key != f:
                     val = record.get(snake_key)
-                if val is None:
-                    camel_f = format_variable_name(snake_key, "camelCase")
-                    if camel_f not in {f, snake_key}:
-                        val = record.get(camel_f)
+                if val is None and camel_opt is not None:
+                    val = record.get(camel_opt)
                 if val is None and active_conv == "sdtm":
                     sdtm_f = format_variable_name(
                         snake_key,
@@ -845,10 +903,16 @@ class CentralizedMapper:
                 val = getattr(record, f, None)
                 if val is None and snake_key != f:
                     val = getattr(record, snake_key, None)
-                if val is None:
-                    camel_f = format_variable_name(snake_key, "camelCase")
-                    if camel_f not in {f, snake_key}:
-                        val = getattr(record, camel_f, None)
+                if (
+                    val is None
+                    and camel_opt is not None
+                    and (
+                        pydantic_fields is None
+                        or has_pydantic_extra
+                        or camel_opt in pydantic_fields
+                    )
+                ):
+                    val = getattr(record, camel_opt, None)
 
             if f == "record_data":
                 val = dict(val or {})

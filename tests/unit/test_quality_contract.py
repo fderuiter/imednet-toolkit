@@ -759,3 +759,44 @@ def test_verification_docs_and_skills_specify_workspace_quality_all() -> None:
         assert "quality:all packages" not in text, (
             f"Stale package-scoped quality:all in {skill_doc}"
         )
+
+
+def test_all_github_workflows_enforce_sha_pins_permissions_concurrency_and_safe_shell() -> None:
+    sha_action_re = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$")
+    workflows_dir = ROOT / ".github" / "workflows"
+    workflow_files = sorted([*workflows_dir.glob("*.yml"), *workflows_dir.glob("*.yaml")])
+    assert len(workflow_files) >= 7
+
+    for wf_path in workflow_files:
+        raw_text = wf_path.read_text(encoding="utf-8")
+        wf = yaml.safe_load(raw_text)
+        assert "concurrency" in wf, f"{wf_path.name} missing top-level concurrency control"
+        assert "permissions" in wf, f"{wf_path.name} missing top-level permissions block"
+        if wf_path.name != "live-tests.yml":
+            assert wf["permissions"] == {}, f"{wf_path.name} top-level permissions should be {{}}"
+
+        for job_id, job in wf["jobs"].items():
+            assert "permissions" in job, f"{wf_path.name}:{job_id} missing job permissions"
+            if wf_path.name == "main.yml" and job_id == "scorecard":
+                assert job.get("if") == "github.event_name != 'pull_request'"
+
+            for step in job.get("steps", []):
+                uses = step.get("uses")
+                if uses is not None:
+                    assert sha_action_re.match(str(uses)), (
+                        f"{wf_path.name}:{job_id} unpinned action: {uses}"
+                    )
+                    assert not str(uses).startswith("actions/cache@"), (
+                        f"{wf_path.name}:{job_id} must use actions/cache/restore + main-gated save"
+                    )
+                run_script = step.get("run")
+                if run_script is not None:
+                    assert "${{" not in str(run_script), (
+                        f"{wf_path.name}:{job_id} has direct expression interpolation in run block"
+                    )
+                    assert "pip install " not in str(run_script) or "uv pip install" in str(
+                        run_script
+                    ), f"{wf_path.name}:{job_id} uses unpinned pip install in run block"
+                    assert ">> $GITHUB_PATH" not in str(run_script), (
+                        f"{wf_path.name}:{job_id} has unquoted $GITHUB_PATH redirection"
+                    )
