@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import functools
 import json
+import os
 import re
 import shutil
 import sys
@@ -14,7 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,28 @@ def _ensure_open_file_headroom(target_soft: int = 65536) -> None:
             resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
     except Exception:
         return
+
+
+@contextlib.contextmanager
+def _single_cpu_affinity_guard() -> Iterator[None]:
+    """Pin Chromium subprocesses to one vCPU to prevent inter-core CLOCK_MONOTONIC skew SIGTRAPs."""
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    set_affinity = getattr(os, "sched_setaffinity", None)
+    original_cpus: set[int] | None = None
+    if callable(get_affinity) and callable(set_affinity):
+        try:
+            current = set(get_affinity(0))
+            if len(current) > 1:
+                original_cpus = current
+                set_affinity(0, {min(current)})
+        except OSError:
+            original_cpus = None
+    try:
+        yield
+    finally:
+        if original_cpus is not None and callable(set_affinity):
+            with contextlib.suppress(OSError):
+                set_affinity(0, original_cpus)
 
 
 def verify_built_tutorial_html(html_dir: Path) -> list[str]:
@@ -480,7 +503,7 @@ def verify_tutorials_in_browser(
         screenshot_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        with sync_playwright() as playwright_instance:
+        with _single_cpu_affinity_guard(), sync_playwright() as playwright_instance:
             # 1. Verify synchronous + mixed tutorial cells on tutorials/quick_start.html
             def _verify_quick_start(
                 qs_page: Any,

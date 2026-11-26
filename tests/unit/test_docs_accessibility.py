@@ -1769,11 +1769,16 @@ def test_verify_built_tutorial_html_invariants(tmp_path: Path) -> None:
         PyodideInitializationError,
         _is_recoverable_browser_error,
     )
+    from scripts.verify_pyodide_tutorials import (
+        _single_cpu_affinity_guard as _pyodide_cpu_guard,
+    )
 
     assert _is_recoverable_browser_error(PyodideInitializationError("CDN timeout")) is True
     assert _is_recoverable_browser_error(TimeoutError("wait_for_function timed out")) is True
     assert _is_recoverable_browser_error(RuntimeError("Page crashed")) is True
     assert _is_recoverable_browser_error(ValueError("assertion failure")) is False
+    with _pyodide_cpu_guard():
+        pass
 
 
 @pytest.mark.unit
@@ -2110,6 +2115,57 @@ def _ensure_open_file_headroom(target_soft: int = 65536) -> None:
         return
 
 
+def _single_cpu_affinity_guard() -> object:
+    """Pin Chromium subprocesses to one vCPU to prevent inter-core CLOCK_MONOTONIC skew SIGTRAPs."""
+    import contextlib
+    import os
+    from collections.abc import Iterator
+
+    @contextlib.contextmanager
+    def _guard() -> Iterator[None]:
+        get_affinity = getattr(os, "sched_getaffinity", None)
+        set_affinity = getattr(os, "sched_setaffinity", None)
+        original_cpus: set[int] | None = None
+        if callable(get_affinity) and callable(set_affinity):
+            try:
+                current = set(get_affinity(0))
+                if len(current) > 1:
+                    original_cpus = current
+                    set_affinity(0, {min(current)})
+            except OSError:
+                original_cpus = None
+        try:
+            yield
+        finally:
+            if original_cpus is not None and callable(set_affinity):
+                with contextlib.suppress(OSError):
+                    set_affinity(0, original_cpus)
+
+    return _guard()
+
+
+@pytest.mark.unit
+def test_single_cpu_affinity_guard_pins_and_restores(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify _single_cpu_affinity_guard pins to lowest CPU core and restores original mask on exit."""
+    import os
+
+    observed_sets: list[set[int]] = []
+    fake_mask = {1, 2, 3}
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(fake_mask), raising=False)
+
+    def _fake_setaffinity(_pid: int, cpus: set[int]) -> None:
+        observed_sets.append(set(cpus))
+
+    monkeypatch.setattr(os, "sched_setaffinity", _fake_setaffinity, raising=False)
+
+    with pytest.raises(RuntimeError, match="boom"), _single_cpu_affinity_guard():  # type: ignore[attr-defined]
+        assert observed_sets == [{1}]
+        raise RuntimeError("boom")
+
+    assert observed_sets == [{1}, {1, 2, 3}]
+
+
 def _launch_chromium_for_accessibility(playwright_instance: object) -> object:
     """Launch headless Chromium with CI-safe flags and local binary fallbacks."""
     _ensure_open_file_headroom()
@@ -2395,7 +2451,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
     """
 
     try:
-        with sync_playwright() as pw:
+        with _single_cpu_affinity_guard(), sync_playwright() as pw:  # type: ignore[attr-defined]
             browser = _launch_chromium_for_accessibility(pw)
             try:
                 from typing import Any
@@ -2513,7 +2569,12 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         self._raw_page = raw_page
                         self._viewport: dict[str, int] | None = None
                         self._media_state: dict[str, Any] = {}
+                        self._listeners: list[tuple[str, Any]] = []
                         self._cdp_wrapper: _ResilientCDPSession | None = None
+
+                    def on(self, event: str, handler: Any) -> None:
+                        self._listeners.append((event, handler))
+                        self._raw_page.on(event, handler)
 
                     def set_viewport_size(self, viewport_size: dict[str, int]) -> None:
                         self._viewport = dict(viewport_size)
@@ -2540,8 +2601,19 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                                     self._raw_page.close()
                                 except Exception:
                                     pass
-                                raw_ctx = self._ctx_wrapper.ensure_raw_context(force_recreate=True)
-                                self._raw_page = raw_ctx.new_page()
+                                has_sibling_pages = self._ctx_wrapper.active_page_count() > 1
+                                try:
+                                    raw_ctx = self._ctx_wrapper.ensure_raw_context(
+                                        force_recreate=not has_sibling_pages
+                                    )
+                                    self._raw_page = raw_ctx.new_page()
+                                except Exception:
+                                    raw_ctx = self._ctx_wrapper.ensure_raw_context(
+                                        force_recreate=True
+                                    )
+                                    self._raw_page = raw_ctx.new_page()
+                                for ev_name, ev_handler in self._listeners:
+                                    self._raw_page.on(ev_name, ev_handler)
                                 if self._viewport is not None:
                                     self._raw_page.set_viewport_size(self._viewport)
                                 if self._media_state:
@@ -2551,6 +2623,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         return None
 
                     def close(self) -> None:
+                        self._ctx_wrapper.unregister_page(self)
                         try:
                             self._raw_page.close()
                         except Exception:
@@ -2562,6 +2635,14 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 class _ResilientContext:
                     def __init__(self, raw_ctx: Any) -> None:
                         self._raw_ctx = raw_ctx
+                        self._open_pages: list[_ResilientPage] = []
+
+                    def active_page_count(self) -> int:
+                        return len(self._open_pages)
+
+                    def unregister_page(self, page_wrapper: _ResilientPage) -> None:
+                        if page_wrapper in self._open_pages:
+                            self._open_pages.remove(page_wrapper)
 
                     def ensure_raw_context(self, *, force_recreate: bool = False) -> Any:
                         if force_recreate or not browser.is_connected():  # type: ignore[attr-defined]
@@ -2574,7 +2655,9 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
 
                     def new_page(self) -> _ResilientPage:
                         raw_ctx = self.ensure_raw_context()
-                        return _ResilientPage(self, raw_ctx.new_page())
+                        wrapped = _ResilientPage(self, raw_ctx.new_page())
+                        self._open_pages.append(wrapped)
+                        return wrapped
 
                     def new_cdp_session(self, page: Any) -> _ResilientCDPSession:
                         raw_ctx = self.ensure_raw_context()
@@ -2585,6 +2668,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         return cdp
 
                     def close(self) -> None:
+                        self._open_pages.clear()
                         try:
                             self._raw_ctx.close()
                         except Exception:
@@ -2926,6 +3010,39 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                 # 3. Showcase SC 2.5.3 Label in Name & 4 roving tabindex tablists
                 # --------------------------------------------------------------
                 _reset_context(restart_browser=True)
+                contrib_page = context.new_page()
+                contrib_page.goto(
+                    f"http://127.0.0.1:{port}/reference/contributing.html",
+                    wait_until="load",
+                )
+                contrib_heading_audit = contrib_page.evaluate(
+                    """() => {
+                        return Array.from(document.querySelectorAll('[role="heading"]')).map((el) => {
+                            const cs = getComputedStyle(el);
+                            return {
+                                text: (el.textContent || '').trim(),
+                                ariaLevel: el.getAttribute('aria-level'),
+                                inSidebar: !!el.closest('.sidebar-tree'),
+                                inToctreeWrapper: !!el.closest('.toctree-wrapper'),
+                                borderBottomWidth: parseFloat(cs.borderBottomWidth)
+                            };
+                        });
+                    }"""
+                )
+                contrib_wrapper = [h for h in contrib_heading_audit if h["inToctreeWrapper"]]
+                assert contrib_wrapper == []
+                contrib_sidebar = [h for h in contrib_heading_audit if h["inSidebar"]]
+                assert len(contrib_sidebar) == 5
+                assert any("Maintainer & Contributor" in h["text"] for h in contrib_sidebar)
+                for h_item in contrib_heading_audit:
+                    assert h_item["ariaLevel"] in {"1", "2", "3", "4", "5", "6"}
+                    assert h_item["borderBottomWidth"] == 0.0
+                    if h_item["inSidebar"]:
+                        assert h_item["ariaLevel"] == "2"
+                        assert h_item["borderBottomWidth"] == 0.0
+                contrib_page.close()
+                _reset_context()
+
                 idx_page = context.new_page()
                 idx_page.goto(
                     f"http://127.0.0.1:{port}/index.html",
@@ -2963,38 +3080,6 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         assert h_item["borderBottomWidth"] == 0.0, (
                             f"index.html caption {h_item['text']!r} unexpectedly picked up h2 bottom border"
                         )
-
-                contrib_page = context.new_page()
-                contrib_page.goto(
-                    f"http://127.0.0.1:{port}/reference/contributing.html",
-                    wait_until="load",
-                )
-                contrib_heading_audit = contrib_page.evaluate(
-                    """() => {
-                        return Array.from(document.querySelectorAll('[role="heading"]')).map((el) => {
-                            const cs = getComputedStyle(el);
-                            return {
-                                text: (el.textContent || '').trim(),
-                                ariaLevel: el.getAttribute('aria-level'),
-                                inSidebar: !!el.closest('.sidebar-tree'),
-                                inToctreeWrapper: !!el.closest('.toctree-wrapper'),
-                                borderBottomWidth: parseFloat(cs.borderBottomWidth)
-                            };
-                        });
-                    }"""
-                )
-                contrib_wrapper = [h for h in contrib_heading_audit if h["inToctreeWrapper"]]
-                assert contrib_wrapper == []
-                contrib_sidebar = [h for h in contrib_heading_audit if h["inSidebar"]]
-                assert len(contrib_sidebar) == 5
-                assert any("Maintainer & Contributor" in h["text"] for h in contrib_sidebar)
-                for h_item in contrib_heading_audit:
-                    assert h_item["ariaLevel"] in {"1", "2", "3", "4", "5", "6"}
-                    assert h_item["borderBottomWidth"] == 0.0
-                    if h_item["inSidebar"]:
-                        assert h_item["ariaLevel"] == "2"
-                        assert h_item["borderBottomWidth"] == 0.0
-                contrib_page.close()
 
                 sc_253_checks = idx_page.evaluate(
                     """() => {
