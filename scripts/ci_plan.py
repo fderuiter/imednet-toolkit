@@ -31,9 +31,22 @@ _WORKFLOW_UNIT_TESTS = frozenset(
 _CORE_AND_WORKFLOW_TESTS = frozenset(
     {
         "tests/unit/test_batch_validation_and_polling.py",
+        "tests/unit/test_idempotent_syncs_and_sdtm_lineage.py",
         "tests/unit/test_keyed_upserts_and_watermark_recovery.py",
         "tests/unit/test_mode_safe_plugin_protocols.py",
+        "tests/unit/test_scoped_sdtm_enrichment_standards_contracts.py",
+        "tests/unit/test_spi_streaming_checkpoints.py",
         "tests/unit/test_tabular_import.py",
+    }
+)
+_AIRFLOW_AND_WORKFLOW_TESTS = frozenset(
+    {
+        "tests/unit/test_airflow_cas_and_wildcards.py",
+    }
+)
+_SINK_AND_WORKFLOW_TESTS = frozenset(
+    {
+        "tests/unit/test_sink_phi_resolution_unification.py",
     }
 )
 _SHARED_TEST_PREFIXES = ("tests/fixtures/", "tests/utils/", "tests/typing/")
@@ -88,6 +101,27 @@ def _owners_for_top_level_test(
     """Map top-level tests/ paths to owning package directories per .github/workflows/main.yml."""
     if normalized in _SHARED_TEST_FILES or normalized.startswith(_SHARED_TEST_PREFIXES):
         return set(packages.keys())
+
+    if normalized in _AIRFLOW_AND_WORKFLOW_TESTS:
+        return _resolve_package_dirs(
+            [
+                ("providers-airflow", "apache-airflow-providers-imednet"),
+                ("plugins-workflows", "imednet-workflows"),
+            ],
+            packages,
+            name_to_dir,
+        )
+
+    if normalized in _SINK_AND_WORKFLOW_TESTS:
+        return _resolve_package_dirs(
+            [
+                ("core", "imednet"),
+                ("plugins-sinks", "imednet-plugins-sinks"),
+                ("plugins-workflows", "imednet-workflows"),
+            ],
+            packages,
+            name_to_dir,
+        )
 
     if fnmatchcase(normalized, "tests/unit/test_airflow*.py") or "airflow" in normalized:
         return _resolve_package_dirs(

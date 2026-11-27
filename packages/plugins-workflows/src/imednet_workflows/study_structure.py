@@ -15,6 +15,12 @@ from imednet.spi.models import (
     StudyStructure,
     Variable,
 )
+from imednet.spi.utils import (
+    SyncToAsyncFacadeAdapter,
+    call_async_facade_method,
+    is_async_facade,
+    run_sync_over_async,
+)
 
 # Use TYPE_CHECKING to avoid circular import at runtime
 if TYPE_CHECKING:
@@ -60,49 +66,21 @@ def _build_study_structure(
     )
 
 
-def get_study_structure(sdk: "ImednetFacade", study_key: str) -> StudyStructure:
-    """Fetches and aggregates study structure information (intervals, forms, variables).
-
-    Args:
-        sdk: An initialized ImednetSDK instance.
-        study_key: The key of the study to fetch structure for.
-
-    Returns:
-        A StudyStructure object containing nested intervals, forms, and variables.
-
-    Raises:
-        ImednetError: If fetching any part of the structure fails.
-    """
-    try:
-        # Fetch all components concurrently (if async were used) or sequentially
-        intervals: list[Interval] = list(sdk.get_intervals(study_key))
-        forms: list[Form] = list(sdk.get_forms(study_key))
-        variables: list[Variable] = list(sdk.get_variables(study_key))
-
-        return _build_study_structure(study_key, intervals, forms, variables)
-
-    except Exception as e:
-        # Catch potential API errors or processing errors
-        raise ImednetError(
-            f"Failed to retrieve or process study structure for {study_key}: {e}"
-        ) from e
-
-
 async def async_get_study_structure(sdk: "AsyncImednetFacade", study_key: str) -> StudyStructure:
-    """Asynchronous variant of :func:`get_study_structure`."""
+    """Canonical asynchronous implementation for retrieving study structural metadata."""
     try:
 
         async def fetch_intervals() -> list[Any]:
             """Asynchronously fetch visit intervals."""
-            return await sdk.async_get_intervals(study_key)
+            return list(await call_async_facade_method(sdk, "get_intervals", study_key))
 
         async def fetch_forms() -> list[Any]:
             """Asynchronously fetch form definitions."""
-            return await sdk.async_get_forms(study_key)
+            return list(await call_async_facade_method(sdk, "get_forms", study_key))
 
         async def fetch_variables() -> list[Any]:
             """Asynchronously fetch variable definitions."""
-            return await sdk.async_get_variables(study_key)
+            return list(await call_async_facade_method(sdk, "get_variables", study_key))
 
         intervals, forms, variables = await asyncio.gather(
             fetch_intervals(),
@@ -112,7 +90,32 @@ async def async_get_study_structure(sdk: "AsyncImednetFacade", study_key: str) -
 
         return _build_study_structure(study_key, intervals, forms, variables)
 
-    except Exception as e:  # pragma: no cover - unexpected
+    except ImednetError:
+        raise
+    except Exception as e:
         raise ImednetError(
             f"Failed to retrieve or process study structure for {study_key}: {e}"
         ) from e
+
+
+def get_study_structure(sdk: "ImednetFacade", study_key: str) -> StudyStructure:
+    """Fetches and aggregates study structure information (intervals, forms, variables).
+
+    Args:
+        sdk: An initialized synchronous ImednetSDK instance.
+        study_key: The key of the study to fetch structure for.
+
+    Returns:
+        A StudyStructure object containing nested intervals, forms, and variables.
+
+    Raises:
+        TypeError: If an asynchronous SDK is passed.
+        ImednetError: If fetching any part of the structure fails.
+    """
+    if is_async_facade(sdk):
+        raise TypeError(
+            "get_study_structure() requires a synchronous ImednetSDK (ImednetFacade). "
+            "With AsyncImednetSDK, await async_get_study_structure(...) instead."
+        )
+    adapter = SyncToAsyncFacadeAdapter(sdk)
+    return run_sync_over_async(lambda: async_get_study_structure(adapter, study_key))

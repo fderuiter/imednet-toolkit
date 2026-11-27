@@ -19,6 +19,8 @@ PUBLIC_SYMBOLS = {
     "PluginLoadError",
     "FilterConflictError",
     "OrchestratorError",
+    "AsyncMultiStudyOrchestrator",
+    "AsyncStudyWorkerCallable",
     "MultiStudyOrchestrator",
     "OrchestratorResult",
     "StudyWorkerCallable",

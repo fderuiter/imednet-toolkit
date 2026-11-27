@@ -308,9 +308,21 @@ async def _fetch_bounded_facade_items(
     if limit is not None:
         req_filters["limit"] = min(limit + 1, MAX_PAGE_SIZE)
 
-    async_fn: Callable[..., Any] | None = getattr(sdk, async_method_name, None)
-    if inspect.iscoroutinefunction(async_fn):
-        raw_items = await async_fn(*args, **req_filters)
+    try:
+        inst_dict = object.__getattribute__(sdk, "__dict__")
+    except AttributeError:
+        inst_dict = {}
+
+    legacy_override = inst_dict.get(async_method_name) if isinstance(inst_dict, dict) else None
+    canonical_fn: Callable[..., Any] | None = getattr(sdk, sync_method_name, None)
+    legacy_fn: Callable[..., Any] | None = getattr(sdk, async_method_name, None)
+
+    if inspect.iscoroutinefunction(legacy_override) and sync_method_name not in inst_dict:
+        raw_items = await legacy_override(*args, **req_filters)
+    elif inspect.iscoroutinefunction(canonical_fn):
+        raw_items = await canonical_fn(*args, **req_filters)
+    elif inspect.iscoroutinefunction(legacy_fn):
+        raw_items = await legacy_fn(*args, **req_filters)
     else:
         sync_fn: Callable[..., Any] = getattr(sdk, sync_method_name)
         raw_items = await asyncio.to_thread(sync_fn, *args, **req_filters)
@@ -1777,9 +1789,19 @@ class JobMonitor(Container):
 
     async def _fetch_job_status(self, study_key: str, jid: str) -> Any:
         """Retrieve a single job status through the async or sync SPI facade."""
-        async_fn: Callable[..., Any] | None = getattr(self.sdk, "async_get_job", None)
-        if inspect.iscoroutinefunction(async_fn):
-            return await async_fn(study_key, jid)
+        try:
+            inst_dict = object.__getattribute__(self.sdk, "__dict__")
+        except AttributeError:
+            inst_dict = {}
+        legacy_override = inst_dict.get("async_get_job") if isinstance(inst_dict, dict) else None
+        canonical_fn: Callable[..., Any] | None = getattr(self.sdk, "get_job", None)
+        legacy_fn: Callable[..., Any] | None = getattr(self.sdk, "async_get_job", None)
+        if inspect.iscoroutinefunction(legacy_override) and "get_job" not in inst_dict:
+            return await legacy_override(study_key, jid)
+        if inspect.iscoroutinefunction(canonical_fn):
+            return await canonical_fn(study_key, jid)
+        if inspect.iscoroutinefunction(legacy_fn):
+            return await legacy_fn(study_key, jid)
         sync_fn = cast(ImednetFacade, self.sdk).get_job
         return await asyncio.to_thread(sync_fn, study_key, jid)
 

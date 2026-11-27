@@ -4,7 +4,7 @@ import sys
 from typing import TYPE_CHECKING
 
 from .cdisc_export import export_to_dataset_json, export_to_odm
-from .dispatcher import register_tabular_target
+from .dispatcher import async_export, register_tabular_target
 from .export import (
     export_to_csv,
     export_to_duckdb,
@@ -18,7 +18,7 @@ from .export import (
 )
 from .parquet import export_to_hive_parquet, hive_parquet_query
 from .parquet_engine import PartitionedStorageEngine, PyArrowDatasetPartitionedStorageEngine
-from .sink_base import ExportSink, SinkConfig
+from .sink_base import AsyncExportSink, ExportSink, SinkConfig, async_run_streaming_export
 
 if TYPE_CHECKING:
     from .dispatcher import export as export
@@ -40,8 +40,9 @@ register_tabular_target("sql_by_form", export_to_sql_by_form)
 register_tabular_target("hive_parquet", export_to_hive_parquet)
 
 __all__ = [  # noqa: RUF022
-    # Unified entry point
+    # Unified entry points
     "export",
+    "async_export",
     # Tabular path
     "export_to_csv",
     "export_to_dataset_json",
@@ -61,4 +62,6 @@ __all__ = [  # noqa: RUF022
     # Shared sink base
     "SinkConfig",
     "ExportSink",
+    "AsyncExportSink",
+    "async_run_streaming_export",
 ]

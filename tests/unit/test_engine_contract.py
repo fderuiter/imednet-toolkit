@@ -1190,3 +1190,49 @@ async def check_async_str_get(sdk: AsyncImednetSDK) -> None:
         f"Expected 14 [arg-type] errors (7 sync + 7 async str item_id get calls), got {len(arg_type_lines)}:\n"
         f"{neg_out}\n{neg_err}"
     )
+
+
+def test_local_fallback_contract_resolution_from_wheel_site_packages_depth_and_mutated_cwd(
+    tmp_path, monkeypatch
+):
+    """Verify local contract fallback walks ancestor directories from wheel site-packages even if CWD changed."""
+    monkeypatch.delenv("IMEDNET_OPENAPI_PATH", raising=False)
+    monkeypatch.delenv("IMEDNET_POSTMAN_PATH", raising=False)
+    monkeypatch.setattr(engine, "_CONTRACT_CACHE", None)
+
+    fake_repo = tmp_path / "workspace"
+    fake_engine_file = (
+        fake_repo
+        / ".venv"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+        / "imednet"
+        / "models"
+        / "engine.py"
+    )
+    fake_engine_file.parent.mkdir(parents=True)
+    fake_engine_file.write_text("# synthetic wheel module\n", encoding="utf-8")
+    (fake_repo / "imednet.postman_collection.json").write_bytes(ROOT_COLLECTION.read_bytes())
+
+    unrelated_cwd = tmp_path / "unrelated_cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+    monkeypatch.setattr(engine, "__file__", str(fake_engine_file))
+
+    class NonFileResource:
+        def is_file(self) -> bool:
+            return False
+
+    class FakePkgRoot:
+        def joinpath(self, *_args):
+            return NonFileResource()
+
+    monkeypatch.setattr(engine.importlib.resources, "files", lambda _pkg: FakePkgRoot())
+
+    candidates = engine._iter_local_postman_candidates(str(fake_engine_file))
+    assert str(fake_repo / "imednet.postman_collection.json") in candidates
+
+    contract = get_contract()
+    assert "Subject" in contract.models
+    assert "Record" in contract.models

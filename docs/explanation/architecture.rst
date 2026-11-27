@@ -126,16 +126,29 @@ Credential redaction
 Async Client
 ------------
 
-:class:`~imednet.core.async_client.AsyncClient` provides the same features as the
-sync client but leverages ``async``/``await`` for concurrency. The public SDK
-surface is split into two client classes:
+:class:`~imednet.core.async_client.AsyncClient` powers a unified **async-first
+execution engine** shared across Data Dictionary loaders, study orchestrators,
+all nine built-in workflows, and streaming export sinks. The public SDK surface
+exposes two strictly typed client facades with **symmetric unprefixed method
+names**:
 
-* :class:`~imednet.sdk.ImednetSDK` for synchronous usage only.
-* :class:`~imednet.sdk.AsyncImednetSDK` for asynchronous usage only.
+* :class:`~imednet.sdk.ImednetSDK` (:class:`~imednet.spi.facade.ImednetFacade`)
+  for synchronous scripts, CLI commands, and interactive notebooks. Synchronous
+  wrappers delegate to canonical ``async`` engines via an event-loop-aware bridge
+  that detects active ``asyncio`` loops (including Jupyter, ``pytest-asyncio``,
+  and single-threaded WebAssembly/Pyodide runtimes) so callers never hit
+  ``RuntimeError``.
+* :class:`~imednet.sdk.AsyncImednetSDK`
+  (:class:`~imednet.spi.facade.AsyncImednetFacade`) for native ``async``/``await``
+  services, exposing symmetric coroutines (for example ``await sdk.get_records(...)``,
+  ``await sdk.create_records_batch(...)``, ``await sdk.poll_jobs(...)``,
+  ``await async_load_from_api(sdk, ...)``, and
+  :class:`~imednet.orchestration.AsyncMultiStudyOrchestrator`). Legacy
+  ``async_*`` convenience methods remain available on ``AsyncImednetSDK`` as
+  deprecated compatibility aliases.
 
-Migration note: if you previously used async behavior from ``ImednetSDK``, move
-to :class:`~imednet.sdk.AsyncImednetSDK` and manage lifecycle with
-``async with`` or ``await sdk.aclose()``.
+Manage asynchronous client lifecycles with ``async with AsyncImednetSDK(...) as sdk:``
+or ``await sdk.aclose()``.
 
 Endpoints
 ---------
@@ -151,10 +164,19 @@ IDE autocomplete, and avoids MRO-related typing ambiguity. Endpoints expose
 Workflows
 ---------
 
-Workflows orchestrate several endpoints to perform higher level tasks. For
-example, :class:`~imednet_workflows.record_update.RecordUpdateWorkflow` validates
-record payloads, submits them, and polls resulting jobs. Workflows have sync and
-async variants and are available under ``sdk.workflows``.
+Workflows orchestrate several endpoints over shared ``async`` cores to perform
+higher-level clinical operations—for example,
+:class:`~imednet_workflows.record_update.RecordUpdateWorkflow` and
+:class:`~imednet_workflows.record_update.AsyncRecordUpdateWorkflow` validate
+record payloads, submit bounded batches, and poll resulting jobs. All nine
+built-in workflows expose symmetric unprefixed methods under ``sdk.workflows``
+on both :class:`~imednet.sdk.ImednetSDK`
+(:class:`~imednet.plugins.SyncWorkflowsNamespaceProtocol`) and
+:class:`~imednet.sdk.AsyncImednetSDK`
+(:class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol`), while ``sdk.sinks``
+binds :class:`~imednet_sinks.plugin.SinksNamespace` and
+:class:`~imednet_sinks.plugin.AsyncSinksNamespace` over native synchronous and
+asynchronous sink drivers.
 
 Caching
 -------
@@ -192,9 +214,12 @@ Adding New Endpoints
 Adding New Workflows
 --------------------
 
-* Create a workflow under ``packages/plugins-workflows/src/imednet_workflows`` and provide sync and async
-  methods where appropriate.
-* Register the workflow factory in the distribution's ``imednet.workflows`` entry points.
+* Implement a canonical ``Async*`` workflow against
+  :class:`~imednet.spi.facade.AsyncImednetFacade` under
+  ``packages/plugins-workflows/src/imednet_workflows`` and wrap synchronous
+  :class:`~imednet.spi.facade.ImednetFacade` calls over it.
+* Register the synchronous adapter in ``imednet.workflows`` and the asynchronous
+  adapter in ``imednet.async_workflows``.
 * Add CLI commands or examples that demonstrate the workflow.
 * Update documentation and tests.
 
@@ -233,7 +258,9 @@ Export Path Decision Matrix
        ``<STUDYID>/<DOMAIN>/<USUBJID>/<*SEQ>`` when ``as_sdtm=True`` and
        ``record_id`` is absent).
      - ``imednet.spi.sinks.build_sink_mapper`` / ``CentralizedMapper`` →
-       :class:`~imednet_sinks.document.MongoDbExportSink`
+       :class:`~imednet_sinks.document.MongoDbExportSink` /
+       :class:`~imednet_sinks.document.AsyncMongoDbExportSink`
+       (native ``pymongo.AsyncMongoClient``)
    * - **Graph**
      - Destination models relationships natively (for example Neo4j),
        preserving *Study → Subject → Visit → Record* for scheduled ``Visit``
@@ -244,7 +271,9 @@ Export Path Decision Matrix
        ``(STUDYID, DOMAIN, USUBJID, *SEQ)`` or ``(STUDYID, DOMAIN, USUBJID)``
        for domains without ``*SEQ`` such as ``DM``).
      - ``imednet.spi.sinks.build_sink_mapper`` / ``CentralizedMapper`` →
-       :class:`~imednet_sinks.graph.Neo4jExportSink`
+       :class:`~imednet_sinks.graph.Neo4jExportSink` /
+       :class:`~imednet_sinks.graph.AsyncNeo4jExportSink`
+       (native ``neo4j.AsyncGraphDatabase``)
    * - **Warehouse**
      - Destination is a cloud data warehouse with a native bulk loader.
        ``Record`` items are mapped via core SPI (supporting ``snake_case``
@@ -255,19 +284,27 @@ Export Path Decision Matrix
        and loaded via ``MERGE INTO`` / ``COPY INTO`` for best throughput.
      - ``imednet.spi.sinks.build_sink_mapper`` / ``CentralizedMapper`` →
        Parquet staging →
-       :class:`~imednet_sinks.warehouse.SnowflakeExportSink`
+       :class:`~imednet_sinks.warehouse.SnowflakeExportSink` /
+       :class:`~imednet_sinks.warehouse.AsyncSnowflakeExportSink`
 
 Data flow diagram
 ~~~~~~~~~~~~~~~~~
 
 .. mermaid:: /diagrams/architecture_6.mmd
 
-Shared ``ExportSink`` contract
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Shared ``ExportSink`` and ``AsyncExportSink`` contracts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-All non-tabular sinks subclass
-``imednet.spi.sinks.ExportSink`` and must implement
-three methods:
+All non-tabular synchronous sinks subclass
+``imednet.spi.sinks.ExportSink`` (executed via
+:func:`~imednet.integrations.sink_base.run_streaming_export` and
+:func:`~imednet.integrations.dispatcher.export`), while native asynchronous
+sinks subclass ``imednet.spi.sinks.AsyncExportSink`` (executed via
+:func:`~imednet.integrations.sink_base.async_run_streaming_export` and
+:func:`~imednet.integrations.dispatcher.async_export`) with identical PHI
+masking, 21 CFR Part 11 voided-record reconciliation, incremental watermark
+checkpointing, and CDISC SDTM lineage guarantees. Each sink implements three
+lifecycle methods (coroutines on ``AsyncExportSink``):
 
 ``write_batch(records, *, batch_id) -> int``
     Write one batch to the destination.  The ``batch_id`` is a

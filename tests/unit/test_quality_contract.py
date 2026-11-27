@@ -791,6 +791,8 @@ def test_all_workflows_enforce_sha_pinning_least_privilege_concurrency_and_safe_
                 f"{ctx} missing explicit job name"
             )
             assert isinstance(job.get("permissions"), dict), f"{ctx} missing job permissions"
+            if wf_name == "main.yml" and job_id == "scorecard":
+                assert job.get("if") == "github.event_name != 'pull_request'"
 
             steps = job.get("steps", [])
             for step in steps:

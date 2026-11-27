@@ -44,19 +44,28 @@ from __future__ import annotations
 import inspect
 import os
 import sys
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterable,
+    AsyncIterator,
+    Callable,
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, Self, overload, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, overload, runtime_checkable
 
 from typing_extensions import deprecated
 
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .datadict import DataDictionary
-    from .integrations.sink_base import ExportSink
+    from .datadict import DataDictionary, DatasetJsonEnvelope, OdmAnnotation, OdmAuditRecord
+    from .integrations.sink_base import AsyncExportSink, ExportSink
     from .models.forms import Form
     from .models.intervals import Interval
     from .models.jobs import Job
@@ -100,8 +109,24 @@ if not TYPE_CHECKING:
                     }
                     return (not is_async) and required.issubset(entry_points_map)
                 if self is AsyncWorkflowsNamespaceProtocol:
-                    required = {"record_update", "register_subjects", "uat_inspector"}
-                    return is_async and required.issubset(entry_points_map)
+                    required = {
+                        "data_extraction",
+                        "duckdb_centralizer",
+                        "query_management",
+                        "record_mapper",
+                        "record_update",
+                        "register_subjects",
+                        "subject_data",
+                        "uat",
+                        "uat_inspector",
+                    }
+                    async_eps = getattr(instance, "_async_entry_points", None)
+                    available = (
+                        set(async_eps) | set(entry_points_map)
+                        if isinstance(async_eps, dict)
+                        else set(entry_points_map)
+                    )
+                    return is_async and required.issubset(available)
             if sys.version_info < (3, 12) and getattr(
                 self, "_is_runtime_protocol", False
             ):  # pragma: no cover
@@ -111,6 +136,25 @@ if not TYPE_CHECKING:
                     try:
                         inspect.getattr_static(instance, attr)
                     except AttributeError:
+                        return False
+                return True
+            ann = getattr(self, "__annotations__", None)
+            if isinstance(ann, dict) and ann:
+                for attr in ann:
+                    try:
+                        inspect.getattr_static(instance, attr)
+                    except AttributeError:
+                        return False
+                de = (
+                    instance.__dict__.get("data_extraction")
+                    if hasattr(instance, "__dict__")
+                    else None
+                )
+                if de is not None and callable(getattr(de, "extract_records_by_criteria", None)):
+                    is_coro = inspect.iscoroutinefunction(de.extract_records_by_criteria)
+                    if self is SyncWorkflowsNamespaceProtocol and is_coro:
+                        return False
+                    if self is AsyncWorkflowsNamespaceProtocol and not is_coro:
                         return False
                 return True
             return super().__instancecheck__(instance)
@@ -144,6 +188,65 @@ class DataExtractionWorkflowProtocol(Protocol):
         """Extract record revisions bounded by optional UTC dates and filters."""
         ...
 
+    def extract_odm_audit_records(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any] | None = None,
+        *,
+        default_location_oid: str | None = None,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **filters: Any,
+    ) -> list[OdmAuditRecord]:
+        """Extract record revisions mapped to CDISC ODM 1.3.2 AuditRecord models."""
+        ...
+
+
+class AsyncDataExtractionWorkflowProtocol(Protocol):
+    """Structural contract for ``sdk.workflows.data_extraction``."""
+
+    async def extract_records_by_criteria(
+        self,
+        study_key: str,
+        record_filter: dict[str, Any] | None = None,
+        subject_filter: dict[str, Any] | None = None,
+        visit_filter: dict[str, Any] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        *,
+        include_deleted: bool = False,
+        **other_filters: Any,
+    ) -> list[Record]:
+        """Extract study records matching combined subject, visit, and record filters."""
+        ...
+
+    async def extract_audit_trail(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any] | None = None,
+        **filters: Any,
+    ) -> list[RecordRevision]:
+        """Extract record revisions bounded by optional UTC dates and filters."""
+        ...
+
+    async def extract_odm_audit_records(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any] | None = None,
+        *,
+        default_location_oid: str | None = None,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **filters: Any,
+    ) -> list[OdmAuditRecord]:
+        """Asynchronously extract record revisions mapped to CDISC ODM 1.3.2 AuditRecord models."""
+        ...
+
 
 class DuckDBIngestionWorkflowProtocol(Protocol):
     """Structural contract for ``sdk.workflows.duckdb_centralizer``."""
@@ -166,6 +269,60 @@ class DuckDBIngestionWorkflowProtocol(Protocol):
 
     def close(self) -> None:
         """Close the underlying DuckDB connection."""
+        ...
+
+    def __enter__(self) -> Self:
+        """Enter the context manager and return the workflow instance."""
+        ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the context manager and close the DuckDB connection."""
+        ...
+
+
+class AsyncDuckDBIngestionWorkflowProtocol(Protocol):
+    """Asynchronous contract for ``sdk.workflows.duckdb_centralizer`` on ``AsyncImednetSDK``."""
+
+    async def ingest_revisions(
+        self,
+        study_key: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        mode: Literal["append", "replace"] = "append",
+        mask_phi: bool | None = None,
+    ) -> int:
+        """Asynchronously ingest study record revisions into the DuckDB bronze table."""
+        ...
+
+    async def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
+        """Asynchronously create or replace the deduplicated DuckDB silver view for a study."""
+        ...
+
+    async def aclose(self) -> None:
+        """Asynchronously close the underlying DuckDB connection."""
+        ...
+
+    def close(self) -> None:
+        """Close the underlying DuckDB connection."""
+        ...
+
+    async def __aenter__(self) -> Self:
+        """Enter the async context manager and return the workflow instance."""
+        ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the async context manager and close the DuckDB connection."""
         ...
 
     def __enter__(self) -> Self:
@@ -255,6 +412,94 @@ class QueryManagementWorkflowProtocol(Protocol):
         **kwargs: Any,
     ) -> list[TriageItem]:
         """Synchronize clinical queries for a study into a local triage queue."""
+        ...
+
+    def extract_odm_annotations(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any] | None = None,
+        *,
+        open_only: bool = False,
+        include_answered: bool = False,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **kwargs: Any,
+    ) -> list[OdmAnnotation]:
+        """Extract study queries mapped to CDISC ODM 1.3.2 Annotation models."""
+        ...
+
+
+class AsyncQueryManagementWorkflowProtocol(Protocol):
+    """Asynchronous contract for ``sdk.workflows.query_management`` on ``AsyncImednetSDK``."""
+
+    async def get_open_queries(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any] | None = None,
+        include_answered: bool = False,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Asynchronously retrieve open queries for a study, optionally including answered."""
+        ...
+
+    async def get_unresolved_queries(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Asynchronously retrieve all unresolved (OPEN and ANSWERED) queries for a study."""
+        ...
+
+    async def get_queries_for_subject(
+        self,
+        study_key: str,
+        subject_key: str,
+        additional_filter: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Asynchronously retrieve queries associated with a specific subject."""
+        ...
+
+    async def get_queries_by_site(
+        self,
+        study_key: str,
+        site_key: str,
+        additional_filter: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[Query]:
+        """Asynchronously retrieve queries associated with a specific site."""
+        ...
+
+    async def get_query_state_counts(self, study_key: str, **kwargs: Any) -> dict[str, int]:
+        """Asynchronously count queries grouped by query status."""
+        ...
+
+    async def sync_queries_to_triage(
+        self,
+        study_key: str,
+        store: TriageStoreProtocol | str | Path | None = None,
+        *,
+        additional_filter: dict[str, Any] | None = None,
+        unresolved_only: bool = False,
+        default_severity: str = "medium",
+        **kwargs: Any,
+    ) -> list[TriageItem]:
+        """Asynchronously synchronize clinical queries into a local triage queue."""
+        ...
+
+    async def extract_odm_annotations(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any] | None = None,
+        *,
+        open_only: bool = False,
+        include_answered: bool = False,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **kwargs: Any,
+    ) -> list[OdmAnnotation]:
+        """Asynchronously extract study queries mapped to CDISC ODM 1.3.2 Annotation models."""
         ...
 
 
@@ -349,6 +594,180 @@ class RecordMapperProtocol(Protocol):
         include_deleted: bool | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked DataFrames mapped to a CDISC SDTM domain."""
+        ...
+
+    def to_dataset_json(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
+        ...
+
+    def sdtm_dataset_json(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Emit a CDISC Dataset-JSON v1.1 envelope for a specific SDTM domain."""
+        ...
+
+
+class AsyncRecordMapperProtocol(Protocol):
+    """Structural contract for ``sdk.workflows.record_mapper``."""
+
+    async def dataframe(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = True,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+    ) -> pd.DataFrame:
+        """Return mapped study records as a pandas DataFrame."""
+        ...
+
+    def iter_dataframes(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = True,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+    ) -> AsyncIterator[pd.DataFrame]:
+        """Yield mapped study record DataFrames in bounded chunks."""
+        ...
+
+    async def build_hierarchy(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_keys: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        records: Iterable[Record] | AsyncIterable[Record] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Generate a nested JSON hierarchy for study records."""
+        ...
+
+    def transform_to_sdtm(
+        self,
+        records: Iterable[Any],
+        domain: str,
+        study_key: str,
+        *,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        seq_counters: dict[str, int] | None = None,
+        record_seqs: dict[str, int] | None = None,
+        preserve_record_id: bool = False,
+    ) -> pd.DataFrame:
+        """Transform records into a normalized SDTM domain DataFrame."""
+        ...
+
+    async def sdtm_dataframe(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+    ) -> pd.DataFrame:
+        """Return study records mapped to a CDISC SDTM domain DataFrame."""
+        ...
+
+    def iter_sdtm_dataframes(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+    ) -> AsyncIterator[pd.DataFrame]:
+        """Yield chunked DataFrames mapped to a CDISC SDTM domain."""
+        ...
+
+    async def to_dataset_json(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | AsyncIterable[Any] | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Asynchronously emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
+        ...
+
+    async def sdtm_dataset_json(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Asynchronously emit a CDISC Dataset-JSON v1.1 envelope for a specific SDTM domain."""
         ...
 
 
@@ -450,6 +869,101 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
 class AsyncRecordUpdateWorkflowProtocol(Protocol):
     """Asynchronous contract for ``sdk.workflows.record_update`` on ``AsyncImednetSDK``."""
 
+    async def create_or_update_records_batch(
+        self,
+        study_key: str,
+        records_data: RecordsInput,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        email_notify: bool | str | None = None,
+        chunk_size: int | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> BatchSubmissionSummary:
+        """Validate once, submit records in bounded chunks, and return a batch summary."""
+        ...
+
+    async def create_or_update_records(
+        self,
+        study_key: str,
+        records_data: RecordsInput,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> Job:
+        """Submit records for creation or update and return the resulting Job."""
+        ...
+
+    async def register_subject(
+        self,
+        study_key: str,
+        form_identifier: str | int,
+        site_identifier: str | int,
+        data: dict[str, Any],
+        form_identifier_type: Literal["key", "id"] = "key",
+        site_identifier_type: Literal["name", "id"] = "name",
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> Job:
+        """Register a new subject by submitting a single enrollment record."""
+        ...
+
+    async def update_scheduled_record(
+        self,
+        study_key: str,
+        form_identifier: str | int,
+        subject_identifier: str | int,
+        interval_identifier: str | int,
+        data: dict[str, Any],
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        interval_identifier_type: Literal["name", "id"] = "name",
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> Job:
+        """Update an existing scheduled record for a subject."""
+        ...
+
+    async def create_new_record(
+        self,
+        study_key: str,
+        form_identifier: str | int,
+        subject_identifier: str | int,
+        data: dict[str, Any],
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> Job:
+        """Create a new unscheduled record for an existing subject."""
+        ...
+
+    @deprecated(
+        "async_create_or_update_records_batch() is deprecated; "
+        "use await create_or_update_records_batch(...) instead."
+    )
     async def async_create_or_update_records_batch(
         self,
         study_key: str,
@@ -468,6 +982,9 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         """Asynchronously validate once, submit chunks, and return a batch summary."""
         ...
 
+    @deprecated(
+        "async_create_or_update_records() is deprecated; use await create_or_update_records(...) instead."
+    )
     async def async_create_or_update_records(
         self,
         study_key: str,
@@ -485,6 +1002,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         """Asynchronously submit records for creation or update and return the Job."""
         ...
 
+    @deprecated("async_register_subject() is deprecated; use await register_subject(...) instead.")
     async def async_register_subject(
         self,
         study_key: str,
@@ -503,6 +1021,9 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         """Asynchronously register a new subject via the Records API."""
         ...
 
+    @deprecated(
+        "async_update_scheduled_record() is deprecated; use await update_scheduled_record(...) instead."
+    )
     async def async_update_scheduled_record(
         self,
         study_key: str,
@@ -523,6 +1044,9 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         """Asynchronously update an existing scheduled record for a subject."""
         ...
 
+    @deprecated(
+        "async_create_new_record() is deprecated; use await create_new_record(...) instead."
+    )
     async def async_create_new_record(
         self,
         study_key: str,
@@ -539,46 +1063,6 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         schema: ValidationSchemaProtocol | None = None,
     ) -> Job:
         """Asynchronously create a new unscheduled record for an existing subject."""
-        ...
-
-    @deprecated(
-        "create_or_update_records_batch() is synchronous and raises TypeError on AsyncImednetSDK; "
-        "use await async_create_or_update_records_batch(...) instead."
-    )
-    def create_or_update_records_batch(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous batch method stub on AsyncImednetSDK."""
-        ...
-
-    @deprecated(
-        "create_or_update_records() is synchronous and raises TypeError on AsyncImednetSDK; "
-        "use await async_create_or_update_records(...) instead."
-    )
-    def create_or_update_records(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous record submission stub on AsyncImednetSDK."""
-        ...
-
-    @deprecated(
-        "register_subject() is synchronous and raises TypeError on AsyncImednetSDK; "
-        "use await async_register_subject(...) instead."
-    )
-    def register_subject(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous subject registration stub on AsyncImednetSDK."""
-        ...
-
-    @deprecated(
-        "update_scheduled_record() is synchronous and raises TypeError on AsyncImednetSDK; "
-        "use await async_update_scheduled_record(...) instead."
-    )
-    def update_scheduled_record(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous scheduled record update stub on AsyncImednetSDK."""
-        ...
-
-    @deprecated(
-        "create_new_record() is synchronous and raises TypeError on AsyncImednetSDK; "
-        "use await async_create_new_record(...) instead."
-    )
-    def create_new_record(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous unscheduled record creation stub on AsyncImednetSDK."""
         ...
 
 
@@ -674,7 +1158,7 @@ RegisterSubjectsWorkflowProtocol = SyncRegisterSubjectsWorkflowProtocol
 class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
     """Asynchronous contract for ``sdk.workflows.register_subjects`` on ``AsyncImednetSDK``."""
 
-    async def async_register_subjects_batch(
+    async def register_subjects_batch(
         self,
         study_key: str,
         subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
@@ -695,7 +1179,7 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         """Asynchronously validate sites and submit subject registrations in bounded chunks."""
         ...
 
-    async def async_register_subjects(
+    async def register_subjects(
         self,
         study_key: str,
         subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
@@ -716,19 +1200,51 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         ...
 
     @deprecated(
-        "register_subjects_batch() is synchronous and raises TypeError on AsyncImednetSDK; "
-        "use await async_register_subjects_batch(...) instead."
+        "async_register_subjects_batch() is deprecated; "
+        "use await register_subjects_batch(...) instead."
     )
-    def register_subjects_batch(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous batch subject registration stub on AsyncImednetSDK."""
+    async def async_register_subjects_batch(
+        self,
+        study_key: str,
+        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        chunk_size: int | None = None,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> BatchSubmissionSummary:
+        """Deprecated alias for :meth:`register_subjects_batch`."""
         ...
 
     @deprecated(
-        "register_subjects() is synchronous and raises TypeError on AsyncImednetSDK; "
-        "use await async_register_subjects(...) instead."
+        "async_register_subjects() is deprecated; use await register_subjects(...) instead."
     )
-    def register_subjects(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous subject registration stub on AsyncImednetSDK."""
+    async def async_register_subjects(
+        self,
+        study_key: str,
+        subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | RecordsInput,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> Job:
+        """Deprecated alias for :meth:`register_subjects`."""
         ...
 
 
@@ -760,6 +1276,20 @@ class SubjectDataWorkflowProtocol(Protocol):
     """Structural contract for ``sdk.workflows.subject_data``."""
 
     def get_all_subject_data(
+        self,
+        study_key: str,
+        subject_key: str,
+        *,
+        include_deleted: bool = False,
+    ) -> SubjectComprehensiveDataProtocol:
+        """Retrieve subject details, visits, records, and queries for a subject."""
+        ...
+
+
+class AsyncSubjectDataWorkflowProtocol(Protocol):
+    """Structural contract for ``sdk.workflows.subject_data``."""
+
+    async def get_all_subject_data(
         self,
         study_key: str,
         subject_key: str,
@@ -850,7 +1380,7 @@ class SyncStudySchemaInspectorProtocol(Protocol):
 class AsyncStudySchemaInspectorProtocol(Protocol):
     """Asynchronous contract for ``sdk.workflows.uat_inspector`` on ``AsyncImednetSDK``."""
 
-    async def async_inspect(
+    async def inspect(
         self, study_key: str, *, force_refresh: bool = False
     ) -> StudySnapshotProtocol:
         """Asynchronously fetch and index structural study metadata concurrently."""
@@ -860,12 +1390,11 @@ class AsyncStudySchemaInspectorProtocol(Protocol):
         """Clear cached study snapshots."""
         ...
 
-    @deprecated(
-        "inspect() is synchronous and raises TypeError on AsyncImednetSDK; "
-        "use await async_inspect(...) instead."
-    )
-    def inspect(self, study_key: str, *, force_refresh: bool = False) -> Never:
-        """Rejected synchronous inspect stub on AsyncImednetSDK."""
+    @deprecated("async_inspect() is deprecated; use await inspect(...) instead.")
+    async def async_inspect(
+        self, study_key: str, *, force_refresh: bool = False
+    ) -> StudySnapshotProtocol:
+        """Deprecated alias for :meth:`inspect`."""
         ...
 
 
@@ -1045,6 +1574,84 @@ class UATWorkflowProtocol(Protocol):
         ...
 
 
+class AsyncUATWorkflowProtocol(Protocol):
+    """Structural contract for ``sdk.workflows.uat``."""
+
+    @property
+    def state(self) -> str:
+        """Current lifecycle state of the UAT workflow."""
+        ...
+
+    @property
+    def state_history(self) -> Sequence[str]:
+        """Recorded lifecycle state transitions for the current or latest run."""
+        ...
+
+    @property
+    def last_result(self) -> UATRunResultProtocol | None:
+        """Result from the most recent ``run()`` invocation, if any."""
+        ...
+
+    def transition_to(self, target: str, *, dry_run: bool = False) -> str:
+        """Transition workflow state along a valid lifecycle edge."""
+        ...
+
+    async def run(
+        self,
+        study_key: str,
+        *,
+        spec: Any = None,
+        subject_count: int = 2,
+        site_name: str | None = None,
+        enabled_form_keys: list[str] | None = None,
+        email_notify: bool | str | None = None,
+        data_dictionary: DataDictionary | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        seed: int | None = None,
+        dry_run: bool = False,
+    ) -> UATRunResultProtocol:
+        """Execute the end-to-end UAT pipeline and return its run result."""
+        ...
+
+    async def inspect(self, study_key: str) -> StudySnapshotProtocol:
+        """Inspect study metadata via StudySchemaInspector."""
+        ...
+
+    def build_spec(self, snapshot: Any, **kwargs: Any) -> Any:
+        """Auto-generate a UAT specification from a study snapshot."""
+        ...
+
+    def generate(
+        self,
+        spec: Any,
+        snapshot: Any,
+        *,
+        data_dictionary: DataDictionary | None = None,
+        seed: int | None = None,
+    ) -> list[Any]:
+        """Generate synthetic record sets from a UAT specification and snapshot."""
+        ...
+
+    async def submit(
+        self,
+        study_key: str,
+        record_sets: list[Any],
+        email_notify: bool | str | None = None,
+        *,
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> Any:
+        """Submit generated UAT record sets in two phases."""
+        ...
+
+    async def monitor(self, study_key: str, submission_result: Any) -> Any:
+        """Poll submitted UAT job batches to completion."""
+        ...
+
+    def reset(self) -> None:
+        """Reset the UAT workflow state machine."""
+        ...
+
+
 @runtime_checkable
 class SyncWorkflowsNamespaceProtocol(Protocol):
     """Synchronous workflows namespace contract exposed on ``ImednetSDK.workflows``."""
@@ -1100,72 +1707,48 @@ class AsyncWorkflowsNamespaceProtocol(Protocol):
     """Asynchronous workflows namespace contract exposed on ``AsyncImednetSDK.workflows``."""
 
     @property
+    def data_extraction(self) -> AsyncDataExtractionWorkflowProtocol:
+        """Access the asynchronous data extraction workflow."""
+        ...
+
+    @property
+    def duckdb_centralizer(self) -> AsyncDuckDBIngestionWorkflowProtocol:
+        """Access the asynchronous DuckDB bronze/silver ingestion workflow."""
+        ...
+
+    @property
+    def query_management(self) -> AsyncQueryManagementWorkflowProtocol:
+        """Access the asynchronous query management workflow."""
+        ...
+
+    @property
+    def record_mapper(self) -> AsyncRecordMapperProtocol:
+        """Access the asynchronous tabular and SDTM record mapper workflow."""
+        ...
+
+    @property
     def record_update(self) -> AsyncRecordUpdateWorkflowProtocol:
-        """Access the async-capable record submission and update workflow."""
+        """Access the asynchronous record submission and update workflow."""
         ...
 
     @property
     def register_subjects(self) -> AsyncRegisterSubjectsWorkflowProtocol:
-        """Access the async-capable bulk subject registration workflow."""
+        """Access the asynchronous bulk subject registration workflow."""
+        ...
+
+    @property
+    def subject_data(self) -> AsyncSubjectDataWorkflowProtocol:
+        """Access the asynchronous comprehensive subject data retrieval workflow."""
+        ...
+
+    @property
+    def uat(self) -> AsyncUATWorkflowProtocol:
+        """Access the asynchronous end-to-end UAT orchestration workflow."""
         ...
 
     @property
     def uat_inspector(self) -> AsyncStudySchemaInspectorProtocol:
-        """Access the async-capable study schema inspector."""
-        ...
-
-    @property
-    @deprecated(
-        "Workflow 'data_extraction' is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK instead."
-    )
-    def data_extraction(self) -> Never:
-        """Rejected synchronous-only workflow stub on AsyncImednetSDK."""
-        ...
-
-    @property
-    @deprecated(
-        "Workflow 'duckdb_centralizer' is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK instead."
-    )
-    def duckdb_centralizer(self) -> Never:
-        """Rejected synchronous-only workflow stub on AsyncImednetSDK."""
-        ...
-
-    @property
-    @deprecated(
-        "Workflow 'query_management' is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK instead."
-    )
-    def query_management(self) -> Never:
-        """Rejected synchronous-only workflow stub on AsyncImednetSDK."""
-        ...
-
-    @property
-    @deprecated(
-        "Workflow 'record_mapper' is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK instead."
-    )
-    def record_mapper(self) -> Never:
-        """Rejected synchronous-only workflow stub on AsyncImednetSDK."""
-        ...
-
-    @property
-    @deprecated(
-        "Workflow 'subject_data' is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK instead."
-    )
-    def subject_data(self) -> Never:
-        """Rejected synchronous-only workflow stub on AsyncImednetSDK."""
-        ...
-
-    @property
-    @deprecated(
-        "Workflow 'uat' is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK instead."
-    )
-    def uat(self) -> Never:
-        """Rejected synchronous-only workflow stub on AsyncImednetSDK."""
+        """Access the asynchronous study schema inspector."""
         ...
 
 
@@ -1182,6 +1765,17 @@ if not TYPE_CHECKING:
         "subject_data": SubjectDataWorkflowProtocol,
         "uat": UATWorkflowProtocol,
         "uat_inspector": SyncStudySchemaInspectorProtocol,
+    }
+    AsyncWorkflowsNamespaceProtocol.__annotations__ = {
+        "data_extraction": AsyncDataExtractionWorkflowProtocol,
+        "duckdb_centralizer": AsyncDuckDBIngestionWorkflowProtocol,
+        "query_management": AsyncQueryManagementWorkflowProtocol,
+        "record_mapper": AsyncRecordMapperProtocol,
+        "record_update": AsyncRecordUpdateWorkflowProtocol,
+        "register_subjects": AsyncRegisterSubjectsWorkflowProtocol,
+        "subject_data": AsyncSubjectDataWorkflowProtocol,
+        "uat": AsyncUATWorkflowProtocol,
+        "uat_inspector": AsyncStudySchemaInspectorProtocol,
     }
     SyncWorkflowsNamespaceProtocol.__class__ = _WorkflowsRuntimeProtocolMeta
     AsyncWorkflowsNamespaceProtocol.__class__ = _WorkflowsRuntimeProtocolMeta
@@ -1256,6 +1850,14 @@ class MongoDbExportSinkFactoryProtocol(Protocol):
         ...
 
 
+class AsyncMongoDbExportSinkFactoryProtocol(Protocol):
+    """Callable factory contract for ``sdk.sinks.AsyncMongoDbExportSink``."""
+
+    def __call__(self, config: Any) -> AsyncExportSink:
+        """Instantiate an asynchronous MongoDB export sink."""
+        ...
+
+
 class BoundExportToMongoDbProtocol(Protocol):
     """Bound callable contract for ``sdk.sinks.export_to_mongodb``."""
 
@@ -1292,6 +1894,45 @@ class BoundExportToMongoDbProtocol(Protocol):
 
     def __call__(self, *args: Any, **kwargs: Any) -> int:
         """Export study records to MongoDB using the bound SDK client."""
+        ...
+
+
+class BoundAsyncExportToMongoDbProtocol(Protocol):
+    """Bound coroutine contract for ``async_sdk.sinks.export_to_mongodb``."""
+
+    @overload
+    async def __call__(
+        self,
+        study_key: str,
+        uri: str = "",
+        database: str = "",
+        collection: str = "",
+        *,
+        config: Any = None,
+        mask_phi: bool | None = None,
+        **kwargs: Any,
+    ) -> int: ...
+
+    @overload
+    @deprecated(
+        "Passing 'sdk' to sdk.sinks.export_to_mongodb() is deprecated; "
+        "pass 'study_key' as the first argument."
+    )
+    async def __call__(
+        self,
+        sdk: AsyncImednetFacade,
+        study_key: str,
+        uri: str = "",
+        database: str = "",
+        collection: str = "",
+        *,
+        config: Any = None,
+        mask_phi: bool | None = None,
+        **kwargs: Any,
+    ) -> int: ...
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> int:
+        """Asynchronously export study records to MongoDB using the bound ``AsyncImednetSDK``."""
         ...
 
 
@@ -1364,6 +2005,14 @@ class Neo4jExportSinkFactoryProtocol(Protocol):
         ...
 
 
+class AsyncNeo4jExportSinkFactoryProtocol(Protocol):
+    """Callable factory contract for ``sdk.sinks.AsyncNeo4jExportSink``."""
+
+    def __call__(self, config: Any) -> AsyncExportSink:
+        """Instantiate an asynchronous Neo4j export sink."""
+        ...
+
+
 class BoundExportToNeo4jProtocol(Protocol):
     """Bound callable contract for ``sdk.sinks.export_to_neo4j``."""
 
@@ -1398,6 +2047,43 @@ class BoundExportToNeo4jProtocol(Protocol):
 
     def __call__(self, *args: Any, **kwargs: Any) -> int:
         """Export study records to Neo4j using the bound SDK client."""
+        ...
+
+
+class BoundAsyncExportToNeo4jProtocol(Protocol):
+    """Bound coroutine contract for ``async_sdk.sinks.export_to_neo4j``."""
+
+    @overload
+    async def __call__(
+        self,
+        study_key: str,
+        uri: str = "",
+        auth: tuple[str, str] = ("", ""),
+        *,
+        config: Any = None,
+        mask_phi: bool | None = None,
+        **kwargs: Any,
+    ) -> int: ...
+
+    @overload
+    @deprecated(
+        "Passing 'sdk' to sdk.sinks.export_to_neo4j() is deprecated; "
+        "pass 'study_key' as the first argument."
+    )
+    async def __call__(
+        self,
+        sdk: AsyncImednetFacade,
+        study_key: str,
+        uri: str = "",
+        auth: tuple[str, str] = ("", ""),
+        *,
+        config: Any = None,
+        mask_phi: bool | None = None,
+        **kwargs: Any,
+    ) -> int: ...
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> int:
+        """Asynchronously export study records to Neo4j using the bound ``AsyncImednetSDK``."""
         ...
 
 
@@ -1485,6 +2171,14 @@ class SnowflakeExportSinkFactoryProtocol(Protocol):
         ...
 
 
+class AsyncSnowflakeExportSinkFactoryProtocol(Protocol):
+    """Callable factory contract for ``sdk.sinks.AsyncSnowflakeExportSink``."""
+
+    def __call__(self, config: Any) -> AsyncExportSink:
+        """Instantiate an asynchronous Snowflake export sink."""
+        ...
+
+
 class BoundExportToSnowflakeProtocol(Protocol):
     """Bound callable contract for ``sdk.sinks.export_to_snowflake``."""
 
@@ -1513,6 +2207,37 @@ class BoundExportToSnowflakeProtocol(Protocol):
 
     def __call__(self, *args: Any, **kwargs: Any) -> int:
         """Export study records to Snowflake using the bound SDK client."""
+        ...
+
+
+class BoundAsyncExportToSnowflakeProtocol(Protocol):
+    """Bound coroutine contract for ``async_sdk.sinks.export_to_snowflake``."""
+
+    @overload
+    async def __call__(
+        self,
+        study_key: str,
+        *,
+        config: Any,
+        mask_phi: bool | None = None,
+    ) -> int: ...
+
+    @overload
+    @deprecated(
+        "Passing 'sdk' to sdk.sinks.export_to_snowflake() is deprecated; "
+        "pass 'study_key' as the first argument."
+    )
+    async def __call__(
+        self,
+        sdk: AsyncImednetFacade,
+        study_key: str,
+        *,
+        config: Any,
+        mask_phi: bool | None = None,
+    ) -> int: ...
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> int:
+        """Asynchronously export study records to Snowflake using the bound ``AsyncImednetSDK``."""
         ...
 
 
@@ -1573,12 +2298,9 @@ SyncSinksNamespaceProtocol = SinksNamespaceProtocol
 class AsyncSinksNamespaceProtocol(Protocol):
     """Asynchronous sinks namespace contract exposed on ``AsyncImednetSDK.sinks``."""
 
-    @deprecated(
-        "export_to_mongodb() is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK instead."
-    )
-    def export_to_mongodb(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous MongoDB export stub on AsyncImednetSDK."""
+    @property
+    def export_to_mongodb(self) -> BoundAsyncExportToMongoDbProtocol:
+        """Bound coroutine helper to export study records to MongoDB."""
         ...
 
     @property
@@ -1588,15 +2310,17 @@ class AsyncSinksNamespaceProtocol(Protocol):
 
     @property
     def MongoDbExportSink(self) -> MongoDbExportSinkFactoryProtocol:
-        """Sink class for MongoDB record exports."""
+        """Synchronous sink class for MongoDB record exports."""
         ...
 
-    @deprecated(
-        "export_to_neo4j() is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK instead."
-    )
-    def export_to_neo4j(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous Neo4j export stub on AsyncImednetSDK."""
+    @property
+    def AsyncMongoDbExportSink(self) -> AsyncMongoDbExportSinkFactoryProtocol:
+        """Asynchronous sink class for MongoDB record exports."""
+        ...
+
+    @property
+    def export_to_neo4j(self) -> BoundAsyncExportToNeo4jProtocol:
+        """Bound coroutine helper to export study records to Neo4j."""
         ...
 
     @property
@@ -1606,15 +2330,17 @@ class AsyncSinksNamespaceProtocol(Protocol):
 
     @property
     def Neo4jExportSink(self) -> Neo4jExportSinkFactoryProtocol:
-        """Sink class for Neo4j record exports."""
+        """Synchronous sink class for Neo4j record exports."""
         ...
 
-    @deprecated(
-        "export_to_snowflake() is synchronous-only and raises TypeError on AsyncImednetSDK; "
-        "use ImednetSDK instead."
-    )
-    def export_to_snowflake(self, *args: Any, **kwargs: Any) -> Never:
-        """Rejected synchronous Snowflake export stub on AsyncImednetSDK."""
+    @property
+    def AsyncNeo4jExportSink(self) -> AsyncNeo4jExportSinkFactoryProtocol:
+        """Asynchronous sink class for Neo4j record exports."""
+        ...
+
+    @property
+    def export_to_snowflake(self) -> BoundAsyncExportToSnowflakeProtocol:
+        """Bound coroutine helper to export study records to Snowflake."""
         ...
 
     @property
@@ -1624,7 +2350,12 @@ class AsyncSinksNamespaceProtocol(Protocol):
 
     @property
     def SnowflakeExportSink(self) -> SnowflakeExportSinkFactoryProtocol:
-        """Sink class for Snowflake record exports."""
+        """Synchronous sink class for Snowflake record exports."""
+        ...
+
+    @property
+    def AsyncSnowflakeExportSink(self) -> AsyncSnowflakeExportSinkFactoryProtocol:
+        """Asynchronous sink class for Snowflake record exports."""
         ...
 
 
@@ -1668,6 +2399,17 @@ class PluginProtocol(Protocol):
 class SinksPluginProtocol(Protocol):
     """Protocol for the sinks plugin factory."""
 
+    @overload
+    def __call__(self, sdk_instance: AsyncImednetFacade, /) -> AsyncSinksNamespaceProtocol: ...
+
+    @overload
+    def __call__(self, sdk_instance: ImednetFacade, /) -> SinksNamespaceProtocol: ...
+
+    @overload
+    def __call__(
+        self, sdk_instance: ImednetFacade | AsyncImednetFacade, /
+    ) -> SinksNamespaceProtocol | AsyncSinksNamespaceProtocol: ...
+
     def __call__(
         self, sdk_instance: ImednetFacade | AsyncImednetFacade, /
     ) -> SinksNamespaceProtocol | AsyncSinksNamespaceProtocol:
@@ -1676,11 +2418,23 @@ class SinksPluginProtocol(Protocol):
 
 
 __all__ = [
+    "AsyncDataExtractionWorkflowProtocol",
+    "AsyncDuckDBIngestionWorkflowProtocol",
+    "AsyncMongoDbExportSinkFactoryProtocol",
+    "AsyncNeo4jExportSinkFactoryProtocol",
+    "AsyncQueryManagementWorkflowProtocol",
+    "AsyncRecordMapperProtocol",
     "AsyncRecordUpdateWorkflowProtocol",
     "AsyncRegisterSubjectsWorkflowProtocol",
     "AsyncSinksNamespaceProtocol",
+    "AsyncSnowflakeExportSinkFactoryProtocol",
     "AsyncStudySchemaInspectorProtocol",
+    "AsyncSubjectDataWorkflowProtocol",
+    "AsyncUATWorkflowProtocol",
     "AsyncWorkflowsNamespaceProtocol",
+    "BoundAsyncExportToMongoDbProtocol",
+    "BoundAsyncExportToNeo4jProtocol",
+    "BoundAsyncExportToSnowflakeProtocol",
     "BoundExportToMongoDbProtocol",
     "BoundExportToNeo4jProtocol",
     "BoundExportToSnowflakeProtocol",

@@ -53,6 +53,7 @@ from .exchange import (
     OdmUser,
 )
 from .loaders import (
+    async_load_from_api,
     load_cdisc_odm_archive,
     load_from_api,
     load_from_cdisc_odm,
@@ -126,6 +127,7 @@ __all__ = [
     "RuleEvaluationResult",
     "Variable",
     "VariableConstraints",
+    "async_load_from_api",
     "build_datadict_from_sdk_metadata",
     "build_dataset_json_envelope",
     "build_odm_archive",

@@ -39,6 +39,17 @@ subject_data = "imednet_workflows.subject_data:SubjectDataWorkflow"
 uat_inspector = "imednet_workflows.uat:StudySchemaInspector"
 uat = "imednet_workflows.uat:UATWorkflow"
 
+[project.entry-points."imednet.async_workflows"]
+data_extraction = "imednet_workflows.data_extraction:AsyncDataExtractionWorkflow"
+duckdb_centralizer = "imednet_workflows.duckdb_centralizer:AsyncDuckDBIngestionWorkflow"
+query_management = "imednet_workflows.query_management:AsyncQueryManagementWorkflow"
+record_mapper = "imednet_workflows.record_mapper:AsyncRecordMapper"
+record_update = "imednet_workflows.record_update:AsyncRecordUpdateWorkflow"
+register_subjects = "imednet_workflows.register_subjects:AsyncRegisterSubjectsWorkflow"
+subject_data = "imednet_workflows.subject_data:AsyncSubjectDataWorkflow"
+uat_inspector = "imednet_workflows.uat:AsyncStudySchemaInspector"
+uat = "imednet_workflows.uat:AsyncUATWorkflow"
+
 [project.entry-points."imednet.cli_plugins"]
 workflows = "imednet_workflows.cli:setup_parser"
 subject_data = "imednet_workflows.cli:setup_subject_parser"

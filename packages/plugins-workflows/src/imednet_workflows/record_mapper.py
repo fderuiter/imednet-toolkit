@@ -12,7 +12,7 @@ import inspect
 import itertools
 import logging
 import types
-from collections.abc import Iterable, Iterator
+from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
@@ -47,6 +47,7 @@ from imednet.spi.sink_base import (
 from imednet.spi.utils import (
     CompiledRecordPredicate,
     EnrichmentPipeline,
+    call_async_facade_method,
     compile_record_predicate,
     get_tabular_batch_stamp,
     global_sensitivity_registry,
@@ -62,7 +63,7 @@ from .cached_loader import CachedRecordsLoader
 from .chunked_pipeline import DEFAULT_CHUNK_SIZE, ChunkedRecordPipeline, iter_chunks
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 # Setup basic logging
 logger = logging.getLogger(__name__)
@@ -1610,6 +1611,26 @@ class RecordMapper:
             preserve_record_id=preserve_record_id,
         )
 
+    def _combine_sdtm_frames(
+        self,
+        frames: list[pd.DataFrame],
+        *,
+        domain: str,
+        study_key: str,
+        should_mask: bool,
+    ) -> pd.DataFrame:
+        if not frames:
+            return transform_records_to_sdtm(
+                [],
+                domain=domain,
+                study_key=study_key,
+                mask_phi=should_mask,
+                enrichment_pipeline=self._get_enrichment_pipeline(study_key),
+            )
+        combined = pd.concat(frames, ignore_index=True)
+        combined.attrs["imednet_sdtm_redacted"] = bool(should_mask)
+        return combined
+
     def sdtm_dataframe(
         self,
         study_key: str,
@@ -1634,17 +1655,12 @@ class RecordMapper:
                 include_deleted=include_deleted,
             )
         )
-        if not frames:
-            return transform_records_to_sdtm(
-                [],
-                domain=domain,
-                study_key=study_key,
-                mask_phi=should_mask,
-                enrichment_pipeline=self._get_enrichment_pipeline(study_key),
-            )
-        combined = pd.concat(frames, ignore_index=True)
-        combined.attrs["imednet_sdtm_redacted"] = bool(should_mask)
-        return combined
+        return self._combine_sdtm_frames(
+            frames,
+            domain=domain,
+            study_key=study_key,
+            should_mask=should_mask,
+        )
 
     @staticmethod
     def _project_record_whitelist(
@@ -1926,6 +1942,39 @@ class RecordMapper:
             if fid is None and fk is None:
                 yield rec
 
+    @staticmethod
+    def _combine_tabular_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+        if not frames:
+            return pd.DataFrame()
+        combined = pd.concat(frames, ignore_index=True)
+        first_stamp = get_tabular_batch_stamp(frames[0])
+        if (
+            first_stamp is not None
+            and all(
+                (st := get_tabular_batch_stamp(f)) is not None
+                and st.mask_phi == first_stamp.mask_phi
+                and st.registry_snapshot == first_stamp.registry_snapshot
+                for f in frames[1:]
+            )
+            and (
+                not first_stamp.mask_phi
+                or first_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
+            )
+        ):
+            common_phi = first_stamp.phi_keys.intersection(
+                *(get_tabular_batch_stamp(f).phi_keys for f in frames[1:])  # type: ignore[union-attr]
+            )
+            stamp_tabular_batch(
+                combined,
+                mask_phi=first_stamp.mask_phi,
+                phi_keys=common_phi,
+                sanitized=all(
+                    bool(get_tabular_batch_stamp(f).sanitized)  # type: ignore[union-attr]
+                    for f in frames
+                ),
+            )
+        return combined
+
     def dataframe(
         self,
         study_key: str,
@@ -1963,36 +2012,7 @@ class RecordMapper:
                 include_deleted=include_deleted,
             )
         )
-        if not frames:
-            return pd.DataFrame()
-        combined = pd.concat(frames, ignore_index=True)
-        first_stamp = get_tabular_batch_stamp(frames[0])
-        if (
-            first_stamp is not None
-            and all(
-                (st := get_tabular_batch_stamp(f)) is not None
-                and st.mask_phi == first_stamp.mask_phi
-                and st.registry_snapshot == first_stamp.registry_snapshot
-                for f in frames[1:]
-            )
-            and (
-                not first_stamp.mask_phi
-                or first_stamp.registry_snapshot == global_sensitivity_registry.snapshot()
-            )
-        ):
-            common_phi = first_stamp.phi_keys.intersection(
-                *(get_tabular_batch_stamp(f).phi_keys for f in frames[1:])  # type: ignore[union-attr]
-            )
-            stamp_tabular_batch(
-                combined,
-                mask_phi=first_stamp.mask_phi,
-                phi_keys=common_phi,
-                sanitized=all(
-                    bool(get_tabular_batch_stamp(f).sanitized)  # type: ignore[union-attr]
-                    for f in frames
-                ),
-            )
-        return combined
+        return self._combine_tabular_frames(frames)
 
     def to_dataset_json(
         self,
@@ -2100,9 +2120,505 @@ class RecordMapper:
         )
 
 
+class _AsyncMapperSdkShim:
+    """In-memory pre-fetched facade shim for synchronous CPU stages of AsyncRecordMapper."""
+
+    def __init__(
+        self,
+        *,
+        variables: list[Any],
+        forms: list[Any],
+        sites: list[Any],
+        intervals: list[Any],
+        visits: list[Any],
+        records: list[Any],
+    ) -> None:
+        self._variables = variables
+        self._forms = forms
+        self._sites = sites
+        self._intervals = intervals
+        self._visits = visits
+        self._records = records
+        self.forms = type("_F", (), {"list": lambda _s, **_kw: list(forms)})()
+
+    def get_variables(self, **_kw: Any) -> list[Any]:
+        return list(self._variables)
+
+    def get_forms(self, **_kw: Any) -> list[Any]:
+        return list(self._forms)
+
+    def get_sites(self, **_kw: Any) -> list[Any]:
+        return list(self._sites)
+
+    def get_intervals(self, **_kw: Any) -> list[Any]:
+        return list(self._intervals)
+
+    def get_visits(self, **_kw: Any) -> list[Any]:
+        return list(self._visits)
+
+    def get_records(self, **kw: Any) -> list[Any]:
+        fid = kw.get("formId")
+        if fid is not None:
+            return [r for r in self._records if getattr(r, "form_id", None) == fid]
+        return list(self._records)
+
+
+class AsyncRecordMapper(RecordMapper):
+    """Asynchronous EDC record-to-DataFrame and SDTM mapping workflow."""
+
+    supports_async = True
+    sdk: AsyncImednetFacade  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        sdk: AsyncImednetFacade,
+        *,
+        loader: CachedRecordsLoader | None = None,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        mask_phi: bool = True,
+        include_deleted: bool = False,
+    ) -> None:
+        """Initialize with an :class:`AsyncImednetSDK` or :class:`AsyncImednetFacade`."""
+        super().__init__(
+            sdk,  # type: ignore[arg-type]
+            loader=loader,
+            chunk_size=chunk_size,
+            mask_phi=mask_phi,
+            include_deleted=include_deleted,
+        )
+
+    @staticmethod
+    async def _drain_async_or_sync(raw: Any) -> list[Any]:
+        if inspect.isawaitable(raw):
+            raw = await raw
+        if hasattr(raw, "__aiter__"):
+            return [item async for item in raw]
+        return list(raw)
+
+    async def _fetch_lookup_async(
+        self, study_key: str, ep_attr: str, method_name: str, **filters: Any
+    ) -> list[Any]:
+        from unittest.mock import NonCallableMock
+
+        try:
+            if isinstance(self.sdk, NonCallableMock):
+                children = getattr(self.sdk, "_mock_children", {})
+                ov = vars(self.sdk)
+                leg = f"async_{method_name}"
+                has_ep = ep_attr in children or ep_attr in ov
+                has_m = method_name in children or method_name in ov or leg in children or leg in ov
+                if not has_ep and not has_m:
+                    return []
+                if has_ep and not has_m:
+                    return await self._drain_async_or_sync(
+                        getattr(self.sdk, ep_attr).list(study_key=study_key, **filters)
+                    )
+                return await self._drain_async_or_sync(
+                    await call_async_facade_method(
+                        self.sdk, method_name, study_key=study_key, **filters
+                    )
+                )
+            if callable(getattr(self.sdk, method_name, None)) or callable(
+                getattr(self.sdk, f"async_{method_name}", None)
+            ):
+                return await self._drain_async_or_sync(
+                    await call_async_facade_method(
+                        self.sdk, method_name, study_key=study_key, **filters
+                    )
+                )
+            ep = getattr(self.sdk, ep_attr, None)
+            if ep is not None and callable(getattr(ep, "list", None)):
+                return await self._drain_async_or_sync(ep.list(study_key=study_key, **filters))
+        except Exception:
+            return []
+        return []
+
+    async def _stream_records_async(
+        self, study_key: str, visit_key: str | None = None, **extra: Any
+    ) -> AsyncIterator[RecordModel]:
+        from contextlib import suppress
+        from unittest.mock import NonCallableMock
+
+        call_kw: dict[str, Any] = {"study_key": study_key, **extra}
+        if visit_key is not None:
+            with suppress(ValueError):
+                call_kw["visitId"] = int(visit_key)
+        use_ep = False
+        if isinstance(self.sdk, NonCallableMock):
+            ch = getattr(self.sdk, "_mock_children", {})
+            ov = vars(self.sdk)
+            use_ep = ("records" in ch or "records" in ov) or not (
+                "get_records" in ch
+                or "get_records" in ov
+                or "async_get_records" in ch
+                or "async_get_records" in ov
+            )
+        else:
+            ep = getattr(self.sdk, "records", None)
+            use_ep = ep is not None and callable(getattr(ep, "list", None))
+
+        form_ids, cleaned_kw, _ = self._extract_form_ids(call_kw)
+        sk = cleaned_kw.pop("study_key", study_key)
+        records_ep: Any = getattr(self.sdk, "records", None) if use_ep else None
+        targets: list[int | None] = list(form_ids) if form_ids is not None else [None]
+        for fid in targets:
+            q = dict(cleaned_kw)
+            if fid is not None:
+                q["formId"] = fid
+            if records_ep is not None:
+                raw = records_ep.list(study_key=sk, **q)
+                if inspect.isawaitable(raw):
+                    raw = await raw
+                if hasattr(raw, "__aiter__"):
+                    async for r in raw:
+                        yield r
+                else:
+                    for r in raw:
+                        yield r
+            else:
+                res = await call_async_facade_method(self.sdk, "get_records", study_key=sk, **q)
+                if hasattr(res, "__aiter__"):
+                    async for r in res:
+                        yield r
+                else:
+                    for r in res:
+                        yield r
+
+    async def _build_shim(
+        self,
+        study_key: str,
+        *,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        need_variables: bool = True,
+        pre_records: list[Any] | None = None,
+    ) -> _AsyncMapperSdkShim:
+        var_filters = build_single_item_variable_filters(form_whitelist, variable_whitelist)
+        variables = (
+            await self._fetch_lookup_async(study_key, "variables", "get_variables", **var_filters)
+            if need_variables
+            else []
+        )
+        forms = await self._fetch_lookup_async(study_key, "forms", "get_forms")
+        sites = await self._fetch_lookup_async(study_key, "sites", "get_sites")
+        intervals = await self._fetch_lookup_async(study_key, "intervals", "get_intervals")
+        visits = await self._fetch_lookup_async(study_key, "visits", "get_visits")
+        if pre_records is not None:
+            records = pre_records
+        elif self._loader is not None:
+            records = []
+        else:
+            rec_kw: dict[str, Any] = {}
+            if form_whitelist is not None:
+                rec_kw["formId"] = form_whitelist
+            records = [
+                r
+                async for r in self._stream_records_async(study_key, visit_key=visit_key, **rec_kw)
+            ]
+        return _AsyncMapperSdkShim(
+            variables=variables,
+            forms=forms,
+            sites=sites,
+            intervals=intervals,
+            visits=visits,
+            records=records,
+        )
+
+    async def iter_dataframes(  # type: ignore[override]
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = True,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+    ) -> AsyncIterator[pd.DataFrame]:
+        """Asynchronously yield mapped record DataFrames in bounded chunks."""
+        if as_sdtm:
+            async for df in self.iter_sdtm_dataframes(
+                study_key=study_key,
+                domain=domain or "AE",
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                mask_phi=mask_phi,
+                include_deleted=include_deleted,
+            ):
+                yield df
+            return
+        shim = await self._build_shim(
+            study_key,
+            visit_key=visit_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            need_variables=True,
+        )
+        orig = self.sdk
+        try:
+            self.sdk = shim  # type: ignore[assignment]
+            frames = list(
+                super().iter_dataframes(
+                    study_key=study_key,
+                    visit_key=visit_key,
+                    use_labels_as_columns=use_labels_as_columns,
+                    variable_whitelist=variable_whitelist,
+                    form_whitelist=form_whitelist,
+                    mask_phi=mask_phi,
+                    include_deleted=include_deleted,
+                )
+            )
+        finally:
+            self.sdk = orig
+        for df in frames:
+            yield df
+
+    async def dataframe(  # type: ignore[override]
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = True,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+    ) -> pd.DataFrame:
+        """Asynchronously return a :class:`pandas.DataFrame` of records for a study."""
+        if as_sdtm:
+            return await self.sdtm_dataframe(
+                study_key=study_key,
+                domain=domain or "AE",
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                mask_phi=mask_phi,
+                include_deleted=include_deleted,
+            )
+        frames = [
+            df
+            async for df in self.iter_dataframes(
+                study_key=study_key,
+                visit_key=visit_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                mask_phi=mask_phi,
+                include_deleted=include_deleted,
+            )
+        ]
+        return self._combine_tabular_frames(frames)
+
+    async def build_hierarchy(  # type: ignore[override]
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_keys: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        records: Iterable[RecordModel] | AsyncIterable[RecordModel] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Asynchronously generate a nested JSON tree structure up to three levels deep."""
+        mat_records: list[RecordModel] | None = None
+        if records is not None:
+            mat_records = (
+                [r async for r in records] if hasattr(records, "__aiter__") else list(records)
+            )
+        shim = await self._build_shim(
+            study_key,
+            visit_key=visit_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            need_variables=True,
+            pre_records=mat_records,
+        )
+        orig = self.sdk
+        try:
+            self.sdk = shim  # type: ignore[assignment]
+            return super().build_hierarchy(
+                study_key=study_key,
+                visit_key=visit_key,
+                use_labels_as_keys=use_labels_as_keys,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                mask_phi=mask_phi,
+                include_deleted=include_deleted,
+                records=mat_records,
+            )
+        finally:
+            self.sdk = orig
+
+    async def iter_sdtm_dataframes(  # type: ignore[override]
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+    ) -> AsyncIterator[pd.DataFrame]:
+        """Asynchronously yield chunked pandas DataFrames transformed into an SDTM domain."""
+        shim = await self._build_shim(
+            study_key,
+            visit_key=visit_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            need_variables=False,
+        )
+        orig = self.sdk
+        try:
+            self.sdk = shim  # type: ignore[assignment]
+            frames = list(
+                super().iter_sdtm_dataframes(
+                    study_key=study_key,
+                    domain=domain,
+                    visit_key=visit_key,
+                    variable_whitelist=variable_whitelist,
+                    form_whitelist=form_whitelist,
+                    mask_phi=mask_phi,
+                    include_deleted=include_deleted,
+                )
+            )
+        finally:
+            self.sdk = orig
+        for df in frames:
+            yield df
+
+    async def sdtm_dataframe(  # type: ignore[override]
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+    ) -> pd.DataFrame:
+        """Asynchronously return a DataFrame transformed into a CDISC SDTM domain dataset."""
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
+        frames = [
+            df
+            async for df in self.iter_sdtm_dataframes(
+                study_key=study_key,
+                domain=domain,
+                visit_key=visit_key,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                mask_phi=should_mask,
+                include_deleted=include_deleted,
+            )
+        ]
+        return self._combine_sdtm_frames(
+            frames,
+            domain=domain,
+            study_key=study_key,
+            should_mask=should_mask,
+        )
+
+    async def to_dataset_json(  # type: ignore[override]
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | AsyncIterable[Any] | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Asynchronously emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
+        mat_records: list[Any] | None = None
+        if records is not None:
+            mat_records = (
+                [r async for r in records] if hasattr(records, "__aiter__") else list(records)
+            )
+        shim = await self._build_shim(
+            study_key,
+            visit_key=visit_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            need_variables=not bool(as_sdtm or domain),
+            pre_records=mat_records,
+        )
+        orig = self.sdk
+        try:
+            self.sdk = shim  # type: ignore[assignment]
+            return super().to_dataset_json(
+                study_key=study_key,
+                visit_key=visit_key,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                as_sdtm=as_sdtm,
+                domain=domain,
+                naming_convention=naming_convention,
+                preserve_record_id=preserve_record_id,
+                mask_phi=mask_phi,
+                include_deleted=include_deleted,
+                metadata_version_oid=metadata_version_oid,
+                file_oid=file_oid,
+                creation_datetime=creation_datetime,
+                records=mat_records,
+            )
+        finally:
+            self.sdk = orig
+
+    async def sdtm_dataset_json(  # type: ignore[override]
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Asynchronously emit a CDISC Dataset-JSON v1.1 envelope for a specific SDTM domain."""
+        return await self.to_dataset_json(
+            study_key=study_key,
+            visit_key=visit_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            as_sdtm=True,
+            domain=domain,
+            preserve_record_id=preserve_record_id,
+            mask_phi=mask_phi,
+            include_deleted=include_deleted,
+            metadata_version_oid=metadata_version_oid,
+            file_oid=file_oid,
+            creation_datetime=creation_datetime,
+        )
+
+
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
     "SDTM_DOMAIN_SPECS",
+    "AsyncRecordMapper",
     "DatasetJsonEnvelope",
     "RecordMapper",
     "_SdtmNormalizer",

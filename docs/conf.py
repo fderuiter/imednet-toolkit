@@ -1989,11 +1989,15 @@ high_contrast_css_variables: dict[str, dict[str, str]] = {
 master_doc = 'index'
 
 # Linkcheck configuration
+user_agent = "imednet-toolkit-docs/1.2 (+https://github.com/fderuiter/imednet-toolkit)"
 linkcheck_ignore = [
-    r"https://.*\.imednet\.com.*",
+    r"https://.*\.imednet(?:api)?\.com.*",
     r"https://cdn\.jsdelivr\.net/(?!pyodide/).*",
     r"https://unpkg\.com/.*",
-    r"https://github\.com/fderuiter/(?:imednet-toolkit|imednet-python-sdk)/(?:commit|compare|issues|pull)/.*",
+    r"https://en\.wikipedia\.org/.*",
+    r"https://github\.com/.*",
 ]
 linkcheck_timeout = 30
 linkcheck_retries = 3
+linkcheck_workers = 2
+linkcheck_rate_limit_timeout = 60.0

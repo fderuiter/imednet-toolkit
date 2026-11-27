@@ -2,7 +2,7 @@
 
 from .engine import EditCheckResultStatus, EditCheckVerificationReport, UATExecutionEngine
 from .generator import GeneratedRecordSet, SyntheticRecordGenerator
-from .inspector import StudySchemaInspector, StudySnapshot
+from .inspector import AsyncStudySchemaInspector, StudySchemaInspector, StudySnapshot
 from .models import (
     InvalidUATStateTransitionError,
     RecordTestType,
@@ -13,9 +13,16 @@ from .models import (
     UATWorkflowState,
     VariableTestStrategy,
 )
-from .orchestrator import UATRunPhase, UATRunResult, UATSpecificationBuilder, UATWorkflow
+from .orchestrator import (
+    AsyncUATWorkflow,
+    UATRunPhase,
+    UATRunResult,
+    UATSpecificationBuilder,
+    UATWorkflow,
+)
 from .submission import (
     ALLOWED_SUBMISSION_TRANSITIONS,
+    AsyncBulkRecordSubmissionWorkflow,
     BatchSubmission,
     BulkRecordSubmissionWorkflow,
     BulkSubmissionError,
@@ -26,6 +33,9 @@ from .submission import (
 
 __all__ = [
     "ALLOWED_SUBMISSION_TRANSITIONS",
+    "AsyncBulkRecordSubmissionWorkflow",
+    "AsyncStudySchemaInspector",
+    "AsyncUATWorkflow",
     "BatchSubmission",
     "BulkRecordSubmissionWorkflow",
     "BulkSubmissionError",

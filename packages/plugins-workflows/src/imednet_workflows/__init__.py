@@ -23,19 +23,20 @@ if TYPE_CHECKING:
     from .cached_loader import CachedRecordsLoader, StudySyncState, StudySyncStatus
     from .chunked_pipeline import ChunkedRecordPipeline, iter_chunks
     from .config_version_control import ConfigVersionStore
-    from .data_extraction import DataExtractionWorkflow
-    from .duckdb_centralizer import DuckDBIngestionWorkflow
+    from .data_extraction import AsyncDataExtractionWorkflow, DataExtractionWorkflow
+    from .duckdb_centralizer import AsyncDuckDBIngestionWorkflow, DuckDBIngestionWorkflow
     from .extraction_engine import ExtractionResult, extract_canonical_records
-    from .namespace import Workflows
-    from .query_management import QueryManagementWorkflow
+    from .namespace import AsyncWorkflows, Workflows
+    from .query_management import AsyncQueryManagementWorkflow, QueryManagementWorkflow
     from .record_mapper import (
+        AsyncRecordMapper,
         RecordMapper,
         format_iso8601_dtc,
         transform_records_to_dataset_json,
         transform_records_to_sdtm,
     )
-    from .record_update import RecordUpdateWorkflow
-    from .register_subjects import RegisterSubjectsWorkflow
+    from .record_update import AsyncRecordUpdateWorkflow, RecordUpdateWorkflow
+    from .register_subjects import AsyncRegisterSubjectsWorkflow, RegisterSubjectsWorkflow
     from .schema_profiler import FieldProfile, FormProfile, SchemaProfiler
     from .standards_validation import (
         CategoricalNormalizer,
@@ -52,13 +53,41 @@ if TYPE_CHECKING:
         StreamState,
     )
     from .study_structure import async_get_study_structure, get_study_structure
-    from .subject_data import SubjectDataWorkflow
+    from .subject_data import AsyncSubjectDataWorkflow, SubjectDataWorkflow
     from .sync_worker import SyncErrorCallback, SyncWorker, SyncWorkerConfig, SyncWorkerState
     from .triage_store import TriageStore
-    from .uat import StudySchemaInspector, UATSpecification, UATWorkflow
+    from .uat import (
+        AsyncStudySchemaInspector,
+        AsyncUATWorkflow,
+        StudySchemaInspector,
+        UATSpecification,
+        UATWorkflow,
+    )
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "AsyncBatchCoordinator": ("imednet.spi.utils", "AsyncBatchCoordinator"),
+    "AsyncDataExtractionWorkflow": (
+        "imednet_workflows.data_extraction",
+        "AsyncDataExtractionWorkflow",
+    ),
+    "AsyncDuckDBIngestionWorkflow": (
+        "imednet_workflows.duckdb_centralizer",
+        "AsyncDuckDBIngestionWorkflow",
+    ),
+    "AsyncQueryManagementWorkflow": (
+        "imednet_workflows.query_management",
+        "AsyncQueryManagementWorkflow",
+    ),
+    "AsyncRecordMapper": ("imednet_workflows.record_mapper", "AsyncRecordMapper"),
+    "AsyncRecordUpdateWorkflow": ("imednet_workflows.record_update", "AsyncRecordUpdateWorkflow"),
+    "AsyncRegisterSubjectsWorkflow": (
+        "imednet_workflows.register_subjects",
+        "AsyncRegisterSubjectsWorkflow",
+    ),
+    "AsyncStudySchemaInspector": ("imednet_workflows.uat", "AsyncStudySchemaInspector"),
+    "AsyncSubjectDataWorkflow": ("imednet_workflows.subject_data", "AsyncSubjectDataWorkflow"),
+    "AsyncUATWorkflow": ("imednet_workflows.uat", "AsyncUATWorkflow"),
+    "AsyncWorkflows": ("imednet_workflows.namespace", "AsyncWorkflows"),
     "AsyncJobPoller": ("imednet.spi.utils", "AsyncJobPoller"),
     "BatchCoordinator": ("imednet.spi.utils", "BatchCoordinator"),
     "BatchSubmissionSummary": ("imednet.spi.utils", "BatchSubmissionSummary"),
@@ -159,7 +188,17 @@ def __dir__() -> list[str]:
 __all__ = [
     "DEFAULT_LEDGER_PATH",
     "AsyncBatchCoordinator",
+    "AsyncDataExtractionWorkflow",
+    "AsyncDuckDBIngestionWorkflow",
     "AsyncJobPoller",
+    "AsyncQueryManagementWorkflow",
+    "AsyncRecordMapper",
+    "AsyncRecordUpdateWorkflow",
+    "AsyncRegisterSubjectsWorkflow",
+    "AsyncStudySchemaInspector",
+    "AsyncSubjectDataWorkflow",
+    "AsyncUATWorkflow",
+    "AsyncWorkflows",
     "BatchCoordinator",
     "BatchSubmissionSummary",
     "CachedRecordsLoader",

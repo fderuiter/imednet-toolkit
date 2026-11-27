@@ -17,17 +17,20 @@ from uuid import uuid4
 from imednet.spi.utils import (
     SensitivityRegistry,
     build_study_sensitivity_registry,
+    is_async_facade,
     mask_clinical_phi,
     mask_custom_phi_recursive,
+    maybe_to_thread,
     parse_iso_datetime,
     resolve_enrichment_pipeline,
     sanitize_diagnostic_text,
 )
 
-from .data_extraction import DataExtractionWorkflow
+from ._workflow_helpers import ensure_sync_workflow_mode
+from .data_extraction import AsyncDataExtractionWorkflow, DataExtractionWorkflow
 
 if TYPE_CHECKING:
-    from imednet.spi.facade import ImednetFacade
+    from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
     from imednet.spi.models import RecordRevision
 
 
@@ -53,23 +56,10 @@ _BRONZE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
 )
 
 
-class DuckDBIngestionWorkflow:
-    """Incremental record centralization pipeline using a bronze/silver DuckDB layout."""
+class _DuckDBCentralizerBase:
+    """Shared bronze/silver DuckDB table, PHI masking, and view materialization engine."""
 
-    def __init__(
-        self,
-        sdk: ImednetFacade,
-        db_path: str = ":memory:",
-        *,
-        mask_phi: bool = True,
-    ) -> None:
-        """Initialize the DuckDB ingestion workflow.
-
-        Args:
-            sdk: An instance of the iMednet SDK facade.
-            db_path: Path to the DuckDB database file or ":memory:". Defaults to ":memory:".
-            mask_phi: Redact sensitive clinical and Study-configured PHI values by default.
-        """
+    def __init__(self, db_path: str = ":memory:", *, mask_phi: bool = True) -> None:
         try:
             import duckdb
         except ImportError as error:
@@ -79,7 +69,6 @@ class DuckDBIngestionWorkflow:
             ) from error
 
         self._connection: Any = duckdb.connect(db_path)
-        self._extractor = DataExtractionWorkflow(sdk)
         self._mask_phi = bool(mask_phi)
         self._closed = False
 
@@ -129,26 +118,15 @@ class DuckDBIngestionWorkflow:
             if row[1] is None or last_index_by_key[(row[0], row[1])] == idx
         ]
 
-    def ingest_revisions(
+    def _ingest_fetched_revisions_sync(
         self,
         study_key: str,
+        revisions: Iterable[RecordRevision],
         *,
-        start_date: str | None = None,
-        end_date: str | None = None,
-        mode: Literal["append", "replace"] = "append",
-        mask_phi: bool | None = None,
+        mode: Literal["append", "replace"],
+        effective_mask_phi: bool,
     ) -> int:
-        """Fetch RecordRevisions and write to the bronze_revisions table."""
-        self._validate_study_key(study_key)
-        if mode not in {"append", "replace"}:
-            raise ValueError("mode must be one of: 'append', 'replace'")
-        effective_mask_phi = self._mask_phi if mask_phi is None else bool(mask_phi)
-
-        revisions = self._extractor.extract_audit_trail(
-            study_key,
-            start_date=start_date,
-            end_date=end_date,
-        )
+        """Write extracted RecordRevision models into the DuckDB bronze_revisions table."""
         rows = self._deduplicate_rows(
             self._to_rows(study_key, revisions, mask_phi=effective_mask_phi)
         )
@@ -298,13 +276,8 @@ class DuckDBIngestionWorkflow:
             f'SELECT * FROM "{prefix}{key}"' for key in built_study_keys
         )
 
-    def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
-        """Create or replace per-Study and combined silver current-state and history views.
-
-        Args:
-            study_key: Study key identifier to materialize.
-            include_deleted: When True, retain records whose latest revision has deleted=True.
-        """
+    def _build_silver_view_sync(self, study_key: str, *, include_deleted: bool = False) -> None:
+        """Materialize per-Study and combined silver current-state and history views."""
         self._validate_study_key(study_key)
         self._ensure_bronze_table()
         escaped_study_key = study_key.replace("'", "''")
@@ -663,3 +636,140 @@ class DuckDBIngestionWorkflow:
             ],
             names=[name for name, _ in _BRONZE_COLUMN_SPECS],
         )
+
+
+class AsyncDuckDBIngestionWorkflow(_DuckDBCentralizerBase):
+    """Asynchronous incremental record centralization pipeline using DuckDB."""
+
+    supports_async = True
+
+    def __init__(
+        self,
+        sdk: AsyncImednetFacade,
+        db_path: str = ":memory:",
+        *,
+        mask_phi: bool = True,
+    ) -> None:
+        """Initialize the asynchronous DuckDB ingestion workflow."""
+        super().__init__(db_path=db_path, mask_phi=mask_phi)
+        self._sdk = sdk
+        self._extractor = AsyncDataExtractionWorkflow(sdk)
+
+    async def aclose(self) -> None:
+        """Asynchronously close the underlying DuckDB connection."""
+        await maybe_to_thread(self.close)
+
+    async def __aenter__(self) -> Self:
+        """Enter the async context manager and return the workflow instance."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the async context manager and close the DuckDB connection."""
+        await self.aclose()
+
+    async def ingest_revisions(
+        self,
+        study_key: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        mode: Literal["append", "replace"] = "append",
+        mask_phi: bool | None = None,
+    ) -> int:
+        """Asynchronously fetch RecordRevisions and write to the bronze_revisions table."""
+        self._validate_study_key(study_key)
+        if mode not in {"append", "replace"}:
+            raise ValueError("mode must be one of: 'append', 'replace'")
+        effective_mask_phi = self._mask_phi if mask_phi is None else bool(mask_phi)
+
+        revisions = await self._extractor.extract_audit_trail(
+            study_key,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return await maybe_to_thread(
+            self._ingest_fetched_revisions_sync,
+            study_key,
+            revisions,
+            mode=mode,
+            effective_mask_phi=effective_mask_phi,
+        )
+
+    async def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
+        """Asynchronously create or replace per-Study and combined silver views."""
+        self._validate_study_key(study_key)
+        await maybe_to_thread(
+            self._build_silver_view_sync,
+            study_key,
+            include_deleted=include_deleted,
+        )
+
+
+class DuckDBIngestionWorkflow(_DuckDBCentralizerBase):
+    """Incremental record centralization pipeline using a bronze/silver DuckDB layout."""
+
+    def __init__(
+        self,
+        sdk: ImednetFacade,
+        db_path: str = ":memory:",
+        *,
+        mask_phi: bool = True,
+    ) -> None:
+        """Initialize the DuckDB ingestion workflow.
+
+        Args:
+            sdk: An instance of the synchronous iMednet SDK facade.
+            db_path: Path to the DuckDB database file or ":memory:". Defaults to ":memory:".
+            mask_phi: Redact sensitive clinical and Study-configured PHI values by default.
+        """
+        super().__init__(db_path=db_path, mask_phi=mask_phi)
+        self._sdk = sdk
+        self._extractor = DataExtractionWorkflow(sdk)
+
+    def ingest_revisions(
+        self,
+        study_key: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        mode: Literal["append", "replace"] = "append",
+        mask_phi: bool | None = None,
+    ) -> int:
+        """Fetch RecordRevisions and write to the bronze_revisions table."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "DuckDBIngestionWorkflow",
+            "ingest_revisions",
+            "ingest_revisions",
+        )
+        self._validate_study_key(study_key)
+        if mode not in {"append", "replace"}:
+            raise ValueError("mode must be one of: 'append', 'replace'")
+        effective_mask_phi = self._mask_phi if mask_phi is None else bool(mask_phi)
+
+        revisions = self._extractor.extract_audit_trail(
+            study_key,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return self._ingest_fetched_revisions_sync(
+            study_key,
+            revisions,
+            mode=mode,
+            effective_mask_phi=effective_mask_phi,
+        )
+
+    def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
+        """Create or replace per-Study and combined silver current-state and history views."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "DuckDBIngestionWorkflow",
+            "build_silver_view",
+            "build_silver_view",
+        )
+        self._build_silver_view_sync(study_key, include_deleted=include_deleted)

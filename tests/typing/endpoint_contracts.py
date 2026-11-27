@@ -373,7 +373,26 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     _queries_ep: EdcAsyncListEndpoint[Query] = sdk.queries
     assert _visits_ep and _codings_ep and _queries_ep
 
-    # Convenience methods on AsyncImednetSDK
+    # Canonical unprefixed convenience methods on AsyncImednetSDK and AsyncImednetFacade
+    assert_type(await sdk.get_codings('S'), list[Coding])
+    assert_type(await sdk.get_forms('S'), list[Form])
+    assert_type(await sdk.get_intervals('S'), list[Interval])
+    assert_type(await sdk.get_queries('S'), list[Query])
+    assert_type(await sdk.get_record_revisions('S'), list[RecordRevision])
+    assert_type(await sdk.get_records('S'), list[Record])
+    assert_type(await sdk.get_sites('S'), list[Site])
+    assert_type(await sdk.get_studies(), list[Study])
+    assert_type(await sdk.get_subjects('S'), list[Subject])
+    assert_type(await sdk.get_users('S'), list[User])
+    assert_type(await sdk.get_variables('S'), list[Variable])
+    assert_type(await sdk.get_visits('S'), list[Visit])
+    assert_type(await sdk.get_job('S', 'B'), JobStatus)
+    assert_type(await sdk.create_record('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(await sdk.create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
+    assert_type(await sdk.poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
+    assert_type(await sdk.poll_jobs('S', ['B1', 'B2'], resolve_results=True), JobPollSummary)
+
+    # Deprecated async_* compatibility aliases on AsyncImednetSDK
     assert_type(await sdk.async_get_codings('S'), list[Coding])
     assert_type(await sdk.async_get_forms('S'), list[Form])
     assert_type(await sdk.async_get_intervals('S'), list[Interval])
@@ -392,12 +411,10 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(await sdk.async_create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
     assert_type(await sdk.async_poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
     assert_type(await sdk.async_poll_job('S', 'B', resolve_results=True), JobStatus)
-    assert_type(await facade.async_poll_job('S', 'B', resolve_results=True), JobStatus)
+    assert_type(await facade.poll_job('S', 'B', resolve_results=True), JobStatus)
     assert_type(await sdk.async_poll_jobs('S', ['B1', 'B2']), JobPollSummary)
     assert_type(await sdk.async_poll_jobs('S', ['B1', 'B2'], resolve_results=True), JobPollSummary)
-    assert_type(
-        await facade.async_poll_jobs('S', ['B1', 'B2'], resolve_results=True), JobPollSummary
-    )
+    assert_type(await facade.poll_jobs('S', ['B1', 'B2'], resolve_results=True), JobPollSummary)
 
     # Narrowed auth, study_context Self preservation, and async plugin protocols
     assert_type(sdk.auth, AuthStrategy | None)
@@ -410,20 +427,32 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert _facade_async_cm
     with facade.study_context('S') as scoped_async_facade:
         assert_type(scoped_async_facade, AsyncImednetFacade)
-        assert_type(await scoped_async_facade.async_get_codings(), list[Coding])
-        assert_type(await scoped_async_facade.async_get_forms(), list[Form])
-        assert_type(await scoped_async_facade.async_get_intervals(), list[Interval])
-        assert_type(await scoped_async_facade.async_get_queries(), list[Query])
-        assert_type(await scoped_async_facade.async_get_record_revisions(), list[RecordRevision])
-        assert_type(await scoped_async_facade.async_get_records(), list[Record])
-        assert_type(await scoped_async_facade.async_get_sites(), list[Site])
-        assert_type(await scoped_async_facade.async_get_subjects(), list[Subject])
-        assert_type(await scoped_async_facade.async_get_users(), list[User])
-        assert_type(await scoped_async_facade.async_get_variables(), list[Variable])
-        assert_type(await scoped_async_facade.async_get_visits(), list[Visit])
+        assert_type(await scoped_async_facade.get_codings(), list[Coding])
+        assert_type(await scoped_async_facade.get_forms(), list[Form])
+        assert_type(await scoped_async_facade.get_intervals(), list[Interval])
+        assert_type(await scoped_async_facade.get_queries(), list[Query])
+        assert_type(await scoped_async_facade.get_record_revisions(), list[RecordRevision])
+        assert_type(await scoped_async_facade.get_records(), list[Record])
+        assert_type(await scoped_async_facade.get_sites(), list[Site])
+        assert_type(await scoped_async_facade.get_subjects(), list[Subject])
+        assert_type(await scoped_async_facade.get_users(), list[User])
+        assert_type(await scoped_async_facade.get_variables(), list[Variable])
+        assert_type(await scoped_async_facade.get_visits(), list[Visit])
 
     assert_type(sdk.workflows, AsyncWorkflowsNamespaceProtocol)
+    assert_type(await sdk.workflows.data_extraction.extract_records_by_criteria('S'), list[Record])
+    assert_type(await sdk.workflows.duckdb_centralizer.ingest_revisions('S'), int)
+    assert_type(await sdk.workflows.query_management.get_open_queries('S'), list[Query])
+    assert_type(await sdk.workflows.record_mapper.dataframe('S'), pd.DataFrame)
     assert_type(sdk.workflows.record_update, AsyncRecordUpdateWorkflowProtocol)
+    assert_type(
+        await sdk.workflows.record_update.create_or_update_records('S', []),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.create_or_update_records_batch('S', []),
+        BatchSubmissionSummary,
+    )
     assert_type(
         await sdk.workflows.record_update.async_create_or_update_records('S', []),
         Job,
@@ -447,25 +476,34 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
         Job,
     )
     assert_type(sdk.workflows.register_subjects, AsyncRegisterSubjectsWorkflowProtocol)
+    assert_type(await sdk.workflows.register_subjects.register_subjects('S', []), Job)
     assert_type(await sdk.workflows.register_subjects.async_register_subjects('S', []), Job)
     assert_type(
         await sdk.workflows.register_subjects.async_register_subjects_batch('S', []),
         BatchSubmissionSummary,
     )
+    assert_type(
+        await sdk.workflows.subject_data.get_all_subject_data('S', 'SUBJ'),
+        SubjectComprehensiveDataProtocol,
+    )
+    assert_type(await sdk.workflows.uat.run('S'), UATRunResultProtocol)
     assert_type(sdk.workflows.uat_inspector, AsyncStudySchemaInspectorProtocol)
+    assert_type(await sdk.workflows.uat_inspector.inspect('S'), StudySnapshotProtocol)
     assert_type(await sdk.workflows.uat_inspector.async_inspect('S'), StudySnapshotProtocol)
 
     assert_type(sdk.sinks, AsyncSinksNamespaceProtocol | None)
     if sdk.sinks is not None:
-        assert_type(
-            sdk.sinks.MongoDbSinkConfig(
-                study_key='S',
-                uri='mongodb://localhost:27017',
-                database='db',
-                collection='records',
-            ),
-            MongoDbSinkConfigProtocol,
+        mongo_cfg_async = sdk.sinks.MongoDbSinkConfig(
+            study_key='S',
+            uri='mongodb://localhost:27017',
+            database='db',
+            collection='records',
         )
+        assert_type(mongo_cfg_async, MongoDbSinkConfigProtocol)
+        assert_type(await sdk.sinks.export_to_mongodb('S', config=mongo_cfg_async), int)
+        assert_type(await sdk.sinks.export_to_neo4j('S'), int)
+        sf_cfg_async = sdk.sinks.SnowflakeSinkConfig(study_key='S')
+        assert_type(await sdk.sinks.export_to_snowflake('S', config=sf_cfg_async), int)
 
 
 def sync_endpoint_contract(ep: StudiesEndpoint) -> None:

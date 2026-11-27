@@ -1431,9 +1431,15 @@ async def poll_facade_single_async(
     poll_interval: float,
     on_progress: JobProgressHandler | None = None,
 ) -> Any:
-    """Asynchronously poll a single batch ID via ``sdk.async_poll_job``."""
-    return await sdk.async_poll_job(
-        study_key, batch_id, **_facade_poll_kwargs(timeout, poll_interval, on_progress)
+    """Asynchronously poll a single batch ID via ``sdk.poll_job``."""
+    from imednet.utils.async_bridge import call_async_facade_method
+
+    return await call_async_facade_method(
+        sdk,
+        "poll_job",
+        study_key,
+        batch_id,
+        **_facade_poll_kwargs(timeout, poll_interval, on_progress),
     )
 
 
@@ -1476,14 +1482,23 @@ async def poll_facade_many_async(
     poll_interval: float,
     on_progress: JobProgressHandler | None = None,
 ) -> JobPollSummary:
-    """Asynchronously poll multiple batch IDs via ``sdk.async_poll_jobs`` with fallback."""
-    maybe_coro = _call_facade_poll_many(
-        sdk, "async_poll_jobs", study_key, batch_ids, timeout, poll_interval, on_progress
+    """Asynchronously poll multiple batch IDs via ``sdk.poll_jobs`` with fallback."""
+    try:
+        inst_dict = object.__getattribute__(sdk, "__dict__")
+    except AttributeError:
+        inst_dict = {}
+    prefer_legacy = "async_poll_jobs" in inst_dict and "poll_jobs" not in inst_dict
+    method_order = (
+        ("async_poll_jobs", "poll_jobs") if prefer_legacy else ("poll_jobs", "async_poll_jobs")
     )
-    if hasattr(maybe_coro, "__await__"):
-        candidate = await maybe_coro
-        if isinstance(candidate, JobPollSummary):
-            return candidate
+    for attr_name in method_order:
+        maybe_coro = _call_facade_poll_many(
+            sdk, attr_name, study_key, batch_ids, timeout, poll_interval, on_progress
+        )
+        if hasattr(maybe_coro, "__await__"):
+            candidate = await maybe_coro
+            if isinstance(candidate, JobPollSummary):
+                return candidate
     return await _poll_sequential_async(
         study_key,
         batch_ids,

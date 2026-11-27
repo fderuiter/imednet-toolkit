@@ -131,7 +131,8 @@ jobs:
               ;;
           esac
           cd "packages/$PACKAGE"
-          uvx --from "hatch==1.18.2" hatch build
+          uv build --out-dir dist
+          rm -f dist/.gitignore
 
       - name: Restore Internal Dependencies
         if: always()

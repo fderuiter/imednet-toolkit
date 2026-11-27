@@ -1,10 +1,13 @@
 """Workflow for registering subjects in iMedNet via the Records API."""
 
-import asyncio
+from __future__ import annotations
+
 import functools
 import inspect
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
+
+from typing_extensions import deprecated
 
 from imednet.spi.models import Job, RegisterSubjectRequest
 from imednet.spi.utils import (
@@ -12,8 +15,12 @@ from imednet.spi.utils import (
     BatchSubmissionSummary,
     JobProgressHandler,
     RecordsInput,
+    SyncToAsyncFacadeAdapter,
+    call_async_facade_method,
     filter_existing_subject_registrations,
+    is_async_facade,
     normalize_subject_registration_inputs,
+    run_sync_over_async,
     validate_subject_registration_sites,
 )
 from imednet.spi.validation import BaseSchemaCache, ValidationSchemaProtocol
@@ -26,7 +33,6 @@ from ._workflow_helpers import (
     ensure_sync_workflow_mode,
     prepare_batch_preflight,
     submit_workflow_batch_async,
-    submit_workflow_batch_sync,
     unwrap_single_submitted_job,
 )
 
@@ -43,6 +49,8 @@ def _is_offline_schema_dry_run(dry_run: bool, schema: ValidationSchemaProtocol |
 
 def _is_async_facade(sdk: object) -> bool:
     """Return True if *sdk* exposes native asynchronous facade methods."""
+    if is_async_facade(sdk):
+        return True
     async_create = getattr(sdk, "async_create_record", None)
     if async_create is None:
         return False
@@ -55,38 +63,11 @@ def _is_async_facade(sdk: object) -> bool:
     return not hasattr(sdk, "create_record")
 
 
-class RegisterSubjectsWorkflow:
-    """Manages the registration of subjects using the iMedNet SDK.
+class _RegisterSubjectsBase:
+    """Shared validation, filtering, and canonical async execution for subject registration."""
 
-    Supports both synchronous (:class:`ImednetFacade`) and asynchronous
-    (:class:`AsyncImednetFacade`) clients.
-    """
-
-    supports_async = True
-
-    def __init__(
-        self,
-        sdk: FacadeLike,
-        *,
-        batch_size: int = DEFAULT_BATCH_CHUNK_SIZE,
-        filter_enrolled: bool = False,
-    ) -> None:
-        """Initialize the RegisterSubjectsWorkflow.
-
-        Args:
-            sdk: An instance of ``ImednetFacade`` or ``AsyncImednetFacade``.
-            batch_size: Maximum number of records per chunked POST request (default: 100).
-            filter_enrolled: If True, filter out subjects already enrolled in the study.
-        """
-        self._sdk = sdk
-        self._batch_size = batch_size
-        self._filter_enrolled = filter_enrolled
-
-    def _ensure_sync_mode(self, method_name: str, async_counterpart: str) -> None:
-        """Raise TypeError when synchronous registration methods are called on an async SDK."""
-        ensure_sync_workflow_mode(
-            _is_async_facade(self._sdk), "RegisterSubjectsWorkflow", method_name, async_counterpart
-        )
+    _batch_size: int
+    _filter_enrolled: bool
 
     def _prepare_registration_batch(
         self,
@@ -148,6 +129,295 @@ class RegisterSubjectsWorkflow:
             collect_errors=collect_errors,
         )
 
+    async def _execute_registration_batch_async(
+        self,
+        async_sdk: AsyncImednetFacade,
+        study_key: str,
+        subjects: SubjectInputs,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        chunk_size: int | None = None,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+        _single_job_method: tuple[str, str] | None = None,
+    ) -> BatchSubmissionSummary:
+        """Canonical asynchronous subject registration pipeline."""
+        eff_chunk, offline_dry_run, should_filter = self._prepare_registration_batch(
+            chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
+        )
+        sites = (
+            None
+            if offline_dry_run
+            else await call_async_facade_method(async_sdk, "get_sites", study_key=study_key)
+        )
+        pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
+        existing = (
+            await call_async_facade_method(async_sdk, "get_subjects", study_key=study_key)
+            if should_filter
+            else None
+        )
+        opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
+        spec = self._build_registration_spec(
+            study_key,
+            pairs,
+            sites,
+            existing,
+            should_filter=should_filter,
+            subject_key_field=subject_key_field,
+            chunk_size=eff_chunk,
+            schema=schema,
+            options=opts,
+            single_job_method=_single_job_method,
+        )
+        create_fn = functools.partial(call_async_facade_method, async_sdk, "create_record")
+        submitter = build_keyword_record_chunk_submitter(
+            create_fn, study_key, email_notify=email_notify, schema=schema
+        )
+        return await submit_workflow_batch_async(async_sdk, spec, submitter)
+
+
+class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
+    """Asynchronous workflow for bulk subject registration on ``AsyncImednetSDK``."""
+
+    supports_async = True
+
+    def __init__(
+        self,
+        sdk: AsyncImednetFacade,
+        *,
+        batch_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        filter_enrolled: bool = False,
+    ) -> None:
+        """Initialize the asynchronous subject registration workflow."""
+        self._sdk = sdk
+        self._batch_size = batch_size
+        self._filter_enrolled = filter_enrolled
+
+    async def register_subjects_batch(
+        self,
+        study_key: str,
+        subjects: SubjectInputs,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        chunk_size: int | None = None,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+        _single_job_method: tuple[str, str] | None = None,
+    ) -> BatchSubmissionSummary:
+        """Asynchronously validate sites, filter enrolled subjects, and submit in bounded chunks."""
+        return await self._execute_registration_batch_async(
+            self._sdk,
+            study_key,
+            subjects,
+            email_notify,
+            wait_for_completion,
+            timeout,
+            poll_interval,
+            chunk_size=chunk_size,
+            filter_enrolled=filter_enrolled,
+            skip_existing=skip_existing,
+            subject_key_field=subject_key_field,
+            schema=schema,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
+            _single_job_method=_single_job_method,
+        )
+
+    async def register_subjects(
+        self,
+        study_key: str,
+        subjects: SubjectInputs,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> Job:
+        """Asynchronously register a single-chunk batch of subjects and return its Job."""
+        pair = ("register_subjects", "register_subjects_batch")
+        summary = await self.register_subjects_batch(
+            study_key,
+            subjects,
+            email_notify,
+            wait_for_completion,
+            timeout,
+            poll_interval,
+            filter_enrolled=filter_enrolled,
+            skip_existing=skip_existing,
+            subject_key_field=subject_key_field,
+            schema=schema,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
+            _single_job_method=pair,
+        )
+        return unwrap_single_submitted_job(summary, pair)
+
+    @deprecated(
+        "async_register_subjects_batch() is deprecated; "
+        "use await register_subjects_batch(...) instead.",
+        category=DeprecationWarning,
+    )
+    async def async_register_subjects_batch(
+        self,
+        study_key: str,
+        subjects: SubjectInputs,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        chunk_size: int | None = None,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+        _single_job_method: tuple[str, str] | None = None,
+    ) -> BatchSubmissionSummary:
+        """Deprecated alias for :meth:`register_subjects_batch`."""
+        return await self.register_subjects_batch(
+            study_key,
+            subjects,
+            email_notify,
+            wait_for_completion,
+            timeout,
+            poll_interval,
+            chunk_size=chunk_size,
+            filter_enrolled=filter_enrolled,
+            skip_existing=skip_existing,
+            subject_key_field=subject_key_field,
+            schema=schema,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
+            _single_job_method=_single_job_method,
+        )
+
+    @deprecated(
+        "async_register_subjects() is deprecated; use await register_subjects(...) instead.",
+        category=DeprecationWarning,
+    )
+    async def async_register_subjects(
+        self,
+        study_key: str,
+        subjects: SubjectInputs,
+        email_notify: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        *,
+        filter_enrolled: bool | None = None,
+        skip_existing: bool = False,
+        subject_key_field: str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        on_progress: JobProgressHandler | None = None,
+        dry_run: bool = False,
+        collect_errors: bool = False,
+    ) -> Job:
+        """Deprecated alias for :meth:`register_subjects`."""
+        pair = ("async_register_subjects", "async_register_subjects_batch")
+        if "async_register_subjects_batch" in vars(self):
+            summary = await self.async_register_subjects_batch(
+                study_key,
+                subjects,
+                email_notify,
+                wait_for_completion,
+                timeout,
+                poll_interval,
+                filter_enrolled=filter_enrolled,
+                skip_existing=skip_existing,
+                subject_key_field=subject_key_field,
+                schema=schema,
+                on_progress=on_progress,
+                dry_run=dry_run,
+                collect_errors=collect_errors,
+                _single_job_method=pair,
+            )
+        else:
+            summary = await self.register_subjects_batch(
+                study_key,
+                subjects,
+                email_notify,
+                wait_for_completion,
+                timeout,
+                poll_interval,
+                filter_enrolled=filter_enrolled,
+                skip_existing=skip_existing,
+                subject_key_field=subject_key_field,
+                schema=schema,
+                on_progress=on_progress,
+                dry_run=dry_run,
+                collect_errors=collect_errors,
+                _single_job_method=pair,
+            )
+        return unwrap_single_submitted_job(summary, pair)
+
+
+class RegisterSubjectsWorkflow(_RegisterSubjectsBase):
+    """Manages synchronous registration of subjects over the shared async execution engine."""
+
+    supports_async = True
+
+    def __init__(
+        self,
+        sdk: FacadeLike,
+        *,
+        batch_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        filter_enrolled: bool = False,
+    ) -> None:
+        """Initialize the RegisterSubjectsWorkflow.
+
+        Args:
+            sdk: An instance of ``ImednetFacade`` or ``AsyncImednetFacade``.
+            batch_size: Maximum number of records per chunked POST request (default: 100).
+            filter_enrolled: If True, filter out subjects already enrolled in the study.
+        """
+        self._sdk = sdk
+        self._batch_size = batch_size
+        self._filter_enrolled = filter_enrolled
+
+    def _ensure_sync_mode(self, method_name: str, async_counterpart: str) -> None:
+        """Raise TypeError when synchronous registration methods are called on an async SDK."""
+        ensure_sync_workflow_mode(
+            _is_async_facade(self._sdk), "RegisterSubjectsWorkflow", method_name, async_counterpart
+        )
+
+    def _resolve_async_facade(self) -> AsyncImednetFacade:
+        """Return an async facade (native or sync-adapted) for canonical async execution."""
+        if _is_async_facade(self._sdk):
+            return cast("AsyncImednetFacade", self._sdk)
+        return cast(
+            "AsyncImednetFacade",
+            SyncToAsyncFacadeAdapter(cast("ImednetFacade", self._sdk)),
+        )
+
     def register_subjects_batch(
         self,
         study_key: str,
@@ -169,30 +439,27 @@ class RegisterSubjectsWorkflow:
     ) -> BatchSubmissionSummary:
         """Validate sites once, optionally filter enrolled subjects, and submit in bounded chunks."""
         self._ensure_sync_mode("register_subjects_batch", "async_register_subjects_batch")
-        eff_chunk, offline_dry_run, should_filter = self._prepare_registration_batch(
-            chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
+        adapter = self._resolve_async_facade()
+        return run_sync_over_async(
+            lambda: self._execute_registration_batch_async(
+                adapter,
+                study_key,
+                subjects,
+                email_notify,
+                wait_for_completion,
+                timeout,
+                poll_interval,
+                chunk_size=chunk_size,
+                filter_enrolled=filter_enrolled,
+                skip_existing=skip_existing,
+                subject_key_field=subject_key_field,
+                schema=schema,
+                on_progress=on_progress,
+                dry_run=dry_run,
+                collect_errors=collect_errors,
+                _single_job_method=_single_job_method,
+            )
         )
-        sdk = cast("ImednetFacade", self._sdk)
-        sites = None if offline_dry_run else sdk.get_sites(study_key=study_key)
-        pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
-        existing = sdk.get_subjects(study_key=study_key) if should_filter else None
-        opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
-        spec = self._build_registration_spec(
-            study_key,
-            pairs,
-            sites,
-            existing,
-            should_filter=should_filter,
-            subject_key_field=subject_key_field,
-            chunk_size=eff_chunk,
-            schema=schema,
-            options=opts,
-            single_job_method=_single_job_method,
-        )
-        submitter = build_keyword_record_chunk_submitter(
-            sdk.create_record, study_key, email_notify=email_notify, schema=schema
-        )
-        return submit_workflow_batch_sync(sdk, spec, submitter)
 
     def register_subjects(
         self,
@@ -232,6 +499,12 @@ class RegisterSubjectsWorkflow:
         )
         return unwrap_single_submitted_job(summary, pair)
 
+    @deprecated(
+        "RegisterSubjectsWorkflow.async_register_subjects_batch() is deprecated; "
+        "use AsyncRegisterSubjectsWorkflow.register_subjects_batch(...) via "
+        "async_sdk.workflows.register_subjects instead.",
+        category=DeprecationWarning,
+    )
     async def async_register_subjects_batch(
         self,
         study_key: str,
@@ -251,53 +524,32 @@ class RegisterSubjectsWorkflow:
         collect_errors: bool = False,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
-        """Asynchronously register subjects using either ``AsyncImednetFacade`` or ``ImednetFacade``."""
-        if not _is_async_facade(self._sdk):
-            sync_call = functools.partial(
-                self.register_subjects_batch,
-                study_key,
-                subjects,
-                email_notify,
-                wait_for_completion,
-                timeout,
-                poll_interval,
-                chunk_size=chunk_size,
-                filter_enrolled=filter_enrolled,
-                skip_existing=skip_existing,
-                subject_key_field=subject_key_field,
-                schema=schema,
-                on_progress=on_progress,
-                dry_run=dry_run,
-                collect_errors=collect_errors,
-                _single_job_method=_single_job_method,
-            )
-            return await asyncio.to_thread(sync_call)
-
-        eff_chunk, offline_dry_run, should_filter = self._prepare_registration_batch(
-            chunk_size, filter_enrolled, skip_existing, schema, dry_run, _single_job_method
-        )
-        sdk = cast("AsyncImednetFacade", self._sdk)
-        sites = None if offline_dry_run else await sdk.async_get_sites(study_key=study_key)
-        pairs = normalize_subject_registration_inputs(subjects, schema=schema, study_key=study_key)
-        existing = await sdk.async_get_subjects(study_key=study_key) if should_filter else None
-        opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
-        spec = self._build_registration_spec(
+        """Deprecated asynchronous alias for subject batch registration."""
+        return await self._execute_registration_batch_async(
+            self._resolve_async_facade(),
             study_key,
-            pairs,
-            sites,
-            existing,
-            should_filter=should_filter,
+            subjects,
+            email_notify,
+            wait_for_completion,
+            timeout,
+            poll_interval,
+            chunk_size=chunk_size,
+            filter_enrolled=filter_enrolled,
+            skip_existing=skip_existing,
             subject_key_field=subject_key_field,
-            chunk_size=eff_chunk,
             schema=schema,
-            options=opts,
-            single_job_method=_single_job_method,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            collect_errors=collect_errors,
+            _single_job_method=_single_job_method,
         )
-        submitter = build_keyword_record_chunk_submitter(
-            sdk.async_create_record, study_key, email_notify=email_notify, schema=schema
-        )
-        return await submit_workflow_batch_async(sdk, spec, submitter)
 
+    @deprecated(
+        "RegisterSubjectsWorkflow.async_register_subjects() is deprecated; "
+        "use AsyncRegisterSubjectsWorkflow.register_subjects(...) via "
+        "async_sdk.workflows.register_subjects instead.",
+        category=DeprecationWarning,
+    )
     async def async_register_subjects(
         self,
         study_key: str,
@@ -315,7 +567,7 @@ class RegisterSubjectsWorkflow:
         dry_run: bool = False,
         collect_errors: bool = False,
     ) -> Job:
-        """Asynchronously register a single-chunk batch of subjects and return its Job."""
+        """Deprecated asynchronous alias for single-chunk subject registration."""
         pair = ("async_register_subjects", "async_register_subjects_batch")
         summary = await self.async_register_subjects_batch(
             study_key,
@@ -334,3 +586,6 @@ class RegisterSubjectsWorkflow:
             _single_job_method=pair,
         )
         return unwrap_single_submitted_job(summary, pair)
+
+
+__all__ = ["AsyncRegisterSubjectsWorkflow", "RegisterSubjectsWorkflow", "SubjectInputs"]

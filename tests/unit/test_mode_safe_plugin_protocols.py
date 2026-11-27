@@ -29,11 +29,25 @@ from imednet.plugins import PluginProtocol, SinksPluginProtocol
 from imednet.simulation import reset_default_simulation_state
 from imednet.spi.validation import DataDictionary
 from imednet.utils.batch_coordinator import BatchCoordinator
-from imednet_sinks.document import MongoDbExportSink, MongoDbSinkConfig
-from imednet_sinks.graph import Neo4jExportSink, Neo4jSinkConfig
-from imednet_sinks.plugin import SinksNamespace, create_sinks
-from imednet_sinks.warehouse import SnowflakeExportSink, SnowflakeSinkConfig
+from imednet_sinks.document import AsyncMongoDbExportSink, MongoDbExportSink, MongoDbSinkConfig
+from imednet_sinks.graph import AsyncNeo4jExportSink, Neo4jExportSink, Neo4jSinkConfig
+from imednet_sinks.plugin import AsyncSinksNamespace, SinksNamespace, create_sinks
+from imednet_sinks.warehouse import (
+    AsyncSnowflakeExportSink,
+    SnowflakeExportSink,
+    SnowflakeSinkConfig,
+)
 from imednet_workflows import (
+    AsyncDataExtractionWorkflow,
+    AsyncDuckDBIngestionWorkflow,
+    AsyncQueryManagementWorkflow,
+    AsyncRecordMapper,
+    AsyncRecordUpdateWorkflow,
+    AsyncRegisterSubjectsWorkflow,
+    AsyncStudySchemaInspector,
+    AsyncSubjectDataWorkflow,
+    AsyncUATWorkflow,
+    AsyncWorkflows,
     DataExtractionWorkflow,
     RecordUpdateWorkflow,
     RegisterSubjectsWorkflow,
@@ -42,18 +56,15 @@ from imednet_workflows import (
     Workflows,
 )
 
-SYNC_ONLY_WORKFLOWS = (
+ALL_WORKFLOWS = (
     "data_extraction",
     "duckdb_centralizer",
     "query_management",
     "record_mapper",
-    "subject_data",
-    "uat",
-)
-
-ASYNC_CAPABLE_WORKFLOWS = (
     "record_update",
     "register_subjects",
+    "subject_data",
+    "uat",
     "uat_inspector",
 )
 
@@ -70,7 +81,7 @@ def test_sync_sdk_workflows_and_sinks_satisfy_protocols() -> None:
     try:
         assert isinstance(sdk.workflows, SyncWorkflowsNamespaceProtocol)
         assert not isinstance(sdk.workflows, AsyncWorkflowsNamespaceProtocol)
-        for wf_name in (*SYNC_ONLY_WORKFLOWS, *ASYNC_CAPABLE_WORKFLOWS):
+        for wf_name in ALL_WORKFLOWS:
             wf = getattr(sdk.workflows, wf_name)
             assert wf is getattr(sdk.workflows, wf_name)
 
@@ -85,8 +96,8 @@ def test_sync_sdk_workflows_and_sinks_satisfy_protocols() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("workflow_name", SYNC_ONLY_WORKFLOWS)
-async def test_async_sdk_rejects_sync_only_workflows_before_instantiation(
+@pytest.mark.parametrize("workflow_name", ALL_WORKFLOWS)
+async def test_async_sdk_rejects_sync_only_fallback_workflows_before_instantiation(
     workflow_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     instantiated = False
@@ -101,6 +112,8 @@ async def test_async_sdk_rejects_sync_only_workflows_before_instantiation(
     fake_ep.load.return_value = _SyncOnlyProbe
 
     def _patched_eps(*, group: str, name: str | None = None) -> Any:
+        if group == "imednet.async_workflows":
+            return []
         if group != "imednet.workflows":
             return (
                 real_entry_points(group=group, name=name)
@@ -118,25 +131,28 @@ async def test_async_sdk_rejects_sync_only_workflows_before_instantiation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("workflow_name", SYNC_ONLY_WORKFLOWS)
-async def test_async_sdk_rejects_builtin_sync_only_workflows(workflow_name: str) -> None:
-    async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
-        with pytest.raises(TypeError, match=rf"Workflow '{workflow_name}' is synchronous-only"):
-            getattr(async_sdk.workflows, workflow_name)
-
-
-@pytest.mark.asyncio
-async def test_async_sdk_loads_async_capable_workflows_and_caches_them() -> None:
+async def test_async_sdk_loads_all_nine_symmetric_async_workflows_and_caches_them() -> None:
+    expected_types = {
+        "data_extraction": AsyncDataExtractionWorkflow,
+        "duckdb_centralizer": AsyncDuckDBIngestionWorkflow,
+        "query_management": AsyncQueryManagementWorkflow,
+        "record_mapper": AsyncRecordMapper,
+        "record_update": AsyncRecordUpdateWorkflow,
+        "register_subjects": AsyncRegisterSubjectsWorkflow,
+        "subject_data": AsyncSubjectDataWorkflow,
+        "uat": AsyncUATWorkflow,
+        "uat_inspector": AsyncStudySchemaInspector,
+    }
     async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
         assert isinstance(async_sdk.workflows, AsyncWorkflowsNamespaceProtocol)
         assert not isinstance(async_sdk.workflows, SyncWorkflowsNamespaceProtocol)
-        for wf_name in ASYNC_CAPABLE_WORKFLOWS:
+        async_ns = AsyncWorkflows(async_sdk)
+        assert isinstance(async_ns, AsyncWorkflowsNamespaceProtocol)
+        for wf_name, expected_cls in expected_types.items():
             first = getattr(async_sdk.workflows, wf_name)
             second = getattr(async_sdk.workflows, wf_name)
             assert first is second
-        assert isinstance(async_sdk.workflows.record_update, RecordUpdateWorkflow)
-        assert isinstance(async_sdk.workflows.register_subjects, RegisterSubjectsWorkflow)
-        assert isinstance(async_sdk.workflows.uat_inspector, StudySchemaInspector)
+            assert isinstance(first, expected_cls)
 
 
 @pytest.mark.asyncio
@@ -194,17 +210,22 @@ async def test_async_sdk_custom_workflow_requires_supports_async_marker(
 
 
 @pytest.mark.asyncio
-async def test_register_subjects_sync_methods_raise_type_error_on_async_sdk() -> None:
+async def test_register_subjects_sync_class_raises_type_error_and_async_workflow_has_symmetric_coroutines() -> (
+    None
+):
     async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
-        wf = async_sdk.workflows.register_subjects
+        sync_wf = RegisterSubjectsWorkflow(async_sdk)  # type: ignore[arg-type]
         with pytest.raises(TypeError, match="async_register_subjects_batch"):
-            wf.register_subjects_batch(
+            sync_wf.register_subjects_batch(
                 "STUDY", [{"formKey": "F_DM", "siteName": "SITE", "data": {}}]
             )
         with pytest.raises(TypeError, match="async_register_subjects"):
-            wf.register_subjects("STUDY", [{"formKey": "F_DM", "siteName": "SITE", "data": {}}])
+            sync_wf.register_subjects(
+                "STUDY", [{"formKey": "F_DM", "siteName": "SITE", "data": {}}]
+            )
 
-        summary = await wf.async_register_subjects_batch(
+        wf = async_sdk.workflows.register_subjects
+        summary = await wf.register_subjects_batch(
             "STUDY",
             [{"formKey": "F_DM", "siteName": "SITE", "subjectKey": "SUBJ-NEW", "data": {}}],
             wait_for_completion=True,
@@ -212,7 +233,7 @@ async def test_register_subjects_sync_methods_raise_type_error_on_async_sdk() ->
         )
         assert summary.all_successful is True
 
-        job = await wf.async_register_subjects(
+        job = await wf.register_subjects(
             "STUDY",
             [{"formKey": "F_DM", "siteName": "SITE", "subjectKey": "SUBJ-NEW-2", "data": {}}],
             wait_for_completion=True,
@@ -220,31 +241,42 @@ async def test_register_subjects_sync_methods_raise_type_error_on_async_sdk() ->
         )
         assert isinstance(job, Job)
 
+        with pytest.deprecated_call():
+            legacy_job = await wf.async_register_subjects(
+                "STUDY",
+                [{"formKey": "F_DM", "siteName": "SITE", "subjectKey": "SUBJ-NEW-3", "data": {}}],
+                wait_for_completion=True,
+                poll_interval=1,
+            )
+        assert isinstance(legacy_job, Job)
+
 
 @pytest.mark.asyncio
-async def test_record_update_sync_methods_raise_type_error_without_runtime_warning() -> None:
+async def test_record_update_sync_class_raises_type_error_without_runtime_warning() -> None:
     async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
-        wf = async_sdk.workflows.record_update
+        sync_wf = RecordUpdateWorkflow(async_sdk)
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
             with pytest.raises(TypeError, match="_async_validate_form_key"):
-                wf._validate_form_key("STUDY", [{"formKey": "F_VS", "data": {"V_WEIGHT": 70.0}}])
+                sync_wf._validate_form_key(
+                    "STUDY", [{"formKey": "F_VS", "data": {"V_WEIGHT": 70.0}}]
+                )
             with pytest.raises(TypeError, match="async_create_or_update_records_batch"):
-                wf.create_or_update_records_batch(
+                sync_wf.create_or_update_records_batch(
                     "STUDY", [{"formKey": "F_VS", "data": {"V_WEIGHT": 70.0}}]
                 )
             with pytest.raises(TypeError, match="async_create_or_update_records"):
-                wf.create_or_update_records(
+                sync_wf.create_or_update_records(
                     "STUDY", [{"formKey": "F_VS", "data": {"V_WEIGHT": 70.0}}]
                 )
             with pytest.raises(TypeError, match="async_register_subject"):
-                wf.register_subject("STUDY", "F_DM", "SITE", {"V_AGE": 30})
+                sync_wf.register_subject("STUDY", "F_DM", "SITE", {"V_AGE": 30})
             with pytest.raises(TypeError, match="async_update_scheduled_record"):
-                wf.update_scheduled_record(
+                sync_wf.update_scheduled_record(
                     "STUDY", "F_VS", "SUBJ-001", "Baseline", {"V_WEIGHT": 70}
                 )
             with pytest.raises(TypeError, match="async_create_new_record"):
-                wf.create_new_record("STUDY", "F_VS", "SUBJ-001", {"V_WEIGHT": 70})
+                sync_wf.create_new_record("STUDY", "F_VS", "SUBJ-001", {"V_WEIGHT": 70})
 
 
 @pytest.mark.asyncio
@@ -365,14 +397,21 @@ def test_batch_coordinator_rejects_async_validate_batch_fn_across_all_branches(
 async def test_study_schema_inspector_inspect_rejects_async_sdk_even_when_cache_warm() -> None:
     async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
         inspector = async_sdk.workflows.uat_inspector
-        snap = await inspector.async_inspect("STUDY")
+        snap = await inspector.inspect("STUDY")
         assert snap.study_key == "STUDY"
+        with pytest.deprecated_call():
+            legacy_snap = await inspector.async_inspect("STUDY")
+        assert legacy_snap is snap
 
-        with pytest.raises(TypeError, match="async_inspect"):
-            inspector.inspect("STUDY")
+        sync_inspector = StudySchemaInspector(async_sdk)
+        with pytest.deprecated_call():
+            warm_snap = await sync_inspector.async_inspect("STUDY")
+        assert warm_snap.study_key == "STUDY"
+        with pytest.raises(TypeError, match="uat_inspector.inspect"):
+            sync_inspector.inspect("STUDY")
 
     async_mock = MagicMock(spec=["async_get_forms"])
-    with pytest.raises(TypeError, match="async_inspect"):
+    with pytest.raises(TypeError, match="uat_inspector.inspect"):
         StudySchemaInspector(async_mock).inspect("STUDY")
 
 
@@ -466,16 +505,31 @@ def test_sinks_namespace_bound_exports_deprecation_shims_and_invalid_calls(
 
 
 @pytest.mark.asyncio
-async def test_async_sdk_sinks_reject_exports_but_expose_config_and_sink_classes() -> None:
+async def test_async_sdk_sinks_bind_native_async_exports_and_expose_classes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
     async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
         assert async_sdk.sinks is not None
+        assert isinstance(async_sdk.sinks, AsyncSinksNamespace)
         assert isinstance(async_sdk.sinks, AsyncSinksNamespaceProtocol)
         assert async_sdk.sinks.MongoDbSinkConfig is MongoDbSinkConfig
         assert async_sdk.sinks.MongoDbExportSink is MongoDbExportSink
+        assert async_sdk.sinks.AsyncMongoDbExportSink is AsyncMongoDbExportSink
         assert async_sdk.sinks.Neo4jSinkConfig is Neo4jSinkConfig
         assert async_sdk.sinks.Neo4jExportSink is Neo4jExportSink
+        assert async_sdk.sinks.AsyncNeo4jExportSink is AsyncNeo4jExportSink
         assert async_sdk.sinks.SnowflakeSinkConfig is SnowflakeSinkConfig
         assert async_sdk.sinks.SnowflakeExportSink is SnowflakeExportSink
+        assert async_sdk.sinks.AsyncSnowflakeExportSink is AsyncSnowflakeExportSink
+
+        mongo_spy = AsyncMock(return_value=7)
+        neo_spy = AsyncMock(return_value=8)
+        sf_spy = AsyncMock(return_value=9)
+        monkeypatch.setattr("imednet_sinks.document.async_export_to_mongodb", mongo_spy)
+        monkeypatch.setattr("imednet_sinks.graph.async_export_to_neo4j", neo_spy)
+        monkeypatch.setattr("imednet_sinks.warehouse.async_export_to_snowflake", sf_spy)
 
         sf_cfg = async_sdk.sinks.SnowflakeSinkConfig(
             study_key="STUDY",
@@ -488,12 +542,14 @@ async def test_async_sdk_sinks_reject_exports_but_expose_config_and_sink_classes
             stage="STG",
             table="TBL",
         )
-        with pytest.raises(TypeError, match="requires a synchronous ImednetSDK"):
-            async_sdk.sinks.export_to_mongodb("STUDY")
-        with pytest.raises(TypeError, match="requires a synchronous ImednetSDK"):
-            async_sdk.sinks.export_to_neo4j("STUDY")
-        with pytest.raises(TypeError, match="requires a synchronous ImednetSDK"):
-            async_sdk.sinks.export_to_snowflake("STUDY", config=sf_cfg)
+        assert (
+            await async_sdk.sinks.export_to_mongodb("STUDY", "mongodb://localhost", "db", "c") == 7
+        )
+        assert await async_sdk.sinks.export_to_neo4j("STUDY", "bolt://localhost:7687") == 8
+        assert await async_sdk.sinks.export_to_snowflake("STUDY", config=sf_cfg) == 9
+        assert mongo_spy.await_args.args[:2] == (async_sdk, "STUDY")
+        assert neo_spy.await_args.args[:2] == (async_sdk, "STUDY")
+        assert sf_spy.await_args.args[:2] == (async_sdk, "STUDY")
 
 
 def test_workflows_top_level_exports_and_sdk_auth_and_study_context_self() -> None:
@@ -583,3 +639,48 @@ def test_sink_config_factories_expose_max_buffered_records() -> None:
         assert sf_cfg.max_buffered_records == 2500
     finally:
         sync_sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_async_workflows_and_async_export_support_cdisc_odm_and_dataset_json(
+    tmp_path: Path,
+) -> None:
+    from imednet.datadict import load_dataset_json, load_odm_archive
+    from imednet.integrations import async_export
+    from imednet_workflows import QueryManagementWorkflow
+
+    async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
+        sync_de = DataExtractionWorkflow(async_sdk)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="extract_odm_audit_records"):
+            sync_de.extract_odm_audit_records("STUDY")
+
+        sync_qm = QueryManagementWorkflow(async_sdk)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="extract_odm_annotations"):
+            sync_qm.extract_odm_annotations("STUDY")
+
+        audit_records = await async_sdk.workflows.data_extraction.extract_odm_audit_records("STUDY")
+        assert isinstance(audit_records, list)
+
+        annotations = await async_sdk.workflows.query_management.extract_odm_annotations("STUDY")
+        open_annotations = await async_sdk.workflows.query_management.extract_odm_annotations(
+            "STUDY", open_only=True
+        )
+        assert isinstance(annotations, list)
+        assert isinstance(open_annotations, list)
+
+        cdash_env = await async_sdk.workflows.record_mapper.to_dataset_json("STUDY")
+        assert cdash_env.dataset_json_version == "1.1.0"
+        assert cdash_env.clinical_data is not None
+
+        sdtm_env = await async_sdk.workflows.record_mapper.sdtm_dataset_json("STUDY", "DM")
+        assert sdtm_env.dataset_json_version == "1.1.0"
+
+        odm_path = tmp_path / "study.odm.xml"
+        dsj_path = tmp_path / "study.dataset.json"
+        await async_export("odm", async_sdk, "STUDY", path=odm_path)
+        await async_export("dataset-json", async_sdk, "STUDY", path=dsj_path)
+
+        archive = load_odm_archive(odm_path)
+        assert archive.data_dictionary.metadata.studyKey == "STUDY"
+        loaded_dsj = load_dataset_json(dsj_path)
+        assert loaded_dsj.dataset_json_version == "1.1.0"

@@ -43,18 +43,28 @@ Plugin authoring reference
 How it works
 ------------
 
-The SDK supports two Python entry-point groups for extending functionality on
-:class:`~imednet.sdk.ImednetSDK` and :class:`~imednet.sdk.AsyncImednetSDK`:
+The SDK supports typed synchronous and asynchronous Python entry-point groups
+for extending functionality on :class:`~imednet.sdk.ImednetSDK` and
+:class:`~imednet.sdk.AsyncImednetSDK`:
 
-* **Individual workflows (``imednet.workflows``)** — ``sdk.workflows`` is a
-  :class:`~imednet.sdk.WorkflowRegistry` that discovers workflow classes or
-  factories registered in the ``imednet.workflows`` entry-point group. Each
-  entry point is loaded and instantiated lazily on first attribute access by
-  passing the SDK instance (``workflow_factory(sdk)``).
+* **Workflows (``imednet.workflows`` and ``imednet.async_workflows``)** —
+  ``sdk.workflows`` is a :class:`~imednet.sdk.WorkflowRegistry` that resolves
+  synchronous adapters from ``imednet.workflows`` on ``ImednetSDK`` and native
+  asynchronous adapters from ``imednet.async_workflows`` on ``AsyncImednetSDK``
+  (falling back to ``imednet.workflows`` entries that declare
+  ``supports_async = True``). Each entry point is loaded and instantiated lazily
+  on first attribute access by passing the active SDK facade.
+* **Export sinks (``imednet.sinks`` and ``imednet.async_sinks``)** —
+  :func:`~imednet.integrations.dispatcher.export` discovers
+  :class:`~imednet.spi.sinks.ExportSink` classes in ``imednet.sinks``, while
+  :func:`~imednet.integrations.dispatcher.async_export` discovers
+  :class:`~imednet.spi.sinks.AsyncExportSink` classes in ``imednet.async_sinks``.
 * **Namespace plugins (``imednet.plugins``)** — Top-level SDK namespaces such
   as ``sdk.sinks`` query the ``imednet.plugins`` entry-point group (for
   example, ``sinks = "imednet_sinks.plugin:create_sinks"``) and invoke the
-  registered factory with the SDK instance.
+  registered factory with the SDK instance to return a mode-matched namespace
+  (:class:`~imednet.plugins.SinksNamespaceProtocol` on ``ImednetSDK`` and
+  :class:`~imednet.plugins.AsyncSinksNamespaceProtocol` on ``AsyncImednetSDK``).
 
 If a workflow or plugin package is **not** installed, accessing the missing
 workflow or namespace attribute raises :exc:`AttributeError` or
@@ -67,19 +77,21 @@ load (duplicate registration, broken import, or non-callable target), a
 Plugin contract
 ---------------
 
-An individual workflow registered under ``imednet.workflows`` is any class or
-callable that accepts the SDK instance as its sole positional argument. By
-default, workflows are synchronous-only and raise :exc:`TypeError` when
-accessed on :class:`~imednet.sdk.AsyncImednetSDK`. Workflows that support
-asynchronous execution on ``AsyncImednetSDK`` must declare
-``supports_async = True`` on the workflow class or factory.
+Workflow adapters registered under ``imednet.workflows`` accept
+:class:`~imednet.spi.facade.ImednetFacade`, while asynchronous adapters
+registered under ``imednet.async_workflows`` accept
+:class:`~imednet.spi.facade.AsyncImednetFacade` and expose symmetric unprefixed
+coroutine methods. Custom workflows registered only under ``imednet.workflows``
+default to synchronous-only and raise :exc:`TypeError` on
+:class:`~imednet.sdk.AsyncImednetSDK` unless they also register an
+``imednet.async_workflows`` adapter or declare ``supports_async = True``.
 
 A namespace-level plugin factory registered under ``imednet.plugins`` satisfies
-:class:`~imednet.plugins.PluginProtocol` (or returns a
-:class:`~imednet.plugins.SinksNamespaceProtocol` /
-:class:`~imednet.plugins.AsyncSinksNamespaceProtocol` /
+:class:`~imednet.plugins.PluginProtocol` (or :class:`~imednet.plugins.SinksPluginProtocol`,
+returning :class:`~imednet.plugins.SinksNamespaceProtocol` /
+:class:`~imednet.plugins.AsyncSinksNamespaceProtocol` or
 :class:`~imednet.plugins.SyncWorkflowsNamespaceProtocol` /
-:class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol` namespace):
+:class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol`):
 
 .. testcode::
 
@@ -89,11 +101,14 @@ A namespace-level plugin factory registered under ``imednet.plugins`` satisfies
     class PluginProtocol(Protocol):
         def __call__(self, sdk_instance: Any) -> SyncWorkflowsNamespaceProtocol: ...
 
-The built-in ``imednet-workflows`` package registers the following workflow
-attributes under ``imednet.workflows`` (matching
-:class:`~imednet.plugins.SyncWorkflowsNamespaceProtocol` on ``ImednetSDK``, with
-``record_update``, ``register_subjects``, and ``uat_inspector`` also enabled on
-:class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol` for ``AsyncImednetSDK``):
+The built-in ``imednet-workflows`` package registers all nine workflows
+symmetrically across ``imednet.workflows``
+(:class:`~imednet.plugins.SyncWorkflowsNamespaceProtocol` on ``ImednetSDK``) and
+``imednet.async_workflows``
+(:class:`~imednet.plugins.AsyncWorkflowsNamespaceProtocol` on
+``AsyncImednetSDK``), while ``imednet-sinks`` binds ``export_to_mongodb``,
+``export_to_neo4j``, and ``export_to_snowflake`` on both ``ImednetSDK.sinks``
+and ``AsyncImednetSDK.sinks``:
 
 * ``data_extraction``
 * ``duckdb_centralizer``

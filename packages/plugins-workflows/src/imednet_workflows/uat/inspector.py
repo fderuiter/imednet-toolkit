@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import Field
+from typing_extensions import deprecated
 
 from imednet.spi.models import (
     Form,
@@ -16,6 +17,12 @@ from imednet.spi.models import (
     Site,
     Variable,
     is_site_enrollment_eligible,
+)
+from imednet.spi.utils import (
+    SyncToAsyncFacadeAdapter,
+    call_async_facade_method,
+    is_async_facade,
+    run_sync_over_async,
 )
 
 from ._contracts import (
@@ -298,81 +305,27 @@ class StudySnapshot(ImednetBaseModel):
         )
 
 
-class StudySchemaInspector:
-    """Fetch and index all structural metadata for an iMednet study.
+class _StudySchemaInspectorBase:
+    """Shared async-first metadata inspection engine for UAT snapshots."""
 
-    Supports both sync and async SDK clients. When an async client is used,
-    metadata calls are executed concurrently via ``asyncio.gather``.
-    The in-memory cache is per inspector instance. It can be shared by concurrent
-    tasks in a single event loop, but is not thread-safe across threads/processes;
-    use external synchronization or separate inspector instances for that access pattern.
-    """
-
-    supports_async = True
-
-    def __init__(self, sdk: ImednetFacade | AsyncImednetFacade) -> None:
-        """Initialize the study schema inspector.
-
-        Args:
-            sdk: An instance of the synchronous or asynchronous iMednet SDK facade.
-        """
-        self._sdk = sdk
+    def __init__(self) -> None:
         self._cache: dict[str, StudySnapshot] = {}
 
-    def inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
-        """Synchronously fetch and return a study snapshot."""
-        if hasattr(self._sdk, "async_get_forms") and not callable(
-            getattr(self._sdk, "get_forms", None)
-        ):
-            raise TypeError(
-                "StudySchemaInspector.inspect() requires a synchronous ImednetSDK "
-                "(ImednetFacade). With AsyncImednetSDK, await "
-                "inspector.async_inspect(...) instead."
-            )
+    async def _inspect_async(
+        self,
+        async_sdk: AsyncImednetFacade,
+        study_key: str,
+        *,
+        force_refresh: bool = False,
+    ) -> StudySnapshot:
         if not force_refresh and study_key in self._cache:
             return self._cache[study_key]
-
-        sdk = cast("ImednetFacade", self._sdk)
-        snapshot = StudySnapshot(
-            study_key=study_key,
-            forms=sdk.get_forms(study_key),
-            variables=sdk.get_variables(study_key),
-            intervals=sdk.get_intervals(study_key),
-            sites=sdk.get_sites(study_key),
-        )
-        self._cache[study_key] = snapshot
-        return snapshot
-
-    async def async_inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
-        """Asynchronously fetch metadata concurrently and return a study snapshot."""
-        if not force_refresh and study_key in self._cache:
-            return self._cache[study_key]
-
-        sdk = cast("AsyncImednetFacade", self._sdk)
-
-        async def fetch_forms() -> list[Any]:
-            """Asynchronous fetch for forms."""
-            return await sdk.async_get_forms(study_key)
-
-        async def fetch_variables() -> list[Any]:
-            """Asynchronous fetch for variables."""
-            return await sdk.async_get_variables(study_key)
-
-        async def fetch_intervals() -> list[Any]:
-            """Asynchronous fetch for intervals."""
-            return await sdk.async_get_intervals(study_key)
-
-        async def fetch_sites() -> list[Any]:
-            """Asynchronous fetch for sites."""
-            return await sdk.async_get_sites(study_key)
-
         forms, variables, intervals, sites = await asyncio.gather(
-            fetch_forms(),
-            fetch_variables(),
-            fetch_intervals(),
-            fetch_sites(),
+            call_async_facade_method(async_sdk, "get_forms", study_key),
+            call_async_facade_method(async_sdk, "get_variables", study_key),
+            call_async_facade_method(async_sdk, "get_intervals", study_key),
+            call_async_facade_method(async_sdk, "get_sites", study_key),
         )
-
         snapshot = StudySnapshot(
             study_key=study_key,
             forms=forms,
@@ -389,3 +342,67 @@ class StudySchemaInspector:
             self._cache.clear()
             return
         self._cache.pop(study_key, None)
+
+
+class AsyncStudySchemaInspector(_StudySchemaInspectorBase):
+    """Asynchronously fetch and index structural metadata for an iMednet study."""
+
+    supports_async = True
+
+    def __init__(self, sdk: AsyncImednetFacade) -> None:
+        """Initialize the async study schema inspector."""
+        super().__init__()
+        self._sdk = sdk
+
+    async def inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
+        """Asynchronously fetch metadata concurrently and return a study snapshot."""
+        return await self._inspect_async(self._sdk, study_key, force_refresh=force_refresh)
+
+    @deprecated(
+        "AsyncStudySchemaInspector.async_inspect() is deprecated; "
+        "use await inspector.inspect(...) instead."
+    )
+    async def async_inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
+        """Deprecated alias for :meth:`inspect`."""
+        return await self.inspect(study_key, force_refresh=force_refresh)
+
+
+class StudySchemaInspector(_StudySchemaInspectorBase):
+    """Fetch and index all structural metadata for an iMednet study."""
+
+    supports_async = True
+
+    def __init__(self, sdk: ImednetFacade | AsyncImednetFacade) -> None:
+        """Initialize the study schema inspector."""
+        super().__init__()
+        self._sdk = sdk
+
+    def inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
+        """Synchronously fetch and return a study snapshot."""
+        if is_async_facade(self._sdk) and not isinstance(self._sdk, SyncToAsyncFacadeAdapter):
+            raise TypeError(
+                "StudySchemaInspector.inspect() requires a synchronous ImednetSDK "
+                "(ImednetFacade). With AsyncImednetSDK, await "
+                "sdk.workflows.uat_inspector.inspect(...) instead."
+            )
+        if not force_refresh and study_key in self._cache:
+            return self._cache[study_key]
+        sync_sdk = cast("ImednetFacade", self._sdk)
+        return run_sync_over_async(
+            lambda: self._inspect_async(
+                SyncToAsyncFacadeAdapter(sync_sdk), study_key, force_refresh=force_refresh
+            )
+        )
+
+    @deprecated(
+        "StudySchemaInspector.async_inspect() is deprecated; "
+        "use await sdk.workflows.uat_inspector.inspect(...) instead."
+    )
+    async def async_inspect(self, study_key: str, *, force_refresh: bool = False) -> StudySnapshot:
+        """Deprecated async alias for fetching metadata concurrently."""
+        return await self._inspect_async(
+            cast("AsyncImednetFacade", self._sdk), study_key, force_refresh=force_refresh
+        )
+
+
+__all__ = ["AsyncStudySchemaInspector", "StudySchemaInspector", "StudySnapshot"]

@@ -125,23 +125,34 @@ Use :func:`~imednet.datadict.load_from_redcap` to convert REDCap instrument CSV 
 From the EDC REST API
 ~~~~~~~~~~~~~~~~~~~~~
 
-Use :func:`~imednet.datadict.load_from_api` with an initialized :class:`~imednet.ImednetSDK` client to extract Study Forms and Variables directly from the ``/forms`` and ``/variables`` REST endpoints:
+Use :func:`~imednet.datadict.load_from_api` with a synchronous :class:`~imednet.ImednetSDK` (:class:`~imednet.spi.facade.ImednetFacade`) or :func:`~imednet.datadict.async_load_from_api` with an asynchronous :class:`~imednet.AsyncImednetSDK` (:class:`~imednet.spi.facade.AsyncImednetFacade`) to extract Study Forms and Variables concurrently from the ``/forms`` and ``/variables`` REST endpoints. Both functions execute the same canonical Data Dictionary builder, and ``load_from_api`` raises :exc:`TypeError` if passed an ``AsyncImednetSDK`` instance:
 
 .. note::
-   The standard iMednet REST API exposes Forms and Variables, but does not expose Choice code lists or ``BusinessLogicRule`` XML definitions. ``load_from_api`` records this limitation in ``metadata.validationWarnings``; use a 4-file CSV or CDISC ODM export when enforcing Choice membership or edit check rules.
+   The standard iMednet REST API exposes Forms and Variables, but does not expose Choice code lists or ``BusinessLogicRule`` XML definitions. ``load_from_api`` and ``async_load_from_api`` record this limitation in ``metadata.validationWarnings``; use a 4-file CSV or CDISC ODM export when enforcing Choice membership or edit check rules.
 
 .. testcode::
 
-   from imednet import ImednetSDK, SimulationState, SimulationTransport
-   from imednet.datadict import load_from_api
+   import asyncio
+   from imednet import AsyncImednetSDK, ImednetSDK, SimulationState, SimulationTransport
+   from imednet.datadict import DataDictionary, async_load_from_api, load_from_api
 
+   state = SimulationState()
    with ImednetSDK(
        simulation_mode=True,
-       transport=SimulationTransport(SimulationState()),
+       transport=SimulationTransport(state),
    ) as sdk:
        api_dd = load_from_api(sdk, "STUDY", no_raw_xml=True)
 
+   async def load_async_dd() -> DataDictionary:
+       async with AsyncImednetSDK(
+           simulation_mode=True,
+           transport=SimulationTransport(state),
+       ) as async_sdk:
+           return await async_load_from_api(async_sdk, "STUDY", no_raw_xml=True)
+
+   async_dd = asyncio.run(load_async_dd())
    assert api_dd.form_for_key("F_VS") is not None
+   assert async_dd.forms == api_dd.forms
    assert len(api_dd.metadata.validationWarnings) == 1
 
 JSON Emission, Schema Export, and Validation

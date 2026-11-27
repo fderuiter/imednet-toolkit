@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -11,15 +13,18 @@ from typing import Any, Literal
 
 from pydantic import Field
 
-from imednet.spi.facade import ImednetFacade
+from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.spi.models import ImednetBaseModel, Job, JobState, normalize_job_state
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
+    AsyncJobPoller,
     JobFailedError,
     JobPoller,
     JobPollSummary,
     JobTimeoutError,
+    call_async_facade_method,
     chunk_records,
+    run_sync_over_async,
 )
 from imednet.spi.validation import ValidationSchemaProtocol
 
@@ -361,6 +366,18 @@ class BulkSubmissionError(Exception):
         self.failed_batches = failed_batches
 
 
+async def _await_if_needed(val: Any) -> Any:
+    return await val if inspect.isawaitable(val) else val
+
+
+class _PreloadedSdkShim:
+    def __init__(self, subjects: list[Any] | None, records: list[Any] | None) -> None:
+        if subjects is not None:
+            self.get_subjects = lambda *_a, **_kw: subjects
+        if records is not None:
+            self.get_records = lambda *_a, **_kw: records
+
+
 class BulkRecordSubmissionWorkflow:
     """Two-phase bulk record submission for UAT scenarios.
 
@@ -432,6 +449,26 @@ class BulkRecordSubmissionWorkflow:
         keyword_tag: str = "UAT",
         schema: ValidationSchemaProtocol | None = None,
     ) -> SubmissionResult:
+        """Execute the two-phase submission synchronously."""
+        return run_sync_over_async(
+            lambda: self._execute_submit_async(
+                study_key,
+                record_sets,
+                email_notify=email_notify,
+                keyword_tag=keyword_tag,
+                schema=schema,
+            )
+        )
+
+    async def _execute_submit_async(
+        self,
+        study_key: str,
+        record_sets: list[GeneratedRecordSet],
+        *,
+        email_notify: bool | str | None = None,
+        keyword_tag: str = "UAT",
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> SubmissionResult:
         """Execute the two-phase submission.
 
         Returns a SubmissionResult with all jobs and metadata.
@@ -457,7 +494,9 @@ class BulkRecordSubmissionWorkflow:
         try:
             ordered_existing_pairs: list[tuple[str, Any]] = []
             if self.skip_existing_subjects:
-                existing_subjects = self._find_existing_uat_subjects(study_key, keyword_tag)
+                existing_subjects = await _await_if_needed(
+                    self._find_existing_uat_subjects(study_key, keyword_tag)
+                )
                 if self._existing_uat_subjects:
                     ordered_existing_pairs = [
                         (k, subj)
@@ -485,7 +524,7 @@ class BulkRecordSubmissionWorkflow:
                 pre_existing.subject_ids.update(self._initial_subjects_snapshot.subject_ids)
                 pre_existing.subject_oids.update(self._initial_subjects_snapshot.subject_oids)
             elif registration_sets and data_sets:
-                snap = self._snapshot_existing_subjects(study_key)
+                snap = await _await_if_needed(self._snapshot_existing_subjects(study_key))
                 pre_existing.subject_keys.update(snap.subject_keys)
                 pre_existing.subject_ids.update(snap.subject_ids)
                 pre_existing.subject_oids.update(snap.subject_oids)
@@ -584,14 +623,16 @@ class BulkRecordSubmissionWorkflow:
                 for chunk in self._chunk_payloads(filtered_payloads):
                     chunk_items = filtered_items[offset : offset + len(chunk)]
                     offset += len(chunk)
-                    batch = self._submit_batch(
-                        study_key,
-                        chunk,
-                        phase="registration",
-                        form_key=rs.form_key,
-                        form_name=rs.form_name,
-                        email_notify=email_notify,
-                        schema=schema,
+                    batch = await _await_if_needed(
+                        self._submit_batch(
+                            study_key,
+                            chunk,
+                            phase="registration",
+                            form_key=rs.form_key,
+                            form_name=rs.form_name,
+                            email_notify=email_notify,
+                            schema=schema,
+                        )
                     )
                     for item in chunk_items:
                         item.batch_id = batch.job.batch_id
@@ -602,17 +643,21 @@ class BulkRecordSubmissionWorkflow:
             poll_summary: JobPollSummary | None = None
             if self.await_registration and result.registration_batches:
                 self.transition_to(SubmissionPhase.AWAITING_REGISTRATION)
-                poll_summary = self._poll_and_validate_registration_batches(
-                    study_key, result.registration_batches
+                poll_summary = await _await_if_needed(
+                    self._poll_and_validate_registration_batches(
+                        study_key, result.registration_batches
+                    )
                 )
                 if batch_item_groups:
                     must_correlate = self._requires_phase2_correlation(data_sets, poll_summary)
-                    enrolled_keys, correlation_error = self._correlate_enrolled_subjects(
-                        study_key=study_key,
-                        batch_item_groups=batch_item_groups,
-                        summary=poll_summary,
-                        pre_existing=pre_existing,
-                        allow_record_lookup=bool(data_sets),
+                    enrolled_keys, correlation_error = await _await_if_needed(
+                        self._correlate_enrolled_subjects(
+                            study_key=study_key,
+                            batch_item_groups=batch_item_groups,
+                            summary=poll_summary,
+                            pre_existing=pre_existing,
+                            allow_record_lookup=bool(data_sets),
+                        )
                     )
                     if enrolled_keys is not None:
                         if reused_key_map:
@@ -662,14 +707,16 @@ class BulkRecordSubmissionWorkflow:
             # Phase 2: Data Submission
             for rs in data_sets:
                 for chunk in self._chunk_payloads(rs.payloads):
-                    batch = self._submit_batch(
-                        study_key,
-                        chunk,
-                        phase="data",
-                        form_key=rs.form_key,
-                        form_name=rs.form_name,
-                        email_notify=email_notify,
-                        schema=schema,
+                    batch = await _await_if_needed(
+                        self._submit_batch(
+                            study_key,
+                            chunk,
+                            phase="data",
+                            form_key=rs.form_key,
+                            form_name=rs.form_name,
+                            email_notify=email_notify,
+                            schema=schema,
+                        )
                     )
                     result.data_batches.append(batch)
             self.transition_to(SubmissionPhase.COMPLETED)
@@ -751,7 +798,13 @@ class BulkRecordSubmissionWorkflow:
 
         batch_ids = [b.job.batch_id for b in batches_to_poll if b.job.batch_id is not None]
         summary = self._poll_registration_batches(study_key, batch_ids)
+        return self._finalize_polled_batches(batches_to_poll, summary)
 
+    @staticmethod
+    def _finalize_polled_batches(
+        batches_to_poll: list[BatchSubmission],
+        summary: JobPollSummary,
+    ) -> JobPollSummary:
         failed_batches: list[BatchSubmission] = []
 
         for batch in batches_to_poll:
@@ -1240,10 +1293,194 @@ class BulkRecordSubmissionWorkflow:
         return set(self._ordered_existing_uat_keys)
 
 
+class AsyncBulkRecordSubmissionWorkflow(BulkRecordSubmissionWorkflow):
+    """Asynchronous two-phase bulk record submission for UAT scenarios."""
+
+    supports_async = True
+    sdk: AsyncImednetFacade  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        sdk: AsyncImednetFacade,
+        batch_size: int = DEFAULT_BATCH_CHUNK_SIZE,
+        await_registration: bool = True,
+        registration_timeout: float = 600.0,
+        skip_existing_subjects: bool = True,
+        registration_poll_interval: float | None = None,
+    ) -> None:
+        """Initialize the async bulk record submission workflow."""
+        super().__init__(
+            sdk,  # type: ignore[arg-type]
+            batch_size=batch_size,
+            await_registration=await_registration,
+            registration_timeout=registration_timeout,
+            skip_existing_subjects=skip_existing_subjects,
+            registration_poll_interval=registration_poll_interval,
+        )
+
+    def _has_sdk_method(self, canonical_name: str) -> bool:
+        legacy_name = f"async_{canonical_name}"
+        inst = getattr(self.sdk, "__dict__", {})
+        if isinstance(inst, dict) and legacy_name in inst:
+            return not _is_unconfigured_mock_method(inst[legacy_name])
+        if not _is_unconfigured_mock_method(getattr(self.sdk, canonical_name, None)):
+            return True
+        return not _is_unconfigured_mock_method(getattr(self.sdk, legacy_name, None))
+
+    def _requires_phase2_correlation(
+        self, data_sets: list[GeneratedRecordSet], summary: JobPollSummary | None
+    ) -> bool:
+        if not data_sets:
+            return False
+        if any("subjectKey" in p or "subject_key" in p for rs in data_sets for p in rs.payloads):
+            return True
+        if summary is not None and any(
+            getattr(st, "results", None) is not None for st in summary.results.values()
+        ):
+            return True
+        return self._has_sdk_method("get_subjects") or self._has_sdk_method("get_records")
+
+    async def submit(  # type: ignore[override]
+        self,
+        study_key: str,
+        record_sets: list[GeneratedRecordSet],
+        *,
+        email_notify: bool | str | None = None,
+        keyword_tag: str = "UAT",
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> SubmissionResult:
+        """Asynchronously execute the two-phase submission."""
+        return await self._execute_submit_async(
+            study_key,
+            record_sets,
+            email_notify=email_notify,
+            keyword_tag=keyword_tag,
+            schema=schema,
+        )
+
+    async def _submit_batch(  # type: ignore[override]
+        self,
+        study_key: str,
+        payloads: list[dict[str, Any]],
+        phase: Literal["registration", "data"] | SubmissionPhase,
+        form_key: str | None,
+        form_name: str | None,
+        email_notify: bool | str | None,
+        schema: ValidationSchemaProtocol | None = None,
+    ) -> BatchSubmission:
+        kwargs: dict[str, Any] = {"email_notify": email_notify}
+        if schema is not None:
+            kwargs["schema"] = schema
+        job = await call_async_facade_method(
+            self.sdk, "create_record", study_key, payloads, **kwargs
+        )
+        return BatchSubmission(
+            phase=phase,
+            form_key=form_key,
+            form_name=form_name,
+            record_count=len(payloads),
+            job=job,
+        )
+
+    async def _poll_registration_batches(  # type: ignore[override]
+        self, study_key: str, batch_ids: list[str]
+    ) -> JobPollSummary:
+        poll_kwargs: dict[str, Any] = {
+            "timeout": float(self.registration_timeout),
+            "fail_fast": False,
+        }
+        if self.registration_poll_interval is not None:
+            poll_kwargs["interval"] = float(self.registration_poll_interval)
+        if self._has_sdk_method("poll_jobs"):
+            candidate = await call_async_facade_method(
+                self.sdk, "poll_jobs", study_key, batch_ids, **poll_kwargs
+            )
+            if isinstance(candidate, JobPollSummary):
+                return candidate
+        poller = AsyncJobPoller(
+            get_job=functools.partial(call_async_facade_method, self.sdk, "get_job")
+        )
+        return await poller.async_poll_many(study_key, batch_ids, **poll_kwargs)
+
+    async def _poll_and_validate_registration_batches(  # type: ignore[override]
+        self, study_key: str, batches: list[BatchSubmission]
+    ) -> JobPollSummary | None:
+        batches_to_poll = [b for b in batches if b.job.batch_id]
+        if not batches_to_poll:
+            return None
+        batch_ids = [b.job.batch_id for b in batches_to_poll if b.job.batch_id is not None]
+        summary = await _await_if_needed(self._poll_registration_batches(study_key, batch_ids))
+        return self._finalize_polled_batches(batches_to_poll, summary)
+
+    async def _snapshot_existing_subjects(  # type: ignore[override]
+        self, study_key: str
+    ) -> _PreExistingSubjectsSnapshot:
+        if self._has_sdk_method("get_subjects"):
+            subjects = await call_async_facade_method(self.sdk, "get_subjects", study_key)
+            return self._extract_snapshot_from_subjects(subjects)
+        return _PreExistingSubjectsSnapshot(set(), set(), set())
+
+    async def _correlate_enrolled_subjects(  # type: ignore[override]
+        self,
+        *,
+        study_key: str,
+        batch_item_groups: list[tuple[BatchSubmission, list[_SubmittedRegistrationItem]]],
+        summary: JobPollSummary | None,
+        pre_existing: _PreExistingSubjectsSnapshot,
+        allow_record_lookup: bool,
+    ) -> tuple[list[str] | None, str | None]:
+        subjects: list[Any] | None = None
+        records: list[Any] | None = None
+        if self._has_sdk_method("get_subjects"):
+            res_s = await call_async_facade_method(self.sdk, "get_subjects", study_key)
+            if isinstance(res_s, list):
+                subjects = res_s
+        if allow_record_lookup and self._has_sdk_method("get_records"):
+            res_r = await call_async_facade_method(self.sdk, "get_records", study_key)
+            if isinstance(res_r, list):
+                records = res_r
+        orig_sdk = self.sdk
+        try:
+            self.sdk = _PreloadedSdkShim(subjects, records)  # type: ignore[assignment]
+            return super()._correlate_enrolled_subjects(
+                study_key=study_key,
+                batch_item_groups=batch_item_groups,
+                summary=summary,
+                pre_existing=pre_existing,
+                allow_record_lookup=allow_record_lookup,
+            )
+        finally:
+            self.sdk = orig_sdk
+
+    async def _find_existing_uat_subjects(  # type: ignore[override]
+        self,
+        study_key: str,
+        keyword_tag: str,
+        *,
+        site_name: str | None = None,
+        site_id: int | None = None,
+    ) -> set[str]:
+        subjects = await call_async_facade_method(
+            self.sdk, "get_subjects", study_key, deleted=False
+        )
+        self._initial_subjects_snapshot = self._extract_snapshot_from_subjects(subjects)
+        matched = iter_matching_uat_subjects(
+            subjects,
+            keyword_tag=keyword_tag,
+            require_keyword=bool(keyword_tag),
+            site_name=site_name,
+            site_id=site_id,
+        )
+        self._existing_uat_subjects = matched
+        self._ordered_existing_uat_keys = [key for key, _ in matched]
+        return set(self._ordered_existing_uat_keys)
+
+
 __all__ = [
     "ACTIVE_SUBMISSION_PHASES",
     "ALLOWED_SUBMISSION_TRANSITIONS",
     "TERMINAL_SUBMISSION_PHASES",
+    "AsyncBulkRecordSubmissionWorkflow",
     "BatchSubmission",
     "BulkRecordSubmissionWorkflow",
     "BulkSubmissionError",

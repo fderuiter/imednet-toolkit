@@ -155,6 +155,7 @@ jobs:
 
   scorecard:
     name: OpenSSF Scorecard
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       security-events: write # Required to upload Scorecard SARIF results to code scanning
@@ -305,7 +306,8 @@ jobs:
               if [ -f "$package/pyproject.toml" ]; then
                 (
                   cd "$package"
-                  uvx --from "hatch==1.18.2" hatch build
+                  uv build --out-dir dist
+                  rm -f dist/.gitignore
                 )
               fi
             done
@@ -441,7 +443,7 @@ jobs:
             TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*sinks* --ignore-glob=*tui/* tests/"
             COV_ARGS="--cov=imednet"
           elif [ "$PACKAGE" = "plugins-workflows" ]; then
-            TEST_ARGS="tests/unit/test_workflows*.py tests/integration/test_workflows*.py tests/integration/test_sync_worker_integration.py tests/unit/workflows/ tests/workflows/ tests/unit/test_chunked_pipeline.py tests/unit/cli/ tests/unit/test_config_version_control.py tests/unit/test_duckdb_ingestion_workflow.py tests/unit/test_job_poller.py tests/unit/test_record_mapper.py tests/unit/test_record_mapper_hierarchy.py tests/unit/test_state_ledger.py tests/unit/test_state_ledger_providers.py tests/unit/test_study_structure.py tests/unit/test_sync_worker.py tests/unit/test_cached_records_loader.py tests/unit/test_batch_validation_and_polling.py tests/unit/test_keyed_upserts_and_watermark_recovery.py tests/unit/test_mode_safe_plugin_protocols.py tests/unit/test_tabular_import.py"
+            TEST_ARGS="tests/unit/test_workflows*.py tests/integration/test_workflows*.py tests/integration/test_sync_worker_integration.py tests/unit/workflows/ tests/workflows/ tests/unit/test_chunked_pipeline.py tests/unit/cli/ tests/unit/test_config_version_control.py tests/unit/test_duckdb_ingestion_workflow.py tests/unit/test_job_poller.py tests/unit/test_record_mapper.py tests/unit/test_record_mapper_hierarchy.py tests/unit/test_state_ledger.py tests/unit/test_state_ledger_providers.py tests/unit/test_study_structure.py tests/unit/test_sync_worker.py tests/unit/test_cached_records_loader.py tests/unit/test_batch_validation_and_polling.py tests/unit/test_keyed_upserts_and_watermark_recovery.py tests/unit/test_mode_safe_plugin_protocols.py tests/unit/test_tabular_import.py tests/unit/test_airflow_cas_and_wildcards.py tests/unit/test_idempotent_syncs_and_sdtm_lineage.py tests/unit/test_scoped_sdtm_enrichment_standards_contracts.py tests/unit/test_sink_phi_resolution_unification.py tests/unit/test_spi_streaming_checkpoints.py"
             COV_ARGS="--cov=imednet_workflows"
           elif [ "$PACKAGE" = "providers-airflow" ]; then
             TEST_ARGS="tests/unit/test_airflow*.py tests/integration/test_airflow*.py"

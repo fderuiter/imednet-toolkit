@@ -14,6 +14,8 @@ if TYPE_CHECKING:
     from .errors import ApiError, ImednetError, NotFoundError, PluginLoadError
     from .errors.orchestration import FilterConflictError, OrchestratorError
     from .orchestration import (
+        AsyncMultiStudyOrchestrator,
+        AsyncStudyWorkerCallable,
         MultiStudyOrchestrator,
         OrchestratorResult,
         StudyWorkerCallable,
@@ -39,7 +41,9 @@ if TYPE_CHECKING:
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "ApiError": ("imednet.errors", "ApiError"),
     "AsyncImednetSDK": ("imednet.sdk", "AsyncImednetSDK"),
+    "AsyncMultiStudyOrchestrator": ("imednet.orchestration", "AsyncMultiStudyOrchestrator"),
     "AsyncSinksNamespaceProtocol": ("imednet.plugins", "AsyncSinksNamespaceProtocol"),
+    "AsyncStudyWorkerCallable": ("imednet.orchestration", "AsyncStudyWorkerCallable"),
     "AsyncWorkflowsNamespaceProtocol": ("imednet.plugins", "AsyncWorkflowsNamespaceProtocol"),
     "BaseClient": ("imednet.core.base_client", "BaseClient"),
     "Config": ("imednet.config", "Config"),
@@ -94,7 +98,9 @@ def __dir__() -> list[str]:
 __all__ = [
     "ApiError",
     "AsyncImednetSDK",
+    "AsyncMultiStudyOrchestrator",
     "AsyncSinksNamespaceProtocol",
+    "AsyncStudyWorkerCallable",
     "AsyncWorkflowsNamespaceProtocol",
     "BaseClient",
     "Config",

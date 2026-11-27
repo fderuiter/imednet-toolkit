@@ -1,5 +1,6 @@
 """SPI for validation utilities."""
 
+from imednet.datadict.loaders.api import async_load_from_api, load_from_api
 from imednet.datadict.logic import (
     ExtractedCondition,
     ExtractedRuleMetadata,
@@ -44,8 +45,10 @@ __all__ = [
     "SchemaValidator",
     "ValidationSchemaProtocol",
     "VariableConstraints",
+    "async_load_from_api",
     "calculate_readiness_score",
     "extract_variable_constraints",
+    "load_from_api",
     "parse_logic_xml",
     "validate_record_data",
     "validate_record_entry",
