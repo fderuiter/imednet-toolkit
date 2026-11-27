@@ -1030,3 +1030,117 @@ async def test_record_update_workflow_email_notify_across_all_ten_methods() -> N
         "false",
         "async-alerts@example.com",
     ]
+
+
+@pytest.mark.asyncio
+async def test_record_update_workflow_accepts_typed_base_record_request_sequences() -> None:
+    """Typed BaseRecordRequest subclasses succeed across _extract_record_form_ref and sync/async workflows."""
+    import json
+
+    import httpx
+
+    from imednet import AsyncImednetSDK
+    from imednet.models.records import (
+        CreateNewRecordRequest,
+        RecordStatus,
+        RegisterSubjectRequest,
+        UpdateRecordRequest,
+        UpdateScheduledRecordRequest,
+    )
+    from imednet_workflows.record_update import AsyncRecordUpdateWorkflow, _extract_record_form_ref
+
+    reqs = (
+        RegisterSubjectRequest(formKey="F_DM", siteName="SITE", data={"V_AGE": 31}),
+        CreateNewRecordRequest(
+            form_key="F_VS",
+            subject_key="SUB1",
+            record_status=RecordStatus.INCOMPLETE,
+            data={"V_WEIGHT": 70.0},
+        ),
+        UpdateScheduledRecordRequest(
+            formId=302,
+            subjectId=201,
+            visitId=401,
+            data={"V_WEIGHT": 71.0},
+        ),
+        UpdateRecordRequest(
+            recordId=602,
+            recordOid="REC-602",
+            recordStatus="Record Complete",
+            reasonForChange="Verified vitals",
+            data={"V_WEIGHT": 72.0},
+        ),
+    )
+
+    assert _extract_record_form_ref(reqs[0]) == ("F_DM", None)
+    assert _extract_record_form_ref(reqs[2]) == (None, 302)
+    assert _extract_record_form_ref(reqs[3]) == (None, None)
+    assert _extract_record_form_ref({"form_key": "F_DM", "data": {}}) == ("F_DM", None)
+
+    captured: list[list[dict[str, object]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/records"):
+            captured.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(202, json={"jobId": "j1", "batchId": "b1", "state": "OPEN"})
+        if request.method == "GET" and "/variables" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "metadata": {"status": "OK"},
+                    "pagination": {
+                        "currentPage": 0,
+                        "size": 25,
+                        "totalPages": 1,
+                        "totalElements": 2,
+                    },
+                    "data": [
+                        {
+                            "studyKey": "STUDY",
+                            "formId": 301,
+                            "formKey": "F_DM",
+                            "variableId": 1,
+                            "variableName": "V_AGE",
+                            "variableType": "integer",
+                        },
+                        {
+                            "studyKey": "STUDY",
+                            "formId": 302,
+                            "formKey": "F_VS",
+                            "variableId": 2,
+                            "variableName": "V_WEIGHT",
+                            "variableType": "float",
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(200, json={"data": []})
+
+    sync_sdk = ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://example.test",
+        transport=httpx.MockTransport(_handler),
+    )
+    async_sdk = AsyncImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url="https://example.test",
+        transport=httpx.MockTransport(_handler),
+    )
+    try:
+        sync_wf = RecordUpdateWorkflow(sync_sdk)
+        async_wf = AsyncRecordUpdateWorkflow(async_sdk)
+
+        assert sync_wf.create_or_update_records("STUDY", reqs).batch_id == "b1"
+        assert sync_wf.create_or_update_records_batch("STUDY", list(reqs)).total_records == 4
+        assert (await async_wf.create_or_update_records("STUDY", reqs)).batch_id == "b1"
+        assert (
+            await async_wf.create_or_update_records_batch("STUDY", list(reqs))
+        ).total_records == 4
+
+        expected = [r.model_dump() for r in reqs]
+        assert captured == [expected, expected, expected, expected]
+    finally:
+        sync_sdk.close()
+        await async_sdk.aclose()

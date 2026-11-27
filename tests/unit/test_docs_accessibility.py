@@ -318,6 +318,42 @@ def test_headerlink_and_viewcode_css_contracts() -> None:
     ):
         assert reveal_selector in css_content
 
+    headerlink_base_match = re.search(
+        r"a\.headerlink,\s*\.code-block-caption\s*>\s*\.headerlink.*?table\s*>\s*caption\s*>\s*\.headerlink\s*\{([^}]*)\}",
+        css_content,
+        re.DOTALL,
+    )
+    assert headerlink_base_match is not None
+    headerlink_base_body = headerlink_base_match.group(1)
+    for expected_hl_decl in (
+        "display: inline-flex;",
+        "align-items: center;",
+        "justify-content: center;",
+        "min-width: 24px;",
+        "min-height: 24px;",
+        "text-indent: 0;",
+        "visibility: visible;",
+        "opacity: 0;",
+    ):
+        assert expected_hl_decl in headerlink_base_body
+
+    math_hl_match = re.search(
+        r"div\.math\s+\.headerlink,\s*div\.math:focus\s+\.headerlink\s*\{([^}]*)\}",
+        css_content,
+        re.DOTALL,
+    )
+    assert math_hl_match is not None
+    math_hl_body = math_hl_match.group(1)
+    for expected_math_decl in (
+        "display: inline-flex;",
+        "align-items: center;",
+        "justify-content: center;",
+        "min-width: 24px;",
+        "min-height: 24px;",
+        "text-indent: 0;",
+    ):
+        assert expected_math_decl in math_hl_body
+
     # 2. Separate .viewcode-source-link and a.reference:has(> .viewcode-link) rule blocks
     #    so engines without :has() never drop the .viewcode-source-link rule
     rule_headers = [
@@ -329,16 +365,24 @@ def test_headerlink_and_viewcode_css_contracts() -> None:
                 f".viewcode-source-link must not share a selector list with :has(): {header!r}"
             )
 
-    assert re.search(
-        r"\.viewcode-source-link\s*\{[^}]*float:\s*right;[^}]*text-indent:\s*0;",
-        css_content,
-        re.DOTALL,
-    )
-    assert re.search(
-        r"a\.reference:has\(>\s*\.viewcode-link\)\s*\{[^}]*float:\s*right;[^}]*text-indent:\s*0;",
-        css_content,
-        re.DOTALL,
-    )
+    for src_pattern in (
+        r"\.viewcode-source-link\s*\{([^}]*)\}",
+        r"a\.reference:has\(>\s*\.viewcode-link\)\s*\{([^}]*)\}",
+    ):
+        src_match = re.search(src_pattern, css_content, re.DOTALL)
+        assert src_match is not None, f"Missing rule matching {src_pattern}"
+        src_body = src_match.group(1)
+        for expected_src_decl in (
+            "display: inline-flex;",
+            "align-items: center;",
+            "justify-content: center;",
+            "min-width: 24px;",
+            "min-height: 24px;",
+            "float: right;",
+            "text-indent: 0;",
+        ):
+            assert expected_src_decl in src_body
+
     assert re.search(
         r"\.viewcode-source-link\s*>\s*\.viewcode-link[^{]*\{[^}]*float:\s*none;[^}]*width:\s*auto;",
         css_content,
@@ -349,6 +393,23 @@ def test_headerlink_and_viewcode_css_contracts() -> None:
         css_content,
         re.DOTALL,
     )
+
+    viewcode_back_match = re.search(
+        r"a\.viewcode-back\s*\{([^}]*)\}",
+        css_content,
+        re.DOTALL,
+    )
+    assert viewcode_back_match is not None
+    viewcode_back_body = viewcode_back_match.group(1)
+    for expected_back_decl in (
+        "display: inline-flex;",
+        "align-items: center;",
+        "justify-content: center;",
+        "min-width: 24px;",
+        "min-height: 24px;",
+        "text-indent: 0;",
+    ):
+        assert expected_back_decl in viewcode_back_body
 
     # 3. 2px :focus-visible outlines across default, prefers-contrast: more, and forced-colors: active
     for focus_sel in (
@@ -2232,6 +2293,10 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
     mermaid_xz = REPO_ROOT / "tests" / "fixtures" / "mermaid-10.2.0.min.js.xz"
     assert mermaid_xz.is_file(), f"Offline Mermaid bundle missing: {mermaid_xz}"
     mermaid_js_bytes = lzma.decompress(mermaid_xz.read_bytes())
+
+    axe_xz = REPO_ROOT / "tests" / "fixtures" / "axe-4.14.1.min.js.xz"
+    assert axe_xz.is_file(), f"Offline axe-core bundle missing: {axe_xz}"
+    axe_js_source = lzma.decompress(axe_xz.read_bytes()).decode("utf-8")
 
     env_html_dir = os.environ.get("IMEDNET_BUILT_HTML_DIR")
     default_html_dir = REPO_ROOT / "docs" / "_build" / "html"
@@ -5664,9 +5729,13 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         """() => {
                             const el = document.getElementById('test-h1-headerlink');
                             const cs = getComputedStyle(el);
+                            const r = el.getBoundingClientRect();
                             return {
                                 isFocused: document.activeElement === el,
                                 opacity: cs.opacity,
+                                display: cs.display,
+                                width: r.width,
+                                height: r.height,
                                 label: el.getAttribute('aria-label') || '',
                                 outline: window.__checkToggleOutline('#test-h1-headerlink')
                             };
@@ -5674,6 +5743,8 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     )
                     assert h1_tab_check["isFocused"] is True
                     assert h1_tab_check["opacity"] == "1"
+                    assert h1_tab_check["display"] == "inline-flex"
+                    assert h1_tab_check["width"] >= 24.0 and h1_tab_check["height"] >= 24.0
                     assert h1_tab_check["label"].startswith("Permalink to ")
                     assert h1_tab_check["outline"]["matches"] is True
                     assert (
@@ -5693,8 +5764,13 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             hl.id = 'test-apikey-headerlink';
                             const aRect = srcA.getBoundingClientRect();
                             const spanRect = srcSpan.getBoundingClientRect();
+                            const hlRect = hl.getBoundingClientRect();
+                            const glyphRange = document.createRange();
+                            glyphRange.selectNodeContents(hl);
+                            const glyphRect = glyphRange.getBoundingClientRect();
                             const aCs = getComputedStyle(srcA);
                             const spanCs = getComputedStyle(srcSpan);
+                            const hlCs = getComputedStyle(hl);
                             return {
                                 aWidth: aRect.width,
                                 aHeight: aRect.height,
@@ -5702,18 +5778,37 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                                 widthDiff: Math.abs(aRect.width - spanRect.width),
                                 textIndent: aCs.textIndent,
                                 spanFloat: spanCs.float,
+                                hlWidth: hlRect.width,
+                                hlHeight: hlRect.height,
+                                hlDisplay: hlCs.display,
+                                hlTextIndent: hlCs.textIndent,
+                                hlLeft: hlRect.left,
+                                hlRight: hlRect.right,
+                                glyphLeft: glyphRect.left,
+                                glyphRight: glyphRect.right,
                                 srcLabel: srcA.getAttribute('aria-label') || '',
                                 hlLabel: hl.getAttribute('aria-label') || ''
                             };
                         }"""
                     )
                     assert api_dt_geom["aWidth"] >= 40, f"Collapsed [source] anchor: {api_dt_geom}"
-                    assert api_dt_geom["aHeight"] >= 12
+                    assert api_dt_geom["aHeight"] >= 24.0, (
+                        f"Undersized [source] anchor height: {api_dt_geom}"
+                    )
                     assert api_dt_geom["widthDiff"] <= 2.0, (
                         f"Outer [source] anchor width diverges from inner span: {api_dt_geom}"
                     )
                     assert api_dt_geom["textIndent"] == "0px"
                     assert api_dt_geom["spanFloat"] == "none"
+                    assert api_dt_geom["hlWidth"] >= 24.0 and api_dt_geom["hlHeight"] >= 24.0, (
+                        f"Undersized signature permalink target: {api_dt_geom}"
+                    )
+                    assert api_dt_geom["hlDisplay"] == "inline-flex"
+                    assert api_dt_geom["hlTextIndent"] == "0px"
+                    assert (
+                        api_dt_geom["glyphLeft"] >= api_dt_geom["hlLeft"] - 0.5
+                        and api_dt_geom["glyphRight"] <= api_dt_geom["hlRight"] + 0.5
+                    ), f"Signature ¶ glyph misaligned outside hit box: {api_dt_geom}"
                     assert api_dt_geom["srcLabel"] == "[source] for imednet.auth.api_key.ApiKeyAuth"
                     assert api_dt_geom["hlLabel"] == "Permalink to imednet.auth.api_key.ApiKeyAuth"
 
@@ -5835,6 +5930,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                             const spanRect = srcSpan.getBoundingClientRect();
                             return {
                                 aWidth: aRect.width,
+                                aHeight: aRect.height,
                                 spanWidth: spanRect.width,
                                 widthDiff: Math.abs(aRect.width - spanRect.width),
                                 label: srcA.getAttribute('aria-label') || ''
@@ -5843,6 +5939,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     )
                     assert parsing_src_geom is not None
                     assert parsing_src_geom["aWidth"] >= 40
+                    assert parsing_src_geom["aHeight"] >= 24.0
                     assert parsing_src_geom["widthDiff"] <= 2.0
                     assert parsing_src_geom["label"].startswith("[source] for imednet.")
 
@@ -5873,9 +5970,12 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     cap_tab_check = link_page.evaluate(
                         """() => {
                             const el = document.getElementById('test-caption-headerlink');
+                            const r = el.getBoundingClientRect();
                             return {
                                 isFocused: document.activeElement === el,
                                 opacity: getComputedStyle(el).opacity,
+                                width: r.width,
+                                height: r.height,
                                 label: el.getAttribute('aria-label') || '',
                                 outline: window.__checkToggleOutline('#test-caption-headerlink')
                             };
@@ -5883,6 +5983,7 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     )
                     assert cap_tab_check["isFocused"] is True
                     assert cap_tab_check["opacity"] == "1"
+                    assert cap_tab_check["width"] >= 24.0 and cap_tab_check["height"] >= 24.0
                     assert cap_tab_check["label"].startswith("Permalink to ")
                     assert cap_tab_check["label"] != "Permalink to this table"
                     assert cap_tab_check["outline"]["matches"] is True
@@ -5903,16 +6004,21 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                         """() => {
                             const backlinks = Array.from(document.querySelectorAll('a.viewcode-back'));
                             if (backlinks[0]) backlinks[0].id = 'test-viewcode-back';
-                            return backlinks.map((el) => ({
-                                label: el.getAttribute('aria-label') || '',
-                                width: el.getBoundingClientRect().width
-                            }));
+                            return backlinks.map((el) => {
+                                const r = el.getBoundingClientRect();
+                                return {
+                                    label: el.getAttribute('aria-label') || '',
+                                    width: r.width,
+                                    height: r.height
+                                };
+                            });
                         }"""
                     )
                     assert len(backlink_meta) >= 1
                     assert all(
                         item["label"].startswith("[docs] for imednet.auth.api_key.")
                         and item["width"] >= 30
+                        and item["height"] >= 24.0
                         for item in backlink_meta
                     )
 
@@ -5962,29 +6068,228 @@ def test_built_html_wcag_and_diagrams_in_chromium(tmp_path: Path) -> None:
                     link_page.emulate_media(forced_colors="none")
                     link_page.evaluate("document.body.setAttribute('data-theme', 'light')")
 
-                    # 7d. Zero horizontal overflow at 1280x800 and 375x667 across key pages
-                    overflow_pages = (
-                        "reference/api/imednet.auth.html",
+                    # 7d. 24x24px SC 2.5.8 target floors, SC 1.4.10 320px reflow, & axe-core 4.14.1 target-size
+                    api_rel_pages = sorted(
+                        p.relative_to(html_dir).as_posix()
+                        for p in (html_dir / "reference" / "api").glob("*.html")
+                    )
+                    core_audit_pages = [
+                        "index.html",
+                        "how-to/cli.html",
                         "explanation/parsing.html",
                         "explanation/schema_validation.html",
+                        "reference/rest_api_reference.html",
+                        "reference/VPAT.html",
+                        "py-modindex.html",
+                        "_modules/imednet/auth/api_key.html",
+                        "_modules/imednet/validation/cache.html",
+                        "_modules/imednet/sdk.html",
+                    ]
+                    target_audit_pages = list(dict.fromkeys([*core_audit_pages, *api_rel_pages]))
+                    assert len(target_audit_pages) >= 54, (
+                        f"Expected >= 54 pages in target-size audit corpus, got {len(target_audit_pages)}"
+                    )
+
+                    axe_sample_pages = (
+                        "reference/api/imednet.auth.html",
+                        "reference/api/imednet.integrations.html",
+                        "reference/api/imednet.models.html",
+                        "reference/api/imednet.utils.html",
+                        "explanation/parsing.html",
+                        "explanation/schema_validation.html",
+                        "how-to/cli.html",
                         "_modules/imednet/auth/api_key.html",
                     )
-                    for vp_w, vp_h in ((1280, 800), (375, 667)):
+
+                    for vp_w, vp_h in ((1280, 800), (320, 640)):
                         link_page.set_viewport_size({"width": vp_w, "height": vp_h})
-                        for ov_rel in overflow_pages:
+                        audited_hl = 0
+                        audited_src = 0
+                        audited_back = 0
+                        for ov_rel in target_audit_pages:
                             link_page.goto(
                                 f"http://127.0.0.1:{port}/{ov_rel}",
                                 wait_until="load",
                             )
-                            ov_dims = link_page.evaluate(
-                                """() => ({
-                                    scrollWidth: document.documentElement.scrollWidth,
-                                    innerWidth: window.innerWidth
-                                })"""
+                            page_audit = link_page.evaluate(
+                                """() => {
+                                    const undersized = [];
+                                    const misaligned = [];
+                                    const widthDiffViolations = [];
+                                    let hlCount = 0;
+                                    let srcCount = 0;
+                                    let backCount = 0;
+
+                                    for (const [sel, kind] of [
+                                        ['a.headerlink', 'headerlink'],
+                                        ['.viewcode-source-link', 'source'],
+                                        ['a.viewcode-back', 'backlink']
+                                    ]) {
+                                        for (const el of document.querySelectorAll(sel)) {
+                                            const cs = getComputedStyle(el);
+                                            if (cs.display === 'none') continue;
+                                            if (kind === 'headerlink') hlCount += 1;
+                                            else if (kind === 'source') srcCount += 1;
+                                            else backCount += 1;
+
+                                            const r = el.getBoundingClientRect();
+                                            if (r.width < 24.0 - 0.05 || r.height < 24.0 - 0.05) {
+                                                undersized.push({
+                                                    kind,
+                                                    width: Number(r.width.toFixed(2)),
+                                                    height: Number(r.height.toFixed(2)),
+                                                    label: el.getAttribute('aria-label') || ''
+                                                });
+                                            }
+                                            if (kind === 'headerlink' && el.closest('dt.sig')) {
+                                                if (cs.textIndent !== '0px') {
+                                                    misaligned.push({
+                                                        textIndent: cs.textIndent,
+                                                        label: el.getAttribute('aria-label') || ''
+                                                    });
+                                                } else {
+                                                    const range = document.createRange();
+                                                    range.selectNodeContents(el);
+                                                    const gr = range.getBoundingClientRect();
+                                                    if (gr.left < r.left - 0.5 || gr.right > r.right + 0.5) {
+                                                        misaligned.push({
+                                                            boxLeft: Number(r.left.toFixed(2)),
+                                                            glyphLeft: Number(gr.left.toFixed(2)),
+                                                            label: el.getAttribute('aria-label') || ''
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            if (kind === 'source') {
+                                                const sp = el.querySelector('.viewcode-link');
+                                                if (sp) {
+                                                    const diff = Math.abs(r.width - sp.getBoundingClientRect().width);
+                                                    if (diff > 2.0) {
+                                                        widthDiffViolations.push({
+                                                            diff: Number(diff.toFixed(2)),
+                                                            label: el.getAttribute('aria-label') || ''
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    return {
+                                        scrollWidth: document.documentElement.scrollWidth,
+                                        innerWidth: window.innerWidth,
+                                        hlCount,
+                                        srcCount,
+                                        backCount,
+                                        undersized: undersized.slice(0, 5),
+                                        misaligned: misaligned.slice(0, 5),
+                                        widthDiffViolations: widthDiffViolations.slice(0, 5)
+                                    };
+                                }"""
                             )
-                            assert ov_dims["scrollWidth"] <= ov_dims["innerWidth"], (
-                                f"Horizontal overflow on {ov_rel} at {vp_w}x{vp_h}: {ov_dims}"
+                            audited_hl += page_audit["hlCount"]
+                            audited_src += page_audit["srcCount"]
+                            audited_back += page_audit["backCount"]
+                            assert page_audit["scrollWidth"] <= page_audit["innerWidth"], (
+                                f"Horizontal overflow on {ov_rel} at {vp_w}x{vp_h}: {page_audit}"
                             )
+                            assert page_audit["undersized"] == [], (
+                                f"SC 2.5.8 undersized targets on {ov_rel} at {vp_w}x{vp_h}: "
+                                f"{page_audit['undersized']}"
+                            )
+                            assert page_audit["misaligned"] == [], (
+                                f"Misaligned signature permalink glyphs on {ov_rel} at {vp_w}x{vp_h}: "
+                                f"{page_audit['misaligned']}"
+                            )
+                            assert page_audit["widthDiffViolations"] == [], (
+                                f"Outer/inner [source] width mismatch on {ov_rel} at {vp_w}x{vp_h}: "
+                                f"{page_audit['widthDiffViolations']}"
+                            )
+
+                            if ov_rel in axe_sample_pages:
+                                link_page.add_script_tag(content=axe_js_source)
+                                # Verify focused state and hovered/revealed state with axe-core 4.14.1 target-size
+                                axe_focus_check = link_page.evaluate(
+                                    """async () => {
+                                        const focusTarget = document.querySelector(
+                                            'dt.sig > a.headerlink, h1 > a.headerlink, a.viewcode-back'
+                                        );
+                                        if (focusTarget) focusTarget.focus();
+                                        const res = await window.axe.run(document, {
+                                            rules: { 'target-size': { enabled: true } },
+                                            runOnly: { type: 'rule', values: ['target-size'] }
+                                        });
+                                        return {
+                                            version: window.axe.version,
+                                            violations: res.violations.map((v) => ({
+                                                id: v.id,
+                                                nodes: v.nodes.slice(0, 3).map((n) => ({
+                                                    target: n.target,
+                                                    summary: n.failureSummary
+                                                }))
+                                            }))
+                                        };
+                                    }"""
+                                )
+                                assert axe_focus_check["version"] == "4.14.1"
+                                assert axe_focus_check["violations"] == [], (
+                                    f"axe-core target-size violations (focused) on {ov_rel} at {vp_w}x{vp_h}: "
+                                    f"{axe_focus_check['violations']}"
+                                )
+
+                                link_page.add_style_tag(
+                                    content="a.headerlink { opacity: 1 !important; }"
+                                )
+                                first_hl = link_page.locator(
+                                    "a.headerlink, .viewcode-source-link, a.viewcode-back"
+                                ).first
+                                if first_hl.count() > 0:
+                                    first_hl.hover()
+                                axe_hover_violations = link_page.evaluate(
+                                    """async () => {
+                                        const res = await window.axe.run(document, {
+                                            rules: { 'target-size': { enabled: true } },
+                                            runOnly: { type: 'rule', values: ['target-size'] }
+                                        });
+                                        return res.violations.map((v) => ({
+                                            id: v.id,
+                                            nodes: v.nodes.slice(0, 3).map((n) => ({
+                                                target: n.target,
+                                                summary: n.failureSummary
+                                            }))
+                                        }));
+                                    }"""
+                                )
+                                assert axe_hover_violations == [], (
+                                    f"axe-core target-size violations (hovered/revealed) on {ov_rel} at {vp_w}x{vp_h}: "
+                                    f"{axe_hover_violations}"
+                                )
+
+                        assert audited_hl >= 4000
+                        assert audited_src >= 1400
+                        assert audited_back >= 50
+
+                    # Preserve 375x667 horizontal overflow check across key pages
+                    link_page.set_viewport_size({"width": 375, "height": 667})
+                    for ov_rel in (
+                        "reference/api/imednet.auth.html",
+                        "explanation/parsing.html",
+                        "explanation/schema_validation.html",
+                        "_modules/imednet/auth/api_key.html",
+                    ):
+                        link_page.goto(
+                            f"http://127.0.0.1:{port}/{ov_rel}",
+                            wait_until="load",
+                        )
+                        ov_dims = link_page.evaluate(
+                            """() => ({
+                                scrollWidth: document.documentElement.scrollWidth,
+                                innerWidth: window.innerWidth
+                            })"""
+                        )
+                        assert ov_dims["scrollWidth"] <= ov_dims["innerWidth"], (
+                            f"Horizontal overflow on {ov_rel} at 375x667: {ov_dims}"
+                        )
                 finally:
                     link_page.close()
 

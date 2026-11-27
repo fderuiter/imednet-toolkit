@@ -225,3 +225,62 @@ def test_datadict_models_forbid_undeclared_keys_and_preserve_extra_attributes() 
         customVendorTag="preserved",
     )
     assert legacy_dd.metadata.extraAttributes["customVendorTag"] == "preserved"
+
+
+def test_datadictionary_legacy_init_preserves_integer_zero_values() -> None:
+    """DataDictionary initialized with integer 0 retains choiceValue='0', formId=0, sequence=0, position=0, id=0."""
+    dd = DataDictionary(
+        forms=[{"Form Key": "F0", "Form Name": "Zero Form", "Form ID": 0}],
+        questions=[
+            {
+                "Form": "F0",
+                "Variable Name": "V0",
+                "Label": "Zero Coded Question",
+                "Variable Type": "Radio",
+                "Sequence": 0,
+            }
+        ],
+        choices=[
+            {
+                "Form": "F0",
+                "Variable Name": "V0",
+                "Choice Value": 0,
+                "Choice Text": "Absent",
+                "Position": 0,
+            },
+            {
+                "Form": "F0",
+                "Variable Name": "V0",
+                "Choice Value": 1,
+                "Choice Text": "Present",
+                "Position": 1,
+            },
+        ],
+        business_logic=[
+            {
+                "ID": 0,
+                "Name": "Zero Rule",
+                "Type": "Form",
+                "Form": "F0",
+                "Sequence": 0,
+            }
+        ],
+    )
+
+    form = dd.forms[0]
+    assert form.formKey == "F0"
+    assert form.formId == 0
+    assert dd.form_key_from_id(0) == "F0"
+
+    var = form.variables[0]
+    assert var.variableName == "V0"
+    assert var.sequence == 0
+
+    zero_choice = var.choices[0]
+    assert zero_choice.choiceValue == "0"
+    assert zero_choice.choiceText == "Absent"
+    assert zero_choice.position == 0
+
+    zero_rule = form.businessLogic[0]
+    assert zero_rule.id == 0
+    assert zero_rule.sequence == 0

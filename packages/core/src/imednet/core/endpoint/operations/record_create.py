@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, TypeVar
-
-from pydantic import BaseModel
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.endpoint.dispatch import Operation
@@ -21,6 +19,9 @@ from imednet.validation.cache import (
     is_schema_record_prevalidated,
     validate_record_entry,
 )
+
+if TYPE_CHECKING:
+    from imednet.models.records import BaseRecordRequest
 
 T = TypeVar("T")
 _STUDY_PATH_RE = re.compile(r"/studies/([^/]+)/records(?:/|$)")
@@ -42,7 +43,7 @@ class RecordCreateOperation(Operation[T]):
     def __init__(
         self,
         path: str,
-        records_data: Sequence[BaseModel | Mapping[str, Any]],
+        records_data: Sequence[BaseRecordRequest | Mapping[str, Any]],
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         *,
@@ -53,7 +54,7 @@ class RecordCreateOperation(Operation[T]):
 
         Args:
             path: The full API path for the request.
-            records_data: Sequence of record models or mappings to create/update.
+            records_data: Sequence of record request models or mappings to create/update.
             email_notify: Email notification setting.
             schema: Optional validation schema (BaseSchemaCache or DataDictionary).
             study_key: Optional study key used for study-partitioned schema lookup.

@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator, Iterator
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal, assert_type
 
 import pandas as pd
@@ -10,9 +11,11 @@ from imednet import (
     AsyncImednetSDK,
     AsyncSinksNamespaceProtocol,
     AsyncWorkflowsNamespaceProtocol,
+    DataFrameLike,
     ImednetError,
     ImednetSDK,
     NotFoundError,
+    RecordsInput,
     SimulationTransport,
     SinksNamespaceProtocol,
     SyncWorkflowsNamespaceProtocol,
@@ -35,7 +38,9 @@ from imednet.models.records import (
     Record,
     RecordData,
     RecordJobResponse,
+    RecordStatus,
     RegisterSubjectRequest,
+    UpdateRecordRequest,
     UpdateScheduledRecordRequest,
 )
 from imednet.models.reporting import (
@@ -78,6 +83,7 @@ from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 from imednet.spi.sinks import ExportSink
 from imednet.utils.batch_coordinator import BatchSubmissionSummary
 from imednet.utils.job_poller import JobPollSummary
+from imednet.validation.cache import SchemaCache, validate_record_entry
 from imednet_sinks.plugin import SinksNamespace, create_sinks
 from imednet_workflows import Workflows
 
@@ -102,8 +108,53 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.record_revisions.get('S', 1), RecordRevision)
     assert_type(sdk.records.list('S'), Iterator[Record])
     assert_type(sdk.records.get('S', 1), Record)
+    req_seq: tuple[BaseRecordRequest, ...] = (
+        BaseRecordRequest(form_key='DEMOG', data={'AGE': 30}),
+        CreateNewRecordRequest(formKey='AE', subjectKey='SUBJ-01', data={'AETERM': 'Headache'}),
+        UpdateScheduledRecordRequest(
+            form_key='VS',
+            subject_key='SUBJ-01',
+            interval_name='Visit 1',
+            visit_id=10,
+            data={'SYSBP': 120},
+        ),
+        UpdateRecordRequest(
+            record_id=501,
+            record_oid='REC-OID-501',
+            record_status=RecordStatus.COMPLETE,
+            reason_for_change='Chart verified',
+            data={'SYSBP': 118},
+        ),
+        RegisterSubjectRequest(formKey='DM', siteName='SITE-01', data={'SUBJID': '001'}),
+    )
+    df_records = pd.DataFrame([{'formKey': 'DEMOG', 'AGE': 30}])
+    csv_records_path = Path('records.csv')
+    _df_like_check: DataFrameLike = df_records
+    _valid_inputs: list[RecordsInput] = [
+        req_seq,
+        list(req_seq),
+        [{'formKey': 'DEMOG'}],
+        ({'form_key': 'DEMOG'},),
+        'records.csv',
+        csv_records_path,
+        df_records,
+        _df_like_check,
+    ]
+    assert _valid_inputs
     assert_type(sdk.records.create('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(sdk.records.create('S', req_seq), Job)
+    assert_type(sdk.records.create('S', csv_records_path), Job)
+    assert_type(sdk.records.create('S', df_records), Job)
     assert_type(sdk.records.create_batch('S', [{'a': 1}]), BatchSubmissionSummary)
+    assert_type(sdk.records.create_batch('S', list(req_seq)), BatchSubmissionSummary)
+    assert_type(sdk.records.create_batch('S', 'records.csv'), BatchSubmissionSummary)
+    assert_type(sdk.records.create_batch('S', df_records), BatchSubmissionSummary)
+    # Invalid scalar RecordsInput values must be rejected under mypy --strict
+    sdk.records.create('S', 123)  # type: ignore[arg-type]
+    sdk.records.create('S', None)  # type: ignore[arg-type]
+    sdk.records.create('S', b'raw-bytes')  # type: ignore[arg-type]
+    sdk.records.create('S', BaseRecordRequest(form_key='DEMOG'))  # type: ignore[arg-type]
+    sdk.records.create_batch('S', {'formKey': 'DEMOG'})  # type: ignore[arg-type]
     assert_type(sdk.sites.list('S'), Iterator[Site])
     assert_type(sdk.sites.get('S', 1), Site)
     assert_type(sdk.studies.list(), Iterator[Study])
@@ -145,7 +196,11 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.get_job('S', 'B'), JobStatus)
     assert sdk.jobs.fetch_result('https://example.com/res.json') is not None or True
     assert_type(sdk.create_record('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(sdk.create_record('S', req_seq), Job)
     assert_type(sdk.create_records_batch('S', [{'a': 1}]), BatchSubmissionSummary)
+    assert_type(sdk.create_records_batch('S', list(req_seq)), BatchSubmissionSummary)
+    sdk.create_record('S', 42)  # type: ignore[arg-type]
+    sdk.create_records_batch('S', BaseRecordRequest(formKey='DEMOG'))  # type: ignore[arg-type]
     assert_type(sdk.poll_job('S', 'B', interval=1.0, timeout=30.0), JobStatus)
     assert_type(sdk.poll_job('S', 'B', resolve_results=True), JobStatus)
     assert_type(facade.poll_job('S', 'B', resolve_results=True), JobStatus)
@@ -265,10 +320,16 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.workflows.record_mapper.dataframe('S'), pd.DataFrame)
     assert_type(sdk.workflows.record_update, SyncRecordUpdateWorkflowProtocol)
     assert_type(sdk.workflows.record_update.create_or_update_records('S', []), Job)
+    assert_type(sdk.workflows.record_update.create_or_update_records('S', req_seq), Job)
     assert_type(
         sdk.workflows.record_update.create_or_update_records_batch('S', []),
         BatchSubmissionSummary,
     )
+    assert_type(
+        sdk.workflows.record_update.create_or_update_records_batch('S', list(req_seq)),
+        BatchSubmissionSummary,
+    )
+    sdk.workflows.record_update.create_or_update_records('S', 99)  # type: ignore[arg-type]
     assert_type(sdk.workflows.record_update.register_subject('S', 'F_DM', 'SITE', {}), Job)
     assert_type(
         sdk.workflows.record_update.update_scheduled_record('S', 'F_VS', 'SUBJ', 'V1', {}),
@@ -347,7 +408,23 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     assert_type(sdk.records.list('S'), AsyncIterator[Record])
     assert_type(await sdk.records.get('S', 1), Record)
     assert_type(await sdk.records.create('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(
+        await sdk.records.create(
+            'S',
+            (
+                UpdateRecordRequest(
+                    recordId=10,
+                    visitId=20,
+                    recordStatus='Complete',
+                    reasonForChange='Updated',
+                    data={'V1': 1},
+                ),
+            ),
+        ),
+        Job,
+    )
     assert_type(await sdk.records.create_batch('S', [{'a': 1}]), BatchSubmissionSummary)
+    await sdk.records.create('S', 123)  # type: ignore[arg-type]
     assert_type(sdk.sites.list('S'), AsyncIterator[Site])
     assert_type(await sdk.sites.get('S', 1), Site)
     assert_type(sdk.studies.list(), AsyncIterator[Study])
@@ -959,6 +1036,34 @@ def mixed_alias_and_narrowed_type_contracts() -> None:
     assert_type(
         CreateNewRecordRequest(form_key='AE', subjectKey='SUBJ-01', data={'AETERM': 'Headache'}),
         CreateNewRecordRequest,
+    )
+    assert_type(
+        UpdateRecordRequest(
+            form_key='VS',
+            formId=10,
+            site_name='SITE-01',
+            siteId=1,
+            subject_key='SUBJ-01',
+            subjectId=100,
+            subject_oid='OID-100',
+            interval_name='Visit 1',
+            intervalId=5,
+            visit_id=50,
+            recordId=500,
+            record_oid='REC-500',
+            recordStatus=RecordStatus.RECORD_COMPLETE,
+            reason_for_change='Audit correction',
+            data={'SYSBP': 120},
+        ),
+        UpdateRecordRequest,
+    )
+    schema_cache = SchemaCache()
+    assert_type(
+        validate_record_entry(
+            schema_cache,
+            UpdateRecordRequest(recordId=500, data={'SYSBP': 120}),
+        ),
+        None,
     )
 
     # Mixed snake_case + camelCase constructors across all 33 multi-alias models
