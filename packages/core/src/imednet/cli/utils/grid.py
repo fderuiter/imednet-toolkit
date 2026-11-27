@@ -178,6 +178,8 @@ def extract_item_details(detail: Any) -> tuple[dict[str, Any], dict[str, Any]]:
 
     raw_vars = data_dict.pop("record_data", None)
     if raw_vars is None:
+        raw_vars = data_dict.pop("recordData", None)
+    if raw_vars is None:
         raw_vars = data_dict.pop("data", None)
 
     variables: dict[str, Any] = {}
@@ -208,6 +210,7 @@ class InteractiveDataGrid:
         status_notice: str | None = None,
         truncated: bool | None = None,
         on_load_all: Callable[[], Any] | None = None,
+        entity_kind: str | None = None,
     ) -> None:
         """Initialize the interactive data grid.
 
@@ -221,6 +224,7 @@ class InteractiveDataGrid:
             status_notice: Optional notice displayed when results are truncated/bounded.
             truncated: Whether initial rows represent a truncated subset of server items.
             on_load_all: Optional callback draining remaining pages on ``[a]``.
+            entity_kind: Optional canonical entity kind (e.g. 'records') for side-panel layout.
         """
         if curses is None:
             raise RuntimeError(
@@ -229,6 +233,7 @@ class InteractiveDataGrid:
         self.stdscr = stdscr
         self.fields = fields
         self.label = label
+        self.entity_kind = entity_kind
         self.status_notice = status_notice
         self.on_load_all = on_load_all
         self.truncated: bool = (
@@ -780,7 +785,10 @@ class InteractiveDataGrid:
         if isinstance(value, dict):
             non_empty = {k: v for k, v in value.items() if v is not None and v != ""}
             if not non_empty:
-                lines.extend(self._wrap_panel_line(f"{indent}{display_key}: {{}}", content_w))
+                empty_dict_marker = "{}" if indent == "  " else "-"
+                lines.extend(
+                    self._wrap_panel_line(f"{indent}{display_key}: {empty_dict_marker}", content_w)
+                )
                 return
             lines.extend(self._wrap_panel_line(f"{indent}{display_key}:", content_w))
             for sub_k, sub_v in non_empty.items():
@@ -811,18 +819,66 @@ class InteractiveDataGrid:
             lines.extend(self._wrap_panel_line(f"{indent}{display_key}:", content_w))
             for entry in value:
                 if isinstance(entry, dict):
-                    entry_pairs = [
-                        f"{ek}: {self._format_panel_scalar(ev, key=str(ek))}"
+                    entry_items = [
+                        (ek, ev)
                         for ek, ev in entry.items()
-                        if ev is not None and ev != ""
+                        if ev is not None and ev not in ("", [], {})
                     ]
-                    item_str = ", ".join(entry_pairs) if entry_pairs else "{}"
-                    lines.extend(
-                        self._wrap_panel_line(
-                            f"{indent}  - {item_str}",
-                            content_w,
-                            cont_indent=indent + "    ",
+                    if not entry_items:
+                        lines.extend(self._wrap_panel_line(f"{indent}  - -", content_w))
+                    elif len(entry_items) <= 4 and all(
+                        isinstance(ev, (str, int, float, bool, Enum, datetime))
+                        for _, ev in entry_items
+                    ):
+                        entry_pairs = [
+                            f"{ek}: {self._format_panel_scalar(ev, key=str(ek))}"
+                            for ek, ev in entry_items
+                        ]
+                        lines.extend(
+                            self._wrap_panel_line(
+                                f"{indent}  - {', '.join(entry_pairs)}",
+                                content_w,
+                                cont_indent=indent + "    ",
+                            )
                         )
+                    else:
+                        first_k, first_v = entry_items[0]
+                        if isinstance(first_v, (dict, list)):
+                            lines.extend(self._wrap_panel_line(f"{indent}  -", content_w))
+                            self._append_panel_value(
+                                lines,
+                                str(first_k),
+                                first_v,
+                                str(first_k),
+                                content_w,
+                                indent=indent + "    ",
+                            )
+                        else:
+                            first_str = self._format_panel_scalar(first_v, key=str(first_k))
+                            lines.extend(
+                                self._wrap_panel_line(
+                                    f"{indent}  - {first_k}: {first_str}",
+                                    content_w,
+                                    cont_indent=indent + "    ",
+                                )
+                            )
+                        for ek, ev in entry_items[1:]:
+                            self._append_panel_value(
+                                lines,
+                                str(ek),
+                                ev,
+                                str(ek),
+                                content_w,
+                                indent=indent + "    ",
+                            )
+                elif isinstance(entry, list):
+                    self._append_panel_value(
+                        lines,
+                        "-",
+                        entry,
+                        "-",
+                        content_w,
+                        indent=indent + "  ",
                     )
                 else:
                     lines.extend(
@@ -843,9 +899,32 @@ class InteractiveDataGrid:
             )
         )
 
+    @staticmethod
+    def _is_record_detail(detail_obj: Any) -> bool:
+        """Return True if *detail_obj* represents a clinical Record model or mapping."""
+        if detail_obj is None:
+            return False
+        if type(detail_obj).__name__ == "Record" or hasattr(detail_obj, "record_data"):
+            return True
+        if isinstance(detail_obj, dict):
+            return "record_data" in detail_obj or "recordData" in detail_obj
+        return False
+
+    def _is_records_view(self) -> bool:
+        """Return True when the side panel should use clinical Record inspection headers."""
+        if self.entity_kind is not None:
+            return self.entity_kind.strip().lower() == "records"
+        if self.label == "records":
+            return True
+        if self.filtered_entries and 0 <= self.selected_idx < len(self.filtered_entries):
+            return self._is_record_detail(self.filtered_entries[self.selected_idx][1])
+        if self.all_entries:
+            return self._is_record_detail(self.all_entries[0][1])
+        return False
+
     def _build_side_panel_lines(self, content_w: int) -> list[tuple[str, int]]:
         """Build wrapped metadata and variable lines for the selected side-panel entry."""
-        is_records = self.label == "records"
+        is_records = self._is_records_view()
         _, detail_obj = self.filtered_entries[self.selected_idx]
         meta, variables = extract_item_details(detail_obj)
 
@@ -963,7 +1042,7 @@ class InteractiveDataGrid:
         content_x = panel_x + 2
         content_w = max(10, panel_width - 3)
 
-        is_records = self.label == "records"
+        is_records = self._is_records_view()
         panel_title = _sanitize_cell_text(
             " RECORD INSPECTION " if is_records else f" {self.label.upper()} DETAILS "
         )
@@ -1326,6 +1405,7 @@ def run_interactive_grid(
     status_notice: str | None = None,
     truncated: bool | None = None,
     on_load_all: Callable[[], Any] | None = None,
+    entity_kind: str | None = None,
 ) -> bool:
     """Launch the curses interactive data grid.
 
@@ -1338,6 +1418,7 @@ def run_interactive_grid(
         status_notice: Optional truncation/status notice to render in the grid bars.
         truncated: Whether initial rows represent a truncated subset of server items.
         on_load_all: Optional callback draining remaining pages on ``[a]``.
+        entity_kind: Optional canonical entity kind (e.g. 'records') for side-panel layout.
 
     Returns:
         True if the interactive grid ran and exited normally, False if curses
@@ -1362,6 +1443,7 @@ def run_interactive_grid(
                 status_notice=status_notice,
                 truncated=truncated,
                 on_load_all=on_load_all,
+                entity_kind=entity_kind,
             )
             grid.run()
 

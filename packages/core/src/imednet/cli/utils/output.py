@@ -738,6 +738,7 @@ def display_list(
     truncated: bool = False,
     status_notice: str | None = None,
     on_load_all: Callable[[], Any] | None = None,
+    entity_kind: str | None = None,
 ) -> None:
     """Display a human table or one versioned JSON response without progress text."""
     from .args import resolve_output_format
@@ -804,6 +805,8 @@ def display_list(
             "label": label,
             "details": effective_details,
         }
+        if entity_kind is not None:
+            grid_kwargs["entity_kind"] = entity_kind
         if truncated:
             grid_kwargs["truncated"] = True
         if grid_notice is not None:

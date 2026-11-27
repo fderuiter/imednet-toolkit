@@ -11,20 +11,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+import imednet.spi.cli as _spi_cli
 from imednet.spi.cli import (
     add_output_format,
     add_simulation_arg,
     add_study_key_args,
     display_list,
     emit_json,
-    export_list_to_file,
     fetching_status,
     is_json_output_mode,
     parse_filter_args,
     print_error,
     redact_cli_secrets,
     resolve_output_format,
-    resolve_records_export_target,
     resolve_study_key,
     simulation_mode_context,
     validate_cli_path_segment,
@@ -37,6 +36,7 @@ from imednet.spi.utils import (
     redact_sensitive_text,
     sanitize_csv_formula,
     sanitize_diagnostic_text,
+    sdk_governance_context,
 )
 
 if TYPE_CHECKING:
@@ -62,8 +62,7 @@ def setup_audit_parsers(
     sub: argparse._SubParsersAction[Any],
     *,
     resolve_attr: Callable[[str], Any],
-    resolve_custom_phi_fields: Callable[[str | None], set[str]],
-    mask_workflow_item: Callable[..., Any],
+    resolve_phi_fields: Callable[..., set[str]],
     emit_line: Callable[..., None],
 ) -> None:
     """Register ``extract-audit-trail`` and ``ingest-revisions`` under ``imednet workflows``."""
@@ -149,7 +148,8 @@ def setup_audit_parsers(
         from imednet.spi.models import RecordRevision, validate_record_revision_chain
 
         resolved_format = resolve_output_format(output_format)
-        study_reg = build_study_sensitivity_registry(resolve_custom_phi_fields(study_key))
+        custom_phi = resolve_phi_fields(study_key, sdk=sdk)
+        study_reg = build_study_sensitivity_registry(custom_phi)
         parsed_filters = parse_filter_args(
             filters,
             model=RecordRevision,
@@ -203,28 +203,39 @@ def setup_audit_parsers(
             if odm_target is not None:
                 from imednet.spi.cdisc import build_odm_archive, to_odm_file
 
-                custom_phi = resolve_custom_phi_fields(study_key) if mask_phi else set()
-                archive = build_odm_archive(
-                    study_key,
-                    revisions=revisions,
-                    mask_phi=mask_phi,
-                    custom_phi_keys=custom_phi or None,
-                )
-                to_odm_file(
-                    archive, odm_target, mask_phi=mask_phi, custom_phi_keys=custom_phi or None
-                )
+                odm_phi = custom_phi if mask_phi else set()
+                with sdk_governance_context(sdk):
+                    archive = build_odm_archive(
+                        study_key,
+                        revisions=revisions,
+                        mask_phi=mask_phi,
+                        custom_phi_keys=odm_phi or None,
+                    )
+                    to_odm_file(
+                        archive,
+                        odm_target,
+                        mask_phi=mask_phi,
+                        custom_phi_keys=odm_phi or None,
+                    )
                 emit_line(f"Saved {len(revisions)} audit_trail to {odm_target}")
                 return
-            export_list_to_file(
+            _spi_cli.export_list_to_file(
                 revisions,
                 "audit_trail",
                 output,
                 study_key=study_key,
                 mask_phi=mask_phi,
+                sdk=sdk,
             )
             return
 
-        masked_revisions = mask_workflow_item(revisions, study_key=study_key, mask_phi=mask_phi)
+        masked_revisions = _spi_cli.mask_cli_models(
+            revisions,
+            study_key=study_key,
+            mask_phi=mask_phi,
+            sdk=sdk,
+            custom_phi_fields=custom_phi if mask_phi else None,
+        )
         if resolved_format == "json":
             display_list(masked_revisions, "record_revisions", output_format="json")
             return
@@ -259,7 +270,7 @@ def setup_audit_parsers(
         study_key = resolve_study_key(audit_parser, args, required=True)
         assert study_key is not None
         validate_cli_path_segment(study_key, name="study_key")
-        study_reg = build_study_sensitivity_registry(resolve_custom_phi_fields(study_key))
+        study_reg = build_study_sensitivity_registry(resolve_phi_fields(study_key))
 
         try:
             if args.start_date:
@@ -267,7 +278,7 @@ def setup_audit_parsers(
             if args.end_date:
                 normalize_utc_timestamp_bound(args.end_date, is_end=True)
             if output_arg:
-                resolved_out = resolve_records_export_target(output_arg, "audit_trail")
+                resolved_out = _spi_cli.resolve_records_export_target(output_arg, "audit_trail")
                 if resolved_out is None and _resolve_audit_odm_target(output_arg) is None:
                     raise ValueError(
                         f"Invalid output format: '{output_arg}'. Supported: csv, json, odm, "
@@ -397,7 +408,8 @@ def setup_audit_parsers(
         from imednet.spi.models import validate_record_revision_chain
 
         resolved_format = resolve_output_format(output_format)
-        study_reg = build_study_sensitivity_registry(resolve_custom_phi_fields(study_key))
+        custom_phi = resolve_phi_fields(study_key, sdk=sdk)
+        study_reg = build_study_sensitivity_registry(custom_phi)
 
         if validate_chain:
             effective_partial = (
@@ -454,7 +466,7 @@ def setup_audit_parsers(
                             history_rows.append(row_dict)
 
         if output:
-            resolved_target = resolve_records_export_target(output, "revisions_history")
+            resolved_target = _spi_cli.resolve_records_export_target(output, "revisions_history")
             if resolved_target is None:
                 print_error(
                     f"Error: Invalid output format: '{output.lower()}'. Supported: csv, json. "
@@ -462,10 +474,13 @@ def setup_audit_parsers(
                 )
                 sys.exit(1)
             fmt, target = resolved_target
-            sanitized_rows = [
-                mask_workflow_item(row, study_key=study_key, mask_phi=mask_phi)
-                for row in history_rows
-            ]
+            sanitized_rows = _spi_cli.mask_cli_models(
+                history_rows,
+                study_key=study_key,
+                mask_phi=mask_phi,
+                sdk=sdk,
+                custom_phi_fields=custom_phi if mask_phi else None,
+            )
             target.parent.mkdir(parents=True, exist_ok=True)
             if fmt == "json":
                 target.write_text(
@@ -530,7 +545,7 @@ def setup_audit_parsers(
         study_key = resolve_study_key(ingest_parser, args, required=True)
         assert study_key is not None
         validate_cli_path_segment(study_key, name="study_key")
-        study_reg = build_study_sensitivity_registry(resolve_custom_phi_fields(study_key))
+        study_reg = build_study_sensitivity_registry(resolve_phi_fields(study_key))
 
         try:
             if args.start_date:
@@ -538,7 +553,9 @@ def setup_audit_parsers(
             if args.end_date:
                 normalize_utc_timestamp_bound(args.end_date, is_end=True)
             if output_arg:
-                resolved_out = resolve_records_export_target(output_arg, "revisions_history")
+                resolved_out = _spi_cli.resolve_records_export_target(
+                    output_arg, "revisions_history"
+                )
                 if resolved_out is None:
                     raise ValueError(
                         f"Invalid output format: '{output_arg}'. Supported: csv, json, "

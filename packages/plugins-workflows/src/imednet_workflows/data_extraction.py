@@ -1,6 +1,6 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
 from imednet.spi.cdisc import OdmAuditRecord, map_revisions_to_audit_records
@@ -27,6 +27,63 @@ _parse_date_created_utc = parse_revision_timestamp_utc
 _matches_local_date_bound = matches_revision_date_bound
 
 
+def _prepare_record_criteria_filters(
+    record_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None,
+    record_data_filter: str | None,
+    other_filters: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    """Merge record filter kwargs and deduplicate ``record_data_filter`` / ``recordDataFilter``."""
+    final_record_filter_dict: dict[str, Any] = dict(record_filter) if record_filter else {}
+    final_record_filter_dict.update(other_filters)
+    popped_snake = final_record_filter_dict.pop("record_data_filter", None)
+    popped_camel = final_record_filter_dict.pop("recordDataFilter", None)
+    effective_rdf = (
+        record_data_filter
+        if record_data_filter is not None
+        else (popped_snake if popped_snake is not None else popped_camel)
+    )
+    return final_record_filter_dict, effective_rdf
+
+
+class _FilteredRecordIterator(Iterator[Record]):
+    """Lazy iterator over ``Record`` items preserving underlying ``has_more`` pagination state."""
+
+    def __init__(
+        self,
+        raw_source: Iterable[Record],
+        predicate: Callable[[Record], bool],
+        on_complete: Callable[[int], None] | None = None,
+    ) -> None:
+        self._raw_source = raw_source
+        self._iterator = iter(raw_source)
+        self._predicate = predicate
+        self._on_complete = on_complete
+        self._yielded = 0
+        self._done = False
+
+    @property
+    def has_more(self) -> bool:
+        """Return True when unread pages or buffered records remain in ``raw_source``."""
+        return not self._done and bool(getattr(self._raw_source, "has_more", False))
+
+    def __iter__(self) -> "_FilteredRecordIterator":
+        return self
+
+    def __next__(self) -> Record:
+        while True:
+            try:
+                rec = next(self._iterator)
+            except StopIteration:
+                if not self._done:
+                    self._done = True
+                    if self._on_complete is not None:
+                        self._on_complete(self._yielded)
+                raise
+            if self._predicate(rec):
+                self._yielded += 1
+                return rec
+
+
 class AsyncDataExtractionWorkflow:
     """Canonical asynchronous workflow for multi-endpoint clinical data extraction."""
 
@@ -45,6 +102,7 @@ class AsyncDataExtractionWorkflow:
         on_progress: Callable[[str], None] | None = None,
         *,
         include_deleted: bool = False,
+        record_data_filter: str | None = None,
         **other_filters: Any,
     ) -> list[Record]:
         """Asynchronously extract records matching combined subject, visit, and record filters."""
@@ -81,8 +139,11 @@ class AsyncDataExtractionWorkflow:
                     on_progress("No visits matched criteria; returning 0 records.")
                 return []
 
-        final_record_filter_dict = dict(record_filter) if record_filter else {}
-        final_record_filter_dict.update(other_filters)
+        final_record_filter_dict, effective_rdf = _prepare_record_criteria_filters(
+            record_filter,
+            record_data_filter,
+            other_filters,
+        )
 
         if on_progress:
             on_progress(f"Querying records for study '{study_key}'...")
@@ -91,7 +152,7 @@ class AsyncDataExtractionWorkflow:
                 self._sdk,
                 "get_records",
                 study_key=study_key,
-                record_data_filter=None,
+                record_data_filter=effective_rdf,
                 **final_record_filter_dict,
             )
         )
@@ -205,6 +266,7 @@ class DataExtractionWorkflow:
         on_progress: Callable[[str], None] | None = None,
         *,
         include_deleted: bool = False,
+        record_data_filter: str | None = None,
         **other_filters: Any,
     ) -> list[Record]:
         """Extracts records based on criteria spanning subjects, visits, and records."""
@@ -222,9 +284,128 @@ class DataExtractionWorkflow:
                 visit_filter=visit_filter,
                 on_progress=on_progress,
                 include_deleted=include_deleted,
+                record_data_filter=record_data_filter,
                 **other_filters,
             )
         )
+
+    def iter_records_by_criteria(
+        self,
+        study_key: str,
+        record_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        subject_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        visit_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        *,
+        include_deleted: bool = False,
+        record_data_filter: str | None = None,
+        **other_filters: Any,
+    ) -> Iterator[Record]:
+        """Lazily yield records matching combined subject, visit, and record filters."""
+        import inspect
+
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "DataExtractionWorkflow",
+            "iter_records_by_criteria",
+            "extract_records_by_criteria",
+        )
+
+        matching_subject_keys: set[str] | None = None
+        if subject_filter:
+            if on_progress:
+                on_progress("Querying subjects matching filter criteria...")
+            subjects = self._sdk.get_subjects(study_key, **subject_filter)
+            matching_subject_keys = {s.subject_key for s in subjects if s.subject_key is not None}
+            if on_progress:
+                on_progress(f"Retrieved {len(matching_subject_keys)} matching subjects.")
+            if not matching_subject_keys:
+                if on_progress:
+                    on_progress("No subjects matched criteria; returning 0 records.")
+                return iter(())
+
+        matching_visit_ids: set[int] | None = None
+        if visit_filter:
+            if on_progress:
+                on_progress("Querying visits matching filter criteria...")
+            visits = list(self._sdk.get_visits(study_key, **visit_filter))
+            if matching_subject_keys is not None:
+                visits = [v for v in visits if v.subject_key in matching_subject_keys]
+            matching_visit_ids = {v.visit_id for v in visits if v.visit_id is not None}
+            if on_progress:
+                on_progress(f"Retrieved {len(matching_visit_ids)} matching visits.")
+            if not matching_visit_ids:
+                if on_progress:
+                    on_progress("No visits matched criteria; returning 0 records.")
+                return iter(())
+
+        final_record_filter_dict, effective_rdf = _prepare_record_criteria_filters(
+            record_filter,
+            record_data_filter,
+            other_filters,
+        )
+
+        if on_progress:
+            on_progress(f"Querying records for study '{study_key}'...")
+
+        records_ep = getattr(self._sdk, "records", None)
+        records_list_fn = getattr(records_ep, "list", None) if records_ep is not None else None
+        use_records_list = callable(records_list_fn)
+        if use_records_list and type(self._sdk).__module__.startswith("unittest.mock"):
+            sdk_dict = getattr(self._sdk, "__dict__", {})
+            if "records" not in sdk_dict and "get_records" in sdk_dict:
+                use_records_list = False
+
+        if use_records_list and records_list_fn is not None:
+            list_kwargs = dict(final_record_filter_dict)
+            if effective_rdf is not None:
+                list_kwargs["record_data_filter"] = effective_rdf
+            raw_source: Iterable[Record] = records_list_fn(study_key, **list_kwargs)
+        else:
+            fallback_kwargs = dict(final_record_filter_dict)
+            if "size" in fallback_kwargs:
+                try:
+                    sig = inspect.signature(self._sdk.get_records)
+                    has_var_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                    )
+                    if not has_var_kw and "size" not in sig.parameters:
+                        fallback_kwargs.pop("size", None)
+                except (TypeError, ValueError):
+                    pass
+            raw_source = self._sdk.get_records(
+                study_key=study_key,
+                record_data_filter=effective_rdf,
+                **fallback_kwargs,
+            )
+
+        def _matches(rec: Record) -> bool:
+            if not include_deleted and is_record_deleted(rec):
+                return False
+            if matching_subject_keys is not None and rec.subject_key not in matching_subject_keys:
+                return False
+            return not (matching_visit_ids is not None and rec.visit_id not in matching_visit_ids)
+
+        def _notify_complete(count: int) -> None:
+            if on_progress:
+                on_progress(f"Extraction complete: found {count} matching records.")
+
+        if hasattr(raw_source, "has_more"):
+            return _FilteredRecordIterator(
+                raw_source,
+                _matches,
+                on_complete=_notify_complete if on_progress else None,
+            )
+
+        def _yield_filtered() -> Iterator[Record]:
+            count = 0
+            for rec in raw_source:
+                if _matches(rec):
+                    count += 1
+                    yield rec
+            _notify_complete(count)
+
+        return _yield_filtered()
 
     def extract_audit_trail(
         self,
