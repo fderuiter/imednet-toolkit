@@ -25,7 +25,7 @@ from .filters import (
     validate_record_filter,
 )
 from .json_logging import configure_json_logging
-from .typing import FilterValue, ItemId, JsonDict, RecordsInput
+from .typing import DataFrameLike, FilterValue, ItemId, JsonDict, RecordsInput
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "flatten": ("imednet.utils.serialization", "flatten"),
@@ -128,6 +128,7 @@ __all__ = [
     "AsyncBatchCoordinator",
     "BatchCoordinator",
     "BatchSubmissionSummary",
+    "DataFrameLike",
     "FilterValue",
     "ItemId",
     "JsonDict",

@@ -604,3 +604,93 @@ def test_cli_datadict_validate_json_format_and_env_var(
     assert any(
         "forms" in err or "foo" in err or "Additional" in err for err in payload_bad["errors"]
     )
+
+
+def test_cli_from_csv_study_key_and_multiformat_validate_diff_to_odm(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """from-csv supports --study-key, and validate/diff/to-odm accept CSV dir, .zip, .xml, and REDCap .csv."""
+    import zipfile
+
+    # 1. Build a .zip archive from the 4-file CSV fixtures
+    zip_path = tmp_path / "study_export.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for csv_name in ("FORMS.csv", "QUESTIONS.csv", "CHOICES.csv", "BUSINESS_LOGIC.csv"):
+            zf.write(FIXTURES_DIR / csv_name, arcname=csv_name)
+
+    # 2. from-csv --study-key STUDY sets metadata.studyKey on both directory and .zip
+    app(["datadict", "from-csv", str(FIXTURES_DIR), "--study-key", "STUDY"])
+    cap_csv = capsys.readouterr()
+    dd_from_csv = json.loads(cap_csv.out)
+    assert dd_from_csv["metadata"]["studyKey"] == "STUDY"
+
+    out_json = tmp_path / "study.json"
+    app(["datadict", "from-csv", str(zip_path), "--study-key", "STUDY", "-o", str(out_json)])
+    capsys.readouterr()
+    assert json.loads(out_json.read_text(encoding="utf-8"))["metadata"]["studyKey"] == "STUDY"
+
+    # Duplicate --study-key rejected by UniqueStoreAction with exit code 2
+    with pytest.raises(SystemExit) as dup_exc:
+        app(["datadict", "from-csv", str(FIXTURES_DIR), "--study-key", "S1", "--study-key", "S2"])
+    assert dup_exc.value.code == 2
+    capsys.readouterr()
+
+    # 3. Prepare .xml ODM and REDCap .csv fixtures
+    odm_path = tmp_path / "study.xml"
+    app(["datadict", "to-odm", str(out_json), "-o", str(odm_path)])
+    capsys.readouterr()
+    assert odm_path.is_file()
+
+    redcap_path = tmp_path / "redcap.csv"
+    redcap_path.write_text(
+        '"Variable / Field Name","Form Name","Field Type","Field Label",'
+        '"Choices, Calculations, OR Slider Labels","Text Validation Type OR Show Slider Number","Required Field?"\n'
+        '"wt","vitals","text","Weight",,"number_2dp","y"\n'
+        '"pain","vitals","slider","Pain Score","0, Low | 100, High",,\n'
+        '"sym","vitals","checkbox","Symptoms","0, None | 1, Cough",,\n',
+        encoding="utf-8",
+    )
+
+    sources = [FIXTURES_DIR, zip_path, odm_path, redcap_path, out_json]
+
+    # 4. validate exits 0 across CSV dir, .zip, .xml, REDCap .csv, and .json
+    for src in sources:
+        app(["datadict", "validate", str(src)])
+        cap_val = capsys.readouterr()
+        assert "Validation passed" in cap_val.out
+        assert cap_val.err == ""
+
+    # Preserve custom --schema JSON Schema validation on .json targets
+    strict_custom_schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["customRequiredTopLevelField"],
+    }
+    custom_schema_path = tmp_path / "custom_schema.json"
+    custom_schema_path.write_text(json.dumps(strict_custom_schema), encoding="utf-8")
+    with pytest.raises(SystemExit) as schema_exc:
+        app(["datadict", "validate", str(out_json), "--schema", str(custom_schema_path)])
+    assert schema_exc.value.code == 1
+    cap_schema = capsys.readouterr()
+    assert "customRequiredTopLevelField" in cap_schema.err
+
+    # 5. diff exits 0 across CSV dir, .zip, .xml, REDCap .csv, and .json
+    for src in sources:
+        app(["datadict", "diff", str(src), str(src), "--format", "json"])
+        cap_diff = capsys.readouterr()
+        diff_payload = json.loads(cap_diff.out)
+        assert diff_payload["has_changes"] is False
+
+    # Cross-format diff (CSV directory vs .zip archive)
+    app(["datadict", "diff", str(FIXTURES_DIR), str(zip_path), "--format", "json"])
+    cap_cross = capsys.readouterr()
+    assert json.loads(cap_cross.out)["has_changes"] is False
+
+    # 6. to-odm exits 0 across CSV dir, .zip, .xml, and REDCap .csv
+    for idx, src in enumerate(sources):
+        exported_xml = tmp_path / f"exported_{idx}.xml"
+        app(["datadict", "to-odm", str(src), "-o", str(exported_xml)])
+        cap_odm = capsys.readouterr()
+        assert "Successfully wrote CDISC ODM XML" in cap_odm.err
+        assert "<ODM" in exported_xml.read_text(encoding="utf-8")

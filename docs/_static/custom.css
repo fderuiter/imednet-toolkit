@@ -106,7 +106,7 @@ a.reference:has(> .viewcode-link):focus-visible {
     outline-offset: 2px;
 }
 
-/* Keyboard-reachable permalinks (WCAG 2.1.1 G202, 2.4.7 C15) & non-collapsed [source] badges (G195) */
+/* Keyboard-reachable permalinks (WCAG 2.1.1 G202, 2.4.7 C15), 24x24px targets (2.5.8 C42), & [source] badges (G195) */
 a.headerlink,
 .code-block-caption > .headerlink,
 dl dt > .headerlink,
@@ -119,6 +119,12 @@ h5 > .headerlink,
 h6 > .headerlink,
 p.caption > .headerlink,
 table > caption > .headerlink {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    min-height: 24px;
+    text-indent: 0;
     visibility: visible;
     opacity: 0;
     border-radius: 2px;
@@ -158,7 +164,12 @@ table > caption:focus-within > .headerlink {
 
 div.math .headerlink,
 div.math:focus .headerlink {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    min-height: 24px;
+    text-indent: 0;
     visibility: visible;
     opacity: 0;
     border-radius: 2px;
@@ -166,12 +177,17 @@ div.math:focus .headerlink {
 
 div.math:hover .headerlink,
 div.math:focus-within .headerlink {
-    display: inline-block;
+    display: inline-flex;
     visibility: visible;
     opacity: 1;
 }
 
 .viewcode-source-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    min-height: 24px;
     float: right;
     margin-left: 0.5rem;
     text-align: right;
@@ -181,6 +197,11 @@ div.math:focus-within .headerlink {
 }
 
 a.reference:has(> .viewcode-link) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    min-height: 24px;
     float: right;
     margin-left: 0.5rem;
     text-align: right;
@@ -202,6 +223,12 @@ a.reference:has(> .viewcode-link) > .viewcode-link,
 }
 
 a.viewcode-back {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    min-height: 24px;
+    text-indent: 0;
     border-radius: 2px;
 }
 

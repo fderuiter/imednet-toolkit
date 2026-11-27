@@ -18,6 +18,7 @@ from imednet.errors import ValidationError
 from imednet.utils.typing import JsonDict, RecordsInput
 
 if TYPE_CHECKING:
+    from imednet.models.records import BaseRecordRequest
     from imednet.validation.cache import ValidationSchemaProtocol
 
 MASKED_SENTINEL: str = "***MASKED***"
@@ -47,36 +48,27 @@ _READ_ONLY_RECORD_COLUMNS: frozenset[str] = frozenset(
 
 _NESTED_DATA_COLUMNS: frozenset[str] = frozenset({"record_data", "recordData", "data"})
 
+_SNAKE_TO_CAMEL_IDENTIFIERS: dict[str, str] = {
+    "record_id": "recordId",
+    "record_oid": "recordOid",
+    "visit_id": "visitId",
+    "record_status": "recordStatus",
+    "reason_for_change": "reasonForChange",
+    "form_key": "formKey",
+    "form_id": "formId",
+    "subject_key": "subjectKey",
+    "subject_oid": "subjectOid",
+    "subject_id": "subjectId",
+    "site_name": "siteName",
+    "site_id": "siteId",
+    "interval_name": "intervalName",
+    "interval_id": "intervalId",
+}
+
 _IDENTIFIER_COLUMNS: frozenset[str] = frozenset(
     {
-        "record_id",
-        "recordId",
-        "record_oid",
-        "recordOid",
-        "visit_id",
-        "visitId",
-        "record_status",
-        "recordStatus",
-        "reason_for_change",
-        "reasonForChange",
-        "form_key",
-        "formKey",
-        "form_id",
-        "formId",
-        "subject_key",
-        "subjectKey",
-        "subject_oid",
-        "subjectOid",
-        "subject_id",
-        "subjectId",
-        "site_name",
-        "siteName",
-        "site_id",
-        "siteId",
-        "interval_name",
-        "intervalName",
-        "interval_id",
-        "intervalId",
+        *_SNAKE_TO_CAMEL_IDENTIFIERS.keys(),
+        *_SNAKE_TO_CAMEL_IDENTIFIERS.values(),
     }
 )
 
@@ -168,12 +160,45 @@ def _contains_masked_sentinel(value: Any) -> bool:
     return False
 
 
-def ensure_no_masked_sentinel(records: Sequence[Mapping[str, Any]]) -> None:
+def normalize_record_payload_item(item: BaseRecordRequest | Mapping[str, Any]) -> JsonDict:
+    """Normalize a :class:`BaseRecordRequest` or mapping into a camelCase ``JsonDict``."""
+    from imednet.models.records import BaseRecordRequest
+
+    if isinstance(item, BaseRecordRequest):
+        return item.model_dump(by_alias=True, exclude_none=True)
+    if isinstance(item, Mapping):
+        if isinstance(item, dict) and not any(k in _SNAKE_TO_CAMEL_IDENTIFIERS for k in item):
+            return item
+        out: JsonDict = {}
+        for key, value in item.items():
+            camel_key = _SNAKE_TO_CAMEL_IDENTIFIERS.get(key)
+            if camel_key is not None:
+                if camel_key not in item or item[camel_key] is None:
+                    out[camel_key] = value
+            else:
+                out[key] = value
+        return out
+    raise TypeError(
+        "All items in records_data sequence must be BaseRecordRequest or Mapping; "
+        f"got {type(item).__name__}."
+    )
+
+
+def ensure_no_masked_sentinel(
+    records: Sequence[BaseRecordRequest | Mapping[str, Any]],
+) -> None:
     """Raise :class:`ValidationError` if any record contains ``***MASKED***``."""
+    from imednet.models.records import BaseRecordRequest
+
     for row_idx, rec in enumerate(records):
-        if not isinstance(rec, Mapping):
+        rec_map: Mapping[str, Any]
+        if isinstance(rec, BaseRecordRequest):
+            rec_map = rec.model_dump(by_alias=True, exclude_none=True)
+        elif isinstance(rec, Mapping):
+            rec_map = rec
+        else:
             continue
-        for key, value in rec.items():
+        for key, value in rec_map.items():
             if key in _NESTED_DATA_COLUMNS and isinstance(value, Mapping):
                 for var_name, var_val in value.items():
                     if _contains_masked_sentinel(var_val):
@@ -680,7 +705,7 @@ def normalize_records_input(
     default_form_key: str | None = None,
     default_form_id: int | None = None,
 ) -> list[JsonDict]:
-    """Normalize ``DataFrame``, CSV path, or ``list[JsonDict]`` into record payload dicts."""
+    """Normalize ``DataFrame``, CSV path, or sequence of requests/mappings into record payload dicts."""
     if isinstance(records_data, (str, os.PathLike)):
         return csv_to_records(
             records_data,
@@ -697,13 +722,9 @@ def normalize_records_input(
             default_form_key=default_form_key,
             default_form_id=default_form_id,
         )
-    if isinstance(records_data, list):
+    if isinstance(records_data, Sequence) and not isinstance(records_data, (str, bytes, bytearray)):
         ensure_no_masked_sentinel(records_data)
-        return records_data
-    if isinstance(records_data, Sequence) and not isinstance(records_data, (str, bytes)):
-        materialized = [dict(item) for item in records_data if isinstance(item, Mapping)]
-        if len(materialized) != len(records_data):
-            raise TypeError("All items in records_data sequence must be mappings.")
+        materialized = [normalize_record_payload_item(item) for item in records_data]
         ensure_no_masked_sentinel(materialized)
         return materialized
     raise TypeError(

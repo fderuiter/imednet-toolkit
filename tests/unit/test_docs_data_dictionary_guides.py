@@ -48,10 +48,22 @@ def test_data_dictionary_guide_registered_and_comprehensive() -> None:
         "LogicTreeEvaluator",
         "parse_logic_xml",
         "extract_variable_constraints",
+        "RangeCheckConstraint",
+        "validate_regex_pattern",
+        "range_check_soft",
+        "unsafe_regex",
         "schema=",
     )
     for token in expected_api_tokens:
         assert token in content, f"Missing API token {token!r} in data_dictionary.rst"
+
+    import imednet.datadict as datadict_pkg
+    from imednet.datadict import RangeCheckConstraint, validate_regex_pattern
+
+    assert "RangeCheckConstraint" in datadict_pkg.__all__
+    assert "validate_regex_pattern" in datadict_pkg.__all__
+    assert RangeCheckConstraint is not None
+    assert callable(validate_regex_pattern)
 
     for subcmd in DATADICT_SUBCOMMANDS:
         assert f"imednet datadict {subcmd}" in content, (
@@ -125,17 +137,26 @@ def test_form_builder_guide_states_legacy_scope_and_uses_uv_run() -> None:
 
 
 def test_schema_validation_and_caching_contrast_schemacache_with_datadictionary() -> None:
-    """schema_validation.rst and caching.rst contrast SchemaCache type checks with DataDictionary rules."""
+    """schema_validation.rst and caching.rst contrast BaseSchemaCache enforcement with DataDictionary rules."""
     schema_val = (DOCS_DIR / "explanation" / "schema_validation.rst").read_text(encoding="utf-8")
     caching = (DOCS_DIR / "how-to" / "caching.rst").read_text(encoding="utf-8")
 
     assert "ValidationSchemaProtocol" in schema_val
+    assert "BaseSchemaCache" in schema_val
     assert "DataDictionary" in schema_val
     assert "LogicTreeEvaluator" in schema_val
-    assert "returns early" in schema_val
+    assert "***MASKED***" in schema_val
+    assert "masked_phi" in schema_val
+    assert "_retired_form_variables" in schema_val
+    assert "Yes" in schema_val and "Auto Query" in schema_val
+    assert "returns early" not in schema_val
     assert "required fields are present" not in schema_val
 
+    assert "BaseSchemaCache" in caching
+    assert "Enforced by" in caching
     assert "Skipped by" in caching
+    assert "Yes" in caching and "Auto Query" in caching
+    assert "masked_phi" in caching
     assert "DataDictionary" in caching
     assert ":doc:`/how-to/data_dictionary`" in caching
     assert ":doc:`/explanation/schema_validation`" in caching

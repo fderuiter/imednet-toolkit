@@ -233,6 +233,16 @@ class Form(DictCompatMixin, BaseModel):
     )
 
 
+def _first_not_none(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Return the first value in ``mapping`` for ``keys`` that is not None or empty string."""
+    for key in keys:
+        if key in mapping:
+            val = mapping[key]
+            if val is not None and val != "":
+                return val
+    return default
+
+
 class DataDictionary(DictCompatMixin, BaseModel):
     """Canonical root data dictionary container."""
 
@@ -258,7 +268,7 @@ class DataDictionary(DictCompatMixin, BaseModel):
             and data["forms"]
             and isinstance(data["forms"][0], dict)
             and "formKey" not in data["forms"][0]
-            and "Form Key" in data["forms"][0]
+            and ("Form Key" in data["forms"][0] or "Form" in data["forms"][0])
         )
 
         if not has_legacy:
@@ -275,10 +285,10 @@ class DataDictionary(DictCompatMixin, BaseModel):
             if isinstance(item, Form):
                 forms_map[item.formKey] = item
             elif isinstance(item, dict):
-                fk = item.get("formKey") or item.get("Form Key") or item.get("Form", "")
-                fn = item.get("formName") or item.get("Form Name")
-                fid = item.get("formId") or item.get("Form ID")
-                ft = item.get("formType") or item.get("Form Type")
+                fk = str(_first_not_none(item, "formKey", "Form Key", "Form", default=""))
+                fn = _first_not_none(item, "formName", "Form Name")
+                fid = _first_not_none(item, "formId", "Form ID")
+                ft = _first_not_none(item, "formType", "Form Type")
                 extra = {
                     to_camel_case(k): v
                     for k, v in item.items()
@@ -307,17 +317,25 @@ class DataDictionary(DictCompatMixin, BaseModel):
             if isinstance(item, Variable):
                 continue
             if isinstance(item, dict):
-                fk = item.get("Form") or item.get("Form Key") or item.get("formKey") or ""
-                vname = item.get("Variable Name") or item.get("variableName") or ""
+                fk = str(_first_not_none(item, "Form", "Form Key", "formKey", default=""))
+                vname = str(_first_not_none(item, "Variable Name", "variableName", default=""))
                 if not fk and not vname:
                     continue
-                vtype = item.get("Variable Type") or item.get("variableType")
-                lbl = item.get("Label") or item.get("label")
-                req = item.get("Required Field") or item.get("Required") or item.get("required")
-                seq_val = item.get("Sequence") or item.get("sequence")
-                seq = int(seq_val) if seq_val is not None and str(seq_val).isdigit() else None
-                fmt = item.get("Format") or item.get("format")
-                prec = item.get("Precision") or item.get("precision")
+                vtype = _first_not_none(item, "Variable Type", "variableType")
+                lbl = _first_not_none(item, "Label", "label")
+                req = _first_not_none(item, "Required Field", "Required", "required")
+                seq_val = _first_not_none(item, "Sequence", "sequence")
+                seq = (
+                    int(seq_val)
+                    if seq_val is not None
+                    and not isinstance(seq_val, bool)
+                    and str(seq_val).strip().isdigit()
+                    else None
+                )
+                fmt_raw = _first_not_none(item, "Format", "format")
+                fmt = str(fmt_raw) if fmt_raw is not None else None
+                prec_raw = _first_not_none(item, "Precision", "precision")
+                prec = str(prec_raw) if prec_raw is not None else None
                 extra = {
                     to_camel_case(k): v
                     for k, v in item.items()
@@ -364,12 +382,18 @@ class DataDictionary(DictCompatMixin, BaseModel):
             if isinstance(item, Choice):
                 continue
             if isinstance(item, dict):
-                fk = item.get("Form") or item.get("Form Key") or item.get("formKey") or ""
-                vname = item.get("Variable Name") or item.get("variableName") or ""
-                ctext = str(item.get("Choice Text") or item.get("choiceText") or "")
-                cval = str(item.get("Choice Value") or item.get("choiceValue") or "")
-                pos_val = item.get("Position") or item.get("position")
-                pos = int(pos_val) if pos_val is not None and str(pos_val).isdigit() else None
+                fk = str(_first_not_none(item, "Form", "Form Key", "formKey", default=""))
+                vname = str(_first_not_none(item, "Variable Name", "variableName", default=""))
+                ctext = str(_first_not_none(item, "Choice Text", "choiceText", default=""))
+                cval = str(_first_not_none(item, "Choice Value", "choiceValue", default=""))
+                pos_val = _first_not_none(item, "Position", "position")
+                pos = (
+                    int(pos_val)
+                    if pos_val is not None
+                    and not isinstance(pos_val, bool)
+                    and str(pos_val).strip().isdigit()
+                    else None
+                )
                 extra = {
                     to_camel_case(k): v
                     for k, v in item.items()
@@ -396,7 +420,7 @@ class DataDictionary(DictCompatMixin, BaseModel):
                 else:
                     placeholder_var = Variable(
                         variableName=vname,
-                        variableType=item.get("Variable Type") or item.get("variableType"),
+                        variableType=_first_not_none(item, "Variable Type", "variableType"),
                         choices=[choice],
                     )
                     if fk not in forms_map:
@@ -413,27 +437,35 @@ class DataDictionary(DictCompatMixin, BaseModel):
                 else:
                     unassigned.append(item)
             elif isinstance(item, dict):
-                rtype = item.get("Type") or item.get("type")
-                rname = item.get("Name") or item.get("name")
-                rstat = item.get("Status") or item.get("status")
-                rid = item.get("ID") or item.get("id")
-                rform = item.get("Form") or item.get("form")
-                rseq_val = item.get("Sequence") or item.get("sequence")
-                rseq = int(rseq_val) if rseq_val is not None and str(rseq_val).isdigit() else None
+                rtype = _first_not_none(item, "Type", "type")
+                rname = _first_not_none(item, "Name", "name")
+                rstat = _first_not_none(item, "Status", "status")
+                rid = _first_not_none(item, "ID", "id")
+                rform_raw = _first_not_none(item, "Form", "form")
+                rform = str(rform_raw) if rform_raw is not None else None
+                rseq_val = _first_not_none(item, "Sequence", "sequence")
+                rseq = (
+                    int(rseq_val)
+                    if rseq_val is not None
+                    and not isinstance(rseq_val, bool)
+                    and str(rseq_val).strip().isdigit()
+                    else None
+                )
 
-                raw_logic_val = (
-                    item.get("Logic")
-                    or item.get("logic")
-                    or item.get("LogicRawXml")
-                    or item.get("logicRawXml")
-                    or item.get("ruleXml")
-                    or item.get("xml")
+                raw_logic_val = _first_not_none(
+                    item,
+                    "Logic",
+                    "logic",
+                    "LogicRawXml",
+                    "logicRawXml",
+                    "ruleXml",
+                    "xml",
                 )
                 logic_ast: dict[str, Any] | None = None
                 xml_content: str | None = None
                 if isinstance(raw_logic_val, dict):
                     logic_ast = raw_logic_val
-                    raw_xml = item.get("LogicRawXml") or item.get("logicRawXml")
+                    raw_xml = _first_not_none(item, "LogicRawXml", "logicRawXml")
                     if isinstance(raw_xml, str):
                         xml_content = raw_xml
                 elif isinstance(raw_logic_val, str) and raw_logic_val.strip():

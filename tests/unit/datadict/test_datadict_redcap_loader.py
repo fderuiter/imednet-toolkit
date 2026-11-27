@@ -274,3 +274,69 @@ def test_load_from_redcap_bounds_annotations_and_odm_emission() -> None:
     assert "<CheckValue>70</CheckValue>" in xml_str
     assert '<RangeCheck SoftHard="Soft" Comparator="LE">' in xml_str
     assert "<CheckValue>250</CheckValue>" in xml_str
+
+
+def test_load_from_redcap_decimals_date_dmy_slider_and_descriptive() -> None:
+    """Verify REDCap decimal precision, date_dmy, slider choices/bounds, and descriptive required=No."""
+    from imednet.datadict.emit import to_odm_xml
+
+    redcap_csv = (
+        '"Variable / Field Name","Form Name","Field Type","Field Label",'
+        '"Choices, Calculations, OR Slider Labels",'
+        '"Text Validation Type OR Show Slider Number","Text Validation Min",'
+        '"Text Validation Max","Required Field?"\n'
+        '"wt_2dp","vitals","text","Weight 2dp",,"number_2dp","0","500","y"\n'
+        '"temp_1dp","vitals","text","Temp 1dp",,"number_1dp",,,"n"\n'
+        '"conc_4dp_comma","vitals","text","Conc 4dp comma",,"number_4dp_comma_decimal",,,\n'
+        '"plain_comma","vitals","text","Plain comma decimal",,"number_comma_decimal",,,\n'
+        '"visit_dmy","vitals","text","Visit Date DMY",,"date_dmy",,,"y"\n'
+        '"vas_default","vitals","slider","Pain VAS","0, None | 50, Moderate | 100, Severe","number",,,\n'
+        '"vas_custom","vitals","slider","Custom Slider",,"","10","90",\n'
+        '"banner_req","vitals","descriptive","Section Instructions",,,,,"y"\n'
+        '"banner_opt","vitals","descriptive","Optional Banner",,,,,\n'
+        '"symptoms","vitals","checkbox","Symptoms","0, None | 1, Fever | 2, Rash",,,,\n'
+    )
+
+    dd = load_from_redcap(redcap_csv, study_key="RC_EDGE", strict=True)
+    vars_by_name = dd.variables_for_form("vitals")
+
+    assert vars_by_name["wt_2dp"].variableType == "Float"
+    assert vars_by_name["wt_2dp"].precision == "2"
+
+    assert vars_by_name["temp_1dp"].variableType == "Float"
+    assert vars_by_name["temp_1dp"].precision == "1"
+
+    assert vars_by_name["conc_4dp_comma"].variableType == "Float"
+    assert vars_by_name["conc_4dp_comma"].precision == "4"
+
+    assert vars_by_name["plain_comma"].variableType == "Float"
+    assert vars_by_name["plain_comma"].precision is None
+
+    assert vars_by_name["visit_dmy"].variableType == "Date DMY"
+
+    vas_def = vars_by_name["vas_default"]
+    assert vas_def.variableType == "Slider"
+    assert vas_def.precision is None
+    assert vas_def.choices == []
+    assert vas_def.extraAttributes["sliderLabels"] == "0, None | 50, Moderate | 100, Severe"
+    assert vas_def.extraAttributes["textValidationMin"] == "0"
+    assert vas_def.extraAttributes["textValidationMax"] == "100"
+
+    vas_cust = vars_by_name["vas_custom"]
+    assert vas_cust.variableType == "Slider"
+    assert vas_cust.choices == []
+    assert "sliderLabels" not in vas_cust.extraAttributes
+    assert vas_cust.extraAttributes["textValidationMin"] == "10"
+    assert vas_cust.extraAttributes["textValidationMax"] == "90"
+
+    assert vars_by_name["banner_req"].variableType == "Descriptive"
+    assert vars_by_name["banner_req"].required == "No"
+    assert vars_by_name["banner_opt"].required == "No"
+
+    # Keep one Multi Select Variable per REDCap checkbox on Form.variables and in ODM ItemDefs
+    sym = vars_by_name["symptoms"]
+    assert sym.variableType == "Multi Select"
+    assert [c.choiceValue for c in sym.choices] == ["0", "1", "2"]
+    odm_xml = to_odm_xml(dd)
+    assert 'OID="IT.vitals.symptoms"' in odm_xml or 'Name="symptoms"' in odm_xml
+    assert 'SignificantDigits="2"' in odm_xml

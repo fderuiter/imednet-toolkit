@@ -324,13 +324,15 @@ Before opening a pull request that adds or modifies public APIs:
 4. Please follow the [Code of Conduct](https://github.com/fderuiter/imednet-toolkit/blob/main/CODE_OF_CONDUCT.md).
 
 ## Dependency-Aware CI Pipeline
-Our CI pipeline is optimized to run quality gates and test suites only for packages affected by your changes.
-- A change to a "leaf" package (e.g., the Airflow provider) will trigger tests exclusively for that package.
-- A change to the core `imednet` package will trigger the full validation matrix for all dependent packages in the monorepo.
+Our CI pipeline (`scripts/ci_plan.py` + `.github/workflows/main.yml`) runs `pre-commit` once for repository-wide formatting, Ruff linting, `typos --force-exclude`, and `detect-secrets`, while `plan` schedules `quality`, `build`, `docs`, `fuzzing`, and `integration-sandbox` in parallel before running affected `test` shards and `validate-package-consumption` behind an unconditional `ci-gate` status summary:
+- A change to a "leaf" package (e.g., the Airflow provider) builds workspace wheels and triggers `test` shards exclusively for that package across Python 3.11–3.13.
+- A change to the core `imednet` package triggers the full validation matrix for all dependent packages in the monorepo.
+- Unit test-only changes skip `build`, `fuzzing` (unless fuzz-harness files changed), and `validate-package-consumption` while still running affected `test` shards and `quality`.
+- Documentation, `.agents/`, or Markdown-only changes skip `quality`, `build`, `test`, `fuzzing`, and `validate-package-consumption`, whereas `examples/` edits still run `quality` (`mypy`) while skipping `build` and `test`.
 - Ensure your tests and linters pass locally before submitting a PR.
-- **Unified Static Analysis:** We use a centralized, orchestrated framework using Hatch. To execute Ruff, MyPy, and all security audits, simply run:
-  `hatch run lint:all`
-- **Adding or Updating Tools:** To add or update a linting or security tool, do **not** add it to `pre-commit-config.yaml` as an external hook or install it manually. Instead:
+- **Unified Static Analysis:** Locally, we provide a centralized framework using Hatch. To execute Ruff, MyPy, secret scanning, and all security/similarity audits locally, run:
+  `hatch run lint:all` (or `uvx hatch run quality:all`)
+- **Adding or Updating Tools:** To add or update a package-scoped linting or security tool, do **not** add it to `.pre-commit-config.yaml` as an external hook or install it manually. Instead:
   1. Add or update the dependency in the `[tool.hatch.envs.lint]` block in the root `pyproject.toml`.
   2. Define or update the command in the `[tool.hatch.envs.lint.scripts]` section.
-  3. Ensure your new script is included in the `all` command sequence so it executes via the unified interface and CI.
+  3. Ensure your new script is included in the `all` command sequence and `.github/workflows/main.yml` `quality` job so local runs and CI stay aligned.

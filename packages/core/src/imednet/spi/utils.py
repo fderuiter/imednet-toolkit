@@ -133,7 +133,14 @@ if TYPE_CHECKING:
         normalize_records_input,
         normalize_tabular_row,
     )
-    from imednet.utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
+    from imednet.utils.typing import (
+        DataFrameLike,
+        FilterScalar,
+        FilterValue,
+        ItemId,
+        JsonDict,
+        RecordsInput,
+    )
     from imednet.utils.url import (
         normalize_cache_origin,
         redact_sensitive_text,
@@ -155,6 +162,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "CompiledRecordPredicate",
     ),
     "DEFAULT_BATCH_CHUNK_SIZE": ("imednet.utils.batch_coordinator", "DEFAULT_BATCH_CHUNK_SIZE"),
+    "DataFrameLike": ("imednet.utils.typing", "DataFrameLike"),
     "DefaultRetryPolicy": ("imednet.core.retry", "DefaultRetryPolicy"),
     "ELIGIBLE_SITE_ENROLLMENT_STATUSES": (
         "imednet.utils.enrollment",
@@ -346,6 +354,7 @@ __all__ = [
     "BatchCoordinator",
     "BatchSubmissionSummary",
     "CompiledRecordPredicate",
+    "DataFrameLike",
     "DefaultRetryPolicy",
     "EnrichmentPipeline",
     "FilterScalar",

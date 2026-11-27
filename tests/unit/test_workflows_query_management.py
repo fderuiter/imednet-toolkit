@@ -301,7 +301,8 @@ def test_sync_queries_to_triage_lifecycle_and_preservation(tmp_path: Any, monkey
     initial_queue = wf.sync_queries_to_triage("STUDY", default_severity="high")
     assert len(initial_queue) == 2
 
-    store = TriageStore(db_path)
+    store = TriageStore()
+    assert store.db_path == db_path.parent / "edc.prod.imednetapi.com" / db_path.name
     item1 = store.get_triage_item("STUDY:701")
     item2 = store.get_triage_item("STUDY/SUBJ 002/602/V_WEIGHT")
     assert item1 is not None and item1.status == TriageStatus.NEW and item1.severity == "high"
@@ -404,3 +405,244 @@ def test_sync_queries_to_triage_with_simulation_sdk(tmp_path: Any) -> None:
         )
         assert len(queue) >= 1
         assert all(item.status in (TriageStatus.NEW, TriageStatus.UNDER_REVIEW) for item in queue)
+
+
+def test_multi_origin_sync_queries_to_triage_isolation_and_comment_redaction(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Verify multi-origin sync_queries_to_triage isolates queues and scrubs PHI/credentials on disk."""
+    import os
+    import sqlite3
+    import stat
+
+    import respx
+
+    from imednet.models.study_config import StudyConfiguration
+    from imednet.models.triage import TriageStatus
+    from imednet.sdk import ImednetSDK
+    from imednet_workflows.config_version_control import ConfigVersionStore
+    from imednet_workflows.triage_store import TriageStore
+
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated_home"))
+    monkeypatch.delenv("IMEDNET_TRIAGE_DB_PATH", raising=False)
+    monkeypatch.delenv("IMEDNET_CONFIG_DB_PATH", raising=False)
+    monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_CONFIG_ENCRYPTION_KEY", raising=False)
+
+    with respx.mock:
+        respx.get("https://tenant-a.edc.example.test/api/v1/edc/studies/DEMO/sites").respond(
+            json={
+                "pagination": {"currentPage": 0, "size": 1, "totalPages": 1, "totalElements": 1},
+                "data": [{"siteId": 1, "siteName": "Site A"}],
+            }
+        )
+        respx.get("https://tenant-a.edc.example.test/api/v1/edc/studies/DEMO/queries").respond(
+            json={
+                "pagination": {"currentPage": 0, "size": 100, "totalPages": 1, "totalElements": 3},
+                "data": [
+                    {
+                        "annotationId": 1,
+                        "subjectKey": "SUB-01",
+                        "variable": "V_NAME",
+                        "queryComments": [
+                            {
+                                "sequence": 1,
+                                "closed": False,
+                                "user": "dm-a",
+                                "comment": (
+                                    "Verify patient_name=CANARY_PATIENT_NAME_A "
+                                    "dob=1979-03-14 custom_mrn=CANARY_CUSTOM_MRN_A "
+                                    "https://tenant-a.edc.example.test/export?token=CANARY_API_TOKEN_A"
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "annotationId": 2,
+                        "subjectKey": "SUB-02",
+                        "variable": "V_DESC",
+                        "description": (
+                            "Fallback custom_mrn='CANARY_CUSTOM_MRN_A' "
+                            "Authorization: Bearer CANARY_API_TOKEN_A"
+                        ),
+                    },
+                    {
+                        "annotationId": 3,
+                        "subjectKey": "SUB-03",
+                        "variable": "V_CLOSED",
+                        "queryComments": [
+                            {"sequence": 1, "closed": True, "user": "dm-a", "comment": "Closed A"}
+                        ],
+                    },
+                ],
+            }
+        )
+        respx.get("https://tenant-b.edc.example.test/api/v1/edc/studies/DEMO/queries").respond(
+            json={
+                "pagination": {"currentPage": 0, "size": 100, "totalPages": 1, "totalElements": 2},
+                "data": [
+                    {
+                        "annotationId": 1,
+                        "subjectKey": "SUB-01",
+                        "variable": "V_NAME",
+                        "queryComments": [
+                            {
+                                "sequence": 1,
+                                "closed": False,
+                                "user": "dm-b",
+                                "comment": "Clean tenant B query",
+                            }
+                        ],
+                    },
+                    {
+                        "annotationId": 3,
+                        "subjectKey": "SUB-03",
+                        "variable": "V_OPEN_B",
+                        "queryComments": [
+                            {
+                                "sequence": 1,
+                                "closed": False,
+                                "user": "dm-b",
+                                "comment": "Open on tenant B",
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+
+        sdk_a = ImednetSDK(
+            api_key="key-a",  # pragma: allowlist secret
+            security_key="sec-a",  # pragma: allowlist secret
+            base_url="https://tenant-a.edc.example.test",
+        )
+        sdk_b = ImednetSDK(
+            api_key="key-b",  # pragma: allowlist secret
+            security_key="sec-b",  # pragma: allowlist secret
+            base_url="https://tenant-b.edc.example.test",
+        )
+
+        with sdk_a.study_context("DEMO"):
+            ConfigVersionStore().commit_config(
+                "DEMO",
+                StudyConfiguration(study_key="DEMO", phi_fields=["custom_mrn"]),
+                "Register custom_mrn PHI",
+                sdk=sdk_a,
+            )
+            queue_a = sdk_a.workflows.query_management.sync_queries_to_triage("DEMO")
+            store_a = TriageStore()
+            store_a.assign_item("DEMO:1", "reviewer-tenant-a")
+            store_a.add_annotation(
+                "DEMO:1",
+                "reviewer-tenant-a",
+                "Local note custom_mrn=CANARY_CUSTOM_MRN_A x-api-key: CANARY_API_TOKEN_A",
+            )
+
+        assert {item.item_id for item in queue_a} == {"DEMO:1", "DEMO:2", "DEMO:3"}
+        item_a3 = store_a.get_triage_item("DEMO:3")
+        assert item_a3 is not None and item_a3.status == TriageStatus.RESOLVED
+
+        # Sync Origin B both inside study_context and directly via SDK workflow without study_context
+        with sdk_b.study_context("DEMO"):
+            queue_b = sdk_b.workflows.query_management.sync_queries_to_triage("DEMO")
+            store_b = TriageStore()
+
+        queue_b_direct = sdk_b.workflows.query_management.sync_queries_to_triage("DEMO")
+        assert {item.item_id for item in queue_b} == {"DEMO:1", "DEMO:3"}
+        assert {item.item_id for item in queue_b_direct} == {"DEMO:1", "DEMO:3"}
+        assert "DEMO:2" not in {item.item_id for item in queue_b}
+        assert store_a.db_path != store_b.db_path
+        assert store_a.db_path.parent.name == "tenant-a.edc.example.test"
+        assert store_b.db_path.parent.name == "tenant-b.edc.example.test"
+
+        # Origin B's open DEMO:3 must not reopen Origin A's resolved DEMO:3, and vice versa
+        item_a3_after = store_a.get_triage_item("DEMO:3")
+        assert item_a3_after is not None and item_a3_after.status == TriageStatus.RESOLVED
+        item_b1 = store_b.get_triage_item("DEMO:1")
+        item_b3 = store_b.get_triage_item("DEMO:3")
+        assert item_b1 is not None
+        assert item_b1.assignee is None
+        assert [ann.comment for ann in item_b1.annotations] == ["Clean tenant B query"]
+        assert item_b3 is not None and item_b3.status == TriageStatus.NEW
+
+        db_file = store_a.db_path
+        with sqlite3.connect(db_file) as conn:
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+
+        raw_sqlite_bytes = b"".join(
+            p.read_bytes()
+            for p in (db_file, db_file.with_name(f"{db_file.name}-wal"))
+            if p.exists()
+        )
+        assert b"CANARY_PATIENT_NAME_A" not in raw_sqlite_bytes
+        assert b"1979-03-14" not in raw_sqlite_bytes
+        assert b"CANARY_CUSTOM_MRN_A" not in raw_sqlite_bytes
+        assert b"CANARY_API_TOKEN_A" not in raw_sqlite_bytes
+        if os.name == "posix":
+            assert (stat.S_IMODE(db_file.stat().st_mode) & 0o077) == 0
+
+
+async def test_async_multi_origin_sync_queries_to_triage_isolation(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Verify AsyncImednetSDK sync_queries_to_triage propagates governance context across worker threads."""
+    import respx
+
+    from imednet.sdk import AsyncImednetSDK
+
+    env_db = tmp_path / "async_triage" / "triage.sqlite3"
+    monkeypatch.setenv("IMEDNET_TRIAGE_DB_PATH", str(env_db))
+    monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
+
+    with respx.mock:
+        respx.get("https://async-a.edc.example.test/api/v1/edc/studies/DEMO/queries").respond(
+            json={
+                "data": [
+                    {
+                        "annotationId": 2,
+                        "subjectKey": "SUB-A",
+                        "queryComments": [
+                            {
+                                "sequence": 1,
+                                "closed": False,
+                                "comment": "patient_name=CANARY_ASYNC_PATIENT",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        respx.get("https://async-b.edc.example.test/api/v1/edc/studies/DEMO/queries").respond(
+            json={
+                "data": [
+                    {
+                        "annotationId": 9,
+                        "subjectKey": "SUB-B",
+                        "queryComments": [{"sequence": 1, "closed": False, "comment": "Async B"}],
+                    }
+                ]
+            }
+        )
+
+        async with (
+            AsyncImednetSDK(
+                api_key="a",  # pragma: allowlist secret
+                security_key="sa",  # pragma: allowlist secret
+                base_url="https://async-a.edc.example.test",
+            ) as sdk_a,
+            AsyncImednetSDK(
+                api_key="b",  # pragma: allowlist secret
+                security_key="sb",  # pragma: allowlist secret
+                base_url="https://async-b.edc.example.test",
+            ) as sdk_b,
+        ):
+            queue_a = await sdk_a.workflows.query_management.sync_queries_to_triage("DEMO")
+            queue_b = await sdk_b.workflows.query_management.sync_queries_to_triage("DEMO")
+
+    assert [item.item_id for item in queue_a] == ["DEMO:2"]
+    assert "CANARY_ASYNC_PATIENT" not in queue_a[0].annotations[0].comment
+    assert [item.item_id for item in queue_b] == ["DEMO:9"]
+    assert (tmp_path / "async_triage" / "async-a.edc.example.test" / "triage.sqlite3").exists()
+    assert (tmp_path / "async_triage" / "async-b.edc.example.test" / "triage.sqlite3").exists()
