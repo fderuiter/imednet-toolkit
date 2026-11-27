@@ -43,11 +43,12 @@ from imednet.utils.security import global_sensitivity_registry
 from imednet.utils.tabular import MASKED_SENTINEL, _contains_masked_sentinel
 
 from ..models.variables import Variable
-from ._base import _extract_form_ref, _ValidatorMixin
+from ._base import _extract_form_ref, _extract_record_data, _ValidatorMixin
 
 if TYPE_CHECKING:
     from ..endpoints.forms import AsyncFormsEndpoint, FormsEndpoint
     from ..endpoints.variables import AsyncVariablesEndpoint, VariablesEndpoint
+    from ..models.records import BaseRecordRequest
     from ..spi.facade import AsyncImednetFacade, ImednetFacade
 
 logger = logging.getLogger(__name__)
@@ -1899,14 +1900,14 @@ def calculate_readiness_score(
     return score, reasons
 
 
-def _has_existing_record_target(record: Mapping[str, Any]) -> bool:
+def _has_existing_record_target(record: Mapping[str, Any] | BaseRecordRequest | Any) -> bool:
     """Return True when *record* specifies an existing record or visit target."""
     for int_key in ("recordId", "record_id", "visitId", "visit_id"):
-        val = record.get(int_key)
+        val = record.get(int_key) if isinstance(record, Mapping) else getattr(record, int_key, None)
         if val is not None and not isinstance(val, bool) and str(val).strip() != "":
             return True
     for str_key in ("recordOid", "record_oid"):
-        val = record.get(str_key)
+        val = record.get(str_key) if isinstance(record, Mapping) else getattr(record, str_key, None)
         if val is not None and str(val).strip() != "":
             return True
     return False
@@ -1915,7 +1916,7 @@ def _has_existing_record_target(record: Mapping[str, Any]) -> bool:
 @overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
-    record: dict[str, Any],
+    record: Mapping[str, Any] | BaseRecordRequest,
     *,
     study_key: str | None = None,
     collect_errors: Literal[False] = False,
@@ -1926,7 +1927,7 @@ def validate_record_entry(
 @overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
-    record: dict[str, Any],
+    record: Mapping[str, Any] | BaseRecordRequest,
     *,
     study_key: str | None = None,
     collect_errors: Literal[True],
@@ -1937,7 +1938,7 @@ def validate_record_entry(
 @overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
-    record: dict[str, Any],
+    record: Mapping[str, Any] | BaseRecordRequest,
     *,
     study_key: str | None = None,
     collect_errors: bool = False,
@@ -1947,7 +1948,7 @@ def validate_record_entry(
 
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
-    record: dict[str, Any],
+    record: Mapping[str, Any] | BaseRecordRequest,
     *,
     study_key: str | None = None,
     collect_errors: bool = False,
@@ -1957,7 +1958,12 @@ def validate_record_entry(
 
     Resolves the form key from "formKey", "form_key", "formId", or "form_id".
     """
-    raw_study = study_key or record.get("studyKey") or record.get("study_key")
+    if isinstance(record, Mapping):
+        raw_study = study_key or record.get("studyKey") or record.get("study_key")
+    else:
+        raw_study = (
+            study_key or getattr(record, "study_key", None) or getattr(record, "studyKey", None)
+        )
     eff_study_key = str(raw_study) if raw_study else None
     fk, fid = _extract_form_ref(record)
     if not fk and fid is not None:
@@ -2006,7 +2012,7 @@ def validate_record_entry(
         return validate_record_data(
             schema,
             fk,
-            record.get("recordData", record.get("data", {})),
+            _extract_record_data(record),
             study_key=eff_study_key,
             collect_errors=collect_errors,
             record_index=record_index,
@@ -2030,7 +2036,7 @@ def validate_record_entry(
             ],
         )
 
-    raw_data = record.get("recordData", record.get("data", {}))
+    raw_data = _extract_record_data(record)
     if isinstance(raw_data, Mapping) and raw_data:
         forms_attr = getattr(schema, "forms", None)
         is_datadict_like = isinstance(forms_attr, Sequence) and not isinstance(
@@ -2120,15 +2126,22 @@ def validate_record_entry(
 
 def validate_records_batch(
     schema: ValidationSchemaProtocol,
-    records: Sequence[Mapping[str, Any]],
+    records: Sequence[Mapping[str, Any] | BaseRecordRequest],
     *,
     study_key: str | None = None,
     collect_errors: bool = True,
 ) -> BatchValidationReport:
     """Validate a sequence of records against *schema*, aggregating errors when requested."""
+    from ..models.records import BaseRecordRequest
+
     aggregated = BatchValidationReport(total_records=len(records))
     for idx, rec in enumerate(records):
-        rec_dict = rec if isinstance(rec, dict) else dict(rec)
+        if isinstance(rec, BaseRecordRequest):
+            rec_dict: dict[str, Any] = rec.model_dump(by_alias=True, exclude_none=True)
+        elif isinstance(rec, dict):
+            rec_dict = rec
+        else:
+            rec_dict = dict(rec)
         if collect_errors:
             entry_report = validate_record_entry(
                 schema,
@@ -2175,7 +2188,7 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
 
     def _needs_refresh(
         self,
-        record: dict[str, Any],
+        record: Mapping[str, Any] | BaseRecordRequest,
         study_key: str | None = None,
     ) -> tuple[str | None, bool]:
         """Determine if the schema cache needs refreshing for the given record.
@@ -2221,7 +2234,9 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
         variables = self._sdk.get_variables(study_key=study_key)
         self._refresh_common(variables, study_key=study_key)
 
-    def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
+    def validate_record(
+        self, study_key: str, record: Mapping[str, Any] | BaseRecordRequest
+    ) -> None:
         """Validate a single record payload."""
         form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
         if needs_refresh:
@@ -2234,7 +2249,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
                 raise ValidationError(f"Unknown form ID {fid}")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            _extract_record_data(record),
             study_key=study_key,
         )
 
@@ -2242,7 +2257,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
     def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[Mapping[str, Any] | BaseRecordRequest],
         *,
         collect_errors: Literal[False] = False,
     ) -> None: ...
@@ -2251,7 +2266,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
     def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[Mapping[str, Any] | BaseRecordRequest],
         *,
         collect_errors: Literal[True],
     ) -> BatchValidationReport: ...
@@ -2260,7 +2275,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
     def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[Mapping[str, Any] | BaseRecordRequest],
         *,
         collect_errors: bool = False,
     ) -> BatchValidationReport | None: ...
@@ -2268,7 +2283,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
     def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[Mapping[str, Any] | BaseRecordRequest],
         *,
         collect_errors: bool = False,
     ) -> BatchValidationReport | None:
@@ -2312,7 +2327,9 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
         variables = await call_async_facade_method(self._sdk, "get_variables", study_key=study_key)
         self._refresh_common(variables, study_key=study_key)
 
-    async def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
+    async def validate_record(
+        self, study_key: str, record: Mapping[str, Any] | BaseRecordRequest
+    ) -> None:
         """Validate a single record payload asynchronously."""
         form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
         if needs_refresh:
@@ -2325,7 +2342,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
                 raise ValidationError(f"Unknown form ID {fid}")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            _extract_record_data(record),
             study_key=study_key,
         )
 
@@ -2333,7 +2350,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
     async def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[Mapping[str, Any] | BaseRecordRequest],
         *,
         collect_errors: Literal[False] = False,
     ) -> None: ...
@@ -2342,7 +2359,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
     async def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[Mapping[str, Any] | BaseRecordRequest],
         *,
         collect_errors: Literal[True],
     ) -> BatchValidationReport: ...
@@ -2351,7 +2368,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
     async def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[Mapping[str, Any] | BaseRecordRequest],
         *,
         collect_errors: bool = False,
     ) -> BatchValidationReport | None: ...
@@ -2359,7 +2376,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
     async def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[Mapping[str, Any] | BaseRecordRequest],
         *,
         collect_errors: bool = False,
     ) -> BatchValidationReport | None:

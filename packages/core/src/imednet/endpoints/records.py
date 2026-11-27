@@ -18,6 +18,7 @@ from imednet.models.records import Record
 from imednet.utils.batch_coordinator import (
     DEFAULT_BATCH_CHUNK_SIZE,
     BatchSubmissionSummary,
+    _accepts_kwarg,
     _submit_records_batch_async,
     _submit_records_batch_sync,
 )
@@ -125,20 +126,30 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and optionally poll jobs."""
+
+        def _poll_one(sk: str, bid: str, **kw: Any) -> Any:
+            ep = JobsEndpoint(client=self._require_sync_client())
+            if not _accepts_kwarg(ep.poll, "resolve_results"):
+                kw.pop("resolve_results", None)
+            return ep.poll(sk, bid, **kw)
+
+        def _poll_many(sk: str, bids: list[str], **kw: Any) -> Any:
+            ep = JobsEndpoint(client=self._require_sync_client())
+            if not _accepts_kwarg(ep.poll_many, "resolve_results"):
+                kw.pop("resolve_results", None)
+            return ep.poll_many(sk, bids, **kw)
+
         return _submit_records_batch_sync(
             study_key,
             records_data,
             email_notify,
             validate_study_key_fn=self._validate_study_key,
             create_records_fn=self.create,
-            poll_single_fn=lambda sk, bid, **kw: JobsEndpoint(
-                client=self._require_sync_client()
-            ).poll(sk, bid, **kw),
-            poll_many_fn=lambda sk, bids, **kw: JobsEndpoint(
-                client=self._require_sync_client()
-            ).poll_many(sk, bids, **kw),
+            poll_single_fn=_poll_one,
+            poll_many_fn=_poll_many,
             sdk=_build_sync_schema_adapter(getattr(self, "_client", None)),
             schema=schema,
             chunk_size=chunk_size,
@@ -149,6 +160,7 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
         )
 
     def to_dataframe(
@@ -198,20 +210,30 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Validate once, asynchronously submit records in bounded chunks, and optionally poll."""
+
+        def _poll_one(sk: str, bid: str, **kw: Any) -> Any:
+            ep = AsyncJobsEndpoint(async_client=self._require_async_client())
+            if not _accepts_kwarg(ep.poll, "resolve_results"):
+                kw.pop("resolve_results", None)
+            return ep.poll(sk, bid, **kw)
+
+        def _poll_many(sk: str, bids: list[str], **kw: Any) -> Any:
+            ep = AsyncJobsEndpoint(async_client=self._require_async_client())
+            if not _accepts_kwarg(ep.poll_many, "resolve_results"):
+                kw.pop("resolve_results", None)
+            return ep.poll_many(sk, bids, **kw)
+
         return await _submit_records_batch_async(
             study_key,
             records_data,
             email_notify,
             validate_study_key_fn=self._validate_study_key,
             create_records_fn=self.create,
-            poll_single_fn=lambda sk, bid, **kw: AsyncJobsEndpoint(
-                async_client=self._require_async_client()
-            ).poll(sk, bid, **kw),
-            poll_many_fn=lambda sk, bids, **kw: AsyncJobsEndpoint(
-                async_client=self._require_async_client()
-            ).poll_many(sk, bids, **kw),
+            poll_single_fn=_poll_one,
+            poll_many_fn=_poll_many,
             sdk=_build_async_schema_adapter(getattr(self, "_async_client", None)),
             schema=schema,
             chunk_size=chunk_size,
@@ -222,6 +244,7 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
         )
 
     async def to_dataframe(

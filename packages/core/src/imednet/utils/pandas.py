@@ -288,6 +288,7 @@ def import_records_csv(
     on_progress: JobProgressHandler | None = None,
     dry_run: bool = False,
     collect_errors: bool = False,
+    resolve_results: bool = True,
 ) -> BatchSubmissionSummary:
     """Import records from a CSV file into ``study_key`` using stdlib CSV parsing.
 
@@ -317,6 +318,7 @@ def import_records_csv(
         on_progress=on_progress,
         dry_run=dry_run,
         collect_errors=collect_errors,
+        resolve_results=resolve_results,
     )
 
 

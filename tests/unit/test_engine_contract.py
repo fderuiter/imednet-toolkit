@@ -876,6 +876,7 @@ def test_all_39_aliased_models_emit_unified_constructors_and_field_aliases():
             "RegisterSubjectRequest",
             "UpdateScheduledRecordRequest",
             "CreateNewRecordRequest",
+            "UpdateRecordRequest",
         },
         "reporting.pyi": {
             "AdverseEvent",
@@ -896,7 +897,7 @@ def test_all_39_aliased_models_emit_unified_constructors_and_field_aliases():
         "variables.pyi": {"Variable"},
         "visits.pyi": {"Visit"},
     }
-    assert sum(len(v) for v in expected_aliased_by_module.values()) == 39
+    assert sum(len(v) for v in expected_aliased_by_module.values()) == 40
 
     class_nodes: dict[str, ast.ClassDef] = {}
     for pyi_name, expected_classes in expected_aliased_by_module.items():
@@ -958,6 +959,26 @@ def test_all_39_aliased_models_emit_unified_constructors_and_field_aliases():
             },
         ),
         ("CreateNewRecordRequest", {"form_key", "formKey", "subject_key", "subjectKey", "data"}),
+        (
+            "UpdateRecordRequest",
+            {
+                "form_key",
+                "formKey",
+                "form_id",
+                "formId",
+                "record_id",
+                "recordId",
+                "record_oid",
+                "recordOid",
+                "visit_id",
+                "visitId",
+                "record_status",
+                "recordStatus",
+                "reason_for_change",
+                "reasonForChange",
+                "data",
+            },
+        ),
     ):
         init_fn = next(
             stmt

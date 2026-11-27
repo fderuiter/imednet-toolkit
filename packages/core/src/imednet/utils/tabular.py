@@ -168,12 +168,18 @@ def _contains_masked_sentinel(value: Any) -> bool:
     return False
 
 
-def ensure_no_masked_sentinel(records: Sequence[Mapping[str, Any]]) -> None:
+def ensure_no_masked_sentinel(records: Sequence[Mapping[str, Any] | Any]) -> None:
     """Raise :class:`ValidationError` if any record contains ``***MASKED***``."""
+    from imednet.models.records import BaseRecordRequest
+
     for row_idx, rec in enumerate(records):
-        if not isinstance(rec, Mapping):
+        if isinstance(rec, BaseRecordRequest):
+            rec_map: Mapping[str, Any] = rec.model_dump(by_alias=True, exclude_none=True)
+        elif isinstance(rec, Mapping):
+            rec_map = rec
+        else:
             continue
-        for key, value in rec.items():
+        for key, value in rec_map.items():
             if key in _NESTED_DATA_COLUMNS and isinstance(value, Mapping):
                 for var_name, var_val in value.items():
                     if _contains_masked_sentinel(var_val):
@@ -697,13 +703,26 @@ def normalize_records_input(
             default_form_key=default_form_key,
             default_form_id=default_form_id,
         )
-    if isinstance(records_data, list):
-        ensure_no_masked_sentinel(records_data)
-        return records_data
-    if isinstance(records_data, Sequence) and not isinstance(records_data, (str, bytes)):
-        materialized = [dict(item) for item in records_data if isinstance(item, Mapping)]
-        if len(materialized) != len(records_data):
-            raise TypeError("All items in records_data sequence must be mappings.")
+    if isinstance(records_data, Sequence) and not isinstance(records_data, (str, bytes, bytearray)):
+        from imednet.models.records import BaseRecordRequest
+
+        if isinstance(records_data, list) and all(type(item) is dict for item in records_data):
+            ensure_no_masked_sentinel(records_data)
+            return records_data
+
+        materialized: list[JsonDict] = []
+        for item in records_data:
+            if isinstance(item, BaseRecordRequest):
+                materialized.append(item.model_dump(by_alias=True, exclude_none=True))
+            elif type(item) is dict:
+                materialized.append(item)
+            elif isinstance(item, Mapping):
+                materialized.append(dict(item))
+            else:
+                raise TypeError(
+                    "All items in records_data sequence must be mappings or BaseRecordRequest "
+                    f"instances; got {type(item).__name__}."
+                )
         ensure_no_masked_sentinel(materialized)
         return materialized
     raise TypeError(

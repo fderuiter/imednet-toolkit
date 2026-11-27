@@ -263,7 +263,9 @@ def test_create_or_update_records_wait_for_completion(
             [{"formKey": "F1", "data": {}}],
             schema=wf._schema,
         )
-        sdk.async_poll_job.assert_awaited_with("STUDY", "1", timeout=5, interval=0)
+        sdk.async_poll_job.assert_awaited_with(
+            "STUDY", "1", timeout=5, interval=0, resolve_results=True
+        )
     else:
         sdk.create_record = MagicMock(return_value=initial_job)
         sdk.poll_job = MagicMock(return_value=completed_job)
@@ -292,5 +294,5 @@ def test_create_or_update_records_wait_for_completion(
             [{"formKey": "F1", "data": {}}],
             schema=wf._schema,
         )
-        sdk.poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0)
+        sdk.poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0, resolve_results=True)
     assert result.state == "COMPLETED"

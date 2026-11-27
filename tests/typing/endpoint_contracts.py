@@ -1,7 +1,7 @@
 from collections.abc import AsyncIterator, Iterator
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
-from typing import Literal, assert_type
+from typing import Any, Literal, assert_type
 
 import pandas as pd
 
@@ -36,6 +36,7 @@ from imednet.models.records import (
     RecordData,
     RecordJobResponse,
     RegisterSubjectRequest,
+    UpdateRecordRequest,
     UpdateScheduledRecordRequest,
 )
 from imednet.models.reporting import (
@@ -103,7 +104,20 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.records.list('S'), Iterator[Record])
     assert_type(sdk.records.get('S', 1), Record)
     assert_type(sdk.records.create('S', [{'formKey': 'DEMOG'}]), Job)
+    assert_type(
+        sdk.records.create('S', (UpdateRecordRequest(record_id=1, data={'AGE': 40}),)),
+        Job,
+    )
     assert_type(sdk.records.create_batch('S', [{'a': 1}]), BatchSubmissionSummary)
+    batch_summary = sdk.records.create_batch(
+        'S',
+        [RegisterSubjectRequest(form_id=10, site_id=1)],
+        resolve_results=True,
+    )
+    assert_type(batch_summary.created_record_ids, list[int])
+    assert_type(batch_summary.enrolled_subject_keys, list[str])
+    assert_type(batch_summary.successful_records, list[dict[str, Any]])
+    assert_type(batch_summary.record_errors, list[dict[str, Any]])
     assert_type(sdk.sites.list('S'), Iterator[Site])
     assert_type(sdk.sites.get('S', 1), Site)
     assert_type(sdk.studies.list(), Iterator[Study])
@@ -275,6 +289,17 @@ def sync_contract(sdk: ImednetSDK) -> None:
         Job,
     )
     assert_type(sdk.workflows.record_update.create_new_record('S', 'F_VS', 'SUBJ', {}), Job)
+    assert_type(
+        sdk.workflows.record_update.update_record(
+            'S',
+            {},
+            record_id=10,
+            record_status='Record Complete',
+            reason_for_change='Audit',
+            resolve_results=True,
+        ),
+        Job,
+    )
     assert_type(sdk.workflows.register_subjects, SyncRegisterSubjectsWorkflowProtocol)
     assert_type(sdk.workflows.register_subjects.register_subjects('S', []), Job)
     assert_type(
@@ -473,6 +498,21 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     )
     assert_type(
         await sdk.workflows.record_update.async_create_new_record('S', 'F_VS', 'SUBJ', {}),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.update_record(
+            'S',
+            {},
+            record_id=10,
+            record_status='Record Complete',
+            reason_for_change='Audit',
+            resolve_results=True,
+        ),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_update_record('S', {}, record_id=10),
         Job,
     )
     assert_type(sdk.workflows.register_subjects, AsyncRegisterSubjectsWorkflowProtocol)
@@ -959,6 +999,19 @@ def mixed_alias_and_narrowed_type_contracts() -> None:
     assert_type(
         CreateNewRecordRequest(form_key='AE', subjectKey='SUBJ-01', data={'AETERM': 'Headache'}),
         CreateNewRecordRequest,
+    )
+    assert_type(
+        UpdateRecordRequest(
+            form_id=10,
+            subjectId=20,
+            record_id=30,
+            recordOid='REC-OID-1',
+            visit_id=40,
+            recordStatus='Record Complete',
+            reason_for_change='Correction',
+            data={'AGE': 55},
+        ),
+        UpdateRecordRequest,
     )
 
     # Mixed snake_case + camelCase constructors across all 33 multi-alias models

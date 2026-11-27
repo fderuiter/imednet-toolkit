@@ -511,7 +511,7 @@ class SyncSDKConvenienceMixin:
         """Create records in the specified study."""
         from imednet.utils.tabular import normalize_records_input
 
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         if skip_validation:
             return self.records.create(
                 study_key,
@@ -543,6 +543,7 @@ class SyncSDKConvenienceMixin:
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Validate once and submit records in bounded chunks (default 100 per POST)."""
         from imednet.core.context import _safe_context_attr
@@ -577,6 +578,7 @@ class SyncSDKConvenienceMixin:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
         )
 
     @_trace_method
@@ -592,14 +594,17 @@ class SyncSDKConvenienceMixin:
     ) -> JobStatus:
         """Poll a job until it reaches a terminal state, optionally resolving ``resultUrl`` payloads."""
         if resolve_results:
-            return self.jobs.poll(
-                study_key,
-                batch_id,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-                resolve_results=True,
-            )
+            from imednet.utils.batch_coordinator import _accepts_kwarg
+
+            if _accepts_kwarg(self.jobs.poll, "resolve_results"):
+                return self.jobs.poll(
+                    study_key,
+                    batch_id,
+                    interval=interval,
+                    timeout=timeout,
+                    on_progress=on_progress,
+                    resolve_results=True,
+                )
         return self.jobs.poll(
             study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
         )
@@ -618,15 +623,18 @@ class SyncSDKConvenienceMixin:
     ) -> JobPollSummary:
         """Poll multiple jobs concurrently until terminal states, optionally resolving ``resultUrl`` payloads."""
         if resolve_results:
-            return self.jobs.poll_many(
-                study_key,
-                batch_ids,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-                fail_fast=fail_fast,
-                resolve_results=True,
-            )
+            from imednet.utils.batch_coordinator import _accepts_kwarg
+
+            if _accepts_kwarg(self.jobs.poll_many, "resolve_results"):
+                return self.jobs.poll_many(
+                    study_key,
+                    batch_ids,
+                    interval=interval,
+                    timeout=timeout,
+                    on_progress=on_progress,
+                    fail_fast=fail_fast,
+                    resolve_results=True,
+                )
         return self.jobs.poll_many(
             study_key,
             batch_ids,
@@ -700,7 +708,7 @@ class AsyncSDKConvenienceMixin:
         """Asynchronously create records in the specified study."""
         from imednet.utils.tabular import normalize_records_input
 
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         if skip_validation:
             return await self.records.create(
                 study_key,
@@ -732,6 +740,7 @@ class AsyncSDKConvenienceMixin:
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once and submit records in bounded chunks."""
         from imednet.core.context import _safe_context_attr
@@ -781,6 +790,7 @@ class AsyncSDKConvenienceMixin:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
         )
 
     @_async_trace_method
@@ -796,14 +806,17 @@ class AsyncSDKConvenienceMixin:
     ) -> JobStatus:
         """Asynchronously poll a job until terminal state, optionally resolving ``resultUrl`` payloads."""
         if resolve_results:
-            return await self.jobs.poll(
-                study_key,
-                batch_id,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-                resolve_results=True,
-            )
+            from imednet.utils.batch_coordinator import _accepts_kwarg
+
+            if _accepts_kwarg(self.jobs.poll, "resolve_results"):
+                return await self.jobs.poll(
+                    study_key,
+                    batch_id,
+                    interval=interval,
+                    timeout=timeout,
+                    on_progress=on_progress,
+                    resolve_results=True,
+                )
         return await self.jobs.poll(
             study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
         )
@@ -822,15 +835,18 @@ class AsyncSDKConvenienceMixin:
     ) -> JobPollSummary:
         """Asynchronously poll multiple jobs concurrently, optionally resolving ``resultUrl`` payloads."""
         if resolve_results:
-            return await self.jobs.poll_many(
-                study_key,
-                batch_ids,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-                fail_fast=fail_fast,
-                resolve_results=True,
-            )
+            from imednet.utils.batch_coordinator import _accepts_kwarg
+
+            if _accepts_kwarg(self.jobs.poll_many, "resolve_results"):
+                return await self.jobs.poll_many(
+                    study_key,
+                    batch_ids,
+                    interval=interval,
+                    timeout=timeout,
+                    on_progress=on_progress,
+                    fail_fast=fail_fast,
+                    resolve_results=True,
+                )
         return await self.jobs.poll_many(
             study_key,
             batch_ids,
@@ -918,7 +934,7 @@ class AsyncSDKConvenienceMixin:
         """Deprecated alias for :meth:`create_record`."""
         from imednet.utils.tabular import normalize_records_input
 
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         if skip_validation:
             return await self.records.create(
                 study_key,
@@ -951,6 +967,7 @@ class AsyncSDKConvenienceMixin:
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Deprecated alias for :meth:`create_records_batch`."""
         from imednet.core.context import _safe_context_attr
@@ -1000,6 +1017,7 @@ class AsyncSDKConvenienceMixin:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
         )
 
     @deprecated("Use 'await sdk.poll_job(...)' instead.")
@@ -1016,14 +1034,17 @@ class AsyncSDKConvenienceMixin:
     ) -> JobStatus:
         """Deprecated alias for :meth:`poll_job`."""
         if resolve_results:
-            return await self.jobs.poll(
-                study_key,
-                batch_id,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-                resolve_results=True,
-            )
+            from imednet.utils.batch_coordinator import _accepts_kwarg
+
+            if _accepts_kwarg(self.jobs.poll, "resolve_results"):
+                return await self.jobs.poll(
+                    study_key,
+                    batch_id,
+                    interval=interval,
+                    timeout=timeout,
+                    on_progress=on_progress,
+                    resolve_results=True,
+                )
         return await self.jobs.poll(
             study_key, batch_id, interval=interval, timeout=timeout, on_progress=on_progress
         )
@@ -1043,15 +1064,18 @@ class AsyncSDKConvenienceMixin:
     ) -> JobPollSummary:
         """Deprecated alias for :meth:`poll_jobs`."""
         if resolve_results:
-            return await self.jobs.poll_many(
-                study_key,
-                batch_ids,
-                interval=interval,
-                timeout=timeout,
-                on_progress=on_progress,
-                fail_fast=fail_fast,
-                resolve_results=True,
-            )
+            from imednet.utils.batch_coordinator import _accepts_kwarg
+
+            if _accepts_kwarg(self.jobs.poll_many, "resolve_results"):
+                return await self.jobs.poll_many(
+                    study_key,
+                    batch_ids,
+                    interval=interval,
+                    timeout=timeout,
+                    on_progress=on_progress,
+                    fail_fast=fail_fast,
+                    resolve_results=True,
+                )
         return await self.jobs.poll_many(
             study_key,
             batch_ids,

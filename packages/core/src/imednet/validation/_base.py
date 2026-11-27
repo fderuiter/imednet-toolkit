@@ -3,16 +3,47 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from imednet.models.records import BaseRecordRequest
 
 
-def _extract_form_ref(record: Mapping[str, Any]) -> tuple[str | None, Any]:
-    """Extract (form_key, form_id) from a record payload without coalescing None to 0."""
-    raw_fk = record.get("formKey") or record.get("form_key")
+def _extract_form_ref(
+    record: Mapping[str, Any] | BaseRecordRequest | Any,
+) -> tuple[str | None, Any]:
+    """Extract (form_key, form_id) from a record payload or BaseRecordRequest without coalescing None to 0."""
+    if isinstance(record, Mapping):
+        raw_fk = record.get("formKey") or record.get("form_key")
+        fk = str(raw_fk) if raw_fk else None
+        raw_fid = (
+            record.get("formId") if record.get("formId") is not None else record.get("form_id")
+        )
+        fid = None if raw_fid == "" else raw_fid
+        return fk, fid
+    raw_fk = getattr(record, "form_key", None) or getattr(record, "formKey", None)
     fk = str(raw_fk) if raw_fk else None
-    raw_fid = record.get("formId") if record.get("formId") is not None else record.get("form_id")
+    raw_fid = getattr(record, "form_id", None)
+    if raw_fid is None:
+        raw_fid = getattr(record, "formId", None)
     fid = None if raw_fid == "" else raw_fid
     return fk, fid
+
+
+def _extract_record_data(record: Mapping[str, Any] | BaseRecordRequest | Any) -> dict[str, Any]:
+    """Extract clinical variable data dictionary from a record mapping or BaseRecordRequest."""
+    if isinstance(record, Mapping):
+        raw_data = record.get("recordData", record.get("data", {}))
+    else:
+        raw_data = getattr(record, "record_data", None)
+        if raw_data is None:
+            raw_data = getattr(record, "data", {})
+    root_val = getattr(raw_data, "root", None)
+    if isinstance(root_val, Mapping):
+        return dict(root_val)
+    if isinstance(raw_data, Mapping):
+        return dict(raw_data)
+    return raw_data  # type: ignore[no-any-return]
 
 
 class _ValidatorMixin:
@@ -22,13 +53,13 @@ class _ValidatorMixin:
 
     def _resolve_form_key(
         self,
-        record: dict[str, Any],
+        record: Mapping[str, Any] | BaseRecordRequest,
         study_key: str | None = None,
     ) -> str | None:
         """Resolve the form key from a record payload.
 
         Args:
-            record: The record data dictionary.
+            record: The record data dictionary or request model.
             study_key: Optional study key used for study-partitioned form ID lookup.
 
         Returns:

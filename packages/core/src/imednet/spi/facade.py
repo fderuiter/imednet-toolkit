@@ -240,6 +240,7 @@ class ImednetFacade(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Submit records in bounded chunks with optional multi-job polling."""
         ...
@@ -503,6 +504,7 @@ class AsyncImednetFacade(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Asynchronously submit records in bounded chunks with optional multi-job polling."""
         ...

@@ -103,6 +103,7 @@ class _RegisterSubjectsBase:
         schema: ValidationSchemaProtocol | None,
         options: tuple[bool, int, int, JobProgressHandler | None, bool, bool],
         single_job_method: tuple[str, str] | None,
+        resolve_results: bool = True,
     ) -> WorkflowBatchSpec:
         """Validate sites, filter enrolled subjects, and assemble a batch submission spec."""
         wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors = options
@@ -127,6 +128,7 @@ class _RegisterSubjectsBase:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
         )
 
     async def _execute_registration_batch_async(
@@ -147,6 +149,7 @@ class _RegisterSubjectsBase:
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Canonical asynchronous subject registration pipeline."""
@@ -176,6 +179,7 @@ class _RegisterSubjectsBase:
             schema=schema,
             options=opts,
             single_job_method=_single_job_method,
+            resolve_results=resolve_results,
         )
         create_fn = functools.partial(call_async_facade_method, async_sdk, "create_record")
         submitter = build_keyword_record_chunk_submitter(
@@ -218,6 +222,7 @@ class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate sites, filter enrolled subjects, and submit in bounded chunks."""
@@ -237,6 +242,7 @@ class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
             _single_job_method=_single_job_method,
         )
 
@@ -256,9 +262,22 @@ class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously register a single-chunk batch of subjects and return its Job."""
         pair = ("register_subjects", "register_subjects_batch")
+        batch_kwargs: dict[str, Any] = {
+            "filter_enrolled": filter_enrolled,
+            "skip_existing": skip_existing,
+            "subject_key_field": subject_key_field,
+            "schema": schema,
+            "on_progress": on_progress,
+            "dry_run": dry_run,
+            "collect_errors": collect_errors,
+            "_single_job_method": pair,
+        }
+        if not resolve_results:
+            batch_kwargs["resolve_results"] = False
         summary = await self.register_subjects_batch(
             study_key,
             subjects,
@@ -266,14 +285,7 @@ class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
             wait_for_completion,
             timeout,
             poll_interval,
-            filter_enrolled=filter_enrolled,
-            skip_existing=skip_existing,
-            subject_key_field=subject_key_field,
-            schema=schema,
-            on_progress=on_progress,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-            _single_job_method=pair,
+            **batch_kwargs,
         )
         return unwrap_single_submitted_job(summary, pair)
 
@@ -299,9 +311,23 @@ class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Deprecated alias for :meth:`register_subjects_batch`."""
+        batch_kwargs: dict[str, Any] = {
+            "chunk_size": chunk_size,
+            "filter_enrolled": filter_enrolled,
+            "skip_existing": skip_existing,
+            "subject_key_field": subject_key_field,
+            "schema": schema,
+            "on_progress": on_progress,
+            "dry_run": dry_run,
+            "collect_errors": collect_errors,
+            "_single_job_method": _single_job_method,
+        }
+        if not resolve_results:
+            batch_kwargs["resolve_results"] = False
         return await self.register_subjects_batch(
             study_key,
             subjects,
@@ -309,15 +335,7 @@ class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
             wait_for_completion,
             timeout,
             poll_interval,
-            chunk_size=chunk_size,
-            filter_enrolled=filter_enrolled,
-            skip_existing=skip_existing,
-            subject_key_field=subject_key_field,
-            schema=schema,
-            on_progress=on_progress,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-            _single_job_method=_single_job_method,
+            **batch_kwargs,
         )
 
     @deprecated(
@@ -340,9 +358,22 @@ class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated alias for :meth:`register_subjects`."""
         pair = ("async_register_subjects", "async_register_subjects_batch")
+        batch_kwargs: dict[str, Any] = {
+            "filter_enrolled": filter_enrolled,
+            "skip_existing": skip_existing,
+            "subject_key_field": subject_key_field,
+            "schema": schema,
+            "on_progress": on_progress,
+            "dry_run": dry_run,
+            "collect_errors": collect_errors,
+            "_single_job_method": pair,
+        }
+        if not resolve_results:
+            batch_kwargs["resolve_results"] = False
         if "async_register_subjects_batch" in vars(self):
             summary = await self.async_register_subjects_batch(
                 study_key,
@@ -351,14 +382,7 @@ class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
                 wait_for_completion,
                 timeout,
                 poll_interval,
-                filter_enrolled=filter_enrolled,
-                skip_existing=skip_existing,
-                subject_key_field=subject_key_field,
-                schema=schema,
-                on_progress=on_progress,
-                dry_run=dry_run,
-                collect_errors=collect_errors,
-                _single_job_method=pair,
+                **batch_kwargs,
             )
         else:
             summary = await self.register_subjects_batch(
@@ -368,14 +392,7 @@ class AsyncRegisterSubjectsWorkflow(_RegisterSubjectsBase):
                 wait_for_completion,
                 timeout,
                 poll_interval,
-                filter_enrolled=filter_enrolled,
-                skip_existing=skip_existing,
-                subject_key_field=subject_key_field,
-                schema=schema,
-                on_progress=on_progress,
-                dry_run=dry_run,
-                collect_errors=collect_errors,
-                _single_job_method=pair,
+                **batch_kwargs,
             )
         return unwrap_single_submitted_job(summary, pair)
 
@@ -435,6 +452,7 @@ class RegisterSubjectsWorkflow(_RegisterSubjectsBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Validate sites once, optionally filter enrolled subjects, and submit in bounded chunks."""
@@ -457,6 +475,7 @@ class RegisterSubjectsWorkflow(_RegisterSubjectsBase):
                 on_progress=on_progress,
                 dry_run=dry_run,
                 collect_errors=collect_errors,
+                resolve_results=resolve_results,
                 _single_job_method=_single_job_method,
             )
         )
@@ -477,10 +496,23 @@ class RegisterSubjectsWorkflow(_RegisterSubjectsBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Register a single-chunk batch of subjects synchronously and return its Job."""
         self._ensure_sync_mode("register_subjects", "async_register_subjects")
         pair = ("register_subjects", "register_subjects_batch")
+        batch_kwargs: dict[str, Any] = {
+            "filter_enrolled": filter_enrolled,
+            "skip_existing": skip_existing,
+            "subject_key_field": subject_key_field,
+            "schema": schema,
+            "on_progress": on_progress,
+            "dry_run": dry_run,
+            "collect_errors": collect_errors,
+            "_single_job_method": pair,
+        }
+        if not resolve_results:
+            batch_kwargs["resolve_results"] = False
         summary = self.register_subjects_batch(
             study_key,
             subjects,
@@ -488,14 +520,7 @@ class RegisterSubjectsWorkflow(_RegisterSubjectsBase):
             wait_for_completion,
             timeout,
             poll_interval,
-            filter_enrolled=filter_enrolled,
-            skip_existing=skip_existing,
-            subject_key_field=subject_key_field,
-            schema=schema,
-            on_progress=on_progress,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-            _single_job_method=pair,
+            **batch_kwargs,
         )
         return unwrap_single_submitted_job(summary, pair)
 
@@ -522,6 +547,7 @@ class RegisterSubjectsWorkflow(_RegisterSubjectsBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Deprecated asynchronous alias for subject batch registration."""
@@ -541,6 +567,7 @@ class RegisterSubjectsWorkflow(_RegisterSubjectsBase):
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
             _single_job_method=_single_job_method,
         )
 
@@ -566,9 +593,22 @@ class RegisterSubjectsWorkflow(_RegisterSubjectsBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated asynchronous alias for single-chunk subject registration."""
         pair = ("async_register_subjects", "async_register_subjects_batch")
+        batch_kwargs: dict[str, Any] = {
+            "filter_enrolled": filter_enrolled,
+            "skip_existing": skip_existing,
+            "subject_key_field": subject_key_field,
+            "schema": schema,
+            "on_progress": on_progress,
+            "dry_run": dry_run,
+            "collect_errors": collect_errors,
+            "_single_job_method": pair,
+        }
+        if not resolve_results:
+            batch_kwargs["resolve_results"] = False
         summary = await self.async_register_subjects_batch(
             study_key,
             subjects,
@@ -576,14 +616,7 @@ class RegisterSubjectsWorkflow(_RegisterSubjectsBase):
             wait_for_completion,
             timeout,
             poll_interval,
-            filter_enrolled=filter_enrolled,
-            skip_existing=skip_existing,
-            subject_key_field=subject_key_field,
-            schema=schema,
-            on_progress=on_progress,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-            _single_job_method=pair,
+            **batch_kwargs,
         )
         return unwrap_single_submitted_job(summary, pair)
 

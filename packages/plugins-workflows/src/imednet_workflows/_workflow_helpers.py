@@ -24,6 +24,7 @@ from imednet.spi.validation import ValidationSchemaProtocol
 
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+    from imednet.spi.models import RecordStatus
 
 FacadeLike = Union["ImednetFacade", "AsyncImednetFacade"]
 _ResultT = TypeVar("_ResultT")
@@ -49,6 +50,7 @@ class WorkflowBatchSpec:
     on_progress: JobProgressHandler | None = None
     dry_run: bool = False
     collect_errors: bool = False
+    resolve_results: bool = True
 
 
 def ensure_sync_workflow_mode(
@@ -99,7 +101,13 @@ def unwrap_single_submitted_job(summary: BatchSubmissionSummary, pair: tuple[str
 
 
 def bind_facade_pollers(
-    sdk: Any, study_key: str, is_async: bool, timeout: int, poll_interval: int
+    sdk: Any,
+    study_key: str,
+    is_async: bool,
+    timeout: int,
+    poll_interval: int,
+    *,
+    resolve_results: bool = True,
 ) -> tuple[Callable[..., Any], Callable[..., Any]]:
     """Bind synchronous or asynchronous SPI facade pollers for a study."""
     single_fn: Callable[..., Any] = (
@@ -107,8 +115,22 @@ def bind_facade_pollers(
     )
     many_fn: Callable[..., Any] = poll_facade_many_async if is_async else poll_facade_many_sync
     return (
-        functools.partial(single_fn, sdk, study_key, timeout=timeout, poll_interval=poll_interval),
-        functools.partial(many_fn, sdk, study_key, timeout=timeout, poll_interval=poll_interval),
+        functools.partial(
+            single_fn,
+            sdk,
+            study_key,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            resolve_results=resolve_results,
+        ),
+        functools.partial(
+            many_fn,
+            sdk,
+            study_key,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            resolve_results=resolve_results,
+        ),
     )
 
 
@@ -141,25 +163,50 @@ def build_keyword_record_chunk_submitter(
 
 
 def build_record_payload(
-    form_id: str | int,
-    form_type: Literal["key", "id"],
-    data: dict[str, Any],
+    form_id: str | int | None,
+    form_type: Literal["key", "id"] = "key",
+    data: dict[str, Any] | None = None,
     *,
     subject_id: str | int | None = None,
     subject_type: Literal["key", "id", "oid"] = "key",
+    subject_key: str | None = None,
+    subject_oid: str | None = None,
     site_id: str | int | None = None,
     site_type: Literal["name", "id"] = "name",
     interval_id: str | int | None = None,
     interval_type: Literal["name", "id"] = "name",
+    record_id: int | None = None,
+    record_oid: str | None = None,
+    visit_id: int | None = None,
+    record_status: RecordStatus | str | None = None,
+    reason_for_change: str | None = None,
 ) -> dict[str, Any]:
-    """Build a single record payload dictionary from form, subject, site, and interval refs."""
-    record: dict[str, Any] = {"formKey" if form_type == "key" else "formId": form_id, "data": data}
+    """Build a single record payload dictionary from form, subject, site, visit, and audit refs."""
+    record: dict[str, Any] = {}
+    if form_id is not None:
+        record["formKey" if form_type == "key" else "formId"] = form_id
+    record["data"] = data if data is not None else {}
     if subject_id is not None:
         record[_SUBJECT_ID_FIELDS[subject_type]] = subject_id
+    if subject_key is not None:
+        record["subjectKey"] = subject_key
+    if subject_oid is not None:
+        record["subjectOid"] = subject_oid
     if site_id is not None:
         record[_SITE_ID_FIELDS[site_type]] = site_id
     if interval_id is not None:
         record[_INTERVAL_ID_FIELDS[interval_type]] = interval_id
+    if record_id is not None:
+        record["recordId"] = record_id
+    if record_oid is not None:
+        record["recordOid"] = record_oid
+    if visit_id is not None:
+        record["visitId"] = visit_id
+    if record_status is not None:
+        raw_status = getattr(record_status, "value", record_status)
+        record["recordStatus"] = raw_status
+    if reason_for_change is not None:
+        record["reasonForChange"] = reason_for_change
     return record
 
 
@@ -171,6 +218,7 @@ def build_single_record_call_kwargs(
     poll_interval: int,
     email_notify: bool | str | None,
     schema: ValidationSchemaProtocol | None,
+    resolve_results: bool = True,
 ) -> dict[str, Any]:
     """Assemble keyword arguments for delegating one record to ``create_or_update_records``."""
     call_kwargs: dict[str, Any] = {
@@ -184,6 +232,8 @@ def build_single_record_call_kwargs(
         call_kwargs["schema"] = schema
     if email_notify is not None:
         call_kwargs["email_notify"] = email_notify
+    if not resolve_results:
+        call_kwargs["resolve_results"] = False
     return call_kwargs
 
 
@@ -196,7 +246,12 @@ def _coordinator_submit_kwargs(
 ) -> dict[str, Any]:
     """Assemble common ``BatchCoordinator.submit`` / ``AsyncBatchCoordinator.submit`` kwargs."""
     poll_single, poll_many = bind_facade_pollers(
-        sdk, spec.study_key, is_async, spec.timeout, spec.poll_interval
+        sdk,
+        spec.study_key,
+        is_async,
+        spec.timeout,
+        spec.poll_interval,
+        resolve_results=spec.resolve_results,
     )
     return {
         "schema": spec.schema,

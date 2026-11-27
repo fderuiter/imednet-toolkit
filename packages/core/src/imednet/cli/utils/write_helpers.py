@@ -126,6 +126,19 @@ def add_write_common_args(
         default=None,
         help="Optional email address or boolean flag for job completion notifications.",
     )
+    parser.add_argument(
+        "--resolve-results",
+        dest="resolve_results",
+        action="store_true",
+        default=True,
+        help="Fetch external resultUrl payloads when --wait is enabled (default).",
+    )
+    parser.add_argument(
+        "--no-resolve-results",
+        dest="resolve_results",
+        action="store_false",
+        help="Skip fetching external resultUrl payloads when --wait is enabled.",
+    )
     add_output_format(parser)
     add_simulation_arg(parser)
 
@@ -847,6 +860,9 @@ def _summary_to_json_item(summary: BatchSubmissionSummary) -> dict[str, Any]:
         "skippedCount": summary.skipped_count,
         "chunkCount": summary.chunk_count,
         "batchIds": summary.batch_ids,
+        "createdRecordIds": summary.created_record_ids,
+        "enrolledSubjectKeys": summary.enrolled_subject_keys,
+        "recordErrors": summary.record_errors,
         "allSuccessful": summary.all_successful,
         "jobs": sanitized_jobs,
         "validationReport": sanitized_report,
