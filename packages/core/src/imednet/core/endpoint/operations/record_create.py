@@ -6,19 +6,22 @@ Encapsulates validation, header construction, and execution logic for record cre
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
-from typing import Any, TypeVar
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.security import validate_header_value
-from imednet.utils.tabular import ensure_no_masked_sentinel
+from imednet.utils.tabular import ensure_no_masked_sentinel, normalize_record_payload_item
 from imednet.validation.cache import (
     ValidationSchemaProtocol,
     is_schema_record_prevalidated,
     validate_record_entry,
 )
+
+if TYPE_CHECKING:
+    from imednet.models.records import BaseRecordRequest
 
 T = TypeVar("T")
 _STUDY_PATH_RE = re.compile(r"/studies/([^/]+)/records(?:/|$)")
@@ -40,7 +43,7 @@ class RecordCreateOperation(Operation[T]):
     def __init__(
         self,
         path: str,
-        records_data: list[dict[str, Any]],
+        records_data: Sequence[BaseRecordRequest | Mapping[str, Any]],
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         *,
@@ -51,7 +54,7 @@ class RecordCreateOperation(Operation[T]):
 
         Args:
             path: The full API path for the request.
-            records_data: List of record data objects to create.
+            records_data: Sequence of record request models or mappings to create.
             email_notify: Email notification setting.
             schema: Optional validation schema (BaseSchemaCache or DataDictionary).
             study_key: Optional study key used for study-partitioned schema lookup.
@@ -63,7 +66,10 @@ class RecordCreateOperation(Operation[T]):
             ClientError: If email_notify contains invalid characters.
         """
         self.path = path
-        self.records_data = records_data
+        ensure_no_masked_sentinel(records_data)
+        self.records_data: list[dict[str, Any]] = [
+            normalize_record_payload_item(rec) for rec in records_data
+        ]
         self.email_notify = email_notify
         self.schema = schema
         self.study_key = study_key if study_key is not None else _infer_study_key_from_path(path)

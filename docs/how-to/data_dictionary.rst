@@ -98,6 +98,116 @@ Use :func:`~imednet.datadict.to_odm_xml` (or :func:`~imednet.datadict.to_odm_fil
    assert odm_dd.metadata.source == "cdisc_odm"
    assert "V_WEIGHT" in odm_dd.variables_for_form("F_VS")
 
+CDISC ODM ``RangeCheck`` Constraints and UTC Temporal Normalization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When :func:`~imednet.datadict.load_from_cdisc_odm` parses an ``ItemDef`` containing CDISC ODM 1.3.2 ``<RangeCheck>`` elements (which declare a required ``SoftHard`` attribute, an optional ``Comparator``, one or more ``<CheckValue>`` children, and an optional ``<ErrorMessage>``), it preserves the raw definitions under ``Variable.extraAttributes["rangeChecks"]``. Calling :func:`~imednet.datadict.extract_variable_constraints` normalizes them into frozen :class:`~imednet.datadict.RangeCheckConstraint` objects on ``VariableConstraints.range_checks``:
+
+* **Supported ODM comparators**: ``LT``, ``LE``, ``GT``, ``GE``, ``EQ``, ``NE``, ``IN``, and ``NOTIN``. Single-value numeric ``GE`` / ``GT`` and ``LE`` / ``LT`` checks also populate implied ``min_value`` and ``max_value`` bounds on ``VariableConstraints`` when explicit Variable bounds are absent, while ``IN`` and ``NOTIN`` test membership against multi-value ``check_values`` tuples.
+* ``Soft`` **vs.** ``Hard`` **severity**: During :func:`~imednet.validation.cache.validate_record_data`, a failed ``Soft`` check (``soft_hard="Soft"``) logs a warning and records a ``RecordValidationIssue`` with ``rule_id="range_check_soft"`` and ``severity="warning"`` in ``report.warnings`` without raising :class:`~imednet.errors.ValidationError`. A failed ``Hard`` check (``soft_hard="Hard"``, the default when ``SoftHard`` is ``"Hard"`` or any non-``"Soft"`` value) raises :class:`~imednet.errors.ValidationError` (or appends an error with ``rule_id="range_check"`` to ``report.errors`` when ``collect_errors=True``).
+* **UTC temporal normalization**: When both the Record Variable value and ``check_values`` target parse as temporal values via ``_parse_comparable_temporal``—supporting both iMednet ``MM-DD-YYYY`` and ISO ``YYYY-MM-DD`` dates and timestamps with optional ISO-8601 timezone offsets (``Z``, ``+HH:MM``, ``-HHMM``)—offset-aware timestamps are converted to UTC-normalized chronological instants before evaluating ``RangeCheckConstraint`` or XML condition comparisons.
+
+.. testcode::
+
+   from imednet.datadict import (
+       RangeCheckConstraint,
+       extract_variable_constraints,
+       load_from_cdisc_odm,
+   )
+   from imednet.validation.cache import validate_record_data
+
+   range_odm_xml = """<?xml version="1.0" encoding="UTF-8"?>
+   <ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" FileOID="ODM.RANGE.001"
+        FileType="Snapshot" CreationDateTime="2026-03-15T12:00:00Z" ODMVersion="1.3.2">
+     <Study OID="STUDY">
+       <GlobalVariables>
+         <StudyName>Range Study</StudyName>
+         <StudyDescription>ODM RangeCheck Demo</StudyDescription>
+         <ProtocolName>PROTO-01</ProtocolName>
+       </GlobalVariables>
+       <MetaDataVersion OID="MDV.001" Name="Version 1">
+         <FormDef OID="F_LAB" Name="Laboratory" Repeating="No">
+           <ItemGroupRef ItemGroupOID="IG_LAB" Mandatory="Yes"/>
+         </FormDef>
+         <ItemGroupDef OID="IG_LAB" Name="Lab Results" Repeating="No">
+           <ItemRef ItemOID="V_TEMP" OrderNumber="1" Mandatory="Yes"/>
+           <ItemRef ItemOID="V_STATUS" OrderNumber="2" Mandatory="No"/>
+           <ItemRef ItemOID="V_COLLECT_DT" OrderNumber="3" Mandatory="No"/>
+         </ItemGroupDef>
+         <ItemDef OID="V_TEMP" Name="Body Temperature" DataType="float">
+           <RangeCheck Comparator="GE" SoftHard="Hard">
+             <CheckValue>30.0</CheckValue>
+             <ErrorMessage><TranslatedText>Temperature below physiological minimum.</TranslatedText></ErrorMessage>
+           </RangeCheck>
+           <RangeCheck Comparator="LE" SoftHard="Soft">
+             <CheckValue>38.0</CheckValue>
+             <ErrorMessage><TranslatedText>Confirm febrile temperature above 38.0 C.</TranslatedText></ErrorMessage>
+           </RangeCheck>
+         </ItemDef>
+         <ItemDef OID="V_STATUS" Name="Result Status" DataType="text">
+           <RangeCheck Comparator="IN" SoftHard="Hard">
+             <CheckValue>NORMAL</CheckValue>
+             <CheckValue>ABNORMAL</CheckValue>
+           </RangeCheck>
+         </ItemDef>
+         <ItemDef OID="V_COLLECT_DT" Name="Collection Timestamp" DataType="datetime">
+           <RangeCheck Comparator="LE" SoftHard="Hard">
+             <CheckValue>2026-03-15T13:00:00Z</CheckValue>
+           </RangeCheck>
+         </ItemDef>
+       </MetaDataVersion>
+     </Study>
+   </ODM>
+   """
+
+   range_dd = load_from_cdisc_odm(io.StringIO(range_odm_xml), study_key="STUDY", strict=True)
+   temp_constraints = extract_variable_constraints(range_dd.variables_for_form("F_LAB")["V_TEMP"])
+   assert temp_constraints.range_checks == (
+       RangeCheckConstraint(
+           comparator="GE",
+           check_values=("30.0",),
+           soft_hard="Hard",
+           error_message="Temperature below physiological minimum.",
+       ),
+       RangeCheckConstraint(
+           comparator="LE",
+           check_values=("38.0",),
+           soft_hard="Soft",
+           error_message="Confirm febrile temperature above 38.0 C.",
+       ),
+   )
+
+   # Soft violation records 'range_check_soft' warning; MM-DD-YYYY -05:00 normalizes to 13:00:00Z UTC
+   soft_report = validate_record_data(
+       range_dd,
+       "F_LAB",
+       {
+           "V_TEMP": 38.6,
+           "V_STATUS": "NORMAL",
+           "V_COLLECT_DT": "03-15-2026 08:00:00-05:00",
+       },
+       collect_errors=True,
+   )
+   assert soft_report.is_valid is True
+   assert [w.rule_id for w in soft_report.warnings] == ["range_check_soft"]
+
+   # Hard violations (numeric GE, IN membership, and UTC timestamp > 13:00:00Z) record 'range_check' errors
+   hard_report = validate_record_data(
+       range_dd,
+       "F_LAB",
+       {
+           "V_TEMP": 28.5,
+           "V_STATUS": "PENDING",
+           "V_COLLECT_DT": "2026-03-15T09:30:00-05:00",
+       },
+       collect_errors=True,
+   )
+   assert [e.rule_id for e in hard_report.errors] == [
+       "range_check",
+       "range_check",
+       "range_check",
+   ]
+
 From REDCap CSV Data Dictionaries
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -232,14 +342,98 @@ Evaluating XML Business Logic Rules
    assert len(warn_eval.errors) == 0
    assert len(warn_eval.warnings) == 1
 
+Regex Edit Check Safety and Length Caps
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When authoring ``operator="regex"`` conditions inside ``BusinessLogicRule`` definitions, call :func:`~imednet.datadict.validate_regex_pattern` to verify syntax and ReDoS safety ahead of deployment:
+
+* **Pattern and repeat bounds**: Patterns exceeding ``512`` characters (``_MAX_REGEX_PATTERN_LENGTH``) or quantifiers with minimum or maximum repeat counts above ``256`` (``_MAX_REGEX_REPEAT_COUNT``) raise :exc:`ValueError`.
+* **AST-level ReDoS guards**: ``validate_regex_pattern`` parses the regular expression AST and rejects backreferences (such as ``\1``), quantified lookaround assertions, nested repeating quantifiers (such as ``(a+)+``), zero-width quantified subpatterns, and overlapping quantified alternations (such as ``(a|ab)+``).
+* **Schema validation vs. runtime evaluation vs. input length cap**:
+
+  1. :func:`~imednet.datadict.validate` inspects static ``operator="regex"`` rules across ``form.businessLogic`` and ``unassignedBusinessLogic`` and returns schema validation error strings (``variable '...' has unsafe or invalid regex: ...``) when ``validate_regex_pattern`` fails.
+  2. During :class:`~imednet.datadict.LogicTreeEvaluator` execution, any rule containing an invalid, over-length (``> 512`` characters), or backtracking-prone static or ``compare_variable`` regex pattern is safely marked ``skipped=True`` with ``skip_reason="unsafe_regex"`` and ``triggered=False``.
+  3. When a safe ``operator="regex"`` condition is evaluated against a Record Variable value exceeding ``1024`` characters (``_MAX_REGEX_INPUT_LENGTH``), the regex condition leaf returns ``False`` (``triggered=False``, ``skipped=False``) without scanning oversized text.
+
+.. testcode::
+
+   from imednet.datadict import Form, Metadata, validate_regex_pattern
+
+   validate_regex_pattern(r"^SUBJ-[0-9]{4}$")
+
+   for bad_pattern in ("a" * 513, "a{257}", r"(a+)+$"):
+       regex_rejected = False
+       try:
+           validate_regex_pattern(bad_pattern)
+       except ValueError:
+           regex_rejected = True
+       assert regex_rejected is True
+
+   unsafe_rule = BusinessLogicRule(
+       id="201",
+       name="Unsafe Subject Pattern",
+       type="Form",
+       status="Active",
+       form="F_VS",
+       logic=parse_logic_xml(
+           "<rule>"
+           '<conditions><condition variable="V_CODE" operator="regex" value="(a+)+$"/></conditions>'
+           '<actions><action type="error" message="Invalid code format."/></actions>'
+           "</rule>"
+       ),
+   )
+   unsafe_dd = DataDictionary(
+       metadata=Metadata.create(study_key="STUDY"),
+       forms=[
+           Form(
+               formKey="F_VS",
+               variables=[Variable(variableName="V_CODE", variableType="Text")],
+               businessLogic=[unsafe_rule],
+           )
+       ],
+   )
+
+   # 1. datadict.validate flags static unsafe regex patterns in BusinessLogicRule definitions
+   schema_regex_errors = validate(unsafe_dd)
+   assert any("unsafe or invalid regex" in err for err in schema_regex_errors)
+
+   # 2. LogicTreeEvaluator skips rules with unsafe regex conditions via skip_reason="unsafe_regex"
+   unsafe_res = evaluator.evaluate_rule(unsafe_rule, {"V_CODE": "aaaa"}, form_key="F_VS")
+   assert unsafe_res.skipped is True
+   assert unsafe_res.skip_reason == "unsafe_regex"
+
+   # 3. Safe regex conditions return False (not skipped) when Record Variable input exceeds 1024 chars
+   safe_regex_rule = BusinessLogicRule(
+       id="202",
+       name="Code Prefix Check",
+       type="Form",
+       status="Active",
+       form="F_VS",
+       logic=parse_logic_xml(
+           "<rule>"
+           '<conditions><condition variable="V_CODE" operator="regex" value="^ERR-"/></conditions>'
+           '<actions><action type="error" message="Error code detected."/></actions>'
+           "</rule>"
+       ),
+   )
+   short_res = evaluator.evaluate_rule(safe_regex_rule, {"V_CODE": "ERR-01"}, form_key="F_VS")
+   assert short_res.triggered is True and short_res.skipped is False
+
+   oversized_res = evaluator.evaluate_rule(
+       safe_regex_rule,
+       {"V_CODE": "ERR-" + ("X" * 1021)},
+       form_key="F_VS",
+   )
+   assert oversized_res.triggered is False and oversized_res.skipped is False
+
 Validating Record Submissions with ``schema=data_dictionary``
 -------------------------------------------------------------
 
-Unlike :class:`~imednet.validation.cache.SchemaCache` (which only checks Form existence, unknown Variables, and basic scalar types), passing a :class:`~imednet.datadict.DataDictionary` via ``schema=data_dictionary`` enforces:
+:class:`~imednet.validation.cache.BaseSchemaCache` (:class:`~imednet.validation.cache.SchemaCache` and :class:`~imednet.validation.cache.AsyncSchemaCache`) enforces Form existence, unknown Variable detection, scalar and nested ``***MASKED***`` PHI sentinel rejection (``rule_id="masked_phi"``), scalar Variable types (including historical type checks on ``deleted`` and ``disabled`` Variables in ``_retired_form_variables``), and active Required Variable policies (``Yes`` raises :class:`~imednet.errors.ValidationError`; ``Auto Query`` logs a warning). Passing a :class:`~imednet.datadict.DataDictionary` via ``schema=data_dictionary`` enforces those checks plus full Study metadata constraints:
 
-1. **Required Variable policies** (``required="Yes"`` raises :class:`~imednet.errors.ValidationError`; ``required="Auto Query"`` logs a warning).
+1. **Required Variable policies** (``required="Yes"`` raises :class:`~imednet.errors.ValidationError`; ``required="Auto Query"`` logs a warning; skipped on ``deleted`` / ``disabled`` Variables).
 2. **Choice membership** for categorical Variables (``Radio``, ``Single Select``, ``Multi Select``).
-3. **Numeric and string length bounds** (``minValue`` / ``maxValue`` and ``minLength`` / ``maxLength``).
+3. **Numeric, string length, and CDISC ODM** ``RangeCheck`` **bounds** (``minValue`` / ``maxValue``, ``minLength`` / ``maxLength``, and ``Soft`` / ``Hard`` :class:`~imednet.datadict.RangeCheckConstraint` checks).
 4. **Active XML edit checks** via :class:`~imednet.datadict.LogicTreeEvaluator` before any HTTP POST is sent.
 
 Pass ``schema=data_dictionary`` to :meth:`~imednet.endpoints.records.RecordsEndpoint.create`, :meth:`~imednet.endpoints.records.RecordsEndpoint.create_batch`, :class:`~imednet_workflows.record_update.RecordUpdateWorkflow`, or :class:`~imednet_workflows.register_subjects.RegisterSubjectsWorkflow` (see :doc:`/explanation/schema_validation`, :doc:`/how-to/register_subjects`, and :doc:`/how-to/workflows/bulk_submission`):
@@ -283,12 +477,12 @@ The ``imednet datadict`` command group exposes eight subcommands for Study metad
 .. code-block:: bash
 
    # 1. Compile canonical JSON from a 4-file CSV directory or ZIP archive
-   imednet datadict from-csv ./datadict_export.zip -o study_dd.json --strict --no-raw-xml
+   imednet datadict from-csv ./datadict_export.zip --study-key STUDY -o study_dd.json --strict --no-raw-xml
 
    # 2. Import CDISC ODM 1.3 XML into canonical Data Dictionary JSON
    imednet datadict from-odm ./study_odm.xml --study-key STUDY -o study_dd.json --strict
 
-   # 3. Export canonical Data Dictionary JSON to CDISC ODM 1.3 XML
+   # 3. Export a Data Dictionary (.json, .xml, REDCap .csv, .zip, or CSV directory) to CDISC ODM 1.3 XML
    imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
 
    # 4. Convert a REDCap CSV Data Dictionary into canonical JSON
@@ -300,9 +494,9 @@ The ``imednet datadict`` command group exposes eight subcommands for Study metad
    # 6. Export the canonical Draft 2020-12 JSON Schema
    imednet datadict schema -o data-dictionary.schema.json
 
-   # 7. Validate a Data Dictionary JSON file against model and JSON Schema rules
+   # 7. Validate a Data Dictionary (.json, .xml, REDCap .csv, .zip, or CSV directory) against model and JSON Schema rules
    imednet datadict validate study_dd.json --schema data-dictionary.schema.json
-   imednet datadict validate study_dd.json --format json
+   imednet datadict validate ./datadict_export.zip --format json
 
-   # 8. Compare two Study Data Dictionary revisions in text, Markdown, or JSON format
+   # 8. Compare two Study Data Dictionary revisions (.json, .xml, REDCap .csv, .zip, or CSV directory) in text, Markdown, or JSON format
    imednet datadict diff baseline_dd.json study_dd.json --format md

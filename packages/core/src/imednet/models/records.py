@@ -8,12 +8,11 @@ from enum import Enum
 from typing import Any
 
 from pydantic import (
+    ConfigDict,
     Field,
     RootModel,
-    SerializerFunctionWrapHandler,
     ValidatorFunctionWrapHandler,
     field_validator,
-    model_serializer,
 )
 
 from imednet.models._lifecycle import (
@@ -212,94 +211,118 @@ class RecordData(RootModel[dict[str, Any]]):
 
 
 class BaseRecordRequest(ImednetBaseModel):
-    """Base class for record creation/update requests."""
+    """Base class for record creation and update requests.
 
-    form_key: str = Field("", alias="formKey")
+    Declares all 14 optional iMednet REST API ``POST /records`` write attributes
+    with ``None`` defaults, forbids undeclared keys (``extra="forbid"``), and
+    serializes to camelCase keys omitting ``None`` and blank identifiers by default.
+    """
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        hide_input_in_errors=True,
+    )
+
+    form_key: str | None = Field(default=None, alias="formKey")
+    form_id: int | None = Field(default=None, alias="formId")
+    site_name: str | None = Field(default=None, alias="siteName")
+    site_id: int | None = Field(default=None, alias="siteId")
+    subject_key: str | None = Field(default=None, alias="subjectKey")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    interval_name: str | None = Field(default=None, alias="intervalName")
+    interval_id: int | None = Field(default=None, alias="intervalId")
+    visit_id: int | None = Field(default=None, alias="visitId")
+    record_id: int | None = Field(default=None, alias="recordId")
+    record_oid: str | None = Field(default=None, alias="recordOid")
+    record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
+    reason_for_change: str | None = Field(default=None, alias="reasonForChange")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
+
+    @field_validator("record_status", mode="wrap")
+    @classmethod
+    def _validate_request_record_status(
+        cls,
+        value: Any,
+        handler: ValidatorFunctionWrapHandler,
+    ) -> RecordStatus | str | None:
+        """Normalize blank strings to None and coerce matching RecordStatus values."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return coerce_field_status(RecordStatus, value, handler)
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        """Serialize record request payload to camelCase keys, omitting None fields by default."""
+        kwargs.setdefault("by_alias", True)
+        kwargs.setdefault("exclude_none", True)
+        dumped: dict[str, Any] = super().model_dump(**kwargs)
+        for status_key in ("recordStatus", "record_status"):
+            raw_status = dumped.get(status_key)
+            if isinstance(raw_status, Enum):
+                dumped[status_key] = str(raw_status.value)
+        if kwargs.get("exclude_none"):
+            for key in (
+                "form_key",
+                "formKey",
+                "site_name",
+                "siteName",
+                "subject_key",
+                "subjectKey",
+                "subject_oid",
+                "subjectOid",
+                "interval_name",
+                "intervalName",
+                "record_oid",
+                "recordOid",
+                "record_status",
+                "recordStatus",
+                "reason_for_change",
+                "reasonForChange",
+            ):
+                val = dumped.get(key)
+                if isinstance(val, str) and not val.strip():
+                    dumped.pop(key, None)
+        return dumped
 
 
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
-    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
-    ``None`` so server-assigned subject keys continue working by default; when
-    explicitly supplied, they are preserved for enrollment and deduplication.
+    Typically supplies ``formKey`` (or ``formId``) and a site identifier
+    (``siteName`` or ``siteId``). Optional ``subjectKey`` and ``subjectOid``
+    attributes are omitted when ``None`` or blank so server-assigned subject
+    keys continue working by default; when explicitly supplied, they are
+    preserved for enrollment and deduplication.
     """
-
-    site_name: str = Field(
-        "", alias="siteName", description="Name of the site where the subject is enrolled"
-    )
-    site_id: int | None = Field(
-        default=None,
-        alias="siteId",
-        description="Numeric ID of the site where the subject is enrolled",
-    )
-    subject_key: str | None = Field(
-        default=None,
-        alias="subjectKey",
-        description="Optional client-assigned subject key",
-    )
-    subject_oid: str | None = Field(
-        default=None,
-        alias="subjectOid",
-        description="Optional subject OID",
-    )
-
-    @field_validator("subject_key", "subject_oid", mode="before")
-    @classmethod
-    def _normalize_optional_subject_identifier(cls, value: Any) -> str | None:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
-
-    @model_serializer(mode="wrap")
-    def _serialize_omitting_unset_enrollment_fields(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, Any]:
-        serialized: dict[str, Any] = handler(self)
-        if self.site_id is None:
-            serialized.pop("site_id", None)
-            serialized.pop("siteId", None)
-        elif not self.site_name:
-            serialized.pop("site_name", None)
-            serialized.pop("siteName", None)
-        if self.subject_key is None:
-            serialized.pop("subject_key", None)
-            serialized.pop("subjectKey", None)
-        if self.subject_oid is None:
-            serialized.pop("subject_oid", None)
-            serialized.pop("subjectOid", None)
-        return serialized
-
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
-        """Serialize enrollment payload, omitting ``None`` optional attributes by default."""
-        kwargs.setdefault("exclude_none", True)
-        if not self.site_name and self.site_id is not None:
-            raw_exclude = kwargs.get("exclude")
-            if raw_exclude is None:
-                kwargs["exclude"] = {"site_name"}
-            elif isinstance(raw_exclude, set):
-                kwargs["exclude"] = raw_exclude | {"site_name"}
-            elif isinstance(raw_exclude, dict):
-                merged = dict(raw_exclude)
-                merged["site_name"] = True
-                kwargs["exclude"] = merged
-        return super().model_dump(**kwargs)
 
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):
-    """Payload for updating an existing scheduled record."""
+    """Payload for updating an existing scheduled record.
 
-    subject_key: str = Field("", alias="subjectKey")
-    interval_name: str = Field("", alias="intervalName")
+    Targets a scheduled form instance via ``formKey``/``formId``,
+    ``subjectKey``/``subjectId``/``subjectOid``, and ``intervalName``/``intervalId``
+    (or ``visitId``), with optional ``recordStatus`` and ``reasonForChange``.
+    """
 
 
 class CreateNewRecordRequest(BaseRecordRequest):
-    """Payload for creating a new unscheduled record."""
+    """Payload for creating a new unscheduled record.
 
-    subject_key: str = Field("", alias="subjectKey")
+    Targets a form and subject via ``formKey``/``formId`` and
+    ``subjectKey``/``subjectId``/``subjectOid``, with optional site, status,
+    and audit reason attributes.
+    """
+
+
+class UpdateRecordRequest(BaseRecordRequest):
+    """Payload for directly updating an existing record by identifier.
+
+    Targets an existing record via ``recordId``, ``recordOid``, or ``visitId``,
+    with optional ``formKey``/``formId``, ``recordStatus``, ``reasonForChange``,
+    and clinical ``data`` updates.
+    """
 
 
 __all__ = [
@@ -312,6 +335,7 @@ __all__ = [
     "RecordJobResponse",
     "RecordStatus",
     "RegisterSubjectRequest",
+    "UpdateRecordRequest",
     "UpdateScheduledRecordRequest",
     "is_valid_record_transition",
     "normalize_record_status",
