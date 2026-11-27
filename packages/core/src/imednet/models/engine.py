@@ -48,6 +48,7 @@ _CANONICAL_MODEL_MODULES: dict[str, str] = {
     "Record": "imednet.models.records",
     "RecordJobResponse": "imednet.models.records",
     "RegisterSubjectRequest": "imednet.models.records",
+    "UpdateRecordRequest": "imednet.models.records",
     "UpdateScheduledRecordRequest": "imednet.models.records",
     "Site": "imednet.models.sites",
     "Study": "imednet.models.studies",

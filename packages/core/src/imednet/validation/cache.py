@@ -40,7 +40,11 @@ from imednet.datadict.logic import (
 from imednet.datadict.models import DataDictionary
 from imednet.errors import UnknownVariableTypeError, ValidationError
 from imednet.utils.security import global_sensitivity_registry
-from imednet.utils.tabular import MASKED_SENTINEL, _contains_masked_sentinel
+from imednet.utils.tabular import (
+    MASKED_SENTINEL,
+    _contains_masked_sentinel,
+    normalize_record_payload_item,
+)
 
 from ..models.variables import Variable
 from ._base import _extract_form_ref, _ValidatorMixin
@@ -48,6 +52,7 @@ from ._base import _extract_form_ref, _ValidatorMixin
 if TYPE_CHECKING:
     from ..endpoints.forms import AsyncFormsEndpoint, FormsEndpoint
     from ..endpoints.variables import AsyncVariablesEndpoint, VariablesEndpoint
+    from ..models.records import BaseRecordRequest
     from ..spi.facade import AsyncImednetFacade, ImednetFacade
 
 logger = logging.getLogger(__name__)
@@ -1915,7 +1920,7 @@ def _has_existing_record_target(record: Mapping[str, Any]) -> bool:
 @overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
-    record: dict[str, Any],
+    record: BaseRecordRequest | Mapping[str, Any],
     *,
     study_key: str | None = None,
     collect_errors: Literal[False] = False,
@@ -1926,7 +1931,7 @@ def validate_record_entry(
 @overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
-    record: dict[str, Any],
+    record: BaseRecordRequest | Mapping[str, Any],
     *,
     study_key: str | None = None,
     collect_errors: Literal[True],
@@ -1937,7 +1942,7 @@ def validate_record_entry(
 @overload
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
-    record: dict[str, Any],
+    record: BaseRecordRequest | Mapping[str, Any],
     *,
     study_key: str | None = None,
     collect_errors: bool = False,
@@ -1947,7 +1952,7 @@ def validate_record_entry(
 
 def validate_record_entry(
     schema: ValidationSchemaProtocol,
-    record: dict[str, Any],
+    record: BaseRecordRequest | Mapping[str, Any],
     *,
     study_key: str | None = None,
     collect_errors: bool = False,
@@ -1957,9 +1962,12 @@ def validate_record_entry(
 
     Resolves the form key from "formKey", "form_key", "formId", or "form_id".
     """
-    raw_study = study_key or record.get("studyKey") or record.get("study_key")
+    record_map: Mapping[str, Any] = (
+        record if isinstance(record, Mapping) else normalize_record_payload_item(record)
+    )
+    raw_study = study_key or record_map.get("studyKey") or record_map.get("study_key")
     eff_study_key = str(raw_study) if raw_study else None
-    fk, fid = _extract_form_ref(record)
+    fk, fid = _extract_form_ref(record_map)
     if not fk and fid is not None:
         if isinstance(fid, bool):
             msg = f"Unknown form ID {fid}"
@@ -2006,12 +2014,12 @@ def validate_record_entry(
         return validate_record_data(
             schema,
             fk,
-            record.get("recordData", record.get("data", {})),
+            record_map.get("recordData", record_map.get("data", {})),
             study_key=eff_study_key,
             collect_errors=collect_errors,
             record_index=record_index,
         )
-    if not _has_existing_record_target(record):
+    if not _has_existing_record_target(record_map):
         msg = "Record payload must include 'formKey' or 'formId'"
         if not collect_errors:
             raise ValidationError(msg)
@@ -2030,7 +2038,7 @@ def validate_record_entry(
             ],
         )
 
-    raw_data = record.get("recordData", record.get("data", {}))
+    raw_data = record_map.get("recordData", record_map.get("data", {}))
     if isinstance(raw_data, Mapping) and raw_data:
         forms_attr = getattr(schema, "forms", None)
         is_datadict_like = isinstance(forms_attr, Sequence) and not isinstance(
@@ -2120,7 +2128,7 @@ def validate_record_entry(
 
 def validate_records_batch(
     schema: ValidationSchemaProtocol,
-    records: Sequence[Mapping[str, Any]],
+    records: Sequence[BaseRecordRequest | Mapping[str, Any]],
     *,
     study_key: str | None = None,
     collect_errors: bool = True,
@@ -2128,7 +2136,13 @@ def validate_records_batch(
     """Validate a sequence of records against *schema*, aggregating errors when requested."""
     aggregated = BatchValidationReport(total_records=len(records))
     for idx, rec in enumerate(records):
-        rec_dict = rec if isinstance(rec, dict) else dict(rec)
+        rec_dict = (
+            rec
+            if isinstance(rec, dict)
+            else dict(rec)
+            if isinstance(rec, Mapping)
+            else normalize_record_payload_item(rec)
+        )
         if collect_errors:
             entry_report = validate_record_entry(
                 schema,
@@ -2221,20 +2235,29 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
         variables = self._sdk.get_variables(study_key=study_key)
         self._refresh_common(variables, study_key=study_key)
 
-    def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
+    def validate_record(
+        self, study_key: str, record: BaseRecordRequest | Mapping[str, Any]
+    ) -> None:
         """Validate a single record payload."""
-        form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
+        rec_dict = (
+            record
+            if isinstance(record, dict)
+            else dict(record)
+            if isinstance(record, Mapping)
+            else normalize_record_payload_item(record)
+        )
+        form_key, needs_refresh = self._needs_refresh(rec_dict, study_key=study_key)
         if needs_refresh:
             self.refresh(study_key)
             if form_key is None:
-                form_key = self._resolve_form_key(record, study_key=study_key)
+                form_key = self._resolve_form_key(rec_dict, study_key=study_key)
         if form_key is None:
-            _, fid = _extract_form_ref(record)
+            _, fid = _extract_form_ref(rec_dict)
             if fid is not None:
                 raise ValidationError(f"Unknown form ID {fid}")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            rec_dict.get("recordData", rec_dict.get("data", {})),
             study_key=study_key,
         )
 
@@ -2242,7 +2265,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
     def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[BaseRecordRequest | Mapping[str, Any]],
         *,
         collect_errors: Literal[False] = False,
     ) -> None: ...
@@ -2251,7 +2274,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
     def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[BaseRecordRequest | Mapping[str, Any]],
         *,
         collect_errors: Literal[True],
     ) -> BatchValidationReport: ...
@@ -2260,7 +2283,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
     def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[BaseRecordRequest | Mapping[str, Any]],
         *,
         collect_errors: bool = False,
     ) -> BatchValidationReport | None: ...
@@ -2268,7 +2291,7 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
     def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[BaseRecordRequest | Mapping[str, Any]],
         *,
         collect_errors: bool = False,
     ) -> BatchValidationReport | None:
@@ -2278,16 +2301,24 @@ class SchemaValidator(BaseSchemaValidator["ImednetFacade"]):
                 self.validate_record(study_key, rec)
             return None
 
+        normalized = [
+            rec
+            if isinstance(rec, dict)
+            else dict(rec)
+            if isinstance(rec, Mapping)
+            else normalize_record_payload_item(rec)
+            for rec in records
+        ]
         refreshed = False
-        for rec in records:
-            _, needs_refresh = self._needs_refresh(rec, study_key=study_key)
+        for rec_dict in normalized:
+            _, needs_refresh = self._needs_refresh(rec_dict, study_key=study_key)
             if needs_refresh and not refreshed:
                 self.refresh(study_key)
                 refreshed = True
                 break
         return validate_records_batch(
             self.schema,
-            records,
+            normalized,
             study_key=study_key,
             collect_errors=True,
         )
@@ -2312,20 +2343,29 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
         variables = await call_async_facade_method(self._sdk, "get_variables", study_key=study_key)
         self._refresh_common(variables, study_key=study_key)
 
-    async def validate_record(self, study_key: str, record: dict[str, Any]) -> None:
+    async def validate_record(
+        self, study_key: str, record: BaseRecordRequest | Mapping[str, Any]
+    ) -> None:
         """Validate a single record payload asynchronously."""
-        form_key, needs_refresh = self._needs_refresh(record, study_key=study_key)
+        rec_dict = (
+            record
+            if isinstance(record, dict)
+            else dict(record)
+            if isinstance(record, Mapping)
+            else normalize_record_payload_item(record)
+        )
+        form_key, needs_refresh = self._needs_refresh(rec_dict, study_key=study_key)
         if needs_refresh:
             await self.refresh(study_key)
             if form_key is None:
-                form_key = self._resolve_form_key(record, study_key=study_key)
+                form_key = self._resolve_form_key(rec_dict, study_key=study_key)
         if form_key is None:
-            _, fid = _extract_form_ref(record)
+            _, fid = _extract_form_ref(rec_dict)
             if fid is not None:
                 raise ValidationError(f"Unknown form ID {fid}")
         self._validate_cached(
             form_key,
-            record.get("recordData", record.get("data", {})),
+            rec_dict.get("recordData", rec_dict.get("data", {})),
             study_key=study_key,
         )
 
@@ -2333,7 +2373,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
     async def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[BaseRecordRequest | Mapping[str, Any]],
         *,
         collect_errors: Literal[False] = False,
     ) -> None: ...
@@ -2342,7 +2382,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
     async def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[BaseRecordRequest | Mapping[str, Any]],
         *,
         collect_errors: Literal[True],
     ) -> BatchValidationReport: ...
@@ -2351,7 +2391,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
     async def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[BaseRecordRequest | Mapping[str, Any]],
         *,
         collect_errors: bool = False,
     ) -> BatchValidationReport | None: ...
@@ -2359,7 +2399,7 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
     async def validate_batch(
         self,
         study_key: str,
-        records: list[dict[str, Any]],
+        records: Sequence[BaseRecordRequest | Mapping[str, Any]],
         *,
         collect_errors: bool = False,
     ) -> BatchValidationReport | None:
@@ -2369,16 +2409,24 @@ class AsyncSchemaValidator(BaseSchemaValidator["AsyncImednetFacade"]):
                 await self.validate_record(study_key, rec)
             return None
 
+        normalized = [
+            rec
+            if isinstance(rec, dict)
+            else dict(rec)
+            if isinstance(rec, Mapping)
+            else normalize_record_payload_item(rec)
+            for rec in records
+        ]
         refreshed = False
-        for rec in records:
-            _, needs_refresh = self._needs_refresh(rec, study_key=study_key)
+        for rec_dict in normalized:
+            _, needs_refresh = self._needs_refresh(rec_dict, study_key=study_key)
             if needs_refresh and not refreshed:
                 await self.refresh(study_key)
                 refreshed = True
                 break
         return validate_records_batch(
             self.schema,
-            records,
+            normalized,
             study_key=study_key,
             collect_errors=True,
         )

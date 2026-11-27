@@ -141,10 +141,17 @@ connections):
 
    imednet records create STUDY --form-key F_DM --subject-key SUB-001 \
        -d ZIP_CODE=90210 -d 'NOTE="0042"' --schema ./study_dd.json --dry-run
-   imednet records update STUDY --record-id 601 -d V_AGE=51 \
-       --reason-for-change "Chart correction" --wait --format json
+   imednet records update STUDY --record-id 601 --visit-id 401 --record-status Complete \
+       -d V_AGE=51 --reason-for-change "Chart correction" --wait --format json
    cat batch.csv | imednet records import STUDY - --schema api --wait --format json
    imednet subjects register STUDY --file subjects.csv --skip-existing --wait
+
+``records create`` and ``records update`` accept all 14 iMednet ``POST /records`` write
+attributes via inline flags (``--form-key`` / ``--form-id``, ``--site-name`` / ``--site-id``,
+``--subject-key`` / ``--subject-id`` / ``--subject-oid``, ``--interval-name`` /
+``--interval-id``, ``--visit-id``, ``--record-id`` / ``--record-oid``, ``--record-status``,
+and ``--reason-for-change``) alongside repeatable ``-d`` / ``--data KEY=VALUE`` clinical
+variable assignments or ``--file`` / ``--json`` payloads.
 
 Passing ``--schema`` (``api``, canonical ``DataDictionary`` JSON, CDISC ODM XML, REDCap
 CSV, or a 4-file CSV directory/ZIP) preserves string values on ``text``, ``string``, and
