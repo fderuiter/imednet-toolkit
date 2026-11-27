@@ -3791,38 +3791,65 @@ def check_sdtm_and_phi_parity(repo_root: Path | None = None) -> bool:
     return has_errors
 
 
-_STALE_SCHEMA_CACHE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "BaseSchemaCache returns early claim",
-        re.compile(r"returns\s+early", re.IGNORECASE),
-    ),
-    (
-        "BaseSchemaCache skips required policies claim",
-        re.compile(r"skipping\s+required", re.IGNORECASE),
-    ),
+_STALE_SCHEMA_CACHE_SUBSTRINGS: tuple[tuple[str, str], ...] = (
+    ("BaseSchemaCache returns early claim", "returns early"),
+    ("BaseSchemaCache skips required policies claim", "skipping required"),
     (
         "SchemaCache structural and scalar type checks only claim",
-        re.compile(r"structural\s+and\s+scalar\s+type\s+checks\s+only", re.IGNORECASE),
+        "structural and scalar type checks only",
     ),
     (
         "SchemaCache basic scalar types only claim",
-        re.compile(
-            r"which\s+only\s+checks\s+Form\s+existence,\s+unknown\s+Variables,\s+and\s+basic\s+scalar\s+types",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "Required Variable policies marked Skipped in coverage table",
-        re.compile(r"\*\s+-\s+Required\s+Variable\s+policies[^\n]*\n\s+-\s+Skipped"),
-    ),
-    (
-        "Skipped by bullet listing Required Variable policies",
-        re.compile(
-            r"-\s+\*\*Skipped\s+by\*\*[^\n]*(?:\n\s+[^\n]+)*?Required\s+Variable",
-            re.IGNORECASE,
-        ),
+        "which only checks form existence, unknown variables, and basic scalar types",
     ),
 )
+
+
+def _find_stale_schema_cache_claims(guide_text: str) -> list[str]:
+    """Return labels for stale ``SchemaCache`` claims using linear line/token scans."""
+    claims: list[str] = []
+    normalized_text = " ".join(guide_text.split()).lower()
+    for label, phrase in _STALE_SCHEMA_CACHE_SUBSTRINGS:
+        if phrase in normalized_text:
+            claims.append(label)
+
+    lines = guide_text.splitlines()
+    for idx, line in enumerate(lines):
+        norm_line = " ".join(line.strip().split()).lower()
+        if (
+            norm_line.startswith("* - required variable policies")
+            and idx + 1 < len(lines)
+            and " ".join(lines[idx + 1].strip().split()).lower().startswith("- skipped")
+        ):
+            claims.append("Required Variable policies marked Skipped in coverage table")
+            break
+
+    idx = 0
+    while idx < len(lines):
+        raw_line = lines[idx]
+        stripped = raw_line.lstrip(" \t")
+        norm_line = " ".join(stripped.split()).lower()
+        if norm_line.startswith("- **skipped by**"):
+            bullet_indent = len(raw_line) - len(stripped)
+            bullet_parts = [norm_line]
+            idx += 1
+            while idx < len(lines):
+                cont_raw = lines[idx]
+                cont_stripped = cont_raw.lstrip(" \t")
+                if not cont_stripped:
+                    break
+                cont_indent = len(cont_raw) - len(cont_stripped)
+                if cont_indent <= bullet_indent:
+                    break
+                bullet_parts.append(" ".join(cont_stripped.split()).lower())
+                idx += 1
+            if "required variable" in " ".join(bullet_parts):
+                claims.append("Skipped by bullet listing Required Variable policies")
+                break
+        else:
+            idx += 1
+
+    return claims
 
 
 def _extract_dunder_all_from_file(init_py: Path) -> set[str] | None:
@@ -3907,10 +3934,9 @@ def check_clinical_guides_parity(repo_root: Path | None = None) -> bool:
                     f"Error: Required BaseSchemaCache policy token '{req_token}' missing from {guide_path}."
                 )
                 has_errors = True
-        for label, pattern in _STALE_SCHEMA_CACHE_PATTERNS:
-            if pattern.search(guide_text):
-                print(f"Error: Stale SchemaCache documentation ({label}) found in {guide_path}.")
-                has_errors = True
+        for label in _find_stale_schema_cache_claims(guide_text):
+            print(f"Error: Stale SchemaCache documentation ({label}) found in {guide_path}.")
+            has_errors = True
 
     for schema_token in (
         f"``{MASKED_SENTINEL}``",

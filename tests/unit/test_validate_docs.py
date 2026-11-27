@@ -23,6 +23,7 @@ from scripts.build_docs import (
 from scripts.validate_docs import (
     RETIRED_GITHUB_LABELS,
     WORKSPACE_PACKAGE_IDS,
+    _find_stale_schema_cache_claims,
     _verify_api_reference_parity,
     _verify_core_html,
     _verify_pagination_html,
@@ -1786,3 +1787,33 @@ def test_check_clinical_guides_parity_passes_repo_and_rejects_drift(tmp_path: Pa
             "docs/how-to/record_mapping.rst",
             originals["docs/how-to/record_mapping.rst"].replace(token, replacement),
         )
+
+
+def test_find_stale_schema_cache_claims_handles_multiline_and_adversarial_inputs_linearly() -> None:
+    """_find_stale_schema_cache_claims detects multiline RST bullets without regex backtracking."""
+    import time
+
+    assert _find_stale_schema_cache_claims(
+        "- **Skipped by** ``BaseSchemaCache``:\n"
+        "  Choice codelist membership, and Required\n"
+        "  Variable policies.\n"
+    ) == ["Skipped by bullet listing Required Variable policies"]
+
+    assert (
+        _find_stale_schema_cache_claims(
+            "- **Skipped by** ``BaseSchemaCache``:\n"
+            "  Choice codelist membership and XML rules.\n\n"
+            "Active Required Variable policies are enforced.\n"
+        )
+        == []
+    )
+
+    # Adversarial CodeQL ReDoS inputs with thousands of repeated '  \n' / continuation lines run in O(N)
+    adversarial_blank_lines = "- **skipped by**\n" + ("  \n" * 5000) + "Required Variable\n"
+    adversarial_continuations = "- **skipped by**\n" + ("  item\n" * 5000) + "end\n"
+
+    start = time.perf_counter()
+    assert _find_stale_schema_cache_claims(adversarial_blank_lines) == []
+    assert _find_stale_schema_cache_claims(adversarial_continuations) == []
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.25, f"Expected linear-time scan (<0.25s), took {elapsed:.3f}s"
