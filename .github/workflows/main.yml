@@ -737,7 +737,7 @@ jobs:
       - fuzzing
       - validate-package-consumption
       - docs
-    if: always()
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     permissions: {}
     steps:

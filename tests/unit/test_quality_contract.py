@@ -210,7 +210,8 @@ def _assert_guardrail_contract(
     assert "tests/utils/verification_reporter.py" in fuzz_patterns
 
     ci_gate = jobs["ci-gate"]
-    assert ci_gate.get("if") == "always()"
+    ci_gate_if = " ".join(str(ci_gate.get("if", "")).split())
+    assert ci_gate_if == "always() && !cancelled()"
     assert {
         "plan",
         "pre-commit",
@@ -724,6 +725,12 @@ def _mutate_missing_ci_gate(project: dict, hooks: dict, typos_cfg: dict, pipelin
     pipeline["jobs"].pop("ci-gate", None)
 
 
+def _mutate_ci_gate_bare_always(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["ci-gate"]["if"] = "always()"
+
+
 def _mutate_missing_sinks_export_filter(
     project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
 ) -> None:
@@ -838,6 +845,7 @@ def _mutate_lint_all_missing_secrets(
         _mutate_test_missing_skipped_build_allowance,
         _mutate_core_sinks_ignore_glob,
         _mutate_missing_ci_gate,
+        _mutate_ci_gate_bare_always,
         _mutate_missing_sinks_export_filter,
         _mutate_build_selective_upload,
         _mutate_test_hatch_run,
@@ -902,6 +910,12 @@ def test_all_workflows_enforce_sha_pinning_least_privilege_concurrency_and_safe_
             assert isinstance(job.get("permissions"), dict), f"{ctx} missing job permissions"
             if wf_name == "main.yml" and job_id == "scorecard":
                 assert job.get("if") == "github.event_name != 'pull_request'"
+            job_if = " ".join(str(job.get("if", "")).split())
+            if "always()" in job_if:
+                assert "!cancelled()" in job_if, (
+                    f"{ctx} uses job-level always() without !cancelled(), "
+                    "which overrides concurrency cancel-in-progress"
+                )
 
             steps = job.get("steps", [])
             for step in steps:
@@ -1006,6 +1020,19 @@ def test_ci_plan_outputs_and_ci_gate_evaluate_upstream_results(tmp_path: Path) -
         assert outputs["run_quality"] == expected_quality
         assert outputs["build_matrix"] == expected_build
         assert outputs["matrix"] == expected_test
+
+    ci_gate_if = " ".join(str(pipeline["jobs"]["ci-gate"].get("if", "")).split())
+
+    def _eval_ci_gate_if(expr: str, *, workflow_cancelled: bool) -> bool:
+        tokens = {part.strip() for part in expr.split("&&")}
+        if "always()" not in tokens:
+            return False
+        if "!cancelled()" in tokens and workflow_cancelled:
+            return False
+        return True
+
+    assert _eval_ci_gate_if(ci_gate_if, workflow_cancelled=True) is False
+    assert _eval_ci_gate_if(ci_gate_if, workflow_cancelled=False) is True
 
     gate_script = pipeline["jobs"]["ci-gate"]["steps"][0]["run"]
     for needs_payload, expected_rc in (
