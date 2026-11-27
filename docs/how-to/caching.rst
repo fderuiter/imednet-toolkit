@@ -32,16 +32,27 @@ using :class:`~imednet.endpoints.forms.FormsEndpoint` and
 What ``SchemaCache`` Validates vs. Skips
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Because ``SchemaCache`` is hydrated from REST ``/forms`` and ``/variables``
-endpoints, it performs **structural and scalar type checks only**:
+Because :class:`~imednet.validation.cache.BaseSchemaCache` (``SchemaCache`` and
+``AsyncSchemaCache``) is hydrated from REST ``/forms`` and ``/variables``
+endpoints, it enforces structural, PHI-sentinel, scalar type, and Required
+Variable checks, while skipping codelist and rule metadata not exposed by those
+endpoints:
 
-- **Enforced by** ``SchemaCache``: Form existence, ``formId`` to ``formKey``
-  resolution, unknown Variable rejection, and scalar Variable type checks
-  (``Number``, ``Integer``, ``Float``, ``Date``, ``Text``).
-- **Skipped by** ``SchemaCache``: Required Variable policies (``Yes`` and
-  ``Auto Query``), Choice codelist membership, numeric (``minValue`` /
-  ``maxValue``) and text length (``minLength`` / ``maxLength``) bounds, and
-  conditional XML business logic rules.
+- **Enforced by** ``BaseSchemaCache`` (``SchemaCache`` / ``AsyncSchemaCache``):
+  Form existence, ``formId`` to ``formKey`` resolution, unknown Variable
+  rejection, scalar and nested ``***MASKED***`` PHI sentinel rejection
+  (``rule_id="masked_phi"``), scalar Variable type checks (``Number``,
+  ``Integer``, ``Float``, ``Date``, ``Text``—including historical type checks on
+  ``deleted`` and ``disabled`` Variables stored in ``_retired_form_variables``
+  without requiring retired Variables to be populated), and Required Variable
+  policies on active Variables (``Yes`` raises
+  :class:`~imednet.errors.ValidationError` with ``rule_id="required"``;
+  ``Auto Query`` logs a warning with ``rule_id="required_auto_query"``).
+- **Skipped by** ``BaseSchemaCache`` (``SchemaCache`` / ``AsyncSchemaCache``):
+  Choice codelist membership, numeric (``minValue`` / ``maxValue``) and text
+  length (``minLength`` / ``maxLength``) bounds, CDISC ODM
+  :class:`~imednet.datadict.RangeCheckConstraint` checks, and conditional XML
+  business logic rules.
 
 When you need offline constraint and edit check enforcement without polling
 ``/forms`` or ``/variables``, load a

@@ -876,6 +876,7 @@ def test_all_39_aliased_models_emit_unified_constructors_and_field_aliases():
             "RegisterSubjectRequest",
             "UpdateScheduledRecordRequest",
             "CreateNewRecordRequest",
+            "UpdateRecordRequest",
         },
         "reporting.pyi": {
             "AdverseEvent",
@@ -896,7 +897,7 @@ def test_all_39_aliased_models_emit_unified_constructors_and_field_aliases():
         "variables.pyi": {"Variable"},
         "visits.pyi": {"Visit"},
     }
-    assert sum(len(v) for v in expected_aliased_by_module.values()) == 39
+    assert sum(len(v) for v in expected_aliased_by_module.values()) == 40
 
     class_nodes: dict[str, ast.ClassDef] = {}
     for pyi_name, expected_classes in expected_aliased_by_module.items():
@@ -941,23 +942,44 @@ def test_all_39_aliased_models_emit_unified_constructors_and_field_aliases():
     assert "alias='studyKey'" in study_fields["study_key"]
     assert "alias='sponsorKey'" in study_fields["sponsor_key"]
 
-    # BaseRecordRequest and subclasses accept RecordData | dict[str, Any] and both aliases in one __init__
-    for req_cls_name, extra_keys in (
-        ("BaseRecordRequest", {"form_key", "formKey", "data"}),
-        ("RegisterSubjectRequest", {"form_key", "formKey", "site_name", "siteName", "data"}),
-        (
-            "UpdateScheduledRecordRequest",
-            {
-                "form_key",
-                "formKey",
-                "subject_key",
-                "subjectKey",
-                "interval_name",
-                "intervalName",
-                "data",
-            },
-        ),
-        ("CreateNewRecordRequest", {"form_key", "formKey", "subject_key", "subjectKey", "data"}),
+    # BaseRecordRequest and subclasses accept RecordData | dict[str, Any] and all 14 aliases in one __init__
+    expected_record_req_keys = {
+        "form_key",
+        "formKey",
+        "form_id",
+        "formId",
+        "site_name",
+        "siteName",
+        "site_id",
+        "siteId",
+        "subject_key",
+        "subjectKey",
+        "subject_id",
+        "subjectId",
+        "subject_oid",
+        "subjectOid",
+        "interval_name",
+        "intervalName",
+        "interval_id",
+        "intervalId",
+        "visit_id",
+        "visitId",
+        "record_id",
+        "recordId",
+        "record_oid",
+        "recordOid",
+        "record_status",
+        "recordStatus",
+        "reason_for_change",
+        "reasonForChange",
+        "data",
+    }
+    for req_cls_name in (
+        "BaseRecordRequest",
+        "RegisterSubjectRequest",
+        "UpdateScheduledRecordRequest",
+        "CreateNewRecordRequest",
+        "UpdateRecordRequest",
     ):
         init_fn = next(
             stmt
@@ -965,7 +987,7 @@ def test_all_39_aliased_models_emit_unified_constructors_and_field_aliases():
             if isinstance(stmt, ast.FunctionDef) and stmt.name == "__init__"
         )
         kw_map = {a.arg: ast.unparse(a.annotation) for a in init_fn.args.kwonlyargs if a.annotation}
-        assert extra_keys.issubset(kw_map.keys())
+        assert expected_record_req_keys == set(kw_map.keys())
         assert kw_map["data"] == "RecordData | dict[str, Any]"
 
     # Role accepts 7-integer timestamp sequences and User.name emits @property -> str

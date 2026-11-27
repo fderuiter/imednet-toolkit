@@ -5,12 +5,13 @@ from __future__ import annotations
 import functools
 import inspect
 import os
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from typing_extensions import deprecated
 
 from imednet.spi.errors import ValidationError
-from imednet.spi.models import Job
+from imednet.spi.models import BaseRecordRequest, Job
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
     BatchSubmissionSummary,
@@ -47,11 +48,18 @@ if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 
-def _extract_record_form_ref(record: dict[str, Any]) -> tuple[str | None, Any]:
+def _extract_record_form_ref(
+    record: BaseRecordRequest | Mapping[str, Any],
+) -> tuple[str | None, Any]:
     """Extract (form_key, form_id) from a record payload without coalescing None to 0."""
-    raw_fk = record.get("formKey") or record.get("form_key")
+    rec_map: Mapping[str, Any] = (
+        record.model_dump(by_alias=True, exclude_none=True)
+        if isinstance(record, BaseRecordRequest)
+        else record
+    )
+    raw_fk = rec_map.get("formKey") or rec_map.get("form_key")
     fk = str(raw_fk) if raw_fk else None
-    raw_fid = record.get("formId") if record.get("formId") is not None else record.get("form_id")
+    raw_fid = rec_map.get("formId") if rec_map.get("formId") is not None else rec_map.get("form_id")
     fid = None if raw_fid == "" else raw_fid
     return fk, fid
 
@@ -83,7 +91,7 @@ class _RecordUpdateBase:
         return self._schema, not isinstance(self._schema, BaseSchemaCache)
 
     def _collect_distinct_form_refs(
-        self, records_data: list[dict[str, Any]]
+        self, records_data: Sequence[BaseRecordRequest | Mapping[str, Any]]
     ) -> tuple[list[str], list[Any]]:
         """Collect distinct explicit form keys and form IDs across all records in order."""
         seen_keys: set[str] = set()
@@ -142,7 +150,7 @@ class _RecordUpdateBase:
                 raise ValidationError(f"Unknown form ID {fid}")
 
     def _prepare_form_ref_validation(
-        self, study_key: str, records_data: list[dict[str, Any]]
+        self, study_key: str, records_data: Sequence[BaseRecordRequest | Mapping[str, Any]]
     ) -> tuple[BaseSchemaCache[Any], list[str], list[Any], bool] | None:
         """Collect distinct form references and determine whether cache refresh is needed."""
         if not records_data or not isinstance(self._schema, BaseSchemaCache):
@@ -161,7 +169,7 @@ class _RecordUpdateBase:
             await res
 
     async def _async_validate_form_key(
-        self, study_key: str, records_data: list[dict[str, Any]]
+        self, study_key: str, records_data: Sequence[BaseRecordRequest | Mapping[str, Any]]
     ) -> None:
         """Asynchronous form-key and form-ID validation with single-pass cache refresh."""
         prepared = self._prepare_form_ref_validation(study_key, records_data)
@@ -696,7 +704,9 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
             SyncToAsyncFacadeAdapter(cast("ImednetFacade", self._sdk)),
         )
 
-    def _validate_form_key(self, study_key: str, records_data: list[dict[str, Any]]) -> None:
+    def _validate_form_key(
+        self, study_key: str, records_data: Sequence[BaseRecordRequest | Mapping[str, Any]]
+    ) -> None:
         """Refresh schema once if any distinct form key or form ID in the batch is uncached."""
         self._ensure_sync_mode("_validate_form_key", "_async_validate_form_key")
         run_sync_over_async(lambda: self._async_validate_form_key(study_key, records_data))

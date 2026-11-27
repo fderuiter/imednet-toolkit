@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
@@ -159,6 +160,21 @@ def _read_source_text(source: Path | str | TextIO | BinaryIO) -> str:
     raise TypeError(f"Unsupported source type for REDCap loader: {type(source)}")
 
 
+_REDCAP_DECIMAL_DP_RE = re.compile(r"^(?:number|decimal|float)_(\d+)dp(?:_comma_decimal)?$")
+
+
+def _extract_decimal_precision(
+    field_type: str | None,
+    validation_type: str | None,
+) -> str | None:
+    """Extract decimal places from REDCap text validation types (e.g. number_2dp -> '2')."""
+    if (field_type or "").strip().lower() != "text":
+        return None
+    vt = (validation_type or "").strip().lower()
+    match = _REDCAP_DECIMAL_DP_RE.match(vt)
+    return match.group(1) if match else None
+
+
 def _map_field_type(
     field_type: str | None,
     validation_type: str | None,
@@ -181,13 +197,22 @@ def _map_field_type(
     if ft == "text":
         if "datetime" in vt:
             return "DateTime"
+        if vt in ("date_dmy", "date dmy") or vt.startswith("date_dmy"):
+            return "Date DMY"
         if "date" in vt:
             return "Date"
         if "time" in vt:
             return "Time"
         if vt in ("int", "integer"):
             return "Integer"
-        if vt in ("number", "float", "decimal"):
+        if vt in (
+            "number",
+            "float",
+            "decimal",
+            "number_comma_decimal",
+            "decimal_comma_decimal",
+            "float_comma_decimal",
+        ) or _REDCAP_DECIMAL_DP_RE.match(vt):
             return "Float"
         return "Text"
 
@@ -197,7 +222,7 @@ def _map_field_type(
 def _parse_redcap_choices(raw_choices: str | None, field_type: str | None) -> list[Choice]:
     """Parse pipe-separated REDCap choices or synthesize defaults for yesno/truefalse."""
     ft = (field_type or "").strip().lower()
-    if ft == "calc":
+    if ft in ("calc", "slider"):
         return []
 
     choices: list[Choice] = []
@@ -337,13 +362,16 @@ def load_from_redcap(
             forms_vars[form_key] = []
 
         field_type = known.get("fieldType")
+        ft_lower = (field_type or "").strip().lower()
         val_type = known.get("textValidationType")
         var_type = _map_field_type(field_type, val_type, var_name, record_warning)
 
-        # Store calculation equation, bounds, annotations, and metadata in extraAttributes
+        # Store calculation equation, slider labels, bounds, annotations, and metadata in extraAttributes
         raw_choices = known.get("choices")
-        if (field_type or "").lower() == "calc" and raw_choices:
+        if ft_lower == "calc" and raw_choices:
             extra["calculation"] = raw_choices
+        elif ft_lower == "slider" and raw_choices:
+            extra["sliderLabels"] = raw_choices
 
         for extra_key in (
             "branchingLogic",
@@ -370,10 +398,19 @@ def load_from_redcap(
         if max_bound:
             extra["textValidationMax"] = max_bound
 
+        if ft_lower == "slider":
+            if not min_bound:
+                extra["textValidationMin"] = "0"
+            if not max_bound:
+                extra["textValidationMax"] = "100"
+
         choices = _parse_redcap_choices(raw_choices, field_type)
 
         req_raw = (known.get("requiredField") or "").lower()
-        req_val = "Yes" if req_raw in ("y", "yes", "1", "true") else ("No" if req_raw else None)
+        if ft_lower == "descriptive":
+            req_val: str | None = "No"
+        else:
+            req_val = "Yes" if req_raw in ("y", "yes", "1", "true") else ("No" if req_raw else None)
 
         seq = len(forms_vars[form_key]) + 1
 
@@ -384,7 +421,7 @@ def load_from_redcap(
             sequence=seq,
             required=req_val,
             format=val_type or None,
-            precision=None,
+            precision=_extract_decimal_precision(field_type, val_type),
             choices=choices,
             extraAttributes=extra,
         )

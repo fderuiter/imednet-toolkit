@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -18,14 +19,23 @@ from imednet.spi.models import (
     calculate_legacy_status,
 )
 from imednet.spi.utils import (
+    SensitivityRegistry,
     SyncToAsyncFacadeAdapter,
+    build_study_sensitivity_registry,
     call_async_facade_method,
+    extract_sdk_base_url,
     is_async_facade,
     maybe_to_thread,
     normalize_iso_date,
     parse_iso_datetime,
+    reset_base_url_context,
     resolve_enrichment_pipeline,
+    resolve_sdk_base_url,
+    resolve_study_configuration,
     run_sync_over_async,
+    sanitize_diagnostic_text,
+    sdk_governance_context,
+    set_base_url_context,
 )
 
 from ._filter_bounds import filter_queries_by_subject_keys, plan_site_subject_query_filters
@@ -84,18 +94,47 @@ class _QueryManagementBase:
             return resolved in (QueryStatus.OPEN, QueryStatus.ANSWERED)
         return resolved == QueryStatus.OPEN
 
+    @contextmanager
+    def _governance_context(self) -> Iterator[None]:
+        """Bind active SDK ``base_url`` and ``security_key`` governance context."""
+        raw_sdk = getattr(self, "_sdk", None)
+        if isinstance(raw_sdk, SyncToAsyncFacadeAdapter):
+            raw_sdk = raw_sdk.sync_sdk
+        if raw_sdk is None:
+            yield
+            return
+        with sdk_governance_context(raw_sdk):
+            token_norm = (
+                set_base_url_context(resolve_sdk_base_url(raw_sdk))
+                if extract_sdk_base_url(raw_sdk) is not None
+                else None
+            )
+            try:
+                yield
+            finally:
+                if token_norm is not None:
+                    reset_base_url_context(token_norm)
+
     @staticmethod
+    def _resolve_study_sensitivity_registry(study_key: str) -> SensitivityRegistry:
+        """Resolve a study-aware ``SensitivityRegistry`` from committed ``StudyConfiguration``."""
+        study_cfg = resolve_study_configuration(study_key)
+        phi_fields = study_cfg.phi_fields if study_cfg is not None else None
+        return build_study_sensitivity_registry(phi_fields)
+
     def _resolve_triage_store(
+        self,
         store: TriageStoreProtocol | str | Path | None,
     ) -> TriageStoreProtocol:
-        """Resolve a TriageStore instance from argument or imednet.stores entry point."""
+        """Resolve a TriageStore instance bound to the active SDK governance context."""
         if store is not None and not isinstance(store, (str, Path)):
             return store
-        eps = list(entry_points(group="imednet.stores", name="TriageStore"))
-        store_cls: Any = eps[0].load() if eps else TriageStore
-        if store is None:
-            return store_cls()  # type: ignore[no-any-return]
-        return store_cls(store)  # type: ignore[no-any-return]
+        with self._governance_context():
+            eps = list(entry_points(group="imednet.stores", name="TriageStore"))
+            store_cls: Any = eps[0].load() if eps else TriageStore
+            if store is None:
+                return store_cls()  # type: ignore[no-any-return]
+            return store_cls(store)  # type: ignore[no-any-return]
 
     @staticmethod
     def _parse_comment_timestamp(raw_date: Any) -> datetime:
@@ -141,8 +180,12 @@ class _QueryManagementBase:
         index: int,
         existing: TriageItem | None = None,
         default_severity: str = "medium",
+        registry: SensitivityRegistry | None = None,
     ) -> TriageItem:
-        """Map a clinical Query model into a TriageItem."""
+        """Map a clinical Query model into a TriageItem with scrubbed comments."""
+        active_registry = (
+            registry if registry is not None else cls._resolve_study_sensitivity_registry(study_key)
+        )
         item_id = cls._build_triage_item_id(query, study_key, index)
         query_status = cls._resolve_query_status(query)
         if query_status == QueryStatus.ANSWERED:
@@ -199,11 +242,12 @@ class _QueryManagementBase:
             user_id = (
                 raw_user.strip() if isinstance(raw_user, str) and raw_user.strip() else "system"
             )
+            scrubbed_text = sanitize_diagnostic_text(text, registry=active_registry)
             annotations.append(
                 TriageAnnotation(
                     annotation_id=ann_id_str,
                     user_id=user_id,
-                    comment=text,
+                    comment=scrubbed_text,
                     timestamp=cls._parse_comment_timestamp(raw_date),
                 )
             )
@@ -211,11 +255,15 @@ class _QueryManagementBase:
         if not annotations:
             raw_desc = getattr(query, "description", None)
             if isinstance(raw_desc, str) and raw_desc.strip():
+                scrubbed_desc = sanitize_diagnostic_text(
+                    raw_desc.strip(),
+                    registry=active_registry,
+                )
                 annotations.append(
                     TriageAnnotation(
                         annotation_id="description",
                         user_id="system",
-                        comment=raw_desc.strip(),
+                        comment=scrubbed_desc,
                         timestamp=cls._parse_comment_timestamp(
                             getattr(query, "date_created", None)
                         ),
@@ -240,19 +288,22 @@ class _QueryManagementBase:
         default_severity: str,
     ) -> list[TriageItem]:
         """Persist fetched queries into the resolved TriageStore synchronously."""
-        target_store = self._resolve_triage_store(store)
-        for idx, query in enumerate(queries, start=1):
-            item_id = self._build_triage_item_id(query, study_key, idx)
-            existing = target_store.get_triage_item(item_id)
-            triage_item = self._query_to_triage_item(
-                query,
-                study_key=study_key,
-                index=idx,
-                existing=existing,
-                default_severity=default_severity,
-            )
-            target_store.upsert_item(triage_item)
-        return target_store.get_queue(study_key)
+        with self._governance_context():
+            target_store = self._resolve_triage_store(store)
+            registry = self._resolve_study_sensitivity_registry(study_key)
+            for idx, query in enumerate(queries, start=1):
+                item_id = self._build_triage_item_id(query, study_key, idx)
+                existing = target_store.get_triage_item(item_id)
+                triage_item = self._query_to_triage_item(
+                    query,
+                    study_key=study_key,
+                    index=idx,
+                    existing=existing,
+                    default_severity=default_severity,
+                    registry=registry,
+                )
+                target_store.upsert_item(triage_item)
+            return target_store.get_queue(study_key)
 
     @staticmethod
     def _queries_to_odm_annotations(
@@ -390,26 +441,27 @@ class AsyncQueryManagementWorkflow(_QueryManagementBase):
         **kwargs: Any,
     ) -> list[TriageItem]:
         """Asynchronously synchronize clinical queries into a local TriageStore queue."""
-        if unresolved_only:
-            queries = await self.get_unresolved_queries(
-                study_key,
-                additional_filter=additional_filter,
-                **kwargs,
-            )
-        else:
-            filters = dict(additional_filter) if additional_filter else {}
-            queries = list(
-                await call_async_facade_method(
-                    self._sdk, "get_queries", study_key, **filters, **kwargs
+        with self._governance_context():
+            if unresolved_only:
+                queries = await self.get_unresolved_queries(
+                    study_key,
+                    additional_filter=additional_filter,
+                    **kwargs,
                 )
+            else:
+                filters = dict(additional_filter) if additional_filter else {}
+                queries = list(
+                    await call_async_facade_method(
+                        self._sdk, "get_queries", study_key, **filters, **kwargs
+                    )
+                )
+            return await maybe_to_thread(
+                self._persist_triage_queries_sync,
+                study_key,
+                queries,
+                store,
+                default_severity=default_severity,
             )
-        return await maybe_to_thread(
-            self._persist_triage_queries_sync,
-            study_key,
-            queries,
-            store,
-            default_severity=default_severity,
-        )
 
     async def extract_odm_annotations(
         self,
@@ -575,28 +627,29 @@ class QueryManagementWorkflow(_QueryManagementBase):
             "sync_queries_to_triage",
             "sync_queries_to_triage",
         )
-        if unresolved_only and "get_unresolved_queries" in vars(self):
-            queries = self.get_unresolved_queries(
-                study_key,
-                additional_filter=additional_filter,
-                **kwargs,
+        with self._governance_context():
+            if unresolved_only and "get_unresolved_queries" in vars(self):
+                queries = self.get_unresolved_queries(
+                    study_key,
+                    additional_filter=additional_filter,
+                    **kwargs,
+                )
+                return self._persist_triage_queries_sync(
+                    study_key,
+                    queries,
+                    store,
+                    default_severity=default_severity,
+                )
+            return run_sync_over_async(
+                lambda: self._async_core.sync_queries_to_triage(
+                    study_key,
+                    store=store,
+                    additional_filter=additional_filter,
+                    unresolved_only=unresolved_only,
+                    default_severity=default_severity,
+                    **kwargs,
+                )
             )
-            return self._persist_triage_queries_sync(
-                study_key,
-                queries,
-                store,
-                default_severity=default_severity,
-            )
-        return run_sync_over_async(
-            lambda: self._async_core.sync_queries_to_triage(
-                study_key,
-                store=store,
-                additional_filter=additional_filter,
-                unresolved_only=unresolved_only,
-                default_severity=default_severity,
-                **kwargs,
-            )
-        )
 
     def extract_odm_annotations(
         self,

@@ -232,8 +232,11 @@ def test_verification_workflows_enforce_reports_caching_and_deep_fuzzing() -> No
 
     main_wf = yaml.safe_load(main_raw)
     fuzz_job = main_wf["jobs"]["fuzzing"]
-    assert fuzz_job["needs"] == ["plan", "build"]
-    assert fuzz_job["if"] == "needs.plan.outputs.matrix != '[]'"
+    assert fuzz_job["needs"] == ["plan"]
+    assert (
+        fuzz_job["if"]
+        == "needs.plan.outputs.build_matrix != '[]' || needs.plan.outputs.run_fuzzing == 'true'"
+    )
     assert fuzz_job["permissions"] == {"contents": "read"}
 
     fuzz_steps = fuzz_job["steps"]
